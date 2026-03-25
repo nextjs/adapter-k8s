@@ -3,6 +3,7 @@ import path from "node:path";
 import { runInit } from "./init.js";
 import { runDeploy } from "./deploy.js";
 import { runDestroy } from "./destroy.js";
+import { runDoctor } from "./doctor.js";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const args = argv.slice(2);
@@ -35,12 +36,13 @@ Usage: npx adapter-k8s <command> [options]
 Commands:
   init       Provision GCP infrastructure, scaffold adapter config
   deploy     Build, push images, helm upgrade
+  doctor     Run health checks on your deployment
   destroy    Tear down all resources
 
 Options:
   --project-id <id>       GCP project ID
   --region <region>        GCP region (default: us-central1)
-  --host <hostname>        Application hostname (e.g. app.example.com)
+  --host <hostname>        Application hostname(s), comma-separated (e.g. app.example.com,api.example.com)
   --bucket <name>          GCS bucket name for static assets
   --registry <url>         Container registry URL
   --release-name <name>    Helm release name (default: current directory name)
@@ -63,18 +65,20 @@ async function main(): Promise<void> {
     case 'init': {
       const projectId = (flags['project-id'] as string) ?? process.env.GCP_PROJECT_ID;
       const region = (flags['region'] as string) ?? process.env.GCP_REGION ?? 'us-central1';
-      const host = (flags['host'] as string) ?? process.env.APP_HOST;
+      const hostRaw = (flags['host'] as string) ?? process.env.APP_HOST;
+      const hosts = hostRaw ? hostRaw.split(',').map(h => h.trim()).filter(Boolean) : [];
       const bucket = (flags['bucket'] as string) ?? (projectId ? `${projectId}-nextjs-static` : undefined);
       const registry = (flags['registry'] as string) ?? (projectId && region ? `${region}-docker.pkg.dev/${projectId}/nextjs` : undefined);
 
-      if (!projectId || !host) {
+      if (!projectId || hosts.length === 0) {
         console.error('Error: --project-id and --host are required for init');
         console.error('  Example: npx adapter-k8s init --project-id my-project --host app.example.com');
+        console.error('  Multiple: npx adapter-k8s init --project-id my-project --host app.example.com,api.example.com');
         process.exit(1);
       }
 
       await runInit({
-        projectId, region, host, bucket: bucket!, registry: registry!,
+        projectId, region, hosts, bucket: bucket!, registry: registry!,
         releaseName, projectDir, dryRun,
       });
       break;
@@ -88,6 +92,11 @@ async function main(): Promise<void> {
         skipPush: flags['skip-push'] === true,
         dryRun,
       });
+      break;
+    }
+
+    case 'doctor': {
+      await runDoctor({ projectDir, releaseName });
       break;
     }
 

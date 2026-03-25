@@ -3,12 +3,16 @@
 export interface ScaffoldOptions {
   projectId: string;
   region: string;
-  host: string;
+  hosts: string[];
   bucket: string;
   registry: string;
 }
 
 export function generateAdapterConfig(options: ScaffoldOptions): string {
+  const hostEntries = options.hosts
+    .map(h => `      { hostname: '${h}', tls: { enabled: true, managedCert: true } },`)
+    .join('\n');
+
   return `import { createK8sAdapter } from '@next-community/adapter-k8s';
 
 export default createK8sAdapter({
@@ -32,8 +36,9 @@ export default createK8sAdapter({
       gateway: {
         type: 'gateway-api',
         className: 'gke-l7-global-external-managed',
-        host: '${options.host}',
-        tls: { enabled: true, managedCert: true },
+        hosts: [
+${hostEntries}
+        ],
       },
     },
   },
@@ -44,21 +49,23 @@ export default createK8sAdapter({
 export interface InfrastructureConfig {
   projectId: string;
   region: string;
-  host: string;
+  hosts: string[];
   gcsBucket: string;
   containerRegistry: string;
   gatewayName: string;
   routeExtensionName: string;
+  releaseName: string;
 }
 
 export function generateInfrastructureJson(config: InfrastructureConfig): string {
   return JSON.stringify({
     projectId: config.projectId,
     region: config.region,
-    host: config.host,
+    hosts: config.hosts,
     gcsBucket: config.gcsBucket,
     containerRegistry: config.containerRegistry,
     gatewayName: config.gatewayName,
     routeExtensionName: config.routeExtensionName,
+    releaseName: config.releaseName,
   }, null, 2);
 }

@@ -27,8 +27,21 @@ export function validateConfig(input: unknown): void {
     throw new Error("provider is required in adapter config");
   }
 
-  if (!config.provider.gke?.gateway?.host) {
-    throw new Error("provider.gke.gateway.host is required");
+  if (!config.provider.gke?.gateway?.hosts || config.provider.gke.gateway.hosts.length === 0) {
+    throw new Error("provider.gke.gateway.hosts is required and must contain at least one host");
+  }
+
+  for (const hostConfig of config.provider.gke.gateway.hosts) {
+    if (!hostConfig.hostname) {
+      throw new Error("each host in provider.gke.gateway.hosts must have a hostname");
+    }
+    if (hostConfig.hostname.includes('*') && hostConfig.tls?.managedCert) {
+      throw new Error(
+        `wildcard hostname "${hostConfig.hostname}" cannot use managedCert. ` +
+        `GKE ManagedCertificate does not support wildcards. ` +
+        `Use Certificate Manager with DNS authorization instead.`
+      );
+    }
   }
 }
 

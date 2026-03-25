@@ -31,7 +31,7 @@ export function createLocalResolver(
         requestBody,
         headers,
         pathnames: manifest.pathnames,
-        i18n: manifest.i18n ?? undefined,
+        i18n: (manifest.i18n as any) ?? undefined,
         routes: manifest.routeGraph,
         // invokeMiddleware MUST always be a function — resolveRoutes calls it
         // unconditionally (no null guard). When no middleware exists, return empty result.

@@ -16,10 +16,12 @@
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "import": "./dist/index.js",
-      "require": "./dist/index.js"
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
     },
     "./package.json": "./package.json"
   },
@@ -30,10 +32,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "build:clean": "rm -rf dist",
+    "build:types": "tsc --emitDeclarationOnly --declaration --declarationDir dist",
     "build:adapter": "esbuild ./src/index.ts --bundle --format=esm --platform=node --outfile=./dist/index.js --external:next --external:@next/routing --external:minimatch",
-    "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs --external:@next/routing",
+    "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs",
     "build:cli": "esbuild ./src/cli/index.ts --bundle --format=cjs --platform=node --outfile=./dist/cli.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cli.cjs",
-    "build": "npm run build:clean && npm run build:adapter && npm run build:pool-server && npm run build:cli",
+    "build": "npm run build:clean && npm run build:types && npm run build:adapter && npm run build:pool-server && npm run build:cli",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "lint": "oxlint",

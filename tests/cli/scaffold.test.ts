@@ -7,7 +7,7 @@ describe('generateAdapterConfig', () => {
     const result = generateAdapterConfig({
       projectId: 'my-project',
       region: 'us-central1',
-      host: 'app.example.com',
+      hosts: ['app.example.com'],
       bucket: 'my-project-nextjs-static',
       registry: 'us-central1-docker.pkg.dev/my-project/nextjs',
     });

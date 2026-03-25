@@ -1,9 +1,20 @@
 // src/types.ts
-import type { NextAdapter, AdapterOutput, AdapterOutputs } from "next";
+import type { NextAdapter, AdapterOutput } from "next";
 import type { ResolveRoutesParams } from "@next/routing";
 
+// Define AdapterOutputs locally since it's not exported from "next"
+export interface AdapterOutputs {
+  appPages: Array<AdapterOutput["APP_PAGE"]>;
+  appRoutes: Array<AdapterOutput["APP_ROUTE"]>;
+  pages: Array<AdapterOutput["PAGES"]>;
+  pagesApi: Array<AdapterOutput["PAGES_API"]>;
+  prerenders: Array<AdapterOutput["PRERENDER"]>;
+  staticFiles: Array<AdapterOutput["STATIC_FILE"]>;
+  middleware?: AdapterOutput["MIDDLEWARE"] | null;
+}
+
 // Re-export Next.js types we use throughout
-export type { NextAdapter, AdapterOutput, AdapterOutputs };
+export type { NextAdapter, AdapterOutput };
 export type BuildCompleteContext = Parameters<NonNullable<NextAdapter["onBuildComplete"]>>[0];
 
 // --- Adapter Config ---
@@ -15,13 +26,20 @@ export interface PoolConfig {
   timeout?: number;
 }
 
+export interface HostConfig {
+  hostname: string;
+  tls: {
+    enabled: boolean;
+    managedCert?: boolean;
+  };
+}
+
 export interface GKEProviderConfig {
   cdn?: { enabled: boolean; bucket: string; origin?: string };
   gateway?: {
     type: "gateway-api" | "ingress";
     className: string;
-    host: string;
-    tls?: { enabled: boolean; managedCert?: boolean };
+    hosts: HostConfig[];
   };
 }
 
@@ -49,7 +67,6 @@ export interface PoolDefinition {
 }
 
 // The route graph shape passed to resolveRoutes — matches ctx.routing from onBuildComplete
-// rsc is inside routeGraph per design doc §5.3
 export type RouteGraph = ResolveRoutesParams["routes"] & {
   shouldNormalizeNextData: boolean;
   rsc: BuildCompleteContext["routing"]["rsc"];

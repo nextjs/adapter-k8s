@@ -1,7 +1,7 @@
 // src/cli/deploy.ts
 import path from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
-import { exec, execOrThrow } from './exec.js';
+import { exec, execOrThrow, execCapture } from './exec.js';
 import { readState, writeState } from './state.js';
 import type { GcloudCommand } from './init.js';
 
@@ -152,7 +152,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // 5. Helm upgrade
+  // 5. Pre-flight: ensure static IP exists (Gateway needs it)
+  if (!dryRun && infra.projectId) {
+    const ipName = `${releaseName}-ip`;
+    console.log(`\n  → Ensuring static IP "${ipName}" exists...`);
+    const ipCheck = await execCapture('gcloud', [
+      'compute', 'addresses', 'describe', ipName,
+      '--global', '--project', infra.projectId, '--format=value(address)',
+    ]);
+    if (ipCheck.exitCode !== 0) {
+      console.log(`    Creating static IP "${ipName}"...`);
+      await execOrThrow('gcloud', [
+        'compute', 'addresses', 'create', ipName,
+        '--global', '--project', infra.projectId, '--quiet',
+      ]);
+    } else {
+      console.log(`    Static IP: ${ipCheck.stdout.trim()}`);
+    }
+  }
+
+  // 6. Helm upgrade
   const state = readState(projectDir);
   const previousBuildId = state?.buildId ?? null;
 
@@ -180,44 +199,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
   console.log(`\n✓ Deploy complete (build: ${buildId})`);
 
-  // 7. Attempt to get Gateway IP
+  // 7. Run domain health checks
   if (!dryRun) {
-    console.log('\nWaiting for GCP Load Balancer to initialize...');
-    console.log('(This typically takes 5-10 minutes. You can Ctrl+C and check manually later via `kubectl get gateway`)');
-    
-    try {
-      const ip = await waitForGatewayIP(releaseName);
-      if (ip) {
-        console.log(`\n🚀 Application is live!`);
-        console.log(`   URL: http://${infra.host || 'your-configured-host'}`);
-        console.log(`   IP:  ${ip}`);
-        console.log(`\nNext: Ensure your DNS A record for ${infra.host || 'your-host'} points to ${ip}`);
-      }
-    } catch (err) {
-      console.log('\nTimed out waiting for Gateway IP. The Load Balancer is still provisioning.');
-      console.log('Check progress manually with: `kubectl get gateway`');
-    }
+    const { runDomainChecks } = await import('./doctor.js');
+    await runDomainChecks({ projectDir, releaseName });
   }
 
-  console.log('\n');
+  console.log('');
 }
 
-async function waitForGatewayIP(releaseName: string): Promise<string | null> {
-  const maxAttempts = 30; // 5 minutes (10s intervals)
-  for (let i = 0; i < maxAttempts; i++) {
-    try {
-      const output = await execCaptureOrThrow('kubectl', [
-        'get', 'gateway', `${releaseName}-gateway`,
-        '-o', 'jsonpath={.status.addresses[0].value}',
-      ]);
-      const ip = output.trim();
-      if (ip && /^[0-9.]+$/.test(ip)) {
-        return ip;
-      }
-    } catch {
-      // Gateway might not be ready or status field missing yet
-    }
-    await new Promise((r) => setTimeout(r, 10000));
-  }
-  return null;
-}

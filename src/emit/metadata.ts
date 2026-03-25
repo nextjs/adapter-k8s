@@ -4,11 +4,13 @@ export function generateBuildMetadata({
   nextVersion,
   poolNames,
   generatedAt,
+  containerStrategy,
 }: {
   buildId: string;
   nextVersion: string;
   poolNames: string[];
   generatedAt: string;
+  containerStrategy?: string | undefined;
 }): string {
   return JSON.stringify(
     {
@@ -16,6 +18,7 @@ export function generateBuildMetadata({
       nextVersion,
       pools: poolNames,
       generatedAt,
+      containerStrategy: containerStrategy ?? "traced-assets",
     },
     null,
     2,

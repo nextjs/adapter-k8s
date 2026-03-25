@@ -1,25 +1,93 @@
 // src/emit/templates/gateway.ts
-import type { PoolDefinition, RoutingManifest } from "../../types.js";
+import type { HostConfig, PoolDefinition, RoutingManifest } from "../../types.js";
 import { sanitizeK8sName } from "./utils.js";
+
+export function renderGateway({
+  releaseName,
+  hosts,
+}: {
+  releaseName: string;
+  hosts: HostConfig[];
+}): string {
+  const hasTls = hosts.some(h => h.tls?.enabled);
+
+  const annotations: Record<string, string> = {};
+
+  // GKE Gateway API uses Certificate Manager for TLS, not ManagedCertificate CRD.
+  // The certmap is created by `init` via gcloud certificate-manager commands.
+  if (hasTls) {
+    annotations["networking.gke.io/certmap"] = `${releaseName}-certmap`;
+  }
+
+  const annotationLines = Object.entries(annotations)
+    .map(([k, v]) => `    ${k}: ${v}`)
+    .join("\n");
+  const annotationsBlock = Object.keys(annotations).length > 0
+    ? `  annotations:\n${annotationLines}\n`
+    : "";
+
+  let listeners = `    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Same`;
+
+  if (hasTls) {
+    // Single HTTPS listener — Certificate Manager certmap handles all hostnames
+    listeners += `
+    - name: https
+      protocol: HTTPS
+      port: 443
+      allowedRoutes:
+        namespaces:
+          from: Same`;
+  }
+
+  return `apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ${releaseName}-gateway
+${annotationsBlock}spec:
+  gatewayClassName: gke-l7-global-external-managed
+  addresses:
+    - type: NamedAddress
+      value: ${releaseName}-ip
+  listeners:
+${listeners}
+`;
+}
+
+// ManagedCertificate is no longer used — Certificate Manager replaces it.
+// Keeping this as a no-op for backward compat during transition.
+export function renderManagedCertificate({
+  releaseName,
+  hosts,
+}: {
+  releaseName: string;
+  hosts: HostConfig[];
+}): string {
+  return "";
+}
 
 export function renderHTTPRoute({
   releaseName,
-  host,
+  hosts,
   pools,
   buildId,
   routingManifest,
 }: {
   releaseName: string;
-  host: string;
+  hosts: HostConfig[];
   pools: Map<string, PoolDefinition>;
   buildId: string;
   routingManifest: RoutingManifest;
 }): string {
+  const hostnames = hosts.map(h => h.hostname);
   const defaultPoolName = [...pools.keys()][0] ?? "default";
 
   // Phase 1: simple path-based routing.
   // We MUST stay under 16 rules for Gateway API.
-  // We achieve this by collapsing paths into coarse prefixes (first path segment).
   const prefixToPool = new Map<string, string>();
 
   for (const [pathname, poolName] of Object.entries(
@@ -86,6 +154,8 @@ export function renderHTTPRoute({
     })
     .join("\n");
 
+  const hostnameLines = hostnames.map(h => `    - ${h}`).join("\n");
+
   return `apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -94,7 +164,7 @@ spec:
   parentRefs:
     - name: ${releaseName}-gateway
   hostnames:
-    - ${host}
+${hostnameLines}
   rules:
 ${rules}
 `;

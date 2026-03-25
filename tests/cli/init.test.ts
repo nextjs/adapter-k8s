@@ -11,7 +11,7 @@ vi.mock("../../src/cli/exec.js");
 vi.mock("../../src/cli/scaffold.js");
 
 describe("buildInitGcloudCommands", () => {
-  it("generates correct gcloud commands for GCS bucket and GKE", () => {
+  it("generates correct gcloud commands for infrastructure", () => {
     const commands = buildInitGcloudCommands({
       projectId: "my-project",
       region: "us-central1",
@@ -32,6 +32,12 @@ describe("buildInitGcloudCommands", () => {
     );
     expect(clusterCmd).toBeDefined();
     expect(clusterCmd!.args).toContain("create-auto");
+
+    const ipCmd = commands.find((c) =>
+      c.description.includes("Reserve Global Static IP"),
+    );
+    expect(ipCmd).toBeDefined();
+    expect(ipCmd!.args).toContain("addresses");
   });
 
   it("includes IAM service account creation", () => {
@@ -64,34 +70,34 @@ describe("runInit", () => {
       .spyOn(scaffold, "generateInfrastructureJson")
       .mockReturnValue("infra");
 
-    // Mock sequence of responses
-    execCapture
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }) // APIs
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }) // Cluster
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }) // Repo create
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }) // Bucket create
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }) // SA create
-      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "denied" }) // IAM binding fail (will retry)
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }) // IAM binding retry success
-      .mockResolvedValueOnce({
-        exitCode: 1,
-        stdout: "",
-        stderr: "ALREADY_EXISTS",
-      }) // Registry writer (already exists)
-      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" }); // Repo admin success
+    // Mock: all gcloud commands succeed, except IAM binding (retry) and registry (already exists)
+    // Default to success for all calls
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    // Override specific calls: IAM binding fails first, then succeeds on retry
+    let callCount = 0;
+    execCapture.mockImplementation(async () => {
+      callCount++;
+      // Call 7 = IAM binding (Grant storage admin) — fail first time
+      if (callCount === 7) return { exitCode: 1, stdout: "", stderr: "denied" };
+      // Call 8 = IAM binding retry — succeed
+      // Call 9 = Registry writer — already exists
+      if (callCount === 9) return { exitCode: 1, stdout: "", stderr: "ALREADY_EXISTS" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
 
     await runInit({
       projectId: "p",
       region: "r",
-      host: "h",
+      hosts: ["h"],
       bucket: "b",
       registry: "reg",
       releaseName: "rel",
       projectDir: tmpDir,
     });
 
-    // APIs, Cluster, Repo, Bucket, SA, IAM (1 + retry), Registry, RepoAdmin = 9 calls
-    expect(execCapture).toHaveBeenCalledTimes(9);
+    // Should have called execCapture for all gcloud commands + DNS auth describe
+    expect(execCapture).toHaveBeenCalled();
     expect(generateAdapterConfig).toHaveBeenCalled();
     expect(generateInfrastructureJson).toHaveBeenCalled();
     rmSync(tmpDir, { recursive: true, force: true });

@@ -47,7 +47,7 @@ describe("generateHelmChart", () => {
             gateway: {
               type: "gateway-api",
               className: "gke-l7-global-external-managed",
-              host: "app.example.com",
+              hosts: [{ hostname: "app.example.com", tls: { enabled: true, managedCert: true } }],
             },
           },
         },
@@ -64,6 +64,9 @@ describe("generateHelmChart", () => {
     expect(result["templates/ssr-hpa.yaml"]).toBeDefined();
     expect(result["templates/routing-manifest-configmap.yaml"]).toBeDefined();
     expect(result["templates/http-route.yaml"]).toBeDefined();
+    expect(result["templates/gateway.yaml"]).toBeDefined();
+    expect(result["templates/gateway.yaml"]).toContain("type: NamedAddress");
+    expect(result["templates/gateway.yaml"]).toContain("value: nextjs-ip");
 
     const deploymentContent = result["templates/ssr-deployment.yaml"];
     const expectedName = sanitizeK8sName("nextjs-ssr-abc123");

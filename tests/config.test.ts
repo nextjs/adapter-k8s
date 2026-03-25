@@ -27,7 +27,7 @@ describe("validateConfig", () => {
           gateway: {
             type: "gateway-api",
             className: "gke-l7-global-external-managed",
-            host: "app.example.com",
+            hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
           },
         },
       },
@@ -37,17 +37,17 @@ describe("validateConfig", () => {
     );
   });
 
-  it("throws error if gke host is missing", () => {
-    const config: K8sAdapterConfig = {
+  it("throws error if hosts is missing or empty", () => {
+    const config = {
       pools: { ssr: { routes: ["appPages"] } },
-      provider: { gke: { gateway: { host: "" } } } as any,
-    };
+      provider: { gke: { gateway: { hosts: [] } } },
+    } as any;
     expect(() => validateConfig(config)).toThrow(
-      /provider.gke.gateway.host is required/,
+      /provider.gke.gateway.hosts is required/,
     );
   });
 
-  it("passes for a valid config", () => {
+  it("throws error for wildcard hostname with managedCert", () => {
     const config: K8sAdapterConfig = {
       pools: { ssr: { routes: ["appPages"] } },
       provider: {
@@ -55,7 +55,42 @@ describe("validateConfig", () => {
           gateway: {
             type: "gateway-api",
             className: "gke-l7-global-external-managed",
-            host: "app.example.com",
+            hosts: [{ hostname: "*.example.com", tls: { enabled: true, managedCert: true } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).toThrow(/wildcard.*managedCert/);
+  });
+
+  it("allows wildcard hostname without managedCert", () => {
+    const config: K8sAdapterConfig = {
+      pools: { ssr: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke-l7-global-external-managed",
+            hosts: [{ hostname: "*.example.com", tls: { enabled: true, managedCert: false } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).not.toThrow();
+  });
+
+  it("passes for a valid config with multiple hosts", () => {
+    const config: K8sAdapterConfig = {
+      pools: { ssr: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke-l7-global-external-managed",
+            hosts: [
+              { hostname: "app.example.com", tls: { enabled: true, managedCert: true } },
+              { hostname: "api.example.com", tls: { enabled: true, managedCert: true } },
+            ],
           },
         },
       },
@@ -69,7 +104,13 @@ describe("applyDefaults", () => {
     const config: K8sAdapterConfig = {
       pools: { ssr: { routes: ["appPages"] } },
       provider: {
-        gke: { gateway: { type: "gateway-api", className: "gke", host: "test.com" } },
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
       },
     };
     const result = applyDefaults(config);

@@ -11,13 +11,13 @@ export function buildStaticManifest(outputs: AdapterOutputs, projectDir: string)
   ];
 
   for (const file of staticOutputs) {
-    if (!file.filePath) {
+    if (!(file as any).filePath) {
       console.warn(`[adapter-k8s] Skipping static asset without filePath: ${file.pathname}`);
       continue;
     }
     entries.push({
       pathname: file.pathname,
-      filePath: path.relative(projectDir, file.filePath),
+      filePath: path.relative(projectDir, (file as any).filePath),
       cacheControl: (file as any).immutableHash
         ? "public, max-age=31536000, immutable"
         : "public, max-age=3600",

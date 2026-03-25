@@ -10,7 +10,10 @@ import { renderDeployment } from "./templates/deployment.js";
 import { renderService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import { renderConfigMap } from "./templates/configmap.js";
-import { renderHTTPRoute } from "./templates/gateway.js";
+import {
+  renderGateway,
+  renderHTTPRoute,
+} from "./templates/gateway.js";
 import { sanitizeK8sName } from "./templates/utils.js";
 
 export function generateHelmChart({
@@ -59,10 +62,15 @@ export function generateHelmChart({
   });
 
   const gke = config.provider.gke;
-  if (gke.gateway?.host) {
+  if (gke.gateway?.hosts?.length) {
+    files["templates/gateway.yaml"] = renderGateway({
+      releaseName,
+      hosts: gke.gateway.hosts,
+    });
+
     files["templates/http-route.yaml"] = renderHTTPRoute({
       releaseName,
-      host: gke.gateway.host,
+      hosts: gke.gateway.hosts,
       pools,
       buildId,
       routingManifest,

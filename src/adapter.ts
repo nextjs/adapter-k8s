@@ -100,6 +100,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
   async function ensureConfig(projectDir: string) {
     if (config) return config;
 
+    // Try to load from project root
     const configPaths = [
       path.join(projectDir, "adapter.config.ts"),
       path.join(projectDir, "adapter.config.js"),
@@ -112,6 +113,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           const mod = await import(pathToFileURL(p).href);
           const exported = mod.default;
           if (exported && typeof exported === "object") {
+            // Standard adapters export the object directly OR an instance.
+            // If it's an instance, we tucked the config into a hidden property below.
             config = exported.config || exported;
           }
           break;
@@ -132,9 +135,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     return config;
   }
 
-  return {
+  const adapter: NextAdapter = {
     name: "k8s",
-    config: userConfig,
 
     async modifyConfig(nextConfig, ctx) {
       const projectDir = (ctx as any).projectDir || process.cwd();
@@ -178,13 +180,24 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const staticManifest = buildStaticManifest(outputs, projectDir);
 
       // 4. Generate Helm chart
+      // Read releaseName from infrastructure.json (written by init) so it matches
+      // the gcloud resource names (IP, gateway, etc.)
+      const infraPath = path.join(projectDir, '.k8s-adapter', 'infrastructure.json');
+      const infra = existsSync(infraPath)
+        ? JSON.parse(readFileSync(infraPath, 'utf-8'))
+        : {};
+      const releaseName = infra.releaseName
+        ?? path.basename(projectDir).toLowerCase().replace(/[^a-z0-9]/g, '-')
+        ?? 'nextjs';
+
       const helmFiles = generateHelmChart({
         pools,
         buildId,
         nextVersion,
         config: cfg,
-        imageRegistry: process.env.IMAGE_REGISTRY ?? "REGISTRY",
+        imageRegistry: infra.containerRegistry ?? process.env.IMAGE_REGISTRY ?? "REGISTRY",
         routingManifest,
+        releaseName,
       });
 
       for (const [filePath, content] of Object.entries(helmFiles)) {
@@ -283,8 +296,25 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             );
           }
 
+          // Stage next/setup-node-env (required for AsyncLocalStorage initialization)
+          const nextPkgDir = path.join(projectDir, "node_modules", "next");
+          if (existsSync(nextPkgDir)) {
+            await stageFile(projectDir, nextPkgDir, "node_modules/next", poolName);
+          }
+
+          // Stage @next/routing (required for pool server local route resolution)
+          const nextRoutingDir = path.join(projectDir, "node_modules", "@next", "routing");
+          if (existsSync(nextRoutingDir)) {
+            await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
+          }
+
           // Shared context files
-          await writeOutputFile(projectDir, "package.json", JSON.stringify({ type: "module" }), poolStageDir);
+          await writeOutputFile(
+            projectDir,
+            "package.json",
+            JSON.stringify({ type: "commonjs" }),
+            poolStageDir,
+          );
           if (poolServerContent) {
             await writeOutputFile(
               projectDir,
@@ -368,4 +398,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       );
     },
   };
+
+  // Expose config for ensureConfig to find when it imports an existing adapter instance
+  Object.defineProperty(adapter, "config", {
+    value: userConfig,
+    enumerable: false,
+    writable: false,
+  });
+
+  return adapter;
 }

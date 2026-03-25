@@ -1,5 +1,6 @@
 // src/pool-server/index.ts
 import { readFileSync, existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest } from "../types.js";
@@ -8,7 +9,30 @@ import { createLocalResolver } from "./resolve.js";
 import { createDispatcher } from "./dispatch.js";
 import { createPoolServer } from "./server.js";
 
+// Initialize Next.js Node runtime shims (AsyncLocalStorage, hooks, crypto polyfills).
+// This MUST run before any Next.js handler modules are imported.
+// Follows the AWS adapter's ensureNextNodeEnvironment pattern.
+async function ensureNextNodeEnvironment(): Promise<void> {
+  try {
+    // @ts-ignore — no type declarations for this internal Next.js setup module
+    await import("next/setup-node-env");
+    return;
+  } catch {
+    // Fallback: try resolving from the .next output directory
+  }
+
+  try {
+    const req = createRequire(path.join(process.cwd(), ".next", "server", "app", "_placeholder.js"));
+    const resolved = req.resolve("next/setup-node-env");
+    await import(pathToFileURL(resolved).href);
+  } catch {
+    console.warn("[pool-server] Could not load next/setup-node-env — AsyncLocalStorage may not work");
+  }
+}
+
 async function main() {
+  // Initialize Next.js runtime BEFORE anything else
+  await ensureNextNodeEnvironment();
   const poolName = process.env.POOL_NAME;
   if (!poolName) throw new Error("POOL_NAME environment variable is required");
 
