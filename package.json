@@ -1,0 +1,43 @@
+{
+  "name": "@next-community/adapter-k8s",
+  "version": "0.0.0",
+  "type": "commonjs",
+  "main": "dist/index.cjs",
+  "files": [
+    "dist"
+  ],
+  "homepage": "https://github.com/nextjs/adapter-k8s#readme",
+  "bugs": {
+    "url": "https://github.com/nextjs/adapter-k8s/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nextjs/adapter-k8s.git"
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build:clean": "rm -rf dist",
+    "build": "npm run build:clean && esbuild ./src/index.js --bundle --format=cjs --platform=node --outfile=./dist/index.cjs --external:next",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix"
+  },
+  "peerDependencies": {
+    "next": "^16.2.0"
+  },
+  "engines": {
+    "node": ">= 20.9.0"
+  },
+  "dependencies": {
+    "@next/routing": "^16.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "esbuild": "^0.27.4",
+    "oxfmt": "^0.42.0",
+    "oxlint": "^1.57.0",
+    "typescript": "^6.0.2"
+  }
+}
