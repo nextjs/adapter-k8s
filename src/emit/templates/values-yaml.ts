@@ -30,6 +30,9 @@ export function renderValuesYaml({
       [...pools.entries()].map(([name, pool]) => [
         name,
         {
+          image: {
+            repository: config.containerStrategy === "shared-image" ? "nextjs-app" : `nextjs-app-${name}`,
+          },
           replicas: pool.config.scaling ?? { min: 1, max: 3, targetCPU: 80 },
           resources: pool.config.resources ?? {
             requests: { cpu: "250m", memory: "256Mi" },
@@ -37,7 +40,7 @@ export function renderValuesYaml({
           },
           _meta: { outputCount: pool.outputs.length },
         },
-      ]),
+      ])
     ),
     gateway: gke?.gateway ?? {},
     build: {

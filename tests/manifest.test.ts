@@ -49,6 +49,7 @@ describe("buildRoutingManifest", () => {
       basePath: "",
       i18n: null,
       nextVersion: "16.2.0",
+      projectDir: "/app",
     });
 
     expect(manifest.buildId).toBe("test123");
@@ -71,7 +72,7 @@ describe("buildRoutingManifest", () => {
           // @ts-ignore - mock property
           parentOutputId: "/app/dashboard",
           fallback: {
-            filePath: "/dist/dashboard.html",
+            filePath: "/app/dist/dashboard.html",
             postponedState: "abc123",
           },
           config: { renderingMode: "PARTIALLY_STATIC" as any },
@@ -89,11 +90,12 @@ describe("buildRoutingManifest", () => {
       basePath: "",
       i18n: null,
       nextVersion: "16.2.0",
+      projectDir: "/app",
     });
 
     expect(manifest.pprRoutes["/dashboard"]).toEqual({
       postponedState: "abc123",
-      fallbackFilePath: "/dist/dashboard.html",
+      fallbackFilePath: "dist/dashboard.html",
     });
   });
 
@@ -124,6 +126,7 @@ describe("buildRoutingManifest", () => {
       basePath: "",
       i18n: null,
       nextVersion: "16.2.0",
+      projectDir: "/app",
     });
 
     expect(manifest.pprRoutes["/partial"]).toBeUndefined();
@@ -142,6 +145,7 @@ describe("buildRoutingManifest", () => {
       basePath: "",
       i18n: null,
       nextVersion: "16.2.0",
+      projectDir: "/app",
     });
 
     expect(manifest.routeGraph.rsc).toBeDefined();

@@ -1,20 +1,21 @@
 // src/emit/static-assets.ts
-import type { AdapterOutputs, StaticAssetEntry } from "../types.js";
+import path from 'node:path';
+import type { AdapterOutputs, StaticAssetEntry } from '../types.js';
 
-export function buildStaticManifest(outputs: AdapterOutputs): StaticAssetEntry[] {
+export function buildStaticManifest(outputs: AdapterOutputs, projectDir: string): StaticAssetEntry[] {
   const entries: StaticAssetEntry[] = [];
 
   const staticOutputs = [
     ...outputs.staticFiles,
     ...outputs.prerenders,
-    ...outputs.appPages.filter((p) => p.type === (1 as any)), // STATIC_PAGE if available
-    ...outputs.pages.filter((p) => p.type === (1 as any)),
+    ...outputs.appPages.filter((p) => String(p.type) === "STATIC_PAGE"),
+    ...outputs.pages.filter((p) => String(p.type) === "STATIC_PAGE"),
   ];
 
   for (const file of staticOutputs) {
     entries.push({
       pathname: file.pathname,
-      filePath: file.filePath,
+      filePath: path.relative(projectDir, file.filePath),
       cacheControl: (file as any).immutableHash
         ? 'public, max-age=31536000, immutable'
         : 'public, max-age=3600',

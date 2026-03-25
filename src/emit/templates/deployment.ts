@@ -32,7 +32,7 @@ spec:
     spec:
       containers:
         - name: pool-server
-          image: "{{ .Values.global.image.registry }}/{{ .Values.global.image.repository }}:{{ .Values.global.image.tag }}"
+          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools \"${poolName}\").image.repository }}:{{ .Values.global.image.tag }}"
           ports:
             - containerPort: 3000
           env:
@@ -54,10 +54,10 @@ spec:
             initialDelaySeconds: 10
           resources:
             requests:
-              cpu: "{{ .Values.pools.${poolName}.resources.requests.cpu }}"
-              memory: "{{ .Values.pools.${poolName}.resources.requests.memory }}"
+              cpu: "{{ (index .Values.pools \"${poolName}\").resources.requests.cpu }}"
+              memory: "{{ (index .Values.pools \"${poolName}\").resources.requests.memory }}"
             limits:
-              cpu: "{{ .Values.pools.${poolName}.resources.limits.cpu }}"
-              memory: "{{ .Values.pools.${poolName}.resources.limits.memory }}"
+              cpu: "{{ (index .Values.pools \"${poolName}\").resources.limits.cpu }}"
+              memory: "{{ (index .Values.pools \"${poolName}\").resources.limits.memory }}"
 `;
 }

@@ -9,6 +9,11 @@ describe("validateConfig", () => {
     expect(() => validateConfig(config)).toThrow(/pools is required/);
   });
 
+  it("throws error if pools is empty", () => {
+    const config = { pools: {}, provider: { gke: {} } } as any;
+    expect(() => validateConfig(config)).toThrow(/at least one pool must be defined/);
+  });
+
   it("throws error if provider is missing", () => {
     const config = { pools: { ssr: { routes: ["appPages"] } } } as any;
     expect(() => validateConfig(config)).toThrow(/provider is required/);
@@ -70,5 +75,8 @@ describe("applyDefaults", () => {
     const result = applyDefaults(config);
     expect(result.containerStrategy).toBe("traced-assets");
     expect(result.provider.gke.cdn?.enabled).toBe(false);
+    expect(result.cache?.enabled).toBe(false);
+    expect(result.skewProtection?.enabled).toBe(false);
+    expect(result.routeExtension?.mode).toBe("auto");
   });
 });

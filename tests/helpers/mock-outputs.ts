@@ -54,6 +54,10 @@ export function mockPrerender(
     config: overrides.config ?? {},
     // @ts-ignore
     fallback: overrides.fallback,
+    // @ts-ignore
+    parentOutputId: overrides.parentOutputId ?? `/app${overrides.sourcePage ?? "/blog/[slug]"}`,
+    // @ts-ignore
+    groupId: overrides.groupId ?? (overrides.sourcePage ?? "/blog/[slug]"),
   };
 }
 
@@ -65,7 +69,7 @@ export function mockOutputs(overrides: Partial<AdapterOutputs> = {}): AdapterOut
     pagesApi: overrides.pagesApi ?? [],
     prerenders: overrides.prerenders ?? [],
     staticFiles: overrides.staticFiles ?? [],
-    middleware: overrides.middleware ?? null,
+    middleware: overrides.middleware ?? undefined,
   };
 }
 
@@ -84,6 +88,9 @@ export function mockRouting(
       header: "RSC",
       varyHeader: "RSC, Next-Router-State-Tree, Next-Router-Prefetch",
       contentType: "text/x-component",
+      suffix: ".rsc",
+      prefetchHeader: "Next-Router-Prefetch",
+      didPostponeHeader: "x-nextjs-postponed",
     },
   };
 }
