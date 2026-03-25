@@ -26,3 +26,7 @@ npx @next-community/adapter-k8s init
 ```sh
 npx @next-community/adapter-k8s deploy
 ```
+
+```sh
+npx @next-community/adapter-k8s doctor
+```

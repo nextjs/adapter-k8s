@@ -261,11 +261,11 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
       if (negResult.exitCode === 0 && negResult.stdout.trim()) {
         for (const line of negResult.stdout.trim().split("\n")) {
           if (!line.includes(releaseName)) continue;
-          const synced = line.includes("Synced=True");
+          const healthy = line.includes("=True");
           results.push(
-            synced
-              ? { name: "Backend NEG", status: "pass", message: line.split(":")[0]?.trim() ?? "Synced" }
-              : { name: "Backend NEG", status: "warn", message: line.trim(), fix: "NEG not yet synced — backend health check may be pending" },
+            healthy
+              ? { name: "Backend NEG", status: "pass", message: line.split(":")[0]?.trim() ?? "Ready" }
+              : { name: "Backend NEG", status: "warn", message: line.trim(), fix: "NEG not yet ready — backend health check may be pending" },
           );
         }
       }
