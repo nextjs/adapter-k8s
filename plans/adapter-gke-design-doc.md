@@ -956,19 +956,23 @@ async function handleRequest(
   // 3. External rewrite (e.g., middleware rewrites to an external URL)
   // Next.js rewrites are transparent proxies (URL stays the same in the
   // browser). Route extensions can't proxy — they can only mutate headers
-  // or return immediate responses. We route to a dedicated reverse-proxy
-  // backend pool that fetches from the external URL and returns the response.
+  // or return immediate responses.
   //
-  // The external-proxy pool is a lightweight Node.js service (or Envoy
-  // sidecar) that reads x-rewrite-target, fetches the external URL, and
-  // pipes the response back. It's deployed as a separate Deployment in
-  // the Helm chart, only when the build output contains external rewrites.
+  // v1: External rewrites are not supported. Return an error response
+  // with a clear message. Users should use Route Handlers to proxy
+  // external APIs instead.
+  //
+  // v2+: A dedicated external-proxy backend pool (lightweight Node.js
+  // service or Envoy sidecar) that reads x-rewrite-target, fetches the
+  // external URL with streaming support, and pipes the response back.
+  // This needs its own Deployment, scaling profile, timeout config,
+  // and body size limits. See §21 Future Work.
   if (resolution.externalRewrite) {
-    headerMutations.push(
-      { key: 'x-upstream-pool', value: 'external-proxy' },
-      { key: 'x-rewrite-target', value: resolution.externalRewrite.toString() },
-    );
-    return headerMutationResponse(headerMutations);
+    return immediateResponse(502, {
+      'content-type': 'text/plain; charset=utf-8',
+    }, `External rewrites are not supported in adapter-k8s v1. ` +
+       `Attempted rewrite to: ${resolution.externalRewrite.toString()}\n` +
+       `Use a Route Handler to proxy external APIs instead.`);
   }
 
   // 4. Normal route — determine the pool and set headers
@@ -1112,6 +1116,46 @@ The adapter provides **two** cache handler implementations backed by a shared Re
 2. **`cacheHandlers`** (plural) — handles `'use cache'` and `'use cache: remote'` directives. Uses the newer `CacheHandler` interface with `ReadableStream` values, `refreshTags`, `getExpiration`, and `updateTags`. Set via `next.config.ts` `cacheHandlers` field.
 
 Both connect to the same Valkey instance but use different key prefixes and serialization formats to match their respective Next.js APIs. **All keys are namespaced by `buildId`** for skew protection (§6.6) — each deployment version reads/writes only its own namespace, preventing cross-version contamination during rolling deployments.
+
+**ReadableStream serialization for `cacheHandlers`:**
+
+The `cacheHandlers` API (for `'use cache'`) uses `ReadableStream<Uint8Array>` values in `CacheEntry`, unlike the `cacheHandler` API which uses plain JSON-serializable objects. Storing streams in Valkey requires:
+
+1. **On `set`:** Buffer the entire stream to a `Uint8Array` before storing. The `pendingEntry` is a `Promise<CacheEntry>` — await it, then read the stream via `.getReader()` and concatenate chunks. Store the buffer as a binary Valkey value (not JSON-encoded — use raw bytes to avoid base64 overhead).
+2. **On `get`:** Reconstruct a `ReadableStream` from the stored buffer. Create a new `ReadableStream` that enqueues the buffer in a single chunk and closes. This is what the Next.js default handler and the AWS adapter's Redis example both do.
+3. **Back-pressure:** Not a concern for Valkey storage — we buffer the full stream before writing. For very large cached values (e.g., large RSC payloads), the buffer fits in memory since Next.js already materialized the stream. Valkey's max value size (512 MiB default) is well above any reasonable cache entry.
+4. **Stream errors:** If the stream errors during `set`, discard the partial entry — don't store incomplete cache entries. The `set` method should catch stream read errors and silently skip caching.
+
+```typescript
+// Simplified cacheHandlers implementation (set method)
+async set(cacheKey: string, pendingEntry: Promise<CacheEntry>): Promise<void> {
+  const entry = await pendingEntry;
+  const reader = entry.value.getReader();
+  const chunks: Uint8Array[] = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+  } catch {
+    return; // Stream errored — discard partial entry
+  } finally {
+    reader.releaseLock();
+  }
+  const buffer = Buffer.concat(chunks);
+  const metadata = { tags: entry.tags, stale: entry.stale, timestamp: entry.timestamp, expire: entry.expire, revalidate: entry.revalidate };
+  const redis = await getClient();
+  const pipeline = redis.multi();
+  pipeline.set(keyPrefix(cacheKey) + ':meta', JSON.stringify(metadata));
+  pipeline.set(keyPrefix(cacheKey) + ':body', buffer); // raw bytes
+  if (entry.expire > 0) {
+    pipeline.expire(keyPrefix(cacheKey) + ':meta', entry.expire);
+    pipeline.expire(keyPrefix(cacheKey) + ':body', entry.expire);
+  }
+  await pipeline.exec();
+}
+```
 
 ### 8.2 Implementation
 
@@ -1594,7 +1638,7 @@ This is a values.yaml toggle — no adapter code change needed, just a different
 ### 12.1 Helm Chart Structure
 
 ```
-.gke-adapter-output/
+.k8s-adapter/output/
 ├── chart/
 │   ├── Chart.yaml
 │   ├── values.yaml                      ← defaults derived from build metadata
@@ -1997,32 +2041,72 @@ function generateCelExpression(
     }
   }
 
-  // 3. If no middleware exists at all, we could be even more aggressive:
-  //    only invoke ext_proc for paths that match known dynamic/prerender routes.
-  //    But this is risky — a missing exclusion means a 404 route hits ext_proc
-  //    unnecessarily (acceptable) vs. a false exclusion means a real route
-  //    bypasses middleware (broken). Default to the safe exclusion-only approach.
+  // 3. No middleware — flip to inclusion list (much more aggressive)
+  if (!outputs.middleware) {
+    const inclusions: string[] = [];
+
+    // Only invoke ext_proc for paths that actually need dispatch metadata
+    // Dynamic routes (need resolveRoutes to determine the output)
+    for (const route of routing.dynamicRoutes) {
+      // Dynamic routes have regex patterns — use startsWith on the static prefix
+      const staticPrefix = extractStaticPrefix(route.sourceRegex);
+      if (staticPrefix) {
+        inclusions.push(`request.path.startsWith('${staticPrefix}')`);
+      }
+    }
+
+    // ISR prerender routes (need cache orchestration in pool server)
+    for (const prerender of outputs.prerenders) {
+      if (prerender.fallback?.initialRevalidate) {
+        inclusions.push(`request.path == '${prerender.pathname}'`);
+      }
+    }
+
+    // Image optimization
+    inclusions.push("request.path.startsWith('/_next/image')");
+
+    if (inclusions.length > 0) {
+      return inclusions.join(' || ');
+    }
+
+    // No dynamic routes, no ISR, no image optimization — nothing needs ext_proc
+    return 'false';
+  }
 
   if (exclusions.length === 0) {
-    return 'true';  // No exclusions possible — call ext_proc for everything
+    return 'true';  // Middleware exists but no exclusions possible
   }
 
   // CEL: invoke ext_proc when NONE of the exclusions match
   return `!(${exclusions.join(' || ')})`;
 }
+
+// Extract the static prefix from a route sourceRegex for CEL startsWith matching.
+// e.g. "^/blog/([^/]+?)(?:/)?$" → "/blog/"
+function extractStaticPrefix(sourceRegex: string): string | null {
+  // Strip leading ^ and extract literal characters before the first regex metacharacter
+  const withoutAnchor = sourceRegex.replace(/^\^/, '');
+  const match = withoutAnchor.match(/^(\/[a-zA-Z0-9_\-/]*)/);
+  return match?.[1] ?? null;
+}
 ```
 
 **Example generated CEL expressions:**
 
-App with middleware:
+App with middleware (exclusion list — conservative):
 ```
 !(request.path.startsWith('/_next/static/') || request.path == '/favicon.ico' || request.path == '/robots.txt')
 ```
 
-App without middleware (more aggressive — also exclude prerendered static paths):
+App without middleware (inclusion list — aggressive):
 ```
-!(request.path.startsWith('/_next/static/') || request.path == '/favicon.ico' || request.path == '/robots.txt' || request.path == '/about' || request.path == '/pricing')
+request.path.startsWith('/blog/') || request.path.startsWith('/api/') || request.path.startsWith('/_next/image') || request.path == '/dashboard'
 ```
+
+The no-middleware inclusion list is safe because:
+- A false positive (calling ext_proc for a route that doesn't need it) costs a gRPC round-trip — acceptable
+- A false negative (skipping ext_proc for a real route) means the pool server handles it via local fallback resolution (§15.1) — no security concern since there's no middleware to bypass
+- Unknown paths (404s) skip ext_proc entirely — the URL map fallback routes them to the pool server which returns 404
 
 **Impact:** For a typical Next.js app, `/_next/static/*` accounts for the majority of CDN-served requests (JS chunks, CSS, fonts, images). Excluding these from ext_proc eliminates the gRPC round-trip on the highest-volume path prefix. The URL map still routes these to the GCS backend via a default rule (no `x-upstream-pool` header needed — the HTTPRoute fallback handles it).
 
@@ -2072,11 +2156,12 @@ App without middleware (more aggressive — also exclude prerendered static path
 | Route extension is headers-only (no request body) | Low | Low | Next.js middleware almost never reads the request body. For the rare POST-with-middleware case, the middleware passes through (`NextResponse.next()`) and body-dependent validation happens in the route handler itself. |
 | `LbRouteExtension` on global ALB requires direct API management (not GKE Gateway CRD) | Medium | High | The GKE Gateway controller's `GCPRoutingExtension` only supports regional gateways. We use the Service Extensions API directly (`LbRouteExtension`), which is GA on global ALBs per the support matrix. This adds operational complexity (Helm hook job vs. native CRD). If GKE Gateway adds global routing extension support, the adapter can switch to the CRD. |
 | PPR resumption relies on cached preambles and in-process resume handlers | Medium | Medium | Preambles are pre-seeded in Valkey at deploy time from build output. Resume handlers use the same invocation pattern as non-PPR routes (§6.2). Fallback: if no cached preamble, do a full render. PPR is opt-in. |
-| External rewrites require a proxy backend pool | Medium | Medium | Next.js rewrites are transparent proxies but route extensions can't proxy. A dedicated reverse-proxy backend pool is needed. Document as a v1 limitation if the proxy pool is not implemented initially. |
+| External rewrites not supported in v1 | Medium | Medium | Next.js rewrites to external URLs are transparent proxies but route extensions can't proxy. v1 returns a 502 with a clear error message directing users to Route Handlers. v2+ will add a dedicated external-proxy backend pool with streaming, timeouts, and body limits. |
 | Traced `assets` maps may miss runtime dependencies | Medium | Medium | The `assets` field is provided by the adapter API and traced via `@vercel/nft`. The AWS adapter uses a similar per-function bundling approach. Provide `shared-image` as a fallback container strategy for operators who hit edge cases. |
 | Next.js adapter API is newly stable (16.2.0) | Medium | Medium | Run the official Next.js e2e test harness for adapters. Pin `peerDependencies`. |
 | `NEXT_PUBLIC_*` env vars are build-time only | Low | High | Well-documented Next.js constraint. Document clearly. Suggest per-environment CI builds. |
 | GCP Service Extensions is a newer GCP feature | Medium | Medium | Service Extensions is GA for global external ALB. `LbRouteExtension` and `LbTrafficExtension` are v1 stable API resources. The ext_proc protocol itself is a stable Envoy standard. |
+| Skew protection doubles pod count during window | Medium | High | With `skewProtection.enabled: true` (default), both old and new pool Deployments run simultaneously. A cluster with 20 SSR replicas will briefly run 40 pods + doubled Valkey memory. Set `duration: '0'` to disable. Operators should factor this into cluster capacity planning. |
 | Tight coupling to GCP load balancer | Medium | Low | This is a GKE-specific provider. The ext_proc protocol is portable — the routing service itself could run behind any ext_proc-capable proxy. The `generic` provider (future) would use in-cluster Envoy. |
 
 ---
@@ -2631,6 +2716,8 @@ This is the default when `mode: 'auto'` and no middleware exists. The adapter de
 
 **Why this is safe:** The Wasm plugin does exactly the same header mutations as the ext_proc service. PPR, ISR, cache orchestration — all of that happens in the pool server, which the Wasm plugin never touches. The plugin is a pure request-header preprocessor.
 
+**Constraint validation:** The 1ms CPU and 16 KiB memory limits are tight. For a large app with hundreds of routes, all regexes are compiled into the Wasm binary at build time (not interpreted at runtime), so matching is fast. However, the adapter should benchmark the compiled plugin during build and warn if the manifest size exceeds safe thresholds. The `auto` mode default handles this gracefully: if the Wasm plugin can't be compiled within constraints (too many routes, binary too large), the adapter falls back to ext_proc and logs a warning.
+
 ### 20.2 Compiled Binary for Route Extension (With Middleware)
 
 **Impact: ~10x faster startup, ~5x lower memory than Node.js ext_proc service.**
@@ -2682,6 +2769,7 @@ The key principle: **the architecture doesn't change.** All optimizations replac
 - **Trace-based autoscaling** — use OpenTelemetry metrics from the routing service to inform HPA decisions
 - **`@next/routing` stabilization** — migrate from experimental to stable when available
 - **Pub/Sub revalidation queue** — decouple ISR background revalidation from pool servers for high-traffic routes (§9.3 Option B)
+- **External rewrite proxy** — dedicated reverse-proxy backend pool for transparent proxying of external URLs (Next.js `rewrites` to external APIs). Needs streaming response support, configurable timeouts, body size limits, and its own scaling profile. v1 returns 502 with a clear error directing users to Route Handlers.
 
 ---
 
