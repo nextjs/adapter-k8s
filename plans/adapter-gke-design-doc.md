@@ -49,46 +49,46 @@ Today, deploying Next.js to Kubernetes involves hand-writing Dockerfiles, Helm c
 ┌──────────────────────────────────────────────────────────────────────┐
 │                                                                      │
 │  Internet ──► [LbRouteExtension] ──► URL Map ──► [Cloud CDN]         │
-│                    │ (ext_proc)          │          │                 │
-│                    │                     │          │                 │
-│                    ▼                     │     cache hit → respond    │
-│              ┌──────────────┐            │          │                 │
-│              │   Routing    │            │     cache miss             │
-│              │   Service    │            │          │                 │
-│              │              │            │          │                 │
-│              │ • @next/     │            │          │                 │
-│              │   routing    │            │          │                 │
-│              │ • middleware │            │          │                 │
-│              └──────────────┘            │          │                 │
-│                                         │          │                 │
-│   immediateResponse ◄── redirects       │          │                 │
-│                                         │          │                 │
-└──────────────────────────────────────────┼──────────┼─────────────────┘
-                                          │          │
-                                   ┌──────┼──────────┼──────────┐
-                                   │      │          │           │
-                                   │      ▼          ▼           │
-                                   │     GKE Cluster             │
-                                   │                             │
-                                   │  ┌────────┐  ┌────────┐    │
-                                   │  │ Pool A │  │ Pool B │    │
-                                   │  │ (SSR)  │  │ (API)  │    │
-                                   │  └───┬────┘  └────────┘    │
-                                   │      │                      │
-                                   │      │ PPR routes:          │
-                                   │      │ 1. read preamble     │
-                                   │      │    from Valkey        │
-                                   │      │ 2. resume in-process │
-                                   │      ▼                      │
-                                   │  ┌────────┐  ┌───────────┐ │
-                                   │  │ Valkey │  │  Image    │ │
-                                   │  │(Cache) │  │ Optimizer │ │
-                                   │  └────────┘  └───────────┘ │
-                                   │                             │
-                                   │  ┌───────┐                  │
-                                   │  │  GCS  │ (static assets) │
-                                   │  └───────┘                  │
-                                   └─────────────────────────────┘
+│                    │ (ext_proc)          │          │                │
+│                    │                     │          │                │
+│                    ▼                     │     cache hit → respond   │
+│              ┌──────────────┐            │          │                │
+│              │   Routing    │            │     cache miss            │
+│              │   Service    │            │          │                │
+│              │              │            │          │                │
+│              │ • @next/     │            │          │                │
+│              │   routing    │            │          │                │
+│              │ • middleware │            │          │                │
+│              └──────────────┘            │          │                │
+│                                          │          │                │
+│   immediateResponse ◄── redirects        │          │                │
+│                                          │          │                │
+└──────────────────────────────────────────┼──────────┼────────────────┘
+                                           │          │
+                                    ┌──────┼──────────┼───────────┐
+                                    │      │          │           │
+                                    │      ▼          ▼           │
+                                    │     GKE Cluster             │
+                                    │                             │
+                                    │  ┌────────┐  ┌────────┐     │
+                                    │  │ Pool A │  │ Pool B │     │
+                                    │  │ (SSR)  │  │ (API)  │     │
+                                    │  └───┬────┘  └────────┘     │
+                                    │      │                      │
+                                    │      │ PPR routes:          │
+                                    │      │ 1. read preamble     │
+                                    │      │    from Valkey       │
+                                    │      │ 2. resume in-process │
+                                    │      ▼                      │
+                                    │  ┌────────┐  ┌───────────┐  │
+                                    │  │ Valkey │  │  Image    │  │
+                                    │  │(Cache) │  │ Optimizer │  │
+                                    │  └────────┘  └───────────┘  │
+                                    │                             │
+                                    │  ┌───────┐                  │
+                                    │  │  GCS  │ (static assets)  │
+                                    │  └───────┘                  │
+                                    └─────────────────────────────┘
 ```
 
 ### Request Flow
@@ -115,7 +115,7 @@ Called before `next build`. The adapter modifies the Next.js configuration to pr
 
 ```typescript
 const adapter: NextAdapter = {
-  name: 'k8s',
+  name: "k8s",
 
   async modifyConfig(config, { phase, nextVersion }) {
     return {
@@ -126,14 +126,14 @@ const adapter: NextAdapter = {
 
       // ISR, route handler responses, and image optimization cache.
       // This is the "incremental cache" — NOT used by 'use cache' directives.
-      cacheHandler: require.resolve('@next-community/adapter-k8s/incremental-cache-handler'),
+      cacheHandler: require.resolve("@next-community/adapter-k8s/incremental-cache-handler"),
 
       // 'use cache' directive handlers — these ARE used by 'use cache' and
       // 'use cache: remote'. Without this, 'use cache' entries are in-memory
       // per-process and not shared across replicas.
       cacheHandlers: {
-        default: require.resolve('@next-community/adapter-k8s/cache-handler'),
-        remote: require.resolve('@next-community/adapter-k8s/cache-handler-remote'),
+        default: require.resolve("@next-community/adapter-k8s/cache-handler"),
+        remote: require.resolve("@next-community/adapter-k8s/cache-handler-remote"),
       },
 
       // Set asset prefix to CDN origin (configured via env var at build time)
@@ -142,8 +142,8 @@ const adapter: NextAdapter = {
       // Image optimization is handled by our sidecar, not the built-in optimizer
       images: {
         ...config.images,
-        loader: 'custom',
-        loaderFile: require.resolve('@next-community/adapter-k8s/image-loader'),
+        loader: "custom",
+        loaderFile: require.resolve("@next-community/adapter-k8s/image-loader"),
       },
     };
   },
@@ -220,7 +220,7 @@ This follows the **External Secrets Operator pattern** — a single `provider` f
 
 ```typescript
 // adapter.config.ts
-import type { K8sAdapterConfig } from '@next-community/adapter-k8s';
+import type { K8sAdapterConfig } from "@next-community/adapter-k8s";
 
 const config: K8sAdapterConfig = {
   // --- Shared across all providers ---
@@ -232,11 +232,11 @@ const config: K8sAdapterConfig = {
 
     // Option 2: SSR + API split (recommended starting point)
     ssr: {
-      routes: ['appPages'],      // All app pages go here
+      routes: ["appPages"], // All app pages go here
       scaling: { min: 2, max: 20, targetCPU: 70 },
     },
     api: {
-      routes: ['appRoutes', 'pagesApi'],  // All route handlers
+      routes: ["appRoutes", "pagesApi"], // All route handlers
       scaling: { min: 2, max: 10, targetCPU: 60 },
     },
 
@@ -251,24 +251,24 @@ const config: K8sAdapterConfig = {
 
   cache: {
     enabled: true,
-    provider: 'valkey',   // or 'redis'
+    provider: "valkey", // or 'redis'
   },
 
-  containerStrategy: 'traced-assets',  // or 'shared-image'
+  containerStrategy: "traced-assets", // or 'shared-image'
 
   imageOptimizer: {
     enabled: true,
-    mode: 'sidecar',  // Sharp container
+    mode: "sidecar", // Sharp container
   },
 
   skewProtection: {
-    enabled: true,      // default: true
-    duration: '5m',     // how long old pools stay alive after new deployment
+    enabled: true, // default: true
+    duration: "5m", // how long old pools stay alive after new deployment
   },
 
   routeExtension: {
-    mode: 'auto',       // 'auto' | 'wasm' | 'extproc'
-                        // auto = Wasm plugin if no middleware, ext_proc otherwise (§20.1)
+    mode: "auto", // 'auto' | 'wasm' | 'extproc'
+    // auto = Wasm plugin if no middleware, ext_proc otherwise (§20.1)
   },
 
   // --- Provider-specific (exactly one) ---
@@ -279,13 +279,13 @@ const config: K8sAdapterConfig = {
     gke: {
       cdn: {
         enabled: true,
-        bucket: 'my-project-nextjs-static',
-        origin: 'https://cdn.example.com',
+        bucket: "my-project-nextjs-static",
+        origin: "https://cdn.example.com",
       },
       gateway: {
-        type: 'gateway-api',
-        className: 'gke-l7-global-external-managed',
-        host: 'app.example.com',
+        type: "gateway-api",
+        className: "gke-l7-global-external-managed",
+        host: "app.example.com",
         tls: { enabled: true, managedCert: true },
       },
       serviceExtensions: {
@@ -341,15 +341,15 @@ export default config;
 // Shared config — identical across providers
 interface SharedConfig {
   pools: Record<string, PoolConfig>;
-  cache: { enabled: boolean; provider: 'valkey' | 'redis' };
-  containerStrategy: 'traced-assets' | 'shared-image';
-  imageOptimizer: { enabled: boolean; mode: 'sidecar' };
+  cache: { enabled: boolean; provider: "valkey" | "redis" };
+  containerStrategy: "traced-assets" | "shared-image";
+  imageOptimizer: { enabled: boolean; mode: "sidecar" };
   skewProtection: {
-    enabled: boolean;    // default: true
-    duration: string;    // e.g. '5m', '10m', '0' to disable
+    enabled: boolean; // default: true
+    duration: string; // e.g. '5m', '10m', '0' to disable
   };
   routeExtension: {
-    mode: 'auto' | 'wasm' | 'extproc';  // default: 'auto' (§20.1)
+    mode: "auto" | "wasm" | "extproc"; // default: 'auto' (§20.1)
   };
 }
 
@@ -365,7 +365,7 @@ type K8sAdapterConfig = SharedConfig & {
 interface GKEProviderConfig {
   cdn: { enabled: boolean; bucket: string; origin?: string };
   gateway: {
-    type: 'gateway-api' | 'ingress';
+    type: "gateway-api" | "ingress";
     className: string;
     host: string;
     tls?: { enabled: boolean; managedCert?: boolean };
@@ -373,15 +373,15 @@ interface GKEProviderConfig {
   serviceExtensions?: {
     routeExtension?: { timeout?: number };
   };
-  cache?: { provider?: 'memorystore' };
-  imageOptimizer?: { mode?: 'cloud-cdn' };
+  cache?: { provider?: "memorystore" };
+  imageOptimizer?: { mode?: "cloud-cdn" };
 }
 
 // Placeholder — not implemented in v1
 interface EKSProviderConfig {
   cdn: { distribution: string; bucket: string; origin?: string };
   ingress: { className: string; host: string; annotations?: Record<string, string> };
-  cache?: { provider?: 'elasticache' };
+  cache?: { provider?: "elasticache" };
 }
 
 // Minimal — works on any K8s cluster
@@ -392,15 +392,15 @@ interface GenericProviderConfig {
 
 **What the provider determines:**
 
-| Concern | GKE | EKS (future) | Generic (future) |
-|---------|-----|--------------|-------------------|
-| Pre-CDN middleware | Route Extension (Service Extensions) | Lambda@Edge / CloudFront Functions | Not available (middleware runs post-CDN in Envoy) |
-| CDN | Cloud CDN | CloudFront | External / none |
-| Static assets | GCS | S3 | Served from pod or external |
-| Gateway | GKE Gateway API | ALB Ingress Controller | Standard K8s Ingress |
-| PPR streaming | Cache-first preamble (Valkey) + in-process resume in pool server | Lambda response streaming | Envoy ext_proc in-cluster |
-| Managed certificates | GKE managed certs | ACM | cert-manager |
-| Helm chart CRDs | `LbRouteExtension`, `LbTrafficExtension` | ALB annotations | None |
+| Concern              | GKE                                                              | EKS (future)                       | Generic (future)                                  |
+| -------------------- | ---------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------- |
+| Pre-CDN middleware   | Route Extension (Service Extensions)                             | Lambda@Edge / CloudFront Functions | Not available (middleware runs post-CDN in Envoy) |
+| CDN                  | Cloud CDN                                                        | CloudFront                         | External / none                                   |
+| Static assets        | GCS                                                              | S3                                 | Served from pod or external                       |
+| Gateway              | GKE Gateway API                                                  | ALB Ingress Controller             | Standard K8s Ingress                              |
+| PPR streaming        | Cache-first preamble (Valkey) + in-process resume in pool server | Lambda response streaming          | Envoy ext_proc in-cluster                         |
+| Managed certificates | GKE managed certs                                                | ACM                                | cert-manager                                      |
+| Helm chart CRDs      | `LbRouteExtension`, `LbTrafficExtension`                         | ALB annotations                    | None                                              |
 
 ### 5.2 Pool Classification Logic
 
@@ -408,7 +408,7 @@ The adapter maps outputs to pools using the configuration. Routes can be matched
 
 ```typescript
 interface PoolConfig {
-  routes: Array<OutputType | string>;  // OutputType or glob pattern
+  routes: Array<OutputType | string>; // OutputType or glob pattern
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu: string; memory: string };
   timeout?: number;
@@ -416,7 +416,7 @@ interface PoolConfig {
 
 function classifyIntoPools(
   outputs: AdapterOutputs,
-  config: K8sAdapterConfig
+  config: K8sAdapterConfig,
 ): Map<string, PoolDefinition> {
   const pools = new Map<string, PoolDefinition>();
   // Track which outputs have been assigned to enforce first-match-wins
@@ -429,16 +429,14 @@ function classifyIntoPools(
       let candidates: AdapterOutput[];
 
       // Match by output type
-      if (routeSpec === 'appPages') candidates = outputs.appPages;
-      else if (routeSpec === 'appRoutes') candidates = outputs.appRoutes;
-      else if (routeSpec === 'pagesApi') candidates = outputs.pagesApi;
+      if (routeSpec === "appPages") candidates = outputs.appPages;
+      else if (routeSpec === "appRoutes") candidates = outputs.appRoutes;
+      else if (routeSpec === "pagesApi") candidates = outputs.pagesApi;
       // Match by glob against pathname
       else {
-        candidates = [
-          ...outputs.appPages,
-          ...outputs.appRoutes,
-          ...outputs.pagesApi,
-        ].filter(o => minimatch(o.pathname, routeSpec));
+        candidates = [...outputs.appPages, ...outputs.appRoutes, ...outputs.pagesApi].filter((o) =>
+          minimatch(o.pathname, routeSpec),
+        );
       }
 
       // First-match-wins: pools are evaluated in config order.
@@ -516,7 +514,7 @@ interface RoutingManifest {
   // --- Middleware ---
 
   middleware: {
-    filePath: string;  // path to .next/server/middleware.js
+    filePath: string; // path to .next/server/middleware.js
   } | null;
 
   // --- GKE-specific: pool assignments and PPR metadata ---
@@ -526,10 +524,13 @@ interface RoutingManifest {
   // e.g. { '/': 'ssr', '/blog/[slug]': 'ssr', '/api/health': 'api' }
 
   // PPR metadata for routes that use partial prerendering
-  pprRoutes: Record<string, {
-    postponedState: string;
-    fallbackFilePath: string;
-  }>;
+  pprRoutes: Record<
+    string,
+    {
+      postponedState: string;
+      fallbackFilePath: string;
+    }
+  >;
 
   // Build metadata
   nextVersion: string;
@@ -547,6 +548,7 @@ interface RoutingManifest {
 Each output in `onBuildComplete` includes `assets: Record<string, string>` — a map of every file the entry point needs (traced via `@vercel/nft`). The adapter unions the assets across all outputs assigned to a pool and builds a container containing only those files.
 
 This is the right approach because:
+
 - The adapter API's `assets` field exists specifically for this purpose
 - Per-pool containers contain only the code needed to serve their assigned routes
 - The `standalone` output mode is likely to be deprecated in favor of the adapter API
@@ -578,9 +580,9 @@ This matches the AWS adapter's `createNodeFunctionArtifactInvoker` pattern:
 
 ```typescript
 // Pool server (simplified)
-import { createServer } from 'node:http';
+import { createServer } from "node:http";
 
-const poolManifest = JSON.parse(readFileSync('/config/pool-manifest.json', 'utf-8'));
+const poolManifest = JSON.parse(readFileSync("/config/pool-manifest.json", "utf-8"));
 const handlerCache = new Map<string, ArtifactRouteHandler>();
 
 async function loadHandler(outputId: string): Promise<ArtifactRouteHandler> {
@@ -596,13 +598,15 @@ async function loadHandler(outputId: string): Promise<ArtifactRouteHandler> {
 
 createServer(async (req, res) => {
   // These headers were set by the route extension
-  const outputId = req.headers['x-output-id'];
-  const matchedPathname = req.headers['x-matched-pathname'];
-  const routeMatches = req.headers['x-route-matches'];
+  const outputId = req.headers["x-output-id"];
+  const matchedPathname = req.headers["x-matched-pathname"];
+  const routeMatches = req.headers["x-route-matches"];
 
   const handler = await loadHandler(outputId);
   await handler(req, res, {
-    waitUntil(p: Promise<unknown>) { void p.catch(() => {}); },
+    waitUntil(p: Promise<unknown>) {
+      void p.catch(() => {});
+    },
     requestMeta: {
       outputId,
       matchedPathname,
@@ -770,19 +774,20 @@ function resolvePoolForRequest(
 
 All Valkey cache keys are namespaced by `buildId` to prevent cross-version contamination:
 
-| Key pattern | Example |
-|-------------|---------|
-| `next:{buildId}:prerender:{pathname}` | `next:a1b2c3d4:prerender:/blog/hello` |
-| `next:{buildId}:ppr:{pathname}` | `next:a1b2c3d4:ppr:/dashboard` |
+| Key pattern                               | Example                                  |
+| ----------------------------------------- | ---------------------------------------- |
+| `next:{buildId}:prerender:{pathname}`     | `next:a1b2c3d4:prerender:/blog/hello`    |
+| `next:{buildId}:ppr:{pathname}`           | `next:a1b2c3d4:ppr:/dashboard`           |
 | `next:{buildId}:ppr:{pathname}:postponed` | `next:a1b2c3d4:ppr:/dashboard:postponed` |
-| `next:{buildId}:cache:{key}` | `next:a1b2c3d4:cache:getUser-42` |
-| `next:{buildId}:tag:{tag}` | `next:a1b2c3d4:tag:blog` |
+| `next:{buildId}:cache:{key}`              | `next:a1b2c3d4:cache:getUser-42`         |
+| `next:{buildId}:tag:{tag}`                | `next:a1b2c3d4:tag:blog`                 |
 
 Each deployment's pool servers read/write only their own buildId-namespaced keys. Old-version pools read old keys, new-version pools read new keys — no cross-contamination even when both are running simultaneously.
 
 The prerender seed job (§9.6) writes keys under the new `buildId` namespace. The old namespace's keys remain untouched until the cleanup job runs.
 
 **Cleanup:** When the skew protection window expires, the Helm cleanup Job:
+
 1. Deletes the old pool Deployments and Services
 2. Scans and deletes all `next:{oldBuildId}:*` keys from Valkey (via `SCAN` + `DEL` to avoid blocking)
 3. Optionally invalidates Cloud CDN entries tagged with the old buildId
@@ -812,6 +817,7 @@ The adapter deploys a single ext_proc service — the Route Extension Service �
 A Node.js gRPC service registered as a **route extension callout**. It runs before URL map evaluation and Cloud CDN cache lookup on every inbound request. This is the primary decision-maker.
 
 **Responsibilities:**
+
 - Resolve the route using `@next/routing` with build manifest data
 - Execute Next.js middleware (redirects, rewrites, auth gates, A/B bucketing)
 - Set `x-upstream-pool` header to direct the URL map to the correct backend
@@ -819,18 +825,21 @@ A Node.js gRPC service registered as a **route extension callout**. It runs befo
 - Return `immediate_response` for middleware short-circuits (redirects, direct responses)
 
 **Dependencies:**
+
 - `@next/routing` — `resolveRoutes()` for route resolution, middleware invocation, i18n, RSC handling (same API the AWS adapter uses)
 - `@connectrpc/connect-node` (or `@connectrpc/connect-fastify`) — gRPC ext_proc server
 - Compiled middleware module from `.next/server/middleware.js`
 - Routing manifest JSON (generated by adapter, mounted as ConfigMap — see §5.3)
 
 **Not a dependency:**
+
 - `next` / `next-server` — the routing service does not render pages
 - Application code — it only needs the routing manifest and middleware
 
 **Cold start:** The route extension loads two things at startup: the routing manifest JSON (small, sync `readFileSync`) and the middleware module (async `import()`). Cold start is typically <500ms. With `minReplicas: 2` (the default), at least one replica is always warm. The HPA should never scale to zero — set `minReplicas` to at least 2 in production.
 
 **Constraints (route extension limitations):**
+
 - Headers only — no request body access (not needed for middleware)
 - Cannot process responses — response handling is done by the pool server
 - Cannot override processing mode
@@ -872,31 +881,27 @@ Route resolution and middleware execution are handled together by `resolveRoutes
 Because this runs as a route extension, `resolveRoutes` executes on **every request before CDN cache lookup** — matching Vercel's behavior where middleware protects cached routes.
 
 ```typescript
-import { resolveRoutes } from '@next/routing';
+import { resolveRoutes } from "@next/routing";
 
 const manifest: RoutingManifest = JSON.parse(
-  readFileSync('/config/routing-manifest.json', 'utf-8')
+  readFileSync("/config/routing-manifest.json", "utf-8"),
 );
 
 // The middleware module, loaded once at startup from the build output
-const middlewareModule = manifest.middleware
-  ? await import(manifest.middleware.filePath)
-  : null;
+const middlewareModule = manifest.middleware ? await import(manifest.middleware.filePath) : null;
 
-async function handleRequest(
-  requestHeaders: HeaderValue[],
-): Promise<ExtProcResponse> {
-  const path = getHeader(requestHeaders, ':path')!;
-  const method = getHeader(requestHeaders, ':method') || 'GET';
-  const scheme = getHeader(requestHeaders, ':scheme')!;
-  const authority = getHeader(requestHeaders, ':authority')!;
+async function handleRequest(requestHeaders: HeaderValue[]): Promise<ExtProcResponse> {
+  const path = getHeader(requestHeaders, ":path")!;
+  const method = getHeader(requestHeaders, ":method") || "GET";
+  const scheme = getHeader(requestHeaders, ":scheme")!;
+  const authority = getHeader(requestHeaders, ":authority")!;
   const url = new URL(`${scheme}://${authority}${path}`);
 
   // Build a Headers object from ext_proc headers (drop HTTP/2 pseudo-headers)
   const headers = new Headers(
     requestHeaders
-      .filter(h => !h.key.startsWith(':'))
-      .map(h => [h.key, decodeHeaderValue(h)] as [string, string])
+      .filter((h) => !h.key.startsWith(":"))
+      .map((h) => [h.key, decodeHeaderValue(h)] as [string, string]),
   );
 
   // Track middleware response if middleware short-circuits
@@ -911,7 +916,11 @@ async function handleRequest(
     basePath: manifest.basePath,
     // Route extensions are headers-only — no request body access.
     // This is fine: Next.js middleware almost never reads the body.
-    requestBody: new ReadableStream({ start(c) { c.close(); } }),
+    requestBody: new ReadableStream({
+      start(c) {
+        c.close();
+      },
+    }),
     headers,
     pathnames: manifest.pathnames,
     i18n: manifest.i18n ?? undefined,
@@ -968,11 +977,15 @@ async function handleRequest(
   // This needs its own Deployment, scaling profile, timeout config,
   // and body size limits. See §21 Future Work.
   if (resolution.externalRewrite) {
-    return immediateResponse(502, {
-      'content-type': 'text/plain; charset=utf-8',
-    }, `External rewrites are not supported in adapter-k8s v1. ` +
-       `Attempted rewrite to: ${resolution.externalRewrite.toString()}\n` +
-       `Use a Route Handler to proxy external APIs instead.`);
+    return immediateResponse(
+      502,
+      {
+        "content-type": "text/plain; charset=utf-8",
+      },
+      `External rewrites are not supported in adapter-k8s v1. ` +
+        `Attempted rewrite to: ${resolution.externalRewrite.toString()}\n` +
+        `Use a Route Handler to proxy external APIs instead.`,
+    );
   }
 
   // 4. Normal route — determine the pool and set headers
@@ -987,40 +1000,41 @@ async function handleRequest(
   }
 
   // Static assets → GCS (served via Cloud CDN)
-  if (matchedPathname.startsWith('/_next/static/')) {
-    headerMutations.push({ key: 'x-upstream-pool', value: 'gcs-backend' });
+  if (matchedPathname.startsWith("/_next/static/")) {
+    headerMutations.push({ key: "x-upstream-pool", value: "gcs-backend" });
     return headerMutationResponse(headerMutations);
   }
 
   // Image optimization
-  if (matchedPathname === '/_next/image') {
-    headerMutations.push({ key: 'x-upstream-pool', value: 'image-optimizer' });
+  if (matchedPathname === "/_next/image") {
+    headerMutations.push({ key: "x-upstream-pool", value: "image-optimizer" });
     return headerMutationResponse(headerMutations);
   }
 
   // Look up pool assignment and output ID for the matched route
-  const pool = manifest.poolAssignments[matchedPathname]
-    || Object.keys(manifest.poolAssignments)[0]
-    || 'default';
-  headerMutations.push({ key: 'x-upstream-pool', value: pool });
+  const pool =
+    manifest.poolAssignments[matchedPathname] ||
+    Object.keys(manifest.poolAssignments)[0] ||
+    "default";
+  headerMutations.push({ key: "x-upstream-pool", value: pool });
 
   // Pass dispatch metadata so the pool server can invoke the correct handler
   // directly (no re-routing needed — see §6.2)
   const outputId = resolution.invocationTarget?.id;
   if (outputId) {
-    headerMutations.push({ key: 'x-output-id', value: outputId });
+    headerMutations.push({ key: "x-output-id", value: outputId });
   }
-  headerMutations.push({ key: 'x-matched-pathname', value: matchedPathname });
+  headerMutations.push({ key: "x-matched-pathname", value: matchedPathname });
   if (resolution.routeMatches) {
     headerMutations.push({
-      key: 'x-route-matches',
+      key: "x-route-matches",
       value: JSON.stringify(resolution.routeMatches),
     });
   }
 
   // Flag PPR routes so the pool server uses cache-first PPR flow
   if (matchedPathname in manifest.pprRoutes) {
-    headerMutations.push({ key: 'x-nextjs-ppr', value: '1' });
+    headerMutations.push({ key: "x-nextjs-ppr", value: "1" });
   }
 
   return headerMutationResponse(headerMutations);
@@ -1029,7 +1043,7 @@ async function handleRequest(
 
 **Why `resolveRoutes` instead of manual middleware execution:**
 
-The original design had separate `createRouteResolver` and `executeMiddleware` steps. The AWS adapter demonstrates a better pattern — `resolveRoutes` from `@next/routing` handles the entire pipeline (rewrites, redirects, middleware, i18n, dynamic routes, RSC resolution) as a single atomic operation. Middleware is invoked via an `invokeMiddleware` callback *within* route resolution, which ensures middleware sees the correct pre-processed URL and that post-middleware routing rules are applied correctly.
+The original design had separate `createRouteResolver` and `executeMiddleware` steps. The AWS adapter demonstrates a better pattern — `resolveRoutes` from `@next/routing` handles the entire pipeline (rewrites, redirects, middleware, i18n, dynamic routes, RSC resolution) as a single atomic operation. Middleware is invoked via an `invokeMiddleware` callback _within_ route resolution, which ensures middleware sees the correct pre-processed URL and that post-middleware routing rules are applied correctly.
 
 The Firebase App Hosting adapter's manual middleware invocation (constructing a Fetch request and calling `middleware.default.default()`) serves as proof-of-concept for how middleware modules are invoked in an ext_proc context. The `invokeMiddleware` callback inside `resolveRoutes` uses the same underlying mechanism but with `@next/routing` managing the request lifecycle.
 
@@ -1059,8 +1073,8 @@ async function handlePPRRequest(
 
   // 2. Start streaming the preamble immediately
   res.writeHead(200, {
-    'content-type': 'text/html; charset=utf-8',
-    'transfer-encoding': 'chunked',
+    "content-type": "text/html; charset=utf-8",
+    "transfer-encoding": "chunked",
   });
   res.write(preamble);
 
@@ -1076,7 +1090,9 @@ async function handlePPRRequest(
   // Suspense fallbacks in the client
   const resumeRes = new PassThrough();
   handler(resumeReq, resumeRes, {
-    waitUntil(p: Promise<unknown>) { void p.catch(() => {}); },
+    waitUntil(p: Promise<unknown>) {
+      void p.catch(() => {});
+    },
     requestMeta: {
       outputId,
       matchedPathname,
@@ -1094,6 +1110,7 @@ async function handlePPRRequest(
 ```
 
 This approach is simpler and faster than a traffic extension because:
+
 - The preamble comes from Valkey (sub-millisecond) instead of an SSR pool round-trip
 - The resume handler is invoked in-process — no second HTTP request
 - No `GCPTrafficExtension` to manage, no separate PPR service to scale
@@ -1106,6 +1123,7 @@ This approach is simpler and faster than a traffic extension because:
 ### 8.1 Purpose
 
 Next.js's built-in cache is in-memory and per-process. With multiple replicas in a pool, this means:
+
 - ISR revalidation on one replica isn't visible to others
 - `use cache` entries are duplicated across replicas
 - `revalidateTag()` / `updateTag()` only invalidates the local process
@@ -1161,7 +1179,7 @@ async set(cacheKey: string, pendingEntry: Promise<CacheEntry>): Promise<void> {
 
 ```typescript
 // incremental-cache-handler.ts (cacheHandler — ISR, route handlers, images)
-import { createClient, type RedisClientType } from 'redis';
+import { createClient, type RedisClientType } from "redis";
 
 let client: RedisClientType;
 // buildId is injected at build time by the adapter or read from env
@@ -1224,7 +1242,7 @@ export default class K8sCacheHandler {
     for (const tag of tagList) {
       const keys = await redis.sMembers(tagPrefix(tag));
       if (keys.length) {
-        await redis.del(keys.map(k => keyPrefix(k)));
+        await redis.del(keys.map((k) => keyPrefix(k)));
       }
       await redis.del(tagPrefix(tag));
     }
@@ -1300,12 +1318,12 @@ Request arrives (with x-output-id, x-matched-pathname, x-nextjs-ppr headers)
 
 Following the AWS adapter's pattern, the pool server tracks cache state for every prerender response:
 
-| State | Condition | Behavior |
-|-------|-----------|----------|
-| `HIT` | Entry exists, within `revalidate` TTL, tags not expired | Serve from Valkey immediately |
-| `STALE` | Entry exists, past `revalidate` TTL but not expired, OR tags are stale | Serve from Valkey immediately, **enqueue background revalidation + CDN invalidation** |
-| `MISS` | No entry, or tags expired, or cache bypassed | Invoke parent handler, cache the response |
-| `BYPASS` | Draft mode or on-demand revalidation request | Skip cache entirely, invoke handler |
+| State    | Condition                                                              | Behavior                                                                              |
+| -------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `HIT`    | Entry exists, within `revalidate` TTL, tags not expired                | Serve from Valkey immediately                                                         |
+| `STALE`  | Entry exists, past `revalidate` TTL but not expired, OR tags are stale | Serve from Valkey immediately, **enqueue background revalidation + CDN invalidation** |
+| `MISS`   | No entry, or tags expired, or cache bypassed                           | Invoke parent handler, cache the response                                             |
+| `BYPASS` | Draft mode or on-demand revalidation request                           | Skip cache entirely, invoke handler                                                   |
 
 **`Cache-Tag` response header:** Every cacheable response served by the pool server includes a `Cache-Tag` header with the entry's Next.js cache tags. Cloud CDN stores these tags as metadata, enabling tag-based CDN invalidation later (see §9.7). This is set by the pool server on both fresh renders and cache hits.
 
@@ -1323,13 +1341,13 @@ async function handlePrerenderRoute(
   const cacheKey = `next:${buildId}:prerender:${matchedPathname}`;
 
   // 1. Check for on-demand revalidation (revalidatePath / revalidateTag)
-  const revalidateToken = req.headers['x-prerender-revalidate'];
+  const revalidateToken = req.headers["x-prerender-revalidate"];
   if (revalidateToken && isValidRevalidateToken(revalidateToken, seed)) {
     const response = await invokeHandler(req, outputId, matchedPathname, routeMatches);
     await cacheResponse(cache, cacheKey, response, seed);
     // Invalidate Cloud CDN so the stale version is purged
     await invalidateCDNPath(matchedPathname);
-    res.setHeader('x-nextjs-cache', 'REVALIDATED');
+    res.setHeader("x-nextjs-cache", "REVALIDATED");
     return pipeResponse(response, res);
   }
 
@@ -1340,16 +1358,16 @@ async function handlePrerenderRoute(
   if (cachedEntry) {
     const evaluation = evaluateEntry(cachedEntry, now, seed);
 
-    if (evaluation === 'fresh') {
+    if (evaluation === "fresh") {
       // HIT: serve directly from cache
-      res.setHeader('x-nextjs-cache', 'HIT');
+      res.setHeader("x-nextjs-cache", "HIT");
       setCacheTagHeader(res, cachedEntry.tags);
       return serveCachedEntry(cachedEntry, res);
     }
 
-    if (evaluation === 'stale') {
+    if (evaluation === "stale") {
       // STALE: serve from cache, revalidate in background (includes CDN invalidation)
-      res.setHeader('x-nextjs-cache', 'STALE');
+      res.setHeader("x-nextjs-cache", "STALE");
       setCacheTagHeader(res, cachedEntry.tags);
       enqueueBackgroundRevalidation(outputId, matchedPathname, routeMatches, seed);
       return serveCachedEntry(cachedEntry, res);
@@ -1365,14 +1383,14 @@ async function handlePrerenderRoute(
   if (seed.fallback) {
     // ISR with fallback: serve fallback, invoke handler in background, cache result
     const handlerPromise = invokeHandler(req, outputId, matchedPathname, routeMatches);
-    handlerPromise.then(response => cacheResponse(cache, cacheKey, response, seed));
+    handlerPromise.then((response) => cacheResponse(cache, cacheKey, response, seed));
     return serveFallback(seed.fallback, res);
   }
 
   // 4. No fallback: invoke handler directly, cache result
   const response = await invokeHandler(req, outputId, matchedPathname, routeMatches);
   await cacheResponse(cache, cacheKey, response, seed);
-  res.setHeader('x-nextjs-cache', 'MISS');
+  res.setHeader("x-nextjs-cache", "MISS");
   setCacheTagHeader(res, seed.tags);
   return pipeResponse(response, res);
 }
@@ -1382,7 +1400,7 @@ function setCacheTagHeader(res: ServerResponse, tags: string[]): void {
   // Always include buildId tag for per-version CDN invalidation on deployment (§6.6)
   // Limit: 50 tags per object, 120 bytes per tag, 4 KiB total
   const allTags = [`build-${buildId}`, ...tags];
-  res.setHeader('Cache-Tag', allTags.join(','));
+  res.setHeader("Cache-Tag", allTags.join(","));
 }
 ```
 
@@ -1441,12 +1459,12 @@ function evaluateEntry(
   entry: CachedPrerenderEntry,
   now: number,
   seed: PrerenderSeed,
-): 'fresh' | 'stale' | 'miss' {
+): "fresh" | "stale" | "miss" {
   // Check TTL-based freshness
   const revalidateMs = (seed.revalidate ?? 0) * 1000;
   if (revalidateMs > 0 && now > entry.createdAt + revalidateMs) {
     // Past revalidate window but entry still exists — stale
-    return 'stale';
+    return "stale";
   }
 
   // Check tag-based freshness
@@ -1454,11 +1472,11 @@ function evaluateEntry(
   // the entry is stale (tag was soft-invalidated) or expired (tag was hard-invalidated)
   if (entry.tags.length > 0) {
     const tagState = checkTagFreshness(entry.tags, entry.createdAt);
-    if (tagState === 'expired') return 'miss';
-    if (tagState === 'stale') return 'stale';
+    if (tagState === "expired") return "miss";
+    if (tagState === "stale") return "stale";
   }
 
-  return 'fresh';
+  return "fresh";
 }
 ```
 
@@ -1491,13 +1509,13 @@ At deploy time, the adapter pre-seeds Valkey with data from `outputs.prerenders`
 
 All keys are namespaced by `buildId` for skew protection (§6.6):
 
-| Data | Valkey Key | Source |
-|------|-----------|--------|
-| Prerender cache entry (initial HTML) | `next:{buildId}:prerender:{pathname}` | `prerender.fallback.filePath` + `prerender.fallback.initialHeaders` + `prerender.fallback.initialStatus` |
-| PPR preamble | `next:{buildId}:ppr:{pathname}` | `prerender.fallback.filePath` (shell HTML) |
-| PPR postponed state | `next:{buildId}:ppr:{pathname}:postponed` | `prerender.fallback.postponedState` |
-| Tag associations | `next:{buildId}:tag:{tag}` → set of cache keys | `prerender.config.tags` + `x-next-cache-tags` header |
-| Revalidation metadata | `next:{buildId}:prerender:{pathname}:meta` | `prerender.config.revalidate`, `prerender.groupId`, `prerender.parentOutputId` |
+| Data                                 | Valkey Key                                     | Source                                                                                                   |
+| ------------------------------------ | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Prerender cache entry (initial HTML) | `next:{buildId}:prerender:{pathname}`          | `prerender.fallback.filePath` + `prerender.fallback.initialHeaders` + `prerender.fallback.initialStatus` |
+| PPR preamble                         | `next:{buildId}:ppr:{pathname}`                | `prerender.fallback.filePath` (shell HTML)                                                               |
+| PPR postponed state                  | `next:{buildId}:ppr:{pathname}:postponed`      | `prerender.fallback.postponedState`                                                                      |
+| Tag associations                     | `next:{buildId}:tag:{tag}` → set of cache keys | `prerender.config.tags` + `x-next-cache-tags` header                                                     |
+| Revalidation metadata                | `next:{buildId}:prerender:{pathname}:meta`     | `prerender.config.revalidate`, `prerender.groupId`, `prerender.parentOutputId`                           |
 
 This is done by a Helm hook job (`ppr-cache-seed-job.yaml`) that runs after deployment. The Bun adapter's `seedPrerenderCache` function serves as a reference — it does the same thing with SQLite.
 
@@ -1509,26 +1527,26 @@ The pool server and Cloud CDN form a **two-layer cache**. Valkey is the authorit
 
 The pool server sets two headers on every cacheable response that Cloud CDN uses:
 
-| Header | Purpose | Example |
-|--------|---------|---------|
+| Header          | Purpose                     | Example                                           |
+| --------------- | --------------------------- | ------------------------------------------------- |
 | `Cache-Control` | Tells CDN how long to cache | `public, s-maxage=60, stale-while-revalidate=300` |
-| `Cache-Tag` | Tags for CDN invalidation | `blog,post-123,author-jane` |
+| `Cache-Tag`     | Tags for CDN invalidation   | `blog,post-123,author-jane`                       |
 
 The `s-maxage` is derived from the prerender seed's `revalidate` value. The `Cache-Tag` values come from the entry's Next.js cache tags (`x-next-cache-tags` header).
 
 **Invalidation flows:**
 
-| Trigger | Valkey | Cloud CDN | Method |
-|---------|--------|-----------|--------|
-| Stale-while-revalidate (§9.3) | Write fresh entry | `invalidateCDNPath(pathname)` | Path-based |
-| `revalidateTag()` in Server Action (§9.4) | Delete entries by tag | `invalidateCDNByTags(tags)` | Tag-based |
-| On-demand `/_next/revalidate` (§9.5) | Delete entries by path/tag | `invalidateCDNPath()` or `invalidateCDNByTags()` | Path or tag |
-| New deployment | Pre-seed all entries | Implicit (new `buildId` changes URLs for `_next/static`) | N/A |
+| Trigger                                   | Valkey                     | Cloud CDN                                                | Method      |
+| ----------------------------------------- | -------------------------- | -------------------------------------------------------- | ----------- |
+| Stale-while-revalidate (§9.3)             | Write fresh entry          | `invalidateCDNPath(pathname)`                            | Path-based  |
+| `revalidateTag()` in Server Action (§9.4) | Delete entries by tag      | `invalidateCDNByTags(tags)`                              | Tag-based   |
+| On-demand `/_next/revalidate` (§9.5)      | Delete entries by path/tag | `invalidateCDNPath()` or `invalidateCDNByTags()`         | Path or tag |
+| New deployment                            | Pre-seed all entries       | Implicit (new `buildId` changes URLs for `_next/static`) | N/A         |
 
 **CDN invalidation implementation:**
 
 ```typescript
-import { compute } from '@google-cloud/compute';
+import { compute } from "@google-cloud/compute";
 
 const urlMapsClient = new compute.UrlMapsClient();
 
@@ -1575,11 +1593,11 @@ async function invalidateCDNByTags(tags: string[]): Promise<void> {
 
 The adapter generates a manifest of all files that should be synced to GCS:
 
-| Source | GCS Path | Cache-Control |
-|--------|----------|---------------|
-| `outputs.staticFiles` (`_next/static/*`) | `/{pathname}` | `public, max-age=31536000, immutable` |
+| Source                                   | GCS Path      | Cache-Control                                           |
+| ---------------------------------------- | ------------- | ------------------------------------------------------- |
+| `outputs.staticFiles` (`_next/static/*`) | `/{pathname}` | `public, max-age=31536000, immutable`                   |
 | `outputs.prerenders[].fallback.filePath` | `/{pathname}` | `public, s-maxage={revalidate}, stale-while-revalidate` |
-| Public directory files | `/{pathname}` | `public, max-age=3600` |
+| Public directory files                   | `/{pathname}` | `public, max-age=3600`                                  |
 
 The adapter emits this as a `static-assets.json` manifest. A Helm Job or CI step runs `gcloud storage rsync` against this manifest.
 
@@ -1694,13 +1712,13 @@ pools:
       max: 20
     resources:
       requests: { cpu: 250m, memory: 512Mi }
-      limits:   { cpu: "1",  memory: 1Gi   }
+      limits: { cpu: "1", memory: 1Gi }
     targetCPU: 70
     # Build metadata (informational)
     _meta:
       outputCount: 47
       hasPPR: true
-      hasMiddleware: false  # middleware runs in routing service
+      hasMiddleware: false # middleware runs in routing service
 
   api:
     replicas:
@@ -1708,7 +1726,7 @@ pools:
       max: 10
     resources:
       requests: { cpu: 250m, memory: 256Mi }
-      limits:   { cpu: 500m, memory: 512Mi }
+      limits: { cpu: 500m, memory: 512Mi }
     targetCPU: 60
     _meta:
       outputCount: 12
@@ -1719,7 +1737,7 @@ routingService:
   replicas: 2
   resources:
     requests: { cpu: 100m, memory: 128Mi }
-    limits:   { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 250m, memory: 256Mi }
 
 # --- Cache ---
 cache:
@@ -1744,7 +1762,7 @@ imageOptimizer:
   replicas: 1
   resources:
     requests: { cpu: 250m, memory: 256Mi }
-    limits:   { cpu: "1", memory: 512Mi }
+    limits: { cpu: "1", memory: 512Mi }
 
 # --- Gateway ---
 gateway:
@@ -1842,19 +1860,23 @@ spec:
 Extension chain configuration (generated at build time, mounted as ConfigMap):
 
 ```json
-[{
-  "name": "nextjs-routing",
-  "matchCondition": {
-    "celExpression": "!(request.path.startsWith('/_next/static/')) && !(request.path.startsWith('/favicon.ico'))"
-  },
-  "extensions": [{
-    "name": "routing-service",
-    "authority": "routing-service.{{ .Release.Namespace }}.svc.cluster.local",
-    "service": "projects/{{ .Values.projectId }}/locations/{{ .Values.provider.gke.region }}/backendServices/{{ .Release.Name }}-routing-service",
-    "timeout": "5s",
-    "supportedEvents": ["REQUEST_HEADERS"]
-  }]
-}]
+[
+  {
+    "name": "nextjs-routing",
+    "matchCondition": {
+      "celExpression": "!(request.path.startsWith('/_next/static/')) && !(request.path.startsWith('/favicon.ico'))"
+    },
+    "extensions": [
+      {
+        "name": "routing-service",
+        "authority": "routing-service.{{ .Release.Namespace }}.svc.cluster.local",
+        "service": "projects/{{ .Values.projectId }}/locations/{{ .Values.provider.gke.region }}/backendServices/{{ .Release.Name }}-routing-service",
+        "timeout": "5s",
+        "supportedEvents": ["REQUEST_HEADERS"]
+      }
+    ]
+  }
+]
 ```
 
 The `celExpression` is **generated at build time** by the adapter based on the build output. See §13.6 for the full generation strategy.
@@ -1970,9 +1992,9 @@ data:
 The route extension loads both at startup:
 
 ```typescript
-const manifest = JSON.parse(readFileSync('/config/current.json', 'utf-8'));
-const previousManifest = existsSync('/config/previous.json')
-  ? JSON.parse(readFileSync('/config/previous.json', 'utf-8'))
+const manifest = JSON.parse(readFileSync("/config/current.json", "utf-8"));
+const previousManifest = existsSync("/config/previous.json")
+  ? JSON.parse(readFileSync("/config/previous.json", "utf-8"))
   : null;
 ```
 
@@ -1980,16 +2002,17 @@ const previousManifest = existsSync('/config/previous.json')
 
 The adapter uses a hybrid approach: direct Service Extensions API for the route extension, GKE Gateway CRDs for everything else. This is driven by a gap in the GKE Gateway controller:
 
-| Resource | Global External ALB | How we create it |
-|----------|-------------------|------------------|
+| Resource                                    | Global External ALB                                                                                                         | How we create it                                          |
+| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `LbRouteExtension` (Service Extensions API) | **Supported** (confirmed in [support matrix](https://docs.cloud.google.com/service-extensions/docs/lb-extensions-overview)) | `init` creates via `gcloud`; Helm hook updates per-deploy |
-| `GCPRoutingExtension` (GKE Gateway CRD) | **Not supported** — regional gateways only | N/A — we don't use this |
-| `GCPTrafficExtension` (GKE Gateway CRD) | **Supported** (not used in v1 — PPR handled by pool server) | N/A |
-| Gateway, HTTPRoute, BackendConfig | **Supported** | Native Kubernetes CRDs |
+| `GCPRoutingExtension` (GKE Gateway CRD)     | **Not supported** — regional gateways only                                                                                  | N/A — we don't use this                                   |
+| `GCPTrafficExtension` (GKE Gateway CRD)     | **Supported** (not used in v1 — PPR handled by pool server)                                                                 | N/A                                                       |
+| Gateway, HTTPRoute, BackendConfig           | **Supported**                                                                                                               | Native Kubernetes CRDs                                    |
 
 The GKE Gateway controller's `GCPRoutingExtension` only supports regional gateways (`gke-l7-regional-external-managed`). But Cloud CDN requires a global external ALB. The underlying Service Extensions API supports `LbRouteExtension` callouts on global ALBs — the GKE Gateway controller simply hasn't exposed this yet.
 
 By using `LbRouteExtension` directly, we get:
+
 - **Pre-CDN middleware on a global ALB** — matching Vercel's model
 - **Cloud CDN** — on the application backends (not the callout service)
 - **Same ext_proc protocol** — the routing service code is identical regardless of how the extension is provisioned
@@ -2002,25 +2025,22 @@ The ext_proc callout adds a Node.js gRPC round-trip to every matched request. Fo
 
 **Route classification at build time:**
 
-| Route class | Needs ext_proc? | Reason |
-|-------------|----------------|--------|
-| `/_next/static/*` | **No** | Immutable hashed assets. Content-addressed, no routing decisions, middleware never matches. |
-| Known public files (`/favicon.ico`, `/robots.txt`, etc.) | **No** | Static files, no routing. Unless middleware matchers explicitly include them. |
-| Middleware-matched paths | **Yes** | Middleware must execute pre-CDN for auth, redirects, A/B. |
-| Dynamic routes | **Yes** | Need `resolveRoutes` to determine the output and pool. |
-| Prerender/ISR routes | **Yes** | Need dispatch metadata (`x-output-id`, etc.) for the pool server. |
-| PPR routes | **Yes** | Need `x-nextjs-ppr` flag for cache-first PPR flow. |
-| Image optimization (`/_next/image`) | **Yes** | Needs routing to the image optimizer pool. |
+| Route class                                              | Needs ext_proc? | Reason                                                                                      |
+| -------------------------------------------------------- | --------------- | ------------------------------------------------------------------------------------------- |
+| `/_next/static/*`                                        | **No**          | Immutable hashed assets. Content-addressed, no routing decisions, middleware never matches. |
+| Known public files (`/favicon.ico`, `/robots.txt`, etc.) | **No**          | Static files, no routing. Unless middleware matchers explicitly include them.               |
+| Middleware-matched paths                                 | **Yes**         | Middleware must execute pre-CDN for auth, redirects, A/B.                                   |
+| Dynamic routes                                           | **Yes**         | Need `resolveRoutes` to determine the output and pool.                                      |
+| Prerender/ISR routes                                     | **Yes**         | Need dispatch metadata (`x-output-id`, etc.) for the pool server.                           |
+| PPR routes                                               | **Yes**         | Need `x-nextjs-ppr` flag for cache-first PPR flow.                                          |
+| Image optimization (`/_next/image`)                      | **Yes**         | Needs routing to the image optimizer pool.                                                  |
 
 **Generation strategy:**
 
 The adapter's `onBuildComplete` generates the CEL expression by building an exclusion list:
 
 ```typescript
-function generateCelExpression(
-  outputs: AdapterOutputs,
-  config: NextConfig,
-): string {
+function generateCelExpression(outputs: AdapterOutputs, config: NextConfig): string {
   const exclusions: string[] = [];
 
   // 1. Always exclude immutable static assets
@@ -2029,12 +2049,12 @@ function generateCelExpression(
   // 2. Exclude known public files UNLESS middleware matchers could match them
   const middlewareMatchers = outputs.middleware?.config.matchers ?? [];
   const publicFiles = outputs.staticFiles
-    .filter(f => !f.pathname.startsWith('/_next/'))
-    .map(f => f.pathname);
+    .filter((f) => !f.pathname.startsWith("/_next/"))
+    .map((f) => f.pathname);
 
   for (const publicPath of publicFiles) {
-    const matchedByMiddleware = middlewareMatchers.some(
-      m => new RegExp(m.sourceRegex).test(publicPath)
+    const matchedByMiddleware = middlewareMatchers.some((m) =>
+      new RegExp(m.sourceRegex).test(publicPath),
     );
     if (!matchedByMiddleware) {
       exclusions.push(`request.path == '${publicPath}'`);
@@ -2066,26 +2086,26 @@ function generateCelExpression(
     inclusions.push("request.path.startsWith('/_next/image')");
 
     if (inclusions.length > 0) {
-      return inclusions.join(' || ');
+      return inclusions.join(" || ");
     }
 
     // No dynamic routes, no ISR, no image optimization — nothing needs ext_proc
-    return 'false';
+    return "false";
   }
 
   if (exclusions.length === 0) {
-    return 'true';  // Middleware exists but no exclusions possible
+    return "true"; // Middleware exists but no exclusions possible
   }
 
   // CEL: invoke ext_proc when NONE of the exclusions match
-  return `!(${exclusions.join(' || ')})`;
+  return `!(${exclusions.join(" || ")})`;
 }
 
 // Extract the static prefix from a route sourceRegex for CEL startsWith matching.
 // e.g. "^/blog/([^/]+?)(?:/)?$" → "/blog/"
 function extractStaticPrefix(sourceRegex: string): string | null {
   // Strip leading ^ and extract literal characters before the first regex metacharacter
-  const withoutAnchor = sourceRegex.replace(/^\^/, '');
+  const withoutAnchor = sourceRegex.replace(/^\^/, "");
   const match = withoutAnchor.match(/^(\/[a-zA-Z0-9_\-/]*)/);
   return match?.[1] ?? null;
 }
@@ -2094,16 +2114,19 @@ function extractStaticPrefix(sourceRegex: string): string | null {
 **Example generated CEL expressions:**
 
 App with middleware (exclusion list — conservative):
+
 ```
 !(request.path.startsWith('/_next/static/') || request.path == '/favicon.ico' || request.path == '/robots.txt')
 ```
 
 App without middleware (inclusion list — aggressive):
+
 ```
 request.path.startsWith('/blog/') || request.path.startsWith('/api/') || request.path.startsWith('/_next/image') || request.path == '/dashboard'
 ```
 
 The no-middleware inclusion list is safe because:
+
 - A false positive (calling ext_proc for a route that doesn't need it) costs a gRPC round-trip — acceptable
 - A false negative (skipping ext_proc for a real route) means the pool server handles it via local fallback resolution (§15.1) — no security concern since there's no middleware to bypass
 - Unknown paths (404s) skip ext_proc entirely — the URL map fallback routes them to the pool server which returns 404
@@ -2149,20 +2172,20 @@ The no-middleware inclusion list is safe because:
 
 ## 14. Risk Assessment
 
-| Risk | Severity | Likelihood | Mitigation |
-|------|----------|-----------|------------|
-| `@next/routing` is experimental, API may change | High | Medium | Fallback to raw `sourceRegex` matching from the routing manifest. Pin `@next/routing` version. |
-| Route extension callout adds latency to every request (pre-CDN) | Medium | Low | Routing service is CPU-light (<1ms typical). This is the same model Vercel uses — middleware runs on every request before CDN. GCP routes callouts to the nearest available backend. |
-| Route extension is headers-only (no request body) | Low | Low | Next.js middleware almost never reads the request body. For the rare POST-with-middleware case, the middleware passes through (`NextResponse.next()`) and body-dependent validation happens in the route handler itself. |
-| `LbRouteExtension` on global ALB requires direct API management (not GKE Gateway CRD) | Medium | High | The GKE Gateway controller's `GCPRoutingExtension` only supports regional gateways. We use the Service Extensions API directly (`LbRouteExtension`), which is GA on global ALBs per the support matrix. This adds operational complexity (Helm hook job vs. native CRD). If GKE Gateway adds global routing extension support, the adapter can switch to the CRD. |
-| PPR resumption relies on cached preambles and in-process resume handlers | Medium | Medium | Preambles are pre-seeded in Valkey at deploy time from build output. Resume handlers use the same invocation pattern as non-PPR routes (§6.2). Fallback: if no cached preamble, do a full render. PPR is opt-in. |
-| External rewrites not supported in v1 | Medium | Medium | Next.js rewrites to external URLs are transparent proxies but route extensions can't proxy. v1 returns a 502 with a clear error message directing users to Route Handlers. v2+ will add a dedicated external-proxy backend pool with streaming, timeouts, and body limits. |
-| Traced `assets` maps may miss runtime dependencies | Medium | Medium | The `assets` field is provided by the adapter API and traced via `@vercel/nft`. The AWS adapter uses a similar per-function bundling approach. Provide `shared-image` as a fallback container strategy for operators who hit edge cases. |
-| Next.js adapter API is newly stable (16.2.0) | Medium | Medium | Run the official Next.js e2e test harness for adapters. Pin `peerDependencies`. |
-| `NEXT_PUBLIC_*` env vars are build-time only | Low | High | Well-documented Next.js constraint. Document clearly. Suggest per-environment CI builds. |
-| GCP Service Extensions is a newer GCP feature | Medium | Medium | Service Extensions is GA for global external ALB. `LbRouteExtension` and `LbTrafficExtension` are v1 stable API resources. The ext_proc protocol itself is a stable Envoy standard. |
-| Skew protection doubles pod count during window | Medium | High | With `skewProtection.enabled: true` (default), both old and new pool Deployments run simultaneously. A cluster with 20 SSR replicas will briefly run 40 pods + doubled Valkey memory. Set `duration: '0'` to disable. Operators should factor this into cluster capacity planning. |
-| Tight coupling to GCP load balancer | Medium | Low | This is a GKE-specific provider. The ext_proc protocol is portable — the routing service itself could run behind any ext_proc-capable proxy. The `generic` provider (future) would use in-cluster Envoy. |
+| Risk                                                                                  | Severity | Likelihood | Mitigation                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------- | -------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `@next/routing` is experimental, API may change                                       | High     | Medium     | Fallback to raw `sourceRegex` matching from the routing manifest. Pin `@next/routing` version.                                                                                                                                                                                                                                                                    |
+| Route extension callout adds latency to every request (pre-CDN)                       | Medium   | Low        | Routing service is CPU-light (<1ms typical). This is the same model Vercel uses — middleware runs on every request before CDN. GCP routes callouts to the nearest available backend.                                                                                                                                                                              |
+| Route extension is headers-only (no request body)                                     | Low      | Low        | Next.js middleware almost never reads the request body. For the rare POST-with-middleware case, the middleware passes through (`NextResponse.next()`) and body-dependent validation happens in the route handler itself.                                                                                                                                          |
+| `LbRouteExtension` on global ALB requires direct API management (not GKE Gateway CRD) | Medium   | High       | The GKE Gateway controller's `GCPRoutingExtension` only supports regional gateways. We use the Service Extensions API directly (`LbRouteExtension`), which is GA on global ALBs per the support matrix. This adds operational complexity (Helm hook job vs. native CRD). If GKE Gateway adds global routing extension support, the adapter can switch to the CRD. |
+| PPR resumption relies on cached preambles and in-process resume handlers              | Medium   | Medium     | Preambles are pre-seeded in Valkey at deploy time from build output. Resume handlers use the same invocation pattern as non-PPR routes (§6.2). Fallback: if no cached preamble, do a full render. PPR is opt-in.                                                                                                                                                  |
+| External rewrites not supported in v1                                                 | Medium   | Medium     | Next.js rewrites to external URLs are transparent proxies but route extensions can't proxy. v1 returns a 502 with a clear error message directing users to Route Handlers. v2+ will add a dedicated external-proxy backend pool with streaming, timeouts, and body limits.                                                                                        |
+| Traced `assets` maps may miss runtime dependencies                                    | Medium   | Medium     | The `assets` field is provided by the adapter API and traced via `@vercel/nft`. The AWS adapter uses a similar per-function bundling approach. Provide `shared-image` as a fallback container strategy for operators who hit edge cases.                                                                                                                          |
+| Next.js adapter API is newly stable (16.2.0)                                          | Medium   | Medium     | Run the official Next.js e2e test harness for adapters. Pin `peerDependencies`.                                                                                                                                                                                                                                                                                   |
+| `NEXT_PUBLIC_*` env vars are build-time only                                          | Low      | High       | Well-documented Next.js constraint. Document clearly. Suggest per-environment CI builds.                                                                                                                                                                                                                                                                          |
+| GCP Service Extensions is a newer GCP feature                                         | Medium   | Medium     | Service Extensions is GA for global external ALB. `LbRouteExtension` and `LbTrafficExtension` are v1 stable API resources. The ext_proc protocol itself is a stable Envoy standard.                                                                                                                                                                               |
+| Skew protection doubles pod count during window                                       | Medium   | High       | With `skewProtection.enabled: true` (default), both old and new pool Deployments run simultaneously. A cluster with 20 SSR replicas will briefly run 40 pods + doubled Valkey memory. Set `duration: '0'` to disable. Operators should factor this into cluster capacity planning.                                                                                |
+| Tight coupling to GCP load balancer                                                   | Medium   | Low        | This is a GKE-specific provider. The ext_proc protocol is portable — the routing service itself could run behind any ext_proc-capable proxy. The `generic` provider (future) would use in-cluster Envoy.                                                                                                                                                          |
 
 ---
 
@@ -2174,10 +2197,10 @@ The `LbRouteExtension` is on the critical path for every non-static request. Its
 
 **The adapter sets this at build time based on whether middleware exists:**
 
-| Middleware? | `failure_mode_allow` | Behavior on route extension failure |
-|-------------|---------------------|-------------------------------------|
-| **Yes** | `false` (fail closed) | Requests return 500. Safe: middleware is a security boundary (auth gates, geo-restrictions). Bypassing it could expose protected content. |
-| **No** | `true` (fail open) | Requests bypass ext_proc and hit the URL map fallback rule. The site degrades but stays up — pool servers receive requests without dispatch metadata and fall back to local route resolution. |
+| Middleware? | `failure_mode_allow`  | Behavior on route extension failure                                                                                                                                                           |
+| ----------- | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Yes**     | `false` (fail closed) | Requests return 500. Safe: middleware is a security boundary (auth gates, geo-restrictions). Bypassing it could expose protected content.                                                     |
+| **No**      | `true` (fail open)    | Requests bypass ext_proc and hit the URL map fallback rule. The site degrades but stays up — pool servers receive requests without dispatch metadata and fall back to local route resolution. |
 
 This is set in the `extension-chains.json` generated by `onBuildComplete` and applied by the Helm hook Job:
 
@@ -2190,14 +2213,14 @@ This is set in the `extension-chains.json` generated by `onBuildComplete` and ap
 **Fail-open fallback in pool servers:** When `failure_mode_allow: true` and the route extension is down, requests arrive at the pool server without `x-output-id` or `x-matched-pathname` headers. The pool server detects this and falls back to local route resolution using the pool manifest:
 
 ```typescript
-if (!req.headers['x-output-id']) {
+if (!req.headers["x-output-id"]) {
   // Route extension was bypassed (fail-open mode)
   // Resolve the route locally from the pool manifest
   const url = new URL(req.url!, `http://${req.headers.host}`);
   const localMatch = poolManifest.resolveLocal(url.pathname);
   if (!localMatch) {
     res.writeHead(503);
-    res.end('Route extension unavailable');
+    res.end("Route extension unavailable");
     return;
   }
   outputId = localMatch.outputId;
@@ -2206,6 +2229,7 @@ if (!req.headers['x-output-id']) {
 ```
 
 **Mitigation for both modes:**
+
 - Route extension runs multiple replicas (default: 2) with a PodDisruptionBudget
 - Health check endpoint on the gRPC service — GCP removes unhealthy backends automatically
 - Fast startup: the route extension is stateless, loads only the routing manifest and middleware module
@@ -2215,14 +2239,14 @@ if (!req.headers['x-output-id']) {
 
 The pool server degrades gracefully when Valkey is unreachable:
 
-| Feature | Behavior without Valkey |
-|---------|------------------------|
-| ISR/prerender cache | Every request is a MISS — handler is invoked directly. Higher latency, more compute, but correct. |
-| PPR preamble | Fall back to full render (no cached preamble). Slower first byte, but the page still works. |
-| `use cache` | Falls back to in-memory per-process cache (Next.js default). Entries not shared across replicas. |
-| Tag invalidation | No-op. Entries will expire via TTL. |
-| CDN invalidation | Still works (doesn't depend on Valkey). |
-| Background revalidation | Fails silently. Next request re-triggers. |
+| Feature                 | Behavior without Valkey                                                                           |
+| ----------------------- | ------------------------------------------------------------------------------------------------- |
+| ISR/prerender cache     | Every request is a MISS — handler is invoked directly. Higher latency, more compute, but correct. |
+| PPR preamble            | Fall back to full render (no cached preamble). Slower first byte, but the page still works.       |
+| `use cache`             | Falls back to in-memory per-process cache (Next.js default). Entries not shared across replicas.  |
+| Tag invalidation        | No-op. Entries will expire via TTL.                                                               |
+| CDN invalidation        | Still works (doesn't depend on Valkey).                                                           |
+| Background revalidation | Fails silently. Next request re-triggers.                                                         |
 
 The cache handler wraps all Valkey operations in try/catch and logs failures without throwing. The pool server monitors Valkey connectivity and exposes it via health check (degraded, not unhealthy — the server can still serve requests).
 
@@ -2241,11 +2265,13 @@ If all replicas of a pool are unhealthy, the GKE backend service returns 503. Th
 All components emit structured JSON logs to stdout (GKE's standard log collection picks them up via Cloud Logging):
 
 **Route Extension Service:**
+
 - Every ext_proc request: `{ path, method, resolved_pool, output_id, middleware_executed, middleware_result, duration_ms }`
 - Middleware errors: `{ path, error, stack }`
 - `immediate_response` events: `{ path, status, reason }` (redirect, middleware response)
 
 **Pool Server:**
+
 - Every request: `{ path, method, output_id, cache_state, duration_ms, status }`
 - Cache operations: `{ operation, key, hit, duration_ms }`
 - PPR: `{ path, preamble_source, resume_duration_ms }`
@@ -2257,12 +2283,14 @@ All components emit structured JSON logs to stdout (GKE's standard log collectio
 The route extension and pool servers export OpenTelemetry metrics. On GKE, these flow to Cloud Monitoring via the OpenTelemetry Collector (deployed as a DaemonSet or sidecar).
 
 **Route Extension metrics:**
+
 - `routing.request.duration` (histogram) — ext_proc processing time, labeled by `pool`, `has_middleware`, `result` (routed / redirect / immediate_response)
 - `routing.request.count` (counter) — request count by pool and result
 - `routing.middleware.duration` (histogram) — middleware execution time
 - `routing.cel.skip_rate` — not directly observable from the service, but can be calculated in Cloud Monitoring by correlating ALB request count (all requests) vs. route extension request count (ext_proc invocations). The difference is the CEL skip volume. Create a dashboard widget: `1 - (route_extension_requests / alb_total_requests)`.
 
 **Pool Server metrics:**
+
 - `pool.request.duration` (histogram) — total request handling time, labeled by `output_id`, `cache_state`
 - `pool.cache.operation` (counter) — Valkey operations by type (get/set/revalidate) and result (hit/miss/error)
 - `pool.handler.cold_start` (counter) — handler module loads (first request per output)
@@ -2272,6 +2300,7 @@ The route extension and pool servers export OpenTelemetry metrics. On GKE, these
 - `pool.revalidation.background` (counter) — background revalidation triggers and outcomes
 
 **Cache metrics:**
+
 - `cache.valkey.latency` (histogram) — Valkey operation latency
 - `cache.valkey.connection_errors` (counter) — connection failures
 - `cache.cdn.invalidation` (counter) — CDN invalidation requests by type (path/tag) and outcome
@@ -2302,6 +2331,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** `npx adapter-k8s init && npx adapter-k8s deploy` produces a working Next.js app on GKE with pool decomposition. Testable against the Next.js e2e harness.
 
 **Scope:**
+
 - **CLI:** `init` (provisions Gateway, GCS bucket, IAM via `gcloud`; scaffolds `adapter.config.ts`; writes `infrastructure.json`), `deploy` (build → push → helm upgrade), `destroy`
 - `NextAdapter` implementation (`modifyConfig`, `onBuildComplete`)
 - Pool classification logic (`classifyIntoPools` with first-match-wins)
@@ -2321,6 +2351,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** Pre-CDN middleware and routing via ext_proc.
 
 **Scope:**
+
 - Route Extension Service (ext_proc gRPC server with `resolveRoutes`)
 - Middleware execution via `invokeMiddleware` callback
 - `init` updated: provisions `LbRouteExtension` via `gcloud`
@@ -2339,6 +2370,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** Distributed ISR/`use cache` across replicas.
 
 **Scope:**
+
 - Valkey deployment (Helm chart in-cluster, or `init` provisions Memorystore)
 - `cacheHandler` (ISR, route handlers, images) — buildId-namespaced keys
 - `cacheHandlers` (use cache directives) — buildId-namespaced keys
@@ -2357,6 +2389,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** Cloud CDN caching with proper invalidation.
 
 **Scope:**
+
 - `init` updated: provisions Cloud CDN config, CDN-enabled backend services
 - GCS static asset sync (Helm hook)
 - `Cache-Tag` response headers (with buildId)
@@ -2374,6 +2407,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** Cache-first partial prerendering.
 
 **Scope:**
+
 - PPR preamble and postponed state seeding in Valkey (Helm hook)
 - Pool server PPR handling (§6.4, §7.4): read preamble from Valkey, stream it, invoke resume handler in parallel
 - `x-nextjs-ppr` header flow from route extension to pool server
@@ -2386,6 +2420,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** Zero-downtime deployments with version isolation.
 
 **Scope:**
+
 - Versioned pool Deployments (`{pool}-{buildId}`)
 - Route extension buildId comparison and version-aware routing (§6.6)
 - HTTPRoute with rules for current + previous version pools (§13.4)
@@ -2404,6 +2439,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Goal:** Production visibility.
 
 **Scope:**
+
 - Structured JSON logging in route extension and pool servers
 - OpenTelemetry metrics (§16.2)
 - Distributed tracing with trace context propagation
@@ -2415,15 +2451,15 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 
 ### Phase Summary
 
-| Phase | What you get | Can run in prod? |
-|-------|-------------|-----------------|
-| 1 | `init` + `deploy` CLI, pool decomposition, handler invocation | Yes (basic, no middleware/CDN) |
-| 2 | Pre-CDN middleware, ext_proc routing | Yes (no caching/CDN) |
-| 3 | Distributed ISR, `use cache` across replicas | Yes (no CDN) |
-| 4 | Cloud CDN with invalidation, `invalidate` command | Yes (full feature set minus PPR/skew) |
-| 5 | PPR with cache-first preamble | Yes (full feature set minus skew) |
-| 6 | Zero-downtime versioned deploys | Yes (full feature set) |
-| 7 | Production observability, `status` + `logs` commands | Operational improvement |
+| Phase | What you get                                                  | Can run in prod?                      |
+| ----- | ------------------------------------------------------------- | ------------------------------------- |
+| 1     | `init` + `deploy` CLI, pool decomposition, handler invocation | Yes (basic, no middleware/CDN)        |
+| 2     | Pre-CDN middleware, ext_proc routing                          | Yes (no caching/CDN)                  |
+| 3     | Distributed ISR, `use cache` across replicas                  | Yes (no CDN)                          |
+| 4     | Cloud CDN with invalidation, `invalidate` command             | Yes (full feature set minus PPR/skew) |
+| 5     | PPR with cache-first preamble                                 | Yes (full feature set minus skew)     |
+| 6     | Zero-downtime versioned deploys                               | Yes (full feature set)                |
+| 7     | Production observability, `status` + `logs` commands          | Operational improvement               |
 
 ---
 
@@ -2451,6 +2487,7 @@ npx @next-community/adapter-k8s init
 ```
 
 The `init` command:
+
 - Detects existing GKE cluster configuration (via `gcloud` or `KUBECONFIG`)
 - Prompts for required values: GCP project, region, domain, container registry
 - **Provisions GCP infrastructure** via idempotent `gcloud` calls (safe to re-run)
@@ -2490,6 +2527,7 @@ gcloud creates/verifies (idempotent):
 This file is committed to the repo. It contains only resource names (no secrets). Helm reads it to configure the hook Job, CDN invalidation, and GCS sync.
 
 **Prerequisites:**
+
 - GKE cluster (the adapter doesn't provision clusters)
 - `gcloud` CLI authenticated with sufficient permissions
 - Domain configured (for TLS/managed certs)
@@ -2553,6 +2591,7 @@ npx @next-community/adapter-k8s deploy
 ```
 
 The adapter tracks the previous `buildId` in `.k8s-adapter/state.json` (or reads it from the cluster). On each deploy:
+
 - `helm upgrade` creates new versioned pool Deployments alongside old ones (skew protection)
 - The Helm hook updates the `LbRouteExtension` CEL expression and extension chain
 - Valkey is seeded with new buildId-namespaced keys
@@ -2626,13 +2665,13 @@ The Helm chart is self-contained — all GCP resource updates happen via hook Jo
 
 ### 18.8 Separation of Concerns
 
-| Layer | Tool | What it manages | When it changes |
-|-------|------|----------------|-----------------|
-| **GCP infrastructure** | `init` (`gcloud`) | Gateway, LbRouteExtension, GCS bucket, CDN, IAM | First setup. Re-run `init` if provider config changes. |
-| **GCP per-deploy updates** | Helm hook (`gcloud`) | LbRouteExtension CEL expression, GCS static assets | Every deploy (automated by Helm hook) |
-| **K8s workloads** | Helm | Pool Deployments, Routing Service, Valkey, Image Optimizer, Services, HPAs | Every deploy (new buildId → new versioned Deployments) |
-| **Build artifacts** | `next build` + adapter | Routing manifest, Dockerfiles, static assets, extension chain config | Every build |
-| **Runtime state** | Pool server + Valkey | Prerender cache, PPR preambles, tag manifests | At runtime (ISR revalidation, on-demand invalidation) |
+| Layer                      | Tool                   | What it manages                                                            | When it changes                                        |
+| -------------------------- | ---------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------ |
+| **GCP infrastructure**     | `init` (`gcloud`)      | Gateway, LbRouteExtension, GCS bucket, CDN, IAM                            | First setup. Re-run `init` if provider config changes. |
+| **GCP per-deploy updates** | Helm hook (`gcloud`)   | LbRouteExtension CEL expression, GCS static assets                         | Every deploy (automated by Helm hook)                  |
+| **K8s workloads**          | Helm                   | Pool Deployments, Routing Service, Valkey, Image Optimizer, Services, HPAs | Every deploy (new buildId → new versioned Deployments) |
+| **Build artifacts**        | `next build` + adapter | Routing manifest, Dockerfiles, static assets, extension chain config       | Every build                                            |
+| **Runtime state**          | Pool server + Valkey   | Prerender cache, PPR preambles, tag manifests                              | At runtime (ISR revalidation, on-demand invalidation)  |
 
 **For Terraform/Pulumi users:** The `init` command is optional. Operators can provision GCP resources themselves using any IaC tool and provide the resource references in `infrastructure.json`. The adapter doesn't generate or depend on Terraform files. The Helm chart consumes `infrastructure.json` values regardless of how the resources were created.
 
@@ -2680,9 +2719,10 @@ Node.js on GCP has meaningful overhead — startup time, memory footprint, and G
 
 GCP Service Extensions supports Proxy-Wasm plugins as route extensions. Route resolution is pure regex matching against a static manifest — no network calls, no async, deterministic. This fits within Wasm plugin constraints (1ms CPU, 16 KiB memory per stream, no outbound calls).
 
-The adapter would compile the routing logic to a Proxy-Wasm plugin (Rust → Wasm) at build time. The plugin runs *inside the load balancer process* — zero network hop, sub-millisecond, no Deployment to manage, no cold starts, no scaling to worry about.
+The adapter would compile the routing logic to a Proxy-Wasm plugin (Rust → Wasm) at build time. The plugin runs _inside the load balancer process_ — zero network hop, sub-millisecond, no Deployment to manage, no cold starts, no scaling to worry about.
 
 What the Wasm plugin does:
+
 - Read request path from headers
 - Match against regexes from the routing manifest (compiled into the Wasm binary at build time)
 - Set `x-upstream-pool`, `x-output-id`, `x-matched-pathname`, `x-route-matches` headers
@@ -2690,6 +2730,7 @@ What the Wasm plugin does:
 - Return `immediate_response` for routing-level redirects
 
 What it does **not** do:
+
 - Execute middleware (Wasm plugins can't run arbitrary JS)
 - Access request body
 - Make outbound network calls
@@ -2709,6 +2750,7 @@ This is the default when `mode: 'auto'` and no middleware exists. The adapter de
 ```
 
 **Build-time Wasm compilation:** The adapter's `onBuildComplete` compiles the routing manifest into a Rust Proxy-Wasm plugin:
+
 - Route regexes are compiled into the binary (no runtime JSON parsing)
 - Pool assignments and PPR route set are embedded as lookup tables
 - The compiled `.wasm` binary is emitted alongside the Helm chart
@@ -2739,6 +2781,7 @@ The route resolution is the hot path (<1ms). Middleware execution is the slow pa
 **Impact: Faster cold starts and I/O for handler invocation.**
 
 The pool server invokes compiled Next.js handler modules. These are JavaScript, but Bun is Node-compatible and significantly faster for:
+
 - Module loading (`import()` of handler modules — critical for cold starts)
 - HTTP server performance
 - File I/O (reading preambles, cache entries)
@@ -2747,14 +2790,14 @@ The Bun adapter already proves handler invocation works under Bun. The pool serv
 
 ### 20.4 Optimization Summary
 
-| Component | v1 (Node.js) | Optimization | When to apply |
-|-----------|-------------|-------------|---------------|
-| Route extension (no middleware) | ext_proc Node.js service | Proxy-Wasm plugin (Rust) | Phase 2+ — eliminates a Deployment |
-| Route extension (with middleware) | ext_proc Node.js service | Go/Rust binary + embedded V8 | After v1 — correctness first |
-| Pool server | Node.js | Bun runtime | After v1 — validate handler compat |
-| Route resolution (in either runtime) | `@next/routing` (JS) | Compiled regex (Rust/Go) | After v1 — perf tuning |
+| Component                            | v1 (Node.js)             | Optimization                 | When to apply                      |
+| ------------------------------------ | ------------------------ | ---------------------------- | ---------------------------------- |
+| Route extension (no middleware)      | ext_proc Node.js service | Proxy-Wasm plugin (Rust)     | Phase 2+ — eliminates a Deployment |
+| Route extension (with middleware)    | ext_proc Node.js service | Go/Rust binary + embedded V8 | After v1 — correctness first       |
+| Pool server                          | Node.js                  | Bun runtime                  | After v1 — validate handler compat |
+| Route resolution (in either runtime) | `@next/routing` (JS)     | Compiled regex (Rust/Go)     | After v1 — perf tuning             |
 
-The key principle: **the architecture doesn't change.** All optimizations replace the *runtime* of existing components. The ext_proc protocol, header conventions, Helm chart structure, cache keys, and pool server dispatch logic are all identical regardless of whether the route extension is a Wasm plugin, a Go binary, or a Node.js process.
+The key principle: **the architecture doesn't change.** All optimizations replace the _runtime_ of existing components. The ext_proc protocol, header conventions, Helm chart structure, cache keys, and pool server dispatch logic are all identical regardless of whether the route extension is a Wasm plugin, a Go binary, or a Node.js process.
 
 ---
 
@@ -2775,13 +2818,13 @@ The key principle: **the architecture doesn't change.** All optimizations replac
 
 ## Appendix A: Comparison with Existing Approaches
 
-| Approach | Routing | Caching | Static Assets | PPR | Image Optimization |
-|----------|---------|---------|---------------|-----|--------------------|
+| Approach                        | Routing                                             | Caching                             | Static Assets   | PPR                                                  | Image Optimization        |
+| ------------------------------- | --------------------------------------------------- | ----------------------------------- | --------------- | ---------------------------------------------------- | ------------------------- |
 | **This adapter (GKE provider)** | Route extension callout (pre-CDN) + `@next/routing` | Valkey cacheHandler + cacheHandlers | GCS + Cloud CDN | Cache-first preamble from Valkey + in-process resume | Sharp sidecar → Cloud CDN |
-| **Firebase App Hosting** | ext_proc (monolith) | Internal | Cloud CDN | ext_proc full-duplex streaming | Cloud CDN |
-| **Vercel** | Internal routing layer (pre-CDN) | Global edge cache | Vercel CDN | Native | Vercel Image CDN |
-| **OpenNext (AWS)** | CloudFront + Lambda@Edge | DynamoDB/S3 | S3 + CloudFront | Not yet supported | Lambda |
-| **Manual K8s** | nginx/Ingress rules | In-memory (per-pod) | Served from pod | Not supported | Built-in Sharp |
+| **Firebase App Hosting**        | ext_proc (monolith)                                 | Internal                            | Cloud CDN       | ext_proc full-duplex streaming                       | Cloud CDN                 |
+| **Vercel**                      | Internal routing layer (pre-CDN)                    | Global edge cache                   | Vercel CDN      | Native                                               | Vercel Image CDN          |
+| **OpenNext (AWS)**              | CloudFront + Lambda@Edge                            | DynamoDB/S3                         | S3 + CloudFront | Not yet supported                                    | Lambda                    |
+| **Manual K8s**                  | nginx/Ingress rules                                 | In-memory (per-pod)                 | Served from pod | Not supported                                        | Built-in Sharp            |
 
 ## Appendix B: Reference Implementations
 

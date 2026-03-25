@@ -8,13 +8,13 @@ npm i @next-community/adapter-k8s@latest
 
 ```ts
 // next.config.ts
-import { NextConfig } from 'next' 
+import { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   experimental: {
-    adapterPath: require.resolve('@next-community/adapter-k8s')
-  }
-}
+    adapterPath: require.resolve("@next-community/adapter-k8s"),
+  },
+};
 
-export default nextConfig
+export default nextConfig;
 ```
