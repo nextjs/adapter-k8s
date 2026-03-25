@@ -11,6 +11,7 @@ export function renderDeployment({
   releaseName: string;
 }): string {
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
+  const safeBuildId = sanitizeK8sName(buildId);
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -18,19 +19,19 @@ metadata:
   labels:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: ${poolName}
-    app.kubernetes.io/version: "${buildId}"
+    app.kubernetes.io/version: "${safeBuildId}"
 spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: ${releaseName}
       app.kubernetes.io/component: ${poolName}
-      app.kubernetes.io/version: "${buildId}"
+      app.kubernetes.io/version: "${safeBuildId}"
   template:
     metadata:
       labels:
         app.kubernetes.io/name: ${releaseName}
         app.kubernetes.io/component: ${poolName}
-        app.kubernetes.io/version: "${buildId}"
+        app.kubernetes.io/version: "${safeBuildId}"
     spec:
       containers:
         - name: pool-server

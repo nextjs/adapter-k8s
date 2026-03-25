@@ -3,7 +3,7 @@
 This repo contains the K8S deployment adapter for Next.js.
 
 ```sh
-npm i @next-community/adapter-k8s@latest
+npm i -D @next-community/adapter-k8s
 ```
 
 ```ts
@@ -17,4 +17,12 @@ const nextConfig: NextConfig = {
 };
 
 export default nextConfig;
+```
+
+```sh
+npx @next-community/adapter-k8s init
+```
+
+```sh
+npx @next-community/adapter-k8s deploy
 ```

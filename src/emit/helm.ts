@@ -11,6 +11,7 @@ import { renderService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import { renderConfigMap } from "./templates/configmap.js";
 import { renderHTTPRoute } from "./templates/gateway.js";
+import { sanitizeK8sName } from "./templates/utils.js";
 
 export function generateHelmChart({
   pools,
@@ -30,10 +31,17 @@ export function generateHelmChart({
   releaseName?: string;
 }): Record<string, string> {
   const files: Record<string, string> = {};
+  // Helm versions must be SemVer. We use a safe version of the buildId as the suffix.
+  // We MUST remove leading underscores/dots and replace invalid chars.
+  const safeVersionSuffix = buildId
+    .toLowerCase()
+    .replace(/^[^a-z0-9]+/, "")
+    .replace(/[^a-z0-9.-]/g, "-")
+    .slice(0, 32);
 
   files["Chart.yaml"] = renderChartYaml({
     name: releaseName,
-    version: `0.1.0+${buildId}`,
+    version: `0.1.0-${safeVersionSuffix || "build"}`,
   });
   files["values.yaml"] = renderValuesYaml({
     pools,
