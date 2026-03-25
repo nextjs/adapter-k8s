@@ -1,4 +1,6 @@
 // src/emit/templates/service.ts
+import { sanitizeK8sName } from "./utils.js";
+
 export function renderService({
   poolName,
   buildId,
@@ -8,10 +10,11 @@ export function renderService({
   buildId: string;
   releaseName: string;
 }): string {
+  const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   return `apiVersion: v1
 kind: Service
 metadata:
-  name: ${releaseName}-${poolName}-${buildId}
+  name: ${name}
   labels:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: ${poolName}

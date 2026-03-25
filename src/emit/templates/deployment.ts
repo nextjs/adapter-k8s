@@ -1,4 +1,6 @@
 // src/emit/templates/deployment.ts
+import { sanitizeK8sName } from "./utils.js";
+
 export function renderDeployment({
   poolName,
   buildId,
@@ -8,7 +10,7 @@ export function renderDeployment({
   buildId: string;
   releaseName: string;
 }): string {
-  const name = `${releaseName}-${poolName}-${buildId}`;
+  const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,7 +34,7 @@ spec:
     spec:
       containers:
         - name: pool-server
-          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools \"${poolName}\").image.repository }}:{{ .Values.global.image.tag }}"
+          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools "${poolName}").image.repository }}:{{ .Values.global.image.tag }}"
           ports:
             - containerPort: 3000
           env:
@@ -54,10 +56,10 @@ spec:
             initialDelaySeconds: 10
           resources:
             requests:
-              cpu: "{{ (index .Values.pools \"${poolName}\").resources.requests.cpu }}"
-              memory: "{{ (index .Values.pools \"${poolName}\").resources.requests.memory }}"
+              cpu: "{{ (index .Values.pools "${poolName}").resources.requests.cpu }}"
+              memory: "{{ (index .Values.pools "${poolName}").resources.requests.memory }}"
             limits:
-              cpu: "{{ (index .Values.pools \"${poolName}\").resources.limits.cpu }}"
-              memory: "{{ (index .Values.pools \"${poolName}\").resources.limits.memory }}"
+              cpu: "{{ (index .Values.pools "${poolName}").resources.limits.cpu }}"
+              memory: "{{ (index .Values.pools "${poolName}").resources.limits.memory }}"
 `;
 }

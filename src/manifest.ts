@@ -82,7 +82,9 @@ export function buildRoutingManifest({
         // @ts-ignore - mock/peer-dep property
         postponedState: prerender.fallback.postponedState,
         // @ts-ignore - mock/peer-dep property
-        fallbackFilePath: path.relative(projectDir, prerender.fallback.filePath),
+        fallbackFilePath: prerender.fallback.filePath
+          ? path.relative(projectDir, prerender.fallback.filePath)
+          : "",
       };
     }
   }

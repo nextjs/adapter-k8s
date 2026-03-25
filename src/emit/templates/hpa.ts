@@ -1,16 +1,16 @@
 // src/emit/templates/hpa.ts
+import { sanitizeK8sName } from "./utils.js";
+
 export function renderHPA({
   poolName,
   buildId,
   releaseName,
-  scaling,
 }: {
   poolName: string;
   buildId: string;
   releaseName: string;
-  scaling: { min: number; max: number; targetCPU: number };
 }): string {
-  const deploymentName = `${releaseName}-${poolName}-${buildId}`;
+  const deploymentName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   return `apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

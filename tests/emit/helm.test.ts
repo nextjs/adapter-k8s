@@ -1,6 +1,7 @@
 // tests/emit/helm.test.ts
 import { describe, it, expect } from "vitest";
 import { generateHelmChart } from "../../src/emit/helm.js";
+import { sanitizeK8sName } from "../../src/emit/templates/utils.js";
 import type {
   PoolDefinition,
   K8sAdapterConfig,
@@ -63,6 +64,10 @@ describe("generateHelmChart", () => {
     expect(result["templates/ssr-hpa.yaml"]).toBeDefined();
     expect(result["templates/routing-manifest-configmap.yaml"]).toBeDefined();
     expect(result["templates/http-route.yaml"]).toBeDefined();
+
+    const deploymentContent = result["templates/ssr-deployment.yaml"];
+    const expectedName = sanitizeK8sName("nextjs-ssr-abc123");
+    expect(deploymentContent).toContain(`name: ${expectedName}`);
   });
 
   it("generates one deployment per pool", () => {
