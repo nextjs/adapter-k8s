@@ -24,9 +24,12 @@ import { generateHelmChart } from "./emit/helm.js";
 import {
   generateDockerfile,
   generatePoolDockerfile,
+  generateRoutingServiceDockerfile,
 } from "./emit/dockerfiles.js";
 import { generateBuildMetadata } from "./emit/metadata.js";
 import { buildStaticManifest } from "./emit/static-assets.js";
+import { generateCelExpression } from "./cel.js";
+import { generateExtensionChain, determineFailureMode } from "./extension-chain.js";
 
 // Output directory matches §18.3 in the design doc
 const OUTPUT_DIR = ".k8s-adapter/output";
@@ -102,9 +105,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
     // Try to load from project root
     const configPaths = [
+      path.join(projectDir, "adapter.config.mjs"),
       path.join(projectDir, "adapter.config.ts"),
       path.join(projectDir, "adapter.config.js"),
-      path.join(projectDir, "adapter.config.mjs"),
     ];
 
     for (const p of configPaths) {
@@ -190,6 +193,28 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         ?? path.basename(projectDir).toLowerCase().replace(/[^a-z0-9]/g, '-')
         ?? 'nextjs';
 
+      // Phase 2 artifacts (Route Extension) — computed before Helm chart so extensionChain is available
+      const celExpression = generateCelExpression({
+        outputs,
+        dynamicRoutes: routing.dynamicRoutes,
+      });
+
+      const failureModeAllow = determineFailureMode(outputs);
+
+      const gkeProvider = cfg.provider.gke;
+
+      const extensionChain = generateExtensionChain({
+        celExpression,
+        releaseName,
+        namespace: infra.namespace ?? 'default',
+        projectId: infra.projectId ?? '',
+        region: infra.region ?? '',
+        timeout: gkeProvider.serviceExtensions?.routeExtension?.timeout
+          ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
+          : '5s',
+        failureModeAllow,
+      });
+
       const helmFiles = generateHelmChart({
         pools,
         buildId,
@@ -198,6 +223,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         imageRegistry: infra.containerRegistry ?? process.env.IMAGE_REGISTRY ?? "REGISTRY",
         routingManifest,
         releaseName,
+        extensionChainJson: extensionChain,
+        infrastructure: { projectId: infra.projectId, region: infra.region },
       });
 
       for (const [filePath, content] of Object.entries(helmFiles)) {
@@ -208,14 +235,23 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const poolServerSrc = path.join(_dirname, "pool-server.cjs");
       const poolServerContent = existsSync(poolServerSrc) ? readFileSync(poolServerSrc, "utf-8") : "";
 
+      // Find .env files to stage into runtime containers
+      const envFiles = ['.env', '.env.production']
+        .filter(f => existsSync(path.join(projectDir, f)));
+
       if (cfg.containerStrategy === "shared-image") {
         const sharedStageDir = "shared-context";
         const absSharedStageDir = path.join(OUTPUT_DIR, sharedStageDir);
-        
+
         // Stage everything for shared image
         await cp(path.join(projectDir, ".next"), path.join(projectDir, absSharedStageDir, ".next"), { recursive: true, dereference: true });
         await cp(path.join(projectDir, "node_modules"), path.join(projectDir, absSharedStageDir, "node_modules"), { recursive: true, dereference: true });
         await copyFile(path.join(projectDir, "package.json"), path.join(projectDir, absSharedStageDir, "package.json"));
+
+        // Stage .env files
+        for (const envFile of envFiles) {
+          await copyFile(path.join(projectDir, envFile), path.join(projectDir, absSharedStageDir, envFile));
+        }
         
         if (poolServerContent) {
           await writeOutputFile(projectDir, "pool-server.cjs", poolServerContent, absSharedStageDir);
@@ -294,6 +330,20 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               relPath,
               poolName,
             );
+            // Stage middleware's traced assets (chunk dependencies)
+            const mwAssets = (outputs.middleware as any).assets ?? {};
+            for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
+              if (typeof absAsset === "string") {
+                await stageFile(projectDir, absAsset, relAsset, poolName);
+              }
+            }
+          }
+
+          // Stage .next/server/chunks/ — required by Turbopack runtime for
+          // middleware and handler chunk loading
+          const chunksDir = path.join(projectDir, ".next", "server", "chunks");
+          if (existsSync(chunksDir)) {
+            await stageFile(projectDir, chunksDir, ".next/server/chunks", poolName);
           }
 
           // Stage next/setup-node-env (required for AsyncLocalStorage initialization)
@@ -306,6 +356,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           const nextRoutingDir = path.join(projectDir, "node_modules", "@next", "routing");
           if (existsSync(nextRoutingDir)) {
             await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
+          }
+
+          // Stage .env files into pool context
+          for (const envFile of envFiles) {
+            await copyFile(
+              path.join(projectDir, envFile),
+              path.join(projectDir, poolStageDir, envFile),
+            ).catch(() => {});
           }
 
           // Shared context files
@@ -385,6 +443,99 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         "static-assets.json",
         JSON.stringify(staticManifest, null, 2),
       );
+
+      // Phase 2 artifacts — write to output (computation moved above Helm chart generation)
+      await writeOutputFile(projectDir, 'extension-chains.json', extensionChain);
+      await writeOutputFile(projectDir, 'cel-expression.txt', celExpression);
+
+      // Routing service Dockerfile + context
+      const routingServiceDir = path.join(OUTPUT_DIR, 'routing-service');
+
+      await writeOutputFile(
+        projectDir,
+        'Dockerfile',
+        generateRoutingServiceDockerfile({ nodeVersion: '22', buildId }),
+        routingServiceDir,
+      );
+
+      const routingServiceContextDir = path.join(routingServiceDir, 'context');
+
+      // Copy routing-service runtime (from adapter package dist/)
+      const routingServiceSrc = path.join(_dirname, 'routing-service.cjs');
+      if (existsSync(routingServiceSrc)) {
+        await writeOutputFile(
+          projectDir,
+          'routing-service.cjs',
+          readFileSync(routingServiceSrc, 'utf-8'),
+          routingServiceContextDir,
+        );
+      }
+
+      // Routing manifest for the routing service
+      await writeOutputFile(
+        projectDir,
+        'config/routing-manifest.json',
+        JSON.stringify(routingManifest, null, 2),
+        routingServiceContextDir,
+      );
+
+      // Stage runtime dependencies for routing service (externals not bundled by esbuild)
+      // @grpc/grpc-js and @grpc/proto-loader are bundled into routing-service.cjs
+      const routingServiceDeps = ['@next/routing'];
+      for (const dep of routingServiceDeps) {
+        const depDir = path.join(projectDir, 'node_modules', ...dep.split('/'));
+        if (existsSync(depDir)) {
+          const dest = path.join(projectDir, routingServiceContextDir, 'node_modules', ...dep.split('/'));
+          if (!existsSync(dest)) {
+            await mkdir(path.dirname(dest), { recursive: true });
+            await cp(depDir, dest, { recursive: true, dereference: true });
+          }
+        }
+      }
+
+      // Stage .env files into routing service context
+      for (const envFile of envFiles) {
+        const envSrc = path.join(projectDir, envFile);
+        const envDest = path.join(projectDir, routingServiceContextDir, envFile);
+        if (existsSync(envSrc) && !existsSync(envDest)) {
+          await mkdir(path.dirname(envDest), { recursive: true });
+          await copyFile(envSrc, envDest);
+        }
+      }
+
+      // Stage middleware module + its chunk dependencies
+      if (outputs.middleware?.filePath && existsSync(outputs.middleware.filePath)) {
+        const mwRelPath = path.relative(projectDir, outputs.middleware.filePath);
+        const mwDest = path.join(projectDir, routingServiceContextDir, mwRelPath);
+        if (!existsSync(mwDest)) {
+          await mkdir(path.dirname(mwDest), { recursive: true });
+          await copyFile(outputs.middleware.filePath, mwDest);
+        }
+        // Stage middleware's traced assets (files and directories)
+        const mwAssets = (outputs.middleware as any).assets ?? {};
+        for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
+          if (typeof absAsset === "string" && existsSync(absAsset)) {
+            const dest = path.join(projectDir, routingServiceContextDir, relAsset);
+            if (!existsSync(dest)) {
+              await mkdir(path.dirname(dest), { recursive: true });
+              const stat = statSync(absAsset);
+              if (stat.isDirectory()) {
+                await cp(absAsset, dest, { recursive: true, dereference: true });
+              } else {
+                await copyFile(absAsset, dest);
+              }
+            }
+          }
+        }
+        // Stage .next/server/chunks/ for Turbopack runtime chunk loading
+        const chunksDir = path.join(projectDir, ".next", "server", "chunks");
+        const chunksDest = path.join(projectDir, routingServiceContextDir, ".next", "server", "chunks");
+        if (existsSync(chunksDir) && !existsSync(chunksDest)) {
+          await mkdir(path.dirname(chunksDest), { recursive: true });
+          await cp(chunksDir, chunksDest, { recursive: true, dereference: true });
+        }
+      }
+
       await writeOutputFile(
         projectDir,
         "build-metadata.json",
@@ -394,6 +545,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           poolNames: [...pools.keys()],
           generatedAt: new Date().toISOString(),
           containerStrategy: cfg.containerStrategy,
+          hasMiddleware: !!outputs.middleware,
+          failureModeAllow,
         }),
       );
     },

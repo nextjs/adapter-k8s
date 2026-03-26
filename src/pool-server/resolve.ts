@@ -37,12 +37,27 @@ export function createLocalResolver(
         // unconditionally (no null guard). When no middleware exists, return empty result.
         invokeMiddleware: middlewareModule
           ? async (ctx) => {
-              const request = new Request(ctx.url.toString(), {
+              const reqInit: RequestInit = {
                 method,
                 headers: new Headers(ctx.headers),
-                body: method === "GET" || method === "HEAD" ? null : ctx.requestBody,
+              };
+              if (method !== "GET" && method !== "HEAD") {
+                reqInit.body = ctx.requestBody;
                 // @ts-ignore - duplex is required in Node.js fetch for streamed bodies
-                duplex: "half",
+                reqInit.duplex = "half";
+              }
+              const baseRequest = new Request(ctx.url.toString(), reqInit);
+              // Next.js middleware expects a mutable request.url property.
+              // Standard Request.url is read-only, so we wrap with a Proxy.
+              const request = new Proxy(baseRequest, {
+                get(target, prop, receiver) {
+                  if (prop === 'url') return (target as any)._mutableUrl ?? target.url;
+                  return Reflect.get(target, prop, receiver);
+                },
+                set(target, prop, value) {
+                  if (prop === 'url') { (target as any)._mutableUrl = value; return true; }
+                  return Reflect.set(target, prop, value);
+                },
               });
               // Middleware modules export default.default (the middleware handler)
               const handlerFn = typeof middlewareModule.default === 'function'

@@ -47,7 +47,7 @@ describe("validateConfig", () => {
     );
   });
 
-  it("throws error for wildcard hostname with managedCert", () => {
+  it("allows wildcard hostnames (Certificate Manager supports them)", () => {
     const config: K8sAdapterConfig = {
       pools: { ssr: { routes: ["appPages"] } },
       provider: {
@@ -56,22 +56,6 @@ describe("validateConfig", () => {
             type: "gateway-api",
             className: "gke-l7-global-external-managed",
             hosts: [{ hostname: "*.example.com", tls: { enabled: true, managedCert: true } }],
-          },
-        },
-      },
-    };
-    expect(() => validateConfig(config)).toThrow(/wildcard.*managedCert/);
-  });
-
-  it("allows wildcard hostname without managedCert", () => {
-    const config: K8sAdapterConfig = {
-      pools: { ssr: { routes: ["appPages"] } },
-      provider: {
-        gke: {
-          gateway: {
-            type: "gateway-api",
-            className: "gke-l7-global-external-managed",
-            hosts: [{ hostname: "*.example.com", tls: { enabled: true, managedCert: false } }],
           },
         },
       },

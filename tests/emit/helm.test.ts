@@ -73,6 +73,72 @@ describe("generateHelmChart", () => {
     expect(deploymentContent).toContain(`name: ${expectedName}`);
   });
 
+  it('generates header-based HTTPRoute rules for pools', () => {
+    const pools = new Map<string, PoolDefinition>([
+      ['ssr', { name: 'ssr', outputs: [], config: { routes: ['appPages'] } }],
+    ]);
+
+    const result = generateHelmChart({
+      pools,
+      buildId: 'abc123',
+      nextVersion: '16.2.0',
+      config: {
+        pools: { ssr: { routes: ['appPages'] } },
+        provider: {
+          gke: {
+            gateway: {
+              type: 'gateway-api',
+              className: 'gke-l7-global-external-managed',
+              hosts: [{ hostname: 'app.example.com', tls: { enabled: true, managedCert: true } }],
+            },
+          },
+        },
+      } as K8sAdapterConfig,
+      imageRegistry: 'gcr.io/my-project',
+      routingManifest: mockManifest,
+    });
+
+    const httpRoute = result['templates/http-route.yaml'];
+    expect(httpRoute).toContain('x-upstream-pool');
+  });
+
+  it('includes routing service templates when extensionChainJson provided', () => {
+    const pools = new Map<string, PoolDefinition>([
+      ['ssr', { name: 'ssr', outputs: [], config: { routes: ['appPages'] } }],
+    ]);
+
+    const result = generateHelmChart({
+      pools,
+      buildId: 'abc123',
+      nextVersion: '16.2.0',
+      config: {
+        pools: { ssr: { routes: ['appPages'] } },
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: 'gcr.io/my-project',
+      routingManifest: mockManifest,
+      extensionChainJson: JSON.stringify([{
+        name: 'nextjs-routing',
+        matchCondition: { celExpression: 'true' },
+        extensions: [{
+          name: 'routing-service',
+          authority: 'nextjs-routing-service.default.svc.cluster.local',
+          service: 'projects/my-project/locations/us-central1/backendServices/nextjs-routing-service',
+          timeout: '5s',
+          supportedEvents: ['REQUEST_HEADERS'],
+          failOpen: true,
+        }],
+      }]),
+      infrastructure: { projectId: 'my-project', region: 'us-central1' },
+    });
+
+    expect(result['templates/routing-service-deployment.yaml']).toBeDefined();
+    expect(result['templates/routing-service-service.yaml']).toBeDefined();
+    expect(result['templates/routing-service-hpa.yaml']).toBeDefined();
+    expect(result['templates/route-ext-config.yaml']).toBeDefined();
+    expect(result['templates/route-ext-update-job.yaml']).toBeDefined();
+  });
+
   it("generates one deployment per pool", () => {
     const pools = new Map<string, PoolDefinition>([
       ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],

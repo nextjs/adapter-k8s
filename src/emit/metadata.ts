@@ -5,12 +5,16 @@ export function generateBuildMetadata({
   poolNames,
   generatedAt,
   containerStrategy,
+  hasMiddleware,
+  failureModeAllow,
 }: {
   buildId: string;
   nextVersion: string;
   poolNames: string[];
   generatedAt: string;
   containerStrategy?: string | undefined;
+  hasMiddleware?: boolean | undefined;
+  failureModeAllow?: boolean | undefined;
 }): string {
   return JSON.stringify(
     {
@@ -19,6 +23,8 @@ export function generateBuildMetadata({
       pools: poolNames,
       generatedAt,
       containerStrategy: containerStrategy ?? "traced-assets",
+      hasMiddleware: hasMiddleware ?? false,
+      failureModeAllow: failureModeAllow ?? true,
     },
     null,
     2,

@@ -63,6 +63,19 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
     }
   }
 
+  // Always build routing service image
+  const routingTag = `${registry}/routing-service:${buildId}`;
+  commands.push({
+    description: 'Build routing service image',
+    command: 'docker',
+    args: ['build', '-f', `${outputDir}/routing-service/Dockerfile`, '-t', routingTag, `${outputDir}/routing-service`],
+  });
+  commands.push({
+    description: 'Push routing service image',
+    command: 'docker',
+    args: ['push', routingTag],
+  });
+
   return commands;
 }
 
@@ -155,19 +168,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // 5. Pre-flight: ensure static IP exists (Gateway needs it)
   if (!dryRun && infra.projectId) {
     const ipName = `${releaseName}-ip`;
-    console.log(`\n  → Ensuring static IP "${ipName}" exists...`);
     const ipCheck = await execCapture('gcloud', [
       'compute', 'addresses', 'describe', ipName,
       '--global', '--project', infra.projectId, '--format=value(address)',
     ]);
     if (ipCheck.exitCode !== 0) {
-      console.log(`    Creating static IP "${ipName}"...`);
+      console.log(`\n  → Creating static IP "${ipName}"...`);
       await execOrThrow('gcloud', [
         'compute', 'addresses', 'create', ipName,
         '--global', '--project', infra.projectId, '--quiet',
       ]);
-    } else {
-      console.log(`    Static IP: ${ipCheck.stdout.trim()}`);
     }
   }
 

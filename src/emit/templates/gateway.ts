@@ -143,7 +143,11 @@ export function renderHTTPRoute({
     finalRules[14] = rulesList[rulesList.length - 1]!;
   }
 
-  const rules = finalRules
+  // Separate catch-all (last rule) from path-prefix rules
+  const catchAllRule = finalRules[finalRules.length - 1]!;
+  const pathPrefixRules = finalRules.slice(0, -1);
+
+  const pathRulesYaml = pathPrefixRules
     .map((rule) => {
       const backendName = sanitizeK8sName(`${releaseName}-${rule.poolName}-${buildId}`);
       return `    - matches:
@@ -151,10 +155,32 @@ export function renderHTTPRoute({
       backendRefs:
         - name: ${backendName}
           port: 3000`;
-    })
-    .join("\n");
+    });
 
-  const hostnameLines = hostnames.map(h => `    - ${h}`).join("\n");
+  // Phase 2+: header-based routing rules for x-upstream-pool (set by route extension)
+  const headerRules = [...pools.keys()].map(poolName => {
+    const backendName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
+    return `    - matches:
+        - headers:
+            - name: x-upstream-pool
+              value: ${poolName}
+      backendRefs:
+        - name: ${backendName}
+          port: 3000`;
+  });
+
+  const catchAllRuleYaml = (() => {
+    const backendName = sanitizeK8sName(`${releaseName}-${catchAllRule.poolName}-${buildId}`);
+    return `    - matches:
+        - path: { type: ${catchAllRule.matchType}, value: "${catchAllRule.path}" }
+      backendRefs:
+        - name: ${backendName}
+          port: 3000`;
+  })();
+
+  const rules = [...pathRulesYaml, ...headerRules, catchAllRuleYaml].join("\n");
+
+  const hostnameLines = hostnames.map(h => `    - "${h}"`).join("\n");
 
   return `apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

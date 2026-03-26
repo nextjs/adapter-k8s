@@ -152,6 +152,7 @@ export function buildInitGcloudCommands(options: {
       `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
       "--role",
       "roles/storage.objectAdmin",
+      "--condition=None",
       "--quiet",
     ],
   });
@@ -168,6 +169,7 @@ export function buildInitGcloudCommands(options: {
       `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
       "--role",
       "roles/artifactregistry.writer",
+      "--condition=None",
       "--quiet",
     ],
   });
@@ -189,9 +191,74 @@ export function buildInitGcloudCommands(options: {
       "roles/artifactregistry.repoAdmin",
       "--project",
       projectId,
+      "--condition=None",
       "--quiet",
     ],
   });
+
+  // --- Deploy Service Account (Workload Identity for Helm hook Jobs) ---
+  // The route-ext update Job needs networkservices.admin to import LbRouteExtension
+  commands.push({
+    description: 'Grant deploy SA networkservices.admin role',
+    command: 'gcloud',
+    args: [
+      'projects', 'add-iam-policy-binding', projectId,
+      '--member', `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      '--role', 'roles/networkservices.admin',
+      '--condition=None',
+      '--quiet',
+    ],
+  });
+
+  // Allow the K8s SA to impersonate the GCP deploy SA via Workload Identity
+  commands.push({
+    description: 'Bind K8s SA to GCP SA via Workload Identity',
+    command: 'gcloud',
+    args: [
+      'iam', 'service-accounts', 'add-iam-policy-binding',
+      `${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      '--role', 'roles/iam.workloadIdentityUser',
+      '--member', `serviceAccount:${projectId}.svc.id.goog[default/${releaseName}-deploy-sa]`,
+      '--condition=None',
+      '--project', projectId,
+      '--quiet',
+    ],
+  });
+
+  // --- Route Extension Service (ext_proc) ---
+  // Create health check for routing service
+  commands.push({
+    description: 'Create health check for routing service',
+    command: 'gcloud',
+    args: [
+      'compute', 'health-checks', 'create', 'grpc',
+      `${releaseName}-routing-hc`,
+      '--port', '8443',
+      '--project', projectId,
+      '--quiet',
+    ],
+  });
+
+  // Create backend service for routing service (needed by LbRouteExtension)
+  commands.push({
+    description: 'Create backend service for routing service',
+    command: 'gcloud',
+    args: [
+      'compute', 'backend-services', 'create',
+      `${releaseName}-routing-service`,
+      '--global',
+      '--protocol', 'HTTP2',
+      '--health-checks', `${releaseName}-routing-hc`,
+      '--project', projectId,
+      '--quiet',
+    ],
+  });
+
+  // Create LbRouteExtension with placeholder CEL
+  // gcloud uses `import` (not `create`) for lb-route-extensions — it takes a YAML spec file.
+  // We'll skip this in init and handle it via the Helm hook Job on first deploy instead.
+  // The Helm hook uses `gcloud service-extensions lb-route-extensions import` with the
+  // extension-chains.json generated at build time.
 
   // --- Certificate Manager (for TLS on GKE Gateway API) ---
   // GKE Gateway API does NOT support ManagedCertificate CRD or certificateRefs.
@@ -206,7 +273,8 @@ export function buildInitGcloudCommands(options: {
         args: [
           "certificate-manager", "dns-authorizations", "create",
           `${releaseName}-dns-auth-${safeName}`,
-          "--domain", host,
+          // For wildcard domains (*.example.com), DNS auth must be for the base domain
+          "--domain", host.replace(/^\*\./, ''),
           "--project", projectId,
           "--quiet",
         ],
@@ -325,10 +393,16 @@ export async function runInit(options: InitOptions): Promise<void> {
     }
   }
 
-  // 3. Scaffold adapter.config.ts (if not exists)
-  const configPath = path.join(projectDir, "adapter.config.ts");
-  if (!existsSync(configPath)) {
-    console.log("\n  → Scaffolding adapter.config.ts");
+  // 3. Scaffold adapter config (if not exists)
+  // Prefer .mjs to avoid Node.js MODULE_TYPELESS_PACKAGE_JSON warning
+  const configExists =
+    existsSync(path.join(projectDir, "adapter.config.mjs")) ||
+    existsSync(path.join(projectDir, "adapter.config.ts")) ||
+    existsSync(path.join(projectDir, "adapter.config.js"));
+
+  if (!configExists) {
+    const configPath = path.join(projectDir, "adapter.config.mjs");
+    console.log("\n  → Scaffolding adapter.config.mjs");
     const configContent = generateAdapterConfig({
       projectId,
       region,
@@ -339,10 +413,10 @@ export async function runInit(options: InitOptions): Promise<void> {
     if (!dryRun) {
       writeFileSync(configPath, configContent);
     } else {
-      console.log("    [dry-run] Would write adapter.config.ts");
+      console.log("    [dry-run] Would write adapter.config.mjs");
     }
   } else {
-    console.log("\n  → adapter.config.ts already exists — skipping");
+    console.log("\n  → adapter config already exists — skipping");
   }
 
   // 4. Write infrastructure.json

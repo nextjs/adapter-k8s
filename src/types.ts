@@ -41,6 +41,9 @@ export interface GKEProviderConfig {
     className: string;
     hosts: HostConfig[];
   };
+  serviceExtensions?: {
+    routeExtension?: { timeout?: number };
+  };
 }
 
 export interface K8sAdapterConfig {

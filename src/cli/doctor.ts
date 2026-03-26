@@ -50,6 +50,7 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
   }
 
   const configExists =
+    existsSync(path.join(projectDir, "adapter.config.mjs")) ||
     existsSync(path.join(projectDir, "adapter.config.ts")) ||
     existsSync(path.join(projectDir, "adapter.config.js"));
   results.push(
@@ -220,6 +221,32 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
       results.push({ name: "Pods", status: "warn", message: "No pods found" });
     }
 
+    // Routing service deployment health
+    const routingSvcResult = await execCapture("kubectl", [
+      "get", "deployment", `${releaseName}-routing-service`,
+      "-o", "jsonpath={.status.readyReplicas}/{.status.replicas}",
+    ]);
+    if (routingSvcResult.exitCode === 0) {
+      const [ready, total] = routingSvcResult.stdout.split("/");
+      const readyCount = parseInt(ready || "0", 10);
+      const totalCount = parseInt(total || "0", 10);
+      if (readyCount === totalCount && totalCount > 0) {
+        results.push({ name: "Routing service", status: "pass", message: `${readyCount}/${totalCount} ready` });
+      } else {
+        // Get reason from pod logs
+        const rsLogsResult = await execCapture("kubectl", [
+          "logs", `deployment/${releaseName}-routing-service`, "--tail=10",
+        ]);
+        const lastLog = rsLogsResult.stdout.trim().split("\n").pop() ?? "";
+        results.push({
+          name: "Routing service",
+          status: "fail",
+          message: `${readyCount}/${totalCount} ready`,
+          fix: lastLog.includes("Error") ? lastLog.slice(0, 120) : `kubectl logs deployment/${releaseName}-routing-service --tail=20`,
+        });
+      }
+    }
+
     // Pod errors — check recent logs for recurring errors
     if (podsResult.exitCode === 0 && podsResult.stdout.trim()) {
       const firstPod = podsResult.stdout.trim().split("\n")[0]?.split(" ")[0];
@@ -288,29 +315,40 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
       }
 
       for (const host of hosts) {
-        if (host.includes("*")) continue;
+        // Wildcard domains: skip DNS A record check (can't resolve *.example.com)
+        // but still check CNAME auth and cert status
+        const isWildcard = host.includes("*");
         const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
 
         results.push({ name: `--- ${host}`, status: "pass", message: "---" });
 
-        // A record
-        const resolvedIp = await resolve4(host).then(ips => ips[0] ?? null).catch(() => null);
-        if (!resolvedIp) {
-          results.push({
-            name: `  A record`,
-            status: "fail",
-            message: "Does not resolve",
-            fix: gwIp ? `Add DNS: ${host} A ${gwIp}` : "Add A record after Gateway IP is assigned",
-          });
-        } else if (gwIp && resolvedIp !== gwIp) {
+        // A record (skip for wildcards — can't resolve *.example.com directly)
+        if (!isWildcard) {
+          const resolvedIp = await resolve4(host).then(ips => ips[0] ?? null).catch(() => null);
+          if (!resolvedIp) {
+            results.push({
+              name: `  A record`,
+              status: "fail",
+              message: "Does not resolve",
+              fix: gwIp ? `Add DNS: ${host} A ${gwIp}` : "Add A record after Gateway IP is assigned",
+            });
+          } else if (gwIp && resolvedIp !== gwIp) {
+            results.push({
+              name: `  A record`,
+              status: "warn",
+              message: `${resolvedIp} (expected ${gwIp})`,
+              fix: `Update DNS: ${host} A ${gwIp}`,
+            });
+          } else {
+            results.push({ name: `  A record`, status: "pass", message: `${host} -> ${resolvedIp}` });
+          }
+        } else {
           results.push({
             name: `  A record`,
             status: "warn",
-            message: `${resolvedIp} (expected ${gwIp})`,
-            fix: `Update DNS: ${host} A ${gwIp}`,
+            message: "Wildcard — configure A record for base domain or subdomains individually",
+            ...(gwIp ? { fix: `Add DNS: ${host} A ${gwIp} (or use individual subdomain A records)` } : {}),
           });
-        } else {
-          results.push({ name: `  A record`, status: "pass", message: `${host} -> ${resolvedIp}` });
         }
 
         // CNAME for DNS authorization (Certificate Manager)
@@ -443,29 +481,38 @@ export async function runDomainChecks(options: { projectDir: string; releaseName
   const results: CheckResult[] = [];
 
   for (const host of hosts) {
-    if (host.includes("*")) continue;
+    const isWildcard = host.includes("*");
     const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
 
     results.push({ name: `--- ${host}`, status: "pass", message: "---" });
 
-    // A record
-    const resolvedIp = await resolve4(host).then(ips => ips[0] ?? null).catch(() => null);
-    if (!resolvedIp) {
-      results.push({
-        name: `  A record`,
-        status: "fail",
-        message: "Does not resolve",
-        fix: gatewayIp ? `Add DNS: ${host} A ${gatewayIp}` : "Add A record after Gateway IP is assigned",
-      });
-    } else if (gatewayIp && resolvedIp !== gatewayIp) {
+    // A record (skip resolve for wildcards)
+    if (!isWildcard) {
+      const resolvedIp = await resolve4(host).then(ips => ips[0] ?? null).catch(() => null);
+      if (!resolvedIp) {
+        results.push({
+          name: `  A record`,
+          status: "fail",
+          message: "Does not resolve",
+          fix: gatewayIp ? `Add DNS: ${host} A ${gatewayIp}` : "Add A record after Gateway IP is assigned",
+        });
+      } else if (gatewayIp && resolvedIp !== gatewayIp) {
+        results.push({
+          name: `  A record`,
+          status: "warn",
+          message: `${resolvedIp} (expected ${gatewayIp})`,
+          fix: `Update DNS: ${host} A ${gatewayIp}`,
+        });
+      } else {
+        results.push({ name: `  A record`, status: "pass", message: `${host} -> ${resolvedIp}` });
+      }
+    } else {
       results.push({
         name: `  A record`,
         status: "warn",
-        message: `${resolvedIp} (expected ${gatewayIp})`,
-        fix: `Update DNS: ${host} A ${gatewayIp}`,
+        message: "Wildcard — configure A record for base domain or subdomains",
+        ...(gatewayIp ? { fix: `Add DNS: ${host} A ${gatewayIp}` } : {}),
       });
-    } else {
-      results.push({ name: `  A record`, status: "pass", message: `${host} -> ${resolvedIp}` });
     }
 
     // CNAME for DNS authorization

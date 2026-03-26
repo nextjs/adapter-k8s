@@ -16,8 +16,8 @@ describe("buildDockerCommands", () => {
       containerStrategy: "traced-assets",
     });
 
-    // 1 auth + 2 pools × 2 commands each (build + push) = 5 commands
-    expect(commands).toHaveLength(5);
+    // 1 auth + 2 pools × 2 commands each (build + push) + 2 routing = 7 commands
+    expect(commands).toHaveLength(7);
     expect(commands[0]!.description).toContain("Docker authentication");
     expect(commands[1]!.args).toContain("build");
     expect(commands[1]!.args).toContain(".k8s-adapter/output/pools/ssr");
@@ -36,12 +36,25 @@ describe("buildDockerCommands", () => {
       containerStrategy: "shared-image",
     });
 
-    // 1 auth + 1 image × 2 commands (build + push) = 3 commands
-    expect(commands).toHaveLength(3);
+    // 1 auth + 1 image × 2 commands (build + push) + 2 routing = 5 commands
+    expect(commands).toHaveLength(5);
     expect(commands[0]!.description).toContain("Docker authentication");
     expect(commands[1]!.args).toContain("build");
     expect(commands[1]!.args).toContain(".k8s-adapter/output/shared-context");
     expect(commands[1]!.args).toContain(`${registry}/nextjs-app:abc123`);
+  });
+
+  it('includes routing service image in docker commands', () => {
+    const commands = buildDockerCommands({
+      pools: ['ssr'],
+      buildId: 'abc123',
+      registry: 'us-central1-docker.pkg.dev/my-project/nextjs',
+      outputDir: '.k8s-adapter/output',
+      containerStrategy: 'traced-assets',
+    });
+
+    const routingBuild = commands.find(c => c.description.includes('routing service'));
+    expect(routingBuild).toBeDefined();
   });
 });
 
