@@ -39,6 +39,7 @@ function mockRes(): ServerResponse & { _status: number; _headers: Record<string,
 describe('createDispatcher', () => {
   it('dispatches route to handler', async () => {
     const handler = vi.fn();
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
     const handlerLoader = {
       load: vi.fn().mockResolvedValue(handler),
       has: vi.fn().mockReturnValue(true),
@@ -49,6 +50,7 @@ describe('createDispatcher', () => {
       poolName: 'ssr',
       buildId: 'test123',
       staticAssets: [],
+      localHandlerInvoker,
     });
 
     const req = mockReq('/about');
@@ -64,9 +66,15 @@ describe('createDispatcher', () => {
     await dispatcher.dispatch(req, res as unknown as ServerResponse, resolution);
 
     expect(handlerLoader.load).toHaveBeenCalledWith('/about');
-    expect(handler).toHaveBeenCalledWith(req, res, expect.objectContaining({
-      requestMeta: expect.objectContaining({ matchedPathname: '/about' }),
-    }));
+    expect(localHandlerInvoker).toHaveBeenCalledWith(
+      expect.objectContaining({
+        handler,
+        req,
+        res,
+        matchedPathname: '/about',
+        routeMatches: null,
+      }),
+    );
   });
 
   it('handles redirects', async () => {
@@ -124,6 +132,77 @@ describe('createDispatcher', () => {
 
     await dispatcher.dispatch(req, res as unknown as ServerResponse, resolution);
     expect(res._status).toBe(404);
+  });
+
+  it('returns 501 for edge runtime route outputs', async () => {
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: 'edge',
+          filePath: '/app/.next/server/edge/page.js',
+        }),
+      } as any,
+      poolName: 'ssr',
+      buildId: 'test123',
+      staticAssets: [],
+    });
+
+    const req = mockReq('/edge-page');
+    const res = mockRes();
+    await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+      kind: 'route',
+      pool: 'ssr',
+      matchedPathname: '/edge-page',
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+
+    expect(res._status).toBe(501);
+    expect(res._body).toContain('Edge runtime routes are not supported');
+  });
+
+  it('applies middleware-mutated request headers before invoking the handler', async () => {
+    const handler = vi.fn();
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const handlerLoader = {
+      load: vi.fn().mockResolvedValue(handler),
+      has: vi.fn().mockReturnValue(true),
+    };
+
+    const dispatcher = createDispatcher({
+      handlerLoader,
+      poolName: 'ssr',
+      buildId: 'test123',
+      staticAssets: [],
+      localHandlerInvoker,
+    });
+
+    const req = mockReq('/about', { cookie: 'a=1' });
+    const res = mockRes();
+
+    await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+      kind: 'route',
+      pool: 'ssr',
+      matchedPathname: '/about',
+      routeMatches: null,
+      resolvedHeaders: undefined,
+      middlewareRequestHeaders: new Headers({
+        cookie: 'b=2',
+        authorization: 'Bearer token',
+        'x-middleware-next': '1',
+      }),
+    });
+
+    expect(req.headers.cookie).toBe('a=1; b=2');
+    expect(req.headers.authorization).toBe('Bearer token');
+    expect(req.headers['x-middleware-next']).toBeUndefined();
+    expect(localHandlerInvoker).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req,
+      })
+    );
   });
 
   describe('static asset serving', () => {
@@ -209,6 +288,7 @@ describe('createDispatcher', () => {
 
     it('falls through to handler when pathname is not in static manifest', async () => {
       const handler = vi.fn();
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
       const handlerLoader = {
         load: vi.fn().mockResolvedValue(handler),
         has: vi.fn().mockReturnValue(true),
@@ -219,6 +299,7 @@ describe('createDispatcher', () => {
         poolName: 'ssr',
         buildId: 'test123',
         staticAssets: [],
+        localHandlerInvoker,
       });
 
       const req = mockReq('/dynamic-page');
@@ -232,7 +313,12 @@ describe('createDispatcher', () => {
       });
 
       expect(handlerLoader.load).toHaveBeenCalledWith('/dynamic-page');
-      expect(handler).toHaveBeenCalled();
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          handler,
+          matchedPathname: '/dynamic-page',
+        })
+      );
     });
   });
 });

@@ -252,10 +252,16 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
         const total = parseInt(totalStr || "0", 10);
         const label = isRouting ? "Routing service" : `Pool: ${shortName}`;
 
-        if (ready === total && total > 0) {
+        if (role === "previous" && total === 0) {
+          results.push({ name: `${label}${roleTag}`, status: "pass", message: `0/0 scaled down (rollback ready)` });
+        } else if (role === "old" && total === 0) {
+          results.push({ name: `${label}${roleTag}`, status: "pass", message: `0/0 (pending cleanup)` });
+        } else if (ready === total && total > 0) {
           results.push({ name: `${label}${roleTag}`, status: "pass", message: `${ready}/${total} ready` });
-        } else if (role !== "current") {
-          results.push({ name: `${label}${roleTag}`, status: "warn", message: `${ready}/${total} ready (pending cleanup)` });
+        } else if (ready === 0 && total > 0) {
+          results.push({ name: `${label}${roleTag}`, status: "fail", message: `${ready}/${total} ready`, fix: `kubectl describe deployment/${name}` });
+        } else if (ready < total) {
+          results.push({ name: `${label}${roleTag}`, status: "warn", message: `${ready}/${total} ready` });
         } else {
           results.push({
             name: `${label}${roleTag}`,

@@ -142,6 +142,8 @@ async function invokeLocalHandlerOverHttp({
   });
 }
 
+type LocalHandlerInvoker = typeof invokeLocalHandlerOverHttp;
+
 function sanitizeK8sName(name: string): string {
   let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
   if (!/^[a-z]/.test(sanitized)) sanitized = `b-${sanitized}`;
@@ -155,10 +157,18 @@ export interface DispatcherOptions {
   buildId: string;
   staticAssets: StaticAssetEntry[];
   releaseName?: string;
+  localHandlerInvoker?: LocalHandlerInvoker;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
-  const { handlerLoader, poolName, buildId, staticAssets, releaseName = 'nextjs' } = options;
+  const {
+    handlerLoader,
+    poolName,
+    buildId,
+    staticAssets,
+    releaseName = 'nextjs',
+    localHandlerInvoker = invokeLocalHandlerOverHttp,
+  } = options;
 
   return {
     async dispatch(
@@ -296,7 +306,7 @@ export function createDispatcher(options: DispatcherOptions) {
             [NEXT_REQUEST_META]?: { actionBody?: Buffer };
           })[NEXT_REQUEST_META]?.actionBody;
 
-          await invokeLocalHandlerOverHttp({
+          await localHandlerInvoker({
             handler,
             req,
             res,

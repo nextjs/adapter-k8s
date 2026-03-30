@@ -1,9 +1,16 @@
 // src/cli/deploy.ts
 import path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { exec, execOrThrow, execCapture } from './exec.js';
 import { readState, writeState } from './state.js';
 import type { GcloudCommand } from './init.js';
+
+function sanitizeK8sName(name: string): string {
+  let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
+  if (!/^[a-z]/.test(sanitized)) sanitized = `b-${sanitized}`;
+  sanitized = sanitized.replace(/-+$/, "");
+  return sanitized.slice(0, 63);
+}
 
 export interface DeployOptions {
   projectDir: string;
@@ -206,6 +213,84 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     overridesFile,
   });
 
+  // Inject previous build's deployment+service into the chart so Helm doesn't delete it.
+  // Without this, helm upgrade only sees the current build's templates and deletes the previous.
+  if (previousBuildId && previousBuildId !== buildId) {
+    const chartTemplatesDir = path.join(outputDir, 'chart', 'templates');
+    const prevName = sanitizeK8sName(`${releaseName}-default-${previousBuildId}`);
+    const prevSafeBuildId = sanitizeK8sName(previousBuildId);
+
+    for (const poolName of pools) {
+      const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
+
+      // Previous deployment at 0 replicas (kept for rollback)
+      writeFileSync(path.join(chartTemplatesDir, `${poolName}-prev-deployment.yaml`), `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${poolPrevName}
+  labels:
+    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/component: ${poolName}
+    app.kubernetes.io/version: "${prevSafeBuildId}"
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${releaseName}
+      app.kubernetes.io/component: ${poolName}
+      app.kubernetes.io/version: "${prevSafeBuildId}"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${releaseName}
+        app.kubernetes.io/component: ${poolName}
+        app.kubernetes.io/version: "${prevSafeBuildId}"
+    spec:
+      containers:
+        - name: pool-server
+          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools "${poolName}").image.repository }}:${previousBuildId}"
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: NEXT_BUILD_ID
+              value: "${previousBuildId}"
+            - name: POOL_NAME
+              value: "${poolName}"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 10
+`);
+
+      // Previous versioned service (needed for the deployment's pods to be reachable)
+      writeFileSync(path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`), `apiVersion: v1
+kind: Service
+metadata:
+  name: ${poolPrevName}
+  labels:
+    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/component: ${poolName}
+    app.kubernetes.io/version: "${prevSafeBuildId}"
+spec:
+  selector:
+    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/component: ${poolName}
+    app.kubernetes.io/version: "${prevSafeBuildId}"
+  ports:
+    - port: 3000
+      targetPort: 3000
+`);
+    }
+  }
+
   console.log('\n  → Running helm upgrade...');
   if (!dryRun) {
     await execOrThrow('helm', helmArgs);
@@ -338,33 +423,31 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       ]);
     }
 
-    // 7d. Handle old deployments: keep one previous (scaled to 0), delete the rest
-    // Don't rely on state.previousBuildId for matching — use the actual deployments.
+    // 7d. Clean up old deployments.
+    // The previous build is already at 0 replicas (from the chart template we injected).
+    // Delete anything that isn't the current or previous build.
+    const previousBuildLower = previousBuildId?.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
+
     const allDeploys = await execCapture('kubectl', [
       'get', 'deployments', '-l', `app.kubernetes.io/name=${releaseName}`,
       '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
     if (allDeploys.exitCode === 0) {
-      const oldDeploys = allDeploys.stdout.trim().split('\n').filter(name =>
-        name && !name.includes('routing-service') &&
-        !name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)
-      );
-
-      if (oldDeploys.length > 0) {
-        // Keep the most recent non-current deploy as "previous" (scale to 0)
-        // It's the last one in the list (K8s returns in creation order)
-        const previousDeploy = oldDeploys[oldDeploys.length - 1]!;
-        console.log(`  → Scaling down previous build: ${previousDeploy}`);
-        await execCapture('kubectl', ['scale', `deployment/${previousDeploy}`, '--replicas=0']);
-
-        // Delete anything older
-        for (const name of oldDeploys) {
-          if (name === previousDeploy) continue;
-          console.log(`  → Deleting old build: ${name}`);
-          await execCapture('kubectl', ['delete', 'deployment', name]);
-          await execCapture('kubectl', ['delete', 'service', name]).catch(() => {});
-          await execCapture('kubectl', ['delete', 'healthcheckpolicy', `${name}-hcp`]).catch(() => {});
+      for (const name of allDeploys.stdout.trim().split('\n')) {
+        if (!name || name.includes('routing-service')) continue;
+        const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+        // Keep current build
+        if (normalized.includes(currentBuildLower)) continue;
+        // Keep previous build (rollback target)
+        if (previousBuildLower && normalized.includes(previousBuildLower)) {
+          console.log(`  → Previous build kept for rollback: ${name}`);
+          continue;
         }
+        // Delete everything else
+        console.log(`  → Deleting old build: ${name}`);
+        await execCapture('kubectl', ['delete', 'deployment', name]);
+        await execCapture('kubectl', ['delete', 'service', name]).catch(() => {});
+        await execCapture('kubectl', ['delete', 'healthcheckpolicy', `${name}-hcp`]).catch(() => {});
       }
     }
 

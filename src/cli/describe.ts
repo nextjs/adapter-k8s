@@ -86,9 +86,14 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
         role = "previous";
       }
 
+      // When scaled to 0, readyReplicas and replicas are absent from the API,
+      // so jsonpath returns empty strings → status is "/" instead of "0/0".
+      const [ready, total] = (status ?? "/").split("/");
+      const normalizedStatus = `${ready || "0"}/${total || "0"}`;
+
       deployments.push({
         shortName,
-        status: status ?? "0/0",
+        status: normalizedStatus,
         revision: image?.split(":").pop() ?? "unknown",
         isRouting,
         role,
@@ -105,8 +110,11 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
   const c = "\x1b[36m";
   const x = "\x1b[0m";
 
-  function icon(status: string): string {
-    if (status.startsWith("0/") || status === "/") return `${r}●${x}`;
+  function icon(dep: DeployInfo): string {
+    const { status, role } = dep;
+    // Scaled to 0 is expected for previous/old — not an error
+    if (status === "0/0") return role === "current" ? `${r}●${x}` : `${d}●${x}`;
+    if (status.startsWith("0/")) return `${r}●${x}`;
     const [ready, total] = status.split("/");
     return ready === total ? `${g}●${x}` : `${y}●${x}`;
   }
@@ -115,7 +123,7 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
     const roleTag = dep.role === "current" ? `${g}current${x}`
       : dep.role === "previous" ? `${y}previous${x}`
       : `${d}old${x}`;
-    return `  ${icon(dep.status)} ${dep.shortName}  ${d}${dep.status}${x}  [${roleTag}]`;
+    return `  ${icon(dep)} ${dep.shortName}  ${d}${dep.status}${x}  [${roleTag}]`;
   }
 
   const hostList = hosts.length > 0 ? hosts.join(", ") : "not configured";

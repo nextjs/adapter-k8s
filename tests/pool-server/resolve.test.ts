@@ -165,4 +165,49 @@ describe('createLocalResolver', () => {
       expect(result.response.status).toBe(401);
     }
   });
+
+  it('continues route resolution when middleware returns x-middleware-next', async () => {
+    const manifest = makeManifest();
+    const legacyMiddleware = vi.fn().mockResolvedValue({
+      response: new Response(null, {
+        status: 200,
+        headers: { 'x-middleware-next': '1' },
+      }),
+      waitUntil: Promise.resolve(),
+    });
+
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      const middlewareResult = await options.invokeMiddleware({
+        url: new URL('http://localhost/about'),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+
+      expect(middlewareResult.bodySent).toBeFalsy();
+
+      return {
+        resolvedPathname: '/about',
+        invocationTarget: { pathname: '/about' },
+      };
+    });
+
+    const resolver = createLocalResolver(manifest, {
+      default: {
+        default: legacyMiddleware,
+      },
+    });
+
+    const result = await resolver.resolve(
+      new URL('http://localhost/about'),
+      new Headers(),
+      'GET',
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe('route');
+    if (result.kind === 'route') {
+      expect(result.pool).toBe('ssr');
+      expect(result.matchedPathname).toBe('/about');
+    }
+  });
 });
