@@ -143,6 +143,18 @@ if [[ " ${NODE_OPTIONS:-} " != *" --max-old-space-size="* ]]; then
 fi
 echo "[adapter-k8s] NODE_OPTIONS=${NODE_OPTIONS}" >&2
 
+# Force middleware to compile as Node.js runtime (not Edge).
+# Our pool server can invoke Node middleware directly but not Edge/Turbopack bundles.
+for MWFILE in middleware.ts middleware.js src/middleware.ts src/middleware.js; do
+  if [ -f "$MWFILE" ]; then
+    if ! grep -q "runtime.*=.*['\"]nodejs['\"]" "$MWFILE" 2>/dev/null; then
+      echo "export const runtime = 'nodejs';" >> "$MWFILE"
+      echo "[adapter-k8s] Forced Node.js runtime for ${MWFILE}" >&2
+    fi
+    break
+  fi
+done
+
 # Inject a local build profile into plain-object next.config.* files:
 # - cap build workers
 # - disable parallel server build workers

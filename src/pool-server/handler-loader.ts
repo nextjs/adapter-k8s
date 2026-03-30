@@ -18,6 +18,18 @@ export function resolveRouteHandlerExport(module: LoadedModule): ArtifactRouteHa
   }
   if (typeof module.fetch === "function") return module.fetch as ArtifactRouteHandler;
 
+  // Edge runtime modules compiled by Turbopack register in globalThis._ENTRIES.
+  // Try to find a matching entry and extract its handler/default export.
+  const entries = (globalThis as Record<string, unknown>)._ENTRIES as
+    | Record<string, Record<string, unknown>>
+    | undefined;
+  if (entries) {
+    for (const entry of Object.values(entries)) {
+      if (typeof entry?.default === "function") return entry.default as ArtifactRouteHandler;
+      if (typeof entry?.handler === "function") return entry.handler as ArtifactRouteHandler;
+    }
+  }
+
   throw new Error("Could not find a valid handler export (handler, default, fetch) in the module.");
 }
 

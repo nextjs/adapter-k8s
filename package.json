@@ -38,7 +38,7 @@
     "build:clean": "rm -rf dist",
     "build:types": "tsc --emitDeclarationOnly --declaration --declarationDir dist",
     "build:adapter": "esbuild ./src/index.ts --bundle --format=esm --platform=node --outfile=./dist/index.js --external:next --external:@next/routing",
-    "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs",
+    "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs --external:@next/routing",
     "build:routing-service": "esbuild ./src/routing-service/index.ts --bundle --format=cjs --platform=node --outfile=./dist/routing-service.cjs --external:@next/routing",
     "build:cli": "esbuild ./src/cli/index.ts --bundle --format=cjs --platform=node --outfile=./dist/cli.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cli.cjs",
     "build": "npm run build:clean && npm run build:types && npm run build:adapter && npm run build:pool-server && npm run build:routing-service && npm run build:cli",

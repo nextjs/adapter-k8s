@@ -44,6 +44,14 @@ export function createPoolServer(options: PoolServerOptions) {
       }
     }
 
+    // Always strip x-middleware-* from incoming requests — clients must not
+    // be able to spoof middleware control headers (e.g. x-middleware-set-cookie).
+    for (const h of Object.keys(req.headers)) {
+      if (h.startsWith("x-middleware-")) {
+        delete req.headers[h];
+      }
+    }
+
     // Wrap res.writeHead to strip internal headers from responses
     const origWriteHead = res.writeHead.bind(res);
     (res as any).writeHead = function (statusCode: number, ...args: any[]) {

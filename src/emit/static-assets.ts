@@ -27,7 +27,7 @@ export function buildStaticManifest(
     const entry: StaticAssetEntry = {
       pathname: prerender.pathname,
       filePath: path.relative(projectDir, fallback.filePath),
-      cacheControl: "public, max-age=3600",
+      cacheControl: "public, max-age=0, must-revalidate",
     };
     if (fallback.initialHeaders) entry.headers = fallback.initialHeaders;
     if (fallback.initialStatus) entry.status = fallback.initialStatus;

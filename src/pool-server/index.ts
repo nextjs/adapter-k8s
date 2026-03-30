@@ -119,6 +119,24 @@ async function main() {
     ? JSON.parse(readFileSync(staticAssetsPath, "utf-8"))
     : [];
 
+  // Set preview/draft mode env vars from prerender manifest.
+  // The web adapter reads these via getEdgePreviewProps() — without them,
+  // middleware invocation crashes with "previewProps missing previewModeId".
+  const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
+  if (existsSync(prerenderManifestPath)) {
+    try {
+      const prerenderManifest = JSON.parse(readFileSync(prerenderManifestPath, "utf-8"));
+      const preview = prerenderManifest.preview;
+      if (preview) {
+        if (preview.previewModeId) process.env.__NEXT_PREVIEW_MODE_ID = preview.previewModeId;
+        if (preview.previewModeSigningKey) process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY = preview.previewModeSigningKey;
+        if (preview.previewModeEncryptionKey) process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY = preview.previewModeEncryptionKey;
+      }
+    } catch {
+      // Non-fatal — draft mode just won't work
+    }
+  }
+
   // Optionally load middleware module
   let middlewareModule = null;
   if (routingManifest.middleware) {

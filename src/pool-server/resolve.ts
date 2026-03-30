@@ -48,25 +48,18 @@ export function createLocalResolver(
         // unconditionally (no null guard). When no middleware exists, return empty result.
         invokeMiddleware: middlewareModule
           ? async (ctx) => {
-              const legacyMiddlewareFn =
-                typeof (middlewareModule.default as Record<string, unknown> | undefined)
-                  ?.default === "function"
-                  ? ((middlewareModule.default as Record<string, unknown>).default as (
-                      ...args: unknown[]
-                    ) => unknown)
-                  : null;
-
-              const requestInit: RequestInit & { duplex?: "half" } = {
-                method,
-                headers: new Headers(
-                  [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                ),
-                duplex: "half",
-              };
-              if (method !== "GET" && method !== "HEAD") {
-                requestInit.body = ctx.requestBody;
-              }
-              const middlewareRequest = new Request(ctx.url.toString(), requestInit);
+              // Next.js middleware modules have multiple shapes depending on
+              // compilation target. We try invocation paths in order:
+              //
+              // 1. Web adapter: default({ handler, request, page }) — Node middleware
+              //    Returns raw NextResponse with x-middleware-* headers intact.
+              // 2. Legacy: default.default({ request }) — older Next.js Edge output
+              //    Pre-processes response (strips x-middleware-* headers).
+              // 3. Direct handler: handler(request, { waitUntil }) — raw handler fn
+              //
+              // Web adapter MUST be tried first — the legacy path strips control
+              // headers from the response, causing responseToMiddlewareResult to
+              // misinterpret the result (sets bodySent=true incorrectly).
 
               const adapterFn =
                 typeof middlewareModule.default === "function"
@@ -80,7 +73,15 @@ export function createLocalResolver(
                 (middlewareModule as Record<string, unknown>).middleware ||
                 middlewareModule;
 
-              if (!adapterFn && !handlerFn) return {};
+              const legacyMiddlewareFn =
+                typeof (middlewareModule.default as Record<string, unknown> | undefined)
+                  ?.default === "function"
+                  ? ((middlewareModule.default as Record<string, unknown>).default as (
+                      ...args: unknown[]
+                    ) => unknown)
+                  : null;
+
+              if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
 
               try {
                 const waitUntil = (waitable: Promise<unknown>) => {
@@ -89,7 +90,38 @@ export function createLocalResolver(
 
                 let response: Response | null = null;
 
-                if (legacyMiddlewareFn) {
+                // Path 1: Web adapter (default({ handler, request, page }))
+                if (adapterFn && handlerFn) {
+                  const requestHeaders = Object.fromEntries(
+                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                  );
+                  const result = await (adapterFn as any)({
+                    handler: handlerFn,
+                    request: {
+                      url: ctx.url.toString(),
+                      method,
+                      headers: requestHeaders,
+                      body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                      signal: new AbortController().signal,
+                      nextConfig: {
+                        basePath: manifest.basePath || undefined,
+                        i18n: (manifest.i18n as any) ?? undefined,
+                      },
+                      waitUntil,
+                    },
+                    page: "middleware",
+                  });
+
+                  response =
+                    result?.response instanceof Response
+                      ? result.response
+                      : result instanceof Response
+                        ? result
+                        : null;
+                }
+
+                // Path 2: Legacy middleware (default.default)
+                if (!response && legacyMiddlewareFn) {
                   const requestHeaders = Object.fromEntries(
                     [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                   );
@@ -119,37 +151,19 @@ export function createLocalResolver(
                         : null;
                 }
 
-                // Next's node middleware modules are wrapped in the web adapter.
-                // Invoke that contract first so compiled middleware receives the
-                // expected `{ handler, request, page }` shape.
-                if (!response && adapterFn && handlerFn) {
-                  const requestHeaders = Object.fromEntries(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                  );
-                  const result = await (adapterFn as any)({
-                    handler: handlerFn,
-                    request: {
-                      url: ctx.url.toString(),
-                      method,
-                      headers: requestHeaders,
-                      body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                      signal: new AbortController().signal,
-                      nextConfig: {
-                        basePath: manifest.basePath || undefined,
-                        i18n: (manifest.i18n as any) ?? undefined,
-                      },
-                      waitUntil,
-                    },
-                    page: "middleware",
-                  });
-
-                  response =
-                    result?.response instanceof Response
-                      ? result.response
-                      : result instanceof Response
-                        ? result
-                        : null;
-                } else if (!response && typeof handlerFn === "function") {
+                // Path 3: Direct handler invocation
+                if (!response && typeof handlerFn === "function") {
+                  const requestInit: RequestInit & { duplex?: "half" } = {
+                    method,
+                    headers: new Headers(
+                      [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                    ),
+                    duplex: "half",
+                  };
+                  if (method !== "GET" && method !== "HEAD") {
+                    requestInit.body = ctx.requestBody;
+                  }
+                  const middlewareRequest = new Request(ctx.url.toString(), requestInit);
                   const result = await (handlerFn as any)(middlewareRequest, {
                     waitUntil,
                   });
@@ -164,10 +178,6 @@ export function createLocalResolver(
 
                 if (response) {
                   middlewareResponse = response;
-                  // responseToMiddlewareResult mutates requestHeaders with:
-                  //  - x-middleware-set-cookie → merged into cookie header
-                  //  - x-middleware-override-headers → replaced request headers
-                  //  - x-middleware-request-* → values for overridden headers
                   const reqHeaders = new Headers(ctx.headers);
                   const mwResult = responseToMiddlewareResult(
                     response.clone(),
@@ -216,9 +226,22 @@ export function createLocalResolver(
 
       // 4. Normal route resolution
       const matchedPathname = resolution.invocationTarget?.pathname ?? url.pathname;
-      const pool =
+
+      // Try exact match first, then try with/without trailing slash, then fall back to default pool
+      let pool =
         manifest.poolAssignments[resolution.resolvedPathname ?? ""] ??
         manifest.poolAssignments[matchedPathname];
+
+      if (!pool) {
+        // Trailing slash fallback: try with/without trailing slash
+        const withSlash = matchedPathname.endsWith("/") ? matchedPathname : matchedPathname + "/";
+        const withoutSlash = matchedPathname.endsWith("/") ? matchedPathname.slice(0, -1) : matchedPathname;
+        pool =
+          manifest.poolAssignments[withSlash] ??
+          manifest.poolAssignments[withoutSlash] ??
+          manifest.poolAssignments["default"] ??
+          Object.values(manifest.poolAssignments)[0];
+      }
 
       if (!pool) {
         return { kind: "not-found" };

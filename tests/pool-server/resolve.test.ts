@@ -210,4 +210,132 @@ describe("createLocalResolver", () => {
       expect(result.matchedPathname).toBe("/about");
     }
   });
+
+  it("invokes web adapter middleware default({ handler, request, page })", async () => {
+    const manifest = makeManifest();
+    // Web adapter: module.default is a function that wraps a handler.
+    // This is the shape Next.js uses for Node-compiled middleware.
+    const adapterFn = vi.fn().mockResolvedValue({
+      response: new Response(null, {
+        status: 200,
+        headers: { "x-middleware-next": "1" },
+      }),
+    });
+
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      await options.invokeMiddleware({
+        url: new URL("http://localhost/about"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about" },
+      };
+    });
+
+    // Module shape: { default: adapterFn, proxy: handlerObj }
+    const resolver = createLocalResolver(manifest, {
+      default: adapterFn,
+      proxy: { handle: vi.fn() },
+    });
+
+    await resolver.resolve(
+      new URL("http://localhost/about"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(adapterFn).toHaveBeenCalledTimes(1);
+    expect(adapterFn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        handler: expect.anything(),
+        request: expect.objectContaining({
+          url: "http://localhost/about",
+          method: "GET",
+        }),
+        page: "middleware",
+      }),
+    );
+  });
+
+  it("invokes direct handler middleware handler(request, { waitUntil })", async () => {
+    const manifest = makeManifest();
+    // Direct handler: module has no default function and no default.default.
+    // Falls through to path 3: handlerFn(request, { waitUntil }).
+    const directHandler = vi.fn().mockResolvedValue(
+      new Response(null, {
+        status: 200,
+        headers: { "x-middleware-next": "1" },
+      }),
+    );
+
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      await options.invokeMiddleware({
+        url: new URL("http://localhost/about"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about" },
+      };
+    });
+
+    // Module shape: just a function (no default wrapper, no default.default)
+    // The code sets handlerFn = module.proxy || module.middleware || module
+    // and since module is a function, typeof handlerFn === "function" → path 3
+    const resolver = createLocalResolver(manifest, {
+      middleware: directHandler,
+    } as any);
+
+    await resolver.resolve(
+      new URL("http://localhost/about"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(directHandler).toHaveBeenCalledTimes(1);
+    expect(directHandler).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        waitUntil: expect.any(Function),
+      }),
+    );
+  });
+
+  it("returns empty result when no middleware module is provided", async () => {
+    const manifest = makeManifest();
+
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      const result = await options.invokeMiddleware({
+        url: new URL("http://localhost/about"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+
+      // No middleware → empty result
+      expect(result).toEqual({});
+
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about" },
+      };
+    });
+
+    const resolver = createLocalResolver(manifest);
+
+    const result = await resolver.resolve(
+      new URL("http://localhost/about"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+  });
 });
