@@ -1,11 +1,146 @@
 // src/pool-server/dispatch.ts
-import { request as httpRequest } from 'node:http';
+import { once } from 'node:events';
+import { createServer, request as httpRequest } from 'node:http';
 import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { HandlerLoader } from './handler-loader.js';
 import type { ResolveResult } from './resolve.js';
 import type { StaticAssetEntry } from '../types.js';
+
+const NEXT_REQUEST_META = Symbol.for('NextInternalRequestMeta');
+
+function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> {
+  const headers: Record<string, string | string[]> = {};
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (typeof value === 'undefined') continue;
+    headers[key] = value;
+  }
+  return headers;
+}
+
+async function writeInnerResponse(
+  outerRes: ServerResponse,
+  innerRes: IncomingMessage,
+): Promise<void> {
+  outerRes.writeHead(innerRes.statusCode ?? 200, innerRes.headers);
+  for await (const chunk of innerRes) {
+    const shouldContinue = outerRes.write(chunk);
+    if (!shouldContinue) {
+      await once(outerRes, 'drain');
+    }
+  }
+  outerRes.end();
+}
+
+async function invokeLocalHandlerOverHttp({
+  handler,
+  req,
+  res,
+  matchedPathname,
+  routeMatches,
+  bufferedBody,
+}: {
+  handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
+  req: IncomingMessage;
+  res: ServerResponse;
+  matchedPathname: string;
+  routeMatches: Record<string, string> | null;
+  bufferedBody: Buffer | undefined;
+}): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const server = createServer((innerReq, innerRes) => {
+      void (async () => {
+        try {
+          const maybeResult = await (handler as any)(innerReq, innerRes, {
+            waitUntil(waitable: Promise<unknown>) {
+              void waitable.catch(() => undefined);
+            },
+            requestMeta: {
+              relativeProjectDir: '.',
+              hostname: req.headers.host?.split(':')[0] ?? '127.0.0.1',
+              outputId: matchedPathname,
+              matchedPathname,
+              routeMatches,
+            },
+          });
+
+          if (maybeResult instanceof Response) {
+            const headers: Record<string, string> = {};
+            for (const [key, value] of maybeResult.headers.entries()) {
+              headers[key] = value;
+            }
+            innerRes.writeHead(maybeResult.status, headers);
+            if (maybeResult.body) {
+              const reader = maybeResult.body.getReader();
+              try {
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  if (value) innerRes.write(Buffer.from(value));
+                }
+              } finally {
+                reader.releaseLock();
+              }
+            }
+            innerRes.end();
+            return;
+          }
+
+          if (!innerRes.writableEnded) {
+            innerRes.end();
+          }
+        } catch (error) {
+          if (!innerRes.headersSent) {
+            innerRes.statusCode = 500;
+            innerRes.end('Internal Server Error');
+          } else if (!innerRes.writableEnded) {
+            innerRes.end();
+          }
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      })();
+    });
+
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        server.close(() => reject(new Error('Failed to allocate loopback port')));
+        return;
+      }
+
+      const clientReq = httpRequest(
+        {
+          hostname: '127.0.0.1',
+          port: address.port,
+          method: req.method,
+          path: req.url,
+          headers: toNodeHeaders(req),
+        },
+        (clientRes) => {
+          void writeInnerResponse(res, clientRes)
+            .then(() => {
+              server.close(() => resolve());
+            })
+            .catch((error) => {
+              server.close(() => reject(error));
+            });
+        },
+      );
+
+      clientReq.once('error', (error) => {
+        server.close(() => reject(error));
+      });
+
+      if (bufferedBody && bufferedBody.length > 0) {
+        clientReq.end(bufferedBody);
+      } else {
+        clientReq.end();
+      }
+    });
+  });
+}
 
 function sanitizeK8sName(name: string): string {
   let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
@@ -157,45 +292,18 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // Load and invoke the handler directly
           const handler = await handlerLoader.load(resolution.matchedPathname);
-          const maybeResult = await (handler as any)(req, res, {
-            waitUntil(p: Promise<unknown>) { void p.catch(() => {}); },
-            requestMeta: {
-              // Standard adapter requestMeta fields (per official adapter docs)
-              relativeProjectDir: '.',
-              hostname: req.headers.host?.split(':')[0] ?? '127.0.0.1',
-              outputId: resolution.matchedPathname,
-              matchedPathname: resolution.matchedPathname,
-              routeMatches: resolution.routeMatches,
-            },
+          const bufferedBody = (req as IncomingMessage & {
+            [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+          })[NEXT_REQUEST_META]?.actionBody;
+
+          await invokeLocalHandlerOverHttp({
+            handler,
+            req,
+            res,
+            matchedPathname: resolution.matchedPathname,
+            routeMatches: resolution.routeMatches,
+            bufferedBody,
           });
-
-          // If handler returned a Response or Lambda-like result, write it
-          if (maybeResult instanceof Response) {
-            const headers: Record<string, string> = {};
-            for (const [key, value] of (maybeResult as Response).headers.entries()) {
-              headers[key] = value;
-            }
-            res.writeHead((maybeResult as Response).status, headers);
-            if ((maybeResult as Response).body) {
-              const reader = (maybeResult as Response).body!.getReader();
-              try {
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-                  if (value) res.write(Buffer.from(value));
-                }
-              } finally {
-                reader.releaseLock();
-              }
-            }
-            res.end();
-            return;
-          }
-
-          // If handler wrote to res directly (most common), ensure it ended
-          if (!res.writableEnded) {
-            res.end();
-          }
           return;
         }
       }
@@ -240,7 +348,15 @@ function proxyToPool(
       resolve();
     });
 
-    req.pipe(proxyReq);
+    const bufferedBody = (req as IncomingMessage & {
+      [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+    })[NEXT_REQUEST_META]?.actionBody;
+
+    if (bufferedBody) {
+      proxyReq.end(bufferedBody);
+    } else {
+      req.pipe(proxyReq);
+    }
   });
 }
 

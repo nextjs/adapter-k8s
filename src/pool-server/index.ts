@@ -9,6 +9,8 @@ import { createLocalResolver } from "./resolve.js";
 import { createDispatcher } from "./dispatch.js";
 import { createPoolServer } from "./server.js";
 
+const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
+
 // Initialize Next.js Node runtime shims (AsyncLocalStorage, hooks, crypto polyfills).
 // This MUST run before any Next.js handler modules are imported.
 // Follows the AWS adapter's ensureNextNodeEnvironment pattern.
@@ -32,6 +34,48 @@ async function ensureNextNodeEnvironment(): Promise<void> {
   console.warn(
     "[pool-server] Could not load Next.js node environment shims from app dependencies — AsyncLocalStorage may not work"
   );
+}
+
+async function readRequestBody(req: NodeJS.ReadableStream): Promise<Buffer | null> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return chunks.length > 0 ? Buffer.concat(chunks) : null;
+}
+
+function createBufferedStream(body: Buffer | null): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      if (body && body.length > 0) {
+        controller.enqueue(body);
+      }
+      controller.close();
+    },
+  });
+}
+
+function addRequestMeta(req: Record<PropertyKey, unknown>, key: string, value: unknown): void {
+  const meta = (req[NEXT_REQUEST_META] as Record<string, unknown> | undefined) ?? {};
+  meta[key] = value;
+  req[NEXT_REQUEST_META] = meta;
+}
+
+function isServerActionRequest(headers: Headers, method: string): boolean {
+  if (method !== "POST") return false;
+  const nextAction = headers.get("next-action");
+  const contentType = headers.get("content-type") ?? "";
+  return (
+    typeof nextAction === "string" ||
+    contentType.startsWith("multipart/form-data") ||
+    contentType.startsWith("application/x-www-form-urlencoded")
+  );
+}
+
+function toDebugPreview(body: Buffer | null): string {
+  if (!body || body.length === 0) return "<empty>";
+  const preview = body.subarray(0, 240).toString("utf8");
+  return preview.replace(/\s+/g, " ").trim();
 }
 
 async function main() {
@@ -118,6 +162,32 @@ async function main() {
           value.forEach((v) => headers.append(key, v));
       }
 
+      const bodyBuffer =
+        req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
+      if (bodyBuffer) {
+        // Next.js action-handler checks request meta first when the original
+        // Node stream has already been consumed upstream.
+        addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
+      }
+
+      if (isServerActionRequest(headers, req.method ?? "GET")) {
+        console.log("[pool-server] action request", {
+          url: url.pathname,
+          method: req.method,
+          nextAction: headers.get("next-action"),
+          rsc: headers.get("rsc"),
+          accept: headers.get("accept"),
+          nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
+          nextRouterStateTreePreview:
+            headers.get("next-router-state-tree")?.slice(0, 160),
+          nextUrl: headers.get("next-url"),
+          contentType: headers.get("content-type"),
+          contentLength: headers.get("content-length"),
+          bodyLength: bodyBuffer?.length ?? 0,
+          bodyPreview: toDebugPreview(bodyBuffer),
+        });
+      }
+
       // Phase 2+: if dispatch headers exist (from route extension), use them directly
       const extOutputId = req.headers["x-output-id"] as string | undefined;
       if (extOutputId) {
@@ -138,19 +208,11 @@ async function main() {
       }
 
       // Phase 1: resolve route locally
-      const requestBody = new ReadableStream({
-        start(controller) {
-          req.on("data", (chunk) => controller.enqueue(chunk));
-          req.on("end", () => controller.close());
-          req.on("error", (err) => controller.error(err));
-        },
-      });
-
       const resolution = await resolver.resolve(
         url,
         headers,
         req.method ?? "GET",
-        requestBody,
+        createBufferedStream(bodyBuffer),
       );
       await dispatcher.dispatch(req, res, resolution);
     },

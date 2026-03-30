@@ -41,43 +41,132 @@ export function createLocalResolver(
         // unconditionally (no null guard). When no middleware exists, return empty result.
         invokeMiddleware: middlewareModule
           ? async (ctx) => {
-              // Following the Firebase adapter pattern: call middleware.default.default()
-              // with a plain object that looks like a Request — avoids private field issues.
-              const middlewareUrl = ctx.url;
+              const legacyMiddlewareFn =
+                typeof (middlewareModule.default as Record<string, unknown> | undefined)?.default === 'function'
+                  ? (((middlewareModule.default as Record<string, unknown>).default) as (...args: unknown[]) => unknown)
+                  : null;
 
-              const middlewareRequest = {
-                url: middlewareUrl.toString(),
+              const requestInit: RequestInit & { duplex?: "half" } = {
                 method,
-                headers: Object.fromEntries(
+                headers: new Headers(
                   [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":"))
                 ),
-                destination: 'document',
-                credentials: 'same-origin',
-                bodyUsed: false,
-                body: method === "GET" || method === "HEAD" ? undefined : ctx.requestBody,
-                mode: "navigate",
-                redirect: "follow",
-                referrer: ctx.headers.get("referer"),
+                duplex: "half",
               };
+              if (method !== "GET" && method !== "HEAD") {
+                requestInit.body = ctx.requestBody;
+              }
+              const middlewareRequest = new Request(ctx.url.toString(), requestInit);
 
-              const handlerFn = typeof middlewareModule.default === 'function'
-                ? middlewareModule.default
-                : (middlewareModule.default as Record<string, unknown>)?.default;
-              if (typeof handlerFn !== 'function') return {};
+              const adapterFn =
+                typeof middlewareModule.default === 'function'
+                  ? (middlewareModule.default as (...args: unknown[]) => unknown)
+                  : typeof middlewareModule === 'function'
+                    ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
+                    : null;
+
+              const handlerFn =
+                (middlewareModule as Record<string, unknown>).proxy ||
+                (middlewareModule as Record<string, unknown>).middleware ||
+                middlewareModule;
+
+              if (!adapterFn && !handlerFn) return {};
 
               try {
-                const result = await (handlerFn as any)({ request: middlewareRequest });
-                if (result.waitUntil) await result.waitUntil;
+                const waitUntil = (waitable: Promise<unknown>) => {
+                  void waitable.catch(() => undefined);
+                };
 
-                if (result.response) {
-                  middlewareResponse = result.response;
+                let response: Response | null = null;
+
+                if (legacyMiddlewareFn) {
+                  const requestHeaders = Object.fromEntries(
+                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(':'))
+                  );
+                  const result = await (legacyMiddlewareFn as any)({
+                    request: {
+                      url: ctx.url.toString(),
+                      method,
+                      headers: requestHeaders,
+                      body:
+                        method !== 'GET' && method !== 'HEAD'
+                          ? ctx.requestBody
+                          : undefined,
+                      destination: 'document',
+                      credentials: 'same-origin',
+                      bodyUsed: false,
+                      mode: 'navigate',
+                      redirect: 'follow',
+                    },
+                  });
+
+                  if (result?.waitUntil) {
+                    await result.waitUntil;
+                  }
+
+                  response =
+                    result?.response instanceof Response
+                      ? result.response
+                      : result instanceof Response
+                        ? result
+                        : null;
+                }
+
+                // Next's node middleware modules are wrapped in the web adapter.
+                // Invoke that contract first so compiled middleware receives the
+                // expected `{ handler, request, page }` shape.
+                if (!response && adapterFn && handlerFn) {
+                  const requestHeaders = Object.fromEntries(
+                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(':'))
+                  );
+                  const result = await (adapterFn as any)({
+                    handler: handlerFn,
+                    request: {
+                      url: ctx.url.toString(),
+                      method,
+                      headers: requestHeaders,
+                      body:
+                        method !== 'GET' && method !== 'HEAD'
+                          ? ctx.requestBody
+                          : undefined,
+                      signal: new AbortController().signal,
+                      nextConfig: {
+                        basePath: manifest.basePath || undefined,
+                        i18n: (manifest.i18n as any) ?? undefined,
+                      },
+                      waitUntil,
+                    },
+                    page: 'middleware',
+                  });
+
+                  response =
+                    result?.response instanceof Response
+                      ? result.response
+                      : result instanceof Response
+                        ? result
+                        : null;
+                } else if (!response && typeof handlerFn === 'function') {
+                  const result = await (handlerFn as any)(middlewareRequest, {
+                    waitUntil,
+                  });
+
+                  response =
+                    result instanceof Response
+                      ? result
+                      : result?.response instanceof Response
+                        ? result.response
+                        : null;
+                }
+
+                if (response) {
+                  middlewareResponse = response;
                   // responseToMiddlewareResult mutates requestHeaders with:
                   //  - x-middleware-set-cookie → merged into cookie header
                   //  - x-middleware-override-headers → replaced request headers
                   //  - x-middleware-request-* → values for overridden headers
                   const reqHeaders = new Headers(ctx.headers);
                   const mwResult = responseToMiddlewareResult(
-                    result.response.clone(),
+                    response.clone(),
                     reqHeaders,
                     ctx.url,
                   );

@@ -16,6 +16,9 @@ ADAPTER_DIST_INDEX="${ADAPTER_DIR}/dist/index.js"
 ADAPTER_PACK_LOCK_DIR="${ADAPTER_DIR}/.e2e-deploy-pack.lock"
 ADAPTER_PACKAGE_NAME="@next-community/adapter-k8s"
 ADAPTER_PACK_DIR=""
+BUILD_CPUS="${ADAPTER_K8S_BUILD_CPUS:-4}"
+BUILD_MAX_OLD_SPACE_MB="${ADAPTER_K8S_BUILD_MAX_OLD_SPACE_MB:-4096}"
+export BUILD_CPUS BUILD_MAX_OLD_SPACE_MB
 adapter_pack_lock_acquired=0
 DEPLOY_LOG=".adapter-deploy.log"
 
@@ -133,18 +136,73 @@ fi
 export NEXT_ADAPTER_PATH="$NEXT_ADAPTER_PATH_LOCAL"
 echo "[adapter-k8s] NEXT_ADAPTER_PATH=${NEXT_ADAPTER_PATH}" >&2
 
-# Inject turbopack.root to prevent workspace root detection from /tmp
+# Keep local deploy builds conservative. The largest failing suites appear to
+# die during "Collecting page data using 31 workers ..." with no useful error.
+if [[ " ${NODE_OPTIONS:-} " != *" --max-old-space-size="* ]]; then
+  export NODE_OPTIONS="--max-old-space-size=${BUILD_MAX_OLD_SPACE_MB} ${NODE_OPTIONS:-}"
+fi
+echo "[adapter-k8s] NODE_OPTIONS=${NODE_OPTIONS}" >&2
+
+# Inject a local build profile into plain-object next.config.* files:
+# - cap build workers
+# - disable parallel server build workers
+# - set turbopack.root to the isolated test app
 for CFGFILE in next.config.ts next.config.mjs next.config.js; do
   if [ -f "$CFGFILE" ]; then
-    if ! grep -q "turbopack" "$CFGFILE" 2>/dev/null; then
-      node -e "
-        const fs = require('fs');
-        const cwd = process.cwd();
-        let c = fs.readFileSync('${CFGFILE}', 'utf8');
-        c = c.replace(/(module\.exports\s*=\s*\{|export\s+default\s*\{)/, '\$1\n  turbopack: { root: \"' + cwd + '\" },');
-        fs.writeFileSync('${CFGFILE}', c);
-      " >&2 2>&1 && echo "[adapter-k8s] Set turbopack.root in ${CFGFILE}" >&2
-    fi
+    node -e "
+      const fs = require('fs');
+      const cwd = process.cwd();
+      const cpus = Number(process.env.BUILD_CPUS || 4);
+      let c = fs.readFileSync('${CFGFILE}', 'utf8');
+
+      if (c.includes('adapter-k8s local build profile')) {
+        process.exit(0);
+      }
+
+      const buildProfile = [
+        '  // adapter-k8s local build profile',
+        '  experimental: {',
+        '    cpus: ' + cpus + ',',
+        '    memoryBasedWorkersCount: false,',
+        '    parallelServerCompiles: false,',
+        '    parallelServerBuildTraces: false,',
+        '    webpackBuildWorker: false,',
+        '  },',
+        '  turbopack: { root: ' + JSON.stringify(cwd) + ' },',
+      ].join('\\n');
+
+      let changed = false;
+
+      if (/experimental\\s*:\\s*\\{/.test(c)) {
+        c = c.replace(
+          /experimental\\s*:\\s*\\{/,
+          'experimental: {\\n    // adapter-k8s local build profile\\n    cpus: ' + cpus + ',\\n    memoryBasedWorkersCount: false,\\n    parallelServerCompiles: false,\\n    parallelServerBuildTraces: false,\\n    webpackBuildWorker: false,'
+        );
+        changed = true;
+      }
+
+      if (/turbopack\\s*:\\s*\\{/.test(c)) {
+        c = c.replace(
+          /turbopack\\s*:\\s*\\{/,
+          'turbopack: {\\n    root: ' + JSON.stringify(cwd) + ','
+        );
+        changed = true;
+      }
+
+      if (!changed) {
+        c = c.replace(
+          /(module\\.exports\\s*=\\s*\\{|export\\s+default\\s*\\{)/,
+          '\$1\\n' + buildProfile + '\\n'
+        );
+        changed = c.includes('adapter-k8s local build profile');
+      }
+
+      if (!changed) {
+        process.exit(2);
+      }
+
+      fs.writeFileSync('${CFGFILE}', c);
+    " >&2 2>&1 && echo "[adapter-k8s] Applied local build profile in ${CFGFILE}" >&2
     break
   fi
 done
