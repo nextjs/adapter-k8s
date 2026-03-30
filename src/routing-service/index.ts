@@ -6,6 +6,12 @@ import { createRequestHandler } from './handler.js';
 import { createRoutingServer } from './server.js';
 
 async function main() {
+  // Load .env files
+  try {
+    const { loadEnvConfig } = require("@next/env");
+    loadEnvConfig(process.cwd(), process.env.NODE_ENV !== "production");
+  } catch {}
+
   const buildId = process.env.NEXT_BUILD_ID;
   if (!buildId) throw new Error('NEXT_BUILD_ID environment variable is required');
 

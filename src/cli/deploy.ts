@@ -90,6 +90,7 @@ export function buildHelmUpgradeArgs(options: {
   const { releaseName, chartPath, buildId, registry, previousBuildId, overridesFile } = options;
   const args = [
     'upgrade', '--install', releaseName, chartPath,
+    '--server-side=true', '--force-conflicts',
     '--set', `global.image.tag=${buildId}`,
     '--set', `global.image.registry=${registry}`,
     '--set', `build.id=${buildId}`,
@@ -117,6 +118,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     );
   }
   const infra = JSON.parse(readFileSync(infraPath, 'utf-8'));
+
+  // 0. Ensure kubectl is pointing at the right cluster
+  if (!dryRun && infra.projectId && infra.region && releaseName) {
+    const clusterName = `${releaseName}-cluster`;
+    console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
+    await execOrThrow('gcloud', [
+      'container', 'clusters', 'get-credentials', clusterName,
+      '--region', infra.region, '--project', infra.projectId, '--quiet',
+    ]);
+  }
 
   // 1. Run next build (adapter's onBuildComplete generates artifacts)
   if (!skipBuild) {
@@ -182,7 +193,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 6. Helm upgrade
-  const state = readState(projectDir);
+  const state = await readState(projectDir, releaseName);
   const previousBuildId = state?.buildId ?? null;
 
   const overridesFile = path.join(projectDir, '.k8s-adapter', 'helm', 'values.override.yaml');
@@ -202,14 +213,177 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     console.log(`    [dry-run] helm ${helmArgs.join(' ')}`);
   }
 
-  // 6. Update state
+  // 6. Update state (local + cluster ConfigMap)
   if (!dryRun) {
-    writeState(projectDir, { buildId, previousBuildId });
+    await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+  }
+
+  // 7. Zero-downtime cutover: wait for new pods, then clean up old build
+  if (!dryRun) {
+    // Strip all non-alphanumeric for matching — K8s names replace special chars with dashes,
+    // so we need to compare alphanumeric-only to avoid mismatches
+    const currentBuildLower = buildId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
+
+    // 7a. Wait for new deployment to be ready
+    console.log(`\n  → Waiting for new pods to be ready...`);
+    const newDeployResult = await execCapture('kubectl', [
+      'get', 'deployments', '-l', `app.kubernetes.io/name=${releaseName}`,
+      '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+    ]);
+    const newDeploys = (newDeployResult.stdout?.trim().split('\n') ?? [])
+      .filter(n => n && !n.includes('routing-service') && n.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower));
+
+    for (const deployName of newDeploys) {
+      console.log(`    Waiting for ${deployName}...`);
+      await execCapture('kubectl', [
+        'rollout', 'status', `deployment/${deployName}`, '--timeout=120s',
+      ]);
+    }
+
+    // 7b. Wait for new pods to be healthy from inside the cluster
+    // We check healthz directly on each new pod rather than waiting for GCP LB health
+    // (GCP backend health propagation can take 5+ minutes for new backends)
+    console.log(`  → Verifying new pods are serving...`);
+    let newBuildHealthy = false;
+    const maxHealthAttempts = 24; // 2 minutes (5s intervals)
+    for (let attempt = 0; attempt < maxHealthAttempts; attempt++) {
+      let allHealthy = true;
+      let checkedCount = 0;
+      for (const deployName of newDeploys) {
+        // Get pods for this deployment
+        const podsResult = await execCapture('kubectl', [
+          'get', 'pods', '-l', `app.kubernetes.io/name=${releaseName}`,
+          '-o', 'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{\"\\n\"}{end}',
+        ]);
+        if (podsResult.exitCode === 0) {
+          for (const line of podsResult.stdout.trim().split('\n')) {
+            const [podName, ready] = line.split('|');
+            if (!podName || !podName.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)) continue;
+            checkedCount++;
+            if (ready !== 'True') allHealthy = false;
+          }
+        }
+      }
+      if (allHealthy && checkedCount > 0) {
+        console.log(`    All ${checkedCount} new pods ready and serving`);
+        newBuildHealthy = true;
+        break;
+      }
+      if (attempt < maxHealthAttempts - 1) {
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    }
+
+    if (!newBuildHealthy) {
+      console.error(`\n  DEPLOY FAILED: New build did not become healthy within 3 minutes.`);
+      console.error(`  The previous build is still serving traffic. No cutover performed.\n`);
+
+      // Try to get more diagnostic info
+      const newPods = await execCapture('kubectl', [
+        'get', 'pods', '-l', `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component!=routing-service`,
+        '-o', 'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{\"\\n\"}{end}',
+      ]);
+      if (newPods.exitCode === 0 && newPods.stdout.trim()) {
+        const podLines = newPods.stdout.trim().split('\n');
+        for (const line of podLines) {
+          const [podName, phase] = line.split('|');
+          if (!podName || !podName.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)) continue;
+          console.error(`  Pod ${podName}: ${phase}`);
+          // Try hitting healthz directly
+          const healthzResult = await execCapture('kubectl', [
+            'exec', podName, '--', 'node', '-e',
+            `const http=require("http");http.get("http://localhost:3000/healthz",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>console.log(r.statusCode,d))}).on("error",e=>console.log("ERR",e.message))`,
+          ]);
+          if (healthzResult.exitCode === 0) {
+            console.error(`  Healthz: ${healthzResult.stdout.trim()}`);
+          }
+          // Get last error from logs
+          const logsResult = await execCapture('kubectl', ['logs', podName, '--tail=20']);
+          if (logsResult.exitCode === 0) {
+            const errorLines = logsResult.stdout.split('\n').filter(l =>
+              l.includes('Error') || l.includes('error') || l.includes('FATAL') || l.includes('Cannot find')
+            );
+            if (errorLines.length > 0) {
+              console.error(`  Errors:`);
+              for (const err of errorLines.slice(0, 5)) {
+                console.error(`    ${err.trim().slice(0, 150)}`);
+              }
+            } else {
+              console.error(`  No errors in pod logs. The issue may be GCP health check configuration.`);
+            }
+          }
+        }
+      }
+
+      console.error(`\n  Diagnose:  npx adapter-k8s doctor`);
+      console.error(`  Tail logs: npx adapter-k8s tail`);
+      // Update state so doctor knows the build was attempted
+      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+      process.exit(1);
+    }
+
+    // 7c. Cut traffic over: patch each active Service selector to the new build
+    const safeBuildId = buildId.toLowerCase().replace(/[^a-z0-9.-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+    console.log(`  → Switching traffic to new build...`);
+    for (const pool of pools) {
+      const activeServiceName = `${releaseName}-${pool}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+      await execCapture('kubectl', [
+        'patch', 'service', activeServiceName, '--type=json',
+        '--field-manager=helm', '--force-conflicts',
+        '-p', JSON.stringify([{
+          op: 'replace',
+          path: '/spec/selector/app.kubernetes.io~1version',
+          value: safeBuildId,
+        }]),
+      ]);
+    }
+
+    // 7d. Handle old deployments: keep one previous (scaled to 0), delete the rest
+    // Don't rely on state.previousBuildId for matching — use the actual deployments.
+    const allDeploys = await execCapture('kubectl', [
+      'get', 'deployments', '-l', `app.kubernetes.io/name=${releaseName}`,
+      '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+    ]);
+    if (allDeploys.exitCode === 0) {
+      const oldDeploys = allDeploys.stdout.trim().split('\n').filter(name =>
+        name && !name.includes('routing-service') &&
+        !name.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)
+      );
+
+      if (oldDeploys.length > 0) {
+        // Keep the most recent non-current deploy as "previous" (scale to 0)
+        // It's the last one in the list (K8s returns in creation order)
+        const previousDeploy = oldDeploys[oldDeploys.length - 1]!;
+        console.log(`  → Scaling down previous build: ${previousDeploy}`);
+        await execCapture('kubectl', ['scale', `deployment/${previousDeploy}`, '--replicas=0']);
+
+        // Delete anything older
+        for (const name of oldDeploys) {
+          if (name === previousDeploy) continue;
+          console.log(`  → Deleting old build: ${name}`);
+          await execCapture('kubectl', ['delete', 'deployment', name]);
+          await execCapture('kubectl', ['delete', 'service', name]).catch(() => {});
+          await execCapture('kubectl', ['delete', 'healthcheckpolicy', `${name}-hcp`]).catch(() => {});
+        }
+      }
+    }
+
+    // Clean up old route-ext Jobs (they're immutable, each deploy creates a new one)
+    const oldJobs = await execCapture('kubectl', [
+      'get', 'jobs', '-l', `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
+      '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+    ]);
+    if (oldJobs.exitCode === 0) {
+      for (const jobName of oldJobs.stdout.trim().split('\n')) {
+        if (!jobName || jobName.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)) continue;
+        await execCapture('kubectl', ['delete', 'job', jobName]);
+      }
+    }
   }
 
   console.log(`\n✓ Deploy complete (build: ${buildId})`);
 
-  // 7. Run domain health checks
+  // 8. Run domain health checks
   if (!dryRun) {
     const { runDomainChecks } = await import('./doctor.js');
     await runDomainChecks({ projectDir, releaseName });

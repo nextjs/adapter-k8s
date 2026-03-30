@@ -119,6 +119,9 @@ export function createRequestHandler(
       ?? 'default';
     mutations.push({ key: 'x-upstream-pool', value: pool });
 
+    // x-output-id tells the pool server which handler to invoke directly,
+    // bypassing local resolveRoutes() (avoids double resolution + middleware)
+    mutations.push({ key: 'x-output-id', value: matchedPathname });
     mutations.push({ key: 'x-matched-pathname', value: matchedPathname });
     if (resolution.routeMatches) {
       mutations.push({

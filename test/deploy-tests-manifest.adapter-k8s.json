@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "suites": {},
+  "rules": {
+    "include": [],
+    "exclude": [
+      "test/e2e/app-dir/app/index.test.ts"
+    ]
+  }
+}

@@ -17,15 +17,19 @@ export function buildStaticManifest(outputs: AdapterOutputs, projectDir: string)
     });
   }
 
-  // Prerenders have their HTML in fallback.filePath, not a top-level filePath
+  // Prerenders have their content in fallback.filePath with initialHeaders/initialStatus
   for (const prerender of outputs.prerenders) {
-    const fallbackPath = prerender.fallback?.filePath;
-    if (!fallbackPath) continue;
-    entries.push({
+    const fallback = prerender.fallback;
+    if (!fallback?.filePath) continue;
+    const entry: StaticAssetEntry = {
       pathname: prerender.pathname,
-      filePath: path.relative(projectDir, fallbackPath),
+      filePath: path.relative(projectDir, fallback.filePath),
       cacheControl: "public, max-age=3600",
-    });
+    };
+    if (fallback.initialHeaders) entry.headers = fallback.initialHeaders;
+    if (fallback.initialStatus) entry.status = fallback.initialStatus;
+    if (fallback.postponedState) entry.ppr = true;
+    entries.push(entry);
   }
 
   return entries.sort((a, b) => a.pathname.localeCompare(b.pathname));

@@ -147,9 +147,11 @@ export function renderHTTPRoute({
   const catchAllRule = finalRules[finalRules.length - 1]!;
   const pathPrefixRules = finalRules.slice(0, -1);
 
+  // All HTTPRoute rules point to the stable "active" Service (no buildId).
+  // The active Service's selector is patched by deploy/rollback to point to the live build.
   const pathRulesYaml = pathPrefixRules
     .map((rule) => {
-      const backendName = sanitizeK8sName(`${releaseName}-${rule.poolName}-${buildId}`);
+      const backendName = sanitizeK8sName(`${releaseName}-${rule.poolName}`);
       return `    - matches:
         - path: { type: ${rule.matchType}, value: "${rule.path}" }
       backendRefs:
@@ -159,7 +161,7 @@ export function renderHTTPRoute({
 
   // Phase 2+: header-based routing rules for x-upstream-pool (set by route extension)
   const headerRules = [...pools.keys()].map(poolName => {
-    const backendName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
+    const backendName = sanitizeK8sName(`${releaseName}-${poolName}`);
     return `    - matches:
         - headers:
             - name: x-upstream-pool
@@ -170,7 +172,7 @@ export function renderHTTPRoute({
   });
 
   const catchAllRuleYaml = (() => {
-    const backendName = sanitizeK8sName(`${releaseName}-${catchAllRule.poolName}-${buildId}`);
+    const backendName = sanitizeK8sName(`${releaseName}-${catchAllRule.poolName}`);
     return `    - matches:
         - path: { type: ${catchAllRule.matchType}, value: "${catchAllRule.path}" }
       backendRefs:

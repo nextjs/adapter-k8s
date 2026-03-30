@@ -4,11 +4,10 @@ import { renderRouteExtConfigMap } from '../../../src/emit/templates/route-ext-c
 
 describe('renderRouteExtUpdateJob', () => {
   it('renders a Helm hook Job using import command', () => {
-    const yaml = renderRouteExtUpdateJob({ releaseName: 'my-app', projectId: 'my-project', region: 'us-central1' });
+    const yaml = renderRouteExtUpdateJob({ releaseName: 'my-app', projectId: 'my-project', region: 'us-central1', buildId: 'abc123' });
     expect(yaml).toContain('kind: Job');
-    expect(yaml).toContain('helm.sh/hook');
-    expect(yaml).toContain('post-upgrade');
-    expect(yaml).toContain('post-install');
+    // Not a Helm hook — runs as a regular Job so it doesn't block deploys
+    expect(yaml).toContain('kind: Job');
     expect(yaml).toContain('gcloud service-extensions lb-route-extensions import');
     expect(yaml).toContain('my-app-route-ext');
     expect(yaml).toContain('route-extension.yaml');

@@ -2,16 +2,9 @@
 import type { NextAdapter, AdapterOutput } from "next";
 import type { ResolveRoutesParams } from "@next/routing";
 
-// Define AdapterOutputs locally since it's not exported from "next"
-export interface AdapterOutputs {
-  appPages: Array<AdapterOutput["APP_PAGE"]>;
-  appRoutes: Array<AdapterOutput["APP_ROUTE"]>;
-  pages: Array<AdapterOutput["PAGES"]>;
-  pagesApi: Array<AdapterOutput["PAGES_API"]>;
-  prerenders: Array<AdapterOutput["PRERENDER"]>;
-  staticFiles: Array<AdapterOutput["STATIC_FILE"]>;
-  middleware?: AdapterOutput["MIDDLEWARE"] | null;
-}
+// Use AdapterOutputs from the stable adapter API
+// Re-exported from the BuildCompleteContext parameter type
+export type AdapterOutputs = Parameters<NonNullable<NextAdapter["onBuildComplete"]>>[0]["outputs"];
 
 // Re-export Next.js types we use throughout
 export type { NextAdapter, AdapterOutput };
@@ -103,6 +96,7 @@ export interface PoolManifest {
       filePath: string;
       pathname: string;
       type: string;
+      runtime?: string;
     }
   >;
 }
@@ -111,4 +105,7 @@ export interface StaticAssetEntry {
   pathname: string;
   filePath: string;
   cacheControl: string;
+  headers?: Record<string, string | string[]>;
+  status?: number;
+  ppr?: boolean;
 }

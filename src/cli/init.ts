@@ -197,7 +197,9 @@ export function buildInitGcloudCommands(options: {
   });
 
   // --- Deploy Service Account (Workload Identity for Helm hook Jobs) ---
-  // The route-ext update Job needs networkservices.admin to import LbRouteExtension
+  // The route-ext update Job needs:
+  // - networkservices.admin to import LbRouteExtension
+  // - compute.viewer to list forwarding rules (for discovery)
   commands.push({
     description: 'Grant deploy SA networkservices.admin role',
     command: 'gcloud',
@@ -205,6 +207,18 @@ export function buildInitGcloudCommands(options: {
       'projects', 'add-iam-policy-binding', projectId,
       '--member', `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
       '--role', 'roles/networkservices.admin',
+      '--condition=None',
+      '--quiet',
+    ],
+  });
+
+  commands.push({
+    description: 'Grant deploy SA compute.viewer role (forwarding rule discovery)',
+    command: 'gcloud',
+    args: [
+      'projects', 'add-iam-policy-binding', projectId,
+      '--member', `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      '--role', 'roles/compute.viewer',
       '--condition=None',
       '--quiet',
     ],
@@ -391,6 +405,34 @@ export async function runInit(options: InitOptions): Promise<void> {
         throw new Error(`${cmd.description} failed:\n${result.stderr}`);
       }
     }
+  }
+
+  // 2b. Grant Artifact Registry reader for GKE image pulls
+  // GKE Autopilot uses the container-engine-robot service agent for image pulls
+  if (!dryRun) {
+    console.log("  → Granting Artifact Registry reader for GKE image pulls");
+    const projNumResult = await execCapture("gcloud", [
+      "projects", "describe", projectId, "--format=value(projectNumber)", "--quiet",
+    ]);
+    if (projNumResult.exitCode === 0) {
+      const projectNumber = projNumResult.stdout.trim();
+      const serviceAgents = [
+        `service-${projectNumber}@container-engine-robot.iam.gserviceaccount.com`,
+        `${projectNumber}-compute@developer.gserviceaccount.com`,
+      ];
+      for (const sa of serviceAgents) {
+        await execCapture("gcloud", [
+          "artifacts", "repositories", "add-iam-policy-binding",
+          "nextjs", "--location", region,
+          "--member", `serviceAccount:${sa}`,
+          "--role", "roles/artifactregistry.reader",
+          "--project", projectId,
+          "--condition=None", "--quiet",
+        ]);
+      }
+    }
+  } else {
+    console.log("  → [dry-run] Grant Artifact Registry reader for GKE image pulls");
   }
 
   // 3. Scaffold adapter config (if not exists)

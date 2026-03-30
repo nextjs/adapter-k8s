@@ -1,11 +1,14 @@
-export function renderRouteExtUpdateJob({ releaseName, projectId, region }: { releaseName: string; projectId: string; region: string }): string {
+export function renderRouteExtUpdateJob({ releaseName, projectId, region, buildId }: { releaseName: string; projectId: string; region: string; buildId: string }): string {
+  // Include buildId in the Job name so each deploy creates a fresh Job
+  // (K8s Jobs are immutable — can't update an existing one)
+  const safeBuildId = buildId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
   return `apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ${releaseName}-update-route-ext
-  annotations:
-    "helm.sh/hook": post-upgrade,post-install
-    "helm.sh/hook-delete-policy": before-hook-creation
+  name: ${releaseName}-route-ext-${safeBuildId}
+  labels:
+    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/component: route-ext-job
 spec:
   template:
     spec:
@@ -16,13 +19,13 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              set -e
               # Discover the forwarding rule created by the GKE Gateway controller
+              echo "Discovering forwarding rules for ${releaseName}..."
               FR=$(gcloud compute forwarding-rules list \
                 --project=${projectId} \
                 --filter="name~${releaseName}" \
                 --format="value(selfLink)" \
-                --limit=1 2>/dev/null)
+                --limit=1 2>&1) || true
               if [ -z "$FR" ]; then
                 echo "WARNING: No forwarding rule found matching '${releaseName}'. Skipping route extension update."
                 exit 0
@@ -35,7 +38,7 @@ spec:
               gcloud service-extensions lb-route-extensions import \
                 ${releaseName}-route-ext \
                 --project=${projectId} \
-                --location=${region} \
+                --location=global \
                 --source=/tmp/route-extension.yaml \
                 --quiet
           env:

@@ -1,8 +1,11 @@
 // tests/pool-server/dispatch.test.ts
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createDispatcher } from '../../src/pool-server/dispatch.js';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ResolveResult } from '../../src/pool-server/resolve.js';
+import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 
 function mockReq(url: string, headers: Record<string, string> = {}): IncomingMessage {
   return {
@@ -121,5 +124,115 @@ describe('createDispatcher', () => {
 
     await dispatcher.dispatch(req, res as unknown as ServerResponse, resolution);
     expect(res._status).toBe(404);
+  });
+
+  describe('static asset serving', () => {
+    let tmpDir: string;
+    const origCwd = process.cwd;
+
+    beforeEach(() => {
+      tmpDir = path.join(os.tmpdir(), `dispatch-test-${Date.now()}`);
+      mkdirSync(tmpDir, { recursive: true });
+      process.cwd = () => tmpDir;
+    });
+
+    afterEach(() => {
+      process.cwd = origCwd;
+      rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('serves a public static file (favicon.ico) from the manifest', async () => {
+      writeFileSync(path.join(tmpDir, 'favicon.ico'), 'icon-data');
+
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+        poolName: 'ssr',
+        buildId: 'test123',
+        staticAssets: [{
+          pathname: '/favicon.ico',
+          filePath: 'favicon.ico',
+          cacheControl: 'public, max-age=3600',
+        }],
+      });
+
+      const req = mockReq('/favicon.ico');
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: 'route',
+        pool: 'ssr',
+        matchedPathname: '/favicon.ico',
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._headers['content-type']).toBe('image/x-icon');
+      expect(res._headers['cache-control']).toBe('public, max-age=3600');
+      expect(res._ended).toBe(true);
+    });
+
+    it('serves a prerender fallback with adapter-provided headers', async () => {
+      mkdirSync(path.join(tmpDir, '.next', 'server', 'app'), { recursive: true });
+      writeFileSync(path.join(tmpDir, '.next', 'server', 'app', 'index.html'), '<html>prerendered</html>');
+
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+        poolName: 'ssr',
+        buildId: 'test123',
+        staticAssets: [{
+          pathname: '/',
+          filePath: '.next/server/app/index.html',
+          cacheControl: 'public, max-age=3600',
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'x-nextjs-cache': 'HIT',
+          },
+          status: 200,
+        }],
+      });
+
+      const req = mockReq('/');
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: 'route',
+        pool: 'ssr',
+        matchedPathname: '/',
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._headers['content-type']).toBe('text/html; charset=utf-8');
+      expect(res._headers['x-nextjs-cache']).toBe('HIT');
+      expect(res._ended).toBe(true);
+    });
+
+    it('falls through to handler when pathname is not in static manifest', async () => {
+      const handler = vi.fn();
+      const handlerLoader = {
+        load: vi.fn().mockResolvedValue(handler),
+        has: vi.fn().mockReturnValue(true),
+      };
+
+      const dispatcher = createDispatcher({
+        handlerLoader,
+        poolName: 'ssr',
+        buildId: 'test123',
+        staticAssets: [],
+      });
+
+      const req = mockReq('/dynamic-page');
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: 'route',
+        pool: 'ssr',
+        matchedPathname: '/dynamic-page',
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(handlerLoader.load).toHaveBeenCalledWith('/dynamic-page');
+      expect(handler).toHaveBeenCalled();
+    });
   });
 });

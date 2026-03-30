@@ -7,7 +7,7 @@ import type {
 import { renderChartYaml } from "./templates/chart-yaml.js";
 import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
-import { renderService } from "./templates/service.js";
+import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import { renderConfigMap } from "./templates/configmap.js";
 import {
@@ -98,6 +98,12 @@ export function generateHelmChart({
       buildId,
       releaseName,
     });
+    // Stable "active" Service — HTTPRoute points here, selector patched on cutover
+    files[`templates/${poolName}-active-service.yaml`] = renderActiveService({
+      poolName,
+      buildId,
+      releaseName,
+    });
     files[`templates/${poolName}-hpa.yaml`] = renderHPA({
       poolName,
       buildId,
@@ -130,6 +136,7 @@ export function generateHelmChart({
         releaseName,
         projectId: infrastructure.projectId,
         region: infrastructure.region,
+        buildId,
       });
       files['templates/deploy-service-account.yaml'] = renderDeployServiceAccount({
         releaseName,

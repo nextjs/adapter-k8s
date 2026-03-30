@@ -28,6 +28,24 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
   const { projectDir, releaseName } = options;
   const results: CheckResult[] = [];
 
+  // Ensure kubectl is pointing at the right cluster
+  const infraPathForCtx = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  if (existsSync(infraPathForCtx)) {
+    const infraCtx = JSON.parse(readFileSync(infraPathForCtx, "utf-8"));
+    if (infraCtx.projectId && infraCtx.region) {
+      const clusterName = `${releaseName}-cluster`;
+      const credResult = await execCapture("gcloud", [
+        "container", "clusters", "get-credentials", clusterName,
+        "--region", infraCtx.region, "--project", infraCtx.projectId, "--quiet",
+      ]);
+      if (credResult.exitCode !== 0) {
+        console.error(`Failed to connect to cluster "${clusterName}": ${credResult.stderr.trim()}`);
+        console.error(`Verify: gcloud container clusters get-credentials ${clusterName} --region ${infraCtx.region} --project ${infraCtx.projectId}`);
+        process.exit(1);
+      }
+    }
+  }
+
   console.log("\nRunning health checks...\n");
 
   // --- Prerequisites ---
@@ -59,12 +77,16 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
       : { name: "adapter.config", status: "warn", message: "Not found (will use defaults)", fix: "Run `npx adapter-k8s init` to scaffold" },
   );
 
-  const statePath = path.join(projectDir, ".k8s-adapter", "state.json");
-  if (existsSync(statePath)) {
-    const state = JSON.parse(readFileSync(statePath, "utf-8"));
-    results.push({ name: "Last deploy", status: "pass", message: `buildId: ${state.buildId}` });
+  // Read state from cluster ConfigMap (works for CI/CD + local), fall back to local file
+  const { readState } = await import("./state.js");
+  const state = await readState(projectDir, releaseName);
+  if (state) {
+    results.push({ name: "Current build", status: "pass", message: state.buildId });
+    if (state.previousBuildId) {
+      results.push({ name: "Previous build", status: "pass", message: `${state.previousBuildId} (rollback target)` });
+    }
   } else {
-    results.push({ name: "Last deploy", status: "warn", message: "No deploys yet" });
+    results.push({ name: "Deploy state", status: "warn", message: "No deploys yet" });
   }
 
   // --- GCP resources (only if infrastructure.json exists) ---
@@ -198,58 +220,91 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
       results.push({ name: "HTTPRoute", status: "warn", message: "Not found" });
     }
 
-    // Pool pods
-    const podsResult = await execCapture("kubectl", [
-      "get", "pods", "-l", `app.kubernetes.io/name=${releaseName}`,
-      "-o", "jsonpath={range .items[*]}{.metadata.name} {.status.phase}{\"\\n\"}{end}",
+    // Per-deployment health with rollout awareness
+    const deploysResult = await execCapture("kubectl", [
+      "get", "deployments", "-l", `app.kubernetes.io/name=${releaseName}`,
+      "-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}{\"\\n\"}{end}",
     ]);
-    if (podsResult.exitCode === 0 && podsResult.stdout.trim()) {
-      const pods = podsResult.stdout.trim().split("\n").filter(Boolean);
-      const running = pods.filter(p => p.includes("Running")).length;
-      const notRunning = pods.filter(p => !p.includes("Running"));
-      if (notRunning.length === 0) {
-        results.push({ name: "Pods", status: "pass", message: `${running}/${pods.length} running` });
-      } else {
-        results.push({
-          name: "Pods",
-          status: "fail",
-          message: `${running}/${pods.length} running`,
-          fix: `kubectl describe pod ${notRunning[0]?.split(" ")[0]}`,
-        });
+    const currentBuildLower = (state?.buildId ?? "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12);
+    const previousBuildLower = (state?.previousBuildId ?? "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12);
+
+    let foundCurrentPool = false;
+
+    if (deploysResult.exitCode === 0 && deploysResult.stdout.trim()) {
+      for (const line of deploysResult.stdout.trim().split("\n")) {
+        const [name, statusStr] = line.split("|");
+        if (!name) continue;
+        const shortName = name.replace(`${releaseName}-`, "");
+        const nameLower = name.toLowerCase();
+        const isRouting = shortName === "routing-service";
+
+        // Determine role
+        let role = "old";
+        if (isRouting) role = "current";
+        else if (currentBuildLower && nameLower.replace(/[^a-z0-9]/g, "").includes(currentBuildLower)) role = "current";
+        else if (previousBuildLower && nameLower.replace(/[^a-z0-9]/g, "").includes(previousBuildLower)) role = "previous";
+
+        if (role === "current" && !isRouting) foundCurrentPool = true;
+
+        const roleTag = role === "current" ? "" : role === "previous" ? " [previous]" : " [old]";
+        const [readyStr, totalStr] = (statusStr ?? "0/0").split("/");
+        const ready = parseInt(readyStr || "0", 10);
+        const total = parseInt(totalStr || "0", 10);
+        const label = isRouting ? "Routing service" : `Pool: ${shortName}`;
+
+        if (ready === total && total > 0) {
+          results.push({ name: `${label}${roleTag}`, status: "pass", message: `${ready}/${total} ready` });
+        } else if (role !== "current") {
+          results.push({ name: `${label}${roleTag}`, status: "warn", message: `${ready}/${total} ready (pending cleanup)` });
+        } else {
+          results.push({
+            name: `${label}${roleTag}`,
+            status: "fail",
+            message: `${ready}/${total} ready`,
+            fix: `kubectl describe deployment/${name}`,
+          });
+        }
       }
     } else {
-      results.push({ name: "Pods", status: "warn", message: "No pods found" });
+      results.push({ name: "Deployments", status: "warn", message: "No deployments found" });
     }
 
-    // Routing service deployment health
-    const routingSvcResult = await execCapture("kubectl", [
-      "get", "deployment", `${releaseName}-routing-service`,
-      "-o", "jsonpath={.status.readyReplicas}/{.status.replicas}",
-    ]);
-    if (routingSvcResult.exitCode === 0) {
-      const [ready, total] = routingSvcResult.stdout.split("/");
-      const readyCount = parseInt(ready || "0", 10);
-      const totalCount = parseInt(total || "0", 10);
-      if (readyCount === totalCount && totalCount > 0) {
-        results.push({ name: "Routing service", status: "pass", message: `${readyCount}/${totalCount} ready` });
+    // Check if current build has a pool Deployment
+    if (state?.buildId && !foundCurrentPool) {
+      results.push({
+        name: "Current build",
+        status: "fail",
+        message: `No pool Deployment found for build ${state.buildId}`,
+        fix: `Run \`npx adapter-k8s deploy\` to redeploy`,
+      });
+    }
+
+    // Check if previous build exists (needed for rollback)
+    if (state?.previousBuildId) {
+      const foundPrevious = deploysResult.exitCode === 0 && deploysResult.stdout.trim().split("\n").some(line => {
+        const [name] = line.split("|");
+        return name && !name.includes("routing-service") &&
+          name.toLowerCase().replace(/[^a-z0-9]/g, "").includes(previousBuildLower);
+      });
+      if (foundPrevious) {
+        results.push({ name: "Rollback ready", status: "pass", message: `Previous build ${state.previousBuildId} available` });
       } else {
-        // Get reason from pod logs
-        const rsLogsResult = await execCapture("kubectl", [
-          "logs", `deployment/${releaseName}-routing-service`, "--tail=10",
-        ]);
-        const lastLog = rsLogsResult.stdout.trim().split("\n").pop() ?? "";
         results.push({
-          name: "Routing service",
+          name: "Rollback ready",
           status: "fail",
-          message: `${readyCount}/${totalCount} ready`,
-          fix: lastLog.includes("Error") ? lastLog.slice(0, 120) : `kubectl logs deployment/${releaseName}-routing-service --tail=20`,
+          message: `Previous build ${state.previousBuildId} not found — rollback unavailable`,
+          fix: "Deploy twice to have a rollback target",
         });
       }
     }
 
     // Pod errors — check recent logs for recurring errors
+    const podsResult = await execCapture("kubectl", [
+      "get", "pods", "-l", `app.kubernetes.io/name=${releaseName}`,
+      "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
+    ]);
     if (podsResult.exitCode === 0 && podsResult.stdout.trim()) {
-      const firstPod = podsResult.stdout.trim().split("\n")[0]?.split(" ")[0];
+      const firstPod = podsResult.stdout.trim().split("\n")[0];
       if (firstPod) {
         const logsResult = await execCapture("kubectl", [
           "logs", firstPod, "--tail=50",
@@ -273,15 +328,62 @@ export async function runDoctor(options: { projectDir: string; releaseName: stri
       }
     }
 
-    // Backend health — check if the GCP load balancer backend service is healthy
+    // GCP backend health checks — query actual LB health status
     if (projectId) {
-      const backendsResult = await execCapture("gcloud", [
-        "compute", "backend-services", "get-health",
-        `k8s1-${releaseName}`, // GKE auto-generated backend name may differ
-        "--global", "--project", projectId, "--format=json",
-      ]).catch(() => null);
-      // GKE backend service names are auto-generated, so this may not match.
-      // Instead, check via the NEG health
+      // List backend services associated with this release
+      const bsResult = await execCapture("gcloud", [
+        "compute", "backend-services", "list",
+        "--project", projectId, "--global",
+        "--filter", `name~${releaseName}`,
+        "--format=value(name)",
+      ]);
+      if (bsResult.exitCode === 0 && bsResult.stdout.trim()) {
+        for (const bsName of bsResult.stdout.trim().split("\n")) {
+          if (!bsName) continue;
+          const healthResult = await execCapture("gcloud", [
+            "compute", "backend-services", "get-health", bsName,
+            "--project", projectId, "--global",
+            "--format=json",
+          ]);
+          if (healthResult.exitCode === 0) {
+            try {
+              const data = JSON.parse(healthResult.stdout);
+              let healthy = 0;
+              let total = 0;
+              for (const backend of data) {
+                for (const hs of backend.status?.healthStatus ?? []) {
+                  total++;
+                  if (hs.healthState === "HEALTHY") healthy++;
+                }
+              }
+              const shortName = bsName.replace(/^gkegw1-[a-z0-9]+-defau-/, "").replace(/^k8s1-[a-z0-9]+-defaul-/, "");
+              // Check if this backend is from the current build or a stale old one
+              const currentBuildId = state?.buildId?.toLowerCase() ?? "";
+              const isCurrentBuild = !currentBuildId || bsName.toLowerCase().replace(/[^a-z0-9]/g, "").includes(currentBuildId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12));
+
+              if (total === 0) {
+                results.push({ name: `LB health: ${shortName}`, status: isCurrentBuild ? "warn" : "pass", message: isCurrentBuild ? "No backends registered yet" : "Old build (pending cleanup)" });
+              } else if (healthy === total) {
+                results.push({ name: `LB health: ${shortName}`, status: "pass", message: `${healthy}/${total} healthy` });
+              } else if (!isCurrentBuild) {
+                // Old build backends being unhealthy is expected — don't fail
+                results.push({ name: `LB health: ${shortName}`, status: "warn", message: `${healthy}/${total} healthy (old build, pending cleanup)` });
+              } else {
+                results.push({
+                  name: `LB health: ${shortName}`,
+                  status: "fail",
+                  message: `${healthy}/${total} healthy`,
+                  fix: `gcloud compute backend-services get-health ${bsName} --project ${projectId} --global`,
+                });
+              }
+            } catch {
+              // JSON parse failed — skip
+            }
+          }
+        }
+      }
+
+      // Also check NEG status from K8s side
       const negResult = await execCapture("kubectl", [
         "get", "svcneg", "-o", "jsonpath={range .items[*]}{.metadata.name}: {.status.conditions[0].type}={.status.conditions[0].status}{\"\\n\"}{end}",
       ]);

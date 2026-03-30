@@ -17,6 +17,7 @@ export function createPoolServer(options: PoolServerOptions) {
       return;
     }
 
+    const start = Date.now();
     try {
       await onRequest(req, res);
     } catch (err) {
@@ -27,6 +28,9 @@ export function createPoolServer(options: PoolServerOptions) {
       } else if (!res.writableEnded) {
         res.end();
       }
+    } finally {
+      const ms = Date.now() - start;
+      console.log(`${req.method} ${req.url} → ${res.statusCode} (${ms}ms)`);
     }
   });
 

@@ -13,24 +13,36 @@ import { createPoolServer } from "./server.js";
 // This MUST run before any Next.js handler modules are imported.
 // Follows the AWS adapter's ensureNextNodeEnvironment pattern.
 async function ensureNextNodeEnvironment(): Promise<void> {
-  try {
-    // @ts-ignore — no type declarations for this internal Next.js setup module
-    await import("next/setup-node-env");
-    return;
-  } catch {
-    // Fallback: try resolving from the .next output directory
+  const req = createRequire(path.join(process.cwd(), "package.json"));
+  const candidates = [
+    "next/setup-node-env",
+    "next/dist/build/adapter/setup-node-env.external",
+    "next/dist/server/node-environment",
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      req(candidate);
+      return;
+    } catch {
+      // Try the next candidate.
+    }
   }
 
-  try {
-    const req = createRequire(path.join(process.cwd(), ".next", "server", "app", "_placeholder.js"));
-    const resolved = req.resolve("next/setup-node-env");
-    await import(pathToFileURL(resolved).href);
-  } catch {
-    console.warn("[pool-server] Could not load next/setup-node-env — AsyncLocalStorage may not work");
-  }
+  console.warn(
+    "[pool-server] Could not load Next.js node environment shims from app dependencies — AsyncLocalStorage may not work"
+  );
 }
 
 async function main() {
+  // Load .env files (Next.js does this in next start, but we're standalone)
+  try {
+    const { loadEnvConfig } = require("@next/env");
+    loadEnvConfig(process.cwd(), process.env.NODE_ENV !== "production");
+  } catch {
+    // @next/env may not be available — .env files won't be loaded automatically
+  }
+
   // Initialize Next.js runtime BEFORE anything else
   await ensureNextNodeEnvironment();
   const poolName = process.env.POOL_NAME;

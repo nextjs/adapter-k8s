@@ -5,7 +5,7 @@ import type { RoutingManifest } from '../types.js';
 type LoadedModule = Record<string, unknown>;
 
 export type ResolveResult =
-  | { kind: 'route'; pool: string; matchedPathname: string; routeMatches: Record<string, string> | null; resolvedHeaders: Headers | undefined }
+  | { kind: 'route'; pool: string; matchedPathname: string; routeMatches: Record<string, string> | null; resolvedHeaders: Headers | undefined; middlewareRequestHeaders?: Headers | undefined }
   | { kind: 'redirect'; url: URL; status: number }
   | { kind: 'middleware-response'; response: Response }
   | { kind: 'external-rewrite'; url: URL }
@@ -23,6 +23,10 @@ export function createLocalResolver(
       requestBody: ReadableStream<Uint8Array>,
     ): Promise<ResolveResult> {
       let middlewareResponse: Response | null = null;
+      // Captures the mutated request headers from responseToMiddlewareResult.
+      // This includes x-middleware-set-cookie, x-middleware-override-headers,
+      // and x-middleware-request-* modifications — all applied in one place.
+      let middlewareRequestHeaders: Headers | null = null;
 
       const resolution = await resolveRoutes({
         url,
@@ -37,46 +41,54 @@ export function createLocalResolver(
         // unconditionally (no null guard). When no middleware exists, return empty result.
         invokeMiddleware: middlewareModule
           ? async (ctx) => {
-              const reqInit: RequestInit = {
+              // Following the Firebase adapter pattern: call middleware.default.default()
+              // with a plain object that looks like a Request — avoids private field issues.
+              const middlewareUrl = ctx.url;
+
+              const middlewareRequest = {
+                url: middlewareUrl.toString(),
                 method,
-                headers: new Headers(ctx.headers),
+                headers: Object.fromEntries(
+                  [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":"))
+                ),
+                destination: 'document',
+                credentials: 'same-origin',
+                bodyUsed: false,
+                body: method === "GET" || method === "HEAD" ? undefined : ctx.requestBody,
+                mode: "navigate",
+                redirect: "follow",
+                referrer: ctx.headers.get("referer"),
               };
-              if (method !== "GET" && method !== "HEAD") {
-                reqInit.body = ctx.requestBody;
-                // @ts-ignore - duplex is required in Node.js fetch for streamed bodies
-                reqInit.duplex = "half";
-              }
-              const baseRequest = new Request(ctx.url.toString(), reqInit);
-              // Next.js middleware expects a mutable request.url property.
-              // Standard Request.url is read-only, so we wrap with a Proxy.
-              const request = new Proxy(baseRequest, {
-                get(target, prop, receiver) {
-                  if (prop === 'url') return (target as any)._mutableUrl ?? target.url;
-                  return Reflect.get(target, prop, receiver);
-                },
-                set(target, prop, value) {
-                  if (prop === 'url') { (target as any)._mutableUrl = value; return true; }
-                  return Reflect.set(target, prop, value);
-                },
-              });
-              // Middleware modules export default.default (the middleware handler)
+
               const handlerFn = typeof middlewareModule.default === 'function'
                 ? middlewareModule.default
                 : (middlewareModule.default as Record<string, unknown>)?.default;
-              if (typeof handlerFn !== 'function') {
+              if (typeof handlerFn !== 'function') return {};
+
+              try {
+                const result = await (handlerFn as any)({ request: middlewareRequest });
+                if (result.waitUntil) await result.waitUntil;
+
+                if (result.response) {
+                  middlewareResponse = result.response;
+                  // responseToMiddlewareResult mutates requestHeaders with:
+                  //  - x-middleware-set-cookie → merged into cookie header
+                  //  - x-middleware-override-headers → replaced request headers
+                  //  - x-middleware-request-* → values for overridden headers
+                  const reqHeaders = new Headers(ctx.headers);
+                  const mwResult = responseToMiddlewareResult(
+                    result.response.clone(),
+                    reqHeaders,
+                    ctx.url,
+                  );
+                  middlewareRequestHeaders = reqHeaders;
+                  return mwResult;
+                }
+                return {};
+              } catch (err) {
+                console.error("[pool-server] Middleware execution failed:", err);
                 return {};
               }
-              const result = await (handlerFn as (opts: { request: Request }) => Promise<{ response?: Response; waitUntil?: Promise<void> }>)({ request });
-              if (result.waitUntil) await result.waitUntil;
-              if (result.response) {
-                middlewareResponse = result.response;
-                return responseToMiddlewareResult(
-                  result.response.clone(),
-                  new Headers(ctx.headers),
-                  ctx.url,
-                );
-              }
-              return {};
             }
           : async () => ({}),
       });
@@ -122,6 +134,7 @@ export function createLocalResolver(
         matchedPathname: finalMatchedPathname,
         routeMatches: resolution.routeMatches ?? null,
         resolvedHeaders: resolution.resolvedHeaders ?? undefined,
+        middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
       };
     },
   };

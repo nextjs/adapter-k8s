@@ -23,7 +23,7 @@ export function generateExtensionChain(options: ExtensionChainOptions): string {
     extensions: [{
       name: 'routing-service',
       authority: `${releaseName}-routing-service.${namespace}.svc.cluster.local`,
-      service: `projects/${projectId}/locations/${region}/backendServices/${releaseName}-routing-service`,
+      service: `projects/${projectId}/global/backendServices/${releaseName}-routing-service`,
       timeout,
       supportedEvents: ['REQUEST_HEADERS'],
       failOpen: failureModeAllow,

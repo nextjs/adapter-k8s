@@ -45,6 +45,44 @@ async function writeOutputFile(
   await writeFile(fullPath, content, "utf-8");
 }
 
+// Resolve and copy .next/node_modules/ — Turbopack creates symlinks to
+// real node_modules packages. Docker COPY doesn't follow symlinks outside
+// the build context, so we resolve each symlink and copy the real content.
+async function resolveAndCopyExternals(src: string, dest: string): Promise<void> {
+  if (!existsSync(src)) return;
+  // Always rebuild — previous builds may have left stale symlinks
+  const { rm } = await import("node:fs/promises");
+  if (existsSync(dest)) await rm(dest, { recursive: true, force: true });
+  await mkdir(dest, { recursive: true });
+
+  const { readdir, lstat, readlink } = await import("node:fs/promises");
+  const entries = await readdir(src);
+
+  for (const entry of entries) {
+    const srcEntry = path.join(src, entry);
+    const destEntry = path.join(dest, entry);
+    const stat = await lstat(srcEntry);
+
+    if (stat.isSymbolicLink()) {
+      // Resolve the symlink to its real target and copy the content
+      const realTarget = await realpath(srcEntry);
+      if (existsSync(realTarget)) {
+        const targetStat = statSync(realTarget);
+        if (targetStat.isDirectory()) {
+          await cp(realTarget, destEntry, { recursive: true, dereference: true });
+        } else {
+          await copyFile(realTarget, destEntry);
+        }
+      }
+    } else if (stat.isDirectory()) {
+      // Recurse into scoped package directories (e.g., @opentelemetry/)
+      await resolveAndCopyExternals(srcEntry, destEntry);
+    } else {
+      await copyFile(srcEntry, destEntry);
+    }
+  }
+}
+
 // Track staged paths per build to avoid redundant work and loops
 const stagedPaths = new Set<string>();
 
@@ -128,9 +166,24 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     }
 
     if (!config) {
-      throw new Error(
-        "adapter.config.ts not found. Run `npx adapter-k8s init` to scaffold it.",
-      );
+      // No config file found — use sensible defaults.
+      // This allows the adapter to work for e2e tests and simple apps
+      // without requiring adapter.config.ts
+      console.log("[adapter-k8s] No adapter config found, using defaults");
+      config = {
+        pools: {
+          default: { routes: ["appPages", "appRoutes", "pagesApi", "pages"] },
+        },
+        provider: {
+          gke: {
+            gateway: {
+              type: "gateway-api",
+              className: "gke-l7-global-external-managed",
+              hosts: [{ hostname: "localhost", tls: { enabled: false } }],
+            },
+          },
+        },
+      };
     }
 
     validateConfig(config);
@@ -142,12 +195,29 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     name: "k8s",
 
     async modifyConfig(nextConfig, ctx) {
-      const projectDir = (ctx as any).projectDir || process.cwd();
-      await ensureConfig(projectDir);
+      // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
+      // Use process.cwd() which is the project root during build.
+      await ensureConfig(process.cwd());
 
       return {
         ...nextConfig,
         compress: false,
+        // Set turbopack root to the project directory to avoid workspace detection issues
+        // when the adapter is loaded from outside the project tree (e.g., e2e tests)
+        turbopack: {
+          ...((nextConfig as any).turbopack ?? {}),
+          root: (nextConfig as any).turbopack?.root ?? process.cwd(),
+        },
+        // Generate K8s-friendly build IDs: lowercase alphanumeric + hyphens only.
+        // Next.js default buildId can contain uppercase, underscores, and other chars
+        // that cause issues in K8s resource names, labels, and image tags.
+        generateBuildId: nextConfig.generateBuildId ?? (() => {
+          // Must be valid for: K8s labels, Docker tags, K8s resource names
+          // Rules: lowercase alphanumeric + hyphens, must start/end with alphanumeric
+          const timestamp = Date.now().toString(36);
+          const random = Math.random().toString(36).slice(2, 8);
+          return `b${timestamp}${random}`;
+        }),
       } as typeof nextConfig;
     },
 
@@ -274,6 +344,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
                     filePath: path.relative(projectDir, o.filePath),
                     pathname: o.pathname,
                     type: o.type,
+                    runtime: "runtime" in o && typeof o.runtime === "string" ? o.runtime : undefined,
                   },
                 ]),
             ),
@@ -346,6 +417,16 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             await stageFile(projectDir, chunksDir, ".next/server/chunks", poolName);
           }
 
+          // Stage .next/node_modules/ — Turbopack's resolved external modules
+          // (hashed names like @opentelemetry/api-6ec0324a2d0bd38c)
+          // These are symlinks pointing outside .next/ — Docker COPY can't follow them.
+          // Resolve each symlink and copy the real content.
+          const nextNodeModules = path.join(projectDir, ".next", "node_modules");
+          if (existsSync(nextNodeModules)) {
+            const dest = path.join(projectDir, OUTPUT_DIR, "pools", poolName, "context", ".next", "node_modules");
+            await resolveAndCopyExternals(nextNodeModules, dest);
+          }
+
           // Stage next/setup-node-env (required for AsyncLocalStorage initialization)
           const nextPkgDir = path.join(projectDir, "node_modules", "next");
           if (existsSync(nextPkgDir)) {
@@ -395,6 +476,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
                     filePath: path.relative(projectDir, o.filePath),
                     pathname: o.pathname,
                     type: o.type,
+                    runtime: "runtime" in o && typeof o.runtime === "string" ? o.runtime : undefined,
                   },
                 ]),
             ),
@@ -530,6 +612,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // Stage .next/server/chunks/ for Turbopack runtime chunk loading
         const chunksDir = path.join(projectDir, ".next", "server", "chunks");
         const chunksDest = path.join(projectDir, routingServiceContextDir, ".next", "server", "chunks");
+
+        // Stage .next/node_modules/ — Turbopack's resolved external modules
+        const nextNodeModules = path.join(projectDir, ".next", "node_modules");
+        const nextNodeModulesDest = path.join(projectDir, routingServiceContextDir, ".next", "node_modules");
+        if (existsSync(nextNodeModules)) {
+          await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
+        }
         if (existsSync(chunksDir) && !existsSync(chunksDest)) {
           await mkdir(path.dirname(chunksDest), { recursive: true });
           await cp(chunksDir, chunksDest, { recursive: true, dereference: true });

@@ -11,7 +11,9 @@
     "url": "git+https://github.com/nextjs/adapter-k8s.git"
   },
   "files": [
-    "dist"
+    "dist",
+    "integration",
+    "scripts"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -19,9 +21,9 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/index.js"
     },
     "./package.json": "./package.json"
   },
@@ -31,9 +33,11 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:e2e": "bash scripts/e2e-local.sh",
+    "test:integration": "NEXT_TEST_DEPLOY_SCRIPT_PATH=scripts/e2e-integration-deploy.sh NEXT_TEST_CLEANUP_SCRIPT_PATH=scripts/e2e-integration-cleanup.sh bash scripts/e2e-local.sh",
     "build:clean": "rm -rf dist",
     "build:types": "tsc --emitDeclarationOnly --declaration --declarationDir dist",
-    "build:adapter": "esbuild ./src/index.ts --bundle --format=esm --platform=node --outfile=./dist/index.js --external:next --external:@next/routing --external:minimatch",
+    "build:adapter": "esbuild ./src/index.ts --bundle --format=esm --platform=node --outfile=./dist/index.js --external:next --external:@next/routing",
     "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs",
     "build:routing-service": "esbuild ./src/routing-service/index.ts --bundle --format=cjs --platform=node --outfile=./dist/routing-service.cjs --external:@next/routing",
     "build:cli": "esbuild ./src/cli/index.ts --bundle --format=cjs --platform=node --outfile=./dist/cli.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cli.cjs",
@@ -47,6 +51,7 @@
     "@grpc/grpc-js": "^1.14.3",
     "@grpc/proto-loader": "^0.8.0",
     "@next/routing": "^16.2.0",
+    "boxen": "^8.0.1",
     "minimatch": "^10.2.4"
   },
   "devDependencies": {
