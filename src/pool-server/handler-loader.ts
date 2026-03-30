@@ -59,6 +59,10 @@ export function createHandlerLoader(
     has(outputId: string): boolean {
       return !!manifest.outputs[outputId];
     },
+
+    get(outputId: string) {
+      return manifest.outputs[outputId];
+    },
   };
 }
 

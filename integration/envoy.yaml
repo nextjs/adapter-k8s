@@ -1,0 +1,56 @@
+## Envoy config for local integration testing.
+##
+## Two modes:
+## 1. With ext_proc: Client :8080 → Envoy → ext_proc (:8443) → Pool Server (:3000)
+## 2. Without ext_proc: Client :8080 → Envoy → Pool Server (:3000)
+##
+## Currently runs WITHOUT ext_proc because the routing service uses JSON
+## serialization while Envoy speaks protobuf. The pool server handles routing
+## locally via resolveRoutes, so the app works correctly.
+##
+## TODO: Add proto-based ext_proc when routing-service supports protobuf.
+
+static_resources:
+  listeners:
+    - name: listener_0
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8080
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: pool_server
+                            timeout: 60s
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: pool_server
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: pool_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 3000

@@ -16,33 +16,33 @@ describe('state', () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('returns null when state file does not exist', () => {
-    const state = readState(tmpDir);
+  it('returns null when state file does not exist', async () => {
+    const state = await readState(tmpDir);
     expect(state).toBeNull();
   });
 
-  it('reads existing state file', () => {
+  it('reads existing state file', async () => {
     const stateDir = path.join(tmpDir, '.k8s-adapter');
     mkdirSync(stateDir, { recursive: true });
     writeFileSync(
       path.join(stateDir, 'state.json'),
       JSON.stringify({ buildId: 'abc123', previousBuildId: null }),
     );
-    const state = readState(tmpDir);
+    const state = await readState(tmpDir);
     expect(state).toEqual({ buildId: 'abc123', previousBuildId: null });
   });
 
-  it('writes state file (creates directory if needed)', () => {
+  it('writes state file (creates directory if needed)', async () => {
     const state: AdapterState = { buildId: 'def456', previousBuildId: 'abc123' };
-    writeState(tmpDir, state);
-    const read = readState(tmpDir);
+    await writeState(tmpDir, state);
+    const read = await readState(tmpDir);
     expect(read).toEqual(state);
   });
 
-  it('overwrites existing state', () => {
-    writeState(tmpDir, { buildId: 'first', previousBuildId: null });
-    writeState(tmpDir, { buildId: 'second', previousBuildId: 'first' });
-    const state = readState(tmpDir);
+  it('overwrites existing state', async () => {
+    await writeState(tmpDir, { buildId: 'first', previousBuildId: null });
+    await writeState(tmpDir, { buildId: 'second', previousBuildId: 'first' });
+    const state = await readState(tmpDir);
     expect(state!.buildId).toBe('second');
     expect(state!.previousBuildId).toBe('first');
   });

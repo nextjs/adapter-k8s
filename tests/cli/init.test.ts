@@ -51,6 +51,25 @@ describe("buildInitGcloudCommands", () => {
     const saCmd = commands.find((c) => c.description.includes("service account"));
     expect(saCmd).toBeDefined();
   });
+
+  it('includes routing service backend provisioning commands', () => {
+    const commands = buildInitGcloudCommands({
+      projectId: 'my-project',
+      region: 'us-central1',
+      bucket: 'my-project-nextjs-static',
+      releaseName: 'my-app',
+    });
+
+    const backendCmd = commands.find(c => c.description.includes('backend service for routing'));
+    expect(backendCmd).toBeDefined();
+
+    const hcCmd = commands.find(c => c.description.includes('health check for routing'));
+    expect(hcCmd).toBeDefined();
+
+    // LbRouteExtension is created via Helm hook `import`, not during init
+    const routeExtCmd = commands.find(c => c.description.includes('LbRouteExtension'));
+    expect(routeExtCmd).toBeUndefined();
+  });
 });
 
 describe("runInit", () => {

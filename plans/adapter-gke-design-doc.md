@@ -681,13 +681,17 @@ Client                     Pool Server                    Valkey
 
 ### 6.5 Edge Runtime Routes
 
-The adapter API surfaces `runtime: 'edge'` on outputs. GKE has no native edge runtime.
+The stable adapter API surfaces `runtime: 'edge'` on outputs, with `edgeRuntime` metadata containing `{ modulePath, entryKey, handlerExport }`. Edge entrypoints use the `handler(request: Request, ctx)` interface (Web API, not Node.js).
 
-**Option A: Run as Node.js** — ignore the edge annotation and run everything on Node.js. Edge-compatible code is a strict subset of Node.js, so this always works.
+GKE has no native edge runtime.
+
+**Option A: Run as Node.js** — ignore the edge annotation and run everything on Node.js. Edge-compatible code is a strict subset of Node.js, so this always works. For handler invocation, the pool server should detect `runtime: 'edge'` and use the edge invocation pattern: load the module, read from `globalThis._ENTRIES[entryKey]`, and invoke `handlerExport` with a Fetch `Request`.
 
 **Option B: Target Cloud Run** — deploy edge-annotated routes to Cloud Run, which has faster cold starts and auto-scales to zero.
 
-**Recommendation:** Option A for v1. Document Option B as a future enhancement. The pool configuration could eventually support `runtime: 'cloud-run'` as a target.
+**Recommendation:** Option A for v1. The pool server runs all handlers as Node.js. Edge-specific invocation (via `edgeRuntime` metadata) should be added as a follow-up to properly handle edge entrypoints that use `globalThis._ENTRIES` registration. Document Option B as a future enhancement.
+
+**Monorepo support:** The stable adapter API provides `ctx.repoRoot` alongside `ctx.projectDir`. For monorepo deployments where the Next.js project is nested (e.g., `apps/web/`), adapters should use `repoRoot` for Docker build context and `projectDir` for Next.js-specific paths. The current implementation uses `projectDir` for both, which works for single-project repos but may need adjustment for monorepos.
 
 ### 6.6 Skew Protection
 
@@ -2326,44 +2330,96 @@ The route extension propagates `traceparent` / `tracestate` headers. The pool se
 
 The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all phases. Each phase adds capabilities to the same workflow — operators never have to learn manual Helm/gcloud commands and then migrate to the CLI later.
 
-### Phase 1: Core Adapter + Pool Server + CLI
+### Implementation Learnings
 
-**Goal:** `npx adapter-k8s init && npx adapter-k8s deploy` produces a working Next.js app on GKE with pool decomposition. Testable against the Next.js e2e harness.
+The following decisions were validated or changed during Phase 1-2 implementation:
 
-**Scope:**
+**Build-time:**
+- **K8s-friendly build IDs** — Next.js default buildIds contain uppercase, underscores, and leading special chars that break K8s labels, Docker tags, and service names. The adapter overrides `generateBuildId` to produce lowercase alphanumeric IDs (`b{timestamp}{random}`). If the user sets their own `generateBuildId`, they own the responsibility.
+- **Turbopack externals** — `.next/node_modules/` contains symlinked external modules with hashed names (e.g., `@opentelemetry/api-6ec0324a2d0bd38c`). These are absolute symlinks that don't survive Docker COPY. The adapter resolves each symlink to its real target and copies the content. This must be done fresh on each build (no caching).
+- **`next/setup-node-env`** — must be imported before any handler module. Without it, AsyncLocalStorage globals aren't set up and handlers crash. The pool server calls this at startup before loading manifests.
+- **`.env` files** — `.env`, `.env.production`, `.env.local`, `.env.production.local` are staged into pool server and routing service containers so server-side env vars work without K8s env var configuration.
+- **Config file format** — `adapter.config.mjs` preferred over `.ts` to avoid Node.js `MODULE_TYPELESS_PACKAGE_JSON` warnings. The adapter loads `.mjs` first, then `.ts`, then `.js`.
 
-- **CLI:** `init` (provisions Gateway, GCS bucket, IAM via `gcloud`; scaffolds `adapter.config.ts`; writes `infrastructure.json`), `deploy` (build → push → helm upgrade), `destroy`
-- `NextAdapter` implementation (`modifyConfig`, `onBuildComplete`)
-- Pool classification logic (`classifyIntoPools` with first-match-wins)
-- Routing manifest generation (`routeGraph`, `pathnames`, `i18n`, `poolAssignments`)
-- Pool server with direct handler invocation (§6.2)
-- Dockerfile generation (traced assets)
-- Helm chart (pool Deployments, Services, HPAs)
-- `adapter.config.ts` schema with pool and provider config
-- State tracking (`.k8s-adapter/state.json`)
+**Gateway & TLS:**
+- **Certificate Manager, not ManagedCertificate CRD** — GKE Gateway API does not support `ManagedCertificate` CRD or `certificateRefs` with `kind: ManagedCertificate`. TLS is handled via Certificate Manager with DNS authorization + certmap annotation (`networking.gke.io/certmap`). Wildcard domains (`*.example.com`) require DNS auth on the base domain.
+- **HealthCheckPolicy CRD** — GKE Gateway auto-generates health checks that probe `/` (root). This fails when the app has middleware or returns errors. A `HealthCheckPolicy` CRD overrides this to probe `/healthz` on port 3000, which the pool server always answers with 200.
+- **Static IP via `addresses` field** — Gateway API uses `spec.addresses[{type: NamedAddress}]`, not the Ingress annotation `networking.gke.io/static-ip`.
+- **Multi-host support** — `gateway.hosts` is an array of `{ hostname, tls }` objects. Wildcard hostnames are quoted in YAML to prevent YAML alias interpretation.
 
-**Not yet:** Route extension, middleware, CDN, Valkey, PPR, skew protection.
+**Deployment (blue/green):**
+- **Stable "active" Service** — HTTPRoute always points to a stable Service (`{releaseName}-{poolName}`, no buildId). The Service's selector is patched by deploy/rollback to point to the active build. This prevents the gap where HTTPRoute references a new backend that isn't healthy yet.
+- **Zero-downtime cutover sequence:** (1) Helm creates new Deployment + versioned Service, (2) wait for K8s readiness probes, (3) verify pod health via kubectl, (4) patch active Service selector, (5) scale previous to 0 (keep for rollback), (6) delete anything older.
+- **Deploy fails if unhealthy** — if new pods don't become ready within 3 minutes, deploy exits with code 1 and does NOT cut over traffic. The previous build continues serving.
+- **Helm server-side apply conflicts** — `kubectl patch` and Helm fight over field ownership. All patches use `--field-manager=helm --force-conflicts`, and Helm upgrade uses `--server-side=true --force-conflicts`.
+- **Rollback is symmetric** — `rollback` scales up previous, waits for health, patches selectors, scales down current. Running it twice rolls forward. Both builds' Deployments are kept at 0 replicas.
+- **Cluster state** — deploy state (`buildId`, `previousBuildId`) is stored in a K8s ConfigMap (`{releaseName}-adapter-state`) in addition to the local `state.json`. This allows `doctor`/`describe`/`rollback` to work from any machine with kubectl access (CI/CD + local dev).
 
-**How it works without ext_proc:** `init` provisions a Gateway with path-based routing (no LbRouteExtension yet). Each pool server resolves routes locally using the routing manifest. `deploy` builds images, pushes them, and runs `helm upgrade`.
+**Route Extension (ext_proc):**
+- **`gcloud service-extensions lb-route-extensions import`** — uses `import` not `create`. The import command takes a YAML spec file with `loadBalancingScheme`, `forwardingRules`, and `extensionChains`.
+- **Global location** — `--location=global` for global external ALBs, not regional.
+- **Forwarding rule discovery** — GKE Gateway auto-generates forwarding rule names. The route-ext Job discovers them via `gcloud compute forwarding-rules list --filter`.
+- **Backend service path** — `projects/{projectId}/global/backendServices/...` not `locations/{region}/...` for global ALBs.
+- **Job naming** — K8s Jobs are immutable. Each deploy creates a new Job with `{releaseName}-route-ext-{buildId}` and old ones are cleaned up.
+- **Not a Helm hook** — the route-ext Job is a regular Job (not `helm.sh/hook`) so it doesn't block deploys if it fails.
+- **Workload Identity** — the Job's ServiceAccount needs `networkservices.admin` and `compute.viewer` roles via Workload Identity binding.
 
-### Phase 2: Route Extension + Service Extensions
+**GCP IAM:**
+- **`--condition=None`** on all `add-iam-policy-binding` commands (required when policies have conditional bindings).
+- **Artifact Registry reader** — GKE Autopilot nodes use the `container-engine-robot` service agent for image pulls. Must grant `artifactregistry.reader` on the repo to `service-{projectNumber}@container-engine-robot.iam.gserviceaccount.com`.
+
+**Adapter API conformance (stable Next.js 16.2):**
+- **`modifyConfig` context** — stable API `ctx` has `{ phase, nextVersion }`, NOT `projectDir`. Use `process.cwd()` instead.
+- **`requestMeta`** — pass `relativeProjectDir: '.'` and `hostname` in handler invocation context.
+- **`AdapterOutputs`** — now derived from `NextAdapter["onBuildComplete"]` parameter type, not locally defined.
+- **Middleware `request.url`** — standard `Request.url` is read-only. Next.js middleware mutates it. Pool server wraps with a Proxy to allow mutation.
+- **`@next/routing` `invokeMiddleware`** — MUST always be a function, never `undefined`. `resolveRoutes` calls it unconditionally.
+
+**Testing:**
+- **Two-tier e2e test suite** — Tier 1 (pool server only, like Bun adapter) validates functional fidelity. Tier 2 (Envoy + routing service + pool server) validates correctness of the split architecture: CEL filtering, ext_proc header mutations, middleware pre-CDN, rewrite chains.
+- **`emulate` command** — `npx adapter-k8s emulate` spins up the full stack locally (Envoy + routing service + pool server) for development and testing.
+
+---
+
+### Phase 1: Core Adapter + Pool Server + CLI (DONE)
+
+**Goal:** `npx adapter-k8s init && npx adapter-k8s deploy` produces a working Next.js app on GKE with pool decomposition.
+
+**Scope (delivered):**
+
+- **CLI:** `init`, `deploy`, `destroy`, `doctor`, `describe`, `rollback`, `tail`/`logs`, `emulate`
+- `NextAdapter` implementation (`modifyConfig`, `onBuildComplete`) conforming to stable API
+- Pool classification (`classifyIntoPools` with first-match-wins)
+- Routing manifest generation
+- Pool server with handler invocation, local route resolution, middleware execution
+- Dockerfile generation (traced assets + shared-image)
+- Helm chart with blue/green Deployments, stable active Services, HealthCheckPolicies, Gateway, HTTPRoute, Certificate Manager
+- Multi-host support with wildcard domains
+- Blue/green zero-downtime deploys with rollback
+- Cluster state via ConfigMap
+- K8s-friendly buildId generation
+- `next/setup-node-env` initialization
+- Turbopack externals resolution
+- `.env` file staging
+- GKE Autopilot IAM + Workload Identity setup
+- Next.js e2e test suite integration (Tier 1 + Tier 2)
+
+### Phase 2: Route Extension + Service Extensions (DONE)
 
 **Goal:** Pre-CDN middleware and routing via ext_proc.
 
-**Scope:**
+**Scope (delivered):**
 
-- Route Extension Service (ext_proc gRPC server with `resolveRoutes`)
-- Middleware execution via `invokeMiddleware` callback
-- `init` updated: provisions `LbRouteExtension` via `gcloud`
-- Helm hook Job: updates `LbRouteExtension` CEL expression on each `deploy`
-- CEL expression generation (skip static assets)
-- Dispatch metadata headers (`x-output-id`, `x-matched-pathname`, `x-route-matches`)
-- `failure_mode_allow` based on middleware presence
-- Pool server updated to consume dispatch headers (fall back to local resolution if missing)
-
-**CLI impact:** `init` now provisions the `LbRouteExtension`. `deploy` Helm hook updates CEL expression per-build.
-
-**Depends on:** Phase 1.
+- Route Extension Service (ext_proc gRPC server with `resolveRoutes`, `@grpc/grpc-js` bundled)
+- CEL expression generation (exclusion list with middleware, inclusion list without)
+- Extension chain JSON generation with `failure_mode_allow`
+- Middleware execution via `invokeMiddleware` callback (with Proxy-wrapped Request for mutable `url`)
+- `x-output-id`, `x-upstream-pool`, `x-matched-pathname`, `x-route-matches` header mutations
+- Pool server consumes dispatch headers (bypasses local resolution when `x-output-id` present)
+- Routing service Dockerfile + context staging (including `@next/routing`, `.next/node_modules/`, `.next/server/chunks/`)
+- Route-ext update Job (`lb-route-extensions import`, `--location=global`, forwarding rule discovery)
+- Envoy-based integration testing (`integration/envoy.yaml`)
+- `emulate` command for local full-stack development
 
 ### Phase 3: Caching Layer
 
@@ -2374,13 +2430,14 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 - Valkey deployment (Helm chart in-cluster, or `init` provisions Memorystore)
 - `cacheHandler` (ISR, route handlers, images) — buildId-namespaced keys
 - `cacheHandlers` (use cache directives) — buildId-namespaced keys
-- Pool server cache orchestration (§9): HIT/STALE/MISS/BYPASS states
+- **`requestMeta.onCacheEntryV2`** — implement the stable adapter callback for observing all cache operations. When a cache entry is generated or looked up, persist to Valkey. This is the official contract for cache coordination — replaces custom cache orchestration. See [adapterPath docs](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath#runtime-integration).
+- **`requestMeta.revalidate`** — implement the internal revalidate function to avoid revalidating over the network in multi-instance deployments
 - Background revalidation (in-process, v1)
-- Tag-based invalidation
+- Tag-based invalidation + tag coordination across instances
 - On-demand revalidation endpoint (`/_next/revalidate`)
-- Prerender seed staging (Valkey seeding Helm hook)
+- Prerender seed staging (Valkey seeding from `outputs.prerenders[].fallback`)
 
-**CLI impact:** `init` gains optional Memorystore provisioning. `deploy` Helm hooks now seed Valkey.
+**CLI impact:** `init` gains optional Memorystore provisioning. `deploy` seeds Valkey with prerender data.
 
 **Depends on:** Phase 1. Independent of Phase 2 (works without ext_proc).
 
@@ -2391,12 +2448,13 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 **Scope:**
 
 - `init` updated: provisions Cloud CDN config, CDN-enabled backend services
-- GCS static asset sync (Helm hook)
-- `Cache-Tag` response headers (with buildId)
+- GCS static asset sync (from `outputs.staticFiles` with `immutableHash` for cache headers)
+- `Cache-Tag` response headers (with buildId) via pool server
 - CDN cache invalidation (path-based and tag-based) via `@google-cloud/compute`
-- `Cache-Control` / `s-maxage` from revalidate config
-- Static asset routing in URL map (path-based, no ext_proc needed)
+- `Cache-Control` / `s-maxage` from prerender `fallback.initialRevalidate`
+- Static asset routing via HealthCheckPolicy + GCS NEG (content-addressed, no ext_proc needed)
 - CLI `invalidate` command
+- **CEL expression correctness is critical here** — a wrong CEL rule that lets a personalized page bypass ext_proc means CDN caches and serves it to everyone. Integration tests (Tier 2) must validate CEL for every route classification.
 
 **CLI impact:** `init` provisions CDN. `deploy` syncs static assets to GCS. `invalidate` command available.
 
@@ -2408,29 +2466,36 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 
 **Scope:**
 
-- PPR preamble and postponed state seeding in Valkey (Helm hook)
-- Pool server PPR handling (§6.4, §7.4): read preamble from Valkey, stream it, invoke resume handler in parallel
+- PPR preamble and postponed state seeding in Valkey from `outputs.prerenders[].fallback.filePath` and `fallback.postponedState`
+- **PPR resume protocol (per stable adapter docs):**
+  - Read `pprChain.headers` from prerender output (contains `next-resume: 1`)
+  - Set those headers on the internal request to the handler
+  - Send as **POST** with `postponedState` as the request body
+  - Handler renders only deferred Suspense boundaries and streams the result
+  - See [PPR Platform Guide](https://nextjs.org/docs/app/guides/ppr-platform-guide)
+- Pool server PPR handling: read preamble from Valkey, start streaming shell, invoke resume handler in parallel, concatenate streams
 - `x-nextjs-ppr` header flow from route extension to pool server
 - Fallback to full render when preamble not cached
+- **`requestMeta.onCacheEntryV2`** for persisting updated shell/postponed data after resume. When `cacheEntry.value.kind === 'APP_PAGE'`, extract `html` (via `toUnchunkedString()`) and `postponed` and write to Valkey.
 
 **Depends on:** Phase 3 (Valkey), Phase 2 (route extension flags PPR routes).
 
 ### Phase 6: Skew Protection
 
-**Goal:** Zero-downtime deployments with version isolation.
+**Goal:** Version isolation during rolling deployments.
+
+**Note:** Blue/green deploy with rollback was implemented in Phase 1. This phase adds *version-aware routing* for RSC navigations — clients that loaded build A's JavaScript get routed to build A's server, even after build B is deployed.
 
 **Scope:**
 
-- Versioned pool Deployments (`{pool}-{buildId}`)
-- Route extension buildId comparison and version-aware routing (§6.6)
-- HTTPRoute with rules for current + previous version pools (§13.4)
-- BuildId-namespaced Valkey keys (already done in Phase 3)
-- CDN cache isolation (`Vary: x-build-id`, `Cache-Tag` with buildId)
-- Cleanup job (old Deployments, old Valkey keys, old CDN entries)
-- `skewProtection.duration` config
-- `deploy` tracks `previousBuildId` in state file
+- Route extension buildId comparison (client sends buildId in RSC request headers)
+- Version-aware pool routing — old clients → old build (if still running within skew window)
+- BuildId-namespaced Valkey keys (done in Phase 3)
+- CDN cache isolation (`Vary` on build-version header, `Cache-Tag` with buildId)
+- Configurable skew duration (`skewProtection.duration`)
+- Cleanup of old Valkey keys + CDN entries after window expires
 
-**CLI impact:** `deploy` manages `previousBuildId` state. Cleanup job scheduled automatically.
+**CLI impact:** `deploy` already manages `previousBuildId` state and keeps previous build at 0 replicas. This phase adds the routing intelligence.
 
 **Depends on:** Phase 2, Phase 3, Phase 4.
 
@@ -2445,21 +2510,30 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 - Distributed tracing with trace context propagation
 - Grafana dashboard templates (or Cloud Monitoring dashboard JSON)
 - Alert rules (route extension latency, cache error rate, pool health)
-- CLI `status` and `logs` commands
+- CLI `status` command (beyond what `doctor` provides — deployment history, traffic metrics)
+
+**Note:** `tail`/`logs` command was implemented in Phase 1.
 
 **Can be incrementally added** to any phase — not gated by other phases.
 
+### Future Work
+
+- **Edge runtime support** — outputs with `runtime: 'edge'` have `edgeRuntime` metadata (`modulePath`, `entryKey`, `handlerExport`). Invoke via `globalThis._ENTRIES[entryKey][handlerExport]`. Option A: run as Node.js (current). Option B: Cloud Run for scale-to-zero edge routes.
+- **Monorepo support** — use `ctx.repoRoot` for Docker build context, `ctx.projectDir` for Next.js paths.
+- **Developer-provided e2e tests** — allow operators to define a smoke test that runs between health confirmation and traffic cutover during deploy.
+- **Wasm route extension** — for apps without middleware, compile routing logic to Proxy-Wasm plugin that runs inside the load balancer (§20.1).
+
 ### Phase Summary
 
-| Phase | What you get                                                  | Can run in prod?                      |
-| ----- | ------------------------------------------------------------- | ------------------------------------- |
-| 1     | `init` + `deploy` CLI, pool decomposition, handler invocation | Yes (basic, no middleware/CDN)        |
-| 2     | Pre-CDN middleware, ext_proc routing                          | Yes (no caching/CDN)                  |
-| 3     | Distributed ISR, `use cache` across replicas                  | Yes (no CDN)                          |
-| 4     | Cloud CDN with invalidation, `invalidate` command             | Yes (full feature set minus PPR/skew) |
-| 5     | PPR with cache-first preamble                                 | Yes (full feature set minus skew)     |
-| 6     | Zero-downtime versioned deploys                               | Yes (full feature set)                |
-| 7     | Production observability, `status` + `logs` commands          | Operational improvement               |
+| Phase | What you get                                                          | Status  |
+| ----- | --------------------------------------------------------------------- | ------- |
+| 1     | Full CLI, pool server, blue/green deploy, rollback, doctor, emulate   | Done    |
+| 2     | Pre-CDN middleware, ext_proc routing, CEL generation                  | Done    |
+| 3     | Distributed ISR, `use cache`, `onCacheEntryV2`                        | Planned |
+| 4     | Cloud CDN with invalidation                                           | Planned |
+| 5     | PPR with resume protocol                                              | Planned |
+| 6     | Skew protection (version-aware routing)                               | Planned |
+| 7     | Observability (metrics, tracing, alerts)                              | Planned |
 
 ---
 

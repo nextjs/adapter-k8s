@@ -35,13 +35,8 @@ export function validateConfig(input: unknown): void {
     if (!hostConfig.hostname) {
       throw new Error("each host in provider.gke.gateway.hosts must have a hostname");
     }
-    if (hostConfig.hostname.includes('*') && hostConfig.tls?.managedCert) {
-      throw new Error(
-        `wildcard hostname "${hostConfig.hostname}" cannot use managedCert. ` +
-        `GKE ManagedCertificate does not support wildcards. ` +
-        `Use Certificate Manager with DNS authorization instead.`
-      );
-    }
+    // Wildcards are supported via Certificate Manager with DNS authorization.
+    // No restriction needed — init provisions the DNS auth + cert automatically.
   }
 }
 

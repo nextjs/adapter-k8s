@@ -7,7 +7,7 @@ import type {
 import { renderChartYaml } from "./templates/chart-yaml.js";
 import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
-import { renderService } from "./templates/service.js";
+import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import { renderConfigMap } from "./templates/configmap.js";
 import {
@@ -15,6 +15,12 @@ import {
   renderHTTPRoute,
 } from "./templates/gateway.js";
 import { sanitizeK8sName } from "./templates/utils.js";
+import { renderRoutingServiceDeployment } from './templates/routing-service-deployment.js';
+import { renderRoutingServiceService } from './templates/routing-service-service.js';
+import { renderRoutingServiceHPA } from './templates/routing-service-hpa.js';
+import { renderRouteExtUpdateJob } from './templates/route-ext-update-job.js';
+import { renderRouteExtConfigMap } from './templates/route-ext-configmap.js';
+import { renderDeployServiceAccount } from './templates/deploy-service-account.js';
 
 export function generateHelmChart({
   pools,
@@ -24,6 +30,8 @@ export function generateHelmChart({
   imageRegistry,
   routingManifest,
   releaseName = "nextjs",
+  extensionChainJson,
+  infrastructure,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -32,6 +40,8 @@ export function generateHelmChart({
   imageRegistry: string;
   routingManifest: RoutingManifest;
   releaseName?: string;
+  extensionChainJson?: string;
+  infrastructure?: { projectId?: string; region?: string };
 }): Record<string, string> {
   const files: Record<string, string> = {};
   // Helm versions must be SemVer. We use a safe version of the buildId as the suffix.
@@ -88,11 +98,51 @@ export function generateHelmChart({
       buildId,
       releaseName,
     });
+    // Stable "active" Service — HTTPRoute points here, selector patched on cutover
+    files[`templates/${poolName}-active-service.yaml`] = renderActiveService({
+      poolName,
+      buildId,
+      releaseName,
+    });
     files[`templates/${poolName}-hpa.yaml`] = renderHPA({
       poolName,
       buildId,
       releaseName,
     });
+  }
+
+  // Phase 2: Routing service templates (only when extension chain is provided)
+  if (extensionChainJson) {
+    files['templates/routing-service-deployment.yaml'] = renderRoutingServiceDeployment({
+      releaseName,
+      buildId,
+      imageRegistry,
+    });
+    files['templates/routing-service-service.yaml'] = renderRoutingServiceService({
+      releaseName,
+    });
+    files['templates/routing-service-hpa.yaml'] = renderRoutingServiceHPA({
+      releaseName,
+    });
+    files['templates/route-ext-config.yaml'] = renderRouteExtConfigMap({
+      releaseName,
+      extensionChainJson,
+      projectId: infrastructure?.projectId ?? '',
+      region: infrastructure?.region ?? '',
+    });
+
+    if (infrastructure?.projectId && infrastructure?.region) {
+      files['templates/route-ext-update-job.yaml'] = renderRouteExtUpdateJob({
+        releaseName,
+        projectId: infrastructure.projectId,
+        region: infrastructure.region,
+        buildId,
+      });
+      files['templates/deploy-service-account.yaml'] = renderDeployServiceAccount({
+        releaseName,
+        projectId: infrastructure.projectId,
+      });
+    }
   }
 
   return files;

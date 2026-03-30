@@ -1,0 +1,119 @@
+name: test-e2e-integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      nextjsRef:
+        description: 'Next.js repo ref (branch/tag/SHA)'
+        default: 'canary'
+        type: string
+
+jobs:
+  build:
+    name: Build Next.js + adapter
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: adapter
+
+      - uses: actions/checkout@v4
+        with:
+          repository: vercel/next.js
+          ref: ${{ inputs.nextjsRef || 'canary' }}
+          path: nextjs
+          fetch-depth: 25
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+
+      - name: Setup pnpm
+        run: npm i -g corepack@0.31 && corepack enable
+
+      - name: Install & build Next.js
+        working-directory: nextjs
+        run: pnpm install && pnpm build && pnpm install
+
+      - name: Install Playwright
+        working-directory: nextjs
+        run: pnpm playwright install --with-deps chromium
+
+      - name: Build adapter
+        working-directory: adapter
+        run: npm install && npm run build
+
+      - name: Pull Envoy image
+        run: docker pull envoyproxy/envoy:v1.32-latest
+
+      - name: Validate adapter test assets
+        run: |
+          test -f adapter/test/deploy-tests-manifest.adapter-k8s.json
+          bash -n adapter/scripts/e2e-integration-deploy.sh
+          bash -n adapter/scripts/e2e-integration-cleanup.sh
+          bash -n adapter/scripts/e2e-logs.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextjs-adapter-integration-${{ github.run_id }}
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            nextjs
+            adapter
+            ~/.cache/ms-playwright
+
+  test:
+    name: Integration Tests (${{ matrix.group }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1/8, 2/8, 3/8, 4/8, 5/8, 6/8, 7/8, 8/8]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextjs-adapter-integration-${{ github.run_id }}
+          path: .
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+
+      - name: Setup pnpm
+        run: npm i -g corepack@0.31 && corepack enable
+
+      - name: Ensure Playwright
+        working-directory: nextjs
+        run: pnpm playwright install chromium
+
+      - name: Validate adapter test assets
+        run: |
+          test -f adapter/test/deploy-tests-manifest.adapter-k8s.json
+          bash -n adapter/scripts/e2e-integration-deploy.sh
+          bash -n adapter/scripts/e2e-integration-cleanup.sh
+          bash -n adapter/scripts/e2e-logs.sh
+
+      - name: Make scripts executable
+        run: |
+          chmod +x adapter/scripts/e2e-integration-deploy.sh
+          chmod +x adapter/scripts/e2e-logs.sh
+          chmod +x adapter/scripts/e2e-integration-cleanup.sh
+
+      - name: Run integration deploy tests
+        working-directory: nextjs
+        env:
+          NEXT_TEST_MODE: deploy
+          NEXT_E2E_TEST_TIMEOUT: 240000
+          NEXT_EXTERNAL_TESTS_FILTERS: ${{ github.workspace }}/adapter/test/deploy-tests-manifest.adapter-k8s.json
+          ADAPTER_DIR: ${{ github.workspace }}/adapter
+          IS_TURBOPACK_TEST: 1
+          NEXT_TEST_JOB: 1
+          NEXT_TELEMETRY_DISABLED: 1
+          NEXTJS_DIR: ${{ github.workspace }}/nextjs
+          # Integration mode — routes through Envoy + ext_proc
+          NEXT_TEST_DEPLOY_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-integration-deploy.sh
+          NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-logs.sh
+          NEXT_TEST_CLEANUP_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-integration-cleanup.sh
+        run: node run-tests.js --timings -g ${{ matrix.group }} -c 1 --type e2e

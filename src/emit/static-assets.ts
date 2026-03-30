@@ -5,23 +5,31 @@ import type { AdapterOutputs, StaticAssetEntry } from '../types.js';
 export function buildStaticManifest(outputs: AdapterOutputs, projectDir: string): StaticAssetEntry[] {
   const entries: StaticAssetEntry[] = [];
 
-  const staticOutputs = [
-    ...outputs.staticFiles,
-    ...outputs.prerenders,
-  ];
-
-  for (const file of staticOutputs) {
-    if (!(file as any).filePath) {
-      console.warn(`[adapter-k8s] Skipping static asset without filePath: ${file.pathname}`);
-      continue;
-    }
+  // Static files have a top-level filePath
+  for (const file of outputs.staticFiles) {
+    if (!file.filePath) continue;
     entries.push({
       pathname: file.pathname,
-      filePath: path.relative(projectDir, (file as any).filePath),
+      filePath: path.relative(projectDir, file.filePath),
       cacheControl: (file as any).immutableHash
         ? "public, max-age=31536000, immutable"
         : "public, max-age=3600",
     });
+  }
+
+  // Prerenders have their content in fallback.filePath with initialHeaders/initialStatus
+  for (const prerender of outputs.prerenders) {
+    const fallback = prerender.fallback;
+    if (!fallback?.filePath) continue;
+    const entry: StaticAssetEntry = {
+      pathname: prerender.pathname,
+      filePath: path.relative(projectDir, fallback.filePath),
+      cacheControl: "public, max-age=3600",
+    };
+    if (fallback.initialHeaders) entry.headers = fallback.initialHeaders;
+    if (fallback.initialStatus) entry.status = fallback.initialStatus;
+    if (fallback.postponedState) entry.ppr = true;
+    entries.push(entry);
   }
 
   return entries.sort((a, b) => a.pathname.localeCompare(b.pathname));

@@ -4,6 +4,10 @@ import { runInit } from "./init.js";
 import { runDeploy } from "./deploy.js";
 import { runDestroy } from "./destroy.js";
 import { runDoctor } from "./doctor.js";
+import { runDescribe } from "./describe.js";
+import { runRollback } from "./rollback.js";
+import { runTail } from "./tail.js";
+import { runEmulate } from "./emulate.js";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const args = argv.slice(2);
@@ -36,7 +40,11 @@ Usage: npx adapter-k8s <command> [options]
 Commands:
   init       Provision GCP infrastructure, scaffold adapter config
   deploy     Build, push images, helm upgrade
+  emulate    Run the full infrastructure locally (Envoy + routing + pool server)
+  rollback   Roll back to the previous deployment
+  describe   Show architecture diagram with live cluster status
   doctor     Run health checks on your deployment
+  tail       Tail logs from all workloads
   destroy    Tear down all resources
 
 Options:
@@ -95,8 +103,33 @@ async function main(): Promise<void> {
       break;
     }
 
+    case 'emulate': {
+      await runEmulate({
+        projectDir,
+        skipBuild: flags['skip-build'] === true,
+        port: flags['port'] ? parseInt(flags['port'] as string, 10) : 8080,
+      });
+      break;
+    }
+
+    case 'rollback': {
+      await runRollback({ projectDir, releaseName, dryRun });
+      break;
+    }
+
+    case 'describe': {
+      await runDescribe({ projectDir, releaseName });
+      break;
+    }
+
     case 'doctor': {
       await runDoctor({ projectDir, releaseName });
+      break;
+    }
+
+    case 'tail':
+    case 'logs': {
+      await runTail({ projectDir, releaseName });
       break;
     }
 
