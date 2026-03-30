@@ -2,10 +2,9 @@ name: ci
 
 on:
   push:
-    branches:
-      - main
-      - canary
+    branches: [main, jamesdaniels_wip]
   pull_request:
+    branches: [main, jamesdaniels_wip]
 
 jobs:
   build-and-test:
