@@ -142,9 +142,14 @@ async function main() {
     releaseName,
   });
 
+  // In GKE, the pool server is behind the ALB — ext_proc sets internal routing headers.
+  // Trust them only when explicitly opted in (the deployment template sets this env var).
+  const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
+
   // Create and start server
   const server = createPoolServer({
     port,
+    trustInternalHeaders,
     onRequest: async (req, res) => {
       const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
       const headers = new Headers();

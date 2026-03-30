@@ -293,6 +293,8 @@ spec:
               value: "${previousBuildId}"
             - name: POOL_NAME
               value: "${poolName}"
+            - name: TRUST_INTERNAL_HEADERS
+              value: "1"
           readinessProbe:
             httpGet:
               path: /healthz
