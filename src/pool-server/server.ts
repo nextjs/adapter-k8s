@@ -1,5 +1,5 @@
 // src/pool-server/server.ts
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 export interface PoolServerOptions {
   onRequest: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
@@ -11,9 +11,9 @@ export function createPoolServer(options: PoolServerOptions) {
 
   const server: Server = createServer(async (req, res) => {
     // Health check — bypass all routing
-    if (req.url === '/healthz') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok' }));
+    if (req.url === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
       return;
     }
 
@@ -21,10 +21,10 @@ export function createPoolServer(options: PoolServerOptions) {
     try {
       await onRequest(req, res);
     } catch (err) {
-      console.error('Unhandled request error:', err);
+      console.error("Unhandled request error:", err);
       if (!res.headersSent) {
-        res.writeHead(500, { 'content-type': 'text/plain' });
-        res.end('Internal Server Error');
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("Internal Server Error");
       } else if (!res.writableEnded) {
         res.end();
       }
@@ -37,11 +37,11 @@ export function createPoolServer(options: PoolServerOptions) {
   return {
     start(): Promise<{ port: number }> {
       return new Promise((resolve, reject) => {
-        server.once('error', reject);
+        server.once("error", reject);
         server.listen(port, () => {
           const addr = server.address();
-          if (!addr || typeof addr === 'string') {
-            reject(new Error('Failed to get server address'));
+          if (!addr || typeof addr === "string") {
+            reject(new Error("Failed to get server address"));
             return;
           }
           console.log(`Pool server listening on port ${addr.port}`);
@@ -59,6 +59,8 @@ export function createPoolServer(options: PoolServerOptions) {
       });
     },
 
-    get server() { return server; },
+    get server() {
+      return server;
+    },
   };
 }

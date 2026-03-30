@@ -21,9 +21,9 @@ export function renderValuesYaml({
     global: {
       image: {
         registry: imageRegistry,
-        repository: 'nextjs-app',
+        repository: "nextjs-app",
         tag: buildId,
-        pullPolicy: 'IfNotPresent',
+        pullPolicy: "IfNotPresent",
       },
     },
     pools: Object.fromEntries(
@@ -31,7 +31,8 @@ export function renderValuesYaml({
         name,
         {
           image: {
-            repository: config.containerStrategy === "shared-image" ? "nextjs-app" : `nextjs-app-${name}`,
+            repository:
+              config.containerStrategy === "shared-image" ? "nextjs-app" : `nextjs-app-${name}`,
           },
           replicas: pool.config.scaling ?? { min: 1, max: 3, targetCPU: 80 },
           resources: pool.config.resources ?? {
@@ -40,7 +41,7 @@ export function renderValuesYaml({
           },
           _meta: { outputCount: pool.outputs.length },
         },
-      ])
+      ]),
     ),
     gateway: gke?.gateway ?? {},
     build: {

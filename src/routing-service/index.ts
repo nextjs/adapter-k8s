@@ -1,9 +1,9 @@
-import { readFileSync, existsSync } from 'node:fs';
-import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import type { RoutingManifest } from '../types.js';
-import { createRequestHandler } from './handler.js';
-import { createRoutingServer } from './server.js';
+import { readFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import type { RoutingManifest } from "../types.js";
+import { createRequestHandler } from "./handler.js";
+import { createRoutingServer } from "./server.js";
 
 async function main() {
   // Load .env files
@@ -13,17 +13,17 @@ async function main() {
   } catch {}
 
   const buildId = process.env.NEXT_BUILD_ID;
-  if (!buildId) throw new Error('NEXT_BUILD_ID environment variable is required');
+  if (!buildId) throw new Error("NEXT_BUILD_ID environment variable is required");
 
-  const port = parseInt(process.env.PORT ?? '8443', 10);
-  const configDir = process.env.CONFIG_DIR ?? '/config';
+  const port = parseInt(process.env.PORT ?? "8443", 10);
+  const configDir = process.env.CONFIG_DIR ?? "/config";
 
   // Load routing manifest
-  const manifestPath = path.join(configDir, 'routing-manifest.json');
+  const manifestPath = path.join(configDir, "routing-manifest.json");
   if (!existsSync(manifestPath)) {
     throw new Error(`Routing manifest not found: ${manifestPath}`);
   }
-  const manifest: RoutingManifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+  const manifest: RoutingManifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
 
   // Load middleware module (if present)
   let middlewareModule = null;
@@ -31,7 +31,7 @@ async function main() {
     const mwPath = path.resolve(process.cwd(), manifest.middleware.filePath);
     if (existsSync(mwPath)) {
       middlewareModule = await import(pathToFileURL(mwPath).href);
-      console.log('Middleware module loaded');
+      console.log("Middleware module loaded");
     } else {
       console.warn(`Middleware file not found: ${mwPath}`);
     }
@@ -45,15 +45,15 @@ async function main() {
 
   // Graceful shutdown
   const shutdown = async () => {
-    console.log('Shutting down routing service...');
+    console.log("Shutting down routing service...");
     await server.stop();
     process.exit(0);
   };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 main().catch((err) => {
-  console.error('Routing service failed to start:', err);
+  console.error("Routing service failed to start:", err);
   process.exit(1);
 });

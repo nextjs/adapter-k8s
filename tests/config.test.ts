@@ -32,9 +32,7 @@ describe("validateConfig", () => {
         },
       },
     };
-    expect(() => validateConfig(config)).toThrow(
-      /pool "ssr" must have at least one route/,
-    );
+    expect(() => validateConfig(config)).toThrow(/pool "ssr" must have at least one route/);
   });
 
   it("throws error if hosts is missing or empty", () => {
@@ -42,9 +40,7 @@ describe("validateConfig", () => {
       pools: { ssr: { routes: ["appPages"] } },
       provider: { gke: { gateway: { hosts: [] } } },
     } as any;
-    expect(() => validateConfig(config)).toThrow(
-      /provider.gke.gateway.hosts is required/,
-    );
+    expect(() => validateConfig(config)).toThrow(/provider.gke.gateway.hosts is required/);
   });
 
   it("allows wildcard hostnames (Certificate Manager supports them)", () => {

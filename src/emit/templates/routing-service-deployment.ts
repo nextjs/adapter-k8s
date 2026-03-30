@@ -1,6 +1,14 @@
-import { sanitizeK8sName } from './utils.js';
+import { sanitizeK8sName } from "./utils.js";
 
-export function renderRoutingServiceDeployment({ releaseName, buildId, imageRegistry }: { releaseName: string; buildId: string; imageRegistry: string }): string {
+export function renderRoutingServiceDeployment({
+  releaseName,
+  buildId,
+  imageRegistry,
+}: {
+  releaseName: string;
+  buildId: string;
+  imageRegistry: string;
+}): string {
   const safeBuildId = sanitizeK8sName(buildId);
   return `apiVersion: apps/v1
 kind: Deployment

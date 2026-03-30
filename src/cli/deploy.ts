@@ -1,9 +1,9 @@
 // src/cli/deploy.ts
-import path from 'node:path';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { exec, execOrThrow, execCapture } from './exec.js';
-import { readState, writeState } from './state.js';
-import type { GcloudCommand } from './init.js';
+import path from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { exec, execOrThrow, execCapture } from "./exec.js";
+import { readState, writeState } from "./state.js";
+import type { GcloudCommand } from "./init.js";
 
 function sanitizeK8sName(name: string): string {
   let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
@@ -25,7 +25,7 @@ export interface DockerCommandOptions {
   buildId: string;
   registry: string;
   outputDir: string;
-  containerStrategy: 'traced-assets' | 'shared-image';
+  containerStrategy: "traced-assets" | "shared-image";
 }
 
 export function buildDockerCommands(options: DockerCommandOptions): GcloudCommand[] {
@@ -73,14 +73,21 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   // Always build routing service image
   const routingTag = `${registry}/routing-service:${buildId}`;
   commands.push({
-    description: 'Build routing service image',
-    command: 'docker',
-    args: ['build', '-f', `${outputDir}/routing-service/Dockerfile`, '-t', routingTag, `${outputDir}/routing-service`],
+    description: "Build routing service image",
+    command: "docker",
+    args: [
+      "build",
+      "-f",
+      `${outputDir}/routing-service/Dockerfile`,
+      "-t",
+      routingTag,
+      `${outputDir}/routing-service`,
+    ],
   });
   commands.push({
-    description: 'Push routing service image',
-    command: 'docker',
-    args: ['push', routingTag],
+    description: "Push routing service image",
+    command: "docker",
+    args: ["push", routingTag],
   });
 
   return commands;
@@ -96,19 +103,26 @@ export function buildHelmUpgradeArgs(options: {
 }): string[] {
   const { releaseName, chartPath, buildId, registry, previousBuildId, overridesFile } = options;
   const args = [
-    'upgrade', '--install', releaseName, chartPath,
-    '--server-side=true', '--force-conflicts',
-    '--set', `global.image.tag=${buildId}`,
-    '--set', `global.image.registry=${registry}`,
-    '--set', `build.id=${buildId}`,
+    "upgrade",
+    "--install",
+    releaseName,
+    chartPath,
+    "--server-side=true",
+    "--force-conflicts",
+    "--set",
+    `global.image.tag=${buildId}`,
+    "--set",
+    `global.image.registry=${registry}`,
+    "--set",
+    `build.id=${buildId}`,
   ];
 
   if (previousBuildId) {
-    args.push('--set', `previousBuildId=${previousBuildId}`);
+    args.push("--set", `previousBuildId=${previousBuildId}`);
   }
 
   if (overridesFile && existsSync(overridesFile)) {
-    args.push('-f', overridesFile);
+    args.push("-f", overridesFile);
   }
 
   return args;
@@ -117,51 +131,58 @@ export function buildHelmUpgradeArgs(options: {
 export async function runDeploy(options: DeployOptions): Promise<void> {
   const { projectDir, releaseName, skipBuild, skipPush, dryRun } = options;
 
-  const infraPath = path.join(projectDir, '.k8s-adapter', 'infrastructure.json');
+  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (!existsSync(infraPath)) {
     throw new Error(
-      'infrastructure.json not found. Run `npx adapter-k8s init` first, ' +
-      'or create .k8s-adapter/infrastructure.json manually.'
+      "infrastructure.json not found. Run `npx adapter-k8s init` first, " +
+        "or create .k8s-adapter/infrastructure.json manually.",
     );
   }
-  const infra = JSON.parse(readFileSync(infraPath, 'utf-8'));
+  const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
 
   // 0. Ensure kubectl is pointing at the right cluster
   if (!dryRun && infra.projectId && infra.region && releaseName) {
     const clusterName = `${releaseName}-cluster`;
     console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
-    await execOrThrow('gcloud', [
-      'container', 'clusters', 'get-credentials', clusterName,
-      '--region', infra.region, '--project', infra.projectId, '--quiet',
+    await execOrThrow("gcloud", [
+      "container",
+      "clusters",
+      "get-credentials",
+      clusterName,
+      "--region",
+      infra.region,
+      "--project",
+      infra.projectId,
+      "--quiet",
     ]);
   }
 
   // 1. Run next build (adapter's onBuildComplete generates artifacts)
   if (!skipBuild) {
-    console.log('\n  → Running next build...');
+    console.log("\n  → Running next build...");
     if (!dryRun) {
-      await execOrThrow('npx', ['next', 'build'], { cwd: projectDir });
+      await execOrThrow("npx", ["next", "build"], { cwd: projectDir });
     } else {
-      console.log('    [dry-run] npx next build');
+      console.log("    [dry-run] npx next build");
     }
   }
 
   // 2. Read build metadata to get buildId and pool names
-  const outputDir = path.join(projectDir, '.k8s-adapter', 'output');
-  const metadataPath = path.join(outputDir, 'build-metadata.json');
+  const outputDir = path.join(projectDir, ".k8s-adapter", "output");
+  const metadataPath = path.join(outputDir, "build-metadata.json");
   if (!existsSync(metadataPath)) {
     throw new Error(`Build metadata not found at ${metadataPath}. Did next build run?`);
   }
-  const metadata = JSON.parse(readFileSync(metadataPath, 'utf-8'));
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf-8"));
   const buildId: string = metadata.buildId;
   const pools: string[] = metadata.pools;
 
   console.log(`\n  Build ID: ${buildId}`);
-  console.log(`  Pools: ${pools.join(', ')}`);
+  console.log(`  Pools: ${pools.join(", ")}`);
 
   // 3. Read adapter config to determine container strategy
   // Default to traced-assets if not specified
-  const containerStrategy = metadata.containerStrategy ?? 'traced-assets';
+  const containerStrategy = metadata.containerStrategy ?? "traced-assets";
 
   // 4. Docker build + push
   if (!skipPush) {
@@ -169,7 +190,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       pools,
       buildId,
       registry: infra.containerRegistry,
-      outputDir: '.k8s-adapter/output',
+      outputDir: ".k8s-adapter/output",
       containerStrategy,
     });
 
@@ -178,7 +199,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (!dryRun) {
         await execOrThrow(cmd.command, cmd.args, { cwd: projectDir });
       } else {
-        console.log(`    [dry-run] ${cmd.command} ${cmd.args.join(' ')}`);
+        console.log(`    [dry-run] ${cmd.command} ${cmd.args.join(" ")}`);
       }
     }
   }
@@ -186,15 +207,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // 5. Pre-flight: ensure static IP exists (Gateway needs it)
   if (!dryRun && infra.projectId) {
     const ipName = `${releaseName}-ip`;
-    const ipCheck = await execCapture('gcloud', [
-      'compute', 'addresses', 'describe', ipName,
-      '--global', '--project', infra.projectId, '--format=value(address)',
+    const ipCheck = await execCapture("gcloud", [
+      "compute",
+      "addresses",
+      "describe",
+      ipName,
+      "--global",
+      "--project",
+      infra.projectId,
+      "--format=value(address)",
     ]);
     if (ipCheck.exitCode !== 0) {
       console.log(`\n  → Creating static IP "${ipName}"...`);
-      await execOrThrow('gcloud', [
-        'compute', 'addresses', 'create', ipName,
-        '--global', '--project', infra.projectId, '--quiet',
+      await execOrThrow("gcloud", [
+        "compute",
+        "addresses",
+        "create",
+        ipName,
+        "--global",
+        "--project",
+        infra.projectId,
+        "--quiet",
       ]);
     }
   }
@@ -203,10 +236,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   const state = await readState(projectDir, releaseName);
   const previousBuildId = state?.buildId ?? null;
 
-  const overridesFile = path.join(projectDir, '.k8s-adapter', 'helm', 'values.override.yaml');
+  const overridesFile = path.join(projectDir, ".k8s-adapter", "helm", "values.override.yaml");
   const helmArgs = buildHelmUpgradeArgs({
     releaseName,
-    chartPath: path.join(outputDir, 'chart'),
+    chartPath: path.join(outputDir, "chart"),
     buildId,
     registry: infra.containerRegistry,
     previousBuildId,
@@ -216,7 +249,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Inject previous build's deployment+service into the chart so Helm doesn't delete it.
   // Without this, helm upgrade only sees the current build's templates and deletes the previous.
   if (previousBuildId && previousBuildId !== buildId) {
-    const chartTemplatesDir = path.join(outputDir, 'chart', 'templates');
+    const chartTemplatesDir = path.join(outputDir, "chart", "templates");
     const prevName = sanitizeK8sName(`${releaseName}-default-${previousBuildId}`);
     const prevSafeBuildId = sanitizeK8sName(previousBuildId);
 
@@ -224,7 +257,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
 
       // Previous deployment at 0 replicas (kept for rollback)
-      writeFileSync(path.join(chartTemplatesDir, `${poolName}-prev-deployment.yaml`), `apiVersion: apps/v1
+      writeFileSync(
+        path.join(chartTemplatesDir, `${poolName}-prev-deployment.yaml`),
+        `apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${poolPrevName}
@@ -268,10 +303,13 @@ spec:
               path: /healthz
               port: 3000
             initialDelaySeconds: 10
-`);
+`,
+      );
 
       // Previous versioned service (needed for the deployment's pods to be reachable)
-      writeFileSync(path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`), `apiVersion: v1
+      writeFileSync(
+        path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`),
+        `apiVersion: v1
 kind: Service
 metadata:
   name: ${poolPrevName}
@@ -287,15 +325,16 @@ spec:
   ports:
     - port: 3000
       targetPort: 3000
-`);
+`,
+      );
     }
   }
 
-  console.log('\n  → Running helm upgrade...');
+  console.log("\n  → Running helm upgrade...");
   if (!dryRun) {
-    await execOrThrow('helm', helmArgs);
+    await execOrThrow("helm", helmArgs);
   } else {
-    console.log(`    [dry-run] helm ${helmArgs.join(' ')}`);
+    console.log(`    [dry-run] helm ${helmArgs.join(" ")}`);
   }
 
   // 6. Update state (local + cluster ConfigMap)
@@ -307,21 +346,38 @@ spec:
   if (!dryRun) {
     // Strip all non-alphanumeric for matching — K8s names replace special chars with dashes,
     // so we need to compare alphanumeric-only to avoid mismatches
-    const currentBuildLower = buildId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
+    const currentBuildLower = buildId
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .slice(0, 12);
 
     // 7a. Wait for new deployment to be ready
     console.log(`\n  → Waiting for new pods to be ready...`);
-    const newDeployResult = await execCapture('kubectl', [
-      'get', 'deployments', '-l', `app.kubernetes.io/name=${releaseName}`,
-      '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+    const newDeployResult = await execCapture("kubectl", [
+      "get",
+      "deployments",
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
-    const newDeploys = (newDeployResult.stdout?.trim().split('\n') ?? [])
-      .filter(n => n && !n.includes('routing-service') && n.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower));
+    const newDeploys = (newDeployResult.stdout?.trim().split("\n") ?? []).filter(
+      (n) =>
+        n &&
+        !n.includes("routing-service") &&
+        n
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "")
+          .includes(currentBuildLower),
+    );
 
     for (const deployName of newDeploys) {
       console.log(`    Waiting for ${deployName}...`);
-      await execCapture('kubectl', [
-        'rollout', 'status', `deployment/${deployName}`, '--timeout=120s',
+      await execCapture("kubectl", [
+        "rollout",
+        "status",
+        `deployment/${deployName}`,
+        "--timeout=120s",
       ]);
     }
 
@@ -336,16 +392,27 @@ spec:
       let checkedCount = 0;
       for (const deployName of newDeploys) {
         // Get pods for this deployment
-        const podsResult = await execCapture('kubectl', [
-          'get', 'pods', '-l', `app.kubernetes.io/name=${releaseName}`,
-          '-o', 'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{\"\\n\"}{end}',
+        const podsResult = await execCapture("kubectl", [
+          "get",
+          "pods",
+          "-l",
+          `app.kubernetes.io/name=${releaseName}`,
+          "-o",
+          'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\\n"}{end}',
         ]);
         if (podsResult.exitCode === 0) {
-          for (const line of podsResult.stdout.trim().split('\n')) {
-            const [podName, ready] = line.split('|');
-            if (!podName || !podName.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)) continue;
+          for (const line of podsResult.stdout.trim().split("\n")) {
+            const [podName, ready] = line.split("|");
+            if (
+              !podName ||
+              !podName
+                .toLowerCase()
+                .replace(/[^a-z0-9]/g, "")
+                .includes(currentBuildLower)
+            )
+              continue;
             checkedCount++;
-            if (ready !== 'True') allHealthy = false;
+            if (ready !== "True") allHealthy = false;
           }
         }
       }
@@ -355,7 +422,7 @@ spec:
         break;
       }
       if (attempt < maxHealthAttempts - 1) {
-        await new Promise(r => setTimeout(r, 5000));
+        await new Promise((r) => setTimeout(r, 5000));
       }
     }
 
@@ -364,37 +431,60 @@ spec:
       console.error(`  The previous build is still serving traffic. No cutover performed.\n`);
 
       // Try to get more diagnostic info
-      const newPods = await execCapture('kubectl', [
-        'get', 'pods', '-l', `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component!=routing-service`,
-        '-o', 'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{\"\\n\"}{end}',
+      const newPods = await execCapture("kubectl", [
+        "get",
+        "pods",
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component!=routing-service`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{"\\n"}{end}',
       ]);
       if (newPods.exitCode === 0 && newPods.stdout.trim()) {
-        const podLines = newPods.stdout.trim().split('\n');
+        const podLines = newPods.stdout.trim().split("\n");
         for (const line of podLines) {
-          const [podName, phase] = line.split('|');
-          if (!podName || !podName.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)) continue;
+          const [podName, phase] = line.split("|");
+          if (
+            !podName ||
+            !podName
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "")
+              .includes(currentBuildLower)
+          )
+            continue;
           console.error(`  Pod ${podName}: ${phase}`);
           // Try hitting healthz directly
-          const healthzResult = await execCapture('kubectl', [
-            'exec', podName, '--', 'node', '-e',
+          const healthzResult = await execCapture("kubectl", [
+            "exec",
+            podName,
+            "--",
+            "node",
+            "-e",
             `const http=require("http");http.get("http://localhost:3000/healthz",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>console.log(r.statusCode,d))}).on("error",e=>console.log("ERR",e.message))`,
           ]);
           if (healthzResult.exitCode === 0) {
             console.error(`  Healthz: ${healthzResult.stdout.trim()}`);
           }
           // Get last error from logs
-          const logsResult = await execCapture('kubectl', ['logs', podName, '--tail=20']);
+          const logsResult = await execCapture("kubectl", ["logs", podName, "--tail=20"]);
           if (logsResult.exitCode === 0) {
-            const errorLines = logsResult.stdout.split('\n').filter(l =>
-              l.includes('Error') || l.includes('error') || l.includes('FATAL') || l.includes('Cannot find')
-            );
+            const errorLines = logsResult.stdout
+              .split("\n")
+              .filter(
+                (l) =>
+                  l.includes("Error") ||
+                  l.includes("error") ||
+                  l.includes("FATAL") ||
+                  l.includes("Cannot find"),
+              );
             if (errorLines.length > 0) {
               console.error(`  Errors:`);
               for (const err of errorLines.slice(0, 5)) {
                 console.error(`    ${err.trim().slice(0, 150)}`);
               }
             } else {
-              console.error(`  No errors in pod logs. The issue may be GCP health check configuration.`);
+              console.error(
+                `  No errors in pod logs. The issue may be GCP health check configuration.`,
+              );
             }
           }
         }
@@ -408,34 +498,56 @@ spec:
     }
 
     // 7c. Cut traffic over: patch each active Service selector to the new build
-    const safeBuildId = buildId.toLowerCase().replace(/[^a-z0-9.-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
+    const safeBuildId = buildId
+      .toLowerCase()
+      .replace(/[^a-z0-9.-]/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 63);
     console.log(`  → Switching traffic to new build...`);
     for (const pool of pools) {
-      const activeServiceName = `${releaseName}-${pool}`.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 63);
-      await execCapture('kubectl', [
-        'patch', 'service', activeServiceName, '--type=json',
-        '--field-manager=helm', '--force-conflicts',
-        '-p', JSON.stringify([{
-          op: 'replace',
-          path: '/spec/selector/app.kubernetes.io~1version',
-          value: safeBuildId,
-        }]),
+      const activeServiceName = `${releaseName}-${pool}`
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 63);
+      await execCapture("kubectl", [
+        "patch",
+        "service",
+        activeServiceName,
+        "--type=json",
+        "--field-manager=helm",
+        "--force-conflicts",
+        "-p",
+        JSON.stringify([
+          {
+            op: "replace",
+            path: "/spec/selector/app.kubernetes.io~1version",
+            value: safeBuildId,
+          },
+        ]),
       ]);
     }
 
     // 7d. Clean up old deployments.
     // The previous build is already at 0 replicas (from the chart template we injected).
     // Delete anything that isn't the current or previous build.
-    const previousBuildLower = previousBuildId?.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12);
+    const previousBuildLower = previousBuildId
+      ?.toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .slice(0, 12);
 
-    const allDeploys = await execCapture('kubectl', [
-      'get', 'deployments', '-l', `app.kubernetes.io/name=${releaseName}`,
-      '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+    const allDeploys = await execCapture("kubectl", [
+      "get",
+      "deployments",
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
     if (allDeploys.exitCode === 0) {
-      for (const name of allDeploys.stdout.trim().split('\n')) {
-        if (!name || name.includes('routing-service')) continue;
-        const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+      for (const name of allDeploys.stdout.trim().split("\n")) {
+        if (!name || name.includes("routing-service")) continue;
+        const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
         // Keep current build
         if (normalized.includes(currentBuildLower)) continue;
         // Keep previous build (rollback target)
@@ -445,21 +557,34 @@ spec:
         }
         // Delete everything else
         console.log(`  → Deleting old build: ${name}`);
-        await execCapture('kubectl', ['delete', 'deployment', name]);
-        await execCapture('kubectl', ['delete', 'service', name]).catch(() => {});
-        await execCapture('kubectl', ['delete', 'healthcheckpolicy', `${name}-hcp`]).catch(() => {});
+        await execCapture("kubectl", ["delete", "deployment", name]);
+        await execCapture("kubectl", ["delete", "service", name]).catch(() => {});
+        await execCapture("kubectl", ["delete", "healthcheckpolicy", `${name}-hcp`]).catch(
+          () => {},
+        );
       }
     }
 
     // Clean up old route-ext Jobs (they're immutable, each deploy creates a new one)
-    const oldJobs = await execCapture('kubectl', [
-      'get', 'jobs', '-l', `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
-      '-o', 'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+    const oldJobs = await execCapture("kubectl", [
+      "get",
+      "jobs",
+      "-l",
+      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
     if (oldJobs.exitCode === 0) {
-      for (const jobName of oldJobs.stdout.trim().split('\n')) {
-        if (!jobName || jobName.toLowerCase().replace(/[^a-z0-9]/g, '').includes(currentBuildLower)) continue;
-        await execCapture('kubectl', ['delete', 'job', jobName]);
+      for (const jobName of oldJobs.stdout.trim().split("\n")) {
+        if (
+          !jobName ||
+          jobName
+            .toLowerCase()
+            .replace(/[^a-z0-9]/g, "")
+            .includes(currentBuildLower)
+        )
+          continue;
+        await execCapture("kubectl", ["delete", "job", jobName]);
       }
     }
   }
@@ -468,10 +593,9 @@ spec:
 
   // 8. Run domain health checks
   if (!dryRun) {
-    const { runDomainChecks } = await import('./doctor.js');
+    const { runDomainChecks } = await import("./doctor.js");
     await runDomainChecks({ projectDir, releaseName });
   }
 
-  console.log('');
+  console.log("");
 }
-

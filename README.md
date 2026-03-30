@@ -44,23 +44,21 @@ NEXT_ADAPTER_PATH=@next-community/adapter-k8s
 Or create `adapter.config.mjs` (scaffolded by `init`):
 
 ```js
-import { createK8sAdapter } from '@next-community/adapter-k8s';
+import { createK8sAdapter } from "@next-community/adapter-k8s";
 
 export default createK8sAdapter({
   pools: {
     default: {
-      routes: ['appPages', 'appRoutes', 'pagesApi'],
+      routes: ["appPages", "appRoutes", "pagesApi"],
       scaling: { min: 2, max: 10, targetCPU: 70 },
     },
   },
   provider: {
     gke: {
       gateway: {
-        type: 'gateway-api',
-        className: 'gke-l7-global-external-managed',
-        hosts: [
-          { hostname: 'app.example.com', tls: { enabled: true, managedCert: true } },
-        ],
+        type: "gateway-api",
+        className: "gke-l7-global-external-managed",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true, managedCert: true } }],
       },
     },
   },
@@ -74,6 +72,7 @@ npx adapter-k8s init --project-id my-project --host app.example.com
 ```
 
 This provisions (idempotently via `gcloud`):
+
 - GKE Autopilot cluster
 - Global static IP
 - Artifact Registry repository
@@ -91,6 +90,7 @@ npx adapter-k8s deploy
 ```
 
 The deploy flow:
+
 1. `next build` (adapter generates artifacts in `.k8s-adapter/output/`)
 2. `docker build` + `push` per pool + routing service
 3. `helm upgrade --install` with the generated chart
@@ -110,15 +110,15 @@ Provision GCP infrastructure and scaffold config.
 npx adapter-k8s init --project-id <id> --host <hostname>
 ```
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--project-id` | GCP project ID | `$GCP_PROJECT_ID` |
-| `--region` | GCP region | `us-central1` |
-| `--host` | Hostname(s), comma-separated. Supports wildcards (`*.example.com`) | `$APP_HOST` |
-| `--bucket` | GCS bucket name | `{project-id}-nextjs-static` |
-| `--registry` | Container registry URL | `{region}-docker.pkg.dev/{project-id}/nextjs` |
-| `--release-name` | Helm release name | Directory name |
-| `--dry-run` | Show commands without executing | |
+| Flag             | Description                                                        | Default                                       |
+| ---------------- | ------------------------------------------------------------------ | --------------------------------------------- |
+| `--project-id`   | GCP project ID                                                     | `$GCP_PROJECT_ID`                             |
+| `--region`       | GCP region                                                         | `us-central1`                                 |
+| `--host`         | Hostname(s), comma-separated. Supports wildcards (`*.example.com`) | `$APP_HOST`                                   |
+| `--bucket`       | GCS bucket name                                                    | `{project-id}-nextjs-static`                  |
+| `--registry`     | Container registry URL                                             | `{region}-docker.pkg.dev/{project-id}/nextjs` |
+| `--release-name` | Helm release name                                                  | Directory name                                |
+| `--dry-run`      | Show commands without executing                                    |                                               |
 
 ### `deploy`
 
@@ -196,15 +196,15 @@ Split your routes across independent scaling groups:
 export default createK8sAdapter({
   pools: {
     ssr: {
-      routes: ['appPages'],
+      routes: ["appPages"],
       scaling: { min: 2, max: 20, targetCPU: 70 },
     },
     api: {
-      routes: ['appRoutes', 'pagesApi'],
+      routes: ["appRoutes", "pagesApi"],
       scaling: { min: 2, max: 10, targetCPU: 60 },
     },
     heavy: {
-      routes: ['/api/generate-report', '/api/export/*'],
+      routes: ["/api/generate-report", "/api/export/*"],
       scaling: { min: 1, max: 5, targetCPU: 50 },
     },
   },
@@ -283,6 +283,7 @@ containerStrategy: 'shared-image',
 Each deploy creates a new versioned Deployment alongside the previous one. The HTTPRoute always points to a **stable active Service** whose selector is patched only after the new build is confirmed healthy.
 
 Traffic cutover sequence:
+
 1. Helm creates new Deployment + versioned Service (old build still serving)
 2. New pods pass Kubernetes readiness probes
 3. New backends pass GCP load balancer health checks (`/healthz`)
@@ -345,14 +346,14 @@ The Helm chart is self-contained. The CLI is a convenience wrapper -- everything
 
 ## Implementation Status
 
-| Phase | Status | What |
-|-------|--------|------|
-| 1 | Done | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback) |
-| 2 | Done | Route extension service (ext_proc), CEL generation, Service Extensions |
-| 3 | Planned | Distributed caching (Valkey/Redis for ISR + `use cache`) |
-| 4 | Planned | Cloud CDN integration with coordinated invalidation |
-| 5 | Planned | PPR (partial prerendering with cache-first preamble) |
-| 6 | Planned | Skew protection (versioned routing for zero-mismatch deploys) |
+| Phase | Status  | What                                                                          |
+| ----- | ------- | ----------------------------------------------------------------------------- |
+| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback) |
+| 2     | Done    | Route extension service (ext_proc), CEL generation, Service Extensions        |
+| 3     | Planned | Distributed caching (Valkey/Redis for ISR + `use cache`)                      |
+| 4     | Planned | Cloud CDN integration with coordinated invalidation                           |
+| 5     | Planned | PPR (partial prerendering with cache-first preamble)                          |
+| 6     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                 |
 
 ## License
 

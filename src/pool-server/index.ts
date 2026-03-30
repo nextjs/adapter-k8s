@@ -32,7 +32,7 @@ async function ensureNextNodeEnvironment(): Promise<void> {
   }
 
   console.warn(
-    "[pool-server] Could not load Next.js node environment shims from app dependencies — AsyncLocalStorage may not work"
+    "[pool-server] Could not load Next.js node environment shims from app dependencies — AsyncLocalStorage may not work",
   );
 }
 
@@ -93,33 +93,25 @@ async function main() {
   if (!poolName) throw new Error("POOL_NAME environment variable is required");
 
   const buildId = process.env.NEXT_BUILD_ID;
-  if (!buildId)
-    throw new Error("NEXT_BUILD_ID environment variable is required");
+  if (!buildId) throw new Error("NEXT_BUILD_ID environment variable is required");
 
   const port = parseInt(process.env.PORT ?? "3000", 10);
   const releaseName = process.env.RELEASE_NAME ?? "nextjs";
   const configDir = process.env.CONFIG_DIR ?? "/config";
 
   // Load pool manifest (mounted as ConfigMap or baked into container)
-  const poolManifestPath = path.join(
-    configDir,
-    `pool-manifest-${poolName}.json`,
-  );
+  const poolManifestPath = path.join(configDir, `pool-manifest-${poolName}.json`);
   if (!existsSync(poolManifestPath)) {
     throw new Error(`Pool manifest not found: ${poolManifestPath}`);
   }
-  const poolManifest: PoolManifest = JSON.parse(
-    readFileSync(poolManifestPath, "utf-8"),
-  );
+  const poolManifest: PoolManifest = JSON.parse(readFileSync(poolManifestPath, "utf-8"));
 
   // Load routing manifest (for local route resolution in Phase 1)
   const routingManifestPath = path.join(configDir, "routing-manifest.json");
   if (!existsSync(routingManifestPath)) {
     throw new Error(`Routing manifest not found: ${routingManifestPath}`);
   }
-  const routingManifest: RoutingManifest = JSON.parse(
-    readFileSync(routingManifestPath, "utf-8"),
-  );
+  const routingManifest: RoutingManifest = JSON.parse(readFileSync(routingManifestPath, "utf-8"));
 
   // Load static assets manifest
   const staticAssetsPath = path.join(configDir, "static-assets.json");
@@ -158,8 +150,7 @@ async function main() {
       const headers = new Headers();
       for (const [key, value] of Object.entries(req.headers)) {
         if (typeof value === "string") headers.set(key, value);
-        else if (Array.isArray(value))
-          value.forEach((v) => headers.append(key, v));
+        else if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
       }
 
       const bodyBuffer =
@@ -178,8 +169,7 @@ async function main() {
           rsc: headers.get("rsc"),
           accept: headers.get("accept"),
           nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
-          nextRouterStateTreePreview:
-            headers.get("next-router-state-tree")?.slice(0, 160),
+          nextRouterStateTreePreview: headers.get("next-router-state-tree")?.slice(0, 160),
           nextUrl: headers.get("next-url"),
           contentType: headers.get("content-type"),
           contentLength: headers.get("content-length"),
@@ -191,8 +181,7 @@ async function main() {
       // Phase 2+: if dispatch headers exist (from route extension), use them directly
       const extOutputId = req.headers["x-output-id"] as string | undefined;
       if (extOutputId) {
-        const matchedPathname =
-          (req.headers["x-matched-pathname"] as string) ?? url.pathname;
+        const matchedPathname = (req.headers["x-matched-pathname"] as string) ?? url.pathname;
         const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
         const routeMatches = routeMatchesRaw ? JSON.parse(routeMatchesRaw) : null;
         const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;

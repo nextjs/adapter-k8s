@@ -1,15 +1,22 @@
 // src/pool-server/resolve.ts
-import { resolveRoutes, responseToMiddlewareResult } from '@next/routing';
-import type { RoutingManifest } from '../types.js';
+import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
+import type { RoutingManifest } from "../types.js";
 
 type LoadedModule = Record<string, unknown>;
 
 export type ResolveResult =
-  | { kind: 'route'; pool: string; matchedPathname: string; routeMatches: Record<string, string> | null; resolvedHeaders: Headers | undefined; middlewareRequestHeaders?: Headers | undefined }
-  | { kind: 'redirect'; url: URL; status: number }
-  | { kind: 'middleware-response'; response: Response }
-  | { kind: 'external-rewrite'; url: URL }
-  | { kind: 'not-found' };
+  | {
+      kind: "route";
+      pool: string;
+      matchedPathname: string;
+      routeMatches: Record<string, string> | null;
+      resolvedHeaders: Headers | undefined;
+      middlewareRequestHeaders?: Headers | undefined;
+    }
+  | { kind: "redirect"; url: URL; status: number }
+  | { kind: "middleware-response"; response: Response }
+  | { kind: "external-rewrite"; url: URL }
+  | { kind: "not-found" };
 
 export function createLocalResolver(
   manifest: RoutingManifest,
@@ -42,14 +49,17 @@ export function createLocalResolver(
         invokeMiddleware: middlewareModule
           ? async (ctx) => {
               const legacyMiddlewareFn =
-                typeof (middlewareModule.default as Record<string, unknown> | undefined)?.default === 'function'
-                  ? (((middlewareModule.default as Record<string, unknown>).default) as (...args: unknown[]) => unknown)
+                typeof (middlewareModule.default as Record<string, unknown> | undefined)
+                  ?.default === "function"
+                  ? ((middlewareModule.default as Record<string, unknown>).default as (
+                      ...args: unknown[]
+                    ) => unknown)
                   : null;
 
               const requestInit: RequestInit & { duplex?: "half" } = {
                 method,
                 headers: new Headers(
-                  [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":"))
+                  [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                 ),
                 duplex: "half",
               };
@@ -59,9 +69,9 @@ export function createLocalResolver(
               const middlewareRequest = new Request(ctx.url.toString(), requestInit);
 
               const adapterFn =
-                typeof middlewareModule.default === 'function'
+                typeof middlewareModule.default === "function"
                   ? (middlewareModule.default as (...args: unknown[]) => unknown)
-                  : typeof middlewareModule === 'function'
+                  : typeof middlewareModule === "function"
                     ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
                     : null;
 
@@ -81,22 +91,19 @@ export function createLocalResolver(
 
                 if (legacyMiddlewareFn) {
                   const requestHeaders = Object.fromEntries(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(':'))
+                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                   );
                   const result = await (legacyMiddlewareFn as any)({
                     request: {
                       url: ctx.url.toString(),
                       method,
                       headers: requestHeaders,
-                      body:
-                        method !== 'GET' && method !== 'HEAD'
-                          ? ctx.requestBody
-                          : undefined,
-                      destination: 'document',
-                      credentials: 'same-origin',
+                      body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                      destination: "document",
+                      credentials: "same-origin",
                       bodyUsed: false,
-                      mode: 'navigate',
-                      redirect: 'follow',
+                      mode: "navigate",
+                      redirect: "follow",
                     },
                   });
 
@@ -117,7 +124,7 @@ export function createLocalResolver(
                 // expected `{ handler, request, page }` shape.
                 if (!response && adapterFn && handlerFn) {
                   const requestHeaders = Object.fromEntries(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(':'))
+                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                   );
                   const result = await (adapterFn as any)({
                     handler: handlerFn,
@@ -125,10 +132,7 @@ export function createLocalResolver(
                       url: ctx.url.toString(),
                       method,
                       headers: requestHeaders,
-                      body:
-                        method !== 'GET' && method !== 'HEAD'
-                          ? ctx.requestBody
-                          : undefined,
+                      body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
                       signal: new AbortController().signal,
                       nextConfig: {
                         basePath: manifest.basePath || undefined,
@@ -136,7 +140,7 @@ export function createLocalResolver(
                       },
                       waitUntil,
                     },
-                    page: 'middleware',
+                    page: "middleware",
                   });
 
                   response =
@@ -145,7 +149,7 @@ export function createLocalResolver(
                       : result instanceof Response
                         ? result
                         : null;
-                } else if (!response && typeof handlerFn === 'function') {
+                } else if (!response && typeof handlerFn === "function") {
                   const result = await (handlerFn as any)(middlewareRequest, {
                     waitUntil,
                   });
@@ -184,13 +188,17 @@ export function createLocalResolver(
 
       // 1. Redirect
       if (resolution.redirect) {
-        return { kind: 'redirect', url: resolution.redirect.url, status: resolution.redirect.status };
+        return {
+          kind: "redirect",
+          url: resolution.redirect.url,
+          status: resolution.redirect.status,
+        };
       }
 
-      const location = resolution.resolvedHeaders?.get('location');
+      const location = resolution.resolvedHeaders?.get("location");
       if (location && [301, 302, 307, 308].includes(resolution.status ?? 0)) {
         return {
-          kind: 'redirect',
+          kind: "redirect",
           url: new URL(location, url.origin),
           status: resolution.status!,
         };
@@ -198,27 +206,29 @@ export function createLocalResolver(
 
       // 2. Middleware short-circuit
       if (resolution.middlewareResponded && middlewareResponse) {
-        return { kind: 'middleware-response', response: middlewareResponse };
+        return { kind: "middleware-response", response: middlewareResponse };
       }
 
       // 3. External rewrite
       if (resolution.externalRewrite) {
-        return { kind: 'external-rewrite', url: resolution.externalRewrite };
+        return { kind: "external-rewrite", url: resolution.externalRewrite };
       }
 
       // 4. Normal route resolution
       const matchedPathname = resolution.invocationTarget?.pathname ?? url.pathname;
-      const pool = manifest.poolAssignments[resolution.resolvedPathname ?? '']
-        ?? manifest.poolAssignments[matchedPathname];
+      const pool =
+        manifest.poolAssignments[resolution.resolvedPathname ?? ""] ??
+        manifest.poolAssignments[matchedPathname];
 
       if (!pool) {
-        return { kind: 'not-found' };
+        return { kind: "not-found" };
       }
 
-      const finalMatchedPathname = resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname;
+      const finalMatchedPathname =
+        resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname;
 
       return {
-        kind: 'route',
+        kind: "route",
         pool,
         matchedPathname: finalMatchedPathname,
         routeMatches: resolution.routeMatches ?? null,

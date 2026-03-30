@@ -1,19 +1,19 @@
 // src/pool-server/dispatch.ts
-import { once } from 'node:events';
-import { createServer, request as httpRequest } from 'node:http';
-import { readFileSync, existsSync } from 'node:fs';
-import path from 'node:path';
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { HandlerLoader } from './handler-loader.js';
-import type { ResolveResult } from './resolve.js';
-import type { StaticAssetEntry } from '../types.js';
+import { once } from "node:events";
+import { createServer, request as httpRequest } from "node:http";
+import { readFileSync, existsSync } from "node:fs";
+import path from "node:path";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import type { HandlerLoader } from "./handler-loader.js";
+import type { ResolveResult } from "./resolve.js";
+import type { StaticAssetEntry } from "../types.js";
 
-const NEXT_REQUEST_META = Symbol.for('NextInternalRequestMeta');
+const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
 function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> {
   const headers: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === 'undefined') continue;
+    if (typeof value === "undefined") continue;
     headers[key] = value;
   }
   return headers;
@@ -27,7 +27,7 @@ async function writeInnerResponse(
   for await (const chunk of innerRes) {
     const shouldContinue = outerRes.write(chunk);
     if (!shouldContinue) {
-      await once(outerRes, 'drain');
+      await once(outerRes, "drain");
     }
   }
   outerRes.end();
@@ -57,8 +57,8 @@ async function invokeLocalHandlerOverHttp({
               void waitable.catch(() => undefined);
             },
             requestMeta: {
-              relativeProjectDir: '.',
-              hostname: req.headers.host?.split(':')[0] ?? '127.0.0.1',
+              relativeProjectDir: ".",
+              hostname: req.headers.host?.split(":")[0] ?? "127.0.0.1",
               outputId: matchedPathname,
               matchedPathname,
               routeMatches,
@@ -93,7 +93,7 @@ async function invokeLocalHandlerOverHttp({
         } catch (error) {
           if (!innerRes.headersSent) {
             innerRes.statusCode = 500;
-            innerRes.end('Internal Server Error');
+            innerRes.end("Internal Server Error");
           } else if (!innerRes.writableEnded) {
             innerRes.end();
           }
@@ -102,17 +102,17 @@ async function invokeLocalHandlerOverHttp({
       })();
     });
 
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
       const address = server.address();
-      if (!address || typeof address === 'string') {
-        server.close(() => reject(new Error('Failed to allocate loopback port')));
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("Failed to allocate loopback port")));
         return;
       }
 
       const clientReq = httpRequest(
         {
-          hostname: '127.0.0.1',
+          hostname: "127.0.0.1",
           port: address.port,
           method: req.method,
           path: req.url,
@@ -129,7 +129,7 @@ async function invokeLocalHandlerOverHttp({
         },
       );
 
-      clientReq.once('error', (error) => {
+      clientReq.once("error", (error) => {
         server.close(() => reject(error));
       });
 
@@ -166,7 +166,7 @@ export function createDispatcher(options: DispatcherOptions) {
     poolName,
     buildId,
     staticAssets,
-    releaseName = 'nextjs',
+    releaseName = "nextjs",
     localHandlerInvoker = invokeLocalHandlerOverHttp,
   } = options;
 
@@ -179,17 +179,21 @@ export function createDispatcher(options: DispatcherOptions) {
       // 1. Serve static assets from the manifest.
       // Skip for PPR routes (they have postponedState) — the handler must stream dynamic content.
       // Skip if request has resume headers (PPR resume step).
-      if (resolution.kind === 'route') {
-        const staticAsset = staticAssets.find(a => a.pathname === resolution.matchedPathname);
+      if (resolution.kind === "route") {
+        const staticAsset = staticAssets.find((a) => a.pathname === resolution.matchedPathname);
         const isPPR = staticAsset?.ppr;
-        const hasResumeHeader = req.headers['next-resume'] === '1' || req.headers['x-nextjs-ppr'] === '1';
+        const hasResumeHeader =
+          req.headers["next-resume"] === "1" || req.headers["x-nextjs-ppr"] === "1";
         if (staticAsset && !isPPR && !hasResumeHeader) {
           const fullPath = path.resolve(process.cwd(), staticAsset.filePath);
           if (existsSync(fullPath)) {
             const content = readFileSync(fullPath);
             const assetHeaders = staticAsset.headers;
             const headers: Record<string, string | string[]> = Object.assign(
-              { 'cache-control': staticAsset.cacheControl, 'content-type': getContentType(staticAsset.pathname) },
+              {
+                "cache-control": staticAsset.cacheControl,
+                "content-type": getContentType(staticAsset.pathname),
+              },
               assetHeaders || {},
             );
             res.writeHead(staticAsset.status ?? 200, headers);
@@ -200,13 +204,13 @@ export function createDispatcher(options: DispatcherOptions) {
       }
 
       switch (resolution.kind) {
-        case 'redirect': {
+        case "redirect": {
           res.writeHead(resolution.status, { location: resolution.url.toString() });
           res.end();
           return;
         }
 
-        case 'middleware-response': {
+        case "middleware-response": {
           const mwRes = resolution.response;
           const headers: Record<string, string> = {};
           for (const [key, value] of mwRes.headers.entries()) {
@@ -229,30 +233,30 @@ export function createDispatcher(options: DispatcherOptions) {
           return;
         }
 
-        case 'external-rewrite': {
-          res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
+        case "external-rewrite": {
+          res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
           res.end(
             `External rewrites are not supported in adapter-k8s v1. ` +
-            `Attempted rewrite to: ${resolution.url.toString()}\n` +
-            `Use a Route Handler to proxy external APIs instead.`
+              `Attempted rewrite to: ${resolution.url.toString()}\n` +
+              `Use a Route Handler to proxy external APIs instead.`,
           );
           return;
         }
 
-        case 'not-found': {
-          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-          res.end('Not Found');
+        case "not-found": {
+          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+          res.end("Not Found");
           return;
         }
 
-        case 'route': {
+        case "route": {
           const outputInfo = handlerLoader.get?.(resolution.matchedPathname);
-          if (outputInfo?.runtime === 'edge' || outputInfo?.filePath?.includes('/server/edge/')) {
-            res.writeHead(501, { 'content-type': 'text/plain; charset=utf-8' });
+          if (outputInfo?.runtime === "edge" || outputInfo?.filePath?.includes("/server/edge/")) {
+            res.writeHead(501, { "content-type": "text/plain; charset=utf-8" });
             res.end(
               `Edge runtime routes are not supported by adapter-k8s pool-server yet. ` +
-              `Route: ${resolution.matchedPathname}\n` +
-              `File: ${outputInfo.filePath}\n`
+                `Route: ${resolution.matchedPathname}\n` +
+                `File: ${outputInfo.filePath}\n`,
             );
             return;
           }
@@ -262,16 +266,18 @@ export function createDispatcher(options: DispatcherOptions) {
             for (const [key, value] of resolution.resolvedHeaders.entries()) {
               // set-cookie needs special handling — Headers joins multiples with ", "
               // but Node requires an array for multiple Set-Cookie headers
-              if (key.toLowerCase() === 'set-cookie') {
-                const existing = res.getHeader('set-cookie');
+              if (key.toLowerCase() === "set-cookie") {
+                const existing = res.getHeader("set-cookie");
                 const arr = existing
-                  ? (Array.isArray(existing) ? existing : [String(existing)])
+                  ? Array.isArray(existing)
+                    ? existing
+                    : [String(existing)]
                   : [];
                 // Split on boundaries between cookies (comma followed by cookie name=)
                 for (const c of value.split(/,(?=[^;]*=)/)) {
                   arr.push(c.trim());
                 }
-                res.setHeader('set-cookie', arr);
+                res.setHeader("set-cookie", arr);
               } else {
                 res.setHeader(key, value);
               }
@@ -284,11 +290,11 @@ export function createDispatcher(options: DispatcherOptions) {
           if (resolution.middlewareRequestHeaders) {
             for (const [key, value] of resolution.middlewareRequestHeaders.entries()) {
               // Skip internal x-middleware-* headers — they're control signals, not for the handler
-              if (key.startsWith('x-middleware-')) continue;
-              if (key === 'cookie') {
+              if (key.startsWith("x-middleware-")) continue;
+              if (key === "cookie") {
                 // Merge middleware-set cookies with original request cookies
-                const existing = req.headers.cookie ?? '';
-                req.headers.cookie = [existing, value].filter(Boolean).join('; ');
+                const existing = req.headers.cookie ?? "";
+                req.headers.cookie = [existing, value].filter(Boolean).join("; ");
               } else {
                 req.headers[key] = value;
               }
@@ -302,9 +308,11 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // Load and invoke the handler directly
           const handler = await handlerLoader.load(resolution.matchedPathname);
-          const bufferedBody = (req as IncomingMessage & {
-            [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-          })[NEXT_REQUEST_META]?.actionBody;
+          const bufferedBody = (
+            req as IncomingMessage & {
+              [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+            }
+          )[NEXT_REQUEST_META]?.actionBody;
 
           await localHandlerInvoker({
             handler,
@@ -324,7 +332,7 @@ export function createDispatcher(options: DispatcherOptions) {
 function proxyToPool(
   req: IncomingMessage,
   res: ServerResponse,
-  resolution: Extract<ResolveResult, { kind: 'route' }>,
+  resolution: Extract<ResolveResult, { kind: "route" }>,
   releaseName: string,
   buildId: string,
 ): Promise<void> {
@@ -338,29 +346,31 @@ function proxyToPool(
         method: req.method,
         headers: {
           ...req.headers,
-          'x-output-id': resolution.matchedPathname,
-          'x-matched-pathname': resolution.matchedPathname,
-          'x-route-matches': resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : '',
+          "x-output-id": resolution.matchedPathname,
+          "x-matched-pathname": resolution.matchedPathname,
+          "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
         },
       },
       (proxyRes) => {
         res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
         proxyRes.pipe(res);
-        proxyRes.on('end', resolve);
+        proxyRes.on("end", resolve);
       },
     );
 
-    proxyReq.on('error', (err) => {
+    proxyReq.on("error", (err) => {
       if (!res.headersSent) {
-        res.writeHead(502, { 'content-type': 'text/plain' });
+        res.writeHead(502, { "content-type": "text/plain" });
         res.end(`Failed to proxy to pool "${resolution.pool}": ${err.message}`);
       }
       resolve();
     });
 
-    const bufferedBody = (req as IncomingMessage & {
-      [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-    })[NEXT_REQUEST_META]?.actionBody;
+    const bufferedBody = (
+      req as IncomingMessage & {
+        [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+      }
+    )[NEXT_REQUEST_META]?.actionBody;
 
     if (bufferedBody) {
       proxyReq.end(bufferedBody);
@@ -373,19 +383,31 @@ function proxyToPool(
 function getContentType(pathname: string): string {
   const ext = path.extname(pathname).toLowerCase();
   switch (ext) {
-    case '.html': return 'text/html; charset=utf-8';
-    case '.json': return 'application/json; charset=utf-8';
-    case '.js': return 'application/javascript; charset=utf-8';
-    case '.css': return 'text/css; charset=utf-8';
-    case '.png': return 'image/png';
-    case '.jpg':
-    case '.jpeg': return 'image/jpeg';
-    case '.gif': return 'image/gif';
-    case '.svg': return 'image/svg+xml';
-    case '.ico': return 'image/x-icon';
-    case '.rsc': return 'text/x-component';
-    case '': return 'text/html; charset=utf-8'; // extensionless routes (/, /about, etc.)
-    default: return 'application/octet-stream';
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".js":
+      return "application/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".gif":
+      return "image/gif";
+    case ".svg":
+      return "image/svg+xml";
+    case ".ico":
+      return "image/x-icon";
+    case ".rsc":
+      return "text/x-component";
+    case "":
+      return "text/html; charset=utf-8"; // extensionless routes (/, /about, etc.)
+    default:
+      return "application/octet-stream";
   }
 }
 

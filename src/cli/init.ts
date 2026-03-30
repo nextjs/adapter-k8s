@@ -2,10 +2,7 @@
 import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
-import {
-  generateAdapterConfig,
-  generateInfrastructureJson,
-} from "./scaffold.js";
+import { generateAdapterConfig, generateInfrastructureJson } from "./scaffold.js";
 
 export interface InitOptions {
   projectId: string;
@@ -201,70 +198,93 @@ export function buildInitGcloudCommands(options: {
   // - networkservices.admin to import LbRouteExtension
   // - compute.viewer to list forwarding rules (for discovery)
   commands.push({
-    description: 'Grant deploy SA networkservices.admin role',
-    command: 'gcloud',
+    description: "Grant deploy SA networkservices.admin role",
+    command: "gcloud",
     args: [
-      'projects', 'add-iam-policy-binding', projectId,
-      '--member', `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
-      '--role', 'roles/networkservices.admin',
-      '--condition=None',
-      '--quiet',
+      "projects",
+      "add-iam-policy-binding",
+      projectId,
+      "--member",
+      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      "--role",
+      "roles/networkservices.admin",
+      "--condition=None",
+      "--quiet",
     ],
   });
 
   commands.push({
-    description: 'Grant deploy SA compute.viewer role (forwarding rule discovery)',
-    command: 'gcloud',
+    description: "Grant deploy SA compute.viewer role (forwarding rule discovery)",
+    command: "gcloud",
     args: [
-      'projects', 'add-iam-policy-binding', projectId,
-      '--member', `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
-      '--role', 'roles/compute.viewer',
-      '--condition=None',
-      '--quiet',
+      "projects",
+      "add-iam-policy-binding",
+      projectId,
+      "--member",
+      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      "--role",
+      "roles/compute.viewer",
+      "--condition=None",
+      "--quiet",
     ],
   });
 
   // Allow the K8s SA to impersonate the GCP deploy SA via Workload Identity
   commands.push({
-    description: 'Bind K8s SA to GCP SA via Workload Identity',
-    command: 'gcloud',
+    description: "Bind K8s SA to GCP SA via Workload Identity",
+    command: "gcloud",
     args: [
-      'iam', 'service-accounts', 'add-iam-policy-binding',
+      "iam",
+      "service-accounts",
+      "add-iam-policy-binding",
       `${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
-      '--role', 'roles/iam.workloadIdentityUser',
-      '--member', `serviceAccount:${projectId}.svc.id.goog[default/${releaseName}-deploy-sa]`,
-      '--condition=None',
-      '--project', projectId,
-      '--quiet',
+      "--role",
+      "roles/iam.workloadIdentityUser",
+      "--member",
+      `serviceAccount:${projectId}.svc.id.goog[default/${releaseName}-deploy-sa]`,
+      "--condition=None",
+      "--project",
+      projectId,
+      "--quiet",
     ],
   });
 
   // --- Route Extension Service (ext_proc) ---
   // Create health check for routing service
   commands.push({
-    description: 'Create health check for routing service',
-    command: 'gcloud',
+    description: "Create health check for routing service",
+    command: "gcloud",
     args: [
-      'compute', 'health-checks', 'create', 'grpc',
+      "compute",
+      "health-checks",
+      "create",
+      "grpc",
       `${releaseName}-routing-hc`,
-      '--port', '8443',
-      '--project', projectId,
-      '--quiet',
+      "--port",
+      "8443",
+      "--project",
+      projectId,
+      "--quiet",
     ],
   });
 
   // Create backend service for routing service (needed by LbRouteExtension)
   commands.push({
-    description: 'Create backend service for routing service',
-    command: 'gcloud',
+    description: "Create backend service for routing service",
+    command: "gcloud",
     args: [
-      'compute', 'backend-services', 'create',
+      "compute",
+      "backend-services",
+      "create",
       `${releaseName}-routing-service`,
-      '--global',
-      '--protocol', 'HTTP2',
-      '--health-checks', `${releaseName}-routing-hc`,
-      '--project', projectId,
-      '--quiet',
+      "--global",
+      "--protocol",
+      "HTTP2",
+      "--health-checks",
+      `${releaseName}-routing-hc`,
+      "--project",
+      projectId,
+      "--quiet",
     ],
   });
 
@@ -285,18 +305,22 @@ export function buildInitGcloudCommands(options: {
         description: `Create DNS authorization for ${host}`,
         command: "gcloud",
         args: [
-          "certificate-manager", "dns-authorizations", "create",
+          "certificate-manager",
+          "dns-authorizations",
+          "create",
           `${releaseName}-dns-auth-${safeName}`,
           // For wildcard domains (*.example.com), DNS auth must be for the base domain
-          "--domain", host.replace(/^\*\./, ''),
-          "--project", projectId,
+          "--domain",
+          host.replace(/^\*\./, ""),
+          "--project",
+          projectId,
           "--quiet",
         ],
       });
     }
 
     // Create Google-managed certificate covering all hosts
-    const dnsAuthRefs = hosts.map(host => {
+    const dnsAuthRefs = hosts.map((host) => {
       const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
       return `${releaseName}-dns-auth-${safeName}`;
     });
@@ -304,11 +328,16 @@ export function buildInitGcloudCommands(options: {
       description: "Create Google-managed certificate",
       command: "gcloud",
       args: [
-        "certificate-manager", "certificates", "create",
+        "certificate-manager",
+        "certificates",
+        "create",
         `${releaseName}-cert`,
-        "--domains", hosts.join(","),
-        "--dns-authorizations", dnsAuthRefs.join(","),
-        "--project", projectId,
+        "--domains",
+        hosts.join(","),
+        "--dns-authorizations",
+        dnsAuthRefs.join(","),
+        "--project",
+        projectId,
         "--quiet",
       ],
     });
@@ -318,9 +347,12 @@ export function buildInitGcloudCommands(options: {
       description: "Create certificate map",
       command: "gcloud",
       args: [
-        "certificate-manager", "maps", "create",
+        "certificate-manager",
+        "maps",
+        "create",
         `${releaseName}-certmap`,
-        "--project", projectId,
+        "--project",
+        projectId,
         "--quiet",
       ],
     });
@@ -332,12 +364,19 @@ export function buildInitGcloudCommands(options: {
         description: `Create certificate map entry for ${host}`,
         command: "gcloud",
         args: [
-          "certificate-manager", "maps", "entries", "create",
+          "certificate-manager",
+          "maps",
+          "entries",
+          "create",
           `${releaseName}-certmap-entry-${safeName}`,
-          "--map", `${releaseName}-certmap`,
-          "--certificates", `${releaseName}-cert`,
-          "--hostname", host,
-          "--project", projectId,
+          "--map",
+          `${releaseName}-certmap`,
+          "--certificates",
+          `${releaseName}-cert`,
+          "--hostname",
+          host,
+          "--project",
+          projectId,
           "--quiet",
         ],
       });
@@ -348,20 +387,9 @@ export function buildInitGcloudCommands(options: {
 }
 
 export async function runInit(options: InitOptions): Promise<void> {
-  const {
-    projectId,
-    region,
-    hosts,
-    bucket,
-    registry,
-    releaseName,
-    projectDir,
-    dryRun,
-  } = options;
+  const { projectId, region, hosts, bucket, registry, releaseName, projectDir, dryRun } = options;
 
-  console.log(
-    `\nInitializing @next-community/adapter-k8s for project: ${projectId}\n`,
-  );
+  console.log(`\nInitializing @next-community/adapter-k8s for project: ${projectId}\n`);
 
   // 1. Generate gcloud commands
   const commands = buildInitGcloudCommands({
@@ -412,7 +440,11 @@ export async function runInit(options: InitOptions): Promise<void> {
   if (!dryRun) {
     console.log("  → Granting Artifact Registry reader for GKE image pulls");
     const projNumResult = await execCapture("gcloud", [
-      "projects", "describe", projectId, "--format=value(projectNumber)", "--quiet",
+      "projects",
+      "describe",
+      projectId,
+      "--format=value(projectNumber)",
+      "--quiet",
     ]);
     if (projNumResult.exitCode === 0) {
       const projectNumber = projNumResult.stdout.trim();
@@ -422,12 +454,20 @@ export async function runInit(options: InitOptions): Promise<void> {
       ];
       for (const sa of serviceAgents) {
         await execCapture("gcloud", [
-          "artifacts", "repositories", "add-iam-policy-binding",
-          "nextjs", "--location", region,
-          "--member", `serviceAccount:${sa}`,
-          "--role", "roles/artifactregistry.reader",
-          "--project", projectId,
-          "--condition=None", "--quiet",
+          "artifacts",
+          "repositories",
+          "add-iam-policy-binding",
+          "nextjs",
+          "--location",
+          region,
+          "--member",
+          `serviceAccount:${sa}`,
+          "--role",
+          "roles/artifactregistry.reader",
+          "--project",
+          projectId,
+          "--condition=None",
+          "--quiet",
         ]);
       }
     }
@@ -490,30 +530,43 @@ export async function runInit(options: InitOptions): Promise<void> {
       const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
       const authName = `${releaseName}-dns-auth-${safeName}`;
       const dnsAuthResult = await execCapture("gcloud", [
-        "certificate-manager", "dns-authorizations", "describe", authName,
-        "--project", projectId, "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
+        "certificate-manager",
+        "dns-authorizations",
+        "describe",
+        authName,
+        "--project",
+        projectId,
+        "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
       ]);
       if (dnsAuthResult.exitCode === 0 && dnsAuthResult.stdout.trim()) {
         const [name, type, data] = dnsAuthResult.stdout.trim().split("\t");
         console.log(`    ${name}  ${type}  ${data}`);
       } else {
-        console.log(`    Run: gcloud certificate-manager dns-authorizations describe ${authName} --project ${projectId}`);
+        console.log(
+          `    Run: gcloud certificate-manager dns-authorizations describe ${authName} --project ${projectId}`,
+        );
       }
     }
   }
 
   console.log("\n✓ Init complete.");
   console.log("\nNext Steps:");
-  console.log("  1. Add the DNS CNAME records shown above (required for TLS certificate provisioning).");
+  console.log(
+    "  1. Add the DNS CNAME records shown above (required for TLS certificate provisioning).",
+  );
   console.log("  2. Run `npx adapter-k8s deploy` to build and deploy your application.");
   console.log(`  3. Configure your DNS A records for your hosts:`);
   console.log("     - Wait 5-10 minutes for the GCP Load Balancer to initialize.");
-  console.log(`     - Run \`kubectl get gateway ${releaseName}-gateway\` to find your external IP address.`);
+  console.log(
+    `     - Run \`kubectl get gateway ${releaseName}-gateway\` to find your external IP address.`,
+  );
   for (const h of hosts) {
     console.log(`     - Create a DNS A record for ${h} pointing to that IP.`);
   }
   console.log(`  4. Verify Certificate Status:`);
-  console.log(`     - Run \`gcloud certificate-manager certificates describe ${releaseName}-cert --project ${projectId}\``);
+  console.log(
+    `     - Run \`gcloud certificate-manager certificates describe ${releaseName}-cert --project ${projectId}\``,
+  );
   console.log("     - Certificate provisioning requires DNS CNAME records to be in place.");
   console.log("\nHappy deploying!\n");
 }

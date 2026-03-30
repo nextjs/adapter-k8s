@@ -1,4 +1,14 @@
-export function renderRoutingServiceHPA({ releaseName, minReplicas = 2, maxReplicas = 10, targetCPU = 70 }: { releaseName: string; minReplicas?: number; maxReplicas?: number; targetCPU?: number }): string {
+export function renderRoutingServiceHPA({
+  releaseName,
+  minReplicas = 2,
+  maxReplicas = 10,
+  targetCPU = 70,
+}: {
+  releaseName: string;
+  minReplicas?: number;
+  maxReplicas?: number;
+  targetCPU?: number;
+}): string {
   return `apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

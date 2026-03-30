@@ -1,8 +1,8 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
-import { createRoutingServer } from '../../src/routing-service/server.js';
-import type { ProcessingResponse } from '../../src/routing-service/ext-proc-types.js';
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { createRoutingServer } from "../../src/routing-service/server.js";
+import type { ProcessingResponse } from "../../src/routing-service/ext-proc-types.js";
 
-describe('createRoutingServer', () => {
+describe("createRoutingServer", () => {
   let server: ReturnType<typeof createRoutingServer> | null = null;
 
   afterEach(async () => {
@@ -12,10 +12,10 @@ describe('createRoutingServer', () => {
     }
   });
 
-  it('creates a gRPC server that can start and stop', async () => {
+  it("creates a gRPC server that can start and stop", async () => {
     const handler = vi.fn().mockResolvedValue({
       requestHeaders: {
-        response: { headerMutation: { setHeaders: [] }, status: 'CONTINUE' },
+        response: { headerMutation: { setHeaders: [] }, status: "CONTINUE" },
       },
     } as ProcessingResponse);
 

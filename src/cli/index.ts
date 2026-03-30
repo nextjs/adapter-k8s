@@ -11,15 +11,15 @@ import { runEmulate } from "./emulate.js";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const args = argv.slice(2);
-  const command = args[0] ?? 'help';
+  const command = args[0] ?? "help";
   const flags: Record<string, string | boolean> = {};
 
   for (let i = 1; i < args.length; i++) {
     const arg = args[i]!;
-    if (arg.startsWith('--')) {
+    if (arg.startsWith("--")) {
       const key = arg.slice(2);
       const nextArg = args[i + 1];
-      if (nextArg && !nextArg.startsWith('--')) {
+      if (nextArg && !nextArg.startsWith("--")) {
         flags[key] = nextArg;
         i++;
       } else {
@@ -63,84 +63,105 @@ Options:
 async function main(): Promise<void> {
   const { command, flags } = parseArgs(process.argv);
   const projectDir = process.cwd();
-  
+
   // Default release name to the directory name (sanitized)
-  const defaultReleaseName = path.basename(projectDir).toLowerCase().replace(/[^a-z0-9]/g, "-");
+  const defaultReleaseName = path
+    .basename(projectDir)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "-");
   const releaseName = (flags["release-name"] as string) ?? defaultReleaseName;
   const dryRun = flags["dry-run"] === true;
 
   switch (command) {
-    case 'init': {
-      const projectId = (flags['project-id'] as string) ?? process.env.GCP_PROJECT_ID;
-      const region = (flags['region'] as string) ?? process.env.GCP_REGION ?? 'us-central1';
-      const hostRaw = (flags['host'] as string) ?? process.env.APP_HOST;
-      const hosts = hostRaw ? hostRaw.split(',').map(h => h.trim()).filter(Boolean) : [];
-      const bucket = (flags['bucket'] as string) ?? (projectId ? `${projectId}-nextjs-static` : undefined);
-      const registry = (flags['registry'] as string) ?? (projectId && region ? `${region}-docker.pkg.dev/${projectId}/nextjs` : undefined);
+    case "init": {
+      const projectId = (flags["project-id"] as string) ?? process.env.GCP_PROJECT_ID;
+      const region = (flags["region"] as string) ?? process.env.GCP_REGION ?? "us-central1";
+      const hostRaw = (flags["host"] as string) ?? process.env.APP_HOST;
+      const hosts = hostRaw
+        ? hostRaw
+            .split(",")
+            .map((h) => h.trim())
+            .filter(Boolean)
+        : [];
+      const bucket =
+        (flags["bucket"] as string) ?? (projectId ? `${projectId}-nextjs-static` : undefined);
+      const registry =
+        (flags["registry"] as string) ??
+        (projectId && region ? `${region}-docker.pkg.dev/${projectId}/nextjs` : undefined);
 
       if (!projectId || hosts.length === 0) {
-        console.error('Error: --project-id and --host are required for init');
-        console.error('  Example: npx adapter-k8s init --project-id my-project --host app.example.com');
-        console.error('  Multiple: npx adapter-k8s init --project-id my-project --host app.example.com,api.example.com');
+        console.error("Error: --project-id and --host are required for init");
+        console.error(
+          "  Example: npx adapter-k8s init --project-id my-project --host app.example.com",
+        );
+        console.error(
+          "  Multiple: npx adapter-k8s init --project-id my-project --host app.example.com,api.example.com",
+        );
         process.exit(1);
       }
 
       await runInit({
-        projectId, region, hosts, bucket: bucket!, registry: registry!,
-        releaseName, projectDir, dryRun,
-      });
-      break;
-    }
-
-    case 'deploy': {
-      await runDeploy({
-        projectDir,
+        projectId,
+        region,
+        hosts,
+        bucket: bucket!,
+        registry: registry!,
         releaseName,
-        skipBuild: flags['skip-build'] === true,
-        skipPush: flags['skip-push'] === true,
+        projectDir,
         dryRun,
       });
       break;
     }
 
-    case 'emulate': {
-      await runEmulate({
+    case "deploy": {
+      await runDeploy({
         projectDir,
-        skipBuild: flags['skip-build'] === true,
-        port: flags['port'] ? parseInt(flags['port'] as string, 10) : 8080,
+        releaseName,
+        skipBuild: flags["skip-build"] === true,
+        skipPush: flags["skip-push"] === true,
+        dryRun,
       });
       break;
     }
 
-    case 'rollback': {
+    case "emulate": {
+      await runEmulate({
+        projectDir,
+        skipBuild: flags["skip-build"] === true,
+        port: flags["port"] ? parseInt(flags["port"] as string, 10) : 8080,
+      });
+      break;
+    }
+
+    case "rollback": {
       await runRollback({ projectDir, releaseName, dryRun });
       break;
     }
 
-    case 'describe': {
+    case "describe": {
       await runDescribe({ projectDir, releaseName });
       break;
     }
 
-    case 'doctor': {
+    case "doctor": {
       await runDoctor({ projectDir, releaseName });
       break;
     }
 
-    case 'tail':
-    case 'logs': {
+    case "tail":
+    case "logs": {
       await runTail({ projectDir, releaseName });
       break;
     }
 
-    case 'destroy': {
+    case "destroy": {
       await runDestroy({ projectDir, releaseName, dryRun });
       break;
     }
 
-    case 'help':
-    case '--help':
-    case '-h':
+    case "help":
+    case "--help":
+    case "-h":
       printHelp();
       break;
 
@@ -152,6 +173,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('\nError:', err.message);
+  console.error("\nError:", err.message);
   process.exit(1);
 });

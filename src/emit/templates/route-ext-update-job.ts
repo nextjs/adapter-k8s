@@ -1,7 +1,20 @@
-export function renderRouteExtUpdateJob({ releaseName, projectId, region, buildId }: { releaseName: string; projectId: string; region: string; buildId: string }): string {
+export function renderRouteExtUpdateJob({
+  releaseName,
+  projectId,
+  region,
+  buildId,
+}: {
+  releaseName: string;
+  projectId: string;
+  region: string;
+  buildId: string;
+}): string {
   // Include buildId in the Job name so each deploy creates a fresh Job
   // (K8s Jobs are immutable — can't update an existing one)
-  const safeBuildId = buildId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 10);
+  const safeBuildId = buildId
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .slice(0, 10);
   return `apiVersion: batch/v1
 kind: Job
 metadata:

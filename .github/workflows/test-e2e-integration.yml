@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       nextjsRef:
-        description: 'Next.js repo ref (branch/tag/SHA)'
-        default: 'canary'
+        description: "Next.js repo ref (branch/tag/SHA)"
+        default: "canary"
         type: string
 
 jobs:
@@ -26,7 +26,7 @@ jobs:
           fetch-depth: 25
 
       - uses: actions/setup-node@v4
-        with: { node-version: '24' }
+        with: { node-version: "24" }
 
       - name: Setup pnpm
         run: npm i -g corepack@0.31 && corepack enable
@@ -79,7 +79,7 @@ jobs:
           path: .
 
       - uses: actions/setup-node@v4
-        with: { node-version: '24' }
+        with: { node-version: "24" }
 
       - name: Setup pnpm
         run: npm i -g corepack@0.31 && corepack enable

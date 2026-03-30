@@ -1,8 +1,11 @@
 // src/emit/static-assets.ts
-import path from 'node:path';
-import type { AdapterOutputs, StaticAssetEntry } from '../types.js';
+import path from "node:path";
+import type { AdapterOutputs, StaticAssetEntry } from "../types.js";
 
-export function buildStaticManifest(outputs: AdapterOutputs, projectDir: string): StaticAssetEntry[] {
+export function buildStaticManifest(
+  outputs: AdapterOutputs,
+  projectDir: string,
+): StaticAssetEntry[] {
   const entries: StaticAssetEntry[] = [];
 
   // Static files have a top-level filePath

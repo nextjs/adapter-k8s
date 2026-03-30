@@ -2335,6 +2335,7 @@ The CLI (`init` + `deploy`) is built in Phase 1 and maintained throughout all ph
 The following decisions were validated or changed during Phase 1-2 implementation:
 
 **Build-time:**
+
 - **K8s-friendly build IDs** — Next.js default buildIds contain uppercase, underscores, and leading special chars that break K8s labels, Docker tags, and service names. The adapter overrides `generateBuildId` to produce lowercase alphanumeric IDs (`b{timestamp}{random}`). If the user sets their own `generateBuildId`, they own the responsibility.
 - **Turbopack externals** — `.next/node_modules/` contains symlinked external modules with hashed names (e.g., `@opentelemetry/api-6ec0324a2d0bd38c`). These are absolute symlinks that don't survive Docker COPY. The adapter resolves each symlink to its real target and copies the content. This must be done fresh on each build (no caching).
 - **`next/setup-node-env`** — must be imported before any handler module. Without it, AsyncLocalStorage globals aren't set up and handlers crash. The pool server calls this at startup before loading manifests.
@@ -2342,12 +2343,14 @@ The following decisions were validated or changed during Phase 1-2 implementatio
 - **Config file format** — `adapter.config.mjs` preferred over `.ts` to avoid Node.js `MODULE_TYPELESS_PACKAGE_JSON` warnings. The adapter loads `.mjs` first, then `.ts`, then `.js`.
 
 **Gateway & TLS:**
+
 - **Certificate Manager, not ManagedCertificate CRD** — GKE Gateway API does not support `ManagedCertificate` CRD or `certificateRefs` with `kind: ManagedCertificate`. TLS is handled via Certificate Manager with DNS authorization + certmap annotation (`networking.gke.io/certmap`). Wildcard domains (`*.example.com`) require DNS auth on the base domain.
 - **HealthCheckPolicy CRD** — GKE Gateway auto-generates health checks that probe `/` (root). This fails when the app has middleware or returns errors. A `HealthCheckPolicy` CRD overrides this to probe `/healthz` on port 3000, which the pool server always answers with 200.
 - **Static IP via `addresses` field** — Gateway API uses `spec.addresses[{type: NamedAddress}]`, not the Ingress annotation `networking.gke.io/static-ip`.
 - **Multi-host support** — `gateway.hosts` is an array of `{ hostname, tls }` objects. Wildcard hostnames are quoted in YAML to prevent YAML alias interpretation.
 
 **Deployment (blue/green):**
+
 - **Stable "active" Service** — HTTPRoute always points to a stable Service (`{releaseName}-{poolName}`, no buildId). The Service's selector is patched by deploy/rollback to point to the active build. This prevents the gap where HTTPRoute references a new backend that isn't healthy yet.
 - **Zero-downtime cutover sequence:** (1) Helm creates new Deployment + versioned Service, (2) wait for K8s readiness probes, (3) verify pod health via kubectl, (4) patch active Service selector, (5) scale previous to 0 (keep for rollback), (6) delete anything older.
 - **Deploy fails if unhealthy** — if new pods don't become ready within 3 minutes, deploy exits with code 1 and does NOT cut over traffic. The previous build continues serving.
@@ -2356,6 +2359,7 @@ The following decisions were validated or changed during Phase 1-2 implementatio
 - **Cluster state** — deploy state (`buildId`, `previousBuildId`) is stored in a K8s ConfigMap (`{releaseName}-adapter-state`) in addition to the local `state.json`. This allows `doctor`/`describe`/`rollback` to work from any machine with kubectl access (CI/CD + local dev).
 
 **Route Extension (ext_proc):**
+
 - **`gcloud service-extensions lb-route-extensions import`** — uses `import` not `create`. The import command takes a YAML spec file with `loadBalancingScheme`, `forwardingRules`, and `extensionChains`.
 - **Global location** — `--location=global` for global external ALBs, not regional.
 - **Forwarding rule discovery** — GKE Gateway auto-generates forwarding rule names. The route-ext Job discovers them via `gcloud compute forwarding-rules list --filter`.
@@ -2365,10 +2369,12 @@ The following decisions were validated or changed during Phase 1-2 implementatio
 - **Workload Identity** — the Job's ServiceAccount needs `networkservices.admin` and `compute.viewer` roles via Workload Identity binding.
 
 **GCP IAM:**
+
 - **`--condition=None`** on all `add-iam-policy-binding` commands (required when policies have conditional bindings).
 - **Artifact Registry reader** — GKE Autopilot nodes use the `container-engine-robot` service agent for image pulls. Must grant `artifactregistry.reader` on the repo to `service-{projectNumber}@container-engine-robot.iam.gserviceaccount.com`.
 
 **Adapter API conformance (stable Next.js 16.2):**
+
 - **`modifyConfig` context** — stable API `ctx` has `{ phase, nextVersion }`, NOT `projectDir`. Use `process.cwd()` instead.
 - **`requestMeta`** — pass `relativeProjectDir: '.'` and `hostname` in handler invocation context.
 - **`AdapterOutputs`** — now derived from `NextAdapter["onBuildComplete"]` parameter type, not locally defined.
@@ -2376,6 +2382,7 @@ The following decisions were validated or changed during Phase 1-2 implementatio
 - **`@next/routing` `invokeMiddleware`** — MUST always be a function, never `undefined`. `resolveRoutes` calls it unconditionally.
 
 **Testing:**
+
 - **Two-tier e2e test suite** — Tier 1 (pool server only, like Bun adapter) validates functional fidelity. Tier 2 (Envoy + routing service + pool server) validates correctness of the split architecture: CEL filtering, ext_proc header mutations, middleware pre-CDN, rewrite chains.
 - **`emulate` command** — `npx adapter-k8s emulate` spins up the full stack locally (Envoy + routing service + pool server) for development and testing.
 
@@ -2484,7 +2491,7 @@ The following decisions were validated or changed during Phase 1-2 implementatio
 
 **Goal:** Version isolation during rolling deployments.
 
-**Note:** Blue/green deploy with rollback was implemented in Phase 1. This phase adds *version-aware routing* for RSC navigations — clients that loaded build A's JavaScript get routed to build A's server, even after build B is deployed.
+**Note:** Blue/green deploy with rollback was implemented in Phase 1. This phase adds _version-aware routing_ for RSC navigations — clients that loaded build A's JavaScript get routed to build A's server, even after build B is deployed.
 
 **Scope:**
 
@@ -2525,15 +2532,15 @@ The following decisions were validated or changed during Phase 1-2 implementatio
 
 ### Phase Summary
 
-| Phase | What you get                                                          | Status  |
-| ----- | --------------------------------------------------------------------- | ------- |
-| 1     | Full CLI, pool server, blue/green deploy, rollback, doctor, emulate   | Done    |
-| 2     | Pre-CDN middleware, ext_proc routing, CEL generation                  | Done    |
-| 3     | Distributed ISR, `use cache`, `onCacheEntryV2`                        | Planned |
-| 4     | Cloud CDN with invalidation                                           | Planned |
-| 5     | PPR with resume protocol                                              | Planned |
-| 6     | Skew protection (version-aware routing)                               | Planned |
-| 7     | Observability (metrics, tracing, alerts)                              | Planned |
+| Phase | What you get                                                        | Status  |
+| ----- | ------------------------------------------------------------------- | ------- |
+| 1     | Full CLI, pool server, blue/green deploy, rollback, doctor, emulate | Done    |
+| 2     | Pre-CDN middleware, ext_proc routing, CEL generation                | Done    |
+| 3     | Distributed ISR, `use cache`, `onCacheEntryV2`                      | Planned |
+| 4     | Cloud CDN with invalidation                                         | Planned |
+| 5     | PPR with resume protocol                                            | Planned |
+| 6     | Skew protection (version-aware routing)                             | Planned |
+| 7     | Observability (metrics, tracing, alerts)                            | Planned |
 
 ---
 

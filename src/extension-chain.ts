@@ -1,4 +1,4 @@
-import type { AdapterOutputs } from './types.js';
+import type { AdapterOutputs } from "./types.js";
 
 export interface ExtensionChainOptions {
   celExpression: string;
@@ -15,20 +15,25 @@ export function determineFailureMode(outputs: AdapterOutputs): boolean {
 }
 
 export function generateExtensionChain(options: ExtensionChainOptions): string {
-  const { celExpression, releaseName, namespace, projectId, region, timeout, failureModeAllow } = options;
+  const { celExpression, releaseName, namespace, projectId, region, timeout, failureModeAllow } =
+    options;
 
-  const chain = [{
-    name: 'nextjs-routing',
-    matchCondition: { celExpression },
-    extensions: [{
-      name: 'routing-service',
-      authority: `${releaseName}-routing-service.${namespace}.svc.cluster.local`,
-      service: `projects/${projectId}/global/backendServices/${releaseName}-routing-service`,
-      timeout,
-      supportedEvents: ['REQUEST_HEADERS'],
-      failOpen: failureModeAllow,
-    }],
-  }];
+  const chain = [
+    {
+      name: "nextjs-routing",
+      matchCondition: { celExpression },
+      extensions: [
+        {
+          name: "routing-service",
+          authority: `${releaseName}-routing-service.${namespace}.svc.cluster.local`,
+          service: `projects/${projectId}/global/backendServices/${releaseName}-routing-service`,
+          timeout,
+          supportedEvents: ["REQUEST_HEADERS"],
+          failOpen: failureModeAllow,
+        },
+      ],
+    },
+  ];
 
   return JSON.stringify(chain, null, 2);
 }

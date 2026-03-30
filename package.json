@@ -10,6 +10,9 @@
     "type": "git",
     "url": "git+https://github.com/nextjs/adapter-k8s.git"
   },
+  "bin": {
+    "adapter-k8s": "dist/cli.cjs"
+  },
   "files": [
     "dist",
     "integration",
@@ -26,9 +29,6 @@
       "require": "./dist/index.js"
     },
     "./package.json": "./package.json"
-  },
-  "bin": {
-    "adapter-k8s": "dist/cli.cjs"
   },
   "scripts": {
     "test": "vitest run",

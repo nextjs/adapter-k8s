@@ -1,9 +1,6 @@
 // tests/cli/deploy.test.ts
 import { describe, it, expect } from "vitest";
-import {
-  buildDockerCommands,
-  buildHelmUpgradeArgs,
-} from "../../src/cli/deploy.js";
+import { buildDockerCommands, buildHelmUpgradeArgs } from "../../src/cli/deploy.js";
 
 describe("buildDockerCommands", () => {
   it("generates docker build and push commands per pool with auth", () => {
@@ -44,16 +41,16 @@ describe("buildDockerCommands", () => {
     expect(commands[1]!.args).toContain(`${registry}/nextjs-app:abc123`);
   });
 
-  it('includes routing service image in docker commands', () => {
+  it("includes routing service image in docker commands", () => {
     const commands = buildDockerCommands({
-      pools: ['ssr'],
-      buildId: 'abc123',
-      registry: 'us-central1-docker.pkg.dev/my-project/nextjs',
-      outputDir: '.k8s-adapter/output',
-      containerStrategy: 'traced-assets',
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+      outputDir: ".k8s-adapter/output",
+      containerStrategy: "traced-assets",
     });
 
-    const routingBuild = commands.find(c => c.description.includes('routing service'));
+    const routingBuild = commands.find((c) => c.description.includes("routing service"));
     expect(routingBuild).toBeDefined();
   });
 });

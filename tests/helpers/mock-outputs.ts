@@ -57,7 +57,7 @@ export function mockPrerender(
     // @ts-ignore
     parentOutputId: overrides.parentOutputId ?? `/app${overrides.sourcePage ?? "/blog/[slug]"}`,
     // @ts-ignore
-    groupId: overrides.groupId ?? (overrides.sourcePage ?? "/blog/[slug]"),
+    groupId: overrides.groupId ?? overrides.sourcePage ?? "/blog/[slug]",
   };
 }
 

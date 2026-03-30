@@ -21,7 +21,7 @@ export interface ProcessingRequest {
 
 export interface HeaderValueOption {
   header: HeaderValue;
-  appendAction?: 'APPEND_IF_EXISTS_OR_ADD' | 'OVERWRITE_IF_EXISTS_OR_ADD';
+  appendAction?: "APPEND_IF_EXISTS_OR_ADD" | "OVERWRITE_IF_EXISTS_OR_ADD";
 }
 
 export interface HeaderMutation {
@@ -31,7 +31,7 @@ export interface HeaderMutation {
 
 export interface CommonResponse {
   headerMutation?: HeaderMutation;
-  status?: 'CONTINUE' | 'CONTINUE_AND_REPLACE';
+  status?: "CONTINUE" | "CONTINUE_AND_REPLACE";
 }
 
 export interface ImmediateResponse {

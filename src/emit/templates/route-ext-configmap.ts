@@ -16,10 +16,10 @@ export function renderRouteExtConfigMap({
   // Build the route extension YAML for the `import` command
   const ext = chains[0]?.extensions?.[0];
   const chain = chains[0];
-  const fwdRule = forwardingRule ?? 'FORWARDING_RULE_PLACEHOLDER';
+  const fwdRule = forwardingRule ?? "FORWARDING_RULE_PLACEHOLDER";
 
   // Escape CEL expression for YAML (double quotes inside double-quoted string)
-  const celExpr = chain?.matchCondition?.celExpression ?? 'true';
+  const celExpr = chain?.matchCondition?.celExpression ?? "true";
 
   const routeExtYaml = [
     `name: "${releaseName}-route-ext"`,
@@ -27,23 +27,29 @@ export function renderRouteExtConfigMap({
     `forwardingRules:`,
     `  - "${fwdRule}"`,
     `extensionChains:`,
-    `  - name: "${chain?.name ?? 'nextjs-routing'}"`,
+    `  - name: "${chain?.name ?? "nextjs-routing"}"`,
     `    matchCondition:`,
     `      celExpression: "${celExpr.replace(/"/g, '\\"')}"`,
     `    extensions:`,
-    `      - name: "${ext?.name ?? 'routing-service'}"`,
-    `        authority: "${ext?.authority ?? ''}"`,
-    `        service: "${ext?.service ?? ''}"`,
-    `        timeout: "${ext?.timeout ?? '5s'}"`,
+    `      - name: "${ext?.name ?? "routing-service"}"`,
+    `        authority: "${ext?.authority ?? ""}"`,
+    `        service: "${ext?.service ?? ""}"`,
+    `        timeout: "${ext?.timeout ?? "5s"}"`,
     `        supportedEvents:`,
     `          - REQUEST_HEADERS`,
     `        failOpen: ${ext?.failOpen ?? true}`,
-  ].join('\n');
+  ].join("\n");
 
   // Indent for YAML block scalar (4 spaces under `data:` key)
-  const indent = '    ';
-  const routeExtIndented = routeExtYaml.split('\n').map(l => indent + l).join('\n');
-  const chainJsonIndented = extensionChainJson.split('\n').map(l => indent + l).join('\n');
+  const indent = "    ";
+  const routeExtIndented = routeExtYaml
+    .split("\n")
+    .map((l) => indent + l)
+    .join("\n");
+  const chainJsonIndented = extensionChainJson
+    .split("\n")
+    .map((l) => indent + l)
+    .join("\n");
 
   return `apiVersion: v1
 kind: ConfigMap

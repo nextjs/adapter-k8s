@@ -6,7 +6,10 @@ import { execCapture } from "./exec.js";
 
 const W = 62; // inner content width for boxen
 
-export async function runDescribe(options: { projectDir: string; releaseName: string }): Promise<void> {
+export async function runDescribe(options: {
+  projectDir: string;
+  releaseName: string;
+}): Promise<void> {
   const { projectDir, releaseName } = options;
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : null;
@@ -18,8 +21,15 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
   // Ensure kubectl is pointing at the right cluster
   if (infra?.projectId && infra?.region) {
     const credResult = await execCapture("gcloud", [
-      "container", "clusters", "get-credentials", `${releaseName}-cluster`,
-      "--region", infra.region, "--project", infra.projectId, "--quiet",
+      "container",
+      "clusters",
+      "get-credentials",
+      `${releaseName}-cluster`,
+      "--region",
+      infra.region,
+      "--project",
+      infra.projectId,
+      "--quiet",
     ]);
     if (credResult.exitCode !== 0) {
       console.error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
@@ -41,21 +51,36 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
 
   if (infra?.projectId) {
     const ipResult = await execCapture("gcloud", [
-      "compute", "addresses", "describe", `${releaseName}-ip`,
-      "--global", "--project", projectId, "--format=value(address)",
+      "compute",
+      "addresses",
+      "describe",
+      `${releaseName}-ip`,
+      "--global",
+      "--project",
+      projectId,
+      "--format=value(address)",
     ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
     if (ipResult.exitCode === 0) gatewayIp = ipResult.stdout.trim();
 
     const certResult = await execCapture("gcloud", [
-      "certificate-manager", "certificates", "describe", `${releaseName}-cert`,
-      "--project", projectId, "--format=value(managed.state)",
+      "certificate-manager",
+      "certificates",
+      "describe",
+      `${releaseName}-cert`,
+      "--project",
+      projectId,
+      "--format=value(managed.state)",
     ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
     if (certResult.exitCode === 0) certStatus = certResult.stdout.trim().toLowerCase();
   }
 
   const deploymentsResult = await execCapture("kubectl", [
-    "get", "deployments", "-l", `app.kubernetes.io/name=${releaseName}`,
-    "-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.spec.template.spec.containers[0].image}{\"\\n\"}{end}",
+    "get",
+    "deployments",
+    "-l",
+    `app.kubernetes.io/name=${releaseName}`,
+    "-o",
+    'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.spec.template.spec.containers[0].image}{"\\n"}{end}',
   ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
 
   interface DeployInfo {
@@ -66,8 +91,15 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
     role: "current" | "previous" | "old";
   }
 
-  const currentBuildLower = buildId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12);
-  const previousBuildLower = previousBuildId?.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12) ?? "";
+  const currentBuildLower = buildId
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .slice(0, 12);
+  const previousBuildLower =
+    previousBuildId
+      ?.toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .slice(0, 12) ?? "";
 
   const deployments: DeployInfo[] = [];
   if (deploymentsResult.exitCode === 0 && deploymentsResult.stdout.trim()) {
@@ -120,15 +152,18 @@ export async function runDescribe(options: { projectDir: string; releaseName: st
   }
 
   function fmtDeploy(dep: DeployInfo): string {
-    const roleTag = dep.role === "current" ? `${g}current${x}`
-      : dep.role === "previous" ? `${y}previous${x}`
-      : `${d}old${x}`;
+    const roleTag =
+      dep.role === "current"
+        ? `${g}current${x}`
+        : dep.role === "previous"
+          ? `${y}previous${x}`
+          : `${d}old${x}`;
     return `  ${icon(dep)} ${dep.shortName}  ${d}${dep.status}${x}  [${roleTag}]`;
   }
 
   const hostList = hosts.length > 0 ? hosts.join(", ") : "not configured";
-  const routingDeploys = deployments.filter(dep => dep.isRouting);
-  const poolDeploys = deployments.filter(dep => !dep.isRouting);
+  const routingDeploys = deployments.filter((dep) => dep.isRouting);
+  const poolDeploys = deployments.filter((dep) => !dep.isRouting);
 
   // Header
   console.log(`
@@ -145,13 +180,13 @@ ${b}Request Flow${x}
   // ALB box
   // Format CEL expression for display — break long expressions across lines
   const celDisplay = celExpression
-    ? celExpression
-        .replace(/ \|\| /g, ` ||\n  `)
-        .replace(/ && /g, ` &&\n  `)
+    ? celExpression.replace(/ \|\| /g, ` ||\n  `).replace(/ && /g, ` &&\n  `)
     : "not generated (run deploy first)";
 
   const celMode = celExpression
-    ? (celExpression.startsWith("!(") ? "exclusion list (has middleware)" : "inclusion list (no middleware)")
+    ? celExpression.startsWith("!(")
+      ? "exclusion list (has middleware)"
+      : "inclusion list (no middleware)"
     : "";
 
   const celSection = [
@@ -164,7 +199,11 @@ ${b}Request Flow${x}
     `${b}GCP Application Load Balancer${x}`,
     `${d}IP: ${gatewayIp}   TLS: ${certStatus}${x}`,
     ``,
-    boxen(celSection, { padding: { left: 1, right: 1, top: 0, bottom: 0 }, borderStyle: "single", dimBorder: true }),
+    boxen(celSection, {
+      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+      borderStyle: "single",
+      dimBorder: true,
+    }),
     ``,
     `    ${d}matched${x}              ${d}skipped${x}`,
     `       ${d}│${x}                     ${d}│${x}`,
@@ -184,17 +223,13 @@ ${b}Request Flow${x}
     `${c}Route Extension Service${x} ${d}(ext_proc gRPC :8443)${x}`,
     `${d}resolveRoutes() + middleware invocation${x}`,
     ``,
-    ...(routingDeploys.length > 0
-      ? routingDeploys.map(fmtDeploy)
-      : [`  ${r}●${x} not deployed`]),
+    ...(routingDeploys.length > 0 ? routingDeploys.map(fmtDeploy) : [`  ${r}●${x} not deployed`]),
   ].join("\n");
 
   const poolSection = [
     `${c}Pool Servers${x} ${d}(HTTP :3000, handler via import())${x}`,
     ``,
-    ...(poolDeploys.length > 0
-      ? poolDeploys.map(fmtDeploy)
-      : [`  ${y}●${x} no pools deployed`]),
+    ...(poolDeploys.length > 0 ? poolDeploys.map(fmtDeploy) : [`  ${y}●${x} no pools deployed`]),
     ``,
     `${d}Config: routing-manifest.json, pool-manifest.json${x}`,
     `${d}Health: /healthz on :3000${x}`,
@@ -203,13 +238,21 @@ ${b}Request Flow${x}
   const gkeContent = [
     `${b}GKE Cluster${x}`,
     ``,
-    boxen(routingSection, { padding: { left: 1, right: 1, top: 0, bottom: 0 }, borderStyle: "single", dimBorder: true }),
+    boxen(routingSection, {
+      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+      borderStyle: "single",
+      dimBorder: true,
+    }),
     ``,
     `  ${d}│${x} ${d}x-upstream-pool, x-output-id${x}`,
     `  ${d}│${x} ${d}x-matched-pathname, x-route-matches${x}`,
     `  ${d}▼${x}`,
     ``,
-    boxen(poolSection, { padding: { left: 1, right: 1, top: 0, bottom: 0 }, borderStyle: "single", dimBorder: true }),
+    boxen(poolSection, {
+      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+      borderStyle: "single",
+      dimBorder: true,
+    }),
   ].join("\n");
 
   console.log(boxen(gkeContent, { padding: 1, borderStyle: "round" }));

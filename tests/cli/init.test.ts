@@ -27,15 +27,11 @@ describe("buildInitGcloudCommands", () => {
     expect(apiCmd).toBeDefined();
     expect(apiCmd!.args).toContain("container.googleapis.com");
 
-    const clusterCmd = commands.find((c) =>
-      c.description.includes("GKE Autopilot cluster"),
-    );
+    const clusterCmd = commands.find((c) => c.description.includes("GKE Autopilot cluster"));
     expect(clusterCmd).toBeDefined();
     expect(clusterCmd!.args).toContain("create-auto");
 
-    const ipCmd = commands.find((c) =>
-      c.description.includes("Reserve Global Static IP"),
-    );
+    const ipCmd = commands.find((c) => c.description.includes("Reserve Global Static IP"));
     expect(ipCmd).toBeDefined();
     expect(ipCmd!.args).toContain("addresses");
   });
@@ -52,22 +48,22 @@ describe("buildInitGcloudCommands", () => {
     expect(saCmd).toBeDefined();
   });
 
-  it('includes routing service backend provisioning commands', () => {
+  it("includes routing service backend provisioning commands", () => {
     const commands = buildInitGcloudCommands({
-      projectId: 'my-project',
-      region: 'us-central1',
-      bucket: 'my-project-nextjs-static',
-      releaseName: 'my-app',
+      projectId: "my-project",
+      region: "us-central1",
+      bucket: "my-project-nextjs-static",
+      releaseName: "my-app",
     });
 
-    const backendCmd = commands.find(c => c.description.includes('backend service for routing'));
+    const backendCmd = commands.find((c) => c.description.includes("backend service for routing"));
     expect(backendCmd).toBeDefined();
 
-    const hcCmd = commands.find(c => c.description.includes('health check for routing'));
+    const hcCmd = commands.find((c) => c.description.includes("health check for routing"));
     expect(hcCmd).toBeDefined();
 
     // LbRouteExtension is created via Helm hook `import`, not during init
-    const routeExtCmd = commands.find(c => c.description.includes('LbRouteExtension'));
+    const routeExtCmd = commands.find((c) => c.description.includes("LbRouteExtension"));
     expect(routeExtCmd).toBeUndefined();
   });
 });

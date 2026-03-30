@@ -10,8 +10,8 @@ export interface ScaffoldOptions {
 
 export function generateAdapterConfig(options: ScaffoldOptions): string {
   const hostEntries = options.hosts
-    .map(h => `      { hostname: '${h}', tls: { enabled: true, managedCert: true } },`)
-    .join('\n');
+    .map((h) => `      { hostname: '${h}', tls: { enabled: true, managedCert: true } },`)
+    .join("\n");
 
   return `import { createK8sAdapter } from '@next-community/adapter-k8s';
 
@@ -58,14 +58,18 @@ export interface InfrastructureConfig {
 }
 
 export function generateInfrastructureJson(config: InfrastructureConfig): string {
-  return JSON.stringify({
-    projectId: config.projectId,
-    region: config.region,
-    hosts: config.hosts,
-    gcsBucket: config.gcsBucket,
-    containerRegistry: config.containerRegistry,
-    gatewayName: config.gatewayName,
-    routeExtensionName: config.routeExtensionName,
-    releaseName: config.releaseName,
-  }, null, 2);
+  return JSON.stringify(
+    {
+      projectId: config.projectId,
+      region: config.region,
+      hosts: config.hosts,
+      gcsBucket: config.gcsBucket,
+      containerRegistry: config.containerRegistry,
+      gatewayName: config.gatewayName,
+      routeExtensionName: config.routeExtensionName,
+      releaseName: config.releaseName,
+    },
+    null,
+    2,
+  );
 }

@@ -69,7 +69,7 @@ export function classifyIntoPools(
   for (const output of allFunctionalOutputs) {
     if (!assigned.has(output.id)) {
       throw new Error(
-        `Output "${output.id}" is not assigned to any pool. Check your adapter config.`
+        `Output "${output.id}" is not assigned to any pool. Check your adapter config.`,
       );
     }
   }

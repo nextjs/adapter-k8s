@@ -5,16 +5,16 @@ import path from "node:path";
 import { execCapture } from "./exec.js";
 
 const COLORS = [
-  "\x1b[36m",  // cyan
-  "\x1b[33m",  // yellow
-  "\x1b[32m",  // green
-  "\x1b[35m",  // magenta
-  "\x1b[34m",  // blue
-  "\x1b[91m",  // bright red
-  "\x1b[92m",  // bright green
-  "\x1b[93m",  // bright yellow
-  "\x1b[94m",  // bright blue
-  "\x1b[95m",  // bright magenta
+  "\x1b[36m", // cyan
+  "\x1b[33m", // yellow
+  "\x1b[32m", // green
+  "\x1b[35m", // magenta
+  "\x1b[34m", // blue
+  "\x1b[91m", // bright red
+  "\x1b[92m", // bright green
+  "\x1b[93m", // bright yellow
+  "\x1b[94m", // bright blue
+  "\x1b[95m", // bright magenta
 ];
 const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
@@ -29,8 +29,15 @@ export async function runTail(options: { projectDir: string; releaseName: string
     const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
     if (infra.projectId && infra.region) {
       const credResult = await execCapture("gcloud", [
-        "container", "clusters", "get-credentials", `${releaseName}-cluster`,
-        "--region", infra.region, "--project", infra.projectId, "--quiet",
+        "container",
+        "clusters",
+        "get-credentials",
+        `${releaseName}-cluster`,
+        "--region",
+        infra.region,
+        "--project",
+        infra.projectId,
+        "--quiet",
       ]);
       if (credResult.exitCode !== 0) {
         console.error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
@@ -70,14 +77,18 @@ export async function runTail(options: { projectDir: string; releaseName: string
         if (!line) continue;
         const isError = line.includes("Error") || line.includes("error") || line.includes("FATAL");
         const lineColor = isError ? RED : "";
-        process.stdout.write(`${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${lineColor}${line}${isError ? RESET : ""}\n`);
+        process.stdout.write(
+          `${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${lineColor}${line}${isError ? RESET : ""}\n`,
+        );
       }
     });
 
     child.stderr?.on("data", (data: Buffer) => {
       for (const line of data.toString().split("\n")) {
         if (!line || line.includes("is waiting to start")) continue;
-        process.stderr.write(`${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${RED}${line}${RESET}\n`);
+        process.stderr.write(
+          `${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${RED}${line}${RESET}\n`,
+        );
       }
     });
 
@@ -94,8 +105,12 @@ export async function runTail(options: { projectDir: string; releaseName: string
 
   async function refreshPods() {
     const podsResult = await execCapture("kubectl", [
-      "get", "pods", "-l", `app.kubernetes.io/name=${releaseName}`,
-      "-o", "jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}|{.status.phase}{\"\\n\"}{end}",
+      "get",
+      "pods",
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}|{.status.phase}{"\\n"}{end}',
     ]);
 
     if (podsResult.exitCode !== 0 || !podsResult.stdout.trim()) return;

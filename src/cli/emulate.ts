@@ -67,7 +67,8 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     const manifest = path.join(outputDir, "routing-manifest.json");
     if (existsSync(manifest)) copyFileSync(manifest, path.join(configDir, "routing-manifest.json"));
     const staticAssets = path.join(outputDir, "static-assets.json");
-    if (existsSync(staticAssets)) copyFileSync(staticAssets, path.join(configDir, "static-assets.json"));
+    if (existsSync(staticAssets))
+      copyFileSync(staticAssets, path.join(configDir, "static-assets.json"));
     // Copy pool manifests
     const { readdirSync } = await import("node:fs");
     for (const f of readdirSync(outputDir)) {
@@ -152,13 +153,15 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
 
   let envoyChild: ChildProcess | null = null;
 
-  console.log(`${DIM}[envoy]${RESET} Config: ${envoyYaml} (exists: ${existsSync(envoyYaml)})`) ;
+  console.log(`${DIM}[envoy]${RESET} Config: ${envoyYaml} (exists: ${existsSync(envoyYaml)})`);
   if (existsSync(envoyYaml)) {
     // Check for local envoy or docker
     // Check for Envoy PROXY binary (not `envoy` the SSH agent manager)
     // The real Envoy proxy responds to `--version` with "envoy version:"
     const envoyCheck = await execCapture("envoy", ["--version"]).catch(() => null);
-    const isEnvoyProxy = envoyCheck && envoyCheck.exitCode === 0 &&
+    const isEnvoyProxy =
+      envoyCheck &&
+      envoyCheck.exitCode === 0 &&
       (envoyCheck.stdout + envoyCheck.stderr).includes("version:");
     if (isEnvoyProxy) {
       console.log(`${DIM}[envoy]${RESET} Starting on :${port} (local binary)...`);
@@ -167,15 +170,25 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       });
     } else {
       console.log(`${DIM}[envoy]${RESET} Starting on :${port} (docker)...`);
-      envoyChild = spawn("docker", [
-        "run", "--rm", "--network", "host",
-        "--name", "adapter-k8s-envoy",
-        "-v", `${envoyYaml}:/etc/envoy/envoy.yaml:ro`,
-        "envoyproxy/envoy:v1.32-latest",
-        "--log-level", "warn",
-      ], {
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      envoyChild = spawn(
+        "docker",
+        [
+          "run",
+          "--rm",
+          "--network",
+          "host",
+          "--name",
+          "adapter-k8s-envoy",
+          "-v",
+          `${envoyYaml}:/etc/envoy/envoy.yaml:ro`,
+          "envoyproxy/envoy:v1.32-latest",
+          "--log-level",
+          "warn",
+        ],
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
     }
 
     children.push(envoyChild);
@@ -205,11 +218,17 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     for (const p of ports) {
       const ok = await new Promise<boolean>((resolve) => {
         const s = require("net").createConnection(p, "127.0.0.1");
-        s.on("connect", () => { s.destroy(); resolve(true); });
+        s.on("connect", () => {
+          s.destroy();
+          resolve(true);
+        });
         s.on("error", () => resolve(false));
         setTimeout(() => resolve(false), 300);
       });
-      if (!ok) { allReady = false; break; }
+      if (!ok) {
+        allReady = false;
+        break;
+      }
     }
     if (allReady) break;
 
@@ -225,7 +244,9 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       process.exit(1);
     }
     if (envoyChild && envoyChild.exitCode !== null) {
-      console.log(`${YELLOW}[envoy]${RESET} Envoy exited — continuing without proxy. Requests go to pool server on :3000`);
+      console.log(
+        `${YELLOW}[envoy]${RESET} Envoy exited — continuing without proxy. Requests go to pool server on :3000`,
+      );
       children.splice(children.indexOf(envoyChild), 1);
       envoyChild = null;
       // Remove envoy port from check list

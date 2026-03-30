@@ -1,4 +1,4 @@
-import type { ProcessingResponse, HeaderValueOption } from './ext-proc-types.js';
+import type { ProcessingResponse, HeaderValueOption } from "./ext-proc-types.js";
 
 export interface HeaderMutationEntry {
   key: string;
@@ -10,12 +10,10 @@ export function buildImmediateResponse(
   headers: Record<string, string>,
   body?: string,
 ): ProcessingResponse {
-  const setHeaders: HeaderValueOption[] = Object.entries(headers).map(
-    ([key, value]) => ({
-      header: { key, value },
-      appendAction: 'OVERWRITE_IF_EXISTS_OR_ADD' as const,
-    }),
-  );
+  const setHeaders: HeaderValueOption[] = Object.entries(headers).map(([key, value]) => ({
+    header: { key, value },
+    appendAction: "OVERWRITE_IF_EXISTS_OR_ADD" as const,
+  }));
   const response: ProcessingResponse = {
     immediateResponse: {
       status: { code: statusCode },
@@ -28,18 +26,16 @@ export function buildImmediateResponse(
   return response;
 }
 
-export function buildHeaderMutationResponse(
-  mutations: HeaderMutationEntry[],
-): ProcessingResponse {
+export function buildHeaderMutationResponse(mutations: HeaderMutationEntry[]): ProcessingResponse {
   const setHeaders: HeaderValueOption[] = mutations.map(({ key, value }) => ({
     header: { key, value },
-    appendAction: 'OVERWRITE_IF_EXISTS_OR_ADD' as const,
+    appendAction: "OVERWRITE_IF_EXISTS_OR_ADD" as const,
   }));
   return {
     requestHeaders: {
       response: {
         headerMutation: { setHeaders },
-        status: 'CONTINUE',
+        status: "CONTINUE",
       },
     },
   };
