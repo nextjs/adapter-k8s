@@ -57,6 +57,7 @@ describe("createDispatcher", () => {
     const handlerLoader = {
       load: vi.fn().mockResolvedValue(handler),
       has: vi.fn().mockReturnValue(true),
+      get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
     };
 
     const dispatcher = createDispatcher({
@@ -93,7 +94,7 @@ describe("createDispatcher", () => {
 
   it("handles redirects", async () => {
     const dispatcher = createDispatcher({
-      handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+      handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
       poolName: "ssr",
       buildId: "test123",
       staticAssets: [],
@@ -114,7 +115,7 @@ describe("createDispatcher", () => {
 
   it("proxies external rewrites", async () => {
     const dispatcher = createDispatcher({
-      handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+      handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
       poolName: "ssr",
       buildId: "test123",
       staticAssets: [],
@@ -137,7 +138,7 @@ describe("createDispatcher", () => {
 
   it("returns 404 for not-found", async () => {
     const dispatcher = createDispatcher({
-      handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+      handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
       poolName: "ssr",
       buildId: "test123",
       staticAssets: [],
@@ -189,6 +190,7 @@ describe("createDispatcher", () => {
     const handlerLoader = {
       load: vi.fn().mockResolvedValue(handler),
       has: vi.fn().mockReturnValue(true),
+      get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
     };
 
     const dispatcher = createDispatcher({
@@ -251,7 +253,7 @@ describe("createDispatcher", () => {
       writeFileSync(path.join(tmpDir, "favicon.ico"), "icon-data");
 
       const dispatcher = createDispatcher({
-        handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
         poolName: "ssr",
         buildId: "test123",
         staticAssets: [
@@ -287,7 +289,7 @@ describe("createDispatcher", () => {
       );
 
       const dispatcher = createDispatcher({
-        handlerLoader: { load: vi.fn(), has: vi.fn() } as any,
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
         poolName: "ssr",
         buildId: "test123",
         staticAssets: [
@@ -326,6 +328,7 @@ describe("createDispatcher", () => {
       const handlerLoader = {
         load: vi.fn().mockResolvedValue(handler),
         has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
       };
 
       const dispatcher = createDispatcher({

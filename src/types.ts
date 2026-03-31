@@ -74,7 +74,7 @@ export interface RoutingManifest {
   i18n: BuildCompleteContext["config"]["i18n"] | null;
   buildId: string;
   basePath: string;
-  middleware: { filePath: string } | null;
+  middleware: { filePath: string; runtime?: string } | null;
   poolAssignments: Record<string, string>;
   pprRoutes: Record<
     string,

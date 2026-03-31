@@ -196,7 +196,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // Use process.cwd() which is the project root during build.
       await ensureConfig(process.cwd());
 
-      return {
+      const modified: Record<string, unknown> = {
         ...nextConfig,
         compress: false,
         // Set turbopack root to the project directory to avoid workspace detection issues
@@ -211,17 +211,65 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         generateBuildId:
           nextConfig.generateBuildId ??
           (() => {
-            // Must be valid for: K8s labels, Docker tags, K8s resource names
-            // Rules: lowercase alphanumeric + hyphens, must start/end with alphanumeric
             const timestamp = Date.now().toString(36);
             const random = Math.random().toString(36).slice(2, 8);
             return `b${timestamp}${random}`;
           }),
-      } as typeof nextConfig;
+      };
+
+      // Local build profile: cap workers and memory for constrained environments
+      // (e2e tests, local emulation). Set ADAPTER_K8S_BUILD_CPUS to activate.
+      const buildCpus = parseInt(process.env.ADAPTER_K8S_BUILD_CPUS ?? "", 10);
+      if (buildCpus > 0) {
+        modified.experimental = {
+          ...(modified.experimental as Record<string, unknown> ?? {}),
+          cpus: buildCpus,
+          memoryBasedWorkersCount: false,
+          parallelServerCompiles: false,
+          parallelServerBuildTraces: false,
+          webpackBuildWorker: false,
+        };
+      }
+
+      return modified as typeof nextConfig;
     },
 
     async onBuildComplete(ctx: BuildCompleteContext) {
       const { routing, outputs, projectDir, config: nextConfig, buildId, nextVersion } = ctx;
+
+      // Dump raw build context for debugging
+      const debugDir = path.join(projectDir, OUTPUT_DIR, "debug");
+      await mkdir(debugDir, { recursive: true });
+      await writeFile(
+        path.join(debugDir, "build-context.json"),
+        JSON.stringify(
+          {
+            buildId,
+            nextVersion,
+            basePath: nextConfig.basePath,
+            i18n: nextConfig.i18n,
+            routing,
+            outputKeys: Object.keys(outputs),
+            outputs: Object.fromEntries(
+              Object.entries(outputs).map(([k, v]) => {
+                if (Array.isArray(v)) {
+                  return [k, v.map((item: any) => ({
+                    ...item,
+                    // Truncate large fields
+                    assets: item.assets ? `[${Object.keys(item.assets).length} assets]` : undefined,
+                  }))];
+                }
+                if (v && typeof v === "object" && "filePath" in v) {
+                  return [k, { ...v, assets: v.assets ? `[${Object.keys(v.assets).length} assets]` : undefined }];
+                }
+                return [k, v];
+              }),
+            ),
+          },
+          null,
+          2,
+        ),
+      );
 
       const cfg = await ensureConfig(projectDir);
       stagedPaths.clear();

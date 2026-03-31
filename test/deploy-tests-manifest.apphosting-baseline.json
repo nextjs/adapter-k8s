@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "suites": {},
+  "rules": {
+    "include": [
+      "test/e2e/test-utils-tests/basic/basic.test.ts"
+    ],
+    "exclude": []
+  }
+}

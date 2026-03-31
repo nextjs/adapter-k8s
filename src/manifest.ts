@@ -106,7 +106,10 @@ export function buildRoutingManifest({
     buildId,
     basePath,
     middleware: outputs.middleware
-      ? { filePath: path.relative(projectDir, outputs.middleware.filePath) }
+      ? {
+          filePath: path.relative(projectDir, outputs.middleware.filePath),
+          runtime: (outputs.middleware as any).runtime ?? "nodejs",
+        }
       : null,
     poolAssignments,
     pprRoutes,

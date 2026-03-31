@@ -1,0 +1,39 @@
+name: test-e2e-baseline-apphosting
+
+on:
+  workflow_dispatch:
+    inputs:
+      adapterVersion:
+        description: "npm version/tag for @apphosting/adapter-nextjs"
+        default: "latest"
+        type: string
+      nextVersion:
+        description: "npm version for next"
+        default: "16.2.1"
+        type: string
+      reactVersion:
+        description: "npm version for react/react-dom"
+        default: "19.2.4"
+        type: string
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install repo dependencies
+        run: npm ci
+
+      - name: Run single-suite Next.js baseline deploy test
+        env:
+          APPHOSTING_BASELINE_ADAPTER_VERSION: ${{ inputs.adapterVersion }}
+          APPHOSTING_BASELINE_NEXT_VERSION: ${{ inputs.nextVersion }}
+          APPHOSTING_BASELINE_REACT_VERSION: ${{ inputs.reactVersion }}
+        run: npm run test:e2e:baseline:apphosting

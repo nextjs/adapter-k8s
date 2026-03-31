@@ -34,6 +34,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "bash scripts/e2e-local.sh",
+    "test:e2e:baseline:apphosting": "bash scripts/e2e-apphosting-baseline.sh",
+    "test:e2e:baseline:firebase": "bash scripts/e2e-firebase-baseline.sh",
     "test:integration": "NEXT_TEST_DEPLOY_SCRIPT_PATH=scripts/e2e-integration-deploy.sh NEXT_TEST_CLEANUP_SCRIPT_PATH=scripts/e2e-integration-cleanup.sh bash scripts/e2e-local.sh",
     "build:clean": "rm -rf dist",
     "build:types": "tsc --emitDeclarationOnly --declaration --declarationDir dist",

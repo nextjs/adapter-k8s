@@ -18,9 +18,49 @@ export type ResolveResult =
   | { kind: "external-rewrite"; url: URL }
   | { kind: "not-found" };
 
+function trailingSlashVariants(pathname: string): string[] {
+  if (pathname === "/") return ["/"];
+  const withSlash = pathname.endsWith("/") ? pathname : pathname + "/";
+  const withoutSlash = pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
+  return [pathname, withoutSlash, withSlash];
+}
+
+function lookupPool(
+  poolAssignments: Record<string, string>,
+  resolvedPathname: string | undefined,
+  matchedPathname: string,
+  i18nLocales?: string[],
+): string | undefined {
+  // Collect candidate pathnames: resolvedPathname first, then matchedPathname
+  const candidates: string[] = [];
+  if (resolvedPathname) candidates.push(...trailingSlashVariants(resolvedPathname));
+  candidates.push(...trailingSlashVariants(matchedPathname));
+
+  // Also try stripping i18n locale prefix (e.g., /en/about → /about)
+  if (i18nLocales?.length) {
+    const extra: string[] = [];
+    for (const c of candidates) {
+      for (const locale of i18nLocales) {
+        const prefix = `/${locale}`;
+        if (c.startsWith(prefix + "/") || c === prefix) {
+          extra.push(...trailingSlashVariants(c.slice(prefix.length) || "/"));
+        }
+      }
+    }
+    candidates.push(...extra);
+  }
+
+  for (const p of candidates) {
+    if (poolAssignments[p]) return poolAssignments[p];
+  }
+  return poolAssignments["default"] ?? Object.values(poolAssignments)[0];
+}
+
 export function createLocalResolver(
   manifest: RoutingManifest,
   middlewareModule?: LoadedModule | null,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  edgeMiddlewareRunner?: ((ctx: any) => Promise<Response | null>) | null,
 ) {
   return {
     async resolve(
@@ -46,11 +86,13 @@ export function createLocalResolver(
         routes: manifest.routeGraph,
         // invokeMiddleware MUST always be a function — resolveRoutes calls it
         // unconditionally (no null guard). When no middleware exists, return empty result.
-        invokeMiddleware: middlewareModule
+        invokeMiddleware: (middlewareModule || edgeMiddlewareRunner)
           ? async (ctx) => {
               // Next.js middleware modules have multiple shapes depending on
               // compilation target. We try invocation paths in order:
               //
+              // 0. Edge sandbox: use Next.js's built-in edge runtime sandbox
+              //    (for middleware compiled with edge runtime target).
               // 1. Web adapter: default({ handler, request, page }) — Node middleware
               //    Returns raw NextResponse with x-middleware-* headers intact.
               // 2. Legacy: default.default({ request }) — older Next.js Edge output
@@ -61,34 +103,46 @@ export function createLocalResolver(
               // headers from the response, causing responseToMiddlewareResult to
               // misinterpret the result (sets bodySent=true incorrectly).
 
-              const adapterFn =
-                typeof middlewareModule.default === "function"
-                  ? (middlewareModule.default as (...args: unknown[]) => unknown)
-                  : typeof middlewareModule === "function"
-                    ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
-                    : null;
-
-              const handlerFn =
-                (middlewareModule as Record<string, unknown>).proxy ||
-                (middlewareModule as Record<string, unknown>).middleware ||
-                middlewareModule;
-
-              const legacyMiddlewareFn =
-                typeof (middlewareModule.default as Record<string, unknown> | undefined)
-                  ?.default === "function"
-                  ? ((middlewareModule.default as Record<string, unknown>).default as (
-                      ...args: unknown[]
-                    ) => unknown)
-                  : null;
-
-              if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
-
               try {
+                let response: Response | null = null;
+
+                // Path 0: Edge sandbox (for edge-compiled middleware)
+                if (edgeMiddlewareRunner) {
+                  response = await edgeMiddlewareRunner({
+                    url: ctx.url,
+                    headers: ctx.headers,
+                    method,
+                    body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                  });
+                }
+
+                // Node middleware paths (only if no edge runner or edge didn't produce a response)
+                if (!response && middlewareModule) {
+                  const adapterFn =
+                    typeof middlewareModule.default === "function"
+                      ? (middlewareModule.default as (...args: unknown[]) => unknown)
+                      : typeof middlewareModule === "function"
+                        ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
+                        : null;
+
+                  const handlerFn =
+                    (middlewareModule as Record<string, unknown>).proxy ||
+                    (middlewareModule as Record<string, unknown>).middleware ||
+                    middlewareModule;
+
+                  const legacyMiddlewareFn =
+                    typeof (middlewareModule.default as Record<string, unknown> | undefined)
+                      ?.default === "function"
+                      ? ((middlewareModule.default as Record<string, unknown>).default as (
+                          ...args: unknown[]
+                        ) => unknown)
+                      : null;
+
+                  if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
+
                 const waitUntil = (waitable: Promise<unknown>) => {
                   void waitable.catch(() => undefined);
                 };
-
-                let response: Response | null = null;
 
                 // Path 1: Web adapter (default({ handler, request, page }))
                 if (adapterFn && handlerFn) {
@@ -175,6 +229,7 @@ export function createLocalResolver(
                         ? result.response
                         : null;
                 }
+                } // end if (!response && middlewareModule)
 
                 if (response) {
                   middlewareResponse = response;
@@ -227,28 +282,46 @@ export function createLocalResolver(
       // 4. Normal route resolution
       const matchedPathname = resolution.invocationTarget?.pathname ?? url.pathname;
 
-      // Try exact match first, then try with/without trailing slash, then fall back to default pool
-      let pool =
-        manifest.poolAssignments[resolution.resolvedPathname ?? ""] ??
-        manifest.poolAssignments[matchedPathname];
-
-      if (!pool) {
-        // Trailing slash fallback: try with/without trailing slash
-        const withSlash = matchedPathname.endsWith("/") ? matchedPathname : matchedPathname + "/";
-        const withoutSlash = matchedPathname.endsWith("/") ? matchedPathname.slice(0, -1) : matchedPathname;
-        pool =
-          manifest.poolAssignments[withSlash] ??
-          manifest.poolAssignments[withoutSlash] ??
-          manifest.poolAssignments["default"] ??
-          Object.values(manifest.poolAssignments)[0];
-      }
+      // Try exact match first, then try with/without trailing slash, then fall back to default pool.
+      // Both resolvedPathname and matchedPathname are checked with trailing slash variants
+      // because the pool assignment keys may differ from what @next/routing returns
+      // depending on the app's trailingSlash config.
+      const i18nLocales = (manifest.i18n as any)?.locales as string[] | undefined;
+      const pool = lookupPool(manifest.poolAssignments, resolution.resolvedPathname, matchedPathname, i18nLocales);
 
       if (!pool) {
         return { kind: "not-found" };
       }
 
-      const finalMatchedPathname =
+      let finalMatchedPathname =
         resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname;
+
+      // For RSC requests, resolve to the .rsc output variant.
+      // resolveRoutes returns the base pathname (e.g., /page) — the adapter must
+      // map it to the .rsc output (e.g., /page.rsc) so the handler knows to
+      // return RSC payload instead of HTML.
+      const rscConfig = (manifest as any).routeGraph?.rsc;
+      if (rscConfig && headers.get(rscConfig.header) === "1") {
+        const basePath = finalMatchedPathname === "/" ? "/index" : finalMatchedPathname;
+
+        // Check for segment prefetch first (specific segment RSC)
+        const segmentPrefetch = headers.get(rscConfig.prefetchSegmentHeader);
+        if (segmentPrefetch && segmentPrefetch.length > 0) {
+          const normalized = segmentPrefetch.replace(/^\/+/, "");
+          const candidate = `${basePath}${rscConfig.prefetchSegmentDirSuffix}/${normalized}${rscConfig.prefetchSegmentSuffix}`;
+          if (manifest.poolAssignments[candidate]) {
+            finalMatchedPathname = candidate;
+          }
+        }
+
+        // Otherwise try the .rsc variant
+        if (finalMatchedPathname === (resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname)) {
+          const rscCandidate = `${basePath}${rscConfig.suffix}`;
+          if (manifest.poolAssignments[rscCandidate]) {
+            finalMatchedPathname = rscCandidate;
+          }
+        }
+      }
 
       return {
         kind: "route",

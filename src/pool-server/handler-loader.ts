@@ -18,6 +18,13 @@ export function resolveRouteHandlerExport(module: LoadedModule): ArtifactRouteHa
   }
   if (typeof module.fetch === "function") return module.fetch as ArtifactRouteHandler;
 
+  // App Router route modules compiled by Turbopack may export routeModule with a handle method
+  if (module.routeModule && typeof module.routeModule === "object") {
+    const rm = module.routeModule as Record<string, unknown>;
+    if (typeof rm.handle === "function") return rm.handle as ArtifactRouteHandler;
+    if (typeof rm.render === "function") return rm.render as ArtifactRouteHandler;
+  }
+
   // Edge runtime modules compiled by Turbopack register in globalThis._ENTRIES.
   // Try to find a matching entry and extract its handler/default export.
   const entries = (globalThis as Record<string, unknown>)._ENTRIES as
@@ -30,7 +37,19 @@ export function resolveRouteHandlerExport(module: LoadedModule): ArtifactRouteHa
     }
   }
 
-  throw new Error("Could not find a valid handler export (handler, default, fetch) in the module.");
+  const exportKeys = Object.keys(module);
+  const exportTypes = exportKeys.map((k) => `${k}:${typeof module[k]}`).join(", ");
+  // Also dump nested default keys if it's an object
+  let defaultInfo = "";
+  if (module.default && typeof module.default === "object") {
+    const dk = Object.keys(module.default as Record<string, unknown>);
+    const dt = dk.map((k) => `${k}:${typeof (module.default as Record<string, unknown>)[k]}`).join(", ");
+    defaultInfo = ` default={${dt}}`;
+  }
+  throw new Error(
+    `Could not find a valid handler export (handler, default, fetch) in the module. ` +
+    `Exports: [${exportTypes}]${defaultInfo}`
+  );
 }
 
 export function createHandlerLoader(
@@ -49,9 +68,25 @@ export function createHandlerLoader(
         throw new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`);
       }
 
-      const promise = loadModule(output.filePath).then((module) =>
-        resolveRouteHandlerExport(module),
-      );
+      const promise = loadModule(output.filePath).then(async (module) => {
+        // Turbopack modules with top-level await (e.g., Genkit, heavy async deps)
+        // may export a Promise as module.exports. Await it to get the real exports.
+        let resolved: LoadedModule = module;
+        const defaultExport = module.default;
+        if (defaultExport instanceof Promise) {
+          resolved = (await defaultExport) as LoadedModule;
+        } else if (defaultExport && typeof defaultExport === "object" && Object.getPrototypeOf(defaultExport)?.constructor?.name === "Promise") {
+          resolved = (await (defaultExport as Promise<LoadedModule>));
+        }
+        try {
+          return resolveRouteHandlerExport(resolved);
+        } catch (err) {
+          throw new Error(
+            `Failed to resolve handler for outputId="${outputId}" ` +
+            `filePath="${output.filePath}": ${(err as Error).message}`
+          );
+        }
+      });
       cache.set(outputId, promise);
       return promise;
     },

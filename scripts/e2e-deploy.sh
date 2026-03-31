@@ -143,81 +143,14 @@ if [[ " ${NODE_OPTIONS:-} " != *" --max-old-space-size="* ]]; then
 fi
 echo "[adapter-k8s] NODE_OPTIONS=${NODE_OPTIONS}" >&2
 
-# Force middleware to compile as Node.js runtime (not Edge).
-# Our pool server can invoke Node middleware directly but not Edge/Turbopack bundles.
-for MWFILE in middleware.ts middleware.js src/middleware.ts src/middleware.js; do
-  if [ -f "$MWFILE" ]; then
-    if ! grep -q "runtime.*=.*['\"]nodejs['\"]" "$MWFILE" 2>/dev/null; then
-      echo "export const runtime = 'nodejs';" >> "$MWFILE"
-      echo "[adapter-k8s] Forced Node.js runtime for ${MWFILE}" >&2
-    fi
-    break
-  fi
-done
+# The pool server supports both Node.js and Edge middleware runtimes.
+# Node middleware is loaded directly; Edge middleware uses Next.js's built-in
+# edge sandbox (same mechanism as `next start`). No runtime forcing needed.
 
-# Inject a local build profile into plain-object next.config.* files:
-# - cap build workers
-# - disable parallel server build workers
-# - set turbopack.root to the isolated test app
-for CFGFILE in next.config.ts next.config.mjs next.config.js; do
-  if [ -f "$CFGFILE" ]; then
-    node -e "
-      const fs = require('fs');
-      const cwd = process.cwd();
-      const cpus = Number(process.env.BUILD_CPUS || 4);
-      let c = fs.readFileSync('${CFGFILE}', 'utf8');
-
-      if (c.includes('adapter-k8s local build profile')) {
-        process.exit(0);
-      }
-
-      const buildProfile = [
-        '  // adapter-k8s local build profile',
-        '  experimental: {',
-        '    cpus: ' + cpus + ',',
-        '    memoryBasedWorkersCount: false,',
-        '    parallelServerCompiles: false,',
-        '    parallelServerBuildTraces: false,',
-        '    webpackBuildWorker: false,',
-        '  },',
-        '  turbopack: { root: ' + JSON.stringify(cwd) + ' },',
-      ].join('\\n');
-
-      let changed = false;
-
-      if (/experimental\\s*:\\s*\\{/.test(c)) {
-        c = c.replace(
-          /experimental\\s*:\\s*\\{/,
-          'experimental: {\\n    // adapter-k8s local build profile\\n    cpus: ' + cpus + ',\\n    memoryBasedWorkersCount: false,\\n    parallelServerCompiles: false,\\n    parallelServerBuildTraces: false,\\n    webpackBuildWorker: false,'
-        );
-        changed = true;
-      }
-
-      if (/turbopack\\s*:\\s*\\{/.test(c)) {
-        c = c.replace(
-          /turbopack\\s*:\\s*\\{/,
-          'turbopack: {\\n    root: ' + JSON.stringify(cwd) + ','
-        );
-        changed = true;
-      }
-
-      if (!changed) {
-        c = c.replace(
-          /(module\\.exports\\s*=\\s*\\{|export\\s+default\\s*\\{)/,
-          '\$1\\n' + buildProfile + '\\n'
-        );
-        changed = c.includes('adapter-k8s local build profile');
-      }
-
-      if (!changed) {
-        process.exit(2);
-      }
-
-      fs.writeFileSync('${CFGFILE}', c);
-    " >&2 2>&1 && echo "[adapter-k8s] Applied local build profile in ${CFGFILE}" >&2
-    break
-  fi
-done
+# Build profile is applied via the adapter's modifyConfig() API — no config file
+# hacking needed. Just set the env var to activate it.
+export ADAPTER_K8S_BUILD_CPUS="${BUILD_CPUS}"
+echo "[adapter-k8s] Build profile: cpus=${BUILD_CPUS}" >&2
 
 # --- 3. Build ---
 echo "[adapter-k8s] Building..." >&2

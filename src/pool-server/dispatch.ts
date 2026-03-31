@@ -110,13 +110,22 @@ async function invokeLocalHandlerOverHttp({
         return;
       }
 
+      const reqHeaders = toNodeHeaders(req);
+      // Ensure content-length matches the buffered body (the original stream is consumed)
+      if (bufferedBody) {
+        reqHeaders["content-length"] = String(bufferedBody.length);
+      } else if (req.method !== "GET" && req.method !== "HEAD") {
+        // Body was consumed but no buffer — send empty body
+        reqHeaders["content-length"] = "0";
+      }
+
       const clientReq = httpRequest(
         {
           hostname: "127.0.0.1",
           port: address.port,
           method: req.method,
           path: req.url,
-          headers: toNodeHeaders(req),
+          headers: reqHeaders,
         },
         (clientRes) => {
           void writeInnerResponse(res, clientRes)
@@ -151,6 +160,14 @@ function sanitizeK8sName(name: string): string {
   return sanitized.slice(0, 63);
 }
 
+// Edge route runner: uses Next.js's edge sandbox to execute edge-compiled route handlers.
+// Returns a web Response which we convert back to Node's ServerResponse.
+type EdgeRouteRunner = (params: {
+  name: string;
+  paths: string[];
+  request: Record<string, unknown>;
+}) => Promise<{ response: Response; waitUntil: Promise<void> }>;
+
 export interface DispatcherOptions {
   handlerLoader: HandlerLoader;
   poolName: string;
@@ -158,6 +175,8 @@ export interface DispatcherOptions {
   staticAssets: StaticAssetEntry[];
   releaseName?: string;
   localHandlerInvoker?: LocalHandlerInvoker;
+  edgeRouteRunner?: EdgeRouteRunner | null;
+  pprRoutes?: Record<string, { postponedState: string }>;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -168,6 +187,8 @@ export function createDispatcher(options: DispatcherOptions) {
     staticAssets,
     releaseName = "nextjs",
     localHandlerInvoker = invokeLocalHandlerOverHttp,
+    edgeRouteRunner = null,
+    pprRoutes = {},
   } = options;
 
   return {
@@ -213,7 +234,14 @@ export function createDispatcher(options: DispatcherOptions) {
       // Skip if request has resume headers (PPR resume step).
       // Skip for non-GET/HEAD methods — static pages don't accept POST etc.
       if (resolution.kind === "route") {
-        const staticAsset = staticAssets.find((a) => a.pathname === resolution.matchedPathname);
+        const mp = resolution.matchedPathname;
+        const isRSC = req.headers["rsc"] === "1";
+        const staticAsset = staticAssets.find((a) =>
+          a.pathname === mp ||
+          a.pathname === (mp.endsWith("/") ? mp.slice(0, -1) : mp + "/") ||
+          // RSC requests: serve the .rsc prerendered payload if available
+          (isRSC && a.pathname === mp + ".rsc"),
+        );
         const isPPR = staticAsset?.ppr;
         const hasResumeHeader =
           req.headers["next-resume"] === "1" || req.headers["x-nextjs-ppr"] === "1";
@@ -354,37 +382,31 @@ export function createDispatcher(options: DispatcherOptions) {
 
         case "route": {
 
-          // Apply middleware's mutated request headers (cookies, overrides, etc.)
-          // responseToMiddlewareResult handles x-middleware-set-cookie,
-          // x-middleware-override-headers, and x-middleware-request-* in one pass.
-          // We REPLACE req.headers to respect deletions (override-headers removes headers).
+          // Apply middleware's mutated request headers on top of the original.
+          // responseToMiddlewareResult processes x-middleware-set-cookie,
+          // x-middleware-override-headers, and x-middleware-request-* headers.
+          // We merge them into the original headers rather than replacing —
+          // let the Next.js handler handle any stripping/filtering internally.
           if (resolution.middlewareRequestHeaders) {
-            const newHeaders: Record<string, string | string[]> = {};
-            const setCookieValues: string[] = [];
             for (const [key, value] of resolution.middlewareRequestHeaders.entries()) {
               if (key === "x-middleware-set-cookie") {
                 // Parse Set-Cookie values and merge into cookie header so the
                 // handler can read middleware-set cookies in the same request.
+                const parts: string[] = [];
                 for (const sc of value.split(/,(?=[^;]*=)/)) {
-                  const nameVal = sc.trim().split(";")[0]; // "name=value" from "name=value; path=/"
-                  if (nameVal) setCookieValues.push(nameVal);
+                  const nameVal = sc.trim().split(";")[0];
+                  if (nameVal) parts.push(nameVal);
+                }
+                if (parts.length > 0) {
+                  const existing = req.headers.cookie ?? "";
+                  req.headers.cookie = [existing, ...parts].filter(Boolean).join("; ");
                 }
                 continue;
               }
-              // Skip other internal x-middleware-* headers
+              // Skip internal x-middleware-* control headers
               if (key.startsWith("x-middleware-")) continue;
-              newHeaders[key] = value;
+              req.headers[key] = value;
             }
-            // Merge middleware-set cookies into the cookie header
-            if (setCookieValues.length > 0) {
-              const existing = typeof newHeaders.cookie === "string" ? newHeaders.cookie : "";
-              newHeaders.cookie = [existing, ...setCookieValues].filter(Boolean).join("; ");
-            }
-            // Preserve host header from original request
-            if (req.headers.host && !newHeaders.host) {
-              newHeaders.host = req.headers.host;
-            }
-            req.headers = newHeaders;
           }
 
           // If this output belongs to another pool, proxy the request
@@ -414,6 +436,78 @@ export function createDispatcher(options: DispatcherOptions) {
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
             res.end("Not Found");
             return;
+          }
+
+          // Edge runtime routes: use the edge sandbox instead of the loopback HTTP server
+          const outputInfo = handlerLoader.get(resolution.matchedPathname);
+          if (edgeRouteRunner && outputInfo?.runtime === "edge") {
+            const headerObj: Record<string, string> = {};
+            for (const [key, value] of Object.entries(req.headers)) {
+              if (typeof value === "string") headerObj[key] = value;
+              else if (Array.isArray(value)) headerObj[key] = value.join(", ");
+            }
+            const fullUrl = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+            const filePath = path.resolve(process.cwd(), outputInfo.filePath);
+            try {
+              const result = await edgeRouteRunner({
+                name: resolution.matchedPathname,
+                paths: [filePath],
+                request: {
+                  url: fullUrl.toString(),
+                  method: req.method,
+                  headers: headerObj,
+                  body: req.method !== "GET" && req.method !== "HEAD"
+                    ? (req as IncomingMessage & { [NEXT_REQUEST_META]?: { actionBody?: Buffer } })[NEXT_REQUEST_META]?.actionBody
+                    : undefined,
+                  page: {
+                    name: resolution.matchedPathname,
+                    ...(resolution.routeMatches && { params: resolution.routeMatches }),
+                  },
+                },
+              });
+              const edgeRes = result.response;
+              const headers: Record<string, string | string[]> = {};
+              for (const [key, value] of edgeRes.headers.entries()) {
+                if (key.toLowerCase() === "set-cookie") {
+                  const existing = headers["set-cookie"];
+                  if (Array.isArray(existing)) existing.push(value);
+                  else if (existing) headers["set-cookie"] = [existing as string, value];
+                  else headers["set-cookie"] = [value];
+                } else {
+                  headers[key] = value;
+                }
+              }
+              res.writeHead(edgeRes.status, headers);
+              if (edgeRes.body) {
+                const reader = edgeRes.body.getReader();
+                try {
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (value) res.write(Buffer.from(value));
+                  }
+                } finally {
+                  reader.releaseLock();
+                }
+              }
+              res.end();
+            } catch (err) {
+              console.error(`Edge route handler failed for ${resolution.matchedPathname}:`, err);
+              if (!res.headersSent) {
+                res.writeHead(500, { "content-type": "text/plain" });
+                res.end("Internal Server Error");
+              }
+            }
+            return;
+          }
+
+          // For PPR routes, set the postponed state on request metadata.
+          // The handler reads this to resume streaming dynamic content after the static shell.
+          const pprInfo = pprRoutes[resolution.matchedPathname];
+          if (pprInfo?.postponedState) {
+            const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
+            meta.postponed = pprInfo.postponedState;
+            (req as any)[NEXT_REQUEST_META] = meta;
           }
 
           // Load and invoke the handler directly
@@ -490,7 +584,7 @@ function proxyToPool(
   });
 }
 
-function getContentType(pathname: string): string {
+export function getContentType(pathname: string): string {
   const ext = path.extname(pathname).toLowerCase();
   switch (ext) {
     case ".html":
