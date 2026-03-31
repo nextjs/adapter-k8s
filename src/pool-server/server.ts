@@ -72,10 +72,11 @@ export function createPoolServer(options: PoolServerOptions) {
     try {
       await onRequest(req, res);
     } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
       console.error("Unhandled request error:", err);
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "text/plain" });
-        res.end("Internal Server Error");
+        res.end(`Internal Server Error: ${errMsg}`);
       } else if (!res.writableEnded) {
         res.end();
       }

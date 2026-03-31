@@ -344,6 +344,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       }
 
       // 5. Build Stage Area & Dockerfiles
+      // Skip staging when running in e2e/emulate mode — the pool server reads
+      // directly from .next/ and staging doubles inode usage needlessly.
+      const skipStaging = process.env.ADAPTER_K8S_SKIP_STAGING === "1";
+
       const poolServerSrc = path.join(_dirname, "pool-server.cjs");
       const poolServerContent = existsSync(poolServerSrc)
         ? readFileSync(poolServerSrc, "utf-8")
@@ -354,7 +358,32 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         existsSync(path.join(projectDir, f)),
       );
 
-      if (cfg.containerStrategy === "shared-image") {
+      if (skipStaging) {
+        // Only write pool manifests — skip Docker context staging (saves thousands of inodes)
+        for (const [poolName, pool] of pools) {
+          const poolManifest = {
+            buildId,
+            poolName,
+            outputs: Object.fromEntries(
+              pool.outputs.map((o: any) => [
+                o.pathname,
+                {
+                  id: o.id ?? o.pathname,
+                  filePath: path.relative(projectDir, o.filePath),
+                  pathname: o.pathname,
+                  type: o.type,
+                  runtime: o.runtime ?? "nodejs",
+                },
+              ]),
+            ),
+          };
+          await writeOutputFile(
+            projectDir,
+            `pool-manifest-${poolName}.json`,
+            JSON.stringify(poolManifest, null, 2),
+          );
+        }
+      } else if (cfg.containerStrategy === "shared-image") {
         const sharedStageDir = "shared-context";
         const absSharedStageDir = path.join(OUTPUT_DIR, sharedStageDir);
 
@@ -606,7 +635,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       await writeOutputFile(projectDir, "extension-chains.json", extensionChain);
       await writeOutputFile(projectDir, "cel-expression.txt", celExpression);
 
-      // Routing service Dockerfile + context
+      // Routing service Dockerfile + context (skip when staging is disabled)
+      if (!skipStaging) {
       const routingServiceDir = path.join(OUTPUT_DIR, "routing-service");
 
       await writeOutputFile(
@@ -716,6 +746,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           await cp(chunksDir, chunksDest, { recursive: true, dereference: true });
         }
       }
+      } // end if (!skipStaging)
 
       await writeOutputFile(
         projectDir,

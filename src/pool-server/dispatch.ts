@@ -433,6 +433,7 @@ export function createDispatcher(options: DispatcherOptions) {
               });
               return;
             }
+            console.log(`[dispatch] 404: no handler for matchedPathname="${resolution.matchedPathname}" url="${req.url}"`);
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
             res.end("Not Found");
             return;

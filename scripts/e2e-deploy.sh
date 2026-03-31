@@ -150,6 +150,9 @@ echo "[adapter-k8s] NODE_OPTIONS=${NODE_OPTIONS}" >&2
 # Build profile is applied via the adapter's modifyConfig() API — no config file
 # hacking needed. Just set the env var to activate it.
 export ADAPTER_K8S_BUILD_CPUS="${BUILD_CPUS}"
+# Skip Docker context staging — pool server reads from .next/ directly.
+# This saves thousands of inodes in /tmp which is critical for large e2e runs.
+export ADAPTER_K8S_SKIP_STAGING=1
 echo "[adapter-k8s] Build profile: cpus=${BUILD_CPUS}" >&2
 
 # --- 3. Build ---

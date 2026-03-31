@@ -137,81 +137,98 @@ async function main() {
     }
   }
 
-  // Optionally load middleware module
-  let middlewareModule = null;
-  let edgeMiddlewareRunner: ((ctx: { url: URL; headers: Headers; method: string; body?: ReadableStream<Uint8Array> }) => Promise<Response | null>) | null = null;
-  if (routingManifest.middleware) {
-    const mwPath = path.resolve(process.cwd(), routingManifest.middleware.filePath);
-    const isEdge = routingManifest.middleware.runtime === "edge";
+  // Load the middleware manifest — contains edge function names, files, and assets.
+  // This is used by the edge sandbox to find the right _ENTRIES key.
+  const middlewareManifestPath = path.join(process.cwd(), ".next", "server", "middleware-manifest.json");
+  const middlewareManifest: {
+    middleware: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
+    functions: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
+  } = existsSync(middlewareManifestPath)
+    ? JSON.parse(readFileSync(middlewareManifestPath, "utf-8"))
+    : { middleware: {}, functions: {} };
 
-    if (!existsSync(mwPath)) {
-      console.warn(`Middleware file not found: ${mwPath}`);
-    } else if (isEdge) {
-      // Edge middleware: use Next.js's built-in edge sandbox to run it in Node.js.
-      // This is the same mechanism `next start` uses.
-      try {
-        const { createRequire } = await import("node:module");
-        const appRequire = createRequire(path.join(process.cwd(), "package.json"));
-        const { run } = appRequire("next/dist/server/web/sandbox") as {
-          run: (params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>;
-        };
-        const distDir = path.join(process.cwd(), ".next");
-
-        edgeMiddlewareRunner = async (ctx) => {
-          const headerObj: Record<string, string> = {};
-          for (const [k, v] of ctx.headers.entries()) {
-            if (!k.startsWith(":")) headerObj[k] = v;
-          }
-          const result = await run({
-            name: "middleware",
-            paths: [mwPath],
-            request: {
-              url: ctx.url.toString(),
-              method: ctx.method,
-              headers: headerObj,
-              body: ctx.method !== "GET" && ctx.method !== "HEAD" ? ctx.body : undefined,
-            },
-            useCache: true,
-            edgeFunctionEntry: { assets: [], wasm: [], env: [] },
-            distDir,
-            clientAssetToken: "",
-          });
-          return result.response;
-        };
-        console.log("Edge middleware sandbox initialized");
-      } catch (err) {
-        console.warn("Failed to initialize edge middleware sandbox:", err);
-        console.warn("Falling back to Node.js middleware loading");
-        // Fall through to Node.js loading
-        middlewareModule = await import(pathToFileURL(mwPath).href);
-        console.log("Middleware module loaded (Node.js fallback)");
-      }
-    } else {
-      middlewareModule = await import(pathToFileURL(mwPath).href);
-      console.log("Middleware module loaded");
-    }
-  }
-
-  // Create edge route runner (reuses the same sandbox mechanism as edge middleware).
-  // This allows the pool server to execute edge-compiled route handlers in-process.
-  let edgeRouteRunner: ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>) | null = null;
+  // Initialize edge sandbox (shared by edge middleware + edge route handlers)
+  let edgeSandboxRun: ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>) | null = null;
+  const distDir = path.join(process.cwd(), ".next");
   try {
     const { createRequire: cr } = await import("node:module");
     const appReq = cr(path.join(process.cwd(), "package.json"));
     const sandbox = appReq("next/dist/server/web/sandbox") as {
       run: (params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>;
     };
-    const distDirForEdge = path.join(process.cwd(), ".next");
-    edgeRouteRunner = (params) => sandbox.run({
+    edgeSandboxRun = (params) => sandbox.run({
       ...params,
       useCache: true,
-      edgeFunctionEntry: { assets: [], wasm: [], env: [] },
-      distDir: distDirForEdge,
+      distDir,
       clientAssetToken: "",
     });
-    console.log("Edge route runner initialized");
+    console.log("Edge sandbox initialized");
   } catch {
-    // Edge sandbox not available — edge routes will fall back to normal handler loading
+    // Edge sandbox not available
+  }
+
+  // Optionally load middleware module
+  let middlewareModule = null;
+  let edgeMiddlewareRunner: ((ctx: { url: URL; headers: Headers; method: string; body?: ReadableStream<Uint8Array> }) => Promise<Response | null>) | null = null;
+  if (routingManifest.middleware) {
+    const mwPath = path.resolve(process.cwd(), routingManifest.middleware.filePath);
+    const isEdge = routingManifest.middleware.runtime === "edge";
+    // Find edge middleware info from the middleware manifest
+    const mwManifestEntry = Object.values(middlewareManifest.middleware)[0];
+
+    if (!existsSync(mwPath)) {
+      console.warn(`Middleware file not found: ${mwPath}`);
+    } else if (isEdge && edgeSandboxRun && mwManifestEntry) {
+      // Edge middleware: use the sandbox with the correct name/files from the manifest
+      const mwName = mwManifestEntry.name;
+      const mwFiles = mwManifestEntry.files.map((f: string) => path.join(distDir, f));
+      edgeMiddlewareRunner = async (ctx) => {
+        const headerObj: Record<string, string> = {};
+        for (const [k, v] of ctx.headers.entries()) {
+          if (!k.startsWith(":")) headerObj[k] = v;
+        }
+        const result = await edgeSandboxRun!({
+          name: mwName,
+          paths: mwFiles,
+          request: {
+            url: ctx.url.toString(),
+            method: ctx.method,
+            headers: headerObj,
+            body: ctx.method !== "GET" && ctx.method !== "HEAD" ? ctx.body : undefined,
+          },
+          edgeFunctionEntry: mwManifestEntry,
+        });
+        return result.response;
+      };
+      console.log(`Edge middleware sandbox ready (name=${mwName}, files=${mwFiles.length})`);
+    } else if (isEdge) {
+      console.warn("Edge middleware found but sandbox not available, falling back to Node.js loading");
+      middlewareModule = await import(pathToFileURL(mwPath).href);
+      console.log("Middleware module loaded (Node.js fallback)");
+    } else {
+      middlewareModule = await import(pathToFileURL(mwPath).href);
+      console.log("Middleware module loaded");
+    }
+  }
+
+  // Edge route runner — uses the middleware manifest's `functions` to get the correct
+  // name and files for each edge-compiled route handler.
+  let edgeRouteRunner: ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>) | null = null;
+  if (edgeSandboxRun && Object.keys(middlewareManifest.functions).length > 0) {
+    edgeRouteRunner = (params) => {
+      // Look up the edge function in the manifest by pathname
+      const fnEntry = middlewareManifest.functions[params.name];
+      if (!fnEntry) {
+        throw new Error(`Edge function not found in middleware-manifest.json: ${params.name}`);
+      }
+      return edgeSandboxRun!({
+        ...params,
+        name: fnEntry.name,
+        paths: fnEntry.files.map((f: string) => path.join(distDir, f)),
+        edgeFunctionEntry: fnEntry,
+      });
+    };
+    console.log(`Edge route runner ready (${Object.keys(middlewareManifest.functions).length} functions)`);
   }
 
   const handlerLoader = createHandlerLoader(poolManifest);

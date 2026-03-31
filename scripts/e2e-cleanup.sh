@@ -42,6 +42,8 @@ fi
 
 # Output any final server log lines
 if [ -f ".adapter-server.log" ]; then
-  echo "=== Final Server Log ==="
+  echo "=== Final Server Log (last 20) ==="
   tail -20 .adapter-server.log
+  echo "=== 404/500 Errors ==="
+  grep "404\|500\|Error\|dispatch" .adapter-server.log | tail -10
 fi
