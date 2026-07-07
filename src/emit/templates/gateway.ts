@@ -1,6 +1,6 @@
 // src/emit/templates/gateway.ts
 import type { HostConfig, PoolDefinition, RoutingManifest } from "../../types.js";
-import { sanitizeK8sName } from "./utils.js";
+import { sanitizeK8sName, assertSafeReleaseName } from "./utils.js";
 
 export function renderGateway({
   releaseName,
@@ -9,6 +9,7 @@ export function renderGateway({
   releaseName: string;
   hosts: HostConfig[];
 }): string {
+  assertSafeReleaseName(releaseName);
   const hasTls = hosts.some((h) => h.tls?.enabled);
 
   const annotations: Record<string, string> = {};
@@ -82,6 +83,7 @@ export function renderHTTPRoute({
   buildId: string;
   routingManifest: RoutingManifest;
 }): string {
+  assertSafeReleaseName(releaseName);
   const hostnames = hosts.map((h) => h.hostname);
   const defaultPoolName = [...pools.keys()][0] ?? "default";
 
@@ -106,19 +108,15 @@ export function renderHTTPRoute({
 
   const sortedPrefixes = [...prefixToPool.keys()].sort((a, b) => b.length - a.length);
 
-  const rulesList: {
+  const pathPrefixRulesAll: {
     path: string;
     poolName: string;
     matchType: "Exact" | "PathPrefix";
-  }[] = [];
-
-  for (const prefix of sortedPrefixes) {
-    rulesList.push({
-      path: prefix,
-      poolName: prefixToPool.get(prefix)!,
-      matchType: "PathPrefix",
-    });
-  }
+  }[] = sortedPrefixes.map((prefix) => ({
+    path: prefix,
+    poolName: prefixToPool.get(prefix)!,
+    matchType: "PathPrefix",
+  }));
 
   let catchAllPool = defaultPoolName;
   for (const [pathname, poolName] of Object.entries(routingManifest.poolAssignments) as [
@@ -131,16 +129,37 @@ export function renderHTTPRoute({
     }
   }
 
-  rulesList.push({ path: "/", poolName: catchAllPool, matchType: "PathPrefix" });
+  const catchAllRule = {
+    path: "/",
+    poolName: catchAllPool,
+    matchType: "PathPrefix" as const,
+  };
 
-  const finalRules = rulesList.slice(0, 15);
-  if (rulesList.length > 15) {
-    finalRules[14] = rulesList[rulesList.length - 1]!;
-  }
+  // Phase 2+: header-based routing rules for x-upstream-pool (set by route extension).
+  // One rule per pool. NOTE: per Gateway API precedence (exact > longest path-prefix >
+  // headers) a path-prefix rule can still shadow these, so they are a best-effort fast path,
+  // not a correctness guarantee — the pool's proxyToPool (dispatch.ts) recovers a wrong-pool
+  // landing at the cost of one extra hop. They still get reserved slots before path-prefix
+  // rules so the fast path works whenever precedence allows.
+  const headerRules = [...pools.keys()].map((poolName) => {
+    const backendName = sanitizeK8sName(`${releaseName}-${poolName}`);
+    return `    - matches:
+        - headers:
+            - name: x-upstream-pool
+              value: ${poolName}
+      backendRefs:
+        - name: ${backendName}
+          port: 3000`;
+  });
 
-  // Separate catch-all (last rule) from path-prefix rules
-  const catchAllRule = finalRules[finalRules.length - 1]!;
-  const pathPrefixRules = finalRules.slice(0, -1);
+  // Gateway API caps an HTTPRoute at 16 rules TOTAL (path-prefix + header + catch-all).
+  // Reserve slots for the required per-pool header rules and the catch-all first, then
+  // fill the remaining slots with the highest-priority path-prefix rules (longest prefix
+  // first — already sorted). Lower-priority prefixes are dropped; they fall through to the
+  // catch-all / header routing, so correctness is preserved.
+  const MAX_RULES = 16;
+  const availableForPathPrefix = Math.max(0, MAX_RULES - headerRules.length - 1);
+  const pathPrefixRules = pathPrefixRulesAll.slice(0, availableForPathPrefix);
 
   // All HTTPRoute rules point to the stable "active" Service (no buildId).
   // The active Service's selector is patched by deploy/rollback to point to the live build.
@@ -148,18 +167,6 @@ export function renderHTTPRoute({
     const backendName = sanitizeK8sName(`${releaseName}-${rule.poolName}`);
     return `    - matches:
         - path: { type: ${rule.matchType}, value: "${rule.path}" }
-      backendRefs:
-        - name: ${backendName}
-          port: 3000`;
-  });
-
-  // Phase 2+: header-based routing rules for x-upstream-pool (set by route extension)
-  const headerRules = [...pools.keys()].map((poolName) => {
-    const backendName = sanitizeK8sName(`${releaseName}-${poolName}`);
-    return `    - matches:
-        - headers:
-            - name: x-upstream-pool
-              value: ${poolName}
       backendRefs:
         - name: ${backendName}
           port: 3000`;

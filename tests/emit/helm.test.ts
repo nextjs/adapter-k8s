@@ -69,6 +69,58 @@ describe("generateHelmChart", () => {
     expect(deploymentContent).toContain(`name: ${expectedName}`);
   });
 
+  it("renders the internal-header Secret and wires it into pool + routing-service deployments", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+
+    const result = generateHelmChart({
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: { gateway: { type: "gateway-api", hosts: [{ hostname: "app.example.com" }] } } },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+      extensionChainJson: "[]",
+      internalSecret: "deadbeef",
+    });
+
+    const secretFile = result["templates/internal-secret.yaml"];
+    expect(secretFile).toBeDefined();
+    expect(secretFile).toContain("kind: Secret");
+    expect(secretFile).toContain("name: nextjs-internal-header-secret");
+    expect(secretFile).toContain('secret: "deadbeef"');
+
+    // Both deployments must read INTERNAL_HEADER_SECRET from that Secret via secretKeyRef.
+    for (const file of ["templates/ssr-deployment.yaml", "templates/routing-service-deployment.yaml"]) {
+      const content = result[file];
+      expect(content).toContain("name: INTERNAL_HEADER_SECRET");
+      expect(content).toContain("secretKeyRef:");
+      expect(content).toContain("name: nextjs-internal-header-secret");
+      expect(content).toContain("key: secret");
+    }
+  });
+
+  it("generates a random internal secret when none is supplied", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+    const args = {
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: { pools: { ssr: { routes: ["appPages"] } }, provider: { gke: {} } } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+    };
+    const a = generateHelmChart(args)["templates/internal-secret.yaml"];
+    const b = generateHelmChart(args)["templates/internal-secret.yaml"];
+    expect(a).not.toEqual(b); // random per render
+  });
+
   it("generates header-based HTTPRoute rules for pools", () => {
     const pools = new Map<string, PoolDefinition>([
       ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
@@ -160,5 +212,35 @@ describe("generateHelmChart", () => {
 
     expect(result["templates/ssr-deployment.yaml"]).toBeDefined();
     expect(result["templates/api-deployment.yaml"]).toBeDefined();
+  });
+
+  it("throws a helpful error when the routing manifest exceeds the ConfigMap size limit", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+
+    // Build a manifest whose serialized form is well over ~950 KiB.
+    const bigPoolAssignments: Record<string, string> = {};
+    for (let i = 0; i < 40000; i++) {
+      bigPoolAssignments[`/some/reasonably/long/route/path/number/${i}`] = "ssr";
+    }
+    const oversizedManifest: RoutingManifest = {
+      ...mockManifest,
+      poolAssignments: bigPoolAssignments,
+    };
+
+    expect(() =>
+      generateHelmChart({
+        pools,
+        buildId: "abc123",
+        nextVersion: "16.2.0",
+        config: {
+          pools: { ssr: { routes: ["appPages"] } },
+          provider: { gke: {} },
+        } as K8sAdapterConfig,
+        imageRegistry: "gcr.io/my-project",
+        routingManifest: oversizedManifest,
+      }),
+    ).toThrow(/too large to embed in a ConfigMap/);
   });
 });

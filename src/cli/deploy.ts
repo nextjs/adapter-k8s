@@ -3,6 +3,7 @@ import path from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { exec, execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
+import { renderInternalSecretEnv } from "../emit/templates/internal-secret.js";
 import type { GcloudCommand } from "./init.js";
 
 function sanitizeK8sName(name: string): string {
@@ -295,6 +296,7 @@ spec:
               value: "${poolName}"
             - name: TRUST_INTERNAL_HEADERS
               value: "1"
+${renderInternalSecretEnv(releaseName, "            ")}
           readinessProbe:
             httpGet:
               path: /healthz
@@ -341,7 +343,19 @@ spec:
 
   // 6. Update state (local + cluster ConfigMap)
   if (!dryRun) {
-    await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+    try {
+      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+    } catch (err) {
+      console.error(`\n  DEPLOY FAILED: could not persist deploy state to the cluster.`);
+      console.error(`  ${err instanceof Error ? err.message : String(err)}`);
+      console.error(
+        `  The local state file was updated but the cluster ConfigMap was not. Aborting before`,
+      );
+      console.error(
+        `  traffic cutover so cluster/local state do not diverge. The previous build is still serving.\n`,
+      );
+      process.exit(1);
+    }
   }
 
   // 7. Zero-downtime cutover: wait for new pods, then clean up old build
@@ -494,8 +508,15 @@ spec:
 
       console.error(`\n  Diagnose:  npx adapter-k8s doctor`);
       console.error(`  Tail logs: npx adapter-k8s tail`);
-      // Update state so doctor knows the build was attempted
-      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+      // Update state so doctor knows the build was attempted. We're already failing,
+      // so a cluster-state write failure here is only logged, not re-thrown.
+      try {
+        await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+      } catch (err) {
+        console.error(
+          `  (also failed to persist state to cluster: ${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
       process.exit(1);
     }
 
@@ -506,13 +527,14 @@ spec:
       .replace(/^-+|-+$/g, "")
       .slice(0, 63);
     console.log(`  → Switching traffic to new build...`);
+    const patchFailures: { pool: string; service: string; stderr: string }[] = [];
     for (const pool of pools) {
       const activeServiceName = `${releaseName}-${pool}`
         .toLowerCase()
         .replace(/[^a-z0-9-]/g, "-")
         .replace(/^-+|-+$/g, "")
         .slice(0, 63);
-      await execCapture("kubectl", [
+      const patchResult = await execCapture("kubectl", [
         "patch",
         "service",
         activeServiceName,
@@ -528,6 +550,41 @@ spec:
           },
         ]),
       ]);
+      if (patchResult.exitCode !== 0) {
+        patchFailures.push({
+          pool,
+          service: activeServiceName,
+          stderr: patchResult.stderr.trim(),
+        });
+      }
+    }
+
+    // If ANY pool's selector patch failed, some/all Services still point at the old
+    // build. Deleting old deployments now would strand those Services with zero healthy
+    // endpoints. Abort the cutover, leave the previous build in place, and fail loudly
+    // rather than proceeding to the cleanup below and printing "Deploy complete".
+    if (patchFailures.length > 0) {
+      console.error(`\n  DEPLOY FAILED: traffic was NOT switched to the new build.`);
+      console.error(
+        `  ${patchFailures.length} of ${pools.length} pool Service selector patch(es) failed:`,
+      );
+      for (const f of patchFailures) {
+        console.error(`    - pool "${f.pool}" (service ${f.service}): ${f.stderr || "unknown error"}`);
+      }
+      console.error(
+        `  The previous build is still serving traffic and old deployments were left in place.`,
+      );
+      console.error(`  No cleanup was performed. Investigate and re-run the deploy.\n`);
+      console.error(`  Diagnose:  npx adapter-k8s doctor`);
+      // We're already failing; a cluster-state write failure here is only logged.
+      try {
+        await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+      } catch (err) {
+        console.error(
+          `  (also failed to persist state to cluster: ${err instanceof Error ? err.message : String(err)})`,
+        );
+      }
+      process.exit(1);
     }
 
     // 7d. Clean up old deployments.
@@ -555,6 +612,16 @@ spec:
         // Keep previous build (rollback target)
         if (previousBuildLower && normalized.includes(previousBuildLower)) {
           console.log(`  → Previous build kept for rollback: ${name}`);
+          continue;
+        }
+        // If we don't know the previous build, we cannot classify this non-current
+        // deployment as safe to delete. Be conservative and keep it as a potential
+        // rollback target rather than blanket-deleting every non-current build.
+        if (!previousBuildLower) {
+          console.log(
+            `  → Conservative cleanup: keeping non-current build "${name}" ` +
+              `(previous-build state unknown, cannot classify as safe to delete)`,
+          );
           continue;
         }
         // Delete everything else

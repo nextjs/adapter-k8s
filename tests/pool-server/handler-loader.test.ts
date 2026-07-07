@@ -76,4 +76,33 @@ describe("createHandlerLoader", () => {
     const loader = createHandlerLoader(manifest, vi.fn());
     await expect(loader.load("unknown")).rejects.toThrow(/unknown/i);
   });
+
+  it("evicts a rejected load so a later request can retry", async () => {
+    const manifest = {
+      buildId: "test123",
+      poolName: "ssr",
+      outputs: {
+        "/": {
+          id: "/app/page",
+          filePath: "/app/.next/server/app/page.js",
+          pathname: "/",
+          type: "APP_PAGE",
+        },
+      },
+    } as any;
+
+    const mockHandler = () => {};
+    const loadModule = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("transient import failure"))
+      .mockResolvedValueOnce({ handler: mockHandler });
+
+    const loader = createHandlerLoader(manifest, loadModule);
+
+    await expect(loader.load("/")).rejects.toThrow(/transient/i);
+    // The failure must not be cached — the retry should call loadModule again and succeed.
+    const handler = await loader.load("/");
+    expect(handler).toBe(mockHandler);
+    expect(loadModule).toHaveBeenCalledTimes(2);
+  });
 });

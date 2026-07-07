@@ -1,5 +1,6 @@
 // src/emit/templates/deployment.ts
 import { sanitizeK8sName } from "./utils.js";
+import { renderInternalSecretEnv } from "./internal-secret.js";
 
 export function renderDeployment({
   poolName,
@@ -12,6 +13,7 @@ export function renderDeployment({
 }): string {
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
+  const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,6 +49,7 @@ spec:
               value: "${poolName}"
             - name: TRUST_INTERNAL_HEADERS
               value: "1"
+${internalSecretEnv}
           readinessProbe:
             httpGet:
               path: /healthz

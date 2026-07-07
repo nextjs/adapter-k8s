@@ -1,4 +1,5 @@
 import { sanitizeK8sName } from "./utils.js";
+import { renderInternalSecretEnv } from "./internal-secret.js";
 
 export function renderRoutingServiceDeployment({
   releaseName,
@@ -10,6 +11,7 @@ export function renderRoutingServiceDeployment({
   imageRegistry: string;
 }): string {
   const safeBuildId = sanitizeK8sName(buildId);
+  const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,6 +46,7 @@ spec:
               value: "8443"
             - name: CONFIG_DIR
               value: /config
+${internalSecretEnv}
           volumeMounts:
             - name: routing-manifest
               mountPath: /config

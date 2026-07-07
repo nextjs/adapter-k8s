@@ -1,3 +1,5 @@
+import { assertSafeReleaseName, assertSafeProjectId, assertSafeRegion } from "./utils.js";
+
 export function renderRouteExtUpdateJob({
   releaseName,
   projectId,
@@ -9,6 +11,12 @@ export function renderRouteExtUpdateJob({
   region: string;
   buildId: string;
 }): string {
+  // These are spliced unescaped into a `/bin/sh -c` script that runs under a
+  // privileged Workload-Identity service account. Validate against a safe charset
+  // before interpolation so shell metacharacters can't break out of the script.
+  assertSafeReleaseName(releaseName);
+  assertSafeProjectId(projectId);
+  assertSafeRegion(region);
   // Include buildId in the Job name so each deploy creates a fresh Job
   // (K8s Jobs are immutable — can't update an existing one)
   const safeBuildId = buildId

@@ -13,6 +13,17 @@ export interface AdapterState {
   previousBuildId: string | null;
 }
 
+// Thrown when the local file was written but the cluster ConfigMap mirror failed.
+// Callers must surface this rather than reporting a clean success — a swallowed
+// failure leaves local=new / cluster=old, and readState prefers the ConfigMap,
+// which silently corrupts later deploy/rollback build-matching.
+export class ClusterStateWriteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ClusterStateWriteError";
+  }
+}
+
 // Read state: try cluster ConfigMap first, fall back to local file
 export async function readState(
   projectDir: string,
@@ -32,7 +43,11 @@ export async function readState(
   }
 }
 
-// Write state: write to both cluster ConfigMap and local file
+// Write state: write to both cluster ConfigMap and local file.
+// Policy: always write the local file first so it reflects the latest intended
+// state; then mirror to the cluster ConfigMap. If the cluster write fails we keep
+// the freshly-written local file but PROPAGATE the error (ClusterStateWriteError)
+// so the caller does not claim a clean success while cluster state is stale.
 export async function writeState(
   projectDir: string,
   state: AdapterState,
@@ -43,7 +58,7 @@ export async function writeState(
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, STATE_FILE), JSON.stringify(state, null, 2));
 
-  // Write to cluster ConfigMap
+  // Write to cluster ConfigMap (throws ClusterStateWriteError on failure)
   if (releaseName) {
     await writeClusterState(releaseName, state);
   }
@@ -84,7 +99,7 @@ data:
   state.json: '${stateJson.replace(/'/g, "''")}'
 `;
 
-  return new Promise<void>((resolve) => {
+  return new Promise<void>((resolve, reject) => {
     const child = spawn("kubectl", ["apply", "-f", "-"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -95,11 +110,22 @@ data:
     });
     child.on("close", (code) => {
       if (code !== 0) {
-        console.warn(`[adapter-k8s] Failed to write cluster state: ${stderr.trim()}`);
+        reject(
+          new ClusterStateWriteError(
+            `Failed to write cluster state ConfigMap ${cmName}: ${stderr.trim() || `kubectl apply exited ${code}`}`,
+          ),
+        );
+      } else {
+        resolve();
       }
-      resolve();
     });
-    child.on("error", () => resolve());
+    child.on("error", (err) =>
+      reject(
+        new ClusterStateWriteError(
+          `Failed to run kubectl apply for cluster state ConfigMap ${cmName}: ${err.message}`,
+        ),
+      ),
+    );
     child.stdin?.write(yaml);
     child.stdin?.end();
   });

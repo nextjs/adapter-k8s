@@ -1,6 +1,8 @@
 // src/emit/helm.ts
+import { randomBytes } from "node:crypto";
 import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types.js";
 import { renderChartYaml } from "./templates/chart-yaml.js";
+import { renderInternalSecret } from "./templates/internal-secret.js";
 import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
 import { renderService, renderActiveService } from "./templates/service.js";
@@ -25,6 +27,7 @@ export function generateHelmChart({
   releaseName = "nextjs",
   extensionChainJson,
   infrastructure,
+  internalSecret,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -35,8 +38,16 @@ export function generateHelmChart({
   releaseName?: string;
   extensionChainJson?: string;
   infrastructure?: { projectId?: string; region?: string };
+  /**
+   * Shared secret authenticating internal dispatch headers between the routing service and the
+   * pools. Generated here if not supplied. Both deployments read it from the rendered Secret,
+   * so they always agree; regenerating per build fails safe (mismatch → pool re-resolves).
+   */
+  internalSecret?: string;
 }): Record<string, string> {
   const files: Record<string, string> = {};
+  const secret = internalSecret ?? randomBytes(32).toString("hex");
+  files["templates/internal-secret.yaml"] = renderInternalSecret({ releaseName, secret });
   // Helm versions must be SemVer. We use a safe version of the buildId as the suffix.
   // We MUST remove leading underscores/dots and replace invalid chars.
   const safeVersionSuffix = buildId
@@ -58,10 +69,24 @@ export function generateHelmChart({
   });
 
   // Routing and Config
+  const routingManifestJson = JSON.stringify(routingManifest, null, 2);
+  // A ConfigMap (like any K8s object) must fit under the ~1 MiB etcd object limit.
+  // Fail fast at generation time with an actionable error rather than letting `helm
+  // install`/`kubectl apply` reject it with an opaque server-side error.
+  const MAX_CONFIGMAP_BYTES = 950 * 1024; // ~950 KiB, leaves headroom under the ~1 MiB limit
+  const routingManifestBytes = Buffer.byteLength(routingManifestJson, "utf8");
+  if (routingManifestBytes > MAX_CONFIGMAP_BYTES) {
+    throw new Error(
+      `Routing manifest is too large to embed in a ConfigMap: ${routingManifestBytes} bytes ` +
+        `exceeds the ${MAX_CONFIGMAP_BYTES}-byte limit (~950 KiB, under the ~1 MiB ` +
+        `Kubernetes/etcd object size limit). Reduce the number of routes per manifest ` +
+        `or split the app across multiple releases.`,
+    );
+  }
   files["templates/routing-manifest-configmap.yaml"] = renderConfigMap({
     name: "routing-manifest",
     releaseName,
-    data: { "routing-manifest.json": JSON.stringify(routingManifest, null, 2) },
+    data: { "routing-manifest.json": routingManifestJson },
   });
 
   const gke = config.provider.gke;

@@ -1,6 +1,11 @@
 // tests/cli/state.test.ts
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { readState, writeState, type AdapterState } from "../../src/cli/state.js";
+import {
+  readState,
+  writeState,
+  ClusterStateWriteError,
+  type AdapterState,
+} from "../../src/cli/state.js";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -45,5 +50,18 @@ describe("state", () => {
     const state = await readState(tmpDir);
     expect(state!.buildId).toBe("second");
     expect(state!.previousBuildId).toBe("first");
+  });
+
+  it("writes the local file even when no releaseName is given (no cluster mirror)", async () => {
+    const state: AdapterState = { buildId: "local-only", previousBuildId: null };
+    // Without a releaseName the cluster ConfigMap is never touched, so this must not throw.
+    await expect(writeState(tmpDir, state)).resolves.toBeUndefined();
+    expect(await readState(tmpDir)).toEqual(state);
+  });
+
+  it("exposes ClusterStateWriteError as an Error subclass for callers to surface", () => {
+    const err = new ClusterStateWriteError("boom");
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe("ClusterStateWriteError");
   });
 });

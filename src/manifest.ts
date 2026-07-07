@@ -47,15 +47,32 @@ export function buildRoutingManifest({
   nextVersion: string;
   projectDir: string;
 }): RoutingManifest {
-  // Build pool assignments: pathname → pool name
+  // Build pool assignments: pathname → pool name.
+  // Also track output id → pool so prerenders can inherit their parent's pool.
   const poolAssignments: Record<string, string> = {};
+  const poolByOutputId: Record<string, string> = {};
   for (const [poolName, pool] of pools) {
     for (const output of pool.outputs) {
       poolAssignments[output.pathname] = poolName;
+      poolByOutputId[output.id] = poolName;
     }
   }
 
-  // Assign remaining pathnames (static files, etc.) to the first pool
+  // Prerenders (e.g. /blog/hello) are not classified into pools, but they carry
+  // parentOutputId pointing at the originating route (e.g. the /blog/[slug]
+  // template). Inherit that parent's pool rather than force-assigning to the
+  // first pool, which would be wrong in multi-pool setups.
+  for (const prerender of outputs.prerenders) {
+    if (poolAssignments[prerender.pathname]) continue;
+    const parentOutputId = (prerender as { parentOutputId?: string }).parentOutputId;
+    const parentPool = parentOutputId ? poolByOutputId[parentOutputId] : undefined;
+    if (parentPool) {
+      poolAssignments[prerender.pathname] = parentPool;
+    }
+  }
+
+  // Assign remaining pathnames (static files, unresolved prerenders, etc.) to
+  // the first pool.
   const allPathnames = collectOutputPathnames(outputs);
   const poolNames = [...pools.keys()];
   const defaultPool = poolNames[0];

@@ -1,13 +1,16 @@
 // src/pool-server/server.ts
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER } from "../routing-common.js";
 
-// Internal headers set by ext_proc / cross-pool proxy — must not be trusted from external clients.
-const INTERNAL_REQUEST_HEADERS = [
-  "x-output-id",
-  "x-matched-pathname",
-  "x-route-matches",
-  "x-upstream-pool",
-];
+// Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
+// unequal-length buffers).
+function secretsMatch(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
 
 // Internal headers that must not leak to the client.
 const INTERNAL_RESPONSE_HEADERS = [
@@ -18,15 +21,37 @@ const INTERNAL_RESPONSE_HEADERS = [
   "x-middleware-set-cookie",
 ];
 
+// True for any internal control header that must never reach the client, whether it
+// arrives via the setHeader-map or as a key in a headers object passed to writeHead.
+function isInternalResponseHeader(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    INTERNAL_RESPONSE_HEADERS.includes(lower) ||
+    lower.startsWith("x-middleware-request-") ||
+    lower.startsWith("x-middleware-")
+  );
+}
+
 export interface PoolServerOptions {
   onRequest: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
   port: number;
-  /** When true, trust x-output-id etc. from the request (set by ext_proc or cross-pool proxy). */
+  /**
+   * When true, trust x-output-id etc. from the request WITHOUT a secret. Legacy fallback used
+   * only when no `internalSecret` is configured (e.g. tests). Ignored once a secret is set.
+   */
   trustInternalHeaders?: boolean;
+  /**
+   * Shared secret proving a request's internal dispatch headers came from the routing
+   * extension / cross-pool proxy (they carry it in x-internal-secret). When set, dispatch
+   * headers are trusted ONLY if the secret matches — regardless of trustInternalHeaders — so a
+   * client that speaks the dispatch protocol on a CEL-excluded path or during a fail-open
+   * outage is still rejected. Absent in emulate/tests.
+   */
+  internalSecret?: string | undefined;
 }
 
 export function createPoolServer(options: PoolServerOptions) {
-  const { onRequest, port, trustInternalHeaders = false } = options;
+  const { onRequest, port, trustInternalHeaders = false, internalSecret } = options;
 
   const server: Server = createServer(async (req, res) => {
     // Health check — bypass all routing
@@ -36,10 +61,21 @@ export function createPoolServer(options: PoolServerOptions) {
       return;
     }
 
-    // Strip internal routing headers from untrusted sources (defense in depth).
-    // In GKE, ext_proc sets these; in emulate mode, there's no Envoy to strip them.
-    if (!trustInternalHeaders) {
-      for (const h of INTERNAL_REQUEST_HEADERS) {
+    // Establish whether the internal dispatch headers on this request can be trusted. With a
+    // secret configured (GKE), trust requires a matching x-internal-secret; without one
+    // (emulate/tests), fall back to the trustInternalHeaders flag. The secret itself must never
+    // reach the handler or leak upstream, so it is always deleted.
+    const presentedSecret = req.headers[INTERNAL_SECRET_HEADER];
+    const trusted = internalSecret
+      ? typeof presentedSecret === "string" && secretsMatch(presentedSecret, internalSecret)
+      : trustInternalHeaders;
+    delete req.headers[INTERNAL_SECRET_HEADER];
+
+    // Strip internal routing headers from untrusted sources. A client must not be able to
+    // spoof the dispatch protocol (e.g. x-output-id → dispatch straight to a handler, skipping
+    // middleware auth); stripping forces the pool's Phase-1 resolver to run with the real body.
+    if (!trusted) {
+      for (const h of INTERNAL_DISPATCH_HEADERS) {
         delete req.headers[h];
       }
     }
@@ -52,17 +88,26 @@ export function createPoolServer(options: PoolServerOptions) {
       }
     }
 
-    // Wrap res.writeHead to strip internal headers from responses
+    // Wrap res.writeHead to strip internal headers from responses.
+    // Real paths pass headers both ways: via the setHeader-map AND as the headers
+    // object argument to writeHead(status[, statusMessage], headers). Strip both.
     const origWriteHead = res.writeHead.bind(res);
     (res as any).writeHead = function (statusCode: number, ...args: any[]) {
-      for (const h of INTERNAL_RESPONSE_HEADERS) {
-        res.removeHeader(h);
-      }
-      // Also strip x-middleware-request-* headers
-      const headerNames = res.getHeaderNames();
-      for (const name of headerNames) {
-        if (name.startsWith("x-middleware-request-")) {
+      // Strip from the setHeader-map.
+      for (const name of res.getHeaderNames()) {
+        if (isInternalResponseHeader(name)) {
           res.removeHeader(name);
+        }
+      }
+      // Strip from the headers object passed as an argument, if present.
+      // writeHead(status, headers) or writeHead(status, statusMessage, headers).
+      const headersArgIdx = typeof args[0] === "string" ? 1 : 0;
+      const headersArg = args[headersArgIdx];
+      if (headersArg && typeof headersArg === "object" && !Array.isArray(headersArg)) {
+        for (const key of Object.keys(headersArg)) {
+          if (isInternalResponseHeader(key)) {
+            delete headersArg[key];
+          }
         }
       }
       return origWriteHead(statusCode, ...args);

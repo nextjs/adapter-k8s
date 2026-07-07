@@ -1,6 +1,7 @@
 // src/pool-server/resolve.ts
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
+import { lookupPool, resolveRscOutput, type RscConfig } from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
 
@@ -17,44 +18,6 @@ export type ResolveResult =
   | { kind: "middleware-response"; response: Response }
   | { kind: "external-rewrite"; url: URL }
   | { kind: "not-found" };
-
-function trailingSlashVariants(pathname: string): string[] {
-  if (pathname === "/") return ["/"];
-  const withSlash = pathname.endsWith("/") ? pathname : pathname + "/";
-  const withoutSlash = pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
-  return [pathname, withoutSlash, withSlash];
-}
-
-function lookupPool(
-  poolAssignments: Record<string, string>,
-  resolvedPathname: string | undefined,
-  matchedPathname: string,
-  i18nLocales?: string[],
-): string | undefined {
-  // Collect candidate pathnames: resolvedPathname first, then matchedPathname
-  const candidates: string[] = [];
-  if (resolvedPathname) candidates.push(...trailingSlashVariants(resolvedPathname));
-  candidates.push(...trailingSlashVariants(matchedPathname));
-
-  // Also try stripping i18n locale prefix (e.g., /en/about → /about)
-  if (i18nLocales?.length) {
-    const extra: string[] = [];
-    for (const c of candidates) {
-      for (const locale of i18nLocales) {
-        const prefix = `/${locale}`;
-        if (c.startsWith(prefix + "/") || c === prefix) {
-          extra.push(...trailingSlashVariants(c.slice(prefix.length) || "/"));
-        }
-      }
-    }
-    candidates.push(...extra);
-  }
-
-  for (const p of candidates) {
-    if (poolAssignments[p]) return poolAssignments[p];
-  }
-  return poolAssignments["default"] ?? Object.values(poolAssignments)[0];
-}
 
 export function createLocalResolver(
   manifest: RoutingManifest,
@@ -293,35 +256,18 @@ export function createLocalResolver(
         return { kind: "not-found" };
       }
 
-      let finalMatchedPathname =
+      const baseMatchedPathname =
         resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname;
 
-      // For RSC requests, resolve to the .rsc output variant.
-      // resolveRoutes returns the base pathname (e.g., /page) — the adapter must
-      // map it to the .rsc output (e.g., /page.rsc) so the handler knows to
-      // return RSC payload instead of HTML.
-      const rscConfig = (manifest as any).routeGraph?.rsc;
-      if (rscConfig && headers.get(rscConfig.header) === "1") {
-        const basePath = finalMatchedPathname === "/" ? "/index" : finalMatchedPathname;
-
-        // Check for segment prefetch first (specific segment RSC)
-        const segmentPrefetch = headers.get(rscConfig.prefetchSegmentHeader);
-        if (segmentPrefetch && segmentPrefetch.length > 0) {
-          const normalized = segmentPrefetch.replace(/^\/+/, "");
-          const candidate = `${basePath}${rscConfig.prefetchSegmentDirSuffix}/${normalized}${rscConfig.prefetchSegmentSuffix}`;
-          if (manifest.poolAssignments[candidate]) {
-            finalMatchedPathname = candidate;
-          }
-        }
-
-        // Otherwise try the .rsc variant
-        if (finalMatchedPathname === (resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname)) {
-          const rscCandidate = `${basePath}${rscConfig.suffix}`;
-          if (manifest.poolAssignments[rscCandidate]) {
-            finalMatchedPathname = rscCandidate;
-          }
-        }
-      }
+      // For RSC requests, resolve to the .rsc / segment-prefetch output variant so the handler
+      // returns a flight payload instead of HTML. Shared with the ext_proc edge path
+      // (routing-service/handler.ts) so both resolvers map RSC identically.
+      const finalMatchedPathname = resolveRscOutput(
+        baseMatchedPathname,
+        headers,
+        (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc,
+        manifest.poolAssignments,
+      );
 
       return {
         kind: "route",

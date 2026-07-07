@@ -113,6 +113,31 @@ describe("createDispatcher", () => {
     expect(res._headers["location"]).toBe("http://localhost/new");
   });
 
+  it("preserves multiple Set-Cookie headers on a middleware-response", async () => {
+    const dispatcher = createDispatcher({
+      handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+    });
+
+    const mwHeaders = new Headers();
+    mwHeaders.append("set-cookie", "a=1; Path=/");
+    mwHeaders.append("set-cookie", "b=2; Path=/");
+    const req = mockReq("/gated");
+    const res = mockRes();
+    const resolution: ResolveResult = {
+      kind: "middleware-response",
+      response: new Response(null, { status: 200, headers: mwHeaders }),
+    };
+
+    await dispatcher.dispatch(req, res as unknown as ServerResponse, resolution);
+
+    const setCookie = res._headers["set-cookie"] as unknown as string[];
+    expect(Array.isArray(setCookie)).toBe(true);
+    expect(setCookie).toEqual(["a=1; Path=/", "b=2; Path=/"]);
+  });
+
   it("proxies external rewrites", async () => {
     const dispatcher = createDispatcher({
       handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,

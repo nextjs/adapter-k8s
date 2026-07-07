@@ -4,11 +4,21 @@
 ## 1. With ext_proc: Client :8080 → Envoy → ext_proc (:8443) → Pool Server (:3000)
 ## 2. Without ext_proc: Client :8080 → Envoy → Pool Server (:3000)
 ##
-## Currently runs WITHOUT ext_proc because the routing service uses JSON
-## serialization while Envoy speaks protobuf. The pool server handles routing
-## locally via resolveRoutes, so the app works correctly.
+## Currently runs WITHOUT ext_proc. The pool server handles routing locally via
+## resolveRoutes, so the app works correctly without an ext_proc filter here.
 ##
-## TODO: Add proto-based ext_proc when routing-service supports protobuf.
+## The routing service now speaks real protobuf over gRPC via connectrpc
+## (@connectrpc/connect-node) using protobuf-es types generated from the upstream
+## Envoy protos (buf.build/envoyproxy/envoy → src/routing-service/protos). It can
+## therefore be wired as a real ext_proc filter. This is NOT enabled below, and
+## end-to-end wire-compatibility with a real Envoy/GCP ext_proc caller is
+## UNVALIDATED (only the converter + protobuf codec are round-tripped in unit
+## tests). The App Hosting adapter uses this same stack, validated against a live
+## deployment; this adapter needs the equivalent smoke test.
+##
+## TODO: Add the ext_proc HTTP filter + ext_proc cluster (routing service on
+## :8443, HTTP/2) to the filter_chain and validate end-to-end against this Envoy
+## before relying on the ext_proc path.
 
 static_resources:
   listeners:

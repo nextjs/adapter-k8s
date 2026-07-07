@@ -68,7 +68,7 @@ export function createHandlerLoader(
         throw new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`);
       }
 
-      const promise = loadModule(output.filePath).then(async (module) => {
+      const promise = loadModule(output.filePath).then(async (module): Promise<ArtifactRouteHandler> => {
         // Turbopack modules with top-level await (e.g., Genkit, heavy async deps)
         // may export a Promise as module.exports. Await it to get the real exports.
         let resolved: LoadedModule = module;
@@ -86,6 +86,11 @@ export function createHandlerLoader(
             `filePath="${output.filePath}": ${(err as Error).message}`
           );
         }
+      });
+      // Evict a rejected load from the cache so a later request can retry —
+      // otherwise a transient import failure poisons the route for the pod's life.
+      promise.catch(() => {
+        if (cache.get(outputId) === promise) cache.delete(outputId);
       });
       cache.set(outputId, promise);
       return promise;

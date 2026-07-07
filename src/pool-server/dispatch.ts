@@ -1,7 +1,7 @@
 // src/pool-server/dispatch.ts
-import { once } from "node:events";
 import { createServer, request as httpRequest } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
+import { pipeline } from "node:stream";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
@@ -19,18 +19,77 @@ function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> 
   return headers;
 }
 
+// Convert a web `Headers` to a Node headers object, preserving multiple Set-Cookie
+// values as an array. `Headers.entries()` collapses repeated Set-Cookie into a single
+// comma-joined string, which would drop all but the last cookie once written to a client.
+function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | string[]> {
+  const headers: Record<string, string | string[]> = {};
+  for (const [key, value] of webHeaders.entries()) {
+    if (key.toLowerCase() === "set-cookie") continue;
+    headers[key] = value;
+  }
+  const setCookies =
+    webHeaders.getSetCookie?.() ??
+    (webHeaders.has("set-cookie")
+      ? webHeaders
+          .get("set-cookie")!
+          .split(/,(?=[^;]*=)/)
+          .map((c) => c.trim())
+      : []);
+  if (setCookies.length > 0) headers["set-cookie"] = setCookies;
+  return headers;
+}
+
+// Swallow socket errors on a client stream. A mid-response client disconnect emits an
+// 'error' on req/res; with no listener Node rethrows it as an uncaught 'error' event and
+// takes the whole process down. There's nothing to recover — the connection is gone.
+function guardStreamErrors(stream: IncomingMessage | ServerResponse): void {
+  if (typeof (stream as { on?: unknown }).on === "function") {
+    stream.on("error", () => undefined);
+  }
+}
+
+// Write a chunk to the client, bailing out if the socket has gone away. Returns false
+// when streaming should stop (socket destroyed/ended), true when it's safe to continue.
+async function writeChunkSafely(res: ServerResponse, chunk: Buffer): Promise<boolean> {
+  if (res.writableEnded || res.destroyed) return false;
+  let flushed: boolean;
+  try {
+    flushed = res.write(chunk);
+  } catch {
+    return false;
+  }
+  if (!flushed) {
+    // Wait for drain, but stop waiting if the socket closes/errors first (else we hang).
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        res.off("drain", done);
+        res.off("close", done);
+        res.off("error", done);
+        resolve();
+      };
+      res.once("drain", done);
+      res.once("close", done);
+      res.once("error", done);
+    });
+  }
+  return !res.writableEnded && !res.destroyed;
+}
+
 async function writeInnerResponse(
   outerRes: ServerResponse,
   innerRes: IncomingMessage,
 ): Promise<void> {
   outerRes.writeHead(innerRes.statusCode ?? 200, innerRes.headers);
   for await (const chunk of innerRes) {
-    const shouldContinue = outerRes.write(chunk);
-    if (!shouldContinue) {
-      await once(outerRes, "drain");
+    const canContinue = await writeChunkSafely(outerRes, chunk as Buffer);
+    if (!canContinue) {
+      // Client is gone — stop reading the inner response and let it be discarded.
+      innerRes.destroy();
+      return;
     }
   }
-  outerRes.end();
+  if (!outerRes.writableEnded) outerRes.end();
 }
 
 async function invokeLocalHandlerOverHttp({
@@ -66,11 +125,7 @@ async function invokeLocalHandlerOverHttp({
           });
 
           if (maybeResult instanceof Response) {
-            const headers: Record<string, string> = {};
-            for (const [key, value] of maybeResult.headers.entries()) {
-              headers[key] = value;
-            }
-            innerRes.writeHead(maybeResult.status, headers);
+            innerRes.writeHead(maybeResult.status, webHeadersToNodeHeaders(maybeResult.headers));
             if (maybeResult.body) {
               const reader = maybeResult.body.getReader();
               try {
@@ -111,6 +166,15 @@ async function invokeLocalHandlerOverHttp({
       }
 
       const reqHeaders = toNodeHeaders(req);
+      // We forward a fixed-length buffered body, so drop any transfer-encoding the
+      // original request carried (e.g. `chunked`). Node's HTTP parser rejects a request
+      // that has BOTH transfer-encoding and content-length, yielding a spurious 400
+      // before the handler runs. Delete case-insensitively.
+      for (const key of Object.keys(reqHeaders)) {
+        if (key.toLowerCase() === "transfer-encoding") {
+          delete reqHeaders[key];
+        }
+      }
       // Ensure content-length matches the buffered body (the original stream is consumed)
       if (bufferedBody) {
         reqHeaders["content-length"] = String(bufferedBody.length);
@@ -197,6 +261,10 @@ export function createDispatcher(options: DispatcherOptions) {
       res: ServerResponse,
       resolution: ResolveResult,
     ): Promise<void> {
+      // A client that disconnects mid-response emits 'error' on the socket; without a
+      // listener Node crashes the process. Guard the outer client response up front.
+      guardStreamErrors(res);
+
       // Install writeHead wrapper early to merge resolved headers (from routing/middleware)
       // into ANY response — static assets, handler responses, etc.
       if (resolution.kind === "route" && resolution.resolvedHeaders) {
@@ -282,24 +350,20 @@ export function createDispatcher(options: DispatcherOptions) {
 
         case "middleware-response": {
           const mwRes = resolution.response;
-          const headers: Record<string, string> = {};
-          for (const [key, value] of mwRes.headers.entries()) {
-            headers[key] = value;
-          }
-          res.writeHead(mwRes.status, headers);
+          res.writeHead(mwRes.status, webHeadersToNodeHeaders(mwRes.headers));
           if (mwRes.body) {
             const reader = mwRes.body.getReader();
             try {
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
-                if (value) res.write(Buffer.from(value));
+                if (value && !(await writeChunkSafely(res, Buffer.from(value)))) break;
               }
             } finally {
               reader.releaseLock();
             }
           }
-          res.end();
+          if (!res.writableEnded) res.end();
           return;
         }
 
@@ -328,8 +392,9 @@ export function createDispatcher(options: DispatcherOptions) {
               },
               (proxyRes) => {
                 res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-                proxyRes.pipe(res);
-                proxyRes.on("end", resolve);
+                // pipeline handles errors on either end (e.g. client disconnect) and
+                // cleans up both streams, unlike a bare .pipe().
+                pipeline(proxyRes, res, () => resolve());
               },
             );
 
@@ -344,7 +409,7 @@ export function createDispatcher(options: DispatcherOptions) {
             if (bufferedBody && bufferedBody.length > 0) {
               proxyReq.end(bufferedBody);
             } else if (req.method !== "GET" && req.method !== "HEAD") {
-              req.pipe(proxyReq);
+              pipeline(req, proxyReq, () => undefined);
             } else {
               proxyReq.end();
             }
@@ -466,32 +531,24 @@ export function createDispatcher(options: DispatcherOptions) {
                   },
                 },
               });
+              // The edge sandbox's background work must not surface as an unhandled
+              // rejection (which would crash the process); we don't await it.
+              result.waitUntil?.catch(() => undefined);
               const edgeRes = result.response;
-              const headers: Record<string, string | string[]> = {};
-              for (const [key, value] of edgeRes.headers.entries()) {
-                if (key.toLowerCase() === "set-cookie") {
-                  const existing = headers["set-cookie"];
-                  if (Array.isArray(existing)) existing.push(value);
-                  else if (existing) headers["set-cookie"] = [existing as string, value];
-                  else headers["set-cookie"] = [value];
-                } else {
-                  headers[key] = value;
-                }
-              }
-              res.writeHead(edgeRes.status, headers);
+              res.writeHead(edgeRes.status, webHeadersToNodeHeaders(edgeRes.headers));
               if (edgeRes.body) {
                 const reader = edgeRes.body.getReader();
                 try {
                   while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
-                    if (value) res.write(Buffer.from(value));
+                    if (value && !(await writeChunkSafely(res, Buffer.from(value)))) break;
                   }
                 } finally {
                   reader.releaseLock();
                 }
               }
-              res.end();
+              if (!res.writableEnded) res.end();
             } catch (err) {
               console.error(`Edge route handler failed for ${resolution.matchedPathname}:`, err);
               if (!res.headersSent) {
@@ -558,8 +615,9 @@ function proxyToPool(
       },
       (proxyRes) => {
         res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
-        proxyRes.pipe(res);
-        proxyRes.on("end", resolve);
+        // pipeline handles errors on either end (e.g. client disconnect) and cleans up
+        // both streams, unlike a bare .pipe().
+        pipeline(proxyRes, res, () => resolve());
       },
     );
 
@@ -580,7 +638,7 @@ function proxyToPool(
     if (bufferedBody) {
       proxyReq.end(bufferedBody);
     } else {
-      req.pipe(proxyReq);
+      pipeline(req, proxyReq, () => undefined);
     }
   });
 }

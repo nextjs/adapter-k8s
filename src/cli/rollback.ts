@@ -172,11 +172,12 @@ export async function runRollback(options: {
     "-o",
     'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
   ]);
+  const patchFailures: { service: string; stderr: string }[] = [];
   if (activeSvcsResult.exitCode === 0 && activeSvcsResult.stdout.trim()) {
     console.log(`  → Switching traffic to previous build...`);
     for (const svcName of activeSvcsResult.stdout.trim().split("\n")) {
       if (!svcName) continue;
-      await execCapture("kubectl", [
+      const patchResult = await execCapture("kubectl", [
         "patch",
         "service",
         svcName,
@@ -192,24 +193,56 @@ export async function runRollback(options: {
           },
         ]),
       ]);
+      if (patchResult.exitCode !== 0) {
+        patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
+      }
     }
   }
 
-  // 5. Scale down current deployment
+  // If any selector patch failed, traffic did not switch to the previous build.
+  // Scaling the current deployment to 0 now would strand the still-current Services
+  // with zero endpoints. Abort before scale-down, leaving the current build serving.
+  if (patchFailures.length > 0) {
+    console.error(`\n  ROLLBACK FAILED: traffic was NOT switched to the previous build.`);
+    console.error(`  ${patchFailures.length} Service selector patch(es) failed:`);
+    for (const f of patchFailures) {
+      console.error(`    - service ${f.service}: ${f.stderr || "unknown error"}`);
+    }
+    console.error(`  The current build is still serving traffic and was left scaled up.`);
+    console.error(`  State was not changed. Investigate and re-run the rollback.\n`);
+    process.exit(1);
+  }
+
+  // 5. Scale down current deployment (only after traffic successfully switched)
   if (currentDeploy) {
     console.log(`  → Scaling down current build: ${currentDeploy}`);
     await execCapture("kubectl", ["scale", `deployment/${currentDeploy}`, "--replicas=0"]);
   }
 
-  // 6. Swap state — previous becomes current, current becomes previous
-  await writeState(
-    projectDir,
-    {
-      buildId: previousBuildId,
-      previousBuildId: currentBuildId,
-    },
-    releaseName,
-  );
+  // 6. Swap state — previous becomes current, current becomes previous.
+  // Traffic has already switched at this point; if the cluster ConfigMap write fails
+  // we surface it (local was updated) rather than reporting a clean rollback, so
+  // cluster/local state don't silently diverge for the next deploy/rollback.
+  try {
+    await writeState(
+      projectDir,
+      {
+        buildId: previousBuildId,
+        previousBuildId: currentBuildId,
+      },
+      releaseName,
+    );
+  } catch (err) {
+    console.error(`\n  Rollback traffic switch succeeded, but persisting state failed:`);
+    console.error(`  ${err instanceof Error ? err.message : String(err)}`);
+    console.error(
+      `  The local state file was updated but the cluster ConfigMap was not. Restore cluster`,
+    );
+    console.error(
+      `  connectivity and re-run so cluster/local state agree before the next deploy or rollback.\n`,
+    );
+    process.exit(1);
+  }
 
   console.log(`\n✓ Rollback complete. Now serving build: ${previousBuildId}`);
   console.log(`  To roll forward again: npx adapter-k8s rollback`);

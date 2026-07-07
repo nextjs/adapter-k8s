@@ -17,6 +17,39 @@ describe("renderRouteExtUpdateJob", () => {
     expect(yaml).toContain("my-app-route-ext");
     expect(yaml).toContain("route-extension.yaml");
   });
+
+  it("rejects a releaseName containing shell metacharacters", () => {
+    expect(() =>
+      renderRouteExtUpdateJob({
+        releaseName: 'foo";rm -rf /;"',
+        projectId: "my-project",
+        region: "us-central1",
+        buildId: "abc123",
+      }),
+    ).toThrow(/Invalid releaseName/);
+  });
+
+  it("rejects a projectId containing an injection payload", () => {
+    expect(() =>
+      renderRouteExtUpdateJob({
+        releaseName: "my-app",
+        projectId: 'p";curl evil"',
+        region: "us-central1",
+        buildId: "abc123",
+      }),
+    ).toThrow(/Invalid projectId/);
+  });
+
+  it("rejects a region containing shell metacharacters", () => {
+    expect(() =>
+      renderRouteExtUpdateJob({
+        releaseName: "my-app",
+        projectId: "my-project",
+        region: "us-central1;reboot",
+        buildId: "abc123",
+      }),
+    ).toThrow(/Invalid region/);
+  });
 });
 
 describe("renderRouteExtConfigMap", () => {

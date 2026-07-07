@@ -17,6 +17,9 @@ async function main() {
 
   const port = parseInt(process.env.PORT ?? "8443", 10);
   const configDir = process.env.CONFIG_DIR ?? "/config";
+  // Fail-open by default (preserves historical behavior). Set ROUTING_FAIL_OPEN=false
+  // to fail closed (respond 500) when the routing handler throws.
+  const failOpen = process.env.ROUTING_FAIL_OPEN !== "false";
 
   // Load routing manifest
   const manifestPath = path.join(configDir, "routing-manifest.json");
@@ -39,7 +42,7 @@ async function main() {
 
   // Create handler and server
   const handler = createRequestHandler(manifest, middlewareModule);
-  const server = createRoutingServer({ handler, port });
+  const server = createRoutingServer({ handler, port, failOpen });
 
   await server.start();
 

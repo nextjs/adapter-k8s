@@ -63,6 +63,40 @@ describe("buildRoutingManifest", () => {
     expect(manifest.pathnames).toContain("/api/hello");
   });
 
+  it("assigns a prerender to its parent route's pool, not the first pool", () => {
+    // Multi-pool setup: "web" is first (the default fallback pool), "blog" owns
+    // the /blog/[slug] template. A concrete prerender /blog/hello must inherit
+    // "blog" via its parentOutputId, not be force-assigned to "web".
+    const webPage = mockAppPage({ pathname: "/", id: "/app/page" });
+    const blogTemplate = mockAppPage({ pathname: "/blog/[slug]", id: "/app/blog/[slug]" });
+    const outputs = mockOutputs({
+      appPages: [webPage, blogTemplate],
+      prerenders: [
+        mockPrerender({
+          pathname: "/blog/hello",
+          sourcePage: "/blog/[slug]",
+          // parentOutputId defaults to `/app/blog/[slug]`, matching blogTemplate.id
+        }),
+      ],
+    });
+    const pools = new Map<string, PoolDefinition>([
+      ["web", { name: "web", outputs: [webPage], config: { routes: ["appPages"] } }],
+      ["blog", { name: "blog", outputs: [blogTemplate], config: { routes: ["/blog/**"] } }],
+    ]);
+    const manifest = buildRoutingManifest({
+      routing: mockRouting(),
+      outputs,
+      pools,
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+
+    expect(manifest.poolAssignments["/blog/hello"]).toBe("blog");
+  });
+
   it("detects PPR routes from prerenders", () => {
     const outputs = mockOutputs({
       appPages: [mockAppPage({ pathname: "/dashboard" })],

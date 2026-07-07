@@ -6,6 +6,11 @@ export interface CelGenerationInput {
   dynamicRoutes: Route[];
 }
 
+/** Escape a value for safe interpolation into a CEL single-quoted string literal. */
+export function escapeCelString(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
 export function extractStaticPrefix(sourceRegex: string): string | null {
   const withoutAnchor = sourceRegex.replace(/^\^/, "");
   const match = withoutAnchor.match(/^(\/[a-zA-Z0-9_\-/]*)/);
@@ -32,7 +37,7 @@ export function generateCelExpression(input: CelGenerationInput): string {
       }
     });
     if (!matchedByMiddleware) {
-      exclusions.push(`request.path == '${publicPath}'`);
+      exclusions.push(`request.path == '${escapeCelString(publicPath)}'`);
     }
   }
 
@@ -41,13 +46,13 @@ export function generateCelExpression(input: CelGenerationInput): string {
     for (const route of dynamicRoutes) {
       const staticPrefix = extractStaticPrefix(route.sourceRegex);
       if (staticPrefix) {
-        inclusions.push(`request.path.startsWith('${staticPrefix}')`);
+        inclusions.push(`request.path.startsWith('${escapeCelString(staticPrefix)}')`);
       }
     }
     for (const prerender of outputs.prerenders) {
       const fallback = prerender.fallback as Record<string, unknown> | undefined;
-      if (fallback?.initialRevalidateSeconds) {
-        inclusions.push(`request.path == '${prerender.pathname}'`);
+      if (fallback?.initialRevalidate) {
+        inclusions.push(`request.path == '${escapeCelString(prerender.pathname)}'`);
       }
     }
     if (inclusions.length === 0) return "false";
@@ -55,6 +60,12 @@ export function generateCelExpression(input: CelGenerationInput): string {
     return inclusions.join(" || ");
   }
 
+  // The extension is invoked for all methods that match. Body-capable requests (non-GET/HEAD)
+  // with middleware are short-circuited at runtime by the handler's backstop (handler.ts): it
+  // clears the internal dispatch headers and adds no secret, so the pool re-resolves with the
+  // real body. Method is NOT gated in CEL because the extension must still run on POSTs to
+  // strip client-spoofed dispatch headers — a CEL method gate would skip the callout entirely
+  // and let a spoofed x-output-id reach the pool. See plans/tripwire-body-middleware-plan.md.
   if (exclusions.length === 0) return "true";
   return `!(${exclusions.join(" || ")})`;
 }

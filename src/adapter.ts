@@ -23,6 +23,7 @@ import {
   generateRoutingServiceDockerfile,
 } from "./emit/dockerfiles.js";
 import { generateBuildMetadata } from "./emit/metadata.js";
+import { generateDockerignore } from "./emit/dockerignore.js";
 import { buildStaticManifest } from "./emit/static-assets.js";
 import { generateCelExpression } from "./cel.js";
 import { generateExtensionChain, determineFailureMode } from "./extension-chain.js";
@@ -77,6 +78,22 @@ async function resolveAndCopyExternals(src: string, dest: string): Promise<void>
       await copyFile(srcEntry, destEntry);
     }
   }
+}
+
+// Traced-asset keys are relative to ctx.repoRoot (the tracing root), which differs from
+// ctx.projectDir in a monorepo/workspace. Entrypoints are staged relative to projectDir,
+// so an asset that lives *under* projectDir must be re-based to a projectDir-relative
+// destination — otherwise Node's upward node_modules walk from the (projectDir-relative)
+// entrypoint can't reach it. Assets outside projectDir (hoisted to repoRoot/node_modules,
+// which is already the common layout) keep their repoRoot-relative key, which lands them
+// where the upward walk expects. Sibling-workspace-package assets remain a known gap
+// (warned about at build time). When repoRoot === projectDir this is a no-op.
+function assetDestPath(projectDir: string, repoRootRelativeKey: string, absAsset: string): string {
+  const abs = path.isAbsolute(absAsset) ? absAsset : path.resolve(projectDir, absAsset);
+  if (abs === projectDir || abs.startsWith(projectDir + path.sep)) {
+    return path.relative(projectDir, abs);
+  }
+  return repoRootRelativeKey;
 }
 
 // Track staged paths per build to avoid redundant work and loops
@@ -154,8 +171,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             // Standard adapters export the object directly OR an instance.
             // If it's an instance, we tucked the config into a hidden property below.
             config = exported.config || exported;
+            break;
           }
-          break;
+          // File loaded but didn't yield a usable config object. Warn loudly rather
+          // than silently falling through to defaults, which would mask a mistake in
+          // the user's config (e.g. a missing/misnamed default export).
+          console.warn(
+            `[adapter-k8s] ${p} loaded but has no usable default export (expected an object ` +
+              `or a createK8sAdapter() instance); ignoring it.`,
+          );
         } catch (err) {
           console.error(`Failed to load config from ${p}:`, err);
         }
@@ -163,7 +187,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     }
 
     if (!config) {
-      // No config file found — use sensible defaults.
+      // No usable config file found — use sensible defaults.
       // This allows the adapter to work for e2e tests and simple apps
       // without requiring adapter.config.ts
       console.log("[adapter-k8s] No adapter config found, using defaults");
@@ -236,6 +260,21 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
     async onBuildComplete(ctx: BuildCompleteContext) {
       const { routing, outputs, projectDir, config: nextConfig, buildId, nextVersion } = ctx;
+      const repoRoot = (ctx as { repoRoot?: string }).repoRoot ?? projectDir;
+
+      // In a monorepo the tracing root (repoRoot) sits above the app dir (projectDir).
+      // Traced assets under projectDir are re-based correctly (see assetDestPath), and
+      // deps hoisted to repoRoot/node_modules resolve via the upward node_modules walk.
+      // Assets that live in a *sibling* workspace package (outside projectDir, e.g.
+      // repoRoot/packages/*) are staged at their repoRoot-relative path and may not be
+      // reachable by Node's resolution from the app entrypoint — warn so it's not silent.
+      if (repoRoot !== projectDir) {
+        console.warn(
+          `[adapter-k8s] Monorepo detected (repoRoot ${repoRoot} != projectDir ${projectDir}). ` +
+            `Traced dependencies in sibling workspace packages may not resolve at runtime; ` +
+            `ensure such deps are hoisted or bundled into the app's node_modules.`,
+        );
+      }
 
       // Dump raw build context for debugging
       const debugDir = path.join(projectDir, OUTPUT_DIR, "debug");
@@ -353,10 +392,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         ? readFileSync(poolServerSrc, "utf-8")
         : "";
 
-      // Find .env files to stage into runtime containers
-      const envFiles = [".env", ".env.production"].filter((f) =>
-        existsSync(path.join(projectDir, f)),
-      );
+      // NOTE: `.env` / `.env.production` are deliberately NOT staged into any
+      // Docker build context. They can hold secrets (DB URLs, non-NEXT_PUBLIC
+      // API keys) and would otherwise be baked into pushed image layers. Env is
+      // supplied to running containers via Kubernetes (ConfigMap/Secret +
+      // envFrom); the runtime reads it from process.env. Each build context
+      // also gets a `.dockerignore` (below) so a stray `COPY . .` can't pick
+      // one up. Local emulate is unaffected: it runs the servers with
+      // cwd=projectDir, so loadEnvConfig reads the real project `.env` directly.
 
       if (skipStaging) {
         // Only write pool manifests — skip Docker context staging (saves thousands of inodes)
@@ -403,13 +446,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           path.join(projectDir, absSharedStageDir, "package.json"),
         );
 
-        // Stage .env files
-        for (const envFile of envFiles) {
-          await copyFile(
-            path.join(projectDir, envFile),
-            path.join(projectDir, absSharedStageDir, envFile),
-          );
-        }
+        // Keep .env secrets out of the shared image (built from this context).
+        await writeOutputFile(
+          projectDir,
+          ".dockerignore",
+          generateDockerignore(),
+          absSharedStageDir,
+        );
 
         if (poolServerContent) {
           await writeOutputFile(
@@ -487,7 +530,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             const assets = output.assets || (output as any).outputs || {};
             for (const [relAsset, absAsset] of Object.entries(assets)) {
               if (typeof absAsset === "string") {
-                await stageFile(projectDir, absAsset, relAsset, poolName);
+                await stageFile(
+                  projectDir,
+                  absAsset,
+                  assetDestPath(projectDir, relAsset, absAsset),
+                  poolName,
+                );
               }
             }
           }
@@ -506,7 +554,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             const mwAssets = (outputs.middleware as any).assets ?? {};
             for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
               if (typeof absAsset === "string") {
-                await stageFile(projectDir, absAsset, relAsset, poolName);
+                await stageFile(
+                  projectDir,
+                  absAsset,
+                  assetDestPath(projectDir, relAsset, absAsset),
+                  poolName,
+                );
               }
             }
           }
@@ -548,13 +601,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
           }
 
-          // Stage .env files into pool context
-          for (const envFile of envFiles) {
-            await copyFile(
-              path.join(projectDir, envFile),
-              path.join(projectDir, poolStageDir, envFile),
-            ).catch(() => {});
-          }
+          // Keep .env secrets out of the pool image. The Dockerfile's
+          // `COPY context/ .` runs from this pool dir (the docker build
+          // context), so the .dockerignore lives here alongside the Dockerfile.
+          await writeOutputFile(
+            projectDir,
+            ".dockerignore",
+            generateDockerignore(),
+            poolDir,
+          );
 
           // Shared context files
           await writeOutputFile(
@@ -648,7 +703,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
       const routingServiceContextDir = path.join(routingServiceDir, "context");
 
-      // Copy routing-service runtime (from adapter package dist/)
+      // Copy routing-service runtime (from adapter package dist/). esbuild bundles
+      // connectrpc/protobuf-es and the generated ext_proc Envoy types into this CJS
+      // bundle, so there's no separate .proto file to stage.
       const routingServiceSrc = path.join(_dirname, "routing-service.cjs");
       if (existsSync(routingServiceSrc)) {
         await writeOutputFile(
@@ -668,7 +725,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       );
 
       // Stage runtime dependencies for routing service (externals not bundled by esbuild)
-      // @grpc/grpc-js and @grpc/proto-loader are bundled into routing-service.cjs
+      // connectrpc/protobuf-es and the generated Envoy protos are bundled into
+      // routing-service.mjs; only @next/routing is external.
       const routingServiceDeps = ["@next/routing"];
       for (const dep of routingServiceDeps) {
         const depDir = path.join(projectDir, "node_modules", ...dep.split("/"));
@@ -686,15 +744,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       }
 
-      // Stage .env files into routing service context
-      for (const envFile of envFiles) {
-        const envSrc = path.join(projectDir, envFile);
-        const envDest = path.join(projectDir, routingServiceContextDir, envFile);
-        if (existsSync(envSrc) && !existsSync(envDest)) {
-          await mkdir(path.dirname(envDest), { recursive: true });
-          await copyFile(envSrc, envDest);
-        }
-      }
+      // Keep .env secrets out of the routing-service image. `docker build`
+      // uses the routing-service dir as its context, so the .dockerignore lives
+      // there alongside the Dockerfile.
+      await writeOutputFile(
+        projectDir,
+        ".dockerignore",
+        generateDockerignore(),
+        routingServiceDir,
+      );
 
       // Stage middleware module + its chunk dependencies
       if (outputs.middleware?.filePath && existsSync(outputs.middleware.filePath)) {
@@ -708,7 +766,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         const mwAssets = (outputs.middleware as any).assets ?? {};
         for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
           if (typeof absAsset === "string" && existsSync(absAsset)) {
-            const dest = path.join(projectDir, routingServiceContextDir, relAsset);
+            const dest = path.join(
+              projectDir,
+              routingServiceContextDir,
+              assetDestPath(projectDir, relAsset, absAsset),
+            );
             if (!existsSync(dest)) {
               await mkdir(path.dirname(dest), { recursive: true });
               const stat = statSync(absAsset);
