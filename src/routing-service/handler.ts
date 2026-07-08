@@ -75,7 +75,10 @@ export function createRequestHandler(
     // extension and have the pool dispatch straight to a handler, bypassing middleware auth.
     // No secret is added, so the pool treats the request as untrusted → runs Phase 1.
     if (middlewareModule && method !== "GET" && method !== "HEAD") {
-      return buildHeaderMutationResponse([], [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]);
+      return buildHeaderMutationResponse(
+        [],
+        [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER],
+      );
     }
 
     let middlewareResponse: Response | undefined;
@@ -276,12 +279,7 @@ export function createRequestHandler(
     // returns a flight payload instead of HTML — mirrors pool-server/resolve.ts.
     const basePathname =
       resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? path;
-    const outputId = resolveRscOutput(
-      basePathname,
-      headers,
-      rscConfig,
-      manifest.poolAssignments,
-    );
+    const outputId = resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
 
     const mutations: HeaderMutationEntry[] = [];
     // Every internal dispatch header the extension does NOT set this response must be actively

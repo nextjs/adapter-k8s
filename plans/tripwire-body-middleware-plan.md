@@ -4,6 +4,7 @@
 method gate** (v3) was found to open a middleware-auth bypass: skipping the callout on POSTs
 meant the extension no longer stripped client-spoofed dispatch headers, and GKE pools trust
 dispatch headers. v4 **reverts the CEL gate** and instead:
+
 - keeps a **runtime backstop** in `handler.ts` that, for non-GET/HEAD requests with
   middleware, runs no `resolveRoutes` (no empty-body middleware) AND actively CLEARS the
   internal dispatch headers, so the pool re-resolves Phase-1 with the real body;
@@ -36,7 +37,7 @@ nothing:
 - **Correct pool via `x-upstream-pool`:** marginal. Per Gateway API precedence
   (exact > longest path-prefix > headers), path-prefix rules shadow the header rules anyway
   (`gateway.ts`), and `proxyToPool` (`dispatch.ts:478`) already recovers a wrong-pool guess.
-- **Avoiding pool-side resolution:** not a saving, a *relocation* — `resolveRoutes` +
+- **Avoiding pool-side resolution:** not a saving, a _relocation_ — `resolveRoutes` +
   middleware runs exactly once per request either way; gating just moves it from the routing
   service to the pool.
 
@@ -44,7 +45,7 @@ Against that, running body-middleware at the edge is either wrong (empty body) o
 the rejected tripwire machinery (Appendix A). The pool's Phase-1 path
 (`pool-server/resolve.ts`) is the **reference resolver** — the same code emulate runs — and
 is where `headers()` are actually applied and external rewrites actually proxy (both of which
-the ext_proc Phase-2 path currently does *not* do; see "Related router gaps" below). So
+the ext_proc Phase-2 path currently does _not_ do; see "Related router gaps" below). So
 sending body-capable requests straight to the pool is the more correct path today.
 
 ## 3. Implemented change
@@ -95,7 +96,7 @@ secretKeyRef wiring on both deployments).
   a tiny cost that buys the header-strip trust boundary. This is the price of not depending on
   the secret alone for safety.
 - **Body-capable requests still resolve at the pool** (Phase 1, real body) — the correctness
-  win from v3 is unchanged; only the *mechanism* moved from CEL to the runtime backstop.
+  win from v3 is unchanged; only the _mechanism_ moved from CEL to the runtime backstop.
 - **GET/HEAD middleware still runs at the edge** with the empty stream — correct only because
   GET/HEAD have no body to read.
 - **Secret regenerates per build.** Acceptable: the chart updates both sides together and a
@@ -103,7 +104,7 @@ secretKeyRef wiring on both deployments).
 - **NEEDS LIVE VERIFICATION** (per `feedback_architectural_precision`): that the LB forwards
   the extension's `x-internal-secret` request-header mutation to the backend (same mechanism as
   the existing dispatch headers, which demonstrably work — so high confidence, but confirm on a
-  real GXLB before relying on the secret as the *sole* trust layer). Safety today does NOT
+  real GXLB before relying on the secret as the _sole_ trust layer). Safety today does NOT
   depend on it: the backstop's `removeHeaders` already strips spoofed dispatch headers on the
   POST path via the proven overwrite/remove mechanism.
 
@@ -160,7 +161,7 @@ on read), and on trip drop the dispatch headers so the pool re-runs middleware w
 body. Rejected because method gating achieves the same correctness with none of the costs:
 
 - Stream instrumentation with a residual false-positive class in the Next.js middleware
-  adapter wrapper (would trip on *every* POST if the wrapper tees the stream).
+  adapter wrapper (would trip on _every_ POST if the wrapper tees the stream).
 - Double middleware execution with empty-body side effects on every trip.
 - A discarded-computation branch that had to dominate all five resolution-derived output
   channels (redirect, resolvedHeaders+status, middlewareResponded, externalRewrite, resolved

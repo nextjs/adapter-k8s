@@ -330,8 +330,10 @@ async function main() {
       const preview = prerenderManifest.preview;
       if (preview) {
         if (preview.previewModeId) process.env.__NEXT_PREVIEW_MODE_ID = preview.previewModeId;
-        if (preview.previewModeSigningKey) process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY = preview.previewModeSigningKey;
-        if (preview.previewModeEncryptionKey) process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY = preview.previewModeEncryptionKey;
+        if (preview.previewModeSigningKey)
+          process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY = preview.previewModeSigningKey;
+        if (preview.previewModeEncryptionKey)
+          process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY = preview.previewModeEncryptionKey;
       }
     } catch {
       // Non-fatal — draft mode just won't work
@@ -340,7 +342,12 @@ async function main() {
 
   // Load the middleware manifest — contains edge function names, files, and assets.
   // This is used by the edge sandbox to find the right _ENTRIES key.
-  const middlewareManifestPath = path.join(process.cwd(), ".next", "server", "middleware-manifest.json");
+  const middlewareManifestPath = path.join(
+    process.cwd(),
+    ".next",
+    "server",
+    "middleware-manifest.json",
+  );
   const middlewareManifest: {
     middleware: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
     functions: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
@@ -349,7 +356,9 @@ async function main() {
     : { middleware: {}, functions: {} };
 
   // Initialize edge sandbox (shared by edge middleware + edge route handlers)
-  let edgeSandboxRun: ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>) | null = null;
+  let edgeSandboxRun:
+    | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
+    | null = null;
   const distDir = path.join(process.cwd(), ".next");
   try {
     const { createRequire: cr } = await import("node:module");
@@ -357,12 +366,13 @@ async function main() {
     const sandbox = appReq("next/dist/server/web/sandbox") as {
       run: (params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>;
     };
-    edgeSandboxRun = (params) => sandbox.run({
-      ...params,
-      useCache: true,
-      distDir,
-      clientAssetToken: "",
-    });
+    edgeSandboxRun = (params) =>
+      sandbox.run({
+        ...params,
+        useCache: true,
+        distDir,
+        clientAssetToken: "",
+      });
     console.log("Edge sandbox initialized");
   } catch {
     // Edge sandbox not available
@@ -370,7 +380,14 @@ async function main() {
 
   // Optionally load middleware module
   let middlewareModule = null;
-  let edgeMiddlewareRunner: ((ctx: { url: URL; headers: Headers; method: string; body?: ReadableStream<Uint8Array> }) => Promise<Response | null>) | null = null;
+  let edgeMiddlewareRunner:
+    | ((ctx: {
+        url: URL;
+        headers: Headers;
+        method: string;
+        body?: ReadableStream<Uint8Array>;
+      }) => Promise<Response | null>)
+    | null = null;
   if (routingManifest.middleware) {
     const mwPath = path.resolve(process.cwd(), routingManifest.middleware.filePath);
     const isEdge = routingManifest.middleware.runtime === "edge";
@@ -405,7 +422,9 @@ async function main() {
       };
       console.log(`Edge middleware sandbox ready (name=${mwName}, files=${mwFiles.length})`);
     } else if (isEdge) {
-      console.warn("Edge middleware found but sandbox not available, falling back to Node.js loading");
+      console.warn(
+        "Edge middleware found but sandbox not available, falling back to Node.js loading",
+      );
       middlewareModule = await import(pathToFileURL(mwPath).href);
       console.log("Middleware module loaded (Node.js fallback)");
     } else {
@@ -416,7 +435,9 @@ async function main() {
 
   // Edge route runner — uses the middleware manifest's `functions` to get the correct
   // name and files for each edge-compiled route handler.
-  let edgeRouteRunner: ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>) | null = null;
+  let edgeRouteRunner:
+    | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
+    | null = null;
   if (edgeSandboxRun && Object.keys(middlewareManifest.functions).length > 0) {
     edgeRouteRunner = (params) => {
       // Look up the edge function in the manifest by pathname
@@ -431,7 +452,9 @@ async function main() {
         edgeFunctionEntry: fnEntry,
       });
     };
-    console.log(`Edge route runner ready (${Object.keys(middlewareManifest.functions).length} functions)`);
+    console.log(
+      `Edge route runner ready (${Object.keys(middlewareManifest.functions).length} functions)`,
+    );
   }
 
   const handlerLoader = createHandlerLoader(poolManifest);
@@ -464,7 +487,12 @@ async function main() {
       // Serve _next/static/* and _next/data/* directly from filesystem.
       // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
       if (url.pathname.startsWith("/_next/static/")) {
-        const filePath = path.join(process.cwd(), ".next", "static", url.pathname.slice("/_next/static/".length));
+        const filePath = path.join(
+          process.cwd(),
+          ".next",
+          "static",
+          url.pathname.slice("/_next/static/".length),
+        );
         if (existsSync(filePath)) {
           const content = readFileSync(filePath);
           res.writeHead(200, {
@@ -520,7 +548,10 @@ async function main() {
               : null;
 
             // A null result means the path escaped its root — reject traversal.
-            if (publicFile === null || (imageUrl.startsWith("/_next/static/") && staticFile === null)) {
+            if (
+              publicFile === null ||
+              (imageUrl.startsWith("/_next/static/") && staticFile === null)
+            ) {
               res.writeHead(400, { "content-type": "text/plain" });
               res.end("Bad Request: invalid image path");
               return;
@@ -528,7 +559,11 @@ async function main() {
 
             if (existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
               imageBuffer = readFileSync(publicFile);
-            } else if (staticFile && existsSync(staticFile) && !statSync(staticFile).isDirectory()) {
+            } else if (
+              staticFile &&
+              existsSync(staticFile) &&
+              !statSync(staticFile).isDirectory()
+            ) {
               imageBuffer = readFileSync(staticFile);
             } else {
               // Fetch from ourselves (same-origin relative image, e.g. served by a route)

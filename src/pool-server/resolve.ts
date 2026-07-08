@@ -49,169 +49,170 @@ export function createLocalResolver(
         routes: manifest.routeGraph,
         // invokeMiddleware MUST always be a function — resolveRoutes calls it
         // unconditionally (no null guard). When no middleware exists, return empty result.
-        invokeMiddleware: (middlewareModule || edgeMiddlewareRunner)
-          ? async (ctx) => {
-              // Next.js middleware modules have multiple shapes depending on
-              // compilation target. We try invocation paths in order:
-              //
-              // 0. Edge sandbox: use Next.js's built-in edge runtime sandbox
-              //    (for middleware compiled with edge runtime target).
-              // 1. Web adapter: default({ handler, request, page }) — Node middleware
-              //    Returns raw NextResponse with x-middleware-* headers intact.
-              // 2. Legacy: default.default({ request }) — older Next.js Edge output
-              //    Pre-processes response (strips x-middleware-* headers).
-              // 3. Direct handler: handler(request, { waitUntil }) — raw handler fn
-              //
-              // Web adapter MUST be tried first — the legacy path strips control
-              // headers from the response, causing responseToMiddlewareResult to
-              // misinterpret the result (sets bodySent=true incorrectly).
+        invokeMiddleware:
+          middlewareModule || edgeMiddlewareRunner
+            ? async (ctx) => {
+                // Next.js middleware modules have multiple shapes depending on
+                // compilation target. We try invocation paths in order:
+                //
+                // 0. Edge sandbox: use Next.js's built-in edge runtime sandbox
+                //    (for middleware compiled with edge runtime target).
+                // 1. Web adapter: default({ handler, request, page }) — Node middleware
+                //    Returns raw NextResponse with x-middleware-* headers intact.
+                // 2. Legacy: default.default({ request }) — older Next.js Edge output
+                //    Pre-processes response (strips x-middleware-* headers).
+                // 3. Direct handler: handler(request, { waitUntil }) — raw handler fn
+                //
+                // Web adapter MUST be tried first — the legacy path strips control
+                // headers from the response, causing responseToMiddlewareResult to
+                // misinterpret the result (sets bodySent=true incorrectly).
 
-              try {
-                let response: Response | null = null;
+                try {
+                  let response: Response | null = null;
 
-                // Path 0: Edge sandbox (for edge-compiled middleware)
-                if (edgeMiddlewareRunner) {
-                  response = await edgeMiddlewareRunner({
-                    url: ctx.url,
-                    headers: ctx.headers,
-                    method,
-                    body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                  });
-                }
-
-                // Node middleware paths (only if no edge runner or edge didn't produce a response)
-                if (!response && middlewareModule) {
-                  const adapterFn =
-                    typeof middlewareModule.default === "function"
-                      ? (middlewareModule.default as (...args: unknown[]) => unknown)
-                      : typeof middlewareModule === "function"
-                        ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
-                        : null;
-
-                  const handlerFn =
-                    (middlewareModule as Record<string, unknown>).proxy ||
-                    (middlewareModule as Record<string, unknown>).middleware ||
-                    middlewareModule;
-
-                  const legacyMiddlewareFn =
-                    typeof (middlewareModule.default as Record<string, unknown> | undefined)
-                      ?.default === "function"
-                      ? ((middlewareModule.default as Record<string, unknown>).default as (
-                          ...args: unknown[]
-                        ) => unknown)
-                      : null;
-
-                  if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
-
-                const waitUntil = (waitable: Promise<unknown>) => {
-                  void waitable.catch(() => undefined);
-                };
-
-                // Path 1: Web adapter (default({ handler, request, page }))
-                if (adapterFn && handlerFn) {
-                  const requestHeaders = Object.fromEntries(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                  );
-                  const result = await (adapterFn as any)({
-                    handler: handlerFn,
-                    request: {
-                      url: ctx.url.toString(),
+                  // Path 0: Edge sandbox (for edge-compiled middleware)
+                  if (edgeMiddlewareRunner) {
+                    response = await edgeMiddlewareRunner({
+                      url: ctx.url,
+                      headers: ctx.headers,
                       method,
-                      headers: requestHeaders,
                       body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                      signal: new AbortController().signal,
-                      nextConfig: {
-                        basePath: manifest.basePath || undefined,
-                        i18n: (manifest.i18n as any) ?? undefined,
-                      },
-                      waitUntil,
-                    },
-                    page: "middleware",
-                  });
-
-                  response =
-                    result?.response instanceof Response
-                      ? result.response
-                      : result instanceof Response
-                        ? result
-                        : null;
-                }
-
-                // Path 2: Legacy middleware (default.default)
-                if (!response && legacyMiddlewareFn) {
-                  const requestHeaders = Object.fromEntries(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                  );
-                  const result = await (legacyMiddlewareFn as any)({
-                    request: {
-                      url: ctx.url.toString(),
-                      method,
-                      headers: requestHeaders,
-                      body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                      destination: "document",
-                      credentials: "same-origin",
-                      bodyUsed: false,
-                      mode: "navigate",
-                      redirect: "follow",
-                    },
-                  });
-
-                  if (result?.waitUntil) {
-                    await result.waitUntil;
+                    });
                   }
 
-                  response =
-                    result?.response instanceof Response
-                      ? result.response
-                      : result instanceof Response
-                        ? result
-                        : null;
-                }
+                  // Node middleware paths (only if no edge runner or edge didn't produce a response)
+                  if (!response && middlewareModule) {
+                    const adapterFn =
+                      typeof middlewareModule.default === "function"
+                        ? (middlewareModule.default as (...args: unknown[]) => unknown)
+                        : typeof middlewareModule === "function"
+                          ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
+                          : null;
 
-                // Path 3: Direct handler invocation
-                if (!response && typeof handlerFn === "function") {
-                  const requestInit: RequestInit & { duplex?: "half" } = {
-                    method,
-                    headers: new Headers(
-                      [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                    ),
-                    duplex: "half",
-                  };
-                  if (method !== "GET" && method !== "HEAD") {
-                    requestInit.body = ctx.requestBody;
+                    const handlerFn =
+                      (middlewareModule as Record<string, unknown>).proxy ||
+                      (middlewareModule as Record<string, unknown>).middleware ||
+                      middlewareModule;
+
+                    const legacyMiddlewareFn =
+                      typeof (middlewareModule.default as Record<string, unknown> | undefined)
+                        ?.default === "function"
+                        ? ((middlewareModule.default as Record<string, unknown>).default as (
+                            ...args: unknown[]
+                          ) => unknown)
+                        : null;
+
+                    if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
+
+                    const waitUntil = (waitable: Promise<unknown>) => {
+                      void waitable.catch(() => undefined);
+                    };
+
+                    // Path 1: Web adapter (default({ handler, request, page }))
+                    if (adapterFn && handlerFn) {
+                      const requestHeaders = Object.fromEntries(
+                        [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                      );
+                      const result = await (adapterFn as any)({
+                        handler: handlerFn,
+                        request: {
+                          url: ctx.url.toString(),
+                          method,
+                          headers: requestHeaders,
+                          body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                          signal: new AbortController().signal,
+                          nextConfig: {
+                            basePath: manifest.basePath || undefined,
+                            i18n: (manifest.i18n as any) ?? undefined,
+                          },
+                          waitUntil,
+                        },
+                        page: "middleware",
+                      });
+
+                      response =
+                        result?.response instanceof Response
+                          ? result.response
+                          : result instanceof Response
+                            ? result
+                            : null;
+                    }
+
+                    // Path 2: Legacy middleware (default.default)
+                    if (!response && legacyMiddlewareFn) {
+                      const requestHeaders = Object.fromEntries(
+                        [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                      );
+                      const result = await (legacyMiddlewareFn as any)({
+                        request: {
+                          url: ctx.url.toString(),
+                          method,
+                          headers: requestHeaders,
+                          body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                          destination: "document",
+                          credentials: "same-origin",
+                          bodyUsed: false,
+                          mode: "navigate",
+                          redirect: "follow",
+                        },
+                      });
+
+                      if (result?.waitUntil) {
+                        await result.waitUntil;
+                      }
+
+                      response =
+                        result?.response instanceof Response
+                          ? result.response
+                          : result instanceof Response
+                            ? result
+                            : null;
+                    }
+
+                    // Path 3: Direct handler invocation
+                    if (!response && typeof handlerFn === "function") {
+                      const requestInit: RequestInit & { duplex?: "half" } = {
+                        method,
+                        headers: new Headers(
+                          [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                        ),
+                        duplex: "half",
+                      };
+                      if (method !== "GET" && method !== "HEAD") {
+                        requestInit.body = ctx.requestBody;
+                      }
+                      const middlewareRequest = new Request(ctx.url.toString(), requestInit);
+                      const result = await (handlerFn as any)(middlewareRequest, {
+                        waitUntil,
+                      });
+
+                      response =
+                        result instanceof Response
+                          ? result
+                          : result?.response instanceof Response
+                            ? result.response
+                            : null;
+                    }
+                  } // end if (!response && middlewareModule)
+
+                  if (response) {
+                    middlewareResponse = response;
+                    const reqHeaders = new Headers(ctx.headers);
+                    const mwResult = responseToMiddlewareResult(
+                      response.clone(),
+                      reqHeaders,
+                      ctx.url,
+                    );
+                    middlewareRequestHeaders = reqHeaders;
+                    return mwResult;
                   }
-                  const middlewareRequest = new Request(ctx.url.toString(), requestInit);
-                  const result = await (handlerFn as any)(middlewareRequest, {
-                    waitUntil,
-                  });
-
-                  response =
-                    result instanceof Response
-                      ? result
-                      : result?.response instanceof Response
-                        ? result.response
-                        : null;
+                  return {};
+                } catch (err) {
+                  console.error("[pool-server] Middleware execution failed:", err);
+                  return {};
                 }
-                } // end if (!response && middlewareModule)
-
-                if (response) {
-                  middlewareResponse = response;
-                  const reqHeaders = new Headers(ctx.headers);
-                  const mwResult = responseToMiddlewareResult(
-                    response.clone(),
-                    reqHeaders,
-                    ctx.url,
-                  );
-                  middlewareRequestHeaders = reqHeaders;
-                  return mwResult;
-                }
-                return {};
-              } catch (err) {
-                console.error("[pool-server] Middleware execution failed:", err);
-                return {};
               }
-            }
-          : async () => ({}),
+            : async () => ({}),
       });
 
       // 1. Redirect
@@ -250,7 +251,12 @@ export function createLocalResolver(
       // because the pool assignment keys may differ from what @next/routing returns
       // depending on the app's trailingSlash config.
       const i18nLocales = (manifest.i18n as any)?.locales as string[] | undefined;
-      const pool = lookupPool(manifest.poolAssignments, resolution.resolvedPathname, matchedPathname, i18nLocales);
+      const pool = lookupPool(
+        manifest.poolAssignments,
+        resolution.resolvedPathname,
+        matchedPathname,
+        i18nLocales,
+      );
 
       if (!pool) {
         return { kind: "not-found" };

@@ -80,9 +80,9 @@ describe("renderHTTPRoute rule cap", () => {
 
 describe("releaseName validation in gateway templates", () => {
   it("renderGateway rejects an unsafe releaseName", () => {
-    expect(() =>
-      renderGateway({ releaseName: 'foo";rm -rf /;"', hosts }),
-    ).toThrow(/Invalid releaseName/);
+    expect(() => renderGateway({ releaseName: 'foo";rm -rf /;"', hosts })).toThrow(
+      /Invalid releaseName/,
+    );
   });
 
   it("renderHTTPRoute rejects an unsafe releaseName", () => {

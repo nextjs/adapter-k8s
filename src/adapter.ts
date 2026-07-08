@@ -246,7 +246,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const buildCpus = parseInt(process.env.ADAPTER_K8S_BUILD_CPUS ?? "", 10);
       if (buildCpus > 0) {
         modified.experimental = {
-          ...(modified.experimental as Record<string, unknown> ?? {}),
+          ...((modified.experimental as Record<string, unknown>) ?? {}),
           cpus: buildCpus,
           memoryBasedWorkersCount: false,
           parallelServerCompiles: false,
@@ -292,14 +292,25 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             outputs: Object.fromEntries(
               Object.entries(outputs).map(([k, v]) => {
                 if (Array.isArray(v)) {
-                  return [k, v.map((item: any) => ({
-                    ...item,
-                    // Truncate large fields
-                    assets: item.assets ? `[${Object.keys(item.assets).length} assets]` : undefined,
-                  }))];
+                  return [
+                    k,
+                    v.map((item: any) => ({
+                      ...item,
+                      // Truncate large fields
+                      assets: item.assets
+                        ? `[${Object.keys(item.assets).length} assets]`
+                        : undefined,
+                    })),
+                  ];
                 }
                 if (v && typeof v === "object" && "filePath" in v) {
-                  return [k, { ...v, assets: v.assets ? `[${Object.keys(v.assets).length} assets]` : undefined }];
+                  return [
+                    k,
+                    {
+                      ...v,
+                      assets: v.assets ? `[${Object.keys(v.assets).length} assets]` : undefined,
+                    },
+                  ];
                 }
                 return [k, v];
               }),
@@ -604,12 +615,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // Keep .env secrets out of the pool image. The Dockerfile's
           // `COPY context/ .` runs from this pool dir (the docker build
           // context), so the .dockerignore lives here alongside the Dockerfile.
-          await writeOutputFile(
-            projectDir,
-            ".dockerignore",
-            generateDockerignore(),
-            poolDir,
-          );
+          await writeOutputFile(projectDir, ".dockerignore", generateDockerignore(), poolDir);
 
           // Shared context files
           await writeOutputFile(
@@ -692,122 +698,122 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
       // Routing service Dockerfile + context (skip when staging is disabled)
       if (!skipStaging) {
-      const routingServiceDir = path.join(OUTPUT_DIR, "routing-service");
+        const routingServiceDir = path.join(OUTPUT_DIR, "routing-service");
 
-      await writeOutputFile(
-        projectDir,
-        "Dockerfile",
-        generateRoutingServiceDockerfile({ nodeVersion: "22", buildId }),
-        routingServiceDir,
-      );
-
-      const routingServiceContextDir = path.join(routingServiceDir, "context");
-
-      // Copy routing-service runtime (from adapter package dist/). esbuild bundles
-      // connectrpc/protobuf-es and the generated ext_proc Envoy types into this CJS
-      // bundle, so there's no separate .proto file to stage.
-      const routingServiceSrc = path.join(_dirname, "routing-service.cjs");
-      if (existsSync(routingServiceSrc)) {
         await writeOutputFile(
           projectDir,
-          "routing-service.cjs",
-          readFileSync(routingServiceSrc, "utf-8"),
+          "Dockerfile",
+          generateRoutingServiceDockerfile({ nodeVersion: "22", buildId }),
+          routingServiceDir,
+        );
+
+        const routingServiceContextDir = path.join(routingServiceDir, "context");
+
+        // Copy routing-service runtime (from adapter package dist/). esbuild bundles
+        // connectrpc/protobuf-es and the generated ext_proc Envoy types into this CJS
+        // bundle, so there's no separate .proto file to stage.
+        const routingServiceSrc = path.join(_dirname, "routing-service.cjs");
+        if (existsSync(routingServiceSrc)) {
+          await writeOutputFile(
+            projectDir,
+            "routing-service.cjs",
+            readFileSync(routingServiceSrc, "utf-8"),
+            routingServiceContextDir,
+          );
+        }
+
+        // Routing manifest for the routing service
+        await writeOutputFile(
+          projectDir,
+          "config/routing-manifest.json",
+          JSON.stringify(routingManifest, null, 2),
           routingServiceContextDir,
         );
-      }
 
-      // Routing manifest for the routing service
-      await writeOutputFile(
-        projectDir,
-        "config/routing-manifest.json",
-        JSON.stringify(routingManifest, null, 2),
-        routingServiceContextDir,
-      );
-
-      // Stage runtime dependencies for routing service (externals not bundled by esbuild)
-      // connectrpc/protobuf-es and the generated Envoy protos are bundled into
-      // routing-service.mjs; only @next/routing is external.
-      const routingServiceDeps = ["@next/routing"];
-      for (const dep of routingServiceDeps) {
-        const depDir = path.join(projectDir, "node_modules", ...dep.split("/"));
-        if (existsSync(depDir)) {
-          const dest = path.join(
-            projectDir,
-            routingServiceContextDir,
-            "node_modules",
-            ...dep.split("/"),
-          );
-          if (!existsSync(dest)) {
-            await mkdir(path.dirname(dest), { recursive: true });
-            await cp(depDir, dest, { recursive: true, dereference: true });
-          }
-        }
-      }
-
-      // Keep .env secrets out of the routing-service image. `docker build`
-      // uses the routing-service dir as its context, so the .dockerignore lives
-      // there alongside the Dockerfile.
-      await writeOutputFile(
-        projectDir,
-        ".dockerignore",
-        generateDockerignore(),
-        routingServiceDir,
-      );
-
-      // Stage middleware module + its chunk dependencies
-      if (outputs.middleware?.filePath && existsSync(outputs.middleware.filePath)) {
-        const mwRelPath = path.relative(projectDir, outputs.middleware.filePath);
-        const mwDest = path.join(projectDir, routingServiceContextDir, mwRelPath);
-        if (!existsSync(mwDest)) {
-          await mkdir(path.dirname(mwDest), { recursive: true });
-          await copyFile(outputs.middleware.filePath, mwDest);
-        }
-        // Stage middleware's traced assets (files and directories)
-        const mwAssets = (outputs.middleware as any).assets ?? {};
-        for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
-          if (typeof absAsset === "string" && existsSync(absAsset)) {
+        // Stage runtime dependencies for routing service (externals not bundled by esbuild)
+        // connectrpc/protobuf-es and the generated Envoy protos are bundled into
+        // routing-service.mjs; only @next/routing is external.
+        const routingServiceDeps = ["@next/routing"];
+        for (const dep of routingServiceDeps) {
+          const depDir = path.join(projectDir, "node_modules", ...dep.split("/"));
+          if (existsSync(depDir)) {
             const dest = path.join(
               projectDir,
               routingServiceContextDir,
-              assetDestPath(projectDir, relAsset, absAsset),
+              "node_modules",
+              ...dep.split("/"),
             );
             if (!existsSync(dest)) {
               await mkdir(path.dirname(dest), { recursive: true });
-              const stat = statSync(absAsset);
-              if (stat.isDirectory()) {
-                await cp(absAsset, dest, { recursive: true, dereference: true });
-              } else {
-                await copyFile(absAsset, dest);
-              }
+              await cp(depDir, dest, { recursive: true, dereference: true });
             }
           }
         }
-        // Stage .next/server/chunks/ for Turbopack runtime chunk loading
-        const chunksDir = path.join(projectDir, ".next", "server", "chunks");
-        const chunksDest = path.join(
+
+        // Keep .env secrets out of the routing-service image. `docker build`
+        // uses the routing-service dir as its context, so the .dockerignore lives
+        // there alongside the Dockerfile.
+        await writeOutputFile(
           projectDir,
-          routingServiceContextDir,
-          ".next",
-          "server",
-          "chunks",
+          ".dockerignore",
+          generateDockerignore(),
+          routingServiceDir,
         );
 
-        // Stage .next/node_modules/ — Turbopack's resolved external modules
-        const nextNodeModules = path.join(projectDir, ".next", "node_modules");
-        const nextNodeModulesDest = path.join(
-          projectDir,
-          routingServiceContextDir,
-          ".next",
-          "node_modules",
-        );
-        if (existsSync(nextNodeModules)) {
-          await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
+        // Stage middleware module + its chunk dependencies
+        if (outputs.middleware?.filePath && existsSync(outputs.middleware.filePath)) {
+          const mwRelPath = path.relative(projectDir, outputs.middleware.filePath);
+          const mwDest = path.join(projectDir, routingServiceContextDir, mwRelPath);
+          if (!existsSync(mwDest)) {
+            await mkdir(path.dirname(mwDest), { recursive: true });
+            await copyFile(outputs.middleware.filePath, mwDest);
+          }
+          // Stage middleware's traced assets (files and directories)
+          const mwAssets = (outputs.middleware as any).assets ?? {};
+          for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
+            if (typeof absAsset === "string" && existsSync(absAsset)) {
+              const dest = path.join(
+                projectDir,
+                routingServiceContextDir,
+                assetDestPath(projectDir, relAsset, absAsset),
+              );
+              if (!existsSync(dest)) {
+                await mkdir(path.dirname(dest), { recursive: true });
+                const stat = statSync(absAsset);
+                if (stat.isDirectory()) {
+                  await cp(absAsset, dest, { recursive: true, dereference: true });
+                } else {
+                  await copyFile(absAsset, dest);
+                }
+              }
+            }
+          }
+          // Stage .next/server/chunks/ for Turbopack runtime chunk loading
+          const chunksDir = path.join(projectDir, ".next", "server", "chunks");
+          const chunksDest = path.join(
+            projectDir,
+            routingServiceContextDir,
+            ".next",
+            "server",
+            "chunks",
+          );
+
+          // Stage .next/node_modules/ — Turbopack's resolved external modules
+          const nextNodeModules = path.join(projectDir, ".next", "node_modules");
+          const nextNodeModulesDest = path.join(
+            projectDir,
+            routingServiceContextDir,
+            ".next",
+            "node_modules",
+          );
+          if (existsSync(nextNodeModules)) {
+            await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
+          }
+          if (existsSync(chunksDir) && !existsSync(chunksDest)) {
+            await mkdir(path.dirname(chunksDest), { recursive: true });
+            await cp(chunksDir, chunksDest, { recursive: true, dereference: true });
+          }
         }
-        if (existsSync(chunksDir) && !existsSync(chunksDest)) {
-          await mkdir(path.dirname(chunksDest), { recursive: true });
-          await cp(chunksDir, chunksDest, { recursive: true, dereference: true });
-        }
-      }
       } // end if (!skipStaging)
 
       await writeOutputFile(

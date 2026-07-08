@@ -17,7 +17,7 @@ function runOrThrow(
   command: string,
   args: string[],
   cwd: string,
-  extraEnv?: Record<string, string>
+  extraEnv?: Record<string, string>,
 ) {
   const result = spawnSync(command, args, {
     cwd,
@@ -27,13 +27,9 @@ function runOrThrow(
 
   if (result.status !== 0) {
     throw new Error(
-      [
-        `Command failed: ${command} ${args.join(" ")}`,
-        result.stdout?.trim(),
-        result.stderr?.trim(),
-      ]
+      [`Command failed: ${command} ${args.join(" ")}`, result.stdout?.trim(), result.stderr?.trim()]
         .filter(Boolean)
-        .join("\n\n")
+        .join("\n\n"),
     );
   }
 
@@ -56,76 +52,72 @@ describeIf("apphosting standalone baseline", () => {
     }
   });
 
-  it(
-    "builds a standalone app with the npm adapter",
-    () => {
-      tempDir = mkdtempSync(path.join(os.tmpdir(), "apphosting-standalone-"));
+  it("builds a standalone app with the npm adapter", () => {
+    tempDir = mkdtempSync(path.join(os.tmpdir(), "apphosting-standalone-"));
 
-      writeFileSync(
-        path.join(tempDir, "package.json"),
-        JSON.stringify(
-          {
-            name: "apphosting-standalone-baseline",
-            private: true,
-            type: "module",
-            dependencies: {
-              next: nextVersion,
-              react: reactVersion,
-              "react-dom": reactVersion,
-              "@apphosting/adapter-nextjs": adapterVersion,
-            },
+    writeFileSync(
+      path.join(tempDir, "package.json"),
+      JSON.stringify(
+        {
+          name: "apphosting-standalone-baseline",
+          private: true,
+          type: "module",
+          dependencies: {
+            next: nextVersion,
+            react: reactVersion,
+            "react-dom": reactVersion,
+            "@apphosting/adapter-nextjs": adapterVersion,
           },
-          null,
-          2
-        )
-      );
+        },
+        null,
+        2,
+      ),
+    );
 
-      writeFileSync(
-        path.join(tempDir, "next.config.mjs"),
-        "export default { output: 'standalone' };\n"
-      );
+    writeFileSync(
+      path.join(tempDir, "next.config.mjs"),
+      "export default { output: 'standalone' };\n",
+    );
 
-      mkdirSync(path.join(tempDir, "app", "api", "hello"), { recursive: true });
-      writeFileSync(
-        path.join(tempDir, "app", "page.jsx"),
-        [
-          "export default function Page() {",
-          "  return <main id=\"home\">apphosting-standalone-baseline</main>;",
-          "}",
-          "",
-        ].join("\n")
-      );
-      writeFileSync(
-        path.join(tempDir, "app", "api", "hello", "route.js"),
-        [
-          "export function GET() {",
-          "  return Response.json({ ok: true, adapter: '@apphosting/adapter-nextjs' });",
-          "}",
-          "",
-        ].join("\n")
-      );
+    mkdirSync(path.join(tempDir, "app", "api", "hello"), { recursive: true });
+    writeFileSync(
+      path.join(tempDir, "app", "page.jsx"),
+      [
+        "export default function Page() {",
+        '  return <main id="home">apphosting-standalone-baseline</main>;',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      path.join(tempDir, "app", "api", "hello", "route.js"),
+      [
+        "export function GET() {",
+        "  return Response.json({ ok: true, adapter: '@apphosting/adapter-nextjs' });",
+        "}",
+        "",
+      ].join("\n"),
+    );
 
-      runOrThrow("npm", ["install"], tempDir);
-      runOrThrow("npx", ["apphosting-adapter-nextjs-build"], tempDir, {
-        FRAMEWORK_VERSION: nextVersion,
-      });
+    runOrThrow("npm", ["install"], tempDir);
+    runOrThrow("npx", ["apphosting-adapter-nextjs-build"], tempDir, {
+      FRAMEWORK_VERSION: nextVersion,
+    });
 
-      const standaloneServer = path.join(tempDir, ".next", "standalone", "server.js");
-      expect(existsSync(standaloneServer)).toBe(true);
-      expect(existsSync(path.join(tempDir, ".apphosting", "bundle.yaml"))).toBe(true);
+    const standaloneServer = path.join(tempDir, ".next", "standalone", "server.js");
+    expect(existsSync(standaloneServer)).toBe(true);
+    expect(existsSync(path.join(tempDir, ".apphosting", "bundle.yaml"))).toBe(true);
 
-      const runCommand = readRunCommand(path.join(tempDir, ".apphosting", "bundle.yaml"));
-      expect(runCommand).toContain("server.js");
+    const runCommand = readRunCommand(path.join(tempDir, ".apphosting", "bundle.yaml"));
+    expect(runCommand).toContain("server.js");
 
-      const installedPackage = JSON.parse(
-        readFileSync(
-          path.join(tempDir, "node_modules", "@apphosting", "adapter-nextjs", "package.json"),
-          "utf8"
-        )
-      );
-      expect(typeof installedPackage.version).toBe("string");
-      expect(installedPackage.version.length).toBeGreaterThan(0);
-    },
-    240_000
-  );
+    const installedPackage = JSON.parse(
+      readFileSync(
+        path.join(tempDir, "node_modules", "@apphosting", "adapter-nextjs", "package.json"),
+        "utf8",
+      ),
+    );
+    expect(typeof installedPackage.version).toBe("string");
+    expect(installedPackage.version.length).toBeGreaterThan(0);
+  }, 240_000);
 });

@@ -569,7 +569,9 @@ spec:
         `  ${patchFailures.length} of ${pools.length} pool Service selector patch(es) failed:`,
       );
       for (const f of patchFailures) {
-        console.error(`    - pool "${f.pool}" (service ${f.service}): ${f.stderr || "unknown error"}`);
+        console.error(
+          `    - pool "${f.pool}" (service ${f.service}): ${f.stderr || "unknown error"}`,
+        );
       }
       console.error(
         `  The previous build is still serving traffic and old deployments were left in place.`,

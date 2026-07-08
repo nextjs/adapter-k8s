@@ -273,7 +273,9 @@ export function createDispatcher(options: DispatcherOptions) {
         (res as any).writeHead = (status: number, ...args: any[]) => {
           // writeHead(status, headers) or writeHead(status, msg, headers)
           const headersArgIdx = typeof args[0] === "string" ? 1 : 0;
-          const handlerHeaders = args[headersArgIdx] as Record<string, string | string[]> | undefined;
+          const handlerHeaders = args[headersArgIdx] as
+            | Record<string, string | string[]>
+            | undefined;
 
           if (handlerHeaders) {
             for (const [key, value] of resolvedHeaders.entries()) {
@@ -304,11 +306,12 @@ export function createDispatcher(options: DispatcherOptions) {
       if (resolution.kind === "route") {
         const mp = resolution.matchedPathname;
         const isRSC = req.headers["rsc"] === "1";
-        const staticAsset = staticAssets.find((a) =>
-          a.pathname === mp ||
-          a.pathname === (mp.endsWith("/") ? mp.slice(0, -1) : mp + "/") ||
-          // RSC requests: serve the .rsc prerendered payload if available
-          (isRSC && a.pathname === mp + ".rsc"),
+        const staticAsset = staticAssets.find(
+          (a) =>
+            a.pathname === mp ||
+            a.pathname === (mp.endsWith("/") ? mp.slice(0, -1) : mp + "/") ||
+            // RSC requests: serve the .rsc prerendered payload if available
+            (isRSC && a.pathname === mp + ".rsc"),
         );
         const isPPR = staticAsset?.ppr;
         const hasResumeHeader =
@@ -446,7 +449,6 @@ export function createDispatcher(options: DispatcherOptions) {
         }
 
         case "route": {
-
           // Apply middleware's mutated request headers on top of the original.
           // responseToMiddlewareResult processes x-middleware-set-cookie,
           // x-middleware-override-headers, and x-middleware-request-* headers.
@@ -498,7 +500,9 @@ export function createDispatcher(options: DispatcherOptions) {
               });
               return;
             }
-            console.log(`[dispatch] 404: no handler for matchedPathname="${resolution.matchedPathname}" url="${req.url}"`);
+            console.log(
+              `[dispatch] 404: no handler for matchedPathname="${resolution.matchedPathname}" url="${req.url}"`,
+            );
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
             res.end("Not Found");
             return;
@@ -522,9 +526,12 @@ export function createDispatcher(options: DispatcherOptions) {
                   url: fullUrl.toString(),
                   method: req.method,
                   headers: headerObj,
-                  body: req.method !== "GET" && req.method !== "HEAD"
-                    ? (req as IncomingMessage & { [NEXT_REQUEST_META]?: { actionBody?: Buffer } })[NEXT_REQUEST_META]?.actionBody
-                    : undefined,
+                  body:
+                    req.method !== "GET" && req.method !== "HEAD"
+                      ? (
+                          req as IncomingMessage & { [NEXT_REQUEST_META]?: { actionBody?: Buffer } }
+                        )[NEXT_REQUEST_META]?.actionBody
+                      : undefined,
                   page: {
                     name: resolution.matchedPathname,
                     ...(resolution.routeMatches && { params: resolution.routeMatches }),

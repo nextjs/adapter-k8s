@@ -43,12 +43,14 @@ export function resolveRouteHandlerExport(module: LoadedModule): ArtifactRouteHa
   let defaultInfo = "";
   if (module.default && typeof module.default === "object") {
     const dk = Object.keys(module.default as Record<string, unknown>);
-    const dt = dk.map((k) => `${k}:${typeof (module.default as Record<string, unknown>)[k]}`).join(", ");
+    const dt = dk
+      .map((k) => `${k}:${typeof (module.default as Record<string, unknown>)[k]}`)
+      .join(", ");
     defaultInfo = ` default={${dt}}`;
   }
   throw new Error(
     `Could not find a valid handler export (handler, default, fetch) in the module. ` +
-    `Exports: [${exportTypes}]${defaultInfo}`
+      `Exports: [${exportTypes}]${defaultInfo}`,
   );
 }
 
@@ -68,25 +70,31 @@ export function createHandlerLoader(
         throw new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`);
       }
 
-      const promise = loadModule(output.filePath).then(async (module): Promise<ArtifactRouteHandler> => {
-        // Turbopack modules with top-level await (e.g., Genkit, heavy async deps)
-        // may export a Promise as module.exports. Await it to get the real exports.
-        let resolved: LoadedModule = module;
-        const defaultExport = module.default;
-        if (defaultExport instanceof Promise) {
-          resolved = (await defaultExport) as LoadedModule;
-        } else if (defaultExport && typeof defaultExport === "object" && Object.getPrototypeOf(defaultExport)?.constructor?.name === "Promise") {
-          resolved = (await (defaultExport as Promise<LoadedModule>));
-        }
-        try {
-          return resolveRouteHandlerExport(resolved);
-        } catch (err) {
-          throw new Error(
-            `Failed to resolve handler for outputId="${outputId}" ` +
-            `filePath="${output.filePath}": ${(err as Error).message}`
-          );
-        }
-      });
+      const promise = loadModule(output.filePath).then(
+        async (module): Promise<ArtifactRouteHandler> => {
+          // Turbopack modules with top-level await (e.g., Genkit, heavy async deps)
+          // may export a Promise as module.exports. Await it to get the real exports.
+          let resolved: LoadedModule = module;
+          const defaultExport = module.default;
+          if (defaultExport instanceof Promise) {
+            resolved = (await defaultExport) as LoadedModule;
+          } else if (
+            defaultExport &&
+            typeof defaultExport === "object" &&
+            Object.getPrototypeOf(defaultExport)?.constructor?.name === "Promise"
+          ) {
+            resolved = await (defaultExport as Promise<LoadedModule>);
+          }
+          try {
+            return resolveRouteHandlerExport(resolved);
+          } catch (err) {
+            throw new Error(
+              `Failed to resolve handler for outputId="${outputId}" ` +
+                `filePath="${output.filePath}": ${(err as Error).message}`,
+            );
+          }
+        },
+      );
       // Evict a rejected load from the cache so a later request can retry —
       // otherwise a transient import failure poisons the route for the pod's life.
       promise.catch(() => {

@@ -9,8 +9,9 @@ import type { Message } from "@bufbuild/protobuf";
 /**
  * Describes the file xds/annotations/v3/status.proto.
  */
-export const file_xds_annotations_v3_status: GenFile = /*@__PURE__*/
-  fileDesc("Ch94ZHMvYW5ub3RhdGlvbnMvdjMvc3RhdHVzLnByb3RvEhJ4ZHMuYW5ub3RhdGlvbnMudjMidgoQU3RhdHVzQW5ub3RhdGlvbhIYChB3b3JrX2luX3Byb2dyZXNzGAEgASgIEkgKFnBhY2thZ2VfdmVyc2lvbl9zdGF0dXMYAiABKA4yKC54ZHMuYW5ub3RhdGlvbnMudjMuUGFja2FnZVZlcnNpb25TdGF0dXMqXQoUUGFja2FnZVZlcnNpb25TdGF0dXMSCwoHVU5LTk9XThAAEgoKBkZST1pFThABEgoKBkFDVElWRRACEiAKHE5FWFRfTUFKT1JfVkVSU0lPTl9DQU5ESURBVEUQA0IrWilnaXRodWIuY29tL2NuY2YveGRzL2dvL3hkcy9hbm5vdGF0aW9ucy92M2IGcHJvdG8z");
+export const file_xds_annotations_v3_status: GenFile /*@__PURE__*/ = fileDesc(
+  "Ch94ZHMvYW5ub3RhdGlvbnMvdjMvc3RhdHVzLnByb3RvEhJ4ZHMuYW5ub3RhdGlvbnMudjMidgoQU3RhdHVzQW5ub3RhdGlvbhIYChB3b3JrX2luX3Byb2dyZXNzGAEgASgIEkgKFnBhY2thZ2VfdmVyc2lvbl9zdGF0dXMYAiABKA4yKC54ZHMuYW5ub3RhdGlvbnMudjMuUGFja2FnZVZlcnNpb25TdGF0dXMqXQoUUGFja2FnZVZlcnNpb25TdGF0dXMSCwoHVU5LTk9XThAAEgoKBkZST1pFThABEgoKBkFDVElWRRACEiAKHE5FWFRfTUFKT1JfVkVSU0lPTl9DQU5ESURBVEUQA0IrWilnaXRodWIuY29tL2NuY2YveGRzL2dvL3hkcy9hbm5vdGF0aW9ucy92M2IGcHJvdG8z",
+);
 
 /**
  * @generated from message xds.annotations.v3.StatusAnnotation
@@ -35,8 +36,10 @@ export type StatusAnnotation = Message<"xds.annotations.v3.StatusAnnotation"> & 
  * Describes the message xds.annotations.v3.StatusAnnotation.
  * Use `create(StatusAnnotationSchema)` to create a new message.
  */
-export const StatusAnnotationSchema: GenMessage<StatusAnnotation> = /*@__PURE__*/
-  messageDesc(file_xds_annotations_v3_status, 0);
+export const StatusAnnotationSchema: GenMessage<StatusAnnotation> /*@__PURE__*/ = messageDesc(
+  file_xds_annotations_v3_status,
+  0,
+);
 
 /**
  * @generated from enum xds.annotations.v3.PackageVersionStatus
@@ -75,6 +78,7 @@ export enum PackageVersionStatus {
 /**
  * Describes the enum xds.annotations.v3.PackageVersionStatus.
  */
-export const PackageVersionStatusSchema: GenEnum<PackageVersionStatus> = /*@__PURE__*/
-  enumDesc(file_xds_annotations_v3_status, 0);
-
+export const PackageVersionStatusSchema: GenEnum<PackageVersionStatus> /*@__PURE__*/ = enumDesc(
+  file_xds_annotations_v3_status,
+  0,
+);

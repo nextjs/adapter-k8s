@@ -154,7 +154,11 @@ describe("internal header security", () => {
 
     it("trusts dispatch headers when the secret matches", async () => {
       const seen: Record<string, string | undefined> = {};
-      server = createPoolServer({ onRequest: seeingServer(seen), port: 0, internalSecret: "the-secret" });
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
       const { port } = await server.start();
 
       await fetch(`http://127.0.0.1:${port}/page`, { headers: DISPATCH_HEADERS });
@@ -166,7 +170,11 @@ describe("internal header security", () => {
 
     it("RED TEAM: strips a spoofed x-output-id when no/invalid secret is presented (secret configured)", async () => {
       const seen: Record<string, string | undefined> = {};
-      server = createPoolServer({ onRequest: seeingServer(seen), port: 0, internalSecret: "the-secret" });
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
       const { port } = await server.start();
 
       // Attacker knows the dispatch protocol but not the secret.
@@ -196,7 +204,11 @@ describe("internal header security", () => {
 
     it("always strips x-internal-secret even in legacy trustInternalHeaders mode (no secret configured)", async () => {
       const seen: Record<string, string | undefined> = {};
-      server = createPoolServer({ onRequest: seeingServer(seen), port: 0, trustInternalHeaders: true });
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        trustInternalHeaders: true,
+      });
       const { port } = await server.start();
 
       await fetch(`http://127.0.0.1:${port}/page`, {

@@ -80,7 +80,9 @@ describe("generateHelmChart", () => {
       nextVersion: "16.2.0",
       config: {
         pools: { ssr: { routes: ["appPages"] } },
-        provider: { gke: { gateway: { type: "gateway-api", hosts: [{ hostname: "app.example.com" }] } } },
+        provider: {
+          gke: { gateway: { type: "gateway-api", hosts: [{ hostname: "app.example.com" }] } },
+        },
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
@@ -95,7 +97,10 @@ describe("generateHelmChart", () => {
     expect(secretFile).toContain('secret: "deadbeef"');
 
     // Both deployments must read INTERNAL_HEADER_SECRET from that Secret via secretKeyRef.
-    for (const file of ["templates/ssr-deployment.yaml", "templates/routing-service-deployment.yaml"]) {
+    for (const file of [
+      "templates/ssr-deployment.yaml",
+      "templates/routing-service-deployment.yaml",
+    ]) {
       const content = result[file];
       expect(content).toContain("name: INTERNAL_HEADER_SECRET");
       expect(content).toContain("secretKeyRef:");
@@ -112,7 +117,10 @@ describe("generateHelmChart", () => {
       pools,
       buildId: "abc123",
       nextVersion: "16.2.0",
-      config: { pools: { ssr: { routes: ["appPages"] } }, provider: { gke: {} } } as K8sAdapterConfig,
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
     };
