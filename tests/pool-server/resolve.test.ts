@@ -419,4 +419,41 @@ it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () =
     expect(typeof receivedBody.cloneBodyStream).toBe("function");
   });
 
+
+  it("sets invokePath to the rewritten path+query (middleware/config rewrite)", async () => {
+    const manifest = makeManifest();
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/blog/[slug]",
+      invocationTarget: { pathname: "/blog/from-middleware", query: { some: "middleware" } },
+      routeMatches: { slug: "from-middleware" },
+    });
+    const resolver = createLocalResolver(manifest);
+    const result = await resolver.resolve(
+      new URL("http://localhost/rw"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.invokePath).toBe("/blog/from-middleware?some=middleware");
+    }
+  });
+
+  it("leaves invokePath undefined when the resolved URL equals the request", async () => {
+    const manifest = makeManifest();
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: { x: "1" } },
+    });
+    const resolver = createLocalResolver(manifest);
+    const result = await resolver.resolve(
+      new URL("http://localhost/about?x=1"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    if (result.kind === "route") expect(result.invokePath).toBeUndefined();
+  });
+
 });

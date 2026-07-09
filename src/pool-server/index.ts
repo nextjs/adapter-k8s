@@ -438,7 +438,13 @@ async function main() {
   // Set preview/draft mode env vars from prerender manifest.
   // The web adapter reads these via getEdgePreviewProps() — without them,
   // middleware invocation crashes with "previewProps missing previewModeId".
+  // Also collect strict (fallback: false / dynamicParams: false) dynamic routes:
+  // a request matching such a route's regex but NOT in the prerendered set must
+  // 404, mirroring `next start` — our loopback handler invocation doesn't
+  // reproduce that check on its own.
   const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
+  const strictDynamicRoutes: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[] = [];
+  const prerenderedPaths = new Set<string>();
   if (existsSync(prerenderManifestPath)) {
     try {
       const prerenderManifest = JSON.parse(readFileSync(prerenderManifestPath, "utf-8"));
@@ -449,6 +455,30 @@ async function main() {
           process.env.__NEXT_PREVIEW_MODE_SIGNING_KEY = preview.previewModeSigningKey;
         if (preview.previewModeEncryptionKey)
           process.env.__NEXT_PREVIEW_MODE_ENCRYPTION_KEY = preview.previewModeEncryptionKey;
+      }
+      // i18n prerender routes are locale-prefixed (/en/blog/x) while the
+      // strict-route regex and default-locale requests are unprefixed — store
+      // both forms so a generated path is recognized regardless of prefixing.
+      const i18nLocales = (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [];
+      for (const p of Object.keys(prerenderManifest.routes ?? {})) {
+        prerenderedPaths.add(p);
+        const seg = p.split("/", 2)[1]?.toLowerCase();
+        if (seg && i18nLocales.some((l) => l.toLowerCase() === seg)) {
+          prerenderedPaths.add(p.slice(seg.length + 1) || "/");
+        }
+      }
+      for (const [, route] of Object.entries<Record<string, unknown>>(
+        prerenderManifest.dynamicRoutes ?? {},
+      )) {
+        if (route.fallback === false && typeof route.routeRegex === "string") {
+          strictDynamicRoutes.push({
+            pageRegex: new RegExp(route.routeRegex),
+            dataRegex:
+              typeof route.dataRouteRegex === "string"
+                ? new RegExp(route.dataRouteRegex)
+                : undefined,
+          });
+        }
       }
     } catch {
       // Non-fatal — draft mode just won't work
@@ -531,6 +561,19 @@ async function main() {
         body?: ReadableStream<Uint8Array>;
       }) => Promise<Response | null>)
     | null = null;
+  // Load a compiled middleware module, resolving the top-level-await wrapper.
+  // When middleware source has a top-level await, Next compiles module.exports
+  // as a Promise of the real exports. import() surfaces that Promise as the
+  // default export; without awaiting it, path detection finds no middleware
+  // function and the middleware silently no-ops (every request bypasses it).
+  const resolveMiddlewareModule = async (mwPath: string) => {
+    const mod = await import(pathToFileURL(mwPath).href);
+    if (mod?.default && typeof (mod.default as { then?: unknown }).then === "function") {
+      return await (mod.default as Promise<Record<string, unknown>>);
+    }
+    return mod;
+  };
+
   if (routingManifest.middleware) {
     const mwPath = path.resolve(process.cwd(), routingManifest.middleware.filePath);
     const isEdge = routingManifest.middleware.runtime === "edge";
@@ -575,10 +618,10 @@ async function main() {
       console.warn(
         "Edge middleware found but sandbox not available, falling back to Node.js loading",
       );
-      middlewareModule = await import(pathToFileURL(mwPath).href);
+      middlewareModule = await resolveMiddlewareModule(mwPath);
       console.log("Middleware module loaded (Node.js fallback)");
     } else {
-      middlewareModule = await import(pathToFileURL(mwPath).href);
+      middlewareModule = await resolveMiddlewareModule(mwPath);
       console.log("Middleware module loaded");
     }
   }
@@ -646,6 +689,9 @@ async function main() {
     pprRoutes: routingManifest.pprRoutes,
     rscConfig: getRscConfig(routingManifest),
     outputIds: Object.keys(poolManifest.outputs),
+    strictDynamicRoutes,
+    prerenderedPaths,
+    buildIdForData: buildId,
   });
 
   // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch

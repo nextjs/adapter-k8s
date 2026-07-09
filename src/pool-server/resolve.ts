@@ -22,6 +22,9 @@ export type ResolveResult =
       routeMatches: Record<string, string> | null;
       resolvedHeaders: Headers | undefined;
       middlewareRequestHeaders?: Headers | undefined;
+      /** Rewritten path+query to invoke the handler with (middleware/config
+       * rewrites). Absent when it equals the original request URL. */
+      invokePath?: string | undefined;
     }
   | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
   | { kind: "error"; status: number }
@@ -324,6 +327,36 @@ export function createLocalResolver(
         manifest.poolAssignments,
       );
 
+      // Build the handler-invocation URL from the resolved routing target so
+      // middleware/config rewrites (which change pathname and/or query) reach
+      // the handler — otherwise the handler runs against the ORIGINAL request
+      // URL and dynamic params / added query are lost. Strip the internally
+      // added locale prefix (handlers receive the unprefixed URL, matching
+      // non-rewrite behavior). Only set when it differs from the original
+      // request so normal requests dispatch exactly as before.
+      // RSC / _next/data requests carry internal negotiation query and follow
+      // their own URL handling (the .rsc/segment output + request headers) —
+      // rewriting their handler URL corrupts flight/data resolution. Restrict
+      // the invoke-URL override to plain document requests.
+      const rscHeader = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc?.header;
+      const isRscReq = rscHeader ? headers.get(rscHeader) === "1" : false;
+      const isDataReq = url.pathname.includes("/_next/data/");
+      let invokePath: string | undefined;
+      const targetPathRaw = resolution.invocationTarget?.pathname ?? resolution.resolvedPathname;
+      if (targetPathRaw && !isRscReq && !isDataReq) {
+        let targetPath = targetPathRaw;
+        if (prep.addedLocale) {
+          const pfx = `/${prep.addedLocale}`;
+          if (targetPath === pfx) targetPath = "/";
+          else if (targetPath.startsWith(pfx + "/")) targetPath = targetPath.slice(pfx.length);
+        }
+        const q = resolution.invocationTarget?.query ?? resolution.resolvedQuery;
+        const qs = buildQueryString(q);
+        const candidate = targetPath + qs;
+        const orig = prep.originalUrl.pathname + prep.originalUrl.search;
+        if (candidate !== orig) invokePath = candidate;
+      }
+
       return {
         kind: "route",
         pool,
@@ -331,9 +364,25 @@ export function createLocalResolver(
         routeMatches: resolution.routeMatches ?? null,
         resolvedHeaders: resolution.resolvedHeaders ?? undefined,
         middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
+        invokePath,
       };
     },
   };
+}
+
+// Serialize a resolved query (Record<string, string | string[]>) to a "?a=b&..."
+// string, preserving repeated keys. Empty → "".
+function buildQueryString(
+  query: Record<string, string | string[]> | undefined,
+): string {
+  if (!query) return "";
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (Array.isArray(value)) for (const v of value) params.append(key, v);
+    else params.append(key, value);
+  }
+  const s = params.toString();
+  return s ? `?${s}` : "";
 }
 
 export type LocalResolver = ReturnType<typeof createLocalResolver>;

@@ -247,6 +247,11 @@ export interface DispatcherOptions {
    * paths back to their dynamic-route template handler (outputs of dynamic
    * routes are keyed by template, e.g. "/blog/[slug]"). */
   outputIds?: string[];
+  /** Dynamic routes with fallback:false / dynamicParams:false — a matching path
+   * not in prerenderedPaths must 404 (mirrors `next start`). */
+  strictDynamicRoutes?: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[];
+  prerenderedPaths?: Set<string>;
+  buildIdForData?: string;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -261,6 +266,9 @@ export function createDispatcher(options: DispatcherOptions) {
     pprRoutes = {},
     rscConfig,
     outputIds = [],
+    strictDynamicRoutes = [],
+    prerenderedPaths = new Set<string>(),
+    buildIdForData = "",
   } = options;
 
   return {
@@ -501,6 +509,49 @@ export function createDispatcher(options: DispatcherOptions) {
         }
 
         case "route": {
+          // A middleware/config rewrite changed the pathname and/or query — the
+          // handler must run against the REWRITTEN URL, not the original request
+          // URL, or dynamic params and added query are lost. Applied to req.url
+          // so the loopback invoker, edge route runner, and cross-pool proxy all
+          // dispatch the rewritten URL. Absent for non-rewrite requests.
+          if (resolution.invokePath) req.url = resolution.invokePath;
+
+          // fallback: false / dynamicParams: false — a path matching a strict
+          // dynamic route but not in the prerendered set 404s (as `next start`
+          // does). Skipped for preview/revalidate requests, which legitimately
+          // render non-generated paths on demand.
+          if (strictDynamicRoutes.length > 0) {
+            const reqPath = (req.url || "/").split("?")[0] ?? "/";
+            const dataPrefix = `/_next/data/${buildIdForData}/`;
+            const pagePath = reqPath.startsWith(dataPrefix)
+              ? "/" + reqPath.slice(dataPrefix.length).replace(/\.json$/, "")
+              : reqPath;
+            const isBypass =
+              (req.headers.cookie ?? "").includes("__prerender_bypass=") ||
+              "x-prerender-revalidate" in req.headers;
+            if (
+              !isBypass &&
+              !prerenderedPaths.has(pagePath) &&
+              strictDynamicRoutes.some((r) => r.pageRegex.test(pagePath))
+            ) {
+              if (handlerLoader.has("/_not-found")) {
+                const notFoundHandler = await handlerLoader.load("/_not-found");
+                await localHandlerInvoker({
+                  handler: notFoundHandler,
+                  req,
+                  res,
+                  matchedPathname: "/_not-found",
+                  routeMatches: null,
+                  bufferedBody: undefined,
+                });
+                return;
+              }
+              res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+              res.end("Not Found");
+              return;
+            }
+          }
+
           // Apply middleware's mutated request headers on top of the original.
           // responseToMiddlewareResult processes x-middleware-set-cookie,
           // x-middleware-override-headers, and x-middleware-request-* headers.

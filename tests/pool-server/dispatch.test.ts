@@ -347,6 +347,78 @@ describe("createDispatcher", () => {
       expect(res._ended).toBe(true);
     });
 
+    it("404s a fallback:false path not in the prerendered set", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((p: string) => p === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
+        prerenderedPaths: new Set(["/blog/first"]),
+        buildIdForData: "test123",
+      });
+
+      // Non-generated path → 404, handler never invoked.
+      const res404 = mockRes();
+      await dispatcher.dispatch(mockReq("/blog/nope"), res404 as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "nope" },
+        resolvedHeaders: undefined,
+      });
+      expect(res404._status).toBe(404);
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+
+      // Generated path → dispatched to the handler.
+      const resOk = mockRes();
+      await dispatcher.dispatch(mockReq("/blog/first"), resOk as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "first" },
+        resolvedHeaders: undefined,
+      });
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
+    it("lets a preview (__prerender_bypass) request through a fallback:false route", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((p: string) => p === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
+        prerenderedPaths: new Set(["/blog/first"]),
+        buildIdForData: "test123",
+      });
+      const res = mockRes();
+      await dispatcher.dispatch(
+        mockReq("/blog/nope", { cookie: "__prerender_bypass=xyz" }),
+        res as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { slug: "nope" },
+          resolvedHeaders: undefined,
+        },
+      );
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
     it("routes a prerender through the handler when one exists (ISR/draft/revalidate semantics)", async () => {
       writeFileSync(path.join(tmpDir, "stale.html"), "<html>stale build file</html>");
 
