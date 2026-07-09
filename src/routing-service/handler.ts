@@ -8,6 +8,11 @@ import {
 } from "./response-builders.js";
 import {
   lookupPool,
+  manifestNextConfig,
+  normalizeMatchedPathname,
+  normalizeResolvedRedirect,
+  preferConcreteOutput,
+  prepareRequest,
   resolveRscOutput,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
@@ -66,6 +71,17 @@ export function createRequestHandler(
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
 
+    // Shared request normalization (decode-400, slash-collapse 308, locale
+    // prefixing) — one sequence with the pool resolver (routing-common.ts).
+    const prep = prepareRequest(url, headers, manifest);
+    if (prep.kind === "error") {
+      return buildImmediateResponse(prep.status, { "content-type": "text/plain; charset=utf-8" });
+    }
+    if (prep.kind === "redirect") {
+      return buildImmediateResponse(prep.status, { location: prep.url.toString() });
+    }
+    const resolveUrl = prep.url;
+
     // Body-capable requests (non-GET/HEAD) with middleware are NOT resolved at the edge: the
     // header-phase ext_proc callout never sees the request body, so body-reading middleware
     // would decide on an empty body. Instead we hand off to the pool's Phase-1 resolver, which
@@ -82,9 +98,13 @@ export function createRequestHandler(
     }
 
     let middlewareResponse: Response | undefined;
+    // Fail CLOSED on middleware throw — see pool-server/resolve.ts. A crashing
+    // middleware must 500, not silently emit trusted dispatch headers that let
+    // the request bypass the auth/redirects/rewrites middleware implements.
+    let middlewareThrew = false;
 
     const resolution = await resolveRoutes({
-      url,
+      url: resolveUrl,
       buildId: manifest.buildId,
       basePath: manifest.basePath,
       requestBody: new ReadableStream({
@@ -146,10 +166,7 @@ export function createRequestHandler(
                     headers: requestHeaders,
                     body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
                     signal: new AbortController().signal,
-                    nextConfig: {
-                      basePath: manifest.basePath || undefined,
-                      i18n: (manifest.i18n as any) ?? undefined,
-                    },
+                    nextConfig: manifestNextConfig(manifest),
                     waitUntil,
                   },
                   page: "middleware",
@@ -228,27 +245,41 @@ export function createRequestHandler(
               return {};
             } catch (err) {
               console.error("[routing-service] Middleware execution failed:", err);
-              return {};
+              middlewareThrew = true;
+              return { bodySent: true };
             }
           }
         : async () => ({}),
     });
 
-    if (resolution.redirect) {
-      return buildImmediateResponse(resolution.redirect.status, {
-        location: resolution.redirect.url.toString(),
-      });
+    if (middlewareThrew) {
+      return buildImmediateResponse(500, { "content-type": "text/plain; charset=utf-8" });
     }
 
-    // Middleware / afterFiles redirects surface as a Location in resolvedHeaders plus a
-    // redirect status — NOT as resolution.redirect. Without this branch the Location would
-    // leak through as a request-header mutation and the pool would serve the page 200.
-    // Mirrors pool-server/resolve.ts so both paths handle middleware redirects identically.
-    const redirectLocation = resolution.resolvedHeaders?.get("location");
-    if (redirectLocation && [301, 302, 307, 308].includes(resolution.status ?? 0)) {
-      return buildImmediateResponse(resolution.status!, {
-        location: new URL(redirectLocation, url).toString(),
-      });
+    // Redirects (rule/detection + Location-in-resolvedHeaders) — shared
+    // normalization with the pool resolver. Forward resolvedHeaders (middleware
+    // Set-Cookie, custom redirect headers) so the edge matches the pool phase.
+    const redirect = normalizeResolvedRedirect(resolution, prep, manifest);
+    if (redirect) {
+      if (redirect.kind === "retry") {
+        // Spurious internal trailing-slash redirect — resolve the real target.
+        const retried = requestHeaders.map((h) =>
+          h.key === ":path"
+            ? { ...h, value: redirect.retryUrl.pathname + redirect.retryUrl.search }
+            : h,
+        );
+        return handleRequest(retried);
+      }
+      const responseHeaders: Record<string, string> = { location: redirect.url.toString() };
+      const setCookies = redirect.resolvedHeaders?.getSetCookie?.() ?? [];
+      if (redirect.resolvedHeaders) {
+        for (const [key, value] of redirect.resolvedHeaders.entries()) {
+          const k = key.toLowerCase();
+          if (k === "location" || k === "set-cookie" || k === "content-length") continue;
+          responseHeaders[key] = value;
+        }
+      }
+      return buildImmediateResponse(redirect.status, responseHeaders, undefined, setCookies);
     }
 
     if (resolution.middlewareResponded && middlewareResponse != null) {
@@ -277,8 +308,14 @@ export function createRequestHandler(
     // Pool ownership is looked up on the BASE pathname (RSC variants live in the same pool as
     // their page). The output id, however, must be the RSC-mapped variant so the handler
     // returns a flight payload instead of HTML — mirrors pool-server/resolve.ts.
-    const basePathname =
-      resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? path;
+    let basePathname = normalizeMatchedPathname(
+      resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? path,
+      manifest.poolAssignments,
+    );
+    // Concrete prerendered outputs win over dynamic templates (decoded lookup).
+    // Mirrors pool-server/resolve.ts.
+    basePathname =
+      preferConcreteOutput(resolveUrl.pathname, basePathname, manifest.poolAssignments) ?? basePathname;
     const outputId = resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
 
     const mutations: HeaderMutationEntry[] = [];

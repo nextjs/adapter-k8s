@@ -36,16 +36,25 @@ cleanup_adapter_pack_dir() {
   fi
 }
 
-# On failure, dump the deploy log so the test harness shows it
+# On failure, dump the deploy log so the test harness shows it.
+# The harness runs this script with stderr inherited (lost to the console) and
+# only embeds stdout in the thrown error, so failure diagnostics must go to
+# stdout to end up in the .results.json files. The URL-on-stdout contract only
+# applies on success.
 on_exit() {
   local exit_code=$?
   cleanup_adapter_pack_lock
   cleanup_adapter_pack_dir
-  if [ "$exit_code" -ne 0 ] && [ -f "$DEPLOY_LOG" ]; then
-    echo "=== DEPLOY FAILED (exit ${exit_code}) ===" >&2
-    cat "$DEPLOY_LOG" >&2
-    # Also dump server log if it exists
-    [ -f ".adapter-server.log" ] && cat .adapter-server.log >&2
+  if [ "$exit_code" -ne 0 ]; then
+    echo "=== DEPLOY FAILED (exit ${exit_code}) ==="
+    if [ -f "$DEPLOY_LOG" ]; then
+      echo "=== Deploy log (last 150 lines) ==="
+      tail -n 150 "$DEPLOY_LOG"
+    fi
+    if [ -f ".adapter-server.log" ]; then
+      echo "=== Server log (last 100 lines) ==="
+      tail -n 100 .adapter-server.log
+    fi
   fi
 }
 
@@ -101,6 +110,14 @@ const fs = require('fs');
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 pkg.dependencies = pkg.dependencies || {};
 pkg.dependencies['${ADAPTER_PACKAGE_NAME}'] = 'file:${ADAPTER_TARBALL}';
+// The harness pins typescript to 'latest', which now resolves to the TS 7
+// (native) compiler and crashes next build's TypeScript verification
+// ('The \"id\" argument must be of type string'). Pin to 6.x until Next
+// supports TS 7. Only rewrite 'latest' so fixtures with explicit versions
+// keep them.
+for (const deps of [pkg.dependencies, pkg.devDependencies]) {
+  if (deps?.typescript === 'latest') deps.typescript = '^6';
+}
 fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 
@@ -113,11 +130,45 @@ fi
 # --- 2. Install dependencies ---
 # The test harness creates package.json with next/react deps but skips install.
 # The deploy script must install them.
+#
+# Some fixtures ship a pre-seeded node_modules (e.g. middleware-general's
+# shared-package) that a fresh install would wipe. Mirror the harness's own
+# Vercel workaround (test/lib/next-modes/base.ts installCommand): set the
+# seeded packages aside, install, then copy them back over the result.
+SEEDED_NODE_MODULES=""
+if [ -d node_modules ]; then
+  SEEDED_NODE_MODULES=".fixture-node-modules"
+  rm -rf "$SEEDED_NODE_MODULES"
+  mv node_modules "$SEEDED_NODE_MODULES"
+fi
 echo "[adapter-k8s] Installing fixture dependencies..." >&2
 if command -v pnpm &>/dev/null; then
   pnpm install --no-frozen-lockfile >&2
 else
   npm install --legacy-peer-deps >&2
+fi
+if [ -n "$SEEDED_NODE_MODULES" ]; then
+  echo "[adapter-k8s] Restoring fixture-seeded node_modules..." >&2
+  # Replace whole entries rather than copying into them: pnpm's top-level
+  # entries are symlinks into its store, and cp into a symlink would follow
+  # it and mutate the shared store.
+  restore_seeded() {
+    local rel="$1"
+    rm -rf "node_modules/${rel}"
+    mkdir -p "$(dirname "node_modules/${rel}")"
+    cp -a "${SEEDED_NODE_MODULES}/${rel}" "node_modules/${rel}"
+  }
+  while IFS= read -r entry; do
+    name="$(basename "$entry")"
+    if [[ "$name" == @* ]]; then
+      while IFS= read -r scoped; do
+        restore_seeded "${name}/$(basename "$scoped")"
+      done < <(find "$entry" -mindepth 1 -maxdepth 1)
+    else
+      restore_seeded "$name"
+    fi
+  done < <(find "$SEEDED_NODE_MODULES" -mindepth 1 -maxdepth 1)
+  rm -rf "$SEEDED_NODE_MODULES"
 fi
 
 ADAPTER_INSTALL_DIR="${PWD}/node_modules/@next-community/adapter-k8s"
@@ -155,10 +206,39 @@ export ADAPTER_K8S_BUILD_CPUS="${BUILD_CPUS}"
 export ADAPTER_K8S_SKIP_STAGING=1
 echo "[adapter-k8s] Build profile: cpus=${BUILD_CPUS}" >&2
 
+# Equivalent to passing --experimental-next-config-strip-types to
+# next build/start: enables Node's native TS loading for next.config.ts.
+# The next-config-ts-native-ts fixtures have top-level await in their configs,
+# which the legacy swc+require() fallback cannot load. Must be exported (not a
+# CLI arg) so the pool server's runtime config load gets it too, and because
+# `pnpm run build -- <arg>` would append to the last command of compound
+# scripts. Harmless when native TS is unavailable: the loader falls back.
+export __NEXT_NODE_NATIVE_TS_LOADER_ENABLED=true
+
+# Mint the deployment ID before the build so Next.js bakes it into
+# config.deploymentId (client bundles append ?dpl= to asset requests and
+# runtime code reads process.env.NEXT_DEPLOYMENT_ID). Tests compare against
+# the DEPLOYMENT_ID marker we report, so build, server, and marker must agree.
+DEPLOYMENT_ID="k8s-$(node -e "console.log(require('crypto').randomBytes(6).toString('hex'))")"
+export NEXT_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
+
 # --- 3. Build ---
+# Fixtures can define a package.json build script with pre-build setup steps
+# (e.g. middleware-general's `setup` copies a local package into node_modules),
+# so prefer `run build` over invoking `next build` directly.
 echo "[adapter-k8s] Building..." >&2
-# Use the local next binary if available, otherwise npx
-if [ -f node_modules/next/dist/bin/next ]; then
+BUILD_SCRIPT="$(node -e "
+const pkg = JSON.parse(require('fs').readFileSync('package.json', 'utf8'));
+process.stdout.write(pkg?.scripts?.build ?? '');
+" 2>/dev/null || true)"
+if [ -n "$BUILD_SCRIPT" ]; then
+  echo "[adapter-k8s] Using package.json build script: ${BUILD_SCRIPT}" >&2
+  if command -v pnpm &>/dev/null; then
+    pnpm run build >&2
+  else
+    npm run build >&2
+  fi
+elif [ -f node_modules/next/dist/bin/next ]; then
   node node_modules/next/dist/bin/next build >&2
 elif [ -f node_modules/.bin/next ]; then
   node_modules/.bin/next build >&2
@@ -167,11 +247,10 @@ else
 fi
 
 BUILD_ID="$(cat .next/BUILD_ID 2>/dev/null || echo unknown)"
-DEPLOYMENT_ID="k8s-$(node -e "console.log(require('crypto').randomBytes(6).toString('hex'))")"
 {
   echo "BUILD_ID: ${BUILD_ID}"
   echo "DEPLOYMENT_ID: ${DEPLOYMENT_ID}"
-  echo "IMMUTABLE_ASSET_TOKEN: undefined"
+  echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: 0"
 } > .adapter-build.log
 echo "[adapter-k8s] Built. ID=${BUILD_ID}" >&2
 

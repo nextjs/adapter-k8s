@@ -47,6 +47,11 @@ spec:
               value: "${buildId}"
             - name: POOL_NAME
               value: "${poolName}"
+            # The pool server derives cross-pool proxy target names from
+            # RELEASE_NAME; without it proxyToPool defaults to "nextjs" and
+            # can't reach sibling pools in any release not named that.
+            - name: RELEASE_NAME
+              value: "${releaseName}"
             - name: TRUST_INTERNAL_HEADERS
               value: "1"
 ${internalSecretEnv}

@@ -262,6 +262,16 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const { routing, outputs, projectDir, config: nextConfig, buildId, nextVersion } = ctx;
       const repoRoot = (ctx as { repoRoot?: string }).repoRoot ?? projectDir;
 
+      // Regenerate the Helm chart from a clean slate. Chart files are named per
+      // pool/build; without wiping, a removed pool's Deployment/Service or a
+      // stale template from a prior build survives and gets re-applied by the
+      // next `helm upgrade`. Only the generated chart dir is cleared — staged
+      // build contexts and injected previous-build templates live elsewhere and
+      // are managed by their own steps.
+      const { rm } = await import("node:fs/promises");
+      const chartDir = path.join(projectDir, OUTPUT_DIR, "chart");
+      if (existsSync(chartDir)) await rm(chartDir, { recursive: true, force: true });
+
       // In a monorepo the tracing root (repoRoot) sits above the app dir (projectDir).
       // Traced assets under projectDir are re-based correctly (see assetDestPath), and
       // deps hoisted to repoRoot/node_modules resolve via the upward node_modules walk.
@@ -335,6 +345,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         buildId,
         basePath: nextConfig.basePath ?? "",
         i18n: nextConfig.i18n ?? null,
+        trailingSlash: nextConfig.trailingSlash ?? false,
         nextVersion,
         projectDir,
       });
@@ -526,9 +537,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           absSharedStageDir,
         );
       } else {
-        const firstPoolName = [...pools.keys()][0];
         for (const [poolName, pool] of pools) {
-          const isDefaultPool = poolName === firstPoolName;
           const poolDir = path.join(OUTPUT_DIR, "pools", poolName);
           const poolStageDir = path.join(poolDir, "context");
 
@@ -551,11 +560,17 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             }
           }
 
-          if (isDefaultPool) {
-            for (const asset of staticManifest) {
-              const absPath = path.resolve(projectDir, asset.filePath);
-              await stageFile(projectDir, absPath, asset.filePath, poolName);
-            }
+          // Stage static/public/prerender files into EVERY pool image, not just
+          // the default one. static-assets.json is written to every pool's config
+          // (so every dispatcher knows these paths), and the gateway routes a
+          // shared URL prefix to whichever pool owns a route under it — which may
+          // be a non-default pool. If the files lived only in the default pool,
+          // a public asset under such a prefix would 404 on the pool that
+          // actually receives it. (Phase 4 CDN/GCS offload will move these off
+          // the pods entirely and make this staging unnecessary.)
+          for (const asset of staticManifest) {
+            const absPath = path.resolve(projectDir, asset.filePath);
+            await stageFile(projectDir, absPath, asset.filePath, poolName);
           }
 
           if (outputs.middleware?.filePath) {

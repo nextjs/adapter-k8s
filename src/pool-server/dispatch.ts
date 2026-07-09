@@ -7,6 +7,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
+import { rscParentCandidates, templateOutputCandidates, type RscConfig } from "../routing-common.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -241,6 +242,11 @@ export interface DispatcherOptions {
   localHandlerInvoker?: LocalHandlerInvoker;
   edgeRouteRunner?: EdgeRouteRunner | null;
   pprRoutes?: Record<string, { postponedState: string }>;
+  rscConfig?: RscConfig | undefined;
+  /** All output ids in this pool's manifest — used to map concrete prerender
+   * paths back to their dynamic-route template handler (outputs of dynamic
+   * routes are keyed by template, e.g. "/blog/[slug]"). */
+  outputIds?: string[];
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -253,6 +259,8 @@ export function createDispatcher(options: DispatcherOptions) {
     localHandlerInvoker = invokeLocalHandlerOverHttp,
     edgeRouteRunner = null,
     pprRoutes = {},
+    rscConfig,
+    outputIds = [],
   } = options;
 
   return {
@@ -266,8 +274,12 @@ export function createDispatcher(options: DispatcherOptions) {
       guardStreamErrors(res);
 
       // Install writeHead wrapper early to merge resolved headers (from routing/middleware)
-      // into ANY response — static assets, handler responses, etc.
-      if (resolution.kind === "route" && resolution.resolvedHeaders) {
+      // into ANY response — static assets, handler responses, and 404s (middleware
+      // next() headers must reach the response even when no route matches).
+      if (
+        (resolution.kind === "route" || resolution.kind === "not-found") &&
+        resolution.resolvedHeaders
+      ) {
         const resolvedHeaders = resolution.resolvedHeaders;
         const origWriteHead = res.writeHead.bind(res);
         (res as any).writeHead = (status: number, ...args: any[]) => {
@@ -299,13 +311,40 @@ export function createDispatcher(options: DispatcherOptions) {
         };
       }
 
-      // 1. Serve static assets from the manifest.
-      // Skip for PPR routes (they have postponedState) — the handler must stream dynamic content.
-      // Skip if request has resume headers (PPR resume step).
-      // Skip for non-GET/HEAD methods — static pages don't accept POST etc.
+      // Resolve the handler output id up front (shared by the static fast path
+      // decision and the route dispatch below). Prerendered RSC variants
+      // (.rsc / segment payloads) have no handler of their own — fall back to
+      // the parent page handler, which serves the flight payload based on the
+      // rsc request headers.
+      let handlerPathname = resolution.kind === "route" ? resolution.matchedPathname : "";
+      if (resolution.kind === "route" && !handlerLoader.has(handlerPathname)) {
+        const candidates = [
+          ...rscParentCandidates(handlerPathname, rscConfig),
+          // Concrete prerender paths (e.g. "/blog/hello") map back to their
+          // dynamic-route template handler ("/blog/[slug]") — ISR regeneration
+          // and server actions on prerendered dynamic routes need the function.
+          ...templateOutputCandidates(handlerPathname, outputIds),
+        ];
+        for (const candidate of candidates) {
+          if (handlerLoader.has(candidate)) {
+            handlerPathname = candidate;
+            break;
+          }
+        }
+      }
+      const hasHandler = resolution.kind === "route" && handlerLoader.has(handlerPathname);
+
+      // 1. Serve static assets from the manifest — build assets, public/ files,
+      // and prerenders that have NO handler (fully-static pages-router SSG emits
+      // no function; the build file is the only source and can never be
+      // revalidated). Prerenders WITH a handler always go through it: Next's
+      // incremental cache serves hits cheaply and owns all the semantics the
+      // manifest file can't (ISR staleness, revalidatePath/Tag — including from
+      // after(), draft mode, PPR resume). Non-GET/HEAD methods also fall
+      // through — server actions POST to the page's own pathname.
       if (resolution.kind === "route") {
         const mp = resolution.matchedPathname;
-        const isRSC = req.headers["rsc"] === "1";
+        const isRSC = req.headers[rscConfig?.header ?? "rsc"] === "1";
         const staticAsset = staticAssets.find(
           (a) =>
             a.pathname === mp ||
@@ -313,18 +352,18 @@ export function createDispatcher(options: DispatcherOptions) {
             // RSC requests: serve the .rsc prerendered payload if available
             (isRSC && a.pathname === mp + ".rsc"),
         );
-        const isPPR = staticAsset?.ppr;
-        const hasResumeHeader =
-          req.headers["next-resume"] === "1" || req.headers["x-nextjs-ppr"] === "1";
         const isReadMethod = req.method === "GET" || req.method === "HEAD";
+        // Handler-less prerenders (pages SSG emits no function) are served from
+        // the manifest file for ANY method — upstream serves SSG pages on POST
+        // too — but only when this pool owns the route; a wrong-pool guess must
+        // fall through so proxyToPool can recover (PPR shells especially must
+        // not be served incomplete by a non-owning pool). Build assets and
+        // public/ files stay GET/HEAD-only: upstream 404s writes to them.
+        const serveHandlerlessPrerender =
+          staticAsset?.prerender && !hasHandler && resolution.pool === poolName;
+        const serveStaticFile = staticAsset && !staticAsset.prerender && isReadMethod;
 
-        if (staticAsset && !isPPR && !hasResumeHeader) {
-          // Static pages only serve GET/HEAD — reject other methods
-          if (!isReadMethod) {
-            res.writeHead(405, { "content-type": "text/plain; charset=utf-8", allow: "GET, HEAD" });
-            res.end("Method Not Allowed");
-            return;
-          }
+        if (staticAsset && (serveStaticFile || serveHandlerlessPrerender)) {
 
           const fullPath = path.resolve(process.cwd(), staticAsset.filePath);
           if (existsSync(fullPath)) {
@@ -345,8 +384,21 @@ export function createDispatcher(options: DispatcherOptions) {
       }
 
       switch (resolution.kind) {
+        case "error": {
+          res.writeHead(resolution.status, { "content-type": "text/plain; charset=utf-8" });
+          res.end(resolution.status >= 500 ? "Internal Server Error" : "Bad Request");
+          return;
+        }
+
         case "redirect": {
-          res.writeHead(resolution.status, { location: resolution.url.toString() });
+          // Middleware/rule redirects can carry additional response headers
+          // (e.g. NextResponse.redirect(url, { headers })) — forward them.
+          const headers: Record<string, string | string[]> = resolution.resolvedHeaders
+            ? webHeadersToNodeHeaders(resolution.resolvedHeaders)
+            : {};
+          delete headers["content-length"];
+          headers["location"] = resolution.url.toString();
+          res.writeHead(resolution.status, headers);
           res.end();
           return;
         }
@@ -477,12 +529,12 @@ export function createDispatcher(options: DispatcherOptions) {
           }
 
           // If this output belongs to another pool, proxy the request
-          if (resolution.pool !== poolName && !handlerLoader.has(resolution.matchedPathname)) {
+          if (resolution.pool !== poolName && !handlerLoader.has(handlerPathname)) {
             return proxyToPool(req, res, resolution, releaseName, buildId);
           }
 
           // If no handler exists for this output, fall through to 404
-          if (!handlerLoader.has(resolution.matchedPathname)) {
+          if (!handlerLoader.has(handlerPathname)) {
             if (handlerLoader.has("/_not-found")) {
               const notFoundHandler = await handlerLoader.load("/_not-found");
               const bufferedBody = (
@@ -501,7 +553,7 @@ export function createDispatcher(options: DispatcherOptions) {
               return;
             }
             console.log(
-              `[dispatch] 404: no handler for matchedPathname="${resolution.matchedPathname}" url="${req.url}"`,
+              `[dispatch] 404: no handler for matchedPathname="${handlerPathname}" url="${req.url}"`,
             );
             res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
             res.end("Not Found");
@@ -509,7 +561,7 @@ export function createDispatcher(options: DispatcherOptions) {
           }
 
           // Edge runtime routes: use the edge sandbox instead of the loopback HTTP server
-          const outputInfo = handlerLoader.get(resolution.matchedPathname);
+          const outputInfo = handlerLoader.get(handlerPathname);
           if (edgeRouteRunner && outputInfo?.runtime === "edge") {
             const headerObj: Record<string, string> = {};
             for (const [key, value] of Object.entries(req.headers)) {
@@ -520,7 +572,7 @@ export function createDispatcher(options: DispatcherOptions) {
             const filePath = path.resolve(process.cwd(), outputInfo.filePath);
             try {
               const result = await edgeRouteRunner({
-                name: resolution.matchedPathname,
+                name: handlerPathname,
                 paths: [filePath],
                 request: {
                   url: fullUrl.toString(),
@@ -533,7 +585,7 @@ export function createDispatcher(options: DispatcherOptions) {
                         )[NEXT_REQUEST_META]?.actionBody
                       : undefined,
                   page: {
-                    name: resolution.matchedPathname,
+                    name: handlerPathname,
                     ...(resolution.routeMatches && { params: resolution.routeMatches }),
                   },
                 },
@@ -557,7 +609,7 @@ export function createDispatcher(options: DispatcherOptions) {
               }
               if (!res.writableEnded) res.end();
             } catch (err) {
-              console.error(`Edge route handler failed for ${resolution.matchedPathname}:`, err);
+              console.error(`Edge route handler failed for ${handlerPathname}:`, err);
               if (!res.headersSent) {
                 res.writeHead(500, { "content-type": "text/plain" });
                 res.end("Internal Server Error");
@@ -568,7 +620,7 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // For PPR routes, set the postponed state on request metadata.
           // The handler reads this to resume streaming dynamic content after the static shell.
-          const pprInfo = pprRoutes[resolution.matchedPathname];
+          const pprInfo = pprRoutes[handlerPathname] ?? pprRoutes[resolution.matchedPathname];
           if (pprInfo?.postponedState) {
             const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
             meta.postponed = pprInfo.postponedState;
@@ -576,7 +628,7 @@ export function createDispatcher(options: DispatcherOptions) {
           }
 
           // Load and invoke the handler directly
-          const handler = await handlerLoader.load(resolution.matchedPathname);
+          const handler = await handlerLoader.load(handlerPathname);
           const bufferedBody = (
             req as IncomingMessage & {
               [NEXT_REQUEST_META]?: { actionBody?: Buffer };
@@ -587,7 +639,7 @@ export function createDispatcher(options: DispatcherOptions) {
             handler,
             req,
             res,
-            matchedPathname: resolution.matchedPathname,
+            matchedPathname: handlerPathname,
             routeMatches: resolution.routeMatches,
             bufferedBody,
           });
@@ -674,6 +726,28 @@ export function getContentType(pathname: string): string {
       return "image/x-icon";
     case ".rsc":
       return "text/x-component";
+    case ".xml":
+      return "application/xml";
+    case ".txt":
+      return "text/plain; charset=utf-8";
+    case ".webp":
+      return "image/webp";
+    case ".avif":
+      return "image/avif";
+    case ".woff2":
+      return "font/woff2";
+    case ".woff":
+      return "font/woff";
+    case ".webmanifest":
+      return "application/manifest+json";
+    case ".wasm":
+      return "application/wasm";
+    case ".map":
+      return "application/json; charset=utf-8";
+    case ".pdf":
+      return "application/pdf";
+    case ".mp4":
+      return "video/mp4";
     case "":
       return "text/html; charset=utf-8"; // extensionless routes (/, /about, etc.)
     default:

@@ -5,11 +5,7 @@
 import type { GenEnum, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
 import { enumDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
 import type { Any } from "@bufbuild/protobuf/wkt";
-import {
-  file_google_protobuf_any,
-  file_google_protobuf_struct,
-  file_google_protobuf_wrappers,
-} from "@bufbuild/protobuf/wkt";
+import { file_google_protobuf_any, file_google_protobuf_struct, file_google_protobuf_wrappers } from "@bufbuild/protobuf/wkt";
 import { file_envoy_annotations_deprecation } from "../../../annotations/deprecation_pb.js";
 import { file_udpa_annotations_migrate } from "../../../../udpa/annotations/migrate_pb.js";
 import { file_udpa_annotations_status } from "../../../../udpa/annotations/status_pb.js";
@@ -20,19 +16,8 @@ import type { JsonObject, Message } from "@bufbuild/protobuf";
 /**
  * Describes the file envoy/config/core/v3/base.proto.
  */
-export const file_envoy_config_core_v3_base: GenFile /*@__PURE__*/ = fileDesc(
-  "Ch9lbnZveS9jb25maWcvY29yZS92My9iYXNlLnByb3RvEhRlbnZveS5jb25maWcuY29yZS52MyKQAwoITWV0YWRhdGESWQoPZmlsdGVyX21ldGFkYXRhGAEgAygLMjIuZW52b3kuY29uZmlnLmNvcmUudjMuTWV0YWRhdGEuRmlsdGVyTWV0YWRhdGFFbnRyeUIM+kIJmgEGIgRyAhABEmQKFXR5cGVkX2ZpbHRlcl9tZXRhZGF0YRgCIAMoCzI3LmVudm95LmNvbmZpZy5jb3JlLnYzLk1ldGFkYXRhLlR5cGVkRmlsdGVyTWV0YWRhdGFFbnRyeUIM+kIJmgEGIgRyAhABGk4KE0ZpbHRlck1ldGFkYXRhRW50cnkSCwoDa2V5GAEgASgJEiYKBXZhbHVlGAIgASgLMhcuZ29vZ2xlLnByb3RvYnVmLlN0cnVjdDoCOAEaUAoYVHlwZWRGaWx0ZXJNZXRhZGF0YUVudHJ5EgsKA2tleRgBIAEoCRIjCgV2YWx1ZRgCIAEoCzIULmdvb2dsZS5wcm90b2J1Zi5Bbnk6AjgBOiGaxYgeHAoaZW52b3kuYXBpLnYyLmNvcmUuTWV0YWRhdGEitwEKC0hlYWRlclZhbHVlEh4KA2tleRgBIAEoCUIR+kIOcgwQASiAgAHIAQDAAQESMAoFdmFsdWUYAiABKAlCIfpCDHIKKICAAcgBAMABAvKY/o8FDBIKdmFsdWVfdHlwZRIwCglyYXdfdmFsdWUYAyABKAxCHfpCCHoGEAAYgIAB8pj+jwUMEgp2YWx1ZV90eXBlOiSaxYgeHwodZW52b3kuYXBpLnYyLmNvcmUuSGVhZGVyVmFsdWUiqwMKEUhlYWRlclZhbHVlT3B0aW9uEjsKBmhlYWRlchgBIAEoCzIhLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlclZhbHVlQgj6QgWKAQIQARI3CgZhcHBlbmQYAiABKAsyGi5nb29nbGUucHJvdG9idWYuQm9vbFZhbHVlQgsYAZLHhtgEAzMuMBJbCg1hcHBlbmRfYWN0aW9uGAMgASgOMjouZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyVmFsdWVPcHRpb24uSGVhZGVyQXBwZW5kQWN0aW9uQgj6QgWCAQIQARIYChBrZWVwX2VtcHR5X3ZhbHVlGAQgASgIIn0KEkhlYWRlckFwcGVuZEFjdGlvbhIbChdBUFBFTkRfSUZfRVhJU1RTX09SX0FERBAAEhEKDUFERF9JRl9BQlNFTlQQARIeChpPVkVSV1JJVEVfSUZfRVhJU1RTX09SX0FERBACEhcKE09WRVJXUklURV9JRl9FWElTVFMQAzoqmsWIHiUKI2Vudm95LmFwaS52Mi5jb3JlLkhlYWRlclZhbHVlT3B0aW9uImMKCUhlYWRlck1hcBIyCgdoZWFkZXJzGAEgAygLMiEuZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyVmFsdWU6IprFiB4dChtlbnZveS5hcGkudjIuY29yZS5IZWFkZXJNYXBCfQoiaW8uZW52b3lwcm94eS5lbnZveS5jb25maWcuY29yZS52M0IJQmFzZVByb3RvUAFaQmdpdGh1Yi5jb20vZW52b3lwcm94eS9nby1jb250cm9sLXBsYW5lL2Vudm95L2NvbmZpZy9jb3JlL3YzO2NvcmV2M7qAyNEGAhACYgZwcm90bzM",
-  [
-    file_google_protobuf_any,
-    file_google_protobuf_struct,
-    file_google_protobuf_wrappers,
-    file_envoy_annotations_deprecation,
-    file_udpa_annotations_migrate,
-    file_udpa_annotations_status,
-    file_udpa_annotations_versioning,
-    file_validate_validate,
-  ],
-);
+export const file_envoy_config_core_v3_base: GenFile = /*@__PURE__*/
+  fileDesc("Ch9lbnZveS9jb25maWcvY29yZS92My9iYXNlLnByb3RvEhRlbnZveS5jb25maWcuY29yZS52MyKQAwoITWV0YWRhdGESWQoPZmlsdGVyX21ldGFkYXRhGAEgAygLMjIuZW52b3kuY29uZmlnLmNvcmUudjMuTWV0YWRhdGEuRmlsdGVyTWV0YWRhdGFFbnRyeUIM+kIJmgEGIgRyAhABEmQKFXR5cGVkX2ZpbHRlcl9tZXRhZGF0YRgCIAMoCzI3LmVudm95LmNvbmZpZy5jb3JlLnYzLk1ldGFkYXRhLlR5cGVkRmlsdGVyTWV0YWRhdGFFbnRyeUIM+kIJmgEGIgRyAhABGk4KE0ZpbHRlck1ldGFkYXRhRW50cnkSCwoDa2V5GAEgASgJEiYKBXZhbHVlGAIgASgLMhcuZ29vZ2xlLnByb3RvYnVmLlN0cnVjdDoCOAEaUAoYVHlwZWRGaWx0ZXJNZXRhZGF0YUVudHJ5EgsKA2tleRgBIAEoCRIjCgV2YWx1ZRgCIAEoCzIULmdvb2dsZS5wcm90b2J1Zi5Bbnk6AjgBOiGaxYgeHAoaZW52b3kuYXBpLnYyLmNvcmUuTWV0YWRhdGEitwEKC0hlYWRlclZhbHVlEh4KA2tleRgBIAEoCUIR+kIOcgwQASiAgAHIAQDAAQESMAoFdmFsdWUYAiABKAlCIfpCDHIKKICAAcgBAMABAvKY/o8FDBIKdmFsdWVfdHlwZRIwCglyYXdfdmFsdWUYAyABKAxCHfpCCHoGEAAYgIAB8pj+jwUMEgp2YWx1ZV90eXBlOiSaxYgeHwodZW52b3kuYXBpLnYyLmNvcmUuSGVhZGVyVmFsdWUiqwMKEUhlYWRlclZhbHVlT3B0aW9uEjsKBmhlYWRlchgBIAEoCzIhLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlclZhbHVlQgj6QgWKAQIQARI3CgZhcHBlbmQYAiABKAsyGi5nb29nbGUucHJvdG9idWYuQm9vbFZhbHVlQgsYAZLHhtgEAzMuMBJbCg1hcHBlbmRfYWN0aW9uGAMgASgOMjouZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyVmFsdWVPcHRpb24uSGVhZGVyQXBwZW5kQWN0aW9uQgj6QgWCAQIQARIYChBrZWVwX2VtcHR5X3ZhbHVlGAQgASgIIn0KEkhlYWRlckFwcGVuZEFjdGlvbhIbChdBUFBFTkRfSUZfRVhJU1RTX09SX0FERBAAEhEKDUFERF9JRl9BQlNFTlQQARIeChpPVkVSV1JJVEVfSUZfRVhJU1RTX09SX0FERBACEhcKE09WRVJXUklURV9JRl9FWElTVFMQAzoqmsWIHiUKI2Vudm95LmFwaS52Mi5jb3JlLkhlYWRlclZhbHVlT3B0aW9uImMKCUhlYWRlck1hcBIyCgdoZWFkZXJzGAEgAygLMiEuZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyVmFsdWU6IprFiB4dChtlbnZveS5hcGkudjIuY29yZS5IZWFkZXJNYXBCfQoiaW8uZW52b3lwcm94eS5lbnZveS5jb25maWcuY29yZS52M0IJQmFzZVByb3RvUAFaQmdpdGh1Yi5jb20vZW52b3lwcm94eS9nby1jb250cm9sLXBsYW5lL2Vudm95L2NvbmZpZy9jb3JlL3YzO2NvcmV2M7qAyNEGAhACYgZwcm90bzM", [file_google_protobuf_any, file_google_protobuf_struct, file_google_protobuf_wrappers, file_envoy_annotations_deprecation, file_udpa_annotations_migrate, file_udpa_annotations_status, file_udpa_annotations_versioning, file_validate_validate]);
 
 /**
  * Metadata provides additional inputs to filters based on matched listeners,
@@ -90,10 +75,8 @@ export type Metadata = Message<"envoy.config.core.v3.Metadata"> & {
  * Describes the message envoy.config.core.v3.Metadata.
  * Use `create(MetadataSchema)` to create a new message.
  */
-export const MetadataSchema: GenMessage<Metadata> /*@__PURE__*/ = messageDesc(
-  file_envoy_config_core_v3_base,
-  0,
-);
+export const MetadataSchema: GenMessage<Metadata> = /*@__PURE__*/
+  messageDesc(file_envoy_config_core_v3_base, 0);
 
 /**
  * Header name/value pair.
@@ -134,10 +117,8 @@ export type HeaderValue = Message<"envoy.config.core.v3.HeaderValue"> & {
  * Describes the message envoy.config.core.v3.HeaderValue.
  * Use `create(HeaderValueSchema)` to create a new message.
  */
-export const HeaderValueSchema: GenMessage<HeaderValue> /*@__PURE__*/ = messageDesc(
-  file_envoy_config_core_v3_base,
-  1,
-);
+export const HeaderValueSchema: GenMessage<HeaderValue> = /*@__PURE__*/
+  messageDesc(file_envoy_config_core_v3_base, 1);
 
 /**
  * Header name/value pair plus option to control append behavior.
@@ -191,10 +172,8 @@ export type HeaderValueOption = Message<"envoy.config.core.v3.HeaderValueOption"
  * Describes the message envoy.config.core.v3.HeaderValueOption.
  * Use `create(HeaderValueOptionSchema)` to create a new message.
  */
-export const HeaderValueOptionSchema: GenMessage<HeaderValueOption> /*@__PURE__*/ = messageDesc(
-  file_envoy_config_core_v3_base,
-  2,
-);
+export const HeaderValueOptionSchema: GenMessage<HeaderValueOption> = /*@__PURE__*/
+  messageDesc(file_envoy_config_core_v3_base, 2);
 
 /**
  * Describes the supported actions types for header append action.
@@ -243,7 +222,7 @@ export enum HeaderValueOption_HeaderAppendAction {
 /**
  * Describes the enum envoy.config.core.v3.HeaderValueOption.HeaderAppendAction.
  */
-export const HeaderValueOption_HeaderAppendActionSchema: GenEnum<HeaderValueOption_HeaderAppendAction> /*@__PURE__*/ =
+export const HeaderValueOption_HeaderAppendActionSchema: GenEnum<HeaderValueOption_HeaderAppendAction> = /*@__PURE__*/
   enumDesc(file_envoy_config_core_v3_base, 2, 0);
 
 /**
@@ -264,7 +243,6 @@ export type HeaderMap = Message<"envoy.config.core.v3.HeaderMap"> & {
  * Describes the message envoy.config.core.v3.HeaderMap.
  * Use `create(HeaderMapSchema)` to create a new message.
  */
-export const HeaderMapSchema: GenMessage<HeaderMap> /*@__PURE__*/ = messageDesc(
-  file_envoy_config_core_v3_base,
-  3,
-);
+export const HeaderMapSchema: GenMessage<HeaderMap> = /*@__PURE__*/
+  messageDesc(file_envoy_config_core_v3_base, 3);
+

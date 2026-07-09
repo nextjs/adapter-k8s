@@ -347,6 +347,193 @@ describe("createDispatcher", () => {
       expect(res._ended).toBe(true);
     });
 
+    it("routes a prerender through the handler when one exists (ISR/draft/revalidate semantics)", async () => {
+      writeFileSync(path.join(tmpDir, "stale.html"), "<html>stale build file</html>");
+
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const handler = vi.fn();
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/isr-page",
+            filePath: "stale.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            revalidate: 60,
+          },
+        ],
+        localHandlerInvoker,
+      });
+
+      const req = mockReq("/isr-page");
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/isr-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+      expect(res._body).not.toContain("stale build file");
+    });
+
+    it("serves a handler-less prerender from the manifest file (pages SSG emits no function)", async () => {
+      writeFileSync(path.join(tmpDir, "ssg.html"), "<html>ssg</html>");
+
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn(),
+          has: vi.fn().mockReturnValue(false),
+          get: vi.fn(),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/ssg-page",
+            filePath: "ssg.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            status: 200,
+          },
+        ],
+      });
+
+      const req = mockReq("/ssg-page");
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/ssg-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._body).toContain("ssg");
+    });
+
+    it("lets POST fall through to the handler instead of 405ing (server actions)", async () => {
+      writeFileSync(path.join(tmpDir, "page.html"), "<html>static</html>");
+
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/action-page",
+            filePath: "page.html",
+            cacheControl: "public, max-age=0",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+      });
+
+      const req = mockReq("/action-page");
+      (req as any).method = "POST";
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/action-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).not.toBe(405);
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
+    it("falls back to the parent page handler for .rsc output ids", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const has = vi.fn((p: string) => p === "/page");
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has,
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        rscConfig: { header: "rsc", suffix: ".rsc" },
+      });
+
+      const req = mockReq("/page", { rsc: "1" });
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/page.rsc",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+      expect(localHandlerInvoker.mock.calls[0][0].matchedPathname).toBe("/page");
+    });
+
+    it("forwards middleware redirect response headers (NextResponse.redirect with headers)", async () => {
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const headers = new Headers({ "x-redirect-header": "hi", location: "/target" });
+      headers.append("set-cookie", "a=1");
+      headers.append("set-cookie", "b=2");
+      const req = mockReq("/old");
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "redirect",
+        url: new URL("http://localhost/target"),
+        status: 307,
+        resolvedHeaders: headers,
+      });
+
+      expect(res._status).toBe(307);
+      expect(res._headers["location"]).toBe("http://localhost/target");
+      expect(res._headers["x-redirect-header"]).toBe("hi");
+      expect(res._headers["set-cookie"]).toEqual(["a=1", "b=2"]);
+    });
+
+    it("returns 400 for the error resolution kind (malformed percent-encoding)", async () => {
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/%zz"), res as unknown as ServerResponse, {
+        kind: "error",
+        status: 400,
+      });
+
+      expect(res._status).toBe(400);
+      expect(res._ended).toBe(true);
+    });
+
     it("falls through to handler when pathname is not in static manifest", async () => {
       const handler = vi.fn();
       const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);

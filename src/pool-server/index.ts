@@ -6,6 +6,7 @@ import dns from "node:dns/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest } from "../types.js";
+import { getRscConfig, manifestNextConfig, rscParentCandidates, templateOutputCandidates, type RscConfig } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { createLocalResolver } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
@@ -38,10 +39,37 @@ async function ensureNextNodeEnvironment(): Promise<void> {
   );
 }
 
-async function readRequestBody(req: NodeJS.ReadableStream): Promise<Buffer | null> {
+// DoS backstop: the pool buffers request/image bodies fully in memory (the
+// loopback handler needs a fixed-length body, and middleware may read it). Cap
+// the buffer well above any legitimate payload so app-level limits
+// (serverActions.bodySizeLimit, the image optimizer) still fire first; this
+// only stops an unbounded upload from exhausting pod memory. Configurable.
+const MAX_BODY_BYTES = Math.max(
+  1,
+  parseInt(process.env.ADAPTER_K8S_MAX_BODY_BYTES ?? "", 10) || 26_214_400, // 25 MiB
+);
+
+class BodyTooLargeError extends Error {
+  constructor() {
+    super("request body exceeds ADAPTER_K8S_MAX_BODY_BYTES");
+    this.name = "BodyTooLargeError";
+  }
+}
+
+async function readRequestBody(
+  req: NodeJS.ReadableStream,
+  maxBytes = MAX_BODY_BYTES,
+): Promise<Buffer | null> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      (req as NodeJS.ReadableStream & { destroy?: (e?: Error) => void }).destroy?.();
+      throw new BodyTooLargeError();
+    }
+    chunks.push(buf);
   }
   return chunks.length > 0 ? Buffer.concat(chunks) : null;
 }
@@ -238,30 +266,117 @@ function isExternalImageAllowed(target: URL, config: ImageConfig): boolean {
 // against the allowlist and the public-address check. `fetch`'s default redirect:"follow"
 // would let an allowlisted host 302 to an internal/metadata address, bypassing the SSRF
 // guards — so we intercept each Location and re-run the same checks before following it.
+type FetchedImage = { ok: boolean; status: number; contentType: string; body: Buffer };
+
+// A DNS lookup that ONLY yields public addresses. Passed to http(s).request so
+// the address the socket actually connects to is the one we validated — closing
+// the TOCTOU/DNS-rebind window where a separate validation lookup could return
+// a public IP while the connection lookup returns a private/link-local one.
+function pinnedPublicLookup(
+  hostname: string,
+  options: import("node:dns").LookupOptions,
+  callback: (
+    err: NodeJS.ErrnoException | null,
+    address: string | import("node:dns").LookupAddress[],
+    family?: number,
+  ) => void,
+): void {
+  dns
+    .lookup(hostname, { all: true })
+    .then((records) => {
+      const publicRecords = records.filter((r) => !isPrivateAddress(r.address));
+      if (publicRecords.length === 0) {
+        callback(Object.assign(new Error("host resolves to non-public address"), { code: "EAI_FAIL" }), "", undefined);
+        return;
+      }
+      if (options.all) {
+        callback(null, publicRecords, undefined);
+      } else {
+        const first = publicRecords[0]!;
+        callback(null, first.address, first.family);
+      }
+    })
+    .catch((err) => callback(err as NodeJS.ErrnoException, "", undefined));
+}
+
+// Fetch an allowlisted external image with SSRF protections: allowlist check,
+// public-only pinned DNS, manual redirect re-validation, and a hard byte cap so
+// a hostile origin can't stream an unbounded body into pod memory.
 async function fetchExternalImageSafely(
   initial: URL,
   config: ImageConfig,
-): Promise<Response | { error: string }> {
+): Promise<FetchedImage | { error: string }> {
   const MAX_REDIRECTS = 3;
+  const { request: httpsRequest } = await import("node:https");
+  const { request: httpRequest2 } = await import("node:http");
   let target = initial;
+
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (!isExternalImageAllowed(target, config)) return { error: "image host not allowed" };
+    if (target.protocol !== "https:" && target.protocol !== "http:") {
+      return { error: "image host not allowed" };
+    }
+    // Pre-check keeps a fast, clear rejection; the pinned lookup below is the
+    // actual guarantee for the connection that happens.
     if (!(await hostResolvesToPublicOnly(target.hostname))) {
       return { error: "image host not allowed" };
     }
-    const res = await fetch(target.toString(), { redirect: "manual" });
-    if (res.status >= 300 && res.status < 400) {
-      const location = res.headers.get("location");
-      if (!location) return { error: "redirect without location" };
+
+    const request = target.protocol === "https:" ? httpsRequest : httpRequest2;
+    const result = await new Promise<FetchedImage | { error: string } | { redirect: string }>(
+      (resolve) => {
+        const req = request(
+          target.toString(),
+          { lookup: pinnedPublicLookup, timeout: 15_000 },
+          (imgRes) => {
+            const status = imgRes.statusCode ?? 502;
+            if (status >= 300 && status < 400) {
+              imgRes.resume(); // drain
+              const location = imgRes.headers.location;
+              if (!location) return resolve({ error: "redirect without location" });
+              return resolve({ redirect: location });
+            }
+            const chunks: Buffer[] = [];
+            let total = 0;
+            imgRes.on("data", (c: Buffer) => {
+              total += c.length;
+              if (total > MAX_BODY_BYTES) {
+                imgRes.destroy();
+                resolve({ error: "image exceeds size limit" });
+                return;
+              }
+              chunks.push(c);
+            });
+            imgRes.on("end", () =>
+              resolve({
+                ok: status >= 200 && status < 300,
+                status,
+                contentType: imgRes.headers["content-type"] ?? "image/jpeg",
+                body: Buffer.concat(chunks),
+              }),
+            );
+            imgRes.on("error", () => resolve({ error: "image fetch failed" }));
+          },
+        );
+        req.on("timeout", () => {
+          req.destroy();
+          resolve({ error: "image fetch timed out" });
+        });
+        req.on("error", () => resolve({ error: "image fetch failed" }));
+        req.end();
+      },
+    );
+
+    if ("redirect" in result) {
       if (hop === MAX_REDIRECTS) return { error: "too many redirects" };
       try {
-        target = new URL(location, target); // resolve relative redirects against current URL
+        target = new URL(result.redirect, target);
       } catch {
         return { error: "invalid redirect location" };
       }
       continue; // re-validate the new target at the top of the loop
     }
-    return res;
+    return result;
   }
   return { error: "too many redirects" };
 }
@@ -378,6 +493,34 @@ async function main() {
     // Edge sandbox not available
   }
 
+  // App-scoped next/dist/server/body-streams#getCloneableBody. Both the edge
+  // sandbox (sandbox.run reads request.body.cloneBodyStream()) and the node
+  // middleware web adapter require a POST body to be a CloneableBody, not a raw
+  // stream. Resolve from the app's next so the representation matches its
+  // runtime. Without this, middleware invocation threw on every body request —
+  // previously masked by fail-open (middleware silently skipped), now surfaced.
+  let getCloneableBody: ((readable: unknown) => unknown) | null = null;
+  try {
+    const appReq2 = createRequire(path.join(process.cwd(), "package.json"));
+    const bodyStreams = appReq2("next/dist/server/body-streams") as {
+      getCloneableBody?: (readable: unknown) => unknown;
+    };
+    getCloneableBody = bodyStreams.getCloneableBody ?? null;
+  } catch {
+    console.warn(
+      "[pool-server] getCloneableBody unavailable — middleware may not run on POST bodies",
+    );
+  }
+  // Wrap a body (Buffer | web ReadableStream | undefined) as a CloneableBody.
+  const wrapCloneableBody = (body: Buffer | ReadableStream<Uint8Array> | undefined): unknown => {
+    if (!body || !getCloneableBody) return body;
+    const { Readable } = require("node:stream") as typeof import("node:stream");
+    const nodeReadable = Buffer.isBuffer(body)
+      ? Readable.from(body)
+      : Readable.fromWeb(body as import("node:stream/web").ReadableStream);
+    return getCloneableBody(nodeReadable);
+  };
+
   // Optionally load middleware module
   let middlewareModule = null;
   let edgeMiddlewareRunner:
@@ -412,7 +555,14 @@ async function main() {
             url: ctx.url.toString(),
             method: ctx.method,
             headers: headerObj,
-            body: ctx.method !== "GET" && ctx.method !== "HEAD" ? ctx.body : undefined,
+            body:
+              ctx.method !== "GET" && ctx.method !== "HEAD"
+                ? wrapCloneableBody(ctx.body)
+                : undefined,
+            // Next's web adapter builds request.nextUrl from this — without it,
+            // locale/basePath prefixes aren't stripped and middleware pathname
+            // checks silently never match.
+            nextConfig: manifestNextConfig(routingManifest),
           },
           edgeFunctionEntry: mwManifestEntry,
         });
@@ -440,8 +590,21 @@ async function main() {
     | null = null;
   if (edgeSandboxRun && Object.keys(middlewareManifest.functions).length > 0) {
     edgeRouteRunner = (params) => {
-      // Look up the edge function in the manifest by pathname
-      const fnEntry = middlewareManifest.functions[params.name];
+      // Look up the edge function in the manifest by pathname. Pages-router
+      // entries are keyed by the bare pathname; app-router pages/route handlers
+      // are keyed "<pathname>/page" / "<pathname>/route". RSC output ids
+      // (.rsc / segment payloads) map to their parent page's edge function —
+      // the rsc request headers drive flight-payload negotiation.
+      const rsc = getRscConfig(routingManifest);
+      let fnEntry;
+      for (const name of [params.name, ...rscParentCandidates(params.name, rsc)]) {
+        const base = name === "/" ? "" : name;
+        fnEntry =
+          middlewareManifest.functions[name] ??
+          middlewareManifest.functions[`${base}/page`] ??
+          middlewareManifest.functions[`${base}/route`];
+        if (fnEntry) break;
+      }
       if (!fnEntry) {
         throw new Error(`Edge function not found in middleware-manifest.json: ${params.name}`);
       }
@@ -450,6 +613,15 @@ async function main() {
         name: fnEntry.name,
         paths: fnEntry.files.map((f: string) => path.join(distDir, f)),
         edgeFunctionEntry: fnEntry,
+        request: {
+          nextConfig: manifestNextConfig(routingManifest),
+          ...params.request,
+          // The sandbox reads request.body via .cloneBodyStream() — wrap the
+          // (possibly Buffer) body as a CloneableBody. undefined passes through.
+          ...(params.request?.body !== undefined
+            ? { body: wrapCloneableBody(params.request.body) }
+            : {}),
+        },
       });
     };
     console.log(
@@ -458,7 +630,12 @@ async function main() {
   }
 
   const handlerLoader = createHandlerLoader(poolManifest);
-  const resolver = createLocalResolver(routingManifest, middlewareModule, edgeMiddlewareRunner);
+  const resolver = createLocalResolver(
+    routingManifest,
+    middlewareModule,
+    edgeMiddlewareRunner,
+    getCloneableBody,
+  );
   const dispatcher = createDispatcher({
     handlerLoader,
     poolName,
@@ -467,6 +644,8 @@ async function main() {
     releaseName,
     edgeRouteRunner,
     pprRoutes: routingManifest.pprRoutes,
+    rscConfig: getRscConfig(routingManifest),
+    outputIds: Object.keys(poolManifest.outputs),
   });
 
   // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch
@@ -504,18 +683,36 @@ async function main() {
         }
       }
 
-      // Pages Router SSG data routes: /_next/data/<buildId>/<page>.json
-      if (url.pathname.startsWith(`/_next/data/${buildId}/`)) {
-        const dataPath = url.pathname.slice(`/_next/data/${buildId}/`.length);
-        const filePath = path.join(process.cwd(), ".next", "server", "pages", dataPath);
-        if (existsSync(filePath)) {
-          const content = readFileSync(filePath);
-          res.writeHead(200, {
-            "content-type": "application/json; charset=utf-8",
-            "cache-control": "public, max-age=0, must-revalidate",
-          });
-          res.end(content);
-          return;
+      // Pages Router SSG data routes: /_next/data/<buildId>/<page>.json.
+      // SSG data JSONs exist only in the build output (no manifest entry), so
+      // serve them from disk — but only when no pool output owns the data
+      // pathname: GSSP and ISR pages have function outputs keyed by their data
+      // URL, and those must go through dispatch so the handler (and its
+      // incremental cache) produces the payload.
+      const dataPrefix = `/_next/data/${buildId}/`;
+      if (url.pathname.startsWith(dataPrefix)) {
+        const dataPath = url.pathname.slice(dataPrefix.length);
+        // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
+        const pagePath = "/" + dataPath.replace(/\.json$/, "");
+        const owned =
+          handlerLoader.has(url.pathname) ||
+          handlerLoader.has(pagePath) ||
+          templateOutputCandidates(pagePath, Object.keys(poolManifest.outputs)).some((t) =>
+            handlerLoader.has(t),
+          );
+        // GSSP/ISR data is owned by a handler (and its incremental cache) —
+        // fall through to dispatch for those; serve only truly static SSG data.
+        if (!owned) {
+          const filePath = path.join(process.cwd(), ".next", "server", "pages", dataPath);
+          if (existsSync(filePath)) {
+            const content = readFileSync(filePath);
+            res.writeHead(200, {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "public, max-age=0, must-revalidate",
+            });
+            res.end(content);
+            return;
+          }
         }
       }
 
@@ -594,14 +791,13 @@ async function main() {
               res.end(`Bad Request: ${fetched.error}`);
               return;
             }
-            const imgRes = fetched;
-            if (!imgRes.ok) {
+            if (!fetched.ok) {
               res.writeHead(502, { "content-type": "text/plain" });
               res.end(`Failed to fetch external image: ${imageUrl}`);
               return;
             }
-            imageBuffer = Buffer.from(await imgRes.arrayBuffer());
-            contentType = imgRes.headers.get("content-type") ?? "image/jpeg";
+            imageBuffer = fetched.body;
+            contentType = fetched.contentType;
           }
 
           // Try to optimize with Sharp if available
@@ -656,8 +852,18 @@ async function main() {
         else if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
       }
 
-      const bodyBuffer =
-        req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
+      let bodyBuffer: Buffer | null;
+      try {
+        bodyBuffer =
+          req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+          res.end("Payload Too Large");
+          return;
+        }
+        throw err;
+      }
       if (bodyBuffer) {
         // Next.js action-handler checks request meta first when the original
         // Node stream has already been consumed upstream.

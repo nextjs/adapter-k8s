@@ -4,27 +4,15 @@
 
 import type { GenEnum, GenExtension, GenFile, GenMessage } from "@bufbuild/protobuf/codegenv2";
 import { enumDesc, extDesc, fileDesc, messageDesc } from "@bufbuild/protobuf/codegenv2";
-import type {
-  Duration,
-  FieldOptions,
-  MessageOptions,
-  OneofOptions,
-  Timestamp,
-} from "@bufbuild/protobuf/wkt";
-import {
-  file_google_protobuf_descriptor,
-  file_google_protobuf_duration,
-  file_google_protobuf_timestamp,
-} from "@bufbuild/protobuf/wkt";
+import type { Duration, FieldOptions, MessageOptions, OneofOptions, Timestamp } from "@bufbuild/protobuf/wkt";
+import { file_google_protobuf_descriptor, file_google_protobuf_duration, file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file validate/validate.proto.
  */
-export const file_validate_validate: GenFile /*@__PURE__*/ = fileDesc(
-  "Chd2YWxpZGF0ZS92YWxpZGF0ZS5wcm90bxIIdmFsaWRhdGUimAcKCkZpZWxkUnVsZXMSJwoHbWVzc2FnZRgRIAEoCzIWLnZhbGlkYXRlLk1lc3NhZ2VSdWxlcxIlCgVmbG9hdBgBIAEoCzIULnZhbGlkYXRlLkZsb2F0UnVsZXNIABInCgZkb3VibGUYAiABKAsyFS52YWxpZGF0ZS5Eb3VibGVSdWxlc0gAEiUKBWludDMyGAMgASgLMhQudmFsaWRhdGUuSW50MzJSdWxlc0gAEiUKBWludDY0GAQgASgLMhQudmFsaWRhdGUuSW50NjRSdWxlc0gAEicKBnVpbnQzMhgFIAEoCzIVLnZhbGlkYXRlLlVJbnQzMlJ1bGVzSAASJwoGdWludDY0GAYgASgLMhUudmFsaWRhdGUuVUludDY0UnVsZXNIABInCgZzaW50MzIYByABKAsyFS52YWxpZGF0ZS5TSW50MzJSdWxlc0gAEicKBnNpbnQ2NBgIIAEoCzIVLnZhbGlkYXRlLlNJbnQ2NFJ1bGVzSAASKQoHZml4ZWQzMhgJIAEoCzIWLnZhbGlkYXRlLkZpeGVkMzJSdWxlc0gAEikKB2ZpeGVkNjQYCiABKAsyFi52YWxpZGF0ZS5GaXhlZDY0UnVsZXNIABIrCghzZml4ZWQzMhgLIAEoCzIXLnZhbGlkYXRlLlNGaXhlZDMyUnVsZXNIABIrCghzZml4ZWQ2NBgMIAEoCzIXLnZhbGlkYXRlLlNGaXhlZDY0UnVsZXNIABIjCgRib29sGA0gASgLMhMudmFsaWRhdGUuQm9vbFJ1bGVzSAASJwoGc3RyaW5nGA4gASgLMhUudmFsaWRhdGUuU3RyaW5nUnVsZXNIABIlCgVieXRlcxgPIAEoCzIULnZhbGlkYXRlLkJ5dGVzUnVsZXNIABIjCgRlbnVtGBAgASgLMhMudmFsaWRhdGUuRW51bVJ1bGVzSAASKwoIcmVwZWF0ZWQYEiABKAsyFy52YWxpZGF0ZS5SZXBlYXRlZFJ1bGVzSAASIQoDbWFwGBMgASgLMhIudmFsaWRhdGUuTWFwUnVsZXNIABIhCgNhbnkYFCABKAsyEi52YWxpZGF0ZS5BbnlSdWxlc0gAEisKCGR1cmF0aW9uGBUgASgLMhcudmFsaWRhdGUuRHVyYXRpb25SdWxl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bl9wYWlycxgBIAEoBBIRCgltYXhfcGFpcnMYAiABKAQSEQoJbm9fc3BhcnNlGAMgASgIEiIKBGtleXMYBCABKAsyFC52YWxpZGF0ZS5GaWVsZFJ1bGVzEiQKBnZhbHVlcxgFIAEoCzIULnZhbGlkYXRlLkZpZWxkUnVsZXMSFAoMaWdub3JlX2VtcHR5GAYgASgIIjgKCEFueVJ1bGVzEhAKCHJlcXVpcmVkGAEgASgIEgoKAmluGAIgAygJEg4KBm5vdF9pbhgDIAMoCSK7AgoNRHVyYXRpb25SdWxlcxIQCghyZXF1aXJlZBgBIAEoCBIoCgVjb25zdBgCIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhIlCgJsdBgDIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhImCgNsdGUYBCABKAsyGS5nb29nbGUucHJvdG9idWYuRHVyYXRpb24SJQoCZ3QYBSABKAsyGS5nb29nbGUucHJvdG9idWYuRHVyYXRpb24SJgoDZ3RlGAYgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEiUKAmluGAcgAygLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEikKBm5vdF9pbhgIIAMoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbiK6AgoOVGltZXN0YW1wUnVsZXMSEAoIcmVxdWlyZWQYASABKAgSKQoFY29uc3QYAiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEiYKAmx0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBInCgNsdGUYBCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEiYKAmd0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBInCgNndGUYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEg4KBmx0X25vdxgHIAEoCBIOCgZndF9ub3cYCCABKAgSKQoGd2l0aGluGAkgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uKkYKCktub3duUmVnZXgSCwoHVU5LTk9XThAAEhQKEEhUVFBfSEVBREVSX05BTUUQARIVChFIVFRQX0hFQURFUl9WQUxVRRACOjwKCGRpc2FibGVkEh8uZ29vZ2xlLnByb3RvYnVmLk1lc3NhZ2VPcHRpb25zGK8IIAEoCFIIZGlzYWJsZWQ6OgoHaWdub3JlZBIfLmdvb2dsZS5wcm90b2J1Zi5NZXNzYWdlT3B0aW9ucxiwCCABKAhSB2lnbm9yZWQ6OgoIcmVxdWlyZWQSHS5nb29nbGUucHJvdG9idWYuT25lb2ZPcHRpb25zGK8IIAEoCFIIcmVxdWlyZWQ6SgoFcnVsZXMSHS5nb29nbGUucHJvdG9idWYuRmllbGRPcHRpb25zGK8IIAEoCzIULnZhbGlkYXRlLkZpZWxkUnVsZXNSBXJ1bGVzQlAKGmlvLmVudm95cHJveHkucGd2LnZhbGlkYXRlWjJnaXRodWIuY29tL2Vudm95cHJveHkvcHJvdG9jLWdlbi12YWxpZGF0ZS92YWxpZGF0ZQ",
-  [file_google_protobuf_descriptor, file_google_protobuf_duration, file_google_protobuf_timestamp],
-);
+export const file_validate_validate: GenFile = /*@__PURE__*/
+  fileDesc("Chd2YWxpZGF0ZS92YWxpZGF0ZS5wcm90bxIIdmFsaWRhdGUimAcKCkZpZWxkUnVsZXMSJwoHbWVzc2FnZRgRIAEoCzIWLnZhbGlkYXRlLk1lc3NhZ2VSdWxlcxIlCgVmbG9hdBgBIAEoCzIULnZhbGlkYXRlLkZsb2F0UnVsZXNIABInCgZkb3VibGUYAiABKAsyFS52YWxpZGF0ZS5Eb3VibGVSdWxlc0gAEiUKBWludDMyGAMgASgLMhQudmFsaWRhdGUuSW50MzJSdWxlc0gAEiUKBWludDY0GAQgASgLMhQudmFsaWRhdGUuSW50NjRSdWxlc0gAEicKBnVpbnQzMhgFIAEoCzIVLnZhbGlkYXRlLlVJbnQzMlJ1bGVzSAASJwoGdWludDY0GAYgASgLMhUudmFsaWRhdGUuVUludDY0UnVsZXNIABInCgZzaW50MzIYByABKAsyFS52YWxpZGF0ZS5TSW50MzJSdWxlc0gAEicKBnNpbnQ2NBgIIAEoCzIVLnZhbGlkYXRlLlNJbnQ2NFJ1bGVzSAASKQoHZml4ZWQzMhgJIAEoCzIWLnZhbGlkYXRlLkZpeGVkMzJSdWxlc0gAEikKB2ZpeGVkNjQYCiABKAsyFi52YWxpZGF0ZS5GaXhlZDY0UnVsZXNIABIrCghzZml4ZWQzMhgLIAEoCzIXLnZhbGlkYXRlLlNGaXhlZDMyUnVsZXNIABIrCghzZml4ZWQ2NBgMIAEoCzIXLnZhbGlkYXRlLlNGaXhlZDY0UnVsZXNIABIjCgRib29sGA0gASgLMhMudmFsaWRhdGUuQm9vbFJ1bGVzSAASJwoGc3RyaW5nGA4gASgLMhUudmFsaWRhdGUuU3RyaW5nUnVsZXNIABIlCgVieXRlcxgPIAEoCzIULnZhbGlkYXRlLkJ5dGVzUnVsZXNIABIjCgRlbnVtGBAgASgLMhMudmFsaWRhdGUuRW51bVJ1bGVzSAASKwoIcmVwZWF0ZWQYEiABKAsyFy52YWxpZGF0ZS5SZXBlYXRlZFJ1bGVzSAASIQoDbWFwGBMgASgLMhIudmFsaWRhdGUuTWFwUnVsZXNIABIhCgNhbnkYFCABKAsyEi52YWxpZGF0ZS5BbnlSdWxlc0gAEisKCGR1cmF0aW9uGBUgASgLMhcudmFsaWRhdGUuRHVyYXRpb25SdWxl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bl9wYWlycxgBIAEoBBIRCgltYXhfcGFpcnMYAiABKAQSEQoJbm9fc3BhcnNlGAMgASgIEiIKBGtleXMYBCABKAsyFC52YWxpZGF0ZS5GaWVsZFJ1bGVzEiQKBnZhbHVlcxgFIAEoCzIULnZhbGlkYXRlLkZpZWxkUnVsZXMSFAoMaWdub3JlX2VtcHR5GAYgASgIIjgKCEFueVJ1bGVzEhAKCHJlcXVpcmVkGAEgASgIEgoKAmluGAIgAygJEg4KBm5vdF9pbhgDIAMoCSK7AgoNRHVyYXRpb25SdWxlcxIQCghyZXF1aXJlZBgBIAEoCBIoCgVjb25zdBgCIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhIlCgJsdBgDIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbhImCgNsdGUYBCABKAsyGS5nb29nbGUucHJvdG9idWYuRHVyYXRpb24SJQoCZ3QYBSABKAsyGS5nb29nbGUucHJvdG9idWYuRHVyYXRpb24SJgoDZ3RlGAYgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEiUKAmluGAcgAygLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uEikKBm5vdF9pbhgIIAMoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbiK6AgoOVGltZXN0YW1wUnVsZXMSEAoIcmVxdWlyZWQYASABKAgSKQoFY29uc3QYAiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEiYKAmx0GAMgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBInCgNsdGUYBCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEiYKAmd0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBInCgNndGUYBiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEg4KBmx0X25vdxgHIAEoCBIOCgZndF9ub3cYCCABKAgSKQoGd2l0aGluGAkgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uKkYKCktub3duUmVnZXgSCwoHVU5LTk9XThAAEhQKEEhUVFBfSEVBREVSX05BTUUQARIVChFIVFRQX0hFQURFUl9WQUxVRRACOjwKCGRpc2FibGVkEh8uZ29vZ2xlLnByb3RvYnVmLk1lc3NhZ2VPcHRpb25zGK8IIAEoCFIIZGlzYWJsZWQ6OgoHaWdub3JlZBIfLmdvb2dsZS5wcm90b2J1Zi5NZXNzYWdlT3B0aW9ucxiwCCABKAhSB2lnbm9yZWQ6OgoIcmVxdWlyZWQSHS5nb29nbGUucHJvdG9idWYuT25lb2ZPcHRpb25zGK8IIAEoCFIIcmVxdWlyZWQ6SgoFcnVsZXMSHS5nb29nbGUucHJvdG9idWYuRmllbGRPcHRpb25zGK8IIAEoCzIULnZhbGlkYXRlLkZpZWxkUnVsZXNSBXJ1bGVzQlAKGmlvLmVudm95cHJveHkucGd2LnZhbGlkYXRlWjJnaXRodWIuY29tL2Vudm95cHJveHkvcHJvdG9jLWdlbi12YWxpZGF0ZS92YWxpZGF0ZQ", [file_google_protobuf_descriptor, file_google_protobuf_duration, file_google_protobuf_timestamp]);
 
 /**
  * FieldRules encapsulates the rules for each type of field. Depending on the
@@ -41,171 +29,147 @@ export type FieldRules = Message<"validate.FieldRules"> & {
   /**
    * @generated from oneof validate.FieldRules.type
    */
-  type:
-    | {
-        /**
-         * Scalar Field Types
-         *
-         * @generated from field: validate.FloatRules float = 1;
-         */
-        value: FloatRules;
-        case: "float";
-      }
-    | {
-        /**
-         * @generated from field: validate.DoubleRules double = 2;
-         */
-        value: DoubleRules;
-        case: "double";
-      }
-    | {
-        /**
-         * @generated from field: validate.Int32Rules int32 = 3;
-         */
-        value: Int32Rules;
-        case: "int32";
-      }
-    | {
-        /**
-         * @generated from field: validate.Int64Rules int64 = 4;
-         */
-        value: Int64Rules;
-        case: "int64";
-      }
-    | {
-        /**
-         * @generated from field: validate.UInt32Rules uint32 = 5;
-         */
-        value: UInt32Rules;
-        case: "uint32";
-      }
-    | {
-        /**
-         * @generated from field: validate.UInt64Rules uint64 = 6;
-         */
-        value: UInt64Rules;
-        case: "uint64";
-      }
-    | {
-        /**
-         * @generated from field: validate.SInt32Rules sint32 = 7;
-         */
-        value: SInt32Rules;
-        case: "sint32";
-      }
-    | {
-        /**
-         * @generated from field: validate.SInt64Rules sint64 = 8;
-         */
-        value: SInt64Rules;
-        case: "sint64";
-      }
-    | {
-        /**
-         * @generated from field: validate.Fixed32Rules fixed32 = 9;
-         */
-        value: Fixed32Rules;
-        case: "fixed32";
-      }
-    | {
-        /**
-         * @generated from field: validate.Fixed64Rules fixed64 = 10;
-         */
-        value: Fixed64Rules;
-        case: "fixed64";
-      }
-    | {
-        /**
-         * @generated from field: validate.SFixed32Rules sfixed32 = 11;
-         */
-        value: SFixed32Rules;
-        case: "sfixed32";
-      }
-    | {
-        /**
-         * @generated from field: validate.SFixed64Rules sfixed64 = 12;
-         */
-        value: SFixed64Rules;
-        case: "sfixed64";
-      }
-    | {
-        /**
-         * @generated from field: validate.BoolRules bool = 13;
-         */
-        value: BoolRules;
-        case: "bool";
-      }
-    | {
-        /**
-         * @generated from field: validate.StringRules string = 14;
-         */
-        value: StringRules;
-        case: "string";
-      }
-    | {
-        /**
-         * @generated from field: validate.BytesRules bytes = 15;
-         */
-        value: BytesRules;
-        case: "bytes";
-      }
-    | {
-        /**
-         * Complex Field Types
-         *
-         * @generated from field: validate.EnumRules enum = 16;
-         */
-        value: EnumRules;
-        case: "enum";
-      }
-    | {
-        /**
-         * @generated from field: validate.RepeatedRules repeated = 18;
-         */
-        value: RepeatedRules;
-        case: "repeated";
-      }
-    | {
-        /**
-         * @generated from field: validate.MapRules map = 19;
-         */
-        value: MapRules;
-        case: "map";
-      }
-    | {
-        /**
-         * Well-Known Field Types
-         *
-         * @generated from field: validate.AnyRules any = 20;
-         */
-        value: AnyRules;
-        case: "any";
-      }
-    | {
-        /**
-         * @generated from field: validate.DurationRules duration = 21;
-         */
-        value: DurationRules;
-        case: "duration";
-      }
-    | {
-        /**
-         * @generated from field: validate.TimestampRules timestamp = 22;
-         */
-        value: TimestampRules;
-        case: "timestamp";
-      }
-    | { case: undefined; value?: undefined };
+  type: {
+    /**
+     * Scalar Field Types
+     *
+     * @generated from field: validate.FloatRules float = 1;
+     */
+    value: FloatRules;
+    case: "float";
+  } | {
+    /**
+     * @generated from field: validate.DoubleRules double = 2;
+     */
+    value: DoubleRules;
+    case: "double";
+  } | {
+    /**
+     * @generated from field: validate.Int32Rules int32 = 3;
+     */
+    value: Int32Rules;
+    case: "int32";
+  } | {
+    /**
+     * @generated from field: validate.Int64Rules int64 = 4;
+     */
+    value: Int64Rules;
+    case: "int64";
+  } | {
+    /**
+     * @generated from field: validate.UInt32Rules uint32 = 5;
+     */
+    value: UInt32Rules;
+    case: "uint32";
+  } | {
+    /**
+     * @generated from field: validate.UInt64Rules uint64 = 6;
+     */
+    value: UInt64Rules;
+    case: "uint64";
+  } | {
+    /**
+     * @generated from field: validate.SInt32Rules sint32 = 7;
+     */
+    value: SInt32Rules;
+    case: "sint32";
+  } | {
+    /**
+     * @generated from field: validate.SInt64Rules sint64 = 8;
+     */
+    value: SInt64Rules;
+    case: "sint64";
+  } | {
+    /**
+     * @generated from field: validate.Fixed32Rules fixed32 = 9;
+     */
+    value: Fixed32Rules;
+    case: "fixed32";
+  } | {
+    /**
+     * @generated from field: validate.Fixed64Rules fixed64 = 10;
+     */
+    value: Fixed64Rules;
+    case: "fixed64";
+  } | {
+    /**
+     * @generated from field: validate.SFixed32Rules sfixed32 = 11;
+     */
+    value: SFixed32Rules;
+    case: "sfixed32";
+  } | {
+    /**
+     * @generated from field: validate.SFixed64Rules sfixed64 = 12;
+     */
+    value: SFixed64Rules;
+    case: "sfixed64";
+  } | {
+    /**
+     * @generated from field: validate.BoolRules bool = 13;
+     */
+    value: BoolRules;
+    case: "bool";
+  } | {
+    /**
+     * @generated from field: validate.StringRules string = 14;
+     */
+    value: StringRules;
+    case: "string";
+  } | {
+    /**
+     * @generated from field: validate.BytesRules bytes = 15;
+     */
+    value: BytesRules;
+    case: "bytes";
+  } | {
+    /**
+     * Complex Field Types
+     *
+     * @generated from field: validate.EnumRules enum = 16;
+     */
+    value: EnumRules;
+    case: "enum";
+  } | {
+    /**
+     * @generated from field: validate.RepeatedRules repeated = 18;
+     */
+    value: RepeatedRules;
+    case: "repeated";
+  } | {
+    /**
+     * @generated from field: validate.MapRules map = 19;
+     */
+    value: MapRules;
+    case: "map";
+  } | {
+    /**
+     * Well-Known Field Types
+     *
+     * @generated from field: validate.AnyRules any = 20;
+     */
+    value: AnyRules;
+    case: "any";
+  } | {
+    /**
+     * @generated from field: validate.DurationRules duration = 21;
+     */
+    value: DurationRules;
+    case: "duration";
+  } | {
+    /**
+     * @generated from field: validate.TimestampRules timestamp = 22;
+     */
+    value: TimestampRules;
+    case: "timestamp";
+  } | { case: undefined; value?: undefined };
 };
 
 /**
  * Describes the message validate.FieldRules.
  * Use `create(FieldRulesSchema)` to create a new message.
  */
-export const FieldRulesSchema: GenMessage<FieldRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  0,
-);
+export const FieldRulesSchema: GenMessage<FieldRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 0);
 
 /**
  * FloatRules describes the constraints applied to `float` values
@@ -283,10 +247,8 @@ export type FloatRules = Message<"validate.FloatRules"> & {
  * Describes the message validate.FloatRules.
  * Use `create(FloatRulesSchema)` to create a new message.
  */
-export const FloatRulesSchema: GenMessage<FloatRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  1,
-);
+export const FloatRulesSchema: GenMessage<FloatRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 1);
 
 /**
  * DoubleRules describes the constraints applied to `double` values
@@ -364,10 +326,8 @@ export type DoubleRules = Message<"validate.DoubleRules"> & {
  * Describes the message validate.DoubleRules.
  * Use `create(DoubleRulesSchema)` to create a new message.
  */
-export const DoubleRulesSchema: GenMessage<DoubleRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  2,
-);
+export const DoubleRulesSchema: GenMessage<DoubleRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 2);
 
 /**
  * Int32Rules describes the constraints applied to `int32` values
@@ -445,10 +405,8 @@ export type Int32Rules = Message<"validate.Int32Rules"> & {
  * Describes the message validate.Int32Rules.
  * Use `create(Int32RulesSchema)` to create a new message.
  */
-export const Int32RulesSchema: GenMessage<Int32Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  3,
-);
+export const Int32RulesSchema: GenMessage<Int32Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 3);
 
 /**
  * Int64Rules describes the constraints applied to `int64` values
@@ -526,10 +484,8 @@ export type Int64Rules = Message<"validate.Int64Rules"> & {
  * Describes the message validate.Int64Rules.
  * Use `create(Int64RulesSchema)` to create a new message.
  */
-export const Int64RulesSchema: GenMessage<Int64Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  4,
-);
+export const Int64RulesSchema: GenMessage<Int64Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 4);
 
 /**
  * UInt32Rules describes the constraints applied to `uint32` values
@@ -607,10 +563,8 @@ export type UInt32Rules = Message<"validate.UInt32Rules"> & {
  * Describes the message validate.UInt32Rules.
  * Use `create(UInt32RulesSchema)` to create a new message.
  */
-export const UInt32RulesSchema: GenMessage<UInt32Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  5,
-);
+export const UInt32RulesSchema: GenMessage<UInt32Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 5);
 
 /**
  * UInt64Rules describes the constraints applied to `uint64` values
@@ -688,10 +642,8 @@ export type UInt64Rules = Message<"validate.UInt64Rules"> & {
  * Describes the message validate.UInt64Rules.
  * Use `create(UInt64RulesSchema)` to create a new message.
  */
-export const UInt64RulesSchema: GenMessage<UInt64Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  6,
-);
+export const UInt64RulesSchema: GenMessage<UInt64Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 6);
 
 /**
  * SInt32Rules describes the constraints applied to `sint32` values
@@ -769,10 +721,8 @@ export type SInt32Rules = Message<"validate.SInt32Rules"> & {
  * Describes the message validate.SInt32Rules.
  * Use `create(SInt32RulesSchema)` to create a new message.
  */
-export const SInt32RulesSchema: GenMessage<SInt32Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  7,
-);
+export const SInt32RulesSchema: GenMessage<SInt32Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 7);
 
 /**
  * SInt64Rules describes the constraints applied to `sint64` values
@@ -850,10 +800,8 @@ export type SInt64Rules = Message<"validate.SInt64Rules"> & {
  * Describes the message validate.SInt64Rules.
  * Use `create(SInt64RulesSchema)` to create a new message.
  */
-export const SInt64RulesSchema: GenMessage<SInt64Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  8,
-);
+export const SInt64RulesSchema: GenMessage<SInt64Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 8);
 
 /**
  * Fixed32Rules describes the constraints applied to `fixed32` values
@@ -931,10 +879,8 @@ export type Fixed32Rules = Message<"validate.Fixed32Rules"> & {
  * Describes the message validate.Fixed32Rules.
  * Use `create(Fixed32RulesSchema)` to create a new message.
  */
-export const Fixed32RulesSchema: GenMessage<Fixed32Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  9,
-);
+export const Fixed32RulesSchema: GenMessage<Fixed32Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 9);
 
 /**
  * Fixed64Rules describes the constraints applied to `fixed64` values
@@ -1012,10 +958,8 @@ export type Fixed64Rules = Message<"validate.Fixed64Rules"> & {
  * Describes the message validate.Fixed64Rules.
  * Use `create(Fixed64RulesSchema)` to create a new message.
  */
-export const Fixed64RulesSchema: GenMessage<Fixed64Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  10,
-);
+export const Fixed64RulesSchema: GenMessage<Fixed64Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 10);
 
 /**
  * SFixed32Rules describes the constraints applied to `sfixed32` values
@@ -1093,10 +1037,8 @@ export type SFixed32Rules = Message<"validate.SFixed32Rules"> & {
  * Describes the message validate.SFixed32Rules.
  * Use `create(SFixed32RulesSchema)` to create a new message.
  */
-export const SFixed32RulesSchema: GenMessage<SFixed32Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  11,
-);
+export const SFixed32RulesSchema: GenMessage<SFixed32Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 11);
 
 /**
  * SFixed64Rules describes the constraints applied to `sfixed64` values
@@ -1174,10 +1116,8 @@ export type SFixed64Rules = Message<"validate.SFixed64Rules"> & {
  * Describes the message validate.SFixed64Rules.
  * Use `create(SFixed64RulesSchema)` to create a new message.
  */
-export const SFixed64RulesSchema: GenMessage<SFixed64Rules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  12,
-);
+export const SFixed64RulesSchema: GenMessage<SFixed64Rules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 12);
 
 /**
  * BoolRules describes the constraints applied to `bool` values
@@ -1197,10 +1137,8 @@ export type BoolRules = Message<"validate.BoolRules"> & {
  * Describes the message validate.BoolRules.
  * Use `create(BoolRulesSchema)` to create a new message.
  */
-export const BoolRulesSchema: GenMessage<BoolRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  13,
-);
+export const BoolRulesSchema: GenMessage<BoolRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 13);
 
 /**
  * StringRules describe the constraints applied to `string` values
@@ -1328,108 +1266,97 @@ export type StringRules = Message<"validate.StringRules"> & {
    *
    * @generated from oneof validate.StringRules.well_known
    */
-  wellKnown:
-    | {
-        /**
-         * Email specifies that the field must be a valid email address as
-         * defined by RFC 5322
-         *
-         * @generated from field: bool email = 12;
-         */
-        value: boolean;
-        case: "email";
-      }
-    | {
-        /**
-         * Hostname specifies that the field must be a valid hostname as
-         * defined by RFC 1034. This constraint does not support
-         * internationalized domain names (IDNs).
-         *
-         * @generated from field: bool hostname = 13;
-         */
-        value: boolean;
-        case: "hostname";
-      }
-    | {
-        /**
-         * Ip specifies that the field must be a valid IP (v4 or v6) address.
-         * Valid IPv6 addresses should not include surrounding square brackets.
-         *
-         * @generated from field: bool ip = 14;
-         */
-        value: boolean;
-        case: "ip";
-      }
-    | {
-        /**
-         * Ipv4 specifies that the field must be a valid IPv4 address.
-         *
-         * @generated from field: bool ipv4 = 15;
-         */
-        value: boolean;
-        case: "ipv4";
-      }
-    | {
-        /**
-         * Ipv6 specifies that the field must be a valid IPv6 address. Valid
-         * IPv6 addresses should not include surrounding square brackets.
-         *
-         * @generated from field: bool ipv6 = 16;
-         */
-        value: boolean;
-        case: "ipv6";
-      }
-    | {
-        /**
-         * Uri specifies that the field must be a valid, absolute URI as defined
-         * by RFC 3986
-         *
-         * @generated from field: bool uri = 17;
-         */
-        value: boolean;
-        case: "uri";
-      }
-    | {
-        /**
-         * UriRef specifies that the field must be a valid URI as defined by RFC
-         * 3986 and may be relative or absolute.
-         *
-         * @generated from field: bool uri_ref = 18;
-         */
-        value: boolean;
-        case: "uriRef";
-      }
-    | {
-        /**
-         * Address specifies that the field must be either a valid hostname as
-         * defined by RFC 1034 (which does not support internationalized domain
-         * names or IDNs), or it can be a valid IP (v4 or v6).
-         *
-         * @generated from field: bool address = 21;
-         */
-        value: boolean;
-        case: "address";
-      }
-    | {
-        /**
-         * Uuid specifies that the field must be a valid UUID as defined by
-         * RFC 4122
-         *
-         * @generated from field: bool uuid = 22;
-         */
-        value: boolean;
-        case: "uuid";
-      }
-    | {
-        /**
-         * WellKnownRegex specifies a common well known pattern defined as a regex.
-         *
-         * @generated from field: validate.KnownRegex well_known_regex = 24;
-         */
-        value: KnownRegex;
-        case: "wellKnownRegex";
-      }
-    | { case: undefined; value?: undefined };
+  wellKnown: {
+    /**
+     * Email specifies that the field must be a valid email address as
+     * defined by RFC 5322
+     *
+     * @generated from field: bool email = 12;
+     */
+    value: boolean;
+    case: "email";
+  } | {
+    /**
+     * Hostname specifies that the field must be a valid hostname as
+     * defined by RFC 1034. This constraint does not support
+     * internationalized domain names (IDNs).
+     *
+     * @generated from field: bool hostname = 13;
+     */
+    value: boolean;
+    case: "hostname";
+  } | {
+    /**
+     * Ip specifies that the field must be a valid IP (v4 or v6) address.
+     * Valid IPv6 addresses should not include surrounding square brackets.
+     *
+     * @generated from field: bool ip = 14;
+     */
+    value: boolean;
+    case: "ip";
+  } | {
+    /**
+     * Ipv4 specifies that the field must be a valid IPv4 address.
+     *
+     * @generated from field: bool ipv4 = 15;
+     */
+    value: boolean;
+    case: "ipv4";
+  } | {
+    /**
+     * Ipv6 specifies that the field must be a valid IPv6 address. Valid
+     * IPv6 addresses should not include surrounding square brackets.
+     *
+     * @generated from field: bool ipv6 = 16;
+     */
+    value: boolean;
+    case: "ipv6";
+  } | {
+    /**
+     * Uri specifies that the field must be a valid, absolute URI as defined
+     * by RFC 3986
+     *
+     * @generated from field: bool uri = 17;
+     */
+    value: boolean;
+    case: "uri";
+  } | {
+    /**
+     * UriRef specifies that the field must be a valid URI as defined by RFC
+     * 3986 and may be relative or absolute.
+     *
+     * @generated from field: bool uri_ref = 18;
+     */
+    value: boolean;
+    case: "uriRef";
+  } | {
+    /**
+     * Address specifies that the field must be either a valid hostname as
+     * defined by RFC 1034 (which does not support internationalized domain
+     * names or IDNs), or it can be a valid IP (v4 or v6).
+     *
+     * @generated from field: bool address = 21;
+     */
+    value: boolean;
+    case: "address";
+  } | {
+    /**
+     * Uuid specifies that the field must be a valid UUID as defined by
+     * RFC 4122
+     *
+     * @generated from field: bool uuid = 22;
+     */
+    value: boolean;
+    case: "uuid";
+  } | {
+    /**
+     * WellKnownRegex specifies a common well known pattern defined as a regex.
+     *
+     * @generated from field: validate.KnownRegex well_known_regex = 24;
+     */
+    value: KnownRegex;
+    case: "wellKnownRegex";
+  } | { case: undefined; value?: undefined };
 
   /**
    * This applies to regexes HTTP_HEADER_NAME and HTTP_HEADER_VALUE to enable
@@ -1455,10 +1382,8 @@ export type StringRules = Message<"validate.StringRules"> & {
  * Describes the message validate.StringRules.
  * Use `create(StringRulesSchema)` to create a new message.
  */
-export const StringRulesSchema: GenMessage<StringRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  14,
-);
+export const StringRulesSchema: GenMessage<StringRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 14);
 
 /**
  * BytesRules describe the constraints applied to `bytes` values
@@ -1551,38 +1476,34 @@ export type BytesRules = Message<"validate.BytesRules"> & {
    *
    * @generated from oneof validate.BytesRules.well_known
    */
-  wellKnown:
-    | {
-        /**
-         * Ip specifies that the field must be a valid IP (v4 or v6) address in
-         * byte format
-         *
-         * @generated from field: bool ip = 10;
-         */
-        value: boolean;
-        case: "ip";
-      }
-    | {
-        /**
-         * Ipv4 specifies that the field must be a valid IPv4 address in byte
-         * format
-         *
-         * @generated from field: bool ipv4 = 11;
-         */
-        value: boolean;
-        case: "ipv4";
-      }
-    | {
-        /**
-         * Ipv6 specifies that the field must be a valid IPv6 address in byte
-         * format
-         *
-         * @generated from field: bool ipv6 = 12;
-         */
-        value: boolean;
-        case: "ipv6";
-      }
-    | { case: undefined; value?: undefined };
+  wellKnown: {
+    /**
+     * Ip specifies that the field must be a valid IP (v4 or v6) address in
+     * byte format
+     *
+     * @generated from field: bool ip = 10;
+     */
+    value: boolean;
+    case: "ip";
+  } | {
+    /**
+     * Ipv4 specifies that the field must be a valid IPv4 address in byte
+     * format
+     *
+     * @generated from field: bool ipv4 = 11;
+     */
+    value: boolean;
+    case: "ipv4";
+  } | {
+    /**
+     * Ipv6 specifies that the field must be a valid IPv6 address in byte
+     * format
+     *
+     * @generated from field: bool ipv6 = 12;
+     */
+    value: boolean;
+    case: "ipv6";
+  } | { case: undefined; value?: undefined };
 
   /**
    * IgnoreEmpty specifies that the validation rules of this field should be
@@ -1597,10 +1518,8 @@ export type BytesRules = Message<"validate.BytesRules"> & {
  * Describes the message validate.BytesRules.
  * Use `create(BytesRulesSchema)` to create a new message.
  */
-export const BytesRulesSchema: GenMessage<BytesRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  15,
-);
+export const BytesRulesSchema: GenMessage<BytesRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 15);
 
 /**
  * EnumRules describe the constraints applied to enum values
@@ -1644,10 +1563,8 @@ export type EnumRules = Message<"validate.EnumRules"> & {
  * Describes the message validate.EnumRules.
  * Use `create(EnumRulesSchema)` to create a new message.
  */
-export const EnumRulesSchema: GenMessage<EnumRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  16,
-);
+export const EnumRulesSchema: GenMessage<EnumRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 16);
 
 /**
  * MessageRules describe the constraints applied to embedded message values.
@@ -1676,10 +1593,8 @@ export type MessageRules = Message<"validate.MessageRules"> & {
  * Describes the message validate.MessageRules.
  * Use `create(MessageRulesSchema)` to create a new message.
  */
-export const MessageRulesSchema: GenMessage<MessageRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  17,
-);
+export const MessageRulesSchema: GenMessage<MessageRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 17);
 
 /**
  * RepeatedRules describe the constraints applied to `repeated` values
@@ -1734,10 +1649,8 @@ export type RepeatedRules = Message<"validate.RepeatedRules"> & {
  * Describes the message validate.RepeatedRules.
  * Use `create(RepeatedRulesSchema)` to create a new message.
  */
-export const RepeatedRulesSchema: GenMessage<RepeatedRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  18,
-);
+export const RepeatedRulesSchema: GenMessage<RepeatedRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 18);
 
 /**
  * MapRules describe the constraints applied to `map` values
@@ -1798,10 +1711,8 @@ export type MapRules = Message<"validate.MapRules"> & {
  * Describes the message validate.MapRules.
  * Use `create(MapRulesSchema)` to create a new message.
  */
-export const MapRulesSchema: GenMessage<MapRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  19,
-);
+export const MapRulesSchema: GenMessage<MapRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 19);
 
 /**
  * AnyRules describe constraints applied exclusively to the
@@ -1838,10 +1749,8 @@ export type AnyRules = Message<"validate.AnyRules"> & {
  * Describes the message validate.AnyRules.
  * Use `create(AnyRulesSchema)` to create a new message.
  */
-export const AnyRulesSchema: GenMessage<AnyRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  20,
-);
+export const AnyRulesSchema: GenMessage<AnyRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 20);
 
 /**
  * DurationRules describe the constraints applied exclusively to the
@@ -1917,10 +1826,8 @@ export type DurationRules = Message<"validate.DurationRules"> & {
  * Describes the message validate.DurationRules.
  * Use `create(DurationRulesSchema)` to create a new message.
  */
-export const DurationRulesSchema: GenMessage<DurationRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  21,
-);
+export const DurationRulesSchema: GenMessage<DurationRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 21);
 
 /**
  * TimestampRules describe the constraints applied exclusively to the
@@ -2005,10 +1912,8 @@ export type TimestampRules = Message<"validate.TimestampRules"> & {
  * Describes the message validate.TimestampRules.
  * Use `create(TimestampRulesSchema)` to create a new message.
  */
-export const TimestampRulesSchema: GenMessage<TimestampRules> /*@__PURE__*/ = messageDesc(
-  file_validate_validate,
-  22,
-);
+export const TimestampRulesSchema: GenMessage<TimestampRules> = /*@__PURE__*/
+  messageDesc(file_validate_validate, 22);
 
 /**
  * WellKnownRegex contain some well-known patterns.
@@ -2039,10 +1944,8 @@ export enum KnownRegex {
 /**
  * Describes the enum validate.KnownRegex.
  */
-export const KnownRegexSchema: GenEnum<KnownRegex> /*@__PURE__*/ = enumDesc(
-  file_validate_validate,
-  0,
-);
+export const KnownRegexSchema: GenEnum<KnownRegex> = /*@__PURE__*/
+  enumDesc(file_validate_validate, 0);
 
 /**
  * Disabled nullifies any validation rules for this message, including any
@@ -2050,20 +1953,16 @@ export const KnownRegexSchema: GenEnum<KnownRegex> /*@__PURE__*/ = enumDesc(
  *
  * @generated from extension: optional bool disabled = 1071;
  */
-export const disabled: GenExtension<MessageOptions, boolean> /*@__PURE__*/ = extDesc(
-  file_validate_validate,
-  0,
-);
+export const disabled: GenExtension<MessageOptions, boolean> = /*@__PURE__*/
+  extDesc(file_validate_validate, 0);
 
 /**
  * Ignore skips generation of validation methods for this message.
  *
  * @generated from extension: optional bool ignored = 1072;
  */
-export const ignored: GenExtension<MessageOptions, boolean> /*@__PURE__*/ = extDesc(
-  file_validate_validate,
-  1,
-);
+export const ignored: GenExtension<MessageOptions, boolean> = /*@__PURE__*/
+  extDesc(file_validate_validate, 1);
 
 /**
  * Required ensures that exactly one the field options in a oneof is set;
@@ -2071,10 +1970,8 @@ export const ignored: GenExtension<MessageOptions, boolean> /*@__PURE__*/ = extD
  *
  * @generated from extension: optional bool required = 1071;
  */
-export const required: GenExtension<OneofOptions, boolean> /*@__PURE__*/ = extDesc(
-  file_validate_validate,
-  2,
-);
+export const required: GenExtension<OneofOptions, boolean> = /*@__PURE__*/
+  extDesc(file_validate_validate, 2);
 
 /**
  * Rules specify the validations to be performed on this field. By default,
@@ -2082,7 +1979,6 @@ export const required: GenExtension<OneofOptions, boolean> /*@__PURE__*/ = extDe
  *
  * @generated from extension: optional validate.FieldRules rules = 1071;
  */
-export const rules: GenExtension<FieldOptions, FieldRules> /*@__PURE__*/ = extDesc(
-  file_validate_validate,
-  3,
-);
+export const rules: GenExtension<FieldOptions, FieldRules> = /*@__PURE__*/
+  extDesc(file_validate_validate, 3);
+

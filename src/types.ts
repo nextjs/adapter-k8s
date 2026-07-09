@@ -74,6 +74,7 @@ export interface RoutingManifest {
   i18n: BuildCompleteContext["config"]["i18n"] | null;
   buildId: string;
   basePath: string;
+  trailingSlash?: boolean;
   middleware: { filePath: string; runtime?: string } | null;
   poolAssignments: Record<string, string>;
   pprRoutes: Record<
@@ -108,4 +109,12 @@ export interface StaticAssetEntry {
   headers?: Record<string, string | string[]>;
   status?: number;
   ppr?: boolean;
+  /** Seconds until the prerender is stale (ISR). false/absent = static forever. */
+  revalidate?: number | false;
+  /**
+   * True for prerender outputs (pages/route payloads seeded at build). These are
+   * never served from the manifest file: Next's incremental cache owns staleness,
+   * draft mode, and revalidatePath/Tag — including for revalidate:false entries.
+   */
+  prerender?: boolean;
 }

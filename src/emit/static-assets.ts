@@ -32,6 +32,8 @@ export function buildStaticManifest(
     if (fallback.initialHeaders) entry.headers = fallback.initialHeaders;
     if (fallback.initialStatus) entry.status = fallback.initialStatus;
     if (fallback.postponedState) entry.ppr = true;
+    if (fallback.initialRevalidate !== undefined) entry.revalidate = fallback.initialRevalidate;
+    entry.prerender = true;
     entries.push(entry);
   }
 

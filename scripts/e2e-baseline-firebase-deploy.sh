@@ -66,7 +66,7 @@ export NEXT_DEPLOYMENT_ID="firebase-baseline-${DEPLOY_RANDOM}"
 {
   echo "BUILD_ID: ${BUILD_ID}"
   echo "DEPLOYMENT_ID: ${NEXT_DEPLOYMENT_ID}"
-  echo "IMMUTABLE_ASSET_TOKEN: undefined"
+  echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: 0"
 } > .adapter-build.log
 
 echo "[firebase-baseline] Starting emulator on :${PORT}..." >&2

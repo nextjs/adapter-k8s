@@ -6,10 +6,7 @@ import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobu
 import { enumDesc, fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
 import type { HeaderMap, HeaderValueOption, Metadata } from "../../../config/core/v3/base_pb.js";
 import { file_envoy_config_core_v3_base } from "../../../config/core/v3/base_pb.js";
-import type {
-  ProcessingMode,
-  ProcessingMode_BodySendMode,
-} from "../../../extensions/filters/http/ext_proc/v3/processing_mode_pb.js";
+import type { ProcessingMode, ProcessingMode_BodySendMode } from "../../../extensions/filters/http/ext_proc/v3/processing_mode_pb.js";
 import { file_envoy_extensions_filters_http_ext_proc_v3_processing_mode } from "../../../extensions/filters/http/ext_proc/v3/processing_mode_pb.js";
 import type { HttpStatus } from "../../../type/v3/http_status_pb.js";
 import { file_envoy_type_v3_http_status } from "../../../type/v3/http_status_pb.js";
@@ -24,20 +21,8 @@ import type { JsonObject, Message } from "@bufbuild/protobuf";
 /**
  * Describes the file envoy/service/ext_proc/v3/external_processor.proto.
  */
-export const file_envoy_service_ext_proc_v3_external_processor: GenFile /*@__PURE__*/ = fileDesc(
-  "CjJlbnZveS9zZXJ2aWNlL2V4dF9wcm9jL3YzL2V4dGVybmFsX3Byb2Nlc3Nvci5wcm90bxIZZW52b3kuc2VydmljZS5leHRfcHJvYy52MyKpAgoVUHJvdG9jb2xDb25maWd1cmF0aW9uEmsKEXJlcXVlc3RfYm9keV9tb2RlGAEgASgOMkYuZW52b3kuZXh0ZW5zaW9ucy5maWx0ZXJzLmh0dHAuZXh0X3Byb2MudjMuUHJvY2Vzc2luZ01vZGUuQm9keVNlbmRNb2RlQgj6QgWCAQIQARJsChJyZXNwb25zZV9ib2R5X21vZGUYAiABKA4yRi5lbnZveS5leHRlbnNpb25zLmZpbHRlcnMuaHR0cC5leHRfcHJvYy52My5Qcm9jZXNzaW5nTW9kZS5Cb2R5U2VuZE1vZGVCCPpCBYIBAhABEjUKLXNlbmRfYm9keV93aXRob3V0X3dhaXRpbmdfZm9yX2hlYWRlcl9yZXNwb25zZRgDIAEoCCKBBgoRUHJvY2Vzc2luZ1JlcXVlc3QSQQoPcmVxdWVzdF9oZWFkZXJzGAIgASgLMiYuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5IdHRwSGVhZGVyc0gAEkIKEHJlc3BvbnNlX2hlYWRlcnMYAyABKAsyJi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBIZWFkZXJzSAASOwoMcmVxdWVzdF9ib2R5GAQgASgLMiMuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5IdHRwQm9keUgAEjwKDXJlc3BvbnNlX2JvZHkYBSABKAsyIy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBCb2R5SAASQwoQcmVxdWVzdF90cmFpbGVycxgGIAEoCzInLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuSHR0cFRyYWlsZXJzSAASRAoRcmVzcG9uc2VfdHJhaWxlcnMYByABKAsyJy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBUcmFpbGVyc0gAEjgKEG1ldGFkYXRhX2NvbnRleHQYCCABKAsyHi5lbnZveS5jb25maWcuY29yZS52My5NZXRhZGF0YRJQCgphdHRyaWJ1dGVzGAkgAygLMjwuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5Qcm9jZXNzaW5nUmVxdWVzdC5BdHRyaWJ1dGVzRW50cnkSGgoSb2JzZXJ2YWJpbGl0eV9tb2RlGAogASgIEkkKD3Byb3RvY29sX2NvbmZpZxgLIAEoCzIwLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuUHJvdG9jb2xDb25maWd1cmF0aW9uGkoKD0F0dHJpYnV0ZXNFbnRyeRILCgNrZXkYASABKAkSJgoFdmFsdWUYAiABKAsyFy5nb29nbGUucHJvdG9idWYuU3RydWN0OgI4AUIOCgdyZXF1ZXN0EgP4QgFKBAgBEAJSCmFzeW5jX21vZGUizAYKElByb2Nlc3NpbmdSZXNwb25zZRJFCg9yZXF1ZXN0X2hlYWRlcnMYASABKAsyKi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlcnNSZXNwb25zZUgAEkYKEHJlc3BvbnNlX2hlYWRlcnMYAiABKAsyKi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlcnNSZXNwb25zZUgAEj8KDHJlcXVlc3RfYm9keRgDIAEoCzInLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuQm9keVJlc3BvbnNlSAASQAoNcmVzcG9uc2VfYm9keRgEIAEoCzInLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuQm9keVJlc3BvbnNlSAASRwoQcmVxdWVzdF90cmFpbGVycxgFIAEoCzIrLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuVHJhaWxlcnNSZXNwb25zZUgAEkgKEXJlc3BvbnNlX3RyYWlsZXJzGAYgASgLMisuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5UcmFpbGVyc1Jlc3BvbnNlSAASSgoSaW1tZWRpYXRlX3Jlc3BvbnNlGAcgASgLMiwuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5JbW1lZGlhdGVSZXNwb25zZUgAElsKG3N0cmVhbWVkX2ltbWVkaWF0ZV9yZXNwb25zZRgLIAEoCzI0LmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuU3RyZWFtZWRJbW1lZGlhdGVSZXNwb25zZUgAEjEKEGR5bmFtaWNfbWV0YWRhdGEYCCABKAsyFy5nb29nbGUucHJvdG9idWYuU3RydWN0ElAKDW1vZGVfb3ZlcnJpZGUYCSABKAsyOS5lbnZveS5leHRlbnNpb25zLmZpbHRlcnMuaHR0cC5leHRfcHJvYy52My5Qcm9jZXNzaW5nTW9kZRIVCg1yZXF1ZXN0X2RyYWluGAwgASgIEjsKGG92ZXJyaWRlX21lc3NhZ2VfdGltZW91dBgKIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbkIPCghyZXNwb25zZRID+EIBIvsBCgtIdHRwSGVhZGVycxIwCgdoZWFkZXJzGAEgASgLMh8uZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyTWFwElcKCmF0dHJpYnV0ZXMYAiADKAsyNi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBIZWFkZXJzLkF0dHJpYnV0ZXNFbnRyeUILGAGSx4bYBAMzLjASFQoNZW5kX29mX3N0cmVhbRgDIAEoCBpKCg9BdHRyaWJ1dGVzRW50cnkSCwoDa2V5GAEgASgJEiYKBXZhbHVlGAIgASgLMhcuZ29vZ2xlLnByb3RvYnVmLlN0cnVjdDoCOAEidwoISHR0cEJvZHkSDAoEYm9keRgBIAEoDBIVCg1lbmRfb2Zfc3RyZWFtGAIgASgIEiUKHWVuZF9vZl9zdHJlYW1fd2l0aG91dF9tZXNzYWdlGAMgASgIEh8KF2dycGNfbWVzc2FnZV9jb21wcmVzc2VkGAQgASgIIkEKDEh0dHBUcmFpbGVycxIxCgh0cmFpbGVycxgBIAEoCzIfLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlck1hcCJOCg9IZWFkZXJzUmVzcG9uc2USOwoIcmVzcG9uc2UYASABKAsyKS5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkNvbW1vblJlc3BvbnNlIksKDEJvZHlSZXNwb25zZRI7CghyZXNwb25zZRgBIAEoCzIpLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuQ29tbW9uUmVzcG9uc2UiVgoQVHJhaWxlcnNSZXNwb25zZRJCCg9oZWFkZXJfbXV0YXRpb24YASABKAsyKS5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlck11dGF0aW9uIvMBChlTdHJlYW1lZEltbWVkaWF0ZVJlc3BvbnNlEkIKEGhlYWRlcnNfcmVzcG9uc2UYASABKAsyJi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBIZWFkZXJzSAASSAoNYm9keV9yZXNwb25zZRgCIAEoCzIvLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuU3RyZWFtZWRCb2R5UmVzcG9uc2VIABI8ChF0cmFpbGVyc19yZXNwb25zZRgDIAEoCzIfLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlck1hcEgAQgoKCHJlc3BvbnNlIvACCg5Db21tb25SZXNwb25zZRJSCgZzdGF0dXMYASABKA4yOC5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkNvbW1vblJlc3BvbnNlLlJlc3BvbnNlU3RhdHVzQgj6QgWCAQIQARJCCg9oZWFkZXJfbXV0YXRpb24YAiABKAsyKS5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlck11dGF0aW9uEj4KDWJvZHlfbXV0YXRpb24YAyABKAsyJy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkJvZHlNdXRhdGlvbhIxCgh0cmFpbGVycxgEIAEoCzIfLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlck1hcBIZChFjbGVhcl9yb3V0ZV9jYWNoZRgFIAEoCCI4Cg5SZXNwb25zZVN0YXR1cxIMCghDT05USU5VRRAAEhgKFENPTlRJTlVFX0FORF9SRVBMQUNFEAEi3wEKEUltbWVkaWF0ZVJlc3BvbnNlEjMKBnN0YXR1cxgBIAEoCzIZLmVudm95LnR5cGUudjMuSHR0cFN0YXR1c0II+kIFigECEAESOgoHaGVhZGVycxgCIAEoCzIpLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuSGVhZGVyTXV0YXRpb24SDAoEYm9keRgDIAEoDBI6CgtncnBjX3N0YXR1cxgEIAEoCzIlLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuR3JwY1N0YXR1cxIPCgdkZXRhaWxzGAUgASgJIhwKCkdycGNTdGF0dXMSDgoGc3RhdHVzGAEgASgNImYKDkhlYWRlck11dGF0aW9uEjwKC3NldF9oZWFkZXJzGAEgAygLMicuZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyVmFsdWVPcHRpb24SFgoOcmVtb3ZlX2hlYWRlcnMYAiADKAkigwEKFFN0cmVhbWVkQm9keVJlc3BvbnNlEgwKBGJvZHkYASABKAwSFQoNZW5kX29mX3N0cmVhbRgCIAEoCBIlCh1lbmRfb2Zfc3RyZWFtX3dpdGhvdXRfbWVzc2FnZRgDIAEoCBIfChdncnBjX21lc3NhZ2VfY29tcHJlc3NlZBgEIAEoCCKYAQoMQm9keU11dGF0aW9uEg4KBGJvZHkYASABKAxIABIUCgpjbGVhcl9ib2R5GAIgASgISAASVgoRc3RyZWFtZWRfcmVzcG9uc2UYAyABKAsyLy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLlN0cmVhbWVkQm9keVJlc3BvbnNlQgjSxqThBgIIAUgAQgoKCG11dGF0aW9uMn8KEUV4dGVybmFsUHJvY2Vzc29yEmoKB1Byb2Nlc3MSLC5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLlByb2Nlc3NpbmdSZXF1ZXN0Gi0uZW52b3kuc2VydmljZS5leHRfcHJvYy52My5Qcm9jZXNzaW5nUmVzcG9uc2UoATABQpgBCidpby5lbnZveXByb3h5LmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjNCFkV4dGVybmFsUHJvY2Vzc29yUHJvdG9QAVpLZ2l0aHViLmNvbS9lbnZveXByb3h5L2dvLWNvbnRyb2wtcGxhbmUvZW52b3kvc2VydmljZS9leHRfcHJvYy92MztleHRfcHJvY3YzuoDI0QYCEAJiBnByb3RvMw",
-  [
-    file_envoy_config_core_v3_base,
-    file_envoy_extensions_filters_http_ext_proc_v3_processing_mode,
-    file_envoy_type_v3_http_status,
-    file_google_protobuf_duration,
-    file_google_protobuf_struct,
-    file_xds_annotations_v3_status,
-    file_envoy_annotations_deprecation,
-    file_udpa_annotations_status,
-    file_validate_validate,
-  ],
-);
+export const file_envoy_service_ext_proc_v3_external_processor: GenFile = /*@__PURE__*/
+  fileDesc("CjJlbnZveS9zZXJ2aWNlL2V4dF9wcm9jL3YzL2V4dGVybmFsX3Byb2Nlc3Nvci5wcm90bxIZZW52b3kuc2VydmljZS5leHRfcHJvYy52MyKpAgoVUHJvdG9jb2xDb25maWd1cmF0aW9uEmsKEXJlcXVlc3RfYm9keV9tb2RlGAEgASgOMkYuZW52b3kuZXh0ZW5zaW9ucy5maWx0ZXJzLmh0dHAuZXh0X3Byb2MudjMuUHJvY2Vzc2luZ01vZGUuQm9keVNlbmRNb2RlQgj6QgWCAQIQARJsChJyZXNwb25zZV9ib2R5X21vZGUYAiABKA4yRi5lbnZveS5leHRlbnNpb25zLmZpbHRlcnMuaHR0cC5leHRfcHJvYy52My5Qcm9jZXNzaW5nTW9kZS5Cb2R5U2VuZE1vZGVCCPpCBYIBAhABEjUKLXNlbmRfYm9keV93aXRob3V0X3dhaXRpbmdfZm9yX2hlYWRlcl9yZXNwb25zZRgDIAEoCCKBBgoRUHJvY2Vzc2luZ1JlcXVlc3QSQQoPcmVxdWVzdF9oZWFkZXJzGAIgASgLMiYuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5IdHRwSGVhZGVyc0gAEkIKEHJlc3BvbnNlX2hlYWRlcnMYAyABKAsyJi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBIZWFkZXJzSAASOwoMcmVxdWVzdF9ib2R5GAQgASgLMiMuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5IdHRwQm9keUgAEjwKDXJlc3BvbnNlX2JvZHkYBSABKAsyIy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBCb2R5SAASQwoQcmVxdWVzdF90cmFpbGVycxgGIAEoCzInLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuSHR0cFRyYWlsZXJzSAASRAoRcmVzcG9uc2VfdHJhaWxlcnMYByABKAsyJy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBUcmFpbGVyc0gAEjgKEG1ldGFkYXRhX2NvbnRleHQYCCABKAsyHi5lbnZveS5jb25maWcuY29yZS52My5NZXRhZGF0YRJQCgphdHRyaWJ1dGVzGAkgAygLMjwuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5Qcm9jZXNzaW5nUmVxdWVzdC5BdHRyaWJ1dGVzRW50cnkSGgoSb2JzZXJ2YWJpbGl0eV9tb2RlGAogASgIEkkKD3Byb3RvY29sX2NvbmZpZxgLIAEoCzIwLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuUHJvdG9jb2xDb25maWd1cmF0aW9uGkoKD0F0dHJpYnV0ZXNFbnRyeRILCgNrZXkYASABKAkSJgoFdmFsdWUYAiABKAsyFy5nb29nbGUucHJvdG9idWYuU3RydWN0OgI4AUIOCgdyZXF1ZXN0EgP4QgFKBAgBEAJSCmFzeW5jX21vZGUizAYKElByb2Nlc3NpbmdSZXNwb25zZRJFCg9yZXF1ZXN0X2hlYWRlcnMYASABKAsyKi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlcnNSZXNwb25zZUgAEkYKEHJlc3BvbnNlX2hlYWRlcnMYAiABKAsyKi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlcnNSZXNwb25zZUgAEj8KDHJlcXVlc3RfYm9keRgDIAEoCzInLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuQm9keVJlc3BvbnNlSAASQAoNcmVzcG9uc2VfYm9keRgEIAEoCzInLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuQm9keVJlc3BvbnNlSAASRwoQcmVxdWVzdF90cmFpbGVycxgFIAEoCzIrLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuVHJhaWxlcnNSZXNwb25zZUgAEkgKEXJlc3BvbnNlX3RyYWlsZXJzGAYgASgLMisuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5UcmFpbGVyc1Jlc3BvbnNlSAASSgoSaW1tZWRpYXRlX3Jlc3BvbnNlGAcgASgLMiwuZW52b3kuc2VydmljZS5leHRfcHJvYy52My5JbW1lZGlhdGVSZXNwb25zZUgAElsKG3N0cmVhbWVkX2ltbWVkaWF0ZV9yZXNwb25zZRgLIAEoCzI0LmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuU3RyZWFtZWRJbW1lZGlhdGVSZXNwb25zZUgAEjEKEGR5bmFtaWNfbWV0YWRhdGEYCCABKAsyFy5nb29nbGUucHJvdG9idWYuU3RydWN0ElAKDW1vZGVfb3ZlcnJpZGUYCSABKAsyOS5lbnZveS5leHRlbnNpb25zLmZpbHRlcnMuaHR0cC5leHRfcHJvYy52My5Qcm9jZXNzaW5nTW9kZRIVCg1yZXF1ZXN0X2RyYWluGAwgASgIEjsKGG92ZXJyaWRlX21lc3NhZ2VfdGltZW91dBgKIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbkIPCghyZXNwb25zZRID+EIBIvsBCgtIdHRwSGVhZGVycxIwCgdoZWFkZXJzGAEgASgLMh8uZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyTWFwElcKCmF0dHJpYnV0ZXMYAiADKAsyNi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBIZWFkZXJzLkF0dHJpYnV0ZXNFbnRyeUILGAGSx4bYBAMzLjASFQoNZW5kX29mX3N0cmVhbRgDIAEoCBpKCg9BdHRyaWJ1dGVzRW50cnkSCwoDa2V5GAEgASgJEiYKBXZhbHVlGAIgASgLMhcuZ29vZ2xlLnByb3RvYnVmLlN0cnVjdDoCOAEidwoISHR0cEJvZHkSDAoEYm9keRgBIAEoDBIVCg1lbmRfb2Zfc3RyZWFtGAIgASgIEiUKHWVuZF9vZl9zdHJlYW1fd2l0aG91dF9tZXNzYWdlGAMgASgIEh8KF2dycGNfbWVzc2FnZV9jb21wcmVzc2VkGAQgASgIIkEKDEh0dHBUcmFpbGVycxIxCgh0cmFpbGVycxgBIAEoCzIfLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlck1hcCJOCg9IZWFkZXJzUmVzcG9uc2USOwoIcmVzcG9uc2UYASABKAsyKS5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkNvbW1vblJlc3BvbnNlIksKDEJvZHlSZXNwb25zZRI7CghyZXNwb25zZRgBIAEoCzIpLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuQ29tbW9uUmVzcG9uc2UiVgoQVHJhaWxlcnNSZXNwb25zZRJCCg9oZWFkZXJfbXV0YXRpb24YASABKAsyKS5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlck11dGF0aW9uIvMBChlTdHJlYW1lZEltbWVkaWF0ZVJlc3BvbnNlEkIKEGhlYWRlcnNfcmVzcG9uc2UYASABKAsyJi5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkh0dHBIZWFkZXJzSAASSAoNYm9keV9yZXNwb25zZRgCIAEoCzIvLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuU3RyZWFtZWRCb2R5UmVzcG9uc2VIABI8ChF0cmFpbGVyc19yZXNwb25zZRgDIAEoCzIfLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlck1hcEgAQgoKCHJlc3BvbnNlIvACCg5Db21tb25SZXNwb25zZRJSCgZzdGF0dXMYASABKA4yOC5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkNvbW1vblJlc3BvbnNlLlJlc3BvbnNlU3RhdHVzQgj6QgWCAQIQARJCCg9oZWFkZXJfbXV0YXRpb24YAiABKAsyKS5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkhlYWRlck11dGF0aW9uEj4KDWJvZHlfbXV0YXRpb24YAyABKAsyJy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLkJvZHlNdXRhdGlvbhIxCgh0cmFpbGVycxgEIAEoCzIfLmVudm95LmNvbmZpZy5jb3JlLnYzLkhlYWRlck1hcBIZChFjbGVhcl9yb3V0ZV9jYWNoZRgFIAEoCCI4Cg5SZXNwb25zZVN0YXR1cxIMCghDT05USU5VRRAAEhgKFENPTlRJTlVFX0FORF9SRVBMQUNFEAEi3wEKEUltbWVkaWF0ZVJlc3BvbnNlEjMKBnN0YXR1cxgBIAEoCzIZLmVudm95LnR5cGUudjMuSHR0cFN0YXR1c0II+kIFigECEAESOgoHaGVhZGVycxgCIAEoCzIpLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuSGVhZGVyTXV0YXRpb24SDAoEYm9keRgDIAEoDBI6CgtncnBjX3N0YXR1cxgEIAEoCzIlLmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjMuR3JwY1N0YXR1cxIPCgdkZXRhaWxzGAUgASgJIhwKCkdycGNTdGF0dXMSDgoGc3RhdHVzGAEgASgNImYKDkhlYWRlck11dGF0aW9uEjwKC3NldF9oZWFkZXJzGAEgAygLMicuZW52b3kuY29uZmlnLmNvcmUudjMuSGVhZGVyVmFsdWVPcHRpb24SFgoOcmVtb3ZlX2hlYWRlcnMYAiADKAkigwEKFFN0cmVhbWVkQm9keVJlc3BvbnNlEgwKBGJvZHkYASABKAwSFQoNZW5kX29mX3N0cmVhbRgCIAEoCBIlCh1lbmRfb2Zfc3RyZWFtX3dpdGhvdXRfbWVzc2FnZRgDIAEoCBIfChdncnBjX21lc3NhZ2VfY29tcHJlc3NlZBgEIAEoCCKYAQoMQm9keU11dGF0aW9uEg4KBGJvZHkYASABKAxIABIUCgpjbGVhcl9ib2R5GAIgASgISAASVgoRc3RyZWFtZWRfcmVzcG9uc2UYAyABKAsyLy5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLlN0cmVhbWVkQm9keVJlc3BvbnNlQgjSxqThBgIIAUgAQgoKCG11dGF0aW9uMn8KEUV4dGVybmFsUHJvY2Vzc29yEmoKB1Byb2Nlc3MSLC5lbnZveS5zZXJ2aWNlLmV4dF9wcm9jLnYzLlByb2Nlc3NpbmdSZXF1ZXN0Gi0uZW52b3kuc2VydmljZS5leHRfcHJvYy52My5Qcm9jZXNzaW5nUmVzcG9uc2UoATABQpgBCidpby5lbnZveXByb3h5LmVudm95LnNlcnZpY2UuZXh0X3Byb2MudjNCFkV4dGVybmFsUHJvY2Vzc29yUHJvdG9QAVpLZ2l0aHViLmNvbS9lbnZveXByb3h5L2dvLWNvbnRyb2wtcGxhbmUvZW52b3kvc2VydmljZS9leHRfcHJvYy92MztleHRfcHJvY3YzuoDI0QYCEAJiBnByb3RvMw", [file_envoy_config_core_v3_base, file_envoy_extensions_filters_http_ext_proc_v3_processing_mode, file_envoy_type_v3_http_status, file_google_protobuf_duration, file_google_protobuf_struct, file_xds_annotations_v3_status, file_envoy_annotations_deprecation, file_udpa_annotations_status, file_validate_validate]);
 
 /**
  * This message specifies the filter protocol configurations which will be sent to the ext_proc
@@ -81,7 +66,7 @@ export type ProtocolConfiguration = Message<"envoy.service.ext_proc.v3.ProtocolC
  * Describes the message envoy.service.ext_proc.v3.ProtocolConfiguration.
  * Use `create(ProtocolConfigurationSchema)` to create a new message.
  */
-export const ProtocolConfigurationSchema: GenMessage<ProtocolConfiguration> /*@__PURE__*/ =
+export const ProtocolConfigurationSchema: GenMessage<ProtocolConfiguration> = /*@__PURE__*/
   messageDesc(file_envoy_service_ext_proc_v3_external_processor, 0);
 
 /**
@@ -99,76 +84,69 @@ export type ProcessingRequest = Message<"envoy.service.ext_proc.v3.ProcessingReq
    *
    * @generated from oneof envoy.service.ext_proc.v3.ProcessingRequest.request
    */
-  request:
-    | {
-        /**
-         * Information about the HTTP request headers, as well as peer info and additional
-         * properties. Unless ``observability_mode`` is ``true``, the server must send back a
-         * ``HeaderResponse`` message, an ``ImmediateResponse`` message, or close the stream.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HttpHeaders request_headers = 2;
-         */
-        value: HttpHeaders;
-        case: "requestHeaders";
-      }
-    | {
-        /**
-         * Information about the HTTP response headers, as well as peer info and additional
-         * properties. Unless ``observability_mode`` is ``true``, the server must send back a
-         * ``HeaderResponse`` message or close the stream.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HttpHeaders response_headers = 3;
-         */
-        value: HttpHeaders;
-        case: "responseHeaders";
-      }
-    | {
-        /**
-         * A chunk of the HTTP request body. Unless ``observability_mode`` is ``true``, the server must
-         * send back a ``BodyResponse`` message, an ``ImmediateResponse`` message, or close the stream.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HttpBody request_body = 4;
-         */
-        value: HttpBody;
-        case: "requestBody";
-      }
-    | {
-        /**
-         * A chunk of the HTTP response body. Unless ``observability_mode`` is ``true``, the server must
-         * send back a ``BodyResponse`` message or close the stream.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HttpBody response_body = 5;
-         */
-        value: HttpBody;
-        case: "responseBody";
-      }
-    | {
-        /**
-         * The HTTP trailers for the request path. Unless ``observability_mode`` is ``true``, the server
-         * must send back a ``TrailerResponse`` message or close the stream.
-         *
-         * This message is only sent if the trailers processing mode is set to ``SEND`` and
-         * the original downstream request has trailers.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HttpTrailers request_trailers = 6;
-         */
-        value: HttpTrailers;
-        case: "requestTrailers";
-      }
-    | {
-        /**
-         * The HTTP trailers for the response path. Unless ``observability_mode`` is ``true``, the server
-         * must send back a ``TrailerResponse`` message or close the stream.
-         *
-         * This message is only sent if the trailers processing mode is set to ``SEND`` and
-         * the original upstream response has trailers.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HttpTrailers response_trailers = 7;
-         */
-        value: HttpTrailers;
-        case: "responseTrailers";
-      }
-    | { case: undefined; value?: undefined };
+  request: {
+    /**
+     * Information about the HTTP request headers, as well as peer info and additional
+     * properties. Unless ``observability_mode`` is ``true``, the server must send back a
+     * ``HeaderResponse`` message, an ``ImmediateResponse`` message, or close the stream.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpHeaders request_headers = 2;
+     */
+    value: HttpHeaders;
+    case: "requestHeaders";
+  } | {
+    /**
+     * Information about the HTTP response headers, as well as peer info and additional
+     * properties. Unless ``observability_mode`` is ``true``, the server must send back a
+     * ``HeaderResponse`` message or close the stream.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpHeaders response_headers = 3;
+     */
+    value: HttpHeaders;
+    case: "responseHeaders";
+  } | {
+    /**
+     * A chunk of the HTTP request body. Unless ``observability_mode`` is ``true``, the server must
+     * send back a ``BodyResponse`` message, an ``ImmediateResponse`` message, or close the stream.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpBody request_body = 4;
+     */
+    value: HttpBody;
+    case: "requestBody";
+  } | {
+    /**
+     * A chunk of the HTTP response body. Unless ``observability_mode`` is ``true``, the server must
+     * send back a ``BodyResponse`` message or close the stream.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpBody response_body = 5;
+     */
+    value: HttpBody;
+    case: "responseBody";
+  } | {
+    /**
+     * The HTTP trailers for the request path. Unless ``observability_mode`` is ``true``, the server
+     * must send back a ``TrailerResponse`` message or close the stream.
+     *
+     * This message is only sent if the trailers processing mode is set to ``SEND`` and
+     * the original downstream request has trailers.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpTrailers request_trailers = 6;
+     */
+    value: HttpTrailers;
+    case: "requestTrailers";
+  } | {
+    /**
+     * The HTTP trailers for the response path. Unless ``observability_mode`` is ``true``, the server
+     * must send back a ``TrailerResponse`` message or close the stream.
+     *
+     * This message is only sent if the trailers processing mode is set to ``SEND`` and
+     * the original upstream response has trailers.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpTrailers response_trailers = 7;
+     */
+    value: HttpTrailers;
+    case: "responseTrailers";
+  } | { case: undefined; value?: undefined };
 
   /**
    * Dynamic metadata associated with the request.
@@ -216,10 +194,8 @@ export type ProcessingRequest = Message<"envoy.service.ext_proc.v3.ProcessingReq
  * Describes the message envoy.service.ext_proc.v3.ProcessingRequest.
  * Use `create(ProcessingRequestSchema)` to create a new message.
  */
-export const ProcessingRequestSchema: GenMessage<ProcessingRequest> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  1,
-);
+export const ProcessingRequestSchema: GenMessage<ProcessingRequest> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 1);
 
 /**
  * This represents the different types of messages the server may send back to the data plane
@@ -241,105 +217,96 @@ export type ProcessingResponse = Message<"envoy.service.ext_proc.v3.ProcessingRe
    *
    * @generated from oneof envoy.service.ext_proc.v3.ProcessingResponse.response
    */
-  response:
-    | {
-        /**
-         * The server must send back this message in response to a message with the
-         * ``request_headers`` field set.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HeadersResponse request_headers = 1;
-         */
-        value: HeadersResponse;
-        case: "requestHeaders";
-      }
-    | {
-        /**
-         * The server must send back this message in response to a message with the
-         * ``response_headers`` field set.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.HeadersResponse response_headers = 2;
-         */
-        value: HeadersResponse;
-        case: "responseHeaders";
-      }
-    | {
-        /**
-         * The server must send back this message in response to a message with
-         * the ``request_body`` field set.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.BodyResponse request_body = 3;
-         */
-        value: BodyResponse;
-        case: "requestBody";
-      }
-    | {
-        /**
-         * The server must send back this message in response to a message with
-         * the ``response_body`` field set.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.BodyResponse response_body = 4;
-         */
-        value: BodyResponse;
-        case: "responseBody";
-      }
-    | {
-        /**
-         * The server must send back this message in response to a message with
-         * the ``request_trailers`` field set.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.TrailersResponse request_trailers = 5;
-         */
-        value: TrailersResponse;
-        case: "requestTrailers";
-      }
-    | {
-        /**
-         * The server must send back this message in response to a message with
-         * the ``response_trailers`` field set.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.TrailersResponse response_trailers = 6;
-         */
-        value: TrailersResponse;
-        case: "responseTrailers";
-      }
-    | {
-        /**
-         * If specified, attempt to create a locally generated response, send it
-         * downstream, and stop processing additional filters and ignore any
-         * additional messages received from the remote server for this request or
-         * response. If a response has already started -- for example, if this
-         * message is sent response to a ``response_body`` message -- then
-         * this will either ship the reply directly to the downstream codec,
-         * or reset the stream.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.ImmediateResponse immediate_response = 7;
-         */
-        value: ImmediateResponse;
-        case: "immediateResponse";
-      }
-    | {
-        /**
-         * The server sends back this message to initiate or continue local response streaming.
-         * The server must initiate local response streaming with the ``headers_response`` in response
-         * to a ``ProcessingRequest`` with the ``request_headers`` only.
-         * The server may follow up with multiple messages containing ``body_response``. The server must
-         * indicate end of stream by setting ``end_of_stream`` to ``true`` in the ``headers_response``
-         * or ``body_response`` message or by sending a ``trailers_response`` message.
-         * The client may send a ``request_body`` or ``request_trailers`` to the server depending on
-         * configuration.
-         * The streaming local response can only be sent when the ``request_header_mode`` in the filter
-         * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
-         * is set to ``SEND``. The ext_proc server should not send ``StreamedImmediateResponse`` if it
-         * did not observe request headers, as it will result in a race with the upstream server
-         * response and reset of the client request.
-         * Presently only the ``FULL_DUPLEX_STREAMED`` or ``NONE`` body modes are supported.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.StreamedImmediateResponse streamed_immediate_response = 11;
-         */
-        value: StreamedImmediateResponse;
-        case: "streamedImmediateResponse";
-      }
-    | { case: undefined; value?: undefined };
+  response: {
+    /**
+     * The server must send back this message in response to a message with the
+     * ``request_headers`` field set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HeadersResponse request_headers = 1;
+     */
+    value: HeadersResponse;
+    case: "requestHeaders";
+  } | {
+    /**
+     * The server must send back this message in response to a message with the
+     * ``response_headers`` field set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HeadersResponse response_headers = 2;
+     */
+    value: HeadersResponse;
+    case: "responseHeaders";
+  } | {
+    /**
+     * The server must send back this message in response to a message with
+     * the ``request_body`` field set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.BodyResponse request_body = 3;
+     */
+    value: BodyResponse;
+    case: "requestBody";
+  } | {
+    /**
+     * The server must send back this message in response to a message with
+     * the ``response_body`` field set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.BodyResponse response_body = 4;
+     */
+    value: BodyResponse;
+    case: "responseBody";
+  } | {
+    /**
+     * The server must send back this message in response to a message with
+     * the ``request_trailers`` field set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.TrailersResponse request_trailers = 5;
+     */
+    value: TrailersResponse;
+    case: "requestTrailers";
+  } | {
+    /**
+     * The server must send back this message in response to a message with
+     * the ``response_trailers`` field set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.TrailersResponse response_trailers = 6;
+     */
+    value: TrailersResponse;
+    case: "responseTrailers";
+  } | {
+    /**
+     * If specified, attempt to create a locally generated response, send it
+     * downstream, and stop processing additional filters and ignore any
+     * additional messages received from the remote server for this request or
+     * response. If a response has already started -- for example, if this
+     * message is sent response to a ``response_body`` message -- then
+     * this will either ship the reply directly to the downstream codec,
+     * or reset the stream.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.ImmediateResponse immediate_response = 7;
+     */
+    value: ImmediateResponse;
+    case: "immediateResponse";
+  } | {
+    /**
+     * The server sends back this message to initiate or continue local response streaming.
+     * The server must initiate local response streaming with the ``headers_response`` in response
+     * to a ``ProcessingRequest`` with the ``request_headers`` only.
+     * The server may follow up with multiple messages containing ``body_response``. The server must
+     * indicate end of stream by setting ``end_of_stream`` to ``true`` in the ``headers_response``
+     * or ``body_response`` message or by sending a ``trailers_response`` message.
+     * The client may send a ``request_body`` or ``request_trailers`` to the server depending on
+     * configuration.
+     * The streaming local response can only be sent when the ``request_header_mode`` in the filter
+     * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
+     * is set to ``SEND``. The ext_proc server should not send ``StreamedImmediateResponse`` if it
+     * did not observe request headers, as it will result in a race with the upstream server
+     * response and reset of the client request.
+     * Presently only the ``FULL_DUPLEX_STREAMED`` or ``NONE`` body modes are supported.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.StreamedImmediateResponse streamed_immediate_response = 11;
+     */
+    value: StreamedImmediateResponse;
+    case: "streamedImmediateResponse";
+  } | { case: undefined; value?: undefined };
 
   /**
    * Optional metadata that will be emitted as dynamic metadata to be consumed by
@@ -407,10 +374,8 @@ export type ProcessingResponse = Message<"envoy.service.ext_proc.v3.ProcessingRe
  * Describes the message envoy.service.ext_proc.v3.ProcessingResponse.
  * Use `create(ProcessingResponseSchema)` to create a new message.
  */
-export const ProcessingResponseSchema: GenMessage<ProcessingResponse> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  2,
-);
+export const ProcessingResponseSchema: GenMessage<ProcessingResponse> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 2);
 
 /**
  * This message is sent to the external server when the HTTP request and response headers
@@ -450,10 +415,8 @@ export type HttpHeaders = Message<"envoy.service.ext_proc.v3.HttpHeaders"> & {
  * Describes the message envoy.service.ext_proc.v3.HttpHeaders.
  * Use `create(HttpHeadersSchema)` to create a new message.
  */
-export const HttpHeadersSchema: GenMessage<HttpHeaders> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  3,
-);
+export const HttpHeadersSchema: GenMessage<HttpHeaders> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 3);
 
 /**
  * This message is sent to the external server when the HTTP request and response bodies are
@@ -505,10 +468,8 @@ export type HttpBody = Message<"envoy.service.ext_proc.v3.HttpBody"> & {
  * Describes the message envoy.service.ext_proc.v3.HttpBody.
  * Use `create(HttpBodySchema)` to create a new message.
  */
-export const HttpBodySchema: GenMessage<HttpBody> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  4,
-);
+export const HttpBodySchema: GenMessage<HttpBody> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 4);
 
 /**
  * This message is sent to the external server when the HTTP request and
@@ -530,10 +491,8 @@ export type HttpTrailers = Message<"envoy.service.ext_proc.v3.HttpTrailers"> & {
  * Describes the message envoy.service.ext_proc.v3.HttpTrailers.
  * Use `create(HttpTrailersSchema)` to create a new message.
  */
-export const HttpTrailersSchema: GenMessage<HttpTrailers> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  5,
-);
+export const HttpTrailersSchema: GenMessage<HttpTrailers> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 5);
 
 /**
  * This message is sent by the external server to the data plane after ``HttpHeaders`` was
@@ -555,10 +514,8 @@ export type HeadersResponse = Message<"envoy.service.ext_proc.v3.HeadersResponse
  * Describes the message envoy.service.ext_proc.v3.HeadersResponse.
  * Use `create(HeadersResponseSchema)` to create a new message.
  */
-export const HeadersResponseSchema: GenMessage<HeadersResponse> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  6,
-);
+export const HeadersResponseSchema: GenMessage<HeadersResponse> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 6);
 
 /**
  * This message is sent by the external server to the data plane after ``HttpBody`` was
@@ -580,10 +537,8 @@ export type BodyResponse = Message<"envoy.service.ext_proc.v3.BodyResponse"> & {
  * Describes the message envoy.service.ext_proc.v3.BodyResponse.
  * Use `create(BodyResponseSchema)` to create a new message.
  */
-export const BodyResponseSchema: GenMessage<BodyResponse> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  7,
-);
+export const BodyResponseSchema: GenMessage<BodyResponse> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 7);
 
 /**
  * This message is sent by the external server to the data plane after ``HttpTrailers`` was
@@ -605,10 +560,8 @@ export type TrailersResponse = Message<"envoy.service.ext_proc.v3.TrailersRespon
  * Describes the message envoy.service.ext_proc.v3.TrailersResponse.
  * Use `create(TrailersResponseSchema)` to create a new message.
  */
-export const TrailersResponseSchema: GenMessage<TrailersResponse> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  8,
-);
+export const TrailersResponseSchema: GenMessage<TrailersResponse> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 8);
 
 /**
  * This message is sent by the external server to the data plane after ``HttpHeaders`` to initiate
@@ -619,47 +572,42 @@ export const TrailersResponseSchema: GenMessage<TrailersResponse> /*@__PURE__*/ 
  *
  * @generated from message envoy.service.ext_proc.v3.StreamedImmediateResponse
  */
-export type StreamedImmediateResponse =
-  Message<"envoy.service.ext_proc.v3.StreamedImmediateResponse"> & {
+export type StreamedImmediateResponse = Message<"envoy.service.ext_proc.v3.StreamedImmediateResponse"> & {
+  /**
+   * @generated from oneof envoy.service.ext_proc.v3.StreamedImmediateResponse.response
+   */
+  response: {
     /**
-     * @generated from oneof envoy.service.ext_proc.v3.StreamedImmediateResponse.response
+     * Response headers to be sent downstream. The ``:status`` header must be set.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.HttpHeaders headers_response = 1;
      */
-    response:
-      | {
-          /**
-           * Response headers to be sent downstream. The ``:status`` header must be set.
-           *
-           * @generated from field: envoy.service.ext_proc.v3.HttpHeaders headers_response = 1;
-           */
-          value: HttpHeaders;
-          case: "headersResponse";
-        }
-      | {
-          /**
-           * Response body to be sent downstream.
-           *
-           * @generated from field: envoy.service.ext_proc.v3.StreamedBodyResponse body_response = 2;
-           */
-          value: StreamedBodyResponse;
-          case: "bodyResponse";
-        }
-      | {
-          /**
-           * Response trailers to be sent downstream.
-           *
-           * @generated from field: envoy.config.core.v3.HeaderMap trailers_response = 3;
-           */
-          value: HeaderMap;
-          case: "trailersResponse";
-        }
-      | { case: undefined; value?: undefined };
-  };
+    value: HttpHeaders;
+    case: "headersResponse";
+  } | {
+    /**
+     * Response body to be sent downstream.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.StreamedBodyResponse body_response = 2;
+     */
+    value: StreamedBodyResponse;
+    case: "bodyResponse";
+  } | {
+    /**
+     * Response trailers to be sent downstream.
+     *
+     * @generated from field: envoy.config.core.v3.HeaderMap trailers_response = 3;
+     */
+    value: HeaderMap;
+    case: "trailersResponse";
+  } | { case: undefined; value?: undefined };
+};
 
 /**
  * Describes the message envoy.service.ext_proc.v3.StreamedImmediateResponse.
  * Use `create(StreamedImmediateResponseSchema)` to create a new message.
  */
-export const StreamedImmediateResponseSchema: GenMessage<StreamedImmediateResponse> /*@__PURE__*/ =
+export const StreamedImmediateResponseSchema: GenMessage<StreamedImmediateResponse> = /*@__PURE__*/
   messageDesc(file_envoy_service_ext_proc_v3_external_processor, 9);
 
 /**
@@ -725,10 +673,8 @@ export type CommonResponse = Message<"envoy.service.ext_proc.v3.CommonResponse">
  * Describes the message envoy.service.ext_proc.v3.CommonResponse.
  * Use `create(CommonResponseSchema)` to create a new message.
  */
-export const CommonResponseSchema: GenMessage<CommonResponse> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  10,
-);
+export const CommonResponseSchema: GenMessage<CommonResponse> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 10);
 
 /**
  * The status of the response.
@@ -769,7 +715,7 @@ export enum CommonResponse_ResponseStatus {
 /**
  * Describes the enum envoy.service.ext_proc.v3.CommonResponse.ResponseStatus.
  */
-export const CommonResponse_ResponseStatusSchema: GenEnum<CommonResponse_ResponseStatus> /*@__PURE__*/ =
+export const CommonResponse_ResponseStatusSchema: GenEnum<CommonResponse_ResponseStatus> = /*@__PURE__*/
   enumDesc(file_envoy_service_ext_proc_v3_external_processor, 10, 0);
 
 /**
@@ -825,10 +771,8 @@ export type ImmediateResponse = Message<"envoy.service.ext_proc.v3.ImmediateResp
  * Describes the message envoy.service.ext_proc.v3.ImmediateResponse.
  * Use `create(ImmediateResponseSchema)` to create a new message.
  */
-export const ImmediateResponseSchema: GenMessage<ImmediateResponse> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  11,
-);
+export const ImmediateResponseSchema: GenMessage<ImmediateResponse> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 11);
 
 /**
  * This message specifies a gRPC status for an ``ImmediateResponse`` message.
@@ -848,10 +792,8 @@ export type GrpcStatus = Message<"envoy.service.ext_proc.v3.GrpcStatus"> & {
  * Describes the message envoy.service.ext_proc.v3.GrpcStatus.
  * Use `create(GrpcStatusSchema)` to create a new message.
  */
-export const GrpcStatusSchema: GenMessage<GrpcStatus> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  12,
-);
+export const GrpcStatusSchema: GenMessage<GrpcStatus> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 12);
 
 /**
  * Change HTTP headers or trailers by appending, replacing, or removing
@@ -884,10 +826,8 @@ export type HeaderMutation = Message<"envoy.service.ext_proc.v3.HeaderMutation">
  * Describes the message envoy.service.ext_proc.v3.HeaderMutation.
  * Use `create(HeaderMutationSchema)` to create a new message.
  */
-export const HeaderMutationSchema: GenMessage<HeaderMutation> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  13,
-);
+export const HeaderMutationSchema: GenMessage<HeaderMutation> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 13);
 
 /**
  * The body response message corresponding to ``FULL_DUPLEX_STREAMED`` or ``GRPC`` body modes.
@@ -941,7 +881,7 @@ export type StreamedBodyResponse = Message<"envoy.service.ext_proc.v3.StreamedBo
  * Describes the message envoy.service.ext_proc.v3.StreamedBodyResponse.
  * Use `create(StreamedBodyResponseSchema)` to create a new message.
  */
-export const StreamedBodyResponseSchema: GenMessage<StreamedBodyResponse> /*@__PURE__*/ =
+export const StreamedBodyResponseSchema: GenMessage<StreamedBodyResponse> = /*@__PURE__*/
   messageDesc(file_envoy_service_ext_proc_v3_external_processor, 14);
 
 /**
@@ -955,53 +895,47 @@ export type BodyMutation = Message<"envoy.service.ext_proc.v3.BodyMutation"> & {
    *
    * @generated from oneof envoy.service.ext_proc.v3.BodyMutation.mutation
    */
-  mutation:
-    | {
-        /**
-         * The entire body to replace.
-         * Should only be used when the corresponding ``BodySendMode`` in the
-         * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
-         * is not set to ``FULL_DUPLEX_STREAMED`` or ``GRPC``.
-         *
-         * @generated from field: bytes body = 1;
-         */
-        value: Uint8Array;
-        case: "body";
-      }
-    | {
-        /**
-         * Clear the corresponding body chunk. Should only be used when the corresponding
-         * ``BodySendMode`` in the
-         * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
-         * is not set to ``FULL_DUPLEX_STREAMED`` or ``GRPC``.
-         *
-         * @generated from field: bool clear_body = 2;
-         */
-        value: boolean;
-        case: "clearBody";
-      }
-    | {
-        /**
-         * Must be used when the corresponding ``BodySendMode`` in the
-         * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
-         * is set to ``FULL_DUPLEX_STREAMED`` or ``GRPC``.
-         *
-         * @generated from field: envoy.service.ext_proc.v3.StreamedBodyResponse streamed_response = 3;
-         */
-        value: StreamedBodyResponse;
-        case: "streamedResponse";
-      }
-    | { case: undefined; value?: undefined };
+  mutation: {
+    /**
+     * The entire body to replace.
+     * Should only be used when the corresponding ``BodySendMode`` in the
+     * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
+     * is not set to ``FULL_DUPLEX_STREAMED`` or ``GRPC``.
+     *
+     * @generated from field: bytes body = 1;
+     */
+    value: Uint8Array;
+    case: "body";
+  } | {
+    /**
+     * Clear the corresponding body chunk. Should only be used when the corresponding
+     * ``BodySendMode`` in the
+     * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
+     * is not set to ``FULL_DUPLEX_STREAMED`` or ``GRPC``.
+     *
+     * @generated from field: bool clear_body = 2;
+     */
+    value: boolean;
+    case: "clearBody";
+  } | {
+    /**
+     * Must be used when the corresponding ``BodySendMode`` in the
+     * :ref:`processing_mode <envoy_v3_api_field_extensions.filters.http.ext_proc.v3.ExternalProcessor.processing_mode>`
+     * is set to ``FULL_DUPLEX_STREAMED`` or ``GRPC``.
+     *
+     * @generated from field: envoy.service.ext_proc.v3.StreamedBodyResponse streamed_response = 3;
+     */
+    value: StreamedBodyResponse;
+    case: "streamedResponse";
+  } | { case: undefined; value?: undefined };
 };
 
 /**
  * Describes the message envoy.service.ext_proc.v3.BodyMutation.
  * Use `create(BodyMutationSchema)` to create a new message.
  */
-export const BodyMutationSchema: GenMessage<BodyMutation> /*@__PURE__*/ = messageDesc(
-  file_envoy_service_ext_proc_v3_external_processor,
-  15,
-);
+export const BodyMutationSchema: GenMessage<BodyMutation> = /*@__PURE__*/
+  messageDesc(file_envoy_service_ext_proc_v3_external_processor, 15);
 
 /**
  * A service that can access and modify HTTP requests and responses as part of a filter chain.
@@ -1041,5 +975,7 @@ export const ExternalProcessor: GenService<{
     methodKind: "bidi_streaming";
     input: typeof ProcessingRequestSchema;
     output: typeof ProcessingResponseSchema;
-  };
-}> /*@__PURE__*/ = serviceDesc(file_envoy_service_ext_proc_v3_external_processor, 0);
+  },
+}> = /*@__PURE__*/
+  serviceDesc(file_envoy_service_ext_proc_v3_external_processor, 0);
+

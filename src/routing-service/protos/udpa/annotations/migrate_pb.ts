@@ -13,9 +13,8 @@ import type { Message } from "@bufbuild/protobuf";
 /**
  * Describes the file udpa/annotations/migrate.proto.
  */
-export const file_udpa_annotations_migrate: GenFile /*@__PURE__*/ = fileDesc(
-  "Ch51ZHBhL2Fubm90YXRpb25zL21pZ3JhdGUucHJvdG8SEHVkcGEuYW5ub3RhdGlvbnMiMAoVRmlsZU1pZ3JhdGVBbm5vdGF0aW9uEhcKD21vdmVfdG9fcGFja2FnZRgCIAEoCUIpWidnaXRodWIuY29tL2NuY2YveGRzL2dvL3VkcGEvYW5ub3RhdGlvbnNiBnByb3RvMw",
-);
+export const file_udpa_annotations_migrate: GenFile = /*@__PURE__*/
+  fileDesc("Ch51ZHBhL2Fubm90YXRpb25zL21pZ3JhdGUucHJvdG8SEHVkcGEuYW5ub3RhdGlvbnMiMAoVRmlsZU1pZ3JhdGVBbm5vdGF0aW9uEhcKD21vdmVfdG9fcGFja2FnZRgCIAEoCUIpWidnaXRodWIuY29tL2NuY2YveGRzL2dvL3VkcGEvYW5ub3RhdGlvbnNiBnByb3RvMw");
 
 /**
  * @generated from message udpa.annotations.FileMigrateAnnotation
@@ -34,5 +33,6 @@ export type FileMigrateAnnotation = Message<"udpa.annotations.FileMigrateAnnotat
  * Describes the message udpa.annotations.FileMigrateAnnotation.
  * Use `create(FileMigrateAnnotationSchema)` to create a new message.
  */
-export const FileMigrateAnnotationSchema: GenMessage<FileMigrateAnnotation> /*@__PURE__*/ =
+export const FileMigrateAnnotationSchema: GenMessage<FileMigrateAnnotation> = /*@__PURE__*/
   messageDesc(file_udpa_annotations_migrate, 0);
+

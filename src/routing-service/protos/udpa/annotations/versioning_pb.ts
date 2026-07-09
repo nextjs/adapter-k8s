@@ -13,9 +13,8 @@ import type { Message } from "@bufbuild/protobuf";
 /**
  * Describes the file udpa/annotations/versioning.proto.
  */
-export const file_udpa_annotations_versioning: GenFile /*@__PURE__*/ = fileDesc(
-  "CiF1ZHBhL2Fubm90YXRpb25zL3ZlcnNpb25pbmcucHJvdG8SEHVkcGEuYW5ub3RhdGlvbnMiNQoUVmVyc2lvbmluZ0Fubm90YXRpb24SHQoVcHJldmlvdXNfbWVzc2FnZV90eXBlGAEgASgJQilaJ2dpdGh1Yi5jb20vY25jZi94ZHMvZ28vdWRwYS9hbm5vdGF0aW9uc2IGcHJvdG8z",
-);
+export const file_udpa_annotations_versioning: GenFile = /*@__PURE__*/
+  fileDesc("CiF1ZHBhL2Fubm90YXRpb25zL3ZlcnNpb25pbmcucHJvdG8SEHVkcGEuYW5ub3RhdGlvbnMiNQoUVmVyc2lvbmluZ0Fubm90YXRpb24SHQoVcHJldmlvdXNfbWVzc2FnZV90eXBlGAEgASgJQilaJ2dpdGh1Yi5jb20vY25jZi94ZHMvZ28vdWRwYS9hbm5vdGF0aW9uc2IGcHJvdG8z");
 
 /**
  * @generated from message udpa.annotations.VersioningAnnotation
@@ -35,5 +34,6 @@ export type VersioningAnnotation = Message<"udpa.annotations.VersioningAnnotatio
  * Describes the message udpa.annotations.VersioningAnnotation.
  * Use `create(VersioningAnnotationSchema)` to create a new message.
  */
-export const VersioningAnnotationSchema: GenMessage<VersioningAnnotation> /*@__PURE__*/ =
+export const VersioningAnnotationSchema: GenMessage<VersioningAnnotation> = /*@__PURE__*/
   messageDesc(file_udpa_annotations_versioning, 0);
+

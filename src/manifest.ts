@@ -35,6 +35,7 @@ export function buildRoutingManifest({
   buildId,
   basePath,
   i18n,
+  trailingSlash,
   nextVersion,
   projectDir,
 }: {
@@ -44,6 +45,7 @@ export function buildRoutingManifest({
   buildId: string;
   basePath: string;
   i18n: BuildCompleteContext["config"]["i18n"] | null;
+  trailingSlash: boolean;
   nextVersion: string;
   projectDir: string;
 }): RoutingManifest {
@@ -122,6 +124,7 @@ export function buildRoutingManifest({
     i18n: i18n ?? null,
     buildId,
     basePath,
+    trailingSlash,
     middleware: outputs.middleware
       ? {
           filePath: path.relative(projectDir, outputs.middleware.filePath),

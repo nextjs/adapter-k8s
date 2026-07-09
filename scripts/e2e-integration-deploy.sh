@@ -43,7 +43,7 @@ ADAPTER_DIR="${ADAPTER_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
   {
     echo "BUILD_ID: ${BUILD_ID}"
     echo "DEPLOYMENT_ID: ${NEXT_DEPLOYMENT_ID}"
-    echo "IMMUTABLE_ASSET_TOKEN: undefined"
+    echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: 0"
   } > .adapter-build.log
 } >&2
 

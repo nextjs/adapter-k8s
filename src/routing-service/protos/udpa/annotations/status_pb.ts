@@ -13,9 +13,8 @@ import type { Message } from "@bufbuild/protobuf";
 /**
  * Describes the file udpa/annotations/status.proto.
  */
-export const file_udpa_annotations_status: GenFile /*@__PURE__*/ = fileDesc(
-  "Ch11ZHBhL2Fubm90YXRpb25zL3N0YXR1cy5wcm90bxIQdWRwYS5hbm5vdGF0aW9ucyJ0ChBTdGF0dXNBbm5vdGF0aW9uEhgKEHdvcmtfaW5fcHJvZ3Jlc3MYASABKAgSRgoWcGFja2FnZV92ZXJzaW9uX3N0YXR1cxgCIAEoDjImLnVkcGEuYW5ub3RhdGlvbnMuUGFja2FnZVZlcnNpb25TdGF0dXMqXQoUUGFja2FnZVZlcnNpb25TdGF0dXMSCwoHVU5LTk9XThAAEgoKBkZST1pFThABEgoKBkFDVElWRRACEiAKHE5FWFRfTUFKT1JfVkVSU0lPTl9DQU5ESURBVEUQA0IpWidnaXRodWIuY29tL2NuY2YveGRzL2dvL3VkcGEvYW5ub3RhdGlvbnNiBnByb3RvMw",
-);
+export const file_udpa_annotations_status: GenFile = /*@__PURE__*/
+  fileDesc("Ch11ZHBhL2Fubm90YXRpb25zL3N0YXR1cy5wcm90bxIQdWRwYS5hbm5vdGF0aW9ucyJ0ChBTdGF0dXNBbm5vdGF0aW9uEhgKEHdvcmtfaW5fcHJvZ3Jlc3MYASABKAgSRgoWcGFja2FnZV92ZXJzaW9uX3N0YXR1cxgCIAEoDjImLnVkcGEuYW5ub3RhdGlvbnMuUGFja2FnZVZlcnNpb25TdGF0dXMqXQoUUGFja2FnZVZlcnNpb25TdGF0dXMSCwoHVU5LTk9XThAAEgoKBkZST1pFThABEgoKBkFDVElWRRACEiAKHE5FWFRfTUFKT1JfVkVSU0lPTl9DQU5ESURBVEUQA0IpWidnaXRodWIuY29tL2NuY2YveGRzL2dvL3VkcGEvYW5ub3RhdGlvbnNiBnByb3RvMw");
 
 /**
  * @generated from message udpa.annotations.StatusAnnotation
@@ -40,10 +39,8 @@ export type StatusAnnotation = Message<"udpa.annotations.StatusAnnotation"> & {
  * Describes the message udpa.annotations.StatusAnnotation.
  * Use `create(StatusAnnotationSchema)` to create a new message.
  */
-export const StatusAnnotationSchema: GenMessage<StatusAnnotation> /*@__PURE__*/ = messageDesc(
-  file_udpa_annotations_status,
-  0,
-);
+export const StatusAnnotationSchema: GenMessage<StatusAnnotation> = /*@__PURE__*/
+  messageDesc(file_udpa_annotations_status, 0);
 
 /**
  * @generated from enum udpa.annotations.PackageVersionStatus
@@ -82,7 +79,6 @@ export enum PackageVersionStatus {
 /**
  * Describes the enum udpa.annotations.PackageVersionStatus.
  */
-export const PackageVersionStatusSchema: GenEnum<PackageVersionStatus> /*@__PURE__*/ = enumDesc(
-  file_udpa_annotations_status,
-  0,
-);
+export const PackageVersionStatusSchema: GenEnum<PackageVersionStatus> = /*@__PURE__*/
+  enumDesc(file_udpa_annotations_status, 0);
+

@@ -4,7 +4,8 @@ import { mockRouting } from "../helpers/mock-outputs.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
 
-vi.mock("@next/routing", () => ({
+vi.mock("@next/routing", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@next/routing")>()),
   resolveRoutes: vi.fn(),
   responseToMiddlewareResult: vi.fn(),
 }));

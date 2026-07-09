@@ -1,7 +1,16 @@
 // src/pool-server/resolve.ts
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
-import { lookupPool, resolveRscOutput, type RscConfig } from "../routing-common.js";
+import {
+  lookupPool,
+  manifestNextConfig,
+  normalizeMatchedPathname,
+  normalizeResolvedRedirect,
+  preferConcreteOutput,
+  prepareRequest,
+  resolveRscOutput,
+  type RscConfig,
+} from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
 
@@ -14,16 +23,24 @@ export type ResolveResult =
       resolvedHeaders: Headers | undefined;
       middlewareRequestHeaders?: Headers | undefined;
     }
-  | { kind: "redirect"; url: URL; status: number }
+  | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
+  | { kind: "error"; status: number }
   | { kind: "middleware-response"; response: Response }
   | { kind: "external-rewrite"; url: URL }
-  | { kind: "not-found" };
+  | { kind: "not-found"; resolvedHeaders?: Headers | undefined };
 
 export function createLocalResolver(
   manifest: RoutingManifest,
   middlewareModule?: LoadedModule | null,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   edgeMiddlewareRunner?: ((ctx: any) => Promise<Response | null>) | null,
+  // App-scoped next/dist/server/body-streams#getCloneableBody. Node middleware's
+  // web adapter reads request.body via .cloneBodyStream(), so a POST body must
+  // be wrapped as a CloneableBody, not passed as a raw ReadableStream (doing so
+  // throws at invocation — which, before failing closed, silently skipped node
+  // middleware entirely on body requests).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  getCloneableBody?: ((readable: any) => any) | null,
 ) {
   return {
     async resolve(
@@ -37,6 +54,18 @@ export function createLocalResolver(
       // This includes x-middleware-set-cookie, x-middleware-override-headers,
       // and x-middleware-request-* modifications — all applied in one place.
       let middlewareRequestHeaders: Headers | null = null;
+      // Fail CLOSED: a middleware that throws must become a 500, never a silent
+      // "middleware passed". Otherwise a crashing/incompatible middleware would
+      // bypass the auth, redirects, and rewrites it implements. Mirrors Next's
+      // own behavior (thrown middleware → 500) and the ext_proc edge.
+      let middlewareThrew = false;
+
+      // Shared request normalization (decode-400, slash-collapse 308, locale
+      // prefixing) — one sequence with the ext_proc edge (routing-common.ts).
+      const prep = prepareRequest(url, headers, manifest);
+      if (prep.kind === "error") return { kind: "error", status: prep.status };
+      if (prep.kind === "redirect") return { kind: "redirect", url: prep.url, status: prep.status };
+      url = prep.url;
 
       const resolution = await resolveRoutes({
         url,
@@ -113,18 +142,27 @@ export function createLocalResolver(
                       const requestHeaders = Object.fromEntries(
                         [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                       );
+                      // Node middleware wants request.body as a CloneableBody
+                      // (has .cloneBodyStream()); wrap the buffered body in a
+                      // Node Readable. GET/HEAD carry no body.
+                      let mwBody: unknown;
+                      if (method !== "GET" && method !== "HEAD") {
+                        if (getCloneableBody) {
+                          const { Readable } = await import("node:stream");
+                          mwBody = getCloneableBody(Readable.fromWeb(ctx.requestBody as any));
+                        } else {
+                          mwBody = ctx.requestBody;
+                        }
+                      }
                       const result = await (adapterFn as any)({
                         handler: handlerFn,
                         request: {
                           url: ctx.url.toString(),
                           method,
                           headers: requestHeaders,
-                          body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                          body: mwBody,
                           signal: new AbortController().signal,
-                          nextConfig: {
-                            basePath: manifest.basePath || undefined,
-                            i18n: (manifest.i18n as any) ?? undefined,
-                          },
+                          nextConfig: manifestNextConfig(manifest),
                           waitUntil,
                         },
                         page: "middleware",
@@ -209,27 +247,30 @@ export function createLocalResolver(
                   return {};
                 } catch (err) {
                   console.error("[pool-server] Middleware execution failed:", err);
-                  return {};
+                  middlewareThrew = true;
+                  return { bodySent: true };
                 }
               }
             : async () => ({}),
       });
 
-      // 1. Redirect
-      if (resolution.redirect) {
-        return {
-          kind: "redirect",
-          url: resolution.redirect.url,
-          status: resolution.redirect.status,
-        };
+      if (middlewareThrew) {
+        return { kind: "error", status: 500 };
       }
 
-      const location = resolution.resolvedHeaders?.get("location");
-      if (location && [301, 302, 307, 308].includes(resolution.status ?? 0)) {
+      // 1. Redirects (rule/detection + Location-in-resolvedHeaders) — shared
+      // normalization with the ext_proc edge (routing-common.ts).
+      const redirect = normalizeResolvedRedirect(resolution, prep, manifest);
+      if (redirect) {
+        if (redirect.kind === "retry") {
+          // Spurious internal trailing-slash redirect — resolve the real target.
+          return this.resolve(redirect.retryUrl, headers, method, requestBody);
+        }
         return {
           kind: "redirect",
-          url: new URL(location, url.origin),
-          status: resolution.status!,
+          url: redirect.url,
+          status: redirect.status,
+          resolvedHeaders: redirect.resolvedHeaders,
         };
       }
 
@@ -259,11 +300,19 @@ export function createLocalResolver(
       );
 
       if (!pool) {
-        return { kind: "not-found" };
+        // Preserve headers set by middleware (NextResponse.next() with headers)
+        // and route rules — they must still reach the 404 response.
+        return { kind: "not-found", resolvedHeaders: resolution.resolvedHeaders ?? undefined };
       }
 
-      const baseMatchedPathname =
-        resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname;
+      let baseMatchedPathname = normalizeMatchedPathname(
+        resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname,
+        manifest.poolAssignments,
+      );
+      // Concrete prerendered outputs win over dynamic templates (decoded lookup).
+      baseMatchedPathname =
+        preferConcreteOutput(url.pathname, baseMatchedPathname, manifest.poolAssignments) ??
+        baseMatchedPathname;
 
       // For RSC requests, resolve to the .rsc / segment-prefetch output variant so the handler
       // returns a flight payload instead of HTML. Shared with the ext_proc edge path

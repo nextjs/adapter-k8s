@@ -29,7 +29,7 @@ export NEXT_DEPLOYMENT_ID="apphosting-baseline-${DEPLOY_RANDOM}"
 {
   echo "BUILD_ID: ${BUILD_ID}"
   echo "DEPLOYMENT_ID: ${NEXT_DEPLOYMENT_ID}"
-  echo "IMMUTABLE_ASSET_TOKEN: undefined"
+  echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: 0"
 } > .adapter-build.log
 
 RUN_COMMAND="$(node - <<'NODE'
