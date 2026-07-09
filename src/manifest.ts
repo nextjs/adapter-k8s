@@ -6,6 +6,15 @@ import type {
   PoolDefinition,
   RoutingManifest,
 } from "./types.js";
+import type { RouteHasCondition } from "./routing-common.js";
+
+// Build-time middleware matcher shape (outputs.middleware.config.matchers).
+interface MiddlewareMatcherBuild {
+  source: string;
+  sourceRegex: string;
+  has?: RouteHasCondition[];
+  missing?: RouteHasCondition[];
+}
 
 export function collectOutputPathnames(outputs: AdapterOutputs): string[] {
   const pathnames = new Set<string>();
@@ -129,6 +138,15 @@ export function buildRoutingManifest({
       ? {
           filePath: path.relative(projectDir, outputs.middleware.filePath),
           runtime: (outputs.middleware as any).runtime ?? "nodejs",
+          matchers: (
+            (outputs.middleware as { config?: { matchers?: MiddlewareMatcherBuild[] } }).config
+              ?.matchers ?? []
+          ).map((m) => ({
+            regexp: m.sourceRegex,
+            ...(m.has ? { has: m.has } : {}),
+            ...(m.missing ? { missing: m.missing } : {}),
+            originalSource: m.source,
+          })),
         }
       : null,
     poolAssignments,

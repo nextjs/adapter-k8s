@@ -456,4 +456,163 @@ it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () =
     if (result.kind === "route") expect(result.invokePath).toBeUndefined();
   });
 
+
+  it("emits x-nextjs-rewritten-path/-query for an RSC middleware rewrite", async () => {
+    const manifest = makeManifest();
+    // rsc config so isRscReq is detected from the header.
+    (manifest.routeGraph as any).rsc = { header: "rsc", suffix: ".rsc" };
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/blog/[slug]",
+      invocationTarget: {
+        pathname: "/blog/from-middleware",
+        // user query + internal capture params that must be filtered out
+        query: { some: "middleware", nxtPslug: "from-middleware" },
+      },
+      routeMatches: { slug: "from-middleware" },
+    });
+    const resolver = createLocalResolver(manifest);
+    const result = await resolver.resolve(
+      new URL("http://localhost/rewrite-to-dynamic"),
+      new Headers({ rsc: "1" }),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.resolvedHeaders?.get("x-nextjs-rewritten-path")).toBe("/blog/from-middleware");
+      // internal nxtP* filtered, only user query remains
+      expect(result.resolvedHeaders?.get("x-nextjs-rewritten-query")).toBe("some=middleware");
+    }
+  });
+
+  it("does not emit rewrite headers for a non-RSC request or a non-rewrite", async () => {
+    const manifest = makeManifest();
+    (manifest.routeGraph as any).rsc = { header: "rsc", suffix: ".rsc" };
+    // Non-RSC request that IS rewritten → no RSC headers (handled via invokePath).
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/blog/[slug]",
+      invocationTarget: { pathname: "/blog/from-middleware", query: { some: "middleware" } },
+    });
+    const resolver = createLocalResolver(manifest);
+    const r1 = await resolver.resolve(
+      new URL("http://localhost/rewrite-to-dynamic"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    if (r1.kind === "route") expect(r1.resolvedHeaders?.get("x-nextjs-rewritten-path")).toBeFalsy();
+
+    // RSC request with no rewrite (target === request) → no headers.
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    });
+    const r2 = await resolver.resolve(
+      new URL("http://localhost/about"),
+      new Headers({ rsc: "1" }),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    if (r2.kind === "route") expect(r2.resolvedHeaders?.get("x-nextjs-rewritten-path")).toBeFalsy();
+  });
+
+
+  // REGRESSION: fail-closed must NOT fire for normal middleware. A middleware
+  // that returns next()/rewrite/redirect (does not throw) must resolve
+  // normally — never a 500. Guards the fail-open→fail-closed change from
+  // over-firing on legitimate middleware.
+  it("does NOT 500 when middleware returns normally (next)", async () => {
+    const manifest = makeManifest();
+    const okMiddleware = vi.fn().mockResolvedValue({
+      response: new Response(null, { headers: { "x-middleware-next": "1" } }),
+      waitUntil: Promise.resolve(),
+    });
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      await options.invokeMiddleware({
+        url: new URL("http://localhost/ok"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+      return { resolvedPathname: "/ok", invocationTarget: { pathname: "/ok" } };
+    });
+    const resolver = createLocalResolver(manifest, { default: okMiddleware, middleware: () => {} });
+    const result = await resolver.resolve(
+      new URL("http://localhost/ok"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(result.kind).toBe("route");
+    expect((result as any).status).not.toBe(500);
+  });
+
+  // REGRESSION: middleware `matcher` gating. When matchers are provided and the
+  // request does NOT match, the middleware function must not be invoked at all
+  // (the resolver returns the no-middleware routing result). A bug here would
+  // run middleware on paths its config excludes.
+  it("skips middleware invocation when the matcher does not match", async () => {
+    const manifest = makeManifest();
+    const mw = vi.fn().mockResolvedValue({ response: new Response(null) });
+    let invokeMwCalled = false;
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      const r = await options.invokeMiddleware({
+        url: new URL("http://localhost/not-matched"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+      invokeMwCalled = true;
+      // matcher no-match → invokeMiddleware returns {} without calling mw
+      expect(r).toEqual({});
+      return { resolvedPathname: "/not-matched", invocationTarget: { pathname: "/not-matched" } };
+    });
+    const matchers = [{ regexp: "^\\/only-here$", originalSource: "/only-here" }];
+    const resolver = createLocalResolver(
+      manifest,
+      { default: mw, middleware: () => {} },
+      null,
+      null,
+      matchers,
+    );
+    await resolver.resolve(
+      new URL("http://localhost/not-matched"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(invokeMwCalled).toBe(true);
+    expect(mw).not.toHaveBeenCalled();
+  });
+
+  // REGRESSION: matcher gating must still RUN middleware on a matching path.
+  it("invokes middleware when the matcher matches", async () => {
+    const manifest = makeManifest();
+    const mw = vi.fn().mockResolvedValue({
+      response: new Response(null, { headers: { "x-middleware-next": "1" } }),
+      waitUntil: Promise.resolve(),
+    });
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      await options.invokeMiddleware({
+        url: new URL("http://localhost/only-here"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+      return { resolvedPathname: "/only-here", invocationTarget: { pathname: "/only-here" } };
+    });
+    const matchers = [{ regexp: "^\\/only-here$", originalSource: "/only-here" }];
+    const resolver = createLocalResolver(
+      manifest,
+      { default: mw, middleware: () => {} },
+      null,
+      null,
+      matchers,
+    );
+    await resolver.resolve(
+      new URL("http://localhost/only-here"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(mw).toHaveBeenCalledOnce();
+  });
+
 });

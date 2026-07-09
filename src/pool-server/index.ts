@@ -6,7 +6,7 @@ import dns from "node:dns/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest } from "../types.js";
-import { getRscConfig, manifestNextConfig, rscParentCandidates, templateOutputCandidates, type RscConfig } from "../routing-common.js";
+import { getRscConfig, manifestNextConfig, rscParentCandidates, templateOutputCandidates, type MiddlewareMatcher, type RscConfig } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { createLocalResolver } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
@@ -494,7 +494,7 @@ async function main() {
     "middleware-manifest.json",
   );
   const middlewareManifest: {
-    middleware: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
+    middleware: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[]; matchers?: MiddlewareMatcher[] }>;
     functions: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
   } = existsSync(middlewareManifestPath)
     ? JSON.parse(readFileSync(middlewareManifestPath, "utf-8"))
@@ -673,11 +673,18 @@ async function main() {
   }
 
   const handlerLoader = createHandlerLoader(poolManifest);
+  // Middleware matchers (source regexp + has/missing) gate whether middleware
+  // runs for a request. From middleware-manifest.json (already loaded).
+  const middlewareMatchers: MiddlewareMatcher[] | undefined = routingManifest.middleware
+    ? Object.values(middlewareManifest.middleware)[0]?.matchers
+    : undefined;
+
   const resolver = createLocalResolver(
     routingManifest,
     middlewareModule,
     edgeMiddlewareRunner,
     getCloneableBody,
+    middlewareMatchers,
   );
   const dispatcher = createDispatcher({
     handlerLoader,

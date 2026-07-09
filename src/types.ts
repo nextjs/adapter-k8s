@@ -1,6 +1,7 @@
 // src/types.ts
 import type { NextAdapter, AdapterOutput } from "next";
 import type { ResolveRoutesParams } from "@next/routing";
+import type { MiddlewareMatcher } from "./routing-common.js";
 
 // Use AdapterOutputs from the stable adapter API
 // Re-exported from the BuildCompleteContext parameter type
@@ -75,7 +76,12 @@ export interface RoutingManifest {
   buildId: string;
   basePath: string;
   trailingSlash?: boolean;
-  middleware: { filePath: string; runtime?: string } | null;
+  middleware: {
+    filePath: string;
+    runtime?: string;
+    /** Compiled `config.matcher` — middleware only runs on matching requests. */
+    matchers?: MiddlewareMatcher[];
+  } | null;
   poolAssignments: Record<string, string>;
   pprRoutes: Record<
     string,

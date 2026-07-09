@@ -4,11 +4,13 @@ import type { RoutingManifest } from "../types.js";
 import {
   lookupPool,
   manifestNextConfig,
+  matchesMiddleware,
   normalizeMatchedPathname,
   normalizeResolvedRedirect,
   preferConcreteOutput,
   prepareRequest,
   resolveRscOutput,
+  type MiddlewareMatcher,
   type RscConfig,
 } from "../routing-common.js";
 
@@ -44,6 +46,9 @@ export function createLocalResolver(
   // middleware entirely on body requests).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   getCloneableBody?: ((readable: any) => any) | null,
+  // Middleware `matcher` config (source regexp + has/missing) — middleware only
+  // runs when the request matches. Absent → run always.
+  middlewareMatchers?: MiddlewareMatcher[] | undefined,
 ) {
   return {
     async resolve(
@@ -100,6 +105,12 @@ export function createLocalResolver(
                 // misinterpret the result (sets bodySent=true incorrectly).
 
                 try {
+                  // Honor the middleware `matcher` config: skip middleware for
+                  // requests it doesn't match (has/missing conditions, source).
+                  if (!matchesMiddleware(middlewareMatchers, ctx.url, ctx.headers)) {
+                    return {};
+                  }
+
                   let response: Response | null = null;
 
                   // Path 0: Edge sandbox (for edge-compiled middleware)
@@ -334,10 +345,16 @@ export function createLocalResolver(
       // added locale prefix (handlers receive the unprefixed URL, matching
       // non-rewrite behavior). Only set when it differs from the original
       // request so normal requests dispatch exactly as before.
-      // RSC / _next/data requests carry internal negotiation query and follow
-      // their own URL handling (the .rsc/segment output + request headers) —
-      // rewriting their handler URL corrupts flight/data resolution. Restrict
-      // the invoke-URL override to plain document requests.
+      //
+      // A middleware/config rewrite is handled two ways depending on request
+      // kind. For a plain document request we override the handler URL
+      // (invokePath) so params/query render correctly. For an RSC request the
+      // routing already resolved the right handler+params (the flight renders
+      // correctly), but the client router needs the x-nextjs-rewritten-path /
+      // -query response headers to reconcile its URL state — without them
+      // router.query reflects the ORIGINAL request path. This is the core of
+      // "middleware rewrites work behind a CDN": the client-transition (flight)
+      // path must carry the rewrite signal, not just the direct render.
       const rscHeader = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc?.header;
       const isRscReq = rscHeader ? headers.get(rscHeader) === "1" : false;
       const isDataReq = url.pathname.includes("/_next/data/");
@@ -353,8 +370,45 @@ export function createLocalResolver(
         const q = resolution.invocationTarget?.query ?? resolution.resolvedQuery;
         const qs = buildQueryString(q);
         const candidate = targetPath + qs;
-        const orig = prep.originalUrl.pathname + prep.originalUrl.search;
-        if (candidate !== orig) invokePath = candidate;
+        if (candidate !== prep.originalUrl.pathname + prep.originalUrl.search) invokePath = candidate;
+      }
+
+      // Middleware/config rewrites must be signalled to the client on the
+      // negotiation requests it makes during a client-side navigation, or the
+      // router's URL state stays on the original path (wrong router.query).
+      // This is the crux of "middleware rewrites work behind a CDN". The two
+      // client protocols:
+      //   - App Router (RSC): x-nextjs-rewritten-path + x-nextjs-rewritten-query
+      //   - Pages Router (_next/data): x-nextjs-rewrite: <path?query>
+      // invocationTarget carries the clean rewritten pathname (e.g.
+      // /blog/from-middleware); its query holds the user-visible params PLUS
+      // internal routing captures (nxtP*, _rsc) — filter those so the headers
+      // match `next start`.
+      // App Router RSC rewrites: the flight render already resolved the right
+      // handler+params, but the client router needs x-nextjs-rewritten-path /
+      // -query to reconcile its URL state (otherwise router.query reflects the
+      // ORIGINAL request path). invocationTarget carries the clean rewritten
+      // pathname; filter internal capture params (nxtP*, _rsc) from its query.
+      // (Pages Router _next/data rewrite signalling is a separate bucket — its
+      // double-resolve path makes the header capture unreliable here.)
+      let resolvedHeaders = resolution.resolvedHeaders ?? undefined;
+      if (isRscReq && resolution.invocationTarget?.pathname) {
+        let rwPath = resolution.invocationTarget.pathname;
+        if (prep.addedLocale) {
+          const pfx = `/${prep.addedLocale}`;
+          if (rwPath === pfx) rwPath = "/";
+          else if (rwPath.startsWith(pfx + "/")) rwPath = rwPath.slice(pfx.length);
+        }
+        const rwQs = buildQueryString(
+          filterInternalQuery(resolution.invocationTarget.query ?? resolution.resolvedQuery),
+        );
+        const pathChanged = rwPath !== prep.originalUrl.pathname;
+        const queryChanged = rwQs !== prep.originalUrl.search;
+        if (pathChanged || queryChanged) {
+          resolvedHeaders = new Headers(resolvedHeaders ?? undefined);
+          if (pathChanged) resolvedHeaders.set("x-nextjs-rewritten-path", rwPath);
+          if (queryChanged) resolvedHeaders.set("x-nextjs-rewritten-query", rwQs.replace(/^\?/, ""));
+        }
       }
 
       return {
@@ -362,12 +416,26 @@ export function createLocalResolver(
         pool,
         matchedPathname: finalMatchedPathname,
         routeMatches: resolution.routeMatches ?? null,
-        resolvedHeaders: resolution.resolvedHeaders ?? undefined,
+        resolvedHeaders,
         middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
         invokePath,
       };
     },
   };
+}
+
+// Drop @next/routing internal capture params (dynamic-route captures nxtP*, the
+// RSC union query _rsc) so they don't leak into client-facing rewrite headers.
+function filterInternalQuery(
+  query: Record<string, string | string[]> | undefined,
+): Record<string, string | string[]> | undefined {
+  if (!query) return undefined;
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(query)) {
+    if (k.startsWith("nxtP") || k === "_rsc") continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 // Serialize a resolved query (Record<string, string | string[]>) to a "?a=b&..."

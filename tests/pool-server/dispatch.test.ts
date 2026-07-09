@@ -1,6 +1,6 @@
 // tests/pool-server/dispatch.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { createDispatcher } from "../../src/pool-server/dispatch.js";
+import { createDispatcher, getContentType } from "../../src/pool-server/dispatch.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
@@ -388,6 +388,112 @@ describe("createDispatcher", () => {
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
     });
 
+    it("does NOT 404 a dynamic path that matches no strict route (fallback:blocking / dynamicParams:true)", async () => {
+      // App has a fallback:false route (/blog/[slug]) but the request is for a
+      // DIFFERENT dynamic route (/shop/[id]) that is fallback:blocking — it must
+      // be served on-demand, never 404'd by the strict check.
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((p: string) => p === "/shop/[id]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
+        prerenderedPaths: new Set(["/blog/first"]),
+        buildIdForData: "test123",
+      });
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/shop/anything"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/shop/[id]",
+        routeMatches: { id: "anything" },
+        resolvedHeaders: undefined,
+      });
+      expect(res._status).not.toBe(404);
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
+    it("does NOT 404 anything when there are no strict dynamic routes", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        // strictDynamicRoutes omitted → no gating
+      });
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/blog/never-generated"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "never-generated" },
+        resolvedHeaders: undefined,
+      });
+      expect(res._status).not.toBe(404);
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
+    it("applies the fallback:false 404 check to the REWRITTEN path (invokePath)", async () => {
+      // A middleware rewrite lands on a fallback:false dynamic route that was
+      // never generated → 404, evaluated against the rewritten path (req.url is
+      // updated from invokePath before the strict check).
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((p: string) => p === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
+        prerenderedPaths: new Set(["/blog/first"]),
+        buildIdForData: "test123",
+      });
+      const res = mockRes();
+      // Request /rw, but middleware rewrote it to /blog/never (via invokePath).
+      await dispatcher.dispatch(mockReq("/rw"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "never" },
+        resolvedHeaders: undefined,
+        invokePath: "/blog/never",
+      });
+      expect(res._status).toBe(404);
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+    });
+
+    it("returns 500 (Internal Server Error) for the error kind >= 500", async () => {
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/boom"), res as unknown as ServerResponse, {
+        kind: "error",
+        status: 500,
+      });
+      expect(res._status).toBe(500);
+      expect(res._body).toContain("Internal Server Error");
+    });
+
     it("lets a preview (__prerender_bypass) request through a fallback:false route", async () => {
       const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
       const dispatcher = createDispatcher({
@@ -642,4 +748,36 @@ describe("createDispatcher", () => {
       );
     });
   });
+});
+
+
+// REGRESSION: getContentType — the map that was extended to fix sitemap
+// (application/xml), font, and asset content-types surfacing in e2e. A missing
+// entry silently serves the wrong type (e.g. sitemap.xml as octet-stream).
+describe("getContentType", () => {
+  const cases: [string, string][] = [
+    ["/sitemap.xml", "application/xml"],
+    ["/robots.txt", "text/plain; charset=utf-8"],
+    ["/a.html", "text/html; charset=utf-8"],
+    ["/a.json", "application/json; charset=utf-8"],
+    ["/a.js", "application/javascript; charset=utf-8"],
+    ["/a.css", "text/css; charset=utf-8"],
+    ["/a.rsc", "text/x-component"],
+    ["/img.png", "image/png"],
+    ["/img.webp", "image/webp"],
+    ["/img.avif", "image/avif"],
+    ["/img.svg", "image/svg+xml"],
+    ["/f.woff2", "font/woff2"],
+    ["/f.woff", "font/woff"],
+    ["/app.wasm", "application/wasm"],
+    ["/site.webmanifest", "application/manifest+json"],
+    ["/", "text/html; charset=utf-8"],
+    ["/about", "text/html; charset=utf-8"],
+    ["/mystery.xyz", "application/octet-stream"],
+  ];
+  for (const [p, expected] of cases) {
+    it(`${p} -> ${expected}`, () => {
+      expect(getContentType(p)).toBe(expected);
+    });
+  }
 });

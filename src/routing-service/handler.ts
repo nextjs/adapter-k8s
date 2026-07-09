@@ -9,6 +9,7 @@ import {
 import {
   lookupPool,
   manifestNextConfig,
+  matchesMiddleware,
   normalizeMatchedPathname,
   normalizeResolvedRedirect,
   preferConcreteOutput,
@@ -125,6 +126,12 @@ export function createRequestHandler(
       invokeMiddleware: middlewareModule
         ? async (ctx) => {
             try {
+              // Honor the middleware `matcher` config (parity with the pool
+              // resolver) — skip middleware for requests it doesn't match.
+              if (!matchesMiddleware(manifest.middleware?.matchers, ctx.url, ctx.headers)) {
+                return {};
+              }
+
               let response: Response | null = null;
 
               const adapterFn =

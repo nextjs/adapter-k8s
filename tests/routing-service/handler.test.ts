@@ -442,3 +442,83 @@ describe("createRequestHandler middleware Set-Cookie passthrough (Fix C)", () =>
     expect(cookies).toEqual(["a=1; Path=/", "b=2; Path=/"]);
   });
 });
+
+
+// REGRESSION: ext_proc parity with the pool resolver for the two riskiest
+// middleware changes — matcher gating and fail-closed. These run in production
+// (routing service) and are not exercised by the single-pool e2e path.
+describe("createRequestHandler middleware matcher + fail-closed (ext_proc parity)", () => {
+  beforeEach(() => {
+    vi.mocked(resolveRoutes).mockReset();
+    vi.mocked(responseToMiddlewareResult).mockReset();
+  });
+
+  it("skips middleware invocation when the config.matcher does not match", async () => {
+    const mw = vi.fn().mockResolvedValue({ response: new Response(null) });
+    const middlewareModule = { default: mw, middleware: vi.fn() };
+    let mwResult: any;
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      mwResult = await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return { resolvedPathname: "/about", invocationTarget: { pathname: "/about", query: {} } } as any;
+    });
+    const manifest = makeManifest({
+      middleware: {
+        filePath: "middleware.js",
+        matchers: [{ regexp: "^\\/only-here$", originalSource: "/only-here" }],
+      },
+    });
+    const handler = createRequestHandler(manifest, middlewareModule);
+    await handler(makeHeaders("/about")); // /about does not match /only-here
+    expect(mwResult).toEqual({});
+    expect(mw).not.toHaveBeenCalled();
+  });
+
+  it("invokes middleware when the config.matcher matches", async () => {
+    const adapterFn = vi.fn().mockResolvedValue({ response: new Response("ok") });
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return { resolvedPathname: "/only-here", invocationTarget: { pathname: "/only-here", query: {} } } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+    const manifest = makeManifest({
+      pathnames: ["/only-here"],
+      poolAssignments: { "/only-here": "ssr" },
+      middleware: {
+        filePath: "middleware.js",
+        matchers: [{ regexp: "^\\/only-here$", originalSource: "/only-here" }],
+      },
+    });
+    const handler = createRequestHandler(manifest, middlewareModule);
+    await handler(makeHeaders("/only-here"));
+    expect(adapterFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails CLOSED with a 500 when middleware throws", async () => {
+    const throwing = vi.fn().mockRejectedValue(new Error("boom"));
+    const middlewareModule = { default: throwing, middleware: vi.fn() };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      const r = await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      // fail-closed surfaces as bodySent (short-circuit), never "{}".
+      expect(r).toEqual({ bodySent: true });
+      return { middlewareResponded: true } as any;
+    });
+    const manifest = makeManifest({ middleware: { filePath: "middleware.js" } });
+    const handler = createRequestHandler(manifest, middlewareModule);
+    const res = (await handler(makeHeaders("/about"))) as any;
+    // buildImmediateResponse(500,...) — assert the exact status code is carried.
+    expect(res.immediateResponse?.status?.code).toBe(500);
+  });
+});

@@ -23,6 +23,80 @@ export const INTERNAL_DISPATCH_HEADERS = [
 // Present only on responses from the trusted routing extension / cross-pool proxy.
 export const INTERNAL_SECRET_HEADER = "x-internal-secret";
 
+// A compiled middleware matcher entry from middleware-manifest.json.
+export interface MiddlewareMatcher {
+  regexp: string;
+  has?: RouteHasCondition[];
+  missing?: RouteHasCondition[];
+  originalSource?: string;
+}
+export interface RouteHasCondition {
+  type: "header" | "cookie" | "query" | "host";
+  key?: string;
+  value?: string;
+}
+
+function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): boolean {
+  let actual: string | null | undefined;
+  switch (cond.type) {
+    case "header":
+      actual = cond.key ? headers.get(cond.key) : undefined;
+      break;
+    case "query":
+      actual = cond.key ? url.searchParams.get(cond.key) : undefined;
+      break;
+    case "cookie": {
+      const cookie = headers.get("cookie");
+      if (cookie && cond.key) {
+        for (const part of cookie.split(";")) {
+          const [k, ...v] = part.trim().split("=");
+          if (k === cond.key) {
+            actual = v.join("=");
+            break;
+          }
+        }
+      }
+      break;
+    }
+    case "host":
+      actual = url.hostname;
+      break;
+  }
+  if (actual === null || actual === undefined) return false;
+  if (cond.value === undefined) return true; // presence-only
+  try {
+    return new RegExp(`^${cond.value}$`).test(actual);
+  } catch {
+    return cond.value === actual;
+  }
+}
+
+// Decide whether middleware should run for a request, honoring its `matcher`
+// config (source regexp + has/missing conditions). Without this, middleware
+// runs on every path — breaking matcher-gated middleware (has/missing) and any
+// source-restricted matcher. Empty/absent matchers → run always (a middleware
+// with no config.matcher compiles to a catch-all, but be safe).
+export function matchesMiddleware(
+  matchers: MiddlewareMatcher[] | undefined,
+  url: URL,
+  headers: Headers,
+): boolean {
+  if (!matchers || matchers.length === 0) return true;
+  for (const m of matchers) {
+    let re: RegExp;
+    try {
+      re = new RegExp(m.regexp);
+    } catch {
+      continue;
+    }
+    if (!re.test(url.pathname)) continue;
+    const hasOk = (m.has ?? []).every((c) => conditionPresent(c, headers, url));
+    const missingOk = (m.missing ?? []).every((c) => !conditionPresent(c, headers, url));
+    if (hasOk && missingOk) return true;
+  }
+  return false;
+}
+
 // Strip basePath only at a segment boundary — "/docsy" must NOT be treated as
 // under basePath "/docs" (upstream requires `p === base || p.startsWith(base + "/")`).
 export function stripBasePath(pathname: string, basePath: string): string {

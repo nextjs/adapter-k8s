@@ -24,6 +24,43 @@ describe("collectOutputPathnames", () => {
 });
 
 describe("buildRoutingManifest", () => {
+  // REGRESSION: middleware config.matcher must be carried into the routing
+  // manifest (build-time sourceRegex -> regexp) so the ext_proc edge can gate
+  // middleware. Without it the routing service runs middleware on every path.
+  it("extracts middleware matchers (sourceRegex -> regexp) into the manifest", () => {
+    const outputs = mockOutputs({
+      appPages: [mockAppPage({ pathname: "/" })],
+      middleware: {
+        pathname: "/_middleware",
+        filePath: "/app/.next/server/middleware.js",
+        config: {
+          matchers: [
+            { source: "/only-here", sourceRegex: "^\\/only-here$", has: [{ type: "header", key: "x" }] },
+            { source: "/other", sourceRegex: "^\\/other$", missing: [{ type: "query", key: "q" }] },
+          ],
+        },
+      } as any,
+    });
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
+    ]);
+    const manifest = buildRoutingManifest({
+      routing: mockRouting(),
+      outputs,
+      pools,
+      buildId: "b",
+      basePath: "",
+      i18n: null,
+      trailingSlash: false,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    } as any);
+    expect(manifest.middleware?.matchers).toEqual([
+      { regexp: "^\\/only-here$", has: [{ type: "header", key: "x" }], originalSource: "/only-here" },
+      { regexp: "^\\/other$", missing: [{ type: "query", key: "q" }], originalSource: "/other" },
+    ]);
+  });
+
   it("generates manifest with routeGraph and pool assignments", () => {
     const outputs = mockOutputs({
       appPages: [mockAppPage({ pathname: "/" }), mockAppPage({ pathname: "/about" })],
