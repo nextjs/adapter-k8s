@@ -29,7 +29,14 @@ export interface HostConfig {
 }
 
 export interface GKEProviderConfig {
-  cdn?: { enabled: boolean; bucket: string; origin?: string };
+  cdn?: {
+    enabled: boolean;
+    bucket: string;
+    origin?: string;
+    cacheMode?: "USE_ORIGIN_HEADERS";
+    /** Override for the CDN cache-key header set; defaults to the Next.js Vary + dispatch headers. */
+    cacheKeyHeaders?: string[];
+  };
   gateway?: {
     type: "gateway-api" | "ingress";
     className: string;

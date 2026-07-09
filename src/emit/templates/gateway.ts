@@ -76,14 +76,30 @@ export function renderHTTPRoute({
   pools,
   buildId,
   routingManifest,
+  cdnFilterName,
 }: {
   releaseName: string;
   hosts: HostConfig[];
   pools: Map<string, PoolDefinition>;
   buildId: string;
   routingManifest: RoutingManifest;
+  /** Name of a GCPHTTPFilter to attach to every rule (enables Cloud CDN). */
+  cdnFilterName?: string | undefined;
 }): string {
   assertSafeReleaseName(releaseName);
+
+  // GKE allows one ExtensionRef filter per rule; attaching the same filter from every
+  // rule is fine (the limit is per rule, not per filter). The name is already sanitized
+  // by its single owner (helm.ts), so it is interpolated verbatim here.
+  const filtersYaml = cdnFilterName
+    ? `
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: networking.gke.io
+            kind: GCPHTTPFilter
+            name: ${cdnFilterName}`
+    : "";
   const hostnames = hosts.map((h) => h.hostname);
   const defaultPoolName = [...pools.keys()][0] ?? "default";
 
@@ -149,7 +165,7 @@ export function renderHTTPRoute({
               value: ${poolName}
       backendRefs:
         - name: ${backendName}
-          port: 3000`;
+          port: 3000${filtersYaml}`;
   });
 
   // Gateway API caps an HTTPRoute at 16 rules TOTAL (path-prefix + header + catch-all).
@@ -169,7 +185,7 @@ export function renderHTTPRoute({
         - path: { type: ${rule.matchType}, value: "${rule.path}" }
       backendRefs:
         - name: ${backendName}
-          port: 3000`;
+          port: 3000${filtersYaml}`;
   });
 
   const catchAllRuleYaml = (() => {
@@ -178,7 +194,7 @@ export function renderHTTPRoute({
         - path: { type: ${catchAllRule.matchType}, value: "${catchAllRule.path}" }
       backendRefs:
         - name: ${backendName}
-          port: 3000`;
+          port: 3000${filtersYaml}`;
   })();
 
   const rules = [...pathRulesYaml, ...headerRules, catchAllRuleYaml].join("\n");

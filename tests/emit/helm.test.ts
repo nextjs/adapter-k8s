@@ -222,6 +222,107 @@ describe("generateHelmChart", () => {
     expect(result["templates/api-deployment.yaml"]).toBeDefined();
   });
 
+  it("emits the CDN filter and wires it into the HTTPRoute when cdn.enabled", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+
+    const result = generateHelmChart({
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: {
+          gke: {
+            cdn: { enabled: true, bucket: "" },
+            gateway: {
+              type: "gateway-api",
+              className: "gke-l7-global-external-managed",
+              hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+            },
+          },
+        },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+    });
+
+    const filter = result["templates/cdn-http-filter.yaml"];
+    expect(filter).toBeDefined();
+    expect(filter).toContain("kind: GCPHTTPFilter");
+    expect(filter).toContain("cacheMode: USE_ORIGIN_HEADERS");
+
+    const httpRoute = result["templates/http-route.yaml"];
+    expect(httpRoute).toContain("type: ExtensionRef");
+    expect(httpRoute).toContain("name: nextjs-cdn");
+    // every rule carries the filter
+    const ruleCount = (httpRoute.match(/- matches:/g) ?? []).length;
+    const filterCount = (httpRoute.match(/type: ExtensionRef/g) ?? []).length;
+    expect(filterCount).toBe(ruleCount);
+  });
+
+  it("emits no CDN artifacts when cdn is disabled or absent, leaving the chart unchanged", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+    const baseArgs = {
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+      internalSecret: "deadbeef",
+    };
+    const gateway = {
+      type: "gateway-api",
+      className: "gke-l7-global-external-managed",
+      hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+    };
+
+    const absent = generateHelmChart({
+      ...baseArgs,
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: { gateway } },
+      } as K8sAdapterConfig,
+    });
+    const disabled = generateHelmChart({
+      ...baseArgs,
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: { gateway, cdn: { enabled: false, bucket: "" } } },
+      } as K8sAdapterConfig,
+    });
+
+    for (const chart of [absent, disabled]) {
+      expect(chart["templates/cdn-http-filter.yaml"]).toBeUndefined();
+      expect(chart["templates/http-route.yaml"]).not.toContain("filters:");
+      expect(chart["templates/http-route.yaml"]).not.toContain("GCPHTTPFilter");
+    }
+    // cdn.enabled: false is byte-identical to cdn absent
+    expect(disabled).toEqual(absent);
+  });
+
+  it("emits no CDN artifacts without gateway hosts (unreachable via validated config)", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+    const result = generateHelmChart({
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: { cdn: { enabled: true, bucket: "" } } },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+    });
+    expect(result["templates/cdn-http-filter.yaml"]).toBeUndefined();
+    expect(result["templates/http-route.yaml"]).toBeUndefined();
+  });
+
   it("throws a helpful error when the routing manifest exceeds the ConfigMap size limit", () => {
     const pools = new Map<string, PoolDefinition>([
       ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],

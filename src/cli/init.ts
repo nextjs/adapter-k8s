@@ -3,6 +3,7 @@ import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { generateAdapterConfig, generateInfrastructureJson } from "./scaffold.js";
+import { gkeVersionAtLeast, MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 
 export interface InitOptions {
   projectId: string;
@@ -431,6 +432,35 @@ export async function runInit(options: InitOptions): Promise<void> {
         }
       } else {
         throw new Error(`${cmd.description} failed:\n${result.stderr}`);
+      }
+    }
+  }
+
+  // 2a. Cloud CDN (GCPHTTPFilter) needs GKE >= MIN_GKE_VERSION_FOR_CDN, and the scaffolded
+  // config enables CDN by default. Warn here; `deploy` hard-fails via CRD detection when a
+  // CDN-enabled chart targets an unsupported cluster.
+  if (!dryRun) {
+    const versionResult = await execCapture("gcloud", [
+      "container",
+      "clusters",
+      "describe",
+      `${releaseName}-cluster`,
+      "--location",
+      region,
+      "--project",
+      projectId,
+      "--format=value(currentMasterVersion)",
+      "--quiet",
+    ]);
+    if (versionResult.exitCode === 0) {
+      const version = versionResult.stdout.trim();
+      const supported = gkeVersionAtLeast(version, MIN_GKE_VERSION_FOR_CDN);
+      if (supported === false) {
+        console.warn(
+          `  ! Cluster version ${version} is below ${MIN_GKE_VERSION_FOR_CDN}: Cloud CDN ` +
+            `(enabled by default in the scaffolded config) will not work. Upgrade the ` +
+            `cluster or set provider.gke.cdn.enabled: false.`,
+        );
       }
     }
   }

@@ -6,10 +6,13 @@ import type { RoutingManifest } from "../../src/types.js";
 
 vi.mock("@next/routing", async () => {
   const actual = await vi.importActual("@next/routing");
-  return {
+  // routing-common.ts imports the CJS default and destructures detect*; expose a
+  // `default` alongside the named exports so both import styles resolve.
+  const mocked = {
     ...actual,
     resolveRoutes: vi.fn(),
   };
+  return { ...mocked, default: mocked };
 });
 import { resolveRoutes } from "@next/routing";
 

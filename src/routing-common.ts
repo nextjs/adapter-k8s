@@ -1,4 +1,11 @@
-import { detectLocale, detectDomainLocale, normalizeLocalePath } from "@next/routing";
+// @next/routing ships as CommonJS. A *named* import of a CJS module works in our
+// CJS bundles (pool-server, routing-service) but breaks Node's ESM loader in the
+// adapter's ESM entrypoint (dist/index.js), which Next imports at build time —
+// cjs-module-lexer can't statically resolve the named exports, so the import throws
+// "Named export 'detectDomainLocale' not found". Import the CJS default (module.exports)
+// and destructure; both bundle formats resolve the symbols this way.
+import NextRouting from "@next/routing";
+const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
 // (routing-service/handler.ts, "Phase 2") and the pool's local resolver

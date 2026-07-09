@@ -4,6 +4,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { exec, execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
 import { renderInternalSecretEnv } from "../emit/templates/internal-secret.js";
+import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import type { GcloudCommand } from "./init.js";
 
 function sanitizeK8sName(name: string): string {
@@ -233,6 +234,41 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
+  // 5b. Pre-flight: the chart carries a Cloud CDN filter only when cdn.enabled — the cluster
+  // must know the GCPHTTPFilter CRD (GKE >= 1.35.2-gke.1751000) or the apply would fail with
+  // an opaque server error. Capability-detect the CRD rather than parsing version strings.
+  const chartHasCdn = existsSync(path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml"));
+  if (!dryRun && chartHasCdn) {
+    const crdCheck = await execCapture("kubectl", [
+      "get",
+      "crd",
+      "gcphttpfilters.networking.gke.io",
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (crdCheck.exitCode !== 0) {
+      // kubectl itself failed (no context, expired credentials, unreachable API server) —
+      // NOT a version problem. `--ignore-not-found` returns exit 0 for a genuinely absent
+      // CRD, so a non-zero exit is always a connectivity/auth failure. Don't send the user
+      // to upgrade a cluster they can't even reach.
+      const detail = crdCheck.stderr.trim();
+      throw new Error(
+        `Cloud CDN is enabled (cdn.enabled: true) but the GCPHTTPFilter CRD check could not ` +
+          `reach the cluster (kubectl exited ${crdCheck.exitCode}). Check your kubectl context ` +
+          `and credentials.${detail ? `\nkubectl: ${detail}` : ""}`,
+      );
+    }
+    if (!crdCheck.stdout.trim()) {
+      // Cluster reachable, CRD genuinely absent → the cluster is too old.
+      throw new Error(
+        `Cloud CDN is enabled (cdn.enabled: true) but this cluster does not have the ` +
+          `GCPHTTPFilter CRD. Cloud CDN for GKE Gateway requires GKE >= ${MIN_GKE_VERSION_FOR_CDN}. ` +
+          `Upgrade the cluster, or set provider.gke.cdn.enabled: false in adapter config.`,
+      );
+    }
+  }
+
   // 6. Helm upgrade
   const state = await readState(projectDir, releaseName);
   const previousBuildId = state?.buildId ?? null;
@@ -339,6 +375,26 @@ spec:
     await execOrThrow("helm", helmArgs);
   } else {
     console.log(`    [dry-run] helm ${helmArgs.join(" ")}`);
+  }
+
+  // 6b. Best-effort CDN verification: confirm the applied HTTPRoute carries the CDN filter.
+  // The chart is the source of truth; this is confirmation only, never fatal.
+  if (!dryRun && chartHasCdn) {
+    const routeCheck = await execCapture("kubectl", [
+      "get",
+      "httproute",
+      `${releaseName}-routes`,
+      "-o",
+      "jsonpath={.spec.rules[*].filters[*].extensionRef.kind}",
+    ]);
+    if (routeCheck.exitCode === 0 && routeCheck.stdout.includes("GCPHTTPFilter")) {
+      console.log("  → Cloud CDN filter attached to HTTPRoute rules ✓");
+    } else {
+      console.warn(
+        "  ! Could not confirm the Cloud CDN filter on the HTTPRoute (non-fatal). " +
+          `Inspect with: kubectl get httproute ${releaseName}-routes -o yaml`,
+      );
+    }
   }
 
   // 6. Update state (local + cluster ConfigMap)
@@ -539,8 +595,12 @@ spec:
         "service",
         activeServiceName,
         "--type=json",
+        // Impersonate helm as the field manager so the next helm upgrade (server-side
+        // apply, manager "helm") does not conflict on the selector field we flip here.
+        // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
+        // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
+        // no conflict override.
         "--field-manager=helm",
-        "--force-conflicts",
         "-p",
         JSON.stringify([
           {

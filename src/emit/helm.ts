@@ -9,6 +9,7 @@ import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import { renderConfigMap } from "./templates/configmap.js";
 import { renderGateway, renderHTTPRoute } from "./templates/gateway.js";
+import { renderCdnFilter } from "./templates/gcp-http-filter.js";
 import { sanitizeK8sName } from "./templates/utils.js";
 import { renderRoutingServiceDeployment } from "./templates/routing-service-deployment.js";
 import { renderRoutingServiceService } from "./templates/routing-service-service.js";
@@ -96,12 +97,26 @@ export function generateHelmChart({
       hosts: gke.gateway.hosts,
     });
 
+    // Cloud CDN rides the HTTPRoute (GCPHTTPFilter via ExtensionRef), so it only exists
+    // when a gateway does. validateConfig guarantees hosts for adapter-built configs;
+    // the double condition covers direct generateHelmChart callers.
+    let cdnFilterName: string | undefined;
+    if (gke.cdn?.enabled) {
+      cdnFilterName = sanitizeK8sName(`${releaseName}-cdn`);
+      files["templates/cdn-http-filter.yaml"] = renderCdnFilter({
+        releaseName,
+        cacheMode: gke.cdn.cacheMode,
+        cacheKeyHeaders: gke.cdn.cacheKeyHeaders,
+      });
+    }
+
     files["templates/http-route.yaml"] = renderHTTPRoute({
       releaseName,
       hosts: gke.gateway.hosts,
       pools,
       buildId,
       routingManifest,
+      cdnFilterName,
     });
   }
 

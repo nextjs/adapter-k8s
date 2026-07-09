@@ -3,6 +3,7 @@ import { writeFile, mkdir, copyFile, cp, realpath } from "node:fs/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import type { NextAdapter, K8sAdapterConfig, BuildCompleteContext } from "./types.js";
 
 // Get current directory in a way that works in ESM and CJS bundle
@@ -621,11 +622,27 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             await stageFile(projectDir, nextPkgDir, "node_modules/next", poolName);
           }
 
-          // Stage @next/routing (required for pool server local route resolution)
-          const nextRoutingDir = path.join(projectDir, "node_modules", "@next", "routing");
-          if (existsSync(nextRoutingDir)) {
-            await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
+          // Stage @next/routing (required for pool server local route resolution).
+          // Resolve via require.resolve rather than a hardcoded projectDir path: as the
+          // adapter's own dependency, @next/routing is frequently hoisted above the app
+          // (workspaces, monorepos, a symlinked adapter checkout). A silent skip here ships
+          // a pool image that crashes at runtime with "Cannot find module '@next/routing'",
+          // so fail the build loudly if it cannot be located.
+          let nextRoutingDir: string | undefined;
+          try {
+            const req = createRequire(path.join(projectDir, "package.json"));
+            nextRoutingDir = path.dirname(req.resolve("@next/routing/package.json"));
+          } catch {
+            nextRoutingDir = undefined;
           }
+          if (!nextRoutingDir || !existsSync(nextRoutingDir)) {
+            throw new Error(
+              `[adapter-k8s] Could not resolve @next/routing from ${projectDir}. It is required ` +
+                `at runtime by the pool server. Ensure @next/routing is installed and resolvable ` +
+                `from your app (it is a dependency of @next-community/adapter-k8s).`,
+            );
+          }
+          await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
 
           // Keep .env secrets out of the pool image. The Dockerfile's
           // `COPY context/ .` runs from this pool dir (the docker build

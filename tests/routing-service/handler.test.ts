@@ -4,11 +4,16 @@ import { mockRouting } from "../helpers/mock-outputs.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
 
-vi.mock("@next/routing", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@next/routing")>()),
-  resolveRoutes: vi.fn(),
-  responseToMiddlewareResult: vi.fn(),
-}));
+vi.mock("@next/routing", async (importOriginal) => {
+  // routing-common.ts imports the CJS default and destructures detect*; expose a
+  // `default` alongside the named exports so both import styles resolve.
+  const mocked = {
+    ...(await importOriginal<typeof import("@next/routing")>()),
+    resolveRoutes: vi.fn(),
+    responseToMiddlewareResult: vi.fn(),
+  };
+  return { ...mocked, default: mocked };
+});
 
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 

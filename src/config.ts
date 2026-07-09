@@ -1,5 +1,6 @@
 // src/config.ts
 import type { K8sAdapterConfig } from "./types.js";
+import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
 
 export function validateConfig(input: unknown): void {
   const config = input as K8sAdapterConfig;
@@ -65,6 +66,8 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
         cdn: {
           enabled: false,
           bucket: "",
+          cacheMode: "USE_ORIGIN_HEADERS",
+          cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
           ...config.provider.gke.cdn,
         },
       },

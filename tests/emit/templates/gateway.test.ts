@@ -78,6 +78,40 @@ describe("renderHTTPRoute rule cap", () => {
   });
 });
 
+describe("renderHTTPRoute CDN filter injection", () => {
+  it("attaches the ExtensionRef filter to every rule when cdnFilterName is set", () => {
+    const pools = makePools(2);
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      buildId: "abc123",
+      routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
+      cdnFilterName: "nextjs-cdn",
+    });
+
+    const ruleCount = (yaml.match(/- matches:/g) ?? []).length;
+    const filterCount = (yaml.match(/type: ExtensionRef/g) ?? []).length;
+    expect(ruleCount).toBeGreaterThan(0);
+    expect(filterCount).toBe(ruleCount);
+    expect(yaml).toContain("kind: GCPHTTPFilter");
+    expect(yaml).toContain("group: networking.gke.io");
+    expect(yaml).toContain("name: nextjs-cdn");
+  });
+
+  it("emits no filters block when cdnFilterName is unset", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(2),
+      buildId: "abc123",
+      routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
+    });
+    expect(yaml).not.toContain("filters:");
+    expect(yaml).not.toContain("GCPHTTPFilter");
+  });
+});
+
 describe("releaseName validation in gateway templates", () => {
   it("renderGateway rejects an unsafe releaseName", () => {
     expect(() => renderGateway({ releaseName: 'foo";rm -rf /;"', hosts })).toThrow(
