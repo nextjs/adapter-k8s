@@ -6,7 +6,7 @@ import dns from "node:dns/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest } from "../types.js";
-import { getRscConfig, manifestNextConfig, rscParentCandidates, templateOutputCandidates, type MiddlewareMatcher, type RscConfig } from "../routing-common.js";
+import { getRscConfig, manifestNextConfig, matchesMiddleware, rscParentCandidates, templateOutputCandidates, type MiddlewareMatcher, type RscConfig } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { createLocalResolver } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
@@ -716,9 +716,24 @@ async function main() {
     onRequest: async (req, res) => {
       const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
 
+      // When middleware's `matcher` covers this path, it must run BEFORE the
+      // filesystem fast paths — Next runs middleware for matched static/public
+      // requests (e.g. a matcher on `/file.svg` or `/_next/static/css/:path*`).
+      // The catch-all matcher excludes /_next/, so normal middleware still lets
+      // static assets fast-path. Skip the fast paths in that case and let
+      // resolve() run middleware.
+      const mwReqHeaders = new Headers();
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === "string") mwReqHeaders.set(k, v);
+        else if (Array.isArray(v)) mwReqHeaders.set(k, v.join(", "));
+      }
+      const middlewareCovers =
+        !!(middlewareModule || edgeMiddlewareRunner) &&
+        matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
+
       // Serve _next/static/* and _next/data/* directly from filesystem.
       // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
-      if (url.pathname.startsWith("/_next/static/")) {
+      if (!middlewareCovers && url.pathname.startsWith("/_next/static/")) {
         const filePath = path.join(
           process.cwd(),
           ".next",
@@ -743,7 +758,7 @@ async function main() {
       // URL, and those must go through dispatch so the handler (and its
       // incremental cache) produces the payload.
       const dataPrefix = `/_next/data/${buildId}/`;
-      if (url.pathname.startsWith(dataPrefix)) {
+      if (!middlewareCovers && url.pathname.startsWith(dataPrefix)) {
         const dataPath = url.pathname.slice(dataPrefix.length);
         // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
         const pagePath = "/" + dataPath.replace(/\.json$/, "");
@@ -886,7 +901,11 @@ async function main() {
 
       // Serve public directory files (favicon.ico, robots.txt, etc.)
       // In production, CDN/GCS serves these. In standalone/emulate, pool server must.
-      if (!url.pathname.startsWith("/_next/") && !url.pathname.startsWith("/api/")) {
+      if (
+        !middlewareCovers &&
+        !url.pathname.startsWith("/_next/") &&
+        !url.pathname.startsWith("/api/")
+      ) {
         const publicPath = path.join(process.cwd(), "public", url.pathname);
         if (existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
           const content = readFileSync(publicPath);

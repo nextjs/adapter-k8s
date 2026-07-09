@@ -82,6 +82,16 @@ export function matchesMiddleware(
   headers: Headers,
 ): boolean {
   if (!matchers || matchers.length === 0) return true;
+  // Match against the raw pathname AND its decoded form: a matcher source
+  // "/another/hello" must match a request for "/another%2fhello" (encoded
+  // slash), which Next normalizes before matching.
+  const paths = [url.pathname];
+  try {
+    const decoded = decodeURIComponent(url.pathname);
+    if (decoded !== url.pathname) paths.push(decoded);
+  } catch {
+    // malformed escape — raw only
+  }
   for (const m of matchers) {
     let re: RegExp;
     try {
@@ -89,7 +99,7 @@ export function matchesMiddleware(
     } catch {
       continue;
     }
-    if (!re.test(url.pathname)) continue;
+    if (!paths.some((p) => re.test(p))) continue;
     const hasOk = (m.has ?? []).every((c) => conditionPresent(c, headers, url));
     const missingOk = (m.missing ?? []).every((c) => !conditionPresent(c, headers, url));
     if (hasOk && missingOk) return true;

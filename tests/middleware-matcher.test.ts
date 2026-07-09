@@ -104,4 +104,52 @@ describe("matchesMiddleware", () => {
     expect(matchesMiddleware(ms, url("/p"), h({ x: "abc" }))).toBe(true);
   });
 
+
+  // REGRESSION: middleware must run on matched STATIC/public paths (a matcher on
+  // /file.svg or /_next/static/css/:path*), but a normal catch-all matcher must
+  // NOT match /_next/ assets (so they still fast-path).
+  it("matches explicit static-file and _next/static/css matchers", () => {
+    const svg: MiddlewareMatcher[] = [
+      {
+        regexp:
+          "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/file\\.svg(\\.json|\\.rsc)?[\\/#\\?]?$",
+        originalSource: "/file.svg",
+      },
+    ];
+    expect(matchesMiddleware(svg, url("/file.svg"), h())).toBe(true);
+    expect(matchesMiddleware(svg, url("/other.svg"), h())).toBe(false);
+
+    const css: MiddlewareMatcher[] = [
+      {
+        regexp:
+          "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/_next\\/static\\/css(?:\\/((?:[^\\/#\\?]+?)(?:\\/(?:[^\\/#\\?]+?))*))?(\\.json|\\.rsc)?[\\/#\\?]?$",
+        originalSource: "/_next/static/css/:path*",
+      },
+    ];
+    expect(matchesMiddleware(css, url("/_next/static/css/app.css"), h())).toBe(true);
+    // A chunk JS under /_next/static/chunks must NOT match a css-only matcher.
+    expect(matchesMiddleware(css, url("/_next/static/chunks/x.js"), h())).toBe(false);
+  });
+
+  it("catch-all matcher excludes /_next/ assets (they keep fast-pathing)", () => {
+    const catchAll: MiddlewareMatcher[] = [
+      {
+        regexp:
+          "^(?:\\/(_next\\/data\\/[^/]{1,}))?(?:\\/((?!_next\\/)(?:[^/.]{1,}\\/)*[^/.]{1,}))?(\\.json)?[\\/#\\?]?$",
+        originalSource: "/:path*",
+      },
+    ];
+    expect(matchesMiddleware(catchAll, url("/_next/static/chunks/x.js"), h())).toBe(false);
+    expect(matchesMiddleware(catchAll, url("/about"), h())).toBe(true);
+  });
+
+
+  // REGRESSION: encoded-slash paths must match a matcher whose source uses a
+  // literal slash (/another%2fhello vs source /another/hello).
+  it("matches an encoded-slash path against a slash matcher (decoded form)", () => {
+    const ms = [M("/another/hello")];
+    expect(matchesMiddleware(ms, url("/another%2fhello"), h())).toBe(true);
+    expect(matchesMiddleware(ms, url("/another/hello"), h())).toBe(true);
+  });
+
 });
