@@ -18,10 +18,8 @@ export async function runRollback(options: {
   }
 
   const { buildId: currentBuildId, previousBuildId } = state;
-  const currentLower = currentBuildId
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .slice(0, 10);
+  // Used only by the best-effort LB-health filter below; deployment discovery matches by
+  // exact per-pool name, not by this slice.
   const previousLower = previousBuildId
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "")
@@ -65,50 +63,127 @@ export async function runRollback(options: {
     throw new Error("Failed to list deployments. Is kubectl connected?");
   }
 
-  let previousDeploy: string | null = null;
-  let currentDeploy: string | null = null;
-
-  for (const line of deploysResult.stdout.trim().split("\n")) {
-    const [name] = line.split("|");
-    if (!name || name.includes("routing-service")) continue;
-    // Normalize the deployment name the SAME way as the build-id slice (strip every
-    // non-alphanumeric) before matching. The sanitized deployment name turns `_`/`-` in
-    // the build id into hyphens (e.g. `7s_BTPT…` → `…-7s-btpt…`), so comparing the raw
-    // name against the stripped build-id slice (`7sbtpt…`) never matches — which made
-    // rollback wrongly report "previous deployment not found" for those build ids.
-    const nameNorm = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (nameNorm.includes(previousLower)) previousDeploy = name;
-    if (nameNorm.includes(currentLower)) currentDeploy = name;
+  // Roll back EVERY pool, not just one. Single previous/current vars kept only the LAST
+  // pool that matched during discovery, so a multi-pool rollback scaled up one pool's
+  // previous Deployment but then switched ALL active Services to the previous build —
+  // every other pool was left at zero replicas with no endpoints. Read the pool list from
+  // build metadata (the same source deploy's cutover uses), resolve each pool's previous
+  // and current Deployment by exact name, and verify every previous pool exists BEFORE
+  // touching traffic.
+  let poolNames: string[] = [];
+  const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+      if (Array.isArray(meta.pools)) {
+        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
+      }
+    } catch {
+      // fall through to the empty guard
+    }
+  }
+  if (poolNames.length === 0) {
+    throw new Error(
+      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
+        "cannot safely roll back. Aborting before touching traffic.",
+    );
   }
 
-  if (!previousDeploy) {
+  const scalingByPool = new Map<string, { min: number; max: number; targetCPU: number }>();
+  const valuesPath = path.join(projectDir, ".k8s-adapter", "output", "chart", "values.yaml");
+  if (existsSync(valuesPath)) {
+    try {
+      const raw = readFileSync(valuesPath, "utf-8");
+      const values = JSON.parse(raw.slice(raw.indexOf("{")));
+      for (const pool of poolNames) {
+        const replicas = values.pools?.[pool]?.replicas;
+        if (replicas) scalingByPool.set(pool, replicas);
+      }
+    } catch {
+      // Defaults below match renderValuesYaml.
+    }
+  }
+
+  const discovered = new Set(
+    deploysResult.stdout
+      .trim()
+      .split("\n")
+      .map((l) => l.split("|")[0])
+      .filter(Boolean),
+  );
+  const previousDeploys: string[] = [];
+  const currentDeploys: string[] = [];
+  const missingPrev: string[] = [];
+  for (const pool of poolNames) {
+    const prevName = sanitizeK8sName(`${releaseName}-${pool}-${previousBuildId}`);
+    const currName = sanitizeK8sName(`${releaseName}-${pool}-${currentBuildId}`);
+    if (discovered.has(prevName)) previousDeploys.push(prevName);
+    else missingPrev.push(pool);
+    if (discovered.has(currName)) currentDeploys.push(currName);
+  }
+
+  if (missingPrev.length > 0) {
     throw new Error(
-      `Previous deployment not found. The deployment for build ${previousBuildId} may have been deleted.\n` +
-        `Only one previous build is retained after deploy.`,
+      `Previous deployment missing for pool(s): ${missingPrev.join(", ")} (build ` +
+        `${previousBuildId}). Rolling back would strand those pools with zero endpoints. ` +
+        `Aborting. Only one previous build is retained after each deploy.`,
     );
   }
 
   if (dryRun) {
-    console.log(`  [dry-run] Would scale up: ${previousDeploy}`);
-    if (currentDeploy) console.log(`  [dry-run] Would scale down: ${currentDeploy}`);
+    console.log(`  [dry-run] Would scale up: ${previousDeploys.join(", ")}`);
+    if (currentDeploys.length)
+      console.log(`  [dry-run] Would scale down: ${currentDeploys.join(", ")}`);
     console.log(
       `  [dry-run] Would swap state: buildId=${previousBuildId}, previousBuildId=${currentBuildId}`,
     );
     return;
   }
 
-  // 1. Scale up the previous deployment
-  console.log(`  → Scaling up previous build: ${previousDeploy}`);
-  await execOrThrow("kubectl", ["scale", `deployment/${previousDeploy}`, "--replicas=2"]);
+  // 1. Scale up every pool's previous deployment
+  for (const previousDeploy of previousDeploys) {
+    console.log(`  → Scaling up previous build: ${previousDeploy}`);
+    await execOrThrow("kubectl", ["scale", `deployment/${previousDeploy}`, "--replicas=2"]);
+  }
 
-  // 2. Wait for previous pods to be ready
+  // Recreate the rollback build's HPA. Deploy removes it before parking that build at zero,
+  // otherwise the autoscaler would immediately raise it back to minReplicas.
+  for (let i = 0; i < previousDeploys.length; i++) {
+    const previousDeploy = previousDeploys[i]!;
+    const pool = poolNames[i]!;
+    const hpaName = `${previousDeploy}-hpa`;
+    const hpa = await execCapture("kubectl", [
+      "get",
+      "hpa",
+      hpaName,
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (!hpa.stdout.trim()) {
+      const scaling = scalingByPool.get(pool) ?? { min: 1, max: 3, targetCPU: 80 };
+      await execOrThrow("kubectl", [
+        "autoscale",
+        "deployment",
+        previousDeploy,
+        `--name=${hpaName}`,
+        `--min=${scaling.min}`,
+        `--max=${scaling.max}`,
+        `--cpu=${scaling.targetCPU}%`,
+      ]);
+    }
+  }
+
+  // 2. Wait for every previous pool's pods to be ready
   console.log(`  → Waiting for previous build pods to be ready...`);
-  await execCapture("kubectl", [
-    "rollout",
-    "status",
-    `deployment/${previousDeploy}`,
-    "--timeout=120s",
-  ]);
+  for (const previousDeploy of previousDeploys) {
+    await execOrThrow("kubectl", [
+      "rollout",
+      "status",
+      `deployment/${previousDeploy}`,
+      "--timeout=120s",
+    ]);
+  }
 
   // 3. Wait for LB health on previous backend
   if (existsSync(infraPath)) {
@@ -175,32 +250,13 @@ export async function runRollback(options: {
   // draining the active Service to zero endpoints and 503'ing the site on rollback.
   const safePreviousBuild = sanitizeK8sName(previousBuildId);
 
-  // Discover the active Services by NAME (`<release>-<pool>`), exactly as deploy's
-  // cutover does. The active-service template's `managed-by: adapter-k8s-active` label
-  // is overwritten by Helm to `managed-by: Helm`, so a label selector matches nothing —
-  // which would patch ZERO Services, skip the failure guard below, and strand the site
-  // when the current build is scaled down. Read the pool list from build metadata.
-  let poolNames: string[] = [];
-  const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
-  if (existsSync(metaPath)) {
-    try {
-      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-      if (Array.isArray(meta.pools)) {
-        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
-      }
-    } catch {
-      // fall through to the empty-pool guard
-    }
-  }
-  if (poolNames.length === 0) {
-    // Never scale down the current build without a known set of Services to switch —
-    // that would strand traffic. Fail loudly instead.
-    throw new Error(
-      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
-        "cannot locate the active Services to switch traffic. Aborting before any scale-down.",
-    );
-  }
+  // Switch each active Service (`<release>-<pool>`) by NAME, exactly as deploy's cutover
+  // does — reusing the pool list resolved above. (The active-service template's
+  // `managed-by: adapter-k8s-active` label is overwritten by Helm to `managed-by: Helm`,
+  // so a label selector would match nothing, patch ZERO Services, skip the failure guard,
+  // and strand the site when the current build is scaled down.)
   const patchFailures: { service: string; stderr: string }[] = [];
+  const patchedServices: string[] = [];
   console.log(`  → Switching traffic to previous build...`);
   for (const pool of poolNames) {
     const svcName = sanitizeK8sName(`${releaseName}-${pool}`);
@@ -223,6 +279,8 @@ export async function runRollback(options: {
     ]);
     if (patchResult.exitCode !== 0) {
       patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
+    } else {
+      patchedServices.push(svcName);
     }
   }
 
@@ -230,26 +288,44 @@ export async function runRollback(options: {
   // Scaling the current deployment to 0 now would strand the still-current Services
   // with zero endpoints. Abort before scale-down, leaving the current build serving.
   if (patchFailures.length > 0) {
+    const safeCurrentBuild = sanitizeK8sName(currentBuildId);
+    const revertFailures: string[] = [];
+    for (const serviceName of patchedServices) {
+      const revertResult = await execCapture("kubectl", [
+        "patch",
+        "service",
+        serviceName,
+        "--type=json",
+        "--field-manager=helm",
+        "-p",
+        JSON.stringify([
+          {
+            op: "replace",
+            path: "/spec/selector/app.kubernetes.io~1version",
+            value: safeCurrentBuild,
+          },
+        ]),
+      ]);
+      if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
+    }
     console.error(`\n  ROLLBACK FAILED: traffic was NOT switched to the previous build.`);
     console.error(`  ${patchFailures.length} Service selector patch(es) failed:`);
     for (const f of patchFailures) {
       console.error(`    - service ${f.service}: ${f.stderr || "unknown error"}`);
     }
-    console.error(`  The current build is still serving traffic and was left scaled up.`);
+    if (revertFailures.length > 0) {
+      console.error(`  WARNING: failed to restore selector(s): ${revertFailures.join(", ")}.`);
+      console.error(`  Traffic may be split across builds; repair those Services manually.`);
+    } else {
+      console.error(`  Successful selector patches were restored to the current build.`);
+    }
+    console.error(`  Both builds were left scaled up.`);
     console.error(`  State was not changed. Investigate and re-run the rollback.\n`);
     process.exit(1);
   }
 
-  // 5. Scale down current deployment (only after traffic successfully switched)
-  if (currentDeploy) {
-    console.log(`  → Scaling down current build: ${currentDeploy}`);
-    await execCapture("kubectl", ["scale", `deployment/${currentDeploy}`, "--replicas=0"]);
-  }
-
-  // 6. Swap state — previous becomes current, current becomes previous.
-  // Traffic has already switched at this point; if the cluster ConfigMap write fails
-  // we surface it (local was updated) rather than reporting a clean rollback, so
-  // cluster/local state don't silently diverge for the next deploy/rollback.
+  // 5. Swap state while both builds are still healthy. If persistence fails, traffic already
+  // points at the previous build but either version remains safe to select during recovery.
   try {
     await writeState(
       projectDir,
@@ -269,6 +345,13 @@ export async function runRollback(options: {
       `  connectivity and re-run so cluster/local state agree before the next deploy or rollback.\n`,
     );
     process.exit(1);
+  }
+
+  // 6. State is durable; scale down every former-current Deployment.
+  for (const currentDeploy of currentDeploys) {
+    console.log(`  → Scaling down current build: ${currentDeploy}`);
+    await execOrThrow("kubectl", ["delete", "hpa", `${currentDeploy}-hpa`, "--ignore-not-found"]);
+    await execOrThrow("kubectl", ["scale", `deployment/${currentDeploy}`, "--replicas=0"]);
   }
 
   console.log(`\n✓ Rollback complete. Now serving build: ${previousBuildId}`);

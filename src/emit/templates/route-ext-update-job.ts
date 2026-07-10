@@ -55,16 +55,29 @@ spec:
               #    only HTTPS leaves http:// traffic bypassing ext_proc, so middleware auth /
               #    rewrites can be bypassed over http://. Wait for the GKE Gateway controller to
               #    provision them; fail loudly if absent (never silently "succeed" unregistered).
-              echo "Discovering forwarding rules for ${releaseName}..."
+              # Discover forwarding rules by the gateway's OWN frontend IP, never by a
+              # name~releaseName substring: a short or shared release name (e.g. "app") would
+              # regex-match another application's forwarding rules and attach this middleware
+              # to their load balancer. The reserved static IP "${releaseName}-ip" is this
+              # gateway's frontend, so filtering on IPAddress selects exactly this LB's rules.
+              echo "Resolving gateway frontend IP (${releaseName}-ip)..."
+              GWIP=$(gcloud compute addresses describe ${releaseName}-ip --global \
+                --project=${projectId} --format="value(address)" 2>/dev/null)
+              if [ -z "$GWIP" ]; then
+                echo "ERROR: could not resolve gateway IP '${releaseName}-ip'. Refusing to fall"
+                echo "back to name matching (could attach middleware to another app's LB)."
+                exit 1
+              fi
+              echo "Gateway IP: $GWIP — discovering only forwarding rules on this IP..."
               FRS=""
               for i in $(seq 1 40); do
                 FRS=$(gcloud compute forwarding-rules list --project=${projectId} \
-                  --filter="name~${releaseName}" --format="value(selfLink)" 2>/dev/null)
+                  --filter="IPAddress=$GWIP" --format="value(selfLink)" 2>/dev/null)
                 [ -n "$FRS" ] && break
                 sleep 5
               done
               if [ -z "$FRS" ]; then
-                echo "ERROR: no forwarding rules for '${releaseName}' after waiting (gateway not provisioned?)."
+                echo "ERROR: no forwarding rules on IP $GWIP after waiting (gateway not provisioned?)."
                 exit 1
               fi
               echo "Forwarding rules:"; echo "$FRS"
@@ -89,9 +102,11 @@ spec:
               ZC=0
               for Z in $ZONES; do
                 echo "Attaching NEG $NEG ($Z) to backend $BS..."
-                gcloud compute backend-services add-backend $BS --global --project=${projectId} \
+                if ! gcloud compute backend-services add-backend $BS --global --project=${projectId} \
                   --network-endpoint-group=$NEG --network-endpoint-group-zone=$Z \
-                  --balancing-mode=RATE --max-rate-per-endpoint=1000 --async --quiet 2>/dev/null || true
+                  --balancing-mode=RATE --max-rate-per-endpoint=1000 --async --quiet; then
+                  echo "Attach request for $NEG ($Z) failed; verifying final backend state..."
+                fi
                 ZC=$((ZC + 1))
               done
               echo "Confirming $ZC zonal NEG(s) attached..."
@@ -101,6 +116,10 @@ spec:
                 [ "$ATTACHED" -ge "$ZC" ] && break
                 sleep 3
               done
+              if [ "\${ATTACHED:-0}" -lt "$ZC" ]; then
+                echo "ERROR: only \${ATTACHED:-0}/$ZC zonal NEG(s) attached to $BS after waiting."
+                exit 1
+              fi
               # 3. Register the ext_proc TRAFFIC extension attached to EVERY forwarding rule
               #    (route extensions are unsupported on the global external ALB; traffic
               #    extensions run post-cache on origin traffic). Expand the placeholder line

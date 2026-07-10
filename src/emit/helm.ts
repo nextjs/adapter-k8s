@@ -137,7 +137,6 @@ export function generateHelmChart({
     // Stable "active" Service — HTTPRoute points here, selector patched on cutover
     files[`templates/${poolName}-active-service.yaml`] = renderActiveService({
       poolName,
-      buildId,
       releaseName,
     });
     files[`templates/${poolName}-hpa.yaml`] = renderHPA({

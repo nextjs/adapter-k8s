@@ -1,6 +1,6 @@
 // src/cli/destroy.ts
 import path from "node:path";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execCapture } from "./exec.js";
 
 export interface DestroyOptions {
@@ -23,6 +23,62 @@ export function isAlreadyGoneError(stderr: string): boolean {
     s.includes("no such") ||
     s.includes("404")
   );
+}
+
+export function buildReleaseScopedGcpResources(
+  releaseName: string,
+  projectId: string,
+): { desc: string; args: string[] }[] {
+  return [
+    {
+      desc: `traffic extension "${releaseName}-traffic-ext"`,
+      args: [
+        "service-extensions",
+        "lb-traffic-extensions",
+        "delete",
+        `${releaseName}-traffic-ext`,
+        "--location=global",
+        `--project=${projectId}`,
+        "--quiet",
+      ],
+    },
+    {
+      desc: `routing backend service "${releaseName}-routing-service"`,
+      args: [
+        "compute",
+        "backend-services",
+        "delete",
+        `${releaseName}-routing-service`,
+        "--global",
+        `--project=${projectId}`,
+        "--quiet",
+      ],
+    },
+    {
+      desc: `routing health check "${releaseName}-routing-hc"`,
+      args: [
+        "compute",
+        "health-checks",
+        "delete",
+        `${releaseName}-routing-hc`,
+        "--global",
+        `--project=${projectId}`,
+        "--quiet",
+      ],
+    },
+    {
+      desc: `static IP "${releaseName}-ip"`,
+      args: [
+        "compute",
+        "addresses",
+        "delete",
+        `${releaseName}-ip`,
+        "--global",
+        `--project=${projectId}`,
+        "--quiet",
+      ],
+    },
+  ];
 }
 
 export async function runDestroy(options: DestroyOptions): Promise<void> {
@@ -105,6 +161,31 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         }
       }
     }
+
+    // Delete the release-scoped ext_proc resources (in dependency order: the traffic
+    // extension references the backend, which references the health check). helm uninstall
+    // removed the Gateway/Service, but these are provisioned outside the chart and would
+    // otherwise be left billing/dangling — the exact "destroy silently leaves infra" gap.
+    const projectId: string | undefined = infra.projectId;
+    if (projectId) {
+      const extResources = buildReleaseScopedGcpResources(releaseName, projectId);
+      for (const { desc, args } of extResources) {
+        console.log(`  → Deleting ${desc}`);
+        if (!dryRun) {
+          const res = await execCapture("gcloud", args);
+          if (res.exitCode !== 0) {
+            if (isAlreadyGoneError(res.stderr)) {
+              console.log("    (not found or already deleted)");
+            } else {
+              console.warn(
+                `    WARNING: deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+              );
+              failures.push(desc);
+            }
+          }
+        }
+      }
+    }
   }
 
   // 3. Report incomplete destroy before touching local state. If real (non-"already
@@ -122,12 +203,37 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     process.exit(1);
   }
 
-  // 4. Clean up local state (only when every resource was fully removed)
-  const stateDir = path.join(projectDir, ".k8s-adapter");
-  if (existsSync(stateDir) && !dryRun) {
-    console.log("  → Removing .k8s-adapter directory");
-    rmSync(stateDir, { recursive: true, force: true });
+  // 4. Report honestly what was removed vs what remains. destroy deliberately does NOT
+  // auto-delete the GKE cluster or Artifact Registry: both are commonly SHARED across
+  // releases and expensive/slow to recreate, so nuking them from a per-release `destroy` is
+  // unsafe. Surface them with exact commands instead of silently leaving them AND deleting
+  // the state needed to find them (the previous behavior).
+  const infra = existsSync(path.join(projectDir, ".k8s-adapter", "infrastructure.json"))
+    ? JSON.parse(
+        readFileSync(path.join(projectDir, ".k8s-adapter", "infrastructure.json"), "utf-8"),
+      )
+    : {};
+  const projectId: string | undefined = infra.projectId;
+  const region: string | undefined = infra.region;
+  console.log("\n✓ Removed: Helm release, GCS bucket, deploy service account, and the");
+  console.log("  release-scoped ext_proc resources (traffic extension, routing backend,");
+  console.log("  health check, static IP).\n");
+  if (projectId) {
+    console.log("  Left in place (shared / expensive — remove manually if truly unused):");
+    console.log(
+      `    • GKE cluster:        gcloud container clusters delete ${releaseName}-cluster --region ${region ?? "REGION"} --project ${projectId}`,
+    );
+    console.log(
+      `    • Artifact Registry:  gcloud artifacts repositories delete nextjs --location ${region ?? "REGION"} --project ${projectId}`,
+    );
+    console.log(`    • TLS/DNS (Certificate Manager): certificate map, certificate, and DNS`);
+    console.log(
+      `      authorizations named "${releaseName}-*" — list: gcloud certificate-manager maps list --project ${projectId}`,
+    );
   }
-
-  console.log("\n✓ Destroy complete\n");
+  // Preserve .k8s-adapter/infrastructure.json: it names the resources left above, so the
+  // manual commands and any retry stay possible. (Previously this was deleted, orphaning them.)
+  console.log(
+    `\n  Local state (.k8s-adapter) preserved so the resources above remain discoverable.\n`,
+  );
 }

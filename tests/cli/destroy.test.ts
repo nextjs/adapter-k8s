@@ -1,6 +1,6 @@
 // tests/cli/destroy.test.ts
 import { describe, it, expect } from "vitest";
-import { isAlreadyGoneError } from "../../src/cli/destroy.js";
+import { buildReleaseScopedGcpResources, isAlreadyGoneError } from "../../src/cli/destroy.js";
 
 describe("isAlreadyGoneError", () => {
   it("treats genuine not-found errors as already deleted", () => {
@@ -21,5 +21,15 @@ describe("isAlreadyGoneError", () => {
     expect(isAlreadyGoneError("Error: forbidden: user cannot delete resource")).toBe(false);
     expect(isAlreadyGoneError("Unauthorized")).toBe(false);
     expect(isAlreadyGoneError("")).toBe(false);
+  });
+});
+
+describe("buildReleaseScopedGcpResources", () => {
+  it("deletes the health check created by init", () => {
+    const resources = buildReleaseScopedGcpResources("my-app", "my-project");
+    const healthCheck = resources.find((resource) => resource.desc.includes("health check"));
+
+    expect(healthCheck?.args).toContain("my-app-routing-hc");
+    expect(healthCheck?.args).not.toContain("my-app-routing-tcp");
   });
 });

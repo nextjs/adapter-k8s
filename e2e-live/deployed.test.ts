@@ -86,7 +86,7 @@ describe("routes", () => {
   });
 });
 
-describe("middleware at the ext_proc edge (in front of the CDN)", () => {
+describe("middleware at the ext_proc edge (traffic extension, after the CDN cache)", () => {
   it("applies the rewrite verdict: /from-mw renders /rewritten", async () => {
     const r = await req("/from-mw");
     expect(r.status).toBe(200);
@@ -125,9 +125,15 @@ describe("Cloud CDN", () => {
     await expect(waitForEdgeCache(asset!)).resolves.toBeGreaterThanOrEqual(0);
   });
 
-  it("edge-caches App Router HTML (requires the complete Vary whitelist)", async () => {
-    // Regression guard for the missing Next-Router-Segment-Prefetch cache-key entry,
-    // which silently disabled all App Router HTML edge caching.
-    await expect(waitForEdgeCache("/")).resolves.toBeGreaterThanOrEqual(0);
+  it("keeps middleware-matched App Router HTML OUT of the edge cache (forced no-cache)", async () => {
+    // Reality on GXLB: ext_proc runs as a traffic extension AFTER the Cloud CDN cache, so a
+    // cache hit is served WITHOUT invoking middleware. Every page route in this app is
+    // matched by the middleware config, so the pool forces `Cache-Control: no-cache` to keep
+    // them out of the edge cache — otherwise the CDN could serve a middleware-gated route
+    // without consulting the middleware that gates it. (The earlier version of this test
+    // asserted `/` becomes edge-cached, which is the opposite of the deployed topology.)
+    const r = await req("/");
+    expect(r.status).toBe(200);
+    expect(r.headers.get("cache-control") ?? "").toMatch(/no-cache|no-store|private/);
   });
 });

@@ -28,16 +28,30 @@ async function main() {
   }
   const manifest: RoutingManifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
 
-  // Load middleware module (if present)
+  // Load middleware module (if present). This MUST mirror the pool's top-level-await
+  // unwrap (pool-server resolveMiddlewareModule): Next compiles TLA middleware as
+  // module.exports = Promise<realExports>, so a plain import() surfaces that Promise as
+  // `default`. Without awaiting it, the handler's middleware detection finds no callable
+  // function and SILENTLY no-ops — and because the routing service then emits trusted
+  // dispatch headers, the pool skips middleware too, bypassing auth on GET/HEAD. And a
+  // configured-but-missing middleware must fail closed, not warn-and-continue, for the
+  // same reason: running ext_proc without the middleware it exists to enforce is a bypass.
   let middlewareModule = null;
   if (manifest.middleware) {
     const mwPath = path.resolve(process.cwd(), manifest.middleware.filePath);
-    if (existsSync(mwPath)) {
-      middlewareModule = await import(pathToFileURL(mwPath).href);
-      console.log("Middleware module loaded");
-    } else {
-      console.warn(`Middleware file not found: ${mwPath}`);
+    if (!existsSync(mwPath)) {
+      throw new Error(
+        `Configured middleware not found at ${mwPath}. Refusing to start the routing ` +
+          `service: serving ext_proc without the middleware it must enforce would ` +
+          `silently bypass it (and the pool trusts that ext_proc already ran).`,
+      );
     }
+    const mod = await import(pathToFileURL(mwPath).href);
+    middlewareModule =
+      mod?.default && typeof (mod.default as { then?: unknown }).then === "function"
+        ? await (mod.default as Promise<Record<string, unknown>>)
+        : mod;
+    console.log("Middleware module loaded");
   }
 
   // Per-request budget: shed slow requests before the ext_proc deadline (default 4s,

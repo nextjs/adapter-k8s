@@ -70,6 +70,7 @@ describe("buildHelmUpgradeArgs", () => {
     expect(args).toContain("my-app");
     expect(args).toContain(".k8s-adapter/output/chart");
     expect(args.join(" ")).toContain("global.image.tag=abc123");
+    expect(args.join(" ")).toContain("activeBuildId=abc123");
   });
 
   it("includes previousBuildId when set", () => {
@@ -82,5 +83,18 @@ describe("buildHelmUpgradeArgs", () => {
     });
 
     expect(args.join(" ")).toContain("previousBuildId=abc123");
+    expect(args.join(" ")).toContain("activeBuildId=abc123");
+  });
+
+  it("sanitizes the serving build selector used during the upgrade", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "new-build",
+      registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+      previousBuildId: "123/old",
+    });
+
+    expect(args.join(" ")).toContain("activeBuildId=b-123-old");
   });
 });

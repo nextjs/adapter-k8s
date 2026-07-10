@@ -24,7 +24,19 @@ export const INTERNAL_DISPATCH_HEADERS = [
   "x-upstream-pool",
   "x-nextjs-ppr",
   "x-resolved-headers",
+  // Positive, secret-gated assertion that the middleware STAGE was evaluated upstream
+  // (by the ext_proc routing service or a cross-pool proxy). The pool skips its own
+  // middleware ONLY when this is present with a recognized value — never on the mere
+  // presence of routing headers. Its ABSENCE means "not evaluated" → the pool fails safe
+  // and runs middleware itself. This closes the middleware-bypass class regardless of why
+  // an upstream failed to evaluate (TLA-wrapped module, missing file, no callable, spoof).
+  "x-mw-evaluated",
 ] as const;
+
+// Recognized `x-mw-evaluated` verdicts that authorize the pool to skip its own middleware.
+// `ran` = matched + executed; `skip-nomatch` = middleware exists but matcher didn't match;
+// `none` = the app has no middleware. Anything else (incl. `error` / absent) ⇒ do NOT skip.
+export const MW_EVALUATED_TRUSTED = new Set(["ran", "skip-nomatch", "none"]);
 
 // Header carrying the shared secret that authenticates the dispatch headers above.
 // Present only on responses from the trusted routing extension / cross-pool proxy.

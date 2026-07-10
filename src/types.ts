@@ -16,7 +16,7 @@ export type BuildCompleteContext = Parameters<NonNullable<NextAdapter["onBuildCo
 export interface PoolConfig {
   routes: string[]; // OutputType name ('appPages', 'appRoutes', 'pages', 'pagesApi') or glob pattern
   scaling?: { min: number; max: number; targetCPU: number };
-  resources?: { cpu: string; memory: string };
+  resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
   timeout?: number;
 }
 

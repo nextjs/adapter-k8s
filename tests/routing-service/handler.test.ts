@@ -75,6 +75,26 @@ describe("createRequestHandler", () => {
     expect(matchedHeader!.header.value).toBe("/about");
   });
 
+  it("stamps x-mw-evaluated=none when the app has no middleware", async () => {
+    // Defense-in-depth: the pool skips its own middleware only on a positive, trusted
+    // x-mw-evaluated verdict. With no middleware module, the handler must POSITIVELY assert
+    // `none` (not omit it) so the pool can tell "no middleware" apart from "ext_proc broken /
+    // absent" — absence is what makes the pool fail safe and re-evaluate.
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const response = await handler(makeHeaders("/about"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    const mw = setHeaders.find((h) => h.header.key === "x-mw-evaluated");
+    expect(mw).toBeDefined();
+    expect(mw!.header.value).toBe("none");
+  });
+
   it("returns immediate response for redirect", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
@@ -190,6 +210,27 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
     expect(arg.request.url).toContain("/about");
     // Because path 1 produced a Response, the direct-handler fallback (path 3) must not run.
     expect(handlerFn).not.toHaveBeenCalled();
+  });
+
+  it("does not mark a middleware module with no callable export as evaluated", async () => {
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
+    });
+
+    const handler = createRequestHandler(makeManifest(), {});
+    const response = await handler(makeHeaders("/about"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    const mw = setHeaders.find((h) => h.header.key === "x-mw-evaluated");
+
+    expect(mw?.header.value).toBe("error");
   });
 });
 
@@ -448,7 +489,6 @@ describe("createRequestHandler middleware Set-Cookie passthrough (Fix C)", () =>
   });
 });
 
-
 // REGRESSION: ext_proc parity with the pool resolver for the two riskiest
 // middleware changes — matcher gating and fail-closed. These run in production
 // (routing service) and are not exercised by the single-pool e2e path.
@@ -468,7 +508,10 @@ describe("createRequestHandler middleware matcher + fail-closed (ext_proc parity
         headers: params.headers,
         requestBody: params.requestBody,
       });
-      return { resolvedPathname: "/about", invocationTarget: { pathname: "/about", query: {} } } as any;
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
     });
     const manifest = makeManifest({
       middleware: {
@@ -491,7 +534,10 @@ describe("createRequestHandler middleware matcher + fail-closed (ext_proc parity
         headers: params.headers,
         requestBody: params.requestBody,
       });
-      return { resolvedPathname: "/only-here", invocationTarget: { pathname: "/only-here", query: {} } } as any;
+      return {
+        resolvedPathname: "/only-here",
+        invocationTarget: { pathname: "/only-here", query: {} },
+      } as any;
     });
     vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
     const manifest = makeManifest({

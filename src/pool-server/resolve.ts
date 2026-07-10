@@ -16,6 +16,14 @@ import {
 
 type LoadedModule = Record<string, unknown>;
 
+export function hasCallableMiddlewareExport(module: LoadedModule | null | undefined): boolean {
+  if (!module) return false;
+  if (typeof module === "function") return true;
+  if (typeof module.default === "function") return true;
+  if (typeof module.proxy === "function" || typeof module.middleware === "function") return true;
+  return typeof (module.default as Record<string, unknown> | undefined)?.default === "function";
+}
+
 export type ResolveResult =
   | {
       kind: "route";
@@ -75,6 +83,17 @@ export function createLocalResolver(
       if (prep.kind === "redirect") return { kind: "redirect", url: prep.url, status: prep.status };
       url = prep.url;
 
+      // A declared middleware policy without an executable implementation is a server error,
+      // never an implicit `next()`. This resolver is the security fallback when ext_proc is
+      // absent/fails, so failing open here would bypass the policy in both tiers.
+      if (
+        manifest.middleware &&
+        !edgeMiddlewareRunner &&
+        !hasCallableMiddlewareExport(middlewareModule)
+      ) {
+        return { kind: "error", status: 500 };
+      }
+
       const resolution = await resolveRoutes({
         url,
         buildId: manifest.buildId,
@@ -128,14 +147,17 @@ export function createLocalResolver(
                     const adapterFn =
                       typeof middlewareModule.default === "function"
                         ? (middlewareModule.default as (...args: unknown[]) => unknown)
+                        : null;
+
+                    const exportedHandler =
+                      (middlewareModule as Record<string, unknown>).proxy ??
+                      (middlewareModule as Record<string, unknown>).middleware;
+                    const handlerFn =
+                      typeof exportedHandler === "function"
+                        ? (exportedHandler as (...args: unknown[]) => unknown)
                         : typeof middlewareModule === "function"
                           ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
                           : null;
-
-                    const handlerFn =
-                      (middlewareModule as Record<string, unknown>).proxy ||
-                      (middlewareModule as Record<string, unknown>).middleware ||
-                      middlewareModule;
 
                     const legacyMiddlewareFn =
                       typeof (middlewareModule.default as Record<string, unknown> | undefined)
@@ -144,6 +166,7 @@ export function createLocalResolver(
                             ...args: unknown[]
                           ) => unknown)
                         : null;
+                    const adapterHandler = handlerFn ?? (adapterFn ? middlewareModule : null);
 
                     if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
 
@@ -152,7 +175,7 @@ export function createLocalResolver(
                     };
 
                     // Path 1: Web adapter (default({ handler, request, page }))
-                    if (adapterFn && handlerFn) {
+                    if (adapterFn && adapterHandler) {
                       const requestHeaders = Object.fromEntries(
                         [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                       );
@@ -169,7 +192,7 @@ export function createLocalResolver(
                         }
                       }
                       const result = await (adapterFn as any)({
-                        handler: handlerFn,
+                        handler: adapterHandler,
                         request: {
                           url: ctx.url.toString(),
                           method,
@@ -370,7 +393,8 @@ export function createLocalResolver(
         const q = resolution.invocationTarget?.query ?? resolution.resolvedQuery;
         const qs = buildQueryString(q);
         const candidate = targetPath + qs;
-        if (candidate !== prep.originalUrl.pathname + prep.originalUrl.search) invokePath = candidate;
+        if (candidate !== prep.originalUrl.pathname + prep.originalUrl.search)
+          invokePath = candidate;
       }
 
       // Middleware/config rewrites must be signalled to the client on the
@@ -407,7 +431,8 @@ export function createLocalResolver(
         if (pathChanged || queryChanged) {
           resolvedHeaders = new Headers(resolvedHeaders ?? undefined);
           if (pathChanged) resolvedHeaders.set("x-nextjs-rewritten-path", rwPath);
-          if (queryChanged) resolvedHeaders.set("x-nextjs-rewritten-query", rwQs.replace(/^\?/, ""));
+          if (queryChanged)
+            resolvedHeaders.set("x-nextjs-rewritten-query", rwQs.replace(/^\?/, ""));
         }
       }
 
@@ -440,9 +465,7 @@ function filterInternalQuery(
 
 // Serialize a resolved query (Record<string, string | string[]>) to a "?a=b&..."
 // string, preserving repeated keys. Empty → "".
-function buildQueryString(
-  query: Record<string, string | string[]> | undefined,
-): string {
+function buildQueryString(query: Record<string, string | string[]> | undefined): string {
   if (!query) return "";
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {

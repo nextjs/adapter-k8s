@@ -57,6 +57,7 @@ describe("renderRouteExtUpdateJob", () => {
     // P2: fail loudly (exit 1) when FR/NEG are absent — never silently "succeed" unregistered.
     expect(yaml).toContain("exit 1");
     expect(yaml).not.toContain("Skipping traffic extension");
+    expect(yaml).toContain("only ${ATTACHED:-0}/$ZC zonal NEG(s) attached");
   });
 
   it("rejects a releaseName containing shell metacharacters", () => {

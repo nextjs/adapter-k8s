@@ -17,6 +17,44 @@ const mockManifest: RoutingManifest = {
 };
 
 describe("generateHelmChart", () => {
+  it("translates flat pool resource settings into Kubernetes requests and limits", () => {
+    const pools = new Map<string, PoolDefinition>([
+      [
+        "ssr",
+        {
+          name: "ssr",
+          outputs: [],
+          config: {
+            routes: ["appPages"],
+            resources: {
+              cpu: "500m",
+              memory: "768Mi",
+              cpuLimit: "2",
+              memoryLimit: "1Gi",
+            },
+          },
+        },
+      ],
+    ]);
+    const result = generateHelmChart({
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+    });
+    const values = JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{")));
+
+    expect(values.pools.ssr.resources).toEqual({
+      requests: { cpu: "500m", memory: "768Mi" },
+      limits: { cpu: "2", memory: "1Gi" },
+    });
+  });
+
   it("generates chart with correct structure", () => {
     const pools = new Map<string, PoolDefinition>([
       [
@@ -55,8 +93,12 @@ describe("generateHelmChart", () => {
     expect(result["Chart.yaml"]).toContain("name:");
     expect(result["Chart.yaml"]).toContain("version:");
     expect(result["values.yaml"]).toContain("abc123");
+    expect(result["values.yaml"]).toContain('"activeBuildId": "abc123"');
     expect(result["templates/ssr-deployment.yaml"]).toBeDefined();
     expect(result["templates/ssr-service.yaml"]).toBeDefined();
+    expect(result["templates/ssr-active-service.yaml"]).toContain(
+      'app.kubernetes.io/version: "{{ .Values.activeBuildId }}"',
+    );
     expect(result["templates/ssr-hpa.yaml"]).toBeDefined();
     expect(result["templates/routing-manifest-configmap.yaml"]).toBeDefined();
     expect(result["templates/http-route.yaml"]).toBeDefined();
@@ -300,8 +342,12 @@ describe("generateHelmChart", () => {
       expect(chart["templates/http-route.yaml"]).not.toContain("filters:");
       expect(chart["templates/http-route.yaml"]).not.toContain("GCPHTTPFilter");
     }
-    // cdn.enabled: false is byte-identical to cdn absent
-    expect(disabled).toEqual(absent);
+    // cdn.enabled: false is byte-identical to cdn absent, excluding the generated timestamp.
+    const withoutTimestamp = (chart: Record<string, string>) => ({
+      ...chart,
+      "values.yaml": chart["values.yaml"].replace(/^# Generated: .*$/m, "# Generated: <time>"),
+    });
+    expect(withoutTimestamp(disabled)).toEqual(withoutTimestamp(absent));
   });
 
   it("emits no CDN artifacts without gateway hosts (unreachable via validated config)", () => {

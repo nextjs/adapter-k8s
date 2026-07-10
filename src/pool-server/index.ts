@@ -6,11 +6,21 @@ import dns from "node:dns/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest } from "../types.js";
-import { getRscConfig, manifestNextConfig, matchesMiddleware, rscParentCandidates, templateOutputCandidates, type MiddlewareMatcher, type RscConfig } from "../routing-common.js";
+import {
+  getRscConfig,
+  manifestNextConfig,
+  matchesMiddleware,
+  MW_EVALUATED_TRUSTED,
+  rscParentCandidates,
+  templateOutputCandidates,
+  type MiddlewareMatcher,
+  type RscConfig,
+} from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
-import { createLocalResolver } from "./resolve.js";
+import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
 import { createPoolServer } from "./server.js";
+import { readWebBodyWithLimit } from "./body-limit.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -124,12 +134,6 @@ function isServerActionRequest(headers: Headers, method: string): boolean {
   );
 }
 
-function toDebugPreview(body: Buffer | null): string {
-  if (!body || body.length === 0) return "<empty>";
-  const preview = body.subarray(0, 240).toString("utf8");
-  return preview.replace(/\s+/g, " ").trim();
-}
-
 // --- Image optimizer SSRF / path-traversal guards -------------------------------
 
 interface ImageRemotePattern {
@@ -142,13 +146,26 @@ interface ImageRemotePattern {
 interface ImageConfig {
   remotePatterns: ImageRemotePattern[];
   domains: string[];
+  // Allowed optimization widths — the union bounds the `w` param so a client can't drive
+  // Sharp into an unbounded allocation. Default to Next's defaults when unconfigured.
+  deviceSizes: number[];
+  imageSizes: number[];
 }
 
-// Read the app's image config (external-host allowlist) from the build output.
-// Next.js writes the resolved config to .next/required-server-files.json. When it's
-// unavailable, external image fetches are denied by default.
+// Next.js defaults (used when required-server-files.json omits them).
+const DEFAULT_DEVICE_SIZES = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
+const DEFAULT_IMAGE_SIZES = [16, 32, 48, 64, 96, 128, 256, 384];
+
+// Read the app's image config (external-host allowlist + allowed sizes) from the build
+// output. Next.js writes the resolved config to .next/required-server-files.json. When it's
+// unavailable, external image fetches are denied by default and sizes fall back to defaults.
 function loadImageConfig(cwd: string): ImageConfig {
-  const config: ImageConfig = { remotePatterns: [], domains: [] };
+  const config: ImageConfig = {
+    remotePatterns: [],
+    domains: [],
+    deviceSizes: DEFAULT_DEVICE_SIZES,
+    imageSizes: DEFAULT_IMAGE_SIZES,
+  };
   try {
     const rsfPath = path.join(cwd, ".next", "required-server-files.json");
     if (existsSync(rsfPath)) {
@@ -156,9 +173,13 @@ function loadImageConfig(cwd: string): ImageConfig {
       const images = rsf?.config?.images ?? {};
       if (Array.isArray(images.remotePatterns)) config.remotePatterns = images.remotePatterns;
       if (Array.isArray(images.domains)) config.domains = images.domains;
+      if (Array.isArray(images.deviceSizes) && images.deviceSizes.length)
+        config.deviceSizes = images.deviceSizes;
+      if (Array.isArray(images.imageSizes) && images.imageSizes.length)
+        config.imageSizes = images.imageSizes;
     }
   } catch {
-    // No image config — external images denied by default.
+    // No image config — external images denied by default, sizes fall back to defaults.
   }
   return config;
 }
@@ -286,7 +307,11 @@ function pinnedPublicLookup(
     .then((records) => {
       const publicRecords = records.filter((r) => !isPrivateAddress(r.address));
       if (publicRecords.length === 0) {
-        callback(Object.assign(new Error("host resolves to non-public address"), { code: "EAI_FAIL" }), "", undefined);
+        callback(
+          Object.assign(new Error("host resolves to non-public address"), { code: "EAI_FAIL" }),
+          "",
+          undefined,
+        );
         return;
       }
       if (options.all) {
@@ -382,14 +407,18 @@ async function fetchExternalImageSafely(
 }
 
 async function main() {
-  // K8s safety net: a single request's client disconnect or a rejected background task
-  // must not take the whole pod down. Log and stay alive rather than process.exit — the
-  // pool serves many concurrent requests and the liveness probe hits /healthz.
+  // A rejected fire-and-forget shouldn't take the pod down — log and continue (per-request
+  // failures are already caught by the request handler).
   process.on("unhandledRejection", (reason) => {
     console.error("Unhandled promise rejection:", reason);
   });
+  // A TRULY uncaught exception, however, means Node can no longer guarantee this process's
+  // invariants — but /healthz would keep returning 200, so Kubernetes would keep routing
+  // traffic to a corrupted pod. Crash so the kubelet restarts it. (Request-level errors are
+  // caught in the handler and never reach here.)
   process.on("uncaughtException", (err) => {
-    console.error("Uncaught exception:", err);
+    console.error("Uncaught exception — terminating so Kubernetes restarts the pod:", err);
+    process.exit(1);
   });
 
   // Load .env files (Next.js does this in next start, but we're standalone)
@@ -494,7 +523,16 @@ async function main() {
     "middleware-manifest.json",
   );
   const middlewareManifest: {
-    middleware: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[]; matchers?: MiddlewareMatcher[] }>;
+    middleware: Record<
+      string,
+      {
+        name: string;
+        files: string[];
+        wasm?: any[];
+        assets?: any[];
+        matchers?: MiddlewareMatcher[];
+      }
+    >;
     functions: Record<string, { name: string; files: string[]; wasm?: any[]; assets?: any[] }>;
   } = existsSync(middlewareManifestPath)
     ? JSON.parse(readFileSync(middlewareManifestPath, "utf-8"))
@@ -581,7 +619,10 @@ async function main() {
     const mwManifestEntry = Object.values(middlewareManifest.middleware)[0];
 
     if (!existsSync(mwPath)) {
-      console.warn(`Middleware file not found: ${mwPath}`);
+      throw new Error(
+        `Configured middleware not found at ${mwPath}. Refusing to start the pool: ` +
+          `serving without it would bypass the application's middleware policy.`,
+      );
     } else if (isEdge && edgeSandboxRun && mwManifestEntry) {
       // Edge middleware: use the sandbox with the correct name/files from the manifest
       const mwName = mwManifestEntry.name;
@@ -623,6 +664,12 @@ async function main() {
     } else {
       middlewareModule = await resolveMiddlewareModule(mwPath);
       console.log("Middleware module loaded");
+    }
+
+    if (!edgeMiddlewareRunner && !hasCallableMiddlewareExport(middlewareModule)) {
+      throw new Error(
+        `Configured middleware at ${mwPath} has no callable export. Refusing to start the pool.`,
+      );
     }
   }
 
@@ -679,6 +726,7 @@ async function main() {
     ? Object.values(middlewareManifest.middleware)[0]?.matchers
     : undefined;
 
+  const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
   const resolver = createLocalResolver(
     routingManifest,
     middlewareModule,
@@ -699,6 +747,7 @@ async function main() {
     strictDynamicRoutes,
     prerenderedPaths,
     buildIdForData: buildId,
+    internalSecret,
   });
 
   // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch
@@ -706,7 +755,6 @@ async function main() {
   // a Secret). When the secret is set the pool trusts dispatch headers only if it matches;
   // TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test paths).
   const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
-  const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
 
   // Create and start server
   const server = createPoolServer({
@@ -818,6 +866,35 @@ async function main() {
           return;
         }
 
+        // Validate w/q against Next's resolved image config before they reach Sharp. An
+        // unbounded `w` (e.g. w=999999) drives Sharp into a huge allocation — a trivial
+        // resource-exhaustion vector. Width must be an allowed device/image size; quality 1..100.
+        const allowedWidths = new Set<number>([
+          ...(imageConfig?.deviceSizes ?? []),
+          ...(imageConfig?.imageSizes ?? []),
+        ]);
+        if (
+          !Number.isFinite(width) ||
+          width <= 0 ||
+          (allowedWidths.size > 0 && !allowedWidths.has(width))
+        ) {
+          res.writeHead(400, { "content-type": "text/plain" });
+          res.end("Bad Request: invalid or unallowed width");
+          return;
+        }
+        if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
+          res.writeHead(400, { "content-type": "text/plain" });
+          res.end("Bad Request: invalid quality");
+          return;
+        }
+        // Reject self-referential optimizer URLs (…?url=/_next/image…): they loop back into
+        // this handler and recurse until the pod exhausts sockets/memory.
+        if (imageUrl.split("?")[0] === "/_next/image") {
+          res.writeHead(400, { "content-type": "text/plain" });
+          res.end("Bad Request: recursive image url");
+          return;
+        }
+
         try {
           // Resolve the image: internal (relative) or external (absolute URL)
           let imageBuffer: Buffer;
@@ -852,15 +929,30 @@ async function main() {
             ) {
               imageBuffer = readFileSync(staticFile);
             } else {
-              // Fetch from ourselves (same-origin relative image, e.g. served by a route)
+              // Fetch from ourselves (same-origin relative image, e.g. served by a route).
+              // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and a
+              // size cap so an oversized body can't exhaust memory.
+              const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
               const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
-              const imgRes = await fetch(selfUrl);
+              const imgRes = await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
               if (!imgRes.ok) {
                 res.writeHead(imgRes.status, { "content-type": "text/plain" });
                 res.end(`Image not found: ${imageUrl}`);
                 return;
               }
-              imageBuffer = Buffer.from(await imgRes.arrayBuffer());
+              const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
+              if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
+                res.writeHead(413, { "content-type": "text/plain" });
+                res.end("Image too large");
+                return;
+              }
+              const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
+              if (streamedBody === null) {
+                res.writeHead(413, { "content-type": "text/plain" });
+                res.end("Image too large");
+                return;
+              }
+              imageBuffer = streamedBody;
             }
             contentType = getContentType(imageUrl);
           } else {
@@ -963,7 +1055,13 @@ async function main() {
         addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
       }
 
-      if (isServerActionRequest(headers, req.method ?? "GET")) {
+      // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
+      // bodies routinely carry credentials, tokens, and PII, and were previously written to
+      // production logs on every action. Body length only, and only when explicitly enabled.
+      if (
+        process.env.ADAPTER_K8S_DEBUG_ACTIONS === "1" &&
+        isServerActionRequest(headers, req.method ?? "GET")
+      ) {
         console.log("[pool-server] action request", {
           url: url.pathname,
           method: req.method,
@@ -971,12 +1069,10 @@ async function main() {
           rsc: headers.get("rsc"),
           accept: headers.get("accept"),
           nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
-          nextRouterStateTreePreview: headers.get("next-router-state-tree")?.slice(0, 160),
           nextUrl: headers.get("next-url"),
           contentType: headers.get("content-type"),
           contentLength: headers.get("content-length"),
           bodyLength: bodyBuffer?.length ?? 0,
-          bodyPreview: toDebugPreview(bodyBuffer),
         });
       }
 
@@ -984,7 +1080,15 @@ async function main() {
       // These are only present when the request passed the secret check in server.ts (else they
       // were stripped), so they can be trusted here.
       const extOutputId = req.headers["x-output-id"] as string | undefined;
-      if (extOutputId) {
+      const extMwEvaluated = req.headers["x-mw-evaluated"] as string | undefined;
+      delete req.headers["x-mw-evaluated"];
+      // Skip the pool's own middleware ONLY when the trusted upstream POSITIVELY asserts it
+      // evaluated the middleware stage (x-mw-evaluated ∈ ran/skip-nomatch/none). x-output-id
+      // alone is NOT proof — a broken ext_proc or cross-pool proxy can emit routing headers
+      // without having run middleware. Absent / `error` / unrecognized ⇒ fall through to
+      // Phase 1 below so the pool evaluates middleware itself. Both headers are secret-gated
+      // (untrusted ones were already stripped in server.ts), so this can't be forged.
+      if (extOutputId && extMwEvaluated && MW_EVALUATED_TRUSTED.has(extMwEvaluated)) {
         const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
         // Secret-gated (trusted) input, but a malformed value from an extension bug should not
         // 500 the request — fall back to no route params rather than throwing.

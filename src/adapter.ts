@@ -172,64 +172,60 @@ async function stageFile(
 
 export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
   let config: K8sAdapterConfig | undefined = userConfig;
+  let configNormalized = false;
 
   async function ensureConfig(projectDir: string) {
-    if (config) return config;
+    if (!config) {
+      // Try to load from project root
+      const configPaths = [
+        path.join(projectDir, "adapter.config.mjs"),
+        path.join(projectDir, "adapter.config.ts"),
+        path.join(projectDir, "adapter.config.js"),
+      ];
 
-    // Try to load from project root
-    const configPaths = [
-      path.join(projectDir, "adapter.config.mjs"),
-      path.join(projectDir, "adapter.config.ts"),
-      path.join(projectDir, "adapter.config.js"),
-    ];
-
-    for (const p of configPaths) {
-      if (existsSync(p)) {
-        try {
-          const mod = await import(pathToFileURL(p).href);
-          const exported = mod.default;
-          if (exported && typeof exported === "object") {
-            // Standard adapters export the object directly OR an instance.
-            // If it's an instance, we tucked the config into a hidden property below.
-            config = exported.config || exported;
-            break;
+      for (const p of configPaths) {
+        if (existsSync(p)) {
+          try {
+            const mod = await import(pathToFileURL(p).href);
+            const exported = mod.default;
+            if (exported && typeof exported === "object") {
+              config = exported.config || exported;
+              break;
+            }
+            console.warn(
+              `[adapter-k8s] ${p} loaded but has no usable default export (expected an object ` +
+                `or a createK8sAdapter() instance); ignoring it.`,
+            );
+          } catch (err) {
+            console.error(`Failed to load config from ${p}:`, err);
           }
-          // File loaded but didn't yield a usable config object. Warn loudly rather
-          // than silently falling through to defaults, which would mask a mistake in
-          // the user's config (e.g. a missing/misnamed default export).
-          console.warn(
-            `[adapter-k8s] ${p} loaded but has no usable default export (expected an object ` +
-              `or a createK8sAdapter() instance); ignoring it.`,
-          );
-        } catch (err) {
-          console.error(`Failed to load config from ${p}:`, err);
         }
+      }
+
+      if (!config) {
+        console.log("[adapter-k8s] No adapter config found, using defaults");
+        config = {
+          pools: {
+            default: { routes: ["appPages", "appRoutes", "pagesApi", "pages"] },
+          },
+          provider: {
+            gke: {
+              gateway: {
+                type: "gateway-api",
+                className: "gke-l7-global-external-managed",
+                hosts: [{ hostname: "localhost", tls: { enabled: false } }],
+              },
+            },
+          },
+        };
       }
     }
 
-    if (!config) {
-      // No usable config file found — use sensible defaults.
-      // This allows the adapter to work for e2e tests and simple apps
-      // without requiring adapter.config.ts
-      console.log("[adapter-k8s] No adapter config found, using defaults");
-      config = {
-        pools: {
-          default: { routes: ["appPages", "appRoutes", "pagesApi", "pages"] },
-        },
-        provider: {
-          gke: {
-            gateway: {
-              type: "gateway-api",
-              className: "gke-l7-global-external-managed",
-              hosts: [{ hostname: "localhost", tls: { enabled: false } }],
-            },
-          },
-        },
-      };
+    if (!configNormalized) {
+      validateConfig(config);
+      config = applyDefaults(config);
+      configNormalized = true;
     }
-
-    validateConfig(config);
-    config = applyDefaults(config);
     return config;
   }
 
@@ -887,9 +883,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
   // Expose config for ensureConfig to find when it imports an existing adapter instance
   Object.defineProperty(adapter, "config", {
-    value: userConfig,
+    get: () => config,
     enumerable: false,
-    writable: false,
   });
 
   return adapter;

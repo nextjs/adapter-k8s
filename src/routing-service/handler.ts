@@ -103,6 +103,13 @@ export function createRequestHandler(
     // middleware must 500, not silently emit trusted dispatch headers that let
     // the request bypass the auth/redirects/rewrites middleware implements.
     let middlewareThrew = false;
+    // Positive record of what the middleware STAGE actually did, stamped to `x-mw-evaluated`
+    // so the pool can trust the skip instead of inferring "middleware ran" from the presence
+    // of routing headers. Pessimistic default `error` while middleware is configured but not
+    // yet confirmed to have run (so the pool re-evaluates); `none` when there is no middleware.
+    let mwEvaluated: "ran" | "skip-nomatch" | "none" | "error" = middlewareModule
+      ? "error"
+      : "none";
 
     const resolution = await resolveRoutes({
       url: resolveUrl,
@@ -129,6 +136,7 @@ export function createRequestHandler(
               // Honor the middleware `matcher` config (parity with the pool
               // resolver) — skip middleware for requests it doesn't match.
               if (!matchesMiddleware(manifest.middleware?.matchers, ctx.url, ctx.headers)) {
+                mwEvaluated = "skip-nomatch";
                 return {};
               }
 
@@ -137,14 +145,17 @@ export function createRequestHandler(
               const adapterFn =
                 typeof middlewareModule.default === "function"
                   ? (middlewareModule.default as (...args: unknown[]) => unknown)
+                  : null;
+
+              const exportedHandler =
+                (middlewareModule as Record<string, unknown>).proxy ??
+                (middlewareModule as Record<string, unknown>).middleware;
+              const handlerFn =
+                typeof exportedHandler === "function"
+                  ? (exportedHandler as (...args: unknown[]) => unknown)
                   : typeof middlewareModule === "function"
                     ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
                     : null;
-
-              const handlerFn =
-                (middlewareModule as Record<string, unknown>).proxy ||
-                (middlewareModule as Record<string, unknown>).middleware ||
-                middlewareModule;
 
               const legacyMiddlewareFn =
                 typeof (middlewareModule.default as Record<string, unknown> | undefined)
@@ -153,20 +164,27 @@ export function createRequestHandler(
                       ...args: unknown[]
                     ) => unknown)
                   : null;
+              const adapterHandler = handlerFn ?? (adapterFn ? middlewareModule : null);
 
+              // Manifest declares middleware but no callable export was found — this is the
+              // exact silent-bypass state. Leave `mwEvaluated = "error"` so the pool does NOT
+              // trust the skip and re-runs middleware itself.
               if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
+              // A callable was found and is about to run — the middleware stage is genuinely
+              // evaluated for this request.
+              mwEvaluated = "ran";
 
               const waitUntil = (waitable: Promise<unknown>) => {
                 void waitable.catch(() => undefined);
               };
 
               // Path 1: Web adapter (default({ handler, request, page }))
-              if (adapterFn && handlerFn) {
+              if (adapterFn && adapterHandler) {
                 const requestHeaders = Object.fromEntries(
                   [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                 );
                 const result = await (adapterFn as any)({
-                  handler: handlerFn,
+                  handler: adapterHandler,
                   request: {
                     url: ctx.url.toString(),
                     method,
@@ -322,7 +340,8 @@ export function createRequestHandler(
     // Concrete prerendered outputs win over dynamic templates (decoded lookup).
     // Mirrors pool-server/resolve.ts.
     basePathname =
-      preferConcreteOutput(resolveUrl.pathname, basePathname, manifest.poolAssignments) ?? basePathname;
+      preferConcreteOutput(resolveUrl.pathname, basePathname, manifest.poolAssignments) ??
+      basePathname;
     const outputId = resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
 
     const mutations: HeaderMutationEntry[] = [];
@@ -351,6 +370,11 @@ export function createRequestHandler(
         i18nLocales,
       ) ?? "default";
     setDispatch("x-upstream-pool", pool);
+
+    // Positive assertion of what the middleware stage did. The pool only skips its own
+    // middleware when this is one of the trusted verdicts (ran / skip-nomatch / none);
+    // `error` (no callable found) leaves the pool to re-evaluate — closing the bypass.
+    setDispatch("x-mw-evaluated", mwEvaluated);
 
     // x-output-id tells the pool server which handler to invoke directly,
     // bypassing local resolveRoutes() (avoids double resolution + middleware)

@@ -1,6 +1,6 @@
 // tests/pool-server/resolve.test.ts
 import { describe, it, expect, vi } from "vitest";
-import { createLocalResolver } from "../../src/pool-server/resolve.js";
+import { createLocalResolver, hasCallableMiddlewareExport } from "../../src/pool-server/resolve.js";
 import { mockRouting } from "../helpers/mock-outputs.js";
 import type { RoutingManifest } from "../../src/types.js";
 
@@ -42,6 +42,23 @@ function makeManifest(overrides: Partial<RoutingManifest> = {}): RoutingManifest
 }
 
 describe("createLocalResolver", () => {
+  it("fails closed when the manifest declares middleware but no callable implementation exists", async () => {
+    const resolver = createLocalResolver(
+      makeManifest({ middleware: { filePath: "middleware.js" } }),
+      {},
+    );
+
+    await expect(
+      resolver.resolve(
+        new URL("http://localhost/protected"),
+        new Headers(),
+        "GET",
+        new ReadableStream<Uint8Array>(),
+      ),
+    ).resolves.toEqual({ kind: "error", status: 500 });
+    expect(resolveRoutes).not.toHaveBeenCalled();
+  });
+
   it("resolves a known static route", async () => {
     const manifest = makeManifest();
     (resolveRoutes as any).mockResolvedValue({
@@ -342,7 +359,7 @@ describe("createLocalResolver", () => {
     expect(result.kind).toBe("route");
   });
 
-it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () => {
+  it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () => {
     const manifest = makeManifest();
     const throwingMiddleware = vi.fn().mockRejectedValue(new Error("boom"));
 
@@ -422,7 +439,6 @@ it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () =
     expect(typeof receivedBody.cloneBodyStream).toBe("function");
   });
 
-
   it("sets invokePath to the rewritten path+query (middleware/config rewrite)", async () => {
     const manifest = makeManifest();
     (resolveRoutes as any).mockResolvedValue({
@@ -458,7 +474,6 @@ it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () =
     );
     if (result.kind === "route") expect(result.invokePath).toBeUndefined();
   });
-
 
   it("emits x-nextjs-rewritten-path/-query for an RSC middleware rewrite", async () => {
     const manifest = makeManifest();
@@ -518,7 +533,6 @@ it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () =
     );
     if (r2.kind === "route") expect(r2.resolvedHeaders?.get("x-nextjs-rewritten-path")).toBeFalsy();
   });
-
 
   // REGRESSION: fail-closed must NOT fire for normal middleware. A middleware
   // that returns next()/rewrite/redirect (does not throw) must resolve
@@ -617,5 +631,13 @@ it("fails CLOSED with a 500 when middleware throws (no auth bypass)", async () =
     );
     expect(mw).toHaveBeenCalledOnce();
   });
+});
 
+describe("hasCallableMiddlewareExport", () => {
+  it("accepts supported shapes and rejects module objects without a callable", () => {
+    expect(hasCallableMiddlewareExport({ default: vi.fn() })).toBe(true);
+    expect(hasCallableMiddlewareExport({ middleware: vi.fn() })).toBe(true);
+    expect(hasCallableMiddlewareExport({ default: { default: vi.fn() } })).toBe(true);
+    expect(hasCallableMiddlewareExport({})).toBe(false);
+  });
 });

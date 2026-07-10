@@ -39,6 +39,21 @@ export function validateConfig(input: unknown): void {
     // Wildcards are supported via Certificate Manager with DNS authorization.
     // No restriction needed — init provisions the DNS auth + cert automatically.
   }
+
+  if (config.cache?.enabled) {
+    throw new Error(
+      "cache.enabled is not implemented yet; disable it until the Valkey cache ships",
+    );
+  }
+  if (config.imageOptimizer?.enabled) {
+    throw new Error("imageOptimizer.enabled is not implemented yet");
+  }
+  if (config.skewProtection?.enabled) {
+    throw new Error("skewProtection.enabled is not implemented yet");
+  }
+  if (config.routeExtension?.mode === "wasm") {
+    throw new Error('routeExtension.mode "wasm" is not implemented; use "auto" or "extproc"');
+  }
 }
 
 export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {

@@ -77,6 +77,29 @@ describe("validateConfig", () => {
     };
     expect(() => validateConfig(config)).not.toThrow();
   });
+
+  it.each([
+    ["cache", { cache: { enabled: true, provider: "valkey" } }],
+    ["image optimizer", { imageOptimizer: { enabled: true, mode: "sidecar" } }],
+    ["skew protection", { skewProtection: { enabled: true, duration: "5m" } }],
+    ["Wasm routing", { routeExtension: { mode: "wasm" } }],
+  ])("rejects the unimplemented %s option", (_name, extra) => {
+    const config = {
+      pools: { ssr: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+      ...extra,
+    } as K8sAdapterConfig;
+
+    expect(() => validateConfig(config)).toThrow(/not implemented/);
+  });
 });
 
 describe("applyDefaults", () => {

@@ -56,15 +56,12 @@ spec:
 // Its selector is patched by deploy/rollback to point to the active build.
 export function renderActiveService({
   poolName,
-  buildId,
   releaseName,
 }: {
   poolName: string;
-  buildId: string;
   releaseName: string;
 }): string {
   const stableName = sanitizeK8sName(`${releaseName}-${poolName}`);
-  const safeBuildId = sanitizeK8sName(buildId);
   return `apiVersion: v1
 kind: Service
 metadata:
@@ -77,7 +74,7 @@ spec:
   selector:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: ${poolName}
-    app.kubernetes.io/version: "${safeBuildId}"
+    app.kubernetes.io/version: "{{ .Values.activeBuildId }}"
   ports:
     - port: 3000
       targetPort: 3000

@@ -7,7 +7,12 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
-import { rscParentCandidates, templateOutputCandidates, type RscConfig } from "../routing-common.js";
+import {
+  INTERNAL_SECRET_HEADER,
+  rscParentCandidates,
+  templateOutputCandidates,
+  type RscConfig,
+} from "../routing-common.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -252,6 +257,8 @@ export interface DispatcherOptions {
   strictDynamicRoutes?: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[];
   prerenderedPaths?: Set<string>;
   buildIdForData?: string;
+  /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
+  internalSecret?: string | undefined;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -269,6 +276,7 @@ export function createDispatcher(options: DispatcherOptions) {
     strictDynamicRoutes = [],
     prerenderedPaths = new Set<string>(),
     buildIdForData = "",
+    internalSecret,
   } = options;
 
   return {
@@ -372,7 +380,6 @@ export function createDispatcher(options: DispatcherOptions) {
         const serveStaticFile = staticAsset && !staticAsset.prerender && isReadMethod;
 
         if (staticAsset && (serveStaticFile || serveHandlerlessPrerender)) {
-
           const fullPath = path.resolve(process.cwd(), staticAsset.filePath);
           if (existsSync(fullPath)) {
             const content = readFileSync(fullPath);
@@ -581,7 +588,7 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // If this output belongs to another pool, proxy the request
           if (resolution.pool !== poolName && !handlerLoader.has(handlerPathname)) {
-            return proxyToPool(req, res, resolution, releaseName, buildId);
+            return proxyToPool(req, res, resolution, releaseName, buildId, internalSecret);
           }
 
           // If no handler exists for this output, fall through to 404
@@ -707,6 +714,7 @@ function proxyToPool(
   resolution: Extract<ResolveResult, { kind: "route" }>,
   releaseName: string,
   buildId: string,
+  internalSecret?: string,
 ): Promise<void> {
   return new Promise((resolve) => {
     const targetHost = sanitizeK8sName(`${releaseName}-${resolution.pool}-${buildId}`);
@@ -721,6 +729,12 @@ function proxyToPool(
           "x-output-id": resolution.matchedPathname,
           "x-matched-pathname": resolution.matchedPathname,
           "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
+          // This pool already ran the middleware stage in its Phase-1 resolve before deciding
+          // to proxy; assert it so the target pool trusts the skip instead of re-running
+          // middleware (which would double-apply cookies/redirects). Without this, the target's
+          // x-mw-evaluated gate would fall through to a second evaluation.
+          "x-mw-evaluated": "ran",
+          ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
         },
       },
       (proxyRes) => {

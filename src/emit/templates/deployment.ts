@@ -6,10 +6,14 @@ export function renderDeployment({
   poolName,
   buildId,
   releaseName,
+  imageTag = "{{ .Values.global.image.tag }}",
+  replicas,
 }: {
   poolName: string;
   buildId: string;
   releaseName: string;
+  imageTag?: string;
+  replicas?: number | undefined;
 }): string {
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
@@ -23,7 +27,7 @@ metadata:
     app.kubernetes.io/component: ${poolName}
     app.kubernetes.io/version: "${safeBuildId}"
 spec:
-  selector:
+${replicas !== undefined ? `  replicas: ${replicas}\n` : ""}  selector:
     matchLabels:
       app.kubernetes.io/name: ${releaseName}
       app.kubernetes.io/component: ${poolName}
@@ -37,7 +41,7 @@ spec:
     spec:
       containers:
         - name: pool-server
-          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools "${poolName}").image.repository }}:{{ .Values.global.image.tag }}"
+          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools "${poolName}").image.repository }}:${imageTag}"
           ports:
             - containerPort: 3000
           env:

@@ -23,9 +23,11 @@ export default createK8sAdapter({
     },
   },
 
-  cache: { enabled: true, provider: 'valkey' },
   containerStrategy: 'traced-assets',
-  skewProtection: { enabled: true, duration: '5m' },
+  // Not yet implemented — uncomment once the corresponding feature ships, otherwise these
+  // validate but do nothing:
+  //   cache: { enabled: true, provider: 'valkey' },   // shared middle cache (in progress)
+  //   skewProtection: { enabled: true, duration: '5m' },
 
   provider: {
     gke: {

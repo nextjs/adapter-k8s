@@ -1,9 +1,11 @@
 // src/cli/deploy.ts
 import path from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { exec, execOrThrow, execCapture } from "./exec.js";
+import { execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
-import { renderInternalSecretEnv } from "../emit/templates/internal-secret.js";
+import { renderDeployment } from "../emit/templates/deployment.js";
+import { renderService } from "../emit/templates/service.js";
+import { renderHPA } from "../emit/templates/hpa.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 // Import the SAME sanitizer that stamps pod names and version labels (deployment.ts /
@@ -116,6 +118,8 @@ export function buildHelmUpgradeArgs(options: {
     `global.image.registry=${registry}`,
     "--set",
     `build.id=${buildId}`,
+    "--set",
+    `activeBuildId=${sanitizeK8sName(previousBuildId ?? buildId)}`,
   ];
 
   if (previousBuildId) {
@@ -236,7 +240,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // 5b. Pre-flight: the chart carries a Cloud CDN filter only when cdn.enabled — the cluster
   // must know the GCPHTTPFilter CRD (GKE >= 1.35.2-gke.1751000) or the apply would fail with
   // an opaque server error. Capability-detect the CRD rather than parsing version strings.
-  const chartHasCdn = existsSync(path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml"));
+  const chartHasCdn = existsSync(
+    path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml"),
+  );
   if (!dryRun && chartHasCdn) {
     const crdCheck = await execCapture("kubectl", [
       "get",
@@ -286,85 +292,48 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Without this, helm upgrade only sees the current build's templates and deletes the previous.
   if (previousBuildId && previousBuildId !== buildId) {
     const chartTemplatesDir = path.join(outputDir, "chart", "templates");
-    const prevName = sanitizeK8sName(`${releaseName}-default-${previousBuildId}`);
-    const prevSafeBuildId = sanitizeK8sName(previousBuildId);
-
     for (const poolName of pools) {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
 
-      // Previous deployment at 0 replicas (kept for rollback)
+      // The "previous" build is the one CURRENTLY SERVING traffic. Render its Deployment at
+      // its current replica count — NOT 0 — so `helm upgrade` doesn't scale it to zero while
+      // the active Service still selects it, which would black-hole the origin on every
+      // deploy until the new pods are ready and the selector switches. It keeps serving
+      // through the rollout; it is scaled to 0 only after state is committed (step 7e).
+      let prevReplicas = 2;
+      if (!dryRun) {
+        const r = await execCapture("kubectl", [
+          "get",
+          "deployment",
+          poolPrevName,
+          "-o",
+          "jsonpath={.spec.replicas}",
+        ]);
+        const n = parseInt(r.stdout?.trim() ?? "", 10);
+        if (r.exitCode === 0 && Number.isFinite(n) && n > 0) prevReplicas = n;
+      }
+
+      // Render retained resources through the same canonical templates as a normal build.
+      // Hand-copying this Deployment previously omitted resources, changing the serving pod
+      // template and rolling the old build during every upgrade.
       writeFileSync(
         path.join(chartTemplatesDir, `${poolName}-prev-deployment.yaml`),
-        `apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ${poolPrevName}
-  labels:
-    app.kubernetes.io/name: ${releaseName}
-    app.kubernetes.io/component: ${poolName}
-    app.kubernetes.io/version: "${prevSafeBuildId}"
-spec:
-  replicas: 0
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: ${releaseName}
-      app.kubernetes.io/component: ${poolName}
-      app.kubernetes.io/version: "${prevSafeBuildId}"
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: ${releaseName}
-        app.kubernetes.io/component: ${poolName}
-        app.kubernetes.io/version: "${prevSafeBuildId}"
-    spec:
-      containers:
-        - name: pool-server
-          image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools "${poolName}").image.repository }}:${previousBuildId}"
-          ports:
-            - containerPort: 3000
-          env:
-            - name: NODE_ENV
-              value: production
-            - name: NEXT_BUILD_ID
-              value: "${previousBuildId}"
-            - name: POOL_NAME
-              value: "${poolName}"
-            - name: TRUST_INTERNAL_HEADERS
-              value: "1"
-${renderInternalSecretEnv(releaseName, "            ")}
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: 3000
-            initialDelaySeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 3000
-            initialDelaySeconds: 10
-`,
+        renderDeployment({
+          poolName,
+          buildId: previousBuildId,
+          releaseName,
+          imageTag: previousBuildId,
+          replicas: prevReplicas,
+        }),
       );
 
-      // Previous versioned service (needed for the deployment's pods to be reachable)
       writeFileSync(
         path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`),
-        `apiVersion: v1
-kind: Service
-metadata:
-  name: ${poolPrevName}
-  labels:
-    app.kubernetes.io/name: ${releaseName}
-    app.kubernetes.io/component: ${poolName}
-    app.kubernetes.io/version: "${prevSafeBuildId}"
-spec:
-  selector:
-    app.kubernetes.io/name: ${releaseName}
-    app.kubernetes.io/component: ${poolName}
-    app.kubernetes.io/version: "${prevSafeBuildId}"
-  ports:
-    - port: 3000
-      targetPort: 3000
-`,
+        renderService({ poolName, buildId: previousBuildId, releaseName }),
+      );
+      writeFileSync(
+        path.join(chartTemplatesDir, `${poolName}-prev-hpa.yaml`),
+        renderHPA({ poolName, buildId: previousBuildId, releaseName }),
       );
     }
   }
@@ -396,22 +365,11 @@ spec:
     }
   }
 
-  // 6. Update state (local + cluster ConfigMap)
-  if (!dryRun) {
-    try {
-      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
-    } catch (err) {
-      console.error(`\n  DEPLOY FAILED: could not persist deploy state to the cluster.`);
-      console.error(`  ${err instanceof Error ? err.message : String(err)}`);
-      console.error(
-        `  The local state file was updated but the cluster ConfigMap was not. Aborting before`,
-      );
-      console.error(
-        `  traffic cutover so cluster/local state do not diverge. The previous build is still serving.\n`,
-      );
-      process.exit(1);
-    }
-  }
+  // NOTE: committed deploy state is NOT written here. Persisting { buildId, previousBuildId }
+  // before the new build actually serves would record a never-serving build as "current" —
+  // a failed deploy (bad image, stuck rollout, failed cutover) would then leave state
+  // pointing at a build that never took traffic, and the next deploy/rollback could delete
+  // the real rollback target. State is committed only after a successful cutover (step 7d).
 
   // 7. Zero-downtime cutover: wait for new pods, then clean up old build
   if (!dryRun) {
@@ -483,6 +441,28 @@ spec:
       }
     }
 
+    // The traffic extension is part of the middleware security boundary. Reconcile and verify
+    // it while the active Services still select the previous build; never cut traffic and call
+    // the deploy successful with a missing/incomplete ext_proc backend.
+    const currentRouteExtJob = routeExtJobName(releaseName, buildId);
+    const routeExtJobYaml = path.join(outputDir, "chart", "templates", "route-ext-update-job.yaml");
+    if (existsSync(routeExtJobYaml)) {
+      const wait = await execCapture("kubectl", [
+        "wait",
+        "--for=condition=complete",
+        `job/${currentRouteExtJob}`,
+        "--timeout=600s",
+      ]);
+      if (wait.exitCode !== 0) {
+        throw new Error(
+          `ext_proc registration job (${currentRouteExtJob}) did not complete; refusing traffic ` +
+            `cutover because middleware may not be wired.\n${(wait.stderr || wait.stdout).trim()}\n` +
+            `Inspect: kubectl logs job/${currentRouteExtJob}`,
+        );
+      }
+      console.log("  → ext_proc traffic extension registration job completed ✓");
+    }
+
     // 7b. Wait for new pods to be healthy from inside the cluster
     // We check healthz directly on each new pod rather than waiting for GCP LB health
     // (GCP backend health propagation can take 5+ minutes for new backends)
@@ -492,30 +472,27 @@ spec:
     for (let attempt = 0; attempt < maxHealthAttempts; attempt++) {
       let allHealthy = true;
       let checkedCount = 0;
-      for (const deployName of newDeploys) {
-        // Get pods for this deployment
-        const podsResult = await execCapture("kubectl", [
-          "get",
-          "pods",
-          "-l",
-          `app.kubernetes.io/name=${releaseName}`,
-          "-o",
-          'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\\n"}{end}',
-        ]);
-        if (podsResult.exitCode === 0) {
-          for (const line of podsResult.stdout.trim().split("\n")) {
-            const [podName, ready] = line.split("|");
-            if (
-              !podName ||
-              !podName
-                .toLowerCase()
-                .replace(/[^a-z0-9]/g, "")
-                .includes(currentBuildLower)
-            )
-              continue;
-            checkedCount++;
-            if (ready !== "True") allHealthy = false;
-          }
+      const podsResult = await execCapture("kubectl", [
+        "get",
+        "pods",
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\\n"}{end}',
+      ]);
+      if (podsResult.exitCode === 0) {
+        for (const line of podsResult.stdout.trim().split("\n")) {
+          const [podName, ready] = line.split("|");
+          if (
+            !podName ||
+            !podName
+              .toLowerCase()
+              .replace(/[^a-z0-9]/g, "")
+              .includes(currentBuildLower)
+          )
+            continue;
+          checkedCount++;
+          if (ready !== "True") allHealthy = false;
         }
       }
       if (allHealthy && checkedCount > 0) {
@@ -594,15 +571,6 @@ spec:
 
       console.error(`\n  Diagnose:  npx adapter-k8s doctor`);
       console.error(`  Tail logs: npx adapter-k8s tail`);
-      // Update state so doctor knows the build was attempted. We're already failing,
-      // so a cluster-state write failure here is only logged, not re-thrown.
-      try {
-        await writeState(projectDir, { buildId, previousBuildId }, releaseName);
-      } catch (err) {
-        console.error(
-          `  (also failed to persist state to cluster: ${err instanceof Error ? err.message : String(err)})`,
-        );
-      }
       process.exit(1);
     }
 
@@ -616,12 +584,9 @@ spec:
     const safeBuildId = sanitizeK8sName(buildId);
     console.log(`  → Switching traffic to new build...`);
     const patchFailures: { pool: string; service: string; stderr: string }[] = [];
+    const patchedServices: string[] = [];
     for (const pool of pools) {
-      const activeServiceName = `${releaseName}-${pool}`
-        .toLowerCase()
-        .replace(/[^a-z0-9-]/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 63);
+      const activeServiceName = sanitizeK8sName(`${releaseName}-${pool}`);
       const patchResult = await execCapture("kubectl", [
         "patch",
         "service",
@@ -648,6 +613,8 @@ spec:
           service: activeServiceName,
           stderr: patchResult.stderr.trim(),
         });
+      } else {
+        patchedServices.push(activeServiceName);
       }
     }
 
@@ -656,6 +623,28 @@ spec:
     // endpoints. Abort the cutover, leave the previous build in place, and fail loudly
     // rather than proceeding to the cleanup below and printing "Deploy complete".
     if (patchFailures.length > 0) {
+      const revertFailures: string[] = [];
+      if (previousBuildId) {
+        const safePreviousBuildId = sanitizeK8sName(previousBuildId);
+        for (const serviceName of patchedServices) {
+          const revertResult = await execCapture("kubectl", [
+            "patch",
+            "service",
+            serviceName,
+            "--type=json",
+            "--field-manager=helm",
+            "-p",
+            JSON.stringify([
+              {
+                op: "replace",
+                path: "/spec/selector/app.kubernetes.io~1version",
+                value: safePreviousBuildId,
+              },
+            ]),
+          ]);
+          if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
+        }
+      }
       console.error(`\n  DEPLOY FAILED: traffic was NOT switched to the new build.`);
       console.error(
         `  ${patchFailures.length} of ${pools.length} pool Service selector patch(es) failed:`,
@@ -665,24 +654,59 @@ spec:
           `    - pool "${f.pool}" (service ${f.service}): ${f.stderr || "unknown error"}`,
         );
       }
-      console.error(
-        `  The previous build is still serving traffic and old deployments were left in place.`,
-      );
+      if (revertFailures.length > 0) {
+        console.error(
+          `  WARNING: failed to restore selector(s) for: ${revertFailures.join(", ")}.`,
+        );
+        console.error(`  Traffic may be split across builds; repair those Services manually.`);
+      } else if (previousBuildId) {
+        console.error(`  Any successful selector patches were reverted to the previous build.`);
+      }
+      console.error(`  Old deployments were left in place.`);
       console.error(`  No cleanup was performed. Investigate and re-run the deploy.\n`);
       console.error(`  Diagnose:  npx adapter-k8s doctor`);
-      // We're already failing; a cluster-state write failure here is only logged.
-      try {
-        await writeState(projectDir, { buildId, previousBuildId }, releaseName);
-      } catch (err) {
-        console.error(
-          `  (also failed to persist state to cluster: ${err instanceof Error ? err.message : String(err)})`,
-        );
-      }
+      // Do NOT write committed state here: traffic did not switch, so the previously-serving
+      // build is still current. Recording the new build as current would strand the real
+      // rollback target on the next deploy/rollback.
       process.exit(1);
     }
 
-    // 7d. Clean up old deployments.
-    // The previous build is already at 0 replicas (from the chart template we injected).
+    // 7d. Commit deploy state — ONLY now, after a confirmed cutover, so a failed deploy
+    // never records a never-serving build as current. Traffic has already switched; if the
+    // cluster ConfigMap write fails we surface it loudly (local was updated) rather than
+    // silently diverging for the next deploy/rollback.
+    try {
+      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+    } catch (err) {
+      console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
+      console.error(`  ${err instanceof Error ? err.message : String(err)}`);
+      console.error(
+        `  The new build IS serving, but the cluster ConfigMap was not updated. Restore`,
+      );
+      console.error(
+        `  connectivity and re-run so cluster/local state agree before the next deploy.\n`,
+      );
+      process.exit(1);
+    }
+
+    // 7e. State is durable and traffic has switched, so it is now safe to scale the previous
+    // build down to 0. It served through the rollout and remains as the rollback target.
+    if (previousBuildId && previousBuildId !== buildId) {
+      for (const poolName of pools) {
+        const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
+        await execOrThrow("kubectl", [
+          "delete",
+          "hpa",
+          `${poolPrevName}-hpa`,
+          "--ignore-not-found",
+        ]);
+        await execOrThrow("kubectl", ["scale", `deployment/${poolPrevName}`, "--replicas=0"]);
+      }
+      console.log(`  → Previous build scaled to 0 (kept for rollback)`);
+    }
+
+    // 7f. Clean up old deployments.
+    // The previous build was scaled to 0 in step 7e above (kept as the rollback target).
     // Delete anything that isn't the current or previous build.
     const previousBuildLower = previousBuildId
       ?.toLowerCase()
@@ -732,7 +756,6 @@ spec:
     // one). Skip the CURRENT job by EXACT name — a fuzzy build-id substring match here
     // (12-char slice vs the name's 10-char slice) previously deleted the running job
     // before it could register the extension, so the traffic ext never got reconciled.
-    const currentRouteExtJob = routeExtJobName(releaseName, buildId);
     const oldJobs = await execCapture("kubectl", [
       "get",
       "jobs",
@@ -745,31 +768,6 @@ spec:
       for (const jobName of oldJobs.stdout.trim().split("\n")) {
         if (!jobName || jobName === currentRouteExtJob) continue;
         await execCapture("kubectl", ["delete", "job", jobName]);
-      }
-    }
-
-    // Verify the traffic-ext registration Job actually completes. Its whole job is
-    // external gcloud reconciliation (NEG attach + ext import), which is silent-failure
-    // prone — surface it instead of "deploy succeeded but middleware isn't wired".
-    // Bounded wait, non-fatal (a first deploy's gateway may still be provisioning).
-    const routeExtJobYaml = path.join(outputDir, "chart", "templates", "route-ext-update-job.yaml");
-    if (existsSync(routeExtJobYaml)) {
-      const wait = await execCapture("kubectl", [
-        "wait",
-        "--for=condition=complete",
-        `job/${currentRouteExtJob}`,
-        // Returns immediately on completion; the longer cap only covers a fresh backend
-        // (first deploy), where the per-zone NEG attaches take longer.
-        "--timeout=240s",
-      ]);
-      if (wait.exitCode === 0) {
-        console.log("  → ext_proc traffic extension registration job completed ✓");
-      } else {
-        console.warn(
-          `  ! ext_proc registration job did not complete — middleware may not be wired.\n` +
-            `    Inspect: kubectl logs job/${currentRouteExtJob}\n` +
-            `    (On a first deploy the gateway may still be provisioning; re-run deploy.)`,
-        );
       }
     }
   }
