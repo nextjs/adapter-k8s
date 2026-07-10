@@ -230,6 +230,25 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
+  // The traffic-ext Job also attaches the routing-service NEG to the ext_proc backend
+  // service (compute.backendServices.update + networkEndpointGroups.use) — beyond the
+  // read-only compute.viewer above.
+  commands.push({
+    description: "Grant deploy SA compute.loadBalancerAdmin (attach NEG to ext_proc backend)",
+    command: "gcloud",
+    args: [
+      "projects",
+      "add-iam-policy-binding",
+      projectId,
+      "--member",
+      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      "--role",
+      "roles/compute.loadBalancerAdmin",
+      "--condition=None",
+      "--quiet",
+    ],
+  });
+
   // Allow the K8s SA to impersonate the GCP deploy SA via Workload Identity
   commands.push({
     description: "Bind K8s SA to GCP SA via Workload Identity",
@@ -251,7 +270,11 @@ export function buildInitGcloudCommands(options: {
   });
 
   // --- Route Extension Service (ext_proc) ---
-  // Create health check for routing service
+  // Create health check for routing service.
+  // TCP (not gRPC): the routing service serves the ext_proc callout over HTTP/2 *with
+  // TLS*, and a plaintext gRPC health check fails against a TLS server (which would mark
+  // the backend unhealthy and bypass the extension). A TCP check on 8443 stays green for
+  // both the h2c (emulate) and TLS (GKE) transports.
   commands.push({
     description: "Create health check for routing service",
     command: "gcloud",
@@ -259,17 +282,20 @@ export function buildInitGcloudCommands(options: {
       "compute",
       "health-checks",
       "create",
-      "grpc",
+      "tcp",
       `${releaseName}-routing-hc`,
       "--port",
       "8443",
+      "--global",
       "--project",
       projectId,
       "--quiet",
     ],
   });
 
-  // Create backend service for routing service (needed by LbRouteExtension)
+  // Create backend service for routing service (the ext_proc TRAFFIC extension target).
+  // Must be EXTERNAL_MANAGED to match the global external ALB the GKE Gateway provisions;
+  // the default (EXTERNAL) is rejected by the extension with a scheme-mismatch error.
   commands.push({
     description: "Create backend service for routing service",
     command: "gcloud",
@@ -279,6 +305,8 @@ export function buildInitGcloudCommands(options: {
       "create",
       `${releaseName}-routing-service`,
       "--global",
+      "--load-balancing-scheme",
+      "EXTERNAL_MANAGED",
       "--protocol",
       "HTTP2",
       "--health-checks",
@@ -387,6 +415,52 @@ export function buildInitGcloudCommands(options: {
   return commands;
 }
 
+// init creates resources idempotently and SKIPS existing ones. A project initialized
+// before traffic extensions kept a gRPC health check and a default (EXTERNAL) backend
+// service, which the traffic extension rejects — and re-running init won't fix them
+// (they already exist). Detect the stale shape and print exact migration commands rather
+// than silently leaving middleware unwired.
+async function checkRoutingResourceShape(releaseName: string, projectId: string): Promise<void> {
+  const hc = `${releaseName}-routing-hc`;
+  const bs = `${releaseName}-routing-service`;
+  const hcType = (
+    await execCapture("gcloud", [
+      "compute", "health-checks", "describe", hc, "--global", "--project", projectId,
+      "--format=value(type)",
+    ])
+  ).stdout
+    .trim()
+    .toUpperCase();
+  const bsScheme = (
+    await execCapture("gcloud", [
+      "compute", "backend-services", "describe", bs, "--global", "--project", projectId,
+      "--format=value(loadBalancingScheme)",
+    ])
+  ).stdout
+    .trim()
+    .toUpperCase();
+
+  const issues: string[] = [];
+  if (bsScheme && bsScheme !== "EXTERNAL_MANAGED")
+    issues.push(`backend service '${bs}' scheme is ${bsScheme} (needs EXTERNAL_MANAGED)`);
+  if (hcType && hcType !== "TCP")
+    issues.push(`health check '${hc}' type is ${hcType} (needs TCP)`);
+  if (issues.length === 0) return;
+
+  console.warn(
+    `\n  ! Existing routing-service resources predate the ext_proc traffic-extension shape ` +
+      `and it will NOT work as-is:`,
+  );
+  for (const issue of issues) console.warn(`      - ${issue}`);
+  console.warn(
+    `    These are immutable, and init skips existing resources — re-running init does not ` +
+      `fix them. Migrate (brief callout disruption while recreated), then re-run init + deploy:\n` +
+      `      gcloud compute backend-services delete ${bs} --global --project=${projectId} --quiet\n` +
+      `      gcloud compute health-checks delete ${hc} --global --project=${projectId} --quiet\n` +
+      `      npx adapter-k8s init ...   # recreates them with EXTERNAL_MANAGED + TCP`,
+  );
+}
+
 export async function runInit(options: InitOptions): Promise<void> {
   const { projectId, region, hosts, bucket, registry, releaseName, projectDir, dryRun } = options;
 
@@ -434,6 +508,11 @@ export async function runInit(options: InitOptions): Promise<void> {
         throw new Error(`${cmd.description} failed:\n${result.stderr}`);
       }
     }
+  }
+
+  // 2a-pre. Surface pre-traffic-extension routing resources that init can't fix in place.
+  if (!dryRun) {
+    await checkRoutingResourceShape(releaseName, projectId);
   }
 
   // 2a. Cloud CDN (GCPHTTPFilter) needs GKE >= MIN_GKE_VERSION_FOR_CDN, and the scaffolded

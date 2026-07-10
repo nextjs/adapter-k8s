@@ -1,5 +1,6 @@
 // src/cli/index.ts
 import path from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { runInit } from "./init.js";
 import { runDeploy } from "./deploy.js";
 import { runDestroy } from "./destroy.js";
@@ -64,12 +65,33 @@ async function main(): Promise<void> {
   const { command, flags } = parseArgs(process.argv);
   const projectDir = process.cwd();
 
-  // Default release name to the directory name (sanitized)
+  // Resolve the release name. Precedence:
+  //   1. --release-name flag (explicit override)
+  //   2. releaseName persisted in .k8s-adapter/infrastructure.json (source of truth
+  //      written by `init`) — so read-only commands (doctor/describe/rollback/tail/
+  //      destroy) target the ACTUAL deployed release without needing the flag. Without
+  //      this, running from a directory whose name differs from the release (e.g. an
+  //      `e2e/` dir that deployed release "test-app") derives the wrong cluster name
+  //      (`e2e-cluster` vs `test-app-cluster`) and doctor fails to connect.
+  //   3. the sanitized directory name (default for a fresh, un-inited project)
   const defaultReleaseName = path
     .basename(projectDir)
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "-");
-  const releaseName = (flags["release-name"] as string) ?? defaultReleaseName;
+  let persistedReleaseName: string | undefined;
+  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  if (existsSync(infraPath)) {
+    try {
+      const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+      if (typeof infra.releaseName === "string" && infra.releaseName) {
+        persistedReleaseName = infra.releaseName;
+      }
+    } catch {
+      // Malformed infrastructure.json — fall back to the directory default.
+    }
+  }
+  const releaseName =
+    (flags["release-name"] as string) ?? persistedReleaseName ?? defaultReleaseName;
   const dryRun = flags["dry-run"] === true;
 
   switch (command) {

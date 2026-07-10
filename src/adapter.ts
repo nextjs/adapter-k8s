@@ -14,6 +14,26 @@ const _dirname =
       ? __dirname
       : process.cwd();
 
+// Resolve a dependency's directory, preferring the ADAPTER package (where the dep is
+// declared, e.g. @next/routing) over the app root. Strict package managers (pnpm) do not
+// expose the adapter's transitive deps from the app root, so app-first resolution turns a
+// valid install into "cannot find module". App-root is kept as a fallback for hoisted
+// layouts (npm) and for a symlinked adapter checkout.
+function resolveDepDir(dep: string, projectDir: string): string | undefined {
+  const fromFiles = [
+    path.join(_dirname, "index.js"), // adapter package (dist/)
+    path.join(projectDir, "package.json"), // app root
+  ];
+  for (const fromFile of fromFiles) {
+    try {
+      return path.dirname(createRequire(fromFile).resolve(`${dep}/package.json`));
+    } catch {
+      // try the next resolution root
+    }
+  }
+  return undefined;
+}
+
 import { validateConfig, applyDefaults } from "./config.js";
 import { classifyIntoPools } from "./classify.js";
 import { buildRoutingManifest } from "./manifest.js";
@@ -373,7 +393,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         dynamicRoutes: routing.dynamicRoutes,
       });
 
-      const failureModeAllow = determineFailureMode(outputs);
+      const failureModeAllow = determineFailureMode(outputs, cfg.routingService?.failureMode);
 
       const gkeProvider = cfg.provider.gke;
 
@@ -398,6 +418,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         routingManifest,
         releaseName,
         extensionChainJson: extensionChain,
+        routingFailOpen: failureModeAllow,
         infrastructure: { projectId: infra.projectId, region: infra.region },
       });
 
@@ -623,18 +644,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           }
 
           // Stage @next/routing (required for pool server local route resolution).
-          // Resolve via require.resolve rather than a hardcoded projectDir path: as the
-          // adapter's own dependency, @next/routing is frequently hoisted above the app
-          // (workspaces, monorepos, a symlinked adapter checkout). A silent skip here ships
-          // a pool image that crashes at runtime with "Cannot find module '@next/routing'",
-          // so fail the build loudly if it cannot be located.
-          let nextRoutingDir: string | undefined;
-          try {
-            const req = createRequire(path.join(projectDir, "package.json"));
-            nextRoutingDir = path.dirname(req.resolve("@next/routing/package.json"));
-          } catch {
-            nextRoutingDir = undefined;
-          }
+          // Resolve adapter-first (it is the adapter's own dependency); a silent skip here
+          // ships a pool image that crashes at runtime with "Cannot find module
+          // '@next/routing'", so fail the build loudly if it cannot be located.
+          const nextRoutingDir = resolveDepDir("@next/routing", projectDir);
           if (!nextRoutingDir || !existsSync(nextRoutingDir)) {
             throw new Error(
               `[adapter-k8s] Could not resolve @next/routing from ${projectDir}. It is required ` +
@@ -767,18 +780,26 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // routing-service.mjs; only @next/routing is external.
         const routingServiceDeps = ["@next/routing"];
         for (const dep of routingServiceDeps) {
-          const depDir = path.join(projectDir, "node_modules", ...dep.split("/"));
-          if (existsSync(depDir)) {
-            const dest = path.join(
-              projectDir,
-              routingServiceContextDir,
-              "node_modules",
-              ...dep.split("/"),
+          // Resolve adapter-first (@next/routing is the adapter's own dependency). A silent
+          // skip here ships a routing-service image that crashloops with "Cannot find module
+          // '@next/routing'" — exactly how it failed undetected. Fail the build loudly.
+          const depDir = resolveDepDir(dep, projectDir);
+          if (!depDir || !existsSync(depDir)) {
+            throw new Error(
+              `[adapter-k8s] Could not resolve ${dep} for the routing service from ${projectDir}. ` +
+                `It is required at runtime by the routing service (ext_proc). Ensure it is installed ` +
+                `and resolvable from your app.`,
             );
-            if (!existsSync(dest)) {
-              await mkdir(path.dirname(dest), { recursive: true });
-              await cp(depDir, dest, { recursive: true, dereference: true });
-            }
+          }
+          const dest = path.join(
+            projectDir,
+            routingServiceContextDir,
+            "node_modules",
+            ...dep.split("/"),
+          );
+          if (!existsSync(dest)) {
+            await mkdir(path.dirname(dest), { recursive: true });
+            await cp(depDir, dest, { recursive: true, dereference: true });
           }
         }
 

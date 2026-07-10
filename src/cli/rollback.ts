@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture, execOrThrow } from "./exec.js";
 import { readState, writeState } from "./state.js";
+import { sanitizeK8sName } from "../emit/templates/utils.js";
 
 export async function runRollback(options: {
   projectDir: string;
@@ -70,8 +71,14 @@ export async function runRollback(options: {
   for (const line of deploysResult.stdout.trim().split("\n")) {
     const [name] = line.split("|");
     if (!name || name.includes("routing-service")) continue;
-    if (name.toLowerCase().includes(previousLower)) previousDeploy = name;
-    if (name.toLowerCase().includes(currentLower)) currentDeploy = name;
+    // Normalize the deployment name the SAME way as the build-id slice (strip every
+    // non-alphanumeric) before matching. The sanitized deployment name turns `_`/`-` in
+    // the build id into hyphens (e.g. `7s_BTPT…` → `…-7s-btpt…`), so comparing the raw
+    // name against the stripped build-id slice (`7sbtpt…`) never matches — which made
+    // rollback wrongly report "previous deployment not found" for those build ids.
+    const nameNorm = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (nameNorm.includes(previousLower)) previousDeploy = name;
+    if (nameNorm.includes(currentLower)) currentDeploy = name;
   }
 
   if (!previousDeploy) {
@@ -122,6 +129,11 @@ export async function runRollback(options: {
           "--limit=1",
         ]);
         const bsName = bsResult.stdout?.trim();
+        // Pool backend services are build-agnostic (the Gateway-managed backend name
+        // carries no build id), so a build-id-filtered lookup finds nothing. Don't burn
+        // the full 2-minute timeout polling for a backend that will never appear — the
+        // rollout-status wait above already gated the previous pods' readiness.
+        if (!bsName) break;
         if (bsName) {
           const healthResult = await execCapture("gcloud", [
             "compute",
@@ -156,46 +168,61 @@ export async function runRollback(options: {
     }
   }
 
-  // 4. Switch traffic: patch active Service selectors to the previous build
-  const safePreviousBuild = previousBuildId
-    .toLowerCase()
-    .replace(/[^a-z0-9.-]/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 63);
+  // 4. Switch traffic: patch active Service selectors to the previous build.
+  // The selector value MUST use the same sanitizer that stamped the pod label
+  // (sanitizeK8sName prepends `b-` when the build id starts with a non-letter). A
+  // divergent value (the old inline sanitizer omitted the `b-` prefix) matches no pods,
+  // draining the active Service to zero endpoints and 503'ing the site on rollback.
+  const safePreviousBuild = sanitizeK8sName(previousBuildId);
 
-  // Find pool names from active services
-  const activeSvcsResult = await execCapture("kubectl", [
-    "get",
-    "services",
-    "-l",
-    `app.kubernetes.io/managed-by=adapter-k8s-active,app.kubernetes.io/name=${releaseName}`,
-    "-o",
-    'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-  ]);
-  const patchFailures: { service: string; stderr: string }[] = [];
-  if (activeSvcsResult.exitCode === 0 && activeSvcsResult.stdout.trim()) {
-    console.log(`  → Switching traffic to previous build...`);
-    for (const svcName of activeSvcsResult.stdout.trim().split("\n")) {
-      if (!svcName) continue;
-      const patchResult = await execCapture("kubectl", [
-        "patch",
-        "service",
-        svcName,
-        "--type=json",
-        "--field-manager=helm",
-        "--force-conflicts",
-        "-p",
-        JSON.stringify([
-          {
-            op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1version",
-            value: safePreviousBuild,
-          },
-        ]),
-      ]);
-      if (patchResult.exitCode !== 0) {
-        patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
+  // Discover the active Services by NAME (`<release>-<pool>`), exactly as deploy's
+  // cutover does. The active-service template's `managed-by: adapter-k8s-active` label
+  // is overwritten by Helm to `managed-by: Helm`, so a label selector matches nothing —
+  // which would patch ZERO Services, skip the failure guard below, and strand the site
+  // when the current build is scaled down. Read the pool list from build metadata.
+  let poolNames: string[] = [];
+  const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+      if (Array.isArray(meta.pools)) {
+        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
       }
+    } catch {
+      // fall through to the empty-pool guard
+    }
+  }
+  if (poolNames.length === 0) {
+    // Never scale down the current build without a known set of Services to switch —
+    // that would strand traffic. Fail loudly instead.
+    throw new Error(
+      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
+        "cannot locate the active Services to switch traffic. Aborting before any scale-down.",
+    );
+  }
+  const patchFailures: { service: string; stderr: string }[] = [];
+  console.log(`  → Switching traffic to previous build...`);
+  for (const pool of poolNames) {
+    const svcName = sanitizeK8sName(`${releaseName}-${pool}`);
+    const patchResult = await execCapture("kubectl", [
+      "patch",
+      "service",
+      svcName,
+      "--type=json",
+      // --force-conflicts is NOT a valid `kubectl patch` flag (only `apply
+      // --server-side` accepts it); a JSON patch needs no conflict override.
+      "--field-manager=helm",
+      "-p",
+      JSON.stringify([
+        {
+          op: "replace",
+          path: "/spec/selector/app.kubernetes.io~1version",
+          value: safePreviousBuild,
+        },
+      ]),
+    ]);
+    if (patchResult.exitCode !== 0) {
+      patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
     }
   }
 

@@ -40,6 +40,10 @@ describe("generatePoolDockerfile", () => {
 describe("generateRoutingServiceDockerfile", () => {
   it("generates a Dockerfile for the routing service", () => {
     const result = generateRoutingServiceDockerfile({ nodeVersion: "22", buildId: "abc123" });
+    // GCP ext_proc callouts require HTTP/2 over TLS; the image bakes a self-signed cert.
+    expect(result).toContain("openssl req -x509");
+    expect(result).toContain("TLS_CERT_FILE=/app/tls-cert.pem");
+    expect(result).toContain("TLS_KEY_FILE=/app/tls-key.pem");
     expect(result).toContain("FROM node:22-slim");
     expect(result).toContain("routing-service.cjs");
     expect(result).toContain("EXPOSE 8443");

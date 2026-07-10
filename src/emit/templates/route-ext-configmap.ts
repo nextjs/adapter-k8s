@@ -22,7 +22,7 @@ export function renderRouteExtConfigMap({
   const celExpr = chain?.matchCondition?.celExpression ?? "true";
 
   const routeExtYaml = [
-    `name: "${releaseName}-route-ext"`,
+    `name: "${releaseName}-traffic-ext"`,
     `loadBalancingScheme: EXTERNAL_MANAGED`,
     `forwardingRules:`,
     `  - "${fwdRule}"`,

@@ -54,6 +54,18 @@ export interface K8sAdapterConfig {
   imageOptimizer?: { enabled: boolean; mode: "sidecar" };
   skewProtection?: { enabled: boolean; duration: string };
   routeExtension?: { mode: "auto" | "wasm" | "extproc" };
+  /** ext_proc routing service (the middleware tier) tuning. */
+  routingService?: {
+    resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
+    scaling?: { min?: number; max?: number; targetCPU?: number };
+    /** Per-request handler budget in ms (< the 5s ext_proc deadline). Default 4000. */
+    requestTimeoutMs?: number;
+    /**
+     * Callout-failure policy. "auto" (default) = fail-closed when the app has
+     * middleware (never bypass auth), fail-open otherwise. "open"/"closed" force it.
+     */
+    failureMode?: "auto" | "open" | "closed";
+  };
   provider: { gke: GKEProviderConfig };
 }
 

@@ -3,7 +3,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RoutingManifest } from "../types.js";
 import { createRequestHandler } from "./handler.js";
-import { createRoutingServer } from "./server.js";
+import { createRoutingServer, startHealthServer } from "./server.js";
 
 async function main() {
   // Load .env files
@@ -40,15 +40,27 @@ async function main() {
     }
   }
 
+  // Per-request budget: shed slow requests before the ext_proc deadline (default 4s,
+  // under GCP's 5s callout timeout). Set 0 to disable.
+  const timeoutMs = parseInt(process.env.ROUTING_REQUEST_TIMEOUT_MS ?? "4000", 10);
+
   // Create handler and server
   const handler = createRequestHandler(manifest, middlewareModule);
-  const server = createRoutingServer({ handler, port, failOpen });
+  const server = createRoutingServer({ handler, port, failOpen, timeoutMs });
 
   await server.start();
+
+  // Real health endpoint (httpGet probe) — evicts a wedged/broken pod that a TCP
+  // probe would leave in the NEG. Ready only once the ext_proc server is listening.
+  let ready = true;
+  const healthPort = parseInt(process.env.HEALTH_PORT ?? "8081", 10);
+  const health = startHealthServer(healthPort, () => ready);
 
   // Graceful shutdown
   const shutdown = async () => {
     console.log("Shutting down routing service...");
+    ready = false;
+    await health.close().catch(() => {});
     await server.stop();
     process.exit(0);
   };

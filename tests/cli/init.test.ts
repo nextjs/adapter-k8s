@@ -58,9 +58,15 @@ describe("buildInitGcloudCommands", () => {
 
     const backendCmd = commands.find((c) => c.description.includes("backend service for routing"));
     expect(backendCmd).toBeDefined();
+    // Must be EXTERNAL_MANAGED to match the global external ALB (the traffic-extension target);
+    // the default EXTERNAL scheme is rejected with a scheme-mismatch error.
+    expect(backendCmd!.args).toContain("EXTERNAL_MANAGED");
 
     const hcCmd = commands.find((c) => c.description.includes("health check for routing"));
     expect(hcCmd).toBeDefined();
+    // TCP, not gRPC: a plaintext gRPC health check fails against the TLS ext_proc server.
+    expect(hcCmd!.args).toContain("tcp");
+    expect(hcCmd!.args).not.toContain("grpc");
 
     // LbRouteExtension is created via Helm hook `import`, not during init
     const routeExtCmd = commands.find((c) => c.description.includes("LbRouteExtension"));

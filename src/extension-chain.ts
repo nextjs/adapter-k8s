@@ -10,7 +10,14 @@ export interface ExtensionChainOptions {
   failureModeAllow: boolean;
 }
 
-export function determineFailureMode(outputs: AdapterOutputs): boolean {
+export function determineFailureMode(
+  outputs: AdapterOutputs,
+  mode?: "auto" | "open" | "closed",
+): boolean {
+  if (mode === "open") return true;
+  if (mode === "closed") return false;
+  // "auto": fail-closed when middleware exists (a routing outage must not silently
+  // bypass auth); fail-open otherwise (bypassing pure routing is safe).
   return !outputs.middleware;
 }
 

@@ -146,4 +146,17 @@ describe("createProcessHandler fail behavior (Fix D)", () => {
     const pathHeader = passedHeaders.find((h) => h.key === ":path");
     expect(pathHeader!.rawValue!.toString("utf-8")).toBe("/about");
   });
+
+  it("times out a slow handler and applies the fail policy", async () => {
+    const slow = vi.fn().mockImplementation(() => new Promise(() => {})); // never resolves
+    const open = createProcessHandler(slow, true, 15);
+    const [r1] = await collect(open(once(makeRequestHeadersCallout("/"))));
+    expect(r1!.response.case).toBe("requestHeaders"); // timeout + fail-open → CONTINUE
+
+    const closed = createProcessHandler(slow, false, 15);
+    const [r2] = await collect(closed(once(makeRequestHeadersCallout("/"))));
+    expect(r2!.response.case).toBe("immediateResponse"); // timeout + fail-closed → 500
+    if (r2!.response.case !== "immediateResponse") throw new Error("wrong case");
+    expect(r2!.response.value.status!.code).toBe(500);
+  });
 });

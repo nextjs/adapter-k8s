@@ -12,11 +12,13 @@ npx adapter-k8s deploy
 The adapter plugs into Next.js 16.2+'s `adapterPath` API. At build time, it analyzes your route structure and generates:
 
 - **Pool servers** that invoke your handlers directly via `import()` -- no `next start`, no `MINIMAL_MODE`
-- **A routing service** (ext_proc gRPC) that runs `@next/routing` pre-CDN for middleware, rewrites, redirects
-- **A Helm chart** with Deployments, Services, Gateway, HTTPRoute, and HealthCheckPolicies
+- **A routing service** (ext_proc over HTTP/2 + TLS) that runs `@next/routing` for middleware, rewrites, and redirects -- wired as a **traffic extension** on the load balancer
+- **A Helm chart** with Deployments, Services, Gateway, HTTPRoute, an optional Cloud CDN filter, and the traffic-extension registration Job
 - **Dockerfiles** with only the traced assets each pool needs
 
 At deploy time, the CLI builds images, pushes them, and runs `helm upgrade` with zero-downtime blue/green cutover.
+
+> **Where middleware runs relative to the CDN.** On GCP's global external Application Load Balancer, ext_proc is only supported as a **traffic extension**, which runs **after** the Cloud CDN cache. Cache *hits* are served without invoking middleware; the routing service runs on cache *misses* on the way to origin. Pool servers therefore send `Cache-Control: no-cache` on middleware-covered routes so those responses are never cached ahead of the middleware that gates them. (Route extensions -- which would run pre-cache -- are not supported on this load balancer.)
 
 ## Requirements
 
@@ -92,13 +94,13 @@ npx adapter-k8s deploy
 The deploy flow:
 
 1. `next build` (adapter generates artifacts in `.k8s-adapter/output/`)
-2. `docker build` + `push` per pool + routing service
-3. `helm upgrade --install` with the generated chart
-4. Wait for new pods to be ready
-5. Wait for GCP load balancer health checks to pass
-6. Patch active Service selectors to route traffic to new build
-7. Scale down previous build to 0 (kept for rollback)
-8. Clean up older builds
+2. `docker build` + `push` per pool + the routing service
+3. `helm upgrade --install` with the generated chart (attaches the Cloud CDN filter to the HTTPRoute when CDN is enabled)
+4. Wait for the new pool + routing-service Deployments to roll out
+5. Verify each new pod is serving (`/healthz` checked directly on the pod -- not via GCP LB health)
+6. Patch active Service selectors to route traffic to the new build (blue/green cutover)
+7. Keep the previous build at 0 replicas (rollback target)
+8. Run the traffic-extension registration Job: attach the routing-service NEG to the ext_proc backend and register the extension across every forwarding rule
 
 ## CLI Commands
 
@@ -146,7 +148,9 @@ Run health checks across your entire stack.
 npx adapter-k8s doctor
 ```
 
-Checks prerequisites (gcloud/kubectl/helm/docker), GCP resources (IP, bucket, registry, auth), Kubernetes resources (Gateway, HTTPRoute, deployments with rollout awareness), LB backend health, and per-host DNS + TLS certificate status.
+Checks prerequisites (gcloud/kubectl/helm/docker), GCP resources (IP, bucket, registry, auth), Kubernetes resources (Gateway, HTTPRoute, deployments with rollout awareness), active Service endpoints (that each active Service's selector actually matches ready pods -- catches a mis-patched cutover before it 503s), LB backend health, ext_proc traffic-extension wiring (registered across all forwarding rules, NEG attached, backend scheme, TCP health check), and per-host DNS + TLS certificate status.
+
+`doctor` resolves the release name from `.k8s-adapter/infrastructure.json`, so it targets the deployed release regardless of the current directory name (override with `--release-name`).
 
 ### `emulate`
 
@@ -238,45 +242,81 @@ containerStrategy: 'traced-assets',
 containerStrategy: 'shared-image',
 ```
 
+### Cloud CDN
+
+Enable Cloud CDN under `provider.gke`. The adapter attaches a `GCPHTTPFilter` to the HTTPRoute and configures a Next.js-aware cache key (whitelisting the RSC/prefetch `Vary` headers so App Router HTML and RSC payloads partition correctly).
+
+```js
+provider: {
+  gke: {
+    cdn: {
+      enabled: true,
+      bucket: 'my-project-nextjs-static',
+      // cacheMode: 'USE_ORIGIN_HEADERS',   // default -- honor the app's Cache-Control
+      // cacheKeyHeaders: [...],            // override the cache-key header set
+    },
+    gateway: { /* ... */ },
+  },
+},
+```
+
+Cache *hits* are served before the routing service runs, so middleware-covered routes are sent `Cache-Control: no-cache` to keep them out of the cache. Deploys emit `x-cache-status` / `x-cache-id` response headers for diagnostics.
+
+### Routing Service Tuning
+
+The ext_proc routing tier (the middleware service) is tunable independently of your pools:
+
+```js
+routingService: {
+  scaling: { min: 2, max: 10, targetCPU: 70 },
+  resources: { cpu: '250m', memory: '256Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
+  requestTimeoutMs: 4000,        // per-request handler budget (< the 5s ext_proc deadline)
+  failureMode: 'auto',           // 'auto' (default) fails closed when the app has middleware
+                                 // (never bypass auth), fails open otherwise; 'open'/'closed' force it
+},
+```
+
 ## Architecture
 
 ```
-                     GCP Application Load Balancer
-+----------------------------------------------------------+
-|                                                          |
-|  Internet --> [CEL Filter] --> URL Map --> [Cloud CDN]   |
-|                    |                           |         |
-|              +-----v------+               cache miss     |
-|              |  Route Ext  |                   |         |
-|              |  (ext_proc) |                   |         |
-|              |  @next/     |                   |         |
-|              |   routing   |                   |         |
-|              |  middleware  |                   |         |
-|              +-------------+                   |         |
-|                                                |         |
-+------------------------------------------------+---------+
-                                                 |
-                                          +------v------+
-                                          |  GKE Cluster |
-                                          |              |
-                                          |  +--------+  |
-                                          |  | Pool A |  |
-                                          |  | (SSR)  |  |
-                                          |  +--------+  |
-                                          |  +--------+  |
-                                          |  | Pool B |  |
-                                          |  | (API)  |  |
-                                          |  +--------+  |
-                                          +--------------+
+                 GCP Global External Application Load Balancer
++---------------------------------------------------------------------+
+|                                                                     |
+|  Internet --> URL Map --> [Cloud CDN] --cache hit--> response       |
+|                                |                                    |
+|                            cache miss                               |
+|                                |                                    |
+|                    +-----------v------------+                       |
+|                    |   Traffic Extension    |  CEL match condition  |
+|                    |       (ext_proc)       |  skips /_next/static/, |
+|                    |  Routing Service:      |  /404, /500           |
+|                    |    @next/routing       |                       |
+|                    |    middleware /        |                       |
+|                    |    rewrites / redirects|                       |
+|                    +-----------+------------+                       |
+|                                | sets x-upstream-pool               |
+|             HTTPRoute header routing on x-upstream-pool             |
++--------------------------------+------------------------------------+
+                                 |
+                          +------v-------+
+                          |  GKE Cluster |
+                          |              |
+                          |  +--------+  |
+                          |  | Pool A |  |  (SSR)
+                          |  +--------+  |
+                          |  +--------+  |
+                          |  | Pool B |  |  (API)
+                          |  +--------+  |
+                          +--------------+
 ```
 
 ### Request Flow
 
-1. Request arrives at the GCP Application Load Balancer
-2. **CEL filter** checks the path -- static assets (`/_next/static/*`) skip ext_proc entirely
-3. **Route Extension Service** (ext_proc gRPC) resolves the route via `@next/routing`, executes middleware, sets `x-upstream-pool` header
-4. **URL Map** routes to the correct pool based on the header
-5. **Pool server** loads the handler module via `import()` and invokes it with `(req, res, ctx)`
+1. Request arrives at the load balancer and hits **Cloud CDN**. A cache hit is served immediately -- middleware does not run for cached responses.
+2. On a **cache miss**, the **traffic extension** fires on the way to origin. Its **CEL match condition** excludes static assets and error pages (`/_next/static/*`, `/404`, `/500`) so those skip the ext_proc callout entirely.
+3. The **routing service** (ext_proc over HTTP/2 + TLS) resolves the route via `@next/routing`, executes middleware/rewrites/redirects, and sets the `x-upstream-pool` header.
+4. The **HTTPRoute** routes to the correct pool based on `x-upstream-pool`.
+5. The **pool server** loads the handler module via `import()` and invokes it with `(req, res, ctx)`. Middleware-covered routes are served `Cache-Control: no-cache` so the CDN never caches them ahead of their middleware.
 
 ### Blue/Green Deploys
 
@@ -284,13 +324,15 @@ Each deploy creates a new versioned Deployment alongside the previous one. The H
 
 Traffic cutover sequence:
 
-1. Helm creates new Deployment + versioned Service (old build still serving)
+1. Helm creates the new Deployment + versioned Service (old build still serving)
 2. New pods pass Kubernetes readiness probes
-3. New backends pass GCP load balancer health checks (`/healthz`)
-4. Active Service selector patched to new build (traffic shifts)
+3. Each new pod is verified serving via `/healthz` (checked directly on the pod, not via GCP LB backend health)
+4. Active Service selector patched to the new build's pod label (traffic shifts). The selector value comes from the same sanitizer that stamps the pod label, so it always matches -- a mismatch would drain the Service to zero endpoints, and `doctor`'s "Active Service endpoints" check guards against exactly that.
 5. Previous build scaled to 0 (kept for rollback)
 
-To roll back: `npx adapter-k8s rollback` scales up the previous build, waits for health, patches the selector back, and scales down the current build.
+The selector flip itself is atomic, but the load balancer reprograms the standalone NEG asynchronously, so expect a brief (typically a few seconds) window where the LB is catching up to the new endpoints before it is fully settled.
+
+To roll back: `npx adapter-k8s rollback` scales up the previous build, waits for it to be ready, patches the active Service selector back to it, and scales down the current build. Rollback is symmetric -- running it again rolls forward to the build you came from.
 
 ### Generated Artifacts
 
@@ -302,13 +344,20 @@ After `next build`, the adapter writes to `.k8s-adapter/output/`:
 |   +-- Chart.yaml
 |   +-- values.yaml
 |   +-- templates/
-|       +-- *-deployment.yaml      Per-pool Deployments
-|       +-- *-service.yaml         Versioned Services
-|       +-- *-active-service.yaml  Stable Services (HTTPRoute targets)
-|       +-- *-hpa.yaml             HorizontalPodAutoscalers
-|       +-- gateway.yaml           Gateway + HTTPRoute
-|       +-- routing-service-*      Route extension Deployment/Service/HPA
+|       +-- {pool}-deployment.yaml       Per-pool Deployment
+|       +-- {pool}-service.yaml          Versioned Service
+|       +-- {pool}-active-service.yaml   Stable Service (HTTPRoute target)
+|       +-- {pool}-prev-*.yaml           Previous build (kept for rollback)
+|       +-- {pool}-hpa.yaml              HorizontalPodAutoscaler
+|       +-- gateway.yaml                 Gateway
+|       +-- http-route.yaml              HTTPRoute (pool routing + CDN filter ref)
+|       +-- cdn-http-filter.yaml         Cloud CDN GCPHTTPFilter (when enabled)
+|       +-- routing-service-*.yaml       Routing service Deployment/Service/HPA
+|       +-- route-ext-config.yaml        Traffic-extension source config
+|       +-- route-ext-update-job.yaml    Traffic-extension registration Job
 |       +-- routing-manifest-configmap.yaml
+|       +-- internal-secret.yaml         Shared secret for internal dispatch headers
+|       +-- deploy-service-account.yaml
 +-- pools/{pool}/
 |   +-- Dockerfile
 |   +-- context/                   Traced assets for this pool
@@ -318,6 +367,7 @@ After `next build`, the adapter writes to `.k8s-adapter/output/`:
 +-- routing-manifest.json
 +-- extension-chains.json
 +-- cel-expression.txt
++-- static-assets.json
 +-- build-metadata.json
 ```
 
@@ -336,24 +386,29 @@ jobs:
           docker build -t $REGISTRY/nextjs-app-default:$BUILD_ID \
             .k8s-adapter/output/pools/default
           docker push $REGISTRY/nextjs-app-default:$BUILD_ID
+          docker build -f .k8s-adapter/output/routing-service/Dockerfile \
+            -t $REGISTRY/routing-service:$BUILD_ID \
+            .k8s-adapter/output/routing-service
+          docker push $REGISTRY/routing-service:$BUILD_ID
       - run: |
           helm upgrade --install my-app .k8s-adapter/output/chart/ \
             --set global.image.tag=$BUILD_ID \
             --set global.image.registry=$REGISTRY
 ```
 
-The Helm chart is self-contained. The CLI is a convenience wrapper -- everything it does can be done with `docker`, `helm`, and `gcloud` directly.
+The Helm chart is self-contained -- it includes the traffic-extension registration Job that attaches the routing-service NEG and registers the ext_proc extension, so `helm upgrade` wires the load balancer for you. The blue/green cutover (patching each active Service selector to the new build's pod label) is the one step the CLI performs outside Helm; replicate it with `kubectl patch service <release>-<pool> --type=json -p '[{"op":"replace","path":"/spec/selector/app.kubernetes.io~1version","value":"<sanitized-build-id>"}]'`. The CLI is a convenience wrapper -- everything it does can be done with `docker`, `helm`, and `gcloud` directly.
 
 ## Implementation Status
 
-| Phase | Status  | What                                                                          |
-| ----- | ------- | ----------------------------------------------------------------------------- |
-| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback) |
-| 2     | Done    | Route extension service (ext_proc), CEL generation, Service Extensions        |
-| 3     | Planned | Distributed caching (Valkey/Redis for ISR + `use cache`)                      |
-| 4     | Planned | Cloud CDN integration with coordinated invalidation                           |
-| 5     | Planned | PPR (partial prerendering with cache-first preamble)                          |
-| 6     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                 |
+| Phase | Status  | What                                                                                    |
+| ----- | ------- | --------------------------------------------------------------------------------------- |
+| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate) |
+| 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions     |
+| 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)      |
+| 4     | Planned | Coordinated CDN invalidation (tag-based purge for ISR / `revalidate`)                    |
+| 5     | Planned | Distributed caching (Valkey/Redis for ISR + `use cache`)                                |
+| 6     | Planned | PPR (partial prerendering with cache-first preamble)                                     |
+| 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                            |
 
 ## License
 

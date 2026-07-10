@@ -27,6 +27,7 @@ export function generateHelmChart({
   routingManifest,
   releaseName = "nextjs",
   extensionChainJson,
+  routingFailOpen,
   infrastructure,
   internalSecret,
 }: {
@@ -38,6 +39,8 @@ export function generateHelmChart({
   routingManifest: RoutingManifest;
   releaseName?: string;
   extensionChainJson?: string;
+  /** Mirrors the GCP callout failOpen to the server (ROUTING_FAIL_OPEN) for a consistent policy. */
+  routingFailOpen?: boolean;
   infrastructure?: { projectId?: string; region?: string };
   /**
    * Shared secret authenticating internal dispatch headers between the routing service and the
@@ -146,16 +149,23 @@ export function generateHelmChart({
 
   // Phase 2: Routing service templates (only when extension chain is provided)
   if (extensionChainJson) {
+    const rs = config.routingService;
     files["templates/routing-service-deployment.yaml"] = renderRoutingServiceDeployment({
       releaseName,
       buildId,
       imageRegistry,
+      ...(rs?.resources ? { resources: rs.resources } : {}),
+      ...(routingFailOpen !== undefined ? { failOpen: routingFailOpen } : {}),
+      ...(rs?.requestTimeoutMs !== undefined ? { requestTimeoutMs: rs.requestTimeoutMs } : {}),
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,
     });
     files["templates/routing-service-hpa.yaml"] = renderRoutingServiceHPA({
       releaseName,
+      ...(rs?.scaling?.min !== undefined ? { minReplicas: rs.scaling.min } : {}),
+      ...(rs?.scaling?.max !== undefined ? { maxReplicas: rs.scaling.max } : {}),
+      ...(rs?.scaling?.targetCPU !== undefined ? { targetCPU: rs.scaling.targetCPU } : {}),
     });
     files["templates/route-ext-config.yaml"] = renderRouteExtConfigMap({
       releaseName,

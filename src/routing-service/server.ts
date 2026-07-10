@@ -1,4 +1,6 @@
-import { createServer, type Http2Server } from "node:http2";
+import { createServer, createSecureServer, type Http2Server } from "node:http2";
+import { createServer as createHttpServer } from "node:http";
+import { readFileSync, existsSync } from "node:fs";
 import { create } from "@bufbuild/protobuf";
 import { connectNodeAdapter } from "@connectrpc/connect-node";
 import type { ConnectRouter } from "@connectrpc/connect";
@@ -24,6 +26,9 @@ export interface RoutingServerOptions {
   // else fail-closed with an immediate 500. Defaults to true to preserve the
   // historical behavior. See ROUTING_FAIL_OPEN wiring in index.ts.
   failOpen?: boolean;
+  // Per-request budget (ms) for the handler; 0 disables. Shed a slow request
+  // deterministically before the ext_proc deadline. Only bounds async slowness.
+  timeoutMs?: number;
 }
 
 const encoder = new TextEncoder();
@@ -124,9 +129,35 @@ function internalError500(): ProcessingResponse {
   });
 }
 
+// Reject a handler promise after `ms` so a slow request is shed deterministically
+// *before* the ext_proc deadline, instead of piling up. NOTE: this only bounds
+// ASYNC slowness (e.g. middleware awaiting a slow upstream) — a synchronously
+// CPU-blocking middleware stalls the single event loop and the timer can't fire;
+// isolating that needs worker threads (future work).
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  if (!ms || ms <= 0) return p;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`routing handler timeout after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
 // Builds the bidi-streaming Process handler. Exported for unit testing without
 // standing up a server.
-export function createProcessHandler(handler: RoutingServerOptions["handler"], failOpen: boolean) {
+export function createProcessHandler(
+  handler: RoutingServerOptions["handler"],
+  failOpen: boolean,
+  timeoutMs = 0,
+) {
   return async function* process(
     requests: AsyncIterable<ProcessingRequest>,
   ): AsyncGenerator<ProcessingResponse> {
@@ -134,7 +165,7 @@ export function createProcessHandler(handler: RoutingServerOptions["handler"], f
       const requestHeaders = requestHeadersToPlain(req);
       if (!requestHeaders) continue;
       try {
-        const result = await handler(requestHeaders);
+        const result = await withTimeout(handler(requestHeaders), timeoutMs);
         yield plainResponseToProto(result);
       } catch (err) {
         console.error("ext_proc handler error:", err);
@@ -144,16 +175,50 @@ export function createProcessHandler(handler: RoutingServerOptions["handler"], f
   };
 }
 
-export function createRoutingServer(options: RoutingServerOptions) {
-  const { handler, port, failOpen = true } = options;
+// A lightweight plaintext HTTP health endpoint on a side port. A TCP probe passes
+// at the socket layer even when the event loop is wedged; an httpGet probe must be
+// *processed* by the loop, so a blocked/broken service fails it and gets evicted —
+// which is the failure the ext_proc callout would otherwise hit silently.
+export function startHealthServer(port: number, isReady: () => boolean): HealthServer {
+  const srv = createHttpServer((req, res) => {
+    if (req.url === "/healthz" || req.url === "/readyz") {
+      const ready = isReady();
+      res.writeHead(ready ? 200 : 503, { "content-type": "text/plain" });
+      res.end(ready ? "ok" : "not-ready");
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  srv.listen(port, "0.0.0.0", () => console.log(`Routing health server on port ${port}`));
+  return { close: () => new Promise<void>((r) => srv.close(() => r())) };
+}
+interface HealthServer {
+  close(): Promise<void>;
+}
 
-  const processImpl = createProcessHandler(handler, failOpen);
+export function createRoutingServer(options: RoutingServerOptions) {
+  const { handler, port, failOpen = true, timeoutMs = 0 } = options;
+
+  const processImpl = createProcessHandler(handler, failOpen, timeoutMs);
   const routes = (router: ConnectRouter) =>
     router.service(ExternalProcessor, { process: processImpl });
 
-  // Plaintext HTTP/2 (h2c) matches the previous insecure gRPC transport; Envoy
-  // ext_proc connects over gRPC, which Connect serves natively over HTTP/2.
-  const server: Http2Server = createServer(connectNodeAdapter({ routes }));
+  // GCP ext_proc callouts require HTTP/2 over TLS on the data path (the gRPC health
+  // check can be plaintext, which is why an h2c server looks HEALTHY but the callout
+  // silently fails). Serve TLS when a cert is provided; fall back to plaintext h2c
+  // (emulate / local) otherwise.
+  const certFile = process.env.TLS_CERT_FILE;
+  const keyFile = process.env.TLS_KEY_FILE;
+  const useTls = !!(certFile && keyFile && existsSync(certFile) && existsSync(keyFile));
+  const nodeHandler = connectNodeAdapter({ routes });
+  const server: Http2Server = useTls
+    ? createSecureServer(
+        { cert: readFileSync(certFile!), key: readFileSync(keyFile!), allowHTTP1: true },
+        nodeHandler,
+      )
+    : createServer(nodeHandler);
+  console.log(`Routing service transport: ${useTls ? "TLS (h2)" : "plaintext (h2c)"}`);
 
   return {
     start(): Promise<{ port: number }> {

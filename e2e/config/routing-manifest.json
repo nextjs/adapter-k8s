@@ -1,0 +1,219 @@
+{
+  "routeGraph": {
+    "beforeMiddleware": [
+      {
+        "source": "/:path+/",
+        "sourceRegex": "^(?:\\/((?:[^\\/]+?)(?:\\/(?:[^\\/]+?))*))\\/$",
+        "headers": {
+          "Location": "/$1"
+        },
+        "status": 308,
+        "priority": true
+      }
+    ],
+    "beforeFiles": [],
+    "afterFiles": [],
+    "dynamicRoutes": [],
+    "onMatch": [
+      {
+        "sourceRegex": "/_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media|9afxl2xs3td)/.+",
+        "headers": {
+          "cache-control": "public,max-age=31536000,immutable"
+        }
+      }
+    ],
+    "fallback": [],
+    "shouldNormalizeNextData": false,
+    "rsc": {
+      "header": "rsc",
+      "varyHeader": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+      "prefetchHeader": "next-router-prefetch",
+      "didPostponeHeader": "x-nextjs-postponed",
+      "contentTypeHeader": "text/x-component",
+      "suffix": ".rsc",
+      "prefetchSegmentHeader": "next-router-segment-prefetch",
+      "prefetchSegmentSuffix": ".segment.rsc",
+      "prefetchSegmentDirSuffix": ".segments",
+      "clientParamParsing": false,
+      "dynamicRSCPrerender": false
+    }
+  },
+  "pathnames": [
+    "/",
+    "/404",
+    "/500",
+    "/_global-error",
+    "/_global-error.rsc",
+    "/_global-error.segments/__PAGE__.segment.rsc",
+    "/_global-error.segments/_full.segment.rsc",
+    "/_global-error.segments/_head.segment.rsc",
+    "/_global-error.segments/_index.segment.rsc",
+    "/_global-error.segments/_tree.segment.rsc",
+    "/_middleware",
+    "/_next/static/9afxl2xs3td/_buildManifest.js",
+    "/_next/static/9afxl2xs3td/_clientMiddlewareManifest.js",
+    "/_next/static/9afxl2xs3td/_ssgManifest.js",
+    "/_next/static/chunks/0cz1d0mv5g_q7.js",
+    "/_next/static/chunks/11xjbeamcdd17.js",
+    "/_next/static/chunks/1q_qba27-61gx.js",
+    "/_next/static/chunks/1u97875k2y7yb.js",
+    "/_next/static/chunks/2fd0hphdk3h_o.js",
+    "/_next/static/chunks/turbopack-1tfu0s-0wkdpk.js",
+    "/_not-found",
+    "/_not-found.rsc",
+    "/api/hello",
+    "/api/hello.rsc",
+    "/index.rsc",
+    "/index.segments/__PAGE__.segment.rsc",
+    "/index.segments/_full.segment.rsc",
+    "/index.segments/_head.segment.rsc",
+    "/index.segments/_index.segment.rsc",
+    "/index.segments/_tree.segment.rsc",
+    "/isr",
+    "/isr.rsc",
+    "/isr.segments/_full.segment.rsc",
+    "/isr.segments/_head.segment.rsc",
+    "/isr.segments/_index.segment.rsc",
+    "/isr.segments/_tree.segment.rsc",
+    "/isr.segments/isr.segment.rsc",
+    "/isr.segments/isr/__PAGE__.segment.rsc",
+    "/rewritten",
+    "/rewritten.rsc",
+    "/rewritten.segments/_full.segment.rsc",
+    "/rewritten.segments/_head.segment.rsc",
+    "/rewritten.segments/_index.segment.rsc",
+    "/rewritten.segments/_tree.segment.rsc",
+    "/rewritten.segments/rewritten.segment.rsc",
+    "/rewritten.segments/rewritten/__PAGE__.segment.rsc",
+    "/ssr",
+    "/ssr.rsc"
+  ],
+  "i18n": null,
+  "buildId": "9afxl2xs3td",
+  "basePath": "",
+  "trailingSlash": false,
+  "middleware": {
+    "filePath": ".next/server/edge/chunks/1459_next_dist_esm_build_templates_edge-wrapper_07q1ayg.js",
+    "runtime": "edge",
+    "matchers": [
+      {
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?(?:\\/(\\/?index|\\/?index\\.json|\\/?index(?:\\.rsc|\\.segments\\/.+\\.segment\\.rsc)))?[\\/#\\?]?$",
+        "missing": [
+          {
+            "type": "header",
+            "key": "x-prerender-revalidate",
+            "value": "142dca0c65035bde766e9721b10e7c3e"
+          }
+        ],
+        "originalSource": "/"
+      },
+      {
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/ssr(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
+        "missing": [
+          {
+            "type": "header",
+            "key": "x-prerender-revalidate",
+            "value": "142dca0c65035bde766e9721b10e7c3e"
+          }
+        ],
+        "originalSource": "/ssr"
+      },
+      {
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/isr(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
+        "missing": [
+          {
+            "type": "header",
+            "key": "x-prerender-revalidate",
+            "value": "142dca0c65035bde766e9721b10e7c3e"
+          }
+        ],
+        "originalSource": "/isr"
+      },
+      {
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/from-mw(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
+        "missing": [
+          {
+            "type": "header",
+            "key": "x-prerender-revalidate",
+            "value": "142dca0c65035bde766e9721b10e7c3e"
+          }
+        ],
+        "originalSource": "/from-mw"
+      },
+      {
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/rewritten(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
+        "missing": [
+          {
+            "type": "header",
+            "key": "x-prerender-revalidate",
+            "value": "142dca0c65035bde766e9721b10e7c3e"
+          }
+        ],
+        "originalSource": "/rewritten"
+      },
+      {
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/api(?:\\/((?:[^\\/#\\?]+?)(?:\\/(?:[^\\/#\\?]+?))*))?(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
+        "missing": [
+          {
+            "type": "header",
+            "key": "x-prerender-revalidate",
+            "value": "142dca0c65035bde766e9721b10e7c3e"
+          }
+        ],
+        "originalSource": "/api/:path*"
+      }
+    ]
+  },
+  "poolAssignments": {
+    "/_not-found.rsc": "default",
+    "/_not-found": "default",
+    "/_global-error.rsc": "default",
+    "/_global-error": "default",
+    "/isr.rsc": "default",
+    "/isr": "default",
+    "/index.rsc": "default",
+    "/": "default",
+    "/rewritten.rsc": "default",
+    "/rewritten": "default",
+    "/ssr.rsc": "default",
+    "/ssr": "default",
+    "/api/hello": "default",
+    "/api/hello.rsc": "default",
+    "/index.segments/_tree.segment.rsc": "default",
+    "/index.segments/_full.segment.rsc": "default",
+    "/index.segments/__PAGE__.segment.rsc": "default",
+    "/index.segments/_index.segment.rsc": "default",
+    "/index.segments/_head.segment.rsc": "default",
+    "/_global-error.segments/_tree.segment.rsc": "default",
+    "/_global-error.segments/_full.segment.rsc": "default",
+    "/_global-error.segments/__PAGE__.segment.rsc": "default",
+    "/_global-error.segments/_index.segment.rsc": "default",
+    "/_global-error.segments/_head.segment.rsc": "default",
+    "/isr.segments/_tree.segment.rsc": "default",
+    "/isr.segments/_full.segment.rsc": "default",
+    "/isr.segments/isr/__PAGE__.segment.rsc": "default",
+    "/isr.segments/isr.segment.rsc": "default",
+    "/isr.segments/_index.segment.rsc": "default",
+    "/isr.segments/_head.segment.rsc": "default",
+    "/rewritten.segments/_tree.segment.rsc": "default",
+    "/rewritten.segments/_full.segment.rsc": "default",
+    "/rewritten.segments/rewritten/__PAGE__.segment.rsc": "default",
+    "/rewritten.segments/rewritten.segment.rsc": "default",
+    "/rewritten.segments/_index.segment.rsc": "default",
+    "/rewritten.segments/_head.segment.rsc": "default",
+    "/404": "default",
+    "/500": "default",
+    "/_middleware": "default",
+    "/_next/static/9afxl2xs3td/_buildManifest.js": "default",
+    "/_next/static/9afxl2xs3td/_clientMiddlewareManifest.js": "default",
+    "/_next/static/9afxl2xs3td/_ssgManifest.js": "default",
+    "/_next/static/chunks/0cz1d0mv5g_q7.js": "default",
+    "/_next/static/chunks/11xjbeamcdd17.js": "default",
+    "/_next/static/chunks/1q_qba27-61gx.js": "default",
+    "/_next/static/chunks/1u97875k2y7yb.js": "default",
+    "/_next/static/chunks/2fd0hphdk3h_o.js": "default",
+    "/_next/static/chunks/turbopack-1tfu0s-0wkdpk.js": "default"
+  },
+  "pprRoutes": {},
+  "nextVersion": "16.2.10"
+}

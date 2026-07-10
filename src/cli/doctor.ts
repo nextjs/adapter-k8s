@@ -418,6 +418,56 @@ export async function runDoctor(options: {
       });
     }
 
+    // Active Service endpoints: pods being "ready" is NOT enough — the blue/green
+    // cutover flips each active Service's `app.kubernetes.io/version` selector to the
+    // new build, and if that selector value doesn't EXACTLY match the pod label the
+    // Service selects zero pods. The Deployment still reports N/N ready, but the
+    // Service drains to zero endpoints, its standalone NEG empties, and the LB returns
+    // 503 `failed_to_connect_to_backend` for every origin request (only CDN cache hits
+    // survive). Verify each active pool Service actually has ready endpoints so this
+    // class of outage can never pass as "all green" again.
+    let poolNames: string[] = [];
+    const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+    if (existsSync(metaPath)) {
+      try {
+        const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+        if (Array.isArray(meta.pools)) poolNames = meta.pools.filter((p: unknown) => typeof p === "string");
+      } catch {
+        // Malformed metadata — skip the endpoint check rather than crash.
+      }
+    }
+    for (const pool of poolNames) {
+      const svc = `${releaseName}-${pool}`;
+      const epResult = await execCapture("kubectl", [
+        "get",
+        "endpointslice",
+        "-l",
+        `kubernetes.io/service-name=${svc}`,
+        "-o",
+        'jsonpath={range .items[*]}{range .endpoints[*]}{.conditions.ready}{"\\n"}{end}{end}',
+      ]);
+      const readyEndpoints =
+        epResult.exitCode === 0
+          ? epResult.stdout.trim().split("\n").filter((v) => v.trim() === "true").length
+          : -1;
+      if (readyEndpoints > 0) {
+        results.push({
+          name: `Active Service endpoints: ${svc}`,
+          status: "pass",
+          message: `${readyEndpoints} ready`,
+        });
+      } else if (readyEndpoints === 0) {
+        results.push({
+          name: `Active Service endpoints: ${svc}`,
+          status: "fail",
+          message: "0 ready endpoints — selector matches no ready pods (origin will 503)",
+          fix: `kubectl get svc ${svc} -o jsonpath='{.spec.selector}' — verify app.kubernetes.io/version matches a running pod's label`,
+        });
+      }
+      // readyEndpoints === -1 (kubectl error) is left unreported — cluster-connectivity
+      // problems are already surfaced by the "K8s cluster" check above.
+    }
+
     // Check if previous build exists (needed for rollback)
     if (state?.previousBuildId) {
       const foundPrevious =
@@ -607,6 +657,107 @@ export async function runDoctor(options: {
                 },
           );
         }
+      }
+    }
+
+    // --- ext_proc traffic-extension wiring (the surface that silently breaks middleware) ---
+    if (projectId) {
+      // Traffic extension registered AND covering EVERY forwarding rule. A missing HTTP
+      // rule lets http:// bypass middleware (auth/rewrites); a missing extension means the
+      // edge middleware never runs at all.
+      const teFrs = await execCapture("gcloud", [
+        "service-extensions", "lb-traffic-extensions", "describe", `${releaseName}-traffic-ext`,
+        "--location=global", "--project", projectId, "--format=value(forwardingRules)",
+      ]);
+      if (teFrs.exitCode !== 0 || !teFrs.stdout.trim()) {
+        results.push({
+          name: "ext_proc traffic extension",
+          status: "fail",
+          message: "not registered — edge middleware is not wired",
+          fix: `npx adapter-k8s deploy   # the traffic-ext Job registers it`,
+        });
+      } else {
+        const covered = teFrs.stdout.trim().split(";").filter(Boolean).length;
+        const allFrs = (
+          await execCapture("gcloud", [
+            "compute", "forwarding-rules", "list", "--project", projectId,
+            "--filter", `name~${releaseName}`, "--format=value(name)",
+          ])
+        ).stdout
+          .trim()
+          .split("\n")
+          .filter(Boolean).length;
+        results.push(
+          allFrs > 0 && covered < allFrs
+            ? {
+                name: "ext_proc traffic extension",
+                status: "fail",
+                message: `covers ${covered}/${allFrs} forwarding rules — http:// can bypass middleware`,
+                fix: `npx adapter-k8s deploy   # re-runs the Job to attach every forwarding rule`,
+              }
+            : {
+                name: "ext_proc traffic extension",
+                status: "pass",
+                message: `registered, covers ${covered}/${allFrs} forwarding rules`,
+              },
+        );
+      }
+
+      // Routing backend service must be EXTERNAL_MANAGED with a NEG attached.
+      const bsScheme = (
+        await execCapture("gcloud", [
+          "compute", "backend-services", "describe", `${releaseName}-routing-service`,
+          "--global", "--project", projectId, "--format=value(loadBalancingScheme)",
+        ])
+      ).stdout
+        .trim()
+        .toUpperCase();
+      if (bsScheme && bsScheme !== "EXTERNAL_MANAGED") {
+        results.push({
+          name: "routing backend scheme",
+          status: "fail",
+          message: `${bsScheme} (the traffic extension requires EXTERNAL_MANAGED)`,
+          fix: `gcloud compute backend-services delete ${releaseName}-routing-service --global --project ${projectId} --quiet  # then re-run init + deploy`,
+        });
+      } else if (bsScheme) {
+        results.push({ name: "routing backend scheme", status: "pass", message: "EXTERNAL_MANAGED" });
+        const backends = (
+          await execCapture("gcloud", [
+            "compute", "backend-services", "describe", `${releaseName}-routing-service`,
+            "--global", "--project", projectId, "--format=value(backends)",
+          ])
+        ).stdout.trim();
+        results.push(
+          backends
+            ? { name: "routing backend NEG", status: "pass", message: "attached" }
+            : {
+                name: "routing backend NEG",
+                status: "fail",
+                message: "no NEG attached — the ext_proc callout has no backend",
+                fix: `npx adapter-k8s deploy   # the Job attaches the standalone NEG`,
+              },
+        );
+      }
+
+      // Routing health check must be TCP — a plaintext gRPC check passes against a TLS
+      // ext_proc server yet the callout still fails (the failure mode that hid for months).
+      const hcType = (
+        await execCapture("gcloud", [
+          "compute", "health-checks", "describe", `${releaseName}-routing-hc`,
+          "--global", "--project", projectId, "--format=value(type)",
+        ])
+      ).stdout
+        .trim()
+        .toUpperCase();
+      if (hcType && hcType !== "TCP") {
+        results.push({
+          name: "routing health check",
+          status: "warn",
+          message: `${hcType} (needs TCP; a gRPC check passes plaintext but the TLS callout fails)`,
+          fix: `gcloud compute health-checks delete ${releaseName}-routing-hc --global --project ${projectId} --quiet  # then re-run init`,
+        });
+      } else if (hcType === "TCP") {
+        results.push({ name: "routing health check", status: "pass", message: "TCP" });
       }
     }
 

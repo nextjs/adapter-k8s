@@ -731,6 +731,27 @@ async function main() {
         !!(middlewareModule || edgeMiddlewareRunner) &&
         matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
 
+      // Middleware-matched routes must reach the ext_proc extension on every request, so
+      // they must not be served from the Cloud CDN edge cache. Force `Cache-Control:
+      // no-cache` (revalidate every request) regardless of what the response set. This is
+      // the App Hosting model: cache public content, but never edge-cache a route the
+      // middleware verdict can change. Non-matched routes keep their origin Cache-Control.
+      if (middlewareCovers) {
+        const originalWriteHead = res.writeHead.bind(res);
+        res.writeHead = function forceNoCache(...args: unknown[]) {
+          for (const arg of args) {
+            if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+              for (const key of Object.keys(arg as Record<string, unknown>)) {
+                if (key.toLowerCase() === "cache-control")
+                  delete (arg as Record<string, unknown>)[key];
+              }
+            }
+          }
+          res.setHeader("cache-control", "no-cache");
+          return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
+        } as typeof res.writeHead;
+      }
+
       // Serve _next/static/* and _next/data/* directly from filesystem.
       // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
       if (!middlewareCovers && url.pathname.startsWith("/_next/static/")) {

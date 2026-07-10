@@ -44,6 +44,15 @@ describe("sanitizeK8sName", () => {
     expect(result).toContain("123abc");
   });
 
+  it("produces the `b-` prefixed version label the blue/green cutover depends on", () => {
+    // REGRESSION: the deploy.ts cutover patches the active Service's
+    // app.kubernetes.io/version selector to sanitizeK8sName(buildId), and pods carry
+    // the same value as their label. A build id starting with a digit MUST get the
+    // `b-` prefix in BOTH places — a cutover copy that omitted it selected zero pods,
+    // draining the Service to no endpoints and 503'ing the site. Pin the exact value.
+    expect(sanitizeK8sName("7s_BTPTfkofoG2MRK25lK")).toBe("b-7s-btptfkofog2mrk25lk");
+  });
+
   it("passes through a normal name unchanged", () => {
     expect(sanitizeK8sName("nextjs-ssr")).toBe("nextjs-ssr");
   });

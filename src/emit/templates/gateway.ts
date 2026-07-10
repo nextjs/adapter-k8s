@@ -91,6 +91,11 @@ export function renderHTTPRoute({
   // GKE allows one ExtensionRef filter per rule; attaching the same filter from every
   // rule is fine (the limit is per rule, not per filter). The name is already sanitized
   // by its single owner (helm.ts), so it is interpolated verbatim here.
+  //
+  // The ResponseHeaderModifier surfaces Cloud CDN diagnostics: the load balancer expands
+  // the {cdn_cache_status} / {cdn_cache_id} variables at the edge (hit|miss|revalidated|
+  // stale|uncacheable|disabled, plus the serving cache node), so cache behaviour is
+  // observable per-response without log-diving.
   const filtersYaml = cdnFilterName
     ? `
       filters:
@@ -98,7 +103,14 @@ export function renderHTTPRoute({
           extensionRef:
             group: networking.gke.io
             kind: GCPHTTPFilter
-            name: ${cdnFilterName}`
+            name: ${cdnFilterName}
+        - type: ResponseHeaderModifier
+          responseHeaderModifier:
+            set:
+              - name: x-cache-status
+                value: "{cdn_cache_status}"
+              - name: x-cache-id
+                value: "{cdn_cache_id}"`
     : "";
   const hostnames = hosts.map((h) => h.hostname);
   const defaultPoolName = [...pools.keys()][0] ?? "default";

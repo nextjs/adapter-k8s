@@ -99,6 +99,24 @@ describe("renderHTTPRoute CDN filter injection", () => {
     expect(yaml).toContain("name: nextjs-cdn");
   });
 
+  it("attaches a ResponseHeaderModifier with CDN diagnostic variables per rule", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(2),
+      buildId: "abc123",
+      routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
+      cdnFilterName: "nextjs-cdn",
+    });
+    const ruleCount = (yaml.match(/- matches:/g) ?? []).length;
+    const modifierCount = (yaml.match(/type: ResponseHeaderModifier/g) ?? []).length;
+    expect(modifierCount).toBe(ruleCount);
+    expect(yaml).toContain("name: x-cache-status");
+    expect(yaml).toContain('value: "{cdn_cache_status}"');
+    expect(yaml).toContain("name: x-cache-id");
+    expect(yaml).toContain('value: "{cdn_cache_id}"');
+  });
+
   it("emits no filters block when cdnFilterName is unset", () => {
     const yaml = renderHTTPRoute({
       releaseName: "nextjs",

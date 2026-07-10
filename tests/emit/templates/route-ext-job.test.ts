@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { renderRouteExtUpdateJob } from "../../../src/emit/templates/route-ext-update-job.js";
+import {
+  renderRouteExtUpdateJob,
+  routeExtJobName,
+} from "../../../src/emit/templates/route-ext-update-job.js";
 import { renderRouteExtConfigMap } from "../../../src/emit/templates/route-ext-configmap.js";
 
 describe("renderRouteExtUpdateJob", () => {
@@ -13,9 +16,47 @@ describe("renderRouteExtUpdateJob", () => {
     expect(yaml).toContain("kind: Job");
     // Not a Helm hook — runs as a regular Job so it doesn't block deploys
     expect(yaml).toContain("kind: Job");
-    expect(yaml).toContain("gcloud service-extensions lb-route-extensions import");
-    expect(yaml).toContain("my-app-route-ext");
+    expect(yaml).toContain("gcloud service-extensions lb-traffic-extensions import");
+    expect(yaml).toContain("my-app-traffic-ext");
     expect(yaml).toContain("route-extension.yaml");
+    // Attaches the standalone routing NEG to the ext_proc backend service
+    expect(yaml).toContain("my-app-routing-neg");
+    expect(yaml).toContain("add-backend");
+  });
+
+  it("renders the exact job name from routeExtJobName (deploy cleanup matches this)", () => {
+    const buildId = "jpY1GCvqshOHB9PiQlgyf";
+    const name = routeExtJobName("my-app", buildId);
+    const yaml = renderRouteExtUpdateJob({
+      releaseName: "my-app",
+      projectId: "my-project",
+      region: "us-central1",
+      buildId,
+    });
+    // The rendered Job name MUST equal routeExtJobName's output — deploy.ts skips the
+    // current job by exact name, and any drift deletes the running job mid-registration.
+    expect(yaml).toContain(`name: ${name}`);
+    // Regression: the name uses a 10-char build-id slice; deploy's old 12-char substring
+    // match failed to skip it and deleted it.
+    expect(name).toBe("my-app-route-ext-jpy1gcvqsh");
+  });
+
+  it("attaches to ALL forwarding rules and fails loudly (no http:// bypass, no false success)", () => {
+    const yaml = renderRouteExtUpdateJob({
+      releaseName: "my-app",
+      projectId: "my-project",
+      region: "us-central1",
+      buildId: "abc123",
+    });
+    // P1: must NOT select a single/HTTPS-only forwarding rule — that leaves http:// traffic
+    // bypassing the extension (middleware auth/rewrite bypass). Expand every FR.
+    expect(yaml).not.toContain("--limit=1");
+    expect(yaml).not.toContain("targetHttpsProxies");
+    expect(yaml).toContain("FORWARDING_RULE_PLACEHOLDER");
+    expect(yaml).toContain("fr_list");
+    // P2: fail loudly (exit 1) when FR/NEG are absent — never silently "succeed" unregistered.
+    expect(yaml).toContain("exit 1");
+    expect(yaml).not.toContain("Skipping traffic extension");
   });
 
   it("rejects a releaseName containing shell metacharacters", () => {
@@ -82,7 +123,7 @@ describe("renderRouteExtConfigMap", () => {
     expect(yaml).toContain("kind: ConfigMap");
     expect(yaml).toContain("route-extension.yaml");
     expect(yaml).toContain("loadBalancingScheme: EXTERNAL_MANAGED");
-    expect(yaml).toContain("my-app-route-ext");
+    expect(yaml).toContain("my-app-traffic-ext");
     expect(yaml).toContain("nextjs-routing");
   });
 });

@@ -20,6 +20,15 @@ describe("determineFailureMode", () => {
     const outputs = mockOutputs();
     expect(determineFailureMode(outputs)).toBe(true);
   });
+
+  it("honors an explicit failureMode override", () => {
+    const withMw = mockOutputs({ middleware: { id: "m", type: 8 } as any });
+    // "auto" mirrors the middleware heuristic
+    expect(determineFailureMode(withMw, "auto")).toBe(false);
+    // explicit overrides win regardless of middleware
+    expect(determineFailureMode(withMw, "open")).toBe(true);
+    expect(determineFailureMode(mockOutputs(), "closed")).toBe(false);
+  });
 });
 
 describe("generateExtensionChain", () => {

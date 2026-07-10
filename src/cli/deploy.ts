@@ -5,14 +5,13 @@ import { exec, execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
 import { renderInternalSecretEnv } from "../emit/templates/internal-secret.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
+import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
+// Import the SAME sanitizer that stamps pod names and version labels (deployment.ts /
+// service.ts). The blue/green cutover patches the active Service selector to this exact
+// value, so it MUST match the pod label byte-for-byte — a divergent local copy that
+// omitted the `b-` prefix drained the Service to zero endpoints and 503'd the site.
+import { sanitizeK8sName } from "../emit/templates/utils.js";
 import type { GcloudCommand } from "./init.js";
-
-function sanitizeK8sName(name: string): string {
-  let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
-  if (!/^[a-z]/.test(sanitized)) sanitized = `b-${sanitized}`;
-  sanitized = sanitized.replace(/-+$/, "");
-  return sanitized.slice(0, 63);
-}
 
 export interface DeployOptions {
   projectDir: string;
@@ -453,6 +452,37 @@ spec:
       ]);
     }
 
+    // 7a-bis. The routing service (ext_proc edge) is a stable Deployment updated in place
+    // per build, and was historically excluded from readiness. That let a broken image
+    // (e.g. a missing @next/routing) crashloop undetected for months while Kubernetes kept
+    // the old ReplicaSet serving stale edge code and the deploy reported success. Verify it
+    // actually rolls out; a stuck rollout is fatal.
+    const routingDeploy = sanitizeK8sName(`${releaseName}-routing-service`);
+    const rsExists = await execCapture("kubectl", [
+      "get",
+      "deployment",
+      routingDeploy,
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (rsExists.exitCode === 0 && rsExists.stdout.trim()) {
+      console.log(`    Waiting for ${routingDeploy}...`);
+      const rsRollout = await execCapture("kubectl", [
+        "rollout",
+        "status",
+        `deployment/${routingDeploy}`,
+        "--timeout=120s",
+      ]);
+      if (rsRollout.exitCode !== 0) {
+        throw new Error(
+          `Routing service (${routingDeploy}) did not become healthy — the ext_proc edge would ` +
+            `keep serving the previous build.\n${(rsRollout.stderr || rsRollout.stdout).trim()}\n` +
+            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service --tail=40`,
+        );
+      }
+    }
+
     // 7b. Wait for new pods to be healthy from inside the cluster
     // We check healthz directly on each new pod rather than waiting for GCP LB health
     // (GCP backend health propagation can take 5+ minutes for new backends)
@@ -576,12 +606,14 @@ spec:
       process.exit(1);
     }
 
-    // 7c. Cut traffic over: patch each active Service selector to the new build
-    const safeBuildId = buildId
-      .toLowerCase()
-      .replace(/[^a-z0-9.-]/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 63);
+    // 7c. Cut traffic over: patch each active Service selector to the new build.
+    // MUST use the exact same sanitizer that stamped the pod labels (sanitizeK8sName,
+    // which prepends `b-` when the build id starts with a non-letter). An inline
+    // transform that omits the `b-` prefix writes a selector that matches no pods:
+    // the Service drains to zero endpoints, its standalone NEG empties, and the LB
+    // returns 503 `failed_to_connect_to_backend` for every origin request (only CDN
+    // cache hits survive). This bit us on build ids beginning with a digit.
+    const safeBuildId = sanitizeK8sName(buildId);
     console.log(`  → Switching traffic to new build...`);
     const patchFailures: { pool: string; service: string; stderr: string }[] = [];
     for (const pool of pools) {
@@ -696,7 +728,11 @@ spec:
       }
     }
 
-    // Clean up old route-ext Jobs (they're immutable, each deploy creates a new one)
+    // Clean up OLD route-ext Jobs (K8s Jobs are immutable; each deploy creates a fresh
+    // one). Skip the CURRENT job by EXACT name — a fuzzy build-id substring match here
+    // (12-char slice vs the name's 10-char slice) previously deleted the running job
+    // before it could register the extension, so the traffic ext never got reconciled.
+    const currentRouteExtJob = routeExtJobName(releaseName, buildId);
     const oldJobs = await execCapture("kubectl", [
       "get",
       "jobs",
@@ -707,15 +743,33 @@ spec:
     ]);
     if (oldJobs.exitCode === 0) {
       for (const jobName of oldJobs.stdout.trim().split("\n")) {
-        if (
-          !jobName ||
-          jobName
-            .toLowerCase()
-            .replace(/[^a-z0-9]/g, "")
-            .includes(currentBuildLower)
-        )
-          continue;
+        if (!jobName || jobName === currentRouteExtJob) continue;
         await execCapture("kubectl", ["delete", "job", jobName]);
+      }
+    }
+
+    // Verify the traffic-ext registration Job actually completes. Its whole job is
+    // external gcloud reconciliation (NEG attach + ext import), which is silent-failure
+    // prone — surface it instead of "deploy succeeded but middleware isn't wired".
+    // Bounded wait, non-fatal (a first deploy's gateway may still be provisioning).
+    const routeExtJobYaml = path.join(outputDir, "chart", "templates", "route-ext-update-job.yaml");
+    if (existsSync(routeExtJobYaml)) {
+      const wait = await execCapture("kubectl", [
+        "wait",
+        "--for=condition=complete",
+        `job/${currentRouteExtJob}`,
+        // Returns immediately on completion; the longer cap only covers a fresh backend
+        // (first deploy), where the per-zone NEG attaches take longer.
+        "--timeout=240s",
+      ]);
+      if (wait.exitCode === 0) {
+        console.log("  → ext_proc traffic extension registration job completed ✓");
+      } else {
+        console.warn(
+          `  ! ext_proc registration job did not complete — middleware may not be wired.\n` +
+            `    Inspect: kubectl logs job/${currentRouteExtJob}\n` +
+            `    (On a first deploy the gateway may still be provisioning; re-run deploy.)`,
+        );
       }
     }
   }
