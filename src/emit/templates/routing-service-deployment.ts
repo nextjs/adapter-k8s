@@ -41,6 +41,18 @@ metadata:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: routing-service
 spec:
+  # Zero-downtime rollout behind a standalone NEG. The routing service is the ext_proc
+  # backend; when it rolls to a new build image, old pods must not drain from the NEG
+  # before new pods are health-checked into it by the GCP load balancer — otherwise the
+  # fail-closed callout 500s for the sync window (observed ~90s on a redeploy). Never drop
+  # below desired replicas, and count a new pod as "available" only after it has been Ready
+  # long enough for the LB backend health check to pass.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  minReadySeconds: 30
   selector:
     matchLabels:
       app.kubernetes.io/name: ${releaseName}
@@ -52,9 +64,18 @@ spec:
         app.kubernetes.io/component: routing-service
         app.kubernetes.io/version: "${safeBuildId}"
     spec:
+      # Give a terminating pod time to keep serving in-flight callouts while the LB stops
+      # routing to it (preStop below), before SIGTERM/kill.
+      terminationGracePeriodSeconds: 40
       containers:
         - name: routing-service
           image: "${imageRegistry}/routing-service:${buildId}"
+          lifecycle:
+            preStop:
+              # Keep serving while GCP reprograms the NEG to drain this terminating pod.
+              # Without this, in-flight ext_proc callouts land on a pod that's already gone.
+              exec:
+                command: ["/bin/sh", "-c", "sleep 25"]
           ports:
             - containerPort: 8443
               name: grpc
