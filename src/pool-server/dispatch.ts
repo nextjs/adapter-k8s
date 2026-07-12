@@ -117,6 +117,18 @@ async function invokeLocalHandlerOverHttp({
     const server = createServer((innerReq, innerRes) => {
       void (async () => {
         try {
+          // The PPR resume token is set on the OUTER req's meta symbol by the caller
+          // (see the pprRoutes branch below). The loopback createServer only carries req/res
+          // streaming — `ctx` here is a direct JS argument, so we thread `postponed` through it
+          // rather than relying on the symbol surviving the hop (it does not). The generated
+          // app-page handler calls setRequestMeta(req, ctx.requestMeta) then reads
+          // getRequestMeta(req, 'postponed') and resumes the dynamic holes onto the prebuilt
+          // shell, streamed. Spike-proven: injecting just `postponed` streams a correct resume
+          // (no minimal mode / resolvedPathname needed). See the PPR/cache-components design doc.
+          const outerMeta =
+            ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
+              NEXT_REQUEST_META
+            ] as { postponed?: string } | undefined) ?? {};
           const maybeResult = await (handler as any)(innerReq, innerRes, {
             waitUntil(waitable: Promise<unknown>) {
               void waitable.catch(() => undefined);
@@ -127,6 +139,7 @@ async function invokeLocalHandlerOverHttp({
               outputId: matchedPathname,
               matchedPathname,
               routeMatches,
+              ...(outerMeta.postponed ? { postponed: outerMeta.postponed } : {}),
             },
           });
 
@@ -246,7 +259,14 @@ export interface DispatcherOptions {
   releaseName?: string;
   localHandlerInvoker?: LocalHandlerInvoker;
   edgeRouteRunner?: EdgeRouteRunner | null;
-  pprRoutes?: Record<string, { postponedState: string }>;
+  pprRoutes?: Record<string, { postponedState: string; tags?: string[] }>;
+  /**
+   * Returns true when a PPR route's baked shell tags have been revalidated since this build
+   * deployed (checked against the shared Valkey manifest). When true the pool withholds the
+   * postponed token and lets the handler do a fresh blocking render instead of resuming a
+   * stale shell. Absent (no cache configured) ⇒ always resume.
+   */
+  checkShellStale?: (tags: string[]) => Promise<boolean>;
   rscConfig?: RscConfig | undefined;
   /** All output ids in this pool's manifest — used to map concrete prerender
    * paths back to their dynamic-route template handler (outputs of dynamic
@@ -271,6 +291,7 @@ export function createDispatcher(options: DispatcherOptions) {
     localHandlerInvoker = invokeLocalHandlerOverHttp,
     edgeRouteRunner = null,
     pprRoutes = {},
+    checkShellStale,
     rscConfig,
     outputIds = [],
     strictDynamicRoutes = [],
@@ -676,13 +697,30 @@ export function createDispatcher(options: DispatcherOptions) {
             return;
           }
 
-          // For PPR routes, set the postponed state on request metadata.
-          // The handler reads this to resume streaming dynamic content after the static shell.
+          // For PPR routes, set the postponed state on request metadata so the handler resumes
+          // the dynamic holes onto the prebuilt shell. BUT first check shell staleness: if a
+          // cache tag baked into the shell has been revalidated since this build deployed, the
+          // shell is stale — withhold the token so the handler does a fresh blocking render
+          // instead of resuming stale content. (Shell regeneration is deferred; correctness is
+          // not — see the PPR/cache-components design.)
           const pprInfo = pprRoutes[handlerPathname] ?? pprRoutes[resolution.matchedPathname];
           if (pprInfo?.postponedState) {
-            const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
-            meta.postponed = pprInfo.postponedState;
-            (req as any)[NEXT_REQUEST_META] = meta;
+            // Do NOT inject the resume token for Server Action requests. Next's app-page handler
+            // only splits the postponed state out of the action body (via the
+            // `x-next-resume-state-length` framing) when no `postponed` meta is already set —
+            // injecting it here would leave the postponed prefix in the action body and corrupt
+            // the action. Server actions carry the `next-action` header (or that length header).
+            const isServerAction =
+              !!req.headers["next-action"] || !!req.headers["x-next-resume-state-length"];
+            const shellStale =
+              checkShellStale && pprInfo.tags && pprInfo.tags.length > 0
+                ? await checkShellStale(pprInfo.tags)
+                : false;
+            if (!isServerAction && !shellStale) {
+              const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
+              meta.postponed = pprInfo.postponedState;
+              (req as any)[NEXT_REQUEST_META] = meta;
+            }
           }
 
           // Load and invoke the handler directly

@@ -170,6 +170,49 @@ describe("buildRoutingManifest", () => {
     });
   });
 
+  it("captures shell cache tags + revalidate/expire from fallback.initialHeaders", () => {
+    const outputs = mockOutputs({
+      appPages: [mockAppPage({ pathname: "/dashboard" })],
+      prerenders: [
+        mockPrerender({
+          pathname: "/dashboard",
+          // @ts-ignore - mock property
+          parentOutputId: "/app/dashboard",
+          fallback: {
+            filePath: "/app/dist/dashboard.html",
+            postponedState: "abc123",
+            // @ts-ignore - mock property
+            initialHeaders: { "x-next-cache-tags": "_N_T_/layout,_N_T_/page,_N_T_/dashboard" },
+            initialRevalidate: 60,
+            initialExpiration: 300,
+          },
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+      ],
+    });
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
+    ]);
+    const manifest = buildRoutingManifest({
+      routing: mockRouting(),
+      outputs,
+      pools,
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+
+    expect(manifest.pprRoutes["/dashboard"]).toEqual({
+      postponedState: "abc123",
+      fallbackFilePath: "dist/dashboard.html",
+      tags: ["_N_T_/layout", "_N_T_/page", "_N_T_/dashboard"],
+      revalidate: 60,
+      expire: 300,
+    });
+  });
+
   it("excludes PPR routes when postponedState or filePath is missing", () => {
     const outputs = mockOutputs({
       appPages: [mockAppPage({ pathname: "/partial" })],

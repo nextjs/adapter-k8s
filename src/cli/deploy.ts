@@ -6,6 +6,8 @@ import { readState, writeState } from "./state.js";
 import { renderDeployment } from "../emit/templates/deployment.js";
 import { renderService } from "../emit/templates/service.js";
 import { renderHPA } from "../emit/templates/hpa.js";
+import { renderValkeySecret } from "../emit/templates/valkey-secret.js";
+import { provisionMemorystore } from "./provision-cache.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 // Import the SAME sanitizer that stamps pod names and version labels (deployment.ts /
@@ -185,6 +187,36 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   console.log(`\n  Build ID: ${buildId}`);
   console.log(`  Pools: ${pools.join(", ")}`);
 
+  // Managed cache: provision Memorystore and write the connection Secret BEFORE the pods roll,
+  // so the Valkey handler registers on startup. Idempotent — reuses an existing instance. BYO
+  // cache (cache.url set) skips this; its Secret is emitted by the Helm chart instead.
+  if (metadata.cacheManaged && !dryRun) {
+    // Fail loudly rather than silently shipping without a shared cache: managed provisioning
+    // needs the project + region. (BYO cache sets cache.url and never reaches this branch.)
+    if (!infra.projectId || !infra.region) {
+      throw new Error(
+        "cache.enabled with managed Memorystore requires infrastructure.json to have projectId " +
+          "and region. Set cache.url for a bring-your-own instance, or re-run `adapter-k8s init`.",
+      );
+    }
+    console.log("\n  → Provisioning managed cache (Memorystore)...");
+    const ms = (metadata as { cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string } })
+      .cacheMemorystore;
+    const endpoint = await provisionMemorystore({
+      projectId: infra.projectId,
+      region: ms?.region ?? infra.region,
+      releaseName,
+      ...(ms?.sizeGb ? { sizeGb: ms.sizeGb } : {}),
+      ...(ms?.tier ? { tier: ms.tier } : {}),
+      log: (m: string) => console.log(m),
+    });
+    const url = `redis://${endpoint.host}:${endpoint.port}`;
+    const secretPath = path.join(projectDir, ".k8s-adapter", "valkey-secret.generated.yaml");
+    writeFileSync(secretPath, renderValkeySecret({ releaseName, url }));
+    await execOrThrow("kubectl", ["apply", "-f", secretPath]);
+    console.log(`    Cache Secret ${releaseName}-valkey → ${url}`);
+  }
+
   // 3. Read adapter config to determine container strategy
   // Default to traced-assets if not specified
   const containerStrategy = metadata.containerStrategy ?? "traced-assets";
@@ -324,6 +356,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           releaseName,
           imageTag: previousBuildId,
           replicas: prevReplicas,
+          cacheEnabled: (metadata as { cacheEnabled?: boolean }).cacheEnabled ?? false,
         }),
       );
 

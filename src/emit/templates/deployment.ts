@@ -1,6 +1,7 @@
 // src/emit/templates/deployment.ts
 import { sanitizeK8sName } from "./utils.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
+import { renderValkeyEnv } from "./valkey-secret.js";
 
 export function renderDeployment({
   poolName,
@@ -8,16 +9,19 @@ export function renderDeployment({
   releaseName,
   imageTag = "{{ .Values.global.image.tag }}",
   replicas,
+  cacheEnabled = false,
 }: {
   poolName: string;
   buildId: string;
   releaseName: string;
   imageTag?: string;
   replicas?: number | undefined;
+  cacheEnabled?: boolean;
 }): string {
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
   const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
+  const valkeyEnv = cacheEnabled ? "\n" + renderValkeyEnv(releaseName, "            ") : "";
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,7 +62,7 @@ ${replicas !== undefined ? `  replicas: ${replicas}\n` : ""}  selector:
               value: "${releaseName}"
             - name: TRUST_INTERNAL_HEADERS
               value: "1"
-${internalSecretEnv}
+${internalSecretEnv}${valkeyEnv}
           readinessProbe:
             httpGet:
               path: /healthz

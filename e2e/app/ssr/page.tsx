@@ -1,12 +1,22 @@
-// Force-dynamic SSR page — must NOT be cached; renders a fresh timestamp per request.
-export const dynamic = "force-dynamic";
+import { Suspense } from "react";
+import { connection } from "next/server";
+
+// Dynamic hole: connection() opts this subtree out of the static shell, so it streams
+// per-request (PPR resume) rather than being prerendered.
+async function Now() {
+  await connection();
+  return <span data-testid="ssr-time">{new Date().toISOString()}</span>;
+}
 
 export default function Ssr() {
   return (
     <main>
-      <h1 data-testid="ssr">SSR</h1>
+      <h1 data-testid="ssr">SSR (PPR)</h1>
       <p>
-        Rendered at <span data-testid="ssr-time">{new Date().toISOString()}</span>
+        Static shell, streamed dynamic time:{" "}
+        <Suspense fallback={<span>…</span>}>
+          <Now />
+        </Suspense>
       </p>
     </main>
   );

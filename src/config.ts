@@ -41,9 +41,12 @@ export function validateConfig(input: unknown): void {
   }
 
   if (config.cache?.enabled) {
-    throw new Error(
-      "cache.enabled is not implemented yet; disable it until the Valkey cache ships",
-    );
+    const url = config.cache.url;
+    if (url && !/^rediss?:\/\//.test(url)) {
+      throw new Error(
+        "cache.url must be a redis:// or rediss:// connection string (or omit it to provision managed Memorystore)",
+      );
+    }
   }
   if (config.imageOptimizer?.enabled) {
     throw new Error("imageOptimizer.enabled is not implemented yet");

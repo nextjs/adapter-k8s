@@ -57,6 +57,7 @@
     "@connectrpc/connect-node": "^2.1.2",
     "@next/routing": "^16.2.0",
     "boxen": "^8.0.1",
+    "ioredis": "^5.11.1",
     "minimatch": "^10.2.4"
   },
   "devDependencies": {

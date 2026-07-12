@@ -21,6 +21,8 @@ import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
 import { createPoolServer } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
+import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
+import type { ValkeyCacheHandler } from "./valkey-cache/use-cache-handler.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -437,6 +439,21 @@ async function main() {
   const buildId = process.env.NEXT_BUILD_ID;
   if (!buildId) throw new Error("NEXT_BUILD_ID environment variable is required");
 
+  // Install the Valkey-backed `use cache` handler BEFORE any app module (and therefore Next's
+  // one-time cache-handler initialization) loads, so cache components / PPR `use cache` entries
+  // are shared across replicas with cross-replica tag revalidation. Gated on the injected
+  // connection URL; when absent the app falls back to Next's default in-process handler.
+  let valkeyHandler: ValkeyCacheHandler | undefined;
+  const valkeyUrl = process.env.VALKEY_URL;
+  if (valkeyUrl) {
+    valkeyHandler = registerValkeyCacheHandler({
+      url: valkeyUrl,
+      buildId,
+      ...(process.env.VALKEY_AUTH ? { password: process.env.VALKEY_AUTH } : {}),
+    });
+    console.log("[pool-server] Valkey use-cache handler registered (build " + buildId + ")");
+  }
+
   const port = parseInt(process.env.PORT ?? "3000", 10);
   const releaseName = process.env.RELEASE_NAME ?? "nextjs";
   const configDir = process.env.CONFIG_DIR ?? "/config";
@@ -742,6 +759,12 @@ async function main() {
     releaseName,
     edgeRouteRunner,
     pprRoutes: routingManifest.pprRoutes,
+    // Shell tag-staleness: any watermark in this build's (namespaced) manifest postdates the
+    // build, so a shell tag with a non-zero expiration was revalidated since deploy → its
+    // shell is stale and must be re-rendered rather than resumed.
+    ...(valkeyHandler
+      ? { checkShellStale: (tags: string[]) => valkeyHandler!.getExpiration(tags).then((e) => e > 0) }
+      : {}),
     rscConfig: getRscConfig(routingManifest),
     outputIds: Object.keys(poolManifest.outputs),
     strictDynamicRoutes,
@@ -779,14 +802,20 @@ async function main() {
         !!(middlewareModule || edgeMiddlewareRunner) &&
         matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
 
-      // Middleware-matched routes must reach the ext_proc extension on every request, so
-      // they must not be served from the Cloud CDN edge cache. Force `Cache-Control:
-      // no-cache` (revalidate every request) regardless of what the response set. This is
-      // the App Hosting model: cache public content, but never edge-cache a route the
-      // middleware verdict can change. Non-matched routes keep their origin Cache-Control.
-      if (middlewareCovers) {
+      // Force the CDN caching verdict for two kinds of route (non-matched routes keep their
+      // origin Cache-Control):
+      //   • PPR routes stream a per-request dynamic resume onto the shell, so the response must
+      //     never be edge-cached — `no-store`. Chunked encoding alone does NOT stop Cloud CDN
+      //     from caching (proven), so this override is required. The routing service marks these
+      //     with the trusted internal `x-nextjs-ppr` dispatch header.
+      //   • Middleware-matched routes must reach the ext_proc extension every request (the
+      //     verdict can change), so they must revalidate — `no-cache` (App Hosting model).
+      // `no-store` wins when a route is both PPR and middleware-matched.
+      const isPprRoute = req.headers["x-nextjs-ppr"] === "1";
+      const forcedCacheControl = isPprRoute ? "no-store" : middlewareCovers ? "no-cache" : null;
+      if (forcedCacheControl) {
         const originalWriteHead = res.writeHead.bind(res);
-        res.writeHead = function forceNoCache(...args: unknown[]) {
+        res.writeHead = function forceCacheControl(...args: unknown[]) {
           for (const arg of args) {
             if (arg && typeof arg === "object" && !Array.isArray(arg)) {
               for (const key of Object.keys(arg as Record<string, unknown>)) {
@@ -795,7 +824,7 @@ async function main() {
               }
             }
           }
-          res.setHeader("cache-control", "no-cache");
+          res.setHeader("cache-control", forcedCacheControl);
           return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
         } as typeof res.writeHead;
       }

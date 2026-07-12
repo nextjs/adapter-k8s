@@ -28,8 +28,27 @@ export function isAlreadyGoneError(stderr: string): boolean {
 export function buildReleaseScopedGcpResources(
   releaseName: string,
   projectId: string,
+  region?: string,
 ): { desc: string; args: string[] }[] {
   return [
+    // Managed cache (Memorystore) is release-scoped and ephemeral — remove it. No-ops when the
+    // instance was never provisioned (BYO cache) or is already gone. Requires the region.
+    ...(region
+      ? [
+          {
+            desc: `Memorystore instance "${releaseName}-cache"`,
+            args: [
+              "redis",
+              "instances",
+              "delete",
+              `${releaseName}-cache`,
+              `--region=${region}`,
+              `--project=${projectId}`,
+              "--quiet",
+            ],
+          },
+        ]
+      : []),
     {
       desc: `traffic extension "${releaseName}-traffic-ext"`,
       args: [
@@ -168,7 +187,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     // otherwise be left billing/dangling — the exact "destroy silently leaves infra" gap.
     const projectId: string | undefined = infra.projectId;
     if (projectId) {
-      const extResources = buildReleaseScopedGcpResources(releaseName, projectId);
+      const extResources = buildReleaseScopedGcpResources(releaseName, projectId, infra?.region);
       for (const { desc, args } of extResources) {
         console.log(`  → Deleting ${desc}`);
         if (!dryRun) {

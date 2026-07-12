@@ -20,4 +20,24 @@ describe("renderDeployment", () => {
     expect(yaml).toContain('.resources.requests.cpu }}"');
     expect(yaml).toContain('.resources.limits.memory }}"');
   });
+
+  it("omits Valkey env when cache is disabled (default)", () => {
+    const yaml = renderDeployment({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });
+    expect(yaml).not.toContain("VALKEY_URL");
+    expect(yaml).not.toContain("VALKEY_AUTH");
+  });
+
+  it("injects optional Valkey env from the release secret when cache is enabled", () => {
+    const yaml = renderDeployment({
+      poolName: "ssr",
+      buildId: "b1",
+      releaseName: "my-app",
+      cacheEnabled: true,
+    });
+    expect(yaml).toContain("name: VALKEY_URL");
+    expect(yaml).toContain("name: VALKEY_AUTH");
+    expect(yaml).toContain("name: my-app-valkey");
+    // optional so a missing secret never blocks pod startup
+    expect(yaml).toContain("optional: true");
+  });
 });

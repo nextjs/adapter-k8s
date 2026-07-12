@@ -11,7 +11,11 @@ export default createK8sAdapter({
     },
   },
 
-  cache: { enabled: false, provider: "valkey" },
+  cache: {
+    enabled: true,
+    provider: "valkey",
+    memorystore: { region: "us-central1", sizeGb: 1 },
+  },
   containerStrategy: "traced-assets",
 
   provider: {

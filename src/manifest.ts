@@ -99,20 +99,35 @@ export function buildRoutingManifest({
   const pprRoutes: RoutingManifest["pprRoutes"] = {};
   for (const prerender of outputs.prerenders) {
     const config = prerender.config as Record<string, unknown>;
-    if (
-      config.renderingMode === "PARTIALLY_STATIC" &&
-      // @ts-ignore - mock/peer-dep property
-      prerender.fallback?.postponedState &&
-      // @ts-ignore - mock/peer-dep property
-      prerender.fallback.filePath
-    ) {
+    const fb = (
+      prerender as {
+        fallback?: {
+          postponedState?: string;
+          filePath?: string;
+          initialHeaders?: Record<string, string | string[]>;
+          initialRevalidate?: unknown;
+          initialExpiration?: unknown;
+        };
+      }
+    ).fallback;
+    if (config.renderingMode === "PARTIALLY_STATIC" && fb?.postponedState && fb.filePath) {
+      // Shell cache tags come from the build's initialHeaders (x-next-cache-tags = the
+      // `_N_T_/…` implicit path tags). The pool checks them against the shared Valkey manifest
+      // to decide resume-vs-blocking-render. Not `x-nextjs-stale-time` — that's client-router
+      // stale time, not server expiry.
+      const rawTags = fb.initialHeaders?.["x-next-cache-tags"];
+      const tags =
+        typeof rawTags === "string"
+          ? rawTags.split(",").map((t) => t.trim()).filter(Boolean)
+          : Array.isArray(rawTags)
+            ? rawTags.flatMap((t) => t.split(",")).map((t) => t.trim()).filter(Boolean)
+            : undefined;
       pprRoutes[prerender.pathname] = {
-        // @ts-ignore - mock/peer-dep property
-        postponedState: prerender.fallback.postponedState,
-        // @ts-ignore - mock/peer-dep property
-        fallbackFilePath: prerender.fallback.filePath
-          ? path.relative(projectDir, prerender.fallback.filePath)
-          : "",
+        postponedState: fb.postponedState,
+        fallbackFilePath: path.relative(projectDir, fb.filePath),
+        ...(tags && tags.length > 0 ? { tags } : {}),
+        ...(typeof fb.initialRevalidate === "number" ? { revalidate: fb.initialRevalidate } : {}),
+        ...(typeof fb.initialExpiration === "number" ? { expire: fb.initialExpiration } : {}),
       };
     }
   }

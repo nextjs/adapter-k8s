@@ -1,13 +1,20 @@
-// ISR page — prerendered, revalidates every 60s. Cacheable at the CDN edge with a
-// bounded TTL; the timestamp reflects the last (re)generation, not the request time.
-export const revalidate = 60;
+import { cacheLife, cacheTag } from "next/cache";
 
-export default function Isr() {
+async function generated() {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("isr");
+  return new Date().toISOString();
+}
+
+export default async function Isr() {
+  const at = await generated();
   return (
     <main>
-      <h1 data-testid="isr">ISR</h1>
+      <h1 data-testid="isr">ISR (use cache)</h1>
       <p>
-        Generated at <span data-testid="isr-time">{new Date().toISOString()}</span> (revalidate 60s)
+        Generated at <span data-testid="isr-time">{at}</span> (use cache, tag=isr) — POST
+        /api/revalidate?tag=isr to refresh
       </p>
     </main>
   );

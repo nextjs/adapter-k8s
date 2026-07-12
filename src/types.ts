@@ -49,7 +49,23 @@ export interface GKEProviderConfig {
 
 export interface K8sAdapterConfig {
   pools: Record<string, PoolConfig>;
-  cache?: { enabled: boolean; provider: "valkey" | "redis" };
+  cache?: {
+    enabled: boolean;
+    provider?: "valkey" | "redis";
+    /**
+     * Bring-your-own connection URL (`redis://` or `rediss://`). When set, the adapter
+     * provisions no managed cache and injects this URL into the pods.
+     */
+    url?: string;
+    /** AUTH string for the connection (typically sourced from a secret at deploy time). */
+    password?: string;
+    /**
+     * Managed Memorystore-for-Valkey provisioning, used when `url` is absent (GKE default).
+     * The instance's discovery endpoint + AUTH are injected into the pods as `VALKEY_URL` /
+     * `VALKEY_AUTH`. This shape firms up alongside the provisioning step.
+     */
+    memorystore?: { region?: string; sizeGb?: number; tier?: "BASIC" | "STANDARD_HA" };
+  };
   containerStrategy?: "traced-assets" | "shared-image";
   imageOptimizer?: { enabled: boolean; mode: "sidecar" };
   skewProtection?: { enabled: boolean; duration: string };
@@ -107,6 +123,16 @@ export interface RoutingManifest {
     {
       postponedState: string;
       fallbackFilePath: string;
+      /**
+       * Cache tags baked into the prerendered shell (from the build's
+       * `fallback.initialHeaders['x-next-cache-tags']`). The pool checks these against the
+       * shared Valkey tag manifest: if any has been revalidated since this build deployed, it
+       * does a fresh blocking render instead of resuming the stale shell.
+       */
+      tags?: string[];
+      /** Shell revalidate/expire (seconds) from the build; reserved for shell seeding. */
+      revalidate?: number;
+      expire?: number;
     }
   >;
   nextVersion: string;

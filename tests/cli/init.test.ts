@@ -115,6 +115,7 @@ describe("runInit", () => {
       registry: "reg",
       releaseName: "rel",
       projectDir: tmpDir,
+      iamRetryDelayMs: 0,
     });
 
     // Should have called execCapture for all gcloud commands + DNS auth describe

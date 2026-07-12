@@ -876,6 +876,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           containerStrategy: cfg.containerStrategy,
           hasMiddleware: !!outputs.middleware,
           failureModeAllow,
+          cacheEnabled: cfg.cache?.enabled ?? false,
+          cacheManaged: !!cfg.cache?.enabled && !cfg.cache.url,
+          ...(cfg.cache?.memorystore ? { cacheMemorystore: cfg.cache.memorystore } : {}),
         }),
       );
     },

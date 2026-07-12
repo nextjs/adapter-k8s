@@ -18,6 +18,8 @@ The adapter plugs into Next.js 16.2+'s `adapterPath` API. At build time, it anal
 
 At deploy time, the CLI builds images, pushes them, and runs `helm upgrade` with zero-downtime blue/green cutover.
 
+With a shared cache configured, the pool servers register a Valkey-backed `use cache` handler so **cache components and Partial Prerendering (PPR)** work correctly across replicas: cached entries are shared, and `revalidateTag` / `revalidatePath` on one pod is seen by all. (Next's default `use cache` store is per-process, which diverges the moment you run more than one replica.) See [Distributed Cache](#distributed-cache-cache-components--ppr).
+
 > **Where middleware runs relative to the CDN.** On GCP's global external Application Load Balancer, ext_proc is only supported as a **traffic extension**, which runs **after** the Cloud CDN cache. Cache *hits* are served without invoking middleware; the routing service runs on cache *misses* on the way to origin. Pool servers therefore send `Cache-Control: no-cache` on middleware-covered routes so those responses are never cached ahead of the middleware that gates them. (Route extensions -- which would run pre-cache -- are not supported on this load balancer.)
 
 ## Requirements
@@ -94,13 +96,14 @@ npx adapter-k8s deploy
 The deploy flow:
 
 1. `next build` (adapter generates artifacts in `.k8s-adapter/output/`)
-2. `docker build` + `push` per pool + the routing service
-3. `helm upgrade --install` with the generated chart (attaches the Cloud CDN filter to the HTTPRoute when CDN is enabled)
-4. Wait for the new pool + routing-service Deployments to roll out
-5. Verify each new pod is serving (`/healthz` checked directly on the pod -- not via GCP LB health)
-6. Patch active Service selectors to route traffic to the new build (blue/green cutover)
-7. Keep the previous build at 0 replicas (rollback target)
-8. Run the traffic-extension registration Job: attach the routing-service NEG to the ext_proc backend and register the extension across every forwarding rule
+2. Provision the managed cache (Memorystore) and write its connection Secret -- only when `cache.enabled` with no `url` (idempotent; reuses an existing instance, waits for it to be ready)
+3. `docker build` + `push` per pool + the routing service
+4. `helm upgrade --install` with the generated chart (attaches the Cloud CDN filter to the HTTPRoute when CDN is enabled)
+5. Wait for the new pool + routing-service Deployments to roll out
+6. Verify each new pod is serving (`/healthz` checked directly on the pod -- not via GCP LB health)
+7. Patch active Service selectors to route traffic to the new build (blue/green cutover)
+8. Keep the previous build at 0 replicas (rollback target)
+9. Run the traffic-extension registration Job: attach the routing-service NEG to the ext_proc backend and register the extension across every forwarding rule
 
 ## CLI Commands
 
@@ -184,7 +187,7 @@ Color-coded per component (pool servers, routing service). Automatically picks u
 
 ### `destroy`
 
-Tear down all resources.
+Tear down the release-scoped resources: the Helm release, GCS bucket, deploy service account, the ext_proc traffic extension + routing backend + health check, the static IP, and the managed cache (Memorystore) when the adapter provisioned it. Shared, expensive infrastructure -- the GKE cluster, Artifact Registry, and Certificate Manager cert/DNS -- is **kept and reported** (with the exact commands to remove it manually), and local state under `.k8s-adapter/` is preserved so a later `deploy` can rebuild everything else.
 
 ```bash
 npx adapter-k8s destroy [--dry-run]
@@ -261,6 +264,33 @@ provider: {
 ```
 
 Cache *hits* are served before the routing service runs, so middleware-covered routes are sent `Cache-Control: no-cache` to keep them out of the cache. Deploys emit `x-cache-status` / `x-cache-id` response headers for diagnostics.
+
+### Distributed Cache (Cache Components & PPR)
+
+Next's `use cache` handler defaults to a per-process in-memory store, which diverges across replicas: two pods cache different values, and a `revalidateTag` on one is invisible to the others. Enable a shared cache so **cache components** and **PPR** behave correctly on more than one pod.
+
+Enable `cacheComponents: true` in your `next.config` (that's what turns on `use cache` / PPR), then point the adapter at a store:
+
+```js
+cache: {
+  enabled: true,
+  provider: 'valkey',                 // 'valkey' | 'redis' (wire-compatible)
+  // Managed (GKE default): the adapter provisions Memorystore and injects the connection.
+  memorystore: { region: 'us-central1', sizeGb: 1, tier: 'BASIC' },
+  // — or bring your own, and the adapter provisions nothing —
+  // url: 'redis://my-valkey.internal:6379',
+  // password: '...',
+},
+```
+
+What it does:
+
+- The pool server registers a **Valkey-backed `use cache` handler** (`{ DefaultCache, RemoteCache }`) before your app loads, so every `use cache` entry lives in the shared store.
+- `revalidateTag` / `revalidatePath` propagate through a **shared tag manifest** (updated atomically, last-event-wins), so an invalidation on one replica is immediately seen by all -- the thing a per-process handler cannot do.
+- **PPR routes** stream the static shell, then resume the dynamic holes pool-native, and are sent `Cache-Control: no-store` so the CDN never caches the per-request dynamic tail. (Chunked encoding alone does *not* keep a response out of Cloud CDN.)
+- With `memorystore` (and no `url`), `deploy` provisions the instance idempotently and `destroy` tears it down. Provide `url` to use your own Valkey/Redis and the adapter provisions nothing.
+
+> **Known limitation.** A `use cache` value baked into a *static* PPR shell is regenerated on the next deploy, not revalidated cross-replica at runtime (the prerendered shell is served from each pod's local incremental cache). Dynamically-fetched `use cache` -- e.g. from a dynamic route or a `use cache` read during a resumed hole -- revalidates cross-replica immediately.
 
 ### Routing Service Tuning
 
@@ -357,6 +387,7 @@ After `next build`, the adapter writes to `.k8s-adapter/output/`:
 |       +-- route-ext-update-job.yaml    Traffic-extension registration Job
 |       +-- routing-manifest-configmap.yaml
 |       +-- internal-secret.yaml         Shared secret for internal dispatch headers
+|       +-- valkey-secret.yaml           Cache connection secret (BYO url; managed is created at deploy)
 |       +-- deploy-service-account.yaml
 +-- pools/{pool}/
 |   +-- Dockerfile
@@ -405,9 +436,9 @@ The Helm chart is self-contained -- it includes the traffic-extension registrati
 | 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate) |
 | 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions     |
 | 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)      |
-| 4     | Planned | Coordinated CDN invalidation (tag-based purge for ISR / `revalidate`)                    |
-| 5     | Planned | Distributed caching (Valkey/Redis for ISR + `use cache`)                                |
-| 6     | Planned | PPR (partial prerendering with cache-first preamble)                                     |
+| 4     | Planned | Coordinated CDN invalidation (tag-based purge at the edge for ISR / `revalidate`)         |
+| 5     | Done    | Distributed cache — Valkey/Redis `use cache` handler shared across replicas (cross-replica `revalidateTag`); managed Memorystore provisioning or BYO. See [Distributed Cache](#distributed-cache-cache-components--ppr) |
+| 6     | Done    | PPR — pool-native shell resume + `no-store` at the CDN (static-shell-baked `use cache` cross-replica revalidation is a known gap) |
 | 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                            |
 
 ## License

@@ -96,15 +96,18 @@ spec:
                 echo "ERROR: NEG $NEG not found after waiting."
                 exit 1
               fi
-              # Fire the per-zone attaches asynchronously (each sync add-backend is ~30-60s;
-              # a fresh backend across many zones otherwise takes minutes), then confirm all
-              # zonal NEGs are attached so we don't proceed with an incomplete backend.
+              # Attach each zonal NEG SYNCHRONOUSLY. add-backend has no --async flag (passing it
+              # errors "unrecognized arguments: --async" and the attach never happens — which only
+              # bites on a FRESH backend, since existing attachments survive redeploys), and
+              # concurrent attaches to one backend conflict on its resource version, so this is
+              # sequential (a few zones take a couple of minutes). The confirm loop below is the
+              # source of truth, so a transient/duplicate error here doesn't fail the job outright.
               ZC=0
               for Z in $ZONES; do
                 echo "Attaching NEG $NEG ($Z) to backend $BS..."
                 if ! gcloud compute backend-services add-backend $BS --global --project=${projectId} \
                   --network-endpoint-group=$NEG --network-endpoint-group-zone=$Z \
-                  --balancing-mode=RATE --max-rate-per-endpoint=1000 --async --quiet; then
+                  --balancing-mode=RATE --max-rate-per-endpoint=1000 --quiet; then
                   echo "Attach request for $NEG ($Z) failed; verifying final backend state..."
                 fi
                 ZC=$((ZC + 1))

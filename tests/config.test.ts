@@ -79,7 +79,6 @@ describe("validateConfig", () => {
   });
 
   it.each([
-    ["cache", { cache: { enabled: true, provider: "valkey" } }],
     ["image optimizer", { imageOptimizer: { enabled: true, mode: "sidecar" } }],
     ["skew protection", { skewProtection: { enabled: true, duration: "5m" } }],
     ["Wasm routing", { routeExtension: { mode: "wasm" } }],
@@ -99,6 +98,40 @@ describe("validateConfig", () => {
     } as K8sAdapterConfig;
 
     expect(() => validateConfig(config)).toThrow(/not implemented/);
+  });
+});
+
+describe("cache config", () => {
+  const withCache = (cache: K8sAdapterConfig["cache"]): K8sAdapterConfig =>
+    ({
+      pools: { ssr: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+      cache,
+    }) as K8sAdapterConfig;
+
+  it("accepts cache.enabled with managed provisioning (no url)", () => {
+    expect(() => validateConfig(withCache({ enabled: true }))).not.toThrow();
+  });
+
+  it("accepts a valid BYO redis:// or rediss:// url", () => {
+    expect(() => validateConfig(withCache({ enabled: true, url: "redis://cache:6379" }))).not.toThrow();
+    expect(() =>
+      validateConfig(withCache({ enabled: true, url: "rediss://cache:6380" })),
+    ).not.toThrow();
+  });
+
+  it("rejects a non-redis cache.url", () => {
+    expect(() => validateConfig(withCache({ enabled: true, url: "http://cache:6379" }))).toThrow(
+      /redis:\/\//,
+    );
   });
 });
 

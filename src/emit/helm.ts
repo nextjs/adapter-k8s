@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types.js";
 import { renderChartYaml } from "./templates/chart-yaml.js";
 import { renderInternalSecret } from "./templates/internal-secret.js";
+import { renderValkeySecret } from "./templates/valkey-secret.js";
 import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
 import { renderService, renderActiveService } from "./templates/service.js";
@@ -52,6 +53,15 @@ export function generateHelmChart({
   const files: Record<string, string> = {};
   const secret = internalSecret ?? randomBytes(32).toString("hex");
   files["templates/internal-secret.yaml"] = renderInternalSecret({ releaseName, secret });
+  // BYO cache: emit the Valkey connection Secret from config. Managed Memorystore instead
+  // creates this Secret imperatively at deploy time (URL known only after provisioning).
+  if (config.cache?.enabled && config.cache.url) {
+    files["templates/valkey-secret.yaml"] = renderValkeySecret({
+      releaseName,
+      url: config.cache.url,
+      ...(config.cache.password ? { password: config.cache.password } : {}),
+    });
+  }
   // Helm versions must be SemVer. We use a safe version of the buildId as the suffix.
   // We MUST remove leading underscores/dots and replace invalid chars.
   const safeVersionSuffix = buildId
@@ -128,6 +138,7 @@ export function generateHelmChart({
       poolName,
       buildId,
       releaseName,
+      cacheEnabled: config.cache?.enabled ?? false,
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,

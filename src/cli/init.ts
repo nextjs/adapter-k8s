@@ -14,6 +14,8 @@ export interface InitOptions {
   releaseName: string;
   projectDir: string;
   dryRun?: boolean;
+  /** Backoff between IAM-binding retries (ms). Defaults to 5000; tests override to run fast. */
+  iamRetryDelayMs?: number;
 }
 
 export interface GcloudCommand {
@@ -462,7 +464,17 @@ async function checkRoutingResourceShape(releaseName: string, projectId: string)
 }
 
 export async function runInit(options: InitOptions): Promise<void> {
-  const { projectId, region, hosts, bucket, registry, releaseName, projectDir, dryRun } = options;
+  const {
+    projectId,
+    region,
+    hosts,
+    bucket,
+    registry,
+    releaseName,
+    projectDir,
+    dryRun,
+    iamRetryDelayMs = 5000,
+  } = options;
 
   console.log(`\nInitializing @next-community/adapter-k8s for project: ${projectId}\n`);
 
@@ -494,15 +506,25 @@ export async function runInit(options: InitOptions): Promise<void> {
         result.stderr.includes("Conflict") ||
         result.stderr.includes("409");
 
+      const isIamBinding = cmd.command === "gcloud" && cmd.args.includes("add-iam-policy-binding");
+
       if (isAlreadyExists) {
         console.log(`    (already exists — skipping)`);
-      } else if (cmd.description.includes("Grant storage admin")) {
-        // Retry once for IAM binding as it sometimes fails right after bucket creation
-        console.log(`    (retrying...)`);
-        await new Promise((r) => setTimeout(r, 2000));
-        result = await execCapture(cmd.command, cmd.args);
-        if (result.exitCode !== 0) {
-          throw new Error(`${cmd.description} failed:\n${result.stderr}`);
+      } else if (isIamBinding) {
+        // IAM bindings routinely fail transiently right after their target is created — a
+        // just-created service account is not yet propagated ("does not exist"), or the policy
+        // read-modify-write conflicts. This is eventual consistency, so retry with backoff
+        // (~30s total covers SA propagation). Applies to ALL grants, not just storage admin —
+        // the Artifact Registry writer grant hit exactly this on a fresh init.
+        let ok = false;
+        for (let attempt = 1; attempt <= 6 && !ok; attempt++) {
+          console.log(`    (IAM binding not ready — retry ${attempt}/6)`);
+          await new Promise((r) => setTimeout(r, iamRetryDelayMs));
+          result = await execCapture(cmd.command, cmd.args);
+          ok = result.exitCode === 0 || /already exists|ALREADY_EXISTS|already own it/.test(result.stderr);
+        }
+        if (!ok) {
+          throw new Error(`${cmd.description} failed after retries:\n${result.stderr}`);
         }
       } else {
         throw new Error(`${cmd.description} failed:\n${result.stderr}`);
