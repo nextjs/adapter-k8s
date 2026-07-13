@@ -9,7 +9,10 @@ import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-ca
 // unavailable so `npm test` stays green on machines without it.
 
 function docker(args: string[]): string {
-  return execFileSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  return execFileSync("docker", args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
 }
 
 let dockerAvailable = false;
@@ -24,7 +27,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function makeEntry(
   text: string,
-  opts: { tags?: string[]; timestamp: number; revalidate?: number; expire?: number; stale?: number },
+  opts: {
+    tags?: string[];
+    timestamp: number;
+    revalidate?: number;
+    expire?: number;
+    stale?: number;
+  },
 ): CacheEntry {
   return {
     value: bufferToStream(Buffer.from(text, "utf8")),
@@ -112,7 +121,10 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
   it("serves stale (revalidate:-1) past revalidate, then expires past expire", async () => {
     const clock = { t: 1000 };
     const h = new ValkeyCacheHandler({ client: newClient(), buildId: "b-ttl", now: () => clock.t });
-    await h.set("k", Promise.resolve(makeEntry("v", { timestamp: 1000, revalidate: 60, expire: 300 })));
+    await h.set(
+      "k",
+      Promise.resolve(makeEntry("v", { timestamp: 1000, revalidate: 60, expire: 300 })),
+    );
     clock.t = 1000 + 61_000; // past revalidate (60s), within expire (300s)
     expect((await h.get("k", []))?.revalidate).toBe(-1);
     clock.t = 1000 + 301_000; // past expire
@@ -144,8 +156,16 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
 
   it("CROSS-REPLICA: updateTags on handler A invalidates get on handler B", async () => {
     const clock = { t: 1000 };
-    const a = new ValkeyCacheHandler({ client: newClient(), buildId: "shared-build", now: () => clock.t });
-    const b = new ValkeyCacheHandler({ client: newClient(), buildId: "shared-build", now: () => clock.t });
+    const a = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "shared-build",
+      now: () => clock.t,
+    });
+    const b = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "shared-build",
+      now: () => clock.t,
+    });
 
     // A writes an entry tagged "prod"; B (a different replica) can read it.
     await a.set("page", Promise.resolve(makeEntry("v1", { timestamp: 1000, tags: ["prod"] })));
@@ -164,8 +184,16 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
   it("CROSS-REPLICA revalidation is visible LIVE without refreshTags", async () => {
     // Reproduces the live bug: a replica that did NOT handle the revalidateTag must still see
     // it immediately (get/getExpiration read the shared manifest live, not a stale snapshot).
-    const a = new ValkeyCacheHandler({ client: newClient(), buildId: "live-build", now: () => 2000 });
-    const b = new ValkeyCacheHandler({ client: newClient(), buildId: "live-build", now: () => 3000 });
+    const a = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "live-build",
+      now: () => 2000,
+    });
+    const b = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "live-build",
+      now: () => 3000,
+    });
     await a.set("e", Promise.resolve(makeEntry("v1", { timestamp: 1000, tags: ["live"] })));
     expect(await b.get("e", [])).toBeDefined();
 

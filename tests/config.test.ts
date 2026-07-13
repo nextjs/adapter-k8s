@@ -122,7 +122,9 @@ describe("cache config", () => {
   });
 
   it("accepts a valid BYO redis:// or rediss:// url", () => {
-    expect(() => validateConfig(withCache({ enabled: true, url: "redis://cache:6379" }))).not.toThrow();
+    expect(() =>
+      validateConfig(withCache({ enabled: true, url: "redis://cache:6379" })),
+    ).not.toThrow();
     expect(() =>
       validateConfig(withCache({ enabled: true, url: "rediss://cache:6380" })),
     ).not.toThrow();

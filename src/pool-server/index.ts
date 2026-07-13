@@ -22,7 +22,6 @@ import { createDispatcher, getContentType } from "./dispatch.js";
 import { createPoolServer } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
-import type { ValkeyCacheHandler } from "./valkey-cache/use-cache-handler.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -184,6 +183,22 @@ function loadImageConfig(cwd: string): ImageConfig {
     // No image config — external images denied by default, sizes fall back to defaults.
   }
   return config;
+}
+
+// True when the app has a classic incremental cacheHandler registered (next.config.cacheHandler).
+// The adapter registers ours (dist/cache-handler.cjs) only when the cache is enabled AND there's no
+// edge middleware; when registered, that handler owns the PPR shell so dispatch must NOT inject the
+// build-time postponed token. Reading the resolved config (rather than VALKEY_URL) tracks exactly
+// that build decision — a cache + edge-middleware app has VALKEY_URL but no registered handler.
+function hasRegisteredCacheHandler(cwd: string): boolean {
+  try {
+    const rsfPath = path.join(cwd, ".next", "required-server-files.json");
+    if (!existsSync(rsfPath)) return false;
+    const rsf = JSON.parse(readFileSync(rsfPath, "utf-8"));
+    return Boolean(rsf?.config?.cacheHandler);
+  } catch {
+    return false;
+  }
 }
 
 // Resolve `relPath` under `root`, returning null if it escapes the root (traversal).
@@ -443,8 +458,8 @@ async function main() {
   // one-time cache-handler initialization) loads, so cache components / PPR `use cache` entries
   // are shared across replicas with cross-replica tag revalidation. Gated on the injected
   // connection URL; when absent the app falls back to Next's default in-process handler.
-  let valkeyHandler: ValkeyCacheHandler | undefined;
   const valkeyUrl = process.env.VALKEY_URL;
+  let valkeyHandler: ReturnType<typeof registerValkeyCacheHandler> | undefined;
   if (valkeyUrl) {
     valkeyHandler = registerValkeyCacheHandler({
       url: valkeyUrl,
@@ -759,18 +774,21 @@ async function main() {
     releaseName,
     edgeRouteRunner,
     pprRoutes: routingManifest.pprRoutes,
-    // Shell tag-staleness: any watermark in this build's (namespaced) manifest postdates the
-    // build, so a shell tag with a non-zero expiration was revalidated since deploy → its
-    // shell is stale and must be re-rendered rather than resumed.
-    ...(valkeyHandler
-      ? { checkShellStale: (tags: string[]) => valkeyHandler!.getExpiration(tags).then((e) => e > 0) }
-      : {}),
     rscConfig: getRscConfig(routingManifest),
     outputIds: Object.keys(poolManifest.outputs),
     strictDynamicRoutes,
     prerenderedPaths,
     buildIdForData: buildId,
     internalSecret,
+    incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
+    // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
+    // revalidateTag invalidate a PPR shell by checking its baked tags against the shared manifest.
+    ...(valkeyHandler
+      ? {
+          checkShellStale: (tags: string[]) =>
+            valkeyHandler!.getExpiration(tags).then((e) => e > 0),
+        }
+      : {}),
   });
 
   // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch

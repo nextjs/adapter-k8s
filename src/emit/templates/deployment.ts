@@ -9,19 +9,21 @@ export function renderDeployment({
   releaseName,
   imageTag = "{{ .Values.global.image.tag }}",
   replicas,
-  cacheEnabled = false,
 }: {
   poolName: string;
   buildId: string;
   releaseName: string;
   imageTag?: string;
   replicas?: number | undefined;
-  cacheEnabled?: boolean;
 }): string {
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
   const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
-  const valkeyEnv = cacheEnabled ? "\n" + renderValkeyEnv(releaseName, "            ") : "";
+  // Always emit the Valkey env — the secret refs are `optional: true`, so this is inert when no
+  // cache is configured (the pool only registers the handler when VALKEY_URL is actually set).
+  // Emitting it unconditionally keeps the pod template identical whether or not the cache is on,
+  // so toggling `cache.enabled` between deploys never rolls the retained previous deployment.
+  const valkeyEnv = "\n" + renderValkeyEnv(releaseName, "            ");
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:

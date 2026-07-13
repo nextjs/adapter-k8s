@@ -14,6 +14,35 @@
 //
 // Watermarks are absolute milliseconds since the epoch, matching Next.
 
+/**
+ * Atomic last-event-wins merge for the shared tag manifest, used by both the V2 and the classic
+ * incremental handlers. ARGV is `[field, json, field, json, …]`; each field is overwritten only
+ * when the incoming `at` (event time) is `>=` the stored one, so a concurrent older revalidation
+ * from another replica can't clobber a newer one. Runs atomically (Redis/Valkey execute a script
+ * to completion without interleaving).
+ */
+export const UPDATE_TAGS_SCRIPT = `
+local i = 1
+while i <= #ARGV do
+  local field = ARGV[i]
+  local incoming = ARGV[i + 1]
+  local existing = redis.call('HGET', KEYS[1], field)
+  local write = true
+  if existing then
+    local okCur, cur = pcall(cjson.decode, existing)
+    local okNew, nw = pcall(cjson.decode, incoming)
+    if okCur and okNew then
+      local curAt = tonumber(cur.at) or 0
+      local nwAt = tonumber(nw.at) or 0
+      if nwAt < curAt then write = false end
+    end
+  end
+  if write then redis.call('HSET', KEYS[1], field, incoming) end
+  i = i + 2
+end
+return 1
+`;
+
 /** Per-tag revalidation watermarks (absolute ms). */
 export interface TagState {
   /** Entry became stale at this time — the stale-while-revalidate boundary. */

@@ -1,9 +1,10 @@
-import type { Redis } from "ioredis";
+import type { ValkeyClient } from "./client.js";
 import { bufferToStream, drainEntryValue } from "./stream-codec.js";
 import {
   computeTagUpdate,
   evaluateEntry,
   maxExpiration,
+  UPDATE_TAGS_SCRIPT,
   type TagManifest,
   type TagState,
 } from "./tag-manifest.js";
@@ -23,36 +24,8 @@ const RETENTION_MARGIN_SECONDS = 60;
 
 const EMPTY_MANIFEST: TagManifest = new Map();
 
-/**
- * Atomic last-event-wins merge for the tag manifest. ARGV is [field, json, field, json, …];
- * each field is overwritten only when the incoming `at` (event time) is >= the stored `at`, so
- * concurrent revalidations from different replicas can't clobber a newer one with an older one.
- * Runs atomically (Redis/Valkey execute a script to completion without interleaving).
- */
-const UPDATE_TAGS_SCRIPT = `
-local i = 1
-while i <= #ARGV do
-  local field = ARGV[i]
-  local incoming = ARGV[i + 1]
-  local existing = redis.call('HGET', KEYS[1], field)
-  local write = true
-  if existing then
-    local okCur, cur = pcall(cjson.decode, existing)
-    local okNew, nw = pcall(cjson.decode, incoming)
-    if okCur and okNew then
-      local curAt = tonumber(cur.at) or 0
-      local nwAt = tonumber(nw.at) or 0
-      if nwAt < curAt then write = false end
-    end
-  end
-  if write then redis.call('HSET', KEYS[1], field, incoming) end
-  i = i + 2
-end
-return 1
-`;
-
 export interface ValkeyCacheHandlerOptions {
-  client: Redis;
+  client: ValkeyClient;
   /** Namespaces all keys so blue-green builds never share cache. */
   buildId: string;
   /** Injectable clock (tests). Defaults to `Date.now`. */
@@ -72,7 +45,7 @@ export interface ValkeyCacheHandlerOptions {
  * cache outage never breaks rendering.
  */
 export class ValkeyCacheHandler implements CacheHandler {
-  private readonly client: Redis;
+  private readonly client: ValkeyClient;
   private readonly now: () => number;
   private readonly prefix: string;
   private readonly tagsKey: string;

@@ -173,8 +173,7 @@ export function templateOutputCandidates(pathname: string, outputIds: string[]):
   }
   // Prefer more specific templates: catch-alls are less specific than single
   // dynamic segments, which are less specific than literals.
-  const weight = (id: string) =>
-    (id.match(/\[/g)?.length ?? 0) + (id.includes("...") ? 10 : 0);
+  const weight = (id: string) => (id.match(/\[/g)?.length ?? 0) + (id.includes("...") ? 10 : 0);
   return matches.sort((a, b) => weight(a) - weight(b));
 }
 
@@ -525,9 +524,7 @@ export function manifestNextConfig(manifest: {
   };
 }
 
-export function getRscConfig(manifest: {
-  routeGraph?: unknown;
-}): RscConfig | undefined {
+export function getRscConfig(manifest: { routeGraph?: unknown }): RscConfig | undefined {
   return (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
 }
 

@@ -11,7 +11,10 @@
 // cacheable content while dynamic responses stay uncacheable.
 import { describe, it, expect, beforeAll } from "vitest";
 
-const BASE = (process.env.E2E_BASE_URL ?? "https://adapter-gke.jamesdaniels.net").replace(/\/$/, "");
+const BASE = (process.env.E2E_BASE_URL ?? "https://adapter-gke.jamesdaniels.net").replace(
+  /\/$/,
+  "",
+);
 
 interface Resp {
   status: number;
@@ -32,7 +35,11 @@ async function req(path: string, init: RequestInit = {}): Promise<Resp> {
  */
 async function waitForEdgeCache(
   path: string,
-  { headers = {}, budgetMs = 45_000, intervalMs = 3_000 }: { headers?: Record<string, string>; budgetMs?: number; intervalMs?: number } = {},
+  {
+    headers = {},
+    budgetMs = 45_000,
+    intervalMs = 3_000,
+  }: { headers?: Record<string, string>; budgetMs?: number; intervalMs?: number } = {},
 ): Promise<number> {
   const deadline = Date.now() + budgetMs;
   let lastAge: string | null = null;
@@ -44,7 +51,9 @@ async function waitForEdgeCache(
     if (lastAge !== null) return Number(lastAge);
     await new Promise((res) => setTimeout(res, intervalMs));
   }
-  throw new Error(`No CDN edge cache (age header) for ${path} within ${budgetMs}ms (last age=${lastAge})`);
+  throw new Error(
+    `No CDN edge cache (age header) for ${path} within ${budgetMs}ms (last age=${lastAge})`,
+  );
 }
 
 beforeAll(async () => {

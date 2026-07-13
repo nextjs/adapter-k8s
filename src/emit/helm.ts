@@ -138,7 +138,6 @@ export function generateHelmChart({
       poolName,
       buildId,
       releaseName,
-      cacheEnabled: config.cache?.enabled ?? false,
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,

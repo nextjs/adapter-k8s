@@ -126,7 +126,12 @@ describe("normalizeI18nRedirect", () => {
   });
 
   it("keeps a non-root detection redirect", () => {
-    const r = normalizeI18nRedirect({ url: url("/fr/about"), status: 307 }, url("/about"), I18N, "");
+    const r = normalizeI18nRedirect(
+      { url: url("/fr/about"), status: 307 },
+      url("/about"),
+      I18N,
+      "",
+    );
     expect(r.kind).toBe("keep");
   });
 
@@ -314,9 +319,7 @@ describe("preferConcreteOutput", () => {
   };
 
   it("prefers a concrete prerender over a dynamic template", () => {
-    expect(preferConcreteOutput("/sticks & stones", "/[id]", assignments)).toBe(
-      "/sticks & stones",
-    );
+    expect(preferConcreteOutput("/sticks & stones", "/[id]", assignments)).toBe("/sticks & stones");
   });
 
   it("decodes the request path when looking up outputs", () => {
@@ -393,14 +396,14 @@ describe("templateOutputCandidates", () => {
   });
 
   it("matches percent-encoded concrete paths", () => {
-    expect(templateOutputCandidates("/blog/sticks%20%26%20stones", ids)).toEqual([
-      "/blog/[slug]",
-    ]);
+    expect(templateOutputCandidates("/blog/sticks%20%26%20stones", ids)).toEqual(["/blog/[slug]"]);
   });
 
   it("does not match literals or cross-segment paths", () => {
     expect(templateOutputCandidates("/static", ids)).toEqual([]);
-    expect(templateOutputCandidates("/blog/a/b", ids)).toEqual(["/docs/[...parts]"].filter(() => false));
+    expect(templateOutputCandidates("/blog/a/b", ids)).toEqual(
+      ["/docs/[...parts]"].filter(() => false),
+    );
   });
 
   it("prefers more specific templates", () => {

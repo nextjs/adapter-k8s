@@ -434,13 +434,17 @@ describe("createDispatcher", () => {
         // strictDynamicRoutes omitted → no gating
       });
       const res = mockRes();
-      await dispatcher.dispatch(mockReq("/blog/never-generated"), res as unknown as ServerResponse, {
-        kind: "route",
-        pool: "ssr",
-        matchedPathname: "/blog/[slug]",
-        routeMatches: { slug: "never-generated" },
-        resolvedHeaders: undefined,
-      });
+      await dispatcher.dispatch(
+        mockReq("/blog/never-generated"),
+        res as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { slug: "never-generated" },
+          resolvedHeaders: undefined,
+        },
+      );
       expect(res._status).not.toBe(404);
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
     });
@@ -749,7 +753,6 @@ describe("createDispatcher", () => {
     });
   });
 });
-
 
 // REGRESSION: getContentType — the map that was extended to fix sitemap
 // (application/xml), font, and asset content-types surfacing in e2e. A missing

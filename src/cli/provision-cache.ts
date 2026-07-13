@@ -120,7 +120,9 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
   }
 
   const gcpTier = (tier ?? "").toUpperCase() === "STANDARD_HA" ? "standard_ha" : "basic";
-  log(`    Creating Memorystore ${name} (${sizeGb}GB, tier ${gcpTier}) — this takes a few minutes…`);
+  log(
+    `    Creating Memorystore ${name} (${sizeGb}GB, tier ${gcpTier}) — this takes a few minutes…`,
+  );
   const create = await execCapture("gcloud", [
     "redis",
     "instances",

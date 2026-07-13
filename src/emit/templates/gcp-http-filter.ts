@@ -42,14 +42,10 @@ export function renderCdnFilter({
   assertSafeReleaseName(releaseName);
   for (const header of cacheKeyHeaders) {
     if (!HEADER_NAME_RE.test(header)) {
-      throw new Error(
-        `Invalid CDN cache-key header "${header}": must match ${HEADER_NAME_RE}.`,
-      );
+      throw new Error(`Invalid CDN cache-key header "${header}": must match ${HEADER_NAME_RE}.`);
     }
     if (header.toLowerCase() === INTERNAL_SECRET_HEADER) {
-      throw new Error(
-        `"${INTERNAL_SECRET_HEADER}" must never be part of the CDN cache key.`,
-      );
+      throw new Error(`"${INTERNAL_SECRET_HEADER}" must never be part of the CDN cache key.`);
     }
   }
 

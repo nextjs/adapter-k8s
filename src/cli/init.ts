@@ -427,7 +427,13 @@ async function checkRoutingResourceShape(releaseName: string, projectId: string)
   const bs = `${releaseName}-routing-service`;
   const hcType = (
     await execCapture("gcloud", [
-      "compute", "health-checks", "describe", hc, "--global", "--project", projectId,
+      "compute",
+      "health-checks",
+      "describe",
+      hc,
+      "--global",
+      "--project",
+      projectId,
       "--format=value(type)",
     ])
   ).stdout
@@ -435,7 +441,13 @@ async function checkRoutingResourceShape(releaseName: string, projectId: string)
     .toUpperCase();
   const bsScheme = (
     await execCapture("gcloud", [
-      "compute", "backend-services", "describe", bs, "--global", "--project", projectId,
+      "compute",
+      "backend-services",
+      "describe",
+      bs,
+      "--global",
+      "--project",
+      projectId,
       "--format=value(loadBalancingScheme)",
     ])
   ).stdout
@@ -445,8 +457,7 @@ async function checkRoutingResourceShape(releaseName: string, projectId: string)
   const issues: string[] = [];
   if (bsScheme && bsScheme !== "EXTERNAL_MANAGED")
     issues.push(`backend service '${bs}' scheme is ${bsScheme} (needs EXTERNAL_MANAGED)`);
-  if (hcType && hcType !== "TCP")
-    issues.push(`health check '${hc}' type is ${hcType} (needs TCP)`);
+  if (hcType && hcType !== "TCP") issues.push(`health check '${hc}' type is ${hcType} (needs TCP)`);
   if (issues.length === 0) return;
 
   console.warn(
@@ -521,7 +532,9 @@ export async function runInit(options: InitOptions): Promise<void> {
           console.log(`    (IAM binding not ready — retry ${attempt}/6)`);
           await new Promise((r) => setTimeout(r, iamRetryDelayMs));
           result = await execCapture(cmd.command, cmd.args);
-          ok = result.exitCode === 0 || /already exists|ALREADY_EXISTS|already own it/.test(result.stderr);
+          ok =
+            result.exitCode === 0 ||
+            /already exists|ALREADY_EXISTS|already own it/.test(result.stderr);
         }
         if (!ok) {
           throw new Error(`${cmd.description} failed after retries:\n${result.stderr}`);

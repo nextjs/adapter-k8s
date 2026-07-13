@@ -260,12 +260,10 @@ export interface DispatcherOptions {
   localHandlerInvoker?: LocalHandlerInvoker;
   edgeRouteRunner?: EdgeRouteRunner | null;
   pprRoutes?: Record<string, { postponedState: string; tags?: string[] }>;
-  /**
-   * Returns true when a PPR route's baked shell tags have been revalidated since this build
-   * deployed (checked against the shared Valkey manifest). When true the pool withholds the
-   * postponed token and lets the handler do a fresh blocking render instead of resuming a
-   * stale shell. Absent (no cache configured) ⇒ always resume.
-   */
+  /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
+   * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
+   * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
+   * `revalidateTag` still forces a fresh shell render. Absent when there's no shared cache. */
   checkShellStale?: (tags: string[]) => Promise<boolean>;
   rscConfig?: RscConfig | undefined;
   /** All output ids in this pool's manifest — used to map concrete prerender
@@ -279,6 +277,13 @@ export interface DispatcherOptions {
   buildIdForData?: string;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
+  /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
+   * and therefore owns the PPR shell. When set, we DON'T inject the build-time postponed token —
+   * the incremental cache serves + revalidates the shell instead. This must track the SAME build
+   * decision that registers the handler (cache enabled AND no edge middleware), not merely whether
+   * VALKEY_URL is present: a cache + edge-middleware app has VALKEY_URL but no classic handler, and
+   * must keep injecting to preserve PPR resume. */
+  incrementalCacheShared?: boolean;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -291,13 +296,14 @@ export function createDispatcher(options: DispatcherOptions) {
     localHandlerInvoker = invokeLocalHandlerOverHttp,
     edgeRouteRunner = null,
     pprRoutes = {},
-    checkShellStale,
     rscConfig,
     outputIds = [],
     strictDynamicRoutes = [],
     prerenderedPaths = new Set<string>(),
     buildIdForData = "",
     internalSecret,
+    incrementalCacheShared = false,
+    checkShellStale,
   } = options;
 
   return {
@@ -698,13 +704,14 @@ export function createDispatcher(options: DispatcherOptions) {
           }
 
           // For PPR routes, set the postponed state on request metadata so the handler resumes
-          // the dynamic holes onto the prebuilt shell. BUT first check shell staleness: if a
-          // cache tag baked into the shell has been revalidated since this build deployed, the
-          // shell is stale — withhold the token so the handler does a fresh blocking render
-          // instead of resuming stale content. (Shell regeneration is deferred; correctness is
-          // not — see the PPR/cache-components design.)
+          // the dynamic holes onto the prebuilt shell — BUT only when no classic incremental
+          // cacheHandler is registered. When it is (incrementalCacheShared), that handler owns the
+          // PPR shell (populated on first render, shared + revalidated cross-replica exactly like
+          // `next start`); injecting the build-time disk token here would bypass that cache and
+          // re-serve a stale shell after a cross-replica `revalidateTag`. A cache + edge-middleware
+          // app has VALKEY_URL set but NO classic handler registered, so it keeps injecting here.
           const pprInfo = pprRoutes[handlerPathname] ?? pprRoutes[resolution.matchedPathname];
-          if (pprInfo?.postponedState) {
+          if (pprInfo?.postponedState && !incrementalCacheShared) {
             // Do NOT inject the resume token for Server Action requests. Next's app-page handler
             // only splits the postponed state out of the action body (via the
             // `x-next-resume-state-length` framing) when no `postponed` meta is already set —
@@ -712,6 +719,10 @@ export function createDispatcher(options: DispatcherOptions) {
             // the action. Server actions carry the `next-action` header (or that length header).
             const isServerAction =
               !!req.headers["next-action"] || !!req.headers["x-next-resume-state-length"];
+            // Without a classic handler owning the shell, still honor cross-replica revalidation:
+            // if a tag baked into the shell has been revalidated since deploy (checked live against
+            // the shared Valkey manifest), withhold the stale build-time token so the handler does a
+            // fresh blocking render. Absent a shared cache, checkShellStale is undefined → inject.
             const shellStale =
               checkShellStale && pprInfo.tags && pprInfo.tags.length > 0
                 ? await checkShellStale(pprInfo.tags)

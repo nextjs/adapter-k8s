@@ -431,7 +431,8 @@ export async function runDoctor(options: {
     if (existsSync(metaPath)) {
       try {
         const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-        if (Array.isArray(meta.pools)) poolNames = meta.pools.filter((p: unknown) => typeof p === "string");
+        if (Array.isArray(meta.pools))
+          poolNames = meta.pools.filter((p: unknown) => typeof p === "string");
       } catch {
         // Malformed metadata — skip the endpoint check rather than crash.
       }
@@ -448,7 +449,10 @@ export async function runDoctor(options: {
       ]);
       const readyEndpoints =
         epResult.exitCode === 0
-          ? epResult.stdout.trim().split("\n").filter((v) => v.trim() === "true").length
+          ? epResult.stdout
+              .trim()
+              .split("\n")
+              .filter((v) => v.trim() === "true").length
           : -1;
       if (readyEndpoints > 0) {
         results.push({
@@ -666,8 +670,14 @@ export async function runDoctor(options: {
       // rule lets http:// bypass middleware (auth/rewrites); a missing extension means the
       // edge middleware never runs at all.
       const teFrs = await execCapture("gcloud", [
-        "service-extensions", "lb-traffic-extensions", "describe", `${releaseName}-traffic-ext`,
-        "--location=global", "--project", projectId, "--format=value(forwardingRules)",
+        "service-extensions",
+        "lb-traffic-extensions",
+        "describe",
+        `${releaseName}-traffic-ext`,
+        "--location=global",
+        "--project",
+        projectId,
+        "--format=value(forwardingRules)",
       ]);
       if (teFrs.exitCode !== 0 || !teFrs.stdout.trim()) {
         results.push({
@@ -680,8 +690,14 @@ export async function runDoctor(options: {
         const covered = teFrs.stdout.trim().split(";").filter(Boolean).length;
         const allFrs = (
           await execCapture("gcloud", [
-            "compute", "forwarding-rules", "list", "--project", projectId,
-            "--filter", `name~${releaseName}`, "--format=value(name)",
+            "compute",
+            "forwarding-rules",
+            "list",
+            "--project",
+            projectId,
+            "--filter",
+            `name~${releaseName}`,
+            "--format=value(name)",
           ])
         ).stdout
           .trim()
@@ -706,8 +722,14 @@ export async function runDoctor(options: {
       // Routing backend service must be EXTERNAL_MANAGED with a NEG attached.
       const bsScheme = (
         await execCapture("gcloud", [
-          "compute", "backend-services", "describe", `${releaseName}-routing-service`,
-          "--global", "--project", projectId, "--format=value(loadBalancingScheme)",
+          "compute",
+          "backend-services",
+          "describe",
+          `${releaseName}-routing-service`,
+          "--global",
+          "--project",
+          projectId,
+          "--format=value(loadBalancingScheme)",
         ])
       ).stdout
         .trim()
@@ -720,11 +742,21 @@ export async function runDoctor(options: {
           fix: `gcloud compute backend-services delete ${releaseName}-routing-service --global --project ${projectId} --quiet  # then re-run init + deploy`,
         });
       } else if (bsScheme) {
-        results.push({ name: "routing backend scheme", status: "pass", message: "EXTERNAL_MANAGED" });
+        results.push({
+          name: "routing backend scheme",
+          status: "pass",
+          message: "EXTERNAL_MANAGED",
+        });
         const backends = (
           await execCapture("gcloud", [
-            "compute", "backend-services", "describe", `${releaseName}-routing-service`,
-            "--global", "--project", projectId, "--format=value(backends)",
+            "compute",
+            "backend-services",
+            "describe",
+            `${releaseName}-routing-service`,
+            "--global",
+            "--project",
+            projectId,
+            "--format=value(backends)",
           ])
         ).stdout.trim();
         results.push(
@@ -743,8 +775,14 @@ export async function runDoctor(options: {
       // ext_proc server yet the callout still fails (the failure mode that hid for months).
       const hcType = (
         await execCapture("gcloud", [
-          "compute", "health-checks", "describe", `${releaseName}-routing-hc`,
-          "--global", "--project", projectId, "--format=value(type)",
+          "compute",
+          "health-checks",
+          "describe",
+          `${releaseName}-routing-hc`,
+          "--global",
+          "--project",
+          projectId,
+          "--format=value(type)",
         ])
       ).stdout
         .trim()

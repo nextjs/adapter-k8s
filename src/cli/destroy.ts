@@ -187,7 +187,14 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     // otherwise be left billing/dangling — the exact "destroy silently leaves infra" gap.
     const projectId: string | undefined = infra.projectId;
     if (projectId) {
-      const extResources = buildReleaseScopedGcpResources(releaseName, projectId, infra?.region);
+      // The managed cache may live in a different region than the cluster when
+      // cache.memorystore.region overrides it — deploy persists that as infra.cacheRegion. Use it
+      // so destroy deletes the instance where it actually is, not the cluster region.
+      const extResources = buildReleaseScopedGcpResources(
+        releaseName,
+        projectId,
+        infra?.cacheRegion ?? infra?.region,
+      );
       for (const { desc, args } of extResources) {
         console.log(`  → Deleting ${desc}`);
         if (!dryRun) {

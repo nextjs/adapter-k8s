@@ -1,5 +1,5 @@
 // src/adapter.ts
-import { writeFile, mkdir, copyFile, cp, realpath } from "node:fs/promises";
+import { writeFile, mkdir, copyFile, cp, rm, realpath } from "node:fs/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -32,6 +32,28 @@ function resolveDepDir(dep: string, projectDir: string): string | undefined {
     }
   }
   return undefined;
+}
+
+// Whether the app defines LEGACY EDGE middleware (`middleware.ts`). A node-based incremental
+// `cacheHandler` (ioredis) gets bundled by Turbopack INTO the edge middleware runtime, where it
+// can't evaluate — so the adapter skips registering that handler when edge middleware is present.
+// The modern `proxy.ts` runs on Node (no edge bundle) and is NOT matched here, so it gets the full
+// handler. (The V2 `use cache` handler, registered via the global symbol, is unaffected either way
+// and always shares `use cache` entries cross-replica.)
+function hasEdgeMiddleware(projectDir: string): boolean {
+  const names = [
+    "middleware.ts",
+    "middleware.js",
+    "middleware.tsx",
+    "middleware.jsx",
+    "middleware.mjs",
+  ];
+  for (const dir of [projectDir, path.join(projectDir, "src")]) {
+    for (const name of names) {
+      if (existsSync(path.join(dir, name))) return true;
+    }
+  }
+  return false;
 }
 
 import { validateConfig, applyDefaults } from "./config.js";
@@ -235,7 +257,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     async modifyConfig(nextConfig, ctx) {
       // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
       // Use process.cwd() which is the project root during build.
-      await ensureConfig(process.cwd());
+      const cfg = await ensureConfig(process.cwd());
 
       const modified: Record<string, unknown> = {
         ...nextConfig,
@@ -270,6 +292,41 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           parallelServerBuildTraces: false,
           webpackBuildWorker: false,
         };
+      }
+
+      // Register the Valkey-backed incremental cache handler when the cache is enabled. The
+      // bundled module (shipped in the adapter's dist) is copied to a build-surviving path and set
+      // as `next.config.cacheHandler`. It falls back to Next's file-system cache when VALKEY_URL is
+      // absent — so it is inert during `next build` and local runs, and only backs the incremental
+      // cache (PPR shells + ISR pages) with Valkey at runtime in the pool, where VALKEY_URL +
+      // NEXT_BUILD_ID are injected. Sharing this store is what makes those revalidate cross-replica.
+      if (cfg.cache?.enabled && !hasEdgeMiddleware(process.cwd())) {
+        // Respect an application-provided cacheHandler rather than silently overwriting it — the two
+        // are mutually exclusive (a custom handler owns the incremental cache, so the adapter's
+        // shared store can't also own it). Warn and keep theirs; the V2 `use cache` handler still
+        // registers at runtime, but cross-replica ISR/PPR-shell sharing needs the adapter's handler.
+        const existingHandler =
+          (modified as { cacheHandler?: unknown }).cacheHandler ??
+          (nextConfig as { cacheHandler?: unknown }).cacheHandler;
+        if (existingHandler) {
+          console.warn(
+            "[adapter-k8s] cache.enabled but next.config already sets `cacheHandler` — keeping " +
+              "yours and skipping the adapter's shared incremental cache. Remove your cacheHandler " +
+              "for cross-replica ISR / PPR-shell revalidation, or set cache.enabled=false to silence.",
+          );
+        } else {
+          const src = path.join(_dirname, "cache-handler.cjs");
+          if (existsSync(src)) {
+            const destDir = path.join(process.cwd(), ".k8s-adapter");
+            await mkdir(destDir, { recursive: true });
+            const dest = path.join(destDir, "cache-handler.cjs");
+            await copyFile(src, dest);
+            modified.cacheHandler = dest;
+            // The handler's bundled Redis client uses only `node:net`/`node:tls` (loaded lazily),
+            // which Next externalizes automatically — so there's no third-party package to mark
+            // external or stage into the pool container.
+          }
+        }
       }
 
       return modified as typeof nextConfig;
@@ -486,6 +543,22 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           path.join(projectDir, absSharedStageDir, "package.json"),
         );
 
+        // Stage the registered incremental cache handler. Next resolves `next.config.cacheHandler`
+        // at runtime relative to the app root (`../.k8s-adapter/cache-handler.cjs`), so the shared
+        // image must contain it too — otherwise the pool crashes with module-not-found on startup.
+        if (cfg.cache?.enabled && !hasEdgeMiddleware(projectDir)) {
+          const handlerSrc = path.join(projectDir, ".k8s-adapter", "cache-handler.cjs");
+          if (existsSync(handlerSrc)) {
+            await mkdir(path.join(projectDir, absSharedStageDir, ".k8s-adapter"), {
+              recursive: true,
+            });
+            await copyFile(
+              handlerSrc,
+              path.join(projectDir, absSharedStageDir, ".k8s-adapter", "cache-handler.cjs"),
+            );
+          }
+        }
+
         // Keep .env secrets out of the shared image (built from this context).
         await writeOutputFile(
           projectDir,
@@ -558,6 +631,18 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         for (const [poolName, pool] of pools) {
           const poolDir = path.join(OUTPUT_DIR, "pools", poolName);
           const poolStageDir = path.join(poolDir, "context");
+
+          // Stage the Valkey incremental cache handler at the same project-relative path the build
+          // config points at, so the runtime `cacheHandler` (resolved relative to distDir/.next)
+          // finds it inside the pool container.
+          if (cfg.cache?.enabled && !hasEdgeMiddleware(projectDir)) {
+            await stageFile(
+              projectDir,
+              path.join(projectDir, ".k8s-adapter", "cache-handler.cjs"),
+              ".k8s-adapter/cache-handler.cjs",
+              poolName,
+            );
+          }
 
           // Copy required files into context
           for (const output of pool.outputs) {
@@ -793,10 +878,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             "node_modules",
             ...dep.split("/"),
           );
-          if (!existsSync(dest)) {
-            await mkdir(path.dirname(dest), { recursive: true });
-            await cp(depDir, dest, { recursive: true, dereference: true });
-          }
+          // Refresh every build (the context dir persists) so a dependency upgrade actually ships
+          // rather than being shadowed by a stale copy from an earlier build.
+          await rm(dest, { recursive: true, force: true });
+          await mkdir(path.dirname(dest), { recursive: true });
+          await cp(depDir, dest, { recursive: true, dereference: true });
         }
 
         // Keep .env secrets out of the routing-service image. `docker build`
@@ -809,14 +895,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           routingServiceDir,
         );
 
-        // Stage middleware module + its chunk dependencies
+        // Stage middleware module + its chunk dependencies. These MUST be re-copied every build:
+        // the routing-service context dir persists across builds, and a prior `if (!existsSync)`
+        // guard here froze the ext_proc tier at the first build's middleware (its `middleware.js`
+        // pins a specific chunk hash, so a stale copy silently runs old middleware code forever).
         if (outputs.middleware?.filePath && existsSync(outputs.middleware.filePath)) {
           const mwRelPath = path.relative(projectDir, outputs.middleware.filePath);
           const mwDest = path.join(projectDir, routingServiceContextDir, mwRelPath);
-          if (!existsSync(mwDest)) {
-            await mkdir(path.dirname(mwDest), { recursive: true });
-            await copyFile(outputs.middleware.filePath, mwDest);
-          }
+          await mkdir(path.dirname(mwDest), { recursive: true });
+          await copyFile(outputs.middleware.filePath, mwDest);
           // Stage middleware's traced assets (files and directories)
           const mwAssets = (outputs.middleware as any).assets ?? {};
           for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
@@ -826,14 +913,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
                 routingServiceContextDir,
                 assetDestPath(projectDir, relAsset, absAsset),
               );
-              if (!existsSync(dest)) {
-                await mkdir(path.dirname(dest), { recursive: true });
-                const stat = statSync(absAsset);
-                if (stat.isDirectory()) {
-                  await cp(absAsset, dest, { recursive: true, dereference: true });
-                } else {
-                  await copyFile(absAsset, dest);
-                }
+              await mkdir(path.dirname(dest), { recursive: true });
+              const stat = statSync(absAsset);
+              if (stat.isDirectory()) {
+                await cp(absAsset, dest, { recursive: true, dereference: true });
+              } else {
+                await copyFile(absAsset, dest);
               }
             }
           }
@@ -858,7 +943,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           if (existsSync(nextNodeModules)) {
             await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
           }
-          if (existsSync(chunksDir) && !existsSync(chunksDest)) {
+          if (existsSync(chunksDir)) {
+            // Replace the whole chunk set (not merge) so a stale prior build's chunks can't linger
+            // and shadow the current middleware's referenced chunk.
+            await rm(chunksDest, { recursive: true, force: true });
             await mkdir(path.dirname(chunksDest), { recursive: true });
             await cp(chunksDir, chunksDest, { recursive: true, dereference: true });
           }

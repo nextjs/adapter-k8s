@@ -7,7 +7,8 @@ import { renderDeployment } from "../emit/templates/deployment.js";
 import { renderService } from "../emit/templates/service.js";
 import { renderHPA } from "../emit/templates/hpa.js";
 import { renderValkeySecret } from "../emit/templates/valkey-secret.js";
-import { provisionMemorystore } from "./provision-cache.js";
+import { provisionMemorystore, buildDeleteMemorystoreCommand } from "./provision-cache.js";
+import { isAlreadyGoneError } from "./destroy.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 // Import the SAME sanitizer that stamps pod names and version labels (deployment.ts /
@@ -114,6 +115,9 @@ export function buildHelmUpgradeArgs(options: {
     chartPath,
     "--server-side=true",
     "--force-conflicts",
+    // Cache Secrets are Helm-owned in every enabled mode. This adopts Secrets created by older
+    // adapter versions that provisioned managed-cache credentials imperatively with kubectl.
+    "--take-ownership",
     "--set",
     `global.image.tag=${buildId}`,
     "--set",
@@ -187,9 +191,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   console.log(`\n  Build ID: ${buildId}`);
   console.log(`  Pools: ${pools.join(", ")}`);
 
-  // Managed cache: provision Memorystore and write the connection Secret BEFORE the pods roll,
-  // so the Valkey handler registers on startup. Idempotent — reuses an existing instance. BYO
-  // cache (cache.url set) skips this; its Secret is emitted by the Helm chart instead.
+  // Managed cache: provision Memorystore and inject its discovered endpoint into the Helm chart.
+  // This keeps the Valkey Secret Helm-owned in both managed and BYO modes, so switching modes
+  // updates one resource instead of crossing the kubectl/Helm ownership boundary.
   if (metadata.cacheManaged && !dryRun) {
     // Fail loudly rather than silently shipping without a shared cache: managed provisioning
     // needs the project + region. (BYO cache sets cache.url and never reaches this branch.)
@@ -200,21 +204,57 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       );
     }
     console.log("\n  → Provisioning managed cache (Memorystore)...");
-    const ms = (metadata as { cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string } })
-      .cacheMemorystore;
+    const ms = (
+      metadata as { cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string } }
+    ).cacheMemorystore;
+    const cacheRegion = ms?.region ?? infra.region;
     const endpoint = await provisionMemorystore({
       projectId: infra.projectId,
-      region: ms?.region ?? infra.region,
+      region: cacheRegion,
       releaseName,
       ...(ms?.sizeGb ? { sizeGb: ms.sizeGb } : {}),
       ...(ms?.tier ? { tier: ms.tier } : {}),
       log: (m: string) => console.log(m),
     });
+    // Persist the actual region immediately after provisioning. Any later failure (writing the
+    // chart, Helm connectivity, rollout) must still leave destroy enough state to find the paid
+    // instance, especially when cache.memorystore.region differs from the cluster region.
+    if (infra.cacheRegion !== cacheRegion) {
+      infra.cacheRegion = cacheRegion;
+      writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+    }
+
     const url = `redis://${endpoint.host}:${endpoint.port}`;
-    const secretPath = path.join(projectDir, ".k8s-adapter", "valkey-secret.generated.yaml");
+    const secretPath = path.join(outputDir, "chart", "templates", "valkey-secret.yaml");
     writeFileSync(secretPath, renderValkeySecret({ releaseName, url }));
-    await execOrThrow("kubectl", ["apply", "-f", secretPath]);
-    console.log(`    Cache Secret ${releaseName}-valkey → ${url}`);
+    console.log(`    Cache Secret ${releaseName}-valkey staged for Helm → ${url}`);
+  } else if (!metadata.cacheEnabled && !dryRun) {
+    // Cache disabled (not just BYO — cacheEnabled distinguishes them). Tear down a previously
+    // provisioned managed instance and its Secret, so new pods stop receiving VALKEY_URL (the pod
+    // template always mounts the optional Secret) and the paid Memorystore isn't left running.
+    // Idempotent: no-ops when nothing was ever provisioned.
+    const secretDelete = await execCapture("kubectl", [
+      "delete",
+      "secret",
+      `${releaseName}-valkey`,
+      "--ignore-not-found",
+    ]);
+    if (secretDelete.stdout.trim()) console.log(`\n  → Removed cache Secret ${releaseName}-valkey`);
+    if (infra.cacheRegion) {
+      console.log("  → Deleting managed cache (Memorystore) — cache is disabled...");
+      const del = buildDeleteMemorystoreCommand(releaseName, infra.cacheRegion, infra.projectId);
+      const res = await execCapture(del.command, del.args);
+      if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
+        delete infra.cacheRegion;
+        writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+        console.log(`    ${del.desc} deleted`);
+      } else {
+        console.warn(
+          `    Warning: could not delete ${del.desc} in ${infra.cacheRegion} — it may still be ` +
+            `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ${res.stderr.trim()}`,
+        );
+      }
+    }
   }
 
   // 3. Read adapter config to determine container strategy
@@ -356,7 +396,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           releaseName,
           imageTag: previousBuildId,
           replicas: prevReplicas,
-          cacheEnabled: (metadata as { cacheEnabled?: boolean }).cacheEnabled ?? false,
         }),
       );
 
@@ -406,12 +445,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
   // 7. Zero-downtime cutover: wait for new pods, then clean up old build
   if (!dryRun) {
-    // Strip all non-alphanumeric for matching — K8s names replace special chars with dashes,
-    // so we need to compare alphanumeric-only to avoid mismatches
-    const currentBuildLower = buildId
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .slice(0, 12);
+    // Match the new build's pods/deployments by their EXACT version label — the same value the
+    // cutover patches Services to (`sanitizeK8sName(buildId)`, which stamps `app.kubernetes.io/
+    // version` on every pod). The prior match used a 12-char normalized-prefix substring, so an OLD
+    // build whose id shared that prefix could satisfy this readiness check; the cutover would then
+    // patch Services to the full new label, match zero pods, drain the NEG, and 503 the origin.
+    const safeBuildId = sanitizeK8sName(buildId);
 
     // 7a. Wait for new deployment to be ready
     console.log(`\n  → Waiting for new pods to be ready...`);
@@ -419,18 +458,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "deployments",
       "-l",
-      `app.kubernetes.io/name=${releaseName}`,
+      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
       "-o",
       'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
+    // The routing service carries the same version label but is a stable in-place Deployment,
+    // verified separately below — exclude it here.
     const newDeploys = (newDeployResult.stdout?.trim().split("\n") ?? []).filter(
-      (n) =>
-        n &&
-        !n.includes("routing-service") &&
-        n
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, "")
-          .includes(currentBuildLower),
+      (n) => n && !n.includes("routing-service"),
     );
 
     for (const deployName of newDeploys) {
@@ -509,21 +544,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "pods",
         "-l",
-        `app.kubernetes.io/name=${releaseName}`,
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
         "-o",
         'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\\n"}{end}',
       ]);
       if (podsResult.exitCode === 0) {
         for (const line of podsResult.stdout.trim().split("\n")) {
           const [podName, ready] = line.split("|");
-          if (
-            !podName ||
-            !podName
-              .toLowerCase()
-              .replace(/[^a-z0-9]/g, "")
-              .includes(currentBuildLower)
-          )
-            continue;
+          // Only new-build pods carry this version label; exclude the routing service (shares it).
+          if (!podName || podName.includes("routing-service")) continue;
           checkedCount++;
           if (ready !== "True") allHealthy = false;
         }
@@ -547,7 +576,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "pods",
         "-l",
-        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component!=routing-service`,
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
         "-o",
         'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{"\\n"}{end}',
       ]);
@@ -555,14 +584,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         const podLines = newPods.stdout.trim().split("\n");
         for (const line of podLines) {
           const [podName, phase] = line.split("|");
-          if (
-            !podName ||
-            !podName
-              .toLowerCase()
-              .replace(/[^a-z0-9]/g, "")
-              .includes(currentBuildLower)
-          )
-            continue;
+          if (!podName) continue; // selector already scoped to this build's pool pods
           console.error(`  Pod ${podName}: ${phase}`);
           // Try hitting healthz directly
           const healthzResult = await execCapture("kubectl", [
@@ -614,7 +636,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // the Service drains to zero endpoints, its standalone NEG empties, and the LB
     // returns 503 `failed_to_connect_to_backend` for every origin request (only CDN
     // cache hits survive). This bit us on build ids beginning with a digit.
-    const safeBuildId = sanitizeK8sName(buildId);
+    // (safeBuildId is computed once in step 7 above and reused here.)
     console.log(`  → Switching traffic to new build...`);
     const patchFailures: { pool: string; service: string; stderr: string }[] = [];
     const patchedServices: string[] = [];
@@ -740,11 +762,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
     // 7f. Clean up old deployments.
     // The previous build was scaled to 0 in step 7e above (kept as the rollback target).
-    // Delete anything that isn't the current or previous build.
-    const previousBuildLower = previousBuildId
-      ?.toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .slice(0, 12);
+    // Delete anything that isn't the current or previous build. Classify by EXACT deployment name
+    // (reconstructed with the same sanitizer the template uses) rather than a 12-char normalized
+    // substring — a shared prefix between two build ids could otherwise delete the wrong build.
+    const currentDeployNames = new Set(
+      pools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${buildId}`)),
+    );
+    const previousDeployNames = previousBuildId
+      ? new Set(pools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
+      : undefined;
 
     const allDeploys = await execCapture("kubectl", [
       "get",
@@ -757,18 +783,17 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (allDeploys.exitCode === 0) {
       for (const name of allDeploys.stdout.trim().split("\n")) {
         if (!name || name.includes("routing-service")) continue;
-        const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
         // Keep current build
-        if (normalized.includes(currentBuildLower)) continue;
+        if (currentDeployNames.has(name)) continue;
         // Keep previous build (rollback target)
-        if (previousBuildLower && normalized.includes(previousBuildLower)) {
+        if (previousDeployNames?.has(name)) {
           console.log(`  → Previous build kept for rollback: ${name}`);
           continue;
         }
         // If we don't know the previous build, we cannot classify this non-current
         // deployment as safe to delete. Be conservative and keep it as a potential
         // rollback target rather than blanket-deleting every non-current build.
-        if (!previousBuildLower) {
+        if (!previousBuildId) {
           console.log(
             `  → Conservative cleanup: keeping non-current build "${name}" ` +
               `(previous-build state unknown, cannot classify as safe to delete)`,

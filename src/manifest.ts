@@ -118,9 +118,15 @@ export function buildRoutingManifest({
       const rawTags = fb.initialHeaders?.["x-next-cache-tags"];
       const tags =
         typeof rawTags === "string"
-          ? rawTags.split(",").map((t) => t.trim()).filter(Boolean)
+          ? rawTags
+              .split(",")
+              .map((t) => t.trim())
+              .filter(Boolean)
           : Array.isArray(rawTags)
-            ? rawTags.flatMap((t) => t.split(",")).map((t) => t.trim()).filter(Boolean)
+            ? rawTags
+                .flatMap((t) => t.split(","))
+                .map((t) => t.trim())
+                .filter(Boolean)
             : undefined;
       pprRoutes[prerender.pathname] = {
         postponedState: fb.postponedState,

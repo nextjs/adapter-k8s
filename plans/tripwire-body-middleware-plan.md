@@ -45,7 +45,7 @@ Against that, running body-middleware at the edge is either wrong (empty body) o
 the rejected tripwire machinery (Appendix A). The pool's Phase-1 path
 (`pool-server/resolve.ts`) is the **reference resolver** — the same code emulate runs — and
 is where `headers()` are actually applied and external rewrites actually proxy (both of which
-the ext_proc Phase-2 path currently does _not_ do; see "Related router gaps" below). So
+the ext*proc Phase-2 path currently does \_not* do; see "Related router gaps" below). So
 sending body-capable requests straight to the pool is the more correct path today.
 
 ## 3. Implemented change

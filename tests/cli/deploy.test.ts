@@ -71,6 +71,7 @@ describe("buildHelmUpgradeArgs", () => {
     expect(args).toContain(".k8s-adapter/output/chart");
     expect(args.join(" ")).toContain("global.image.tag=abc123");
     expect(args.join(" ")).toContain("activeBuildId=abc123");
+    expect(args).toContain("--take-ownership");
   });
 
   it("includes previousBuildId when set", () => {

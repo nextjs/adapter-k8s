@@ -35,7 +35,11 @@ describe("buildRoutingManifest", () => {
         filePath: "/app/.next/server/middleware.js",
         config: {
           matchers: [
-            { source: "/only-here", sourceRegex: "^\\/only-here$", has: [{ type: "header", key: "x" }] },
+            {
+              source: "/only-here",
+              sourceRegex: "^\\/only-here$",
+              has: [{ type: "header", key: "x" }],
+            },
             { source: "/other", sourceRegex: "^\\/other$", missing: [{ type: "query", key: "q" }] },
           ],
         },
@@ -56,7 +60,11 @@ describe("buildRoutingManifest", () => {
       projectDir: "/app",
     } as any);
     expect(manifest.middleware?.matchers).toEqual([
-      { regexp: "^\\/only-here$", has: [{ type: "header", key: "x" }], originalSource: "/only-here" },
+      {
+        regexp: "^\\/only-here$",
+        has: [{ type: "header", key: "x" }],
+        originalSource: "/only-here",
+      },
       { regexp: "^\\/other$", missing: [{ type: "query", key: "q" }], originalSource: "/other" },
     ]);
   });

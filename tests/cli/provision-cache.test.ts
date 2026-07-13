@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildDeleteMemorystoreCommand,
-  cacheInstanceName,
-} from "../../src/cli/provision-cache.js";
+import { buildDeleteMemorystoreCommand, cacheInstanceName } from "../../src/cli/provision-cache.js";
 import { buildReleaseScopedGcpResources } from "../../src/cli/destroy.js";
 
 describe("cacheInstanceName", () => {

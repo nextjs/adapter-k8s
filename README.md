@@ -20,7 +20,19 @@ At deploy time, the CLI builds images, pushes them, and runs `helm upgrade` with
 
 With a shared cache configured, the pool servers register a Valkey-backed `use cache` handler so **cache components and Partial Prerendering (PPR)** work correctly across replicas: cached entries are shared, and `revalidateTag` / `revalidatePath` on one pod is seen by all. (Next's default `use cache` store is per-process, which diverges the moment you run more than one replica.) See [Distributed Cache](#distributed-cache-cache-components--ppr).
 
-> **Where middleware runs relative to the CDN.** On GCP's global external Application Load Balancer, ext_proc is only supported as a **traffic extension**, which runs **after** the Cloud CDN cache. Cache *hits* are served without invoking middleware; the routing service runs on cache *misses* on the way to origin. Pool servers therefore send `Cache-Control: no-cache` on middleware-covered routes so those responses are never cached ahead of the middleware that gates them. (Route extensions -- which would run pre-cache -- are not supported on this load balancer.)
+> **Where middleware runs relative to the CDN.** On GCP's global external Application Load Balancer, ext*proc is only supported as a **traffic extension**, which runs **after** the Cloud CDN cache. Cache \_hits* are served without invoking middleware; the routing service runs on cache _misses_ on the way to origin. Pool servers therefore send `Cache-Control: no-cache` on middleware-covered routes so those responses are never cached ahead of the middleware that gates them. (Route extensions -- which would run pre-cache -- are not supported on this load balancer.)
+
+## Project Status
+
+**This adapter is experimental and optimized for correctness, not yet for throughput.** The goal so far has been to prove that Next.js's harder edges -- middleware, Partial Prerendering, cache components, and ISR -- behave correctly in front of a CDN on GCP with no edge compute, across multiple replicas. It follows _make it work, make it correct, make it fast_ -- and "fast" is deliberately last.
+
+Concretely, that means:
+
+- **Correctness is validated; performance is not.** Cross-replica cache sharing and `revalidateTag` for `use cache`, ISR, and PPR shells are verified end-to-end against real infrastructure, but the adapter has **not** been load-tested or tuned for high QPS, and there are no published benchmarks yet.
+- **The hot paths favor clarity over peak throughput.** The Valkey client is a small zero-dependency RESP2 client written for correctness (bounded timeouts, defensive degrade-to-miss) rather than maximum throughput -- no connection pooling, pipelining heuristics, or backpressure tuning yet. The routing service runs `@next/routing` per request over ext_proc. Both are correct and bounded, not squeezed.
+- **APIs and generated infrastructure may change** between versions as the design firms up.
+
+Treat it as a way to evaluate and validate Next.js-on-GKE semantics today, not as a hardened, benchmarked production tier. Performance work (pooling, request-decomposition upstream in the routing service, benchmarking) is planned once correctness has real usage behind it. Issues and contributions are welcome.
 
 ## Requirements
 
@@ -263,7 +275,7 @@ provider: {
 },
 ```
 
-Cache *hits* are served before the routing service runs, so middleware-covered routes are sent `Cache-Control: no-cache` to keep them out of the cache. Deploys emit `x-cache-status` / `x-cache-id` response headers for diagnostics.
+Cache _hits_ are served before the routing service runs, so middleware-covered routes are sent `Cache-Control: no-cache` to keep them out of the cache. Deploys emit `x-cache-status` / `x-cache-id` response headers for diagnostics.
 
 ### Distributed Cache (Cache Components & PPR)
 
@@ -287,10 +299,11 @@ What it does:
 
 - The pool server registers a **Valkey-backed `use cache` handler** (`{ DefaultCache, RemoteCache }`) before your app loads, so every `use cache` entry lives in the shared store.
 - `revalidateTag` / `revalidatePath` propagate through a **shared tag manifest** (updated atomically, last-event-wins), so an invalidation on one replica is immediately seen by all -- the thing a per-process handler cannot do.
-- **PPR routes** stream the static shell, then resume the dynamic holes pool-native, and are sent `Cache-Control: no-store` so the CDN never caches the per-request dynamic tail. (Chunked encoding alone does *not* keep a response out of Cloud CDN.)
+- **PPR routes** stream the static shell, then resume the dynamic holes pool-native, and are sent `Cache-Control: no-store` so the CDN never caches the per-request dynamic tail. (Chunked encoding alone does _not_ keep a response out of Cloud CDN.)
+- **PPR shells and ISR pages** revalidate cross-replica too: the adapter registers a Valkey-backed **incremental cache handler** (`next.config.cacheHandler`) so `use cache` baked into a static PPR shell, and `revalidate`-based ISR pages, are shared and invalidated across every pod. Verified live: `revalidateTag` regenerates a baked PPR shell (and an ISR page) consistently across replicas.
 - With `memorystore` (and no `url`), `deploy` provisions the instance idempotently and `destroy` tears it down. Provide `url` to use your own Valkey/Redis and the adapter provisions nothing.
 
-> **Known limitation.** A `use cache` value baked into a *static* PPR shell is regenerated on the next deploy, not revalidated cross-replica at runtime (the prerendered shell is served from each pod's local incremental cache). Dynamically-fetched `use cache` -- e.g. from a dynamic route or a `use cache` read during a resumed hole -- revalidates cross-replica immediately.
+> **Requires Node middleware (`proxy.ts`), not edge.** The incremental cache handler is a Node module (ioredis). Legacy **edge** `middleware.ts` makes the bundler pull it into the edge runtime, which can't run it -- so the adapter registers the incremental handler only for apps whose middleware runs on Node, i.e. Next 16.2's `proxy.ts` (the non-deprecated replacement for edge middleware). Apps still on edge `middleware.ts` keep cross-replica `use cache` (the V2 handler) but fall back to per-replica for PPR-shell/ISR revalidation. Migrate `middleware.ts` → `proxy.ts` to get the full behavior.
 
 ### Routing Service Tuning
 
@@ -431,15 +444,15 @@ The Helm chart is self-contained -- it includes the traffic-extension registrati
 
 ## Implementation Status
 
-| Phase | Status  | What                                                                                    |
-| ----- | ------- | --------------------------------------------------------------------------------------- |
-| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate) |
-| 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions     |
-| 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)      |
-| 4     | Planned | Coordinated CDN invalidation (tag-based purge at the edge for ISR / `revalidate`)         |
-| 5     | Done    | Distributed cache — Valkey/Redis `use cache` handler shared across replicas (cross-replica `revalidateTag`); managed Memorystore provisioning or BYO. See [Distributed Cache](#distributed-cache-cache-components--ppr) |
-| 6     | Done    | PPR — pool-native shell resume + `no-store` at the CDN (static-shell-baked `use cache` cross-replica revalidation is a known gap) |
-| 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                            |
+| Phase | Status  | What                                                                                                                                                                                                                                                                  |
+| ----- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate)                                                                                                                                                                            |
+| 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions                                                                                                                                                                                  |
+| 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)                                                                                                                                                                                   |
+| 4     | Planned | Coordinated CDN invalidation (tag-based purge at the edge for ISR / `revalidate`)                                                                                                                                                                                     |
+| 5     | Done    | Distributed cache — Valkey `use cache` handler + incremental cache handler shared across replicas (cross-replica `revalidateTag` for `use cache`, ISR, and PPR shells); managed Memorystore or BYO. See [Distributed Cache](#distributed-cache-cache-components--ppr) |
+| 6     | Done    | PPR — pool-native shell resume + `no-store` at the CDN; PPR shells revalidate cross-replica via the incremental cache (needs Node `proxy.ts`)                                                                                                                         |
+| 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                                                                                                                                                                                                         |
 
 ## License
 
