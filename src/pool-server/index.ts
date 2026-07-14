@@ -1,5 +1,6 @@
 // src/pool-server/index.ts
 import { readFileSync, existsSync, statSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { isIP } from "node:net";
 import dns from "node:dns/promises";
@@ -601,6 +602,15 @@ async function main() {
         ...params,
         useCache: true,
         distDir,
+        // Match NextNodeServer.runEdgeFunction: Node entrypoints publish their
+        // request-scoped IncrementalCache on globalThis, and every edge sandbox
+        // must receive that shared instance. Without it each edge function
+        // creates an isolated cache, so fetch/unstable_cache entries never
+        // survive across routes and edge revalidateTag/revalidatePath cannot
+        // invalidate the Node-rendered page cache.
+        incrementalCache:
+          params.incrementalCache ??
+          (globalThis as typeof globalThis & { __incrementalCache?: unknown }).__incrementalCache,
         clientAssetToken: "",
       });
     console.log("Edge sandbox initialized");
@@ -612,7 +622,9 @@ async function main() {
   // manifest stores those relative to distDir — and the sandbox resolves them against the pool's
   // CWD, not .next/. Left relative, `next/og`'s yoga/resvg WASM fails with ENOENT and the handler
   // 500s. Absolutize the binding paths so they're found.
-  const resolveEdgeEntryAssets = <T extends { wasm?: unknown[]; assets?: unknown[] }>(entry: T): T => {
+  const resolveEdgeEntryAssets = <T extends { wasm?: unknown[]; assets?: unknown[] }>(
+    entry: T,
+  ): T => {
     const abs = (arr?: unknown[]): unknown[] =>
       (arr ?? []).map((b) => {
         const binding = b as { filePath?: string };
@@ -796,6 +808,49 @@ async function main() {
     getCloneableBody,
     middlewareMatchers,
   );
+  const appRequire = createRequire(path.join(process.cwd(), "package.json"));
+  const { createRequestResponseMocks } = appRequire("next/dist/server/lib/mock-request") as {
+    createRequestResponseMocks(options: {
+      url: string;
+      headers: Record<string, string | string[]>;
+    }): {
+      req: unknown;
+      res: {
+        statusCode: number;
+        hasStreamed: Promise<unknown>;
+        getHeader(name: string): string | string[] | number | undefined;
+      };
+    };
+  };
+  let handleRequest: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+  const revalidate = async ({
+    urlPath,
+    headers,
+    opts,
+  }: {
+    urlPath: string;
+    headers: Record<string, string | string[]>;
+    opts: { unstable_onlyGenerated?: boolean };
+  }): Promise<void> => {
+    const mocked = createRequestResponseMocks({
+      url: urlPath,
+      headers: { host: "127.0.0.1", ...headers },
+    });
+    await handleRequest(
+      mocked.req as unknown as IncomingMessage,
+      mocked.res as unknown as ServerResponse,
+    );
+    await mocked.res.hasStreamed;
+
+    const cacheHeader = mocked.res.getHeader("x-nextjs-cache");
+    if (
+      cacheHeader !== "REVALIDATED" &&
+      mocked.res.statusCode !== 200 &&
+      !(mocked.res.statusCode === 404 && opts.unstable_onlyGenerated)
+    ) {
+      throw new Error(`Invalid revalidate response ${mocked.res.statusCode} for ${urlPath}`);
+    }
+  };
   const dispatcher = createDispatcher({
     handlerLoader,
     poolName,
@@ -810,6 +865,7 @@ async function main() {
     prerenderedPaths,
     buildIdForData: buildId,
     internalSecret,
+    revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
     // revalidateTag invalidate a PPR shell by checking its baked tags against the shared manifest.
@@ -827,425 +883,431 @@ async function main() {
   // TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test paths).
   const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
 
-  // Create and start server
-  const server = createPoolServer({
-    port,
-    trustInternalHeaders,
-    internalSecret,
-    onRequest: async (req, res) => {
-      const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+  handleRequest = async (req, res) => {
+    const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
 
-      // When middleware's `matcher` covers this path, it must run BEFORE the
-      // filesystem fast paths — Next runs middleware for matched static/public
-      // requests (e.g. a matcher on `/file.svg` or `/_next/static/css/:path*`).
-      // The catch-all matcher excludes /_next/, so normal middleware still lets
-      // static assets fast-path. Skip the fast paths in that case and let
-      // resolve() run middleware.
-      const mwReqHeaders = new Headers();
-      for (const [k, v] of Object.entries(req.headers)) {
-        if (typeof v === "string") mwReqHeaders.set(k, v);
-        else if (Array.isArray(v)) mwReqHeaders.set(k, v.join(", "));
-      }
-      const middlewareCovers =
-        !!(middlewareModule || edgeMiddlewareRunner) &&
-        matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
+    // When middleware's `matcher` covers this path, it must run BEFORE the
+    // filesystem fast paths — Next runs middleware for matched static/public
+    // requests (e.g. a matcher on `/file.svg` or `/_next/static/css/:path*`).
+    // The catch-all matcher excludes /_next/, so normal middleware still lets
+    // static assets fast-path. Skip the fast paths in that case and let
+    // resolve() run middleware.
+    const mwReqHeaders = new Headers();
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (typeof v === "string") mwReqHeaders.set(k, v);
+      else if (Array.isArray(v)) mwReqHeaders.set(k, v.join(", "));
+    }
+    const middlewareCovers =
+      !!(middlewareModule || edgeMiddlewareRunner) &&
+      matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
 
-      // Force the CDN caching verdict for two kinds of route (non-matched routes keep their
-      // origin Cache-Control):
-      //   • PPR routes stream a per-request dynamic resume onto the shell, so the response must
-      //     never be edge-cached — `no-store`. Chunked encoding alone does NOT stop Cloud CDN
-      //     from caching (proven), so this override is required. The routing service marks these
-      //     with the trusted internal `x-nextjs-ppr` dispatch header.
-      //   • Middleware-matched routes must reach the ext_proc extension every request (the
-      //     verdict can change), so they must revalidate — `no-cache` (App Hosting model).
-      // `no-store` wins when a route is both PPR and middleware-matched.
-      const isPprRoute = req.headers["x-nextjs-ppr"] === "1";
-      const forcedCacheControl = isPprRoute ? "no-store" : middlewareCovers ? "no-cache" : null;
-      if (forcedCacheControl) {
-        const originalWriteHead = res.writeHead.bind(res);
-        res.writeHead = function forceCacheControl(...args: unknown[]) {
-          for (const arg of args) {
-            if (arg && typeof arg === "object" && !Array.isArray(arg)) {
-              for (const key of Object.keys(arg as Record<string, unknown>)) {
-                if (key.toLowerCase() === "cache-control")
-                  delete (arg as Record<string, unknown>)[key];
-              }
+    // Force the CDN caching verdict for two kinds of route (non-matched routes keep their
+    // origin Cache-Control):
+    //   • PPR routes stream a per-request dynamic resume onto the shell, so the response must
+    //     never be edge-cached — `no-store`. Chunked encoding alone does NOT stop Cloud CDN
+    //     from caching (proven), so this override is required. The routing service marks these
+    //     with the trusted internal `x-nextjs-ppr` dispatch header.
+    //   • Middleware-matched routes must reach the ext_proc extension every request (the
+    //     verdict can change), so they must revalidate — `no-cache` (App Hosting model).
+    // `no-store` wins when a route is both PPR and middleware-matched.
+    const isPprRoute = req.headers["x-nextjs-ppr"] === "1";
+    const forcedCacheControl = isPprRoute ? "no-store" : middlewareCovers ? "no-cache" : null;
+    if (forcedCacheControl) {
+      const originalWriteHead = res.writeHead.bind(res);
+      res.writeHead = function forceCacheControl(...args: unknown[]) {
+        for (const arg of args) {
+          if (arg && typeof arg === "object" && !Array.isArray(arg)) {
+            for (const key of Object.keys(arg as Record<string, unknown>)) {
+              if (key.toLowerCase() === "cache-control")
+                delete (arg as Record<string, unknown>)[key];
             }
           }
-          res.setHeader("cache-control", forcedCacheControl);
-          return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
-        } as typeof res.writeHead;
-      }
+        }
+        res.setHeader("cache-control", forcedCacheControl);
+        return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
+      } as typeof res.writeHead;
+    }
 
-      // Serve _next/static/* and _next/data/* directly from filesystem.
-      // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
-      const staticPathname =
-        assetPrefix && url.pathname.startsWith(assetPrefix + "/_next/static/")
-          ? url.pathname.slice(assetPrefix.length)
-          : url.pathname;
-      if (!middlewareCovers && staticPathname.startsWith("/_next/static/")) {
-        const filePath = path.join(
-          process.cwd(),
-          ".next",
-          "static",
-          staticPathname.slice("/_next/static/".length),
+    // Serve _next/static/* and _next/data/* directly from filesystem.
+    // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
+    const staticPathname =
+      assetPrefix && url.pathname.startsWith(assetPrefix + "/_next/static/")
+        ? url.pathname.slice(assetPrefix.length)
+        : url.pathname;
+    if (!middlewareCovers && staticPathname.startsWith("/_next/static/")) {
+      const filePath = path.join(
+        process.cwd(),
+        ".next",
+        "static",
+        staticPathname.slice("/_next/static/".length),
+      );
+      if (existsSync(filePath)) {
+        const content = readFileSync(filePath);
+        // Mirror Next's own server: service workers are revalidated (not immutable) and get
+        // Service-Worker-Allowed; every other _next/static asset is immutable.
+        const { cacheControl, headers } = nextStaticAssetHeaders(
+          staticPathname,
+          routingManifest.basePath ?? "",
         );
+        res.writeHead(200, {
+          "content-type": getContentType(staticPathname),
+          "cache-control": cacheControl,
+          ...(headers ?? {}),
+        });
+        res.end(content);
+        return;
+      }
+      // A missing `/_next/static/*` asset is a plain 404 — these paths are never app routes, so
+      // don't fall through to render the app's (HTML) 404 page. Matches Next's own router-server.
+      res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Not Found");
+      return;
+    }
+
+    // Pages Router SSG data routes: /_next/data/<buildId>/<page>.json.
+    // SSG data JSONs exist only in the build output (no manifest entry), so
+    // serve them from disk — but only when no pool output owns the data
+    // pathname: GSSP and ISR pages have function outputs keyed by their data
+    // URL, and those must go through dispatch so the handler (and its
+    // incremental cache) produces the payload.
+    const dataPrefix = `/_next/data/${buildId}/`;
+    let pagesDataRoutingUrl: URL | undefined;
+    if (!middlewareCovers && url.pathname.startsWith(dataPrefix)) {
+      const dataPath = url.pathname.slice(dataPrefix.length);
+      // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
+      const pagePath = "/" + dataPath.replace(/\.json$/, "");
+      const owned =
+        handlerLoader.has(url.pathname) ||
+        handlerLoader.has(pagePath) ||
+        templateOutputCandidates(pagePath, Object.keys(poolManifest.outputs)).some((t) =>
+          handlerLoader.has(t),
+        );
+      // GSSP/ISR data is owned by a handler (and its incremental cache) —
+      // fall through to dispatch for those; serve only truly static SSG data.
+      if (!owned) {
+        const filePath = path.join(process.cwd(), ".next", "server", "pages", dataPath);
         if (existsSync(filePath)) {
           const content = readFileSync(filePath);
-          // Mirror Next's own server: service workers are revalidated (not immutable) and get
-          // Service-Worker-Allowed; every other _next/static asset is immutable.
-          const { cacheControl, headers } = nextStaticAssetHeaders(
-            staticPathname,
-            routingManifest.basePath ?? "",
-          );
           res.writeHead(200, {
-            "content-type": getContentType(staticPathname),
-            "cache-control": cacheControl,
-            ...(headers ?? {}),
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "public, max-age=0, must-revalidate",
           });
           res.end(content);
           return;
         }
-        // A missing `/_next/static/*` asset is a plain 404 — these paths are never app routes, so
-        // don't fall through to render the app's (HTML) 404 page. Matches Next's own router-server.
-        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-        res.end("Not Found");
+      } else {
+        // Route lookup operates on the public page pathname, while the Pages
+        // entrypoint must still observe the original `/_next/data/...` URL so
+        // it negotiates JSON. Keep req.url untouched and use this URL only to
+        // locate the owning page/dynamic template.
+        pagesDataRoutingUrl = new URL(url);
+        pagesDataRoutingUrl.pathname = pagePath === "/index" ? "/" : pagePath;
+      }
+    }
+
+    // Basic image optimization: /_next/image?url=...&w=...&q=...
+    // Fetches the source image and serves it (with optimization if Sharp is available).
+    if (url.pathname === "/_next/image") {
+      const imageUrl = url.searchParams.get("url");
+      const width = parseInt(url.searchParams.get("w") ?? "0", 10);
+      const quality = parseInt(url.searchParams.get("q") ?? "75", 10);
+
+      if (!imageUrl) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Bad Request: missing url parameter");
         return;
       }
 
-      // Pages Router SSG data routes: /_next/data/<buildId>/<page>.json.
-      // SSG data JSONs exist only in the build output (no manifest entry), so
-      // serve them from disk — but only when no pool output owns the data
-      // pathname: GSSP and ISR pages have function outputs keyed by their data
-      // URL, and those must go through dispatch so the handler (and its
-      // incremental cache) produces the payload.
-      const dataPrefix = `/_next/data/${buildId}/`;
-      if (!middlewareCovers && url.pathname.startsWith(dataPrefix)) {
-        const dataPath = url.pathname.slice(dataPrefix.length);
-        // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
-        const pagePath = "/" + dataPath.replace(/\.json$/, "");
-        const owned =
-          handlerLoader.has(url.pathname) ||
-          handlerLoader.has(pagePath) ||
-          templateOutputCandidates(pagePath, Object.keys(poolManifest.outputs)).some((t) =>
-            handlerLoader.has(t),
-          );
-        // GSSP/ISR data is owned by a handler (and its incremental cache) —
-        // fall through to dispatch for those; serve only truly static SSG data.
-        if (!owned) {
-          const filePath = path.join(process.cwd(), ".next", "server", "pages", dataPath);
-          if (existsSync(filePath)) {
-            const content = readFileSync(filePath);
-            res.writeHead(200, {
-              "content-type": "application/json; charset=utf-8",
-              "cache-control": "public, max-age=0, must-revalidate",
-            });
-            res.end(content);
-            return;
-          }
-        }
+      // Validate w/q against Next's resolved image config before they reach Sharp. An
+      // unbounded `w` (e.g. w=999999) drives Sharp into a huge allocation — a trivial
+      // resource-exhaustion vector. Width must be an allowed device/image size; quality 1..100.
+      const allowedWidths = new Set<number>([
+        ...(imageConfig?.deviceSizes ?? []),
+        ...(imageConfig?.imageSizes ?? []),
+      ]);
+      if (
+        !Number.isFinite(width) ||
+        width <= 0 ||
+        (allowedWidths.size > 0 && !allowedWidths.has(width))
+      ) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Bad Request: invalid or unallowed width");
+        return;
+      }
+      if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Bad Request: invalid quality");
+        return;
+      }
+      // Reject self-referential optimizer URLs (…?url=/_next/image…): they loop back into
+      // this handler and recurse until the pod exhausts sockets/memory.
+      if (imageUrl.split("?")[0] === "/_next/image") {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Bad Request: recursive image url");
+        return;
       }
 
-      // Basic image optimization: /_next/image?url=...&w=...&q=...
-      // Fetches the source image and serves it (with optimization if Sharp is available).
-      if (url.pathname === "/_next/image") {
-        const imageUrl = url.searchParams.get("url");
-        const width = parseInt(url.searchParams.get("w") ?? "0", 10);
-        const quality = parseInt(url.searchParams.get("q") ?? "75", 10);
+      try {
+        // Resolve the image: internal (relative) or external (absolute URL)
+        let imageBuffer: Buffer;
+        let contentType: string;
 
-        if (!imageUrl) {
-          res.writeHead(400, { "content-type": "text/plain" });
-          res.end("Bad Request: missing url parameter");
-          return;
-        }
+        if (imageUrl.startsWith("/")) {
+          // Internal image: read from filesystem. Confine the path to public/ or
+          // .next/static/ — a raw `?url=/../../etc/passwd` must not traverse out.
+          const publicRoot = path.join(process.cwd(), "public");
+          const staticRoot = path.join(process.cwd(), ".next", "static");
+          const publicFile = resolveWithinRoot(publicRoot, imageUrl);
+          const staticFile = imageUrl.startsWith("/_next/static/")
+            ? resolveWithinRoot(staticRoot, imageUrl.slice("/_next/static/".length))
+            : null;
 
-        // Validate w/q against Next's resolved image config before they reach Sharp. An
-        // unbounded `w` (e.g. w=999999) drives Sharp into a huge allocation — a trivial
-        // resource-exhaustion vector. Width must be an allowed device/image size; quality 1..100.
-        const allowedWidths = new Set<number>([
-          ...(imageConfig?.deviceSizes ?? []),
-          ...(imageConfig?.imageSizes ?? []),
-        ]);
-        if (
-          !Number.isFinite(width) ||
-          width <= 0 ||
-          (allowedWidths.size > 0 && !allowedWidths.has(width))
-        ) {
-          res.writeHead(400, { "content-type": "text/plain" });
-          res.end("Bad Request: invalid or unallowed width");
-          return;
-        }
-        if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
-          res.writeHead(400, { "content-type": "text/plain" });
-          res.end("Bad Request: invalid quality");
-          return;
-        }
-        // Reject self-referential optimizer URLs (…?url=/_next/image…): they loop back into
-        // this handler and recurse until the pod exhausts sockets/memory.
-        if (imageUrl.split("?")[0] === "/_next/image") {
-          res.writeHead(400, { "content-type": "text/plain" });
-          res.end("Bad Request: recursive image url");
-          return;
-        }
-
-        try {
-          // Resolve the image: internal (relative) or external (absolute URL)
-          let imageBuffer: Buffer;
-          let contentType: string;
-
-          if (imageUrl.startsWith("/")) {
-            // Internal image: read from filesystem. Confine the path to public/ or
-            // .next/static/ — a raw `?url=/../../etc/passwd` must not traverse out.
-            const publicRoot = path.join(process.cwd(), "public");
-            const staticRoot = path.join(process.cwd(), ".next", "static");
-            const publicFile = resolveWithinRoot(publicRoot, imageUrl);
-            const staticFile = imageUrl.startsWith("/_next/static/")
-              ? resolveWithinRoot(staticRoot, imageUrl.slice("/_next/static/".length))
-              : null;
-
-            // A null result means the path escaped its root — reject traversal.
-            if (
-              publicFile === null ||
-              (imageUrl.startsWith("/_next/static/") && staticFile === null)
-            ) {
-              res.writeHead(400, { "content-type": "text/plain" });
-              res.end("Bad Request: invalid image path");
-              return;
-            }
-
-            if (existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
-              imageBuffer = readFileSync(publicFile);
-            } else if (
-              staticFile &&
-              existsSync(staticFile) &&
-              !statSync(staticFile).isDirectory()
-            ) {
-              imageBuffer = readFileSync(staticFile);
-            } else {
-              // Fetch from ourselves (same-origin relative image, e.g. served by a route).
-              // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and a
-              // size cap so an oversized body can't exhaust memory.
-              const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-              const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
-              const imgRes = await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
-              if (!imgRes.ok) {
-                res.writeHead(imgRes.status, { "content-type": "text/plain" });
-                res.end(`Image not found: ${imageUrl}`);
-                return;
-              }
-              const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
-              if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
-                res.writeHead(413, { "content-type": "text/plain" });
-                res.end("Image too large");
-                return;
-              }
-              const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
-              if (streamedBody === null) {
-                res.writeHead(413, { "content-type": "text/plain" });
-                res.end("Image too large");
-                return;
-              }
-              imageBuffer = streamedBody;
-            }
-            contentType = getContentType(imageUrl);
-          } else {
-            // External image: only fetch allowlisted http(s) hosts, and only after
-            // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
-            let target: URL;
-            try {
-              target = new URL(imageUrl);
-            } catch {
-              res.writeHead(400, { "content-type": "text/plain" });
-              res.end("Bad Request: invalid image url");
-              return;
-            }
-            const fetched = await fetchExternalImageSafely(target, imageConfig);
-            if ("error" in fetched) {
-              res.writeHead(400, { "content-type": "text/plain" });
-              res.end(`Bad Request: ${fetched.error}`);
-              return;
-            }
-            if (!fetched.ok) {
-              res.writeHead(502, { "content-type": "text/plain" });
-              res.end(`Failed to fetch external image: ${imageUrl}`);
-              return;
-            }
-            imageBuffer = fetched.body;
-            contentType = fetched.contentType;
+          // A null result means the path escaped its root — reject traversal.
+          if (
+            publicFile === null ||
+            (imageUrl.startsWith("/_next/static/") && staticFile === null)
+          ) {
+            res.writeHead(400, { "content-type": "text/plain" });
+            res.end("Bad Request: invalid image path");
+            return;
           }
 
-          // Try to optimize with Sharp if available
-          try {
-            const sharp = require("sharp");
-            const q = quality || 75;
-            const accept = String(req.headers["accept"] ?? "");
-            // Negotiate the output format like Next's optimizer: prefer avif/webp when the client
-            // accepts them, otherwise PRESERVE the source format (a PNG stays PNG — do not force
-            // JPEG). Animated/vector formats sharp shouldn't re-encode are passed through as-is.
-            let pipeline = sharp(imageBuffer).resize(width || undefined);
-            let outType: string;
-            if (accept.includes("image/avif")) {
-              pipeline = pipeline.avif({ quality: q });
-              outType = "image/avif";
-            } else if (accept.includes("image/webp")) {
-              pipeline = pipeline.webp({ quality: q });
-              outType = "image/webp";
-            } else if (contentType.includes("png")) {
-              pipeline = pipeline.png();
-              outType = "image/png";
-            } else if (contentType.includes("gif") || contentType.includes("svg")) {
-              res.writeHead(200, {
-                "content-type": contentType,
-                "cache-control": "public, max-age=60, must-revalidate",
-              });
-              res.end(imageBuffer);
+          if (existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
+            imageBuffer = readFileSync(publicFile);
+          } else if (staticFile && existsSync(staticFile) && !statSync(staticFile).isDirectory()) {
+            imageBuffer = readFileSync(staticFile);
+          } else {
+            // Fetch from ourselves (same-origin relative image, e.g. served by a route).
+            // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and a
+            // size cap so an oversized body can't exhaust memory.
+            const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+            const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
+            const imgRes = await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
+            if (!imgRes.ok) {
+              res.writeHead(imgRes.status, { "content-type": "text/plain" });
+              res.end(`Image not found: ${imageUrl}`);
               return;
-            } else {
-              pipeline = pipeline.jpeg({ quality: q });
-              outType = "image/jpeg";
             }
-            const optimized = await pipeline.toBuffer();
-            res.writeHead(200, {
-              "content-type": outType,
-              "cache-control": "public, max-age=60, must-revalidate",
-            });
-            res.end(optimized);
+            const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
+            if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
+              res.writeHead(413, { "content-type": "text/plain" });
+              res.end("Image too large");
+              return;
+            }
+            const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
+            if (streamedBody === null) {
+              res.writeHead(413, { "content-type": "text/plain" });
+              res.end("Image too large");
+              return;
+            }
+            imageBuffer = streamedBody;
+          }
+          contentType = getContentType(imageUrl);
+        } else {
+          // External image: only fetch allowlisted http(s) hosts, and only after
+          // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
+          let target: URL;
+          try {
+            target = new URL(imageUrl);
           } catch {
-            // Sharp not available — serve unoptimized
+            res.writeHead(400, { "content-type": "text/plain" });
+            res.end("Bad Request: invalid image url");
+            return;
+          }
+          const fetched = await fetchExternalImageSafely(target, imageConfig);
+          if ("error" in fetched) {
+            res.writeHead(400, { "content-type": "text/plain" });
+            res.end(`Bad Request: ${fetched.error}`);
+            return;
+          }
+          if (!fetched.ok) {
+            res.writeHead(502, { "content-type": "text/plain" });
+            res.end(`Failed to fetch external image: ${imageUrl}`);
+            return;
+          }
+          imageBuffer = fetched.body;
+          contentType = fetched.contentType;
+        }
+
+        // Try to optimize with Sharp if available
+        try {
+          const sharp = require("sharp");
+          const q = quality || 75;
+          const accept = String(req.headers["accept"] ?? "");
+          // Negotiate the output format like Next's optimizer: prefer avif/webp when the client
+          // accepts them, otherwise PRESERVE the source format (a PNG stays PNG — do not force
+          // JPEG). Animated/vector formats sharp shouldn't re-encode are passed through as-is.
+          let pipeline = sharp(imageBuffer).resize(width || undefined);
+          let outType: string;
+          if (accept.includes("image/avif")) {
+            pipeline = pipeline.avif({ quality: q });
+            outType = "image/avif";
+          } else if (accept.includes("image/webp")) {
+            pipeline = pipeline.webp({ quality: q });
+            outType = "image/webp";
+          } else if (contentType.includes("png")) {
+            pipeline = pipeline.png();
+            outType = "image/png";
+          } else if (contentType.includes("gif") || contentType.includes("svg")) {
             res.writeHead(200, {
               "content-type": contentType,
               "cache-control": "public, max-age=60, must-revalidate",
             });
             res.end(imageBuffer);
+            return;
+          } else {
+            pipeline = pipeline.jpeg({ quality: q });
+            outType = "image/jpeg";
           }
-          return;
-        } catch (err) {
-          console.error("Image optimization error:", err);
-          if (!res.headersSent) {
-            res.writeHead(500, { "content-type": "text/plain" });
-            res.end("Image optimization failed");
-          }
-          return;
-        }
-      }
-
-      // Serve public directory files (favicon.ico, robots.txt, etc.)
-      // In production, CDN/GCS serves these. In standalone/emulate, pool server must.
-      if (
-        !middlewareCovers &&
-        !url.pathname.startsWith("/_next/") &&
-        !url.pathname.startsWith("/api/")
-      ) {
-        const publicPath = path.join(process.cwd(), "public", url.pathname);
-        if (existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
-          const content = readFileSync(publicPath);
+          const optimized = await pipeline.toBuffer();
           res.writeHead(200, {
-            "content-type": getContentType(url.pathname),
-            "cache-control": "public, max-age=3600",
+            "content-type": outType,
+            "cache-control": "public, max-age=60, must-revalidate",
           });
-          res.end(content);
-          return;
+          res.end(optimized);
+        } catch {
+          // Sharp not available — serve unoptimized
+          res.writeHead(200, {
+            "content-type": contentType,
+            "cache-control": "public, max-age=60, must-revalidate",
+          });
+          res.end(imageBuffer);
         }
-      }
-
-      const headers = new Headers();
-      for (const [key, value] of Object.entries(req.headers)) {
-        if (typeof value === "string") headers.set(key, value);
-        else if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
-      }
-
-      let bodyBuffer: Buffer | null;
-      try {
-        bodyBuffer =
-          req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
+        return;
       } catch (err) {
-        if (err instanceof BodyTooLargeError) {
-          res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
-          res.end("Payload Too Large");
-          return;
+        console.error("Image optimization error:", err);
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end("Image optimization failed");
         }
-        throw err;
-      }
-      if (bodyBuffer) {
-        // Next.js action-handler checks request meta first when the original
-        // Node stream has already been consumed upstream.
-        addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
-      }
-
-      // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
-      // bodies routinely carry credentials, tokens, and PII, and were previously written to
-      // production logs on every action. Body length only, and only when explicitly enabled.
-      if (
-        process.env.ADAPTER_K8S_DEBUG_ACTIONS === "1" &&
-        isServerActionRequest(headers, req.method ?? "GET")
-      ) {
-        console.log("[pool-server] action request", {
-          url: url.pathname,
-          method: req.method,
-          nextAction: headers.get("next-action"),
-          rsc: headers.get("rsc"),
-          accept: headers.get("accept"),
-          nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
-          nextUrl: headers.get("next-url"),
-          contentType: headers.get("content-type"),
-          contentLength: headers.get("content-length"),
-          bodyLength: bodyBuffer?.length ?? 0,
-        });
-      }
-
-      // Phase 2+: if dispatch headers exist (from route extension), use them directly.
-      // These are only present when the request passed the secret check in server.ts (else they
-      // were stripped), so they can be trusted here.
-      const extOutputId = req.headers["x-output-id"] as string | undefined;
-      const extMwEvaluated = req.headers["x-mw-evaluated"] as string | undefined;
-      delete req.headers["x-mw-evaluated"];
-      // Skip the pool's own middleware ONLY when the trusted upstream POSITIVELY asserts it
-      // evaluated the middleware stage (x-mw-evaluated ∈ ran/skip-nomatch/none). x-output-id
-      // alone is NOT proof — a broken ext_proc or cross-pool proxy can emit routing headers
-      // without having run middleware. Absent / `error` / unrecognized ⇒ fall through to
-      // Phase 1 below so the pool evaluates middleware itself. Both headers are secret-gated
-      // (untrusted ones were already stripped in server.ts), so this can't be forged.
-      if (extOutputId && extMwEvaluated && MW_EVALUATED_TRUSTED.has(extMwEvaluated)) {
-        const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
-        // Secret-gated (trusted) input, but a malformed value from an extension bug should not
-        // 500 the request — fall back to no route params rather than throwing.
-        let routeMatches: Record<string, string> | null = null;
-        if (routeMatchesRaw) {
-          try {
-            routeMatches = JSON.parse(routeMatchesRaw);
-          } catch {
-            routeMatches = null;
-          }
-        }
-        const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
-
-        // next.config headers() + middleware response headers, serialized by the routing
-        // extension. The dispatcher merges these into the response (they'd otherwise be dropped
-        // on this path). Delete the header after parsing so it doesn't leak to the handler.
-        const resolvedHeaders = parseResolvedHeaders(
-          req.headers["x-resolved-headers"] as string | undefined,
-        );
-        delete req.headers["x-resolved-headers"];
-
-        await dispatcher.dispatch(req, res, {
-          kind: "route",
-          pool,
-          matchedPathname: extOutputId, // Use outputId/pathname from header
-          routeMatches,
-          resolvedHeaders,
-        });
         return;
       }
+    }
 
-      // Phase 1: resolve route locally
-      const resolution = await resolver.resolve(
-        url,
-        headers,
-        req.method ?? "GET",
-        createBufferedStream(bodyBuffer),
+    // Serve public directory files (favicon.ico, robots.txt, etc.)
+    // In production, CDN/GCS serves these. In standalone/emulate, pool server must.
+    if (
+      !middlewareCovers &&
+      !url.pathname.startsWith("/_next/") &&
+      !url.pathname.startsWith("/api/")
+    ) {
+      const publicPath = path.join(process.cwd(), "public", url.pathname);
+      if (existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
+        const content = readFileSync(publicPath);
+        res.writeHead(200, {
+          "content-type": getContentType(url.pathname),
+          "cache-control": "public, max-age=3600",
+        });
+        res.end(content);
+        return;
+      }
+    }
+
+    const headers = new Headers();
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (typeof value === "string") headers.set(key, value);
+      else if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
+    }
+
+    let bodyBuffer: Buffer | null;
+    try {
+      bodyBuffer =
+        req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Payload Too Large");
+        return;
+      }
+      throw err;
+    }
+    if (bodyBuffer) {
+      // Next.js action-handler checks request meta first when the original
+      // Node stream has already been consumed upstream.
+      addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
+    }
+
+    // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
+    // bodies routinely carry credentials, tokens, and PII, and were previously written to
+    // production logs on every action. Body length only, and only when explicitly enabled.
+    if (
+      process.env.ADAPTER_K8S_DEBUG_ACTIONS === "1" &&
+      isServerActionRequest(headers, req.method ?? "GET")
+    ) {
+      console.log("[pool-server] action request", {
+        url: url.pathname,
+        method: req.method,
+        nextAction: headers.get("next-action"),
+        rsc: headers.get("rsc"),
+        accept: headers.get("accept"),
+        nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
+        nextUrl: headers.get("next-url"),
+        contentType: headers.get("content-type"),
+        contentLength: headers.get("content-length"),
+        bodyLength: bodyBuffer?.length ?? 0,
+      });
+    }
+
+    // Phase 2+: if dispatch headers exist (from route extension), use them directly.
+    // These are only present when the request passed the secret check in server.ts (else they
+    // were stripped), so they can be trusted here.
+    const extOutputId = req.headers["x-output-id"] as string | undefined;
+    const extMwEvaluated = req.headers["x-mw-evaluated"] as string | undefined;
+    delete req.headers["x-mw-evaluated"];
+    // Skip the pool's own middleware ONLY when the trusted upstream POSITIVELY asserts it
+    // evaluated the middleware stage (x-mw-evaluated ∈ ran/skip-nomatch/none). x-output-id
+    // alone is NOT proof — a broken ext_proc or cross-pool proxy can emit routing headers
+    // without having run middleware. Absent / `error` / unrecognized ⇒ fall through to
+    // Phase 1 below so the pool evaluates middleware itself. Both headers are secret-gated
+    // (untrusted ones were already stripped in server.ts), so this can't be forged.
+    if (extOutputId && extMwEvaluated && MW_EVALUATED_TRUSTED.has(extMwEvaluated)) {
+      const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
+      // Secret-gated (trusted) input, but a malformed value from an extension bug should not
+      // 500 the request — fall back to no route params rather than throwing.
+      let routeMatches: Record<string, string> | null = null;
+      if (routeMatchesRaw) {
+        try {
+          routeMatches = JSON.parse(routeMatchesRaw);
+        } catch {
+          routeMatches = null;
+        }
+      }
+      const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
+
+      // next.config headers() + middleware response headers, serialized by the routing
+      // extension. The dispatcher merges these into the response (they'd otherwise be dropped
+      // on this path). Delete the header after parsing so it doesn't leak to the handler.
+      const resolvedHeaders = parseResolvedHeaders(
+        req.headers["x-resolved-headers"] as string | undefined,
       );
-      await dispatcher.dispatch(req, res, resolution);
-    },
+      delete req.headers["x-resolved-headers"];
+
+      await dispatcher.dispatch(req, res, {
+        kind: "route",
+        pool,
+        matchedPathname: extOutputId, // Use outputId/pathname from header
+        routeMatches,
+        resolvedHeaders,
+      });
+      return;
+    }
+
+    // Phase 1: resolve route locally
+    const resolution = await resolver.resolve(
+      pagesDataRoutingUrl ?? url,
+      headers,
+      req.method ?? "GET",
+      createBufferedStream(bodyBuffer),
+    );
+    await dispatcher.dispatch(req, res, resolution);
+  };
+
+  // Create and start server
+  const server = createPoolServer({
+    port,
+    trustInternalHeaders,
+    internalSecret,
+    onRequest: handleRequest,
   });
 
   await server.start();

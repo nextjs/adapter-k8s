@@ -53,6 +53,7 @@ function mockRes(): ServerResponse & {
 describe("createDispatcher", () => {
   it("dispatches route to handler", async () => {
     const handler = vi.fn();
+    const revalidate = vi.fn().mockResolvedValue(undefined);
     const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
     const handlerLoader = {
       load: vi.fn().mockResolvedValue(handler),
@@ -66,6 +67,7 @@ describe("createDispatcher", () => {
       buildId: "test123",
       staticAssets: [],
       localHandlerInvoker,
+      revalidate,
     });
 
     const req = mockReq("/about");
@@ -88,8 +90,134 @@ describe("createDispatcher", () => {
         res,
         matchedPathname: "/about",
         routeMatches: null,
+        revalidate,
       }),
     );
+  });
+
+  it("maps the public root pathname to the Pages Router /index output", async () => {
+    const handler = vi.fn();
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const handlerLoader = {
+      load: vi.fn().mockResolvedValue(handler),
+      has: vi.fn((outputId: string) => outputId === "/index"),
+      get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+    };
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoader as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [
+        {
+          pathname: "/",
+          filePath: ".next/server/pages/index.html",
+          cacheControl: "public, max-age=0, must-revalidate",
+          prerender: true,
+        },
+      ],
+      localHandlerInvoker,
+    });
+
+    await dispatcher.dispatch(mockReq("/"), mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+
+    expect(handlerLoader.load).toHaveBeenCalledWith("/index");
+    expect(localHandlerInvoker).toHaveBeenCalledWith(
+      expect.objectContaining({ matchedPathname: "/index" }),
+    );
+  });
+
+  it("provides a render404 callback that renders the custom not-found entrypoint", async () => {
+    const pageHandler = vi.fn();
+    const notFoundHandler = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(res.statusCode);
+      res.end("custom app 404");
+    });
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const handlerLoader = {
+      load: vi.fn(async (outputId: string) =>
+        outputId === "/_not-found" ? notFoundHandler : pageHandler,
+      ),
+      has: vi.fn((outputId: string) => outputId === "/about" || outputId === "/_not-found"),
+      get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+    };
+
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoader as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      localHandlerInvoker,
+    });
+    const req = mockReq("/about");
+    const res = mockRes();
+
+    await dispatcher.dispatch(req, res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/about",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+
+    const render404 = localHandlerInvoker.mock.calls[0]?.[0]?.render404;
+    expect(render404).toBeTypeOf("function");
+    await render404(req, res);
+
+    expect(notFoundHandler).toHaveBeenCalledOnce();
+    expect(res._status).toBe(404);
+    expect(res._body).toBe("custom app 404");
+  });
+
+  it("provides an error callback that invokes the custom 500 entrypoint with error metadata", async () => {
+    const pageHandler = vi.fn();
+    const errorHandler = vi.fn(
+      (
+        _req: IncomingMessage,
+        res: ServerResponse,
+        ctx: { requestMeta: Record<string, unknown> },
+      ) => {
+        expect(ctx.requestMeta.invokeStatus).toBe(500);
+        expect(ctx.requestMeta.invokeError).toBeInstanceOf(Error);
+        res.writeHead(res.statusCode);
+        res.end("custom pages/500");
+      },
+    );
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const handlerLoader = {
+      load: vi.fn(async (outputId: string) => (outputId === "/500" ? errorHandler : pageHandler)),
+      has: vi.fn((outputId: string) => outputId === "/about" || outputId === "/500"),
+      get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+    };
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoader as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      localHandlerInvoker,
+    });
+    const req = mockReq("/about");
+    const res = mockRes();
+
+    await dispatcher.dispatch(req, res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/about",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+    const renderError = localHandlerInvoker.mock.calls[0]?.[0]?.renderError;
+    expect(renderError).toBeTypeOf("function");
+    await renderError(req, res, new Error("oof"));
+
+    expect(errorHandler).toHaveBeenCalledOnce();
+    expect(res._status).toBe(500);
+    expect(res._body).toBe("custom pages/500");
   });
 
   it("handles redirects", async () => {
@@ -209,6 +337,50 @@ describe("createDispatcher", () => {
     expect(localHandlerInvoker).toHaveBeenCalled();
   });
 
+  it("merges dynamic params into the request URL for edge Pages outputs", async () => {
+    const edgeRouteRunner = vi.fn().mockResolvedValue({
+      response: new Response("ok"),
+      waitUntil: Promise.resolve(),
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: "edge",
+          type: "PAGES",
+          filePath: "/app/.next/server/edge/page.js",
+        }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      edgeRouteRunner,
+    });
+
+    const req = mockReq("/post-1?draft=1");
+    const res = mockRes();
+    await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/[id]",
+      routeMatches: { "1": "post-1", nxtPid: "post-1" },
+      resolvedHeaders: undefined,
+    });
+
+    expect(edgeRouteRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          url: "http://localhost/post-1?draft=1&nxtPid=post-1",
+          page: { name: "/[id]", params: { id: "post-1" } },
+          waitUntil: expect.any(Function),
+        }),
+      }),
+    );
+    expect(res._status).toBe(200);
+    expect(res._body).toBe("ok");
+  });
+
   it("applies middleware-mutated request headers before invoking the handler", async () => {
     const handler = vi.fn();
     const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
@@ -272,6 +444,47 @@ describe("createDispatcher", () => {
     afterEach(() => {
       process.cwd = origCwd;
       rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it("prefers a prerendered custom 404 over the generic /_error handler", async () => {
+      writeFileSync(path.join(tmpDir, "404.html"), '<main id="not-found">404 page</main>');
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const errorHandler = vi.fn();
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn(async (outputId: string) =>
+            outputId === "/_error" ? errorHandler : vi.fn(),
+          ),
+          has: vi.fn((outputId: string) => outputId === "/about" || outputId === "/_error"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/404",
+            filePath: "404.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+      });
+      const req = mockReq("/about");
+      const res = mockRes();
+
+      await dispatcher.dispatch(req, res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/about",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+      await localHandlerInvoker.mock.calls[0]?.[0]?.render404(req, res);
+
+      expect(res._status).toBe(404);
+      expect(res._body).toContain("404 page");
+      expect(errorHandler).not.toHaveBeenCalled();
     });
 
     it("serves a public static file (favicon.ico) from the manifest", async () => {
@@ -360,7 +573,7 @@ describe("createDispatcher", () => {
         staticAssets: [],
         localHandlerInvoker,
         strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
-        prerenderedPaths: new Set(["/blog/first"]),
+        prerenderedPaths: new Set(["/blog/first", "/blog/[first]"]),
         buildIdForData: "test123",
       });
 
@@ -386,6 +599,23 @@ describe("createDispatcher", () => {
         resolvedHeaders: undefined,
       });
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
+
+      // Generated data paths may contain encoded literal brackets. Manifest
+      // keys are decoded, so the strict-route guard must compare like-for-like.
+      const resEncoded = mockRes();
+      await dispatcher.dispatch(
+        mockReq("/_next/data/test123/blog/%5Bfirst%5D.json"),
+        resEncoded as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { slug: "[first]" },
+          resolvedHeaders: undefined,
+        },
+      );
+      expect(resEncoded._status).not.toBe(404);
+      expect(localHandlerInvoker).toHaveBeenCalledTimes(2);
     });
 
     it("does NOT 404 a dynamic path that matches no strict route (fallback:blocking / dynamicParams:true)", async () => {
@@ -449,10 +679,10 @@ describe("createDispatcher", () => {
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
     });
 
-    it("applies the fallback:false 404 check to the REWRITTEN path (invokePath)", async () => {
+    it("applies the fallback:false 404 check to the internal invocation path", async () => {
       // A middleware rewrite lands on a fallback:false dynamic route that was
-      // never generated → 404, evaluated against the rewritten path (req.url is
-      // updated from invokePath before the strict check).
+      // never generated → 404, evaluated against the rewritten path without
+      // exposing that internal path through the public request URL.
       const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
       const dispatcher = createDispatcher({
         handlerLoader: {
@@ -480,6 +710,40 @@ describe("createDispatcher", () => {
       });
       expect(res._status).toBe(404);
       expect(localHandlerInvoker).not.toHaveBeenCalled();
+    });
+
+    it("preserves the public request URL and passes a rewrite as invocation metadata", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+      });
+      const req = mockReq("/blog-post-1?visible=yes");
+      const res = mockRes();
+
+      await dispatcher.dispatch(req, res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[post]",
+        routeMatches: { post: "post-1" },
+        resolvedHeaders: undefined,
+        invokePath: "/blog/post-1?post=post-1&hello=world",
+      });
+
+      expect(req.url).toBe("/blog-post-1?visible=yes");
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          invocationPath: "/blog/post-1?post=post-1&hello=world",
+          routeMatches: { post: "post-1" },
+        }),
+      );
     });
 
     it("returns 500 (Internal Server Error) for the error kind >= 500", async () => {
@@ -640,6 +904,104 @@ describe("createDispatcher", () => {
 
       expect(res._status).not.toBe(405);
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
+    it("returns 405 when the real invoker sees a cached response to POST", async () => {
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse) => {
+        innerRes.setHeader("x-nextjs-cache", "HIT");
+        innerRes.end("static page");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const req = mockReq("/static-page");
+      req.method = "POST";
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/static-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(res._status).toBe(405);
+      expect(res._body).toBe("static page");
+    });
+
+    it("does not return 405 when the real invoker sees a dynamic response to POST", async () => {
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse) => {
+        innerRes.statusCode = 201;
+        innerRes.end("action response");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const req = mockReq("/action-page");
+      req.method = "POST";
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/action-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(handler).toHaveBeenCalledOnce();
+      expect(res._status).toBe(201);
+      expect(res._body).toBe("action response");
+    });
+
+    it("passes the route template and concrete rewrite separately in request metadata", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/public-post"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "post-1" },
+        resolvedHeaders: undefined,
+        invokePath: "/blog/post-1?draft=1",
+      });
+
+      expect(requestMeta).toMatchObject({
+        resolvedPathname: "/blog/[slug]",
+        rewrittenPathname: "/blog/post-1",
+        query: { draft: "1" },
+      });
     });
 
     it("falls back to the parent page handler for .rsc output ids", async () => {

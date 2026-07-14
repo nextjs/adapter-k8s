@@ -87,7 +87,15 @@ async function writeInnerResponse(
   innerRes: IncomingMessage,
   forceStatus?: number,
 ): Promise<void> {
-  outerRes.writeHead(forceStatus ?? innerRes.statusCode ?? 200, innerRes.headers);
+  const headers = { ...innerRes.headers };
+  // Entrypoints emit origin-oriented s-maxage/private cache directives for
+  // incremental responses. In adapter deploy mode the platform cache owns ISR,
+  // while the browser-facing response must always revalidate. Next marks this
+  // response class explicitly, so avoid altering SSR, APIs, or user headers.
+  if (headers["x-nextjs-cache"] !== undefined) {
+    headers["cache-control"] = "public, max-age=0, must-revalidate";
+  }
+  outerRes.writeHead(forceStatus ?? innerRes.statusCode ?? 200, headers);
   for await (const chunk of innerRes) {
     const canContinue = await writeChunkSafely(outerRes, chunk as Buffer);
     if (!canContinue) {
@@ -99,6 +107,42 @@ async function writeInnerResponse(
   if (!outerRes.writableEnded) outerRes.end();
 }
 
+type Render404 = (
+  req: IncomingMessage,
+  res: ServerResponse,
+  parsedUrl?: { pathname?: string | null; query?: Record<string, unknown> },
+  setHeaders?: boolean,
+) => Promise<void>;
+
+type RenderError = (req: IncomingMessage, res: ServerResponse, error: Error) => Promise<void>;
+
+type Revalidate = (config: {
+  urlPath: string;
+  headers: Record<string, string | string[]>;
+  opts: { unstable_onlyGenerated?: boolean };
+}) => Promise<void>;
+
+async function writeWebResponseToNode(
+  res: ServerResponse,
+  response: Response,
+  forceStatus?: number,
+): Promise<void> {
+  res.writeHead(forceStatus ?? response.status, webHeadersToNodeHeaders(response.headers));
+  if (response.body) {
+    const reader = response.body.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value && !(await writeChunkSafely(res, Buffer.from(value)))) break;
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  if (!res.writableEnded) res.end();
+}
+
 async function invokeLocalHandlerOverHttp({
   handler,
   req,
@@ -106,8 +150,11 @@ async function invokeLocalHandlerOverHttp({
   matchedPathname,
   routeMatches,
   bufferedBody,
+  invocationPath,
   forceStatus,
   render404,
+  renderError,
+  revalidate,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -115,12 +162,18 @@ async function invokeLocalHandlerOverHttp({
   matchedPathname: string;
   routeMatches: Record<string, string> | null;
   bufferedBody: Buffer | undefined;
+  /** Concrete internal rewrite target. The loopback request keeps the public URL; this target is
+   * supplied through documented request metadata for route params/query resolution. */
+  invocationPath?: string;
   /** Override the response status regardless of what the handler set — used to make a not-found
    * render return 404 even when the underlying page handler (e.g. Pages Router `/404`) renders 200. */
   forceStatus?: number;
-  /** Tell the handler to render its 404 page (status + body) — the adapter API's requestMeta.render404.
-   * This is how a Pages/App handler produces the *custom* 404 content, not just a status. */
-  render404?: boolean;
+  /** Adapter-provided 404 renderer used when a Pages handler returns `notFound: true`. */
+  render404?: Render404;
+  /** Adapter-provided error renderer used when an entrypoint throws before sending a response. */
+  renderError?: RenderError;
+  /** In-process on-demand revalidation, matching Next's documented requestMeta contract. */
+  revalidate?: Revalidate;
 }): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const server = createServer((innerReq, innerRes) => {
@@ -138,6 +191,27 @@ async function invokeLocalHandlerOverHttp({
             ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
               NEXT_REQUEST_META
             ] as { postponed?: string } | undefined) ?? {};
+          let invocationMeta: Record<string, unknown> = {};
+          if (invocationPath) {
+            const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
+            const query: Record<string, string | string[]> = {};
+            for (const [key, value] of target.searchParams) {
+              const previous = query[key];
+              query[key] =
+                previous === undefined
+                  ? value
+                  : Array.isArray(previous)
+                    ? [...previous, value]
+                    : [previous, value];
+            }
+            invocationMeta = {
+              query,
+              // The documented contract distinguishes the matched route
+              // template from the concrete internal invocation target.
+              resolvedPathname: matchedPathname,
+              rewrittenPathname: target.pathname,
+            };
+          }
           const maybeResult = await (handler as any)(innerReq, innerRes, {
             waitUntil(waitable: Promise<unknown>) {
               void waitable.catch(() => undefined);
@@ -148,26 +222,15 @@ async function invokeLocalHandlerOverHttp({
               outputId: matchedPathname,
               matchedPathname,
               routeMatches,
+              ...invocationMeta,
               ...(outerMeta.postponed ? { postponed: outerMeta.postponed } : {}),
-              ...(render404 ? { render404: true } : {}),
+              ...(render404 ? { render404 } : {}),
+              ...(revalidate ? { revalidate } : {}),
             },
           });
 
           if (maybeResult instanceof Response) {
-            innerRes.writeHead(maybeResult.status, webHeadersToNodeHeaders(maybeResult.headers));
-            if (maybeResult.body) {
-              const reader = maybeResult.body.getReader();
-              try {
-                while (true) {
-                  const { done, value } = await reader.read();
-                  if (done) break;
-                  if (value) innerRes.write(Buffer.from(value));
-                }
-              } finally {
-                reader.releaseLock();
-              }
-            }
-            innerRes.end();
+            await writeWebResponseToNode(innerRes, maybeResult);
             return;
           }
 
@@ -175,10 +238,16 @@ async function invokeLocalHandlerOverHttp({
             innerRes.end();
           }
         } catch (error) {
-          // Surface handler exceptions — otherwise a 500 from a route (e.g. an OG/ImageResponse
-          // failure) is opaque. Logged to the pool server's stderr for diagnosis.
           console.error(`[pool-server] handler error for ${matchedPathname}:`, error);
           if (!innerRes.headersSent) {
+            if (renderError) {
+              await renderError(
+                innerReq,
+                innerRes,
+                error instanceof Error ? error : new Error(String(error)),
+              );
+              return;
+            }
             innerRes.statusCode = 500;
             innerRes.end("Internal Server Error");
           } else if (!innerRes.writableEnded) {
@@ -224,7 +293,15 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
-          void writeInnerResponse(res, clientRes, forceStatus)
+          const methodNotAllowed =
+            req.method !== "GET" &&
+            req.method !== "HEAD" &&
+            clientRes.headers["x-nextjs-cache"] !== undefined;
+          void writeInnerResponse(
+            res,
+            clientRes,
+            forceStatus ?? (methodNotAllowed ? 405 : undefined),
+          )
             .then(() => {
               server.close(() => resolve());
             })
@@ -272,9 +349,7 @@ async function serveNotFound(
         matchedPathname: notFoundPath,
         routeMatches: null,
         bufferedBody,
-        // Render the custom 404 page (body) via the adapter API, and force 404 in case the handler
-        // (e.g. a Pages Router `/404`) still renders 200.
-        render404: true,
+        // A Pages Router `/404` entrypoint renders like a normal page, so force the status here.
         forceStatus: 404,
       });
       return;
@@ -349,6 +424,8 @@ export interface DispatcherOptions {
    * VALKEY_URL is present: a cache + edge-middleware app has VALKEY_URL but no classic handler, and
    * must keep injecting to preserve PPR resume. */
   incrementalCacheShared?: boolean;
+  /** Re-enter the pool request pipeline for Pages API `res.revalidate()` without a network hop. */
+  revalidate?: Revalidate;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -369,7 +446,107 @@ export function createDispatcher(options: DispatcherOptions) {
     internalSecret,
     incrementalCacheShared = false,
     checkShellStale,
+    revalidate,
   } = options;
+
+  // Pages entrypoints call requestMeta.render404 when getStaticProps/getServerSideProps returns
+  // notFound. In a custom adapter there is no Next router-server above the entrypoint, so provide
+  // that missing layer explicitly and render into the SAME response. This also preserves request
+  // metadata (locale, original URL, cookies) already attached by the calling pages entrypoint.
+  const render404FromEntrypoint: Render404 = async (req, res) => {
+    if (res.writableEnded) return;
+
+    const renderHandler = async (notFoundPath: string): Promise<boolean> => {
+      if (!handlerLoader.has(notFoundPath)) return false;
+      try {
+        const handler = await handlerLoader.load(notFoundPath);
+        res.statusCode = 404;
+        const maybeResult = await (handler as any)(req, res, {
+          waitUntil(waitable: Promise<unknown>) {
+            void waitable.catch(() => undefined);
+          },
+          requestMeta: {
+            relativeProjectDir: ".",
+            hostname: req.headers.host?.split(":")[0] ?? "127.0.0.1",
+            outputId: notFoundPath,
+            matchedPathname: notFoundPath,
+            routeMatches: null,
+            invokeStatus: 404,
+          },
+        });
+        if (maybeResult instanceof Response) {
+          await writeWebResponseToNode(res, maybeResult, 404);
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+        return true;
+      } catch (error) {
+        console.error(`[pool-server] failed to render ${notFoundPath}:`, error);
+        return false;
+      }
+    };
+
+    for (const notFoundPath of ["/_not-found", "/404"]) {
+      if (await renderHandler(notFoundPath)) return;
+    }
+
+    // A Pages Router custom 404 is commonly fully prerendered and therefore
+    // has no runtime handler. It must win over the generic `/_error` function.
+    const prerendered404 = staticAssets.find((asset) => asset.pathname === "/404");
+    if (prerendered404) {
+      const fullPath = path.resolve(process.cwd(), prerendered404.filePath);
+      if (existsSync(fullPath)) {
+        res.writeHead(404, {
+          "content-type": "text/html; charset=utf-8",
+          ...(prerendered404.headers as Record<string, string> | undefined),
+        });
+        res.end(readFileSync(fullPath));
+        return;
+      }
+    }
+
+    if (await renderHandler("/_error")) return;
+
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("This page could not be found");
+  };
+
+  const renderErrorFromEntrypoint: RenderError = async (req, res, error) => {
+    if (res.writableEnded) return;
+
+    for (const errorPath of ["/500", "/_error"]) {
+      if (!handlerLoader.has(errorPath)) continue;
+      try {
+        const handler = await handlerLoader.load(errorPath);
+        res.statusCode = 500;
+        const maybeResult = await (handler as any)(req, res, {
+          waitUntil(waitable: Promise<unknown>) {
+            void waitable.catch(() => undefined);
+          },
+          requestMeta: {
+            relativeProjectDir: ".",
+            hostname: req.headers.host?.split(":")[0] ?? "127.0.0.1",
+            outputId: errorPath,
+            matchedPathname: errorPath,
+            routeMatches: null,
+            invokeError: error,
+            invokeStatus: 500,
+          },
+        });
+        if (maybeResult instanceof Response) {
+          await writeWebResponseToNode(res, maybeResult, 500);
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+        return;
+      } catch (renderError) {
+        console.error(`[pool-server] failed to render ${errorPath}:`, renderError);
+      }
+    }
+
+    res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Internal Server Error");
+  };
 
   return {
     async dispatch(
@@ -427,6 +604,9 @@ export function createDispatcher(options: DispatcherOptions) {
       let handlerPathname = resolution.kind === "route" ? resolution.matchedPathname : "";
       if (resolution.kind === "route" && !handlerLoader.has(handlerPathname)) {
         const candidates = [
+          // Pages Router's root function output is keyed as `/index`, while
+          // public requests and prerenders use `/`.
+          ...(handlerPathname === "/" ? ["/index"] : []),
           ...rscParentCandidates(handlerPathname, rscConfig),
           // Concrete prerender paths (e.g. "/blog/hello") map back to their
           // dynamic-route template handler ("/blog/[slug]") — ISR regeneration
@@ -585,28 +765,35 @@ export function createDispatcher(options: DispatcherOptions) {
               [NEXT_REQUEST_META]?: { actionBody?: Buffer };
             }
           )[NEXT_REQUEST_META]?.actionBody;
-          await serveNotFound(handlerLoader, localHandlerInvoker, staticAssets, req, res, bufferedBody);
+          await serveNotFound(
+            handlerLoader,
+            localHandlerInvoker,
+            staticAssets,
+            req,
+            res,
+            bufferedBody,
+          );
           return;
         }
 
         case "route": {
-          // A middleware/config rewrite changed the pathname and/or query — the
-          // handler must run against the REWRITTEN URL, not the original request
-          // URL, or dynamic params and added query are lost. Applied to req.url
-          // so the loopback invoker, edge route runner, and cross-pool proxy all
-          // dispatch the rewritten URL. Absent for non-rewrite requests.
-          if (resolution.invokePath) req.url = resolution.invokePath;
-
           // fallback: false / dynamicParams: false — a path matching a strict
           // dynamic route but not in the prerendered set 404s (as `next start`
           // does). Skipped for preview/revalidate requests, which legitimately
           // render non-generated paths on demand.
           if (strictDynamicRoutes.length > 0) {
-            const reqPath = (req.url || "/").split("?")[0] ?? "/";
+            const reqPath = (resolution.invokePath || req.url || "/").split("?")[0] ?? "/";
             const dataPrefix = `/_next/data/${buildIdForData}/`;
-            const pagePath = reqPath.startsWith(dataPrefix)
+            const encodedPagePath = reqPath.startsWith(dataPrefix)
               ? "/" + reqPath.slice(dataPrefix.length).replace(/\.json$/, "")
               : reqPath;
+            let pagePath = encodedPagePath;
+            try {
+              pagePath = decodeURIComponent(encodedPagePath);
+            } catch {
+              // Keep the encoded value; malformed escapes will simply fail the
+              // prerender-manifest membership check below.
+            }
             const isBypass =
               (req.headers.cookie ?? "").includes("__prerender_bypass=") ||
               "x-prerender-revalidate" in req.headers;
@@ -615,7 +802,14 @@ export function createDispatcher(options: DispatcherOptions) {
               !prerenderedPaths.has(pagePath) &&
               strictDynamicRoutes.some((r) => r.pageRegex.test(pagePath))
             ) {
-              await serveNotFound(handlerLoader, localHandlerInvoker, staticAssets, req, res, undefined);
+              await serveNotFound(
+                handlerLoader,
+                localHandlerInvoker,
+                staticAssets,
+                req,
+                res,
+                undefined,
+              );
               return;
             }
           }
@@ -664,7 +858,14 @@ export function createDispatcher(options: DispatcherOptions) {
                 [NEXT_REQUEST_META]?: { actionBody?: Buffer };
               }
             )[NEXT_REQUEST_META]?.actionBody;
-            await serveNotFound(handlerLoader, localHandlerInvoker, staticAssets, req, res, bufferedBody);
+            await serveNotFound(
+              handlerLoader,
+              localHandlerInvoker,
+              staticAssets,
+              req,
+              res,
+              bufferedBody,
+            );
             return;
           }
 
@@ -677,7 +878,51 @@ export function createDispatcher(options: DispatcherOptions) {
               else if (Array.isArray(value)) headerObj[key] = value.join(", ");
             }
             const fullUrl = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+            const declaredParams = new Set<string>();
+            for (const match of handlerPathname.matchAll(
+              /\[\[?\.\.\.([^\]]+)\]\]?|\[([^\]]+)\]/g,
+            )) {
+              const paramName = match[1] ?? match[2];
+              if (paramName) declaredParams.add(paramName);
+            }
+            const edgeRouteParams: Record<string, string> = {};
+            const edgeRouteQueryParams: Record<string, string> = {};
+            for (const key of declaredParams) {
+              const internalKey = `nxtP${key}`;
+              const value =
+                resolution.routeMatches?.[key] ?? resolution.routeMatches?.[internalKey];
+              if (value !== undefined) {
+                edgeRouteParams[key] = value;
+                // @next/routing uses nxtP<name> as the transport key. The
+                // Pages edge entrypoint consumes it, removes the internal key,
+                // and exposes the value as query.<name>.
+                edgeRouteQueryParams[internalKey] = value;
+              }
+            }
+            // NextNodeServer.runEdgeFunction merges dynamic params into the
+            // request URL query for Pages Router edge functions as well as
+            // passing page.params. Pages getServerSideProps/API handlers build
+            // `ctx.query` from that URL; page.params alone only populates
+            // `ctx.params`. App Router deliberately does not receive this
+            // merge because rewrite params can change its RSC payload.
+            if (
+              (outputInfo.type === "PAGES" || outputInfo.type === "PAGES_API") &&
+              Object.keys(edgeRouteQueryParams).length > 0
+            ) {
+              for (const [key, value] of Object.entries(edgeRouteQueryParams)) {
+                fullUrl.searchParams.set(key, value);
+              }
+            }
             const filePath = path.resolve(process.cwd(), outputInfo.filePath);
+            // Edge handlers use ctx.waitUntil for stale-while-revalidate and
+            // other background cache work. Keep those promises observed but do
+            // not await them before streaming the response. This is the same
+            // lifecycle boundary NextNodeServer supplies to sandbox.run.
+            const waitUntil = (waitable: Promise<unknown>): void => {
+              void Promise.resolve(waitable).catch((error) => {
+                console.error(`Edge background work failed for ${handlerPathname}:`, error);
+              });
+            };
             try {
               const result = await edgeRouteRunner({
                 name: handlerPathname,
@@ -694,8 +939,9 @@ export function createDispatcher(options: DispatcherOptions) {
                       : undefined,
                   page: {
                     name: handlerPathname,
-                    ...(resolution.routeMatches && { params: resolution.routeMatches }),
+                    ...(Object.keys(edgeRouteParams).length > 0 && { params: edgeRouteParams }),
                   },
+                  waitUntil,
                 },
               });
               // The edge sandbox's background work must not surface as an unhandled
@@ -772,6 +1018,10 @@ export function createDispatcher(options: DispatcherOptions) {
             matchedPathname: handlerPathname,
             routeMatches: resolution.routeMatches,
             bufferedBody,
+            ...(resolution.invokePath ? { invocationPath: resolution.invokePath } : {}),
+            render404: render404FromEntrypoint,
+            renderError: renderErrorFromEntrypoint,
+            ...(revalidate ? { revalidate } : {}),
           });
           return;
         }
