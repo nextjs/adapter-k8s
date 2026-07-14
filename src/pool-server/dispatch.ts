@@ -85,8 +85,9 @@ async function writeChunkSafely(res: ServerResponse, chunk: Buffer): Promise<boo
 async function writeInnerResponse(
   outerRes: ServerResponse,
   innerRes: IncomingMessage,
+  forceStatus?: number,
 ): Promise<void> {
-  outerRes.writeHead(innerRes.statusCode ?? 200, innerRes.headers);
+  outerRes.writeHead(forceStatus ?? innerRes.statusCode ?? 200, innerRes.headers);
   for await (const chunk of innerRes) {
     const canContinue = await writeChunkSafely(outerRes, chunk as Buffer);
     if (!canContinue) {
@@ -105,6 +106,8 @@ async function invokeLocalHandlerOverHttp({
   matchedPathname,
   routeMatches,
   bufferedBody,
+  forceStatus,
+  render404,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -112,6 +115,12 @@ async function invokeLocalHandlerOverHttp({
   matchedPathname: string;
   routeMatches: Record<string, string> | null;
   bufferedBody: Buffer | undefined;
+  /** Override the response status regardless of what the handler set — used to make a not-found
+   * render return 404 even when the underlying page handler (e.g. Pages Router `/404`) renders 200. */
+  forceStatus?: number;
+  /** Tell the handler to render its 404 page (status + body) — the adapter API's requestMeta.render404.
+   * This is how a Pages/App handler produces the *custom* 404 content, not just a status. */
+  render404?: boolean;
 }): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const server = createServer((innerReq, innerRes) => {
@@ -140,6 +149,7 @@ async function invokeLocalHandlerOverHttp({
               matchedPathname,
               routeMatches,
               ...(outerMeta.postponed ? { postponed: outerMeta.postponed } : {}),
+              ...(render404 ? { render404: true } : {}),
             },
           });
 
@@ -165,6 +175,9 @@ async function invokeLocalHandlerOverHttp({
             innerRes.end();
           }
         } catch (error) {
+          // Surface handler exceptions — otherwise a 500 from a route (e.g. an OG/ImageResponse
+          // failure) is opaque. Logged to the pool server's stderr for diagnosis.
+          console.error(`[pool-server] handler error for ${matchedPathname}:`, error);
           if (!innerRes.headersSent) {
             innerRes.statusCode = 500;
             innerRes.end("Internal Server Error");
@@ -211,7 +224,7 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
-          void writeInnerResponse(res, clientRes)
+          void writeInnerResponse(res, clientRes, forceStatus)
             .then(() => {
               server.close(() => resolve());
             })
@@ -235,6 +248,58 @@ async function invokeLocalHandlerOverHttp({
 }
 
 type LocalHandlerInvoker = typeof invokeLocalHandlerOverHttp;
+
+// Render the best available custom 404, then fall back to plain text. Order: App Router handler
+// (`/_not-found`), Pages Router handler (`/404`), a prerendered Pages Router `/404.html` from the
+// static manifest, then plain text. Previously only `/_not-found` was attempted, so a pages-router
+// app with a custom `pages/404` (which prerenders to a static `404.html`) got a bare "Not Found".
+async function serveNotFound(
+  handlerLoader: HandlerLoader,
+  localHandlerInvoker: LocalHandlerInvoker,
+  staticAssets: StaticAssetEntry[],
+  req: IncomingMessage,
+  res: ServerResponse,
+  bufferedBody: Buffer | undefined,
+): Promise<void> {
+  for (const notFoundPath of ["/_not-found", "/404"]) {
+    if (!handlerLoader.has(notFoundPath)) continue;
+    try {
+      const handler = await handlerLoader.load(notFoundPath);
+      await localHandlerInvoker({
+        handler,
+        req,
+        res,
+        matchedPathname: notFoundPath,
+        routeMatches: null,
+        bufferedBody,
+        // Render the custom 404 page (body) via the adapter API, and force 404 in case the handler
+        // (e.g. a Pages Router `/404`) still renders 200.
+        render404: true,
+        forceStatus: 404,
+      });
+      return;
+    } catch {
+      // Fall through to the next candidate.
+    }
+  }
+  // Prerendered Pages Router 404 (static `404.html`) — serve its body with a 404 status.
+  const prerendered404 = staticAssets.find((a) => a.pathname === "/404");
+  if (prerendered404) {
+    const fullPath = path.resolve(process.cwd(), prerendered404.filePath);
+    if (existsSync(fullPath) && !res.writableEnded) {
+      res.writeHead(404, {
+        "content-type": "text/html; charset=utf-8",
+        ...(prerendered404.headers as Record<string, string> | undefined),
+      });
+      res.end(readFileSync(fullPath));
+      return;
+    }
+  }
+  if (!res.writableEnded) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    res.end("Not Found");
+  }
+}
 
 function sanitizeK8sName(name: string): string {
   let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
@@ -514,31 +579,13 @@ export function createDispatcher(options: DispatcherOptions) {
         }
 
         case "not-found": {
-          // Try to invoke the app's /_not-found handler for a styled 404 page
-          if (handlerLoader.has("/_not-found")) {
-            try {
-              const handler = await handlerLoader.load("/_not-found");
-              const bufferedBody = (
-                req as IncomingMessage & {
-                  [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-                }
-              )[NEXT_REQUEST_META]?.actionBody;
-
-              await localHandlerInvoker({
-                handler,
-                req,
-                res,
-                matchedPathname: "/_not-found",
-                routeMatches: null,
-                bufferedBody,
-              });
-              return;
-            } catch {
-              // Fall through to plain text 404
+          // Render the app's custom 404 (App Router /_not-found or Pages Router /404), else plain text.
+          const bufferedBody = (
+            req as IncomingMessage & {
+              [NEXT_REQUEST_META]?: { actionBody?: Buffer };
             }
-          }
-          res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-          res.end("Not Found");
+          )[NEXT_REQUEST_META]?.actionBody;
+          await serveNotFound(handlerLoader, localHandlerInvoker, staticAssets, req, res, bufferedBody);
           return;
         }
 
@@ -568,20 +615,7 @@ export function createDispatcher(options: DispatcherOptions) {
               !prerenderedPaths.has(pagePath) &&
               strictDynamicRoutes.some((r) => r.pageRegex.test(pagePath))
             ) {
-              if (handlerLoader.has("/_not-found")) {
-                const notFoundHandler = await handlerLoader.load("/_not-found");
-                await localHandlerInvoker({
-                  handler: notFoundHandler,
-                  req,
-                  res,
-                  matchedPathname: "/_not-found",
-                  routeMatches: null,
-                  bufferedBody: undefined,
-                });
-                return;
-              }
-              res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-              res.end("Not Found");
+              await serveNotFound(handlerLoader, localHandlerInvoker, staticAssets, req, res, undefined);
               return;
             }
           }
@@ -620,28 +654,17 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // If no handler exists for this output, fall through to 404
           if (!handlerLoader.has(handlerPathname)) {
-            if (handlerLoader.has("/_not-found")) {
-              const notFoundHandler = await handlerLoader.load("/_not-found");
-              const bufferedBody = (
-                req as IncomingMessage & {
-                  [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-                }
-              )[NEXT_REQUEST_META]?.actionBody;
-              await localHandlerInvoker({
-                handler: notFoundHandler,
-                req,
-                res,
-                matchedPathname: "/_not-found",
-                routeMatches: null,
-                bufferedBody,
-              });
-              return;
+            if (!handlerLoader.has("/_not-found") && !handlerLoader.has("/404")) {
+              console.log(
+                `[dispatch] 404: no handler for matchedPathname="${handlerPathname}" url="${req.url}"`,
+              );
             }
-            console.log(
-              `[dispatch] 404: no handler for matchedPathname="${handlerPathname}" url="${req.url}"`,
-            );
-            res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
-            res.end("Not Found");
+            const bufferedBody = (
+              req as IncomingMessage & {
+                [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+              }
+            )[NEXT_REQUEST_META]?.actionBody;
+            await serveNotFound(handlerLoader, localHandlerInvoker, staticAssets, req, res, bufferedBody);
             return;
           }
 

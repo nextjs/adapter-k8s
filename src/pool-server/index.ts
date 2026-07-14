@@ -19,6 +19,7 @@ import {
 import { createHandlerLoader } from "./handler-loader.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
+import { nextStaticAssetHeaders } from "../static-asset-headers.js";
 import { createPoolServer } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
@@ -496,6 +497,20 @@ async function main() {
   // Allowlist for external /_next/image sources (SSRF guard).
   const imageConfig = loadImageConfig(process.cwd());
 
+  // A path-based assetPrefix (e.g. "/assets") prefixes `_next/static` URLs; strip it so those
+  // requests are served/404'd like un-prefixed ones. (URL assetPrefixes point at a separate host,
+  // so those requests never reach the pool.)
+  let assetPrefix = "";
+  try {
+    const rsf = JSON.parse(
+      readFileSync(path.join(process.cwd(), ".next", "required-server-files.json"), "utf-8"),
+    );
+    const ap = String(rsf?.config?.assetPrefix ?? "");
+    if (ap.startsWith("/")) assetPrefix = ap.replace(/\/$/, "");
+  } catch {
+    // no assetPrefix
+  }
+
   // Set preview/draft mode env vars from prerender manifest.
   // The web adapter reads these via getEdgePreviewProps() — without them,
   // middleware invocation crashes with "previewProps missing previewModeId".
@@ -593,6 +608,21 @@ async function main() {
     // Edge sandbox not available
   }
 
+  // The edge sandbox loads an entry's WASM/asset bindings by their `filePath`, but the middleware
+  // manifest stores those relative to distDir — and the sandbox resolves them against the pool's
+  // CWD, not .next/. Left relative, `next/og`'s yoga/resvg WASM fails with ENOENT and the handler
+  // 500s. Absolutize the binding paths so they're found.
+  const resolveEdgeEntryAssets = <T extends { wasm?: unknown[]; assets?: unknown[] }>(entry: T): T => {
+    const abs = (arr?: unknown[]): unknown[] =>
+      (arr ?? []).map((b) => {
+        const binding = b as { filePath?: string };
+        return binding?.filePath
+          ? { ...binding, filePath: path.join(distDir, binding.filePath) }
+          : b;
+      });
+    return { ...entry, wasm: abs(entry.wasm), assets: abs(entry.assets) };
+  };
+
   // App-scoped next/dist/server/body-streams#getCloneableBody. Both the edge
   // sandbox (sandbox.run reads request.body.cloneBodyStream()) and the node
   // middleware web adapter require a POST body to be a CloneableBody, not a raw
@@ -680,7 +710,7 @@ async function main() {
             // checks silently never match.
             nextConfig: manifestNextConfig(routingManifest),
           },
-          edgeFunctionEntry: mwManifestEntry,
+          edgeFunctionEntry: resolveEdgeEntryAssets(mwManifestEntry),
         });
         // Don't let the sandbox's background work surface as an unhandled rejection.
         result.waitUntil?.catch(() => undefined);
@@ -734,7 +764,7 @@ async function main() {
         ...params,
         name: fnEntry.name,
         paths: fnEntry.files.map((f: string) => path.join(distDir, f)),
-        edgeFunctionEntry: fnEntry,
+        edgeFunctionEntry: resolveEdgeEntryAssets(fnEntry),
         request: {
           nextConfig: manifestNextConfig(routingManifest),
           ...params.request,
@@ -849,22 +879,38 @@ async function main() {
 
       // Serve _next/static/* and _next/data/* directly from filesystem.
       // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
-      if (!middlewareCovers && url.pathname.startsWith("/_next/static/")) {
+      const staticPathname =
+        assetPrefix && url.pathname.startsWith(assetPrefix + "/_next/static/")
+          ? url.pathname.slice(assetPrefix.length)
+          : url.pathname;
+      if (!middlewareCovers && staticPathname.startsWith("/_next/static/")) {
         const filePath = path.join(
           process.cwd(),
           ".next",
           "static",
-          url.pathname.slice("/_next/static/".length),
+          staticPathname.slice("/_next/static/".length),
         );
         if (existsSync(filePath)) {
           const content = readFileSync(filePath);
+          // Mirror Next's own server: service workers are revalidated (not immutable) and get
+          // Service-Worker-Allowed; every other _next/static asset is immutable.
+          const { cacheControl, headers } = nextStaticAssetHeaders(
+            staticPathname,
+            routingManifest.basePath ?? "",
+          );
           res.writeHead(200, {
-            "content-type": getContentType(url.pathname),
-            "cache-control": "public, max-age=31536000, immutable",
+            "content-type": getContentType(staticPathname),
+            "cache-control": cacheControl,
+            ...(headers ?? {}),
           });
           res.end(content);
           return;
         }
+        // A missing `/_next/static/*` asset is a plain 404 — these paths are never app routes, so
+        // don't fall through to render the app's (HTML) 404 page. Matches Next's own router-server.
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Not Found");
+        return;
       }
 
       // Pages Router SSG data routes: /_next/data/<buildId>/<page>.json.
@@ -1031,12 +1077,36 @@ async function main() {
           // Try to optimize with Sharp if available
           try {
             const sharp = require("sharp");
-            const optimized = await sharp(imageBuffer)
-              .resize(width || undefined)
-              .jpeg({ quality: quality || 75 })
-              .toBuffer();
+            const q = quality || 75;
+            const accept = String(req.headers["accept"] ?? "");
+            // Negotiate the output format like Next's optimizer: prefer avif/webp when the client
+            // accepts them, otherwise PRESERVE the source format (a PNG stays PNG — do not force
+            // JPEG). Animated/vector formats sharp shouldn't re-encode are passed through as-is.
+            let pipeline = sharp(imageBuffer).resize(width || undefined);
+            let outType: string;
+            if (accept.includes("image/avif")) {
+              pipeline = pipeline.avif({ quality: q });
+              outType = "image/avif";
+            } else if (accept.includes("image/webp")) {
+              pipeline = pipeline.webp({ quality: q });
+              outType = "image/webp";
+            } else if (contentType.includes("png")) {
+              pipeline = pipeline.png();
+              outType = "image/png";
+            } else if (contentType.includes("gif") || contentType.includes("svg")) {
+              res.writeHead(200, {
+                "content-type": contentType,
+                "cache-control": "public, max-age=60, must-revalidate",
+              });
+              res.end(imageBuffer);
+              return;
+            } else {
+              pipeline = pipeline.jpeg({ quality: q });
+              outType = "image/jpeg";
+            }
+            const optimized = await pipeline.toBuffer();
             res.writeHead(200, {
-              "content-type": "image/jpeg",
+              "content-type": outType,
               "cache-control": "public, max-age=60, must-revalidate",
             });
             res.end(optimized);

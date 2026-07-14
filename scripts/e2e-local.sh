@@ -77,6 +77,10 @@ echo "Running tests..."
 cd "$NEXTJS_DIR"
 
 export NEXT_TEST_MODE=deploy
+# Identify as an adapter run. Canary uses this to skip tests it disables for Turbopack adapters
+# (e.g. middleware-rewrites via `skipDeployment: isAdapterTest && isTurbopackTest`), and the harness
+# gates its immutable-assets reporting on it. Without it we wrongly run+fail upstream-disabled tests.
+export NEXT_ENABLE_ADAPTER=1
 export NEXT_E2E_TEST_TIMEOUT=240000
 export NEXT_EXTERNAL_TESTS_FILTERS="$NEXT_TEST_FILTERS"
 export ADAPTER_DIR="$ADAPTER_DIR"

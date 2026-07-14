@@ -40,6 +40,51 @@ describe("buildStaticManifest", () => {
     expect(imm.cacheControl).toBe("public, max-age=31536000, immutable");
   });
 
+  it("serves service workers as mutable with Service-Worker-Allowed (not immutable)", () => {
+    const m = buildStaticManifest(
+      outputs({
+        staticFiles: [
+          {
+            pathname: "/_next/static/service-worker/sw.js",
+            filePath: `${PROJ}/.next/static/service-worker/sw.js`,
+            immutableHash: undefined,
+          },
+        ] as any,
+      }),
+      PROJ,
+    );
+    const sw = m.find((e) => e.pathname === "/_next/static/service-worker/sw.js")!;
+    expect(sw.cacheControl).toBe("public, max-age=0, must-revalidate");
+    expect(sw.cacheControl).not.toContain("immutable");
+    expect(sw.headers).toEqual({ "Service-Worker-Allowed": "/" });
+  });
+
+  it("uses basePath for the service-worker scope when configured", () => {
+    const m = buildStaticManifest(
+      outputs({
+        staticFiles: [
+          { pathname: "/_next/static/service-worker/sw.js", filePath: `${PROJ}/x` },
+        ] as any,
+      }),
+      PROJ,
+      "/app",
+    );
+    expect(m[0]!.headers).toEqual({ "Service-Worker-Allowed": "/app" });
+  });
+
+  it("serves non-content-hashed _next/static assets immutable too (matches Next's server)", () => {
+    const m = buildStaticManifest(
+      outputs({
+        staticFiles: [
+          // _buildManifest.js has a stable name (no immutableHash) but lives under the build-id path
+          { pathname: "/_next/static/BUILDID/_buildManifest.js", filePath: `${PROJ}/x` },
+        ] as any,
+      }),
+      PROJ,
+    );
+    expect(m[0]!.cacheControl).toBe("public, max-age=31536000, immutable");
+  });
+
   // REGRESSION: prerenders must be marked prerender:true so dispatch routes them
   // through the Next handler (ISR/draft/revalidate), and carry the revalidate
   // window. A missing flag would serve stale build files forever.

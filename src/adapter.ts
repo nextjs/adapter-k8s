@@ -280,6 +280,22 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           }),
       };
 
+      // Opt into immutable static assets (Turbopack-only). Next then content-addresses immutable
+      // assets and drops the `?dpl` skew token from their URLs (mutable assets like service workers
+      // keep it), and the adapter serves them per Next's own header policy (see static-asset-headers).
+      // Respect an explicit user opt-out.
+      {
+        const userImmutable = (nextConfig.experimental as { supportsImmutableAssets?: boolean } | undefined)
+          ?.supportsImmutableAssets;
+        // ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS=1 forces it off — used to A/B whether the immutable
+        // asset split regresses client bootstrap (asset URLs move under /_next/static/immutable/).
+        const disabled = process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS === "1";
+        modified.experimental = {
+          ...((modified.experimental as Record<string, unknown>) ?? {}),
+          supportsImmutableAssets: disabled ? false : (userImmutable ?? true),
+        };
+      }
+
       // Local build profile: cap workers and memory for constrained environments
       // (e2e tests, local emulation). Set ADAPTER_K8S_BUILD_CPUS to activate.
       const buildCpus = parseInt(process.env.ADAPTER_K8S_BUILD_CPUS ?? "", 10);
@@ -425,7 +441,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       });
 
       // 3. Build static asset manifest
-      const staticManifest = buildStaticManifest(outputs, projectDir);
+      const staticManifest = buildStaticManifest(outputs, projectDir, nextConfig.basePath ?? "");
 
       // 4. Generate Helm chart
       // Read releaseName from infrastructure.json (written by init) so it matches

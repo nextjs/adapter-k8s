@@ -14,6 +14,7 @@ ADAPTER_DIR="$(cd "$ADAPTER_DIR" && pwd -P)"
 TEST_DIR="$PWD"
 ADAPTER_DIST_INDEX="${ADAPTER_DIR}/dist/index.js"
 ADAPTER_PACK_LOCK_DIR="${ADAPTER_DIR}/.e2e-deploy-pack.lock"
+ADAPTER_PACK_LOCK_OWNER="${ADAPTER_PACK_LOCK_DIR}/owner"
 ADAPTER_PACKAGE_NAME="@next-community/adapter-k8s"
 ADAPTER_PACK_DIR=""
 BUILD_CPUS="${ADAPTER_K8S_BUILD_CPUS:-4}"
@@ -24,6 +25,7 @@ DEPLOY_LOG=".adapter-deploy.log"
 
 cleanup_adapter_pack_lock() {
   if [ "$adapter_pack_lock_acquired" -eq 1 ]; then
+    rm -f "$ADAPTER_PACK_LOCK_OWNER"
     rmdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || true
     adapter_pack_lock_acquired=0
   fi
@@ -64,12 +66,37 @@ trap on_exit EXIT
 exec 2> >(tee -a "$DEPLOY_LOG" >&2)
 
 # --- 1. Pack adapter and install it into the temp app ---
-# Multiple deploy tests can share the same adapter checkout.
-# Serialize pack access so tarball creation sees a consistent dist/ tree.
-for _attempt in $(seq 1 300); do
+# Multiple deploy tests can share the same adapter checkout. Serialize build +
+# pack access so tarball creation sees a consistent dist/ tree. Record the lock
+# owner so an interrupted full-suite run cannot poison every later deployment.
+# A legitimate adapter build can take longer than 30 seconds under c=4, so wait
+# up to ten minutes while a live owner holds the lock.
+for _attempt in $(seq 1 6000); do
   if mkdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$ADAPTER_PACK_LOCK_OWNER"
     adapter_pack_lock_acquired=1
     break
+  fi
+
+  lock_owner="$(cat "$ADAPTER_PACK_LOCK_OWNER" 2>/dev/null || true)"
+  if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+    # Rename first: only one waiter can claim and remove this abandoned lock,
+    # and no waiter can delete a newly acquired lock by mistake.
+    stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
+    if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+      rm -rf "$stale_lock"
+    fi
+  elif [ -z "$lock_owner" ]; then
+    # Older harness versions created ownerless locks. Only reclaim one after it
+    # has remained untouched long enough that its creator cannot still be in
+    # the mkdir-to-owner-file window.
+    lock_age="$(( $(date +%s) - $(stat -c %Y "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || date +%s) ))"
+    if [ "$lock_age" -ge 60 ]; then
+      stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
+      if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+        rm -rf "$stale_lock"
+      fi
+    fi
   fi
   sleep 0.1
 done
@@ -247,10 +274,20 @@ else
 fi
 
 BUILD_ID="$(cat .next/BUILD_ID 2>/dev/null || echo unknown)"
+# Report immutable-asset support from the ACTUAL build output, so the harness's asset-URL/?dpl
+# expectations match what shipped. Next does NOT persist experimental.supportsImmutableAssets into
+# required-server-files.json, so reading the config there always yields undefined→0 even when the
+# HTML references /_next/static/immutable/* (no ?dpl). Detect instead by the immutable artifacts Next
+# emits only when the flag is active for this build: the immutable/ static dir + the hashes manifest.
+if [ -d .next/static/immutable ] || [ -f .next/immutable-static-hashes.json ]; then
+  SUPPORTS_IMMUTABLE=1
+else
+  SUPPORTS_IMMUTABLE=0
+fi
 {
   echo "BUILD_ID: ${BUILD_ID}"
   echo "DEPLOYMENT_ID: ${DEPLOYMENT_ID}"
-  echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: 0"
+  echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: ${SUPPORTS_IMMUTABLE}"
 } > .adapter-build.log
 echo "[adapter-k8s] Built. ID=${BUILD_ID}" >&2
 
