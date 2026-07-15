@@ -28,6 +28,13 @@ export function collectOutputPathnames(outputs: AdapterOutputs): string[] {
     ...outputs.staticFiles,
   ]) {
     pathnames.add(output.pathname);
+    // The Pages Router root page is keyed "/index", but @next/routing matches
+    // the public request path "/". Without "/" in the set it doesn't see the
+    // root as a page, so a catch-all rewrite (`/:path* -> /category/:path*`)
+    // wrongly fires for "/". Add the public alias so the root resolves to itself.
+    if (output.pathname === "/index") {
+      pathnames.add("/");
+    }
   }
 
   if (outputs.middleware) {
@@ -35,6 +42,18 @@ export function collectOutputPathnames(outputs: AdapterOutputs): string[] {
   }
 
   return [...pathnames].sort();
+}
+
+// Wrap each route's baked sourceRegex in an inline case-insensitive group so
+// @next/routing matches rewrite/redirect/header sources the way `next start`
+// does (path-to-regexp `sensitive: false`). The `(?i:…)` modifier keeps named
+// capture groups intact, so dynamic-param extraction is unaffected.
+function caseInsensitiveSources<T extends { sourceRegex: string }>(routes: T[]): T[] {
+  return routes.map((route) =>
+    route.sourceRegex && !route.sourceRegex.startsWith("(?i")
+      ? { ...route, sourceRegex: `(?i:${route.sourceRegex})` }
+      : route,
+  );
 }
 
 export function buildRoutingManifest({
@@ -142,8 +161,13 @@ export function buildRoutingManifest({
     // rsc is inside routeGraph per design doc §5.3
     routeGraph: {
       beforeMiddleware: routing.beforeMiddleware,
-      beforeFiles: routing.beforeFiles,
-      afterFiles: routing.afterFiles,
+      // Rewrites/redirects/headers match case-insensitively in Next (path-to-regexp
+      // `sensitive: false`), but @next/routing compiles the baked sourceRegex with
+      // no flags, so `/Rewrite-1` would miss `/rewrite-1`. Wrap each source in an
+      // inline case-insensitive group so both the pool and the ext_proc routing
+      // service match the way `next start` does. Named capture groups are preserved.
+      beforeFiles: caseInsensitiveSources(routing.beforeFiles),
+      afterFiles: caseInsensitiveSources(routing.afterFiles),
       dynamicRoutes: routing.dynamicRoutes,
       onMatch: routing.onMatch,
       fallback: routing.fallback,

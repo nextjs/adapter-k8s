@@ -227,9 +227,10 @@ export function lookupPool(
 // rule and dropping the query. Prevent both at the source: pre-prefix every
 // unprefixed page path with the locale resolveRoutes would pick, using
 // @next/routing's own exported detection helpers so the logic cannot drift
-// (same skip conditions: /_next/*, /api/*, already-prefixed). Only the
-// no-redirect case is pre-prefixed — when detection would send the visitor to
-// a non-default locale, resolveRoutes must still produce that redirect itself.
+// (same skip conditions: /_next/*, /api/*, already-prefixed). Next performs
+// preferred-locale detection only for the index route; non-root unprefixed
+// pages render in the default locale even when Accept-Language prefers another
+// locale. Only an index request that should redirect is left to resolveRoutes.
 export function prefixRequestLocale(
   url: URL,
   headers: Headers,
@@ -252,8 +253,9 @@ export function prefixRequestLocale(
 
   const domainLocale = detectDomainLocale(i18n.domains as never, url.hostname);
   const defaultLocale = domainLocale?.defaultLocale || i18n.defaultLocale;
+  const isIndex = path === "/" || path === "/index";
   let locale = defaultLocale;
-  if (i18n.localeDetection !== false) {
+  if (isIndex && i18n.localeDetection !== false) {
     locale = detectLocale({
       pathname: path,
       hostname: url.hostname,
@@ -553,14 +555,14 @@ export function preferConcreteOutput(
     // a dynamic template and a concrete output exists for the request path.
     if (!resolvedPathname.includes("[")) return undefined;
   }
-  const candidates = [requestPathname];
+  const candidates = trailingSlashVariants(requestPathname);
   try {
     const decoded = decodeURIComponent(requestPathname);
-    if (decoded !== requestPathname) candidates.push(decoded);
+    if (decoded !== requestPathname) candidates.push(...trailingSlashVariants(decoded));
   } catch {
     // malformed escape — leave as-is
   }
-  for (const c of candidates) {
+  for (const c of new Set(candidates)) {
     if (c !== resolvedPathname && poolAssignments[c]) return c;
   }
   return undefined;

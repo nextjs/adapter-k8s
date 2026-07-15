@@ -35,6 +35,8 @@ export type ResolveResult =
       /** Rewritten path+query to invoke the handler with (middleware/config
        * rewrites). Absent when it equals the original request URL. */
       invokePath?: string | undefined;
+      /** Resolved user query for the documented handler context. */
+      invocationQuery?: Record<string, string | string[]> | undefined;
     }
   | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
   | { kind: "error"; status: number }
@@ -346,8 +348,15 @@ export function createLocalResolver(
         resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname,
         manifest.poolAssignments,
       );
-      // Concrete prerendered outputs win over dynamic templates (decoded lookup).
+      // Concrete outputs win over dynamic templates (decoded lookup). Check the
+      // invocation target first: a rewrite to a concrete page (`/rewrite-1` ->
+      // `/gssp`) makes @next/routing report resolvedPathname `/[slug]` (the
+      // rewrite destination also matches the dynamic route) with an
+      // invocationTarget of `/gssp` — the real page. Preferring the concrete
+      // output for the target routes to `/gssp` instead of the `[slug]` handler.
+      // Fall back to the original request path for the non-rewrite case.
       baseMatchedPathname =
+        preferConcreteOutput(matchedPathname, baseMatchedPathname, manifest.poolAssignments) ??
         preferConcreteOutput(url.pathname, baseMatchedPathname, manifest.poolAssignments) ??
         baseMatchedPathname;
 
@@ -383,7 +392,11 @@ export function createLocalResolver(
       const isDataReq = url.pathname.includes("/_next/data/");
       let invokePath: string | undefined;
       const targetPathRaw = resolution.invocationTarget?.pathname ?? resolution.resolvedPathname;
-      if (targetPathRaw && !isRscReq && !isDataReq) {
+      // An unmatched optional catch-all is represented internally as
+      // `/$nxtP<param>`. It is a routing sentinel, never a handler URL.
+      const hasUnresolvedDynamicSentinel =
+        targetPathRaw?.includes("$nxtP") || /%24nxtP/i.test(targetPathRaw ?? "");
+      if (targetPathRaw && !hasUnresolvedDynamicSentinel && !isRscReq && !isDataReq) {
         let targetPath = targetPathRaw;
         if (prep.addedLocale) {
           const pfx = `/${prep.addedLocale}`;
@@ -391,7 +404,7 @@ export function createLocalResolver(
           else if (targetPath.startsWith(pfx + "/")) targetPath = targetPath.slice(pfx.length);
         }
         const q = resolution.invocationTarget?.query ?? resolution.resolvedQuery;
-        const qs = buildQueryString(q);
+        const qs = buildQueryString(filterInternalQuery(q));
         const candidate = targetPath + qs;
         if (candidate !== prep.originalUrl.pathname + prep.originalUrl.search)
           invokePath = candidate;
@@ -440,13 +453,31 @@ export function createLocalResolver(
         kind: "route",
         pool,
         matchedPathname: finalMatchedPathname,
-        routeMatches: resolution.routeMatches ?? null,
+        routeMatches: sanitizeRouteMatches(resolution.routeMatches),
         resolvedHeaders,
         middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
         invokePath,
+        invocationQuery: filterInternalQuery(
+          resolution.invocationTarget?.query ?? resolution.resolvedQuery,
+        ),
       };
     },
   };
+}
+
+function sanitizeRouteMatches(
+  matches: Record<string, string> | null | undefined,
+): Record<string, string> | null {
+  if (!matches) return null;
+  const unresolvedValues = new Set(
+    Object.values(matches).filter((value) => /^\$nxtP[^/]*$/.test(value)),
+  );
+  if (unresolvedValues.size === 0) return matches;
+
+  const sanitized = Object.fromEntries(
+    Object.entries(matches).filter(([, value]) => !unresolvedValues.has(value)),
+  );
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
 }
 
 // Drop @next/routing internal capture params (dynamic-route captures nxtP*, the
@@ -458,6 +489,8 @@ function filterInternalQuery(
   const out: Record<string, string | string[]> = {};
   for (const [k, v] of Object.entries(query)) {
     if (k.startsWith("nxtP") || k === "_rsc") continue;
+    const values = Array.isArray(v) ? v : [v];
+    if (values.some((value) => /^\$nxtP/.test(value))) continue;
     out[k] = v;
   }
   return out;

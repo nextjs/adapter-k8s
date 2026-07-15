@@ -21,6 +21,17 @@ describe("collectOutputPathnames", () => {
     const result = collectOutputPathnames(outputs);
     expect(result).toEqual(["/", "/_next/static/chunk.js", "/about", "/api/hello"]);
   });
+
+  it("adds the public '/' alias for the Pages Router '/index' root output", () => {
+    const outputs = mockOutputs({
+      appPages: [mockAppPage({ pathname: "/index" }), mockAppPage({ pathname: "/about" })],
+    });
+    const result = collectOutputPathnames(outputs);
+    // both the internal "/index" key and the public "/" the request arrives as
+    expect(result).toContain("/");
+    expect(result).toContain("/index");
+    expect(result).toContain("/about");
+  });
 });
 
 describe("buildRoutingManifest", () => {
@@ -106,6 +117,38 @@ describe("buildRoutingManifest", () => {
     expect(manifest.routeGraph).toBeDefined();
     expect(manifest.pathnames).toContain("/");
     expect(manifest.pathnames).toContain("/api/hello");
+  });
+
+  it("wraps rewrite/redirect sourceRegex case-insensitively (matches next start)", () => {
+    const routing = mockRouting({
+      beforeFiles: [
+        { source: "/redir", sourceRegex: "^\\/redir(?:\\/)?$", destination: "/dest", status: 307 },
+      ],
+      afterFiles: [
+        { source: "/rewrite-1", sourceRegex: "^\\/rewrite-1(?:\\/)?$", destination: "/gssp" },
+      ],
+    });
+    const manifest = buildRoutingManifest({
+      routing,
+      outputs: mockOutputs({}),
+      pools: new Map<string, PoolDefinition>(),
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+
+    const rg = manifest.routeGraph as {
+      afterFiles: Array<{ sourceRegex: string }>;
+      beforeFiles: Array<{ sourceRegex: string }>;
+    };
+    expect(rg.afterFiles[0]!.sourceRegex).toBe("(?i:^\\/rewrite-1(?:\\/)?$)");
+    expect(rg.beforeFiles[0]!.sourceRegex).toBe("(?i:^\\/redir(?:\\/)?$)");
+    // the wrapped regex matches a differently-cased request path
+    expect(new RegExp(rg.afterFiles[0]!.sourceRegex).test("/Rewrite-1")).toBe(true);
+    // named groups + non-source rules are untouched (idempotent, no double-wrap)
+    expect(rg.afterFiles[0]!.sourceRegex.startsWith("(?i:(?i:")).toBe(false);
   });
 
   it("assigns a prerender to its parent route's pool, not the first pool", () => {

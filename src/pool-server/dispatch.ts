@@ -10,6 +10,7 @@ import type { StaticAssetEntry } from "../types.js";
 import {
   INTERNAL_SECRET_HEADER,
   rscParentCandidates,
+  stripBasePath,
   templateOutputCandidates,
   type RscConfig,
 } from "../routing-common.js";
@@ -151,6 +152,7 @@ async function invokeLocalHandlerOverHttp({
   routeMatches,
   bufferedBody,
   invocationPath,
+  invocationQuery,
   forceStatus,
   render404,
   renderError,
@@ -165,6 +167,8 @@ async function invokeLocalHandlerOverHttp({
   /** Concrete internal rewrite target. The loopback request keeps the public URL; this target is
    * supplied through documented request metadata for route params/query resolution. */
   invocationPath?: string;
+  /** Query resolved by @next/routing, excluding internal capture placeholders. */
+  invocationQuery?: Record<string, string | string[]>;
   /** Override the response status regardless of what the handler set — used to make a not-found
    * render return 404 even when the underlying page handler (e.g. Pages Router `/404`) renders 200. */
   forceStatus?: number;
@@ -191,7 +195,9 @@ async function invokeLocalHandlerOverHttp({
             ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
               NEXT_REQUEST_META
             ] as { postponed?: string } | undefined) ?? {};
-          let invocationMeta: Record<string, unknown> = {};
+          let invocationMeta: Record<string, unknown> = invocationQuery
+            ? { query: invocationQuery }
+            : {};
           if (invocationPath) {
             const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
             const query: Record<string, string | string[]> = {};
@@ -205,7 +211,7 @@ async function invokeLocalHandlerOverHttp({
                     : [previous, value];
             }
             invocationMeta = {
-              query,
+              query: invocationQuery ?? query,
               // The documented contract distinguishes the matched route
               // template from the concrete internal invocation target.
               resolvedPathname: matchedPathname,
@@ -337,8 +343,14 @@ async function serveNotFound(
   req: IncomingMessage,
   res: ServerResponse,
   bufferedBody: Buffer | undefined,
+  basePath = "",
 ): Promise<void> {
-  for (const notFoundPath of ["/_not-found", "/404"]) {
+  const notFoundPaths = [
+    ...(basePath ? [`${basePath}/_not-found`, `${basePath}/404`] : []),
+    "/_not-found",
+    "/404",
+  ];
+  for (const notFoundPath of notFoundPaths) {
     if (!handlerLoader.has(notFoundPath)) continue;
     try {
       const handler = await handlerLoader.load(notFoundPath);
@@ -358,7 +370,9 @@ async function serveNotFound(
     }
   }
   // Prerendered Pages Router 404 (static `404.html`) — serve its body with a 404 status.
-  const prerendered404 = staticAssets.find((a) => a.pathname === "/404");
+  const prerendered404 = staticAssets.find(
+    (a) => a.pathname === (basePath ? `${basePath}/404` : "/404") || a.pathname === "/404",
+  );
   if (prerendered404) {
     const fullPath = path.resolve(process.cwd(), prerendered404.filePath);
     if (existsSync(fullPath) && !res.writableEnded) {
@@ -426,6 +440,8 @@ export interface DispatcherOptions {
   incrementalCacheShared?: boolean;
   /** Re-enter the pool request pipeline for Pages API `res.revalidate()` without a network hop. */
   revalidate?: Revalidate;
+  /** Configured public basePath. Output ids and static 404 assets may be basePath-prefixed. */
+  basePath?: string;
 }
 
 export function createDispatcher(options: DispatcherOptions) {
@@ -447,6 +463,7 @@ export function createDispatcher(options: DispatcherOptions) {
     incrementalCacheShared = false,
     checkShellStale,
     revalidate,
+    basePath = "",
   } = options;
 
   // Pages entrypoints call requestMeta.render404 when getStaticProps/getServerSideProps returns
@@ -486,13 +503,22 @@ export function createDispatcher(options: DispatcherOptions) {
       }
     };
 
-    for (const notFoundPath of ["/_not-found", "/404"]) {
+    const notFoundPaths = [
+      ...(basePath ? [`${basePath}/_not-found`, `${basePath}/404`] : []),
+      "/_not-found",
+      "/404",
+    ];
+    for (const notFoundPath of notFoundPaths) {
       if (await renderHandler(notFoundPath)) return;
     }
 
     // A Pages Router custom 404 is commonly fully prerendered and therefore
     // has no runtime handler. It must win over the generic `/_error` function.
-    const prerendered404 = staticAssets.find((asset) => asset.pathname === "/404");
+    const prerendered404 = staticAssets.find(
+      (asset) =>
+        asset.pathname === (basePath ? `${basePath}/404` : "/404") ||
+        asset.pathname === "/404",
+    );
     if (prerendered404) {
       const fullPath = path.resolve(process.cwd(), prerendered404.filePath);
       if (existsSync(fullPath)) {
@@ -558,6 +584,20 @@ export function createDispatcher(options: DispatcherOptions) {
       // listener Node crashes the process. Guard the outer client response up front.
       guardStreamErrors(res);
 
+      // Pages Router uses this response header to interpret middleware data-request
+      // preflights and retain the matched route template. Next's router-server sets
+      // it for both static and dynamic data routes.
+      if (resolution.kind === "route" && req.url) {
+        const requestPathname = new URL(req.url, "http://localhost").pathname;
+        if (requestPathname.startsWith(`${basePath}/_next/data/`)) {
+          const publicMatchedPathname = stripBasePath(resolution.matchedPathname, basePath);
+          res.setHeader(
+            "x-nextjs-matched-path",
+            publicMatchedPathname === "/index" ? "/" : publicMatchedPathname,
+          );
+        }
+      }
+
       // Install writeHead wrapper early to merge resolved headers (from routing/middleware)
       // into ANY response — static assets, handler responses, and 404s (middleware
       // next() headers must reach the response even when no route matches).
@@ -604,6 +644,7 @@ export function createDispatcher(options: DispatcherOptions) {
       let handlerPathname = resolution.kind === "route" ? resolution.matchedPathname : "";
       if (resolution.kind === "route" && !handlerLoader.has(handlerPathname)) {
         const candidates = [
+          ...(basePath && handlerPathname === basePath ? [`${basePath}/index`] : []),
           // Pages Router's root function output is keyed as `/index`, while
           // public requests and prerenders use `/`.
           ...(handlerPathname === "/" ? ["/index"] : []),
@@ -637,6 +678,13 @@ export function createDispatcher(options: DispatcherOptions) {
           (a) =>
             a.pathname === mp ||
             a.pathname === (mp.endsWith("/") ? mp.slice(0, -1) : mp + "/") ||
+            // The Pages Router root prerender is keyed "/index"; a request
+            // resolved to "/" (now that "/" is a recognized page) must find it.
+            (mp === "/" && a.pathname === "/index") ||
+            // Fully-static root outputs may remain keyed as `/` while public
+            // routing resolves the configured basePath root (for example `/docs`).
+            (basePath && mp === basePath && (a.pathname === "/" || a.pathname === "/index")) ||
+            (basePath && mp === basePath && a.pathname === `${basePath}/index`) ||
             // RSC requests: serve the .rsc prerendered payload if available
             (isRSC && a.pathname === mp + ".rsc"),
         );
@@ -659,7 +707,13 @@ export function createDispatcher(options: DispatcherOptions) {
             const headers: Record<string, string | string[]> = Object.assign(
               {
                 "cache-control": staticAsset.cacheControl,
-                "content-type": getContentType(staticAsset.pathname),
+                // Derive the type from the file being served, not the public
+                // route: a prerendered page's pathname is extensionless (e.g.
+                // "/" or "/index"), which getContentType maps to octet-stream —
+                // so the browser downloads the HTML instead of rendering it.
+                // The filePath (".next/server/pages/index.html") carries the
+                // real extension. assetHeaders still overrides when present.
+                "content-type": getContentType(staticAsset.filePath),
               },
               assetHeaders || {},
             );
@@ -772,6 +826,7 @@ export function createDispatcher(options: DispatcherOptions) {
             req,
             res,
             bufferedBody,
+            basePath,
           );
           return;
         }
@@ -783,7 +838,7 @@ export function createDispatcher(options: DispatcherOptions) {
           // render non-generated paths on demand.
           if (strictDynamicRoutes.length > 0) {
             const reqPath = (resolution.invokePath || req.url || "/").split("?")[0] ?? "/";
-            const dataPrefix = `/_next/data/${buildIdForData}/`;
+            const dataPrefix = `${basePath}/_next/data/${buildIdForData}/`;
             const encodedPagePath = reqPath.startsWith(dataPrefix)
               ? "/" + reqPath.slice(dataPrefix.length).replace(/\.json$/, "")
               : reqPath;
@@ -809,6 +864,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 req,
                 res,
                 undefined,
+                basePath,
               );
               return;
             }
@@ -865,6 +921,7 @@ export function createDispatcher(options: DispatcherOptions) {
               req,
               res,
               bufferedBody,
+              basePath,
             );
             return;
           }
@@ -1019,6 +1076,9 @@ export function createDispatcher(options: DispatcherOptions) {
             routeMatches: resolution.routeMatches,
             bufferedBody,
             ...(resolution.invokePath ? { invocationPath: resolution.invokePath } : {}),
+            ...(resolution.invocationQuery
+              ? { invocationQuery: resolution.invocationQuery }
+              : {}),
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
             ...(revalidate ? { revalidate } : {}),

@@ -66,70 +66,85 @@ trap on_exit EXIT
 exec 2> >(tee -a "$DEPLOY_LOG" >&2)
 
 # --- 1. Pack adapter and install it into the temp app ---
-# Multiple deploy tests can share the same adapter checkout. Serialize build +
-# pack access so tarball creation sees a consistent dist/ tree. Record the lock
-# owner so an interrupted full-suite run cannot poison every later deployment.
-# A legitimate adapter build can take longer than 30 seconds under c=4, so wait
-# up to ten minutes while a live owner holds the lock.
-for _attempt in $(seq 1 6000); do
-  if mkdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' "$$" > "$ADAPTER_PACK_LOCK_OWNER"
-    adapter_pack_lock_acquired=1
-    break
+# Fast path: a prebuilt tarball (built + packed ONCE by the run wrapper) is
+# reused across every deploy. This skips the per-deploy `npm run build` +
+# `npm pack` — hundreds of redundant builds across a full suite — and the pack
+# lock that serialized them. It also makes every deploy install the exact
+# published file set, so a missing `files` entry or a dev-only dependency fails
+# uniformly instead of per-fixture. Set ADAPTER_K8S_PREBUILT_TARBALL to enable.
+if [ -n "${ADAPTER_K8S_PREBUILT_TARBALL:-}" ]; then
+  if [ ! -f "$ADAPTER_K8S_PREBUILT_TARBALL" ]; then
+    echo "[adapter-k8s] ADAPTER_K8S_PREBUILT_TARBALL set but missing: ${ADAPTER_K8S_PREBUILT_TARBALL}" >&2
+    exit 1
   fi
-
-  lock_owner="$(cat "$ADAPTER_PACK_LOCK_OWNER" 2>/dev/null || true)"
-  if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
-    # Rename first: only one waiter can claim and remove this abandoned lock,
-    # and no waiter can delete a newly acquired lock by mistake.
-    stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
-    if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
-      rm -rf "$stale_lock"
+  ADAPTER_TARBALL="$ADAPTER_K8S_PREBUILT_TARBALL"
+  echo "[adapter-k8s] Using prebuilt tarball: ${ADAPTER_TARBALL}" >&2
+else
+  # Slow path: build + pack per deploy. Multiple deploy tests can share the same
+  # adapter checkout. Serialize build + pack access so tarball creation sees a
+  # consistent dist/ tree. Record the lock owner so an interrupted full-suite run
+  # cannot poison every later deployment. A legitimate adapter build can take
+  # longer than 30 seconds under c=4, so wait up to ten minutes for a live owner.
+  for _attempt in $(seq 1 6000); do
+    if mkdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "$ADAPTER_PACK_LOCK_OWNER"
+      adapter_pack_lock_acquired=1
+      break
     fi
-  elif [ -z "$lock_owner" ]; then
-    # Older harness versions created ownerless locks. Only reclaim one after it
-    # has remained untouched long enough that its creator cannot still be in
-    # the mkdir-to-owner-file window.
-    lock_age="$(( $(date +%s) - $(stat -c %Y "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || date +%s) ))"
-    if [ "$lock_age" -ge 60 ]; then
+
+    lock_owner="$(cat "$ADAPTER_PACK_LOCK_OWNER" 2>/dev/null || true)"
+    if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+      # Rename first: only one waiter can claim and remove this abandoned lock,
+      # and no waiter can delete a newly acquired lock by mistake.
       stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
       if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
         rm -rf "$stale_lock"
       fi
+    elif [ -z "$lock_owner" ]; then
+      # Older harness versions created ownerless locks. Only reclaim one after it
+      # has remained untouched long enough that its creator cannot still be in
+      # the mkdir-to-owner-file window.
+      lock_age="$(( $(date +%s) - $(stat -c %Y "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || date +%s) ))"
+      if [ "$lock_age" -ge 60 ]; then
+        stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
+        if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+          rm -rf "$stale_lock"
+        fi
+      fi
     fi
+    sleep 0.1
+  done
+
+  if [ "$adapter_pack_lock_acquired" -ne 1 ]; then
+    echo "Timed out waiting for adapter pack lock: ${ADAPTER_PACK_LOCK_DIR}" >&2
+    exit 1
   fi
-  sleep 0.1
-done
 
-if [ "$adapter_pack_lock_acquired" -ne 1 ]; then
-  echo "Timed out waiting for adapter pack lock: ${ADAPTER_PACK_LOCK_DIR}" >&2
-  exit 1
-fi
+  echo "[adapter-k8s] Building adapter package..." >&2
+  (
+    cd "$ADAPTER_DIR"
+    npm run build >&2
+  )
 
-echo "[adapter-k8s] Building adapter package..." >&2
-(
-  cd "$ADAPTER_DIR"
-  npm run build >&2
-)
+  if [ ! -f "$ADAPTER_DIST_INDEX" ]; then
+    echo "[adapter-k8s] Adapter dist build failed; missing ${ADAPTER_DIST_INDEX}" >&2
+    exit 1
+  fi
 
-if [ ! -f "$ADAPTER_DIST_INDEX" ]; then
-  echo "[adapter-k8s] Adapter dist build failed; missing ${ADAPTER_DIST_INDEX}" >&2
-  exit 1
-fi
+  ADAPTER_PACK_DIR="$(mktemp -d /tmp/adapter-k8s-pack-XXXXXX)"
+  PACK_RESULT="$(
+    cd "$ADAPTER_DIR"
+    npm pack --json --ignore-scripts --pack-destination "$ADAPTER_PACK_DIR"
+  )"
+  ADAPTER_TARBALL="$ADAPTER_PACK_DIR/$(
+    node -e "const result = JSON.parse(process.argv[1]); console.log(result[0].filename)" "$PACK_RESULT"
+  )"
+  cleanup_adapter_pack_lock
 
-ADAPTER_PACK_DIR="$(mktemp -d /tmp/adapter-k8s-pack-XXXXXX)"
-PACK_RESULT="$(
-  cd "$ADAPTER_DIR"
-  npm pack --json --ignore-scripts --pack-destination "$ADAPTER_PACK_DIR"
-)"
-ADAPTER_TARBALL="$ADAPTER_PACK_DIR/$(
-  node -e "const result = JSON.parse(process.argv[1]); console.log(result[0].filename)" "$PACK_RESULT"
-)"
-cleanup_adapter_pack_lock
-
-if [ ! -f "$ADAPTER_TARBALL" ]; then
-  echo "[adapter-k8s] Packed tarball missing: ${ADAPTER_TARBALL}" >&2
-  exit 1
+  if [ ! -f "$ADAPTER_TARBALL" ]; then
+    echo "[adapter-k8s] Packed tarball missing: ${ADAPTER_TARBALL}" >&2
+    exit 1
+  fi
 fi
 
 node -e "

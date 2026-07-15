@@ -132,6 +132,34 @@ describe("createDispatcher", () => {
     );
   });
 
+  it("sets the public matched route on basePath data responses", async () => {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(vi.fn()),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      localHandlerInvoker,
+      basePath: "/docs",
+    });
+    const req = mockReq("/docs/_next/data/test123/first.json?path=first");
+    const res = mockRes();
+
+    await dispatcher.dispatch(req, res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/docs/[...path]",
+      routeMatches: { path: "first" },
+      resolvedHeaders: undefined,
+    });
+
+    expect(res._headers["x-nextjs-matched-path"]).toBe("/[...path]");
+  });
+
   it("provides a render404 callback that renders the custom not-found entrypoint", async () => {
     const pageHandler = vi.fn();
     const notFoundHandler = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
@@ -303,6 +331,35 @@ describe("createDispatcher", () => {
 
     await dispatcher.dispatch(req, res as unknown as ServerResponse, resolution);
     expect(res._status).toBe(404);
+  });
+
+  it("uses a basePath-prefixed custom 404 output", async () => {
+    const handler = vi.fn();
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const handlerLoader = {
+      load: vi.fn().mockResolvedValue(handler),
+      has: vi.fn((pathname: string) => pathname === "/docs/404"),
+      get: vi.fn(),
+    } as any;
+    const dispatcher = createDispatcher({
+      handlerLoader,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      basePath: "/docs",
+      localHandlerInvoker,
+    });
+
+    await dispatcher.dispatch(
+      mockReq("/docs/missing"),
+      mockRes() as unknown as ServerResponse,
+      { kind: "not-found" },
+    );
+
+    expect(handlerLoader.load).toHaveBeenCalledWith("/docs/404");
+    expect(localHandlerInvoker).toHaveBeenCalledWith(
+      expect.objectContaining({ matchedPathname: "/docs/404", forceStatus: 404 }),
+    );
   });
 
   it("attempts to invoke edge runtime routes (no longer rejects with 501)", async () => {
@@ -517,6 +574,51 @@ describe("createDispatcher", () => {
       expect(res._headers["content-type"]).toBe("image/x-icon");
       expect(res._headers["cache-control"]).toBe("public, max-age=3600");
       expect(res._ended).toBe(true);
+    });
+
+    it("serves an extensionless handler-less prerender as text/html (not octet-stream download)", async () => {
+      // A pure-static index page (pages/index.js, no getStaticProps) is served
+      // straight from the manifest with no per-asset content-type header. Its
+      // pathname is extensionless ("/index"), so deriving the type from the
+      // pathname yields application/octet-stream and the browser DOWNLOADS the
+      // HTML. The type must come from the .html filePath instead.
+      mkdirSync(path.join(tmpDir, ".next", "server", "pages"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, ".next", "server", "pages", "index.html"),
+        "<!DOCTYPE html><html><body>home</body></html>",
+      );
+
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn(),
+          has: vi.fn().mockReturnValue(false),
+          get: vi.fn(),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index",
+            filePath: ".next/server/pages/index.html",
+            cacheControl: "public, max-age=3600",
+            prerender: true,
+          },
+        ],
+      });
+
+      const req = mockReq("/");
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/index",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._headers["content-type"]).toBe("text/html; charset=utf-8");
+      expect(res._body).toContain("home");
     });
 
     it("serves a prerender fallback with adapter-provided headers", async () => {

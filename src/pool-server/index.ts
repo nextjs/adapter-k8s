@@ -18,6 +18,7 @@ import {
   type RscConfig,
 } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
+import { collectPublicPathnames } from "./public-files.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
@@ -801,6 +802,9 @@ async function main() {
     : undefined;
 
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
+  routingManifest.pathnames = [
+    ...new Set([...routingManifest.pathnames, ...collectPublicPathnames(process.cwd())]),
+  ].sort();
   const resolver = createLocalResolver(
     routingManifest,
     middlewareModule,
@@ -865,6 +869,7 @@ async function main() {
     prerenderedPaths,
     buildIdForData: buildId,
     internalSecret,
+    basePath: routingManifest.basePath ?? "",
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
@@ -970,12 +975,17 @@ async function main() {
     // pathname: GSSP and ISR pages have function outputs keyed by their data
     // URL, and those must go through dispatch so the handler (and its
     // incremental cache) produces the payload.
-    const dataPrefix = `/_next/data/${buildId}/`;
+    const basePath = routingManifest.basePath ?? "";
+    const dataPrefix = `${basePath}/_next/data/${buildId}/`;
     let pagesDataRoutingUrl: URL | undefined;
     if (!middlewareCovers && url.pathname.startsWith(dataPrefix)) {
       const dataPath = url.pathname.slice(dataPrefix.length);
       // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
-      const pagePath = "/" + dataPath.replace(/\.json$/, "");
+      const pagePathWithoutBase = "/" + dataPath.replace(/\.json$/, "");
+      const pagePath =
+        pagePathWithoutBase === "/index"
+          ? basePath || "/"
+          : `${basePath}${pagePathWithoutBase}`;
       const owned =
         handlerLoader.has(url.pathname) ||
         handlerLoader.has(pagePath) ||
@@ -1001,7 +1011,7 @@ async function main() {
         // it negotiates JSON. Keep req.url untouched and use this URL only to
         // locate the owning page/dynamic template.
         pagesDataRoutingUrl = new URL(url);
-        pagesDataRoutingUrl.pathname = pagePath === "/index" ? "/" : pagePath;
+        pagesDataRoutingUrl.pathname = pagePath;
       }
     }
 
@@ -1299,6 +1309,21 @@ async function main() {
       req.method ?? "GET",
       createBufferedStream(bodyBuffer),
     );
+    if (resolution.kind === "route" && !handlerLoader.has(resolution.matchedPathname)) {
+      const resolvedPathname = resolution.invokePath
+        ? new URL(resolution.invokePath, url).pathname
+        : resolution.matchedPathname;
+      const publicRoot = path.join(process.cwd(), "public");
+      const publicFile = resolveWithinRoot(publicRoot, resolvedPathname);
+      if (publicFile && existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
+        res.writeHead(200, {
+          "content-type": getContentType(resolvedPathname),
+          "cache-control": "public, max-age=3600",
+        });
+        res.end(readFileSync(publicFile));
+        return;
+      }
+    }
     await dispatcher.dispatch(req, res, resolution);
   };
 

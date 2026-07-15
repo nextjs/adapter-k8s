@@ -78,6 +78,33 @@ describe("createLocalResolver", () => {
     }
   });
 
+  it("prefers the concrete rewrite destination over a dynamic template that also matches", async () => {
+    // A rewrite `/rewrite-1 -> /gssp` where a `/[slug]` dynamic route also
+    // exists: @next/routing reports resolvedPathname `/[slug]` (the destination
+    // `/gssp` matches the dynamic route too) but invocationTarget `/gssp` — the
+    // real page. The resolver must route to `/gssp`, not the `[slug]` handler.
+    const manifest = makeManifest({
+      pathnames: ["/", "/gssp", "/[slug]"],
+      poolAssignments: { "/gssp": "ssr", "/[slug]": "ssr" },
+    });
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/[slug]",
+      invocationTarget: { pathname: "/gssp", query: { nxtPslug: "gssp" } },
+      routeMatches: { nxtPslug: "gssp" },
+    });
+    const resolver = createLocalResolver(manifest);
+    const result = await resolver.resolve(
+      new URL("http://localhost/rewrite-1"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.matchedPathname).toBe("/gssp");
+    }
+  });
+
   it("returns redirect when resolveRoutes returns redirect", async () => {
     const manifest = makeManifest();
     (resolveRoutes as any).mockResolvedValue({
@@ -473,6 +500,33 @@ describe("createLocalResolver", () => {
       new ReadableStream<Uint8Array>(),
     );
     if (result.kind === "route") expect(result.invokePath).toBeUndefined();
+  });
+
+  it("does not expose unresolved optional catch-all sentinels", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/[[...slug]]"],
+      poolAssignments: { "/[[...slug]]": "ssr" },
+    });
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/[[...slug]]",
+      invocationTarget: { pathname: "/%24nxtPslug", query: { nxtPslug: "$nxtPslug" } },
+      routeMatches: { "1": "$nxtPslug", nxtPslug: "$nxtPslug" },
+    });
+
+    const result = await createLocalResolver(manifest).resolve(
+      new URL("http://localhost/"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.matchedPathname).toBe("/[[...slug]]");
+      expect(result.invokePath).toBeUndefined();
+      expect(result.routeMatches).toBeNull();
+      expect(result.invocationQuery).toEqual({});
+    }
   });
 
   it("emits x-nextjs-rewritten-path/-query for an RSC middleware rewrite", async () => {

@@ -85,12 +85,21 @@ describe("prefixRequestLocale", () => {
     expect(u.pathname).toBe("/base/en/about");
   });
 
-  it("leaves the URL alone when detection picks a non-default locale (resolveRoutes redirects)", () => {
+  it("uses the default locale for non-root paths despite a preferred locale", () => {
     const u = url("/about");
     const headers = new Headers({ cookie: "NEXT_LOCALE=fr" });
     const added = prefixRequestLocale(u, headers, I18N, "");
-    expect(u.pathname).toBe("/about");
-    expect(added).toBeNull();
+    expect(u.pathname).toBe("/en/about");
+    expect(added).toBe("en");
+  });
+
+  it("leaves the index alone when detection picks a non-default locale", () => {
+    for (const pathname of ["/", "/index"]) {
+      const u = url(pathname);
+      const headers = new Headers({ cookie: "NEXT_LOCALE=fr" });
+      expect(prefixRequestLocale(u, headers, I18N, "")).toBeNull();
+      expect(u.pathname).toBe(pathname);
+    }
   });
 
   it("honors the NEXT_LOCALE cookie when it matches the default", () => {
@@ -326,6 +335,10 @@ describe("preferConcreteOutput", () => {
     expect(preferConcreteOutput("/sticks%20%26%20stones", "/[id]", assignments)).toBe(
       "/sticks & stones",
     );
+  });
+
+  it("ignores a request trailing slash when preferring a concrete output", () => {
+    expect(preferConcreteOutput("/plain/", "/[id]", assignments)).toBe("/plain");
   });
 
   it("keeps a non-template resolution even when the request path is an output", () => {
