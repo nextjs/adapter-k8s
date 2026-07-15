@@ -21,10 +21,17 @@ const INTERNAL_RESPONSE_HEADERS = [
   "x-middleware-set-cookie",
 ];
 
+// These two x-middleware-* names are part of the public Pages Router prefetch
+// protocol, not middleware control state. The browser sends `prefetch`; a
+// dynamic handler answers `skip` so the router discards the speculative result.
+const PUBLIC_MIDDLEWARE_REQUEST_HEADERS = new Set(["x-middleware-prefetch"]);
+const PUBLIC_MIDDLEWARE_RESPONSE_HEADERS = new Set(["x-middleware-skip"]);
+
 // True for any internal control header that must never reach the client, whether it
 // arrives via the setHeader-map or as a key in a headers object passed to writeHead.
 function isInternalResponseHeader(name: string): boolean {
   const lower = name.toLowerCase();
+  if (PUBLIC_MIDDLEWARE_RESPONSE_HEADERS.has(lower)) return false;
   return (
     INTERNAL_RESPONSE_HEADERS.includes(lower) ||
     lower.startsWith("x-middleware-request-") ||
@@ -80,10 +87,10 @@ export function createPoolServer(options: PoolServerOptions) {
       }
     }
 
-    // Always strip x-middleware-* from incoming requests — clients must not
-    // be able to spoof middleware control headers (e.g. x-middleware-set-cookie).
+    // Strip private middleware control headers from incoming requests. The
+    // Pages Router's public prefetch hint is deliberately retained.
     for (const h of Object.keys(req.headers)) {
-      if (h.startsWith("x-middleware-")) {
+      if (h.startsWith("x-middleware-") && !PUBLIC_MIDDLEWARE_REQUEST_HEADERS.has(h)) {
         delete req.headers[h];
       }
     }

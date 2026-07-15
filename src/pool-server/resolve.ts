@@ -66,6 +66,7 @@ export function createLocalResolver(
       headers: Headers,
       method: string,
       requestBody: ReadableStream<Uint8Array>,
+      rewriteDepth = 0,
     ): Promise<ResolveResult> {
       let middlewareResponse: Response | null = null;
       // Captures the mutated request headers from responseToMiddlewareResult.
@@ -84,6 +85,12 @@ export function createLocalResolver(
       if (prep.kind === "error") return { kind: "error", status: prep.status };
       if (prep.kind === "redirect") return { kind: "redirect", url: prep.url, status: prep.status };
       url = prep.url;
+      // x-nextjs-data is a client hint, not sufficient proof of a data
+      // request. Next only exposes it to middleware after the URL has matched
+      // the build-scoped /_next/data protocol; accepting it on an arbitrary
+      // document URL makes middleware redirects lose Location.
+      const routingHeaders = new Headers(headers);
+      if (!prep.isDataRequest) routingHeaders.delete("x-nextjs-data");
 
       // A declared middleware policy without an executable implementation is a server error,
       // never an implicit `next()`. This resolver is the security fallback when ext_proc is
@@ -101,7 +108,7 @@ export function createLocalResolver(
         buildId: manifest.buildId,
         basePath: manifest.basePath,
         requestBody,
-        headers,
+        headers: routingHeaders,
         pathnames: manifest.pathnames,
         i18n: (manifest.i18n as any) ?? undefined,
         routes: manifest.routeGraph,
@@ -320,6 +327,49 @@ export function createLocalResolver(
 
       // 3. External rewrite
       if (resolution.externalRewrite) {
+        // @next/routing uses externalRewrite for every middleware rewrite URL,
+        // including same-origin NextResponse.rewrite() targets. Those are an
+        // internal routing continuation, not an HTTP proxy hop: proxying loses
+        // the original Pages data URL and makes the entrypoint render HTML.
+        if (isSameDeploymentRewrite(url, resolution.externalRewrite)) {
+          if (rewriteDepth >= 8) return { kind: "error", status: 508 };
+          const rewritten = await this.resolve(
+            resolution.externalRewrite,
+            middlewareRequestHeaders ?? headers,
+            method,
+            requestBody,
+            rewriteDepth + 1,
+          );
+          if (rewritten.kind !== "route") return rewritten;
+
+          const rewriteQuery = queryFromUrl(resolution.externalRewrite);
+          const resolvedHeaders =
+            mergeHeaders(resolution.resolvedHeaders ?? undefined, rewritten.resolvedHeaders) ??
+            (prep.isDataRequest ? new Headers() : undefined);
+          if (prep.isDataRequest) {
+            resolvedHeaders?.set(
+              "x-nextjs-rewrite",
+              pagesDataRewritePath(resolution.externalRewrite, manifest),
+            );
+          }
+          return {
+            ...rewritten,
+            resolvedHeaders,
+            middlewareRequestHeaders:
+              rewritten.middlewareRequestHeaders ?? middlewareRequestHeaders ?? undefined,
+            // A data request must keep its public /_next/data URL so the Pages
+            // entrypoint emits JSON. Document requests use invocation metadata
+            // to render the internal target while preserving req.url.
+            invokePath: prep.isDataRequest
+              ? undefined
+              : rewritten.invokePath ??
+                resolution.externalRewrite.pathname + resolution.externalRewrite.search,
+            invocationQuery: mergeInvocationQuery(
+              rewriteQuery,
+              rewritten.invocationQuery,
+            ),
+          };
+        }
         return { kind: "external-rewrite", url: resolution.externalRewrite };
       }
 
@@ -389,7 +439,11 @@ export function createLocalResolver(
       // path must carry the rewrite signal, not just the direct render.
       const rscHeader = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc?.header;
       const isRscReq = rscHeader ? headers.get(rscHeader) === "1" : false;
-      const isDataReq = url.pathname.includes("/_next/data/");
+      const isDataReq = prep.isDataRequest;
+      const invocationQuery = mergeInvocationQuery(
+        resolution.resolvedQuery,
+        resolution.invocationTarget?.query,
+      );
       let invokePath: string | undefined;
       const targetPathRaw = resolution.invocationTarget?.pathname ?? resolution.resolvedPathname;
       // An unmatched optional catch-all is represented internally as
@@ -403,8 +457,7 @@ export function createLocalResolver(
           if (targetPath === pfx) targetPath = "/";
           else if (targetPath.startsWith(pfx + "/")) targetPath = targetPath.slice(pfx.length);
         }
-        const q = resolution.invocationTarget?.query ?? resolution.resolvedQuery;
-        const qs = buildQueryString(filterInternalQuery(q));
+        const qs = buildQueryString(invocationQuery);
         const candidate = targetPath + qs;
         if (candidate !== prep.originalUrl.pathname + prep.originalUrl.search)
           invokePath = candidate;
@@ -437,7 +490,7 @@ export function createLocalResolver(
           else if (rwPath.startsWith(pfx + "/")) rwPath = rwPath.slice(pfx.length);
         }
         const rwQs = buildQueryString(
-          filterInternalQuery(resolution.invocationTarget.query ?? resolution.resolvedQuery),
+          invocationQuery,
         );
         const pathChanged = rwPath !== prep.originalUrl.pathname;
         const queryChanged = rwQs !== prep.originalUrl.search;
@@ -457,12 +510,70 @@ export function createLocalResolver(
         resolvedHeaders,
         middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
         invokePath,
-        invocationQuery: filterInternalQuery(
-          resolution.invocationTarget?.query ?? resolution.resolvedQuery,
-        ),
+        invocationQuery,
       };
     },
   };
+}
+
+function mergeInvocationQuery(
+  resolvedQuery: Record<string, string | string[]> | undefined,
+  targetQuery: Record<string, string | string[]> | undefined,
+): Record<string, string | string[]> | undefined {
+  if (!resolvedQuery && !targetQuery) return undefined;
+  return filterInternalQuery({ ...resolvedQuery, ...targetQuery });
+}
+
+function queryFromUrl(url: URL): Record<string, string | string[]> {
+  const query: Record<string, string | string[]> = {};
+  for (const [key, value] of url.searchParams) {
+    const previous = query[key];
+    query[key] =
+      previous === undefined
+        ? value
+        : Array.isArray(previous)
+          ? [...previous, value]
+          : [previous, value];
+  }
+  return query;
+}
+
+/**
+ * Pages Router clients expect middleware rewrite metadata in the same data-URL
+ * namespace as the request. Next's web adapter does this by assigning buildId
+ * to the rewritten NextURL before serializing x-nextjs-rewrite.
+ */
+function pagesDataRewritePath(target: URL, manifest: RoutingManifest): string {
+  let pagePath = target.pathname;
+  if (
+    manifest.basePath &&
+    (pagePath === manifest.basePath || pagePath.startsWith(`${manifest.basePath}/`))
+  ) {
+    pagePath = pagePath.slice(manifest.basePath.length) || "/";
+  }
+  if (pagePath !== "/" && pagePath.endsWith("/")) pagePath = pagePath.slice(0, -1);
+  const dataPath = pagePath === "/" ? "/index" : pagePath;
+  return `${manifest.basePath}/_next/data/${manifest.buildId}${dataPath}.json${target.search}`;
+}
+
+function mergeHeaders(first: Headers | undefined, second: Headers | undefined): Headers | undefined {
+  if (!first && !second) return undefined;
+  const merged = new Headers(first);
+  for (const [key, value] of second ?? []) merged.set(key, value);
+  return merged;
+}
+
+function isSameDeploymentRewrite(requestUrl: URL, rewriteUrl: URL): boolean {
+  if (requestUrl.origin === rewriteUrl.origin) return true;
+  const loopback = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+  const effectivePort = (url: URL) =>
+    url.port || (url.protocol === "https:" ? "443" : url.protocol === "http:" ? "80" : "");
+  return (
+    requestUrl.protocol === rewriteUrl.protocol &&
+    effectivePort(requestUrl) === effectivePort(rewriteUrl) &&
+    loopback.has(requestUrl.hostname) &&
+    loopback.has(rewriteUrl.hostname)
+  );
 }
 
 function sanitizeRouteMatches(

@@ -451,6 +451,20 @@ describe("prepareRequest / normalizeResolvedRedirect (shared orchestration)", ()
     }
   });
 
+  it("normalizes Pages data URLs before trailing-slash rules and middleware", () => {
+    const r = prepareRequest(
+      url("/docs/_next/data/build123/blog/first.json?draft=1"),
+      new Headers({ "x-nextjs-data": "1" }),
+      { buildId: "build123", i18n: null, basePath: "/docs", trailingSlash: true },
+    );
+    expect(r.kind).toBe("ok");
+    if (r.kind === "ok") {
+      expect(r.isDataRequest).toBe(true);
+      expect(r.url.pathname + r.url.search).toBe("/docs/blog/first/?draft=1");
+      expect(r.originalUrl.pathname).toBe("/docs/_next/data/build123/blog/first.json");
+    }
+  });
+
   it("carries resolvedHeaders on rule redirects and strips the added locale", () => {
     const prep = prepareRequest(url("/redirect-1"), new Headers(), manifest);
     if (prep.kind !== "ok") throw new Error("expected ok");

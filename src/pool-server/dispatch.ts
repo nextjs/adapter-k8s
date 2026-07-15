@@ -195,9 +195,14 @@ async function invokeLocalHandlerOverHttp({
             ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
               NEXT_REQUEST_META
             ] as { postponed?: string } | undefined) ?? {};
+          const params = extractRouteParams(matchedPathname, routeMatches);
           let invocationMeta: Record<string, unknown> = invocationQuery
             ? { query: invocationQuery }
             : {};
+          if (params) invocationMeta.params = params;
+          if (new URL(req.url ?? "/", "http://localhost").pathname.includes("/_next/data/")) {
+            invocationMeta.isNextDataReq = true;
+          }
           if (invocationPath) {
             const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
             const query: Record<string, string | string[]> = {};
@@ -211,6 +216,7 @@ async function invokeLocalHandlerOverHttp({
                     : [previous, value];
             }
             invocationMeta = {
+              ...invocationMeta,
               query: invocationQuery ?? query,
               // The documented contract distinguishes the matched route
               // template from the concrete internal invocation target.
@@ -328,6 +334,42 @@ async function invokeLocalHandlerOverHttp({
       }
     });
   });
+}
+
+function extractRouteParams(
+  matchedPathname: string,
+  routeMatches: Record<string, string> | null,
+): Record<string, string | string[]> | undefined {
+  if (!routeMatches) return undefined;
+  const params: Record<string, string | string[]> = {};
+  for (const match of matchedPathname.matchAll(/\[\[?\.\.\.([^\]]+)\]\]?|\[([^\]]+)\]/g)) {
+    const name = match[1] ?? match[2];
+    if (!name) continue;
+    const value = routeMatches[name] ?? routeMatches[`nxtP${name}`];
+    if (value === undefined || /^\$nxtP/.test(value)) continue;
+    params[name] = match[1]
+      ? value.split("/").map((segment) => {
+          try {
+            return decodeURIComponent(segment);
+          } catch {
+            return segment;
+          }
+        })
+      : value;
+  }
+  return Object.keys(params).length > 0 ? params : undefined;
+}
+
+function pagesDataPathToPagePath(
+  pathname: string,
+  basePath: string,
+  buildId: string,
+): string | null {
+  const prefix = `${basePath}/_next/data/${buildId}/`;
+  if (!pathname.startsWith(prefix) || !pathname.endsWith(".json")) return null;
+  const dataPath = pathname.slice(prefix.length, -".json".length);
+  const pagePath = dataPath === "index" ? "/" : `/${dataPath}`;
+  return `${basePath}${pagePath === "/" ? "" : pagePath}` || "/";
 }
 
 type LocalHandlerInvoker = typeof invokeLocalHandlerOverHttp;
@@ -587,15 +629,14 @@ export function createDispatcher(options: DispatcherOptions) {
       // Pages Router uses this response header to interpret middleware data-request
       // preflights and retain the matched route template. Next's router-server sets
       // it for both static and dynamic data routes.
-      if (resolution.kind === "route" && req.url) {
-        const requestPathname = new URL(req.url, "http://localhost").pathname;
-        if (requestPathname.startsWith(`${basePath}/_next/data/`)) {
+      const requestPathname = req.url ? new URL(req.url, "http://localhost").pathname : "";
+      const isPagesDataRequest = requestPathname.startsWith(`${basePath}/_next/data/`);
+      if (resolution.kind === "route" && isPagesDataRequest) {
           const publicMatchedPathname = stripBasePath(resolution.matchedPathname, basePath);
           res.setHeader(
             "x-nextjs-matched-path",
             publicMatchedPathname === "/index" ? "/" : publicMatchedPathname,
           );
-        }
       }
 
       // Install writeHead wrapper early to merge resolved headers (from routing/middleware)
@@ -662,6 +703,45 @@ export function createDispatcher(options: DispatcherOptions) {
         }
       }
       const hasHandler = resolution.kind === "route" && handlerLoader.has(handlerPathname);
+
+      // Pages Router marks speculative middleware data requests explicitly. A
+      // dynamic page must not run GSSP during that prefetch: Next returns an
+      // empty, non-cacheable result with x-middleware-skip so the client will
+      // perform the real request on navigation. In adapter/minimal mode the
+      // generated entrypoint can classify the rewritten data URL as SSG, so
+      // enforce the documented router protocol at the dispatch boundary where
+      // the prerender inventory is authoritative.
+      if (
+        resolution.kind === "route" &&
+        isPagesDataRequest &&
+        req.headers["x-middleware-prefetch"]
+      ) {
+        const rewrittenDataPath = resolution.resolvedHeaders?.get("x-nextjs-rewrite");
+        const dataPagePath = pagesDataPathToPagePath(
+          rewrittenDataPath
+            ? new URL(rewrittenDataPath, "http://localhost").pathname
+            : requestPathname,
+          basePath,
+          buildIdForData || buildId,
+        );
+        const isPrerendered =
+          dataPagePath !== null &&
+          staticAssets.some(
+            (asset) =>
+              asset.prerender &&
+              (asset.pathname === dataPagePath ||
+                stripBasePath(asset.pathname, basePath) === stripBasePath(dataPagePath, basePath)),
+          );
+        if (!isPrerendered) {
+          res.writeHead(200, {
+            "x-middleware-skip": "1",
+            "cache-control": "private, no-cache, no-store, max-age=0, must-revalidate",
+            "content-type": "application/json; charset=utf-8",
+          });
+          res.end("{}");
+          return;
+        }
+      }
 
       // 1. Serve static assets from the manifest — build assets, public/ files,
       // and prerenders that have NO handler (fully-static pages-router SSG emits
@@ -934,7 +1014,18 @@ export function createDispatcher(options: DispatcherOptions) {
               if (typeof value === "string") headerObj[key] = value;
               else if (Array.isArray(value)) headerObj[key] = value.join(", ");
             }
+            // Edge Pages/API entrypoints observe the public request pathname,
+            // even after a rewrite, but receive the rewrite-added query. Do
+            // not replace req.url with the internal invocation target.
             const fullUrl = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+            if (resolution.invocationQuery) {
+              for (const [key, value] of Object.entries(resolution.invocationQuery)) {
+                fullUrl.searchParams.delete(key);
+                for (const item of Array.isArray(value) ? value : [value]) {
+                  fullUrl.searchParams.append(key, item);
+                }
+              }
+            }
             const declaredParams = new Set<string>();
             for (const match of handlerPathname.matchAll(
               /\[\[?\.\.\.([^\]]+)\]\]?|\[([^\]]+)\]/g,

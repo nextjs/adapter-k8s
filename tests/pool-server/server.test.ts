@@ -134,6 +134,26 @@ describe("internal header security", () => {
 
       expect(authHeader).toBe("Bearer token123");
     });
+
+    it("preserves the public Pages Router middleware prefetch hint", async () => {
+      let prefetchHeader: string | undefined;
+      let privateHeader: string | undefined;
+      const onRequest = vi.fn((req: IncomingMessage, res: ServerResponse) => {
+        prefetchHeader = req.headers["x-middleware-prefetch"] as string | undefined;
+        privateHeader = req.headers["x-middleware-next"] as string | undefined;
+        res.writeHead(200);
+        res.end("ok");
+      });
+
+      server = createPoolServer({ onRequest, port: 0 });
+      const { port } = await server.start();
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: { "x-middleware-prefetch": "1", "x-middleware-next": "1" },
+      });
+
+      expect(prefetchHeader).toBe("1");
+      expect(privateHeader).toBeUndefined();
+    });
   });
 
   describe("ingress — secret-gated trust", () => {
@@ -221,6 +241,22 @@ describe("internal header security", () => {
   });
 
   describe("egress — stripping internal response headers", () => {
+    it("preserves the public Pages Router middleware prefetch response", async () => {
+      const onRequest = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
+        res.setHeader("x-middleware-skip", "1");
+        res.setHeader("x-middleware-next", "1");
+        res.writeHead(200);
+        res.end("{}");
+      });
+
+      server = createPoolServer({ onRequest, port: 0 });
+      const { port } = await server.start();
+      const res = await fetch(`http://127.0.0.1:${port}/page`);
+
+      expect(res.headers.get("x-middleware-skip")).toBe("1");
+      expect(res.headers.has("x-middleware-next")).toBe(false);
+    });
+
     it("strips x-middleware-* headers from responses", async () => {
       const onRequest = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
         res.setHeader("x-middleware-next", "1");

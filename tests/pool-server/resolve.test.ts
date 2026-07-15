@@ -470,7 +470,11 @@ describe("createLocalResolver", () => {
     const manifest = makeManifest();
     (resolveRoutes as any).mockResolvedValue({
       resolvedPathname: "/blog/[slug]",
-      invocationTarget: { pathname: "/blog/from-middleware", query: { some: "middleware" } },
+      resolvedQuery: { from: "middleware", nxtPslug: "discard-me" },
+      invocationTarget: {
+        pathname: "/blog/from-middleware",
+        query: { some: "middleware", nxtPslug: "from-middleware" },
+      },
       routeMatches: { slug: "from-middleware" },
     });
     const resolver = createLocalResolver(manifest);
@@ -482,7 +486,121 @@ describe("createLocalResolver", () => {
     );
     expect(result.kind).toBe("route");
     if (result.kind === "route") {
-      expect(result.invokePath).toBe("/blog/from-middleware?some=middleware");
+      expect(result.invokePath).toBe(
+        "/blog/from-middleware?from=middleware&some=middleware",
+      );
+      expect(result.invocationQuery).toEqual({ from: "middleware", some: "middleware" });
+    }
+  });
+
+  it("routes Pages data requests using their canonical page URL without redirecting", async () => {
+    const manifest = makeManifest({
+      trailingSlash: true,
+      pathnames: ["/ssr-page"],
+      poolAssignments: { "/ssr-page": "ssr" },
+    });
+    (resolveRoutes as any).mockImplementation(async ({ url }: { url: URL }) => {
+      expect(url.pathname).toBe("/ssr-page/");
+      return {
+        resolvedPathname: "/ssr-page",
+        invocationTarget: { pathname: "/ssr-page", query: {} },
+      };
+    });
+
+    const result = await createLocalResolver(manifest).resolve(
+      new URL("http://localhost/_next/data/test123/ssr-page.json"),
+      new Headers({ "x-nextjs-data": "1" }),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") expect(result.invokePath).toBeUndefined();
+  });
+
+  it("does not expose a spoofed data hint to middleware on a document URL", async () => {
+    const manifest = makeManifest();
+    (resolveRoutes as any).mockImplementation(async ({ headers }: { headers: Headers }) => {
+      expect(headers.has("x-nextjs-data")).toBe(false);
+      return {
+        resolvedPathname: "/redirect-to-somewhere",
+        invocationTarget: { pathname: "/redirect-to-somewhere", query: {} },
+      };
+    });
+
+    await createLocalResolver(manifest).resolve(
+      new URL("http://localhost/redirect-to-somewhere"),
+      new Headers({ "x-nextjs-data": "1" }),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+  });
+
+  it("continues same-origin middleware rewrites without losing the public data request", async () => {
+    const manifest = makeManifest({
+      trailingSlash: true,
+      pathnames: ["/blog/[slug]"],
+      poolAssignments: { "/blog/[slug]": "ssr" },
+    });
+    (resolveRoutes as any)
+      .mockResolvedValueOnce({
+        externalRewrite: new URL("http://localhost/blog/from-middleware/?some=middleware"),
+        resolvedHeaders: new Headers({ "x-first": "yes" }),
+      })
+      .mockResolvedValueOnce({
+        resolvedPathname: "/blog/[slug]",
+        resolvedQuery: { some: "middleware", nxtPslug: "from-middleware" },
+        invocationTarget: {
+          pathname: "/blog/from-middleware/",
+          query: { some: "middleware", nxtPslug: "from-middleware" },
+        },
+        routeMatches: { nxtPslug: "from-middleware" },
+      });
+
+    const result = await createLocalResolver(manifest).resolve(
+      new URL("http://127.0.0.1/_next/data/test123/rewrite.json"),
+      new Headers({ "x-nextjs-data": "1" }),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.matchedPathname).toBe("/blog/[slug]");
+      expect(result.invokePath).toBeUndefined();
+      expect(result.invocationQuery).toEqual({ some: "middleware" });
+      expect(result.resolvedHeaders?.get("x-first")).toBe("yes");
+      expect(result.resolvedHeaders?.get("x-nextjs-rewrite")).toBe(
+        "/_next/data/test123/blog/from-middleware.json?some=middleware",
+      );
+    }
+  });
+
+  it("passes a same-origin middleware rewrite as document invocation metadata", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/about"],
+      poolAssignments: { "/about": "ssr" },
+    });
+    (resolveRoutes as any)
+      .mockResolvedValueOnce({
+        externalRewrite: new URL("http://localhost/about?from=middleware"),
+      })
+      .mockResolvedValueOnce({
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: { from: "middleware" } },
+      });
+
+    const result = await createLocalResolver(manifest).resolve(
+      new URL("http://localhost/public-alias"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.invokePath).toBe("/about?from=middleware");
+      expect(result.invocationQuery).toEqual({ from: "middleware" });
     }
   });
 

@@ -419,6 +419,8 @@ export interface PreparedRequest {
   url: URL;
   /** Untouched request URL — redirect normalization compares against this. */
   originalUrl: URL;
+  /** Whether the public request used the Pages Router /_next/data protocol. */
+  isDataRequest: boolean;
   addedLocale: string | null;
 }
 
@@ -431,6 +433,7 @@ export function prepareRequest(
   requestUrl: URL,
   headers: Headers,
   manifest: {
+    buildId?: string | undefined;
     i18n?: unknown;
     basePath: string;
     trailingSlash?: boolean | undefined;
@@ -449,6 +452,18 @@ export function prepareRequest(
 
   const originalUrl = new URL(requestUrl.toString());
   const url = new URL(requestUrl.toString());
+  const dataPrefix = `${manifest.basePath}/_next/data/${manifest.buildId ?? ""}/`;
+  const isDataRequest = Boolean(
+    manifest.buildId && url.pathname.startsWith(dataPrefix) && url.pathname.endsWith(".json"),
+  );
+  if (isDataRequest) {
+    const dataPath = url.pathname.slice(dataPrefix.length, -".json".length);
+    const pagePath = dataPath === "index" ? "/" : `/${dataPath}`;
+    url.pathname = `${manifest.basePath}${pagePath === "/" ? "" : pagePath}` || "/";
+    if (manifest.trailingSlash && url.pathname !== "/" && !url.pathname.endsWith("/")) {
+      url.pathname += "/";
+    }
+  }
   const addedLocale = prefixRequestLocale(
     url,
     headers,
@@ -456,7 +471,7 @@ export function prepareRequest(
     manifest.basePath,
     manifest.trailingSlash,
   );
-  return { kind: "ok", url, originalUrl, addedLocale };
+  return { kind: "ok", url, originalUrl, isDataRequest, addedLocale };
 }
 
 // Post-resolution redirect handling, shared verbatim by both resolvers:

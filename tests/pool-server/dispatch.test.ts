@@ -160,6 +160,78 @@ describe("createDispatcher", () => {
     expect(res._headers["x-nextjs-matched-path"]).toBe("/[...path]");
   });
 
+  it("bails dynamic Pages middleware prefetches without invoking GSSP", async () => {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(vi.fn()),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      localHandlerInvoker,
+    });
+    const req = mockReq("/_next/data/test123/sha.json?hello=goodbye", {
+      "x-middleware-prefetch": "1",
+    });
+    const res = mockRes();
+
+    await dispatcher.dispatch(req, res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/shallow",
+      routeMatches: null,
+      resolvedHeaders: new Headers({
+        "x-nextjs-rewrite": "/_next/data/test123/shallow.json?hello=goodbye",
+      }),
+    });
+
+    expect(res._status).toBe(200);
+    expect(res._headers["x-middleware-skip"]).toBe("1");
+    expect(res._body).toBe("{}");
+    expect(localHandlerInvoker).not.toHaveBeenCalled();
+  });
+
+  it("does not bail middleware prefetches rewritten to a prerender", async () => {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(vi.fn()),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [
+        {
+          pathname: "/ssg/hello",
+          filePath: ".next/server/pages/ssg/hello.html",
+          cacheControl: "public, max-age=0, must-revalidate",
+          prerender: true,
+        },
+      ],
+      localHandlerInvoker,
+    });
+
+    await dispatcher.dispatch(
+      mockReq("/_next/data/test123/to-ssg.json", { "x-middleware-prefetch": "1" }),
+      mockRes(),
+      {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/ssg/[slug]",
+        routeMatches: { slug: "hello" },
+        resolvedHeaders: new Headers({
+          "x-nextjs-rewrite": "/_next/data/test123/ssg/hello.json",
+        }),
+      },
+    );
+
+    expect(localHandlerInvoker).toHaveBeenCalledOnce();
+  });
+
   it("provides a render404 callback that renders the custom not-found entrypoint", async () => {
     const pageHandler = vi.fn();
     const notFoundHandler = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
@@ -436,6 +508,46 @@ describe("createDispatcher", () => {
     );
     expect(res._status).toBe(200);
     expect(res._body).toBe("ok");
+  });
+
+  it("invokes edge routes with the resolved middleware rewrite URL", async () => {
+    const edgeRouteRunner = vi.fn().mockResolvedValue({
+      response: Response.json({ ok: true }),
+      waitUntil: Promise.resolve(),
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: "edge",
+          type: "PAGES_API",
+          filePath: "/app/.next/server/edge/api.js",
+        }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      edgeRouteRunner,
+    });
+
+    await dispatcher.dispatch(mockReq("/rewrite-me?a=b"), mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/api/edge-search-params",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+      invokePath: "/api/edge-search-params?a=b&foo=bar",
+      invocationQuery: { a: "b", foo: "bar" },
+    });
+
+    expect(edgeRouteRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          url: "http://localhost/rewrite-me?a=b&foo=bar",
+        }),
+      }),
+    );
   });
 
   it("applies middleware-mutated request headers before invoking the handler", async () => {
@@ -1094,7 +1206,7 @@ describe("createDispatcher", () => {
         kind: "route",
         pool: "ssr",
         matchedPathname: "/blog/[slug]",
-        routeMatches: { slug: "post-1" },
+        routeMatches: { nxtPslug: "post-1" },
         resolvedHeaders: undefined,
         invokePath: "/blog/post-1?draft=1",
       });
@@ -1103,6 +1215,7 @@ describe("createDispatcher", () => {
         resolvedPathname: "/blog/[slug]",
         rewrittenPathname: "/blog/post-1",
         query: { draft: "1" },
+        params: { slug: "post-1" },
       });
     });
 
