@@ -1,0 +1,6 @@
+{
+  "/_global-error/page": "/_global-error",
+  "/_not-found/page": "/_not-found",
+  "/edge-catchall/[[...slug]]/route": "/edge-catchall/[[...slug]]",
+  "/page": "/"
+}

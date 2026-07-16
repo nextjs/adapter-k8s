@@ -9,3 +9,5 @@ docs/**
 
 /reports/
 E2E-FAILURE-RUNBOOK.md
+# Adapter build + deploy output (generated per build; machine-local state)
+.k8s-adapter/

@@ -6,7 +6,7 @@ import { createK8sAdapter } from "@next-community/adapter-k8s";
 export default createK8sAdapter({
   pools: {
     default: {
-      routes: ["appPages", "appRoutes", "pagesApi"],
+      routes: ["appPages", "appRoutes", "pages", "pagesApi"],
       scaling: { min: 2, max: 10, targetCPU: 70 },
     },
   },

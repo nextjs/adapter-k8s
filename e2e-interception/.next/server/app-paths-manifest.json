@@ -1,0 +1,7 @@
+{
+  "/[locale]/@modal/(.)[username]/p/[id]/page": "app/[locale]/@modal/(.)[username]/p/[id]/page.js",
+  "/[locale]/[username]/p/[id]/page": "app/[locale]/[username]/p/[id]/page.js",
+  "/[locale]/page": "app/[locale]/page.js",
+  "/_global-error/page": "app/_global-error/page.js",
+  "/_not-found/page": "app/_not-found/page.js"
+}

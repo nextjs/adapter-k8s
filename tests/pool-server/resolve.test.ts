@@ -337,12 +337,21 @@ describe("createLocalResolver", () => {
     const manifest = makeManifest();
     // Direct handler: module has no default function and no default.default.
     // Falls through to path 3: handlerFn(request, { waitUntil }).
-    const directHandler = vi.fn().mockResolvedValue(
-      new Response(null, {
+    let backgroundComplete = false;
+    const directHandler = vi.fn(async (_request: Request, ctx: { waitUntil: Function }) => {
+      ctx.waitUntil(
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            backgroundComplete = true;
+            resolve();
+          }, 5);
+        }),
+      );
+      return new Response(null, {
         status: 200,
         headers: { "x-middleware-next": "1" },
-      }),
-    );
+      });
+    });
 
     (resolveRoutes as any).mockImplementation(async (options: any) => {
       await options.invokeMiddleware({
@@ -378,13 +387,14 @@ describe("createLocalResolver", () => {
         waitUntil: expect.any(Function),
       }),
     );
+    expect(backgroundComplete).toBe(true);
   });
 
   it("prefers the generated handler entrypoint over compatibility default exports", async () => {
     const manifest = makeManifest();
-    const generatedHandler = vi.fn().mockResolvedValue(
-      new Response(null, { headers: { "x-middleware-next": "1" } }),
-    );
+    const generatedHandler = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { headers: { "x-middleware-next": "1" } }));
     const compatibilityDefault = vi.fn();
     (resolveRoutes as any).mockImplementation(async (options: any) => {
       await options.invokeMiddleware({
@@ -547,10 +557,41 @@ describe("createLocalResolver", () => {
     );
     expect(result.kind).toBe("route");
     if (result.kind === "route") {
-      expect(result.invokePath).toBe(
-        "/blog/from-middleware?from=middleware&some=middleware",
-      );
+      expect(result.invokePath).toBe("/blog/from-middleware?from=middleware&some=middleware");
       expect(result.invocationQuery).toEqual({ from: "middleware", some: "middleware" });
+    }
+  });
+
+  it("preserves repeated values in a rewrite destination as a query array", async () => {
+    const manifest = makeManifest({
+      routeGraph: {
+        ...makeManifest().routeGraph,
+        beforeFiles: [
+          {
+            sourceRegex: "^/some-page$",
+            destination: "/?items=1&items=2",
+          },
+        ],
+      },
+    });
+    // @next/routing's current URLSearchParams.set() behavior reports only the final value. The
+    // adapter must restore Next's public Pages query contract from the matched route metadata.
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/",
+      resolvedQuery: { items: "2" },
+      invocationTarget: { pathname: "/", query: { items: "2" } },
+    });
+    const result = await createLocalResolver(manifest).resolve(
+      new URL("http://localhost/some-page"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.invocationQuery).toEqual({ items: ["1", "2"] });
+      expect(result.invokePath).toBe("/?items=1&items=2");
     }
   });
 
@@ -663,6 +704,54 @@ describe("createLocalResolver", () => {
       expect(result.invokePath).toBe("/about?from=middleware");
       expect(result.invocationQuery).toEqual({ from: "middleware" });
     }
+  });
+
+  it("runs middleware once when continuing a same-origin POST rewrite", async () => {
+    vi.mocked(resolveRoutes).mockReset();
+    const middlewareHandler = vi.fn(async (request: Request) => {
+      expect(await request.text()).toBe("action-body");
+      return new Response(null, {
+        headers: { "x-middleware-rewrite": "http://localhost/action-target" },
+      });
+    });
+    (resolveRoutes as any)
+      .mockImplementationOnce(async ({ invokeMiddleware, requestBody, headers, url }: any) => {
+        await invokeMiddleware({ url, requestBody, headers });
+        return { externalRewrite: new URL("http://localhost/action-target") };
+      })
+      .mockImplementationOnce(async ({ invokeMiddleware, requestBody, headers, url }: any) => {
+        // @next/routing calls this hook unconditionally. The resolver must return its already-ran
+        // verdict without re-entering user middleware or touching the locked body stream.
+        await invokeMiddleware({ url, requestBody, headers });
+        return {
+          resolvedPathname: "/action-target",
+          invocationTarget: { pathname: "/action-target", query: {} },
+        };
+      });
+    const resolver = createLocalResolver(
+      makeManifest({
+        pathnames: ["/action-target"],
+        poolAssignments: { "/action-target": "ssr" },
+      }),
+      // Real generated middleware modules also include a compatibility default export.
+      { handler: middlewareHandler, default: vi.fn() },
+    );
+    const body = new TextEncoder().encode("action-body");
+
+    const result = await resolver.resolve(
+      new URL("http://localhost/action-source"),
+      new Headers({ "content-type": "text/plain" }),
+      "POST",
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(body);
+          controller.close();
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("route");
+    expect(middlewareHandler).toHaveBeenCalledOnce();
   });
 
   it("leaves invokePath undefined when the resolved URL equals the request", async () => {

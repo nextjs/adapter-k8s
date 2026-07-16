@@ -3,7 +3,10 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { collectPublicPathnames } from "../../src/pool-server/public-files.js";
+import {
+  collectPublicPathnames,
+  decodePublicPathname,
+} from "../../src/pool-server/public-files.js";
 
 describe("collectPublicPathnames", () => {
   let projectDir: string;
@@ -50,5 +53,11 @@ describe("collectPublicPathnames", () => {
     writeFileSync(path.join(projectDir, "public", "keep.txt"), "x");
 
     expect(collectPublicPathnames(projectDir)).toEqual(["/keep.txt"]);
+  });
+
+  it("decodes a public URL pathname exactly once for filesystem lookup", () => {
+    expect(decodePublicPathname("/hello%20world.jpg")).toBe("/hello world.jpg");
+    expect(decodePublicPathname("/literal%2520name.jpg")).toBe("/literal%20name.jpg");
+    expect(decodePublicPathname("/%zz.jpg")).toBeNull();
   });
 });

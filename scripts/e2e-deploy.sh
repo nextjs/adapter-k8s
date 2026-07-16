@@ -147,21 +147,8 @@ else
   fi
 fi
 
-node -e "
-const fs = require('fs');
-const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-pkg.dependencies = pkg.dependencies || {};
-pkg.dependencies['${ADAPTER_PACKAGE_NAME}'] = 'file:${ADAPTER_TARBALL}';
-// The harness pins typescript to 'latest', which now resolves to the TS 7
-// (native) compiler and crashes next build's TypeScript verification
-// ('The \"id\" argument must be of type string'). Pin to 6.x until Next
-// supports TS 7. Only rewrite 'latest' so fixtures with explicit versions
-// keep them.
-for (const deps of [pkg.dependencies, pkg.devDependencies]) {
-  if (deps?.typescript === 'latest') deps.typescript = '^6';
-}
-fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
-" >&2
+node "$ADAPTER_DIR/scripts/e2e-package-manager.mjs" prepare package.json \
+  "$ADAPTER_PACKAGE_NAME" "$ADAPTER_TARBALL" >&2
 
 # Next's deploy harness aliases NEXT_PRIVATE_TEST_MODE -> __NEXT_TEST_MODE
 # in next.config.js for test-only client/runtime markers.
@@ -184,7 +171,10 @@ if [ -d node_modules ]; then
   mv node_modules "$SEEDED_NODE_MODULES"
 fi
 echo "[adapter-k8s] Installing fixture dependencies..." >&2
-if command -v pnpm &>/dev/null; then
+FIXTURE_PACKAGE_MANAGER="$(node "$ADAPTER_DIR/scripts/e2e-package-manager.mjs" package.json)"
+if [ "$FIXTURE_PACKAGE_MANAGER" = "npm" ]; then
+  npm install --legacy-peer-deps >&2
+elif command -v pnpm &>/dev/null; then
   pnpm install --no-frozen-lockfile >&2
 else
   npm install --legacy-peer-deps >&2
@@ -275,7 +265,9 @@ process.stdout.write(pkg?.scripts?.build ?? '');
 " 2>/dev/null || true)"
 if [ -n "$BUILD_SCRIPT" ]; then
   echo "[adapter-k8s] Using package.json build script: ${BUILD_SCRIPT}" >&2
-  if command -v pnpm &>/dev/null; then
+  if [ "$FIXTURE_PACKAGE_MANAGER" = "npm" ]; then
+    npm run build >&2
+  elif command -v pnpm &>/dev/null; then
     pnpm run build >&2
   else
     npm run build >&2

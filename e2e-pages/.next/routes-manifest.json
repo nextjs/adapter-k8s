@@ -1,0 +1,99 @@
+{
+  "version": 3,
+  "pages404": true,
+  "appType": "pages",
+  "caseSensitive": false,
+  "basePath": "",
+  "redirects": [
+    {
+      "source": "/:path+/",
+      "destination": "/:path+",
+      "locale": false,
+      "internal": true,
+      "priority": true,
+      "statusCode": 308,
+      "regex": "^(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))/$"
+    }
+  ],
+  "headers": [],
+  "onMatchHeaders": [],
+  "rewrites": {
+    "beforeFiles": [],
+    "afterFiles": [],
+    "fallback": []
+  },
+  "dynamicRoutes": [
+    {
+      "page": "/[[...slug]]",
+      "regex": "^(?:/(.+?))?(?:/)?$",
+      "routeKeys": {
+        "nxtPslug": "nxtPslug"
+      },
+      "namedRegex": "^(?:/(?<nxtPslug>.+?))?(?:/)?$"
+    }
+  ],
+  "staticRoutes": [
+    {
+      "page": "/404",
+      "regex": "^/404(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/404(?:/)?$"
+    },
+    {
+      "page": "/500",
+      "regex": "^/500(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/500(?:/)?$"
+    },
+    {
+      "page": "/boom",
+      "regex": "^/boom(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/boom(?:/)?$"
+    },
+    {
+      "page": "/static-vary",
+      "regex": "^/static\\-vary(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/static\\-vary(?:/)?$"
+    }
+  ],
+  "dataRoutes": [
+    {
+      "page": "/static-vary",
+      "dataRouteRegex": "^/_next/data/MCHyQkNY6Xyk\\-VnQxn4g2/static-vary\\.json$"
+    },
+    {
+      "page": "/[[...slug]]",
+      "routeKeys": {
+        "nxtPslug": "nxtPslug"
+      },
+      "dataRouteRegex": "^/_next/data/MCHyQkNY6Xyk\\-VnQxn4g2(?:/(.+?))?\\.json$",
+      "namedDataRouteRegex": "^/_next/data/MCHyQkNY6Xyk\\-VnQxn4g2(?:/(?<nxtPslug>.+?))?\\.json$"
+    }
+  ],
+  "i18n": {
+    "defaultLocale": "en-US",
+    "locales": [
+      "en-US",
+      "fr"
+    ]
+  },
+  "rsc": {
+    "header": "rsc",
+    "varyHeader": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "prefetchHeader": "next-router-prefetch",
+    "didPostponeHeader": "x-nextjs-postponed",
+    "contentTypeHeader": "text/x-component",
+    "suffix": ".rsc",
+    "prefetchSegmentHeader": "next-router-segment-prefetch",
+    "prefetchSegmentSuffix": ".segment.rsc",
+    "prefetchSegmentDirSuffix": ".segments",
+    "clientParamParsing": false,
+    "dynamicRSCPrerender": false
+  },
+  "rewriteHeaders": {
+    "pathHeader": "x-nextjs-rewritten-path",
+    "queryHeader": "x-nextjs-rewritten-query"
+  }
+}

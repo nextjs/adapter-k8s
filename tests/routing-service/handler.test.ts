@@ -181,7 +181,18 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
 
   it("invokes a web-adapter-shaped middleware with { handler, request, page } (not the wrong { request } shape)", async () => {
     // Web-adapter module: default is the adapter fn, `middleware` is the handler fn.
-    const adapterFn = vi.fn().mockResolvedValue({ response: new Response("ok") });
+    let backgroundComplete = false;
+    const adapterFn = vi.fn(async ({ request }: any) => {
+      request.waitUntil(
+        new Promise<void>((resolve) => {
+          setTimeout(() => {
+            backgroundComplete = true;
+            resolve();
+          }, 5);
+        }),
+      );
+      return { response: new Response("ok") };
+    });
     const handlerFn = vi.fn();
     const middlewareModule = { default: adapterFn, middleware: handlerFn };
 
@@ -208,6 +219,7 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
     expect(arg.page).toBe("middleware");
     expect(arg.request).toBeDefined();
     expect(arg.request.url).toContain("/about");
+    expect(backgroundComplete).toBe(true);
     // Because path 1 produced a Response, the direct-handler fallback (path 3) must not run.
     expect(handlerFn).not.toHaveBeenCalled();
   });

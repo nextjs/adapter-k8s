@@ -174,8 +174,15 @@ export function createRequestHandler(
               // evaluated for this request.
               mwEvaluated = "ran";
 
+              const pendingWaitUntil: Promise<void>[] = [];
               const waitUntil = (waitable: Promise<unknown>) => {
-                void waitable.catch(() => undefined);
+                pendingWaitUntil.push(
+                  Promise.resolve(waitable)
+                    .then(() => undefined)
+                    .catch((error) => {
+                      console.error("[routing-service] middleware background work failed:", error);
+                    }),
+                );
               };
 
               // Path 1: Web adapter (default({ handler, request, page }))
@@ -256,8 +263,13 @@ export function createRequestHandler(
                     ? result
                     : result?.response instanceof Response
                       ? result.response
-                      : null;
+                    : null;
               }
+
+              // ext_proc is the platform invocation for Node middleware. Keep it alive until
+              // registered after()/cache work completes so cutover or request teardown cannot
+              // discard side effects; shared cache state itself remains in Valkey.
+              await Promise.all(pendingWaitUntil);
 
               if (response) {
                 middlewareResponse = response;

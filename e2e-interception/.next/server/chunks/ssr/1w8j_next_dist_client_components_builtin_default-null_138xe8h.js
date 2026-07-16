@@ -1,0 +1,3 @@
+module.exports=[20611,(a,b,c)=>{"use strict";Object.defineProperty(c,"__esModule",{value:!0});var d={PARALLEL_ROUTE_DEFAULT_NULL_PATH:function(){return f},default:function(){return g}};for(var e in d)Object.defineProperty(c,e,{enumerable:!0,get:d[e]});let f="next/dist/client/components/builtin/default-null.js";function g(){return null}("function"==typeof c.default||"object"==typeof c.default&&null!==c.default)&&void 0===c.default.__esModule&&(Object.defineProperty(c.default,"__esModule",{value:!0}),Object.assign(c.default,c),b.exports=c.default)},76513,a=>{a.n(a.i(20611))}];
+
+//# sourceMappingURL=1w8j_next_dist_client_components_builtin_default-null_138xe8h.js.map

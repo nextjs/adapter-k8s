@@ -69,6 +69,7 @@ export function createLocalResolver(
       method: string,
       requestBody: ReadableStream<Uint8Array>,
       rewriteDepth = 0,
+      middlewareAlreadyRan = false,
     ): Promise<ResolveResult> {
       let middlewareResponse: Response | null = null;
       // Captures the mutated request headers from responseToMiddlewareResult.
@@ -135,6 +136,12 @@ export function createLocalResolver(
                 // misinterpret the result (sets bodySent=true incorrectly).
 
                 try {
+                  // A same-origin middleware rewrite continues route resolution internally. It
+                  // is still the same request and middleware has already produced its verdict;
+                  // invoking it again both violates Next's single-pass middleware contract and
+                  // attempts to consume the same POST body stream twice (`ReadableStream is
+                  // locked`). Config rewrites continue to resolve normally through @next/routing.
+                  if (middlewareAlreadyRan) return {};
                   // Honor the middleware `matcher` config: skip middleware for
                   // requests it doesn't match (has/missing conditions, source).
                   if (!matchesMiddleware(middlewareMatchers, ctx.url, ctx.headers)) {
@@ -191,8 +198,18 @@ export function createLocalResolver(
 
                     if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
 
+                    const pendingWaitUntil: Promise<void>[] = [];
                     const waitUntil = (waitable: Promise<unknown>) => {
-                      void waitable.catch(() => undefined);
+                      pendingWaitUntil.push(
+                        Promise.resolve(waitable)
+                          .then(() => undefined)
+                          .catch((error) => {
+                            console.error(
+                              "[pool-server] middleware background work failed:",
+                              error,
+                            );
+                          }),
+                      );
                     };
 
                     // Modern adapter builds expose the documented middleware entrypoint as
@@ -314,6 +331,11 @@ export function createLocalResolver(
                             ? result.response
                             : null;
                     }
+
+                    // The response verdict is ready, but the middleware invocation is not done
+                    // until its registered after()/cache work settles. Keep the platform request
+                    // alive; this does not move cache state into process memory.
+                    await Promise.all(pendingWaitUntil);
                   } // end if (!response && middlewareModule)
 
                   if (response) {
@@ -376,6 +398,7 @@ export function createLocalResolver(
             method,
             requestBody,
             rewriteDepth + 1,
+            true,
           );
           if (rewritten.kind !== "route") return rewritten;
 
@@ -399,12 +422,9 @@ export function createLocalResolver(
             // to render the internal target while preserving req.url.
             invokePath: prep.isDataRequest
               ? undefined
-              : rewritten.invokePath ??
-                resolution.externalRewrite.pathname + resolution.externalRewrite.search,
-            invocationQuery: mergeInvocationQuery(
-              rewriteQuery,
-              rewritten.invocationQuery,
-            ),
+              : (rewritten.invokePath ??
+                resolution.externalRewrite.pathname + resolution.externalRewrite.search),
+            invocationQuery: mergeInvocationQuery(rewriteQuery, rewritten.invocationQuery),
           };
         }
         return { kind: "external-rewrite", url: resolution.externalRewrite };
@@ -491,9 +511,10 @@ export function createLocalResolver(
       const rscHeader = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc?.header;
       const isRscReq = rscHeader ? headers.get(rscHeader) === "1" : false;
       const isDataReq = prep.isDataRequest;
-      const invocationQuery = mergeInvocationQuery(
-        resolution.resolvedQuery,
-        resolution.invocationTarget?.query,
+      const invocationQuery = restoreRepeatedRewriteQuery(
+        prep.originalUrl,
+        manifest.routeGraph,
+        mergeInvocationQuery(resolution.resolvedQuery, resolution.invocationTarget?.query),
       );
       let invokePath: string | undefined;
       const targetPathRaw = resolution.invocationTarget?.pathname ?? resolution.resolvedPathname;
@@ -540,9 +561,7 @@ export function createLocalResolver(
           if (rwPath === pfx) rwPath = "/";
           else if (rwPath.startsWith(pfx + "/")) rwPath = rwPath.slice(pfx.length);
         }
-        const rwQs = buildQueryString(
-          invocationQuery,
-        );
+        const rwQs = buildQueryString(invocationQuery);
         const pathChanged = rwPath !== prep.originalUrl.pathname;
         const queryChanged = rwQs !== prep.originalUrl.search;
         if (pathChanged || queryChanged) {
@@ -573,6 +592,60 @@ function mergeInvocationQuery(
 ): Record<string, string | string[]> | undefined {
   if (!resolvedQuery && !targetQuery) return undefined;
   return filterInternalQuery({ ...resolvedQuery, ...targetQuery });
+}
+
+function restoreRepeatedRewriteQuery(
+  requestUrl: URL,
+  routes: RoutingManifest["routeGraph"],
+  query: Record<string, string | string[]> | undefined,
+): Record<string, string | string[]> | undefined {
+  if (!query) return undefined;
+
+  // @next/routing currently applies a rewrite destination with URLSearchParams.set(), which
+  // collapses `?items=1&items=2` to the last value. Next's request contract exposes repeated
+  // destination keys as string[], so reconstruct only keys that (a) are repeated in a rewrite
+  // which matched this public pathname and (b) currently equal that rewrite's final value. The
+  // latter guard prevents an unrelated matching rule from replacing middleware/user query data.
+  const out = { ...query };
+  const candidates = [
+    ...routes.beforeMiddleware,
+    ...routes.beforeFiles,
+    ...routes.afterFiles,
+    ...routes.fallback,
+  ];
+  for (const route of candidates) {
+    if (!route.destination || (route.status && route.status >= 300 && route.status < 400)) continue;
+    let match: RegExpMatchArray | null = null;
+    try {
+      match = requestUrl.pathname.match(new RegExp(route.sourceRegex));
+    } catch {
+      continue;
+    }
+    if (!match) continue;
+
+    let destination = route.destination;
+    for (let index = 1; index < match.length; index++) {
+      const value = match[index];
+      if (value !== undefined) {
+        destination = destination.replaceAll(`$${index}`, () => value);
+      }
+    }
+    for (const [name, value] of Object.entries(match.groups ?? {})) {
+      if (value !== undefined) destination = destination.replaceAll(`$${name}`, () => value);
+    }
+    const rawQuery = destination.split("?", 2)[1];
+    if (!rawQuery) continue;
+    const repeated = new Map<string, string[]>();
+    for (const [key, value] of new URLSearchParams(rawQuery)) {
+      const values = repeated.get(key) ?? [];
+      values.push(value);
+      repeated.set(key, values);
+    }
+    for (const [key, values] of repeated) {
+      if (values.length > 1 && out[key] === values.at(-1)) out[key] = values;
+    }
+  }
+  return out;
 }
 
 function queryFromUrl(url: URL): Record<string, string | string[]> {
@@ -607,7 +680,10 @@ function pagesDataRewritePath(target: URL, manifest: RoutingManifest): string {
   return `${manifest.basePath}/_next/data/${manifest.buildId}${dataPath}.json${target.search}`;
 }
 
-function mergeHeaders(first: Headers | undefined, second: Headers | undefined): Headers | undefined {
+function mergeHeaders(
+  first: Headers | undefined,
+  second: Headers | undefined,
+): Headers | undefined {
   if (!first && !second) return undefined;
   const merged = new Headers(first);
   for (const [key, value] of second ?? []) merged.set(key, value);

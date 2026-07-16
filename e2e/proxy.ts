@@ -12,6 +12,28 @@ export function proxy(request: NextRequest) {
     });
   }
 
+  if (pathname === "/rsc-redirect-origin") {
+    return NextResponse.redirect(new URL("/rewritten", request.url));
+  }
+
+  if (pathname === "/api/rewrite-body-source") {
+    // Deliberately rewrite a body-bearing request to itself. The adapter must continue routing
+    // without invoking middleware a second time: Web request bodies are single-consumer streams,
+    // and a second middleware pass would fail with `ReadableStream is locked` before the route
+    // handler can read the payload. This probe covers the Server Action rewrite failure mode with
+    // a stable action-independent HTTP contract.
+    return NextResponse.rewrite(request.nextUrl.clone());
+  }
+
+  if (pathname === "/middleware-cache-probe.txt") {
+    const response = NextResponse.next();
+    // This is an explicit app-owned cache decision used to verify response-header precedence.
+    // It is intentionally confined to this probe: middleware-matched routes without an explicit
+    // safe policy remain no-cache because GXLB runs this traffic extension after Cloud CDN.
+    response.headers.set("cache-control", "max-age=2345");
+    return response;
+  }
+
   let response: NextResponse;
   if (pathname === "/from-mw") {
     const url = request.nextUrl.clone();
@@ -27,4 +49,6 @@ export function proxy(request: NextRequest) {
   return response;
 }
 
-export const config = { matcher: ["/((?!_next/static|_next/image|favicon.ico|cdn-probe.txt).*)"] };
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|cdn-probe.txt|header-priority.txt).*)"],
+};

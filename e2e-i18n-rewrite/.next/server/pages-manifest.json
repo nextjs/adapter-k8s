@@ -1,0 +1,10 @@
+{
+  "/[...slug]": "pages/[...slug].js",
+  "/_app": "pages/_app.js",
+  "/_document": "pages/_document.js",
+  "/_error": "pages/_error.js",
+  "/en/404": "pages/en/404.html",
+  "/nl-NL/404": "pages/nl-NL/404.html",
+  "/en/500": "pages/en/500.html",
+  "/nl-NL/500": "pages/nl-NL/500.html"
+}

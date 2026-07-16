@@ -23,9 +23,13 @@ import { cdnCacheTag } from "../cdn-tags.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
+import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
+import { decodePublicPathname } from "./public-files.js";
+import { resizeForRequestedWidth } from "./image-utils.js";
 import { createPoolServer } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
+import { forcedCdnCacheControl } from "./cache-policy.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -726,8 +730,13 @@ async function main() {
           },
           edgeFunctionEntry: resolveEdgeEntryAssets(mwManifestEntry),
         });
-        // Don't let the sandbox's background work surface as an unhandled rejection.
-        result.waitUntil?.catch(() => undefined);
+        // Keep the middleware invocation alive through after()/cache side effects. The routing
+        // verdict is already available, but returning before this promise settles lets a platform
+        // terminate the request context and lose the work. This is lifecycle ownership, not cache
+        // storage: Valkey remains the shared middle cache in production.
+        await result.waitUntil?.catch((error) => {
+          console.error("[pool-server] edge middleware background work failed:", error);
+        });
         return result.response;
       };
       console.log(`Edge middleware sandbox ready (name=${mwName}, files=${mwFiles.length})`);
@@ -803,8 +812,7 @@ async function main() {
   // Node-runtime `proxy.ts`, which left middlewareMatchers `undefined` → matchesMiddleware
   // fail-broad-covered EVERY request (incl. `_next/static`) → every response forced `no-cache`
   // → the CDN cached nothing. The routing manifest carries matchers for both node and edge.
-  const middlewareMatchers: MiddlewareMatcher[] | undefined =
-    routingManifest.middleware?.matchers;
+  const middlewareMatchers: MiddlewareMatcher[] | undefined = routingManifest.middleware?.matchers;
 
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
   routingManifest.pathnames = [
@@ -860,6 +868,13 @@ async function main() {
       throw new Error(`Invalid revalidate response ${mocked.res.statusCode} for ${urlPath}`);
     }
   };
+  // Next's local deploy-test harness (NEXT_ENABLE_ADAPTER=1) has neither Cloud CDN nor Valkey, so
+  // it stands in Next's built-in filesystem cache for the platform cache and expects `next start`
+  // response headers. This is E2E-only and MUST NOT be true in a real deployment — the second guard
+  // (no VALKEY_URL) ensures production, which always sets it, never takes these branches. Single
+  // source of truth so the three safety-critical flags below can never diverge.
+  const emulateNextServer =
+    process.env.NEXT_ENABLE_ADAPTER === "1" && process.env.VALKEY_URL === undefined;
   const dispatcher = createDispatcher({
     handlerLoader,
     poolName,
@@ -875,6 +890,7 @@ async function main() {
     buildIdForData: buildId,
     internalSecret,
     basePath: routingManifest.basePath ?? "",
+    i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
@@ -882,8 +898,11 @@ async function main() {
     // platform PPR-shell cache and exercise shell upgrades/RDC end to end. Production deliberately
     // does NOT take this branch: cache entries that are unsafe for Cloud CDN belong in Valkey via
     // the registered cacheHandler, never in process-local memory or an ephemeral pod filesystem.
-    entrypointOwnsPprShell:
-      process.env.NEXT_ENABLE_ADAPTER === "1" && process.env.VALKEY_URL === undefined,
+    entrypointOwnsPprShell: emulateNextServer,
+    // Explicit E2E-only stand-in for classic Pages fallback:true cache orchestration: serve the
+    // build shell on the first miss, then let Next's filesystem cache return the materialized page.
+    // NEVER use this with Valkey or in production; shared cache state cannot live in one pod.
+    emulatePlatformCache: emulateNextServer,
     // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
     // revalidateTag invalidate a PPR shell by checking its baked tags against the shared manifest.
     ...(valkeyHandler
@@ -928,7 +947,11 @@ async function main() {
     //     verdict can change), so they must revalidate — `no-cache` (App Hosting model).
     // `no-store` wins when a route is both PPR and middleware-matched.
     const isPprRoute = req.headers["x-nextjs-ppr"] === "1";
-    const forcedCacheControl = isPprRoute ? "no-store" : middlewareCovers ? "no-cache" : null;
+    const forcedCacheControl = forcedCdnCacheControl({
+      isPprRoute,
+      middlewareCovers,
+      emulateNextServer,
+    });
     if (forcedCacheControl) {
       const originalWriteHead = res.writeHead.bind(res);
       res.writeHead = function forceCacheControl(...args: unknown[]) {
@@ -971,12 +994,20 @@ async function main() {
           staticPathname,
           routingManifest.basePath ?? "",
         );
-        res.writeHead(200, {
+        const etag = staticAssetEtag(content);
+        const responseHeaders = {
           "content-type": getContentType(staticPathname),
           "cache-control": cacheControl,
+          etag,
           ...(headers ?? {}),
-        });
-        res.end(content);
+        };
+        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
+          res.writeHead(304, responseHeaders);
+          res.end();
+          return;
+        }
+        res.writeHead(200, responseHeaders);
+        res.end(req.method === "HEAD" ? undefined : content);
         return;
       }
       // A missing `/_next/static/*` asset is a plain 404 — these paths are never app routes, so
@@ -1000,9 +1031,7 @@ async function main() {
       // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
       const pagePathWithoutBase = "/" + dataPath.replace(/\.json$/, "");
       const pagePath =
-        pagePathWithoutBase === "/index"
-          ? basePath || "/"
-          : `${basePath}${pagePathWithoutBase}`;
+        pagePathWithoutBase === "/index" ? basePath || "/" : `${basePath}${pagePathWithoutBase}`;
       const owned =
         handlerLoader.has(url.pathname) ||
         handlerLoader.has(pagePath) ||
@@ -1082,17 +1111,23 @@ async function main() {
         if (imageUrl.startsWith("/")) {
           // Internal image: read from filesystem. Confine the path to public/ or
           // .next/static/ — a raw `?url=/../../etc/passwd` must not traverse out.
+          const decodedImagePath = decodePublicPathname(imageUrl);
+          if (decodedImagePath === null) {
+            res.writeHead(400, { "content-type": "text/plain" });
+            res.end("Bad Request: malformed image path");
+            return;
+          }
           const publicRoot = path.join(process.cwd(), "public");
           const staticRoot = path.join(process.cwd(), ".next", "static");
-          const publicFile = resolveWithinRoot(publicRoot, imageUrl);
-          const staticFile = imageUrl.startsWith("/_next/static/")
-            ? resolveWithinRoot(staticRoot, imageUrl.slice("/_next/static/".length))
+          const publicFile = resolveWithinRoot(publicRoot, decodedImagePath);
+          const staticFile = decodedImagePath.startsWith("/_next/static/")
+            ? resolveWithinRoot(staticRoot, decodedImagePath.slice("/_next/static/".length))
             : null;
 
           // A null result means the path escaped its root — reject traversal.
           if (
             publicFile === null ||
-            (imageUrl.startsWith("/_next/static/") && staticFile === null)
+            (decodedImagePath.startsWith("/_next/static/") && staticFile === null)
           ) {
             res.writeHead(400, { "content-type": "text/plain" });
             res.end("Bad Request: invalid image path");
@@ -1129,7 +1164,7 @@ async function main() {
             }
             imageBuffer = streamedBody;
           }
-          contentType = getContentType(imageUrl);
+          contentType = getContentType(decodedImagePath);
         } else {
           // External image: only fetch allowlisted http(s) hosts, and only after
           // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
@@ -1164,7 +1199,7 @@ async function main() {
           // Negotiate the output format like Next's optimizer: prefer avif/webp when the client
           // accepts them, otherwise PRESERVE the source format (a PNG stays PNG — do not force
           // JPEG). Animated/vector formats sharp shouldn't re-encode are passed through as-is.
-          let pipeline = sharp(imageBuffer).resize(width || undefined);
+          let pipeline = resizeForRequestedWidth(sharp(imageBuffer), width || undefined);
           let outType: string;
           if (accept.includes("image/avif")) {
             pipeline = pipeline.avif({ quality: q });
@@ -1218,17 +1253,28 @@ async function main() {
       !url.pathname.startsWith("/_next/") &&
       !url.pathname.startsWith("/api/")
     ) {
-      const publicPath = path.join(process.cwd(), "public", url.pathname);
-      if (existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
+      const decodedPublicPathname = decodePublicPathname(url.pathname);
+      const publicPath = decodedPublicPathname
+        ? resolveWithinRoot(path.join(process.cwd(), "public"), decodedPublicPathname)
+        : null;
+      if (publicPath && existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
         const content = readFileSync(publicPath);
-        res.writeHead(200, {
-          "content-type": getContentType(url.pathname),
+        const etag = staticAssetEtag(content);
+        const responseHeaders = {
+          "content-type": getContentType(decodedPublicPathname!),
           "cache-control": "public, max-age=3600",
+          etag,
           // Mutable public file cached at the CDN — tag it so a deploy/rollback can invalidate
           // the outgoing build's copy (its content can change at the same URL across builds).
           ...cdnCacheTag("public, max-age=3600", buildId),
-        });
-        res.end(content);
+        };
+        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
+          res.writeHead(304, responseHeaders);
+          res.end();
+          return;
+        }
+        res.writeHead(200, responseHeaders);
+        res.end(req.method === "HEAD" ? undefined : content);
         return;
       }
     }
@@ -1334,14 +1380,26 @@ async function main() {
         ? new URL(resolution.invokePath, url).pathname
         : resolution.matchedPathname;
       const publicRoot = path.join(process.cwd(), "public");
-      const publicFile = resolveWithinRoot(publicRoot, resolvedPathname);
+      const decodedResolvedPathname = decodePublicPathname(resolvedPathname);
+      const publicFile = decodedResolvedPathname
+        ? resolveWithinRoot(publicRoot, decodedResolvedPathname)
+        : null;
       if (publicFile && existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
-        res.writeHead(200, {
-          "content-type": getContentType(resolvedPathname),
+        const content = readFileSync(publicFile);
+        const etag = staticAssetEtag(content);
+        const responseHeaders = {
+          "content-type": getContentType(decodedResolvedPathname!),
           "cache-control": "public, max-age=3600",
+          etag,
           ...cdnCacheTag("public, max-age=3600", buildId),
-        });
-        res.end(readFileSync(publicFile));
+        };
+        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
+          res.writeHead(304, responseHeaders);
+          res.end();
+          return;
+        }
+        res.writeHead(200, responseHeaders);
+        res.end(req.method === "HEAD" ? undefined : content);
         return;
       }
     }

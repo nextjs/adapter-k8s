@@ -1,0 +1,1 @@
+self.__INTERCEPTION_ROUTE_REWRITE_MANIFEST="[{\"source\":\"/:nxtPlocale/:nxtIusername/p/:nxtPid\",\"destination\":\"/:nxtPlocale/(.):nxtIusername/p/:nxtPid\",\"has\":[{\"type\":\"header\",\"key\":\"next-url\",\"value\":\"/(?<nxtPlocale>[^/]+?)(?:/.*)?\"}],\"regex\":\"^/(?<nxtPlocale>[^/]+?)/(?<nxtIusername>[^/]+?)/p/(?<nxtPid>[^/]+?)(?:/)?$\"}]";

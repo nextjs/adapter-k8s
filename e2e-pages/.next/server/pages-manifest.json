@@ -1,0 +1,10 @@
+{
+  "/404": "pages/404.js",
+  "/500": "pages/500.js",
+  "/[[...slug]]": "pages/[[...slug]].js",
+  "/_app": "pages/_app.js",
+  "/_document": "pages/_document.js",
+  "/_error": "pages/_error.js",
+  "/boom": "pages/boom.js",
+  "/static-vary": "pages/static-vary.js"
+}

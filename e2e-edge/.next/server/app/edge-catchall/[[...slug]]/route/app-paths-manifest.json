@@ -1,0 +1,3 @@
+{
+  "/edge-catchall/[[...slug]]/route": "app-edge-has-no-entrypoint"
+}

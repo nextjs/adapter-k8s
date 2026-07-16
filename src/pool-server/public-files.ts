@@ -2,6 +2,18 @@
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 
+export function decodePublicPathname(pathname: string): string | null {
+  try {
+    // URL.pathname remains percent-encoded. Filesystem lookup must decode exactly once: an image
+    // optimizer URL contains `/hello%20world.jpg` after its outer query decoding, and the staged
+    // file is literally `public/hello world.jpg`. A second decode would corrupt literal `%20`
+    // filenames; resolveWithinRoot remains responsible for rejecting decoded traversal.
+    return decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+}
+
 // @next/routing resolves rewrites against a filesystem pathname set. Next's
 // adapter outputs don't enumerate files from public/, so without augmenting the
 // set a valid rewrite such as `/files/:path* -> /:path*` is discarded before

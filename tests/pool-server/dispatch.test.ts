@@ -1,6 +1,11 @@
 // tests/pool-server/dispatch.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { createDispatcher, getContentType } from "../../src/pool-server/dispatch.js";
+import {
+  createDispatcher,
+  extractRouteParams,
+  getContentType,
+  pagesDataRequestPathnameToPagePath,
+} from "../../src/pool-server/dispatch.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
@@ -51,6 +56,30 @@ function mockRes(): ServerResponse & {
 }
 
 describe("createDispatcher", () => {
+  it("keeps Pages data protocol segments out of optional catch-all params", () => {
+    const rootPath = pagesDataRequestPathnameToPagePath("/_next/data/build123/index.json");
+    const nestedPath = pagesDataRequestPathnameToPagePath("/docs/_next/data/build123/one/two.json");
+    const localizedRootPath = pagesDataRequestPathnameToPagePath("/_next/data/build123/fr.json", [
+      "en-US",
+      "fr",
+    ]);
+
+    expect(rootPath).toBe("/");
+    expect(extractRouteParams("/[[...slug]]", null, rootPath!)).toBeUndefined();
+    expect(nestedPath).toBe("/docs/one/two");
+    expect(extractRouteParams("/docs/[[...slug]]", null, nestedPath!)).toEqual({
+      slug: ["one", "two"],
+    });
+    expect(localizedRootPath).toBe("/");
+    expect(extractRouteParams("/[[...slug]]", null, localizedRootPath!)).toBeUndefined();
+  });
+
+  it("extracts an i18n catch-all from the concrete rewritten prerender path", () => {
+    expect(
+      extractRouteParams("/en/[...slug]", { nextInternalLocale: "en" }, "/en/company/about-us"),
+    ).toEqual({ slug: ["company", "about-us"] });
+  });
+
   it("dispatches route to handler", async () => {
     const handler = vi.fn();
     const revalidate = vi.fn().mockResolvedValue(undefined);
@@ -320,6 +349,85 @@ describe("createDispatcher", () => {
     expect(res._body).toBe("custom pages/500");
   });
 
+  it("renders a Pages 404 through /_error with invokeStatus when no /404 output exists", async () => {
+    const errorHandler = vi.fn(
+      (
+        _req: IncomingMessage,
+        res: ServerResponse,
+        ctx: { requestMeta: Record<string, unknown> },
+      ) => {
+        expect(ctx.requestMeta.outputId).toBe("/_error");
+        expect(ctx.requestMeta.invokeStatus).toBe(404);
+        res.writeHead(200, { "content-type": "text/html" });
+        res.end("<h2>pages error entrypoint</h2>");
+      },
+    );
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(errorHandler),
+        has: vi.fn((outputId: string) => outputId === "/_error"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+    });
+    const res = mockRes();
+
+    await dispatcher.dispatch(mockReq("/missing"), res, { kind: "not-found" });
+
+    expect(errorHandler).toHaveBeenCalledOnce();
+    expect(res._status).toBe(404);
+    expect(res._body).toContain("pages error entrypoint");
+  });
+
+  it("prefers a prerendered custom 500 over the generic /_error handler", async () => {
+    writeFileSync(path.join(os.tmpdir(), "adapter-k8s-custom-500.html"), "custom static 500");
+    const previousCwd = process.cwd;
+    process.cwd = () => os.tmpdir();
+    const errorHandler = vi.fn();
+    const pageHandler = vi.fn(() => {
+      throw new Error("page failed");
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(async (outputId: string) =>
+          outputId === "/_error" ? errorHandler : pageHandler,
+        ),
+        has: vi.fn((outputId: string) => outputId === "/boom" || outputId === "/_error"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "PAGES" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [
+        {
+          pathname: "/500",
+          filePath: "adapter-k8s-custom-500.html",
+          cacheControl: "public, max-age=0, must-revalidate",
+          prerender: true,
+        },
+      ],
+    });
+    const res = mockRes();
+
+    try {
+      await dispatcher.dispatch(mockReq("/boom"), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/boom",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+    } finally {
+      process.cwd = previousCwd;
+      rmSync(path.join(os.tmpdir(), "adapter-k8s-custom-500.html"), { force: true });
+    }
+
+    expect(res._status).toBe(500);
+    expect(res._body).toContain("custom static 500");
+    expect(errorHandler).not.toHaveBeenCalled();
+  });
+
   it("handles redirects", async () => {
     const dispatcher = createDispatcher({
       handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
@@ -465,9 +573,15 @@ describe("createDispatcher", () => {
   });
 
   it("merges dynamic params into the request URL for edge Pages outputs", async () => {
+    let backgroundComplete = false;
     const edgeRouteRunner = vi.fn().mockResolvedValue({
       response: new Response("ok"),
-      waitUntil: Promise.resolve(),
+      waitUntil: new Promise<void>((resolve) => {
+        setTimeout(() => {
+          backgroundComplete = true;
+          resolve();
+        }, 5);
+      }),
     });
     const dispatcher = createDispatcher({
       handlerLoader: {
@@ -506,6 +620,47 @@ describe("createDispatcher", () => {
     );
     expect(res._status).toBe(200);
     expect(res._body).toBe("ok");
+    expect(backgroundComplete).toBe(true);
+  });
+
+  it("recovers Edge App catch-all params from the concrete pathname", async () => {
+    const edgeRouteRunner = vi.fn().mockResolvedValue({
+      response: new Response("ok"),
+      waitUntil: Promise.resolve(),
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: "edge",
+          type: "APP_ROUTE",
+          filePath: "/app/.next/server/edge/page.js",
+        }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      edgeRouteRunner,
+    });
+
+    await dispatcher.dispatch(mockReq("/edge/one/two"), mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/edge/[[...slug]]",
+      // @next/routing can omit the named alias for an optional catch-all Edge output.
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+
+    expect(edgeRouteRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          url: "http://localhost/edge/one/two?nxtPslug=one%2Ftwo",
+          page: { name: "/edge/[[...slug]]", params: { slug: ["one", "two"] } },
+        }),
+      }),
+    );
   });
 
   it("invokes edge routes with the resolved middleware rewrite URL", async () => {
@@ -543,6 +698,46 @@ describe("createDispatcher", () => {
       expect.objectContaining({
         request: expect.objectContaining({
           url: "http://localhost/rewrite-me?a=b&foo=bar",
+        }),
+      }),
+    );
+  });
+
+  it("transports rewritten dynamic params to an Edge App Route", async () => {
+    const edgeRouteRunner = vi.fn().mockResolvedValue({
+      response: Response.json({ ok: true }),
+      waitUntil: Promise.resolve(),
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: "edge",
+          type: "APP_ROUTE",
+          filePath: "/app/.next/server/edge/route.js",
+        }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      edgeRouteRunner,
+    });
+
+    await dispatcher.dispatch(mockReq("/dynamic-test/foo"), mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/dynamic/[slug]",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+      invokePath: "/dynamic/foo",
+    });
+
+    expect(edgeRouteRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          url: "http://localhost/dynamic-test/foo?nxtPslug=foo",
+          page: { name: "/dynamic/[slug]", params: { slug: "foo" } },
         }),
       }),
     );
@@ -687,6 +882,76 @@ describe("createDispatcher", () => {
       expect(res._ended).toBe(true);
     });
 
+    it("ETag-revalidates a mutable static worker without returning its body again", async () => {
+      writeFileSync(path.join(tmpDir, "sw.js"), "self.addEventListener('fetch', () => {})");
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/_next/static/service-worker/sw.js",
+            filePath: "sw.js",
+            cacheControl: "public, max-age=0, must-revalidate",
+          },
+        ],
+      });
+      const resolution = {
+        kind: "route" as const,
+        pool: "ssr",
+        matchedPathname: "/_next/static/service-worker/sw.js",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      };
+      const first = mockRes();
+      await dispatcher.dispatch(mockReq(resolution.matchedPathname), first, resolution);
+
+      expect(first._status).toBe(200);
+      expect(first._headers.etag).toMatch(/^".+"$/);
+      expect(first._body).toContain("addEventListener");
+
+      const revalidated = mockRes();
+      await dispatcher.dispatch(
+        mockReq(resolution.matchedPathname, { "if-none-match": first._headers.etag }),
+        revalidated,
+        resolution,
+      );
+
+      expect(revalidated._status).toBe(304);
+      expect(revalidated._headers.etag).toBe(first._headers.etag);
+      expect(revalidated._body).toBe("");
+    });
+
+    it("lets app-owned resolved headers override static asset defaults case-insensitively", async () => {
+      writeFileSync(path.join(tmpDir, "cache-probe.txt"), "probe");
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/cache-probe.txt",
+            filePath: "cache-probe.txt",
+            cacheControl: "public, max-age=3600",
+          },
+        ],
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(mockReq("/cache-probe.txt"), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/cache-probe.txt",
+        routeMatches: null,
+        resolvedHeaders: new Headers({ "Cache-Control": "max-age=1234" }),
+      });
+
+      expect(res._headers["cache-control"]).toBe("max-age=1234");
+      expect(
+        Object.keys(res._headers).filter((name) => name.toLowerCase() === "cache-control"),
+      ).toHaveLength(1);
+    });
+
     it("serves an extensionless handler-less prerender as text/html (not octet-stream download)", async () => {
       // A pure-static index page (pages/index.js, no getStaticProps) is served
       // straight from the manifest with no per-asset content-type header. Its
@@ -717,7 +982,7 @@ describe("createDispatcher", () => {
         ],
       });
 
-      const req = mockReq("/");
+      const req = mockReq("/", { rsc: "1" });
       const res = mockRes();
       await dispatcher.dispatch(req, res as unknown as ServerResponse, {
         kind: "route",
@@ -729,6 +994,9 @@ describe("createDispatcher", () => {
 
       expect(res._status).toBe(200);
       expect(res._headers["content-type"]).toBe("text/html; charset=utf-8");
+      expect(res._headers.vary).toBe(
+        "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+      );
       expect(res._body).toContain("home");
     });
 
@@ -775,6 +1043,7 @@ describe("createDispatcher", () => {
 
     it("derives opaque metadata artifact content types from their public pathname", async () => {
       writeFileSync(path.join(tmpDir, "sitemap.body"), "<urlset />");
+      writeFileSync(path.join(tmpDir, "icon.body"), "png-bytes");
       const dispatcher = createDispatcher({
         handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
         poolName: "ssr",
@@ -783,6 +1052,11 @@ describe("createDispatcher", () => {
           {
             pathname: "/sitemap.xml",
             filePath: "sitemap.body",
+            cacheControl: "public, max-age=0, must-revalidate",
+          },
+          {
+            pathname: "/icon.png",
+            filePath: "icon.body",
             cacheControl: "public, max-age=0, must-revalidate",
           },
         ],
@@ -800,6 +1074,17 @@ describe("createDispatcher", () => {
       expect(res._status).toBe(200);
       expect(res._headers["content-type"]).toBe("application/xml");
       expect(res._body).toBe("<urlset />");
+
+      const iconRes = mockRes();
+      await dispatcher.dispatch(mockReq("/icon.png"), iconRes, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/icon.png",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+      expect(iconRes._status).toBe(200);
+      expect(iconRes._headers["content-type"]).toBe("image/png");
     });
 
     it("serves a fresh concrete ISR seed instead of its template handler", async () => {
@@ -915,6 +1200,45 @@ describe("createDispatcher", () => {
       });
 
       expect(res._body).toBe("<!DOCTYPE html><p>specialized-shell</p><script>resume()</script>");
+    });
+
+    it("deduplicates PPR shell and resume headers case-insensitively", async () => {
+      writeFileSync(path.join(tmpDir, "cached-shell.html"), "<!DOCTYPE html><p>shell</p>");
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse) => {
+        innerRes.writeHead(200, { link: "</resume.css>; rel=preload; as=style" });
+        innerRes.end("<script>resume()</script>");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {
+          "/dashboard": {
+            postponedState: "postponed-state",
+            fallbackFilePath: "cached-shell.html",
+            initialHeaders: { Link: "</shell.css>; rel=preload; as=style" },
+          },
+        },
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/dashboard"), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/dashboard",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._headers).toMatchObject({ link: "</resume.css>; rel=preload; as=style" });
+      expect(
+        Object.keys(res._headers).filter((name) => name.toLowerCase() === "link"),
+      ).toHaveLength(1);
     });
 
     it("prefers a specialized PPR shell over the executable handler template", async () => {
@@ -1543,6 +1867,47 @@ describe("createDispatcher", () => {
       expect(res._body).not.toContain("stale build file");
     });
 
+    it("bypasses a concrete prerender seed when preview mode is active", async () => {
+      writeFileSync(path.join(tmpDir, "seed.html"), "<html>non-preview seed</html>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "PAGES" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        outputIds: ["/blog/[slug]"],
+        staticAssets: [
+          {
+            pathname: "/blog/first",
+            filePath: "seed.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            revalidate: 60,
+          },
+        ],
+        localHandlerInvoker,
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(
+        mockReq("/blog/first", { cookie: "__prerender_bypass=preview-token" }),
+        res,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/first",
+          routeMatches: { slug: "first" },
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+      expect(res._body).not.toContain("non-preview seed");
+    });
+
     it("serves a handler-less prerender from the manifest file (pages SSG emits no function)", async () => {
       writeFileSync(path.join(tmpDir, "ssg.html"), "<html>ssg</html>");
 
@@ -1577,6 +1942,185 @@ describe("createDispatcher", () => {
 
       expect(res._status).toBe(200);
       expect(res._body).toContain("ssg");
+    });
+
+    it("returns 405 for POST to a handler-less prerender", async () => {
+      writeFileSync(path.join(tmpDir, "ssg.html"), "<html>ssg</html>");
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn(),
+          has: vi.fn().mockReturnValue(false),
+          get: vi.fn(),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/ssg-page",
+            filePath: "ssg.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+      });
+      const req = mockReq("/ssg-page");
+      req.method = "POST";
+      const res = mockRes();
+
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/ssg-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(405);
+      expect(res._headers.allow).toBe("GET, HEAD");
+      expect(res._body).toBe("");
+    });
+
+    it("normalizes origin cache headers on a prerender artifact for the Valkey-owned cache", async () => {
+      writeFileSync(path.join(tmpDir, "ssg.html"), "<html>ssg</html>");
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn(),
+          has: vi.fn().mockReturnValue(false),
+          get: vi.fn(),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/ssg-page",
+            filePath: "ssg.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: {
+              "cache-control": "s-maxage=60, stale-while-revalidate=31535940",
+              "cache-tag": "must-not-reach-cdn",
+              "x-next-cache-tags": "internal-route-tag",
+            },
+            prerender: true,
+          },
+        ],
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(mockReq("/ssg-page"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/ssg-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._headers["cache-control"]).toBe("public, max-age=0, must-revalidate");
+      expect(res._headers["cache-tag"]).toBeUndefined();
+      expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+    });
+
+    it("invokes the dynamic handler for a seeded Pages data request instead of serving HTML", async () => {
+      writeFileSync(path.join(tmpDir, "first.html"), "<html>wrong protocol</html>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        buildIdForData: "test123",
+        outputIds: ["/blog/[slug]"],
+        staticAssets: [
+          {
+            pathname: "/blog/first",
+            filePath: "first.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            revalidate: 60,
+          },
+        ],
+        localHandlerInvoker,
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(
+        mockReq("/_next/data/test123/blog/first.json"),
+        res as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/first",
+          routeMatches: { slug: "first" },
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({ matchedPathname: "/blog/[slug]" }),
+      );
+      expect(res._body).not.toContain("wrong protocol");
+    });
+
+    it("serves the emitted Pages fallback shell for an unseeded fallback:true document", async () => {
+      writeFileSync(path.join(tmpDir, "fallback.html"), "<html><p>fallback</p></html>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/blog/[slug]",
+            filePath: "fallback.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        emulatePlatformCache: true,
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(mockReq("/blog/unseeded"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "unseeded" },
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._body).toContain("fallback");
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+
+      await dispatcher.dispatch(mockReq("/blog/unseeded"), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "unseeded" },
+        resolvedHeaders: undefined,
+      });
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+
+      await dispatcher.dispatch(
+        mockReq("/blog/crawler", {
+          "user-agent": "Mozilla/5.0 (compatible; Googlebot/2.1)",
+        }),
+        mockRes(),
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { slug: "crawler" },
+          resolvedHeaders: undefined,
+        },
+      );
+      expect(localHandlerInvoker).toHaveBeenCalledTimes(2);
     });
 
     it("lets POST fall through to the handler instead of 405ing (server actions)", async () => {
@@ -1617,9 +2161,81 @@ describe("createDispatcher", () => {
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
     });
 
-    it("returns 405 when the real invoker sees a cached response to POST", async () => {
+    it("returns 405 for a handler-backed Pages prerender without relying on response headers", async () => {
+      writeFileSync(path.join(tmpDir, "page.html"), "<html>static</html>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "PAGES" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/pages-ssg",
+            filePath: "page.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+      });
+      const req = mockReq("/pages-ssg");
+      req.method = "POST";
+      const res = mockRes();
+
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/pages-ssg",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(405);
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+    });
+
+    it("marks handler-backed Pages prerenders for client-facing cache normalization", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "PAGES" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/pages-isr",
+            filePath: "page.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+      });
+
+      await dispatcher.dispatch(mockReq("/pages-isr"), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/pages-isr",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({ normalizePrerenderCacheControl: true }),
+      );
+    });
+
+    it("does not infer POST 405 from an App response cache header", async () => {
       const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse) => {
         innerRes.setHeader("x-nextjs-cache", "HIT");
+        innerRes.setHeader("x-next-cache-tags", "internal-route-tag");
         innerRes.end("static page");
       });
       const dispatcher = createDispatcher({
@@ -1645,8 +2261,12 @@ describe("createDispatcher", () => {
       });
 
       expect(handler).toHaveBeenCalledOnce();
-      expect(res._status).toBe(405);
+      // Non-minimal App entrypoints can emit x-nextjs-cache on a valid Server Action response.
+      // Pages prerender POSTs are rejected earlier from output metadata, so this header is not a
+      // safe method classifier at the generic invoker boundary.
+      expect(res._status).toBe(200);
       expect(res._body).toBe("static page");
+      expect(res._headers["x-next-cache-tags"]).toBeUndefined();
     });
 
     it("does not return 405 when the real invoker sees a dynamic response to POST", async () => {
@@ -1679,6 +2299,126 @@ describe("createDispatcher", () => {
       expect(handler).toHaveBeenCalledOnce();
       expect(res._status).toBe(201);
       expect(res._body).toBe("action response");
+    });
+
+    it("waits for entrypoint work registered from the response close event", async () => {
+      let backgroundComplete = false;
+      const handler = vi.fn(
+        (_req: IncomingMessage, innerRes: ServerResponse, ctx: { waitUntil: Function }) => {
+          // This mirrors App Router's after() integration: it does not register the task until
+          // the response lifecycle fires close.
+          innerRes.on("close", () => {
+            ctx.waitUntil(
+              new Promise<void>((resolve) => {
+                setTimeout(() => {
+                  backgroundComplete = true;
+                  resolve();
+                }, 5);
+              }),
+            );
+          });
+          innerRes.end("action response");
+        },
+      );
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/action-page"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/action-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._body).toBe("action response");
+      expect(backgroundComplete).toBe(true);
+    });
+
+    it("lets Next's filesystem cache own prerenders only in platform-cache emulation", async () => {
+      writeFileSync(path.join(tmpDir, "app-static.html"), "<html>seed</html>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const options = {
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/app-static",
+            filePath: "app-static.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+      };
+      const dispatcher = createDispatcher({
+        ...options,
+        emulatePlatformCache: true,
+      });
+
+      const resolution = {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/app-static",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      } as const;
+      await dispatcher.dispatch(mockReq("/app-static"), mockRes(), resolution);
+      expect(localHandlerInvoker).toHaveBeenLastCalledWith(
+        expect.objectContaining({ minimalMode: false }),
+      );
+
+      (options.handlerLoader.get as any).mockReturnValue({
+        runtime: "nodejs",
+        type: "PAGES",
+      });
+      localHandlerInvoker.mockClear();
+      await createDispatcher({ ...options, emulatePlatformCache: true }).dispatch(
+        mockReq("/app-static"),
+        mockRes(),
+        resolution,
+      );
+      expect(localHandlerInvoker).toHaveBeenLastCalledWith(
+        expect.objectContaining({ minimalMode: false }),
+      );
+
+      (options.handlerLoader.get as any).mockReturnValue({
+        runtime: "nodejs",
+        type: "APP_ROUTE",
+      });
+      localHandlerInvoker.mockClear();
+      await createDispatcher({ ...options, emulatePlatformCache: true }).dispatch(
+        mockReq("/app-static"),
+        mockRes(),
+        resolution,
+      );
+      expect(localHandlerInvoker).toHaveBeenLastCalledWith(
+        expect.objectContaining({ minimalMode: false }),
+      );
+
+      (options.handlerLoader.get as any).mockReturnValue({
+        runtime: "nodejs",
+        type: "APP_PAGE",
+      });
+      localHandlerInvoker.mockClear();
+      await createDispatcher(options).dispatch(mockReq("/app-static"), mockRes(), resolution);
+      expect(localHandlerInvoker).toHaveBeenLastCalledWith(
+        expect.objectContaining({ minimalMode: true }),
+      );
     });
 
     it("waits for an entrypoint-owned asynchronous response stream", async () => {
@@ -1730,23 +2470,61 @@ describe("createDispatcher", () => {
       });
 
       const res = mockRes();
-      await dispatcher.dispatch(mockReq("/public-post"), res as unknown as ServerResponse, {
-        kind: "route",
-        pool: "ssr",
-        matchedPathname: "/blog/[slug]",
-        routeMatches: { nxtPslug: "post-1" },
-        resolvedHeaders: undefined,
-        invokePath: "/blog/post-1?draft=1",
-      });
+      await dispatcher.dispatch(
+        mockReq("/public-post", { host: "deployment.test:4321" }),
+        res as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { nxtPslug: "post-1" },
+          resolvedHeaders: undefined,
+          invokePath: "/blog/post-1?draft=1",
+        },
+      );
 
       expect(requestMeta).toMatchObject({
         matchedPathname: "/blog/[slug]",
         outputId: "/blog/[slug]",
         resolvedPathname: "/blog/post-1",
         rewrittenPathname: "/blog/post-1",
+        initURL: "http://deployment.test:4321/public-post",
         query: { draft: "1" },
         params: { slug: "post-1" },
       });
+    });
+
+    it("does not inject the ordinary-request initURL into the Server Action protocol", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const req = mockReq("/action", {
+        host: "deployment.test:4321",
+        "next-action": "action-id",
+      });
+      req.method = "POST";
+      await dispatcher.dispatch(req, mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/action",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(requestMeta).not.toHaveProperty("initURL");
     });
 
     it("passes a concrete resolved pathname for a direct dynamic route", async () => {
@@ -1784,6 +2562,38 @@ describe("createDispatcher", () => {
         params: { slug: "post-1" },
       });
       expect(requestMeta).not.toHaveProperty("rewrittenPathname");
+    });
+
+    it("decodes an encoded slash once inside an ordinary dynamic param", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      await dispatcher.dispatch(
+        mockReq("/timestamp/key/%2Fnodejs%2Froute"),
+        mockRes() as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/timestamp/key/[key]",
+          routeMatches: { nxtPkey: "%2Fnodejs%2Froute" },
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(requestMeta).toMatchObject({ params: { key: "/nodejs/route" } });
     });
 
     it("does not expose a trailing-slash delimiter as an empty catch-all param", async () => {
@@ -1856,6 +2666,72 @@ describe("createDispatcher", () => {
       expect(requestMeta).toMatchObject({ params: { lang: "en", id: "1" } });
     });
 
+    it("recovers params through interception markers on an RSC output", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      await dispatcher.dispatch(mockReq("/foo/p/1?_rsc=probe", { rsc: "1" }), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/[locale]/(.)[username]/p/[id].rsc",
+        routeMatches: { username: "foo", id: "1" },
+        resolvedHeaders: undefined,
+        invokePath: "/en/foo/p/1?_rsc=probe",
+      });
+
+      expect(requestMeta).toMatchObject({
+        resolvedPathname: "/en/foo/p/1",
+        params: { locale: "en", username: "foo", id: "1" },
+      });
+    });
+
+    it("passes the concrete locale-prefixed prerender path to the dynamic handler", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/en/[...slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "PAGES" }),
+        } as any,
+        poolName: "default",
+        buildId: "test123",
+        staticAssets: [],
+        outputIds: ["/en/[...slug]"],
+        localHandlerInvoker,
+      });
+
+      await dispatcher.dispatch(mockReq("/"), mockRes(), {
+        kind: "route",
+        pool: "default",
+        matchedPathname: "/en/company/about-us",
+        routeMatches: { nextInternalLocale: "en" },
+        resolvedHeaders: undefined,
+        invokePath: "/company/about-us?nextInternalLocale=en",
+        invocationQuery: { nextInternalLocale: "en" },
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          matchedPathname: "/en/[...slug]",
+          invocationPath: "/company/about-us?nextInternalLocale=en",
+          routeParamPathname: "/en/company/about-us",
+        }),
+      );
+    });
+
     it("falls back to the parent page handler for .rsc output ids", async () => {
       const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
       const has = vi.fn((p: string) => p === "/page");
@@ -1910,6 +2786,27 @@ describe("createDispatcher", () => {
       expect(res._headers["location"]).toBe("/target");
       expect(res._headers["x-redirect-header"]).toBe("hi");
       expect(res._headers["set-cookie"]).toEqual(["a=1", "b=2"]);
+    });
+
+    it("translates an RSC redirect into the App Router redirect header", async () => {
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(mockReq("/old?_rsc=abc", { rsc: "1" }), res, {
+        kind: "redirect",
+        url: new URL("http://localhost/target"),
+        status: 307,
+        resolvedHeaders: new Headers({ location: "/target" }),
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._headers["location"]).toBeUndefined();
+      expect(res._headers["x-nextjs-redirect"]).toBe("/target");
     });
 
     it("returns 400 for the error resolution kind (malformed percent-encoding)", async () => {
