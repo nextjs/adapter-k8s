@@ -565,7 +565,7 @@ describe("createDispatcher", () => {
       localHandlerInvoker,
     });
 
-    const req = mockReq("/about", { cookie: "a=1" });
+    const req = mockReq("/about", { cookie: "a=1", "x-remove-me": "gone" });
     const res = mockRes();
 
     // middlewareRequestHeaders is the FINAL set of request headers after
@@ -587,6 +587,7 @@ describe("createDispatcher", () => {
     // Headers replaced entirely (not merged) — original cookie is gone
     expect(req.headers.cookie).toBe("b=2");
     expect(req.headers.authorization).toBe("Bearer token");
+    expect(req.headers["x-remove-me"]).toBeUndefined();
     // x-middleware-* filtered out
     expect(req.headers["x-middleware-next"]).toBeUndefined();
     // host preserved from original request
@@ -1680,6 +1681,37 @@ describe("createDispatcher", () => {
       expect(res._body).toBe("action response");
     });
 
+    it("waits for an entrypoint-owned asynchronous response stream", async () => {
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse) => {
+        setTimeout(() => {
+          innerRes.setHeader("content-type", "application/json");
+          innerRes.end('{"ok":true}');
+        }, 5);
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/api/proxy"), res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/api/proxy",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._body).toBe('{"ok":true}');
+    });
+
     it("passes the route template and concrete rewrite separately in request metadata", async () => {
       let requestMeta: Record<string, unknown> | undefined;
       const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
@@ -1752,6 +1784,44 @@ describe("createDispatcher", () => {
         params: { slug: "post-1" },
       });
       expect(requestMeta).not.toHaveProperty("rewrittenPathname");
+    });
+
+    it("does not expose a trailing-slash delimiter as an empty catch-all param", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      await dispatcher.dispatch(
+        mockReq("/product/shirts/mens-polo/1327037/"),
+        mockRes() as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/product/[...product-params]",
+          routeMatches: {
+            "1": "shirts/mens-polo/1327037",
+            // @next/routing removes punctuation in its internal nxtP alias.
+            nxtPproductparams: "shirts/mens-polo/1327037",
+          },
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(requestMeta).toMatchObject({
+        params: { "product-params": ["shirts", "mens-polo", "1327037"] },
+      });
     });
 
     it("recovers a specialized root param missing from routing matches", async () => {
@@ -1837,7 +1907,7 @@ describe("createDispatcher", () => {
       });
 
       expect(res._status).toBe(307);
-      expect(res._headers["location"]).toBe("http://localhost/target");
+      expect(res._headers["location"]).toBe("/target");
       expect(res._headers["x-redirect-header"]).toBe("hi");
       expect(res._headers["set-cookie"]).toEqual(["a=1", "b=2"]);
     });

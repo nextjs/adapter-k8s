@@ -48,6 +48,22 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
   return headers;
 }
 
+function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
+  const forwardedHost = req.headers["x-forwarded-host"];
+  const host =
+    (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) ??
+    req.headers.host ??
+    "localhost";
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const protocol =
+    (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)?.split(",")[0]?.trim() ||
+    "http";
+  const requestOrigin = new URL(`${protocol}://${host}`).origin;
+  return target.origin === requestOrigin
+    ? `${target.pathname}${target.search}${target.hash}`
+    : target.toString();
+}
+
 // Swallow socket errors on a client stream. A mid-response client disconnect emits an
 // 'error' on req/res; with no listener Node rethrows it as an uncaught 'error' event and
 // takes the whole process down. There's nothing to recover — the connection is gone.
@@ -309,10 +325,9 @@ async function invokeLocalHandlerOverHttp({
             await writeWebResponseToNode(innerRes, maybeResult);
             return;
           }
-
-          if (!innerRes.writableEnded) {
-            innerRes.end();
-          }
+          // Node entrypoints own the response lifecycle. A Pages API handler may return while
+          // an outbound stream is still piping into `res`; ending here truncates that body to
+          // empty. The loopback client naturally completes when the entrypoint finishes `res`.
         } catch (error) {
           console.error(`[pool-server] handler error for ${matchedPathname}:`, error);
           if (!innerRes.headersSent) {
@@ -429,15 +444,24 @@ function extractRouteParams(
     if (!name) continue;
     const value = routeMatches?.[name] ?? routeMatches?.[`nxtP${name}`];
     if (value === undefined || /^\$nxtP/.test(value)) continue;
-    params[name] = match[1]
-      ? value.split("/").map((segment) => {
+    if (match[1]) {
+      const segments = value.split("/");
+      // With `trailingSlash: true`, @next/routing can preserve the terminal slash in a
+      // catch-all capture (for example `a/b/`). It is a pathname delimiter, not an
+      // additional empty route parameter. Keep interior empty segments untouched so this
+      // normalization remains limited to the routing artifact we actually observed.
+      while (segments.at(-1) === "") segments.pop();
+      if (segments.length === 0) continue;
+      params[name] = segments.map((segment) => {
           try {
             return decodeURIComponent(segment);
           } catch {
             return segment;
           }
-        })
-      : value;
+        });
+    } else {
+      params[name] = value;
+    }
   }
 
   // @next/routing may match a partially specialized PPR output such as
@@ -477,7 +501,16 @@ function extractRouteParams(
             return value;
           }
         };
-        params[name] = catchAll ? raw.split("/").map(decode) : decode(raw);
+        if (catchAll) {
+          const segments = raw.split("/");
+          // The optional terminal slash belongs to the pathname, not the catch-all value.
+          // This fallback is used when @next/routing's internal alias normalizes a param name
+          // (for example `product-params` -> `nxtPproductparams`) and cannot be read by name.
+          while (segments.at(-1) === "") segments.pop();
+          if (segments.length > 0) params[name] = segments.map(decode);
+        } else {
+          params[name] = decode(raw);
+        }
       });
     }
   }
@@ -1058,7 +1091,9 @@ export function createDispatcher(options: DispatcherOptions) {
             ? webHeadersToNodeHeaders(resolution.resolvedHeaders)
             : {};
           delete headers["content-length"];
-          headers["location"] = resolution.url.toString();
+          headers["location"] = resolution.resolvedHeaders?.has("location")
+            ? middlewareRedirectLocation(req, resolution.url)
+            : resolution.url.toString();
           res.writeHead(resolution.status, headers);
           res.end();
           return;
@@ -1190,12 +1225,14 @@ export function createDispatcher(options: DispatcherOptions) {
             }
           }
 
-          // Apply middleware's mutated request headers on top of the original.
+          // Apply middleware's final request-header set as a replacement, not a merge.
           // responseToMiddlewareResult processes x-middleware-set-cookie,
           // x-middleware-override-headers, and x-middleware-request-* headers.
-          // We merge them into the original headers rather than replacing —
-          // let the Next.js handler handle any stripping/filtering internally.
+          // The override list is authoritative: a listed header with no corresponding
+          // x-middleware-request-* value means deletion. Merging would resurrect it.
           if (resolution.middlewareRequestHeaders) {
+            const originalHost = req.headers.host;
+            const nextHeaders: IncomingMessage["headers"] = {};
             for (const [key, value] of resolution.middlewareRequestHeaders.entries()) {
               if (key === "x-middleware-set-cookie") {
                 // Parse Set-Cookie values and merge into cookie header so the
@@ -1206,15 +1243,17 @@ export function createDispatcher(options: DispatcherOptions) {
                   if (nameVal) parts.push(nameVal);
                 }
                 if (parts.length > 0) {
-                  const existing = req.headers.cookie ?? "";
-                  req.headers.cookie = [existing, ...parts].filter(Boolean).join("; ");
+                  const existing = resolution.middlewareRequestHeaders.get("cookie") ?? "";
+                  nextHeaders.cookie = [existing, ...parts].filter(Boolean).join("; ");
                 }
                 continue;
               }
               // Skip internal x-middleware-* control headers
               if (key.startsWith("x-middleware-")) continue;
-              req.headers[key] = value;
+              nextHeaders[key] = value;
             }
+            if (!nextHeaders.host && originalHost) nextHeaders.host = originalHost;
+            req.headers = nextHeaders;
           }
 
           // If this output belongs to another pool, proxy the request

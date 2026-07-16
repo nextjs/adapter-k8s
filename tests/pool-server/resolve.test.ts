@@ -380,6 +380,42 @@ describe("createLocalResolver", () => {
     );
   });
 
+  it("prefers the generated handler entrypoint over compatibility default exports", async () => {
+    const manifest = makeManifest();
+    const generatedHandler = vi.fn().mockResolvedValue(
+      new Response(null, { headers: { "x-middleware-next": "1" } }),
+    );
+    const compatibilityDefault = vi.fn();
+    (resolveRoutes as any).mockImplementation(async (options: any) => {
+      await options.invokeMiddleware({
+        url: new URL("http://localhost/about"),
+        headers: new Headers(),
+        requestBody: new ReadableStream<Uint8Array>(),
+      });
+      return { resolvedPathname: "/about", invocationTarget: { pathname: "/about" } };
+    });
+
+    const resolver = createLocalResolver(manifest, {
+      handler: generatedHandler,
+      default: compatibilityDefault,
+    });
+    await resolver.resolve(
+      new URL("http://localhost/about"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(generatedHandler).toHaveBeenCalledWith(
+      expect.any(Request),
+      expect.objectContaining({
+        waitUntil: expect.any(Function),
+        requestMeta: { relativeProjectDir: "." },
+      }),
+    );
+    expect(compatibilityDefault).not.toHaveBeenCalled();
+  });
+
   it("returns empty result when no middleware module is provided", async () => {
     const manifest = makeManifest();
 
@@ -833,6 +869,8 @@ describe("createLocalResolver", () => {
 describe("hasCallableMiddlewareExport", () => {
   it("accepts supported shapes and rejects module objects without a callable", () => {
     expect(hasCallableMiddlewareExport({ default: vi.fn() })).toBe(true);
+    expect(hasCallableMiddlewareExport({ handler: vi.fn() })).toBe(true);
+    expect(hasCallableMiddlewareExport({ default: { handler: vi.fn() } })).toBe(true);
     expect(hasCallableMiddlewareExport({ middleware: vi.fn() })).toBe(true);
     expect(hasCallableMiddlewareExport({ default: { default: vi.fn() } })).toBe(true);
     expect(hasCallableMiddlewareExport({})).toBe(false);

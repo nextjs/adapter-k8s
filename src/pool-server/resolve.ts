@@ -19,9 +19,11 @@ type LoadedModule = Record<string, unknown>;
 export function hasCallableMiddlewareExport(module: LoadedModule | null | undefined): boolean {
   if (!module) return false;
   if (typeof module === "function") return true;
+  if (typeof module.handler === "function") return true;
   if (typeof module.default === "function") return true;
   if (typeof module.proxy === "function" || typeof module.middleware === "function") return true;
-  return typeof (module.default as Record<string, unknown> | undefined)?.default === "function";
+  const nested = module.default as Record<string, unknown> | undefined;
+  return typeof nested?.handler === "function" || typeof nested?.default === "function";
 }
 
 export type ResolveResult =
@@ -153,6 +155,16 @@ export function createLocalResolver(
 
                   // Node middleware paths (only if no edge runner or edge didn't produce a response)
                   if (!response && middlewareModule) {
+                    const nestedDefault =
+                      middlewareModule.default && typeof middlewareModule.default === "object"
+                        ? (middlewareModule.default as Record<string, unknown>)
+                        : null;
+                    const generatedHandler =
+                      typeof middlewareModule.handler === "function"
+                        ? (middlewareModule.handler as (...args: unknown[]) => unknown)
+                        : typeof nestedDefault?.handler === "function"
+                          ? (nestedDefault.handler as (...args: unknown[]) => unknown)
+                          : null;
                     const adapterFn =
                       typeof middlewareModule.default === "function"
                         ? (middlewareModule.default as (...args: unknown[]) => unknown)
@@ -183,8 +195,33 @@ export function createLocalResolver(
                       void waitable.catch(() => undefined);
                     };
 
+                    // Modern adapter builds expose the documented middleware entrypoint as
+                    // `handler(Request, ctx)`. Prefer it over compatibility `default` wrappers;
+                    // invoking a wrapper with the wrong legacy shape silently returns next()
+                    // and bypasses the user's Node proxy.
+                    if (generatedHandler) {
+                      const requestInit: RequestInit & { duplex?: "half" } = {
+                        method,
+                        headers: new Headers(
+                          [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                        ),
+                        duplex: "half",
+                      };
+                      if (method !== "GET" && method !== "HEAD") {
+                        requestInit.body = ctx.requestBody;
+                      }
+                      const result = await (generatedHandler as any)(
+                        new Request(ctx.url.toString(), requestInit),
+                        {
+                          waitUntil,
+                          requestMeta: { relativeProjectDir: "." },
+                        },
+                      );
+                      response = result instanceof Response ? result : null;
+                    }
+
                     // Path 1: Web adapter (default({ handler, request, page }))
-                    if (adapterFn && adapterHandler) {
+                    if (!response && adapterFn && adapterHandler) {
                       const requestHeaders = Object.fromEntries(
                         [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                       );
