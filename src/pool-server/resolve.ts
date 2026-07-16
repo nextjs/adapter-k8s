@@ -405,9 +405,23 @@ export function createLocalResolver(
       // invocationTarget of `/gssp` — the real page. Preferring the concrete
       // output for the target routes to `/gssp` instead of the `[slug]` handler.
       // Fall back to the original request path for the non-rewrite case.
+      const concreteInvocationOutput = preferConcreteOutput(
+        matchedPathname,
+        baseMatchedPathname,
+        manifest.poolAssignments,
+      );
+      // Only consult the public request pathname when routing did not rewrite
+      // it. A beforeFiles rewrite is allowed to override a real filesystem
+      // sibling (`/featured` -> `/some-team`); preferring `/featured` here
+      // would silently undo that rewrite. When the invocation target differs,
+      // it is authoritative even if it ultimately resolves through a dynamic
+      // handler template.
+      const requestWasRewritten = matchedPathname !== url.pathname;
       baseMatchedPathname =
-        preferConcreteOutput(matchedPathname, baseMatchedPathname, manifest.poolAssignments) ??
-        preferConcreteOutput(url.pathname, baseMatchedPathname, manifest.poolAssignments) ??
+        concreteInvocationOutput ??
+        (!requestWasRewritten
+          ? preferConcreteOutput(url.pathname, baseMatchedPathname, manifest.poolAssignments)
+          : undefined) ??
         baseMatchedPathname;
 
       // For RSC requests, resolve to the .rsc / segment-prefetch output variant so the handler

@@ -150,6 +150,16 @@ export function buildRoutingManifest({
       pprRoutes[prerender.pathname] = {
         postponedState: fb.postponedState,
         fallbackFilePath: path.relative(projectDir, fb.filePath),
+        ...((prerender as { pprChain?: { headers?: Record<string, string> } }).pprChain?.headers
+          ? {
+              chainHeaders: (prerender as { pprChain: { headers: Record<string, string> } })
+                .pprChain.headers,
+            }
+          : {}),
+        ...(fb.initialHeaders ? { initialHeaders: fb.initialHeaders } : {}),
+        ...(typeof (fb as { initialStatus?: unknown }).initialStatus === "number"
+          ? { initialStatus: (fb as { initialStatus: number }).initialStatus }
+          : {}),
         ...(tags && tags.length > 0 ? { tags } : {}),
         ...(typeof fb.initialRevalidate === "number" ? { revalidate: fb.initialRevalidate } : {}),
         ...(typeof fb.initialExpiration === "number" ? { expire: fb.initialExpiration } : {}),

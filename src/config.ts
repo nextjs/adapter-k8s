@@ -86,6 +86,7 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
           bucket: "",
           cacheMode: "USE_ORIGIN_HEADERS",
           cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
+          invalidateOnDeploy: true,
           ...config.provider.gke.cdn,
         },
       },

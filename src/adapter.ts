@@ -68,6 +68,7 @@ import {
 import { generateBuildMetadata } from "./emit/metadata.js";
 import { generateDockerignore } from "./emit/dockerignore.js";
 import { buildStaticManifest } from "./emit/static-assets.js";
+import { collectPublicPathnames } from "./pool-server/public-files.js";
 import { generateCelExpression } from "./cel.js";
 import { generateExtensionChain, determineFailureMode } from "./extension-chain.js";
 
@@ -692,6 +693,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             await stageFile(projectDir, absPath, asset.filePath, poolName);
           }
 
+          // Stage public/ files (favicon, robots, arbitrary static assets). They are NOT in
+          // Next's staticFiles output — the loop above misses them — so without this the pool's
+          // public-file fast-path 404s on every public asset. Enumerate with the same helper the
+          // router uses. (Until Phase-4 CDN/GCS offload moves these off the pods entirely.)
+          for (const publicPathname of collectPublicPathnames(projectDir)) {
+            const rel = `public${publicPathname}`; // publicPathname starts with "/"
+            await stageFile(projectDir, path.join(projectDir, rel), rel, poolName);
+          }
+
           if (outputs.middleware?.filePath) {
             const relPath = path.relative(projectDir, outputs.middleware.filePath);
             await stageFile(projectDir, outputs.middleware.filePath, relPath, poolName);
@@ -832,6 +842,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         projectDir,
         "static-assets.json",
         JSON.stringify(staticManifest, null, 2),
+      );
+      // Deploy/rollback read this to decide whether to invalidate the outgoing build's CDN tag.
+      // Emitted here (not infra state, which lacks cdn config); a missing/false flag = no-op.
+      await writeOutputFile(
+        projectDir,
+        "cdn-invalidation.json",
+        JSON.stringify({ invalidateOnDeploy: gkeProvider.cdn?.invalidateOnDeploy ?? true }),
       );
 
       // Phase 2 artifacts — write to output (computation moved above Helm chart generation)

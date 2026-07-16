@@ -258,6 +258,7 @@ describe("buildRoutingManifest", () => {
     expect(manifest.pprRoutes["/dashboard"]).toEqual({
       postponedState: "abc123",
       fallbackFilePath: "dist/dashboard.html",
+      initialHeaders: { "x-next-cache-tags": "_N_T_/layout,_N_T_/page,_N_T_/dashboard" },
       tags: ["_N_T_/layout", "_N_T_/page", "_N_T_/dashboard"],
       revalidate: 60,
       expire: 300,

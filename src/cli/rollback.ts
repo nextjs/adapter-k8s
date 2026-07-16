@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture, execOrThrow } from "./exec.js";
 import { readState, writeState } from "./state.js";
+import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 
 export async function runRollback(options: {
@@ -322,6 +323,30 @@ export async function runRollback(options: {
     console.error(`  Both builds were left scaled up.`);
     console.error(`  State was not changed. Investigate and re-run the rollback.\n`);
     process.exit(1);
+  }
+
+  // 4b. Traffic now points at the previous build. Invalidate the CDN entries tagged for the
+  // build we rolled AWAY from (currentBuildId) so its stale content stops serving. Best-effort,
+  // non-fatal, before the state swap (origin is already switched). Mirrors deploy's cutover.
+  const rbOutputDir = path.join(projectDir, ".k8s-adapter", "output");
+  if (existsSync(path.join(rbOutputDir, "chart", "templates", "cdn-http-filter.yaml"))) {
+    try {
+      const rbInfra = JSON.parse(readFileSync(infraPath, "utf-8"));
+      if (rbInfra.projectId) {
+        await invalidateCdnBuildTag({
+          projectId: rbInfra.projectId,
+          releaseName,
+          outputDir: rbOutputDir,
+          buildId: currentBuildId,
+          run: execCapture,
+          log: (m) => console.log(m),
+        });
+      }
+    } catch (err) {
+      console.log(
+        `  ! CDN invalidation error (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // 5. Swap state while both builds are still healthy. If persistence fails, traffic already

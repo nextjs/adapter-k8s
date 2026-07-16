@@ -3,6 +3,7 @@ import path from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
+import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import { renderDeployment } from "../emit/templates/deployment.js";
 import { renderService } from "../emit/templates/service.js";
 import { renderHPA } from "../emit/templates/hpa.js";
@@ -726,7 +727,28 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       process.exit(1);
     }
 
-    // 7d. Commit deploy state — ONLY now, after a confirmed cutover, so a failed deploy
+    // 7d. Traffic switched. Invalidate the PREVIOUS build's Cloud CDN entries (best-effort,
+    // non-fatal) BEFORE persisting state, so the writeState-failure recovery path — where the
+    // new origin is already live — still clears the outgoing build's stale CDN content.
+    const cdnFilterPath = path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml");
+    if (existsSync(cdnFilterPath) && infra.projectId) {
+      try {
+        await invalidateCdnBuildTag({
+          projectId: infra.projectId,
+          releaseName,
+          outputDir,
+          buildId: previousBuildId ?? undefined,
+          run: execCapture,
+          log: (m) => console.log(m),
+        });
+      } catch (err) {
+        console.log(
+          `  ! CDN invalidation error (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // 7e. Commit deploy state — ONLY now, after a confirmed cutover, so a failed deploy
     // never records a never-serving build as current. Traffic has already switched; if the
     // cluster ConfigMap write fails we surface it loudly (local was updated) rather than
     // silently diverging for the next deploy/rollback.

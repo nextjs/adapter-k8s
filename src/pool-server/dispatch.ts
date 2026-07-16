@@ -14,6 +14,7 @@ import {
   templateOutputCandidates,
   type RscConfig,
 } from "../routing-common.js";
+import { cdnCacheTag } from "../cdn-tags.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -87,8 +88,30 @@ async function writeInnerResponse(
   outerRes: ServerResponse,
   innerRes: IncomingMessage,
   forceStatus?: number,
+  prefix?: {
+    body: Buffer;
+    headers?: Record<string, string | string[]>;
+    status?: number;
+  },
 ): Promise<void> {
-  const headers = { ...innerRes.headers };
+  // A direct adapter entrypoint can produce either of two valid shapes from postponed state:
+  // a resume tail (which needs the persisted shell prepended), or a complete HTML document (the
+  // partial-fallback chain already replayed its prelude). Peek at the first chunk before committing
+  // headers so we do not concatenate two documents for the latter shape.
+  const iterator = innerRes[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  const firstChunk = first.done ? undefined : Buffer.from(first.value as Buffer);
+  const handlerRenderedDocument =
+    !!prefix &&
+    !!firstChunk &&
+    /^\s*(?:<!doctype\s+html(?:\s[^>]*)?>|<html(?:\s|>))/i.test(
+      firstChunk.toString("utf8", 0, Math.min(firstChunk.length, 256)),
+    );
+  const effectivePrefix = handlerRenderedDocument ? undefined : prefix;
+  const headers = { ...effectivePrefix?.headers, ...innerRes.headers };
+  // The combined response is shell bytes followed by resume bytes, so neither
+  // component's content length describes the final body.
+  if (effectivePrefix) delete headers["content-length"];
   // Entrypoints emit origin-oriented s-maxage/private cache directives for
   // incremental responses. In adapter deploy mode the platform cache owns ISR,
   // while the browser-facing response must always revalidate. Next marks this
@@ -96,9 +119,19 @@ async function writeInnerResponse(
   if (headers["x-nextjs-cache"] !== undefined) {
     headers["cache-control"] = "public, max-age=0, must-revalidate";
   }
-  outerRes.writeHead(forceStatus ?? innerRes.statusCode ?? 200, headers);
-  for await (const chunk of innerRes) {
-    const canContinue = await writeChunkSafely(outerRes, chunk as Buffer);
+  outerRes.writeHead(forceStatus ?? effectivePrefix?.status ?? innerRes.statusCode ?? 200, headers);
+  if (effectivePrefix && !(await writeChunkSafely(outerRes, effectivePrefix.body))) {
+    innerRes.destroy();
+    return;
+  }
+  if (firstChunk && !(await writeChunkSafely(outerRes, firstChunk))) {
+    innerRes.destroy();
+    return;
+  }
+  for (;;) {
+    const next = await iterator.next();
+    if (next.done) break;
+    const canContinue = await writeChunkSafely(outerRes, next.value as Buffer);
     if (!canContinue) {
       // Client is gone — stop reading the inner response and let it be discarded.
       innerRes.destroy();
@@ -153,6 +186,10 @@ async function invokeLocalHandlerOverHttp({
   bufferedBody,
   invocationPath,
   invocationQuery,
+  responsePrefix,
+  invocationHeaders,
+  discardResponse,
+  minimalMode = false,
   forceStatus,
   render404,
   renderError,
@@ -169,6 +206,19 @@ async function invokeLocalHandlerOverHttp({
   invocationPath?: string;
   /** Query resolved by @next/routing, excluding internal capture placeholders. */
   invocationQuery?: Record<string, string | string[]>;
+  /** Build-time PPR shell prepended to the handler's resumed render stream. */
+  responsePrefix?: {
+    filePath: string;
+    headers?: Record<string, string | string[]>;
+    status?: number;
+  };
+  /** Headers prescribed by the build output's internal invocation chain (for example next-resume). */
+  invocationHeaders?: Record<string, string>;
+  /** Drain the entrypoint response without forwarding it. Used only by the explicitly E2E-gated
+   * platform-cache simulation to let a segment prefetch schedule a background shell fill. */
+  discardResponse?: boolean;
+  /** Next direct-entrypoint runtime mode. False is reserved for the E2E filesystem stand-in. */
+  minimalMode?: boolean;
   /** Override the response status regardless of what the handler set — used to make a not-found
    * render return 404 even when the underlying page handler (e.g. Pages Router `/404`) renders 200. */
   forceStatus?: number;
@@ -195,10 +245,18 @@ async function invokeLocalHandlerOverHttp({
             ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
               NEXT_REQUEST_META
             ] as { postponed?: string } | undefined) ?? {};
-          const params = extractRouteParams(matchedPathname, routeMatches);
-          let invocationMeta: Record<string, unknown> = invocationQuery
-            ? { query: invocationQuery }
-            : {};
+          const concreteInvocationPath = new URL(
+            invocationPath ?? req.url ?? "/",
+            "http://localhost",
+          ).pathname;
+          const params = extractRouteParams(matchedPathname, routeMatches, concreteInvocationPath);
+          let invocationMeta: Record<string, unknown> = {
+            // Always provide the concrete decoded/interpolated target. Direct dynamic requests do
+            // not have an `invocationPath`, but the entrypoint still needs this to match the right
+            // prerender/fallback record rather than treating the route template as the request.
+            resolvedPathname: concreteInvocationPath,
+            ...(invocationQuery ? { query: invocationQuery } : {}),
+          };
           if (params) invocationMeta.params = params;
           if (new URL(req.url ?? "/", "http://localhost").pathname.includes("/_next/data/")) {
             invocationMeta.isNextDataReq = true;
@@ -218,9 +276,10 @@ async function invokeLocalHandlerOverHttp({
             invocationMeta = {
               ...invocationMeta,
               query: invocationQuery ?? query,
-              // The documented contract distinguishes the matched route
-              // template from the concrete internal invocation target.
-              resolvedPathname: matchedPathname,
+              // `matchedPathname`/`outputId` carry the executable route template. The documented
+              // request-meta contract instead defines `resolvedPathname` as decoded and with
+              // dynamic params interpolated, so it must carry the concrete invocation target.
+              resolvedPathname: target.pathname,
               rewrittenPathname: target.pathname,
             };
           }
@@ -231,11 +290,16 @@ async function invokeLocalHandlerOverHttp({
             requestMeta: {
               relativeProjectDir: ".",
               hostname: req.headers.host?.split(":")[0] ?? "127.0.0.1",
+              minimalMode,
               outputId: matchedPathname,
               matchedPathname,
               routeMatches,
               ...invocationMeta,
               ...(outerMeta.postponed ? { postponed: outerMeta.postponed } : {}),
+              // Cache Components entrypoints use the presence of the documented V2 callback to
+              // select adapter/minimal-mode cache semantics (including RDC generation). Returning
+              // false means the adapter observed the entry but did not write the HTTP response.
+              onCacheEntryV2: async () => false,
               ...(render404 ? { render404 } : {}),
               ...(revalidate ? { revalidate } : {}),
             },
@@ -279,6 +343,7 @@ async function invokeLocalHandlerOverHttp({
       }
 
       const reqHeaders = toNodeHeaders(req);
+      Object.assign(reqHeaders, invocationHeaders);
       // We forward a fixed-length buffered body, so drop any transfer-encoding the
       // original request carried (e.g. `chunked`). Node's HTTP parser rejects a request
       // that has BOTH transfer-encoding and content-length, yielding a spurious 400
@@ -305,6 +370,16 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
+          if (discardResponse) {
+            void (async () => {
+              for await (const _chunk of clientRes) {
+                // Drain the response so the loopback connection can close cleanly.
+              }
+            })()
+              .then(() => server.close(() => resolve()))
+              .catch((error) => server.close(() => reject(error)));
+            return;
+          }
           const methodNotAllowed =
             req.method !== "GET" &&
             req.method !== "HEAD" &&
@@ -313,6 +388,13 @@ async function invokeLocalHandlerOverHttp({
             res,
             clientRes,
             forceStatus ?? (methodNotAllowed ? 405 : undefined),
+            responsePrefix
+              ? {
+                  body: readFileSync(responsePrefix.filePath),
+                  ...(responsePrefix.headers ? { headers: responsePrefix.headers } : {}),
+                  ...(responsePrefix.status ? { status: responsePrefix.status } : {}),
+                }
+              : undefined,
           )
             .then(() => {
               server.close(() => resolve());
@@ -339,13 +421,13 @@ async function invokeLocalHandlerOverHttp({
 function extractRouteParams(
   matchedPathname: string,
   routeMatches: Record<string, string> | null,
+  concretePathname?: string,
 ): Record<string, string | string[]> | undefined {
-  if (!routeMatches) return undefined;
   const params: Record<string, string | string[]> = {};
   for (const match of matchedPathname.matchAll(/\[\[?\.\.\.([^\]]+)\]\]?|\[([^\]]+)\]/g)) {
     const name = match[1] ?? match[2];
     if (!name) continue;
-    const value = routeMatches[name] ?? routeMatches[`nxtP${name}`];
+    const value = routeMatches?.[name] ?? routeMatches?.[`nxtP${name}`];
     if (value === undefined || /^\$nxtP/.test(value)) continue;
     params[name] = match[1]
       ? value.split("/").map((segment) => {
@@ -356,6 +438,48 @@ function extractRouteParams(
           }
         })
       : value;
+  }
+
+  // @next/routing may match a partially specialized PPR output such as
+  // `/with-root-param/en/posts/[id].rsc`. Its routeMatches contains `id`, but the
+  // executable handler template also needs the already-specialized root param `lang`.
+  // Recover only missing values from the concrete invocation pathname.
+  if (concretePathname && matchedPathname.includes("[")) {
+    const names: { name: string; catchAll: boolean }[] = [];
+    let pattern = "";
+    for (const segment of matchedPathname.split("/").slice(1)) {
+      const optionalCatchAll = /^\[\[\.\.\.(.+)\]\]$/.exec(segment);
+      const catchAll = /^\[\.\.\.(.+)\]$/.exec(segment);
+      const dynamic = /^\[(.+)\]$/.exec(segment);
+      if (optionalCatchAll) {
+        names.push({ name: optionalCatchAll[1]!, catchAll: true });
+        pattern += "(?:/(.*))?";
+      } else if (catchAll) {
+        names.push({ name: catchAll[1]!, catchAll: true });
+        pattern += "/(.+)";
+      } else if (dynamic) {
+        names.push({ name: dynamic[1]!, catchAll: false });
+        pattern += "/([^/]+)";
+      } else {
+        pattern += "/" + segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      }
+    }
+    const concreteMatch = new RegExp(`^${pattern}/?$`).exec(concretePathname);
+    if (concreteMatch) {
+      names.forEach(({ name, catchAll }, index) => {
+        if (params[name] !== undefined) return;
+        const raw = concreteMatch[index + 1];
+        if (raw === undefined || raw === "") return;
+        const decode = (value: string) => {
+          try {
+            return decodeURIComponent(value);
+          } catch {
+            return value;
+          }
+        };
+        params[name] = catchAll ? raw.split("/").map(decode) : decode(raw);
+      });
+    }
   }
   return Object.keys(params).length > 0 ? params : undefined;
 }
@@ -455,7 +579,17 @@ export interface DispatcherOptions {
   releaseName?: string;
   localHandlerInvoker?: LocalHandlerInvoker;
   edgeRouteRunner?: EdgeRouteRunner | null;
-  pprRoutes?: Record<string, { postponedState: string; tags?: string[] }>;
+  pprRoutes?: Record<
+    string,
+    {
+      postponedState: string;
+      fallbackFilePath: string;
+      chainHeaders?: Record<string, string>;
+      initialHeaders?: Record<string, string | string[]>;
+      initialStatus?: number;
+      tags?: string[];
+    }
+  >;
   /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
    * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
@@ -480,6 +614,11 @@ export interface DispatcherOptions {
    * VALKEY_URL is present: a cache + edge-middleware app has VALKEY_URL but no classic handler, and
    * must keep injecting to preserve PPR resume. */
   incrementalCacheShared?: boolean;
+  /** Test-harness-only equivalent of `incrementalCacheShared`: let the Next entrypoint own PPR
+   * shell lookup/upgrades using its built-in filesystem cache. The real adapter must use the
+   * registered Valkey incremental handler for this role; this option only simulates that missing
+   * platform layer in Next's local deploy E2E and must never be enabled in production. */
+  entrypointOwnsPprShell?: boolean;
   /** Re-enter the pool request pipeline for Pages API `res.revalidate()` without a network hop. */
   revalidate?: Revalidate;
   /** Configured public basePath. Output ids and static 404 assets may be basePath-prefixed. */
@@ -503,10 +642,14 @@ export function createDispatcher(options: DispatcherOptions) {
     buildIdForData = "",
     internalSecret,
     incrementalCacheShared = false,
+    entrypointOwnsPprShell = false,
     checkShellStale,
     revalidate,
     basePath = "",
   } = options;
+
+  const deployedAt = Date.now();
+  const entrypointOwnsPprCache = incrementalCacheShared || entrypointOwnsPprShell;
 
   // Pages entrypoints call requestMeta.render404 when getStaticProps/getServerSideProps returns
   // notFound. In a custom adapter there is no Next router-server above the entrypoint, so provide
@@ -558,8 +701,7 @@ export function createDispatcher(options: DispatcherOptions) {
     // has no runtime handler. It must win over the generic `/_error` function.
     const prerendered404 = staticAssets.find(
       (asset) =>
-        asset.pathname === (basePath ? `${basePath}/404` : "/404") ||
-        asset.pathname === "/404",
+        asset.pathname === (basePath ? `${basePath}/404` : "/404") || asset.pathname === "/404",
     );
     if (prerendered404) {
       const fullPath = path.resolve(process.cwd(), prerendered404.filePath);
@@ -632,11 +774,11 @@ export function createDispatcher(options: DispatcherOptions) {
       const requestPathname = req.url ? new URL(req.url, "http://localhost").pathname : "";
       const isPagesDataRequest = requestPathname.startsWith(`${basePath}/_next/data/`);
       if (resolution.kind === "route" && isPagesDataRequest) {
-          const publicMatchedPathname = stripBasePath(resolution.matchedPathname, basePath);
-          res.setHeader(
-            "x-nextjs-matched-path",
-            publicMatchedPathname === "/index" ? "/" : publicMatchedPathname,
-          );
+        const publicMatchedPathname = stripBasePath(resolution.matchedPathname, basePath);
+        res.setHeader(
+          "x-nextjs-matched-path",
+          publicMatchedPathname === "/index" ? "/" : publicMatchedPathname,
+        );
       }
 
       // Install writeHead wrapper early to merge resolved headers (from routing/middleware)
@@ -777,9 +919,97 @@ export function createDispatcher(options: DispatcherOptions) {
         // public/ files stay GET/HEAD-only: upstream 404s writes to them.
         const serveHandlerlessPrerender =
           staticAsset?.prerender && !hasHandler && resolution.pool === poolName;
+        // A concrete non-PPR prerender under a dynamic template is the initial response-cache
+        // seed. Serve it while its build-time revalidate window is fresh; after expiry (or shared
+        // tag invalidation), the handler regenerates and onCacheEntryV2 owns later completed
+        // entries. PPR artifacts still require shell + resume and never take this path.
+        const seedRevalidate = staticAsset?.revalidate;
+        const seedWithinRevalidateWindow =
+          seedRevalidate === false ||
+          (typeof seedRevalidate === "number" &&
+            seedRevalidate > 0 &&
+            Date.now() - deployedAt < seedRevalidate * 1000);
+        const rawSeedTags = staticAsset?.headers?.["x-next-cache-tags"];
+        const seedTags =
+          typeof rawSeedTags === "string"
+            ? rawSeedTags
+                .split(",")
+                .map((tag) => tag.trim())
+                .filter(Boolean)
+            : [];
+        const seedTagsStale =
+          seedWithinRevalidateWindow && checkShellStale && seedTags.length > 0
+            ? await checkShellStale(seedTags)
+            : false;
+        const serveConcretePrerenderSeed =
+          isReadMethod &&
+          !!staticAsset?.prerender &&
+          seedWithinRevalidateWindow &&
+          !seedTagsStale &&
+          !staticAsset.ppr &&
+          handlerPathname !== mp &&
+          resolution.pool === poolName;
+        // Segment-prefetch outputs are independent build-time cache entries, not executable
+        // handlers. `handlerPathname` deliberately maps them back to the parent page so dynamic
+        // RSC requests can run, but a segment-prefetch request must still read its exact seeded
+        // entry. Sending it to the parent with a document postponed token makes the app-page
+        // entrypoint reject the request (404) and loses the Resume Data Cache payload.
+        const serveRscPrerenderVariant =
+          isReadMethod &&
+          isRSC &&
+          !!staticAsset?.prerender &&
+          handlerPathname !== mp &&
+          resolution.pool === poolName;
         const serveStaticFile = staticAsset && !staticAsset.prerender && isReadMethod;
 
-        if (staticAsset && (serveStaticFile || serveHandlerlessPrerender)) {
+        if (
+          entrypointOwnsPprShell &&
+          serveRscPrerenderVariant &&
+          typeof req.headers["next-router-segment-prefetch"] === "string"
+        ) {
+          // Next's deploy E2E has no Cloud CDN/Valkey platform layer. A real platform serves this
+          // seeded segment immediately, then fills the more-specific route shell in its durable
+          // middle cache. Reproduce only that missing orchestration here: keep the fast seeded
+          // response, and run a document render whose output is discarded while Next writes the
+          // upgraded shell to its filesystem cache. This branch is unreachable in production;
+          // production cache ownership is the separately registered Valkey incremental handler.
+          const backgroundHeaders = { ...req.headers };
+          delete backgroundHeaders.rsc;
+          delete backgroundHeaders["next-router-prefetch"];
+          delete backgroundHeaders["next-router-segment-prefetch"];
+          const backgroundReq = {
+            method: "GET",
+            url: req.url,
+            headers: backgroundHeaders,
+          } as IncomingMessage;
+          void handlerLoader
+            .load(handlerPathname)
+            .then((handler) =>
+              localHandlerInvoker({
+                handler,
+                req: backgroundReq,
+                res,
+                matchedPathname: handlerPathname,
+                routeMatches: resolution.routeMatches,
+                bufferedBody: undefined,
+                discardResponse: true,
+                render404: render404FromEntrypoint,
+                renderError: renderErrorFromEntrypoint,
+                ...(revalidate ? { revalidate } : {}),
+              }),
+            )
+            .catch((error) => {
+              console.error("[pool-server] background PPR shell fill failed:", error);
+            });
+        }
+
+        if (
+          staticAsset &&
+          (serveStaticFile ||
+            serveHandlerlessPrerender ||
+            serveConcretePrerenderSeed ||
+            serveRscPrerenderVariant)
+        ) {
           const fullPath = path.resolve(process.cwd(), staticAsset.filePath);
           if (existsSync(fullPath)) {
             const content = readFileSync(fullPath);
@@ -793,9 +1023,19 @@ export function createDispatcher(options: DispatcherOptions) {
                 // so the browser downloads the HTML instead of rendering it.
                 // The filePath (".next/server/pages/index.html") carries the
                 // real extension. assetHeaders still overrides when present.
-                "content-type": getContentType(staticAsset.filePath),
+                "content-type": getStaticAssetContentType(
+                  staticAsset.filePath,
+                  staticAsset.pathname,
+                ),
               },
               assetHeaders || {},
+            );
+            // Stamp the CDN cache tag from the EFFECTIVE cache-control (after assetHeaders
+            // may have overridden it), and apply it last so it can't itself be overridden.
+            // Mutable static (SSG HTML / public files) → tagged; immutable/max-age=0 → not.
+            Object.assign(
+              headers,
+              cdnCacheTag(String(headers["cache-control"] ?? staticAsset.cacheControl), buildId),
             );
             res.writeHead(staticAsset.status ?? 200, headers);
             res.end(content);
@@ -1127,8 +1367,38 @@ export function createDispatcher(options: DispatcherOptions) {
           // `next start`); injecting the build-time disk token here would bypass that cache and
           // re-serve a stale shell after a cross-replica `revalidateTag`. A cache + edge-middleware
           // app has VALKEY_URL set but NO classic handler registered, so it keeps injecting here.
-          const pprInfo = pprRoutes[handlerPathname] ?? pprRoutes[resolution.matchedPathname];
-          if (pprInfo?.postponedState && !incrementalCacheShared) {
+          // Prefer the route selected by @next/routing over its executable handler template.
+          // PPR builds can emit both a generic shell (`/[lang]/[slug]`) and a more-specialized
+          // shell (`/en/[slug]`). The handler is necessarily the generic template, but resuming
+          // it with the generic postponed state for an `/en/*` request duplicates/misplaces the
+          // root-param shell. Fall back to the handler key only when no specialized entry exists.
+          const matchedPrerender = staticAssets.find(
+            (asset) => asset.prerender && asset.pathname === resolution.matchedPathname,
+          );
+          const handlerPprInfo = [
+            resolution.matchedPathname,
+            handlerPathname,
+            ...rscParentCandidates(resolution.matchedPathname, rscConfig),
+            ...rscParentCandidates(handlerPathname, rscConfig),
+          ]
+            .map((candidate) => pprRoutes[candidate])
+            .find((candidate) => candidate !== undefined);
+          // A concrete non-PPR prerender under a PPR-capable dynamic handler is a blocking/static
+          // branch of that route, not permission to reuse the handler template's generic shell.
+          // Falling through to the generic postponed state leaks build-time layouts into requests
+          // that Next intentionally classified as full renders.
+          const manifestPprInfo =
+            matchedPrerender && !matchedPrerender.ppr ? undefined : handlerPprInfo;
+          const pprInfo = manifestPprInfo;
+          let pprResponsePrefix:
+            | {
+                filePath: string;
+                headers?: Record<string, string | string[]>;
+                status?: number;
+              }
+            | undefined;
+          let pprInvocationHeaders: Record<string, string> | undefined;
+          if (pprInfo?.postponedState && !entrypointOwnsPprCache) {
             // Do NOT inject the resume token for Server Action requests. Next's app-page handler
             // only splits the postponed state out of the action body (via the
             // `x-next-resume-state-length` framing) when no `postponed` meta is already set —
@@ -1140,14 +1410,35 @@ export function createDispatcher(options: DispatcherOptions) {
             // if a tag baked into the shell has been revalidated since deploy (checked live against
             // the shared Valkey manifest), withhold the stale build-time token so the handler does a
             // fresh blocking render. Absent a shared cache, checkShellStale is undefined → inject.
+            const pprTags = pprInfo.tags;
             const shellStale =
-              checkShellStale && pprInfo.tags && pprInfo.tags.length > 0
-                ? await checkShellStale(pprInfo.tags)
+              checkShellStale && pprTags && pprTags.length > 0
+                ? await checkShellStale(pprTags)
                 : false;
-            if (!isServerAction && !shellStale) {
+            const shellPath = path.resolve(process.cwd(), pprInfo.fallbackFilePath);
+            const shellAvailable = existsSync(shellPath);
+            if (!isServerAction && !shellStale && shellAvailable) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
               meta.postponed = pprInfo.postponedState;
               (req as any)[NEXT_REQUEST_META] = meta;
+              pprInvocationHeaders = pprInfo.chainHeaders;
+
+              // Direct handler invocation with requestMeta.postponed returns only the resumed
+              // dynamic stream. For document requests, prepend the build-time fallback shell so
+              // the client receives the single `[shell][resume]` response required by the PPR
+              // protocol. RSC requests consume only the resumed flight stream and must not get
+              // HTML prepended.
+              const isDocumentRequest =
+                req.method === "GET" &&
+                req.headers.rsc !== "1" &&
+                req.headers["next-router-prefetch"] !== "1";
+              if (isDocumentRequest) {
+                pprResponsePrefix = {
+                  filePath: shellPath,
+                  ...(pprInfo.initialHeaders ? { headers: pprInfo.initialHeaders } : {}),
+                  ...(pprInfo.initialStatus ? { status: pprInfo.initialStatus } : {}),
+                };
+              }
             }
           }
 
@@ -1167,9 +1458,20 @@ export function createDispatcher(options: DispatcherOptions) {
             routeMatches: resolution.routeMatches,
             bufferedBody,
             ...(resolution.invokePath ? { invocationPath: resolution.invokePath } : {}),
-            ...(resolution.invocationQuery
-              ? { invocationQuery: resolution.invocationQuery }
-              : {}),
+            ...(resolution.invocationQuery ? { invocationQuery: resolution.invocationQuery } : {}),
+            ...(pprResponsePrefix ? { responsePrefix: pprResponsePrefix } : {}),
+            ...(pprInvocationHeaders ? { invocationHeaders: pprInvocationHeaders } : {}),
+            // Production invokes generated entrypoints in minimal mode because platform caching
+            // lives outside Next: Cloud CDN may hold only public-safe variants, while Valkey owns
+            // PPR/ISR/tag-sensitive entries. NEXT_ENABLE_ADAPTER's local harness has neither. Its
+            // explicitly gated filesystem stand-in must use non-minimal mode only for routes with
+            // a real build-emitted PPR shell so Next can read that shell locally. Routes whose
+            // prerender metadata says `fallback: null` stay minimal and block-render; otherwise a
+            // generic build shell is incorrectly served while the concrete URL renders later.
+            // Use handler capability rather than `manifestPprInfo` here. A concrete document can
+            // intentionally suppress build-token injection while a dynamic RSC request for the
+            // same PPR-capable handler still needs Next's local cache to recover its RDC.
+            minimalMode: !entrypointOwnsPprShell || !handlerPprInfo,
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
             ...(revalidate ? { revalidate } : {}),
@@ -1291,6 +1593,24 @@ export function getContentType(pathname: string): string {
     default:
       return "application/octet-stream";
   }
+}
+
+function getStaticAssetContentType(filePath: string, publicPathname: string): string {
+  const artifactType = getContentType(filePath);
+  if (artifactType !== "application/octet-stream") return artifactType;
+
+  // Next stores prerendered metadata route bodies under opaque artifact names such as `.body`.
+  // Their public pathname is the authoritative source of the media type. Keep this deliberately
+  // narrow: a generic extensionless public asset may genuinely be binary and must not become HTML.
+  if (
+    /(?:^|\/)robots\.txt$/.test(publicPathname) ||
+    /(?:^|\/)sitemap(?:\/\d+)?\.xml$/.test(publicPathname) ||
+    /(?:^|\/)manifest\.(?:json|webmanifest)$/.test(publicPathname)
+  ) {
+    return getContentType(publicPathname);
+  }
+
+  return artifactType;
 }
 
 export type Dispatcher = ReturnType<typeof createDispatcher>;

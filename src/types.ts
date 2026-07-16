@@ -36,6 +36,8 @@ export interface GKEProviderConfig {
     cacheMode?: "USE_ORIGIN_HEADERS";
     /** Override for the CDN cache-key header set; defaults to the Next.js Vary + dispatch headers. */
     cacheKeyHeaders?: string[];
+    /** Invalidate the outgoing build's Cloud CDN entries after a successful cutover/rollback. Default true. */
+    invalidateOnDeploy?: boolean;
   };
   gateway?: {
     type: "gateway-api" | "ingress";
@@ -123,6 +125,11 @@ export interface RoutingManifest {
     {
       postponedState: string;
       fallbackFilePath: string;
+      /** Headers Next requires on the internal resume invocation (currently `next-resume: 1`). */
+      chainHeaders?: Record<string, string>;
+      /** Headers/status generated with the shell and sent on the combined client response. */
+      initialHeaders?: Record<string, string | string[]>;
+      initialStatus?: number;
       /**
        * Cache tags baked into the prerendered shell (from the build's
        * `fallback.initialHeaders['x-next-cache-tags']`). The pool checks these against the

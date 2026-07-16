@@ -105,6 +105,31 @@ describe("createLocalResolver", () => {
     }
   });
 
+  it("does not let a concrete request-path sibling override a beforeFiles rewrite", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/", "/featured", "/[teamSlug]"],
+      poolAssignments: { "/featured": "ssr", "/[teamSlug]": "ssr" },
+    });
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/[teamSlug]",
+      invocationTarget: { pathname: "/some-team", query: { nxtPteamSlug: "some-team" } },
+      routeMatches: { nxtPteamSlug: "some-team" },
+    });
+    const resolver = createLocalResolver(manifest);
+    const result = await resolver.resolve(
+      new URL("http://localhost/featured"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.matchedPathname).toBe("/[teamSlug]");
+      expect(result.invokePath).toBe("/some-team");
+    }
+  });
+
   it("returns redirect when resolveRoutes returns redirect", async () => {
     const manifest = makeManifest();
     (resolveRoutes as any).mockResolvedValue({

@@ -422,11 +422,9 @@ describe("createDispatcher", () => {
       localHandlerInvoker,
     });
 
-    await dispatcher.dispatch(
-      mockReq("/docs/missing"),
-      mockRes() as unknown as ServerResponse,
-      { kind: "not-found" },
-    );
+    await dispatcher.dispatch(mockReq("/docs/missing"), mockRes() as unknown as ServerResponse, {
+      kind: "not-found",
+    });
 
     expect(handlerLoader.load).toHaveBeenCalledWith("/docs/404");
     expect(localHandlerInvoker).toHaveBeenCalledWith(
@@ -772,6 +770,504 @@ describe("createDispatcher", () => {
       expect(res._headers["content-type"]).toBe("text/html; charset=utf-8");
       expect(res._headers["x-nextjs-cache"]).toBe("HIT");
       expect(res._ended).toBe(true);
+    });
+
+    it("derives opaque metadata artifact content types from their public pathname", async () => {
+      writeFileSync(path.join(tmpDir, "sitemap.body"), "<urlset />");
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/sitemap.xml",
+            filePath: "sitemap.body",
+            cacheControl: "public, max-age=0, must-revalidate",
+          },
+        ],
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/sitemap.xml"), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/sitemap.xml",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._headers["content-type"]).toBe("application/xml");
+      expect(res._body).toBe("<urlset />");
+    });
+
+    it("serves a fresh concrete ISR seed instead of its template handler", async () => {
+      writeFileSync(path.join(tmpDir, "fr-1.html"), "<p>buildtime</p>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const handlerLoader = {
+        load: vi.fn().mockResolvedValue(vi.fn()),
+        has: vi.fn((pathname: string) => pathname === "/[lang]/[slug]"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      };
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoader as any,
+        poolName: "ssr",
+        buildId: "test123",
+        outputIds: ["/[lang]/[slug]"],
+        staticAssets: [
+          {
+            pathname: "/fr/1",
+            filePath: "fr-1.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            revalidate: 900,
+          },
+        ],
+        localHandlerInvoker,
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/fr/1"), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/fr/1",
+        routeMatches: { lang: "fr", slug: "1" },
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._body).toBe("<p>buildtime</p>");
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+    });
+
+    it("prepends the build-time PPR shell to a document resume", async () => {
+      writeFileSync(path.join(tmpDir, "ppr-shell.html"), "<html><body><p>shell</p>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        pprRoutes: {
+          "/dashboard": {
+            postponedState: "postponed-state",
+            fallbackFilePath: "ppr-shell.html",
+            initialHeaders: { "content-type": "text/html; charset=utf-8" },
+            initialStatus: 200,
+          },
+        },
+      });
+
+      await dispatcher.dispatch(mockReq("/dashboard"), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/dashboard",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          responsePrefix: {
+            filePath: path.join(tmpDir, "ppr-shell.html"),
+            headers: { "content-type": "text/html; charset=utf-8" },
+            status: 200,
+          },
+        }),
+      );
+    });
+
+    it("does not prepend a shell when a partial-fallback resume returns a full document", async () => {
+      writeFileSync(path.join(tmpDir, "cached-shell.html"), "<!DOCTYPE html><p>cached-shell</p>");
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse) => {
+        innerRes.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        innerRes.end("<!DOCTYPE html><p>specialized-shell</p><script>resume()</script>");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {
+          "/dashboard": {
+            postponedState: "postponed-state",
+            fallbackFilePath: "cached-shell.html",
+          },
+        },
+      });
+
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/dashboard"), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/dashboard",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._body).toBe("<!DOCTYPE html><p>specialized-shell</p><script>resume()</script>");
+    });
+
+    it("prefers a specialized PPR shell over the executable handler template", async () => {
+      writeFileSync(path.join(tmpDir, "generic.html"), "generic-shell");
+      writeFileSync(path.join(tmpDir, "en.html"), "en-shell");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const handlerLoader = {
+        load: vi.fn().mockResolvedValue(vi.fn()),
+        has: vi.fn((pathname: string) => pathname === "/[lang]/[slug]"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      };
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoader as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        outputIds: ["/[lang]/[slug]"],
+        localHandlerInvoker,
+        pprRoutes: {
+          "/[lang]/[slug]": {
+            postponedState: "generic-state",
+            fallbackFilePath: "generic.html",
+          },
+          "/en/[slug]": {
+            postponedState: "en-state",
+            fallbackFilePath: "en.html",
+            chainHeaders: { "next-resume": "1" },
+          },
+        },
+      });
+
+      const req = mockReq("/en/post");
+      await dispatcher.dispatch(req, mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/en/[slug]",
+        routeMatches: { lang: "en", slug: "post" },
+        resolvedHeaders: undefined,
+      });
+
+      expect(handlerLoader.load).toHaveBeenCalledWith("/[lang]/[slug]");
+      expect((req as any)[Symbol.for("NextInternalRequestMeta")].postponed).toBe("en-state");
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          responsePrefix: expect.objectContaining({ filePath: path.join(tmpDir, "en.html") }),
+          invocationHeaders: { "next-resume": "1" },
+        }),
+      );
+    });
+
+    it("does not reuse a template PPR shell for a concrete non-PPR prerender", async () => {
+      writeFileSync(path.join(tmpDir, "generic.html"), "generic-shell");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        outputIds: ["/[slug]"],
+        staticAssets: [
+          {
+            pathname: "/blocking",
+            filePath: "blocking.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        entrypointOwnsPprShell: true,
+        pprRoutes: {
+          "/[slug]": {
+            postponedState: "generic-state",
+            fallbackFilePath: "generic.html",
+          },
+        },
+      });
+
+      const req = mockReq("/blocking");
+      await dispatcher.dispatch(req, mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blocking",
+        routeMatches: { slug: "blocking" },
+        resolvedHeaders: undefined,
+      });
+
+      expect((req as any)[Symbol.for("NextInternalRequestMeta")]?.postponed).toBeUndefined();
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.not.objectContaining({ responsePrefix: expect.anything() }),
+      );
+    });
+
+    it("lets the E2E filesystem stand-in own only build-emitted PPR handlers", async () => {
+      writeFileSync(path.join(tmpDir, "generic.html"), "generic-shell");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        entrypointOwnsPprShell: true,
+        pprRoutes: {
+          "/[slug]": {
+            postponedState: "generic-state",
+            fallbackFilePath: "generic.html",
+          },
+        },
+      });
+
+      await dispatcher.dispatch(mockReq("/novel"), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/[slug]",
+        routeMatches: { slug: "novel" },
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({ minimalMode: false }),
+      );
+    });
+
+    it("keeps E2E handlers without a build-emitted PPR artifact in minimal mode", async () => {
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        entrypointOwnsPprShell: true,
+        pprRoutes: {},
+      });
+
+      await dispatcher.dispatch(mockReq("/blocking"), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/[slug]",
+        routeMatches: { slug: "blocking" },
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({ minimalMode: true }),
+      );
+    });
+
+    it("does not prepend an HTML PPR shell to an RSC resume", async () => {
+      writeFileSync(path.join(tmpDir, "ppr-shell.html"), "<html><body><p>shell</p>");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        localHandlerInvoker,
+        pprRoutes: {
+          "/dashboard": {
+            postponedState: "postponed-state",
+            fallbackFilePath: "ppr-shell.html",
+          },
+        },
+      });
+
+      await dispatcher.dispatch(mockReq("/dashboard", { rsc: "1" }), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/dashboard",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.not.objectContaining({ responsePrefix: expect.anything() }),
+      );
+    });
+
+    it("serves a seeded segment-prefetch entry even when its parent page has a handler", async () => {
+      mkdirSync(path.join(tmpDir, "index.segments"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
+        "seeded-segment-rsc",
+      );
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index.segments/__PAGE__.segment.rsc",
+            filePath: "index.segments/__PAGE__.segment.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        rscConfig: {
+          header: "rsc",
+          suffix: ".rsc",
+          prefetchSegmentHeader: "next-router-segment-prefetch",
+          prefetchSegmentDirSuffix: ".segments",
+          prefetchSegmentSuffix: ".segment.rsc",
+        },
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(
+        mockReq("/?_rsc=abc", {
+          rsc: "1",
+          "next-router-prefetch": "1",
+          "next-router-segment-prefetch": "/__PAGE__",
+        }),
+        res,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/index.segments/__PAGE__.segment.rsc",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(res._status).toBe(200);
+      expect(res._body).toBe("seeded-segment-rsc");
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+    });
+
+    it("schedules an E2E filesystem shell fill after serving a seeded segment prefetch", async () => {
+      mkdirSync(path.join(tmpDir, "index.segments"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
+        "seeded-segment-rsc",
+      );
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index.segments/__PAGE__.segment.rsc",
+            filePath: "index.segments/__PAGE__.segment.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        entrypointOwnsPprShell: true,
+        rscConfig: {
+          header: "rsc",
+          suffix: ".rsc",
+          prefetchSegmentHeader: "next-router-segment-prefetch",
+          prefetchSegmentDirSuffix: ".segments",
+          prefetchSegmentSuffix: ".segment.rsc",
+        },
+      });
+
+      await dispatcher.dispatch(
+        mockReq("/?_rsc=abc", {
+          rsc: "1",
+          "next-router-prefetch": "1",
+          "next-router-segment-prefetch": "/__PAGE__",
+        }),
+        mockRes(),
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/index.segments/__PAGE__.segment.rsc",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+      );
+
+      await vi.waitFor(() => expect(localHandlerInvoker).toHaveBeenCalledOnce());
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          discardResponse: true,
+          req: expect.objectContaining({
+            method: "GET",
+            headers: expect.not.objectContaining({
+              rsc: expect.anything(),
+              "next-router-prefetch": expect.anything(),
+              "next-router-segment-prefetch": expect.anything(),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it("serves a seeded concrete RSC entry when execution maps to a dynamic parent handler", async () => {
+      mkdirSync(path.join(tmpDir, "blog"), { recursive: true });
+      writeFileSync(path.join(tmpDir, "blog", "first.rsc"), "seeded-concrete-rsc");
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/blog/[slug]"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/blog/first.rsc",
+            filePath: "blog/first.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        outputIds: ["/blog/[slug]"],
+        rscConfig: { header: "rsc", suffix: ".rsc" },
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(mockReq("/blog/first?_rsc=abc", { rsc: "1" }), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/first.rsc",
+        routeMatches: { slug: "first" },
+        resolvedHeaders: undefined,
+      });
+
+      expect(res._status).toBe(200);
+      expect(res._body).toBe("seeded-concrete-rsc");
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
     });
 
     it("404s a fallback:false path not in the prerendered set", async () => {
@@ -1212,11 +1708,82 @@ describe("createDispatcher", () => {
       });
 
       expect(requestMeta).toMatchObject({
-        resolvedPathname: "/blog/[slug]",
+        matchedPathname: "/blog/[slug]",
+        outputId: "/blog/[slug]",
+        resolvedPathname: "/blog/post-1",
         rewrittenPathname: "/blog/post-1",
         query: { draft: "1" },
         params: { slug: "post-1" },
       });
+    });
+
+    it("passes a concrete resolved pathname for a direct dynamic route", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      await dispatcher.dispatch(
+        mockReq("/blog/post-1?draft=1"),
+        mockRes() as unknown as ServerResponse,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { nxtPslug: "post-1" },
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(requestMeta).toMatchObject({
+        matchedPathname: "/blog/[slug]",
+        resolvedPathname: "/blog/post-1",
+        params: { slug: "post-1" },
+      });
+      expect(requestMeta).not.toHaveProperty("rewrittenPathname");
+    });
+
+    it("recovers a specialized root param missing from routing matches", async () => {
+      let requestMeta: Record<string, unknown> | undefined;
+      const handler = vi.fn((_req: IncomingMessage, innerRes: ServerResponse, ctx: any) => {
+        requestMeta = ctx.requestMeta;
+        innerRes.end("ok");
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      await dispatcher.dispatch(
+        mockReq("/with-root-param/en/posts/1?_rsc=abc", { rsc: "1" }),
+        mockRes(),
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/with-root-param/[lang]/posts/[id]",
+          routeMatches: { id: "1" },
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(requestMeta).toMatchObject({ params: { lang: "en", id: "1" } });
     });
 
     it("falls back to the parent page handler for .rsc output ids", async () => {

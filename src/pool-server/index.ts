@@ -19,6 +19,7 @@ import {
 } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
+import { cdnCacheTag } from "../cdn-tags.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import { createDispatcher, getContentType } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
@@ -795,11 +796,15 @@ async function main() {
   }
 
   const handlerLoader = createHandlerLoader(poolManifest);
-  // Middleware matchers (source regexp + has/missing) gate whether middleware
-  // runs for a request. From middleware-manifest.json (already loaded).
-  const middlewareMatchers: MiddlewareMatcher[] | undefined = routingManifest.middleware
-    ? Object.values(middlewareManifest.middleware)[0]?.matchers
-    : undefined;
+  // Middleware matchers (source regexp + has/missing) gate whether middleware runs — and,
+  // downstream, whether a route is forced `no-cache` for the CDN. Read them from the ADAPTER's
+  // routing manifest (built from the build's `outputs.middleware.config.matchers`), NOT Next's
+  // `middleware-manifest.json`: the latter only holds EDGE middleware and is EMPTY for a
+  // Node-runtime `proxy.ts`, which left middlewareMatchers `undefined` → matchesMiddleware
+  // fail-broad-covered EVERY request (incl. `_next/static`) → every response forced `no-cache`
+  // → the CDN cached nothing. The routing manifest carries matchers for both node and edge.
+  const middlewareMatchers: MiddlewareMatcher[] | undefined =
+    routingManifest.middleware?.matchers;
 
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
   routingManifest.pathnames = [
@@ -872,6 +877,13 @@ async function main() {
     basePath: routingManifest.basePath ?? "",
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
+    // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
+    // Cloud CDN nor Valkey, so let Next's built-in filesystem incremental cache stand in for the
+    // platform PPR-shell cache and exercise shell upgrades/RDC end to end. Production deliberately
+    // does NOT take this branch: cache entries that are unsafe for Cloud CDN belong in Valkey via
+    // the registered cacheHandler, never in process-local memory or an ephemeral pod filesystem.
+    entrypointOwnsPprShell:
+      process.env.NEXT_ENABLE_ADAPTER === "1" && process.env.VALKEY_URL === undefined,
     // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
     // revalidateTag invalidate a PPR shell by checking its baked tags against the shared manifest.
     ...(valkeyHandler
@@ -923,11 +935,16 @@ async function main() {
         for (const arg of args) {
           if (arg && typeof arg === "object" && !Array.isArray(arg)) {
             for (const key of Object.keys(arg as Record<string, unknown>)) {
-              if (key.toLowerCase() === "cache-control")
+              // forcedCacheControl is always no-cache/no-store (uncacheable), so a serve site's
+              // preliminary cache-control AND its CDN cache-tag are both moot — strip both, so a
+              // tag never lands on a response the CDN won't cache (the final-Cache-Control rule).
+              const lower = key.toLowerCase();
+              if (lower === "cache-control" || lower === "cache-tag")
                 delete (arg as Record<string, unknown>)[key];
             }
           }
         }
+        res.removeHeader("cache-tag");
         res.setHeader("cache-control", forcedCacheControl);
         return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
       } as typeof res.writeHead;
@@ -1207,6 +1224,9 @@ async function main() {
         res.writeHead(200, {
           "content-type": getContentType(url.pathname),
           "cache-control": "public, max-age=3600",
+          // Mutable public file cached at the CDN — tag it so a deploy/rollback can invalidate
+          // the outgoing build's copy (its content can change at the same URL across builds).
+          ...cdnCacheTag("public, max-age=3600", buildId),
         });
         res.end(content);
         return;
@@ -1319,6 +1339,7 @@ async function main() {
         res.writeHead(200, {
           "content-type": getContentType(resolvedPathname),
           "cache-control": "public, max-age=3600",
+          ...cdnCacheTag("public, max-age=3600", buildId),
         });
         res.end(readFileSync(publicFile));
         return;
