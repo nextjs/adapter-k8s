@@ -1,7 +1,0 @@
-{
-  "/[locale]/@modal/(.)[username]/p/[id]/page": "/[locale]/(.)[username]/p/[id]",
-  "/[locale]/[username]/p/[id]/page": "/[locale]/[username]/p/[id]",
-  "/[locale]/page": "/[locale]",
-  "/_global-error/page": "/_global-error",
-  "/_not-found/page": "/_not-found"
-}

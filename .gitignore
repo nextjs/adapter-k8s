@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.next/
 *.log
 
 *.tgz
@@ -11,3 +12,9 @@ docs/**
 E2E-FAILURE-RUNBOOK.md
 # Adapter build + deploy output (generated per build; machine-local state)
 .k8s-adapter/
+
+# Stray tsc declaration emit for tests/config (real declarations go to dist/ via build:types)
+tests/**/*.d.ts
+tests/**/*.d.ts.map
+/vitest.config.d.ts
+/vitest.config.d.ts.map
