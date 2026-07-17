@@ -114,8 +114,9 @@ The deploy flow:
 5. Wait for the new pool + routing-service Deployments to roll out
 6. Verify each new pod is serving (`/healthz` checked directly on the pod -- not via GCP LB health)
 7. Patch active Service selectors to route traffic to the new build (blue/green cutover)
-8. Keep the previous build at 0 replicas (rollback target)
-9. Run the traffic-extension registration Job: attach the routing-service NEG to the ext_proc backend and register the extension across every forwarding rule
+8. Invalidate the previous build's Cloud CDN cache tag (when CDN is enabled) so the new build never serves the old build's stale same-URL content from the edge -- best-effort and non-fatal (TTL self-heals)
+9. Keep the previous build at 0 replicas (rollback target)
+10. Run the traffic-extension registration Job: attach the routing-service NEG to the ext_proc backend and register the extension across every forwarding rule
 
 ## CLI Commands
 
@@ -147,7 +148,7 @@ npx adapter-k8s deploy [--skip-build] [--skip-push] [--dry-run]
 
 ### `rollback`
 
-Roll back to the previous deployment. The previous build is kept at 0 replicas after each deploy, so rollback is a scale + selector patch -- no image pull or build needed.
+Roll back to the previous deployment. The previous build is kept at 0 replicas after each deploy, so rollback is a scale + selector patch -- no image pull or build needed. When CDN is enabled, it also invalidates the outgoing build's cache tag on cutover.
 
 ```bash
 npx adapter-k8s rollback [--dry-run]
@@ -269,6 +270,7 @@ provider: {
       bucket: 'my-project-nextjs-static',
       // cacheMode: 'USE_ORIGIN_HEADERS',   // default -- honor the app's Cache-Control
       // cacheKeyHeaders: [...],            // override the cache-key header set
+      // invalidateOnDeploy: true,          // default -- purge the previous build's cache tag on cutover
     },
     gateway: { /* ... */ },
   },
@@ -276,6 +278,8 @@ provider: {
 ```
 
 Cache _hits_ are served before the routing service runs, so middleware-covered routes are sent `Cache-Control: no-cache` to keep them out of the cache. Deploys emit `x-cache-status` / `x-cache-id` response headers for diagnostics.
+
+**Cross-deploy invalidation.** Mutable cacheable responses -- Pages-Router SSG HTML and `public/` files, served at the same URL across deploys -- carry a per-build `Cache-Tag` (`build-<hash>`). On cutover, `deploy` (and `rollback`) invalidate the _outgoing_ build's tag via `gcloud compute url-maps invalidate-cdn-cache --tags=...`, so a new build never serves the previous build's stale content from the edge. Immutable, content-hashed assets (`/_next/static/*`) are left untagged -- they're safe to share across deploys and never need purging. The purge is best-effort and non-fatal (a failure just lets the TTL self-heal); set `invalidateOnDeploy: false` to opt out.
 
 ### Distributed Cache (Cache Components & PPR)
 
@@ -412,6 +416,7 @@ After `next build`, the adapter writes to `.k8s-adapter/output/`:
 +-- extension-chains.json
 +-- cel-expression.txt
 +-- static-assets.json
++-- cdn-invalidation.json          CDN tag-invalidation opt-out flag (read by deploy/rollback)
 +-- build-metadata.json
 ```
 
@@ -449,7 +454,7 @@ The Helm chart is self-contained -- it includes the traffic-extension registrati
 | 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate)                                                                                                                                                                            |
 | 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions                                                                                                                                                                                  |
 | 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)                                                                                                                                                                                   |
-| 4     | Planned | Coordinated CDN invalidation (tag-based purge at the edge for ISR / `revalidate`)                                                                                                                                                                                     |
+| 4     | Done    | Coordinated CDN invalidation — pool servers stamp a per-build `Cache-Tag` on mutable cacheable responses (SSG HTML, `public/` files); `deploy` and `rollback` purge the outgoing build's tag on cutover so a new build never serves the previous build's stale same-URL content from the edge                                    |
 | 5     | Done    | Distributed cache — Valkey `use cache` handler + incremental cache handler shared across replicas (cross-replica `revalidateTag` for `use cache`, ISR, and PPR shells); managed Memorystore or BYO. See [Distributed Cache](#distributed-cache-cache-components--ppr) |
 | 6     | Done    | PPR — pool-native shell resume + `no-store` at the CDN; PPR shells revalidate cross-replica via the incremental cache (needs Node `proxy.ts`)                                                                                                                         |
 | 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                                                                                                                                                                                                         |
