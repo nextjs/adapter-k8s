@@ -1,0 +1,17 @@
+{
+  "name": "adapter-k8s-ws-canary-e2e-app",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@next-community/adapter-k8s": "file:../..",
+    "next": "16.3.0-canary.88",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "scripts": {
+    "build": "next build"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.17"
+  }
+}

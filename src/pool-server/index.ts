@@ -27,6 +27,7 @@ import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
 import { decodePublicPathname } from "./public-files.js";
 import { resizeForRequestedWidth } from "./image-utils.js";
 import { createPoolServer } from "./server.js";
+import { handleWebSocketUpgrade } from "./ws-upgrade.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
 import { forcedCdnCacheControl } from "./cache-policy.js";
@@ -1412,14 +1413,47 @@ async function main() {
     trustInternalHeaders,
     internalSecret,
     onRequest: handleRequest,
+    // WebSocket upgrades (Next 16.3+ `upgradeHandler`). Resolved locally like any request; routes
+    // without an upgradeHandler get a 426. Inert for apps on a Next without the API.
+    onUpgrade: (req, socket, head) =>
+      handleWebSocketUpgrade(
+        {
+          resolve: (url, headers, method, body) =>
+            resolver.resolve(url, headers, method, body as ReturnType<typeof createBufferedStream>),
+          loadUpgrade: (outputId) => handlerLoader.loadUpgrade(outputId),
+          hasOutput: (outputId) => handlerLoader.has(outputId),
+          makeEmptyBody: () => createBufferedStream(null),
+          minimalMode: true, // WS routes are inherently dynamic — never prerendered/PPR
+          poolName,
+          releaseName,
+          buildId,
+          internalSecret,
+        },
+        req,
+        socket,
+        head,
+      ),
   });
 
   await server.start();
 
-  // Graceful shutdown
+  // Graceful shutdown — drain established WebSocket connections before exiting. DRAIN_SECONDS is
+  // injected by the Deployment and must be < terminationGracePeriodSeconds (minus the preStop
+  // window) so we finish and exit before the kubelet SIGKILLs us.
+  // 0 is a valid, explicit "don't wait" — only fall back to the default when unset/non-numeric.
+  const parsedDrain = Number(process.env.DRAIN_SECONDS);
+  const drainSeconds = Number.isFinite(parsedDrain) && parsedDrain >= 0 ? parsedDrain : 25;
+  let shuttingDown = false;
   const shutdown = async () => {
-    console.log("Shutting down pool server...");
-    await server.close();
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Draining pool server (WebSocket grace up to ${drainSeconds}s)...`);
+    try {
+      const { drained, forced } = await server.drain({ drainMs: drainSeconds * 1000 });
+      console.log(`Drain complete: ${drained} connection(s) closed cleanly, ${forced} force-closed.`);
+    } catch (err) {
+      console.error("Drain error:", err);
+    }
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);

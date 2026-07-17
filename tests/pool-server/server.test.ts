@@ -364,3 +364,84 @@ describe("internal header security", () => {
     });
   });
 });
+
+describe("createPoolServer WebSocket drain", () => {
+  let server: ReturnType<typeof createPoolServer> | null = null;
+
+  afterEach(async () => {
+    if (server) {
+      try {
+        await server.close();
+      } catch {
+        /* listener may already be closed by drain() */
+      }
+      server = null;
+    }
+  });
+
+  const HANDSHAKE =
+    "GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n" +
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+  // Connect and send a WS handshake; resolves with the socket + the first response chunk.
+  async function upgradeConn(port: number): Promise<{ sock: import("node:net").Socket; data: string }> {
+    const net = await import("node:net");
+    return new Promise((resolve, reject) => {
+      const sock = net.connect(port, "127.0.0.1", () => sock.write(HANDSHAKE));
+      sock.once("data", (d: Buffer) => resolve({ sock, data: d.toString("latin1") }));
+      sock.once("error", reject);
+    });
+  }
+
+  // onUpgrade that accepts the handshake and holds the socket open (like a live WebSocket). A real
+  // handler reads the socket to receive frames, which also lets it observe the peer disconnect.
+  const holdOpen = (_req: unknown, socket: import("node:stream").Duplex) => {
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n");
+    socket.on("data", () => {});
+    socket.on("end", () => socket.destroy()); // peer disconnected → tear down (real handler cleanup)
+  };
+
+  it("force-closes a still-open socket after the drain deadline (going-away + destroy)", async () => {
+    server = createPoolServer({ onRequest: vi.fn(), onUpgrade: holdOpen, port: 0 });
+    const { port } = await server.start();
+    const { sock } = await upgradeConn(port);
+
+    const closed = new Promise<void>((r) => sock.once("close", () => r()));
+    const result = await server.drain({ drainMs: 200 });
+
+    expect(result).toEqual({ drained: 0, forced: 1 });
+    await closed; // the server force-closed it
+  }, 10_000);
+
+  it("counts a socket that disconnects before the deadline as cleanly drained", async () => {
+    server = createPoolServer({ onRequest: vi.fn(), onUpgrade: holdOpen, port: 0 });
+    const { port } = await server.start();
+    const { sock } = await upgradeConn(port);
+
+    const drainPromise = server.drain({ drainMs: 5_000 });
+    setTimeout(() => sock.end(), 100); // client goes away (FIN) well before the deadline
+    const result = await drainPromise;
+
+    expect(result.drained).toBe(1);
+    expect(result.forced).toBe(0);
+  }, 10_000);
+
+  it("refuses new upgrades with 503 once draining", async () => {
+    // Keep one live socket so drain() stays inside its wait loop while we race a second upgrade in.
+    server = createPoolServer({ onRequest: vi.fn(), onUpgrade: holdOpen, port: 0 });
+    const { port } = await server.start();
+    await upgradeConn(port); // establishes the listener + one tracked socket
+
+    const drainPromise = server.drain({ drainMs: 800 });
+    // A connection accepted before server.close() took effect can still send an upgrade; it must 503.
+    let rejected = "";
+    try {
+      const { data } = await upgradeConn(port);
+      rejected = data;
+    } catch {
+      rejected = "ECONNREFUSED"; // listener already closed — also an acceptable rejection
+    }
+    await drainPromise;
+    expect(rejected === "ECONNREFUSED" || rejected.includes("503")).toBe(true);
+  }, 10_000);
+});

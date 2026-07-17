@@ -16,6 +16,7 @@ import {
 } from "../routing-common.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
+import { applyMiddlewareRequestHeaders } from "./middleware-headers.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -1560,29 +1561,7 @@ export function createDispatcher(options: DispatcherOptions) {
           // The override list is authoritative: a listed header with no corresponding
           // x-middleware-request-* value means deletion. Merging would resurrect it.
           if (resolution.middlewareRequestHeaders) {
-            const originalHost = req.headers.host;
-            const nextHeaders: IncomingMessage["headers"] = {};
-            for (const [key, value] of resolution.middlewareRequestHeaders.entries()) {
-              if (key === "x-middleware-set-cookie") {
-                // Parse Set-Cookie values and merge into cookie header so the
-                // handler can read middleware-set cookies in the same request.
-                const parts: string[] = [];
-                for (const sc of value.split(/,(?=[^;]*=)/)) {
-                  const nameVal = sc.trim().split(";")[0];
-                  if (nameVal) parts.push(nameVal);
-                }
-                if (parts.length > 0) {
-                  const existing = resolution.middlewareRequestHeaders.get("cookie") ?? "";
-                  nextHeaders.cookie = [existing, ...parts].filter(Boolean).join("; ");
-                }
-                continue;
-              }
-              // Skip internal x-middleware-* control headers
-              if (key.startsWith("x-middleware-")) continue;
-              nextHeaders[key] = value;
-            }
-            if (!nextHeaders.host && originalHost) nextHeaders.host = originalHost;
-            req.headers = nextHeaders;
+            applyMiddlewareRequestHeaders(req, resolution.middlewareRequestHeaders);
           }
 
           // If this output belongs to another pool, proxy the request

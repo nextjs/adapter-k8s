@@ -639,7 +639,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           "Dockerfile",
           generateDockerfile({
             containerStrategy: "shared-image",
-            nodeVersion: "22",
+            nodeVersion: "24",
             buildId,
           }),
           absSharedStageDir,
@@ -824,7 +824,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             `Dockerfile`,
             generatePoolDockerfile({
               poolName,
-              nodeVersion: "22",
+              nodeVersion: "24",
               buildId,
             }),
             poolDir,
@@ -862,7 +862,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         await writeOutputFile(
           projectDir,
           "Dockerfile",
-          generateRoutingServiceDockerfile({ nodeVersion: "22", buildId }),
+          generateRoutingServiceDockerfile({ nodeVersion: "24", buildId }),
           routingServiceDir,
         );
 

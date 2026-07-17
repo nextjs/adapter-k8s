@@ -1,6 +1,29 @@
 import { describe, expect, it } from "vitest";
 import { renderDeployment } from "../../../src/emit/templates/deployment.js";
 
+describe("renderDeployment WebSocket drain", () => {
+  it("emits a grace period, preStop NEG-deprogram sleep, and DRAIN_SECONDS env by default", () => {
+    const yaml = renderDeployment({ poolName: "ws", buildId: "b1", releaseName: "app" });
+    // default drainSeconds 25 + preStop 10 + buffer 5 = 40
+    expect(yaml).toContain("terminationGracePeriodSeconds: 40");
+    expect(yaml).toContain("preStop:");
+    expect(yaml).toContain('sleep 10"');
+    expect(yaml).toContain("name: DRAIN_SECONDS");
+    expect(yaml).toContain('value: "25"');
+  });
+
+  it("threads a custom drainSeconds into the grace period and env", () => {
+    const yaml = renderDeployment({
+      poolName: "ws",
+      buildId: "b1",
+      releaseName: "app",
+      drainSeconds: 120,
+    });
+    expect(yaml).toContain("terminationGracePeriodSeconds: 135"); // 120 + 10 + 5
+    expect(yaml).toContain('value: "120"');
+  });
+});
+
 describe("renderDeployment", () => {
   it("renders a retained build with the canonical pod template", () => {
     const yaml = renderDeployment({

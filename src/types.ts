@@ -18,6 +18,12 @@ export interface PoolConfig {
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
   timeout?: number;
+  /**
+   * Seconds to let established WebSocket connections drain on pod termination (blue/green cutover,
+   * rollback, or HPA scale-down) before they are closed. During drain the pod refuses new upgrades
+   * so clients reconnect to a live build. Raise it for pools serving long-lived sockets. Default 25.
+   */
+  drainSeconds?: number;
 }
 
 export interface HostConfig {

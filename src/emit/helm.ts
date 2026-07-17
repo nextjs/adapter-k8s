@@ -138,6 +138,7 @@ export function generateHelmChart({
       poolName,
       buildId,
       releaseName,
+      drainSeconds: pools.get(poolName)?.config.drainSeconds,
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,

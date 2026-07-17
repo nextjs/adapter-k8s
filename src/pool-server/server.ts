@@ -1,6 +1,7 @@
 // src/pool-server/server.ts
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import type { Duplex } from "node:stream";
 import { INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER } from "../routing-common.js";
 
 // Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
@@ -41,6 +42,12 @@ function isInternalResponseHeader(name: string): boolean {
 
 export interface PoolServerOptions {
   onRequest: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+  /**
+   * Optional WebSocket handshake handler. A WS upgrade is an HTTP GET with `Connection: Upgrade`
+   * that Node routes to the `upgrade` event (never `onRequest`). When omitted, upgrade requests
+   * fall through to Node's default (the socket is closed).
+   */
+  onUpgrade?: (req: IncomingMessage, socket: Duplex, head: Buffer) => void | Promise<void>;
   port: number;
   /**
    * When true, trust x-output-id etc. from the request WITHOUT a secret. Legacy fallback used
@@ -58,7 +65,7 @@ export interface PoolServerOptions {
 }
 
 export function createPoolServer(options: PoolServerOptions) {
-  const { onRequest, port, trustInternalHeaders = false, internalSecret } = options;
+  const { onRequest, onUpgrade, port, trustInternalHeaders = false, internalSecret } = options;
 
   const server: Server = createServer(async (req, res) => {
     // Health check — bypass all routing
@@ -121,6 +128,7 @@ export function createPoolServer(options: PoolServerOptions) {
     };
 
     const start = Date.now();
+    httpInflight++;
     try {
       await onRequest(req, res);
     } catch (err) {
@@ -133,12 +141,88 @@ export function createPoolServer(options: PoolServerOptions) {
         res.end();
       }
     } finally {
+      httpInflight--;
       const ms = Date.now() - start;
       console.log(`${req.method} ${req.url} → ${res.statusCode} (${ms}ms)`);
     }
   });
 
+  // Track established WebSocket sockets so shutdown can drain them gracefully (blue/green cutover,
+  // rollback, HPA scale-down all SIGTERM the pod) instead of dropping them mid-connection.
+  const wsSockets = new Set<Duplex>();
+  // In-flight ordinary HTTP requests — drain must let these finish too, else a rollout/scale-down
+  // truncates responses (the pre-drain behavior was `await server.close()`, which waited for them).
+  let httpInflight = 0;
+  let draining = false;
+
+  if (onUpgrade) {
+    server.on("upgrade", (req, socket: Duplex, head: Buffer) => {
+      if (draining) {
+        // Terminating: refuse new upgrades so the client reconnects to a live pod/build.
+        try {
+          socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+        } catch {
+          // socket already gone
+        }
+        socket.destroy();
+        return;
+      }
+      wsSockets.add(socket);
+      socket.once("close", () => wsSockets.delete(socket));
+      // A peer reset (common when a client drops mid-connection or during drain) must not surface
+      // as an uncaught 'error' and crash the pool; the route handler adds its own handling on top.
+      socket.on("error", () => {});
+      // A throw after the route takes over the socket must not leak an open connection.
+      Promise.resolve(onUpgrade(req, socket, head)).catch((err) => {
+        console.error("Unhandled WebSocket upgrade error:", err);
+        if (!socket.destroyed) socket.destroy();
+      });
+    });
+  }
+
+  // WebSocket CLOSE frame, status 1001 "going away" (FIN|close, len 2, code 0x03E9). Unmasked
+  // because server→client frames are never masked.
+  const GOING_AWAY = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+
   return {
+    /**
+     * Stop accepting new connections and drain established WebSocket sockets: wait up to `drainMs`
+     * for clients to disconnect, then send a `going away` close and force-destroy the rest so
+     * clients reconnect to the new build. Resolves once the socket set is empty or forced.
+     */
+    async drain({ drainMs }: { drainMs: number }): Promise<{ drained: number; forced: number }> {
+      draining = true;
+      // Stop accepting NEW connections immediately. We do NOT await the close callback — it only
+      // fires once every socket (including live WebSockets) is gone, which is what we bound below.
+      server.close();
+      const total = wsSockets.size;
+      const deadline = Date.now() + drainMs;
+      // Wait for both established WebSockets AND in-flight HTTP requests to finish — exiting while
+      // an ordinary request is mid-response would truncate it on every rollout/scale-down.
+      while ((wsSockets.size > 0 || httpInflight > 0) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const remaining = wsSockets.size;
+      if (remaining > 0) {
+        for (const s of wsSockets) {
+          try {
+            if (!s.destroyed) s.write(GOING_AWAY);
+          } catch {
+            /* ignore */
+          }
+        }
+        await new Promise((r) => setTimeout(r, 1000)); // let close frames flush
+        for (const s of wsSockets) {
+          try {
+            if (!s.destroyed) s.destroy();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      return { drained: total - remaining, forced: remaining };
+    },
+
     start(): Promise<{ port: number }> {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
