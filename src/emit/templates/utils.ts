@@ -23,7 +23,9 @@ export function sanitizeK8sName(name: string): string {
 // releaseName is capped at 40 chars: it is prefixed into longer resource names
 // (`${releaseName}-routing-service`, GKE cluster `${releaseName}-cluster`, etc.) that
 // must each fit their own length limits (63 for K8s names, 40 for GKE clusters).
-const RELEASE_NAME_RE = /^[a-z0-9-]{1,40}$/;
+// Edge hyphens are rejected — the templates embed releaseName at the start of DNS-1123
+// resource names, where a leading/trailing hyphen renders an invalid name.
+const RELEASE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/;
 const PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
 const REGION_RE = /^[a-z0-9-]+$/;
 // DNS-1123 hostname, optionally with a single left-most wildcard label (`*.example.com`).
@@ -44,7 +46,8 @@ export function assertSafeReleaseName(releaseName: string): void {
   if (!RELEASE_NAME_RE.test(releaseName)) {
     throw new Error(
       `Invalid releaseName "${releaseName}": must match ${RELEASE_NAME_RE} ` +
-        `(lowercase letters, digits, and hyphens only, max 40 chars).`,
+        `(lowercase letters, digits, and hyphens only, max 40 chars, ` +
+        `must start and end with a letter or digit).`,
     );
   }
 }

@@ -36,18 +36,24 @@ describe("renderRouteExtUpdateJob", () => {
     // The rendered Job name MUST equal routeExtJobName's output — deploy.ts skips the
     // current job by exact name, and any drift deletes the running job mid-registration.
     expect(yaml).toContain(`name: ${name}`);
-    // The name keeps the FULL build id (DNS-sanitized, ≤63 chars) — Jobs are immutable,
-    // so per-build uniqueness is the requirement; a short slice risks collisions.
-    expect(name).toBe("my-app-route-ext-jpy1gcvqshohb9piqlgyf");
+    // A fixed digest of the complete build id keeps immutable Job names collision-resistant
+    // without risking truncation beyond Kubernetes' 63-character name limit.
+    expect(name).toBe("my-app-route-ext-ca7026fd6961");
     expect(name.length).toBeLessThanOrEqual(63);
+    // The digested name no longer reveals the build — the annotation records the full id
+    // so operators can map a Job back to its build.
+    expect(yaml).toContain(`adapter-k8s.dev/build-id: "${buildId}"`);
   });
 
   it("produces collision-resistant, DNS-safe job names for awkward build ids", () => {
-    // Two build ids sharing a 10-char prefix must not collide (the old slice scheme did).
-    const a = routeExtJobName("my-app", "aaaaaaaaaabbbb");
-    const b = routeExtJobName("my-app", "aaaaaaaaaacccc");
+    // A maximum-length release leaves only 12 build-id characters in the old truncated
+    // name. The digest must still distinguish full build ids that share that prefix.
+    const releaseName = "a".repeat(40);
+    const a = routeExtJobName(releaseName, "aaaaaaaaaaaabbbb");
+    const b = routeExtJobName(releaseName, "aaaaaaaaaaaacccc");
     expect(a).not.toBe(b);
-    // Non-DNS chars are sanitized away and the result fits the 63-char limit.
+    expect(a).toHaveLength(63);
+    // The digest result is DNS-safe and fits the Kubernetes name limit.
     const c = routeExtJobName("my-app", "Feature/Branch_X.Y");
     expect(c).toMatch(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/);
   });
@@ -118,6 +124,30 @@ describe("renderRouteExtUpdateJob", () => {
         buildId: "abc123",
       }),
     ).toThrow(/Invalid releaseName/);
+  });
+
+  it("rejects a releaseName with a leading or trailing hyphen (invalid DNS-1123 prefix)", () => {
+    for (const releaseName of ["-my-app", "my-app-"]) {
+      expect(() =>
+        renderRouteExtUpdateJob({
+          releaseName,
+          projectId: "my-project",
+          region: "us-central1",
+          buildId: "abc123",
+        }),
+      ).toThrow(/Invalid releaseName/);
+    }
+  });
+
+  it("rejects a buildId outside the safe charset (interpolated into the annotation)", () => {
+    expect(() =>
+      renderRouteExtUpdateJob({
+        releaseName: "my-app",
+        projectId: "my-project",
+        region: "us-central1",
+        buildId: 'abc"123',
+      }),
+    ).toThrow(/Invalid buildId/);
   });
 
   it("rejects a projectId containing an injection payload", () => {

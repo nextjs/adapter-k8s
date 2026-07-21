@@ -1,18 +1,19 @@
+import { createHash } from "node:crypto";
 import {
   assertSafeReleaseName,
   assertSafeProjectId,
   assertSafeRegion,
-  sanitizeK8sName,
+  assertSafeBuildId,
 } from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
-// "delete old jobs" cleanup MUST match this exactly — a mismatch (it previously used a
-// 12-char build-id slice while the name uses 10) deletes the current job mid-run, so the
-// extension never gets registered. sanitizeK8sName keeps the full (DNS-safe) build id, so
-// names stay unique per build — K8s Jobs are immutable, so per-build uniqueness is the
-// requirement — while still fitting the 63-char name limit.
+// "delete old jobs" cleanup MUST match this exactly — a mismatch deletes the current job
+// mid-run, so the extension never gets registered. Kubernetes Jobs are immutable, so each
+// build needs a distinct name. A 12-hex-character SHA-256 suffix preserves 48 bits of the
+// complete build ID while always fitting after the 40-character release-name limit.
 export function routeExtJobName(releaseName: string, buildId: string): string {
-  return sanitizeK8sName(`${releaseName}-route-ext-${buildId}`);
+  const buildDigest = createHash("sha256").update(buildId).digest("hex").slice(0, 12);
+  return `${releaseName}-route-ext-${buildDigest}`;
 }
 
 export function renderRouteExtUpdateJob({
@@ -32,6 +33,7 @@ export function renderRouteExtUpdateJob({
   assertSafeReleaseName(releaseName);
   assertSafeProjectId(projectId);
   assertSafeRegion(region);
+  assertSafeBuildId(buildId);
   // Include buildId in the Job name so each deploy creates a fresh Job
   // (K8s Jobs are immutable — can't update an existing one)
   return `apiVersion: batch/v1
@@ -41,6 +43,10 @@ metadata:
   labels:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: route-ext-job
+  annotations:
+    # The Job name carries only a digest of the build id — record the full id for
+    # operators (an annotation, not a label: build ids may exceed the 63-char label cap).
+    adapter-k8s.dev/build-id: "${buildId}"
 spec:
   # Sweep finished Jobs so re-registrations don't accumulate in the namespace.
   ttlSecondsAfterFinished: 3600
