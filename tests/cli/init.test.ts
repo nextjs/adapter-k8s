@@ -1,14 +1,28 @@
 // tests/cli/init.test.ts
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { buildInitGcloudCommands, runInit } from "../../src/cli/init.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  buildInitGcloudCommands,
+  runInit,
+  deployExtRoleId,
+  DEPLOY_EXT_ROLE_PERMISSIONS,
+} from "../../src/cli/init.js";
 import * as exec from "../../src/cli/exec.js";
 import * as scaffold from "../../src/cli/scaffold.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
 vi.mock("../../src/cli/exec.js");
 vi.mock("../../src/cli/scaffold.js");
+
+const VALID = {
+  projectId: "my-project",
+  region: "us-central1",
+  hosts: ["app.example.com"],
+  bucket: "my-project-nextjs-static",
+  registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+  releaseName: "my-app",
+};
 
 describe("buildInitGcloudCommands", () => {
   it("generates correct gcloud commands for infrastructure", () => {
@@ -72,6 +86,87 @@ describe("buildInitGcloudCommands", () => {
     const routeExtCmd = commands.find((c) => c.description.includes("LbRouteExtension"));
     expect(routeExtCmd).toBeUndefined();
   });
+
+  it("M9: grants Artifact Registry writer at REPOSITORY scope, not project scope", () => {
+    const commands = buildInitGcloudCommands({
+      projectId: "my-project",
+      region: "us-central1",
+      bucket: "my-project-nextjs-static",
+      releaseName: "my-app",
+    });
+
+    const writerGrants = commands.filter((c) => c.args.includes("roles/artifactregistry.writer"));
+    expect(writerGrants).toHaveLength(1);
+    // Repository-scoped binding (mirrors the repoAdmin pattern), not `projects add-iam-policy-binding`.
+    expect(writerGrants[0]!.args).toContain("repositories");
+    expect(writerGrants[0]!.args).toContain("add-iam-policy-binding");
+    expect(writerGrants[0]!.args).toContain("nextjs");
+    expect(writerGrants[0]!.args).not.toContain("projects");
+  });
+
+  it("M9: binds the release-scoped custom role instead of the broad admin roles", () => {
+    const commands = buildInitGcloudCommands({
+      projectId: "my-project",
+      region: "us-central1",
+      bucket: "my-project-nextjs-static",
+      releaseName: "my-app",
+    });
+    const flat = commands.map((c) => c.args.join(" ")).join("\n");
+
+    expect(flat).not.toContain("roles/networkservices.admin");
+    expect(flat).not.toContain("roles/compute.loadBalancerAdmin");
+
+    const customBinding = commands.find((c) =>
+      c.args.some((a) => a.includes(`projects/my-project/roles/${deployExtRoleId("my-app")}`)),
+    );
+    expect(customBinding).toBeDefined();
+    expect(customBinding!.args).toContain("add-iam-policy-binding");
+  });
+
+  it("NetworkPolicy: Autopilot clusters never get --enable-network-policy (it is rejected)", () => {
+    const commands = buildInitGcloudCommands({
+      projectId: "my-project",
+      region: "us-central1",
+      bucket: "my-project-nextjs-static",
+      releaseName: "my-app",
+    });
+    const clusterCmd = commands.find((c) => c.args.includes("clusters"));
+    expect(clusterCmd!.args).toContain("create-auto");
+    expect(clusterCmd!.args).not.toContain("--enable-network-policy");
+  });
+
+  it("NetworkPolicy: Standard clusters are created with --enable-network-policy", () => {
+    const commands = buildInitGcloudCommands({
+      projectId: "my-project",
+      region: "us-central1",
+      bucket: "my-project-nextjs-static",
+      releaseName: "my-app",
+      autopilot: false,
+    });
+    const clusterCmd = commands.find((c) => c.args.includes("clusters"));
+    expect(clusterCmd!.args).toContain("create");
+    expect(clusterCmd!.args).not.toContain("create-auto");
+    expect(clusterCmd!.args).toContain("--enable-network-policy");
+  });
+});
+
+describe("deployExtRoleId", () => {
+  it("derives a hyphen-free role id from the release name", () => {
+    expect(deployExtRoleId("my-app")).toBe("nextjs_deploy_ext_my_app");
+  });
+
+  it("matches the GCP custom-role id charset and length limits", () => {
+    for (const name of ["a", "my-app", "x".repeat(40)]) {
+      expect(deployExtRoleId(name)).toMatch(/^[a-zA-Z0-9_]{3,64}$/);
+    }
+  });
+
+  it("covers exactly the permissions the traffic-extension Job needs", () => {
+    expect(DEPLOY_EXT_ROLE_PERMISSIONS).toContain("networkservices.lbTrafficExtensions.create");
+    expect(DEPLOY_EXT_ROLE_PERMISSIONS).toContain("networkservices.lbTrafficExtensions.update");
+    expect(DEPLOY_EXT_ROLE_PERMISSIONS).toContain("compute.backendServices.update");
+    expect(DEPLOY_EXT_ROLE_PERMISSIONS).toContain("compute.forwardingRules.list");
+  });
 });
 
 describe("runInit", () => {
@@ -80,48 +175,165 @@ describe("runInit", () => {
   beforeEach(() => {
     tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-init-test-"));
     vi.clearAllMocks();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
   });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function mockScaffold(): void {
+    vi.spyOn(scaffold, "generateAdapterConfig").mockReturnValue("config");
+    vi.spyOn(scaffold, "generateInfrastructureJson").mockReturnValue("infra");
+  }
 
   it("retries on IAM binding failure and handles already exists", async () => {
     const execCapture = vi.spyOn(exec, "execCapture");
-    const generateAdapterConfig = vi
-      .spyOn(scaffold, "generateAdapterConfig")
-      .mockReturnValue("config");
-    const generateInfrastructureJson = vi
-      .spyOn(scaffold, "generateInfrastructureJson")
-      .mockReturnValue("infra");
+    mockScaffold();
 
-    // Mock: all gcloud commands succeed, except IAM binding (retry) and registry (already exists)
-    // Default to success for all calls
-    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
-
-    // Override specific calls: IAM binding fails first, then succeeds on retry
-    let callCount = 0;
-    execCapture.mockImplementation(async () => {
-      callCount++;
-      // Call 7 = IAM binding (Grant storage admin) — fail first time
-      if (callCount === 7) return { exitCode: 1, stdout: "", stderr: "denied" };
-      // Call 8 = IAM binding retry — succeed
-      // Call 9 = Registry writer — already exists
-      if (callCount === 9) return { exitCode: 1, stdout: "", stderr: "ALREADY_EXISTS" };
+    // Fail the storage-admin binding once (retry then succeeds), and report
+    // ALREADY_EXISTS for the Artifact Registry writer grant.
+    let storageGrantFailed = false;
+    execCapture.mockImplementation(async (_cmd, args) => {
+      if (args.includes("roles/storage.objectAdmin") && !storageGrantFailed) {
+        storageGrantFailed = true;
+        return { exitCode: 1, stdout: "", stderr: "denied" };
+      }
+      if (args.includes("roles/artifactregistry.writer")) {
+        return { exitCode: 1, stdout: "", stderr: "ALREADY_EXISTS" };
+      }
       return { exitCode: 0, stdout: "", stderr: "" };
     });
 
     await runInit({
-      projectId: "p",
-      region: "r",
-      hosts: ["h"],
-      bucket: "b",
-      registry: "reg",
-      releaseName: "rel",
+      ...VALID,
       projectDir: tmpDir,
       iamRetryDelayMs: 0,
     });
 
     // Should have called execCapture for all gcloud commands + DNS auth describe
     expect(execCapture).toHaveBeenCalled();
-    expect(generateAdapterConfig).toHaveBeenCalled();
-    expect(generateInfrastructureJson).toHaveBeenCalled();
-    rmSync(tmpDir, { recursive: true, force: true });
+    expect(scaffold.generateAdapterConfig).toHaveBeenCalled();
+    expect(scaffold.generateInfrastructureJson).toHaveBeenCalled();
+  });
+
+  it("creates the custom traffic-extension role and binds it (never the admin roles)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+
+    const calls = execCapture.mock.calls.map(([, args]) => args);
+    const roleCreate = calls.find((a) => a.includes("roles") && a.includes("create"));
+    expect(roleCreate).toBeDefined();
+    expect(roleCreate!).toContain(deployExtRoleId(VALID.releaseName));
+    for (const perm of DEPLOY_EXT_ROLE_PERMISSIONS) {
+      expect(roleCreate!.join(" ")).toContain(perm);
+    }
+    const flat = calls.map((a) => a.join(" ")).join("\n");
+    expect(flat).not.toContain("roles/networkservices.admin");
+    expect(flat).not.toContain("roles/compute.loadBalancerAdmin");
+  });
+
+  it("updates the custom role when it already exists (idempotent)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockImplementation(async (_cmd, args) => {
+      if (args.includes("roles") && args.includes("create")) {
+        return { exitCode: 1, stdout: "", stderr: "ALREADY_EXISTS" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+
+    const calls = execCapture.mock.calls.map(([, args]) => args);
+    const roleUpdate = calls.find((a) => a.includes("roles") && a.includes("update"));
+    expect(roleUpdate).toBeDefined();
+    expect(roleUpdate!).toContain(deployExtRoleId(VALID.releaseName));
+    for (const perm of DEPLOY_EXT_ROLE_PERMISSIONS) {
+      expect(roleUpdate!.join(" ")).toContain(perm);
+    }
+  });
+
+  it("fails loudly when the custom role cannot be created (no admin-role fallback)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 1, stdout: "", stderr: "PERMISSION_DENIED" });
+
+    await expect(runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 })).rejects.toThrow(
+      /custom IAM role/,
+    );
+  });
+
+  it("validates operator inputs before running anything (injection guards)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await expect(
+      runInit({ ...VALID, hosts: ["evil'example.com"], projectDir: tmpDir }),
+    ).rejects.toThrow(/Invalid hostname/);
+    await expect(runInit({ ...VALID, bucket: "bad bucket'", projectDir: tmpDir })).rejects.toThrow(
+      /Invalid bucket name/,
+    );
+    await expect(
+      runInit({ ...VALID, registry: "registry.example.com/x:tag", projectDir: tmpDir }),
+    ).rejects.toThrow(/Invalid image registry/);
+    await expect(runInit({ ...VALID, projectId: "BAD", projectDir: tmpDir })).rejects.toThrow(
+      /Invalid projectId/,
+    );
+    await expect(runInit({ ...VALID, region: "us central1", projectDir: tmpDir })).rejects.toThrow(
+      /Invalid region/,
+    );
+
+    // Nothing should have been executed for any of the invalid inputs.
+    expect(execCapture).not.toHaveBeenCalled();
+  });
+
+  it("M4b: scaffolds .gitignore with .k8s-adapter/ and never duplicates it", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+    const gitignorePath = path.join(tmpDir, ".gitignore");
+    expect(existsSync(gitignorePath)).toBe(true);
+    expect(readFileSync(gitignorePath, "utf-8")).toContain(".k8s-adapter/");
+
+    // Second run: line must not be duplicated.
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+    const content = readFileSync(gitignorePath, "utf-8");
+    const occurrences = content.split("\n").filter((l) => l.trim() === ".k8s-adapter/").length;
+    expect(occurrences).toBe(1);
+  });
+
+  it("M4b: appends to an existing .gitignore (adding a trailing newline if needed)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    writeFileSync(path.join(tmpDir, ".gitignore"), "node_modules"); // no trailing newline
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+    const content = readFileSync(path.join(tmpDir, ".gitignore"), "utf-8");
+    expect(content).toBe("node_modules\n.k8s-adapter/\n");
+  });
+
+  it("dry-run prints the role commands without executing them", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await runInit({ ...VALID, projectDir: tmpDir, dryRun: true, iamRetryDelayMs: 0 });
+
+    expect(execCapture).not.toHaveBeenCalled();
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(printed).toContain("[dry-run] gcloud iam roles create");
+    expect(printed).toContain(deployExtRoleId(VALID.releaseName));
+    // dry-run must not scaffold .gitignore
+    expect(existsSync(path.join(tmpDir, ".gitignore"))).toBe(false);
   });
 });

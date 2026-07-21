@@ -9,11 +9,12 @@ describe("generateDockerignore", () => {
     expect(result).toContain("**/.env.*");
   });
 
-  it("re-includes .env.example so non-secret sample files survive", () => {
+  it("does NOT re-include .env.example — no env file variant belongs in an image", () => {
     const result = generateDockerignore();
-    expect(result).toContain("!**/.env.example");
-    // The negation must come after the broad .env.* exclusion to take effect.
-    const lines = result.split("\n");
-    expect(lines.indexOf("!**/.env.example")).toBeGreaterThan(lines.indexOf("**/.env.*"));
+    // The broad `**/.env.*` exclusion must stand with no negation punching a hole in it:
+    // example files can drift into real-looking credentials and would be baked into
+    // pushed image layers.
+    expect(result).not.toContain("!**/.env.example");
+    expect(result).not.toMatch(/^!/m);
   });
 });

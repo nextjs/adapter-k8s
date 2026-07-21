@@ -58,18 +58,32 @@ export interface ValkeyClient {
 }
 
 export interface RespClientOptions {
-  /** `redis://host:port` or `rediss://host:port` (TLS). */
+  /** `redis://host:port` or `rediss://host:port` (TLS). Userinfo (`redis://:pass@host`) is
+   * honored as the AUTH password when `password` isn't given explicitly. */
   url: string;
-  /** AUTH string, sent before any command. */
+  /** AUTH string, sent before any command. Takes precedence over URL userinfo. */
   password?: string | undefined;
+  /** PEM of the server CA to pin TLS verification against (e.g. a Memorystore in-transit
+   * encryption CA, which is not publicly rooted). Only meaningful with `rediss:`. */
+  caCert?: string | undefined;
   /** Reject (and drop the socket) if a command has no reply within this window. 0 disables. */
   commandTimeoutMs?: number;
   /** Reject if the TCP/TLS connection isn't established within this window (a blackholed endpoint
    * has no connect timeout of its own and would otherwise hang the first command's render). */
   connectTimeoutMs?: number;
+  /** Maximum size of a single reply frame in bytes (default 64 MiB). A server-advertised bulk
+   * length or array that would exceed this is a protocol error: the connection is destroyed and
+   * all in-flight commands fail (we never buffer an unbounded/untrustworthy advertised length). */
+  maxReplyBytes?: number;
 }
 
 const CRLF = Buffer.from("\r\n");
+
+/** Default cap for one reply frame (M6b). Entries are capped at 16 MiB, so 64 MiB is generous. */
+const DEFAULT_MAX_REPLY_BYTES = 64 * 1024 * 1024;
+/** Total buffered-but-unparsed bytes are capped at a multiple of the frame cap: pipelined replies
+ * (MULTI, concurrent commands) legitimately stack several frames behind the head one. */
+const MAX_BUFFERED_FACTOR = 4;
 
 function encodeCommand(args: Arg[]): Buffer {
   const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`)];
@@ -82,7 +96,9 @@ function encodeCommand(args: Arg[]): Buffer {
 
 // Parse one reply starting at `offset`. Returns [value, nextOffset], or null if `buf` doesn't yet
 // hold a complete reply (caller waits for more data). Bulk payloads are sliced by their length
-// prefix, so binary values containing CRLF parse correctly.
+// prefix, so binary values containing CRLF parse correctly. Callers must have validated the frame
+// with `scanFrameEnd` first (which rejects malformed lengths), so the length fields seen here are
+// already known-good.
 function parseReply(buf: Buffer, offset: number): [Reply, number] | null {
   if (offset >= buf.length) return null;
   const lineEnd = buf.indexOf(CRLF, offset);
@@ -123,30 +139,154 @@ function parseReply(buf: Buffer, offset: number): [Reply, number] | null {
   }
 }
 
+/**
+ * Measure the RESP frame starting at `offset` WITHOUT copying anything (M6b). Returns `{ end }`
+ * (absolute index one past the complete frame) or `{ need }` (rescanning is pointless until
+ * `buf.length >= need`). The `need` contract is what lets the inbound path buffer chunks of a
+ * large reply without re-scanning (and re-copying) per chunk: the bulk header reveals the full
+ * frame size up front.
+ *
+ * Throws a RespError on a protocol violation (L8): a non-integer or `< -1` length/count (RESP
+ * nulls use -1), an unknown type byte, a frame that would exceed `limit` bytes, or nesting past
+ * MAX_FRAME_DEPTH. Such a reply means the byte stream can no longer be trusted — the caller
+ * destroys the connection and fails all in-flight commands rather than risking a
+ * command-queue desync.
+ */
+// Real Valkey replies nest at most 2-3 levels (array → bulk, array → array → bulk). The
+// scanner recurses per array element, so a hostile endpoint could otherwise crash the process
+// with a stack overflow via `*1\r\n*1\r\n...` — cap the depth far above anything legitimate.
+const MAX_FRAME_DEPTH = 32;
+function scanFrameEnd(
+  buf: Buffer,
+  offset: number,
+  limit: number,
+  depth = 0,
+): { end: number } | { need: number } {
+  if (depth > MAX_FRAME_DEPTH) {
+    throw new RespError(`RESP frame nested past ${MAX_FRAME_DEPTH} levels`);
+  }
+  if (offset >= buf.length) return { need: offset + 1 };
+  const type = buf[offset]!;
+  const lineEnd = buf.indexOf(CRLF, offset);
+  if (lineEnd === -1) return { need: buf.length + 1 };
+  const after = lineEnd + 2;
+  switch (type) {
+    case 0x2b: // '+' simple string
+    case 0x2d: // '-' error
+    case 0x3a: // ':' integer
+      return { end: after };
+    case 0x24: {
+      // '$' bulk string
+      const len = Number(buf.toString("utf8", offset + 1, lineEnd));
+      if (!Number.isInteger(len) || len < -1) {
+        throw new RespError(
+          `RESP protocol error: invalid bulk length ${JSON.stringify(buf.toString("utf8", offset + 1, lineEnd))}`,
+        );
+      }
+      if (len === -1) return { end: after };
+      const end = after + len + 2;
+      if (end > limit) {
+        throw new RespError(`RESP reply frame of ${len} bytes exceeds the ${limit}-byte cap`);
+      }
+      return buf.length >= end ? { end } : { need: end };
+    }
+    case 0x2a: {
+      // '*' array
+      const count = Number(buf.toString("utf8", offset + 1, lineEnd));
+      if (!Number.isInteger(count) || count < -1) {
+        throw new RespError(
+          `RESP protocol error: invalid array count ${JSON.stringify(buf.toString("utf8", offset + 1, lineEnd))}`,
+        );
+      }
+      if (count === -1) return { end: after };
+      let cursor = after;
+      for (let i = 0; i < count; i++) {
+        const sub = scanFrameEnd(buf, cursor, limit, depth + 1);
+        if ("need" in sub) return sub;
+        cursor = sub.end;
+      }
+      if (cursor > limit) {
+        throw new RespError(`RESP reply frame exceeds the ${limit}-byte cap`);
+      }
+      return { end: cursor };
+    }
+    default:
+      throw new RespError(`RESP protocol error: unknown type byte 0x${type.toString(16)}`);
+  }
+}
+
 class RespClient implements ValkeyClient {
   private socket: Socket | TLSSocket | undefined;
   private connecting: Promise<void> | undefined;
-  private inbound: Buffer = Buffer.alloc(0);
+  /** Inbound bytes not yet attributed to a complete reply frame, as a chunk list + running total
+   * (concatenated lazily, once per emitted frame — never per received chunk). */
+  private inboundChunks: Buffer[] = [];
+  private inboundBytes = 0;
+  /** Rescan hint from `scanFrameEnd`: don't touch the chunk list until this many bytes exist. */
+  private neededBytes = 0;
   private readonly queue: Pending[] = [];
   private ended = false;
   private readonly url: string;
   private readonly password: string | undefined;
+  private readonly caCert: string | undefined;
   private readonly commandTimeoutMs: number;
   private readonly connectTimeoutMs: number;
+  private readonly maxReplyBytes: number;
+  private readonly maxBufferedBytes: number;
 
   constructor(options: RespClientOptions) {
     this.url = options.url;
     this.password = options.password;
+    this.caCert = options.caCert;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 5000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? 5000;
+    this.maxReplyBytes = options.maxReplyBytes ?? DEFAULT_MAX_REPLY_BYTES;
+    this.maxBufferedBytes = this.maxReplyBytes * MAX_BUFFERED_FACTOR;
   }
 
   private onData(chunk: Buffer): void {
-    this.inbound = this.inbound.length ? Buffer.concat([this.inbound, chunk]) : chunk;
-    while (this.queue.length) {
-      const parsed = parseReply(this.inbound, 0);
-      if (!parsed) break;
-      this.inbound = this.inbound.subarray(parsed[1]);
+    this.inboundChunks.push(chunk);
+    this.inboundBytes += chunk.length;
+    if (this.inboundBytes > this.maxBufferedBytes) {
+      // Unbounded buffering is a memory-exhaustion vector (M6b); bail out exactly like a socket
+      // error: destroy the connection and fail every in-flight command.
+      this.failAll(
+        new RespError(
+          `Valkey reply buffer grew past ${this.maxBufferedBytes} bytes; destroying connection`,
+        ),
+      );
+      return;
+    }
+    this.drainInbound();
+  }
+
+  // Emit every complete reply frame the inbound buffer currently holds. The expensive path — a
+  // large reply arriving in many TCP chunks — copies each byte exactly once: the header scan
+  // learns the frame size up front, intermediate chunks are only appended to the chunk list,
+  // and a single concat happens when the last chunk lands.
+  private drainInbound(): void {
+    while (this.queue.length > 0) {
+      if (this.inboundBytes < this.neededBytes) return; // head frame known-incomplete: wait cheaply
+      const buf = this.flattenInbound();
+      let scan: { end: number } | { need: number };
+      try {
+        scan = scanFrameEnd(buf, 0, this.maxReplyBytes);
+      } catch (error) {
+        this.failAll(error instanceof Error ? error : new RespError(String(error)));
+        return;
+      }
+      if ("need" in scan) {
+        this.neededBytes = scan.need;
+        return;
+      }
+      const parsed = parseReply(buf, 0);
+      if (!parsed || parsed[1] !== scan.end) {
+        // scanFrameEnd proved the frame complete, so parseReply cannot disagree — unless the two
+        // parsers drifted apart. Fail closed rather than desync the command queue.
+        this.failAll(new RespError("RESP protocol error: frame scanner/parser disagree"));
+        return;
+      }
+      this.consumeInbound(parsed[1]);
       const pending = this.queue.shift()!;
       if (pending.timer) clearTimeout(pending.timer);
       const value = parsed[0];
@@ -155,14 +295,33 @@ class RespClient implements ValkeyClient {
     }
   }
 
-  // Tear down the socket and fail every in-flight command. Called on socket error/close and on a
-  // command timeout — destroying is deliberate: a late reply after we've shifted the queue would
-  // map to the wrong caller, so we resync from a clean slate and let the next command reconnect.
+  // Join the chunk list into one contiguous buffer for scanning/parsing. No-op when a single
+  // chunk is buffered; afterwards the list collapses to that one buffer.
+  private flattenInbound(): Buffer {
+    if (this.inboundChunks.length === 1) return this.inboundChunks[0]!;
+    const flat = Buffer.concat(this.inboundChunks, this.inboundBytes);
+    this.inboundChunks = [flat];
+    return flat;
+  }
+
+  private consumeInbound(consumed: number): void {
+    const rest = this.inboundChunks[0]!.subarray(consumed);
+    this.inboundChunks = rest.length > 0 ? [rest] : [];
+    this.inboundBytes = rest.length;
+    this.neededBytes = 0; // the next head frame's size is unknown until scanned
+  }
+
+  // Tear down the socket and fail every in-flight command. Called on socket error/close, on a
+  // command timeout, and on a reply-protocol violation — destroying is deliberate: a late or
+  // mistramed reply after we've shifted the queue would map to the wrong caller, so we resync
+  // from a clean slate and let the next command reconnect.
   private failAll(error: Error): void {
     const socket = this.socket;
     this.socket = undefined;
     this.connecting = undefined;
-    this.inbound = Buffer.alloc(0);
+    this.inboundChunks = [];
+    this.inboundBytes = 0;
+    this.neededBytes = 0;
     if (socket) {
       socket.removeAllListeners();
       socket.destroy();
@@ -179,9 +338,29 @@ class RespClient implements ValkeyClient {
     const host = parsed.hostname;
     const port = parsed.port ? Number(parsed.port) : 6379;
     const useTls = parsed.protocol === "rediss:";
+    // Honor URL userinfo (`redis://:secret@host`) when no explicit password is configured (L6) —
+    // it was previously parsed and silently dropped, which surfaced as a permanent NOAUTH.
+    let userinfoPassword: string | undefined;
+    if (parsed.password) {
+      try {
+        userinfoPassword = decodeURIComponent(parsed.password);
+      } catch {
+        userinfoPassword = parsed.password; // malformed percent-encoding: use it verbatim
+      }
+    }
+    const password = this.password ?? userinfoPassword;
+    if (password && !useTls) warnPlaintextAuthOnce();
+
     // Lazy dynamic import keeps `node:net`/`node:tls` out of module eval (edge-eval-safe).
+    // With a configured CA (Memorystore in-transit encryption), pin verification to it — its
+    // CA is not publicly rooted, so the default trust store would reject the handshake.
     const socket: Socket | TLSSocket = useTls
-      ? (await import("node:tls")).connect({ host, port, servername: host })
+      ? (await import("node:tls")).connect({
+          host,
+          port,
+          servername: host,
+          ...(this.caCert ? { ca: this.caCert } : {}),
+        })
       : (await import("node:net")).connect({ host, port });
     socket.setNoDelay(true);
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
@@ -229,7 +408,7 @@ class RespClient implements ValkeyClient {
 
     // AUTH before any user command. connect() stays pending (so ensureConnected keeps gating user
     // commands) until AUTH's reply lands; its own command timeout bounds it.
-    if (this.password) await this.write(["AUTH", this.password]);
+    if (password) await this.write(["AUTH", password]);
   }
 
   private ensureConnected(): Promise<void> {
@@ -318,7 +497,9 @@ class RespClient implements ValkeyClient {
     // it rather than silently dropping the trailing element.
     if (reply.length % 2 !== 0)
       throw new RespError(`HGETALL returned an odd-length reply (${reply.length})`);
-    const out: Record<string, Buffer> = {};
+    // Null-prototype object (L4): a hash field literally named `__proto__` must be stored as data,
+    // not silently mutate the result's prototype chain.
+    const out: Record<string, Buffer> = Object.create(null);
     for (let i = 0; i + 1 < reply.length; i += 2) out[reply[i]!.toString("utf8")] = reply[i + 1]!;
     return out;
   }
@@ -344,6 +525,18 @@ class RespClient implements ValkeyClient {
   _write(args: Arg[]): Promise<Reply> {
     return this.write(args);
   }
+}
+
+let warnedPlaintextAuth = false;
+
+/** One-time warning (L6): AUTH and every cached page cross the network unencrypted on redis://. */
+function warnPlaintextAuthOnce(): void {
+  if (warnedPlaintextAuth) return;
+  warnedPlaintextAuth = true;
+  console.warn(
+    "[valkey-cache] a Valkey password is configured over a plaintext redis:// connection — " +
+      "AUTH and all cache content cross the network in cleartext; use rediss:// (TLS) instead",
+  );
 }
 
 class RespMulti implements ValkeyMulti {

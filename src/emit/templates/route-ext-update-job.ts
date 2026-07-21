@@ -1,15 +1,18 @@
-import { assertSafeReleaseName, assertSafeProjectId, assertSafeRegion } from "./utils.js";
+import {
+  assertSafeReleaseName,
+  assertSafeProjectId,
+  assertSafeRegion,
+  sanitizeK8sName,
+} from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
 // "delete old jobs" cleanup MUST match this exactly — a mismatch (it previously used a
 // 12-char build-id slice while the name uses 10) deletes the current job mid-run, so the
-// extension never gets registered.
+// extension never gets registered. sanitizeK8sName keeps the full (DNS-safe) build id, so
+// names stay unique per build — K8s Jobs are immutable, so per-build uniqueness is the
+// requirement — while still fitting the 63-char name limit.
 export function routeExtJobName(releaseName: string, buildId: string): string {
-  const safeBuildId = buildId
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .slice(0, 10);
-  return `${releaseName}-route-ext-${safeBuildId}`;
+  return sanitizeK8sName(`${releaseName}-route-ext-${buildId}`);
 }
 
 export function renderRouteExtUpdateJob({
@@ -39,12 +42,27 @@ metadata:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: route-ext-job
 spec:
+  # Sweep finished Jobs so re-registrations don't accumulate in the namespace.
+  ttlSecondsAfterFinished: 3600
   template:
     spec:
       serviceAccountName: ${releaseName}-deploy-sa
+      # NOTE: the SA token stays automounted — this Job needs Workload Identity to call
+      # gcloud. It still runs as an unprivileged user with a locked-down container.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: update-ext
           image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -140,13 +158,21 @@ spec:
           env:
             - name: CLOUDSDK_CORE_PROJECT
               value: "${projectId}"
+            # gcloud refuses to run when its config home is unwritable; running as
+            # non-root with a read-only root FS, point it at the /tmp emptyDir.
+            - name: CLOUDSDK_CONFIG
+              value: /tmp/.config/gcloud
           volumeMounts:
             - name: config
               mountPath: /config
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: ${releaseName}-route-ext-config
+        - name: tmp
+          emptyDir: {}
       restartPolicy: Never
   backoffLimit: 3
 `;

@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
+import { sanitizeForTerminal } from "./terminal.js";
 
 const COLORS = [
   "\x1b[36m", // cyan
@@ -75,10 +76,13 @@ export async function runTail(options: { projectDir: string; releaseName: string
     child.stdout?.on("data", (data: Buffer) => {
       for (const line of data.toString().split("\n")) {
         if (!line) continue;
-        const isError = line.includes("Error") || line.includes("error") || line.includes("FATAL");
+        // L14: log lines are cluster-sourced — strip terminal control characters.
+        const clean = sanitizeForTerminal(line);
+        const isError =
+          clean.includes("Error") || clean.includes("error") || clean.includes("FATAL");
         const lineColor = isError ? RED : "";
         process.stdout.write(
-          `${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${lineColor}${line}${isError ? RESET : ""}\n`,
+          `${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${lineColor}${clean}${isError ? RESET : ""}\n`,
         );
       }
     });
@@ -86,8 +90,10 @@ export async function runTail(options: { projectDir: string; releaseName: string
     child.stderr?.on("data", (data: Buffer) => {
       for (const line of data.toString().split("\n")) {
         if (!line || line.includes("is waiting to start")) continue;
+        // L14: log lines are cluster-sourced — strip terminal control characters.
+        const clean = sanitizeForTerminal(line);
         process.stderr.write(
-          `${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${RED}${line}${RESET}\n`,
+          `${color}${badge.padEnd(25)}${RESET} ${DIM}│${RESET} ${RED}${clean}${RESET}\n`,
         );
       }
     });

@@ -8,11 +8,11 @@
 // call @next/env loadEnvConfig at startup, which simply finds no file and falls
 // back to process.env. `**/` covers both context layouts (root-level `.env` in
 // shared-context, `context/.env` in the pool and routing-service contexts).
-// `.env.example` is re-included so committed, non-secret sample files survive.
+// `.env.example` is NOT re-included: example files can drift into real-looking
+// credentials over time, and nothing at runtime needs them inside the image.
 export function generateDockerignore(): string {
   return `# Keep .env secrets out of image layers — env is injected via Kubernetes at runtime.
 **/.env
 **/.env.*
-!**/.env.example
 `;
 }

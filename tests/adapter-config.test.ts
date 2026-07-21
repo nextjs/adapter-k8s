@@ -33,3 +33,41 @@ describe("createK8sAdapter config normalization", () => {
     expect((adapter as any).config.provider.gke.cdn.enabled).toBe(false);
   });
 });
+
+describe("buildId validation at build time (H2)", () => {
+  // The finalized buildId flows into helm --set values, K8s names/labels, image tags and
+  // chart YAML — an unsafe one (e.g. a git branch from a custom generateBuildId) must
+  // fail the build at the source, before any artifact is emitted.
+  it.each([
+    ['feature/foo";rm', "YAML/shell breakout"],
+    ["foo,bar=baz", "helm --set metacharacters"],
+    ["foo\\bar", "helm --set escape char"],
+    ["line1\nline2", "newline"],
+  ])("rejects an unsafe buildId (%s)", async (buildId) => {
+    const adapter = createK8sAdapter(validConfig);
+    await expect(
+      adapter.onBuildComplete!({
+        buildId,
+        routing: {},
+        outputs: {},
+        projectDir: "/nonexistent",
+        config: {},
+        nextVersion: "16.2.0",
+      } as any),
+    ).rejects.toThrow(/Invalid buildId/);
+  });
+
+  it("mentions the generateBuildId contract in the error", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    await expect(
+      adapter.onBuildComplete!({
+        buildId: "bad,id",
+        routing: {},
+        outputs: {},
+        projectDir: "/nonexistent",
+        config: {},
+        nextVersion: "16.2.0",
+      } as any),
+    ).rejects.toThrow(/generateBuildId/);
+  });
+});

@@ -17,6 +17,14 @@ import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 // value, so it MUST match the pod label byte-for-byte — a divergent local copy that
 // omitted the `b-` prefix drained the Service to zero endpoints and 503'd the site.
 import { sanitizeK8sName } from "../emit/templates/utils.js";
+import {
+  assertSafeBuildId,
+  assertSafeImageRegistry,
+  assertSafeNamespace,
+  assertSafeProjectId,
+  assertSafeRegion,
+} from "../emit/templates/utils.js";
+import { sanitizeForTerminal } from "./terminal.js";
 import type { GcloudCommand } from "./init.js";
 
 export interface DeployOptions {
@@ -25,6 +33,14 @@ export interface DeployOptions {
   skipBuild?: boolean;
   skipPush?: boolean;
   dryRun?: boolean;
+  /**
+   * Explicit opt-out of the fail-closed NetworkPolicy posture: allow the deploy to
+   * proceed WITHOUT pod-CIDR NetworkPolicies when the cluster CIDR can't be discovered.
+   * Without this flag a discovery failure aborts the deploy — silently shipping the
+   * chart without its network isolation would re-open the in-cluster secret-extraction
+   * path the policies close (H1).
+   */
+  allowNoNetworkPolicy?: boolean;
 }
 
 export interface DockerCommandOptions {
@@ -100,6 +116,18 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   return commands;
 }
 
+// L15: pool names are read from build-metadata.json and used in chart file paths and
+// docker build contexts — a malicious or corrupt name (e.g. "../x") could otherwise
+// escape the chart templates directory.
+export function assertSafePoolName(poolName: string): void {
+  if (!/^[a-z0-9-]+$/.test(poolName)) {
+    throw new Error(
+      `Invalid pool name "${poolName}" in build-metadata.json: must match /^[a-z0-9-]+$/ ` +
+        `(lowercase letters, digits, hyphens). Refusing to use it in file paths.`,
+    );
+  }
+}
+
 export function buildHelmUpgradeArgs(options: {
   releaseName: string;
   chartPath: string;
@@ -107,8 +135,16 @@ export function buildHelmUpgradeArgs(options: {
   registry: string;
   previousBuildId: string | null;
   overridesFile?: string;
+  podCidrs?: string | null;
 }): string[] {
-  const { releaseName, chartPath, buildId, registry, previousBuildId, overridesFile } = options;
+  const { releaseName, chartPath, buildId, registry, previousBuildId, overridesFile, podCidrs } =
+    options;
+  // H2: these values land in `helm --set` assignments — reject helm metacharacters
+  // (","  "\"  quotes) before they can split one assignment into several. The buildId
+  // comes from generateBuildId()/git refs and the registry from infrastructure.json.
+  assertSafeBuildId(buildId);
+  assertSafeImageRegistry(registry);
+  if (previousBuildId) assertSafeBuildId(previousBuildId);
   const args = [
     "upgrade",
     "--install",
@@ -133,6 +169,12 @@ export function buildHelmUpgradeArgs(options: {
     args.push("--set", `previousBuildId=${previousBuildId}`);
   }
 
+  // NetworkPolicy interface with the chart: discovered cluster pod CIDR(s), passed as a
+  // helm brace list (CIDRs contain no commas, so no escaping needed).
+  if (podCidrs) {
+    args.push("--set", `global.networkPolicy.podCidrs={${podCidrs}}`);
+  }
+
   if (overridesFile && existsSync(overridesFile)) {
     args.push("-f", overridesFile);
   }
@@ -140,8 +182,58 @@ export function buildHelmUpgradeArgs(options: {
   return args;
 }
 
+/**
+ * Discover the cluster's pod CIDR for the chart-rendered NetworkPolicies. FAIL-CLOSED:
+ * the helm `podCidrs` guard renders NO policy when the value is absent, so a failed or
+ * malformed lookup throws (the NetworkPolicies are what close in-cluster access to the
+ * routing service's dispatch secret, H1) — unless the operator explicitly opts out with
+ * `--allow-no-network-policy`, in which case this warns loudly and returns null.
+ */
+export async function discoverClusterPodCidr({
+  clusterName,
+  region,
+  projectId,
+  allowNoNetworkPolicy = false,
+}: {
+  clusterName: string;
+  region: string;
+  projectId: string;
+  allowNoNetworkPolicy?: boolean;
+}): Promise<string | null> {
+  const cidrResult = await execCapture("gcloud", [
+    "container",
+    "clusters",
+    "describe",
+    clusterName,
+    "--region",
+    region,
+    "--project",
+    projectId,
+    "--format=value(clusterIpv4Cidr)",
+  ]);
+  const discovered = cidrResult.exitCode === 0 ? cidrResult.stdout.trim() : "";
+  // One or more comma-separated IPv4 CIDRs — anything else would corrupt the helm list.
+  const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d{1,2})*$/;
+  if (CIDR_LIST_RE.test(discovered)) return discovered;
+
+  if (allowNoNetworkPolicy) {
+    console.warn(
+      "  ! Could not discover the cluster pod CIDR — continuing WITHOUT NetworkPolicies " +
+        "(--allow-no-network-policy). The routing service is reachable from any in-cluster " +
+        "pod; re-run without the flag once the cluster is describable.",
+    );
+    return null;
+  }
+  throw new Error(
+    `Could not discover the pod CIDR for cluster "${clusterName}" ` +
+      `(gcloud exited ${cidrResult.exitCode}${discovered ? `, unexpected value ${JSON.stringify(discovered)}` : ", empty output"}). ` +
+      `The chart's NetworkPolicies require it; refusing to deploy without network isolation. ` +
+      `Fix cluster access, or pass --allow-no-network-policy to explicitly deploy without them.`,
+  );
+}
+
 export async function runDeploy(options: DeployOptions): Promise<void> {
-  const { projectDir, releaseName, skipBuild, skipPush, dryRun } = options;
+  const { projectDir, releaseName, skipBuild, skipPush, dryRun, allowNoNetworkPolicy } = options;
 
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (!existsSync(infraPath)) {
@@ -151,6 +243,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     );
   }
   const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+
+  // H2: infrastructure.json values reach the privileged route-ext Job script
+  // (projectId/region), extension-chain authority/YAML (namespace), and helm --set
+  // assignments / docker tags (containerRegistry) — validate before any use.
+  if (infra.projectId) assertSafeProjectId(infra.projectId);
+  if (infra.region) assertSafeRegion(infra.region);
+  if (infra.namespace) assertSafeNamespace(infra.namespace);
+  if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
 
   // 0. Ensure kubectl is pointing at the right cluster
   if (!dryRun && infra.projectId && infra.region && releaseName) {
@@ -167,6 +267,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       infra.projectId,
       "--quiet",
     ]);
+  }
+
+  // 0b. Discover the cluster pod CIDR for chart-rendered NetworkPolicies (fail-closed —
+  // see discoverClusterPodCidr).
+  let podCidr: string | null = null;
+  if (!dryRun && infra.projectId && infra.region && releaseName) {
+    podCidr = await discoverClusterPodCidr({
+      clusterName: `${releaseName}-cluster`,
+      region: infra.region,
+      projectId: infra.projectId,
+      allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
+    });
   }
 
   // 1. Run next build (adapter's onBuildComplete generates artifacts)
@@ -187,7 +299,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
   const metadata = JSON.parse(readFileSync(metadataPath, "utf-8"));
   const buildId: string = metadata.buildId;
+  // H2: the buildId comes from generateBuildId()/git refs and is spliced into helm
+  // --set assignments and image tags — reject helm/shell metacharacters up front.
+  assertSafeBuildId(buildId);
   const pools: string[] = metadata.pools;
+  if (!Array.isArray(pools)) {
+    throw new Error(`build-metadata.json is missing a "pools" array. Did next build run?`);
+  }
+  for (const poolName of pools) assertSafePoolName(poolName);
 
   console.log(`\n  Build ID: ${buildId}`);
   console.log(`  Pools: ${pools.join(", ")}`);
@@ -206,7 +325,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
     console.log("\n  → Provisioning managed cache (Memorystore)...");
     const ms = (
-      metadata as { cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string } }
+      metadata as {
+        cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string; auth?: boolean };
+      }
     ).cacheMemorystore;
     const cacheRegion = ms?.region ?? infra.region;
     const endpoint = await provisionMemorystore({
@@ -215,6 +336,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       releaseName,
       ...(ms?.sizeGb ? { sizeGb: ms.sizeGb } : {}),
       ...(ms?.tier ? { tier: ms.tier } : {}),
+      ...(ms?.auth ? { auth: true } : {}),
       log: (m: string) => console.log(m),
     });
     // Persist the actual region immediately after provisioning. Any later failure (writing the
@@ -225,9 +347,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       writeFileSync(infraPath, JSON.stringify(infra, null, 2));
     }
 
-    const url = `redis://${endpoint.host}:${endpoint.port}`;
+    // AUTH mode ⇒ TLS endpoint (Memorystore requires in-transit encryption for AUTH).
+    const url = `${endpoint.authString ? "rediss" : "redis"}://${endpoint.host}:${endpoint.port}`;
     const secretPath = path.join(outputDir, "chart", "templates", "valkey-secret.yaml");
-    writeFileSync(secretPath, renderValkeySecret({ releaseName, url }));
+    // M4a: this file carries the cache connection Secret — owner-read/write only.
+    writeFileSync(
+      secretPath,
+      renderValkeySecret({
+        releaseName,
+        url,
+        ...(endpoint.authString ? { password: endpoint.authString } : {}),
+        ...(endpoint.caCert ? { ca: endpoint.caCert } : {}),
+      }),
+      { mode: 0o600 },
+    );
     console.log(`    Cache Secret ${releaseName}-valkey staged for Helm → ${url}`);
   } else if (!metadata.cacheEnabled && !dryRun) {
     // Cache disabled (not just BYO — cacheEnabled distinguishes them). Tear down a previously
@@ -348,8 +481,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 6. Helm upgrade
-  const state = await readState(projectDir, releaseName);
+  // L13: dry-run must not touch the cluster — skip the cluster ConfigMap read and use
+  // local state only (best-effort).
+  const state = dryRun
+    ? await readState(projectDir).catch(() => null)
+    : await readState(projectDir, releaseName);
   const previousBuildId = state?.buildId ?? null;
+  // H2: previousBuildId is spliced into a helm --set assignment below.
+  if (previousBuildId) assertSafeBuildId(previousBuildId);
 
   const overridesFile = path.join(projectDir, ".k8s-adapter", "helm", "values.override.yaml");
   const helmArgs = buildHelmUpgradeArgs({
@@ -359,6 +498,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     registry: infra.containerRegistry,
     previousBuildId,
     overridesFile,
+    podCidrs: podCidr,
   });
 
   // Inject previous build's deployment+service into the chart so Helm doesn't delete it.
@@ -389,25 +529,35 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // Render retained resources through the same canonical templates as a normal build.
       // Hand-copying this Deployment previously omitted resources, changing the serving pod
       // template and rolling the old build during every upgrade.
-      writeFileSync(
-        path.join(chartTemplatesDir, `${poolName}-prev-deployment.yaml`),
-        renderDeployment({
-          poolName,
-          buildId: previousBuildId,
-          releaseName,
-          imageTag: previousBuildId,
-          replicas: prevReplicas,
-        }),
-      );
-
-      writeFileSync(
-        path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`),
-        renderService({ poolName, buildId: previousBuildId, releaseName }),
-      );
-      writeFileSync(
-        path.join(chartTemplatesDir, `${poolName}-prev-hpa.yaml`),
-        renderHPA({ poolName, buildId: previousBuildId, releaseName }),
-      );
+      // L13: dry-run must not write into the chart — report the planned writes instead.
+      const retainedFiles: [string, string][] = [
+        [
+          `${poolName}-prev-deployment.yaml`,
+          renderDeployment({
+            poolName,
+            buildId: previousBuildId,
+            releaseName,
+            imageTag: previousBuildId,
+            replicas: prevReplicas,
+          }),
+        ],
+        [
+          `${poolName}-prev-service.yaml`,
+          renderService({ poolName, buildId: previousBuildId, releaseName }),
+        ],
+        [
+          `${poolName}-prev-hpa.yaml`,
+          renderHPA({ poolName, buildId: previousBuildId, releaseName }),
+        ],
+      ];
+      for (const [fileName, content] of retainedFiles) {
+        const target = path.join(chartTemplatesDir, fileName);
+        if (dryRun) {
+          console.log(`    [dry-run] would write ${target}`);
+        } else {
+          writeFileSync(target, content);
+        }
+      }
     }
   }
 
@@ -614,7 +764,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             if (errorLines.length > 0) {
               console.error(`  Errors:`);
               for (const err of errorLines.slice(0, 5)) {
-                console.error(`    ${err.trim().slice(0, 150)}`);
+                // L14: pod log lines are cluster-sourced — strip terminal control
+                // characters before printing.
+                console.error(`    ${sanitizeForTerminal(err.trim()).slice(0, 150)}`);
               }
             } else {
               console.error(

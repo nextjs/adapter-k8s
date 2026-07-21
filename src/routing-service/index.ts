@@ -1,9 +1,58 @@
-import { readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RoutingManifest } from "../types.js";
 import { createRequestHandler } from "./handler.js";
 import { createRoutingServer, startHealthServer } from "./server.js";
+
+// The TLS identity is generated per-replica at container start, NOT baked into the image at
+// build time (where every replica would share one key and anyone with registry pull could
+// extract it). When TLS_CERT_FILE/TLS_KEY_FILE are configured but absent (the deployment points
+// them at an emptyDir such as /tmp/tls), mint a self-signed pair with openssl. Parent dirs are
+// created so a read-only /app is tolerated. Any failure — openssl missing, unwritable path —
+// falls back to the existing plaintext h2c behavior (emulate parity) instead of crashing.
+function ensureTlsIdentity(): void {
+  const certFile = process.env.TLS_CERT_FILE;
+  const keyFile = process.env.TLS_KEY_FILE;
+  if (!certFile || !keyFile) return;
+  if (existsSync(certFile) && existsSync(keyFile)) return;
+  const release = process.env.RELEASE_NAME ?? "nextjs";
+  const namespace = process.env.NAMESPACE ?? "default";
+  const serviceName = `${release}-routing-service`;
+  try {
+    mkdirSync(path.dirname(certFile), { recursive: true });
+    mkdirSync(path.dirname(keyFile), { recursive: true });
+    // execFileSync with an argv array — never a shell string — so the release/namespace
+    // values can never become command injection.
+    execFileSync(
+      "openssl",
+      [
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        keyFile,
+        "-out",
+        certFile,
+        "-days",
+        "3650",
+        "-subj",
+        `/CN=${serviceName}`,
+        "-addext",
+        `subjectAltName=DNS:${serviceName}.${namespace}.svc.cluster.local`,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    console.log(`Routing service: generated self-signed TLS identity at ${certFile}`);
+  } catch (err) {
+    console.warn(
+      `Routing service: could not generate TLS identity (${err instanceof Error ? err.message : String(err)}); falling back to plaintext h2c`,
+    );
+  }
+}
 
 async function main() {
   // Load .env files
@@ -58,8 +107,11 @@ async function main() {
   // under GCP's 5s callout timeout). Set 0 to disable.
   const timeoutMs = parseInt(process.env.ROUTING_REQUEST_TIMEOUT_MS ?? "4000", 10);
 
-  // Create handler and server
+  // Create handler and server. Mint the TLS identity first so createRoutingServer sees the
+  // cert files (or their deliberate absence, after a generation failure) when it picks its
+  // transport.
   const handler = createRequestHandler(manifest, middlewareModule);
+  ensureTlsIdentity();
   const server = createRoutingServer({ handler, port, failOpen, timeoutMs });
 
   await server.start();

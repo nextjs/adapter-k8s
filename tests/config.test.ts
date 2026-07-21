@@ -43,6 +43,34 @@ describe("validateConfig", () => {
     expect(() => validateConfig(config)).toThrow(/provider.gke.gateway.hosts is required/);
   });
 
+  it("rejects a hostname that would break out of the quoted YAML scalar", () => {
+    // The hostname is interpolated into gateway.ts as "- "<hostname>"" — a quote+newline
+    // injects arbitrary chart YAML. validateConfig must reject it at the boundary.
+    const makeConfig = (hostname: string): K8sAdapterConfig =>
+      ({
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: {
+          gke: {
+            gateway: {
+              type: "gateway-api",
+              className: "gke",
+              hosts: [{ hostname, tls: { enabled: true } }],
+            },
+          },
+        },
+      }) as K8sAdapterConfig;
+
+    expect(() => validateConfig(makeConfig('app.example.com"\nmalicious: true'))).toThrow(
+      /Invalid hostname/,
+    );
+    expect(() => validateConfig(makeConfig("app.example.com;rm -rf /"))).toThrow(
+      /Invalid hostname/,
+    );
+    expect(() => validateConfig(makeConfig("UPPER.example.com"))).toThrow(/Invalid hostname/);
+    expect(() => validateConfig(makeConfig("app.example.com"))).not.toThrow();
+    expect(() => validateConfig(makeConfig("localhost"))).not.toThrow();
+  });
+
   it("allows wildcard hostnames (Certificate Manager supports them)", () => {
     const config: K8sAdapterConfig = {
       pools: { ssr: { routes: ["appPages"] } },

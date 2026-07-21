@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve4 } from "node:dns/promises";
 import path from "node:path";
 import { execCapture } from "./exec.js";
+import { sanitizeForTerminal } from "./terminal.js";
 
 interface CheckResult {
   name: string;
@@ -240,7 +241,9 @@ export async function runDoctor(options: {
         results.push({
           name: "Gateway",
           status: "fail",
-          message: reasonResult.stdout.trim() || `Status: ${accepted || "Unknown"}`,
+          // L14: condition messages are cluster-sourced — strip terminal control chars.
+          message:
+            sanitizeForTerminal(reasonResult.stdout.trim()) || `Status: ${accepted || "Unknown"}`,
           fix: `kubectl describe gateway ${releaseName}-gateway`,
         });
       }
@@ -530,7 +533,8 @@ export async function runDoctor(options: {
                 l.includes("Cannot find module"),
             );
           if (errorLines.length > 0) {
-            const firstError = errorLines[0]!.trim().slice(0, 120);
+            // L14: pod log lines are cluster-sourced — strip terminal control chars.
+            const firstError = sanitizeForTerminal(errorLines[0]!.trim()).slice(0, 120);
             results.push({
               name: "Pod logs",
               status: "fail",
@@ -646,17 +650,19 @@ export async function runDoctor(options: {
         for (const line of negResult.stdout.trim().split("\n")) {
           if (!line.includes(releaseName)) continue;
           const healthy = line.includes("=True");
+          // L14: NEG condition lines are cluster-sourced — strip terminal control chars.
+          const cleanLine = sanitizeForTerminal(line);
           results.push(
             healthy
               ? {
                   name: "Backend NEG",
                   status: "pass",
-                  message: line.split(":")[0]?.trim() ?? "Ready",
+                  message: cleanLine.split(":")[0]?.trim() ?? "Ready",
                 }
               : {
                   name: "Backend NEG",
                   status: "warn",
-                  message: line.trim(),
+                  message: cleanLine.trim(),
                   fix: "NEG not yet ready — backend health check may be pending",
                 },
           );

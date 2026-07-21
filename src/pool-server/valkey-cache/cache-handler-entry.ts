@@ -30,7 +30,11 @@ function getValkeyHandler(): ValkeyIncrementalCacheHandler | undefined {
   if (!url || !buildId) return undefined;
   if (!sharedHandler) {
     // Lazy: only reached in the node pool runtime when a cache is configured. Never in edge.
-    const client = createValkeyClient({ url, password: process.env.VALKEY_AUTH });
+    const client = createValkeyClient({
+      url,
+      password: process.env.VALKEY_AUTH,
+      caCert: process.env.VALKEY_CA_CERT,
+    });
     sharedHandler = new ValkeyIncrementalCacheHandler({ client, buildId });
   }
   return sharedHandler;

@@ -213,16 +213,53 @@ export function renderHTTPRoute({
 
   const hostnameLines = hostnames.map((h) => `    - "${h}"`).join("\n");
 
-  return `apiVersion: gateway.networking.k8s.io/v1
+  // When TLS is enabled the app route must attach ONLY to the https listener —
+  // otherwise http:// traffic is served plaintext. Plain HTTP is instead upgraded by
+  // the redirect route below (attached to the http listener). Without TLS the gateway
+  // has just the http listener, so no sectionName is needed (or valid).
+  const hasTls = hosts.some((h) => h.tls?.enabled);
+  const appParentRef = hasTls
+    ? `    - name: ${releaseName}-gateway
+      sectionName: https`
+    : `    - name: ${releaseName}-gateway`;
+
+  const appRoute = `apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: ${releaseName}-routes
 spec:
   parentRefs:
-    - name: ${releaseName}-gateway
+${appParentRef}
   hostnames:
 ${hostnameLines}
   rules:
 ${rules}
 `;
+
+  if (!hasTls) return appRoute;
+
+  // HTTP -> HTTPS redirect: a rule whose only filter is RequestRedirect short-circuits
+  // before any backendRef (GKE Gateway API supports RequestRedirect with scheme/port/
+  // statusCode), so http:// traffic gets a 302 to https:// instead of plaintext service.
+  const redirectRoute = `---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ${releaseName}-http-redirect
+spec:
+  parentRefs:
+    - name: ${releaseName}-gateway
+      sectionName: http
+  hostnames:
+${hostnameLines}
+  rules:
+    - filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            port: 443
+            statusCode: 302
+`;
+
+  return appRoute + redirectRoute;
 }

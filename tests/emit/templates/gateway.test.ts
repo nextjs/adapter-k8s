@@ -130,6 +130,56 @@ describe("renderHTTPRoute CDN filter injection", () => {
   });
 });
 
+describe("renderHTTPRoute HTTP->HTTPS redirect (M8)", () => {
+  const tlsHosts: HostConfig[] = [{ hostname: "app.example.com", tls: { enabled: true } }];
+
+  it("pins the app route to the https listener and adds a RequestRedirect route when TLS is on", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts: tlsHosts,
+      pools: makePools(2),
+      buildId: "abc123",
+      routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
+    });
+
+    // Two HTTPRoute documents: the app route and the redirect route.
+    const routeDocs = yaml.match(/kind: HTTPRoute/g) ?? [];
+    expect(routeDocs).toHaveLength(2);
+
+    // The app route attaches ONLY to the https listener (no plaintext service).
+    expect(yaml).toMatch(
+      /name: nextjs-routes\nspec:\n  parentRefs:\n    - name: nextjs-gateway\n      sectionName: https/,
+    );
+
+    // The redirect route attaches to the http listener and 302-upgrades to https:443.
+    expect(yaml).toContain("name: nextjs-http-redirect");
+    expect(yaml).toMatch(
+      /name: nextjs-http-redirect\nspec:\n  parentRefs:\n    - name: nextjs-gateway\n      sectionName: http/,
+    );
+    expect(yaml).toContain("type: RequestRedirect");
+    expect(yaml).toMatch(/requestRedirect:\n\s+scheme: https\n\s+port: 443\n\s+statusCode: 302/);
+    // Same hostnames on the redirect route.
+    const redirectDoc = yaml.slice(yaml.indexOf("name: nextjs-http-redirect"));
+    expect(redirectDoc).toContain('"app.example.com"');
+  });
+
+  it("emits no redirect route and no sectionName when TLS is off", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts, // tls disabled
+      pools: makePools(2),
+      buildId: "abc123",
+      routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
+    });
+
+    const routeDocs = yaml.match(/kind: HTTPRoute/g) ?? [];
+    expect(routeDocs).toHaveLength(1);
+    expect(yaml).not.toContain("RequestRedirect");
+    expect(yaml).not.toContain("sectionName");
+    expect(yaml).not.toContain("http-redirect");
+  });
+});
+
 describe("releaseName validation in gateway templates", () => {
   it("renderGateway rejects an unsafe releaseName", () => {
     expect(() => renderGateway({ releaseName: 'foo";rm -rf /;"', hosts })).toThrow(

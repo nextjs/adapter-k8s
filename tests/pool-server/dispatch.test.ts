@@ -492,9 +492,10 @@ describe("createDispatcher", () => {
     // External rewrites are proxied — the actual HTTP request will fail in tests
     // but the dispatch should attempt the proxy (not return 502 immediately)
     await dispatcher.dispatch(req, res as unknown as ServerResponse, resolution);
-    // Proxy will fail with connection error in test env → 502 with error message
+    // Proxy will fail with connection error in test env → 502, but the body is generic:
+    // the upstream error detail must not leak to clients (L1).
     expect(res._status).toBe(502);
-    expect(res._body).toContain("External rewrite failed");
+    expect(res._body).toBe("Bad Gateway");
   });
 
   it("returns 404 for not-found", async () => {
@@ -1797,35 +1798,113 @@ describe("createDispatcher", () => {
       expect(res._body).toContain("Internal Server Error");
     });
 
-    it("lets a preview (__prerender_bypass) request through a fallback:false route", async () => {
-      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
-      const dispatcher = createDispatcher({
-        handlerLoader: {
-          load: vi.fn().mockResolvedValue(vi.fn()),
-          has: vi.fn((p: string) => p === "/blog/[slug]"),
-          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
-        } as any,
-        poolName: "ssr",
-        buildId: "test123",
-        staticAssets: [],
-        localHandlerInvoker,
-        strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
-        prerenderedPaths: new Set(["/blog/first"]),
-        buildIdForData: "test123",
+    // M10: the strict-dynamic-route 404 bypass requires a VERIFIED preview credential —
+    // upstream Next validates x-prerender-revalidate and the __prerender_bypass cookie
+    // against the build's random previewModeId (loaded as __NEXT_PREVIEW_MODE_ID).
+    describe("strict-route preview bypass credentials (M10)", () => {
+      const PREVIEW_ID = "build-preview-id";
+      let previousPreviewId: string | undefined;
+
+      function makeStrictDispatcher(localHandlerInvoker: ReturnType<typeof vi.fn>) {
+        return createDispatcher({
+          handlerLoader: {
+            load: vi.fn().mockResolvedValue(vi.fn()),
+            has: vi.fn((p: string) => p === "/blog/[slug]"),
+            get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+          } as any,
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          localHandlerInvoker,
+          strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
+          prerenderedPaths: new Set(["/blog/first"]),
+          buildIdForData: "test123",
+        });
+      }
+
+      const strictResolution: ResolveResult = {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/blog/[slug]",
+        routeMatches: { slug: "nope" },
+        resolvedHeaders: undefined,
+      };
+
+      beforeEach(() => {
+        previousPreviewId = process.env.__NEXT_PREVIEW_MODE_ID;
       });
-      const res = mockRes();
-      await dispatcher.dispatch(
-        mockReq("/blog/nope", { cookie: "__prerender_bypass=xyz" }),
-        res as unknown as ServerResponse,
-        {
-          kind: "route",
-          pool: "ssr",
-          matchedPathname: "/blog/[slug]",
-          routeMatches: { slug: "nope" },
-          resolvedHeaders: undefined,
-        },
-      );
-      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+
+      afterEach(() => {
+        if (previousPreviewId === undefined) delete process.env.__NEXT_PREVIEW_MODE_ID;
+        else process.env.__NEXT_PREVIEW_MODE_ID = previousPreviewId;
+      });
+
+      it("lets a VERIFIED preview/revalidate request through a fallback:false route", async () => {
+        process.env.__NEXT_PREVIEW_MODE_ID = PREVIEW_ID;
+        const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+        const dispatcher = makeStrictDispatcher(localHandlerInvoker);
+
+        // On-demand revalidation: header value equals the build's previewModeId.
+        const resRevalidate = mockRes();
+        await dispatcher.dispatch(
+          mockReq("/blog/nope", { "x-prerender-revalidate": PREVIEW_ID }),
+          resRevalidate as unknown as ServerResponse,
+          strictResolution,
+        );
+        expect(localHandlerInvoker).toHaveBeenCalledOnce();
+
+        // Draft mode: the bypass cookie's value equals the previewModeId — exactly
+        // what Next's setDraftMode writes into the cookie.
+        const resDraft = mockRes();
+        await dispatcher.dispatch(
+          mockReq("/blog/nope", { cookie: `__prerender_bypass=${PREVIEW_ID}` }),
+          resDraft as unknown as ServerResponse,
+          strictResolution,
+        );
+        expect(localHandlerInvoker).toHaveBeenCalledTimes(2);
+      });
+
+      it("RED TEAM: forged preview credentials do NOT bypass a fallback:false 404", async () => {
+        process.env.__NEXT_PREVIEW_MODE_ID = PREVIEW_ID;
+        const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+        const dispatcher = makeStrictDispatcher(localHandlerInvoker);
+
+        // Presence alone proves nothing — every forged credential must still 404.
+        for (const headers of [
+          { "x-prerender-revalidate": "1" },
+          { "x-prerender-revalidate": `${PREVIEW_ID}-typo` },
+          { cookie: "__prerender_bypass=forged" },
+          // A lookalike cookie name must not satisfy the check either.
+          { cookie: `x__prerender_bypass=${PREVIEW_ID}` },
+        ]) {
+          const res = mockRes();
+          await dispatcher.dispatch(
+            mockReq("/blog/nope", headers),
+            res as unknown as ServerResponse,
+            strictResolution,
+          );
+          expect(res._status).toBe(404);
+        }
+        expect(localHandlerInvoker).not.toHaveBeenCalled();
+      });
+
+      it("never honors a preview bypass when the build has no preview identity", async () => {
+        delete process.env.__NEXT_PREVIEW_MODE_ID;
+        const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+        const dispatcher = makeStrictDispatcher(localHandlerInvoker);
+
+        const res = mockRes();
+        await dispatcher.dispatch(
+          mockReq("/blog/nope", {
+            "x-prerender-revalidate": PREVIEW_ID,
+            cookie: `__prerender_bypass=${PREVIEW_ID}`,
+          }),
+          res as unknown as ServerResponse,
+          strictResolution,
+        );
+        expect(res._status).toBe(404);
+        expect(localHandlerInvoker).not.toHaveBeenCalled();
+      });
     });
 
     it("routes a prerender through the handler when one exists (ISR/draft/revalidate semantics)", async () => {
@@ -2807,6 +2886,73 @@ describe("createDispatcher", () => {
       expect(res._status).toBe(200);
       expect(res._headers["location"]).toBeUndefined();
       expect(res._headers["x-nextjs-redirect"]).toBe("/target");
+    });
+
+    // L2: middlewareRedirectLocation consumes client-supplied x-forwarded-host/-proto.
+    // Only well-formed values may influence the relative-vs-absolute Location decision.
+    describe("middleware redirect Location with forwarded headers (L2)", () => {
+      function makeRedirectDispatcher() {
+        return createDispatcher({
+          handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+        });
+      }
+
+      async function dispatchRedirect(headers: Record<string, string>, target: string) {
+        const res = mockRes();
+        await makeRedirectDispatcher().dispatch(
+          mockReq("/old", headers),
+          res as unknown as ServerResponse,
+          {
+            kind: "redirect",
+            url: new URL(target),
+            status: 307,
+            resolvedHeaders: new Headers({ location: "/target" }),
+          },
+        );
+        return res;
+      }
+
+      it("honors a well-formed x-forwarded-host and x-forwarded-proto", async () => {
+        const res = await dispatchRedirect(
+          { "x-forwarded-host": "app.example.com:8443", "x-forwarded-proto": "https" },
+          "https://app.example.com:8443/target",
+        );
+        expect(res._status).toBe(307);
+        // Same origin as the forwarded host → relative Location.
+        expect(res._headers["location"]).toBe("/target");
+      });
+
+      it("RED TEAM: ignores a malformed x-forwarded-host and falls back to Host", async () => {
+        const res = await dispatchRedirect(
+          { "x-forwarded-host": "http://evil.example/" },
+          "http://localhost/target",
+        );
+        expect(res._status).toBe(307);
+        // The malformed value must not win — Host (localhost) decides → relative.
+        expect(res._headers["location"]).toBe("/target");
+      });
+
+      it("RED TEAM: a spoofed non-http(s) x-forwarded-proto falls back to http", async () => {
+        const res = await dispatchRedirect(
+          { "x-forwarded-proto": "javascript:alert(1)" },
+          "http://localhost/target",
+        );
+        expect(res._status).toBe(307);
+        expect(res._headers["location"]).toBe("/target");
+      });
+
+      it("RED TEAM: an out-of-range forwarded port never throws into a 500", async () => {
+        const res = await dispatchRedirect(
+          { "x-forwarded-host": "localhost:99999" },
+          "http://localhost/target",
+        );
+        expect(res._status).toBe(307);
+        // URL construction fails defensively → absolute target, still a valid Location.
+        expect(res._headers["location"]).toBe("http://localhost/target");
+      });
     });
 
     it("returns 400 for the error resolution kind (malformed percent-encoding)", async () => {

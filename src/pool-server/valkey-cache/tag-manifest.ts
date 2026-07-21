@@ -17,24 +17,38 @@
 /**
  * Atomic last-event-wins merge for the shared tag manifest, used by both the V2 and the classic
  * incremental handlers. ARGV is `[field, json, field, json, …]`; each field is overwritten only
- * when the incoming `at` (event time) is `>=` the stored one, so a concurrent older revalidation
- * from another replica can't clobber a newer one. Runs atomically (Redis/Valkey execute a script
- * to completion without interleaving).
+ * when the incoming event is `>=` the stored one, so a concurrent older revalidation from
+ * another replica can't clobber a newer one. Runs atomically (Redis/Valkey execute a script to
+ * completion without interleaving).
+ *
+ * The merge clock is the VALKEY SERVER's (`TIME`), not the client-supplied `at`: replicas'
+ * clocks skew, and a backward-stepping replica would otherwise stamp an older `at` on a newer
+ * event and have its invalidation silently dropped by the merge. The script rewrites the
+ * incoming state's `at` to the server time before comparing/storing, so "last event" means
+ * "last to reach the server" — a single monotonic clock for ordering. The `stale`/`expired`
+ * watermarks stay client-computed: they are compared against entry timestamps, which are
+ * themselves client clocks. The client still sends its own `at` (see `computeTagUpdate`) as a
+ * fallback for any path where the script can't run its rewrite.
  */
 export const UPDATE_TAGS_SCRIPT = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local i = 1
 while i <= #ARGV do
   local field = ARGV[i]
   local incoming = ARGV[i + 1]
   local existing = redis.call('HGET', KEYS[1], field)
   local write = true
+  local okNew, nw = pcall(cjson.decode, incoming)
+  if okNew and type(nw) == 'table' then
+    nw.at = now
+    incoming = cjson.encode(nw)
+  end
   if existing then
     local okCur, cur = pcall(cjson.decode, existing)
-    local okNew, nw = pcall(cjson.decode, incoming)
     if okCur and okNew then
       local curAt = tonumber(cur.at) or 0
-      local nwAt = tonumber(nw.at) or 0
-      if nwAt < curAt then write = false end
+      if now < curAt then write = false end
     end
   end
   if write then redis.call('HSET', KEYS[1], field, incoming) end
@@ -52,9 +66,36 @@ export interface TagState {
   /**
    * Event time of the `updateTags` call that produced this state. Used only for the
    * last-event-wins merge across replicas (so a concurrent older revalidation can't clobber a
-   * newer one) — not read by the freshness predicates.
+   * newer one) — not read by the freshness predicates. The Lua merge script rewrites this to
+   * the Valkey SERVER's clock on write; the client-stamped value is only a fallback.
    */
   at?: number;
+}
+
+/**
+ * Parse + sanitize a manifest field read back from Valkey (L5). Corrupt input degrades to
+ * `undefined` (treated as "tag never revalidated" — the same as a missing field); non-finite
+ * numeric watermarks are dropped, and a corrupt/missing `at` becomes 0 so the server-side
+ * merge treats it as older than any real event. Never throws.
+ */
+export function parseTagState(raw: string): TagState | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const s = parsed as Record<string, unknown>;
+  const finite = (x: unknown): number | undefined =>
+    typeof x === "number" && Number.isFinite(x) ? x : undefined;
+  const out: TagState = {};
+  const stale = finite(s.stale);
+  if (stale !== undefined) out.stale = stale;
+  const expired = finite(s.expired);
+  if (expired !== undefined) out.expired = expired;
+  out.at = finite(s.at) ?? 0;
+  return out;
 }
 
 export type TagManifest = ReadonlyMap<string, TagState>;

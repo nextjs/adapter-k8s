@@ -59,7 +59,12 @@ function hasEdgeMiddleware(projectDir: string): boolean {
 import { validateConfig, applyDefaults } from "./config.js";
 import { classifyIntoPools } from "./classify.js";
 import { buildRoutingManifest } from "./manifest.js";
-import { generateHelmChart } from "./emit/helm.js";
+import { generateHelmChart, SECRET_CHART_FILES } from "./emit/helm.js";
+import {
+  assertSafeBuildId,
+  assertSafeImageRegistry,
+  assertSafeNamespace,
+} from "./emit/templates/utils.js";
 import {
   generateDockerfile,
   generatePoolDockerfile,
@@ -80,10 +85,11 @@ async function writeOutputFile(
   relativePath: string,
   content: string,
   baseDir: string = OUTPUT_DIR,
+  mode?: number,
 ): Promise<void> {
   const fullPath = path.join(projectDir, baseDir, relativePath);
   await mkdir(path.dirname(fullPath), { recursive: true });
-  await writeFile(fullPath, content, "utf-8");
+  await writeFile(fullPath, content, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
 }
 
 // Resolve and copy .next/node_modules/ — Turbopack creates symlinks to
@@ -286,8 +292,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // keep it), and the adapter serves them per Next's own header policy (see static-asset-headers).
       // Respect an explicit user opt-out.
       {
-        const userImmutable = (nextConfig.experimental as { supportsImmutableAssets?: boolean } | undefined)
-          ?.supportsImmutableAssets;
+        const userImmutable = (
+          nextConfig.experimental as { supportsImmutableAssets?: boolean } | undefined
+        )?.supportsImmutableAssets;
         // ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS=1 forces it off — used to A/B whether the immutable
         // asset split regresses client bootstrap (asset URLs move under /_next/static/immutable/).
         const disabled = process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS === "1";
@@ -352,6 +359,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     async onBuildComplete(ctx: BuildCompleteContext) {
       const { routing, outputs, projectDir, config: nextConfig, buildId, nextVersion } = ctx;
       const repoRoot = (ctx as { repoRoot?: string }).repoRoot ?? projectDir;
+
+      // The finalized build id (Next's default or a custom `generateBuildId()` — commonly
+      // a git ref in CI) flows into helm `--set` values, K8s resource names/labels, image
+      // tags, and chart YAML. Validate it here, at the source, so an unsafe id fails the
+      // build with a clear message instead of injecting into any of those sinks.
+      assertSafeBuildId(buildId);
 
       // Regenerate the Helm chart from a clean slate. Chart files are named per
       // pool/build; without wiping, a removed pool's Deployment/Service or a
@@ -467,10 +480,36 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
       const gkeProvider = cfg.provider.gke;
 
+      // infrastructure.json is operator/CI-managed state, but a tampered or hand-edited
+      // value here flows into helm --set, resource names, and chart YAML — validate at
+      // the point of consumption and fail the build rather than emit an unsafe chart.
+      const namespace = infra.namespace ?? "default";
+      try {
+        assertSafeNamespace(namespace);
+      } catch (err) {
+        throw new Error(
+          `[adapter-k8s] Unsafe namespace in .k8s-adapter/infrastructure.json: ${(err as Error).message}`,
+        );
+      }
+
+      const configuredRegistry = infra.containerRegistry ?? process.env.IMAGE_REGISTRY;
+      if (configuredRegistry !== undefined) {
+        try {
+          assertSafeImageRegistry(configuredRegistry);
+        } catch (err) {
+          throw new Error(
+            `[adapter-k8s] Unsafe image registry from ` +
+              `${infra.containerRegistry ? "infrastructure.json containerRegistry" : "the IMAGE_REGISTRY env var"}: ` +
+              `${(err as Error).message}`,
+          );
+        }
+      }
+      const imageRegistry = configuredRegistry ?? "REGISTRY";
+
       const extensionChain = generateExtensionChain({
         celExpression,
         releaseName,
-        namespace: infra.namespace ?? "default",
+        namespace,
         projectId: infra.projectId ?? "",
         region: infra.region ?? "",
         timeout: gkeProvider.serviceExtensions?.routeExtension?.timeout
@@ -484,7 +523,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         buildId,
         nextVersion,
         config: cfg,
-        imageRegistry: infra.containerRegistry ?? process.env.IMAGE_REGISTRY ?? "REGISTRY",
+        imageRegistry,
         routingManifest,
         releaseName,
         extensionChainJson: extensionChain,
@@ -493,7 +532,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       });
 
       for (const [filePath, content] of Object.entries(helmFiles)) {
-        await writeOutputFile(projectDir, `chart/${filePath}`, content);
+        // Secret-bearing templates land on disk mode 0600 — they hold the internal
+        // dispatch secret / Valkey AUTH and must not be group/world-readable.
+        await writeOutputFile(
+          projectDir,
+          `chart/${filePath}`,
+          content,
+          OUTPUT_DIR,
+          SECRET_CHART_FILES.has(filePath) ? 0o600 : undefined,
+        );
       }
 
       // 5. Build Stage Area & Dockerfiles

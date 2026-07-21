@@ -26,6 +26,12 @@ export function renderValuesYaml({
         tag: buildId,
         pullPolicy: "IfNotPresent",
       },
+      // Empty by default: the deploy CLI passes `--set global.networkPolicy.podCidrs=
+      // {..}` when it can discover the cluster's pod CIDRs; an empty list renders no
+      // NetworkPolicies (the templates are wrapped in a helm `if` guard).
+      networkPolicy: {
+        podCidrs: [] as string[],
+      },
     },
     pools: Object.fromEntries(
       [...pools.entries()].map(([name, pool]) => [

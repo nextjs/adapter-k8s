@@ -18,6 +18,18 @@ import { renderRoutingServiceHPA } from "./templates/routing-service-hpa.js";
 import { renderRouteExtUpdateJob } from "./templates/route-ext-update-job.js";
 import { renderRouteExtConfigMap } from "./templates/route-ext-configmap.js";
 import { renderDeployServiceAccount } from "./templates/deploy-service-account.js";
+import { renderNetworkPolicies } from "./templates/network-policy.js";
+
+/**
+ * Chart files that carry secret material. The write site (adapter.ts) MUST create these
+ * with mode 0600 — they hold the internal dispatch secret / Valkey AUTH and must not be
+ * group/world-readable on disk. Single source of truth lives here, next to where the
+ * files are generated.
+ */
+export const SECRET_CHART_FILES: ReadonlySet<string> = new Set([
+  "templates/internal-secret.yaml",
+  "templates/valkey-secret.yaml",
+]);
 
 export function generateHelmChart({
   pools,
@@ -132,6 +144,14 @@ export function generateHelmChart({
       cdnFilterName,
     });
   }
+
+  // NetworkPolicies for both workload tiers. Always emitted — the template is wrapped
+  // in a helm `if` on global.networkPolicy.podCidrs, so it renders nothing until the
+  // deploy CLI discovers the cluster pod CIDRs and sets the value.
+  files["templates/network-policy.yaml"] = renderNetworkPolicies({
+    releaseName,
+    poolNames: [...pools.keys()],
+  });
 
   for (const poolName of pools.keys()) {
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({

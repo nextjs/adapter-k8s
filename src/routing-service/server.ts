@@ -207,14 +207,17 @@ export function createRoutingServer(options: RoutingServerOptions) {
   // GCP ext_proc callouts require HTTP/2 over TLS on the data path (the gRPC health
   // check can be plaintext, which is why an h2c server looks HEALTHY but the callout
   // silently fails). Serve TLS when a cert is provided; fall back to plaintext h2c
-  // (emulate / local) otherwise.
+  // (emulate / local) otherwise. allowHTTP1 stays OFF on the TLS server: the ext_proc
+  // data path is HTTP/2-only and health checks run on the separate plaintext HTTP
+  // server, so HTTP/1.1 would be pure attack surface (it lets any Connect-protocol
+  // client speak to the service trivially).
   const certFile = process.env.TLS_CERT_FILE;
   const keyFile = process.env.TLS_KEY_FILE;
   const useTls = !!(certFile && keyFile && existsSync(certFile) && existsSync(keyFile));
   const nodeHandler = connectNodeAdapter({ routes });
   const server: Http2Server = useTls
     ? createSecureServer(
-        { cert: readFileSync(certFile!), key: readFileSync(keyFile!), allowHTTP1: true },
+        { cert: readFileSync(certFile!), key: readFileSync(keyFile!), allowHTTP1: false },
         nodeHandler,
       )
     : createServer(nodeHandler);

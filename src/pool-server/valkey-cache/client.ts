@@ -7,6 +7,8 @@ export interface ValkeyConfig {
   url: string;
   /** AUTH string (e.g. the Memorystore auth string), optional. */
   password?: string | undefined;
+  /** PEM of the server CA for TLS verification (e.g. Memorystore in-transit encryption). */
+  caCert?: string | undefined;
 }
 
 /**
@@ -19,5 +21,5 @@ export interface ValkeyConfig {
  * degrades to a cache miss) rather than hanging a render.
  */
 export function createValkeyClient(config: ValkeyConfig): ValkeyClient {
-  return createRespClient({ url: config.url, password: config.password });
+  return createRespClient({ url: config.url, password: config.password, caCert: config.caCert });
 }

@@ -1,6 +1,7 @@
 // src/config.ts
 import type { K8sAdapterConfig } from "./types.js";
 import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
+import { assertSafeHostname } from "./emit/templates/utils.js";
 
 export function validateConfig(input: unknown): void {
   const config = input as K8sAdapterConfig;
@@ -36,8 +37,11 @@ export function validateConfig(input: unknown): void {
     if (!hostConfig.hostname) {
       throw new Error("each host in provider.gke.gateway.hosts must have a hostname");
     }
-    // Wildcards are supported via Certificate Manager with DNS authorization.
-    // No restriction needed — init provisions the DNS auth + cert automatically.
+    // The hostname is interpolated into quoted YAML scalars (gateway.ts) and helm
+    // values — a `"`+newline would break out of the scalar and inject chart YAML.
+    // Wildcards ("*.example.com") are supported via Certificate Manager with DNS
+    // authorization; init provisions the DNS auth + cert automatically.
+    assertSafeHostname(hostConfig.hostname);
   }
 
   if (config.cache?.enabled) {

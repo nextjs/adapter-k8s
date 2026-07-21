@@ -4,8 +4,6 @@ import path from "node:path";
 import boxen from "boxen";
 import { execCapture } from "./exec.js";
 
-const W = 62; // inner content width for boxen
-
 export async function runDescribe(options: {
   projectDir: string;
   releaseName: string;

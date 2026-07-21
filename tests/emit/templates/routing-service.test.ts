@@ -38,6 +38,42 @@ describe("renderRoutingServiceDeployment", () => {
     expect(yaml).toMatch(/ROUTING_FAIL_OPEN[\s\S]*?value: "false"/);
     expect(yaml).toContain('value: "3000"');
   });
+
+  it("ships the hardened pod/container security posture", () => {
+    const yaml = renderRoutingServiceDeployment({
+      releaseName: "my-app",
+      buildId: "abc123",
+      imageRegistry: "reg",
+    });
+    // Pod level: non-root uid 1000 (the node user), seccomp, no SA token (the routing
+    // service never calls the Kubernetes API).
+    expect(yaml).toContain("automountServiceAccountToken: false");
+    expect(yaml).toContain("runAsNonRoot: true");
+    expect(yaml).toContain("runAsUser: 1000");
+    expect(yaml).toContain("fsGroup: 1000");
+    expect(yaml).toContain("seccompProfile:");
+    expect(yaml).toContain("type: RuntimeDefault");
+    // Container level: no privilege escalation, read-only root FS, all caps dropped.
+    expect(yaml).toContain("allowPrivilegeEscalation: false");
+    expect(yaml).toContain("readOnlyRootFilesystem: true");
+    expect(yaml).toContain('drop: ["ALL"]');
+    // A writable /tmp (emptyDir) backs the read-only root filesystem — the runtime TLS
+    // cert generation writes under /tmp/tls.
+    expect(yaml).toMatch(/volumeMounts:[\s\S]*?name: tmp\n\s+mountPath: \/tmp/);
+    expect(yaml).toMatch(/volumes:[\s\S]*?name: tmp\n\s+emptyDir: \{\}/);
+  });
+
+  it("injects RELEASE_NAME and NAMESPACE so the runtime can build the cert CN/SAN", () => {
+    const yaml = renderRoutingServiceDeployment({
+      releaseName: "my-app",
+      buildId: "abc123",
+      imageRegistry: "reg",
+    });
+    expect(yaml).toMatch(/- name: RELEASE_NAME\n\s+value: "my-app"/);
+    expect(yaml).toMatch(
+      /- name: NAMESPACE\n\s+valueFrom:\n\s+fieldRef:\n\s+fieldPath: metadata\.namespace/,
+    );
+  });
 });
 
 describe("renderRoutingServiceService", () => {
