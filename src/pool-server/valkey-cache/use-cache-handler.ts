@@ -1,9 +1,18 @@
 import type { ValkeyClient } from "./client.js";
-import { bufferToStream, drainEntryValue } from "./stream-codec.js";
+import { DURABLE_TTL_SECONDS } from "./incremental-cache-handler.js";
+import { RespError } from "./resp-client.js";
+import {
+  bufferToStream,
+  drainEntryValue,
+  logErrorRateLimited,
+  maxCacheEntryBytes,
+  warnOnce,
+} from "./stream-codec.js";
 import {
   computeTagUpdate,
   evaluateEntry,
   maxExpiration,
+  parseTagState,
   UPDATE_TAGS_SCRIPT,
   type TagManifest,
   type TagState,
@@ -23,6 +32,31 @@ interface StoredMeta {
 const RETENTION_MARGIN_SECONDS = 60;
 
 const EMPTY_MANIFEST: TagManifest = new Map();
+
+/**
+ * Parse and validate the stored meta field (L5). A corrupt meta — wrong JSON, non-finite
+ * lifetimes, a non-array tag list — degrades to a cache miss, never a synthesized entry.
+ */
+function parseStoredMeta(raw: string): StoredMeta | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const m = parsed as Record<string, unknown>;
+  if (
+    !Number.isFinite(m.timestamp) ||
+    !Number.isFinite(m.expire) ||
+    !Number.isFinite(m.revalidate) ||
+    !Number.isFinite(m.stale)
+  ) {
+    return undefined;
+  }
+  if (!Array.isArray(m.tags) || !m.tags.every((tag) => typeof tag === "string")) return undefined;
+  return m as unknown as StoredMeta;
+}
 
 export interface ValkeyCacheHandlerOptions {
   client: ValkeyClient;
@@ -73,7 +107,12 @@ export class ValkeyCacheHandler implements CacheHandler {
       const data = await this.client.hgetallBuffer(key);
       const metaBuf = data?.m;
       if (!metaBuf) return undefined;
-      const meta = JSON.parse(metaBuf.toString("utf8")) as StoredMeta;
+      // A meta field without its value field is a corrupt/partially-written entry — treat it as
+      // a miss (L5). The old code synthesized an EMPTY body and served it as a valid fresh entry.
+      const valueBuf = data.v;
+      if (!valueBuf) return undefined;
+      const meta = parseStoredMeta(metaBuf.toString("utf8"));
+      if (!meta) return undefined; // corrupt meta → miss, never a fabricated entry (L5)
 
       const now = this.now();
       const manifest = await this.tagStates(meta.tags);
@@ -84,7 +123,7 @@ export class ValkeyCacheHandler implements CacheHandler {
       }
       const revalidate = freshness.state === "stale" ? -1 : freshness.revalidate;
       return {
-        value: bufferToStream(data.v ?? Buffer.alloc(0)),
+        value: bufferToStream(valueBuf),
         tags: meta.tags,
         stale: meta.stale,
         timestamp: meta.timestamp,
@@ -102,10 +141,30 @@ export class ValkeyCacheHandler implements CacheHandler {
       release = resolve;
     });
     this.pendingSets.set(cacheKey, gate);
+    const key = this.entryKey(cacheKey);
+    // Tracks whether the MULTI/EXEC was dispatched: only then can a partially-applied write
+    // exist, and only then is the cleanup DEL warranted (a rejected entry promise must not
+    // delete a still-valid previously cached entry).
+    let writeAttempted = false;
     try {
       const entry = await pendingEntry;
-      const buf = await drainEntryValue(entry);
-      if (buf === null) return; // partial/errored stream → miss, don't cache
+      // H4: a non-finite or non-positive lifetime would produce a NaN/Infinity EXPIRE argument,
+      // which Valkey rejects — while the HSET in the same transaction still applies, leaving the
+      // entry cached FOREVER. Refuse to cache it: an uncacheable entry is a miss + recompute.
+      if (
+        !Number.isFinite(entry.expire) ||
+        !Number.isFinite(entry.revalidate) ||
+        entry.expire <= 0 ||
+        entry.revalidate <= 0
+      ) {
+        warnOnce(
+          "nonfinite-lifetime",
+          "[valkey-cache] refusing to cache a `use cache` entry with a non-finite or non-positive expire/revalidate; treating it as uncacheable",
+        );
+        return;
+      }
+      const buf = await drainEntryValue(entry, maxCacheEntryBytes());
+      if (buf === null) return; // partial/errored/over-cap stream → miss, don't cache
       const meta: StoredMeta = {
         tags: entry.tags,
         stale: entry.stale,
@@ -113,15 +172,30 @@ export class ValkeyCacheHandler implements CacheHandler {
         expire: entry.expire,
         revalidate: entry.revalidate,
       };
-      const ttl = Math.max(entry.expire, entry.revalidate, 1) + RETENTION_MARGIN_SECONDS;
-      const key = this.entryKey(cacheKey);
-      await this.client
+      // M7: Next hands INFINITE_CACHE-scale expires (~136 years) to this handler; cap the key
+      // TTL at the same durable bound the incremental handler uses. A cold key is just a miss +
+      // recompute — freshness logic is TTL-independent.
+      const ttl = Math.min(
+        Math.max(entry.expire, entry.revalidate, 1) + RETENTION_MARGIN_SECONDS,
+        DURABLE_TTL_SECONDS,
+      );
+      writeAttempted = true;
+      const results = await this.client
         .multi()
         .hset(key, "m", JSON.stringify(meta), "v", buf)
         .expire(key, Math.ceil(ttl))
         .exec();
+      // H4: MULTI/EXEC is NOT all-or-nothing — a rejected command leaves the others applied
+      // (e.g. HSET succeeds, EXPIRE fails → a TTL-less key cached forever). The EXEC reply
+      // carries per-command errors as elements; inspect them and treat any failure as a failed
+      // write instead of assuming success.
+      const failure = results.find((result): result is RespError => result instanceof RespError);
+      if (failure) throw failure;
     } catch {
-      // A cache write failure must not break the response.
+      // A cache write failure must not break the response. If the write may have partially
+      // applied, best-effort DEL the key so a TTL-less partial entry can't live forever (the DEL
+      // itself may fail during an outage — bounded by the build-namespaced keyspace's lifetime).
+      if (writeAttempted) this.client.del(key).catch(() => undefined);
     } finally {
       // Only clear the gate if it's still ours — an overlapping `set` may have replaced it, and
       // deleting a newer set's gate would let a concurrent `get` skip the required wait.
@@ -144,8 +218,18 @@ export class ValkeyCacheHandler implements CacheHandler {
     try {
       const manifest = await this.tagStates(tags);
       return maxExpiration(tags, manifest);
-    } catch {
-      return 0;
+    } catch (error) {
+      // L3: fail STALE, not fresh. Returning 0 ("never invalidated") would let revalidated
+      // entries keep serving during a transient manifest outage; returning the current time
+      // (`this.now()` — `Date.now` by default) makes Next treat affected entries as invalidated
+      // and regenerate, the same safe direction as `get` degrading to a miss. Logged
+      // (rate-limited) so the outage is observable without per-request log spam.
+      logErrorRateLimited(
+        "getExpiration",
+        "[valkey-cache] getExpiration failed to read the tag manifest; treating entries as stale",
+        error,
+      );
+      return this.now();
     }
   }
 
@@ -154,18 +238,25 @@ export class ValkeyCacheHandler implements CacheHandler {
     try {
       const now = this.now();
       // Apply each tag's new state atomically with LAST-EVENT-WINS semantics: the server-side
-      // script only overwrites a field when the incoming `at` (event time) is >= the stored one.
-      // This eliminates the read-modify-write race where two replicas revalidating the same tag
-      // interleave and an older/profiled update clobbers a newer hard-expire (Redis runs the
-      // whole script atomically). Passing `undefined` as the base keeps each event's state
-      // self-contained.
+      // script only overwrites a field when the incoming event (stamped with the server's clock)
+      // is >= the stored one. This eliminates the read-modify-write race where two replicas
+      // revalidating the same tag interleave and an older/profiled update clobbers a newer
+      // hard-expire (Redis runs the whole script atomically). Passing `undefined` as the base
+      // keeps each event's state self-contained.
       const args: string[] = [];
       for (const tag of tags) {
         args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
       }
       await this.client.eval(UPDATE_TAGS_SCRIPT, 1, this.tagsKey, ...args);
-    } catch {
-      // Best-effort: a failed manifest write means a revalidation is missed, not a crash.
+    } catch (error) {
+      // Best-effort: a failed manifest write means a revalidation is missed, not a crash — but
+      // it must be OBSERVABLE (M1): a Valkey outage here otherwise silently serves stale entries
+      // indefinitely. Rate-limited so the outage doesn't emit one log line per request.
+      logErrorRateLimited(
+        "updateTags",
+        "[valkey-cache] updateTags failed to write the shared tag manifest; invalidation may be lost",
+        error,
+      );
     }
   }
 
@@ -181,11 +272,9 @@ export class ValkeyCacheHandler implements CacheHandler {
     tags.forEach((tag, i) => {
       const raw = values[i];
       if (raw) {
-        try {
-          manifest.set(tag, JSON.parse(raw) as TagState);
-        } catch {
-          // ignore corrupt field
-        }
+        // Corrupt fields degrade to "no state" (a corrupt `at` becomes 0); never throw (L5).
+        const state = parseTagState(raw);
+        if (state) manifest.set(tag, state);
       }
     });
     return manifest;

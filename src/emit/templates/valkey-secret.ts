@@ -8,6 +8,9 @@ import { assertSafeReleaseName } from "./utils.js";
 export const VALKEY_SECRET_NAME = "valkey";
 export const VALKEY_URL_KEY = "url";
 export const VALKEY_AUTH_KEY = "auth";
+// PEM of the cache server's CA — present when the managed instance uses in-transit
+// encryption (AUTH mode). The pool pins TLS verification to this CA.
+export const VALKEY_CA_KEY = "ca";
 
 /**
  * Env-var snippet (YAML list items) injecting VALKEY_URL / VALKEY_AUTH into a pool container.
@@ -28,6 +31,12 @@ ${indent}  valueFrom:
 ${indent}    secretKeyRef:
 ${indent}      name: ${secret}
 ${indent}      key: ${VALKEY_AUTH_KEY}
+${indent}      optional: true
+${indent}- name: VALKEY_CA_CERT
+${indent}  valueFrom:
+${indent}    secretKeyRef:
+${indent}      name: ${secret}
+${indent}      key: ${VALKEY_CA_KEY}
 ${indent}      optional: true`;
 }
 
@@ -36,14 +45,17 @@ export function renderValkeySecret({
   releaseName,
   url,
   password,
+  ca,
 }: {
   releaseName: string;
   url: string;
   password?: string;
+  ca?: string;
 }): string {
   assertSafeReleaseName(releaseName);
   const entries: [string, string][] = [[VALKEY_URL_KEY, url]];
   if (password) entries.push([VALKEY_AUTH_KEY, password]);
+  if (ca) entries.push([VALKEY_CA_KEY, ca]);
   return `apiVersion: v1
 kind: Secret
 metadata:

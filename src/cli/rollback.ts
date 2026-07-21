@@ -26,6 +26,56 @@ export async function runRollback(options: {
     .replace(/[^a-z0-9]/g, "")
     .slice(0, 10);
 
+  // Pool names come from local build metadata (the same source deploy's cutover uses) —
+  // readable without touching the cluster, so the dry-run plan can be printed before any
+  // cluster interaction.
+  let poolNames: string[] = [];
+  const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+      if (Array.isArray(meta.pools)) {
+        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
+      }
+    } catch {
+      // fall through to the empty guard
+    }
+  }
+
+  // L13: dry-run must not mutate anything — and get-credentials mutates the operator's
+  // kubeconfig, so it is skipped too. Print the planned steps and return.
+  if (dryRun) {
+    const prevNames = poolNames.map((p) =>
+      sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`),
+    );
+    const currNames = poolNames.map((p) =>
+      sanitizeK8sName(`${releaseName}-${p}-${currentBuildId}`),
+    );
+    console.log(`\n  [dry-run] Rollback plan: ${currentBuildId} → ${previousBuildId}`);
+    console.log(
+      `  [dry-run] Skipping "gcloud container clusters get-credentials" (it would mutate your kubeconfig).`,
+    );
+    if (prevNames.length > 0)
+      console.log(`  [dry-run] Would scale up previous build: ${prevNames.join(", ")}`);
+    console.log(`  [dry-run] Would wait for the previous build's rollout to complete`);
+    console.log(
+      `  [dry-run] Would patch active Service selectors to app.kubernetes.io/version=${sanitizeK8sName(previousBuildId)}`,
+    );
+    if (currNames.length > 0)
+      console.log(`  [dry-run] Would scale down current build: ${currNames.join(", ")}`);
+    console.log(
+      `  [dry-run] Would swap state: buildId=${previousBuildId}, previousBuildId=${currentBuildId}`,
+    );
+    return;
+  }
+
+  if (poolNames.length === 0) {
+    throw new Error(
+      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
+        "cannot safely roll back. Aborting before touching traffic.",
+    );
+  }
+
   console.log(`\nRolling back: ${currentBuildId} → ${previousBuildId}\n`);
 
   // Ensure kubectl is on the right cluster
@@ -67,29 +117,10 @@ export async function runRollback(options: {
   // Roll back EVERY pool, not just one. Single previous/current vars kept only the LAST
   // pool that matched during discovery, so a multi-pool rollback scaled up one pool's
   // previous Deployment but then switched ALL active Services to the previous build —
-  // every other pool was left at zero replicas with no endpoints. Read the pool list from
-  // build metadata (the same source deploy's cutover uses), resolve each pool's previous
-  // and current Deployment by exact name, and verify every previous pool exists BEFORE
-  // touching traffic.
-  let poolNames: string[] = [];
-  const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
-  if (existsSync(metaPath)) {
-    try {
-      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-      if (Array.isArray(meta.pools)) {
-        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
-      }
-    } catch {
-      // fall through to the empty guard
-    }
-  }
-  if (poolNames.length === 0) {
-    throw new Error(
-      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
-        "cannot safely roll back. Aborting before touching traffic.",
-    );
-  }
-
+  // every other pool was left at zero replicas with no endpoints. The pool list was read
+  // from build metadata above (the same source deploy's cutover uses); resolve each
+  // pool's previous and current Deployment by exact name, and verify every previous pool
+  // exists BEFORE touching traffic.
   const scalingByPool = new Map<string, { min: number; max: number; targetCPU: number }>();
   const valuesPath = path.join(projectDir, ".k8s-adapter", "output", "chart", "values.yaml");
   if (existsSync(valuesPath)) {
@@ -129,16 +160,6 @@ export async function runRollback(options: {
         `${previousBuildId}). Rolling back would strand those pools with zero endpoints. ` +
         `Aborting. Only one previous build is retained after each deploy.`,
     );
-  }
-
-  if (dryRun) {
-    console.log(`  [dry-run] Would scale up: ${previousDeploys.join(", ")}`);
-    if (currentDeploys.length)
-      console.log(`  [dry-run] Would scale down: ${currentDeploys.join(", ")}`);
-    console.log(
-      `  [dry-run] Would swap state: buildId=${previousBuildId}, previousBuildId=${currentBuildId}`,
-    );
-    return;
   }
 
   // 1. Scale up every pool's previous deployment

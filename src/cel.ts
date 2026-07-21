@@ -8,6 +8,16 @@ export interface CelGenerationInput {
 
 /** Escape a value for safe interpolation into a CEL single-quoted string literal. */
 export function escapeCelString(value: string): string {
+  // The escaped text is later embedded in a YAML scalar (route-extension.yaml) where a
+  // control character (e.g. a newline in a public filename) would silently fold and
+  // corrupt the extension spec — reject anything outside printable ASCII at build time.
+  if (/[^\x20-\x7e]/.test(value)) {
+    throw new Error(
+      `Cannot embed ${JSON.stringify(value)} in the CEL match condition: ` +
+        `control/non-ASCII characters are not supported (they would corrupt the ` +
+        `route-extension YAML). Rename the file to printable ASCII.`,
+    );
+  }
   return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 

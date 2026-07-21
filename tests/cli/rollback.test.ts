@@ -17,7 +17,14 @@ const PROJECT = "/proj";
 const RELEASE = "rel";
 const infraPath = path.join(PROJECT, ".k8s-adapter", "infrastructure.json");
 const metaPath = path.join(PROJECT, ".k8s-adapter", "output", "build-metadata.json");
-const cdnFilter = path.join(PROJECT, ".k8s-adapter", "output", "chart", "templates", "cdn-http-filter.yaml");
+const cdnFilter = path.join(
+  PROJECT,
+  ".k8s-adapter",
+  "output",
+  "chart",
+  "templates",
+  "cdn-http-filter.yaml",
+);
 
 /** execCapture stub: success everywhere except optionally the service selector patch. */
 function capture(patchFails: boolean) {
@@ -34,7 +41,10 @@ function capture(patchFails: boolean) {
 describe("runRollback — CDN invalidation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(readState).mockResolvedValue({ buildId: "buildn", previousBuildId: "buildm" } as never);
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+    } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
@@ -74,5 +84,29 @@ describe("runRollback — CDN invalidation", () => {
       /process\.exit:1/,
     );
     expect(invalidateCdnBuildTag).not.toHaveBeenCalled();
+  });
+
+  it("L13: dry-run prints the plan without touching the cluster or the kubeconfig", async () => {
+    vi.mocked(execCapture).mockImplementation(capture(false) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE, dryRun: true });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args);
+    // get-credentials mutates the operator's kubeconfig — forbidden in dry-run.
+    expect(calls.some((args) => args.includes("get-credentials"))).toBe(false);
+    // No mutations of any kind.
+    expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    expect(invalidateCdnBuildTag).not.toHaveBeenCalled();
+    // The plan was printed.
+    const printed = vi
+      .mocked(console.log)
+      .mock.calls.map((c) => String(c[0]))
+      .join("\n");
+    expect(printed).toContain("[dry-run] Rollback plan: buildn → buildm");
+    expect(printed).toContain("[dry-run] Would scale up previous build: rel-ssr-buildm");
+    expect(printed).toContain("[dry-run] Would scale down current build: rel-ssr-buildn");
+    expect(printed).toContain("[dry-run] Would patch active Service selectors");
+    expect(printed).toContain("[dry-run] Would swap state: buildId=buildm, previousBuildId=buildn");
   });
 });

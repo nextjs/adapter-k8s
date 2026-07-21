@@ -9,6 +9,7 @@ import { runDescribe } from "./describe.js";
 import { runRollback } from "./rollback.js";
 import { runTail } from "./tail.js";
 import { runEmulate } from "./emulate.js";
+import { assertSafeReleaseName } from "../emit/templates/utils.js";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const args = argv.slice(2);
@@ -26,6 +27,9 @@ function parseArgs(argv: string[]): { command: string; flags: Record<string, str
       } else {
         flags[key] = true;
       }
+    } else if (arg.startsWith("-") && arg.length > 1) {
+      // Short flags (e.g. -y) are always booleans.
+      flags[arg.slice(1)] = true;
     }
   }
 
@@ -57,6 +61,9 @@ Options:
   --release-name <name>    Helm release name (default: current directory name)
   --skip-build             Skip next build (use existing artifacts)
   --skip-push              Skip docker build + push
+  --allow-no-network-policy  Deploy even if the cluster pod CIDR can't be discovered
+                             (NetworkPolicies skipped — the routing service stays
+                             reachable from in-cluster pods; not recommended)
   --dry-run                Show what would be done without executing
   `);
 }
@@ -74,10 +81,18 @@ async function main(): Promise<void> {
   //      `e2e/` dir that deployed release "test-app") derives the wrong cluster name
   //      (`e2e-cluster` vs `test-app-cluster`) and doctor fails to connect.
   //   3. the sanitized directory name (default for a fresh, un-inited project)
-  const defaultReleaseName = path
-    .basename(projectDir)
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "-");
+  // The directory-name default must degrade gracefully: truncate to the 40-char
+  // release-name limit and strip trailing hyphens so a long directory name never
+  // throws (only the explicit --release-name flag and the persisted
+  // infrastructure.json value hard-fail validation below). If nothing usable
+  // survives (e.g. a directory named "!!!"), fall back to a constant.
+  const defaultReleaseName =
+    path
+      .basename(projectDir)
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "-")
+      .slice(0, 40)
+      .replace(/-+$/, "") || "app";
   let persistedReleaseName: string | undefined;
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (existsSync(infraPath)) {
@@ -92,6 +107,10 @@ async function main(): Promise<void> {
   }
   const releaseName =
     (flags["release-name"] as string) ?? persistedReleaseName ?? defaultReleaseName;
+  // M3: the release name is prefixed into GKE cluster names, K8s resources, IAM role
+  // ids, and helm invocations — reject anything outside the safe charset at the CLI
+  // boundary (main()'s catch prints the error and exits 1).
+  assertSafeReleaseName(releaseName);
   const dryRun = flags["dry-run"] === true;
 
   switch (command) {
@@ -141,6 +160,7 @@ async function main(): Promise<void> {
         releaseName,
         skipBuild: flags["skip-build"] === true,
         skipPush: flags["skip-push"] === true,
+        allowNoNetworkPolicy: flags["allow-no-network-policy"] === true,
         dryRun,
       });
       break;
@@ -177,7 +197,12 @@ async function main(): Promise<void> {
     }
 
     case "destroy": {
-      await runDestroy({ projectDir, releaseName, dryRun });
+      await runDestroy({
+        projectDir,
+        releaseName,
+        dryRun,
+        yes: flags["yes"] === true || flags["y"] === true,
+      });
       break;
     }
 

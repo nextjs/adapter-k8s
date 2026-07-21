@@ -473,6 +473,7 @@ async function main() {
       url: valkeyUrl,
       buildId,
       ...(process.env.VALKEY_AUTH ? { password: process.env.VALKEY_AUTH } : {}),
+      ...(process.env.VALKEY_CA_CERT ? { caCert: process.env.VALKEY_CA_CERT } : {}),
     });
     console.log("[pool-server] Valkey use-cache handler registered (build " + buildId + ")");
   }

@@ -1,4 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import http2 from "node:http2";
+import https from "node:https";
 import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
 import {
   createRoutingServer,
@@ -39,24 +45,118 @@ async function collect(gen: AsyncGenerator<ProcessingResponse>): Promise<Process
 
 describe("createRoutingServer", () => {
   let server: ReturnType<typeof createRoutingServer> | null = null;
+  let tmpDir: string | null = null;
+  const savedTlsEnv: Record<string, string | undefined> = {};
 
   afterEach(async () => {
     if (server) {
       await server.stop();
       server = null;
     }
+    for (const key of ["TLS_CERT_FILE", "TLS_KEY_FILE"]) {
+      if (savedTlsEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedTlsEnv[key];
+      delete savedTlsEnv[key];
+    }
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = null;
+    }
   });
 
-  it("creates an HTTP/2 ext_proc server that can start and stop", async () => {
-    const handler = vi.fn().mockResolvedValue({
+  function continueHandler() {
+    return vi.fn().mockResolvedValue({
       requestHeaders: { response: { headerMutation: { setHeaders: [] }, status: "CONTINUE" } },
     } as PlainProcessingResponse);
+  }
 
-    server = createRoutingServer({ handler, port: 0 });
+  it("creates an HTTP/2 ext_proc server that can start and stop", async () => {
+    server = createRoutingServer({ handler: continueHandler(), port: 0 });
     const address = await server.start();
     expect(address.port).toBeGreaterThan(0);
     await server.stop();
     server = null;
+  });
+
+  it("keeps the plaintext h2c path working for emulate (no TLS env)", async () => {
+    server = createRoutingServer({ handler: continueHandler(), port: 0 });
+    const { port } = await server.start();
+
+    // An h2 client connects to the plaintext server — the local/emulate path is unchanged.
+    const session = http2.connect(`http://127.0.0.1:${port}`);
+    await new Promise<void>((resolve, reject) => {
+      session.once("connect", () => resolve());
+      session.once("error", reject);
+    });
+    session.close();
+  });
+
+  // H1b: the TLS ext_proc data path is HTTP/2-only (allowHTTP1: false). Health checks run
+  // on the separate plaintext HTTP server, so HTTP/1.1 must never reach the Connect handler.
+  it("serves HTTP/2 over TLS and rejects HTTP/1.1 clients", async () => {
+    // Mint a throwaway self-signed pair — the same openssl invocation the container-start
+    // path in index.ts uses (L11).
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "routing-tls-test-"));
+    const certFile = path.join(tmpDir, "tls-cert.pem");
+    const keyFile = path.join(tmpDir, "tls-key.pem");
+    execFileSync(
+      "openssl",
+      [
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-keyout",
+        keyFile,
+        "-out",
+        certFile,
+        "-days",
+        "1",
+        "-subj",
+        "/CN=test-routing-service",
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    savedTlsEnv.TLS_CERT_FILE = process.env.TLS_CERT_FILE;
+    savedTlsEnv.TLS_KEY_FILE = process.env.TLS_KEY_FILE;
+    process.env.TLS_CERT_FILE = certFile;
+    process.env.TLS_KEY_FILE = keyFile;
+
+    server = createRoutingServer({ handler: continueHandler(), port: 0 });
+    // Track TLS sockets so the test can force-close the ALPN-rejected HTTP/1.1 connection:
+    // Node answers it with a terminal 403 but deliberately keeps the socket open, which
+    // would otherwise stall server.stop() waiting for it.
+    const sockets = new Set<import("node:net").Socket>();
+    server.server.on("secureConnection", (socket: import("node:net").Socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+    const { port } = await server.start();
+
+    // HTTP/2 over TLS works — this is the GCP ext_proc data path.
+    const session = http2.connect(`https://127.0.0.1:${port}`, { rejectUnauthorized: false });
+    await new Promise<void>((resolve, reject) => {
+      session.once("connect", () => resolve());
+      session.once("error", reject);
+    });
+    session.destroy();
+
+    // An HTTP/1.1 client is rejected at the ALPN layer (allowHTTP1: false) and never
+    // reaches the Connect handler.
+    const http1Status = await new Promise<number>((resolve, reject) => {
+      const req = https.request(
+        { host: "127.0.0.1", port, path: "/", rejectUnauthorized: false, agent: false },
+        (res) => {
+          res.resume();
+          res.once("end", () => resolve(res.statusCode ?? 0));
+        },
+      );
+      req.once("error", reject);
+      req.end();
+    });
+    expect(http1Status).toBe(403);
+    for (const socket of sockets) socket.destroy();
   });
 });
 

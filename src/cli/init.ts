@@ -1,9 +1,16 @@
 // src/cli/init.ts
-import { existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, writeFileSync, appendFileSync, readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { generateAdapterConfig, generateInfrastructureJson } from "./scaffold.js";
 import { gkeVersionAtLeast, MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
+import {
+  assertSafeBucketName,
+  assertSafeHostname,
+  assertSafeImageRegistry,
+  assertSafeProjectId,
+  assertSafeRegion,
+} from "../emit/templates/utils.js";
 
 export interface InitOptions {
   projectId: string;
@@ -16,6 +23,11 @@ export interface InitOptions {
   dryRun?: boolean;
   /** Backoff between IAM-binding retries (ms). Defaults to 5000; tests override to run fast. */
   iamRetryDelayMs?: number;
+  /**
+   * Cluster mode. Defaults to Autopilot (always enforces NetworkPolicy). Standard
+   * clusters are created with --enable-network-policy, which Autopilot rejects.
+   */
+  autopilot?: boolean;
 }
 
 export interface GcloudCommand {
@@ -24,14 +36,36 @@ export interface GcloudCommand {
   args: string[];
 }
 
+// M9: least-privilege stand-in for the project-level roles/networkservices.admin and
+// roles/compute.loadBalancerAdmin grants. Covers exactly the gcloud calls made by the
+// traffic-extension update Job (src/emit/templates/route-ext-update-job.ts).
+export const DEPLOY_EXT_ROLE_PERMISSIONS = [
+  "compute.addresses.get",
+  "compute.forwardingRules.list",
+  "compute.networkEndpointGroups.list",
+  "compute.backendServices.get",
+  "compute.backendServices.update",
+  "networkservices.lbTrafficExtensions.create",
+  "networkservices.lbTrafficExtensions.update",
+  "networkservices.lbTrafficExtensions.get",
+] as const;
+
+// GCP custom role IDs forbid hyphens (^[a-zA-Z0-9_]{3,64}$), so derive the id from the
+// release name with `-` → `_`. The 18-char prefix + 40-char release cap fits the 64-char
+// limit; slice defensively anyway.
+export function deployExtRoleId(releaseName: string): string {
+  return `nextjs_deploy_ext_${releaseName.replace(/-/g, "_")}`.slice(0, 64);
+}
+
 export function buildInitGcloudCommands(options: {
   projectId: string;
   region: string;
   bucket: string;
   releaseName: string;
   hosts?: string[];
+  autopilot?: boolean;
 }): GcloudCommand[] {
-  const { projectId, region, bucket, releaseName, hosts = [] } = options;
+  const { projectId, region, bucket, releaseName, hosts = [], autopilot = true } = options;
   const commands: GcloudCommand[] = [];
 
   // 0. Enable required APIs
@@ -52,22 +86,42 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
-  // 0.1 Create GKE Autopilot cluster
-  commands.push({
-    description: "Create GKE Autopilot cluster",
-    command: "gcloud",
-    args: [
-      "container",
-      "clusters",
-      "create-auto",
-      `${releaseName}-cluster`,
-      "--location",
-      region,
-      "--project",
-      projectId,
-      "--quiet",
-    ],
-  });
+  // 0.1 Create the GKE cluster. Autopilot always enforces NetworkPolicy and REJECTS
+  // --enable-network-policy, so only pass it for Standard clusters.
+  if (autopilot) {
+    commands.push({
+      description: "Create GKE Autopilot cluster",
+      command: "gcloud",
+      args: [
+        "container",
+        "clusters",
+        "create-auto",
+        `${releaseName}-cluster`,
+        "--location",
+        region,
+        "--project",
+        projectId,
+        "--quiet",
+      ],
+    });
+  } else {
+    commands.push({
+      description: "Create GKE Standard cluster (NetworkPolicy enforced)",
+      command: "gcloud",
+      args: [
+        "container",
+        "clusters",
+        "create",
+        `${releaseName}-cluster`,
+        "--location",
+        region,
+        "--project",
+        projectId,
+        "--enable-network-policy",
+        "--quiet",
+      ],
+    });
+  }
 
   // 0.2 Reserve Global Static IP
   commands.push({
@@ -157,18 +211,24 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
-  // 4. Grant Artifact Registry writer (for pushing container images)
+  // 4. Grant Artifact Registry writer on the repository only (M9: least privilege —
+  // pushing images must not require project-wide writer).
   commands.push({
-    description: "Grant Artifact Registry writer for container images",
+    description: "Grant Artifact Registry writer on nextjs repository",
     command: "gcloud",
     args: [
-      "projects",
+      "artifacts",
+      "repositories",
       "add-iam-policy-binding",
-      projectId,
+      "nextjs",
+      "--location",
+      region,
       "--member",
       `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
       "--role",
       "roles/artifactregistry.writer",
+      "--project",
+      projectId,
       "--condition=None",
       "--quiet",
     ],
@@ -197,11 +257,12 @@ export function buildInitGcloudCommands(options: {
   });
 
   // --- Deploy Service Account (Workload Identity for Helm hook Jobs) ---
-  // The route-ext update Job needs:
-  // - networkservices.admin to import LbRouteExtension
-  // - compute.viewer to list forwarding rules (for discovery)
+  // M9: the route-ext update Job gets a release-scoped CUSTOM role (created/updated
+  // imperatively in runInit before these commands run) bound at project level, instead
+  // of the broad networkservices.admin + compute.loadBalancerAdmin roles it used to
+  // receive. compute.viewer remains for generic read-only diagnostics.
   commands.push({
-    description: "Grant deploy SA networkservices.admin role",
+    description: "Grant deploy SA release-scoped traffic-extension role",
     command: "gcloud",
     args: [
       "projects",
@@ -210,7 +271,7 @@ export function buildInitGcloudCommands(options: {
       "--member",
       `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
       "--role",
-      "roles/networkservices.admin",
+      `projects/${projectId}/roles/${deployExtRoleId(releaseName)}`,
       "--condition=None",
       "--quiet",
     ],
@@ -227,25 +288,6 @@ export function buildInitGcloudCommands(options: {
       `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
       "--role",
       "roles/compute.viewer",
-      "--condition=None",
-      "--quiet",
-    ],
-  });
-
-  // The traffic-ext Job also attaches the routing-service NEG to the ext_proc backend
-  // service (compute.backendServices.update + networkEndpointGroups.use) — beyond the
-  // read-only compute.viewer above.
-  commands.push({
-    description: "Grant deploy SA compute.loadBalancerAdmin (attach NEG to ext_proc backend)",
-    command: "gcloud",
-    args: [
-      "projects",
-      "add-iam-policy-binding",
-      projectId,
-      "--member",
-      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
-      "--role",
-      "roles/compute.loadBalancerAdmin",
       "--condition=None",
       "--quiet",
     ],
@@ -485,9 +527,65 @@ export async function runInit(options: InitOptions): Promise<void> {
     projectDir,
     dryRun,
     iamRetryDelayMs = 5000,
+    autopilot = true,
   } = options;
 
+  // Validate every operator-supplied value BEFORE it reaches a gcloud arg array or the
+  // scaffolded adapter.config.mjs — a `'` in a host/bucket name would otherwise be raw
+  // JS injection into the generated config file.
+  assertSafeProjectId(projectId);
+  assertSafeRegion(region);
+  assertSafeBucketName(bucket);
+  assertSafeImageRegistry(registry);
+  for (const host of hosts) assertSafeHostname(host);
+
   console.log(`\nInitializing @next-community/adapter-k8s for project: ${projectId}\n`);
+
+  // 0. Ensure the least-privilege custom IAM role for the traffic-extension Job exists
+  // BEFORE the command loop binds it. Fail loudly — never fall back to broad admin
+  // roles. Idempotent: create, and on "already exists" update with the same set.
+  const extRoleId = deployExtRoleId(releaseName);
+  const extRoleTitle = `Next.js deploy traffic-extension (${releaseName})`;
+  const extRoleArgs = [
+    "--project",
+    projectId,
+    "--title",
+    extRoleTitle,
+    "--permissions",
+    DEPLOY_EXT_ROLE_PERMISSIONS.join(","),
+    "--quiet",
+  ];
+  console.log(`  → Ensuring custom IAM role ${extRoleId} (traffic-extension Job)`);
+  if (dryRun) {
+    console.log(`    [dry-run] gcloud iam roles create ${extRoleId} ${extRoleArgs.join(" ")}`);
+    console.log(
+      `    [dry-run]   (on "already exists": gcloud iam roles update ${extRoleId} with the same permissions)`,
+    );
+  } else {
+    const created = await execCapture("gcloud", [
+      "iam",
+      "roles",
+      "create",
+      extRoleId,
+      ...extRoleArgs,
+    ]);
+    if (created.exitCode !== 0) {
+      if (/already exists|ALREADY_EXISTS/.test(created.stderr)) {
+        const updated = await execCapture("gcloud", [
+          "iam",
+          "roles",
+          "update",
+          extRoleId,
+          ...extRoleArgs,
+        ]);
+        if (updated.exitCode !== 0) {
+          throw new Error(`Updating custom IAM role ${extRoleId} failed:\n${updated.stderr}`);
+        }
+      } else {
+        throw new Error(`Creating custom IAM role ${extRoleId} failed:\n${created.stderr}`);
+      }
+    }
+  }
 
   // 1. Generate gcloud commands
   const commands = buildInitGcloudCommands({
@@ -496,6 +594,7 @@ export async function runInit(options: InitOptions): Promise<void> {
     bucket,
     releaseName,
     hosts,
+    autopilot,
   });
 
   // 2. Run gcloud commands (idempotent — safe to re-run)
@@ -691,6 +790,28 @@ export async function runInit(options: InitOptions): Promise<void> {
         );
       }
     }
+  }
+
+  // 6. M4b: .k8s-adapter/ holds generated secrets (cache connection Secret, deploy
+  // state) — make sure it can never be committed.
+  if (!dryRun) {
+    const gitignorePath = path.join(projectDir, ".gitignore");
+    const ignoreLine = ".k8s-adapter/";
+    const existing = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf-8") : null;
+    const alreadyIgnored =
+      existing !== null && existing.split("\n").some((l) => l.trim() === ignoreLine);
+    if (!alreadyIgnored) {
+      if (existing === null) {
+        writeFileSync(gitignorePath, `${ignoreLine}\n`);
+      } else {
+        const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+        appendFileSync(gitignorePath, `${prefix}${ignoreLine}\n`);
+      }
+      console.log(`  → Added "${ignoreLine}" to .gitignore`);
+    }
+    console.log(
+      "  ℹ .k8s-adapter/ contains generated secrets and state — it must not be committed.",
+    );
   }
 
   console.log("\n✓ Init complete.");

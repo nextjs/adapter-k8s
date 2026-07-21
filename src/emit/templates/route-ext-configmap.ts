@@ -18,7 +18,13 @@ export function renderRouteExtConfigMap({
   const chain = chains[0];
   const fwdRule = forwardingRule ?? "FORWARDING_RULE_PLACEHOLDER";
 
-  // Escape CEL expression for YAML (double quotes inside double-quoted string)
+  // Escape CEL expression for YAML. This MUST be a single-quoted YAML scalar: the CEL
+  // text is already CEL-escaped (escapeCelString turns ' into \'), and \' is NOT a valid
+  // escape in a YAML double-quoted scalar — an apostrophe in a public path (o'brien.txt)
+  // would make route-extension.yaml unparseable and the extension would never register.
+  // YAML single-quote escaping doubles the quote (' -> ''), so a CEL \' becomes \'' and
+  // the YAML parser reads it back as \' — an exact round-trip. (escapeCelString also
+  // rejects control characters, so no newline can reach this scalar.)
   const celExpr = chain?.matchCondition?.celExpression ?? "true";
 
   const routeExtYaml = [
@@ -29,7 +35,7 @@ export function renderRouteExtConfigMap({
     `extensionChains:`,
     `  - name: "${chain?.name ?? "nextjs-routing"}"`,
     `    matchCondition:`,
-    `      celExpression: "${celExpr.replace(/"/g, '\\"')}"`,
+    `      celExpression: '${celExpr.replace(/'/g, "''")}'`,
     `    extensions:`,
     `      - name: "${ext?.name ?? "routing-service"}"`,
     `        authority: "${ext?.authority ?? ""}"`,

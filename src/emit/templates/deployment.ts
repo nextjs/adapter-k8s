@@ -45,9 +45,22 @@ ${replicas !== undefined ? `  replicas: ${replicas}\n` : ""}  selector:
         app.kubernetes.io/component: ${poolName}
         app.kubernetes.io/version: "${safeBuildId}"
     spec:
+      # The pool server never calls the Kubernetes API — don't mount a SA token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: pool-server
           image: "{{ .Values.global.image.registry }}/{{ (index .Values.pools "${poolName}").image.repository }}:${imageTag}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           ports:
             - containerPort: 3000
           env:
@@ -62,9 +75,18 @@ ${replicas !== undefined ? `  replicas: ${replicas}\n` : ""}  selector:
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-            - name: TRUST_INTERNAL_HEADERS
-              value: "1"
 ${internalSecretEnv}${valkeyEnv}
+          volumeMounts:
+            # readOnlyRootFilesystem makes / read-only; Next still needs a writable
+            # scratch dir, so /tmp is an in-memory emptyDir.
+            - name: tmp
+              mountPath: /tmp
+            # Without the shared Valkey incremental handler wired (cache disabled, or an
+            # edge-middleware app), Next falls back to its FILESYSTEM incremental cache at
+            # .next/cache — which must exist writable or renders fail with EROFS. Per-pod
+            # and ephemeral: correct (if unshared) degradation, never durable state.
+            - name: next-cache
+              mountPath: /app/.next/cache
           readinessProbe:
             httpGet:
               path: /healthz
@@ -82,5 +104,10 @@ ${internalSecretEnv}${valkeyEnv}
             limits:
               cpu: "{{ (index .Values.pools "${poolName}").resources.limits.cpu }}"
               memory: "{{ (index .Values.pools "${poolName}").resources.limits.memory }}"
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: next-cache
+          emptyDir: {}
 `;
 }

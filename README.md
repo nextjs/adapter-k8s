@@ -292,12 +292,19 @@ cache: {
   enabled: true,
   provider: 'valkey',                 // 'valkey' | 'redis' (wire-compatible)
   // Managed (GKE default): the adapter provisions Memorystore and injects the connection.
-  memorystore: { region: 'us-central1', sizeGb: 1, tier: 'BASIC' },
+  memorystore: {
+    region: 'us-central1',
+    sizeGb: 1,
+    tier: 'BASIC',
+    // auth: true,                    // recommended — Redis AUTH + in-transit encryption
+  },
   // — or bring your own, and the adapter provisions nothing —
   // url: 'redis://my-valkey.internal:6379',
   // password: '...',
 },
 ```
+
+> **Secure the cache endpoint.** Without `auth: true`, the managed instance has no AUTH and no in-transit encryption — any workload that can reach the VPC endpoint can read and write the shared cache (and cached pages can carry PII). With `auth: true` the instance is created with AUTH + TLS (`SERVER_AUTHENTICATION`), and the pods connect over `rediss://` with the instance AUTH string and server CA injected from the connection Secret (`VALKEY_AUTH` / `VALKEY_CA_CERT`). AUTH can only be set at instance creation, so enable it before the first deploy (or destroy the instance first). Treat one Memorystore instance as one tenant: cache keys are namespaced by build id, but that namespace is **not** a security boundary — don't point two unrelated applications at the same instance.
 
 What it does:
 
@@ -322,6 +329,18 @@ routingService: {
                                  // (never bypass auth), fails open otherwise; 'open'/'closed' force it
 },
 ```
+
+## Security Posture
+
+What the generated infrastructure does by default:
+
+- **Non-root, read-only workloads.** Pool and routing-service containers run as `USER node` with `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, all capabilities dropped, seccomp `RuntimeDefault`, and no service-account token (the traffic-extension Job keeps its Workload Identity token — it needs it — but runs with the same hardening). Writable scratch space is provided by `emptyDir` mounts at `/tmp` and `/app/.next/cache` (per-pod, ephemeral).
+- **NetworkPolicies, fail-closed.** The chart isolates the dataplane: the routing service accepts traffic only from the load balancer / health-check ranges (never from in-cluster pods, which closes off extraction of the internal dispatch secret), and pools accept LB traffic plus sibling-**pool** pods only (the routing service can't originate pool traffic). Deploy discovers the cluster pod CIDR and **aborts** if it can't — pass `--allow-no-network-policy` to explicitly deploy without isolation. Standard clusters are created with `--enable-network-policy`; Autopilot always enforces it.
+- **A shared secret authenticates internal routing headers** between the routing service and pools (`INTERNAL_HEADER_SECRET`, 32 random bytes per deploy, delivered only via a Kubernetes Secret, compared in constant time). Dispatch headers from any other source are stripped.
+- **HTTPS redirect.** When TLS is enabled, the chart emits an HTTP→HTTPS `RequestRedirect` route so plaintext HTTP is never served.
+- **Secrets never touch command lines, logs, or git** (init scaffolds `.k8s-adapter/` into `.gitignore`; secret-bearing chart files are written `0600`).
+- **Input validation at every boundary**: release name, hostnames, registry, namespace, and the build id are charset-validated before they reach Helm values, YAML, or the privileged registration Job. A custom `generateBuildId()` outside `[A-Za-z0-9._-]` fails the build.
+- **Least-privilege deploy identity.** The deploy service account gets a release-scoped custom IAM role for traffic-extension registration and repository-scoped Artifact Registry access — not project-wide LB admin.
 
 ## Architecture
 
@@ -449,15 +468,15 @@ The Helm chart is self-contained -- it includes the traffic-extension registrati
 
 ## Implementation Status
 
-| Phase | Status  | What                                                                                                                                                                                                                                                                  |
-| ----- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate)                                                                                                                                                                            |
-| 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions                                                                                                                                                                                  |
-| 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)                                                                                                                                                                                   |
-| 4     | Done    | Coordinated CDN invalidation — pool servers stamp a per-build `Cache-Tag` on mutable cacheable responses (SSG HTML, `public/` files); `deploy` and `rollback` purge the outgoing build's tag on cutover so a new build never serves the previous build's stale same-URL content from the edge                                    |
-| 5     | Done    | Distributed cache — Valkey `use cache` handler + incremental cache handler shared across replicas (cross-replica `revalidateTag` for `use cache`, ISR, and PPR shells); managed Memorystore or BYO. See [Distributed Cache](#distributed-cache-cache-components--ppr) |
-| 6     | Done    | PPR — pool-native shell resume + `no-store` at the CDN; PPR shells revalidate cross-replica via the incremental cache (needs Node `proxy.ts`)                                                                                                                         |
-| 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                                                                                                                                                                                                         |
+| Phase | Status  | What                                                                                                                                                                                                                                                                                          |
+| ----- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Done    | Adapter core, pool server, CLI (init/deploy/destroy/doctor/describe/rollback/tail/emulate)                                                                                                                                                                                                    |
+| 2     | Done    | Routing service (ext_proc **traffic extension**), CEL generation, Service Extensions                                                                                                                                                                                                          |
+| 3     | Done    | Cloud CDN integration (GCPHTTPFilter, Next.js-aware cache keys, diagnostic headers)                                                                                                                                                                                                           |
+| 4     | Done    | Coordinated CDN invalidation — pool servers stamp a per-build `Cache-Tag` on mutable cacheable responses (SSG HTML, `public/` files); `deploy` and `rollback` purge the outgoing build's tag on cutover so a new build never serves the previous build's stale same-URL content from the edge |
+| 5     | Done    | Distributed cache — Valkey `use cache` handler + incremental cache handler shared across replicas (cross-replica `revalidateTag` for `use cache`, ISR, and PPR shells); managed Memorystore or BYO. See [Distributed Cache](#distributed-cache-cache-components--ppr)                         |
+| 6     | Done    | PPR — pool-native shell resume + `no-store` at the CDN; PPR shells revalidate cross-replica via the incremental cache (needs Node `proxy.ts`)                                                                                                                                                 |
+| 7     | Planned | Skew protection (versioned routing for zero-mismatch deploys)                                                                                                                                                                                                                                 |
 
 ## License
 

@@ -2,6 +2,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { pipeline } from "node:stream";
+import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
@@ -49,20 +50,100 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
   return headers;
 }
 
+// Client-supplied forwarding headers are only a hint. x-forwarded-host is honored solely when it
+// is a plain host[:port] token — anything else (URL syntax, whitespace, empty) falls back to the
+// Host header so a malformed value can neither throw during URL construction nor smuggle an
+// attacker-chosen origin into the relative-vs-absolute Location comparison below.
+const FORWARDED_HOST_RE = /^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/;
+
 function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
   const forwardedHost = req.headers["x-forwarded-host"];
+  const forwardedHostValue = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost;
   const host =
-    (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) ??
+    (forwardedHostValue && FORWARDED_HOST_RE.test(forwardedHostValue)
+      ? forwardedHostValue
+      : undefined) ??
     req.headers.host ??
     "localhost";
   const forwardedProto = req.headers["x-forwarded-proto"];
+  const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
+    ?.split(",")[0]
+    ?.trim();
+  // Only the two real schemes are honored — a spoofed value (e.g. `javascript:`) becomes http.
   const protocol =
-    (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)?.split(",")[0]?.trim() ||
-    "http";
-  const requestOrigin = new URL(`${protocol}://${host}`).origin;
-  return target.origin === requestOrigin
-    ? `${target.pathname}${target.search}${target.hash}`
-    : target.toString();
+    forwardedProtoValue === "https" || forwardedProtoValue === "http"
+      ? forwardedProtoValue
+      : "http";
+  try {
+    const requestOrigin = new URL(`${protocol}://${host}`).origin;
+    return target.origin === requestOrigin
+      ? `${target.pathname}${target.search}${target.hash}`
+      : target.toString();
+  } catch {
+    // The port group above admits out-of-range ports (e.g. :99999), which the URL parser
+    // rejects. A bad forwarded value must never turn a middleware redirect into a 500 —
+    // the absolute target is always a valid Location.
+    return target.toString();
+  }
+}
+
+// Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
+// unequal-length buffers). Mirrors secretsMatch in server.ts.
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+// Extract one cookie's value from a Cookie header, percent-decoded the way Next's RequestCookies
+// does it (next/dist/compiled/@edge-runtime/cookies). Returns undefined when the cookie is absent.
+function readCookieValue(cookieHeader: string, name: string): string | undefined {
+  for (const pair of cookieHeader.split(";")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    if (pair.slice(0, eq).trim() !== name) continue;
+    const raw = pair.slice(eq + 1).trim();
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      // Malformed percent-encoding: keep the raw value so the equality check below simply fails.
+      return raw;
+    }
+  }
+  return undefined;
+}
+
+// The strict-dynamic-route 404 (fallback:false / dynamicParams:false) may only yield to an
+// AUTHENTICATED preview/draft or on-demand-revalidate request. Both credentials are validated
+// against the build's random previewModeId, which pool-server/index.ts loads from
+// prerender-manifest.json into __NEXT_PREVIEW_MODE_ID — the same values upstream Next 16.2 checks:
+//  - `x-prerender-revalidate`: direct equality with previewModeId (checkIsOnDemandRevalidate in
+//    next/dist/server/api-utils/index.js).
+//  - `__prerender_bypass` cookie: Next sets the cookie's VALUE to the previewModeId itself
+//    (setDraftMode in next/dist/server/api-utils/node/api-resolver.js), and tryGetPreviewData
+//    (next/dist/server/api-utils/node/try-get-preview-data.js) accepts it when the decoded value
+//    equals previewModeId. NOTE: the previewModeSigningKey signs only the separate legacy Preview
+//    Mode `__next_preview_data` JWT — the bypass cookie carries no HMAC — so an exact,
+//    constant-time equality against the random build-time id IS the complete upstream scheme.
+// When the build produced no preview identity, neither credential is ever honored.
+function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
+  const previewModeId = process.env.__NEXT_PREVIEW_MODE_ID;
+  if (!previewModeId) return false;
+  const revalidateHeader = req.headers["x-prerender-revalidate"];
+  const revalidateValue = Array.isArray(revalidateHeader) ? revalidateHeader[0] : revalidateHeader;
+  if (
+    typeof revalidateValue === "string" &&
+    timingSafeStringEqual(revalidateValue, previewModeId)
+  ) {
+    return true;
+  }
+  const cookieHeader = req.headers.cookie;
+  const bypassValue = readCookieValue(
+    Array.isArray(cookieHeader) ? cookieHeader.join("; ") : (cookieHeader ?? ""),
+    "__prerender_bypass",
+  );
+  return bypassValue !== undefined && timingSafeStringEqual(bypassValue, previewModeId);
 }
 
 // Swallow socket errors on a client stream. A mid-response client disconnect emits an
@@ -1479,9 +1560,15 @@ export function createDispatcher(options: DispatcherOptions) {
             );
 
             proxyReq.on("error", (err) => {
+              // The dial error stays in the server log — the client body must not leak
+              // upstream error detail (connection failures reveal internal topology/targets).
+              console.error(
+                `[pool-server] external rewrite to ${target.origin}${target.pathname} failed:`,
+                err,
+              );
               if (!res.headersSent) {
                 res.writeHead(502, { "content-type": "text/plain" });
-                res.end(`External rewrite failed: ${err.message}`);
+                res.end("Bad Gateway");
               }
               resolve();
             });
@@ -1518,8 +1605,13 @@ export function createDispatcher(options: DispatcherOptions) {
         case "route": {
           // fallback: false / dynamicParams: false — a path matching a strict
           // dynamic route but not in the prerendered set 404s (as `next start`
-          // does). Skipped for preview/revalidate requests, which legitimately
-          // render non-generated paths on demand.
+          // does). Skipped only for VERIFIED preview/revalidate requests, which
+          // legitimately render non-generated paths on demand. A bare
+          // `x-prerender-revalidate` header or a forged `__prerender_bypass`
+          // cookie must NOT skip the 404 — that would let any client force
+          // renders (which then land in the shared cache) of paths the app
+          // declared must 404. See isVerifiedPreviewRequest for the upstream
+          // credential scheme this mirrors.
           if (strictDynamicRoutes.length > 0) {
             const reqPath = (resolution.invokePath || req.url || "/").split("?")[0] ?? "/";
             const dataPrefix = `${basePath}/_next/data/${buildIdForData}/`;
@@ -1533,9 +1625,7 @@ export function createDispatcher(options: DispatcherOptions) {
               // Keep the encoded value; malformed escapes will simply fail the
               // prerender-manifest membership check below.
             }
-            const isBypass =
-              (req.headers.cookie ?? "").includes("__prerender_bypass=") ||
-              "x-prerender-revalidate" in req.headers;
+            const isBypass = isVerifiedPreviewRequest(req);
             if (
               !isBypass &&
               !prerenderedPaths.has(pagePath) &&
@@ -1921,9 +2011,15 @@ function proxyToPool(
     );
 
     proxyReq.on("error", (err) => {
+      // Pool name + dial error stay in the server log — the client body must not leak
+      // pool topology or internal hostnames.
+      console.error(
+        `[pool-server] cross-pool proxy to pool "${resolution.pool}" (${targetHost}) failed:`,
+        err,
+      );
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "text/plain" });
-        res.end(`Failed to proxy to pool "${resolution.pool}": ${err.message}`);
+        res.end("Bad Gateway");
       }
       resolve();
     });

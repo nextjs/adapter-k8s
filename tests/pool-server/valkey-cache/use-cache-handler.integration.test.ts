@@ -203,13 +203,26 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     expect(await b.getExpiration(["live"])).toBeGreaterThan(0);
   });
 
-  it("updateTags is last-event-wins: an older event cannot clobber a newer one", async () => {
-    // Reproduces the concurrent-revalidation race: a later profiled revalidation (future expiry)
-    // must not be overwritten by an older hard-expire that arrives afterward.
-    const early = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => 5000 });
-    const late = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => 9000 });
-    await late.updateTags(["t"], { expire: 300 }); // event at 9000 → expired = 9000 + 300_000
-    await early.updateTags(["t"]); // older event at 5000 → must be ignored by the atomic merge
-    expect(await early.getExpiration(["t"])).toBe(9000 + 300_000);
+  it("updateTags merge is last-event-wins on the SERVER clock (client clocks don't order events)", async () => {
+    // The Lua merge stamps each event with the Valkey server's TIME, so ARRIVAL ORDER — not the
+    // (possibly skewed) client clock — decides which event wins. Here the second event carries
+    // the OLDER client clock yet still wins, because it reached the server later. (Pre-L7 this
+    // merge compared client-stamped `at`s, so a backward-stepping replica's invalidation was
+    // silently dropped.)
+    const ahead = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => 9000 });
+    const behind = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => 5000 });
+    await ahead.updateTags(["t"], { expire: 300 }); // expired = 9000 + 300_000, arrives first
+    await behind.updateTags(["t"]); // hard-expire (expired = 5000), arrives LATER → wins
+    expect(await ahead.getExpiration(["t"])).toBe(5000);
+  });
+
+  it("updateTags merge: a later-arriving profiled revalidation wins over an earlier hard-expire", async () => {
+    // Same server-clock ordering, opposite direction: the hard-expire arrives first, the
+    // profiled revalidation (future expiry) arrives later and must not be shadowed by it.
+    const early = new ValkeyCacheHandler({ client: newClient(), buildId: "lew2", now: () => 5000 });
+    const late = new ValkeyCacheHandler({ client: newClient(), buildId: "lew2", now: () => 9000 });
+    await early.updateTags(["u"]); // hard-expire, arrives first
+    await late.updateTags(["u"], { expire: 300 }); // arrives LATER → wins
+    expect(await early.getExpiration(["u"])).toBe(9000 + 300_000);
   });
 });

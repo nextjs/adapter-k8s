@@ -64,12 +64,25 @@ spec:
         app.kubernetes.io/component: routing-service
         app.kubernetes.io/version: "${safeBuildId}"
     spec:
+      # The routing service never calls the Kubernetes API — don't mount a SA token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       # Give a terminating pod time to keep serving in-flight callouts while the LB stops
       # routing to it (preStop below), before SIGTERM/kill.
       terminationGracePeriodSeconds: 40
       containers:
         - name: routing-service
           image: "${imageRegistry}/routing-service:${buildId}"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           lifecycle:
             preStop:
               # Keep serving while GCP reprograms the NEG to drain this terminating pod.
@@ -96,10 +109,22 @@ spec:
               value: "${requestTimeoutMs ?? 4000}"
             - name: CONFIG_DIR
               value: /config
+            # The per-replica TLS cert generated at container start needs the release
+            # name + namespace to build its CN/SAN (cert lands in /tmp/tls).
+            - name: RELEASE_NAME
+              value: "${releaseName}"
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
 ${internalSecretEnv}
           volumeMounts:
             - name: routing-manifest
               mountPath: /config
+            # readOnlyRootFilesystem makes / read-only; the runtime TLS cert
+            # generation writes under /tmp/tls, backed by this emptyDir.
+            - name: tmp
+              mountPath: /tmp
           # httpGet, not a socket check: a wedged event loop still accepts a TCP
           # connection but fails to *serve* /healthz, so a broken-but-listening pod
           # gets evicted from the NEG instead of silently failing callouts.
@@ -127,5 +152,7 @@ ${internalSecretEnv}
         - name: routing-manifest
           configMap:
             name: ${releaseName}-routing-manifest
+        - name: tmp
+          emptyDir: {}
 `;
 }

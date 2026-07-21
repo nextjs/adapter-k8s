@@ -1,15 +1,19 @@
-import { assertSafeReleaseName, assertSafeProjectId, assertSafeRegion } from "./utils.js";
+import { createHash } from "node:crypto";
+import {
+  assertSafeReleaseName,
+  assertSafeProjectId,
+  assertSafeRegion,
+  assertSafeBuildId,
+} from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
-// "delete old jobs" cleanup MUST match this exactly — a mismatch (it previously used a
-// 12-char build-id slice while the name uses 10) deletes the current job mid-run, so the
-// extension never gets registered.
+// "delete old jobs" cleanup MUST match this exactly — a mismatch deletes the current job
+// mid-run, so the extension never gets registered. Kubernetes Jobs are immutable, so each
+// build needs a distinct name. A 12-hex-character SHA-256 suffix preserves 48 bits of the
+// complete build ID while always fitting after the 40-character release-name limit.
 export function routeExtJobName(releaseName: string, buildId: string): string {
-  const safeBuildId = buildId
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .slice(0, 10);
-  return `${releaseName}-route-ext-${safeBuildId}`;
+  const buildDigest = createHash("sha256").update(buildId).digest("hex").slice(0, 12);
+  return `${releaseName}-route-ext-${buildDigest}`;
 }
 
 export function renderRouteExtUpdateJob({
@@ -29,6 +33,7 @@ export function renderRouteExtUpdateJob({
   assertSafeReleaseName(releaseName);
   assertSafeProjectId(projectId);
   assertSafeRegion(region);
+  assertSafeBuildId(buildId);
   // Include buildId in the Job name so each deploy creates a fresh Job
   // (K8s Jobs are immutable — can't update an existing one)
   return `apiVersion: batch/v1
@@ -38,13 +43,32 @@ metadata:
   labels:
     app.kubernetes.io/name: ${releaseName}
     app.kubernetes.io/component: route-ext-job
+  annotations:
+    # The Job name carries only a digest of the build id — record the full id for
+    # operators (an annotation, not a label: build ids may exceed the 63-char label cap).
+    adapter-k8s.dev/build-id: "${buildId}"
 spec:
+  # Sweep finished Jobs so re-registrations don't accumulate in the namespace.
+  ttlSecondsAfterFinished: 3600
   template:
     spec:
       serviceAccountName: ${releaseName}-deploy-sa
+      # NOTE: the SA token stays automounted — this Job needs Workload Identity to call
+      # gcloud. It still runs as an unprivileged user with a locked-down container.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: update-ext
           image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           command: ["/bin/sh", "-c"]
           args:
             - |
@@ -140,13 +164,21 @@ spec:
           env:
             - name: CLOUDSDK_CORE_PROJECT
               value: "${projectId}"
+            # gcloud refuses to run when its config home is unwritable; running as
+            # non-root with a read-only root FS, point it at the /tmp emptyDir.
+            - name: CLOUDSDK_CONFIG
+              value: /tmp/.config/gcloud
           volumeMounts:
             - name: config
               mountPath: /config
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: ${releaseName}-route-ext-config
+        - name: tmp
+          emptyDir: {}
       restartPolicy: Never
   backoffLimit: 3
 `;

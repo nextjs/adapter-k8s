@@ -14,10 +14,12 @@
 // `get` returns null when the entry's tags have been revalidated since it was stored (Next then
 // regenerates), so the per-process `tags-manifest.external` check Next also runs is irrelevant here.
 import type { ValkeyClient } from "./client.js";
+import { logErrorRateLimited, maxCacheEntryBytes, warnOnce } from "./stream-codec.js";
 import {
   areTagsExpired,
   areTagsStale,
   computeTagUpdate,
+  parseTagState,
   UPDATE_TAGS_SCRIPT,
   type TagState,
 } from "./tag-manifest.js";
@@ -28,8 +30,15 @@ const RETENTION_MARGIN_SECONDS = 60;
 // never time-revalidate). Next's semantics are "cache until a tag revalidates it", so these must NOT
 // fall to the ~61s numeric-revalidate floor (which would make them cold-miss every minute). Bounded
 // (not infinite) so a failed blue/green teardown can't leak build-namespaced keys forever; a build
-// living past this simply re-renders the entry once, then re-caches it.
-const DURABLE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+// living past this simply re-renders the entry once, then re-caches it. Exported: the V2 `use cache`
+// handler caps its key TTL at the same bound (M7).
+export const DURABLE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+// Bounds for the tag list stored with an entry (L9). Next's own `cacheTag()` enforces the
+// 256-char per-tag limit, but a route handler can set `x-next-cache-tags` manually with
+// arbitrary content — drop over-limit tags rather than storing/looking-up unbounded lists.
+const MAX_TAGS_PER_ENTRY = 128;
+const MAX_TAG_LENGTH = 256;
 
 // Minimal structural mirror of Next's classic CacheHandler contract (avoids a compile-time
 // dependency on Next internals). `value` is an `IncrementalCacheValue`; we serialize its binary
@@ -56,6 +65,29 @@ interface StoredEntry {
   lastModified: number;
   /** Retention hint (seconds) for the Valkey key TTL; not the staleness source. */
   ttlSeconds: number;
+}
+
+/**
+ * Parse and validate a stored incremental entry (L5). A corrupt entry — wrong JSON, non-finite
+ * `lastModified`/`ttlSeconds`, a non-array tag list, or a missing `value` member (`null` is a
+ * REAL cached value, but it must be present) — degrades to a miss so Next regenerates.
+ */
+function parseStoredEntry(raw: string): StoredEntry | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const e = parsed as Record<string, unknown>;
+  if (!Number.isFinite(e.lastModified)) return undefined;
+  if (!Array.isArray(e.tags) || !e.tags.every((tag) => typeof tag === "string")) return undefined;
+  if (typeof e.ttlSeconds !== "number" || !Number.isFinite(e.ttlSeconds) || e.ttlSeconds <= 0) {
+    return undefined;
+  }
+  if (!("value" in e)) return undefined;
+  return e as unknown as StoredEntry;
 }
 
 export interface ValkeyIncrementalCacheOptions {
@@ -111,20 +143,35 @@ function decodeValue(value: unknown): unknown {
 }
 
 function extractTags(value: Record<string, unknown> | null, ctx: SetCtx): string[] {
-  if (ctx.tags && ctx.tags.length) return ctx.tags;
-  const headers = value?.headers as Record<string, string | string[]> | undefined;
-  const raw = headers?.[NEXT_CACHE_TAGS_HEADER];
-  if (typeof raw === "string")
-    return raw
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
-  if (Array.isArray(raw))
-    return raw
-      .flatMap((t) => t.split(","))
-      .map((t) => t.trim())
-      .filter(Boolean);
-  return [];
+  let raw: string[];
+  if (ctx.tags && ctx.tags.length) {
+    raw = ctx.tags;
+  } else {
+    const headers = value?.headers as Record<string, string | string[]> | undefined;
+    const header = headers?.[NEXT_CACHE_TAGS_HEADER];
+    if (typeof header === "string") {
+      raw = header
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+    } else if (Array.isArray(header)) {
+      raw = header
+        .flatMap((t) => t.split(","))
+        .map((t) => t.trim())
+        .filter(Boolean);
+    } else {
+      raw = [];
+    }
+  }
+  // Cap count and per-tag length (L9): over-limit tags are dropped, keeping the first
+  // well-formed ones in declared order.
+  const tags: string[] = [];
+  for (const tag of raw) {
+    if (typeof tag !== "string" || tag.length === 0 || tag.length > MAX_TAG_LENGTH) continue;
+    tags.push(tag);
+    if (tags.length >= MAX_TAGS_PER_ENTRY) break;
+  }
+  return tags;
 }
 
 /**
@@ -153,7 +200,8 @@ export class ValkeyIncrementalCacheHandler {
     try {
       const raw = await this.client.get(this.entryKey(cacheKey));
       if (!raw) return null;
-      const entry = JSON.parse(raw) as StoredEntry;
+      const entry = parseStoredEntry(raw);
+      if (!entry) return null; // corrupt entry → miss, Next regenerates (L5)
       const now = this.now();
 
       // Own the staleness check against the SHARED manifest (the tags-manifest.external check Next
@@ -214,7 +262,17 @@ export class ValkeyIncrementalCacheHandler {
         lastModified: this.now(),
         ttlSeconds: Math.ceil(ttlSeconds),
       };
-      await this.client.set(this.entryKey(cacheKey), JSON.stringify(entry), "EX", entry.ttlSeconds);
+      const serialized = JSON.stringify(entry);
+      // M6: skip (and log once) when the serialized entry exceeds the configured cap — an
+      // oversized page/shell must not be pushed through the socket into Valkey unboundedly.
+      if (Buffer.byteLength(serialized, "utf8") > maxCacheEntryBytes()) {
+        warnOnce(
+          "oversize-entry",
+          `[valkey-cache] an incremental cache entry exceeded ADAPTER_K8S_MAX_CACHE_ENTRY_BYTES; it was not cached (further occurrences logged once per process)`,
+        );
+        return;
+      }
+      await this.client.set(this.entryKey(cacheKey), serialized, "EX", entry.ttlSeconds);
     } catch {
       // Cache write failure must not break the response.
     }
@@ -229,8 +287,14 @@ export class ValkeyIncrementalCacheHandler {
       for (const tag of list)
         args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
       await this.client.eval(UPDATE_TAGS_SCRIPT, 1, this.tagsKey, ...args);
-    } catch {
-      // Best-effort; a missed manifest write means a revalidation is skipped, not a crash.
+    } catch (error) {
+      // Best-effort; a missed manifest write means a revalidation is skipped, not a crash — but
+      // it must be OBSERVABLE (M1). Rate-limited so a Valkey outage doesn't spam per-request logs.
+      logErrorRateLimited(
+        "revalidateTag",
+        "[valkey-cache] revalidateTag failed to write the shared tag manifest; invalidation may be lost",
+        error,
+      );
     }
   }
 
@@ -245,11 +309,9 @@ export class ValkeyIncrementalCacheHandler {
     tags.forEach((tag, i) => {
       const rawState = values[i];
       if (rawState) {
-        try {
-          manifest.set(tag, JSON.parse(rawState) as TagState);
-        } catch {
-          // ignore a corrupt field
-        }
+        // Corrupt fields degrade to "no state" (a corrupt `at` becomes 0); never throw (L5).
+        const state = parseTagState(rawState);
+        if (state) manifest.set(tag, state);
       }
     });
     return manifest;

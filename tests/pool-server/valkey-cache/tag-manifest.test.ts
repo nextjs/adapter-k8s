@@ -5,6 +5,8 @@ import {
   computeTagUpdate,
   evaluateEntry,
   maxExpiration,
+  parseTagState,
+  UPDATE_TAGS_SCRIPT,
   type TagManifest,
   type TagState,
 } from "../../../src/pool-server/valkey-cache/tag-manifest.js";
@@ -73,6 +75,52 @@ describe("maxExpiration (mirrors default.js getExpiration)", () => {
     const m = manifest({ a: { expired: 100 }, b: { expired: 900 }, c: {} });
     expect(maxExpiration(["a", "b", "c"], m)).toBe(900);
     expect(maxExpiration(["c", "missing"], m)).toBe(0);
+  });
+});
+
+describe("UPDATE_TAGS_SCRIPT (L7: merge ordered on the server clock)", () => {
+  it("takes the merge timestamp from the server's TIME, not an ARGV-supplied `at`", () => {
+    expect(UPDATE_TAGS_SCRIPT).toContain("redis.call('TIME')");
+    // The incoming state's `at` is rewritten to the server time before comparing/storing.
+    expect(UPDATE_TAGS_SCRIPT).toContain("nw.at = now");
+    // The merge comparison is against the server clock, never a client-parsed `nw.at`.
+    expect(UPDATE_TAGS_SCRIPT).not.toContain("nwAt");
+  });
+});
+
+describe("parseTagState (L5: corrupt manifest fields degrade safely)", () => {
+  it("parses a well-formed state", () => {
+    expect(parseTagState(JSON.stringify({ stale: 1, expired: 2, at: 3 }))).toEqual({
+      stale: 1,
+      expired: 2,
+      at: 3,
+    });
+  });
+
+  it("returns undefined for invalid JSON", () => {
+    expect(parseTagState("{not json")).toBeUndefined();
+  });
+
+  it("returns undefined for non-object JSON", () => {
+    expect(parseTagState("42")).toBeUndefined();
+    expect(parseTagState('"str"')).toBeUndefined();
+    expect(parseTagState("null")).toBeUndefined();
+    expect(parseTagState("[1,2]")).toBeUndefined();
+  });
+
+  it("treats a corrupt `at` as 0 (older than any real event in the merge)", () => {
+    expect(parseTagState(JSON.stringify({ expired: 5, at: "soon" }))).toEqual({
+      expired: 5,
+      at: 0,
+    });
+    expect(parseTagState(JSON.stringify({ expired: 5 }))).toEqual({ expired: 5, at: 0 });
+  });
+
+  it("drops non-finite watermarks instead of poisoning freshness predicates", () => {
+    // JSON can't represent Infinity/NaN, but a hand-corrupted field can carry strings/null.
+    expect(parseTagState(JSON.stringify({ stale: "x", expired: null, at: 7 }))).toEqual({
+      at: 7,
+    });
   });
 });
 

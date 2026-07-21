@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { generateCelExpression, extractStaticPrefix } from "../src/cel.js";
+import { generateCelExpression, extractStaticPrefix, escapeCelString } from "../src/cel.js";
 import {
   mockOutputs,
   mockStaticFile,
@@ -128,6 +128,17 @@ describe("generateCelExpression", () => {
     expect(cel).toContain("request.path == '/o\\'brien.txt'");
     // No unescaped quote should prematurely close the literal.
     expect(cel).not.toContain("'/o'brien.txt'");
+  });
+
+  it("rejects control characters in pathnames instead of letting them fold in YAML", () => {
+    // The CEL text is embedded in a YAML scalar in route-extension.yaml — a newline in a
+    // public filename would silently fold and corrupt the extension spec. Fail the build.
+    expect(() => escapeCelString("/evil\nfile.txt")).toThrow(/control\/non-ASCII/);
+    expect(() => escapeCelString("/evil\tfile.txt")).toThrow(/control\/non-ASCII/);
+    expect(() => escapeCelString("/café.txt")).toThrow(/control\/non-ASCII/);
+    // Printable ASCII (incl. spaces and quotes) still escapes normally.
+    expect(escapeCelString("/o'brien.txt")).toBe("/o\\'brien.txt");
+    expect(escapeCelString("/my file.txt")).toBe("/my file.txt");
   });
 
   it("returns false when nothing needs ext_proc", () => {

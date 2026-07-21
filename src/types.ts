@@ -66,7 +66,20 @@ export interface K8sAdapterConfig {
      * The instance's discovery endpoint + AUTH are injected into the pods as `VALKEY_URL` /
      * `VALKEY_AUTH`. This shape firms up alongside the provisioning step.
      */
-    memorystore?: { region?: string; sizeGb?: number; tier?: "BASIC" | "STANDARD_HA" };
+    memorystore?: {
+      region?: string;
+      sizeGb?: number;
+      tier?: "BASIC" | "STANDARD_HA";
+      /**
+       * Enable Redis AUTH + in-transit encryption (SERVER_AUTHENTICATION) on the managed
+       * instance. The pods then connect over `rediss://` with the instance AUTH string and
+       * server CA injected as `VALKEY_AUTH` / `VALKEY_CA_CERT`. Recommended — without it any
+       * workload that can reach the VPC endpoint can read/write the shared cache. NOTE: AUTH
+       * can only be set at instance creation; an existing non-AUTH instance must be recreated
+       * (`destroy` removes it) before enabling.
+       */
+      auth?: boolean;
+    };
   };
   containerStrategy?: "traced-assets" | "shared-image";
   imageOptimizer?: { enabled: boolean; mode: "sidecar" };

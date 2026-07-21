@@ -1,6 +1,6 @@
 // tests/emit/helm.test.ts
 import { describe, it, expect } from "vitest";
-import { generateHelmChart } from "../../src/emit/helm.js";
+import { generateHelmChart, SECRET_CHART_FILES } from "../../src/emit/helm.js";
 import { sanitizeK8sName } from "../../src/emit/templates/utils.js";
 import type { PoolDefinition, K8sAdapterConfig, RoutingManifest } from "../../src/types.js";
 
@@ -367,6 +367,42 @@ describe("generateHelmChart", () => {
     });
     expect(result["templates/cdn-http-filter.yaml"]).toBeUndefined();
     expect(result["templates/http-route.yaml"]).toBeUndefined();
+  });
+
+  it("always emits the NetworkPolicy template (helm-gated) with an empty podCidrs default", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+    const result = generateHelmChart({
+      pools,
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+    });
+
+    // The template is always in the chart; the helm `if` guard renders nothing until the
+    // deploy CLI sets global.networkPolicy.podCidrs.
+    const netpol = result["templates/network-policy.yaml"];
+    expect(netpol).toBeDefined();
+    expect(netpol).toContain("{{- if .Values.global.networkPolicy.podCidrs }}");
+    expect(netpol).toContain("kind: NetworkPolicy");
+
+    // values.yaml carries the empty default the CLI overrides with --set.
+    const values = JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{")));
+    expect(values.global.networkPolicy).toEqual({ podCidrs: [] });
+  });
+
+  it("marks the secret-bearing templates for mode-0600 writes (M4)", () => {
+    // adapter.ts writes chart files and MUST create these with mode 0600 — the set is
+    // the single source of truth, kept next to the files' generation.
+    expect(SECRET_CHART_FILES.has("templates/internal-secret.yaml")).toBe(true);
+    expect(SECRET_CHART_FILES.has("templates/valkey-secret.yaml")).toBe(true);
+    expect(SECRET_CHART_FILES.size).toBe(2);
   });
 
   it("throws a helpful error when the routing manifest exceeds the ConfigMap size limit", () => {

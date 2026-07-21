@@ -46,6 +46,20 @@ describe("createPoolServer", () => {
     await server.close();
     server = null; // already closed
   });
+
+  it("returns a generic body when onRequest throws (L1: no internals to the client)", async () => {
+    const onRequest = vi.fn(() => {
+      throw new Error("sensitive internals: /secret/db password");
+    });
+    server = createPoolServer({ onRequest, port: 0 });
+    const address = await server.start();
+
+    const res = await fetch(`http://127.0.0.1:${address.port}/boom`);
+    expect(res.status).toBe(500);
+    const body = await res.text();
+    expect(body).toBe("Internal Server Error");
+    expect(body).not.toContain("sensitive");
+  });
 });
 
 describe("internal header security", () => {
