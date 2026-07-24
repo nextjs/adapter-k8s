@@ -1,6 +1,6 @@
 // tests/pool-server/server.test.ts
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { createPoolServer } from "../../src/pool-server/server.js";
+import { createPoolServer, filterWriteHeadHeadersArg } from "../../src/pool-server/server.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 describe("createPoolServer", () => {
@@ -47,6 +47,38 @@ describe("createPoolServer", () => {
     server = null; // already closed
   });
 
+  it("survives a client disconnect mid-response (central socket error guard)", async () => {
+    const onRequest = vi.fn(async (_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      // Keep writing after the client hangs up — writes to the dead socket emit
+      // 'error' on res, which must be swallowed (else the process crashes).
+      for (let i = 0; i < 100; i++) {
+        res.write(Buffer.alloc(64 * 1024, 65));
+        await new Promise((r) => setTimeout(r, 1));
+      }
+      res.end();
+    });
+    server = createPoolServer({ onRequest, port: 0 });
+    const { port } = await server.start();
+
+    const net = await import("node:net");
+    await new Promise<void>((resolve) => {
+      const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
+        socket.write(`GET /big HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+      });
+      socket.once("data", () => {
+        socket.destroy();
+        resolve();
+      });
+    });
+    // Give the server time to hit the dead socket with more writes.
+    await new Promise((r) => setTimeout(r, 300));
+
+    // The process survived and the server keeps serving.
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+    expect(res.status).toBe(200);
+  });
+
   it("returns a generic body when onRequest throws (L1: no internals to the client)", async () => {
     const onRequest = vi.fn(() => {
       throw new Error("sensitive internals: /secret/db password");
@@ -59,6 +91,30 @@ describe("createPoolServer", () => {
     const body = await res.text();
     expect(body).toBe("Internal Server Error");
     expect(body).not.toContain("sensitive");
+  });
+
+  it("logs only the pathname, never the query string (tokens stay out of logs)", async () => {
+    const onRequest = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(200);
+      res.end("ok");
+    });
+    server = createPoolServer({ onRequest, port: 0 });
+    const { port } = await server.start();
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await fetch(`http://127.0.0.1:${port}/page?sig=secret-token&x=1`);
+      const requestLog = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .find((line) => line.includes("GET /page"));
+      expect(requestLog).toBeDefined();
+      expect(requestLog).toContain("GET /page");
+      expect(requestLog).not.toContain("sig");
+      expect(requestLog).not.toContain("secret-token");
+      expect(requestLog).not.toContain("x=1");
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 });
 
@@ -361,6 +417,58 @@ describe("internal header security", () => {
       expect(res.headers.get("content-type")).toBe("text/plain");
     });
 
+    it("strips internal headers passed via the array form of writeHead", async () => {
+      // writeHead(status, [[name, value], ...]) bypassed the object-map strip —
+      // internal headers must be filtered from the array form too.
+      const onRequest = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, [
+          ["x-middleware-rewrite", "http://internal/path"],
+          ["x-middleware-set-cookie", "session=abc; Path=/"],
+          ["content-type", "text/plain"],
+        ]);
+        res.end("ok");
+      });
+
+      server = createPoolServer({ onRequest, port: 0 });
+      const { port } = await server.start();
+
+      const res = await fetch(`http://127.0.0.1:${port}/page`);
+      expect(res.status).toBe(200);
+      expect(res.headers.has("x-middleware-rewrite")).toBe(false);
+      expect(res.headers.has("x-middleware-set-cookie")).toBe(false);
+      expect(res.headers.get("content-type")).toBe("text/plain");
+    });
+
+    it("strips internal headers passed via the FLAT array form of writeHead", async () => {
+      // Node also accepts writeHead(status, [name1, value1, name2, value2]) — the
+      // rawHeaders layout. The tuple-only filter took String(entry[0]) — the first
+      // CHARACTER of the header name — so nothing matched and internal headers
+      // leaked to the client (verified).
+      const onRequest = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, [
+          "x-middleware-rewrite",
+          "http://internal/x",
+          "x-middleware-set-cookie",
+          "session=abc; Path=/",
+          "content-type",
+          "text/plain",
+          "x-should-survive",
+          "yes",
+        ] as unknown as Parameters<typeof res.writeHead>[1]);
+        res.end("ok");
+      });
+
+      server = createPoolServer({ onRequest, port: 0 });
+      const { port } = await server.start();
+
+      const res = await fetch(`http://127.0.0.1:${port}/page`);
+      expect(res.status).toBe(200);
+      expect(res.headers.has("x-middleware-rewrite")).toBe(false);
+      expect(res.headers.has("x-middleware-set-cookie")).toBe(false);
+      expect(res.headers.get("content-type")).toBe("text/plain");
+      expect(res.headers.get("x-should-survive")).toBe("yes");
+    });
+
     it("strips response headers regardless of trustInternalHeaders setting", async () => {
       const onRequest = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
         res.setHeader("x-middleware-next", "1");
@@ -376,5 +484,41 @@ describe("internal header security", () => {
       expect(res.headers.has("x-middleware-next")).toBe(false);
       expect(res.headers.has("x-middleware-rewrite")).toBe(false);
     });
+  });
+});
+
+describe("filterWriteHeadHeadersArg", () => {
+  // Shared by server.ts's internal-header strip and index.ts's forced cache-policy
+  // wrapper — pin every headers shape Node's writeHead accepts.
+  const banned = (name: string) => name.toLowerCase() === "x-banned";
+
+  it("filters the object form in place", () => {
+    const obj = { "x-banned": "1", "X-Banned": "2", keep: "yes" };
+    const result = filterWriteHeadHeadersArg(obj, banned) as Record<string, string>;
+    expect(result).toEqual({ keep: "yes" });
+  });
+
+  it("filters the tuple-array form", () => {
+    const result = filterWriteHeadHeadersArg(
+      [
+        ["x-banned", "1"],
+        ["keep", "yes"],
+      ],
+      banned,
+    );
+    expect(result).toEqual([["keep", "yes"]]);
+  });
+
+  it("filters the FLAT array form pairwise (name/value pairs, not tuples)", () => {
+    const result = filterWriteHeadHeadersArg(
+      ["x-banned", "1", "keep", "yes", "X-BANNED", "2", "also-keep", "sure"],
+      banned,
+    );
+    expect(result).toEqual(["keep", "yes", "also-keep", "sure"]);
+  });
+
+  it("leaves non-object arguments untouched", () => {
+    expect(filterWriteHeadHeadersArg(undefined, banned)).toBeUndefined();
+    expect(filterWriteHeadHeadersArg("OK", banned)).toBe("OK");
   });
 });

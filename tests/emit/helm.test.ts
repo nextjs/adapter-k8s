@@ -9,6 +9,7 @@ const mockManifest: RoutingManifest = {
   pathnames: [],
   i18n: null,
   buildId: "abc123",
+  builtAt: "2026-01-01T00:00:00.000Z",
   basePath: "",
   middleware: null,
   poolAssignments: {},

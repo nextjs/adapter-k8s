@@ -369,7 +369,11 @@ export function createLocalResolver(
       if (redirect) {
         if (redirect.kind === "retry") {
           // Spurious internal trailing-slash redirect — resolve the real target.
-          return this.resolve(redirect.retryUrl, headers, method, requestBody);
+          // Middleware already ran in THIS pass (same request, same verdict), so mark
+          // it: re-invoking would both double-apply middleware and consume the POST
+          // body stream a second time (`ReadableStream is locked` → 500), exactly
+          // like the same-deployment rewrite continuation below.
+          return this.resolve(redirect.retryUrl, headers, method, requestBody, 0, true);
         }
         return {
           kind: "redirect",

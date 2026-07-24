@@ -1,16 +1,7 @@
 // src/pool-server/server.ts
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { timingSafeEqual } from "node:crypto";
 import { INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER } from "../routing-common.js";
-
-// Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
-// unequal-length buffers).
-function secretsMatch(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
-}
+import { guardStreamErrors, timingSafeStringEqual } from "./dispatch.js";
 
 // Internal headers that must not leak to the client.
 const INTERNAL_RESPONSE_HEADERS = [
@@ -37,6 +28,38 @@ function isInternalResponseHeader(name: string): boolean {
     lower.startsWith("x-middleware-request-") ||
     lower.startsWith("x-middleware-")
   );
+}
+
+// Filter banned names out of the headers argument passed to writeHead. Node accepts
+// THREE shapes there: an object map, an array of [name, value] tuples, AND a flat
+// array [name1, value1, name2, value2] (the request.rawHeaders layout). A tuple-only
+// filter silently fails on the flat form — `String(entry[0])` is the first CHARACTER
+// of the header name, so nothing matches and banned headers sail through to the
+// client (verified leak: writeHead(200, ["x-middleware-rewrite", …])). Shared by the
+// internal-header strip below and index.ts's forced cache-policy wrapper.
+export function filterWriteHeadHeadersArg(
+  headersArg: unknown,
+  isBanned: (name: string) => boolean,
+): unknown {
+  if (Array.isArray(headersArg)) {
+    if (headersArg.length > 0 && !Array.isArray(headersArg[0])) {
+      // Flat form: even offsets are names, odd offsets are values — filter pairwise.
+      const filtered: unknown[] = [];
+      for (let i = 0; i + 1 < headersArg.length; i += 2) {
+        if (!isBanned(String(headersArg[i]))) filtered.push(headersArg[i], headersArg[i + 1]);
+      }
+      return filtered;
+    }
+    return headersArg.filter((entry) => !isBanned(String((entry as [unknown])[0])));
+  }
+  if (headersArg && typeof headersArg === "object") {
+    for (const key of Object.keys(headersArg)) {
+      if (isBanned(key)) {
+        delete (headersArg as Record<string, unknown>)[key];
+      }
+    }
+  }
+  return headersArg;
 }
 
 export interface PoolServerOptions {
@@ -74,7 +97,8 @@ export function createPoolServer(options: PoolServerOptions) {
     // reach the handler or leak upstream, so it is always deleted.
     const presentedSecret = req.headers[INTERNAL_SECRET_HEADER];
     const trusted = internalSecret
-      ? typeof presentedSecret === "string" && secretsMatch(presentedSecret, internalSecret)
+      ? typeof presentedSecret === "string" &&
+        timingSafeStringEqual(presentedSecret, internalSecret)
       : trustInternalHeaders;
     delete req.headers[INTERNAL_SECRET_HEADER];
 
@@ -106,19 +130,24 @@ export function createPoolServer(options: PoolServerOptions) {
           res.removeHeader(name);
         }
       }
-      // Strip from the headers object passed as an argument, if present.
-      // writeHead(status, headers) or writeHead(status, statusMessage, headers).
+      // Strip from the headers argument, if present — object, tuple-array, AND
+      // flat-array forms (writeHead(status[, statusMessage], headers)); any of them
+      // sails past the setHeader-map checks above.
       const headersArgIdx = typeof args[0] === "string" ? 1 : 0;
-      const headersArg = args[headersArgIdx];
-      if (headersArg && typeof headersArg === "object" && !Array.isArray(headersArg)) {
-        for (const key of Object.keys(headersArg)) {
-          if (isInternalResponseHeader(key)) {
-            delete headersArg[key];
-          }
-        }
+      if (args[headersArgIdx] !== undefined) {
+        args[headersArgIdx] = filterWriteHeadHeadersArg(
+          args[headersArgIdx],
+          isInternalResponseHeader,
+        );
       }
       return origWriteHead(statusCode, ...args);
     };
+
+    // Attach the no-op socket-error guard at the single per-request choke point: every
+    // downstream write (the index.ts static/public/image fast paths, dispatch, and the
+    // 500 fallback below) is then safe from a mid-response client disconnect crashing
+    // the process with an unhandled 'error' event.
+    guardStreamErrors(res);
 
     const start = Date.now();
     try {
@@ -135,7 +164,10 @@ export function createPoolServer(options: PoolServerOptions) {
       }
     } finally {
       const ms = Date.now() - start;
-      console.log(`${req.method} ${req.url} → ${res.statusCode} (${ms}ms)`);
+      // Log the pathname only — the raw query string routinely carries tokens and
+      // signed parameters (pre-signed URLs, session hints) that must not land in logs.
+      const logPath = req.url?.split("?", 1)[0] ?? "";
+      console.log(`${req.method} ${logPath} → ${res.statusCode} (${ms}ms)`);
     }
   });
 

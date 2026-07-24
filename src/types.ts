@@ -124,6 +124,8 @@ export interface RoutingManifest {
   pathnames: string[];
   i18n: BuildCompleteContext["config"]["i18n"] | null;
   buildId: string;
+  /** ISO timestamp of when this manifest was generated (build time). */
+  builtAt: string;
   basePath: string;
   trailingSlash?: boolean;
   middleware: {

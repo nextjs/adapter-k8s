@@ -754,6 +754,58 @@ describe("createLocalResolver", () => {
     expect(middlewareHandler).toHaveBeenCalledOnce();
   });
 
+  it("runs middleware once on the i18n trailing-slash retry path (POST body single consumption)", async () => {
+    vi.mocked(resolveRoutes).mockReset();
+    const middlewareHandler = vi.fn(async (request: Request) => {
+      expect(await request.text()).toBe("action-body");
+      return new Response(null, { headers: { "x-middleware-next": "1" } });
+    });
+    (resolveRoutes as any)
+      .mockImplementationOnce(async ({ invokeMiddleware, requestBody, headers, url }: any) => {
+        // First pass: middleware runs, then routing emits the spurious internal
+        // trailing-slash redirect (target locale-stripped == original path, 308).
+        await invokeMiddleware({ url, requestBody, headers });
+        return {
+          redirect: { url: new URL("http://localhost/en/about"), status: 308 },
+          resolvedHeaders: new Headers(),
+        };
+      })
+      .mockImplementationOnce(async ({ invokeMiddleware, requestBody, headers, url }: any) => {
+        // The retry pass: @next/routing calls this hook unconditionally. The resolver
+        // must return its already-ran verdict — re-entering user middleware would
+        // throw on the locked POST body stream and surface as a 500.
+        await invokeMiddleware({ url, requestBody, headers });
+        return {
+          resolvedPathname: "/en/about",
+          invocationTarget: { pathname: "/en/about" },
+          resolvedHeaders: new Headers(),
+        };
+      });
+    const resolver = createLocalResolver(
+      makeManifest({
+        i18n: { locales: ["en", "fr"], defaultLocale: "en", localeDetection: false } as any,
+        middleware: { filePath: "middleware.js" },
+      }),
+      // Real generated middleware modules also include a compatibility default export.
+      { handler: middlewareHandler, default: vi.fn() },
+    );
+
+    const result = await resolver.resolve(
+      new URL("http://localhost/about"),
+      new Headers({ "content-type": "text/plain" }),
+      "POST",
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("action-body"));
+          controller.close();
+        },
+      }),
+    );
+
+    expect(result.kind).toBe("route");
+    expect(middlewareHandler).toHaveBeenCalledOnce();
+  });
+
   it("leaves invokePath undefined when the resolved URL equals the request", async () => {
     const manifest = makeManifest();
     (resolveRoutes as any).mockResolvedValue({

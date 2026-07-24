@@ -127,6 +127,112 @@ describe("validateConfig", () => {
 
     expect(() => validateConfig(config)).toThrow(/not implemented/);
   });
+
+  it("caps the pool count at 15 (HTTPRoute 16-rule budget)", () => {
+    // Gateway API caps an HTTPRoute at 16 rules; the generated route reserves one
+    // header rule per pool plus the catch-all. 16 pools can't be routed at all.
+    const pools = Object.fromEntries(
+      Array.from({ length: 16 }, (_, i) => [`pool-${i}`, { routes: ["appPages"] }]),
+    );
+    const config: K8sAdapterConfig = {
+      pools,
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).toThrow(/16 pools.*maximum is 15|maximum is 15/);
+    expect(() => validateConfig(config)).toThrow(/16 rules/);
+
+    // 15 pools is the (degenerate but valid) ceiling.
+    const atCap: K8sAdapterConfig = {
+      ...config,
+      pools: Object.fromEntries(
+        Array.from({ length: 15 }, (_, i) => [`pool-${i}`, { routes: ["appPages"] }]),
+      ),
+    };
+    expect(() => validateConfig(atCap)).not.toThrow();
+  });
+
+  it("caps pool-name length at 40 chars (K8s 63-char resource-name budget)", () => {
+    const makeConfig = (name: string): K8sAdapterConfig => ({
+      pools: { [name]: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    });
+    expect(() => validateConfig(makeConfig("a".repeat(41)))).toThrow(/too long.*max 40/);
+    expect(() => validateConfig(makeConfig("a".repeat(40)))).not.toThrow();
+  });
+
+  it("reserves the pool name 'routing-service' for the routing tier", () => {
+    // The chart renders the routing tier's Service as `${release}-routing-service` —
+    // exactly the active-Service name a pool called "routing-service" would get: two
+    // same-named Services in one chart. Mirrors the deploy-time reservation
+    // (assertSafePoolName in cli/deploy.ts).
+    const config: K8sAdapterConfig = {
+      pools: { "routing-service": { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).toThrow(/reserved for the routing tier/);
+  });
+
+  it("enforces the combined release+pool budget when the release name is known", () => {
+    // sanitizeK8sName truncates `${release}-${pool}-${buildId}` to 63 (59 for the
+    // -hpa/-hcp variants): at least 8 build-id chars must survive, i.e.
+    // release + 1 + pool + 1 + 8 <= 59. Two individually-valid 40-char names
+    // together truncate the build id away ENTIRELY — guaranteed blue/green collision.
+    const makeConfig = (name: string): K8sAdapterConfig => ({
+      pools: { [name]: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    });
+
+    // 40 + 1 + 40 + 1 = 82 — no build-id chars survive.
+    expect(() => validateConfig(makeConfig("p".repeat(40)), "r".repeat(40))).toThrow(
+      /leave too little room for the build id/,
+    );
+    // The error states the arithmetic.
+    expect(() => validateConfig(makeConfig("p".repeat(40)), "r".repeat(40))).toThrow(
+      /40 \+ 1 \+ 40 \+ 1 = 82/,
+    );
+    // Exactly at the boundary: 40 + 1 + 9 + 1 + 8 = 59 — allowed.
+    expect(() => validateConfig(makeConfig("p".repeat(9)), "r".repeat(40))).not.toThrow();
+    // One char over the boundary — rejected.
+    expect(() => validateConfig(makeConfig("p".repeat(10)), "r".repeat(40))).toThrow(
+      /leave too little room for the build id/,
+    );
+    // Normal-length combinations pass.
+    expect(() => validateConfig(makeConfig("ssr"), "my-app")).not.toThrow();
+    // Without a release name (not derivable yet) only the per-field caps apply.
+    expect(() => validateConfig(makeConfig("p".repeat(40)))).not.toThrow();
+  });
 });
 
 describe("cache config", () => {

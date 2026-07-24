@@ -23,7 +23,10 @@ export function cdnTagForBuildId(buildId: string): string {
  *  - a missing build id.
  * The tag value is the safe hashed tag, identical to what deploy/rollback invalidate with.
  */
-export function cdnCacheTag(cacheControl: string, buildId: string | undefined): Record<string, string> {
+export function cdnCacheTag(
+  cacheControl: string,
+  buildId: string | undefined,
+): Record<string, string> {
   if (!buildId) return {};
   if (/\bimmutable\b/.test(cacheControl)) return {};
   const m = /max-age=(\d+)/.exec(cacheControl);

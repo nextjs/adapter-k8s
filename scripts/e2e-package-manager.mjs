@@ -2,7 +2,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export function packageManagerFamily(packageJson) {
-  const declared = typeof packageJson?.packageManager === "string" ? packageJson.packageManager : "";
+  const declared =
+    typeof packageJson?.packageManager === "string" ? packageJson.packageManager : "";
   if (declared.startsWith("npm@")) return "npm";
   if (declared.startsWith("pnpm@")) return "pnpm";
   // The adapter harness historically uses pnpm for undeclared fixtures because it is materially

@@ -17,6 +17,12 @@ import {
 } from "../routing-common.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
+// The pool-server bundle is esbuild-bundled, so cross-importing the emit-side sanitizer
+// is fine — and REQUIRED: this module previously carried a local copy that stripped
+// trailing hyphens BEFORE truncating to 63 chars, so a >63-char name with a hyphen at
+// the cut kept its trailing hyphen → invalid DNS hostname → cross-pool proxy dial
+// failure. The emit version truncates first, then strips, so it can't regress that.
+import { sanitizeK8sName } from "../emit/templates/utils.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -88,8 +94,9 @@ function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
 }
 
 // Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
-// unequal-length buffers). Mirrors secretsMatch in server.ts.
-function timingSafeStringEqual(a: string, b: string): boolean {
+// unequal-length buffers). Canonical implementation — server.ts imports this one; keep a
+// single copy so the two secret checks can never drift.
+export function timingSafeStringEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
@@ -149,9 +156,128 @@ function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
 // Swallow socket errors on a client stream. A mid-response client disconnect emits an
 // 'error' on req/res; with no listener Node rethrows it as an uncaught 'error' event and
 // takes the whole process down. There's nothing to recover — the connection is gone.
-function guardStreamErrors(stream: IncomingMessage | ServerResponse): void {
+// Exported so server.ts can attach the same guard at the single per-request choke point
+// (the static/public/image fast paths in index.ts write responses without one).
+export function guardStreamErrors(stream: IncomingMessage | ServerResponse): void {
   if (typeof (stream as { on?: unknown }).on === "function") {
     stream.on("error", () => undefined);
+  }
+}
+
+// Marker for a deliberate upstream teardown after the CLIENT hung up. The teardown
+// surfaces as an 'error' event on the proxied request; without the marker it was
+// reported as `cross-pool proxy failed: socket hang up` at error level — a client
+// closing a tab is not an upstream failure and must not page anyone.
+class ClientAbortError extends Error {
+  constructor() {
+    super("client disconnected before the proxied response completed");
+    this.name = "ClientAbortError";
+  }
+}
+
+// Cancel an upstream request when the client connection dies before the response
+// completes — otherwise a wedged/slow upstream keeps running into a dead socket.
+// Guarded because unit-test response doubles don't implement the EventEmitter surface.
+function abortOnClientClose(res: ServerResponse, abort: () => void): void {
+  if (typeof (res as { on?: unknown }).on === "function") {
+    res.on("close", () => {
+      if (!res.writableEnded) abort();
+    });
+  }
+}
+
+// Bounded wait for proxied upstreams (external rewrites + cross-pool). A wedged target
+// must not pin the client connection and this pod's sockets until the server-wide
+// requestTimeout (300s default) fires.
+const PROXY_TIMEOUT_MS = 30_000;
+
+// RFC 9110 §7.6.1 hop-by-hop headers describe a single transport-level connection.
+// Forwarding an upstream's `connection`/`transfer-encoding`/etc. to our client
+// mis-describes framing WE own (and a `connection: close` from the target would
+// wrongly tear down our client keep-alive). Strip them at both proxy boundaries.
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "transfer-encoding",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+]);
+
+function stripHopByHopHeaders(
+  headers: IncomingMessage["headers"],
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined || HOP_BY_HOP_HEADERS.has(name.toLowerCase())) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+// Same principle on the REQUEST side: the client's hop-by-hop headers describe the
+// client↔pool connection, not the new pool↔upstream connection we are about to open.
+// RFC 9110 §7.6.1 additionally lets the incoming Connection header NOMINATE arbitrary
+// headers as connection-scoped — those must be dropped too, or a client can tunnel a
+// header past the boundary (`connection: x-anything` + `x-anything: …`). Node sets its
+// own connection semantics (keep-alive/close, framing) on the outbound request.
+function stripRequestHopByHopHeaders(
+  headers: IncomingMessage["headers"],
+): Record<string, string | string[] | undefined> {
+  const nominated = new Set<string>();
+  const connection = headers["connection"];
+  for (const value of Array.isArray(connection) ? connection : connection ? [connection] : []) {
+    for (const token of value.split(",")) {
+      const name = token.trim().toLowerCase();
+      if (name) nominated.add(name);
+    }
+  }
+  const out: Record<string, string | string[] | undefined> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower) || nominated.has(lower)) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+// Delete a header from a plain headers object regardless of the casing it was written
+// with (build-time manifest headers keep their original casing; Node lowercases live ones).
+function deleteHeaderCaseInsensitive(
+  headers: Record<string, string | string[] | undefined>,
+  name: string,
+): void {
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lower) delete headers[key];
+  }
+}
+
+// Restate honest framing headers on a forwarded request: drop any client-supplied
+// content-length/transfer-encoding, then set content-length from the ACTUAL buffered
+// body when there is one. Forwarding the client's declared length without the bytes
+// (forged `Content-Length: 100` on a GET) makes the receiving server await a body
+// that never arrives — hanging the invocation until the 300s requestTimeout, an
+// unauthenticated resource pin. Delete case-insensitively (Node lowercases incoming
+// names, but invocation headers may not be).
+function restateFramingHeaders(
+  headers: Record<string, string | string[] | undefined>,
+  bufferedBody: Buffer | undefined,
+  method: string | undefined,
+  setExplicitEmpty: boolean,
+): void {
+  for (const key of Object.keys(headers)) {
+    const lower = key.toLowerCase();
+    if (lower === "content-length" || lower === "transfer-encoding") {
+      delete headers[key];
+    }
+  }
+  if (bufferedBody && bufferedBody.length > 0) {
+    headers["content-length"] = String(bufferedBody.length);
+  } else if (setExplicitEmpty && method !== "GET" && method !== "HEAD") {
+    // Body was consumed but empty — send an explicit empty body.
+    headers["content-length"] = "0";
   }
 }
 
@@ -189,7 +315,8 @@ async function writeChunkSafely(res: ServerResponse, chunk: Buffer): Promise<boo
   return !res.writableEnded && !res.destroyed;
 }
 
-function mergeResponseHeaders(
+// Exported for unit tests (PPR shell/resume set-cookie merge is pinned there).
+export function mergeResponseHeaders(
   prefix: Record<string, string | string[]> | undefined,
   response: IncomingMessage["headers"],
 ): Record<string, string | string[] | undefined> {
@@ -202,10 +329,102 @@ function mergeResponseHeaders(
   for (const headers of [prefix, response]) {
     if (!headers) continue;
     for (const [name, value] of Object.entries(headers)) {
-      merged[name.toLowerCase()] = value;
+      const lower = name.toLowerCase();
+      // Set-Cookie is the one header that must never be folded: the PPR shell and the
+      // resume stream are two responses merged into one client answer, and each may
+      // carry its own cookies. Wholesale replacement (the normal rule above) silently
+      // drops the shell's cookies — append instead.
+      if (lower === "set-cookie" && merged["set-cookie"] !== undefined) {
+        const existing = merged["set-cookie"];
+        const combined = Array.isArray(existing) ? [...existing] : [existing!];
+        if (Array.isArray(value)) combined.push(...value);
+        else if (value !== undefined) combined.push(value);
+        merged["set-cookie"] = combined;
+      } else {
+        merged[lower] = value;
+      }
     }
   }
   return merged;
+}
+
+// Merge the resolved routing verdict (next.config headers() + middleware response
+// headers) into the headers argument a serve site passed to writeHead. Node accepts
+// THREE shapes there: an object map, an array of [name, value] tuples, and a FLAT
+// array [name1, value1, name2, value2] (the request.rawHeaders layout). The array
+// forms never enter an Object.keys loop usefully (it yields indices), which silently
+// dropped middleware headers — normalize arrays to tuples and merge pairwise.
+// Set-Cookie is APPENDED (both the serve site's and middleware's cookies must
+// survive); any other resolved header REPLACES the serve site's value, because
+// next.config headers() and explicit middleware response headers are the final
+// public response policy in Next's router-server — adapter defaults (including
+// static/public cache-control) must not silently win over that app-owned value.
+// Name comparison is case-insensitive (Node and Web Headers normalize differently).
+export function mergeResolvedHeadersIntoHeadersArg(
+  resolvedHeaders: Headers,
+  headersArg: unknown,
+): unknown {
+  if (headersArg === undefined || headersArg === null) return headersArg;
+
+  if (Array.isArray(headersArg)) {
+    const pairs: [string, unknown][] = [];
+    if (headersArg.length > 0 && !Array.isArray(headersArg[0])) {
+      // Flat form: even offsets are names, odd offsets are values.
+      for (let i = 0; i + 1 < headersArg.length; i += 2) {
+        pairs.push([String(headersArg[i]), headersArg[i + 1]]);
+      }
+    } else {
+      for (const entry of headersArg as [unknown, unknown][]) {
+        pairs.push([String(entry[0]), entry[1]]);
+      }
+    }
+    for (const [key, value] of resolvedHeaders.entries()) {
+      if (key.toLowerCase() === "set-cookie") {
+        for (const c of value.split(/,(?=[^;]*=)/)) {
+          pairs.push(["set-cookie", c.trim()]);
+        }
+      } else {
+        for (let i = pairs.length - 1; i >= 0; i--) {
+          if (pairs[i]![0].toLowerCase() === key.toLowerCase()) pairs.splice(i, 1);
+        }
+        pairs.push([key, value]);
+      }
+    }
+    // Tuple form back to Node — it accepts tuples regardless of the input shape.
+    return pairs;
+  }
+
+  if (typeof headersArg === "object") {
+    const handlerHeaders = headersArg as Record<string, string | string[]>;
+    for (const [key, value] of resolvedHeaders.entries()) {
+      if (key.toLowerCase() === "set-cookie") {
+        const existingKey = Object.keys(handlerHeaders).find(
+          (name) => name.toLowerCase() === "set-cookie",
+        );
+        const existing = existingKey ? handlerHeaders[existingKey] : undefined;
+        const arr: string[] = [];
+        if (existing) {
+          if (Array.isArray(existing)) arr.push(...existing);
+          else arr.push(existing);
+        }
+        for (const c of value.split(/,(?=[^;]*=)/)) {
+          arr.push(c.trim());
+        }
+        if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
+        handlerHeaders["set-cookie"] = arr;
+      } else {
+        for (const existingKey of Object.keys(handlerHeaders)) {
+          if (existingKey.toLowerCase() === key.toLowerCase()) {
+            delete handlerHeaders[existingKey];
+          }
+        }
+        handlerHeaders[key] = value;
+      }
+    }
+    return handlerHeaders;
+  }
+
+  return headersArg;
 }
 
 async function writeInnerResponse(
@@ -527,22 +746,13 @@ async function invokeLocalHandlerOverHttp({
 
       const reqHeaders = toNodeHeaders(req);
       Object.assign(reqHeaders, invocationHeaders);
-      // We forward a fixed-length buffered body, so drop any transfer-encoding the
-      // original request carried (e.g. `chunked`). Node's HTTP parser rejects a request
-      // that has BOTH transfer-encoding and content-length, yielding a spurious 400
-      // before the handler runs. Delete case-insensitively.
-      for (const key of Object.keys(reqHeaders)) {
-        if (key.toLowerCase() === "transfer-encoding") {
-          delete reqHeaders[key];
-        }
-      }
-      // Ensure content-length matches the buffered body (the original stream is consumed)
-      if (bufferedBody) {
-        reqHeaders["content-length"] = String(bufferedBody.length);
-      } else if (req.method !== "GET" && req.method !== "HEAD") {
-        // Body was consumed but no buffer — send empty body
-        reqHeaders["content-length"] = "0";
-      }
+      // We forward a fixed-length buffered body (or none), so restate the framing:
+      // Node's HTTP parser rejects a request carrying BOTH transfer-encoding and
+      // content-length (spurious 400 before the handler runs), and a forged
+      // content-length with no body (e.g. `Content-Length: 100` on a GET) makes the
+      // loopback server await bytes that never arrive — hanging the invocation until
+      // the 300s requestTimeout, an unauthenticated resource pin.
+      restateFramingHeaders(reqHeaders, bufferedBody, req.method, true);
 
       const clientReq = httpRequest(
         {
@@ -594,6 +804,17 @@ async function invokeLocalHandlerOverHttp({
       clientReq.once("error", (error) => {
         server.close(() => reject(error));
       });
+
+      // If the outer client goes away while the handler is still computing, cancel the
+      // loopback request instead of letting the invocation run to completion into a
+      // dead socket. Skipped for discardResponse: that invocation is deliberately
+      // detached background work (E2E PPR shell fill) that shares the outer res
+      // object and must outlive the client response.
+      if (!discardResponse) {
+        abortOnClientClose(res, () =>
+          clientReq.destroy(new Error("client disconnected during handler invocation")),
+        );
+      }
 
       if (bufferedBody && bufferedBody.length > 0) {
         clientReq.end(bufferedBody);
@@ -840,13 +1061,6 @@ async function serveNotFound(
   }
 }
 
-function sanitizeK8sName(name: string): string {
-  let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
-  if (!/^[a-z]/.test(sanitized)) sanitized = `b-${sanitized}`;
-  sanitized = sanitized.replace(/-+$/, "");
-  return sanitized.slice(0, 63);
-}
-
 // Edge route runner: uses Next.js's edge sandbox to execute edge-compiled route handlers.
 // Returns a web Response which we convert back to Node's ServerResponse.
 type EdgeRouteRunner = (params: {
@@ -886,9 +1100,15 @@ export interface DispatcherOptions {
   outputIds?: string[];
   /** Dynamic routes with fallback:false / dynamicParams:false — a matching path
    * not in prerenderedPaths must 404 (mirrors `next start`). */
-  strictDynamicRoutes?: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[];
+  strictDynamicRoutes?: { pageRegex: RegExp }[];
   prerenderedPaths?: Set<string>;
   buildIdForData?: string;
+  /** Build timestamp (ISO) from the routing manifest — anchors the ISR seed-freshness
+   * window to build time rather than pod start. Absent in older manifests → pod start. */
+  builtAt?: string | undefined;
+  /** Bounded wait for proxied upstreams (external rewrite / cross-pool). Defaults to
+   * PROXY_TIMEOUT_MS; injectable so tests don't wait out the real budget. */
+  proxyTimeoutMs?: number | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
@@ -937,10 +1157,22 @@ export function createDispatcher(options: DispatcherOptions) {
     revalidate,
     basePath = "",
     i18nLocales = [],
+    builtAt,
+    proxyTimeoutMs = PROXY_TIMEOUT_MS,
   } = options;
 
-  const deployedAt = Date.now();
+  // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
+  // (re)started long after the build must not re-serve a stale seed as "fresh" for
+  // another full revalidate window. Older manifests carry no builtAt — fall back to
+  // pod start (the previous behavior). A garbage timestamp parses to NaN → same fallback.
+  const builtAtMs = builtAt ? Date.parse(builtAt) : Number.NaN;
+  const deployedAt = Number.isFinite(builtAtMs) ? builtAtMs : Date.now();
   const entrypointOwnsPprCache = incrementalCacheShared || entrypointOwnsPprShell;
+  // NEXT_ENABLE_ADAPTER-only bookkeeping (unreachable in production — the add site is
+  // gated on emulatePlatformCache): one shell-served marker per concrete URL. Cap it so
+  // a long-lived harness pod crawling many URLs can't grow it without bound. Eviction
+  // only means the harness re-serves a build shell for that URL; production never sees it.
+  const MAX_SERVED_FALLBACK_SHELLS = 10_000;
   const servedFallbackShells = new Set<string>();
 
   // Pages entrypoints call requestMeta.render404 when getStaticProps/getServerSideProps returns
@@ -1107,42 +1339,15 @@ export function createDispatcher(options: DispatcherOptions) {
         const resolvedHeaders = resolution.resolvedHeaders;
         const origWriteHead = res.writeHead.bind(res);
         (res as any).writeHead = (status: number, ...args: any[]) => {
-          // writeHead(status, headers) or writeHead(status, msg, headers)
+          // writeHead(status, headers) or writeHead(status, msg, headers). The headers
+          // argument may be an object OR an array (tuple/flat) — the merge helper
+          // handles every shape Node accepts.
           const headersArgIdx = typeof args[0] === "string" ? 1 : 0;
-          const handlerHeaders = args[headersArgIdx] as
-            | Record<string, string | string[]>
-            | undefined;
-
-          if (handlerHeaders) {
-            for (const [key, value] of resolvedHeaders.entries()) {
-              if (key.toLowerCase() === "set-cookie") {
-                const existingKey = Object.keys(handlerHeaders).find(
-                  (name) => name.toLowerCase() === "set-cookie",
-                );
-                const existing = existingKey ? handlerHeaders[existingKey] : undefined;
-                const arr: string[] = [];
-                if (existing) {
-                  if (Array.isArray(existing)) arr.push(...existing);
-                  else arr.push(existing);
-                }
-                for (const c of value.split(/,(?=[^;]*=)/)) {
-                  arr.push(c.trim());
-                }
-                if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
-                handlerHeaders["set-cookie"] = arr;
-              } else {
-                // next.config headers() and explicit middleware response headers are the final
-                // public response policy in Next's router-server. Adapter defaults (including
-                // static/public cache-control) must not silently replace that app-owned value.
-                // Compare case-insensitively because Node and Web Headers normalize differently.
-                for (const existingKey of Object.keys(handlerHeaders)) {
-                  if (existingKey.toLowerCase() === key.toLowerCase()) {
-                    delete handlerHeaders[existingKey];
-                  }
-                }
-                handlerHeaders[key] = value;
-              }
-            }
+          if (args[headersArgIdx] !== undefined && args[headersArgIdx] !== null) {
+            args[headersArgIdx] = mergeResolvedHeadersIntoHeadersArg(
+              resolvedHeaders,
+              args[headersArgIdx],
+            );
           }
           return origWriteHead(status, ...args);
         };
@@ -1245,11 +1450,15 @@ export function createDispatcher(options: DispatcherOptions) {
         const isReadMethod = req.method === "GET" || req.method === "HEAD";
         const isPreviewRequest = (req.headers.cookie ?? "").includes("__prerender_bypass=");
         // Handler-less prerenders (pages SSG emits no function) are served from
-        // the manifest file for ANY method — upstream serves SSG pages on POST
-        // too — but only when this pool owns the route; a wrong-pool guess must
-        // fall through so proxyToPool can recover (PPR shells especially must
-        // not be served incomplete by a non-owning pool). Build assets and
-        // public/ files stay GET/HEAD-only: upstream 404s writes to them.
+        // the manifest file for GET/HEAD only. A POST to a fully-static page 405s
+        // below — that IS upstream behavior: `next start` answers non-GET/HEAD on a
+        // static Pages prerender with 405 + `Allow: GET, HEAD` (verified against the
+        // Next 16.2 renderToResponse path; the "upstream serves SSG on POST too" note
+        // that used to live here was wrong). The serve itself stays restricted to
+        // this pool's own routes; a wrong-pool guess must fall through so proxyToPool
+        // can recover (PPR shells especially must not be served incomplete by a
+        // non-owning pool). Build assets and public/ files stay GET/HEAD-only too:
+        // upstream 404s writes to them.
         const serveHandlerlessPrerender =
           staticAsset?.prerender && !hasHandler && resolution.pool === poolName;
         // A concrete non-PPR prerender under a dynamic template is the initial response-cache
@@ -1390,6 +1599,10 @@ export function createDispatcher(options: DispatcherOptions) {
               // per concrete URL; after the data request materializes the page, later documents
               // invoke Next's filesystem-cache stand-in. The explicit index.ts gate makes this
               // process-local marker unreachable in production.
+              if (servedFallbackShells.size >= MAX_SERVED_FALLBACK_SHELLS) {
+                const oldest = servedFallbackShells.values().next().value;
+                if (oldest !== undefined) servedFallbackShells.delete(oldest);
+              }
               servedFallbackShells.add(requestPathname);
             }
             const content = readFileSync(fullPath);
@@ -1410,7 +1623,11 @@ export function createDispatcher(options: DispatcherOptions) {
               },
               assetHeaders || {},
             );
-            if (req.headers.rsc === "1") {
+            // Use the CONFIGURED RSC negotiation header (usually "rsc") — the isRSC
+            // check at the top of this section already does; hardcoding "rsc" here
+            // would skip Vary augmentation for apps with a custom RSC header name.
+            const rscRequestHeader = rscConfig?.header ?? "rsc";
+            if (req.headers[rscRequestHeader] === "1") {
               const varyKey = Object.keys(headers).find((name) => name.toLowerCase() === "vary");
               const existingVary = varyKey ? headers[varyKey] : undefined;
               const varyTokens = new Set(
@@ -1423,7 +1640,7 @@ export function createDispatcher(options: DispatcherOptions) {
               // Next's router-server normally adds these fields above static serving; a direct
               // adapter entrypoint has no such layer, so lock the protocol at this boundary.
               for (const token of [
-                "rsc",
+                rscRequestHeader,
                 "next-router-state-tree",
                 "next-router-prefetch",
                 "next-router-segment-prefetch",
@@ -1455,9 +1672,12 @@ export function createDispatcher(options: DispatcherOptions) {
               // to build-time seeds and fallback shells, which bypass the entrypoint entirely.
               // This is production behavior, not an E2E-only environment-variable exception.
               headers["cache-control"] = "public, max-age=0, must-revalidate";
-              delete headers["cache-tag"];
+              deleteHeaderCaseInsensitive(headers, "cache-tag");
             }
-            delete headers["x-next-cache-tags"];
+            // Manifest headers preserve build-time casing (e.g. `X-Next-Cache-Tags`,
+            // `Cache-Tag`) — a literal lowercase delete leaks the internal header to
+            // clients whenever the build cased it differently.
+            deleteHeaderCaseInsensitive(headers, "x-next-cache-tags");
             // Stamp the CDN cache tag from the EFFECTIVE cache-control (after assetHeaders
             // may have overridden it), and apply it last so it can't itself be overridden.
             // Mutable static (SSG HTML / public files) → tagged; immutable/max-age=0 → not.
@@ -1540,26 +1760,49 @@ export function createDispatcher(options: DispatcherOptions) {
               }
             )[NEXT_REQUEST_META]?.actionBody;
 
+            // Hop-by-hop headers (and anything the client's Connection header
+            // nominated) describe the client↔pool connection — strip them before
+            // forwarding; Node sets its own connection semantics on this request.
+            // Then the same forged-framing guard as the loopback invocation: a
+            // client-declared content-length with no body would make the upstream
+            // await bytes that never arrive (hang until its own timeout).
+            const forwardHeaders: Record<string, string | string[] | undefined> = {
+              ...stripRequestHopByHopHeaders(req.headers),
+              host: target.host,
+            };
+            restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);
+
             const proxyReq = proxyMod.request(
               {
                 hostname: target.hostname,
                 port: target.port || (target.protocol === "https:" ? 443 : 80),
                 path: target.pathname + target.search,
                 method: req.method,
-                headers: {
-                  ...req.headers,
-                  host: target.host,
-                },
+                headers: forwardHeaders,
+                timeout: proxyTimeoutMs,
               },
               (proxyRes) => {
-                res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+                res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
                 // pipeline handles errors on either end (e.g. client disconnect) and
                 // cleans up both streams, unlike a bare .pipe().
                 pipeline(proxyRes, res, () => resolve());
               },
             );
 
+            proxyReq.on("timeout", () => {
+              proxyReq.destroy(new Error(`external rewrite to ${target.origin} timed out`));
+            });
+
             proxyReq.on("error", (err) => {
+              // A client abort is our own deliberate teardown, not an upstream failure —
+              // log it at info level and skip the 502 (the client is gone anyway).
+              if (err instanceof ClientAbortError) {
+                console.log(
+                  `[pool-server] external rewrite to ${target.origin}${target.pathname} aborted: client disconnected`,
+                );
+                resolve();
+                return;
+              }
               // The dial error stays in the server log — the client body must not leak
               // upstream error detail (connection failures reveal internal topology/targets).
               console.error(
@@ -1572,6 +1815,10 @@ export function createDispatcher(options: DispatcherOptions) {
               }
               resolve();
             });
+
+            // Client disconnected before the upstream answered — cancel the upstream
+            // request rather than letting it run to completion into a dead socket.
+            abortOnClientClose(res, () => proxyReq.destroy(new ClientAbortError()));
 
             if (bufferedBody && bufferedBody.length > 0) {
               proxyReq.end(bufferedBody);
@@ -1625,6 +1872,17 @@ export function createDispatcher(options: DispatcherOptions) {
               // Keep the encoded value; malformed escapes will simply fail the
               // prerender-manifest membership check below.
             }
+            // i18n requests arrive locale-prefixed (/en/blog/x — including data URLs
+            // converted above), while the strict-route regexes and prerendered set are
+            // unprefixed. Strip the prefix so a locale-prefixed request for a
+            // non-generated path still hits the fallback:false 404 instead of sailing
+            // past the regex and rendering a path the app declared must not exist.
+            if (i18nLocales.length > 0) {
+              const firstSegment = pagePath.split("/", 2)[1]?.toLowerCase();
+              if (firstSegment && i18nLocales.some((l) => l.toLowerCase() === firstSegment)) {
+                pagePath = pagePath.slice(firstSegment.length + 1) || "/";
+              }
+            }
             const isBypass = isVerifiedPreviewRequest(req);
             if (
               !isBypass &&
@@ -1677,7 +1935,15 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // If this output belongs to another pool, proxy the request
           if (resolution.pool !== poolName && !handlerLoader.has(handlerPathname)) {
-            return proxyToPool(req, res, resolution, releaseName, buildId, internalSecret);
+            return proxyToPool(
+              req,
+              res,
+              resolution,
+              releaseName,
+              buildId,
+              internalSecret,
+              proxyTimeoutMs,
+            );
           }
 
           // If no handler exists for this output, fall through to 404
@@ -1829,6 +2095,13 @@ export function createDispatcher(options: DispatcherOptions) {
               if (!res.headersSent) {
                 res.writeHead(500, { "content-type": "text/plain" });
                 res.end("Internal Server Error");
+              } else if (!res.writableEnded) {
+                // The edge stream threw AFTER writeHead — a clean 500 is impossible,
+                // but leaving the response open hangs the client until the server-wide
+                // timeout. Terminate it instead (mirrors the loopback handler's
+                // fail-safe mid-stream behavior).
+                if (typeof res.destroy === "function") res.destroy();
+                else res.end();
               }
             }
             return;
@@ -1980,37 +2253,81 @@ function proxyToPool(
   releaseName: string,
   buildId: string,
   internalSecret?: string,
+  proxyTimeoutMs: number = PROXY_TIMEOUT_MS,
 ): Promise<void> {
   return new Promise((resolve) => {
     const targetHost = sanitizeK8sName(`${releaseName}-${resolution.pool}-${buildId}`);
+    const bufferedBody = (
+      req as IncomingMessage & {
+        [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+      }
+    )[NEXT_REQUEST_META]?.actionBody;
+
+    // Hop-by-hop headers (and anything the client's Connection header nominated) are
+    // stripped before forwarding — they describe the client↔pool connection, and Node
+    // sets its own connection semantics on the outbound request.
+    const forwardHeaders: Record<string, string | string[] | undefined> = {
+      ...stripRequestHopByHopHeaders(req.headers),
+      "x-output-id": resolution.matchedPathname,
+      "x-matched-pathname": resolution.matchedPathname,
+      "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
+      // This pool already ran the middleware stage in its Phase-1 resolve before deciding
+      // to proxy; assert it so the target pool trusts the skip instead of re-running
+      // middleware (which would double-apply cookies/redirects). Without this, the target's
+      // x-mw-evaluated gate would fall through to a second evaluation.
+      "x-mw-evaluated": "ran",
+      ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
+    };
+    // Same forged-framing guard as the loopback invocation: the target pool would
+    // otherwise await body bytes that never arrive (hang until requestTimeout).
+    restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);
+    // This pool's Phase-1 routing verdict (next.config headers() + middleware response
+    // headers) is deliberately NOT forwarded in the x-resolved-headers slot: the
+    // resolvedHeaders on this resolution already installed the writeHead merge wrapper
+    // on the OUTER res (dispatch() line above), which applies them to the relayed
+    // response. Forwarding them too made the target pool's dispatcher merge them a
+    // second time — the client received middleware's Set-Cookie twice. The pool that
+    // ran the resolve is the single application point.
+
     const proxyReq = httpRequest(
       {
         hostname: targetHost,
         port: 3000,
         path: req.url,
         method: req.method,
-        headers: {
-          ...req.headers,
-          "x-output-id": resolution.matchedPathname,
-          "x-matched-pathname": resolution.matchedPathname,
-          "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
-          // This pool already ran the middleware stage in its Phase-1 resolve before deciding
-          // to proxy; assert it so the target pool trusts the skip instead of re-running
-          // middleware (which would double-apply cookies/redirects). Without this, the target's
-          // x-mw-evaluated gate would fall through to a second evaluation.
-          "x-mw-evaluated": "ran",
-          ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
-        },
+        headers: forwardHeaders,
+        timeout: proxyTimeoutMs,
       },
       (proxyRes) => {
-        res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+        // The timeout option is an IDLE timeout that stays armed while the response
+        // streams — a cross-pool SSE/streaming response quiet for >proxyTimeoutMs (or
+        // stalled on client backpressure) was destroyed mid-stream, while the same
+        // route served same-pool has no such cap (parity break). Disarm it once
+        // response headers arrive; the cap still bounds connect/headers, and
+        // client-abort propagation plus the server-wide requestTimeout still bound
+        // the streaming phase.
+        proxyReq.setTimeout(0);
+        res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
         // pipeline handles errors on either end (e.g. client disconnect) and cleans up
         // both streams, unlike a bare .pipe().
         pipeline(proxyRes, res, () => resolve());
       },
     );
 
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy(new Error(`cross-pool proxy to pool "${resolution.pool}" timed out`));
+    });
+
     proxyReq.on("error", (err) => {
+      // A client abort is our own deliberate teardown, not a pool failure — log it at
+      // info level and skip the 502 (the client is gone anyway).
+      if (err instanceof ClientAbortError) {
+        console.log(
+          `[pool-server] cross-pool proxy to pool "${resolution.pool}" aborted: client disconnected`,
+        );
+        resolve();
+        return;
+      }
       // Pool name + dial error stay in the server log — the client body must not leak
       // pool topology or internal hostnames.
       console.error(
@@ -2024,16 +2341,17 @@ function proxyToPool(
       resolve();
     });
 
-    const bufferedBody = (
-      req as IncomingMessage & {
-        [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-      }
-    )[NEXT_REQUEST_META]?.actionBody;
+    // Client disconnected before the target pool answered — cancel the upstream request.
+    abortOnClientClose(res, () => proxyReq.destroy(new ClientAbortError()));
 
     if (bufferedBody) {
       proxyReq.end(bufferedBody);
-    } else {
+    } else if (req.method !== "GET" && req.method !== "HEAD") {
+      // GET/HEAD carry no body: piping the raw stream would wait for bytes that
+      // (with a forged content-length) never arrive — hang. End immediately instead.
       pipeline(req, proxyReq, () => undefined);
+    } else {
+      proxyReq.end();
     }
   });
 }

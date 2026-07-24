@@ -3,6 +3,7 @@ import { DURABLE_TTL_SECONDS } from "../../../src/pool-server/valkey-cache/incre
 import { RespError, type ValkeyMulti } from "../../../src/pool-server/valkey-cache/resp-client.js";
 import type { ValkeyClient } from "../../../src/pool-server/valkey-cache/client.js";
 import { bufferToStream } from "../../../src/pool-server/valkey-cache/stream-codec.js";
+import { TAG_MANIFEST_TTL_SECONDS } from "../../../src/pool-server/valkey-cache/tag-manifest.js";
 import type { CacheEntry } from "../../../src/pool-server/valkey-cache/types.js";
 import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
 
@@ -17,11 +18,15 @@ class FakeValkeyClient implements ValkeyClient {
   readonly tagFields = new Map<string, string>();
   readonly delCalls: string[][] = [];
   readonly multiExpireArgs: number[] = [];
+  /** The manifest TTL from each updateTags eval call (the script EXPIREs the key per write). */
+  readonly manifestExpireCalls: number[] = [];
   multiCount = 0;
   /** When set, `multi().exec()` reports it as a per-command failure inside the EXEC reply. */
   execFailure: RespError | null = null;
   evalError: Error | null = null;
   hmgetError: Error | null = null;
+  /** The fake's "server clock" for the eval merge; 0 means Date.now(). */
+  serverNow = 0;
 
   async get(key: string): Promise<string | null> {
     return this.strings.get(key) ?? null;
@@ -47,11 +52,29 @@ class FakeValkeyClient implements ValkeyClient {
   }
   async eval(...args: Arg[]): Promise<unknown> {
     if (this.evalError) throw this.evalError;
-    // args: [script, numkeys, key, field, json, field, json, ...] — naive store, no merge.
-    for (let i = 3; i + 1 < args.length; i += 2) {
-      this.tagFields.set(String(args[i]), String(args[i + 1]));
+    // Emulates UPDATE_TAGS_SCRIPT — keep in sync with the real script (the Docker integration
+    // tests verify it against actual Valkey): args are
+    // [script, numkeys, key, field, json, field, json, ..., ttlSeconds]; each event wins when
+    // its server-stamped `at` is >= the stored one, merging PER DIMENSION (an event replaces
+    // only the watermarks it sets, preserving the rest), and the trailing ttl refreshes the
+    // manifest key's expiry on every write (M11). Returns the clamp count (always 0 here).
+    this.manifestExpireCalls.push(Number(args[args.length - 1]));
+    const pairEnd = args.length - 1;
+    const now = this.serverNow || Date.now();
+    for (let i = 3; i < pairEnd; i += 2) {
+      const field = String(args[i]);
+      const incoming = JSON.parse(String(args[i + 1])) as Record<string, number>;
+      const storedRaw = this.tagFields.get(field);
+      const stored = storedRaw ? (JSON.parse(storedRaw) as Record<string, number>) : undefined;
+      if (stored && (stored.at ?? 0) > now) continue; // out-of-order event loses (LEW)
+      const merged: Record<string, number> = { at: now };
+      const stale = incoming.stale ?? stored?.stale;
+      if (stale !== undefined) merged.stale = stale;
+      const expired = incoming.expired ?? stored?.expired;
+      if (expired !== undefined) merged.expired = expired;
+      this.tagFields.set(field, JSON.stringify(merged));
     }
-    return 1;
+    return 0;
   }
   async hmget(_key: string, ...fields: string[]): Promise<(string | null)[]> {
     if (this.hmgetError) throw this.hmgetError;
@@ -131,6 +154,8 @@ async function readStream(s: ReadableStream<Uint8Array>): Promise<string> {
   }
   return Buffer.concat(chunks).toString("utf8");
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const validMeta = (overrides: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -316,5 +341,125 @@ describe("tag state reads", () => {
     expect(await h.getExpiration(["t"])).toBe(0);
     await h.set("k", Promise.resolve(makeEntry("v", { tags: ["t"] })));
     expect(await h.get("k", [])).toBeDefined();
+  });
+});
+
+describe("M11: the tag manifest itself is TTL-bounded (refreshed per write)", () => {
+  it("passes TAG_MANIFEST_TTL_SECONDS as the trailing eval argv on every updateTags", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyCacheHandler({ client, buildId: "m11", now: () => 1000 });
+    await h.updateTags(["a"]);
+    await h.updateTags(["b"], { expire: 300 });
+    expect(client.manifestExpireCalls).toEqual([
+      TAG_MANIFEST_TTL_SECONDS,
+      TAG_MANIFEST_TTL_SECONDS,
+    ]);
+  });
+});
+
+describe("M12: updateTags merges per dimension (a profiled event keeps a hard-expire watermark)", () => {
+  const storedState = (client: FakeValkeyClient, tag: string) => {
+    const raw = client.tagFields.get(tag);
+    if (!raw) throw new Error(`no stored state for ${tag}`);
+    return JSON.parse(raw) as { stale?: number; expired?: number; at: number };
+  };
+
+  it("hard then profile-without-expire: the hard-expire watermark survives", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1000 };
+    client.serverNow = clock.t;
+    const h = new ValkeyCacheHandler({ client, buildId: "m12", now: () => clock.t });
+
+    await h.updateTags(["t"]); // hard expire at 1000
+    clock.t = 2000;
+    client.serverNow = 2000;
+    await h.updateTags(["t"], {}); // profiled, but no expire → only {stale, at}
+
+    const state = storedState(client, "t");
+    expect(state.expired).toBe(1000); // preserved — whole-field replace would have ERASED it
+    expect(state.stale).toBe(2000);
+    // And the hard expire still bites: an entry created before 1000 is expired, not served SWR.
+    await h.set("k", Promise.resolve(makeEntry("v", { tags: ["t"], timestamp: 500 })));
+    expect(await h.get("k", [])).toBeUndefined();
+  });
+
+  it("profile-with-expire then hard: the later hard expire wins immediately, stale survives", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1000 };
+    client.serverNow = clock.t;
+    const h = new ValkeyCacheHandler({ client, buildId: "m12b", now: () => clock.t });
+
+    await h.updateTags(["t"], { expire: 300 }); // stale=1000, expired=1000+300_000 (future)
+    clock.t = 2000;
+    client.serverNow = 2000;
+    await h.updateTags(["t"]); // hard expire at 2000
+
+    const state = storedState(client, "t");
+    expect(state.expired).toBe(2000); // the later event's expired wins (immediate, not future)
+    expect(state.stale).toBe(1000); // the profile's stale watermark is preserved
+    await h.set("k", Promise.resolve(makeEntry("v", { tags: ["t"], timestamp: 500 })));
+    expect(await h.get("k", [])).toBeUndefined(); // expired (2000 > 500, 2000 <= now)
+  });
+});
+
+describe("L10: a hung set does not block a concurrent same-key get forever", () => {
+  it("get proceeds as a miss after pendingSetWaitMs", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyCacheHandler({
+      client,
+      buildId: "l10",
+      now: () => 1000,
+      pendingSetWaitMs: 50,
+    });
+    // A set whose entry promise never resolves — the gate never releases on its own.
+    const setP = h.set("k", new Promise<CacheEntry>(() => undefined));
+    const started = Date.now();
+    const got = await h.get("k", []);
+    const elapsed = Date.now() - started;
+    expect(got).toBeUndefined(); // proceeded as a miss rather than hanging
+    expect(elapsed).toBeGreaterThanOrEqual(45);
+    expect(elapsed).toBeLessThan(3000); // bounded by the option, not unbounded
+    // The set is still in flight; a later get sees the resolved value once it lands.
+    expect(client.hashes.size).toBe(0);
+    await expect(Promise.race([setP, sleep(20).then(() => "pending")])).resolves.toBe("pending");
+  });
+
+  it("a healthy set is still awaited (the bound does not race ahead of it)", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyCacheHandler({
+      client,
+      buildId: "l10b",
+      now: () => 1000,
+      pendingSetWaitMs: 500,
+    });
+    let resolveEntry!: (e: CacheEntry) => void;
+    const pending = new Promise<CacheEntry>((r) => {
+      resolveEntry = r;
+    });
+    const setP = h.set("k", pending);
+    const getP = h.get("k", []);
+    await sleep(30);
+    resolveEntry(makeEntry("late", { timestamp: 1000 }));
+    await setP;
+    const got = await getP;
+    expect(got).toBeDefined();
+    expect(await readStream(got!.value)).toBe("late");
+  });
+});
+
+describe("N5: the stored tag list is capped like the incremental handler's", () => {
+  it("caps at 128 tags and drops tags longer than 256 chars", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyCacheHandler({ client, buildId: "n5", now: () => 1000 });
+    const tags = Array.from({ length: 200 }, (_, i) => `tag-${i}`);
+    tags[3] = "x".repeat(300); // over-length: dropped, so tag-4 shifts into place
+    await h.set("k", Promise.resolve(makeEntry("v", { tags })));
+    const meta = JSON.parse(client.hashes.get("k8s:n5:entry:k")!.m.toString("utf8")) as {
+      tags: string[];
+    };
+    expect(meta.tags).toHaveLength(128);
+    expect(meta.tags[0]).toBe("tag-0");
+    expect(meta.tags).not.toContain("x".repeat(300));
+    expect(meta.tags[3]).toBe("tag-4"); // the over-length tag left no hole
   });
 });

@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  packageManagerFamily,
-  prepareFixturePackage,
-} from "../scripts/e2e-package-manager.mjs";
+import { packageManagerFamily, prepareFixturePackage } from "../scripts/e2e-package-manager.mjs";
 
 describe("E2E fixture package-manager selection", () => {
   it("honors an explicit npm declaration even when pnpm is installed", () => {
@@ -27,8 +24,6 @@ describe("E2E fixture package-manager selection", () => {
 
     expect(prepared.scripts.build).toBe("next build && npm run post-build");
     expect(prepared.devDependencies.typescript).toBe("^6");
-    expect(prepared.dependencies["@next-community/adapter-k8s"]).toBe(
-      "file:/tmp/adapter.tgz",
-    );
+    expect(prepared.dependencies["@next-community/adapter-k8s"]).toBe("file:/tmp/adapter.tgz");
   });
 });

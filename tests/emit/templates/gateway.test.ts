@@ -19,6 +19,7 @@ function makeManifest(poolAssignments: Record<string, string>): RoutingManifest 
     pathnames: [],
     i18n: null,
     buildId: "abc123",
+    builtAt: "2026-01-01T00:00:00.000Z",
     basePath: "",
     middleware: null,
     poolAssignments,
@@ -42,7 +43,6 @@ describe("renderHTTPRoute rule cap", () => {
       releaseName: "nextjs",
       hosts,
       pools,
-      buildId: "abc123",
       routingManifest: makeManifest(poolAssignments),
     });
 
@@ -67,7 +67,6 @@ describe("renderHTTPRoute rule cap", () => {
       releaseName: "nextjs",
       hosts,
       pools,
-      buildId: "abc123",
       routingManifest: makeManifest(poolAssignments),
     });
     const ruleCount = (yaml.match(/- matches:/g) ?? []).length;
@@ -75,6 +74,56 @@ describe("renderHTTPRoute rule cap", () => {
     expect(ruleCount).toBe(5);
     expect(yaml).toContain('value: "/dashboard"');
     expect(yaml).toContain('value: "/settings"');
+  });
+
+  it("does not burn rule slots on _next/_middleware/error-page/root-template prefixes", () => {
+    const pools = makePools(2);
+    const poolAssignments: Record<string, string> = {
+      "/_next/static/chunk.js": "pool0",
+      "/_next/data/build/about.json": "pool0",
+      "/_middleware": "pool0",
+      "/404": "pool0",
+      "/500": "pool0",
+      "/_not-found": "pool0",
+      "/_error": "pool0",
+      "/[slug]": "pool1",
+      "/[...rest]": "pool1",
+      "/dashboard/page": "pool1",
+    };
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      routingManifest: makeManifest(poolAssignments),
+    });
+    // Only the real app prefix gets a path rule (1 path + 2 header + 1 catch-all).
+    const ruleCount = (yaml.match(/- matches:/g) ?? []).length;
+    expect(ruleCount).toBe(4);
+    expect(yaml).toContain('value: "/dashboard"');
+    for (const junk of [
+      "/_next",
+      "/_middleware",
+      "/404",
+      "/500",
+      "/_not-found",
+      "/_error",
+      "/[slug]",
+      "/[...rest]",
+    ]) {
+      expect(yaml).not.toContain(`value: "${junk}"`);
+    }
+  });
+
+  it("rejects a manifest pathname that would break the quoted YAML scalar", () => {
+    const pools = makePools(1);
+    expect(() =>
+      renderHTTPRoute({
+        releaseName: "nextjs",
+        hosts,
+        pools,
+        routingManifest: makeManifest({ '/evil"path/page': "pool0" }),
+      }),
+    ).toThrow(/Unsafe pathname/);
   });
 });
 
@@ -85,7 +134,6 @@ describe("renderHTTPRoute CDN filter injection", () => {
       releaseName: "nextjs",
       hosts,
       pools,
-      buildId: "abc123",
       routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
       cdnFilterName: "nextjs-cdn",
     });
@@ -104,7 +152,6 @@ describe("renderHTTPRoute CDN filter injection", () => {
       releaseName: "nextjs",
       hosts,
       pools: makePools(2),
-      buildId: "abc123",
       routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
       cdnFilterName: "nextjs-cdn",
     });
@@ -122,7 +169,6 @@ describe("renderHTTPRoute CDN filter injection", () => {
       releaseName: "nextjs",
       hosts,
       pools: makePools(2),
-      buildId: "abc123",
       routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
     });
     expect(yaml).not.toContain("filters:");
@@ -138,7 +184,6 @@ describe("renderHTTPRoute HTTP->HTTPS redirect (M8)", () => {
       releaseName: "nextjs",
       hosts: tlsHosts,
       pools: makePools(2),
-      buildId: "abc123",
       routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
     });
 
@@ -168,7 +213,6 @@ describe("renderHTTPRoute HTTP->HTTPS redirect (M8)", () => {
       releaseName: "nextjs",
       hosts, // tls disabled
       pools: makePools(2),
-      buildId: "abc123",
       routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
     });
 
@@ -193,7 +237,6 @@ describe("releaseName validation in gateway templates", () => {
         releaseName: "foo$(whoami)",
         hosts,
         pools: makePools(1),
-        buildId: "abc123",
         routingManifest: makeManifest({}),
       }),
     ).toThrow(/Invalid releaseName/);

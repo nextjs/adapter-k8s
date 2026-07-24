@@ -84,10 +84,52 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
   if (actual === null || actual === undefined) return false;
   if (cond.value === undefined) return true; // presence-only
   try {
+    // Anchored (^…$) on purpose: this evaluates MIDDLEWARE matcher has/missing,
+    // which `next start` runs through matchHas (prepare-destination.js) — and
+    // matchHas anchors (`new RegExp(`^${value}$`)`). @next/routing's own
+    // matchesCondition is unanchored, but it never evaluates middleware matchers
+    // (resolveRoutes defers matcher gating to the invokeMiddleware callback), so
+    // matchHas is the behavior to mirror. See middleware-matcher.test.ts.
     return new RegExp(`^${cond.value}$`).test(actual);
   } catch {
     return cond.value === actual;
   }
+}
+
+// Compiled matcher regexps, memoized per matcher OBJECT (matchers come from the
+// routing manifest, which is parsed once per process — object identity is stable,
+// so a WeakMap both caches for the process lifetime and lets a replaced manifest
+// be GC'd). Compiling per request showed up in profiles: a middleware catch-all
+// regexp is ~200 chars and every request re-parsed it.
+const matcherRegexCache = new WeakMap<MiddlewareMatcher, RegExp | null>();
+
+// Warn-once bookkeeping for uncompilable matcher patterns. The compile failure
+// itself is cached in the WeakMap (per matcher object), but the warn is keyed by
+// pattern TEXT so a re-parsed manifest (new objects, same patterns) doesn't re-spam.
+const warnedUncompilableMatchers = new Set<string>();
+
+function compileMatcherRegex(m: MiddlewareMatcher): RegExp | null {
+  let re = matcherRegexCache.get(m);
+  if (re === undefined) {
+    try {
+      re = new RegExp(m.regexp);
+    } catch (err) {
+      // Remember the failure too — a bad regexp must not re-throw per request.
+      re = null;
+      if (!warnedUncompilableMatchers.has(m.regexp)) {
+        warnedUncompilableMatchers.add(m.regexp);
+        console.warn(
+          `[adapter-k8s] middleware matcher regexp failed to compile in this runtime; ` +
+            `treating it as MATCHED so middleware always runs for it (fail-safe): ` +
+            `${JSON.stringify(m.regexp)} — ${err instanceof Error ? err.message : String(err)}. ` +
+            `This usually means the build machine's Node/V8 accepts regex syntax the serving ` +
+            `runtime does not (e.g. inline-flag groups like "(?i:)" on an older Node).`,
+        );
+      }
+    }
+    matcherRegexCache.set(m, re);
+  }
+  return re;
 }
 
 // Decide whether middleware should run for a request, honoring its `matcher`
@@ -112,13 +154,15 @@ export function matchesMiddleware(
     // malformed escape — raw only
   }
   for (const m of matchers) {
-    let re: RegExp;
-    try {
-      re = new RegExp(m.regexp);
-    } catch {
-      continue;
-    }
-    if (!paths.some((p) => re.test(p))) continue;
+    const re = compileMatcherRegex(m);
+    // FAIL-SAFE: a matcher that cannot compile in THIS runtime (build-machine vs
+    // serving-runtime V8 skew — the `(?i:)` Node-version incident class) is treated
+    // as MATCHED, never skipped. Skipping it would return false here, the ext_proc
+    // handler would stamp the TRUSTED `skip-nomatch` verdict, and the pool would
+    // skip its own middleware too — a silent middleware BYPASS. Running middleware
+    // when in doubt is safe; not running it is not. has/missing still gate below,
+    // exactly as they would for a genuinely matched source.
+    if (re && !paths.some((p) => re.test(p))) continue;
     const hasOk = (m.has ?? []).every((c) => conditionPresent(c, headers, url));
     const missingOk = (m.missing ?? []).every((c) => !conditionPresent(c, headers, url));
     if (hasOk && missingOk) return true;
@@ -231,6 +275,18 @@ export function lookupPool(
 // preferred-locale detection only for the index route; non-root unprefixed
 // pages render in the default locale even when Accept-Language prefers another
 // locale. Only an index request that should redirect is left to resolveRoutes.
+//
+// KNOWN DIVERGENCE (deliberate): this means middleware invoked downstream sees
+// the locale-PREFIXED ctx.url (/en/about) where `next start` shows the
+// unprefixed pathname (/about, locale on nextUrl.locale). We can't un-prefix:
+// @next/routing itself prefixes the internal URL before calling
+// invokeMiddleware (verified in dist: `u.pathname = ${basePath}/${locale}${path}`
+// runs before `invokeMiddleware({url: u})`), and responseToMiddlewareResult +
+// the rewrite/redirect normalization below are built around the prefixed form.
+// Un-prefixing only for middleware would desync the two tiers (pool + ext_proc)
+// and the whole normalization stack, for a cosmetic difference middleware can
+// still compensate for via the Accept-Language/cookie hints. Pinned by the i18n
+// suites (routing-common.test.ts, fixtures/i18n-rewrite).
 export function prefixRequestLocale(
   url: URL,
   headers: Headers,

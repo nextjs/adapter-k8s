@@ -13,12 +13,15 @@ import os from "node:os";
 
 vi.mock("../../src/cli/exec.js");
 
-// L12: control what the interactive prompt "types" per test.
-const mockAnswer = vi.hoisted(() => ({ value: "" }));
+// L12: control what the interactive prompt "types" per test. `queue` answers multiple
+// prompts in order (release-name gate, then the unpinned-context confirmation); when
+// the queue is empty every prompt gets `value`.
+const mockAnswer = vi.hoisted(() => ({ value: "", queue: [] as string[] }));
 vi.mock("node:readline", () => ({
   default: {
     createInterface: () => ({
-      question: (_question: string, cb: (answer: string) => void) => cb(mockAnswer.value),
+      question: (_question: string, cb: (answer: string) => void) =>
+        cb(mockAnswer.queue.length > 0 ? mockAnswer.queue.shift()! : mockAnswer.value),
       close: () => {},
     }),
   },
@@ -213,5 +216,257 @@ describe("runDestroy — confirmation gate (L12)", () => {
     await expect(
       runDestroy({ projectDir: tmpDir, releaseName: "my-app", dryRun: true }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("runDestroy — kubectl context pinning", () => {
+  let tmpDir: string;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  const INFRA = { projectId: "deploy-project", region: "us-central1" };
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-destroy-test-"));
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    writeFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), JSON.stringify(INFRA));
+    vi.clearAllMocks();
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("runs get-credentials BEFORE helm uninstall", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const calls = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
+    const credIdx = calls.findIndex((a) => a.includes("get-credentials"));
+    const helmIdx = calls.findIndex((a) => a.includes("uninstall"));
+    expect(credIdx).toBeGreaterThanOrEqual(0);
+    expect(helmIdx).toBeGreaterThan(credIdx);
+    // ...and it targets this release's cluster explicitly.
+    expect(calls[credIdx]).toContain("my-app-cluster");
+    expect(calls[credIdx]).toContain("--project deploy-project");
+  });
+
+  it("aborts before ANY deletion when get-credentials fails", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) => {
+      if (args.includes("get-credentials")) {
+        return { exitCode: 1, stdout: "", stderr: "cluster not found" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow(/Failed to connect to cluster "my-app-cluster"/);
+    const calls = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(
+      calls.some((a) => a.includes("uninstall") || a.includes("delete") || a.includes("rm -r")),
+    ).toBe(false);
+  });
+
+  it("helm uninstall is pinned to the default namespace", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    const helm = vi
+      .mocked(exec.execCapture)
+      .mock.calls.find(([cmd, args]) => cmd === "helm" && args.includes("uninstall"));
+    expect(helm?.[1]).toContain("--namespace");
+    expect(helm?.[1]).toContain("default");
+  });
+
+  it("dry-run does not run get-credentials and prints the skip line", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", dryRun: true });
+    expect(vi.mocked(exec.execCapture)).not.toHaveBeenCalled();
+    const out = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(out).toContain(
+      `[dry-run] Skipping "gcloud container clusters get-credentials" (it would mutate your kubeconfig).`,
+    );
+  });
+});
+
+describe("runDestroy — adapter state ConfigMap cleanup", () => {
+  let tmpDir: string;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+
+  const INFRA = { projectId: "deploy-project", region: "us-central1" };
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-destroy-test-"));
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    writeFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), JSON.stringify(INFRA));
+    vi.clearAllMocks();
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("deletes the adapter state ConfigMaps (state + routing-manifest snapshots) after helm uninstall", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const calls = vi.mocked(exec.execCapture).mock.calls;
+    const cmDelete = calls.find(
+      ([cmd, args]) => cmd === "kubectl" && args.includes("delete") && args.includes("configmap"),
+    );
+    expect(cmDelete).toBeDefined();
+    expect(cmDelete![1].join(" ")).toContain(
+      "app.kubernetes.io/name=my-app,app.kubernetes.io/managed-by=adapter-k8s",
+    );
+    expect(cmDelete![1]).toContain("--ignore-not-found");
+    expect(cmDelete![1]).toContain("default");
+    // Ordered after helm uninstall (cluster is pinned, release removed first).
+    const helmIdx = calls.findIndex(([cmd]) => cmd === "helm");
+    expect(calls.indexOf(cmDelete!)).toBeGreaterThan(helmIdx);
+  });
+
+  it("tolerates a ConfigMap-delete failure (warns, destroy still succeeds)", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args.includes("delete")) {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).resolves.toBeUndefined();
+    expect(
+      warnSpy.mock.calls.some((c) =>
+        String(c[0]).includes("could not delete adapter state ConfigMaps"),
+      ),
+    ).toBe(true);
+  });
+
+  it("dry-run prints the ConfigMap delete without executing it", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", dryRun: true });
+    expect(vi.mocked(exec.execCapture)).not.toHaveBeenCalled();
+    const out = logSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(out).toContain("[dry-run] kubectl delete configmap -n default -l");
+  });
+});
+
+describe("runDestroy — unpinnable kubectl context (C1)", () => {
+  let tmpDir: string;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  // No region → context pinning is impossible.
+  const INFRA_NO_REGION = { projectId: "deploy-project" };
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-destroy-test-"));
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify(INFRA_NO_REGION),
+    );
+    vi.clearAllMocks();
+    mockAnswer.value = "";
+    mockAnswer.queue = [];
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) => {
+      if (args.includes("current-context")) {
+        return { exitCode: 0, stdout: "gke_other-project_us-west1_some-cluster\n", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    mockAnswer.queue = [];
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function printedOutput(): string {
+    return [...logSpy.mock.calls, ...warnSpy.mock.calls].map((c) => String(c[0])).join("\n");
+  }
+
+  it("--yes: prints the CURRENT kubectl context loudly and proceeds without pinning", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const calls = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
+    // Pinning never ran (nothing to pin with)...
+    expect(calls.some((a) => a.includes("get-credentials"))).toBe(false);
+    // ...but the current context was fetched and surfaced before anything was deleted.
+    const ctxIdx = calls.findIndex((a) => a.includes("current-context"));
+    const helmIdx = calls.findIndex((a) => a.includes("uninstall"));
+    expect(ctxIdx).toBeGreaterThanOrEqual(0);
+    expect(helmIdx).toBeGreaterThan(ctxIdx);
+    const out = printedOutput();
+    expect(out).toContain("could NOT be pinned");
+    expect(out).toContain("gke_other-project_us-west1_some-cluster");
+  });
+
+  it("TTY: requires explicit confirmation of the current context before deleting", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+    mockAnswer.queue = ["my-app", "yes"]; // release-name gate, then context confirmation
+    try {
+      await runDestroy({ projectDir: tmpDir, releaseName: "my-app" });
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+    }
+    expect(
+      vi
+        .mocked(exec.execCapture)
+        .mock.calls.some(([cmd, args]) => cmd === "helm" && args.includes("uninstall")),
+    ).toBe(true);
+  });
+
+  it("TTY: aborts without deleting anything when the context is NOT confirmed", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+    mockAnswer.queue = ["my-app", "no"];
+    try {
+      await expect(runDestroy({ projectDir: tmpDir, releaseName: "my-app" })).rejects.toThrow(
+        /kubectl context was not confirmed/,
+      );
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", { value: undefined, configurable: true });
+    }
+    const calls = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(
+      calls.some((a) => a.includes("uninstall") || a.includes("delete") || a.includes("rm -r")),
+    ).toBe(false);
+  });
+
+  it("non-TTY without --yes refuses (context cannot be confirmed)", async () => {
+    // The release-name gate already requires --yes non-interactively; with --yes the
+    // context confirmation is skipped too — so exercise the context gate directly by
+    // simulating a TTY release-name confirmation... not possible non-interactively.
+    // What must hold: without --yes on a non-TTY stdin, destroy never reaches deletion.
+    await expect(runDestroy({ projectDir: tmpDir, releaseName: "my-app" })).rejects.toThrow(
+      /--yes/,
+    );
+    const calls = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((a) => a.includes("uninstall") || a.includes("delete"))).toBe(false);
+  });
+
+  it("dry-run prints that pinning is impossible without executing anything", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", dryRun: true });
+    expect(vi.mocked(exec.execCapture)).not.toHaveBeenCalled();
+    const out = printedOutput();
+    expect(out).toContain("kubectl context pinning is impossible");
+  });
+
+  it("missing infrastructure.json entirely also triggers the context confirmation", async () => {
+    rmSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"));
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    const out = printedOutput();
+    expect(out).toContain("could NOT be pinned");
+    expect(out).toContain("gke_other-project_us-west1_some-cluster");
   });
 });

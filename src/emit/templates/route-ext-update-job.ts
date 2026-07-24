@@ -63,7 +63,15 @@ spec:
           type: RuntimeDefault
       containers:
         - name: update-ext
-          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+          # Pinned by digest: this Job runs under the privileged deploy Workload
+          # Identity, so a retagged/compromised mutable tag would execute under
+          # those permissions. Pinned 2026-07-21 via
+          # "docker manifest inspect -v gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
+          # (Descriptor digest). NOTE: :slim publishes a single-arch (amd64)
+          # manifest — on arm64 node pools, re-pin to the arm64 digest or use a
+          # manifest-list tag. To update: re-resolve the digest, replace, and
+          # bump this comment's date; verify a route-ext registration Job run.
+          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:4ff69e21bec9a7d0ed54d0134a9b9682fc8008252cb5f173a23ddd70b8e024a4
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

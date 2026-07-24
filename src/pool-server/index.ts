@@ -25,8 +25,8 @@ import { createDispatcher, getContentType } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
 import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
 import { decodePublicPathname } from "./public-files.js";
-import { resizeForRequestedWidth } from "./image-utils.js";
-import { createPoolServer } from "./server.js";
+import { negotiateImageFormat, resizeForRequestedWidth } from "./image-utils.js";
+import { createPoolServer, filterWriteHeadHeadersArg } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
 import { forcedCdnCacheControl } from "./cache-policy.js";
@@ -79,17 +79,48 @@ async function readRequestBody(
   req: NodeJS.ReadableStream,
   maxBytes = MAX_BODY_BYTES,
 ): Promise<Buffer | null> {
+  const stream = req as NodeJS.ReadableStream & {
+    on: (event: string, cb: (...args: never[]) => void) => unknown;
+    off: (event: string, cb: (...args: never[]) => void) => unknown;
+    once: (event: string, cb: (...args: never[]) => void) => unknown;
+    pause?: () => void;
+  };
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > maxBytes) {
-      (req as NodeJS.ReadableStream & { destroy?: (e?: Error) => void }).destroy?.();
-      throw new BodyTooLargeError();
-    }
-    chunks.push(buf);
-  }
+  // Explicit listener pump instead of `for await`: an early exit from a stream async
+  // iterator DESTROYS the stream (and, for IncomingMessage, the socket), which turned
+  // a deliverable 413 into an ECONNRESET the client couldn't read. On oversize we
+  // pause and throw; the caller writes 413 + `connection: close` and only then
+  // destroys the socket after the response has been flushed.
+  await new Promise<void>((resolve, reject) => {
+    const onData = (chunk: Buffer | string): void => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > maxBytes) {
+        cleanup();
+        stream.pause?.();
+        reject(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(buf);
+    };
+    const onEnd = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    const cleanup = (): void => {
+      stream.off("data", onData);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+    };
+    stream.on("data", onData);
+    stream.once("end", onEnd);
+    stream.once("error", onError);
+  });
   return chunks.length > 0 ? Buffer.concat(chunks) : null;
 }
 
@@ -159,11 +190,19 @@ interface ImageConfig {
   // Sharp into an unbounded allocation. Default to Next's defaults when unconfigured.
   deviceSizes: number[];
   imageSizes: number[];
+  // `next start` parity: SVG through /_next/image is a 400 unless the app opted in via
+  // images.dangerouslyAllowSVG, and even then Next serves it with Content-Disposition:
+  // attachment + this CSP so a crafted SVG can't run script in the site's origin.
+  dangerouslyAllowSVG: boolean;
+  contentSecurityPolicy: string;
 }
 
 // Next.js defaults (used when required-server-files.json omits them).
 const DEFAULT_DEVICE_SIZES = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
 const DEFAULT_IMAGE_SIZES = [16, 32, 48, 64, 96, 128, 256, 384];
+// Next's default images.contentSecurityPolicy (config-shared) — applied to allowed
+// SVG responses when the app doesn't configure its own.
+const DEFAULT_IMAGE_CSP = "script-src 'none'; frame-src 'none'; sandbox;";
 
 // Read the app's image config (external-host allowlist + allowed sizes) from the build
 // output. Next.js writes the resolved config to .next/required-server-files.json. When it's
@@ -174,6 +213,8 @@ function loadImageConfig(cwd: string): ImageConfig {
     domains: [],
     deviceSizes: DEFAULT_DEVICE_SIZES,
     imageSizes: DEFAULT_IMAGE_SIZES,
+    dangerouslyAllowSVG: false,
+    contentSecurityPolicy: DEFAULT_IMAGE_CSP,
   };
   try {
     const rsfPath = path.join(cwd, ".next", "required-server-files.json");
@@ -186,9 +227,13 @@ function loadImageConfig(cwd: string): ImageConfig {
         config.deviceSizes = images.deviceSizes;
       if (Array.isArray(images.imageSizes) && images.imageSizes.length)
         config.imageSizes = images.imageSizes;
+      config.dangerouslyAllowSVG = images.dangerouslyAllowSVG === true;
+      if (typeof images.contentSecurityPolicy === "string" && images.contentSecurityPolicy)
+        config.contentSecurityPolicy = images.contentSecurityPolicy;
     }
   } catch {
-    // No image config — external images denied by default, sizes fall back to defaults.
+    // No image config — external images denied by default, sizes fall back to defaults,
+    // SVG stays denied (fail-safe direction).
   }
   return config;
 }
@@ -431,7 +476,10 @@ async function fetchExternalImageSafely(
   return { error: "too many redirects" };
 }
 
-async function main() {
+// Boot the pool server. Exported (instead of a self-invoking main) so the startup
+// smoke test can boot against a synthetic staged dir; the module self-runs only when
+// executed directly (see the guard at the bottom).
+export async function startPoolServer(): Promise<ReturnType<typeof createPoolServer>> {
   // A rejected fire-and-forget shouldn't take the pod down — log and continue (per-request
   // failures are already caught by the request handler).
   process.on("unhandledRejection", (reason) => {
@@ -527,7 +575,7 @@ async function main() {
   // 404, mirroring `next start` — our loopback handler invocation doesn't
   // reproduce that check on its own.
   const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
-  const strictDynamicRoutes: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[] = [];
+  const strictDynamicRoutes: { pageRegex: RegExp }[] = [];
   const prerenderedPaths = new Set<string>();
   if (existsSync(prerenderManifestPath)) {
     try {
@@ -557,10 +605,6 @@ async function main() {
         if (route.fallback === false && typeof route.routeRegex === "string") {
           strictDynamicRoutes.push({
             pageRegex: new RegExp(route.routeRegex),
-            dataRegex:
-              typeof route.dataRouteRegex === "string"
-                ? new RegExp(route.dataRouteRegex)
-                : undefined,
           });
         }
       }
@@ -892,6 +936,10 @@ async function main() {
     internalSecret,
     basePath: routingManifest.basePath ?? "",
     i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
+    // Build timestamp anchoring the ISR seed-freshness window. Newer adapters write it
+    // into the routing manifest; read defensively — older manifests (and any build
+    // without it) fall back to pod-start anchoring inside the dispatcher.
+    builtAt: (routingManifest as { builtAt?: string }).builtAt,
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
@@ -921,7 +969,16 @@ async function main() {
   const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
 
   handleRequest = async (req, res) => {
-    const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+    let url: URL;
+    try {
+      url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+    } catch {
+      // A malformed Host header (or absolute-form request-target) must not become a
+      // 500 — it's the client's own protocol error.
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Bad Request");
+      return;
+    }
 
     // When middleware's `matcher` covers this path, it must run BEFORE the
     // filesystem fast paths — Next runs middleware for matched static/public
@@ -956,16 +1013,18 @@ async function main() {
     if (forcedCacheControl) {
       const originalWriteHead = res.writeHead.bind(res);
       res.writeHead = function forceCacheControl(...args: unknown[]) {
-        for (const arg of args) {
-          if (arg && typeof arg === "object" && !Array.isArray(arg)) {
-            for (const key of Object.keys(arg as Record<string, unknown>)) {
-              // forcedCacheControl is always no-cache/no-store (uncacheable), so a serve site's
-              // preliminary cache-control AND its CDN cache-tag are both moot — strip both, so a
-              // tag never lands on a response the CDN won't cache (the final-Cache-Control rule).
-              const lower = key.toLowerCase();
-              if (lower === "cache-control" || lower === "cache-tag")
-                delete (arg as Record<string, unknown>)[key];
-            }
+        // forcedCacheControl is always no-cache/no-store (uncacheable), so a serve site's
+        // preliminary cache-control AND its CDN cache-tag are both moot — strip both, so a
+        // tag never lands on a response the CDN won't cache (the final-Cache-Control rule).
+        // The headers argument may be an object, a tuple array, or a FLAT array
+        // ([name1, value1, …]) — filterWriteHeadHeadersArg handles every shape Node
+        // accepts (a tuple-only filter let the flat form sail past).
+        for (let i = 1; i < args.length; i++) {
+          const arg = args[i];
+          if (arg && typeof arg === "object") {
+            args[i] = filterWriteHeadHeadersArg(arg, (name) =>
+              ["cache-control", "cache-tag"].includes(name.toLowerCase()),
+            );
           }
         }
         res.removeHeader("cache-tag");
@@ -1145,7 +1204,19 @@ async function main() {
             // size cap so an oversized body can't exhaust memory.
             const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
             const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
-            const imgRes = await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
+            const imgRes = await fetch(selfUrl, {
+              signal: AbortSignal.timeout(5000),
+              // The EXTERNAL path re-validates every redirect hop against the SSRF
+              // allowlist; this loopback fetch has no such machinery. Refuse redirects
+              // outright rather than let a same-origin route bounce the optimizer to
+              // an unvetted target (or back into the optimizer itself).
+              redirect: "manual",
+            });
+            if (imgRes.status >= 300 && imgRes.status < 400) {
+              res.writeHead(502, { "content-type": "text/plain" });
+              res.end("Failed to fetch image: redirect not followed");
+              return;
+            }
             if (!imgRes.ok) {
               res.writeHead(imgRes.status, { "content-type": "text/plain" });
               res.end(`Image not found: ${imageUrl}`);
@@ -1192,49 +1263,94 @@ async function main() {
           contentType = fetched.contentType;
         }
 
-        // Try to optimize with Sharp if available
+        // `next start` parity: SVG never goes through the optimizer by default — Next
+        // 400s it unless images.dangerouslyAllowSVG is set, and then serves it with
+        // Content-Disposition: attachment plus the configured CSP so a crafted SVG
+        // can't run script in the site's origin. This gate runs BEFORE any sharp
+        // handling: the verdict must not depend on the optimizer being present.
+        if (contentType.toLowerCase().includes("svg")) {
+          if (!imageConfig.dangerouslyAllowSVG) {
+            res.writeHead(400, { "content-type": "text/plain" });
+            res.end('Bad Request: "url" parameter is valid but image type is not allowed');
+            return;
+          }
+          res.writeHead(200, {
+            "content-type": contentType,
+            "cache-control": "public, max-age=60, must-revalidate",
+            "content-disposition": 'attachment; filename="image"',
+            "content-security-policy": imageConfig.contentSecurityPolicy,
+            // Every /_next/image 200 is Accept-negotiated — see the comment on the
+            // optimized path below.
+            vary: "Accept",
+          });
+          res.end(imageBuffer);
+          return;
+        }
+
+        // Optimize with Sharp. There is deliberately NO passthrough fallback: a sharp
+        // that loads but rejects the input (corrupt/non-image bytes) must never serve
+        // the raw bytes back under a content-type guessed from the URL — that turns
+        // /_next/image into an XSS delivery channel (an extensionless HTML route would
+        // be served as text/html) — and a MISSING sharp means the image stack is
+        // broken (production images always ship sharp), not that unvalidated
+        // passthrough is safe. Fail closed in both cases.
+        let sharp: ReturnType<typeof require> | undefined;
         try {
-          const sharp = require("sharp");
+          sharp = require("sharp");
+        } catch {
+          sharp = undefined;
+        }
+        if (!sharp) {
+          console.error(
+            "[pool-server] sharp is unavailable — refusing to serve /_next/image unoptimized (production images always ship sharp; check the image build)",
+          );
+          res.writeHead(503, { "content-type": "text/plain" });
+          res.end("Image optimization unavailable");
+          return;
+        }
+        try {
           const q = quality || 75;
           const accept = String(req.headers["accept"] ?? "");
-          // Negotiate the output format like Next's optimizer: prefer avif/webp when the client
-          // accepts them, otherwise PRESERVE the source format (a PNG stays PNG — do not force
-          // JPEG). Animated/vector formats sharp shouldn't re-encode are passed through as-is.
-          let pipeline = resizeForRequestedWidth(sharp(imageBuffer), width || undefined);
-          let outType: string;
-          if (accept.includes("image/avif")) {
-            pipeline = pipeline.avif({ quality: q });
-            outType = "image/avif";
-          } else if (accept.includes("image/webp")) {
-            pipeline = pipeline.webp({ quality: q });
-            outType = "image/webp";
-          } else if (contentType.includes("png")) {
-            pipeline = pipeline.png();
-            outType = "image/png";
-          } else if (contentType.includes("gif") || contentType.includes("svg")) {
+          // Negotiate the output format like Next's optimizer (see image-utils).
+          const { encode, contentType: outType } = negotiateImageFormat(accept, contentType);
+          if (encode === "passthrough") {
             res.writeHead(200, {
-              "content-type": contentType,
+              "content-type": outType,
               "cache-control": "public, max-age=60, must-revalidate",
+              // Negotiated like every other image response — without Vary, Cloud CDN
+              // caches whichever variant the first visitor got and serves it to all.
+              vary: "Accept",
             });
             res.end(imageBuffer);
             return;
-          } else {
-            pipeline = pipeline.jpeg({ quality: q });
-            outType = "image/jpeg";
+          }
+          let pipeline = resizeForRequestedWidth(sharp(imageBuffer), width || undefined);
+          switch (encode) {
+            case "avif":
+              pipeline = pipeline.avif({ quality: q });
+              break;
+            case "webp":
+              pipeline = pipeline.webp({ quality: q });
+              break;
+            case "png":
+              pipeline = pipeline.png();
+              break;
+            default:
+              pipeline = pipeline.jpeg({ quality: q });
           }
           const optimized = await pipeline.toBuffer();
           res.writeHead(200, {
             "content-type": outType,
             "cache-control": "public, max-age=60, must-revalidate",
+            // The bytes depend on the client's Accept — without Vary, Cloud CDN caches
+            // whichever variant the first visitor got and serves it to everyone.
+            vary: "Accept",
           });
           res.end(optimized);
         } catch {
-          // Sharp not available — serve unoptimized
-          res.writeHead(200, {
-            "content-type": contentType,
-            "cache-control": "public, max-age=60, must-revalidate",
-          });
-          res.end(imageBuffer);
+          // Sharp exists but failed on the input — refuse to serve unvalidated bytes.
+          res.writeHead(502, { "content-type": "text/plain" });
+          res.end("Failed to process image");
         }
         return;
       } catch (err) {
@@ -1292,8 +1408,23 @@ async function main() {
         req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
     } catch (err) {
       if (err instanceof BodyTooLargeError) {
-        res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+        // readRequestBody deliberately left the socket alive (paused, not destroyed):
+        // destroying first turns the 413 into an ECONNRESET the client can't read.
+        // Say we're closing, flush the response, and only then tear the socket down
+        // so the remainder of the oversized upload can't pin the connection.
+        res.writeHead(413, {
+          "content-type": "text/plain; charset=utf-8",
+          connection: "close",
+        });
         res.end("Payload Too Large");
+        // 'finish' never fires if the socket dies first (client gone mid-flush) —
+        // listen for 'close' too so the paused oversized upload can't pin the
+        // connection. destroy() on an already-destroyed socket is a no-op.
+        const teardown = () => {
+          if (!req.destroyed) req.destroy();
+        };
+        res.once("finish", teardown);
+        res.once("close", teardown);
         return;
       }
       throw err;
@@ -1425,9 +1556,20 @@ async function main() {
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+
+  return server;
 }
 
-main().catch((err) => {
-  console.error("Pool server failed to start:", err);
-  process.exit(1);
-});
+// Self-run only when executed directly (node dist/pool-server.cjs), never on import
+// (tests import startPoolServer). The production bundle is CJS, where require.main
+// identifies the entry module; require/module are undefined under the ESM source
+// loader (vitest), so the guard is false there even with this module imported.
+// (import.meta is intentionally NOT used: esbuild leaves it empty in CJS output.)
+const isDirectRun =
+  typeof require !== "undefined" && typeof module !== "undefined" && require.main === module;
+if (isDirectRun) {
+  startPoolServer().catch((err) => {
+    console.error("Pool server failed to start:", err);
+    process.exit(1);
+  });
+}

@@ -8,7 +8,7 @@ import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
 import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
-import { renderConfigMap } from "./templates/configmap.js";
+import { renderRoutingManifestConfigMap } from "./templates/routing-manifest-configmap.js";
 import { renderGateway, renderHTTPRoute } from "./templates/gateway.js";
 import { renderCdnFilter } from "./templates/gcp-http-filter.js";
 import { sanitizeK8sName } from "./templates/utils.js";
@@ -96,23 +96,9 @@ export function generateHelmChart({
 
   // Routing and Config
   const routingManifestJson = JSON.stringify(routingManifest, null, 2);
-  // A ConfigMap (like any K8s object) must fit under the ~1 MiB etcd object limit.
-  // Fail fast at generation time with an actionable error rather than letting `helm
-  // install`/`kubectl apply` reject it with an opaque server-side error.
-  const MAX_CONFIGMAP_BYTES = 950 * 1024; // ~950 KiB, leaves headroom under the ~1 MiB limit
-  const routingManifestBytes = Buffer.byteLength(routingManifestJson, "utf8");
-  if (routingManifestBytes > MAX_CONFIGMAP_BYTES) {
-    throw new Error(
-      `Routing manifest is too large to embed in a ConfigMap: ${routingManifestBytes} bytes ` +
-        `exceeds the ${MAX_CONFIGMAP_BYTES}-byte limit (~950 KiB, under the ~1 MiB ` +
-        `Kubernetes/etcd object size limit). Reduce the number of routes per manifest ` +
-        `or split the app across multiple releases.`,
-    );
-  }
-  files["templates/routing-manifest-configmap.yaml"] = renderConfigMap({
-    name: "routing-manifest",
+  files["templates/routing-manifest-configmap.yaml"] = renderRoutingManifestConfigMap({
     releaseName,
-    data: { "routing-manifest.json": routingManifestJson },
+    routingManifestJson,
   });
 
   const gke = config.provider.gke;
@@ -139,7 +125,6 @@ export function generateHelmChart({
       releaseName,
       hosts: gke.gateway.hosts,
       pools,
-      buildId,
       routingManifest,
       cdnFilterName,
     });
@@ -199,8 +184,6 @@ export function generateHelmChart({
     files["templates/route-ext-config.yaml"] = renderRouteExtConfigMap({
       releaseName,
       extensionChainJson,
-      projectId: infrastructure?.projectId ?? "",
-      region: infrastructure?.region ?? "",
     });
 
     if (infrastructure?.projectId && infrastructure?.region) {

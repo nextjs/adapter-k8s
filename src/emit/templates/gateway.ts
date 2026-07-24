@@ -1,6 +1,6 @@
 // src/emit/templates/gateway.ts
 import type { HostConfig, PoolDefinition, RoutingManifest } from "../../types.js";
-import { sanitizeK8sName, assertSafeReleaseName } from "./utils.js";
+import { sanitizeK8sName, assertSafeReleaseName, assertSafePathname } from "./utils.js";
 
 export function renderGateway({
   releaseName,
@@ -58,30 +58,16 @@ ${listeners}
 `;
 }
 
-// ManagedCertificate is no longer used — Certificate Manager replaces it.
-// Keeping this as a no-op for backward compat during transition.
-export function renderManagedCertificate({
-  releaseName,
-  hosts,
-}: {
-  releaseName: string;
-  hosts: HostConfig[];
-}): string {
-  return "";
-}
-
 export function renderHTTPRoute({
   releaseName,
   hosts,
   pools,
-  buildId,
   routingManifest,
   cdnFilterName,
 }: {
   releaseName: string;
   hosts: HostConfig[];
   pools: Map<string, PoolDefinition>;
-  buildId: string;
   routingManifest: RoutingManifest;
   /** Name of a GCPHTTPFilter to attach to every rule (enables Cloud CDN). */
   cdnFilterName?: string | undefined;
@@ -126,11 +112,28 @@ export function renderHTTPRoute({
     if (pathname === "/") continue;
 
     const firstSegment = pathname.split("/")[1];
-    if (firstSegment) {
-      const prefix = `/${firstSegment}`;
-      if (!prefixToPool.has(prefix) || poolName !== defaultPoolName) {
-        prefixToPool.set(prefix, poolName);
-      }
+    // Skip infrastructure and error-page paths — poolAssignments includes
+    // /_next/static/*, /_middleware, /404, /_not-found, and their prefixes would
+    // burn slots in the 16-rule budget on paths no app request ever routes by.
+    // Next reserves every root segment starting with "_" (_app, _document,
+    // _error, _next…), so the underscore rule loses no real app prefix. Root
+    // dynamic templates (/[slug], /[...rest]) are likewise skipped: a literal
+    // PathPrefix on "/[slug]" can never fire — the catch-all rule owns those.
+    // Deliberate rule-budget trade-off: dropping the /_next prefix rule means a
+    // CDN-miss /_next/static/* request whose asset belongs to a non-catch-all
+    // pool lands on the catch-all pool first and takes one extra cross-pool hop
+    // (the pool-server's proxyToPool recovery serves it) — accepted cost to keep
+    // scarce HTTPRoute slots for real app prefixes.
+    if (!firstSegment || firstSegment.startsWith("_") || firstSegment.startsWith("[")) continue;
+    if (pathname === "/404" || pathname === "/500") continue;
+
+    const prefix = `/${firstSegment}`;
+    // The prefix is spliced into a quoted YAML scalar below; pathnames are
+    // already validated at manifest time, but this template is a consumption
+    // point — a hand-rolled/tampered manifest must fail here, not emit junk YAML.
+    assertSafePathname(prefix);
+    if (!prefixToPool.has(prefix) || poolName !== defaultPoolName) {
+      prefixToPool.set(prefix, poolName);
     }
   }
 

@@ -22,6 +22,19 @@ import {
 
 type LoadedModule = Record<string, unknown>;
 
+// Abort-shaped errors raised by the request-shed signal: AbortSignal.timeout()
+// aborts with a DOMException named "TimeoutError", a manual controller.abort()
+// yields "AbortError", and middleware (e.g. a fetch wrapper) may re-wrap either —
+// so also check `cause` one level deep for the same shapes.
+function isAbortError(err: unknown): boolean {
+  const shaped = (e: unknown): boolean =>
+    typeof e === "object" &&
+    e !== null &&
+    ((e as { name?: unknown }).name === "AbortError" ||
+      (e instanceof DOMException && e.name === "TimeoutError"));
+  return shaped(err) || shaped((err as { cause?: unknown } | null | undefined)?.cause);
+}
+
 function getHeader(headers: HeaderValue[], key: string): string | undefined {
   const h = headers.find((h) => h.key === key);
   if (!h) return undefined;
@@ -52,23 +65,45 @@ function serializeResolvedHeaders(resolved: Headers): string | null {
 export function createRequestHandler(
   manifest: RoutingManifest,
   middlewareModule: LoadedModule | null,
+  opts?: { timeoutMs?: number },
 ) {
   // Shared secret authenticating the internal dispatch headers to the pool. Present in GKE
   // (injected from a Secret); absent in emulate/tests, where the pool trusts nothing over the
   // wire and re-resolves locally. Read once — the deployment env is fixed for the process.
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
   const rscConfig = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
+  // Per-request budget mirrored from the server's withTimeout shed — when it fires,
+  // this signal aborts so middleware awaiting a slow upstream is actually cancelled
+  // instead of racing a shed response it can no longer influence. 0 disables.
+  const timeoutMs = opts?.timeoutMs ?? 0;
 
-  return async function handleRequest(requestHeaders: HeaderValue[]): Promise<ProcessingResponse> {
-    const path = getHeader(requestHeaders, ":path") ?? "/";
+  return async function handleRequest(
+    requestHeaders: HeaderValue[],
+    // Internal (trailing-slash retry only): the shed signal of the ORIGINAL request,
+    // so the retry spends the remaining budget instead of minting a fresh full window
+    // while the server-side withTimeout keeps the original clock.
+    inheritedShedSignal?: AbortSignal,
+  ): Promise<ProcessingResponse> {
+    const rawPath = getHeader(requestHeaders, ":path") ?? "/";
     const method = getHeader(requestHeaders, ":method") ?? "GET";
     const scheme = getHeader(requestHeaders, ":scheme") ?? "https";
     const authority = getHeader(requestHeaders, ":authority") ?? "localhost";
-    const url = new URL(`${scheme}://${authority}${path}`);
+    const url = new URL(`${scheme}://${authority}${rawPath}`);
 
+    // Ingress hygiene: a client can send any x-* header, and the egress mutations
+    // below only overwrite the keys they set — so strip the whole internal dispatch
+    // vocabulary (plus the secret) BEFORE anything else sees it. Spoofed values must
+    // never reach resolveRoutes or middleware (an auth middleware reading a spoofed
+    // x-output-id / x-mw-evaluated would be deciding on attacker input). The pool
+    // applies the same strip-unless-secret discipline server-side.
     const headers = new Headers(
       requestHeaders
-        .filter((h) => !h.key.startsWith(":"))
+        .filter(
+          (h) =>
+            !h.key.startsWith(":") &&
+            !(INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.key.toLowerCase()) &&
+            h.key.toLowerCase() !== INTERNAL_SECRET_HEADER,
+        )
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
 
@@ -82,6 +117,24 @@ export function createRequestHandler(
       return buildImmediateResponse(prep.status, { location: prep.url.toString() });
     }
     const resolveUrl = prep.url;
+    // Fallback pathname for dispatch when resolution yields none. NEVER the raw
+    // :path — that includes the query string, so "?x=1" would leak into the
+    // x-output-id/x-upstream-pool derivation. resolveUrl is the prepared
+    // (locale-prefixed) URL, matching the pool resolver's url.pathname fallback.
+    const fallbackPathname = resolveUrl.pathname;
+
+    // x-nextjs-data is a client hint, not proof of a data request — Next only
+    // honors it after the URL matches the build-scoped /_next/data protocol.
+    // Mirrors the pool resolver (resolve.ts): drop it for non-data requests.
+    if (!prep.isDataRequest) headers.delete("x-nextjs-data");
+
+    // The shed signal handed to middleware: aborts when the per-request budget
+    // expires (server.ts's withTimeout shed uses the same budget), so middleware
+    // awaiting a slow upstream is actually cancelled instead of racing a shed
+    // response it can no longer influence. AbortSignal.timeout is unref'd and
+    // self-cleaning — no manual timer to clear on the many return paths below.
+    const shedSignal =
+      inheritedShedSignal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined);
 
     // Body-capable requests (non-GET/HEAD) with middleware are NOT resolved at the edge: the
     // header-phase ext_proc callout never sees the request body, so body-reading middleware
@@ -197,7 +250,10 @@ export function createRequestHandler(
                     method,
                     headers: requestHeaders,
                     body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                    signal: new AbortController().signal,
+                    // Wired to the request-time shed budget — a previously
+                    // never-aborted controller meant the timeout shed rejected the
+                    // response but the middleware kept running detached.
+                    signal: shedSignal ?? new AbortController().signal,
                     nextConfig: manifestNextConfig(manifest),
                     waitUntil,
                   },
@@ -223,6 +279,12 @@ export function createRequestHandler(
                     method,
                     headers: requestHeaders,
                     body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                    // Next's legacy adapter (next/dist/server/web/adapter.js) forwards
+                    // params.request.signal into the NextRequest init, so the shed
+                    // budget reaches legacy middleware through the same field Path 1
+                    // uses — without it, legacy middleware keeps running detached
+                    // after the server-side timeout shed rejects the response.
+                    signal: shedSignal ?? new AbortController().signal,
                     destination: "document",
                     credentials: "same-origin",
                     bodyUsed: false,
@@ -250,6 +312,9 @@ export function createRequestHandler(
                   headers: new Headers(
                     [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                   ),
+                  // Shed budget must abort Path 3 middleware too — the Request ctor
+                  // adopts this signal as request.signal for the handler to observe.
+                  signal: shedSignal ?? null,
                   duplex: "half",
                 };
                 if (method !== "GET" && method !== "HEAD") {
@@ -263,7 +328,7 @@ export function createRequestHandler(
                     ? result
                     : result?.response instanceof Response
                       ? result.response
-                    : null;
+                      : null;
               }
 
               // ext_proc is the platform invocation for Node middleware. Keep it alive until
@@ -281,6 +346,16 @@ export function createRequestHandler(
               }
               return {};
             } catch (err) {
+              // Shed-abort ≠ middleware crash. When the per-request budget expires,
+              // the shed signal aborts signal-aware middleware and the rejection must
+              // be answered by the SERVER's configured fail-open/fail-closed policy
+              // (createProcessHandler in server.ts), not the unconditional fail-closed
+              // 500 below — that one exists for genuine middleware crashes (auth must
+              // not be bypassed). Rethrow: resolveRoutes awaits invokeMiddleware bare,
+              // so this rejects the handleRequest promise the server observes.
+              // Previously the abort was classified as a crash, making `failOpen: true`
+              // a no-op for signal-aware middleware exceeding timeoutMs.
+              if (isAbortError(err) || shedSignal?.aborted) throw err;
               console.error("[routing-service] Middleware execution failed:", err);
               middlewareThrew = true;
               return { bodySent: true };
@@ -305,7 +380,11 @@ export function createRequestHandler(
             ? { ...h, value: redirect.retryUrl.pathname + redirect.retryUrl.search }
             : h,
         );
-        return handleRequest(retried);
+        // Carry the ORIGINAL shed signal into the retry: the server-side withTimeout
+        // (server.ts) keeps the first request's clock across this recursion, so a
+        // fresh AbortSignal.timeout here would give the retried middleware a full
+        // new budget that outlives the shed response.
+        return handleRequest(retried, shedSignal);
       }
       const responseHeaders: Record<string, string> = { location: redirect.url.toString() };
       const setCookies = redirect.resolvedHeaders?.getSetCookie?.() ?? [];
@@ -346,7 +425,7 @@ export function createRequestHandler(
     // their page). The output id, however, must be the RSC-mapped variant so the handler
     // returns a flight payload instead of HTML — mirrors pool-server/resolve.ts.
     let basePathname = normalizeMatchedPathname(
-      resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? path,
+      resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? fallbackPathname,
       manifest.poolAssignments,
     );
     // Concrete prerendered outputs win over dynamic templates (decoded lookup).
@@ -378,7 +457,7 @@ export function createRequestHandler(
       lookupPool(
         manifest.poolAssignments,
         resolution.resolvedPathname,
-        resolution.invocationTarget?.pathname ?? path,
+        resolution.invocationTarget?.pathname ?? fallbackPathname,
         i18nLocales,
       ) ?? "default";
     setDispatch("x-upstream-pool", pool);

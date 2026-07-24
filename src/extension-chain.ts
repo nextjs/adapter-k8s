@@ -5,7 +5,6 @@ export interface ExtensionChainOptions {
   releaseName: string;
   namespace: string;
   projectId: string;
-  region: string;
   timeout: string;
   failureModeAllow: boolean;
 }
@@ -22,8 +21,7 @@ export function determineFailureMode(
 }
 
 export function generateExtensionChain(options: ExtensionChainOptions): string {
-  const { celExpression, releaseName, namespace, projectId, region, timeout, failureModeAllow } =
-    options;
+  const { celExpression, releaseName, namespace, projectId, timeout, failureModeAllow } = options;
 
   const chain = [
     {

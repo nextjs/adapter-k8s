@@ -1,5 +1,6 @@
 // src/manifest.ts
 import path from "node:path";
+import { statSync } from "node:fs";
 import type {
   AdapterOutputs,
   BuildCompleteContext,
@@ -7,6 +8,7 @@ import type {
   RoutingManifest,
 } from "./types.js";
 import type { RouteHasCondition } from "./routing-common.js";
+import { assertSafePathname } from "./emit/templates/utils.js";
 
 // Build-time middleware matcher shape (outputs.middleware.config.matchers).
 interface MiddlewareMatcherBuild {
@@ -54,6 +56,28 @@ function caseInsensitiveSources<T extends { sourceRegex: string }>(routes: T[]):
       ? { ...route, sourceRegex: `(?i:${route.sourceRegex})` }
       : route,
   );
+}
+
+// builtAt is embedded in the chart ConfigMap and every Docker build context, so a
+// wall-clock stamp makes two chart generations of the SAME build byte-different —
+// busting Docker layer caches and violating the clean chart-regeneration invariant
+// (regenerating must be a no-op when nothing changed). Derivation, in order:
+//   1. SOURCE_DATE_EPOCH (the reproducible-builds standard, seconds since epoch) when set;
+//   2. the mtime of .next/BUILD_ID — written once per `next build`, so it is stable
+//      across chart regenerations of the same build output;
+//   3. Date.now() only when neither exists (synthetic build contexts, unit tests).
+// Consumers (pool-server dispatch.ts ISR anchor) parse this with a NaN fallback —
+// keep the ISO-8601 format.
+function stableBuiltAt(projectDir: string): string {
+  const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
+  if (sourceDateEpoch && /^\d+$/.test(sourceDateEpoch)) {
+    return new Date(Number(sourceDateEpoch) * 1000).toISOString();
+  }
+  try {
+    return statSync(path.join(projectDir, ".next", "BUILD_ID")).mtime.toISOString();
+  } catch {
+    return new Date().toISOString();
+  }
 }
 
 export function buildRoutingManifest({
@@ -167,26 +191,40 @@ export function buildRoutingManifest({
     }
   }
 
+  // Every emitted pathname ends up spliced into quoted YAML in the HTTPRoute
+  // prefix rules (gateway.ts) — reject `"`/`\`/control characters at the source.
+  const pathnames = collectOutputPathnames(outputs);
+  for (const pathname of pathnames) {
+    assertSafePathname(pathname);
+  }
+
   return {
     // rsc is inside routeGraph per design doc §5.3
     routeGraph: {
-      beforeMiddleware: routing.beforeMiddleware,
-      // Rewrites/redirects/headers match case-insensitively in Next (path-to-regexp
-      // `sensitive: false`), but @next/routing compiles the baked sourceRegex with
-      // no flags, so `/Rewrite-1` would miss `/rewrite-1`. Wrap each source in an
-      // inline case-insensitive group so both the pool and the ext_proc routing
-      // service match the way `next start` does. Named capture groups are preserved.
+      // Rewrites/redirects/headers/onMatch match case-insensitively in `next start`
+      // (path-to-regexp `sensitive: false` — filesystem.js buildCustomRoute passes
+      // experimental.caseSensitiveRoutes, default false), but @next/routing's
+      // matchRoute compiles the baked sourceRegex with no flags, so `/Rewrite-1`
+      // would miss `/rewrite-1`. Wrap each custom-route source in an inline
+      // case-insensitive group so both the pool and the ext_proc routing service
+      // match the way `next start` does. Named capture groups are preserved.
+      beforeMiddleware: caseInsensitiveSources(routing.beforeMiddleware),
       beforeFiles: caseInsensitiveSources(routing.beforeFiles),
       afterFiles: caseInsensitiveSources(routing.afterFiles),
+      // dynamicRoutes stay case-SENSITIVE: `next start` matches dynamic PAGE routes
+      // via getRouteRegex (route-regex.js) which compiles `new RegExp(...)` with no
+      // flags — verified: /BLOG/hello does not match /blog/[slug] upstream. Only
+      // custom routes are case-insensitive, so only they get the wrap.
       dynamicRoutes: routing.dynamicRoutes,
-      onMatch: routing.onMatch,
-      fallback: routing.fallback,
+      onMatch: caseInsensitiveSources(routing.onMatch),
+      fallback: caseInsensitiveSources(routing.fallback),
       shouldNormalizeNextData: routing.shouldNormalizeNextData,
       rsc: routing.rsc,
     },
-    pathnames: collectOutputPathnames(outputs),
+    pathnames,
     i18n: i18n ?? null,
     buildId,
+    builtAt: stableBuiltAt(projectDir),
     basePath,
     trailingSlash,
     middleware: outputs.middleware

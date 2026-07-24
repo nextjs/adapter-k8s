@@ -6,7 +6,13 @@ import { cdnTagForBuildId } from "../cdn-tags.js";
 export type Runner = (
   cmd: string,
   args: string[],
+  opts?: { timeoutMs?: number },
 ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+
+// The synchronous `invalidate-cdn-cache` waits on Google's long-running operation; a
+// wedged operation previously hung the whole deploy (no timeout existed anywhere). Cap
+// it generously — invalidation normally completes in well under a minute.
+const CDN_INVALIDATE_TIMEOUT_MS = 10 * 60 * 1000;
 
 const basename = (s: string): string => s.trim().split("/").pop() ?? "";
 const okOut = (r: { exitCode: number; stdout: string }): string =>
@@ -109,15 +115,19 @@ export async function invalidateCdnBuildTag(opts: {
 
   const tag = cdnTagForBuildId(opts.buildId);
   opts.log(`  → Invalidating CDN cache for outgoing build (tag ${tag}) on ${urlMap}...`);
-  const r = await opts.run("gcloud", [
-    "compute",
-    "url-maps",
-    "invalidate-cdn-cache",
-    urlMap,
-    `--tags=${tag}`,
-    "--global",
-    `--project=${opts.projectId}`,
-  ]); // no --async: wait for the operation to complete
+  const r = await opts.run(
+    "gcloud",
+    [
+      "compute",
+      "url-maps",
+      "invalidate-cdn-cache",
+      urlMap,
+      `--tags=${tag}`,
+      "--global",
+      `--project=${opts.projectId}`,
+    ], // no --async: wait for the operation to complete
+    { timeoutMs: CDN_INVALIDATE_TIMEOUT_MS },
+  );
   if (r.exitCode !== 0) {
     opts.log(
       `  ! CDN invalidation failed (non-fatal; TTL self-heals): ${r.stderr.trim().slice(0, 200)}`,

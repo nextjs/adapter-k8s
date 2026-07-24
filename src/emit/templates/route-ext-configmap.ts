@@ -1,14 +1,10 @@
 export function renderRouteExtConfigMap({
   releaseName,
   extensionChainJson,
-  projectId,
-  region,
   forwardingRule,
 }: {
   releaseName: string;
   extensionChainJson: string;
-  projectId: string;
-  region: string;
   forwardingRule?: string;
 }): string {
   const chains = JSON.parse(extensionChainJson);

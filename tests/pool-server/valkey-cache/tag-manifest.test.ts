@@ -1,15 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   areTagsExpired,
   areTagsStale,
   computeTagUpdate,
   evaluateEntry,
+  MAX_CLOCK_SKEW_MS,
   maxExpiration,
   parseTagState,
+  TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
+  warnOnClockSkewClamp,
   type TagManifest,
   type TagState,
 } from "../../../src/pool-server/valkey-cache/tag-manifest.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const manifest = (entries: Record<string, TagState>): TagManifest =>
   new Map(Object.entries(entries));
@@ -68,6 +75,21 @@ describe("computeTagUpdate (mirrors default.js updateTags)", () => {
       at: NOW,
     });
   });
+
+  it("hard expire preserves a stored stale watermark (per-dimension merge, M12)", () => {
+    // The server-side script merges an event's SET dimensions into the stored state; a hard
+    // expire only sets `expired`, so a prior profile's `stale` watermark must survive. This
+    // mirrors Next's read-modify-write (`{...existing, expired: now}`).
+    expect(computeTagUpdate({ stale: 1 }, NOW)).toEqual({ stale: 1, expired: NOW, at: NOW });
+  });
+
+  it("a profile without `expire` leaves `expired` unset for the server-side merge (M12)", () => {
+    // The event must NOT carry an `expired` key — otherwise the merge would (correctly)
+    // replace the stored one. The stored hard-expire watermark is preserved by the script.
+    const event = computeTagUpdate(undefined, NOW, {});
+    expect(event).toEqual({ stale: NOW, at: NOW });
+    expect("expired" in event).toBe(false);
+  });
 });
 
 describe("maxExpiration (mirrors default.js getExpiration)", () => {
@@ -85,6 +107,58 @@ describe("UPDATE_TAGS_SCRIPT (L7: merge ordered on the server clock)", () => {
     expect(UPDATE_TAGS_SCRIPT).toContain("nw.at = now");
     // The merge comparison is against the server clock, never a client-parsed `nw.at`.
     expect(UPDATE_TAGS_SCRIPT).not.toContain("nwAt");
+  });
+});
+
+describe("UPDATE_TAGS_SCRIPT (M11: the manifest key itself is TTL-bounded)", () => {
+  it("EXPIREs the manifest key from the trailing ARGV ttl on every write", () => {
+    expect(UPDATE_TAGS_SCRIPT).toContain("redis.call('EXPIRE', KEYS[1], ttlSeconds)");
+    // The ttl is read off the END of ARGV, and the field/json pairs stop before it.
+    expect(UPDATE_TAGS_SCRIPT).toContain("tonumber(ARGV[#ARGV])");
+    expect(UPDATE_TAGS_SCRIPT).toContain("pairCount = #ARGV - 1");
+    expect(UPDATE_TAGS_SCRIPT).toContain("while i <= pairCount");
+    // 30 days, mirroring DURABLE_TTL_SECONDS for entry keys.
+    expect(TAG_MANIFEST_TTL_SECONDS).toBe(30 * 24 * 60 * 60);
+  });
+});
+
+describe("UPDATE_TAGS_SCRIPT (M12: per-dimension merge, not whole-field replace)", () => {
+  it("preserves stored watermarks the incoming event did not set", () => {
+    // A profiled event without `expire` (only `{stale, at}`) must not erase a stored
+    // hard-expire `expired` watermark, and a hard expire must not erase a stored `stale`.
+    expect(UPDATE_TAGS_SCRIPT).toContain("if nw.stale == nil then nw.stale = cur.stale end");
+    expect(UPDATE_TAGS_SCRIPT).toContain("if nw.expired == nil then nw.expired = cur.expired end");
+    // The merge only happens for the event that WINS the server-clock ordering.
+    expect(UPDATE_TAGS_SCRIPT).toContain("if now < curAt then");
+  });
+});
+
+describe("UPDATE_TAGS_SCRIPT (L16: fast-clock watermarks are clamped to the server clock)", () => {
+  it("clamps stale/hard-expired watermarks past the skew bound and reports the count", () => {
+    const bound = String(MAX_CLOCK_SKEW_MS);
+    expect(MAX_CLOCK_SKEW_MS).toBe(60_000);
+    expect(UPDATE_TAGS_SCRIPT).toContain(`nw.stale > now + ${bound}`);
+    // A hard expire (no stale) has its expired watermark clamped directly.
+    expect(UPDATE_TAGS_SCRIPT).toContain(`nw.expired = now + ${bound}`);
+    // A profiled event's expired watermark is SHIFTED with its stale base (duration preserved).
+    expect(UPDATE_TAGS_SCRIPT).toContain("nw.expired = nw.expired - shift");
+    // The script returns the clamp count so callers can warn.
+    expect(UPDATE_TAGS_SCRIPT).toContain("return clamped");
+  });
+});
+
+describe("warnOnClockSkewClamp (L16)", () => {
+  it("warns once when the script reports clamping, silently otherwise", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    warnOnClockSkewClamp(0);
+    warnOnClockSkewClamp(null);
+    warnOnClockSkewClamp(undefined);
+    expect(warn).not.toHaveBeenCalled();
+    warnOnClockSkewClamp(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/clock/);
+    warnOnClockSkewClamp(1); // once per process
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });
 

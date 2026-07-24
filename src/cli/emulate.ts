@@ -27,6 +27,10 @@ interface EmulateOptions {
 export async function runEmulate(options: EmulateOptions): Promise<void> {
   const { projectDir, skipBuild, port = 8080 } = options;
   const children: ChildProcess[] = [];
+  // Per-port container name: two concurrent `emulate` runs on different ports used to
+  // share the hardcoded name `adapter-k8s-envoy`, so one's cleanup (docker rm -f)
+  // killed the other's proxy.
+  const envoyContainerName = `adapter-k8s-envoy-${port}`;
 
   // __dirname in the bundled CLI is the dist/ directory itself.
   const distDir = __dirname;
@@ -54,9 +58,15 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   }
 
   const buildMetaPath = path.join(outputDir, "build-metadata.json");
-  const buildId = existsSync(buildMetaPath)
-    ? JSON.parse(readFileSync(buildMetaPath, "utf-8")).buildId
-    : "local";
+  let buildId = "local";
+  if (existsSync(buildMetaPath)) {
+    try {
+      buildId = JSON.parse(readFileSync(buildMetaPath, "utf-8")).buildId;
+    } catch (err) {
+      // Name the file — a bare SyntaxError gives no clue WHICH file is corrupt.
+      throw new Error(`Failed to parse ${buildMetaPath}: ${(err as Error).message}`);
+    }
+  }
 
   // --- 2. Copy configs (always refresh from build output) ---
   const configDir = path.join(projectDir, "config");
@@ -107,6 +117,14 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   });
   children.push(poolServer);
 
+  // A spawn "error" event (e.g. ENOENT on the interpreter) with no listener crashes
+  // the process with a bare stack — fail cleanly instead.
+  poolServer.on("error", (err) => {
+    console.error(`${RED}Failed to start pool server: ${err.message}${RESET}`);
+    cleanup(children, envoyContainerName);
+    process.exit(1);
+  });
+
   poolServer.stdout?.on("data", (d) => {
     for (const line of d.toString().split("\n").filter(Boolean)) {
       console.log(`  ${GREEN}pool-server${RESET}       ${DIM}│${RESET} ${line}`);
@@ -128,10 +146,20 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       NEXT_BUILD_ID: buildId,
       CONFIG_DIR: configDir,
       NODE_ENV: "production",
+      // Local emulation has no TLS identity (Envoy talks h2c to the routing service).
+      // The routing service CRASHES on TLS-identity failure unless this is set — opt in
+      // explicitly here; GKE never sets it (mTLS via the internal secret there).
+      ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT: "1",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
   children.push(routingService);
+
+  routingService.on("error", (err) => {
+    console.error(`${RED}Failed to start routing service: ${err.message}${RESET}`);
+    cleanup(children, envoyContainerName);
+    process.exit(1);
+  });
 
   routingService.stdout?.on("data", (d) => {
     for (const line of d.toString().split("\n").filter(Boolean)) {
@@ -178,7 +206,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
           "--network",
           "host",
           "--name",
-          "adapter-k8s-envoy",
+          envoyContainerName,
           "-v",
           `${envoyYaml}:/etc/envoy/envoy.yaml:ro`,
           "envoyproxy/envoy:v1.32-latest",
@@ -190,6 +218,21 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
         },
       );
     }
+
+    // A missing envoy/docker binary surfaces as a spawn "error" event — an uncaught
+    // "error" event crashes the whole process. Envoy is best-effort (requests can go
+    // straight to the pool server), so degrade instead of dying.
+    envoyChild.on("error", (err) => {
+      console.error(
+        `${YELLOW}[envoy]${RESET} Failed to start: ${err.message} — continuing without proxy. ` +
+          `Requests go to pool server on :3000`,
+      );
+      const idx = children.indexOf(envoyChild!);
+      if (idx >= 0) children.splice(idx, 1);
+      envoyChild = null;
+      const envoyIdx = ports.indexOf(port);
+      if (envoyIdx >= 0) ports.splice(envoyIdx, 1);
+    });
 
     children.push(envoyChild);
 
@@ -213,8 +256,11 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   const ports = [3000, 8443];
   if (envoyChild) ports.push(port);
 
-  for (let attempt = 0; attempt < 60; attempt++) {
-    let allReady = true;
+  // Track readiness explicitly — the old loop simply ran out of attempts and fell
+  // through to "Ready!" even when a service never came up.
+  let ready = false;
+  for (let attempt = 0; attempt < 60 && !ready; attempt++) {
+    ready = true;
     for (const p of ports) {
       const ok = await new Promise<boolean>((resolve) => {
         const s = require("net").createConnection(p, "127.0.0.1");
@@ -226,21 +272,21 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
         setTimeout(() => resolve(false), 300);
       });
       if (!ok) {
-        allReady = false;
+        ready = false;
         break;
       }
     }
-    if (allReady) break;
+    if (ready) break;
 
     // Check for crashes — Envoy failing is non-fatal, pool/routing crashing is fatal
     if (poolServer.exitCode !== null) {
       console.error(`${RED}Pool server crashed. Check logs above.${RESET}`);
-      cleanup(children);
+      cleanup(children, envoyContainerName);
       process.exit(1);
     }
     if (routingService.exitCode !== null) {
       console.error(`${RED}Routing service crashed. Check logs above.${RESET}`);
-      cleanup(children);
+      cleanup(children, envoyContainerName);
       process.exit(1);
     }
     if (envoyChild && envoyChild.exitCode !== null) {
@@ -254,6 +300,15 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       if (envoyIdx >= 0) ports.splice(envoyIdx, 1);
     }
     await new Promise((r) => setTimeout(r, 500));
+  }
+
+  if (!ready) {
+    console.error(
+      `${RED}Timed out after 30s waiting for services on port(s): ${ports.join(", ")}. ` +
+        `Check the logs above.${RESET}`,
+    );
+    cleanup(children, envoyContainerName);
+    process.exit(1);
   }
 
   const url = envoyChild ? `http://localhost:${port}` : "http://localhost:3000";
@@ -272,7 +327,7 @@ ${GREEN}${BOLD}Ready!${RESET}
   // --- 7. Keep alive + cleanup ---
   const shutdown = () => {
     console.log(`\n${DIM}Shutting down...${RESET}`);
-    cleanup(children);
+    cleanup(children, envoyContainerName);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -290,10 +345,12 @@ ${GREEN}${BOLD}Ready!${RESET}
   await new Promise(() => {});
 }
 
-function cleanup(children: ChildProcess[]) {
+function cleanup(children: ChildProcess[], envoyContainerName: string) {
   for (const child of children) {
     child.kill("SIGTERM");
   }
-  // Kill docker envoy container if running
-  spawn("docker", ["rm", "-f", "adapter-k8s-envoy"], { stdio: "ignore" });
+  // Kill docker envoy container if running. Ignore a spawn error here — docker may
+  // not even be installed (envoy may have run as a local binary or not at all), and
+  // an unhandled "error" event during cleanup would mask the real failure.
+  spawn("docker", ["rm", "-f", envoyContainerName], { stdio: "ignore" }).on("error", () => {});
 }

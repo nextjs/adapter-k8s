@@ -1,9 +1,25 @@
 // src/cli/doctor.ts
 import { existsSync, readFileSync } from "node:fs";
-import { resolve4 } from "node:dns/promises";
+import { resolve4, resolveCname } from "node:dns/promises";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { sanitizeK8sName } from "../emit/templates/utils.js";
+
+// The release lives in the literal "default" namespace (init binds Workload Identity
+// there; deploy/rollback/state/destroy all pin it). Pin every kubectl read here too —
+// a kubeconfig namespace override otherwise makes every check report "not found".
+const K8S_NAMESPACE = "default";
+
+// Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
+// WHICH file is corrupt.
+function readJsonFile<T = Record<string, unknown>>(filePath: string): T {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf-8"));
+  } catch (err) {
+    throw new Error(`Failed to parse ${filePath}: ${(err as Error).message}`);
+  }
+}
 
 interface CheckResult {
   name: string;
@@ -30,6 +46,138 @@ async function checkTool(name: string, args: string[]): Promise<CheckResult> {
   return { name: `${name} installed`, status: "pass", message: version };
 }
 
+// Per-host DNS/TLS checks shared by runDoctor and runDomainChecks (previously two
+// near-identical copies that had already drifted in messages and edge handling).
+// gatewayIp/certStatus are resolved once by the caller; certStatus === null with a
+// projectId set means "certificate not found".
+async function checkDomainForHost(opts: {
+  host: string;
+  releaseName: string;
+  projectId: string;
+  gatewayIp: string | null;
+  certStatus: string | null;
+}): Promise<CheckResult[]> {
+  const { host, releaseName, projectId, gatewayIp, certStatus } = opts;
+  const results: CheckResult[] = [];
+  // Wildcard domains: skip the DNS A record check (can't resolve *.example.com)
+  // but still check CNAME auth and cert status.
+  const isWildcard = host.includes("*");
+  const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
+
+  results.push({ name: `--- ${host}`, status: "pass", message: "---" });
+
+  // A record (skip for wildcards — can't resolve *.example.com directly)
+  if (!isWildcard) {
+    const resolvedIp = await resolve4(host)
+      .then((ips) => ips[0] ?? null)
+      .catch(() => null);
+    if (!resolvedIp) {
+      results.push({
+        name: `  A record`,
+        status: "fail",
+        message: "Does not resolve",
+        fix: gatewayIp
+          ? `Add DNS: ${host} A ${gatewayIp}`
+          : "Add A record after Gateway IP is assigned",
+      });
+    } else if (gatewayIp && resolvedIp !== gatewayIp) {
+      results.push({
+        name: `  A record`,
+        status: "warn",
+        message: `${resolvedIp} (expected ${gatewayIp})`,
+        fix: `Update DNS: ${host} A ${gatewayIp}`,
+      });
+    } else {
+      results.push({
+        name: `  A record`,
+        status: "pass",
+        message: `${host} -> ${resolvedIp}`,
+      });
+    }
+  } else {
+    results.push({
+      name: `  A record`,
+      status: "warn",
+      message: "Wildcard — configure A record for base domain or subdomains individually",
+      ...(gatewayIp
+        ? { fix: `Add DNS: ${host} A ${gatewayIp} (or use individual subdomain A records)` }
+        : {}),
+    });
+  }
+
+  // CNAME for DNS authorization (Certificate Manager)
+  if (projectId) {
+    const authName = `${releaseName}-dns-auth-${safeName}`;
+    const authResult = await execCapture("gcloud", [
+      "certificate-manager",
+      "dns-authorizations",
+      "describe",
+      authName,
+      "--project",
+      projectId,
+      "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
+    ]);
+    if (authResult.exitCode === 0 && authResult.stdout.trim()) {
+      const parts = authResult.stdout.trim().split(/\s+/);
+      const cnameHost = parts[0] ?? "";
+      const cnameTarget = parts[2] ?? parts[1] ?? "";
+
+      // Check if the CNAME actually resolves
+      const cnameResolved = await resolveCname(cnameHost)
+        .then((r) => r[0] ?? null)
+        .catch(() => null);
+
+      if (cnameResolved) {
+        results.push({
+          name: `  CNAME (cert auth)`,
+          status: "pass",
+          message: `${cnameHost} -> ${cnameResolved}`,
+        });
+      } else {
+        results.push({
+          name: `  CNAME (cert auth)`,
+          status: "fail",
+          message: "Not configured",
+          fix: `Add DNS: ${cnameHost} CNAME ${cnameTarget}`,
+        });
+      }
+    } else {
+      results.push({
+        name: `  CNAME (cert auth)`,
+        status: "warn",
+        message: "DNS authorization not found",
+        fix: `Run \`npx adapter-k8s init\` to create DNS authorizations`,
+      });
+    }
+
+    // Certificate status
+    if (certStatus) {
+      if (certStatus === "ACTIVE") {
+        results.push({ name: `  TLS certificate`, status: "pass", message: "Active" });
+      } else {
+        results.push({
+          name: `  TLS certificate`,
+          status: certStatus === "PROVISIONING" ? "warn" : "fail",
+          message: certStatus,
+          fix:
+            certStatus === "PROVISIONING"
+              ? "Requires CNAME + A records. Provisioning can take up to 60 min."
+              : `gcloud certificate-manager certificates describe ${releaseName}-cert --project ${projectId}`,
+        });
+      }
+    } else {
+      results.push({
+        name: `  TLS certificate`,
+        status: "warn",
+        message: "Not found",
+        fix: `Run \`npx adapter-k8s init\` to create certificates`,
+      });
+    }
+  }
+
+  return results;
+}
+
 export async function runDoctor(options: {
   projectDir: string;
   releaseName: string;
@@ -40,7 +188,7 @@ export async function runDoctor(options: {
   // Ensure kubectl is pointing at the right cluster
   const infraPathForCtx = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (existsSync(infraPathForCtx)) {
-    const infraCtx = JSON.parse(readFileSync(infraPathForCtx, "utf-8"));
+    const infraCtx = readJsonFile<{ projectId?: string; region?: string }>(infraPathForCtx);
     if (infraCtx.projectId && infraCtx.region) {
       const clusterName = `${releaseName}-cluster`;
       const credResult = await execCapture("gcloud", [
@@ -119,7 +267,12 @@ export async function runDoctor(options: {
   // --- GCP resources (only if infrastructure.json exists) ---
   let projectId = "";
   if (existsSync(infraPath)) {
-    const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+    const infra = readJsonFile<{
+      projectId?: string;
+      region?: string;
+      gcsBucket?: string;
+      containerRegistry?: string;
+    }>(infraPath);
     projectId = infra.projectId ?? "";
 
     // gcloud auth
@@ -194,7 +347,9 @@ export async function runDoctor(options: {
         "describe",
         repoName,
         "--location",
-        infra.region,
+        // init always writes region; ?? "" keeps a malformed file from putting
+        // `undefined` on gcloud's argv (spawn throws) — the describe just fails.
+        infra.region ?? "",
         "--project",
         projectId,
         "--format=value(name)",
@@ -222,6 +377,8 @@ export async function runDoctor(options: {
       "get",
       "gateway",
       `${releaseName}-gateway`,
+      "-n",
+      K8S_NAMESPACE,
       "-o",
       "jsonpath={.status.conditions[?(@.type=='Accepted')].status}",
     ]);
@@ -235,6 +392,8 @@ export async function runDoctor(options: {
           "get",
           "gateway",
           `${releaseName}-gateway`,
+          "-n",
+          K8S_NAMESPACE,
           "-o",
           "jsonpath={.status.conditions[?(@.type=='Accepted')].message}",
         ]);
@@ -261,6 +420,8 @@ export async function runDoctor(options: {
       "get",
       "gateway",
       `${releaseName}-gateway`,
+      "-n",
+      K8S_NAMESPACE,
       "-o",
       "jsonpath={.status.addresses[0].value}",
     ]);
@@ -298,6 +459,8 @@ export async function runDoctor(options: {
       "get",
       "httproute",
       `${releaseName}-routes`,
+      "-n",
+      K8S_NAMESPACE,
       "-o",
       "jsonpath={.status.parents[0].conditions[?(@.type=='Accepted')].status}",
     ]);
@@ -321,47 +484,49 @@ export async function runDoctor(options: {
     const deploysResult = await execCapture("kubectl", [
       "get",
       "deployments",
+      "-n",
+      K8S_NAMESPACE,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
-      'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}{"\\n"}{end}',
+      'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.metadata.labels.app\\.kubernetes\\.io/version}{"\\n"}{end}',
     ]);
-    const currentBuildLower = (state?.buildId ?? "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .slice(0, 12);
-    const previousBuildLower = (state?.previousBuildId ?? "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .slice(0, 12);
+    // Classify by the EXACT `app.kubernetes.io/version` label — the same
+    // sanitizeK8sName value the chart stamps and the cutover patches Services to. The
+    // old 12-char normalized-prefix substring match misclassified two builds sharing
+    // that prefix; deploy's comments record that technique draining a Service to zero
+    // endpoints and 503'ing production. Deployments with no version label can't be
+    // classified — say "unknown" rather than guessing.
+    const currentBuildLabel = state?.buildId ? sanitizeK8sName(state.buildId) : null;
+    const previousBuildLabel = state?.previousBuildId
+      ? sanitizeK8sName(state.previousBuildId)
+      : null;
 
     let foundCurrentPool = false;
 
     if (deploysResult.exitCode === 0 && deploysResult.stdout.trim()) {
       for (const line of deploysResult.stdout.trim().split("\n")) {
-        const [name, statusStr] = line.split("|");
+        const [name, statusStr, versionLabel] = line.split("|");
         if (!name) continue;
         const shortName = name.replace(`${releaseName}-`, "");
-        const nameLower = name.toLowerCase();
         const isRouting = shortName === "routing-service";
 
         // Determine role
-        let role = "old";
+        let role: "current" | "previous" | "old" | "unknown" = versionLabel ? "old" : "unknown";
         if (isRouting) role = "current";
-        else if (
-          currentBuildLower &&
-          nameLower.replace(/[^a-z0-9]/g, "").includes(currentBuildLower)
-        )
-          role = "current";
-        else if (
-          previousBuildLower &&
-          nameLower.replace(/[^a-z0-9]/g, "").includes(previousBuildLower)
-        )
-          role = "previous";
+        else if (currentBuildLabel && versionLabel === currentBuildLabel) role = "current";
+        else if (previousBuildLabel && versionLabel === previousBuildLabel) role = "previous";
 
         if (role === "current" && !isRouting) foundCurrentPool = true;
 
-        const roleTag = role === "current" ? "" : role === "previous" ? " [previous]" : " [old]";
+        const roleTag =
+          role === "current"
+            ? ""
+            : role === "previous"
+              ? " [previous]"
+              : role === "old"
+                ? " [old]"
+                : " [unknown]";
         const [readyStr, totalStr] = (statusStr ?? "0/0").split("/");
         const ready = parseInt(readyStr || "0", 10);
         const total = parseInt(totalStr || "0", 10);
@@ -429,22 +594,73 @@ export async function runDoctor(options: {
     // 503 `failed_to_connect_to_backend` for every origin request (only CDN cache hits
     // survive). Verify each active pool Service actually has ready endpoints so this
     // class of outage can never pass as "all green" again.
-    let poolNames: string[] = [];
-    const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
-    if (existsSync(metaPath)) {
-      try {
-        const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-        if (Array.isArray(meta.pools))
-          poolNames = meta.pools.filter((p: unknown) => typeof p === "string");
-      } catch {
-        // Malformed metadata — skip the endpoint check rather than crash.
+    //
+    // Discover the active Services from the CLUSTER — local build-metadata.json
+    // reflects the last LOCAL build, which may not be the deployed release at all.
+    // Discovery is by NAME, not by the `managed-by: adapter-k8s-active` label the
+    // template stamps: rollback.ts records (from live debugging) that Helm rewrites
+    // that label to `managed-by: Helm`, so a label selector matches nothing (which is
+    // why rollback patches Services by name). The active Service for a pool is the
+    // stable `sanitizeK8sName(<release>-<pool>)` — the exact name deploy/rollback
+    // patch — so reconstruct it from each Service's pool (`app.kubernetes.io/
+    // component`) label and keep only exact name matches; per-build Services
+    // (`<release>-<pool>-<build>`) and the routing tier drop out. Fall back to local
+    // metadata only when cluster discovery finds nothing, and say so in the output.
+    let svcNames: string[] = [];
+    let svcSource: "cluster" | "local" | null = null;
+    const svcResult = await execCapture("kubectl", [
+      "get",
+      "svc",
+      "-n",
+      K8S_NAMESPACE,
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}{"\\n"}{end}',
+    ]);
+    if (svcResult.exitCode === 0 && svcResult.stdout.trim()) {
+      svcNames = svcResult.stdout
+        .trim()
+        .split("\n")
+        .map((line) => {
+          const [name, component] = line.split("|");
+          if (!name || !component || component === "routing-service") return null;
+          return name === sanitizeK8sName(`${releaseName}-${component}`) ? name : null;
+        })
+        .filter((n): n is string => n !== null);
+      if (svcNames.length > 0) svcSource = "cluster";
+    }
+    if (svcSource !== "cluster") {
+      const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+      if (existsSync(metaPath)) {
+        try {
+          const meta = readJsonFile<{ pools?: unknown }>(metaPath);
+          if (Array.isArray(meta.pools)) {
+            svcNames = meta.pools
+              .filter((p): p is string => typeof p === "string")
+              .map((p) => `${releaseName}-${p}`);
+            svcSource = "local";
+          }
+        } catch {
+          // Malformed metadata — skip the endpoint check rather than crash.
+        }
       }
     }
-    for (const pool of poolNames) {
-      const svc = `${releaseName}-${pool}`;
+    if (svcSource === "local") {
+      results.push({
+        name: "Active Service endpoints",
+        status: "warn",
+        message:
+          "no active pool Services found in the cluster — pool list taken from " +
+          "LOCAL build-metadata.json, which may not match the deployed release",
+      });
+    }
+    for (const svc of svcNames) {
       const epResult = await execCapture("kubectl", [
         "get",
         "endpointslice",
+        "-n",
+        K8S_NAMESPACE,
         "-l",
         `kubernetes.io/service-name=${svc}`,
         "-o",
@@ -483,14 +699,12 @@ export async function runDoctor(options: {
           .trim()
           .split("\n")
           .some((line) => {
-            const [name] = line.split("|");
+            const [name, , versionLabel] = line.split("|");
             return (
               name &&
               !name.includes("routing-service") &&
-              name
-                .toLowerCase()
-                .replace(/[^a-z0-9]/g, "")
-                .includes(previousBuildLower)
+              previousBuildLabel !== null &&
+              versionLabel === previousBuildLabel
             );
           });
       if (foundPrevious) {
@@ -509,42 +723,62 @@ export async function runDoctor(options: {
       }
     }
 
-    // Pod errors — check recent logs for recurring errors
+    // Pod errors — check recent logs across ALL pods (bounded: checking only the first
+    // pod used to miss a crash-looping sibling entirely). Transient app-level "error"
+    // lines (a failed request, a retried fetch) are a WARNING — hard FAIL is reserved
+    // for fatal signatures that mean the workload can't serve at all.
     const podsResult = await execCapture("kubectl", [
       "get",
       "pods",
+      "-n",
+      K8S_NAMESPACE,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
       'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
     if (podsResult.exitCode === 0 && podsResult.stdout.trim()) {
-      const firstPod = podsResult.stdout.trim().split("\n")[0];
-      if (firstPod) {
-        const logsResult = await execCapture("kubectl", ["logs", firstPod, "--tail=50"]);
-        if (logsResult.exitCode === 0) {
-          const errorLines = logsResult.stdout
-            .split("\n")
-            .filter(
-              (l) =>
-                l.includes("Error") ||
-                l.includes("error") ||
-                l.includes("FATAL") ||
-                l.includes("Cannot find module"),
-            );
-          if (errorLines.length > 0) {
-            // L14: pod log lines are cluster-sourced — strip terminal control chars.
-            const firstError = sanitizeForTerminal(errorLines[0]!.trim()).slice(0, 120);
-            results.push({
-              name: "Pod logs",
-              status: "fail",
-              message: `Errors detected: ${firstError}`,
-              fix: `kubectl logs ${firstPod} --tail=50`,
-            });
-          } else {
-            results.push({ name: "Pod logs", status: "pass", message: "No errors in recent logs" });
-          }
-        }
+      const isFatal = (l: string) => l.includes("FATAL") || l.includes("Cannot find module");
+      const isError = (l: string) => l.includes("Error") || l.includes("error");
+      const podsToCheck = podsResult.stdout.trim().split("\n").filter(Boolean).slice(0, 5);
+      let fatalHit: { pod: string; line: string } | null = null;
+      const errorPods: string[] = [];
+      for (const pod of podsToCheck) {
+        const logsResult = await execCapture("kubectl", [
+          "logs",
+          pod,
+          "-n",
+          K8S_NAMESPACE,
+          "--tail=50",
+        ]);
+        if (logsResult.exitCode !== 0) continue;
+        const lines = logsResult.stdout.split("\n");
+        const fatalLine = lines.find(isFatal);
+        if (fatalLine && !fatalHit) fatalHit = { pod, line: fatalLine };
+        else if (!fatalLine && lines.some(isError)) errorPods.push(pod);
+      }
+      if (fatalHit) {
+        // L14: pod log lines are cluster-sourced — strip terminal control chars.
+        const firstFatal = sanitizeForTerminal(fatalHit.line.trim()).slice(0, 120);
+        results.push({
+          name: "Pod logs",
+          status: "fail",
+          message: `Fatal error in ${fatalHit.pod}: ${firstFatal}`,
+          fix: `kubectl logs ${fatalHit.pod} --tail=50`,
+        });
+      } else if (errorPods.length > 0) {
+        results.push({
+          name: "Pod logs",
+          status: "warn",
+          message: `error-level lines in ${errorPods.length}/${podsToCheck.length} pod(s) — likely transient app errors`,
+          fix: `kubectl logs ${errorPods[0]} --tail=50`,
+        });
+      } else if (podsToCheck.length > 0) {
+        results.push({
+          name: "Pod logs",
+          status: "pass",
+          message: `No errors in recent logs (${podsToCheck.length} pod(s) checked)`,
+        });
       }
     }
 
@@ -565,6 +799,13 @@ export async function runDoctor(options: {
       if (bsResult.exitCode === 0 && bsResult.stdout.trim()) {
         for (const bsName of bsResult.stdout.trim().split("\n")) {
           if (!bsName) continue;
+          // `name~${releaseName}` is a substring REGEX — a short release name also
+          // matches other releases' backends ("app" matches "myapp2"), and a
+          // neighbour's unhealthy backend then false-FAILs this check. Require the
+          // release name as a hyphen-bounded token (GKE-generated names embed the
+          // Service name as `-defau<lt>-<svc>-`; ours all start with `${releaseName}-`).
+          if (!bsName.startsWith(`${releaseName}-`) && !bsName.includes(`-${releaseName}-`))
+            continue;
           const healthResult = await execCapture("gcloud", [
             "compute",
             "backend-services",
@@ -589,19 +830,23 @@ export async function runDoctor(options: {
               const shortName = bsName
                 .replace(/^gkegw1-[a-z0-9]+-defau-/, "")
                 .replace(/^k8s1-[a-z0-9]+-defaul-/, "");
-              // Check if this backend is from the current build or a stale old one
-              const currentBuildId = state?.buildId?.toLowerCase() ?? "";
-              const isCurrentBuild =
-                !currentBuildId ||
-                bsName
-                  .toLowerCase()
-                  .replace(/[^a-z0-9]/g, "")
-                  .includes(
-                    currentBuildId
-                      .toLowerCase()
-                      .replace(/[^a-z0-9]/g, "")
-                      .slice(0, 12),
-                  );
+              // Attribute the backend to a build by EXACT hyphen-bounded token on the
+              // sanitized build id (a 12-char normalized-prefix substring previously
+              // misclassified builds sharing a prefix — the technique deploy's comments
+              // record causing a production 503). IMPORTANT caveat: Gateway-managed
+              // POOL backends are named after the stable active Service and NEVER
+              // embed a build id, so for them neither token can match. Fail closed:
+              // only a backend positively attributed to the PREVIOUS build gets the
+              // lenient "pending cleanup" treatment; everything else — including
+              // build-agnostic names — is treated as current, so an unhealthy backend
+              // is never waved through as an "old build" it may not be.
+              const embedsCurrent = currentBuildLabel
+                ? bsName.includes(`-${currentBuildLabel}-`)
+                : false;
+              const embedsPrevious = previousBuildLabel
+                ? bsName.includes(`-${previousBuildLabel}-`)
+                : false;
+              const isCurrentBuild = embedsCurrent || !embedsPrevious;
 
               if (total === 0) {
                 results.push({
@@ -609,7 +854,7 @@ export async function runDoctor(options: {
                   status: isCurrentBuild ? "warn" : "pass",
                   message: isCurrentBuild
                     ? "No backends registered yet"
-                    : "Old build (pending cleanup)",
+                    : "Previous build (pending cleanup)",
                 });
               } else if (healthy === total) {
                 results.push({
@@ -618,11 +863,11 @@ export async function runDoctor(options: {
                   message: `${healthy}/${total} healthy`,
                 });
               } else if (!isCurrentBuild) {
-                // Old build backends being unhealthy is expected — don't fail
+                // Previous-build backends being unhealthy is expected — don't fail
                 results.push({
                   name: `LB health: ${shortName}`,
                   status: "warn",
-                  message: `${healthy}/${total} healthy (old build, pending cleanup)`,
+                  message: `${healthy}/${total} healthy (previous build, pending cleanup)`,
                 });
               } else {
                 results.push({
@@ -639,30 +884,37 @@ export async function runDoctor(options: {
         }
       }
 
-      // Also check NEG status from K8s side
+      // Also check NEG status from K8s side. Find the condition BY TYPE ("Initialized"
+      // is what the GKE NEG controller reports) — conditions[0] is whichever condition
+      // happens to sort first, so the old positional read could report a healthy NEG
+      // as not-ready (or vice versa).
       const negResult = await execCapture("kubectl", [
         "get",
         "svcneg",
+        "-n",
+        K8S_NAMESPACE,
         "-o",
-        'jsonpath={range .items[*]}{.metadata.name}: {.status.conditions[0].type}={.status.conditions[0].status}{"\\n"}{end}',
+        "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=='Initialized')].status}{\"\\n\"}{end}",
       ]);
       if (negResult.exitCode === 0 && negResult.stdout.trim()) {
         for (const line of negResult.stdout.trim().split("\n")) {
-          if (!line.includes(releaseName)) continue;
-          const healthy = line.includes("=True");
-          // L14: NEG condition lines are cluster-sourced — strip terminal control chars.
-          const cleanLine = sanitizeForTerminal(line);
+          const [negName, negStatus] = line.split("|");
+          // svcneg is named after its Service; ours start with `${releaseName}-`
+          // (substring matching would pull in other releases' NEGs).
+          if (!negName || !negName.startsWith(`${releaseName}-`)) continue;
+          // L14: NEG names are cluster-sourced — strip terminal control chars.
+          const cleanName = sanitizeForTerminal(negName);
           results.push(
-            healthy
+            negStatus === "True"
               ? {
                   name: "Backend NEG",
                   status: "pass",
-                  message: cleanLine.split(":")[0]?.trim() ?? "Ready",
+                  message: cleanName,
                 }
               : {
                   name: "Backend NEG",
                   status: "warn",
-                  message: cleanLine.trim(),
+                  message: `${cleanName} (Initialized=${negStatus || "not reported"})`,
                   fix: "NEG not yet ready — backend health check may be pending",
                 },
           );
@@ -694,35 +946,73 @@ export async function runDoctor(options: {
         });
       } else {
         const covered = teFrs.stdout.trim().split(";").filter(Boolean).length;
-        const allFrs = (
+        // Enumerate THIS release's forwarding rules via its reserved static IP (exact
+        // IPAddress match, the same chain cdn-invalidate uses) — `name~${releaseName}`
+        // is a substring regex that also matches OTHER releases' rules ("app" vs
+        // "myapp2"), producing false coverage failures.
+        let frCount: number | null = null;
+        const ipAddr = (
           await execCapture("gcloud", [
+            "compute",
+            "addresses",
+            "describe",
+            `${releaseName}-ip`,
+            "--global",
+            "--project",
+            projectId,
+            "--format=value(address)",
+          ])
+        ).stdout.trim();
+        if (ipAddr) {
+          const frList = await execCapture("gcloud", [
             "compute",
             "forwarding-rules",
             "list",
             "--project",
             projectId,
             "--filter",
-            `name~${releaseName}`,
+            `IPAddress=${ipAddr}`,
             "--format=value(name)",
-          ])
-        ).stdout
-          .trim()
-          .split("\n")
-          .filter(Boolean).length;
-        results.push(
-          allFrs > 0 && covered < allFrs
-            ? {
-                name: "ext_proc traffic extension",
-                status: "fail",
-                message: `covers ${covered}/${allFrs} forwarding rules — http:// can bypass middleware`,
-                fix: `npx adapter-k8s deploy   # re-runs the Job to attach every forwarding rule`,
-              }
-            : {
-                name: "ext_proc traffic extension",
-                status: "pass",
-                message: `registered, covers ${covered}/${allFrs} forwarding rules`,
-              },
-        );
+          ]);
+          if (frList.exitCode === 0) {
+            frCount = frList.stdout.trim().split("\n").filter(Boolean).length;
+          }
+        }
+        if (frCount === null) {
+          // The old code read .stdout unconditionally — a failed list call meant
+          // "covers N/0", a vacuous PASS. Say we can't verify instead.
+          results.push({
+            name: "ext_proc traffic extension",
+            status: "warn",
+            message:
+              `registered, but forwarding-rule coverage could not be enumerated ` +
+              `(static IP / forwarding-rule lookup failed) — cannot verify http:// coverage`,
+            fix: `gcloud compute forwarding-rules list --project ${projectId}`,
+          });
+        } else if (frCount === 0) {
+          results.push({
+            name: "ext_proc traffic extension",
+            status: "warn",
+            message:
+              `registered, but no forwarding rules found for the release's static ` +
+              `IP — the load balancer may not be provisioned yet`,
+          });
+        } else {
+          results.push(
+            covered < frCount
+              ? {
+                  name: "ext_proc traffic extension",
+                  status: "fail",
+                  message: `covers ${covered}/${frCount} forwarding rules — http:// can bypass middleware`,
+                  fix: `npx adapter-k8s deploy   # re-runs the Job to attach every forwarding rule`,
+                }
+              : {
+                  name: "ext_proc traffic extension",
+                  status: "pass",
+                  message: `registered, covers ${covered}/${frCount} forwarding rules`,
+                },
+          );
+        }
       }
 
       // Routing backend service must be EXTERNAL_MANAGED with a NEG attached.
@@ -807,13 +1097,12 @@ export async function runDoctor(options: {
 
     // --- Per-host checks: A record, CNAME (DNS auth), Certificate ---
     if (existsSync(infraPath)) {
-      const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+      const infra = readJsonFile<{ hosts?: string[]; host?: string }>(infraPath);
       const hosts: string[] = Array.isArray(infra.hosts)
         ? infra.hosts
         : infra.host
           ? [infra.host]
           : [];
-      const gwIp = gatewayIp;
 
       // Get certificate status from Certificate Manager
       let certStatus: string | null = null;
@@ -831,122 +1120,9 @@ export async function runDoctor(options: {
       }
 
       for (const host of hosts) {
-        // Wildcard domains: skip DNS A record check (can't resolve *.example.com)
-        // but still check CNAME auth and cert status
-        const isWildcard = host.includes("*");
-        const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
-
-        results.push({ name: `--- ${host}`, status: "pass", message: "---" });
-
-        // A record (skip for wildcards — can't resolve *.example.com directly)
-        if (!isWildcard) {
-          const resolvedIp = await resolve4(host)
-            .then((ips) => ips[0] ?? null)
-            .catch(() => null);
-          if (!resolvedIp) {
-            results.push({
-              name: `  A record`,
-              status: "fail",
-              message: "Does not resolve",
-              fix: gwIp
-                ? `Add DNS: ${host} A ${gwIp}`
-                : "Add A record after Gateway IP is assigned",
-            });
-          } else if (gwIp && resolvedIp !== gwIp) {
-            results.push({
-              name: `  A record`,
-              status: "warn",
-              message: `${resolvedIp} (expected ${gwIp})`,
-              fix: `Update DNS: ${host} A ${gwIp}`,
-            });
-          } else {
-            results.push({
-              name: `  A record`,
-              status: "pass",
-              message: `${host} -> ${resolvedIp}`,
-            });
-          }
-        } else {
-          results.push({
-            name: `  A record`,
-            status: "warn",
-            message: "Wildcard — configure A record for base domain or subdomains individually",
-            ...(gwIp
-              ? { fix: `Add DNS: ${host} A ${gwIp} (or use individual subdomain A records)` }
-              : {}),
-          });
-        }
-
-        // CNAME for DNS authorization (Certificate Manager)
-        if (projectId) {
-          const authName = `${releaseName}-dns-auth-${safeName}`;
-          const authResult = await execCapture("gcloud", [
-            "certificate-manager",
-            "dns-authorizations",
-            "describe",
-            authName,
-            "--project",
-            projectId,
-            "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
-          ]);
-          if (authResult.exitCode === 0 && authResult.stdout.trim()) {
-            const parts = authResult.stdout.trim().split(/\s+/);
-            const cnameHost = parts[0] ?? "";
-            const cnameTarget = parts[2] ?? parts[1] ?? "";
-
-            // Check if the CNAME actually resolves
-            const { resolveCname } = await import("node:dns/promises");
-            const cnameResolved = await resolveCname(cnameHost)
-              .then((r) => r[0] ?? null)
-              .catch(() => null);
-
-            if (cnameResolved) {
-              results.push({
-                name: `  CNAME (cert auth)`,
-                status: "pass",
-                message: `${cnameHost} -> ${cnameResolved}`,
-              });
-            } else {
-              results.push({
-                name: `  CNAME (cert auth)`,
-                status: "fail",
-                message: "Not configured",
-                fix: `Add DNS: ${cnameHost} CNAME ${cnameTarget}`,
-              });
-            }
-          } else {
-            results.push({
-              name: `  CNAME (cert auth)`,
-              status: "warn",
-              message: "DNS authorization not found",
-              fix: `Run \`npx adapter-k8s init\` to create DNS authorizations`,
-            });
-          }
-        }
-
-        // Certificate status
-        if (certStatus) {
-          if (certStatus === "ACTIVE") {
-            results.push({ name: `  TLS certificate`, status: "pass", message: "Active" });
-          } else {
-            results.push({
-              name: `  TLS certificate`,
-              status: certStatus === "PROVISIONING" ? "warn" : "fail",
-              message: certStatus,
-              fix:
-                certStatus === "PROVISIONING"
-                  ? "Requires CNAME + A records. Provisioning can take up to 60 min."
-                  : `gcloud certificate-manager certificates describe ${releaseName}-cert --project ${projectId}`,
-            });
-          }
-        } else if (projectId) {
-          results.push({
-            name: `  TLS certificate`,
-            status: "warn",
-            message: "Not found",
-            fix: `Run \`npx adapter-k8s init\` to create certificates`,
-          });
-        }
+        results.push(
+          ...(await checkDomainForHost({ host, releaseName, projectId, gatewayIp, certStatus })),
+        );
       }
     }
   } else {
@@ -1000,7 +1176,7 @@ export async function runDomainChecks(options: {
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (!existsSync(infraPath)) return;
 
-  const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+  const infra = readJsonFile<{ projectId?: string; hosts?: string[]; host?: string }>(infraPath);
   const projectId: string = infra.projectId ?? "";
   const hosts: string[] = Array.isArray(infra.hosts) ? infra.hosts : infra.host ? [infra.host] : [];
   if (hosts.length === 0) return;
@@ -1039,106 +1215,9 @@ export async function runDomainChecks(options: {
   const results: CheckResult[] = [];
 
   for (const host of hosts) {
-    const isWildcard = host.includes("*");
-    const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
-
-    results.push({ name: `--- ${host}`, status: "pass", message: "---" });
-
-    // A record (skip resolve for wildcards)
-    if (!isWildcard) {
-      const resolvedIp = await resolve4(host)
-        .then((ips) => ips[0] ?? null)
-        .catch(() => null);
-      if (!resolvedIp) {
-        results.push({
-          name: `  A record`,
-          status: "fail",
-          message: "Does not resolve",
-          fix: gatewayIp
-            ? `Add DNS: ${host} A ${gatewayIp}`
-            : "Add A record after Gateway IP is assigned",
-        });
-      } else if (gatewayIp && resolvedIp !== gatewayIp) {
-        results.push({
-          name: `  A record`,
-          status: "warn",
-          message: `${resolvedIp} (expected ${gatewayIp})`,
-          fix: `Update DNS: ${host} A ${gatewayIp}`,
-        });
-      } else {
-        results.push({ name: `  A record`, status: "pass", message: `${host} -> ${resolvedIp}` });
-      }
-    } else {
-      results.push({
-        name: `  A record`,
-        status: "warn",
-        message: "Wildcard — configure A record for base domain or subdomains",
-        ...(gatewayIp ? { fix: `Add DNS: ${host} A ${gatewayIp}` } : {}),
-      });
-    }
-
-    // CNAME for DNS authorization
-    if (projectId) {
-      const authName = `${releaseName}-dns-auth-${safeName}`;
-      const authResult = await execCapture("gcloud", [
-        "certificate-manager",
-        "dns-authorizations",
-        "describe",
-        authName,
-        "--project",
-        projectId,
-        "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
-      ]);
-      if (authResult.exitCode === 0 && authResult.stdout.trim()) {
-        const parts = authResult.stdout.trim().split(/\s+/);
-        const cnameHost = parts[0] ?? "";
-        const cnameTarget = parts[2] ?? parts[1] ?? "";
-
-        const { resolveCname } = await import("node:dns/promises");
-        const cnameResolved = await resolveCname(cnameHost)
-          .then((r) => r[0] ?? null)
-          .catch(() => null);
-
-        if (cnameResolved) {
-          results.push({
-            name: `  CNAME (cert auth)`,
-            status: "pass",
-            message: `${cnameHost} -> ${cnameResolved}`,
-          });
-        } else {
-          results.push({
-            name: `  CNAME (cert auth)`,
-            status: "fail",
-            message: "Not configured",
-            fix: `Add DNS: ${cnameHost} CNAME ${cnameTarget}`,
-          });
-        }
-      } else {
-        results.push({
-          name: `  CNAME (cert auth)`,
-          status: "warn",
-          message: "DNS authorization not found",
-          fix: `Run \`npx adapter-k8s init\` to create DNS authorizations`,
-        });
-      }
-    }
-
-    // Certificate status
-    if (certStatus) {
-      if (certStatus === "ACTIVE") {
-        results.push({ name: `  TLS certificate`, status: "pass", message: "Active" });
-      } else {
-        results.push({
-          name: `  TLS certificate`,
-          status: certStatus === "PROVISIONING" ? "warn" : "fail",
-          message: certStatus,
-          fix:
-            certStatus === "PROVISIONING"
-              ? "Requires CNAME + A records. Provisioning can take up to 60 min."
-              : `gcloud certificate-manager certificates describe ${releaseName}-cert --project ${projectId}`,
-        });
-      }
-    }
+    results.push(
+      ...(await checkDomainForHost({ host, releaseName, projectId, gatewayIp, certStatus })),
+    );
   }
 
   // Print

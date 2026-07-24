@@ -1,5 +1,8 @@
 // tests/manifest.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { buildRoutingManifest, collectOutputPathnames } from "../src/manifest.js";
 import {
   mockAppPage,
@@ -149,6 +152,168 @@ describe("buildRoutingManifest", () => {
     expect(new RegExp(rg.afterFiles[0]!.sourceRegex).test("/Rewrite-1")).toBe(true);
     // named groups + non-source rules are untouched (idempotent, no double-wrap)
     expect(rg.afterFiles[0]!.sourceRegex.startsWith("(?i:(?i:")).toBe(false);
+  });
+
+  it("wraps ALL custom-route buckets case-insensitively, but NOT dynamicRoutes", () => {
+    // Verified against upstream (see comment in manifest.ts): next start matches
+    // custom routes with path-to-regexp sensitive:false but dynamic page routes
+    // with a flagless RegExp (case-sensitive). @next/routing compiles everything
+    // flagless — so only the custom-route buckets get the (?i:…) wrap.
+    const routing = mockRouting({
+      beforeMiddleware: [{ source: "/bm", sourceRegex: "^\\/bm(?:\\/)?$", destination: "/dest" }],
+      beforeFiles: [{ source: "/bf", sourceRegex: "^\\/bf(?:\\/)?$", destination: "/dest" }],
+      afterFiles: [{ source: "/af", sourceRegex: "^\\/af(?:\\/)?$", destination: "/dest" }],
+      fallback: [{ source: "/fb", sourceRegex: "^\\/fb(?:\\/)?$", destination: "/dest" }],
+      onMatch: [{ source: "/om", sourceRegex: "^\\/om(?:\\/)?$", headers: { "x-h": "1" } }],
+      dynamicRoutes: [{ source: "/blog/[slug]", sourceRegex: "^\\/blog\\/([^/]+?)(?:\\/)?$" }],
+    } as any);
+    const manifest = buildRoutingManifest({
+      routing,
+      outputs: mockOutputs({}),
+      pools: new Map<string, PoolDefinition>(),
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+
+    const rg = manifest.routeGraph as Record<
+      "beforeMiddleware" | "beforeFiles" | "afterFiles" | "fallback" | "onMatch" | "dynamicRoutes",
+      Array<{ sourceRegex: string }>
+    >;
+    for (const bucket of [
+      "beforeMiddleware",
+      "beforeFiles",
+      "afterFiles",
+      "fallback",
+      "onMatch",
+    ] as const) {
+      expect(rg[bucket][0]!.sourceRegex.startsWith("(?i:"), bucket).toBe(true);
+    }
+    expect(new RegExp(rg.beforeMiddleware[0]!.sourceRegex).test("/BM")).toBe(true);
+    expect(new RegExp(rg.fallback[0]!.sourceRegex).test("/Fb")).toBe(true);
+    expect(new RegExp(rg.onMatch[0]!.sourceRegex).test("/OM")).toBe(true);
+    // dynamicRoutes: untouched, matching upstream case-sensitive page matching
+    expect(rg.dynamicRoutes[0]!.sourceRegex).toBe("^\\/blog\\/([^/]+?)(?:\\/)?$");
+    expect(new RegExp(rg.dynamicRoutes[0]!.sourceRegex).test("/BLOG/x")).toBe(false);
+  });
+
+  it("emits sourceRegexes that compile with new RegExp on the deploy runtime", () => {
+    // N24 REGRESSION PIN: the (?i:…) wraps are inline regexp modifiers, which V8 only
+    // accepts from Node 24 (the emitted containers' base image — dockerfiles.ts). Every
+    // regex the manifest ships must be constructible on the runtime this suite runs on
+    // (mise.toml pins Node 24); on Node 22 `new RegExp("(?i:/x)")` throws and the
+    // deployed pool/routing containers would 500 every request.
+    const routing = mockRouting({
+      beforeMiddleware: [{ source: "/bm", sourceRegex: "^\\/bm(?:\\/)?$", destination: "/d" }],
+      beforeFiles: [{ source: "/bf", sourceRegex: "^\\/bf(?:\\/)?$", destination: "/d" }],
+      afterFiles: [{ source: "/af", sourceRegex: "^\\/af(?:\\/)?$", destination: "/d" }],
+      fallback: [{ source: "/fb", sourceRegex: "^\\/fb(?:\\/)?$", destination: "/d" }],
+      onMatch: [{ source: "/om", sourceRegex: "^\\/om(?:\\/)?$", headers: { "x-h": "1" } }],
+      dynamicRoutes: [{ source: "/blog/[slug]", sourceRegex: "^\\/blog\\/([^/]+?)(?:\\/)?$" }],
+    } as any);
+    const manifest = buildRoutingManifest({
+      routing,
+      outputs: mockOutputs({
+        middleware: {
+          pathname: "/_middleware",
+          filePath: "/app/.next/server/middleware.js",
+          config: { matchers: [{ source: "/m", sourceRegex: "^\\/m$" }] },
+        } as any,
+      }),
+      pools: new Map<string, PoolDefinition>(),
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+    const rg = manifest.routeGraph as Record<string, Array<{ sourceRegex?: string }>>;
+    const allRegexes = [
+      ...["beforeMiddleware", "beforeFiles", "afterFiles", "fallback", "onMatch", "dynamicRoutes"]
+        .flatMap((bucket) => rg[bucket] ?? [])
+        .map((r) => r.sourceRegex),
+      ...(manifest.middleware?.matchers ?? []).map((m) => m.regexp),
+    ].filter((r): r is string => typeof r === "string" && r.length > 0);
+    expect(allRegexes.length).toBeGreaterThanOrEqual(7);
+    for (const regex of allRegexes) {
+      expect(() => new RegExp(regex), regex).not.toThrow();
+    }
+  });
+
+  describe("builtAt determinism (chart-regeneration invariant)", () => {
+    // builtAt lands in the chart ConfigMap and every Docker context — a wall-clock
+    // stamp makes byte-different charts per regeneration and busts Docker caches.
+    const build = (projectDir: string) =>
+      buildRoutingManifest({
+        routing: mockRouting(),
+        outputs: mockOutputs({}),
+        pools: new Map<string, PoolDefinition>(),
+        buildId: "test123",
+        basePath: "",
+        i18n: null,
+        nextVersion: "16.2.0",
+        projectDir,
+      });
+
+    let savedEpoch: string | undefined;
+    beforeEach(() => {
+      savedEpoch = process.env.SOURCE_DATE_EPOCH;
+    });
+    afterEach(() => {
+      if (savedEpoch === undefined) delete process.env.SOURCE_DATE_EPOCH;
+      else process.env.SOURCE_DATE_EPOCH = savedEpoch;
+    });
+
+    it("stamps builtAt as an ISO timestamp", () => {
+      delete process.env.SOURCE_DATE_EPOCH;
+      const manifest = build("/app");
+      expect(typeof manifest.builtAt).toBe("string");
+      expect(Number.isNaN(Date.parse(manifest.builtAt))).toBe(false);
+    });
+
+    it("honors SOURCE_DATE_EPOCH (reproducible-builds standard)", () => {
+      process.env.SOURCE_DATE_EPOCH = "1750000000";
+      const manifest = build("/app");
+      expect(manifest.builtAt).toBe(new Date(1750000000 * 1000).toISOString());
+    });
+
+    it("anchors builtAt to the .next/BUILD_ID mtime so regeneration is byte-stable", () => {
+      delete process.env.SOURCE_DATE_EPOCH;
+      const projectDir = mkdtempSync(path.join(os.tmpdir(), "manifest-builtat-"));
+      try {
+        mkdirSync(path.join(projectDir, ".next"), { recursive: true });
+        writeFileSync(path.join(projectDir, ".next", "BUILD_ID"), "test123");
+        const past = new Date("2026-01-02T03:04:05Z");
+        utimesSync(path.join(projectDir, ".next", "BUILD_ID"), past, past);
+        const first = build(projectDir).builtAt;
+        const second = build(projectDir).builtAt;
+        expect(first).toBe(past.toISOString());
+        expect(second).toBe(first);
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("rejects pathnames that would break out of the HTTPRoute quoted YAML scalar", () => {
+    // poolAssignments keys land in gateway.ts as `path: { value: "<prefix>" }` —
+    // a quote/backslash/control char in a page pathname is a chart-YAML injection.
+    for (const bad of ['/evil"page', "/evil\\page", "/evil\npage"]) {
+      expect(() =>
+        buildRoutingManifest({
+          routing: mockRouting(),
+          outputs: mockOutputs({ appPages: [mockAppPage({ pathname: bad })] }),
+          pools: new Map<string, PoolDefinition>(),
+          buildId: "test123",
+          basePath: "",
+          i18n: null,
+          nextVersion: "16.2.0",
+          projectDir: "/app",
+        }),
+      ).toThrow(/Unsafe pathname/);
+    }
   });
 
   it("assigns a prerender to its parent route's pool, not the first pool", () => {

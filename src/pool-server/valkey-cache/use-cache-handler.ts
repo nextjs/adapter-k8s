@@ -1,5 +1,5 @@
 import type { ValkeyClient } from "./client.js";
-import { DURABLE_TTL_SECONDS } from "./incremental-cache-handler.js";
+import { capTags, DURABLE_TTL_SECONDS } from "./incremental-cache-handler.js";
 import { RespError } from "./resp-client.js";
 import {
   bufferToStream,
@@ -13,7 +13,9 @@ import {
   evaluateEntry,
   maxExpiration,
   parseTagState,
+  TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
+  warnOnClockSkewClamp,
   type TagManifest,
   type TagState,
 } from "./tag-manifest.js";
@@ -30,6 +32,14 @@ interface StoredMeta {
 
 /** Extra seconds of Valkey key retention beyond the entry's own `expire` window. */
 const RETENTION_MARGIN_SECONDS = 60;
+
+/**
+ * Bound on how long `get` waits for an in-flight same-key `set` before proceeding as a miss
+ * (L10). The interface contract wants `get` to wait for an in-flight `set`, but the gate only
+ * releases when `set`'s `finally` runs — which awaits an unbounded entry-promise/stream drain.
+ * A hung `set` would otherwise block every concurrent same-key `get` (and its render) forever.
+ */
+const PENDING_SET_WAIT_MS = 5_000;
 
 const EMPTY_MANIFEST: TagManifest = new Map();
 
@@ -64,6 +74,9 @@ export interface ValkeyCacheHandlerOptions {
   buildId: string;
   /** Injectable clock (tests). Defaults to `Date.now`. */
   now?: () => number;
+  /** How long `get` waits for an in-flight same-key `set` before proceeding as a miss (L10).
+   * Defaults to PENDING_SET_WAIT_MS; injectable for tests. */
+  pendingSetWaitMs?: number;
 }
 
 /**
@@ -83,6 +96,7 @@ export class ValkeyCacheHandler implements CacheHandler {
   private readonly now: () => number;
   private readonly prefix: string;
   private readonly tagsKey: string;
+  private readonly pendingSetWaitMs: number;
   /** In-process gate so a concurrent `get` waits for an in-flight `set` (interface contract). */
   private readonly pendingSets = new Map<string, Promise<void>>();
 
@@ -91,6 +105,7 @@ export class ValkeyCacheHandler implements CacheHandler {
     this.now = options.now ?? Date.now;
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;
+    this.pendingSetWaitMs = options.pendingSetWaitMs ?? PENDING_SET_WAIT_MS;
   }
 
   private entryKey(cacheKey: string): string {
@@ -98,9 +113,21 @@ export class ValkeyCacheHandler implements CacheHandler {
   }
 
   async get(cacheKey: string, _softTags: string[]): Promise<CacheEntry | undefined> {
-    // Contract: if a `set` for this key is in flight on this replica, wait for it.
+    // Contract: if a `set` for this key is in flight on this replica, wait for it — but only
+    // up to a bound (L10): a hung `set` must not block this render forever; the read simply
+    // proceeds and misses, and Next regenerates.
     const pending = this.pendingSets.get(cacheKey);
-    if (pending) await pending;
+    if (pending) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        pending,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, this.pendingSetWaitMs);
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(timer);
+    }
 
     try {
       const key = this.entryKey(cacheKey);
@@ -166,7 +193,9 @@ export class ValkeyCacheHandler implements CacheHandler {
       const buf = await drainEntryValue(entry, maxCacheEntryBytes());
       if (buf === null) return; // partial/errored/over-cap stream → miss, don't cache
       const meta: StoredMeta = {
-        tags: entry.tags,
+        // N5: cap the stored tag list like the incremental handler does — `entry.tags` was
+        // stored verbatim, so an over-limit list bloated every entry meta and freshness HMGET.
+        tags: capTags(entry.tags),
         stale: entry.stale,
         timestamp: entry.timestamp,
         expire: entry.expire,
@@ -238,16 +267,27 @@ export class ValkeyCacheHandler implements CacheHandler {
     try {
       const now = this.now();
       // Apply each tag's new state atomically with LAST-EVENT-WINS semantics: the server-side
-      // script only overwrites a field when the incoming event (stamped with the server's clock)
-      // is >= the stored one. This eliminates the read-modify-write race where two replicas
-      // revalidating the same tag interleave and an older/profiled update clobbers a newer
-      // hard-expire (Redis runs the whole script atomically). Passing `undefined` as the base
-      // keeps each event's state self-contained.
+      // script only applies a field when the incoming event (stamped with the server's clock)
+      // is >= the stored one, and merges it PER DIMENSION into the stored state (M12). This
+      // eliminates the read-modify-write race where two replicas revalidating the same tag
+      // interleave (Redis runs the whole script atomically), and keeps a profiled update from
+      // erasing a stored hard-expire watermark — the merge Next's in-memory handler gets for
+      // free from being single-process. Passing `undefined` as the base lets the script own
+      // the merge; the event carries only the watermarks this call SETS.
       const args: string[] = [];
       for (const tag of tags) {
         args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
       }
-      await this.client.eval(UPDATE_TAGS_SCRIPT, 1, this.tagsKey, ...args);
+      // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
+      // the per-build manifest's lifetime the same way entry keys are bounded.
+      const clamped = await this.client.eval(
+        UPDATE_TAGS_SCRIPT,
+        1,
+        this.tagsKey,
+        ...args,
+        String(TAG_MANIFEST_TTL_SECONDS),
+      );
+      warnOnClockSkewClamp(clamped);
     } catch (error) {
       // Best-effort: a failed manifest write means a revalidation is missed, not a crash — but
       // it must be OBSERVABLE (M1): a Valkey outage here otherwise silently serves stale entries

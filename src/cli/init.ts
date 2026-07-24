@@ -609,16 +609,46 @@ export async function runInit(options: InitOptions): Promise<void> {
     let result = await execCapture(cmd.command, cmd.args);
 
     if (result.exitCode !== 0) {
+      // Broad substrings ("Conflict", bare "409") are NOT already-exists signals: the
+      // GCS bucket namespace is global, so a name collision is HTTP 409 whether WE own
+      // the bucket or a stranger does — and the old matcher printed
+      // "(already exists — skipping)" for both, letting init declare success while every
+      // later static-asset upload failed against someone else's bucket.
       const isAlreadyExists =
         result.stderr.includes("already exists") ||
         result.stderr.includes("ALREADY_EXISTS") ||
-        result.stderr.includes("already own it") ||
-        result.stderr.includes("Conflict") ||
-        result.stderr.includes("409");
+        result.stderr.includes("already own it");
 
+      const isBucketCreate =
+        cmd.command === "gcloud" &&
+        cmd.args.includes("buckets") &&
+        cmd.args.includes("create") &&
+        cmd.args.includes(`gs://${bucket}`);
       const isIamBinding = cmd.command === "gcloud" && cmd.args.includes("add-iam-policy-binding");
 
-      if (isAlreadyExists) {
+      if (isBucketCreate) {
+        // Verify the existing bucket is visible to THIS project before skipping; a
+        // foreign-owned name must fail loudly so the operator picks another one.
+        const check = await execCapture("gcloud", [
+          "storage",
+          "buckets",
+          "describe",
+          `gs://${bucket}`,
+          "--project",
+          projectId,
+          "--format=value(name)",
+        ]);
+        if (check.exitCode === 0) {
+          console.log(`    (already exists — verified accessible — skipping)`);
+        } else {
+          throw new Error(
+            `${cmd.description} failed, and gs://${bucket} is not visible from project ` +
+              `${projectId}. The GCS bucket namespace is shared by all GCP users — the name ` +
+              `is likely owned by someone else. Re-run with a different --bucket name.\n` +
+              `Original error:\n${result.stderr}`,
+          );
+        }
+      } else if (isAlreadyExists) {
         console.log(`    (already exists — skipping)`);
       } else if (isIamBinding) {
         // IAM bindings routinely fail transiently right after their target is created — a
@@ -696,7 +726,7 @@ export async function runInit(options: InitOptions): Promise<void> {
         `${projectNumber}-compute@developer.gserviceaccount.com`,
       ];
       for (const sa of serviceAgents) {
-        await execCapture("gcloud", [
+        const grant = await execCapture("gcloud", [
           "artifacts",
           "repositories",
           "add-iam-policy-binding",
@@ -712,7 +742,25 @@ export async function runInit(options: InitOptions): Promise<void> {
           "--condition=None",
           "--quiet",
         ]);
+        // A failed grant used to be swallowed — the first symptom was ImagePullBackOff
+        // at deploy time, far from the cause. Warn loudly (non-fatal: the operator may
+        // manage these grants centrally).
+        if (grant.exitCode !== 0) {
+          console.warn(
+            `  ! Granting roles/artifactregistry.reader to ${sa} FAILED — GKE nodes may ` +
+              `be unable to pull images (first symptom: ImagePullBackOff at deploy).\n` +
+              `    ${grant.stderr.trim().split("\n")[0] ?? ""}`,
+          );
+        }
       }
+    } else {
+      console.warn(
+        `  ! Could not look up the project number for ${projectId} — SKIPPED the Artifact ` +
+          `Registry reader grants for GKE image pulls. Pods may fail with ImagePullBackOff ` +
+          `at deploy; grant roles/artifactregistry.reader on the 'nextjs' repository to the ` +
+          `container-engine-robot and compute service agents manually.\n` +
+          `    ${projNumResult.stderr.trim().split("\n")[0] ?? ""}`,
+      );
     }
   } else {
     console.log("  → [dry-run] Grant Artifact Registry reader for GKE image pulls");

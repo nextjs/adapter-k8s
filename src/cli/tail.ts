@@ -27,7 +27,13 @@ export async function runTail(options: { projectDir: string; releaseName: string
   // Connect to the right cluster
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (existsSync(infraPath)) {
-    const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+    let infra: { projectId?: string; region?: string };
+    try {
+      infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+    } catch (err) {
+      // Name the file — a bare SyntaxError gives no clue WHICH file is corrupt.
+      throw new Error(`Failed to parse ${infraPath}: ${(err as Error).message}`);
+    }
     if (infra.projectId && infra.region) {
       const credResult = await execCapture("gcloud", [
         "container",
