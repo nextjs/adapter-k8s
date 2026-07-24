@@ -62,6 +62,20 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
 // attacker-chosen origin into the relative-vs-absolute Location comparison below.
 const FORWARDED_HOST_RE = /^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/;
 
+// Effective public scheme of a request that reached this pool. TLS terminates at the load
+// balancer (GXLB) which stamps x-forwarded-proto, so the pool's own socket is always plain
+// http — the forwarded value is the only witness of the client's real scheme. Only the two
+// real schemes are honored — a spoofed value (e.g. `javascript:`) becomes http.
+function requestProtocol(req: IncomingMessage): "http" | "https" {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
+    ?.split(",")[0]
+    ?.trim();
+  return forwardedProtoValue === "https" || forwardedProtoValue === "http"
+    ? forwardedProtoValue
+    : "http";
+}
+
 function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
   const forwardedHost = req.headers["x-forwarded-host"];
   const forwardedHostValue = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost;
@@ -71,15 +85,7 @@ function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
       : undefined) ??
     req.headers.host ??
     "localhost";
-  const forwardedProto = req.headers["x-forwarded-proto"];
-  const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
-    ?.split(",")[0]
-    ?.trim();
-  // Only the two real schemes are honored — a spoofed value (e.g. `javascript:`) becomes http.
-  const protocol =
-    forwardedProtoValue === "https" || forwardedProtoValue === "http"
-      ? forwardedProtoValue
-      : "http";
+  const protocol = requestProtocol(req);
   try {
     const requestOrigin = new URL(`${protocol}://${host}`).origin;
     return target.origin === requestOrigin
@@ -453,6 +459,25 @@ async function writeInnerResponse(
     );
   const effectivePrefix = handlerRenderedDocument ? undefined : prefix;
   const headers = mergeResponseHeaders(effectivePrefix?.headers, innerRes.headers);
+  // The same HTTP field must not be forwarded twice. On a shared-cache MISS, Next's generated
+  // app-page template appends the freshly captured cache-entry headers onto a response whose
+  // streaming render already set them (React's onHeaders `link` preload budget being the
+  // observable victim: the loopback response carries two identical `link` fields, which Node
+  // folds into one comma-joined value of double the length — blowing the app's configured
+  // reactMaxHeadersLength budget at the client). Collapse EXACT-duplicate repeats using the
+  // raw (unfolded) header list; distinct values and set-cookie are never touched.
+  const rawHeaders = innerRes.rawHeaders ?? [];
+  const seenRawValues = new Map<string, string[]>();
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const name = rawHeaders[i]!.toLowerCase();
+    const values = seenRawValues.get(name) ?? [];
+    values.push(rawHeaders[i + 1]!);
+    seenRawValues.set(name, values);
+  }
+  for (const [name, values] of seenRawValues) {
+    if (name === "set-cookie" || values.length < 2) continue;
+    if (values.every((v) => v === values[0])) headers[name] = values[0]!;
+  }
   // Next uses this header to transport cache tags between its entrypoint and incremental cache.
   // It is internal bookkeeping, can expose route/tag structure, and `next start` removes it before
   // the public response. The adapter owns that server boundary, so never forward it to clients.
@@ -464,7 +489,22 @@ async function writeInnerResponse(
   // incremental responses. In adapter deploy mode the platform cache owns ISR,
   // while the browser-facing response must always revalidate. Next marks this
   // response class explicitly, so avoid altering SSR, APIs, or user headers.
-  if (normalizePrerenderCacheControl || headers["x-nextjs-cache"] !== undefined) {
+  // `x-nextjs-prerender` marks the same class: a cache-miss render of a prerenderable
+  // route carries it WITHOUT `x-nextjs-cache`, and its `cache-control: s-maxage=31536000`
+  // previously passed through untagged — Cloud CDN stored it for a year and tag-based
+  // cutover invalidation could never purge it (M13 stale-apex incident, stamping side).
+  // Only CDN-storable directives are rewritten: a prerender-marked response the entry
+  // already declared uncacheable (PPR documents are `private, no-cache, no-store`) keeps
+  // that stricter verdict — this guard exists to stop long-lived leaks, not to loosen.
+  const innerCacheControl = String(headers["cache-control"] ?? "");
+  const prerenderLeaksCacheable =
+    headers["x-nextjs-prerender"] !== undefined &&
+    !/\b(?:no-store|no-cache|private)\b/i.test(innerCacheControl);
+  if (
+    normalizePrerenderCacheControl ||
+    headers["x-nextjs-cache"] !== undefined ||
+    prerenderLeaksCacheable
+  ) {
     headers["cache-control"] = "public, max-age=0, must-revalidate";
     delete headers["cache-tag"];
   }
@@ -629,9 +669,13 @@ async function invokeLocalHandlerOverHttp({
             ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
               NEXT_REQUEST_META
             ] as { postponed?: string } | undefined) ?? {};
+          // The scheme must come from the validated x-forwarded-proto witness: TLS terminates
+          // at the load balancer, so hardcoding `http://` here made every absolute redirect a
+          // generated App Route entry derives from request.url/nextUrl (initURL below) escape
+          // to `http://` on an https deployment (live 307 form-redirect regression).
           const publicRequestUrl = new URL(
             req.url ?? "/",
-            `http://${req.headers.host ?? "localhost"}`,
+            `${requestProtocol(req)}://${req.headers.host ?? "localhost"}`,
           );
           const publicRequestPathname = publicRequestUrl.pathname;
           const concreteInvocationPath = invocationPath
@@ -759,7 +803,15 @@ async function invokeLocalHandlerOverHttp({
           hostname: "127.0.0.1",
           port: address.port,
           method: req.method,
-          path: req.url,
+          // A middleware/config rewrite must reach the entrypoint as the REQUEST URL, not just
+          // as request-meta: generated App Route/App Page entries derive request.url/nextUrl
+          // from `new URL(innerReq.url, initURL)`, so keeping the public req.url here dropped
+          // the rewrite destination's query entirely (repeated `?item=one&item=two` rewrite
+          // params never reached the handler). This mirrors Next's own router-server, which
+          // invokes the render server with the rewritten URL while initURL keeps the public
+          // origin. invocationPath is already locale-stripped and carries the merged
+          // source+destination query with repeated keys restored (resolve.ts invokePath).
+          path: invocationPath ?? req.url,
           headers: reqHeaders,
         },
         (clientRes) => {
@@ -2229,8 +2281,20 @@ export function createDispatcher(options: DispatcherOptions) {
             // Use handler capability rather than `manifestPprInfo` here. A concrete document can
             // intentionally suppress build-token injection while a dynamic RSC request for the
             // same PPR-capable handler still needs Next's local cache to recover its RDC.
+            // PPR routes when a classic incremental cacheHandler is registered
+            // (incrementalCacheShared — production Valkey) must ALSO run non-minimal: minimal
+            // mode makes the entrypoint answer a document request with the bare postponed shell
+            // plus `x-nextjs-postponed: 1` and expects the PLATFORM to run the resume dance —
+            // which this adapter does not implement for the entry-owned shell (the build-token
+            // injection above is deliberately gated off when the entry owns the shell). Every
+            // PPR document was therefore served as an unfinished shell (dynamic holes never
+            // streamed) on live. Non-minimal mode lets Next itself do the shell lookup +
+            // resume join against the SHARED Valkey-backed incremental cache — the same
+            // ownership model the entrypointOwnsPprShell harness case uses with its
+            // filesystem cache, and cross-replica correct because revalidateTag writes
+            // through the same registered handler.
             minimalMode: !(
-              (entrypointOwnsPprShell && !!handlerPprInfo) ||
+              ((entrypointOwnsPprShell || incrementalCacheShared) && !!handlerPprInfo) ||
               (emulatePlatformCache && !!dispatchStaticAsset?.prerender && !dispatchStaticAsset.ppr)
             ),
             normalizePrerenderCacheControl:
@@ -2271,6 +2335,14 @@ function proxyToPool(
       "x-output-id": resolution.matchedPathname,
       "x-matched-pathname": resolution.matchedPathname,
       "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
+      // Rewrite invocation target (path+query with repeated destination keys restored). The
+      // public req.url is forwarded as-is above, so without these the target pool's dispatch
+      // would invoke the handler with the ORIGINAL URL and the rewrite-added query would be
+      // silently dropped (same wire vocabulary the ext_proc routing service stamps).
+      ...(resolution.invokePath ? { "x-invoke-path": resolution.invokePath } : {}),
+      ...(resolution.invocationQuery
+        ? { "x-invoke-query": JSON.stringify(resolution.invocationQuery) }
+        : {}),
       // This pool already ran the middleware stage in its Phase-1 resolve before deciding
       // to proxy; assert it so the target pool trusts the skip instead of re-running
       // middleware (which would double-apply cookies/redirects). Without this, the target's

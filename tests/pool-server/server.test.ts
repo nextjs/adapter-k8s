@@ -134,6 +134,10 @@ describe("internal header security", () => {
       "x-matched-pathname",
       "x-route-matches",
       "x-upstream-pool",
+      // Rewrite invocation target — spoofing these would let a client pick the
+      // handler's internal URL/query, so they are secret-gated like the rest.
+      "x-invoke-path",
+      "x-invoke-query",
     ];
 
     it("strips internal routing headers by default (untrusted mode)", async () => {
@@ -155,6 +159,8 @@ describe("internal header security", () => {
           "x-matched-pathname": "/admin/secrets",
           "x-route-matches": '{"id":"evil"}',
           "x-upstream-pool": "admin",
+          "x-invoke-path": "/admin/secrets?leak=1",
+          "x-invoke-query": '{"leak":"1"}',
         },
       });
 

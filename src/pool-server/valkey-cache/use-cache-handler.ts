@@ -6,6 +6,7 @@ import {
   drainEntryValue,
   logErrorRateLimited,
   maxCacheEntryBytes,
+  wallClockNow,
   warnOnce,
 } from "./stream-codec.js";
 import {
@@ -102,7 +103,8 @@ export class ValkeyCacheHandler implements CacheHandler {
 
   constructor(options: ValkeyCacheHandlerOptions) {
     this.client = options.client;
-    this.now = options.now ?? Date.now;
+    // N8: never Date.now — patched to throw inside tracked static renders (see wallClockNow).
+    this.now = options.now ?? wallClockNow;
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;
     this.pendingSetWaitMs = options.pendingSetWaitMs ?? PENDING_SET_WAIT_MS;

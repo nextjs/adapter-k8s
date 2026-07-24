@@ -56,6 +56,28 @@ describe("state", () => {
     expect(state!.previousBuildId).toBe("first");
   });
 
+  it("M13: round-trips recorded per-build CDN tags", async () => {
+    const state: AdapterState = {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      cdnTags: { buildn: `build-${"ab".repeat(32)}`, buildm: `build-${"cd".repeat(32)}` },
+    };
+    await writeState(tmpDir, state);
+    expect(await readState(tmpDir)).toEqual(state);
+  });
+
+  it("M13: reads legacy state without cdnTags (pre-recording deploys)", async () => {
+    const stateDir = path.join(tmpDir, ".k8s-adapter");
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      path.join(stateDir, "state.json"),
+      JSON.stringify({ buildId: "abc123", previousBuildId: null }),
+    );
+    const state = await readState(tmpDir);
+    expect(state).toEqual({ buildId: "abc123", previousBuildId: null });
+    expect(state!.cdnTags).toBeUndefined();
+  });
+
   it("writes the local file even when no releaseName is given (no cluster mirror)", async () => {
     const state: AdapterState = { buildId: "local-only", previousBuildId: null };
     // Without a releaseName the cluster ConfigMap is never touched, so this must not throw.

@@ -763,6 +763,10 @@ export async function runRollback(options: {
       {
         buildId: previousBuildId,
         previousBuildId: currentBuildId,
+        // M13: carry the recorded per-build CDN tags verbatim — a rollback keeps both
+        // builds in play, and each build's tag is only ever the one recorded at ITS
+        // deploy (re-deriving under newer code is exactly the M13 failure).
+        ...(state.cdnTags ? { cdnTags: state.cdnTags } : {}),
       },
       releaseName,
     );
@@ -790,6 +794,9 @@ export async function runRollback(options: {
           releaseName,
           outputDir: rbOutputDir,
           buildId: currentBuildId,
+          // M13: the tag recorded when the rolled-away-from build deployed — never
+          // re-derived here. Absent (pre-recording state) → full --path=/* purge.
+          recordedTag: state.cdnTags?.[currentBuildId],
           run: execCapture,
           log: (m) => console.log(m),
         });

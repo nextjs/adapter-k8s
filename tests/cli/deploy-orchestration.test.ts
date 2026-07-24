@@ -25,6 +25,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { routingManifestSnapshotName } from "../../src/emit/templates/routing-manifest-configmap.js";
 import { poolResourceNames } from "../../src/emit/templates/utils.js";
 import { renderHPA } from "../../src/emit/templates/hpa.js";
+import { cdnTagForBuildId } from "../../src/cdn-tags.js";
 
 const PROJECT = "/proj";
 const RELEASE = "rel";
@@ -230,15 +231,25 @@ describe("runDeploy — orchestration", () => {
     expect(positions.every((p) => p >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
 
-    // State committed with the swapped builds.
+    // State committed with the swapped builds, recording the new build's CDN tag (M13).
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildn", previousBuildId: "buildm" },
+      {
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        cdnTags: { buildn: cdnTagForBuildId("buildn") },
+      },
       RELEASE,
     );
-    // CDN invalidated for the OUTGOING build.
+    // CDN invalidated for the OUTGOING build. Prior state (legacy) recorded no tag for
+    // it, so no recordedTag is passed — cdn-invalidate falls back to the full purge (M13).
     expect(vi.mocked(invalidateCdnBuildTag)).toHaveBeenCalledWith(
-      expect.objectContaining({ buildId: "buildm", releaseName: RELEASE, projectId: "my-project" }),
+      expect.objectContaining({
+        buildId: "buildm",
+        releaseName: RELEASE,
+        projectId: "my-project",
+        recordedTag: undefined,
+      }),
     );
     // Helm pinned to the namespace init binds Workload Identity to.
     const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
@@ -433,7 +444,11 @@ describe("runDeploy — guards and teardown", () => {
     // The deploy completed: cutover happened and state was committed.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildn", previousBuildId: "buildm" },
+      {
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        cdnTags: { buildn: cdnTagForBuildId("buildn") },
+      },
       RELEASE,
     );
     // A loud warning named the missing deployment...
@@ -569,7 +584,41 @@ describe("runDeploy — guards and teardown", () => {
 
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildn", previousBuildId: "buildm" },
+      {
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        cdnTags: { buildn: cdnTagForBuildId("buildn") },
+      },
+      RELEASE,
+    );
+  });
+
+  it("M13: passes the outgoing build's RECORDED tag to invalidation and carries it in state", async () => {
+    // Prior state recorded the tag buildm's pods actually stamp (possibly under an older
+    // derivation — deliberately not cdnTagForBuildId("buildm")). Cutover must hand that
+    // exact value to cdn-invalidate and keep it recorded while buildm remains the
+    // rollback target.
+    const recordedPrev = `build-${"cd".repeat(32)}`;
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      cdnTags: { buildm: recordedPrev },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(vi.mocked(invalidateCdnBuildTag)).toHaveBeenCalledWith(
+      expect.objectContaining({ buildId: "buildm", recordedTag: recordedPrev }),
+    );
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      {
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        // Carried verbatim + the new build's own recording; buildm0 pruned (out of play).
+        cdnTags: { buildm: recordedPrev, buildn: cdnTagForBuildId("buildn") },
+      },
       RELEASE,
     );
   });

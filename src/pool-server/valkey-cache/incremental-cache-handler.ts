@@ -14,7 +14,7 @@
 // `get` returns null when the entry's tags have been revalidated since it was stored (Next then
 // regenerates), so the per-process `tags-manifest.external` check Next also runs is irrelevant here.
 import type { ValkeyClient } from "./client.js";
-import { logErrorRateLimited, maxCacheEntryBytes, warnOnce } from "./stream-codec.js";
+import { logErrorRateLimited, maxCacheEntryBytes, wallClockNow, warnOnce } from "./stream-codec.js";
 import {
   areTagsExpired,
   areTagsStale,
@@ -198,7 +198,8 @@ export class ValkeyIncrementalCacheHandler {
 
   constructor(options: ValkeyIncrementalCacheOptions) {
     this.client = options.client;
-    this.now = options.now ?? Date.now;
+    // N8: never Date.now — patched to throw inside tracked static renders (see wallClockNow).
+    this.now = options.now ?? wallClockNow;
     // Same build-namespaced tag keyspace as the V2 handler, so `revalidateTag` is shared.
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;

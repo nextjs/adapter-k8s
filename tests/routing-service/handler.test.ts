@@ -1107,3 +1107,173 @@ describe("createRequestHandler shed-abort → server fail policy (P2)", () => {
     expect(wasLoggedAsMiddlewareCrash()).toBe(true);
   });
 });
+
+describe("rewrite invocation transport (x-invoke-path / x-invoke-query)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function rewriteManifest(): RoutingManifest {
+    const manifest = makeManifest({
+      pathnames: ["/", "/about", "/api/hello", "/rewrite-source"],
+      poolAssignments: { "/": "ssr", "/about": "ssr", "/api/hello": "api" },
+    });
+    // next.config rewrite whose destination carries a REPEATED query key. @next/routing
+    // applies destinations with URLSearchParams.set (collapses to the last value), so the
+    // handler must restore the repetition before stamping the transport header.
+    manifest.routeGraph.afterFiles = [
+      {
+        source: "/rewrite-source",
+        sourceRegex: "^\\/rewrite-source(?:\\/)?$",
+        destination: "/api/hello?item=one&item=two",
+      },
+    ] as any;
+    return manifest;
+  }
+
+  it("stamps the rewritten invocation target with repeated destination keys restored", async () => {
+    const handler = createRequestHandler(rewriteManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/api/hello",
+      // Collapsed query — what @next/routing currently reports for the destination above.
+      invocationTarget: { pathname: "/api/hello", query: { item: "two" } },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const response = await handler(makeHeaders("/rewrite-source"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    const invokePath = setHeaders.find((h) => h.header.key === "x-invoke-path");
+    expect(invokePath!.header.value).toBe("/api/hello?item=one&item=two");
+    const invokeQuery = setHeaders.find((h) => h.header.key === "x-invoke-query");
+    expect(JSON.parse(invokeQuery!.header.value!)).toEqual({ item: ["one", "two"] });
+    // Stamped keys must not simultaneously be cleared.
+    const removeHeaders = response.requestHeaders!.response!.headerMutation!.removeHeaders ?? [];
+    expect(removeHeaders).not.toContain("x-invoke-path");
+    expect(removeHeaders).not.toContain("x-invoke-query");
+  });
+
+  it("clears (never stamps) the invocation transport when routing did not rewrite", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const response = await handler(makeHeaders("/about"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-invoke-path")).toBeUndefined();
+    expect(setHeaders.find((h) => h.header.key === "x-invoke-query")).toBeUndefined();
+    // A client-smuggled value must be actively removed on the way in.
+    const removeHeaders = response.requestHeaders!.response!.headerMutation!.removeHeaders ?? [];
+    expect(removeHeaders).toContain("x-invoke-path");
+    expect(removeHeaders).toContain("x-invoke-query");
+  });
+
+  it("does not stamp an invocation target for RSC requests (client reconciles via headers)", async () => {
+    const manifest = rewriteManifest();
+    const handler = createRequestHandler(manifest, null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/api/hello",
+      invocationTarget: { pathname: "/api/hello", query: { item: "two" } },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const rscHeader = manifest.routeGraph.rsc?.header ?? "rsc";
+    const response = await handler([...makeHeaders("/rewrite-source"), { key: rscHeader, value: "1" }]);
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-invoke-path")).toBeUndefined();
+  });
+});
+
+describe("RSC redirect translation (x-nextjs-redirect)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function rscHeaders(path: string): HeaderValue[] {
+    return [...makeHeaders(path), { key: "rsc", value: "1" }];
+  }
+
+  it("translates a same-origin middleware redirect into a 200 RSC navigation response", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
+      status: 307,
+    } as any);
+
+    const response = await handler(rscHeaders("/rsc-redirect-origin?_rsc=probe"));
+    expect(response.immediateResponse).toBeDefined();
+    // Flight requests cannot follow an HTTP redirect — Next answers 200 with the internal
+    // navigation field and the client router performs the redirect (next start parity).
+    expect(response.immediateResponse!.status!.code).toBe(200);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "location")).toBeUndefined();
+    const nav = setHeaders.find((h) => h.header.key === "x-nextjs-redirect");
+    // Same-origin middleware target → RELATIVE path, exactly like `next start`.
+    expect(nav!.header.value).toBe("/rewritten");
+  });
+
+  it("keeps an absolute x-nextjs-redirect for a cross-origin middleware redirect", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://other.example.com/away" }),
+      status: 307,
+    } as any);
+
+    const response = await handler(rscHeaders("/rsc-redirect-origin"));
+    expect(response.immediateResponse!.status!.code).toBe(200);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    const nav = setHeaders.find((h) => h.header.key === "x-nextjs-redirect");
+    expect(nav!.header.value).toBe("https://other.example.com/away");
+  });
+
+  it("translates rule redirects for RSC requests with their absolute form", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      redirect: { url: new URL("https://app.example.com/new"), status: 308 },
+    } as any);
+
+    const response = await handler(rscHeaders("/old"));
+    expect(response.immediateResponse!.status!.code).toBe(200);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    const nav = setHeaders.find((h) => h.header.key === "x-nextjs-redirect");
+    expect(nav!.header.value).toBe("https://app.example.com/new");
+    expect(setHeaders.find((h) => h.header.key === "location")).toBeUndefined();
+  });
+
+  it("leaves non-RSC redirects untouched (real Location, real status)", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
+      status: 307,
+    } as any);
+
+    const response = await handler(makeHeaders("/rsc-redirect-origin"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe(
+      "https://app.example.com/rewritten",
+    );
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+  });
+
+  it("preserves middleware Set-Cookie on the translated RSC response", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    const resolvedHeaders = new Headers({ location: "https://app.example.com/rewritten" });
+    resolvedHeaders.append("set-cookie", "session=abc; Path=/");
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders,
+      status: 307,
+    } as any);
+
+    const response = await handler(rscHeaders("/rsc-redirect-origin"));
+    expect(response.immediateResponse!.status!.code).toBe(200);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    const cookie = setHeaders.find((h) => h.header.key === "set-cookie");
+    expect(cookie!.header.value).toBe("session=abc; Path=/");
+  });
+});

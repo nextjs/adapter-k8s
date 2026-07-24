@@ -47,21 +47,50 @@ CMD ["node", "pool-server.cjs"]
 `;
 }
 
+// installSharpVersion lands inside a Dockerfile RUN instruction — validate at the
+// point of consumption (repo convention): npm version strings only, so a tampered
+// sharp package.json can't inject shell into the emitted Dockerfile.
+function assertSafeSharpVersion(version: string): void {
+  if (!/^[0-9A-Za-z][0-9A-Za-z.+-]*$/.test(version)) {
+    throw new Error(
+      `Unsafe sharp version for the emitted Dockerfile: ${JSON.stringify(version)} — ` +
+        `expected an npm version string ([0-9A-Za-z.+-] only).`,
+    );
+  }
+}
+
 export function generatePoolDockerfile({
   poolName,
   nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
   buildId,
+  installSharpVersion,
 }: {
   poolName: string;
   nodeVersion?: string;
   buildId: string;
+  /**
+   * When the build host could not supply sharp's linux-x64 native packages
+   * (adapter.ts stageSharpRuntimePackages), install sharp inside the image —
+   * npm running in the target container resolves the correct platform binding.
+   * Pinned to the app's resolved sharp version so the native ABI matches the
+   * sharp JS inlined into pool-server.cjs.
+   */
+  installSharpVersion?: string;
 }): string {
   assertSupportedNodeVersion(nodeVersion);
+  if (installSharpVersion !== undefined) assertSafeSharpVersion(installSharpVersion);
+  const sharpInstall = installSharpVersion
+    ? `# Build host had no linux-x64 sharp binding to stage — install it in-image so
+# /_next/image works (pool-server.cjs requires @img/sharp-linux-x64 at runtime).
+RUN npm install --no-save --no-audit --no-fund sharp@${installSharpVersion} \\
+ && npm cache clean --force
+`
+    : "";
   // context/ is prepared by the adapter with exactly what's needed.
   return `FROM node:${nodeVersion}-slim
 WORKDIR /app
 COPY --chown=node:node context/ .
-ENV NODE_ENV=production
+${sharpInstall}ENV NODE_ENV=production
 ENV POOL_NAME=${poolName}
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config

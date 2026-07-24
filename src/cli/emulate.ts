@@ -6,6 +6,7 @@
 // Usage: npx adapter-k8s emulate [--skip-build] [--port 8080]
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture, execOrThrow } from "./exec.js";
@@ -35,6 +36,13 @@ export async function runEmulate(options: EmulateOptions): Promise<void> {
   // __dirname in the bundled CLI is the dist/ directory itself.
   const distDir = __dirname;
 
+  // Shared per-run secret, mirroring the K8s Secret production injects into both
+  // tiers: the routing service stamps it on mutated request headers via ext_proc,
+  // and the pool trusts the internal dispatch vocabulary (Phase 2) only when it
+  // matches. Without it the pool re-resolves everything locally (Phase 1) and
+  // edge-only behavior is invisible in emulation.
+  const internalSecret = randomBytes(32).toString("hex");
+
   console.log(`
 ${BOLD}${CYAN}adapter-k8s emulate${RESET}
 ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESET}
@@ -59,12 +67,72 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
 
   const buildMetaPath = path.join(outputDir, "build-metadata.json");
   let buildId = "local";
+  let cacheEnabled = false;
   if (existsSync(buildMetaPath)) {
     try {
-      buildId = JSON.parse(readFileSync(buildMetaPath, "utf-8")).buildId;
+      const meta = JSON.parse(readFileSync(buildMetaPath, "utf-8"));
+      buildId = meta.buildId;
+      cacheEnabled = meta.cacheEnabled === true;
     } catch (err) {
       // Name the file — a bare SyntaxError gives no clue WHICH file is corrupt.
       throw new Error(`Failed to parse ${buildMetaPath}: ${(err as Error).message}`);
+    }
+  }
+
+  // --- 1b. Valkey (when the build enabled the shared cache) ---
+  // Production pools get VALKEY_URL from the Memorystore secret; without it the app
+  // falls back to Next's per-process cache and cross-replica revalidation / PPR shell
+  // sharing silently degrades — an emulation blind spot. Run a real Valkey in docker
+  // when available so the emulated cache path matches production.
+  const valkeyContainerName = `adapter-k8s-valkey-${port}`;
+  const valkeyPort = port + 8299; // default 8080 → 16379, clear of a local :6379
+  let valkeyUrl: string | undefined;
+  if (cacheEnabled) {
+    const dockerCheck = await execCapture("docker", ["version", "--format", "ok"]).catch(
+      () => null,
+    );
+    if (dockerCheck && dockerCheck.exitCode === 0) {
+      console.log(`${DIM}[valkey]${RESET} Starting on :${valkeyPort} (docker)...`);
+      await execCapture("docker", ["rm", "-f", valkeyContainerName]).catch(() => null);
+      const run = await execCapture("docker", [
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        valkeyContainerName,
+        "-p",
+        `127.0.0.1:${valkeyPort}:6379`,
+        "valkey/valkey:8",
+      ]);
+      if (run.exitCode === 0) {
+        // Readiness: PING until PONG (image pull + boot can take a few seconds).
+        for (let i = 0; i < 30; i++) {
+          const ping = await execCapture("docker", [
+            "exec",
+            valkeyContainerName,
+            "valkey-cli",
+            "ping",
+          ]).catch(() => null);
+          if (ping && ping.exitCode === 0 && ping.stdout.trim() === "PONG") {
+            valkeyUrl = `redis://127.0.0.1:${valkeyPort}`;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        if (!valkeyUrl) {
+          console.log(
+            `${YELLOW}[valkey] container did not become ready — continuing with the in-process cache fallback${RESET}`,
+          );
+        }
+      } else {
+        console.log(
+          `${YELLOW}[valkey] docker run failed (${run.stderr.trim().split("\n")[0] ?? "unknown"}) — continuing with the in-process cache fallback${RESET}`,
+        );
+      }
+    } else {
+      console.log(
+        `${YELLOW}[valkey] cache is enabled for this build but docker is unavailable — cross-replica cache behavior will not be emulated${RESET}`,
+      );
     }
   }
 
@@ -94,7 +162,10 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
         if (existsSync(ctxConfig)) {
           for (const f of readdirSync(ctxConfig)) {
             const dest = path.join(configDir, f);
-            if (!existsSync(dest)) copyFileSync(path.join(ctxConfig, f), dest);
+            // Always overwrite: a stale copy from a previous build made the emulated
+            // pool 404 routes that exist in the fresh manifest (config/ kept a Jul-13
+            // pool-manifest while the context had the current one).
+            copyFileSync(path.join(ctxConfig, f), dest);
           }
         }
       }
@@ -112,6 +183,8 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       NEXT_BUILD_ID: buildId,
       CONFIG_DIR: configDir,
       NODE_ENV: "production",
+      INTERNAL_HEADER_SECRET: internalSecret,
+      ...(valkeyUrl ? { VALKEY_URL: valkeyUrl } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -121,7 +194,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   // the process with a bare stack — fail cleanly instead.
   poolServer.on("error", (err) => {
     console.error(`${RED}Failed to start pool server: ${err.message}${RESET}`);
-    cleanup(children, envoyContainerName);
+    cleanup(children, [envoyContainerName, valkeyContainerName]);
     process.exit(1);
   });
 
@@ -150,6 +223,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       // The routing service CRASHES on TLS-identity failure unless this is set — opt in
       // explicitly here; GKE never sets it (mTLS via the internal secret there).
       ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT: "1",
+      INTERNAL_HEADER_SECRET: internalSecret,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -157,7 +231,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
 
   routingService.on("error", (err) => {
     console.error(`${RED}Failed to start routing service: ${err.message}${RESET}`);
-    cleanup(children, envoyContainerName);
+    cleanup(children, [envoyContainerName, valkeyContainerName]);
     process.exit(1);
   });
 
@@ -281,12 +355,12 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     // Check for crashes — Envoy failing is non-fatal, pool/routing crashing is fatal
     if (poolServer.exitCode !== null) {
       console.error(`${RED}Pool server crashed. Check logs above.${RESET}`);
-      cleanup(children, envoyContainerName);
+      cleanup(children, [envoyContainerName, valkeyContainerName]);
       process.exit(1);
     }
     if (routingService.exitCode !== null) {
       console.error(`${RED}Routing service crashed. Check logs above.${RESET}`);
-      cleanup(children, envoyContainerName);
+      cleanup(children, [envoyContainerName, valkeyContainerName]);
       process.exit(1);
     }
     if (envoyChild && envoyChild.exitCode !== null) {
@@ -307,7 +381,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       `${RED}Timed out after 30s waiting for services on port(s): ${ports.join(", ")}. ` +
         `Check the logs above.${RESET}`,
     );
-    cleanup(children, envoyContainerName);
+    cleanup(children, [envoyContainerName, valkeyContainerName]);
     process.exit(1);
   }
 
@@ -327,7 +401,7 @@ ${GREEN}${BOLD}Ready!${RESET}
   // --- 7. Keep alive + cleanup ---
   const shutdown = () => {
     console.log(`\n${DIM}Shutting down...${RESET}`);
-    cleanup(children, envoyContainerName);
+    cleanup(children, [envoyContainerName, valkeyContainerName]);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -345,12 +419,13 @@ ${GREEN}${BOLD}Ready!${RESET}
   await new Promise(() => {});
 }
 
-function cleanup(children: ChildProcess[], envoyContainerName: string) {
+function cleanup(children: ChildProcess[], containerNames: string[]) {
   for (const child of children) {
     child.kill("SIGTERM");
   }
-  // Kill docker envoy container if running. Ignore a spawn error here — docker may
-  // not even be installed (envoy may have run as a local binary or not at all), and
-  // an unhandled "error" event during cleanup would mask the real failure.
-  spawn("docker", ["rm", "-f", envoyContainerName], { stdio: "ignore" }).on("error", () => {});
+  // Kill docker containers (envoy, valkey) if running. Ignore a spawn error here —
+  // docker may not even be installed (envoy may have run as a local binary and the
+  // cache fallback needs no container), and an unhandled "error" event during
+  // cleanup would mask the real failure.
+  spawn("docker", ["rm", "-f", ...containerNames], { stdio: "ignore" }).on("error", () => {});
 }

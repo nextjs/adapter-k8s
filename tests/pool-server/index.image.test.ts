@@ -28,6 +28,12 @@ const SVG_BODY = `<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</scri
 // Not a real animation decoder target: passthrough must serve the SOURCE bytes, so
 // any GIF-typed content works to prove sharp never touched it.
 const GIF_BODY = Buffer.concat([Buffer.from("GIF89a"), Buffer.alloc(64, 0x2a)]);
+// A real 1x1 PNG (same bytes the live fixture's /api/tiny-png serves) so sharp can
+// actually decode it.
+const ONE_PIXEL_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "base64",
+);
 
 function writeStagedDir(images: Record<string, unknown> | null): { dir: string; configDir: string } {
   const dir = mkdtempSync(path.join(REPO_ROOT, ".image-stage-"));
@@ -38,6 +44,13 @@ function writeStagedDir(images: Record<string, unknown> | null): { dir: string; 
   writeFileSync(path.join(dir, "package.json"), "{}");
   writeFileSync(path.join(dir, "public", "icon.svg"), SVG_BODY);
   writeFileSync(path.join(dir, "public", "anim.gif"), GIF_BODY);
+  // PNG bytes under a lying extension and under no extension at all: the source
+  // format must come from a magic-byte sniff (next start parity), never the URL.
+  writeFileSync(path.join(dir, "public", "mislabeled.jpg"), ONE_PIXEL_PNG);
+  writeFileSync(path.join(dir, "public", "extensionless-png"), ONE_PIXEL_PNG);
+  // SVG bytes hiding behind a raster extension: the dangerouslyAllowSVG gate must
+  // fire on the sniffed type, not the claimed one.
+  writeFileSync(path.join(dir, "public", "evil.png"), SVG_BODY);
 
   if (images) {
     mkdirSync(path.join(dir, ".next"), { recursive: true });
@@ -155,9 +168,36 @@ describe("image optimizer parity — default config", () => {
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/icon.svg&w=640&q=75`);
     expect(res.status).toBe(400);
     const body = await res.text();
-    expect(body).toContain("image type is not allowed");
-    // The SVG bytes must never be served inline.
-    expect(body).not.toContain("<svg");
+    // Byte-for-byte the body `next start` sends (verified empirically 2026-07-24
+    // against next start on fixtures/main, Next 16.2.x).
+    expect(body).toBe('"url" parameter is valid but image type is not allowed');
+  });
+
+  it("keeps a PNG source PNG regardless of its URL extension (sniff, not extension)", async () => {
+    // The regression: source type was derived from the URL (getContentType), so a
+    // PNG served from an extensionless path (or a lying one) negotiated to JPEG.
+    // next start sniffs the bytes and returned image/png for both of these
+    // (verified against /api/tiny-png with `accept: image/png` on 2026-07-24).
+    for (const name of ["mislabeled.jpg", "extensionless-png"]) {
+      const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/${name}&w=640&q=75`, {
+        headers: { accept: "image/png" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      const body = Buffer.from(await res.arrayBuffer());
+      // PNG signature, and no upscale: IHDR width/height (offsets 16/20) stay 1x1.
+      expect(body.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+      expect(body.readUInt32BE(16)).toBe(1);
+      expect(body.readUInt32BE(20)).toBe(1);
+    }
+  });
+
+  it("400s SVG bytes hiding behind a raster extension (the gate fires on the sniff)", async () => {
+    // An SVG at /evil.png previously classified as image/png from the extension and
+    // sailed past the dangerouslyAllowSVG gate into sharp.
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/evil.png&w=640&q=75`);
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe('"url" parameter is valid but image type is not allowed');
   });
 
   it("passes a GIF through untouched even when the client accepts avif/webp", async () => {

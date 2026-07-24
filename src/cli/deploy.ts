@@ -4,6 +4,7 @@ import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
+import { cdnTagForBuildId } from "../cdn-tags.js";
 import { retainLiveRoutingManifest } from "./rollback.js";
 import { renderDeployment } from "../emit/templates/deployment.js";
 import { renderService } from "../emit/templates/service.js";
@@ -1084,7 +1085,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // build as current. Traffic has already switched; if the cluster ConfigMap write fails
     // we surface it loudly (local was updated) rather than silently diverging.
     try {
-      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+      // M13: record the exact Cache-Tag THIS build's pool-server stamps (derived HERE,
+      // at its deploy — the only moment code and pods agree), and carry the outgoing
+      // build's recorded tag verbatim (it stays the rollback target; re-deriving its tag
+      // under newer code is exactly the M13 failure). Pruned to the two builds in play.
+      const cdnTags: Record<string, string> = {};
+      if (previousBuildId && state?.cdnTags?.[previousBuildId]) {
+        cdnTags[previousBuildId] = state.cdnTags[previousBuildId];
+      }
+      cdnTags[buildId] = cdnTagForBuildId(buildId);
+      await writeState(projectDir, { buildId, previousBuildId, cdnTags }, releaseName);
     } catch (err) {
       console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
       console.error(`  ${err instanceof Error ? err.message : String(err)}`);
@@ -1110,6 +1120,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           releaseName,
           outputDir,
           buildId: previousBuildId ?? undefined,
+          // M13: the tag recorded when the OUTGOING build deployed — never re-derived
+          // here. Absent (pre-recording state) → cdn-invalidate purges --path=/*.
+          recordedTag: previousBuildId ? state?.cdnTags?.[previousBuildId] : undefined,
           run: execCapture,
           log: (m) => console.log(m),
         });

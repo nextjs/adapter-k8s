@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  detectImageContentType,
   negotiateImageFormat,
   resizeForRequestedWidth,
 } from "../../src/pool-server/image-utils.js";
@@ -103,5 +104,48 @@ describe("image format negotiation", () => {
       encode: "jpeg",
       contentType: "image/jpeg",
     });
+  });
+});
+
+describe("image content-type sniffing (next start parity: detectContentType)", () => {
+  // Next's optimizer derives the SOURCE format from the bytes, never from the URL
+  // or the upstream Content-Type header. These signatures mirror
+  // next/dist/server/image-optimizer.js detectContentType.
+  const ONE_PIXEL_PNG = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+
+  it("detects png/jpeg/gif from magic bytes", () => {
+    expect(detectImageContentType(ONE_PIXEL_PNG)).toBe("image/png");
+    expect(detectImageContentType(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]))).toBe("image/jpeg");
+    expect(detectImageContentType(Buffer.from("GIF89a\x2a\x2a"))).toBe("image/gif");
+  });
+
+  it("detects webp and avif with wildcard length bytes", () => {
+    expect(
+      detectImageContentType(
+        Buffer.concat([Buffer.from("RIFF"), Buffer.from([1, 2, 3, 4]), Buffer.from("WEBPVP8 ")]),
+      ),
+    ).toBe("image/webp");
+    expect(
+      detectImageContentType(Buffer.concat([Buffer.from([0, 0, 0, 0x1c]), Buffer.from("ftypavif")])),
+    ).toBe("image/avif");
+  });
+
+  it("detects svg by both document openings (the dangerouslyAllowSVG gate depends on this)", () => {
+    expect(detectImageContentType(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>'))).toBe(
+      "image/svg+xml",
+    );
+    expect(detectImageContentType(Buffer.from('<?xml version="1.0"?><svg/>'))).toBe("image/svg+xml");
+  });
+
+  it("detects ico", () => {
+    expect(detectImageContentType(Buffer.from([0x00, 0x00, 0x01, 0x00, 0x01]))).toBe("image/x-icon");
+  });
+
+  it("returns null for unrecognized bytes so callers can fall back", () => {
+    expect(detectImageContentType(Buffer.from("not an image"))).toBeNull();
+    expect(detectImageContentType(Buffer.alloc(0))).toBeNull();
   });
 });

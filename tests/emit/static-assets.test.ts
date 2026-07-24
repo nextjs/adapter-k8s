@@ -1,5 +1,8 @@
 // tests/emit/static-assets.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { buildStaticManifest } from "../../src/emit/static-assets.js";
 import type { AdapterOutputs } from "../../src/types.js";
 
@@ -141,6 +144,78 @@ describe("buildStaticManifest", () => {
     );
     expect(m[0]!.ppr).toBe(true);
     expect(m[0]!.prerender).toBe(true);
+  });
+
+  // REGRESSION (live deploy XchOtaGFu6GdFrcdujVc0): Next's adapter outputs do NOT
+  // enumerate public/ — outputs.staticFiles covers only build outputs — so the
+  // emitted static-assets.json had zero public entries. The pool dispatcher serves
+  // Phase-2 (trusted routing-extension dispatch) responses EXCLUSIVELY from this
+  // manifest, so every middleware-covered public asset 404'd in production while
+  // local Phase-1 resolution still found the file on disk. The manifest must carry
+  // the same public/ inventory the pool's filesystem fast paths use.
+  describe("public/ directory enumeration", () => {
+    let projDir: string;
+
+    beforeEach(() => {
+      projDir = mkdtempSync(path.join(os.tmpdir(), "static-assets-public-"));
+      const pub = path.join(projDir, "public");
+      mkdirSync(path.join(pub, "nested"), { recursive: true });
+      writeFileSync(path.join(pub, "sw-revalidation-probe.js"), "self.x=1");
+      writeFileSync(path.join(pub, "image probe.svg"), "<svg/>");
+      writeFileSync(path.join(pub, "nested", "deep.txt"), "deep");
+    });
+
+    afterEach(() => {
+      rmSync(projDir, { recursive: true, force: true });
+    });
+
+    it("emits every public/ file with the mutable public-file default cache policy", () => {
+      const m = buildStaticManifest(outputs(), projDir);
+      const sw = m.find((e) => e.pathname === "/sw-revalidation-probe.js")!;
+      expect(sw).toBeDefined();
+      expect(sw.filePath).toBe("public/sw-revalidation-probe.js");
+      expect(sw.cacheControl).toBe("public, max-age=3600");
+      expect(sw.prerender).toBeUndefined();
+      const nested = m.find((e) => e.pathname === "/nested/deep.txt")!;
+      expect(nested.filePath).toBe("public/nested/deep.txt");
+    });
+
+    // The dispatcher matches manifest pathnames against `new URL(req.url).pathname`
+    // (x-output-id at the edge preserves the request's percent-encoding), so a file
+    // named with a space must be keyed "/image%20probe.svg" — the decoded form can
+    // never match and 404s.
+    it("keys names needing percent-encoding by their canonical URL-encoded pathname", () => {
+      const m = buildStaticManifest(outputs(), projDir);
+      expect(m.some((e) => e.pathname === "/image probe.svg")).toBe(false);
+      const img = m.find((e) => e.pathname === "/image%20probe.svg")!;
+      expect(img).toBeDefined();
+      // filePath stays decoded — it addresses the real file on disk.
+      expect(img.filePath).toBe("public/image probe.svg");
+    });
+
+    it("does not duplicate a public pathname already present in outputs.staticFiles", () => {
+      const m = buildStaticManifest(
+        outputs({
+          staticFiles: [
+            {
+              pathname: "/sw-revalidation-probe.js",
+              filePath: `${projDir}/public/sw-revalidation-probe.js`,
+            },
+          ] as any,
+        }),
+        projDir,
+      );
+      expect(m.filter((e) => e.pathname === "/sw-revalidation-probe.js")).toHaveLength(1);
+    });
+
+    it("emits nothing extra when the project has no public/ directory", () => {
+      const empty = mkdtempSync(path.join(os.tmpdir(), "static-assets-nopublic-"));
+      try {
+        expect(buildStaticManifest(outputs(), empty)).toEqual([]);
+      } finally {
+        rmSync(empty, { recursive: true, force: true });
+      }
+    });
   });
 
   it("skips prerenders/static files with no filePath and sorts by pathname", () => {

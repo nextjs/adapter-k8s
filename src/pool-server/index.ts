@@ -6,7 +6,7 @@ import { isIP } from "node:net";
 import dns from "node:dns/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { PoolManifest, RoutingManifest } from "../types.js";
+import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.js";
 import {
   getRscConfig,
   manifestNextConfig,
@@ -21,15 +21,23 @@ import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
-import { createDispatcher, getContentType } from "./dispatch.js";
+import {
+  createDispatcher,
+  getContentType,
+  mergeResolvedHeadersIntoHeadersArg,
+} from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
 import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
 import { decodePublicPathname } from "./public-files.js";
-import { negotiateImageFormat, resizeForRequestedWidth } from "./image-utils.js";
+import {
+  detectImageContentType,
+  negotiateImageFormat,
+  resizeForRequestedWidth,
+} from "./image-utils.js";
 import { createPoolServer, filterWriteHeadHeadersArg } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
-import { forcedCdnCacheControl } from "./cache-policy.js";
+import { explicitCacheControlWins, forcedCdnCacheControl } from "./cache-policy.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -157,6 +165,95 @@ function parseResolvedHeaders(raw: string | undefined): Headers | undefined {
   }
 }
 
+// Every cache-control observable on the response at writeHead time: from the headers
+// ARGUMENT (object, tuple-array, and flat-array forms — the same shapes the strip
+// wrappers handle) and from the setHeader map. The forced-cache skip below must see a
+// `no-store` in ANY of them: dispatch's resolved-header merge may have replaced the
+// argument copy while a setHeader copy still records the handler's own verdict (or
+// vice versa), and missing one would let a weaker resolved value uncork a response
+// the app declared uncacheable.
+function observedCacheControls(args: unknown[], res: ServerResponse): string[] {
+  const found: string[] = [];
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg || typeof arg !== "object") continue;
+    if (Array.isArray(arg)) {
+      if (arg.length > 0 && !Array.isArray(arg[0])) {
+        // Flat form: even offsets are names, odd offsets are values.
+        for (let j = 0; j + 1 < arg.length; j += 2) {
+          if (String(arg[j]).toLowerCase() === "cache-control") found.push(String(arg[j + 1]));
+        }
+      } else {
+        for (const entry of arg as [unknown, unknown][]) {
+          if (String(entry[0]).toLowerCase() === "cache-control") found.push(String(entry[1]));
+        }
+      }
+    } else {
+      for (const [key, value] of Object.entries(arg as Record<string, unknown>)) {
+        if (key.toLowerCase() === "cache-control") {
+          found.push(Array.isArray(value) ? value.join(", ") : String(value));
+        }
+      }
+    }
+  }
+  const fromMap = res.getHeader("cache-control");
+  if (fromMap !== undefined) {
+    found.push(Array.isArray(fromMap) ? fromMap.join(", ") : String(fromMap));
+  }
+  return found;
+}
+
+// LAST-RESORT public/ file serving from disk. The canonical path for public files is the
+// static-assets manifest via dispatcher.dispatch (which merges the resolved routing
+// verdict — next.config headers() / middleware headers — over the adapter's mutable
+// default); this fallback exists only for a file that is on disk but missing from the
+// manifest (stale or absent static-assets.json, e.g. emulate/bootstrap setups or a
+// canonical-encoding miss), so a build inconsistency degrades to the old serve instead
+// of a 404. It applies the SAME resolved-header merge dispatch would have, then stamps
+// the CDN cache tag from the EFFECTIVE cache-control (mutable cacheable ⇒ tagged,
+// uncacheable ⇒ never — the final-Cache-Control rule).
+function servePublicFileFromDisk(
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestPathname: string,
+  resolvedHeaders: Headers | undefined,
+  buildId: string,
+): boolean {
+  const decodedPathname = decodePublicPathname(requestPathname);
+  const publicFile = decodedPathname
+    ? resolveWithinRoot(path.join(process.cwd(), "public"), decodedPathname)
+    : null;
+  if (!publicFile || !existsSync(publicFile) || statSync(publicFile).isDirectory()) {
+    return false;
+  }
+  const content = readFileSync(publicFile);
+  const etag = staticAssetEtag(content);
+  let responseHeaders: Record<string, string | string[]> = {
+    "content-type": getContentType(decodedPathname!),
+    "cache-control": "public, max-age=3600",
+    etag,
+  };
+  if (resolvedHeaders) {
+    responseHeaders = mergeResolvedHeadersIntoHeadersArg(
+      resolvedHeaders,
+      responseHeaders,
+    ) as Record<string, string | string[]>;
+  }
+  Object.assign(
+    responseHeaders,
+    cdnCacheTag(String(responseHeaders["cache-control"] ?? ""), buildId),
+  );
+  const effectiveEtag = String(responseHeaders["etag"] ?? etag);
+  if (ifNoneMatchMatches(req.headers["if-none-match"], effectiveEtag)) {
+    res.writeHead(304, responseHeaders);
+    res.end();
+    return true;
+  }
+  res.writeHead(200, responseHeaders);
+  res.end(req.method === "HEAD" ? undefined : content);
+  return true;
+}
+
 function addRequestMeta(req: Record<PropertyKey, unknown>, key: string, value: unknown): void {
   const meta = (req[NEXT_REQUEST_META] as Record<string, unknown> | undefined) ?? {};
   meta[key] = value;
@@ -195,6 +292,46 @@ interface ImageConfig {
   // attachment + this CSP so a crafted SVG can't run script in the site's origin.
   dangerouslyAllowSVG: boolean;
   contentSecurityPolicy: string;
+}
+
+// Load sharp exactly once per process and cache the verdict — success OR failure.
+// esbuild bundles sharp's JS into pool-server.cjs, and its __commonJS wrapper
+// registers the module record BEFORE evaluating it: when the native binding is
+// missing (no @img/sharp-* in the container), the FIRST require throws but every
+// LATER require returns the broken partially-initialized module. Live this showed
+// up as one honest 503 ("sharp is unavailable") followed by an endless stream of
+// misleading 502s from deep inside the pipeline (build XchOtaGFu6GdFrcdujVc0).
+// Memoizing the first attempt keeps the failure mode consistent and logs WHY once.
+type SharpModule = (input: Buffer) => SharpPipeline;
+type SharpPipeline = {
+  resize: (w: number | undefined, h: undefined, o: { withoutEnlargement: true }) => SharpPipeline;
+  avif: (o: { quality: number }) => SharpPipeline;
+  webp: (o: { quality: number }) => SharpPipeline;
+  png: () => SharpPipeline;
+  jpeg: (o: { quality: number }) => SharpPipeline;
+  toBuffer: () => Promise<Buffer>;
+};
+let sharpLoadAttempted = false;
+let sharpModule: SharpModule | null = null;
+function loadSharpOnce(): SharpModule | null {
+  if (sharpLoadAttempted) return sharpModule;
+  sharpLoadAttempted = true;
+  try {
+    // In the production CJS bundle `require` exists (and esbuild has inlined sharp's
+    // JS behind it). Under the ESM source loader (vitest) it is undefined — resolve
+    // from the app dir instead, the same way the pool resolves next/dist modules.
+    sharpModule =
+      typeof require === "function"
+        ? (require("sharp") as SharpModule)
+        : (createRequire(path.join(process.cwd(), "package.json"))("sharp") as SharpModule);
+  } catch (err) {
+    sharpModule = null;
+    console.error(
+      "[pool-server] sharp failed to load — /_next/image will refuse to serve unoptimized (production images always ship sharp; check the image build):",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return sharpModule;
 }
 
 // Next.js defaults (used when required-server-files.json omits them).
@@ -546,9 +683,22 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
   // Load static assets manifest
   const staticAssetsPath = path.join(configDir, "static-assets.json");
-  const staticAssets = existsSync(staticAssetsPath)
+  const staticAssets: StaticAssetEntry[] = existsSync(staticAssetsPath)
     ? JSON.parse(readFileSync(staticAssetsPath, "utf-8"))
     : [];
+  // Whether dispatch's static-manifest lookup would find this pathname (a SUBSET of
+  // dispatch's own candidates — exact, trailing-slash variant, and the "/index" root
+  // alias — so `true` here guarantees dispatch finds an entry). Public files now live
+  // in the manifest (see emit/static-assets.ts), so a covered pathname must flow
+  // through dispatcher.dispatch, which merges the resolved routing verdict; the disk
+  // fallback (servePublicFileFromDisk) is reserved for pathnames this returns false for.
+  const staticManifestCovers = (pathname: string): boolean =>
+    staticAssets.some(
+      (a) =>
+        a.pathname === pathname ||
+        a.pathname === (pathname.endsWith("/") ? pathname.slice(0, -1) : pathname + "/") ||
+        (pathname === "/" && a.pathname === "/index"),
+    );
 
   // Allowlist for external /_next/image sources (SSRF guard).
   const imageConfig = loadImageConfig(process.cwd());
@@ -995,6 +1145,22 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       !!(middlewareModule || edgeMiddlewareRunner) &&
       matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
 
+    // next.config headers() + middleware response headers, serialized by the routing
+    // extension (secret-gated: server.ts already stripped the header unless the request
+    // proved trust). Parsed ONCE here — the forced cache-policy wrapper below must see an
+    // explicit app-owned cache-control before any response is written, and the Phase-2
+    // dispatch reuses the same parse. Deleted immediately so it can never leak to handlers.
+    const extResolvedHeaders = parseResolvedHeaders(
+      req.headers["x-resolved-headers"] as string | undefined,
+    );
+    delete req.headers["x-resolved-headers"];
+
+    // The explicit app-owned cache-control for this request, if any: from the routing
+    // extension's resolved verdict (Phase 2, above) or from local resolution (Phase 1
+    // fills this in after resolve()). The forced-cache wrapper reads it lazily at
+    // writeHead time — every response write happens after the owning phase populated it.
+    let appCacheControl: string | null = extResolvedHeaders?.get("cache-control") ?? null;
+
     // Force the CDN caching verdict for two kinds of route (non-matched routes keep their
     // origin Cache-Control):
     //   • PPR routes stream a per-request dynamic resume onto the shell, so the response must
@@ -1012,7 +1178,49 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     });
     if (forcedCacheControl) {
       const originalWriteHead = res.writeHead.bind(res);
-      res.writeHead = function forceCacheControl(...args: unknown[]) {
+      // Cache-control values seen BEFORE a later wrapper rewrote the headers argument.
+      // dispatch's resolved-header merge stacks OVER this wrapper and MUTATES the
+      // argument in place (replacing the serve site's cache-control with the resolved
+      // value) — so by the time forceCacheControl runs, a handler's own `no-store` has
+      // already been overwritten there. The writeHead setter below prefixes every
+      // later-stacked wrapper with a recorder that snapshots the serve site's values
+      // first; the never-weaken-`no-store` rule depends on this record.
+      const preMergeCacheControls: string[] = [];
+      const forceWriteHead = function forceCacheControl(...args: unknown[]) {
+        // An EXPLICIT app-owned cache-control (next.config headers() / middleware response
+        // headers, carried by the resolved routing verdict) overrides the middleware-matched
+        // `no-cache` default — the app took ownership of the cache decision, matching
+        // `next start`, which serves the headers() value on matched responses.
+        // explicitCacheControlWins pins the precedence: never for the PPR `no-store`
+        // verdict, and never weakening a response that itself declares `no-store`.
+        if (
+          explicitCacheControlWins({
+            forced: forcedCacheControl,
+            resolvedCacheControl: appCacheControl,
+            responseCacheControls: [...preMergeCacheControls, ...observedCacheControls(args, res)],
+          })
+        ) {
+          // dispatch's resolved-header merge only rewrites a headers ARGUMENT — a serve
+          // site that used setHeader (or passed no headers arg) still needs the explicit
+          // value stamped. And the CDN cache tag must be reconciled with the EFFECTIVE
+          // cache-control (M13 rule: mutable cacheable ⇒ deploy-tagged so cutover can
+          // invalidate it; uncacheable ⇒ never tagged): strip any tag a serve site
+          // stamped from its pre-merge default, then re-derive from the app value.
+          for (let i = 1; i < args.length; i++) {
+            const arg = args[i];
+            if (arg && typeof arg === "object") {
+              args[i] = filterWriteHeadHeadersArg(
+                arg,
+                (name) => name.toLowerCase() === "cache-tag",
+              );
+            }
+          }
+          res.removeHeader("cache-tag");
+          res.setHeader("cache-control", appCacheControl!);
+          const reconciledTag = cdnCacheTag(appCacheControl!, buildId)["cache-tag"];
+          if (reconciledTag) res.setHeader("cache-tag", reconciledTag);
+          return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
+        }
         // forcedCacheControl is always no-cache/no-store (uncacheable), so a serve site's
         // preliminary cache-control AND its CDN cache-tag are both moot — strip both, so a
         // tag never lands on a response the CDN won't cache (the final-Cache-Control rule).
@@ -1031,6 +1239,24 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         res.setHeader("cache-control", forcedCacheControl);
         return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
       } as typeof res.writeHead;
+      // Accessor instead of a plain assignment: later wrappers install themselves with
+      // `res.writeHead = wrapped(res.writeHead.bind(res))` (dispatch's resolved-header
+      // merge does exactly this), and the merge mutates the headers argument before this
+      // wrapper can read it. The setter re-wraps anything stacked later with the
+      // pre-merge cache-control recorder; the getter keeps normal stacking intact.
+      let stackedWriteHead: typeof res.writeHead = forceWriteHead;
+      Object.defineProperty(res, "writeHead", {
+        configurable: true,
+        get() {
+          return stackedWriteHead;
+        },
+        set(next: typeof res.writeHead) {
+          stackedWriteHead = function recordPreMergeCacheControls(...args: unknown[]) {
+            preMergeCacheControls.push(...observedCacheControls(args, res));
+            return (next as (...a: unknown[]) => ServerResponse).apply(res, args);
+          } as typeof res.writeHead;
+        },
+      });
     }
 
     // Serve _next/static/* and _next/data/* directly from filesystem.
@@ -1167,6 +1393,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // Resolve the image: internal (relative) or external (absolute URL)
         let imageBuffer: Buffer;
         let contentType: string;
+        let selfFetchContentType: string | null = null;
 
         if (imageUrl.startsWith("/")) {
           // Internal image: read from filesystem. Confine the path to public/ or
@@ -1235,8 +1462,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               return;
             }
             imageBuffer = streamedBody;
+            // A route-served image has no meaningful extension (e.g. /api/tiny-png) —
+            // the response's own Content-Type is the fallback, not an extension guess.
+            selfFetchContentType = imgRes.headers.get("content-type");
           }
-          contentType = getContentType(decodedImagePath);
+          contentType = selfFetchContentType ?? getContentType(decodedImagePath);
         } else {
           // External image: only fetch allowlisted http(s) hosts, and only after
           // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
@@ -1263,6 +1493,15 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           contentType = fetched.contentType;
         }
 
+        // `next start` parity: Next derives the source format from the BYTES
+        // (detectContentType), never from the URL or the upstream header — an
+        // extensionless route serving a PNG must stay PNG through negotiation
+        // (deriving it from the URL re-encoded /api/tiny-png's PNG to JPEG), and the
+        // SVG gate below must fire on actual SVG bytes even under a lying name.
+        // Where Next 400s an unrecognized signature outright, we keep the
+        // header/extension fallback — the encode path below fails closed anyway.
+        contentType = detectImageContentType(imageBuffer) ?? contentType;
+
         // `next start` parity: SVG never goes through the optimizer by default — Next
         // 400s it unless images.dangerouslyAllowSVG is set, and then serves it with
         // Content-Disposition: attachment plus the configured CSP so a crafted SVG
@@ -1271,7 +1510,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         if (contentType.toLowerCase().includes("svg")) {
           if (!imageConfig.dangerouslyAllowSVG) {
             res.writeHead(400, { "content-type": "text/plain" });
-            res.end('Bad Request: "url" parameter is valid but image type is not allowed');
+            // Byte-for-byte the body `next start` sends for this case.
+            res.end('"url" parameter is valid but image type is not allowed');
             return;
           }
           res.writeHead(200, {
@@ -1294,16 +1534,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // be served as text/html) — and a MISSING sharp means the image stack is
         // broken (production images always ship sharp), not that unvalidated
         // passthrough is safe. Fail closed in both cases.
-        let sharp: ReturnType<typeof require> | undefined;
-        try {
-          sharp = require("sharp");
-        } catch {
-          sharp = undefined;
-        }
+        const sharp = loadSharpOnce();
         if (!sharp) {
-          console.error(
-            "[pool-server] sharp is unavailable — refusing to serve /_next/image unoptimized (production images always ship sharp; check the image build)",
-          );
+          // The load failure (with its cause) was logged once by loadSharpOnce.
           res.writeHead(503, { "content-type": "text/plain" });
           res.end("Image optimization unavailable");
           return;
@@ -1347,8 +1580,15 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             vary: "Accept",
           });
           res.end(optimized);
-        } catch {
+        } catch (err) {
           // Sharp exists but failed on the input — refuse to serve unvalidated bytes.
+          // Log the actual failure: the live 502s for /api/tiny-png were undebuggable
+          // without it (the cause turned out to be a broken sharp module, see
+          // loadSharpOnce — but a genuinely corrupt input lands here too).
+          console.error(
+            `[pool-server] /_next/image failed to process ${imageUrl} (${contentType}):`,
+            err instanceof Error ? err.message : err,
+          );
           res.writeHead(502, { "content-type": "text/plain" });
           res.end("Failed to process image");
         }
@@ -1363,38 +1603,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
     }
 
-    // Serve public directory files (favicon.ico, robots.txt, etc.)
-    // In production, CDN/GCS serves these. In standalone/emulate, pool server must.
-    if (
-      !middlewareCovers &&
-      !url.pathname.startsWith("/_next/") &&
-      !url.pathname.startsWith("/api/")
-    ) {
-      const decodedPublicPathname = decodePublicPathname(url.pathname);
-      const publicPath = decodedPublicPathname
-        ? resolveWithinRoot(path.join(process.cwd(), "public"), decodedPublicPathname)
-        : null;
-      if (publicPath && existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
-        const content = readFileSync(publicPath);
-        const etag = staticAssetEtag(content);
-        const responseHeaders = {
-          "content-type": getContentType(decodedPublicPathname!),
-          "cache-control": "public, max-age=3600",
-          etag,
-          // Mutable public file cached at the CDN — tag it so a deploy/rollback can invalidate
-          // the outgoing build's copy (its content can change at the same URL across builds).
-          ...cdnCacheTag("public, max-age=3600", buildId),
-        };
-        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
-          res.writeHead(304, responseHeaders);
-          res.end();
-          return;
-        }
-        res.writeHead(200, responseHeaders);
-        res.end(req.method === "HEAD" ? undefined : content);
-        return;
-      }
-    }
+    // public/ files deliberately have NO pre-routing fast path here. They are in the
+    // static-assets manifest (see emit/static-assets.ts), so Phase 2 serves them via
+    // dispatcher.dispatch and Phase 1 via resolve() → dispatch — both of which merge the
+    // resolved routing verdict (next.config headers() / middleware response headers)
+    // over the adapter's `public, max-age=3600` + deploy-tag default. A pre-parse disk
+    // serve here returned the hardcoded default and silently dropped headers() and
+    // middleware headers. servePublicFileFromDisk remains as the last resort for files
+    // the manifest missed (both phases, below).
 
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
@@ -1482,20 +1698,45 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
       const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
 
-      // next.config headers() + middleware response headers, serialized by the routing
-      // extension. The dispatcher merges these into the response (they'd otherwise be dropped
-      // on this path). Delete the header after parsing so it doesn't leak to the handler.
-      const resolvedHeaders = parseResolvedHeaders(
-        req.headers["x-resolved-headers"] as string | undefined,
-      );
-      delete req.headers["x-resolved-headers"];
+      // Public files flow through dispatch via the static manifest (which merges
+      // extResolvedHeaders — parsed and deleted above — into the response). Disk is the
+      // LAST resort for a public file the manifest missed: without it a stale/absent
+      // static-assets.json would turn the file into a 404 (dispatch has already written
+      // its verdict by the time it misses, so this check must come first).
+      if (
+        !handlerLoader.has(extOutputId) &&
+        !staticManifestCovers(extOutputId) &&
+        servePublicFileFromDisk(req, res, extOutputId, extResolvedHeaders, buildId)
+      ) {
+        return;
+      }
+
+      // Rewrite invocation target stamped by the routing extension / cross-pool proxy
+      // (secret-gated members of INTERNAL_DISPATCH_HEADERS, stripped from untrusted
+      // clients in server.ts): the handler must be invoked with the REWRITTEN internal
+      // URL and its resolved query (repeated destination keys restored) while req.url
+      // keeps the public one. Trusted input, but a malformed query from an extension
+      // bug must not 500 the request — the invoker recovers the query from the
+      // invocation path itself.
+      const extInvokePath = req.headers["x-invoke-path"] as string | undefined;
+      let extInvocationQuery: Record<string, string | string[]> | undefined;
+      const extInvokeQueryRaw = req.headers["x-invoke-query"] as string | undefined;
+      if (extInvokeQueryRaw) {
+        try {
+          extInvocationQuery = JSON.parse(extInvokeQueryRaw);
+        } catch {
+          extInvocationQuery = undefined;
+        }
+      }
 
       await dispatcher.dispatch(req, res, {
         kind: "route",
         pool,
         matchedPathname: extOutputId, // Use outputId/pathname from header
         routeMatches,
-        resolvedHeaders,
+        resolvedHeaders: extResolvedHeaders,
+        ...(extInvokePath ? { invokePath: extInvokePath } : {}),
+        ...(extInvocationQuery ? { invocationQuery: extInvocationQuery } : {}),
       });
       return;
     }
@@ -1507,31 +1748,25 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       req.method ?? "GET",
       createBufferedStream(bodyBuffer),
     );
+    // The explicit app-owned cache-control discovered by local resolution (next.config
+    // headers() / middleware response headers) — the forced-cache wrapper reads this at
+    // writeHead time, which always happens after this point (Phase 2 populated it from
+    // x-resolved-headers instead and returned above).
+    if (appCacheControl === null && "resolvedHeaders" in resolution) {
+      appCacheControl = resolution.resolvedHeaders?.get("cache-control") ?? null;
+    }
     if (resolution.kind === "route" && !handlerLoader.has(resolution.matchedPathname)) {
       const resolvedPathname = resolution.invokePath
         ? new URL(resolution.invokePath, url).pathname
         : resolution.matchedPathname;
-      const publicRoot = path.join(process.cwd(), "public");
-      const decodedResolvedPathname = decodePublicPathname(resolvedPathname);
-      const publicFile = decodedResolvedPathname
-        ? resolveWithinRoot(publicRoot, decodedResolvedPathname)
-        : null;
-      if (publicFile && existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
-        const content = readFileSync(publicFile);
-        const etag = staticAssetEtag(content);
-        const responseHeaders = {
-          "content-type": getContentType(decodedResolvedPathname!),
-          "cache-control": "public, max-age=3600",
-          etag,
-          ...cdnCacheTag("public, max-age=3600", buildId),
-        };
-        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
-          res.writeHead(304, responseHeaders);
-          res.end();
-          return;
-        }
-        res.writeHead(200, responseHeaders);
-        res.end(req.method === "HEAD" ? undefined : content);
+      // Manifest-covered pathnames flow through dispatch, which serves the manifest
+      // entry and merges resolution.resolvedHeaders over the adapter default. Disk is
+      // the LAST resort for a public file the manifest missed (or a rewrite target the
+      // manifest can't key) — it applies the same resolved-header merge itself.
+      if (
+        !staticManifestCovers(resolution.matchedPathname) &&
+        servePublicFileFromDisk(req, res, resolvedPathname, resolution.resolvedHeaders, buildId)
+      ) {
         return;
       }
     }

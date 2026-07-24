@@ -208,6 +208,95 @@ export async function stageFile(
   }
 }
 
+// Sharp's native runtime packages for the emitted pool container platform: the pool
+// base image is node:*-slim (linux glibc) and GKE's default node pools are amd64, so
+// the container needs the linux-x64 pair. esbuild inlines sharp's JS into
+// pool-server.cjs, but the binding stays a RUNTIME require
+// (`@img/sharp-linux-x64/sharp.node`, which in turn dlopens libvips from
+// `@img/sharp-libvips-linux-x64`). Build XchOtaGFu6GdFrcdujVc0 shipped without either
+// — every containerized /_next/image failed the sharp load (503 "sharp is
+// unavailable") while local runs resolved the binding by walking up to the repo's own
+// node_modules, which masked the gap.
+export const SHARP_RUNTIME_PACKAGES = [
+  "@img/sharp-linux-x64",
+  "@img/sharp-libvips-linux-x64",
+] as const;
+
+// Resolver for sharp and its platform packages. resolveDepDir asks for
+// `${dep}/package.json`, which the @img/* packages BLOCK via their exports maps
+// (they export "./package", not "./package.json") — ERR_PACKAGE_PATH_NOT_EXPORTED
+// would silently skip staging on every build. Resolve the exported "./package"
+// subpath instead (sharp itself exports both), adapter-first like resolveDepDir.
+// Falls back to the sibling layout next to the resolved sharp package: npm hoists
+// @img/* beside sharp, and pnpm links a package's deps as virtual-store siblings.
+export function resolveSharpDepDir(dep: string, projectDir: string): string | undefined {
+  const fromFiles = [
+    path.join(_dirname, "index.js"), // adapter package (dist/)
+    path.join(projectDir, "package.json"), // app root
+  ];
+  for (const fromFile of fromFiles) {
+    try {
+      return path.dirname(createRequire(fromFile).resolve(`${dep}/package`));
+    } catch {
+      // try the next resolution root
+    }
+  }
+  if (dep !== "sharp") {
+    // Check the sibling of EVERY resolvable sharp copy — the adapter-first copy may
+    // simply not have this platform package installed while the app root's does.
+    for (const fromFile of fromFiles) {
+      try {
+        const sharpDir = path.dirname(createRequire(fromFile).resolve("sharp/package"));
+        const sibling = path.join(sharpDir, "..", ...dep.split("/"));
+        if (existsSync(path.join(sibling, "package.json"))) return sibling;
+      } catch {
+        // try the next resolution root
+      }
+    }
+  }
+  return undefined;
+}
+
+// Stage sharp's linux-x64 native packages into the pool's traced-assets context.
+// npm installs platform-specific optional packages for the BUILD host only, so a
+// darwin/arm64 host won't have the linux-x64 pair at all — in that case fall back to
+// reporting the app's resolved sharp version so the caller can emit an npm-install
+// step into the pool Dockerfile (running inside the image resolves the correct
+// platform packages natively). `staged: false` with no version means sharp is not
+// resolvable at all; image optimization will be unavailable in the container.
+export async function stageSharpRuntimePackages(
+  projectDir: string,
+  poolName: string,
+  resolveDep: (dep: string, projectDir: string) => string | undefined = resolveSharpDepDir,
+): Promise<{ staged: boolean; sharpVersion?: string }> {
+  const resolved = SHARP_RUNTIME_PACKAGES.map((pkg) => ({ pkg, dir: resolveDep(pkg, projectDir) }));
+  if (resolved.every(({ dir }) => dir !== undefined && existsSync(dir))) {
+    for (const { pkg, dir } of resolved) {
+      await stageFile(projectDir, dir!, `node_modules/${pkg}`, poolName);
+    }
+    return { staged: true };
+  }
+  const sharpDir = resolveDep("sharp", projectDir);
+  const sharpPkgJson = sharpDir ? path.join(sharpDir, "package.json") : undefined;
+  if (sharpPkgJson && existsSync(sharpPkgJson)) {
+    try {
+      const version = (JSON.parse(readFileSync(sharpPkgJson, "utf-8")) as { version?: unknown })
+        .version;
+      if (typeof version === "string" && version.length > 0) {
+        return { staged: false, sharpVersion: version };
+      }
+    } catch {
+      // Unreadable/corrupt sharp package.json — fall through to the warning below.
+    }
+  }
+  console.warn(
+    `[adapter-k8s] Could not resolve sharp's linux-x64 runtime packages ` +
+      `(${SHARP_RUNTIME_PACKAGES.join(", ")}) or a local sharp install — ` +
+      `/_next/image optimization will be UNAVAILABLE (503) in the "${poolName}" pool container.`,
+  );
+  return { staged: false };
+}
+
 // releaseName comes from infrastructure.json (written by init, so it matches the gcloud
 // resource names — IP, gateway, etc.) with a project-dir-basename fallback. The fallback
 // is capped at 40 chars to mirror assertSafeReleaseName's limit — an over-long directory
@@ -933,6 +1022,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           }
           await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
 
+          // Stage sharp's native linux-x64 packages (see stageSharpRuntimePackages) —
+          // pool-server.cjs inlines sharp's JS but requires the platform binding at
+          // runtime, and the traced-assets context otherwise ships no @img/* at all.
+          const sharpStaging = await stageSharpRuntimePackages(projectDir, poolName);
+
           // Keep .env secrets out of the pool image. The Dockerfile's
           // `COPY context/ .` runs from this pool dir (the docker build
           // context), so the .dockerignore lives here alongside the Dockerfile.
@@ -994,6 +1088,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             generatePoolDockerfile({
               poolName,
               buildId,
+              // Build host lacked linux-x64 sharp packages — install in-image instead,
+              // pinned to the app's sharp so the native ABI matches the inlined JS.
+              ...(!sharpStaging.staged && sharpStaging.sharpVersion
+                ? { installSharpVersion: sharpStaging.sharpVersion }
+                : {}),
             }),
             poolDir,
           );

@@ -7,6 +7,7 @@ import {
   type HeaderMutationEntry,
 } from "./response-builders.js";
 import {
+  computeRewriteInvocation,
   lookupPool,
   manifestNextConfig,
   matchesMiddleware,
@@ -386,7 +387,7 @@ export function createRequestHandler(
         // new budget that outlives the shed response.
         return handleRequest(retried, shedSignal);
       }
-      const responseHeaders: Record<string, string> = { location: redirect.url.toString() };
+      const responseHeaders: Record<string, string> = {};
       const setCookies = redirect.resolvedHeaders?.getSetCookie?.() ?? [];
       if (redirect.resolvedHeaders) {
         for (const [key, value] of redirect.resolvedHeaders.entries()) {
@@ -395,6 +396,24 @@ export function createRequestHandler(
           responseHeaders[key] = value;
         }
       }
+      // App Router flight requests cannot follow an HTTP redirect as an RSC payload: Next's
+      // router-server converts it into a SUCCESSFUL response carrying the internal
+      // x-nextjs-redirect field, and the client router performs the navigation. The edge must
+      // do the same translation the pool dispatcher does — an ext_proc 307 with a Location
+      // reaches the RSC client as an opaque cross-document redirect and breaks the soft
+      // navigation. Middleware-authored redirects (Location present in resolvedHeaders) are
+      // relativized when same-origin, matching the pool's middlewareRedirectLocation and
+      // `next start` (which reports a RELATIVE path for same-origin targets); rule redirects
+      // keep their absolute form — mirrors pool-server/dispatch.ts, keep the two in lockstep.
+      if (headers.get(rscConfig?.header ?? "rsc") === "1") {
+        const sameOrigin = redirect.url.origin === url.origin;
+        responseHeaders["x-nextjs-redirect"] =
+          redirect.resolvedHeaders?.has("location") && sameOrigin
+            ? redirect.url.pathname + redirect.url.search + redirect.url.hash
+            : redirect.url.toString();
+        return buildImmediateResponse(200, responseHeaders, undefined, setCookies);
+      }
+      responseHeaders["location"] = redirect.url.toString();
       return buildImmediateResponse(redirect.status, responseHeaders, undefined, setCookies);
     }
 
@@ -473,6 +492,29 @@ export function createRequestHandler(
     setDispatch("x-matched-pathname", outputId);
     if (resolution.routeMatches) {
       setDispatch("x-route-matches", JSON.stringify(resolution.routeMatches));
+    }
+
+    // Rewrite invocation target: when routing rewrote the URL (middleware or next.config
+    // rewrites), the pool must invoke the handler with the REWRITTEN path+query while the
+    // public :path is preserved for the client. Without this transport, a trusted-dispatch
+    // request runs the handler against the ORIGINAL URL and every rewrite-added query param
+    // (e.g. a destination's repeated `?item=one&item=two`) is silently dropped. Same
+    // derivation as pool-server/resolve.ts (shared computeRewriteInvocation).
+    const invocation = computeRewriteInvocation({
+      originalUrl: prep.originalUrl,
+      addedLocale: prep.addedLocale,
+      isRscRequest: rscConfig ? headers.get(rscConfig.header) === "1" : false,
+      isDataRequest: prep.isDataRequest,
+      routes: manifest.routeGraph,
+      resolvedQuery: resolution.resolvedQuery,
+      invocationTarget: resolution.invocationTarget,
+      resolvedPathname: resolution.resolvedPathname,
+    });
+    if (invocation.invokePath) {
+      setDispatch("x-invoke-path", invocation.invokePath);
+    }
+    if (invocation.invocationQuery && Object.keys(invocation.invocationQuery).length > 0) {
+      setDispatch("x-invoke-query", JSON.stringify(invocation.invocationQuery));
     }
 
     if (basePathname in manifest.pprRoutes) {

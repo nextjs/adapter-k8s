@@ -37,12 +37,24 @@ const RATE_LIMIT_MS = 60_000;
 const lastErrorAt = new Map<string, number>();
 
 /**
+ * Wall-clock milliseconds WITHOUT `Date.now()` (N8). Under cacheComponents, Next patches
+ * `Date.now` to THROW `DYNAMIC_SERVER_USAGE` when called synchronously inside a tracked
+ * static render — and this cache stack runs inside renders, so every clock read here must
+ * use the unpatched `performance` pair instead (same trick as Next's own default cache
+ * handler, next/dist/server/lib/cache-handlers/default.js). Same epoch and semantics as
+ * Date.now(); stored timestamps and tag-manifest comparisons are unaffected.
+ */
+export function wallClockNow(): number {
+  return Math.round(performance.timeOrigin + performance.now());
+}
+
+/**
  * `console.error` at most once per 60s per failure class (M1). The handlers' invalidation and
  * freshness paths fail open by design — a missed revalidation must not crash a render — but a
  * Valkey outage there must still be OBSERVABLE without emitting one log line per request.
  */
 export function logErrorRateLimited(failureClass: string, message: string, error: unknown): void {
-  const now = Date.now();
+  const now = wallClockNow();
   const last = lastErrorAt.get(failureClass);
   if (last !== undefined && now - last < RATE_LIMIT_MS) return;
   lastErrorAt.set(failureClass, now);

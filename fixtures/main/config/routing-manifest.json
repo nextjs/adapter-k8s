@@ -2,8 +2,22 @@
   "routeGraph": {
     "beforeMiddleware": [
       {
+        "source": "/header-priority.txt",
+        "sourceRegex": "(?i:^\\/header-priority\\.txt(?:\\/)?$)",
+        "headers": {
+          "Cache-Control": "max-age=1234"
+        }
+      },
+      {
+        "source": "/sw-revalidation-probe.js",
+        "sourceRegex": "(?i:^\\/sw-revalidation-probe\\.js(?:\\/)?$)",
+        "headers": {
+          "Cache-Control": "public, max-age=0, must-revalidate"
+        }
+      },
+      {
         "source": "/:path+/",
-        "sourceRegex": "^(?:\\/((?:[^\\/]+?)(?:\\/(?:[^\\/]+?))*))\\/$",
+        "sourceRegex": "(?i:^(?:\\/((?:[^\\/]+?)(?:\\/(?:[^\\/]+?))*))\\/$)",
         "headers": {
           "Location": "/$1"
         },
@@ -12,18 +26,55 @@
       }
     ],
     "beforeFiles": [],
-    "afterFiles": [],
-    "dynamicRoutes": [],
+    "afterFiles": [
+      {
+        "source": "/rewrite-query-array",
+        "sourceRegex": "(?i:^\\/rewrite-query-array(?:\\/)?$)",
+        "destination": "/api/rewrite-query-array?item=one&item=two"
+      }
+    ],
+    "dynamicRoutes": [
+      {
+        "source": "/fallback-cache/[slug]",
+        "sourceRegex": "^/_next/data/5XvmnjRi2uE2e_gaBmQzE[/]?/fallback\\-cache/(?<nxtPslug>[^/]+?)\\.json(?:/)?$",
+        "destination": "/_next/data/5XvmnjRi2uE2e_gaBmQzE/fallback-cache/[slug].json?nxtPslug=$nxtPslug"
+      },
+      {
+        "source": "/encoded-key/[key]",
+        "sourceRegex": "^[/]?/encoded\\-key/(?<nxtPkey>[^/]+?)\\.segments/encoded\\-key/\\$d\\$key(?<segment>/__PAGE__\\.segment\\.rsc|\\.segment\\.rsc)(?:/)?$",
+        "destination": "/encoded-key/[key].segments/encoded-key/$d$key$segment?nxtPkey=$nxtPkey"
+      },
+      {
+        "source": "/encoded-key/[key].rsc",
+        "sourceRegex": "^[/]?/encoded\\-key/(?<nxtPkey>[^/]+?)(?<rscSuffix>\\.rsc|\\.segments/.+\\.segment\\.rsc)(?:/)?$",
+        "destination": "/encoded-key/[key]$rscSuffix?nxtPkey=$nxtPkey"
+      },
+      {
+        "source": "/encoded-key/[key]",
+        "sourceRegex": "^[/]?/encoded\\-key/(?<nxtPkey>[^/]+?)(?:/)?$",
+        "destination": "/encoded-key/[key]?nxtPkey=$nxtPkey"
+      },
+      {
+        "source": "/fallback-cache/[slug].rsc",
+        "sourceRegex": "^[/]?/fallback\\-cache/(?<nxtPslug>[^/]+?)(?<rscSuffix>\\.rsc|\\.segments/.+\\.segment\\.rsc)(?:/)?$",
+        "destination": "/fallback-cache/[slug]$rscSuffix?nxtPslug=$nxtPslug"
+      },
+      {
+        "source": "/fallback-cache/[slug]",
+        "sourceRegex": "^[/]?/fallback\\-cache/(?<nxtPslug>[^/]+?)(?:/)?$",
+        "destination": "/fallback-cache/[slug]?nxtPslug=$nxtPslug"
+      }
+    ],
     "onMatch": [
       {
-        "sourceRegex": "/_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media|9afxl2xs3td)/.+",
+        "sourceRegex": "(?i:/_next/static/(?:[^/]+/pages|pages|chunks|runtime|css|image|media|5XvmnjRi2uE2e_gaBmQzE)/.+)",
         "headers": {
           "cache-control": "public,max-age=31536000,immutable"
         }
       }
     ],
     "fallback": [],
-    "shouldNormalizeNextData": false,
+    "shouldNormalizeNextData": true,
     "rsc": {
       "header": "rsc",
       "varyHeader": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
@@ -34,35 +85,86 @@
       "prefetchSegmentHeader": "next-router-segment-prefetch",
       "prefetchSegmentSuffix": ".segment.rsc",
       "prefetchSegmentDirSuffix": ".segments",
-      "clientParamParsing": false,
-      "dynamicRSCPrerender": false
+      "clientParamParsing": true,
+      "dynamicRSCPrerender": true
     }
   },
   "pathnames": [
     "/",
     "/404",
     "/500",
-    "/_global-error",
-    "/_global-error.rsc",
-    "/_global-error.segments/__PAGE__.segment.rsc",
-    "/_global-error.segments/_full.segment.rsc",
-    "/_global-error.segments/_head.segment.rsc",
-    "/_global-error.segments/_index.segment.rsc",
-    "/_global-error.segments/_tree.segment.rsc",
+    "/_error",
     "/_middleware",
-    "/_next/static/9afxl2xs3td/_buildManifest.js",
-    "/_next/static/9afxl2xs3td/_clientMiddlewareManifest.js",
-    "/_next/static/9afxl2xs3td/_ssgManifest.js",
+    "/_next/data/5XvmnjRi2uE2e_gaBmQzE/fallback-cache/[slug].json",
+    "/_next/static/5XvmnjRi2uE2e_gaBmQzE/_buildManifest.js",
+    "/_next/static/5XvmnjRi2uE2e_gaBmQzE/_clientMiddlewareManifest.js",
+    "/_next/static/5XvmnjRi2uE2e_gaBmQzE/_ssgManifest.js",
+    "/_next/static/chunks/0-m5km3_0g7ct.js",
     "/_next/static/chunks/0cz1d0mv5g_q7.js",
-    "/_next/static/chunks/11xjbeamcdd17.js",
-    "/_next/static/chunks/1q_qba27-61gx.js",
-    "/_next/static/chunks/1u97875k2y7yb.js",
-    "/_next/static/chunks/2fd0hphdk3h_o.js",
-    "/_next/static/chunks/turbopack-1tfu0s-0wkdpk.js",
+    "/_next/static/chunks/0j8ifruuzyo45.js",
+    "/_next/static/chunks/0lcs338qjh2v9.js",
+    "/_next/static/chunks/112tq_v3euo_r.js",
+    "/_next/static/chunks/1fx80cq21m9kd.js",
+    "/_next/static/chunks/1hvmfyqw-euxk.js",
+    "/_next/static/chunks/1idxd2a-kzs2z.js",
+    "/_next/static/chunks/1te197tmc5x9l.js",
+    "/_next/static/chunks/2pw91db71bmfs.js",
+    "/_next/static/chunks/2t5qhcwte2m1k.js",
+    "/_next/static/chunks/2uc5gmuon0u4d.js",
+    "/_next/static/chunks/2ut8vpu779gs6.js",
+    "/_next/static/chunks/3ib5t-r56xhe1.js",
+    "/_next/static/chunks/3mdwr0_v2evae.js",
+    "/_next/static/chunks/turbopack-10huo3r2ydhew.js",
+    "/_next/static/chunks/turbopack-1pzdzbhvem_87.js",
+    "/_next/static/chunks/turbopack-3usgy_3n3q1oe.js",
+    "/_next/static/chunks/turbopack-3uv_77fa-dav_.js",
+    "/_next/static/media/icon.38hsh64avopbl.svg",
     "/_not-found",
     "/_not-found.rsc",
+    "/api/cache-probe",
+    "/api/cache-probe.rsc",
+    "/api/catalog",
+    "/api/catalog.rsc",
+    "/api/form-redirect",
+    "/api/form-redirect.rsc",
     "/api/hello",
     "/api/hello.rsc",
+    "/api/revalidate",
+    "/api/revalidate.rsc",
+    "/api/rewrite-body-source",
+    "/api/rewrite-body-source.rsc",
+    "/api/rewrite-query-array",
+    "/api/rewrite-query-array.rsc",
+    "/api/tiny-png",
+    "/api/tiny-png.rsc",
+    "/encoded-key/[key]",
+    "/encoded-key/[key].rsc",
+    "/encoded-key/[key].segments/_full.segment.rsc",
+    "/encoded-key/[key].segments/_head.segment.rsc",
+    "/encoded-key/[key].segments/_index.segment.rsc",
+    "/encoded-key/[key].segments/_tree.segment.rsc",
+    "/encoded-key/[key].segments/encoded-key.segment.rsc",
+    "/encoded-key/[key].segments/encoded-key/$d$key.segment.rsc",
+    "/encoded-key/[key].segments/encoded-key/$d$key/__PAGE__.segment.rsc",
+    "/fallback-cache/[slug]",
+    "/fallback-cache/[slug].rsc",
+    "/form-redirect-target",
+    "/form-redirect-target.rsc",
+    "/form-redirect-target.segments/_full.segment.rsc",
+    "/form-redirect-target.segments/_head.segment.rsc",
+    "/form-redirect-target.segments/_index.segment.rsc",
+    "/form-redirect-target.segments/_tree.segment.rsc",
+    "/form-redirect-target.segments/form-redirect-target.segment.rsc",
+    "/form-redirect-target.segments/form-redirect-target/__PAGE__.segment.rsc",
+    "/header-budget",
+    "/header-budget.rsc",
+    "/header-budget.segments/_full.segment.rsc",
+    "/header-budget.segments/_head.segment.rsc",
+    "/header-budget.segments/_index.segment.rsc",
+    "/header-budget.segments/_tree.segment.rsc",
+    "/header-budget.segments/header-budget.segment.rsc",
+    "/header-budget.segments/header-budget/__PAGE__.segment.rsc",
+    "/icon.svg",
     "/index.rsc",
     "/index.segments/__PAGE__.segment.rsc",
     "/index.segments/_full.segment.rsc",
@@ -77,6 +179,14 @@
     "/isr.segments/_tree.segment.rsc",
     "/isr.segments/isr.segment.rsc",
     "/isr.segments/isr/__PAGE__.segment.rsc",
+    "/resume-probe",
+    "/resume-probe.rsc",
+    "/resume-probe.segments/_full.segment.rsc",
+    "/resume-probe.segments/_head.segment.rsc",
+    "/resume-probe.segments/_index.segment.rsc",
+    "/resume-probe.segments/_tree.segment.rsc",
+    "/resume-probe.segments/resume-probe.segment.rsc",
+    "/resume-probe.segments/resume-probe/__PAGE__.segment.rsc",
     "/rewritten",
     "/rewritten.rsc",
     "/rewritten.segments/_full.segment.rsc",
@@ -85,135 +195,259 @@
     "/rewritten.segments/_tree.segment.rsc",
     "/rewritten.segments/rewritten.segment.rsc",
     "/rewritten.segments/rewritten/__PAGE__.segment.rsc",
+    "/shell-cache",
+    "/shell-cache.rsc",
+    "/shell-cache.segments/_full.segment.rsc",
+    "/shell-cache.segments/_head.segment.rsc",
+    "/shell-cache.segments/_index.segment.rsc",
+    "/shell-cache.segments/_tree.segment.rsc",
+    "/shell-cache.segments/shell-cache.segment.rsc",
+    "/shell-cache.segments/shell-cache/__PAGE__.segment.rsc",
     "/ssr",
-    "/ssr.rsc"
+    "/ssr.rsc",
+    "/ssr.segments/_full.segment.rsc",
+    "/ssr.segments/_head.segment.rsc",
+    "/ssr.segments/_index.segment.rsc",
+    "/ssr.segments/_tree.segment.rsc",
+    "/ssr.segments/ssr.segment.rsc",
+    "/ssr.segments/ssr/__PAGE__.segment.rsc"
   ],
   "i18n": null,
-  "buildId": "9afxl2xs3td",
+  "buildId": "5XvmnjRi2uE2e_gaBmQzE",
+  "builtAt": "2026-07-24T21:06:17.397Z",
   "basePath": "",
   "trailingSlash": false,
   "middleware": {
-    "filePath": ".next/server/edge/chunks/1459_next_dist_esm_build_templates_edge-wrapper_07q1ayg.js",
-    "runtime": "edge",
+    "filePath": ".next/server/middleware.js",
+    "runtime": "nodejs",
     "matchers": [
       {
-        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?(?:\\/(\\/?index|\\/?index\\.json|\\/?index(?:\\.rsc|\\.segments\\/.+\\.segment\\.rsc)))?[\\/#\\?]?$",
+        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?(?:\\/((?!_next\\/static|_next\\/image|favicon.ico|cdn-probe.txt|header-priority.txt).*))(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
         "missing": [
           {
             "type": "header",
             "key": "x-prerender-revalidate",
-            "value": "142dca0c65035bde766e9721b10e7c3e"
+            "value": "5b02120c7a4f9ed5c8fd7d0767ab1669"
           }
         ],
-        "originalSource": "/"
-      },
-      {
-        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/ssr(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
-        "missing": [
-          {
-            "type": "header",
-            "key": "x-prerender-revalidate",
-            "value": "142dca0c65035bde766e9721b10e7c3e"
-          }
-        ],
-        "originalSource": "/ssr"
-      },
-      {
-        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/isr(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
-        "missing": [
-          {
-            "type": "header",
-            "key": "x-prerender-revalidate",
-            "value": "142dca0c65035bde766e9721b10e7c3e"
-          }
-        ],
-        "originalSource": "/isr"
-      },
-      {
-        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/from-mw(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
-        "missing": [
-          {
-            "type": "header",
-            "key": "x-prerender-revalidate",
-            "value": "142dca0c65035bde766e9721b10e7c3e"
-          }
-        ],
-        "originalSource": "/from-mw"
-      },
-      {
-        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/rewritten(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
-        "missing": [
-          {
-            "type": "header",
-            "key": "x-prerender-revalidate",
-            "value": "142dca0c65035bde766e9721b10e7c3e"
-          }
-        ],
-        "originalSource": "/rewritten"
-      },
-      {
-        "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?\\/api(?:\\/((?:[^\\/#\\?]+?)(?:\\/(?:[^\\/#\\?]+?))*))?(\\.json|\\.rsc|\\.segments\\/.+\\.segment\\.rsc)?[\\/#\\?]?$",
-        "missing": [
-          {
-            "type": "header",
-            "key": "x-prerender-revalidate",
-            "value": "142dca0c65035bde766e9721b10e7c3e"
-          }
-        ],
-        "originalSource": "/api/:path*"
+        "originalSource": "/((?!_next/static|_next/image|favicon.ico|cdn-probe.txt|header-priority.txt).*)"
       }
     ]
   },
   "poolAssignments": {
     "/_not-found.rsc": "default",
     "/_not-found": "default",
-    "/_global-error.rsc": "default",
-    "/_global-error": "default",
+    "/encoded-key/[key].rsc": "default",
+    "/encoded-key/[key]": "default",
+    "/form-redirect-target.rsc": "default",
+    "/form-redirect-target": "default",
+    "/header-budget.rsc": "default",
+    "/header-budget": "default",
     "/isr.rsc": "default",
     "/isr": "default",
     "/index.rsc": "default",
     "/": "default",
+    "/resume-probe.rsc": "default",
+    "/resume-probe": "default",
     "/rewritten.rsc": "default",
     "/rewritten": "default",
+    "/shell-cache.rsc": "default",
+    "/shell-cache": "default",
     "/ssr.rsc": "default",
     "/ssr": "default",
+    "/api/cache-probe": "default",
+    "/api/cache-probe.rsc": "default",
+    "/api/catalog": "default",
+    "/api/catalog.rsc": "default",
+    "/api/form-redirect": "default",
+    "/api/form-redirect.rsc": "default",
     "/api/hello": "default",
     "/api/hello.rsc": "default",
+    "/api/revalidate": "default",
+    "/api/revalidate.rsc": "default",
+    "/api/rewrite-body-source": "default",
+    "/api/rewrite-body-source.rsc": "default",
+    "/api/rewrite-query-array": "default",
+    "/api/rewrite-query-array.rsc": "default",
+    "/api/tiny-png": "default",
+    "/api/tiny-png.rsc": "default",
+    "/_error": "default",
+    "/fallback-cache/[slug]": "default",
     "/index.segments/_tree.segment.rsc": "default",
     "/index.segments/_full.segment.rsc": "default",
     "/index.segments/__PAGE__.segment.rsc": "default",
     "/index.segments/_index.segment.rsc": "default",
     "/index.segments/_head.segment.rsc": "default",
-    "/_global-error.segments/_tree.segment.rsc": "default",
-    "/_global-error.segments/_full.segment.rsc": "default",
-    "/_global-error.segments/__PAGE__.segment.rsc": "default",
-    "/_global-error.segments/_index.segment.rsc": "default",
-    "/_global-error.segments/_head.segment.rsc": "default",
+    "/form-redirect-target.segments/_tree.segment.rsc": "default",
+    "/form-redirect-target.segments/_full.segment.rsc": "default",
+    "/form-redirect-target.segments/form-redirect-target/__PAGE__.segment.rsc": "default",
+    "/form-redirect-target.segments/form-redirect-target.segment.rsc": "default",
+    "/form-redirect-target.segments/_index.segment.rsc": "default",
+    "/form-redirect-target.segments/_head.segment.rsc": "default",
+    "/header-budget.segments/_tree.segment.rsc": "default",
+    "/header-budget.segments/_full.segment.rsc": "default",
+    "/header-budget.segments/header-budget/__PAGE__.segment.rsc": "default",
+    "/header-budget.segments/header-budget.segment.rsc": "default",
+    "/header-budget.segments/_index.segment.rsc": "default",
+    "/header-budget.segments/_head.segment.rsc": "default",
     "/isr.segments/_tree.segment.rsc": "default",
     "/isr.segments/_full.segment.rsc": "default",
     "/isr.segments/isr/__PAGE__.segment.rsc": "default",
     "/isr.segments/isr.segment.rsc": "default",
     "/isr.segments/_index.segment.rsc": "default",
     "/isr.segments/_head.segment.rsc": "default",
+    "/resume-probe.segments/_tree.segment.rsc": "default",
+    "/resume-probe.segments/_full.segment.rsc": "default",
+    "/resume-probe.segments/resume-probe/__PAGE__.segment.rsc": "default",
+    "/resume-probe.segments/resume-probe.segment.rsc": "default",
+    "/resume-probe.segments/_index.segment.rsc": "default",
+    "/resume-probe.segments/_head.segment.rsc": "default",
     "/rewritten.segments/_tree.segment.rsc": "default",
     "/rewritten.segments/_full.segment.rsc": "default",
     "/rewritten.segments/rewritten/__PAGE__.segment.rsc": "default",
     "/rewritten.segments/rewritten.segment.rsc": "default",
     "/rewritten.segments/_index.segment.rsc": "default",
     "/rewritten.segments/_head.segment.rsc": "default",
+    "/shell-cache.segments/_tree.segment.rsc": "default",
+    "/shell-cache.segments/_full.segment.rsc": "default",
+    "/shell-cache.segments/shell-cache/__PAGE__.segment.rsc": "default",
+    "/shell-cache.segments/shell-cache.segment.rsc": "default",
+    "/shell-cache.segments/_index.segment.rsc": "default",
+    "/shell-cache.segments/_head.segment.rsc": "default",
+    "/ssr.segments/_tree.segment.rsc": "default",
+    "/ssr.segments/_full.segment.rsc": "default",
+    "/ssr.segments/ssr/__PAGE__.segment.rsc": "default",
+    "/ssr.segments/ssr.segment.rsc": "default",
+    "/ssr.segments/_index.segment.rsc": "default",
+    "/ssr.segments/_head.segment.rsc": "default",
+    "/encoded-key/[key].segments/_tree.segment.rsc": "default",
+    "/encoded-key/[key].segments/_full.segment.rsc": "default",
+    "/encoded-key/[key].segments/encoded-key/$d$key/__PAGE__.segment.rsc": "default",
+    "/encoded-key/[key].segments/encoded-key/$d$key.segment.rsc": "default",
+    "/encoded-key/[key].segments/encoded-key.segment.rsc": "default",
+    "/encoded-key/[key].segments/_index.segment.rsc": "default",
+    "/encoded-key/[key].segments/_head.segment.rsc": "default",
+    "/_next/data/5XvmnjRi2uE2e_gaBmQzE/fallback-cache/[slug].json": "default",
     "/404": "default",
     "/500": "default",
     "/_middleware": "default",
-    "/_next/static/9afxl2xs3td/_buildManifest.js": "default",
-    "/_next/static/9afxl2xs3td/_clientMiddlewareManifest.js": "default",
-    "/_next/static/9afxl2xs3td/_ssgManifest.js": "default",
+    "/_next/static/5XvmnjRi2uE2e_gaBmQzE/_buildManifest.js": "default",
+    "/_next/static/5XvmnjRi2uE2e_gaBmQzE/_clientMiddlewareManifest.js": "default",
+    "/_next/static/5XvmnjRi2uE2e_gaBmQzE/_ssgManifest.js": "default",
+    "/_next/static/chunks/0-m5km3_0g7ct.js": "default",
     "/_next/static/chunks/0cz1d0mv5g_q7.js": "default",
-    "/_next/static/chunks/11xjbeamcdd17.js": "default",
-    "/_next/static/chunks/1q_qba27-61gx.js": "default",
-    "/_next/static/chunks/1u97875k2y7yb.js": "default",
-    "/_next/static/chunks/2fd0hphdk3h_o.js": "default",
-    "/_next/static/chunks/turbopack-1tfu0s-0wkdpk.js": "default"
+    "/_next/static/chunks/0j8ifruuzyo45.js": "default",
+    "/_next/static/chunks/0lcs338qjh2v9.js": "default",
+    "/_next/static/chunks/112tq_v3euo_r.js": "default",
+    "/_next/static/chunks/1fx80cq21m9kd.js": "default",
+    "/_next/static/chunks/1hvmfyqw-euxk.js": "default",
+    "/_next/static/chunks/1idxd2a-kzs2z.js": "default",
+    "/_next/static/chunks/1te197tmc5x9l.js": "default",
+    "/_next/static/chunks/2pw91db71bmfs.js": "default",
+    "/_next/static/chunks/2t5qhcwte2m1k.js": "default",
+    "/_next/static/chunks/2uc5gmuon0u4d.js": "default",
+    "/_next/static/chunks/2ut8vpu779gs6.js": "default",
+    "/_next/static/chunks/3ib5t-r56xhe1.js": "default",
+    "/_next/static/chunks/3mdwr0_v2evae.js": "default",
+    "/_next/static/chunks/turbopack-10huo3r2ydhew.js": "default",
+    "/_next/static/chunks/turbopack-1pzdzbhvem_87.js": "default",
+    "/_next/static/chunks/turbopack-3usgy_3n3q1oe.js": "default",
+    "/_next/static/chunks/turbopack-3uv_77fa-dav_.js": "default",
+    "/_next/static/media/icon.38hsh64avopbl.svg": "default",
+    "/fallback-cache/[slug].rsc": "default",
+    "/icon.svg": "default"
   },
-  "pprRoutes": {},
+  "pprRoutes": {
+    "/resume-probe": {
+      "postponedState": "2117:[1,{\"nextSegmentId\":1,\"rootFormatContext\":{\"insertionMode\":0,\"selectedValue\":null,\"tagScope\":0,\"viewTransition\":null},\"progressiveChunkSize\":12800,\"resumableState\":{\"idPrefix\":\"\",\"nextFormID\":0,\"streamingFormat\":0,\"instructions\":96,\"hasBody\":true,\"hasHtml\":true,\"unknownResources\":{},\"dnsResources\":{},\"connectResources\":{\"default\":{},\"anonymous\":{},\"credentials\":{}},\"imageResources\":{},\"styleResources\":{},\"scriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null,\"/_next/static/chunks/1te197tmc5x9l.js\":null,\"/_next/static/chunks/0-m5km3_0g7ct.js\":null,\"/_next/static/chunks/turbopack-10huo3r2ydhew.js\":null,\"/_next/static/chunks/1hvmfyqw-euxk.js\":null},\"moduleUnknownResources\":{},\"moduleScriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null}},\"replayNodes\":[[\"lU\",0,[[\"Context\",0,[[\"Context\",0,[[\"ServerInsertedHTMLProvider\",0,[[\"Context\",0,[[\"sI\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"s$\",0,[[\"Fragment\",0,[[\"Context\",2,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"af\",0,[[\"ad\",0,[[\"__next_root_layout_boundary__\",1,[[\"Fragment\",\"c\",[[\"html\",1,[[\"body\",0,[[null,0,[[\"Activity\",\"resume-probe\",[[\"Context\",\"resume-probe\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"h\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[null,1,[[\"Activity\",\"__PAGE__\",[[\"Context\",\"__PAGE__\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"Fragment\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[\"main\",0,[[\"Suspense\",2,[],0,[\"Suspense Fallback\",2,[],null],0]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],\"replaySlots\":null}]eJxVkNluo0AQRf+lnplRQ1gMb3aMGTwmCxrHxotG7aYwTZpFdNuGWPz7iCgPmbdSndLRvXUHqeoWwbtDhorl4N0HDRhl+edufwBrey2rIubGxTfw75nOytcP/wDaASbEImaa2bZJJxNGdJfpjGQm2hkzMkYxw8xm6clk5ADa/ngchVipth+HKxUXBA+iec2X/rQLz3X3LCRfPoYyrKZ8FVj6KbhJ7JfvyTbOV9tYsIe42T2GdljN+t1moZKyEyG/8cTIm1MQ97uNyUcH+7UUyUbnp2CtEmNR0ODtfbVZkGceyrAIb1GRqGjOVFTE66jw7Wie2NEfdnn6WHeb8YbPbifj1R7dL/0yzd7Ib9BA0bMEbw8tykuJP2SOQsBRA6moQPAeCNFA8RKlomUDnu5MTNdwdMdxLP0n0YmlAXYNH79tGq7p2o7hmhq0eKWCp1QheC4hgwY5lX7XCM64ir/BjAqJ/1H/S/dFWqRpXNfqhba0fKIljnGPw6ABVqztG4XprL5U6bQdi9yHYfgHtkuqZA==",
+      "fallbackFilePath": ".next/server/app/resume-probe.html",
+      "chainHeaders": {
+        "next-resume": "1"
+      },
+      "initialHeaders": {
+        "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+        "content-type": "text/html; charset=utf-8",
+        "x-nextjs-stale-time": "300",
+        "x-nextjs-prerender": "1",
+        "x-next-cache-tags": "_N_T_/layout,_N_T_/resume-probe/layout,_N_T_/resume-probe/page,_N_T_/resume-probe,resume-shell"
+      },
+      "initialStatus": 200,
+      "tags": [
+        "_N_T_/layout",
+        "_N_T_/resume-probe/layout",
+        "_N_T_/resume-probe/page",
+        "_N_T_/resume-probe",
+        "resume-shell"
+      ],
+      "revalidate": 900,
+      "expire": 31536000
+    },
+    "/shell-cache": {
+      "postponedState": "2115:[1,{\"nextSegmentId\":1,\"rootFormatContext\":{\"insertionMode\":0,\"selectedValue\":null,\"tagScope\":0,\"viewTransition\":null},\"progressiveChunkSize\":12800,\"resumableState\":{\"idPrefix\":\"\",\"nextFormID\":0,\"streamingFormat\":0,\"instructions\":96,\"hasBody\":true,\"hasHtml\":true,\"unknownResources\":{},\"dnsResources\":{},\"connectResources\":{\"default\":{},\"anonymous\":{},\"credentials\":{}},\"imageResources\":{},\"styleResources\":{},\"scriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null,\"/_next/static/chunks/1te197tmc5x9l.js\":null,\"/_next/static/chunks/0-m5km3_0g7ct.js\":null,\"/_next/static/chunks/turbopack-10huo3r2ydhew.js\":null,\"/_next/static/chunks/1hvmfyqw-euxk.js\":null},\"moduleUnknownResources\":{},\"moduleScriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null}},\"replayNodes\":[[\"lU\",0,[[\"Context\",0,[[\"Context\",0,[[\"ServerInsertedHTMLProvider\",0,[[\"Context\",0,[[\"sI\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"s$\",0,[[\"Fragment\",0,[[\"Context\",2,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"af\",0,[[\"ad\",0,[[\"__next_root_layout_boundary__\",1,[[\"Fragment\",\"c\",[[\"html\",1,[[\"body\",0,[[null,0,[[\"Activity\",\"shell-cache\",[[\"Context\",\"shell-cache\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"h\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[null,1,[[\"Activity\",\"__PAGE__\",[[\"Context\",\"__PAGE__\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"Fragment\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[\"main\",0,[[\"Suspense\",2,[],0,[\"Suspense Fallback\",2,[],null],0]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],\"replaySlots\":null}]eJxVkFtvozAQRv/LPKOVcRxub0lDI7IhbVC3CbmoMsYEU3MRdgJpxH9fserD9m00Z3T0ffMApeuWg/eAjGuWg/cYDGCU5f92xxNM97eyKiKBrz7mHxc6L7df/gmMEzjIxpOEUkKn1HUSjKbYRNxhKTUzhzA0NREjTuaw5ATG8XwehbzS7X0cblReOXgQLmqx8md9cKn7F6nE6ilQQTUT6+XUTJad4vfVZ7yP8vU+kmwSNYenwAqqTX3Y9Wq92+QxzmUgOhHjvEmW0f2wI2L0MJzLZNnpGD8XdPn+ud49oxcRqKAIurCIdbhgOiyiP2HhW+EitsI3dt18bcluvBHzLsFba/S+3ldp9o5+gwGaXhR4R1A5lxLOBihNJQdvgpABWpRcaVo24Jm2Q1xsm7ZtE+cXcS3HAN43YnwzwS5xLRu7xICW36gUKdUcPBehwYCcKr9vpGBCR//BjErFf1D/W/dNWk7TqK71K21puaElH3Oeh8EAXrH23miezutrlc7ascFjGIa/FG+mlw==",
+      "fallbackFilePath": ".next/server/app/shell-cache.html",
+      "chainHeaders": {
+        "next-resume": "1"
+      },
+      "initialHeaders": {
+        "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+        "content-type": "text/html; charset=utf-8",
+        "x-nextjs-stale-time": "300",
+        "x-nextjs-prerender": "1",
+        "x-next-cache-tags": "_N_T_/layout,_N_T_/shell-cache/layout,_N_T_/shell-cache/page,_N_T_/shell-cache,shell"
+      },
+      "initialStatus": 200,
+      "tags": [
+        "_N_T_/layout",
+        "_N_T_/shell-cache/layout",
+        "_N_T_/shell-cache/page",
+        "_N_T_/shell-cache",
+        "shell"
+      ],
+      "revalidate": 900,
+      "expire": 31536000
+    },
+    "/ssr": {
+      "postponedState": "2114:[1,{\"nextSegmentId\":1,\"rootFormatContext\":{\"insertionMode\":0,\"selectedValue\":null,\"tagScope\":0,\"viewTransition\":null},\"progressiveChunkSize\":12800,\"resumableState\":{\"idPrefix\":\"\",\"nextFormID\":0,\"streamingFormat\":0,\"instructions\":96,\"hasBody\":true,\"hasHtml\":true,\"unknownResources\":{},\"dnsResources\":{},\"connectResources\":{\"default\":{},\"anonymous\":{},\"credentials\":{}},\"imageResources\":{},\"styleResources\":{},\"scriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null,\"/_next/static/chunks/1te197tmc5x9l.js\":null,\"/_next/static/chunks/0-m5km3_0g7ct.js\":null,\"/_next/static/chunks/turbopack-10huo3r2ydhew.js\":null,\"/_next/static/chunks/1hvmfyqw-euxk.js\":null},\"moduleUnknownResources\":{},\"moduleScriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null}},\"replayNodes\":[[\"lU\",0,[[\"Context\",0,[[\"Context\",0,[[\"ServerInsertedHTMLProvider\",0,[[\"Context\",0,[[\"sI\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"s$\",0,[[\"Fragment\",0,[[\"Context\",2,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"af\",0,[[\"ad\",0,[[\"__next_root_layout_boundary__\",1,[[\"Fragment\",\"c\",[[\"html\",1,[[\"body\",0,[[null,0,[[\"Activity\",\"ssr\",[[\"Context\",\"ssr\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"h\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[null,1,[[\"Activity\",\"__PAGE__\",[[\"Context\",\"__PAGE__\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"Fragment\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[\"main\",0,[[\"p\",1,[[\"Suspense\",2,[],0,[\"Suspense Fallback\",2,[],null],0]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],\"replaySlots\":null}]null",
+      "fallbackFilePath": ".next/server/app/ssr.html",
+      "chainHeaders": {
+        "next-resume": "1"
+      },
+      "initialHeaders": {
+        "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+        "content-type": "text/html; charset=utf-8",
+        "x-nextjs-stale-time": "300",
+        "x-nextjs-prerender": "1",
+        "x-next-cache-tags": "_N_T_/layout,_N_T_/ssr/layout,_N_T_/ssr/page,_N_T_/ssr"
+      },
+      "initialStatus": 200,
+      "tags": [
+        "_N_T_/layout",
+        "_N_T_/ssr/layout",
+        "_N_T_/ssr/page",
+        "_N_T_/ssr"
+      ]
+    },
+    "/encoded-key/[key]": {
+      "postponedState": "2535:43[[\"key\",[\"%%drp:key:00794eae7f8c3%%\",\"d\"]]][1,{\"nextSegmentId\":1,\"rootFormatContext\":{\"insertionMode\":0,\"selectedValue\":null,\"tagScope\":0,\"viewTransition\":null},\"progressiveChunkSize\":12800,\"resumableState\":{\"idPrefix\":\"\",\"nextFormID\":0,\"streamingFormat\":0,\"instructions\":96,\"hasBody\":true,\"hasHtml\":true,\"unknownResources\":{},\"dnsResources\":{},\"connectResources\":{\"default\":{},\"anonymous\":{},\"credentials\":{}},\"imageResources\":{},\"styleResources\":{},\"scriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null,\"/_next/static/chunks/1te197tmc5x9l.js\":null,\"/_next/static/chunks/0-m5km3_0g7ct.js\":null,\"/_next/static/chunks/turbopack-10huo3r2ydhew.js\":null,\"/_next/static/chunks/1hvmfyqw-euxk.js\":null},\"moduleUnknownResources\":{},\"moduleScriptResources\":{\"/_next/static/chunks/2uc5gmuon0u4d.js\":null}},\"replayNodes\":[[\"lU\",0,[[\"Context\",0,[[\"Context\",0,[[\"ServerInsertedHTMLProvider\",0,[[\"Context\",0,[[\"sI\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"s$\",0,[[\"Fragment\",0,[[\"Context\",2,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"Context\",0,[[\"sf\",0,[[\"sd\",0,[[\"sc\",0,[[\"af\",0,[[\"ad\",0,[[\"__next_root_layout_boundary__\",1,[[\"Fragment\",\"c\",[[\"html\",1,[[\"body\",0,[[null,0,[[\"Activity\",\"encoded-key\",[[\"Context\",\"encoded-key\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"h\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[null,1,[[\"Activity\",\"key|%%drp:key:00794eae7f8c3%%|d\",[[\"Context\",\"key|%%drp:key:00794eae7f8c3%%|d\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"Fragment\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[null,1,[[\"Activity\",\"__PAGE__\",[[\"Context\",\"__PAGE__\",[[null,2,[[\"Fragment\",0,[[\"L\",0,[[\"K\",0,[[\"n\",0,[[\"Fragment\",0,[[\"N\",0,[[\"Fragment\",0,[[null,0,[[\"Fragment\",0,[[\"x\",0,[[\"w\",0,[[\"M\",0,[[\"Context\",0,[[\"Fragment\",\"c\",[[\"Suspense\",0,[],0,[\"Suspense Fallback\",0,[],null],0]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],null]],\"replaySlots\":null}]null",
+      "fallbackFilePath": ".next/server/app/encoded-key/[key].html",
+      "chainHeaders": {
+        "next-resume": "1"
+      },
+      "initialHeaders": {
+        "vary": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+        "content-type": "text/html; charset=utf-8",
+        "x-nextjs-stale-time": "300",
+        "x-nextjs-prerender": "1",
+        "x-next-cache-tags": "_N_T_/layout,_N_T_/encoded-key/layout,_N_T_/encoded-key/[key]/layout,_N_T_/encoded-key/[key]/page"
+      },
+      "initialStatus": 200,
+      "tags": [
+        "_N_T_/layout",
+        "_N_T_/encoded-key/layout",
+        "_N_T_/encoded-key/[key]/layout",
+        "_N_T_/encoded-key/[key]/page"
+      ]
+    }
+  },
   "nextVersion": "16.2.10"
 }

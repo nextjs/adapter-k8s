@@ -19,6 +19,7 @@
 
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
+import { wallClockNow } from "./stream-codec.js";
 
 export class RespError extends Error {
   constructor(message: string) {
@@ -251,7 +252,7 @@ class RespClient implements ValkeyClient {
   private readonly circuitBreakerMs: number;
   private readonly maxReplyBytes: number;
   private readonly maxBufferedBytes: number;
-  /** L17: while `Date.now()` is below this, commands fail fast instead of reconnecting. */
+  /** L17: while the wall clock (wallClockNow, N8) is below this, commands fail fast instead of reconnecting. */
   private circuitOpenUntil = 0;
 
   constructor(options: RespClientOptions) {
@@ -353,7 +354,10 @@ class RespClient implements ValkeyClient {
     // reconnected transparently on the next command, and opening here made that next cache read
     // fail fast for circuitBreakerMs even though an immediate reconnect would have succeeded.
     if (this.circuitBreakerMs > 0 && (fromConnectFailure || this.queue.length > 0)) {
-      this.circuitOpenUntil = Date.now() + this.circuitBreakerMs;
+      // N8: wallClockNow, not Date.now — a patched Date.now throwing INSIDE ensureConnection
+      // corrupted the connect state ("Connection closed" on every later command), silently
+      // killing freshness checks. These circuit-breaker clock reads are load-bearing.
+      this.circuitOpenUntil = wallClockNow() + this.circuitBreakerMs;
     }
     if (socket) {
       socket.removeAllListeners();
@@ -486,7 +490,7 @@ class RespClient implements ValkeyClient {
     // very likely pay the full connect timeout again — per cache read, per render. Fail fast;
     // the handlers treat a rejected command as a cache miss. The window is short and only a
     // fresh attempt past it can close the breaker, so recovery needs no probe traffic.
-    if (Date.now() < this.circuitOpenUntil) {
+    if (wallClockNow() < this.circuitOpenUntil) {
       return Promise.reject(
         new Error("Valkey circuit breaker open after a recent failure; failing fast"),
       );

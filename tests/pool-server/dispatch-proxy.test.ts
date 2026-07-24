@@ -445,6 +445,44 @@ describe("cross-pool proxy hardening", () => {
     expect(lookedUp).toContain("rel-api-test123");
   });
 
+  it("forwards the rewrite invocation target (x-invoke-path/x-invoke-query)", async (ctx) => {
+    pinPoolDns();
+    let seenInvokePath: string | undefined;
+    let seenInvokeQuery: string | undefined;
+    let seenUrl: string | undefined;
+    await startTargetPool((req, res) => {
+      seenInvokePath = req.headers["x-invoke-path"] as string | undefined;
+      seenInvokeQuery = req.headers["x-invoke-query"] as string | undefined;
+      seenUrl = req.url;
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    }, ctx);
+
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api", // ≠ front poolName "ssr" → cross-pool proxy
+          matchedPathname: "/api/thing",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+          invokePath: "/api/thing?item=one&item=two",
+          invocationQuery: { item: ["one", "two"] },
+        },
+        { releaseName: "rel", internalSecret: "shared-secret" },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/rewrite-source`);
+    expect(res.status).toBe(200);
+    // The public URL is preserved on the wire while the rewrite target rides the
+    // dispatch vocabulary — without it the target pool invokes the handler with the
+    // ORIGINAL URL and the rewrite-added (repeated) query params are silently lost.
+    expect(seenUrl).toBe("/rewrite-source");
+    expect(seenInvokePath).toBe("/api/thing?item=one&item=two");
+    expect(JSON.parse(seenInvokeQuery ?? "null")).toEqual({ item: ["one", "two"] });
+  });
+
   it("produces a valid DNS hostname (no trailing hyphen) for over-long names", async (ctx) => {
     const lookedUp = pinPoolDns();
     await startTargetPool((_req, res) => {

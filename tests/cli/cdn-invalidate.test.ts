@@ -94,11 +94,37 @@ describe("invalidateCdnBuildTag", () => {
   const invalidateCall = (calls: string[][]) =>
     calls.find((c) => c.includes("invalidate-cdn-cache"));
 
-  it("invalidates the safe hashed tag, synchronously (no --async)", async () => {
+  it("M13: invalidates the RECORDED tag for the outgoing build, synchronously (no --async)", async () => {
     writeFileSync(
       path.join(dir, "cdn-invalidation.json"),
       JSON.stringify({ invalidateOnDeploy: true }),
     );
+    // Deliberately NOT the current derivation for "old42": the outgoing build's pods
+    // stamped whatever THEIR adapter version derived, and the recorded value must win.
+    const recorded = `build-${"ab".repeat(32)}`;
+    expect(recorded).not.toBe(cdnTagForBuildId("old42"));
+    const { run, calls } = fakeRunner(happyRoutes);
+    await invalidateCdnBuildTag({
+      projectId: "proj",
+      releaseName: "rel",
+      outputDir: dir,
+      buildId: "old42",
+      recordedTag: recorded,
+      run,
+      log,
+    });
+    const call = invalidateCall(calls)!;
+    expect(call).toContain(`--tags=${recorded}`);
+    expect(call.join(" ")).not.toContain(cdnTagForBuildId("old42"));
+    expect(call.join(" ")).not.toContain("--path");
+    expect(call).not.toContain("--async");
+    expect(call).toContain("um");
+  });
+
+  it("M13: falls back to a full --path=/* purge when no tag was recorded for the outgoing build", async () => {
+    // The stale-apex incident: entries written by a pre-recording adapter carry unknown
+    // or NO Cache-Tag (untagged prerender HTML at s-maxage=31536000). No tag selector can
+    // reach them — only the path wildcard.
     const { run, calls } = fakeRunner(happyRoutes);
     await invalidateCdnBuildTag({
       projectId: "proj",
@@ -109,9 +135,28 @@ describe("invalidateCdnBuildTag", () => {
       log,
     });
     const call = invalidateCall(calls)!;
-    expect(call).toContain(`--tags=${cdnTagForBuildId("old42")}`);
-    expect(call).not.toContain("--async");
-    expect(call).toContain("um");
+    expect(call).toContain("--path=/*");
+    expect(call.join(" ")).not.toContain("--tags");
+    // Never guess: the current derivation for the outgoing build id must NOT be used.
+    expect(call.join(" ")).not.toContain(cdnTagForBuildId("old42"));
+    expect(logs.some((l) => /full purge/.test(l))).toBe(true);
+  });
+
+  it("M13: treats a malformed recorded tag as unrecorded (full purge, never spliced into argv)", async () => {
+    const { run, calls } = fakeRunner(happyRoutes);
+    await invalidateCdnBuildTag({
+      projectId: "proj",
+      releaseName: "rel",
+      outputDir: dir,
+      buildId: "old42",
+      recordedTag: "build-XYZ,evil-tag", // comma would corrupt Cloud CDN's --tags list
+      run,
+      log,
+    });
+    const call = invalidateCall(calls)!;
+    expect(call).toContain("--path=/*");
+    expect(call.join(" ")).not.toContain("evil");
+    expect(logs.some((l) => /malformed/.test(l))).toBe(true);
   });
 
   it("skips when there is no outgoing build id", async () => {

@@ -1,5 +1,5 @@
 {
-  "buildId": "9afxl2xs3td",
+  "buildId": "5XvmnjRi2uE2e_gaBmQzE",
   "poolName": "default",
   "outputs": {
     "/_not-found.rsc": {
@@ -16,17 +16,45 @@
       "type": "APP_PAGE",
       "runtime": "nodejs"
     },
-    "/_global-error.rsc": {
-      "id": "/_global-error.rsc",
-      "filePath": ".next/server/app/_global-error/page.js",
-      "pathname": "/_global-error.rsc",
+    "/encoded-key/[key].rsc": {
+      "id": "/encoded-key/[key].rsc",
+      "filePath": ".next/server/app/encoded-key/[key]/page.js",
+      "pathname": "/encoded-key/[key].rsc",
       "type": "APP_PAGE",
       "runtime": "nodejs"
     },
-    "/_global-error": {
-      "id": "/_global-error",
-      "filePath": ".next/server/app/_global-error/page.js",
-      "pathname": "/_global-error",
+    "/encoded-key/[key]": {
+      "id": "/encoded-key/[key]",
+      "filePath": ".next/server/app/encoded-key/[key]/page.js",
+      "pathname": "/encoded-key/[key]",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/form-redirect-target.rsc": {
+      "id": "/form-redirect-target.rsc",
+      "filePath": ".next/server/app/form-redirect-target/page.js",
+      "pathname": "/form-redirect-target.rsc",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/form-redirect-target": {
+      "id": "/form-redirect-target",
+      "filePath": ".next/server/app/form-redirect-target/page.js",
+      "pathname": "/form-redirect-target",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/header-budget.rsc": {
+      "id": "/header-budget.rsc",
+      "filePath": ".next/server/app/header-budget/page.js",
+      "pathname": "/header-budget.rsc",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/header-budget": {
+      "id": "/header-budget",
+      "filePath": ".next/server/app/header-budget/page.js",
+      "pathname": "/header-budget",
       "type": "APP_PAGE",
       "runtime": "nodejs"
     },
@@ -58,6 +86,20 @@
       "type": "APP_PAGE",
       "runtime": "nodejs"
     },
+    "/resume-probe.rsc": {
+      "id": "/resume-probe.rsc",
+      "filePath": ".next/server/app/resume-probe/page.js",
+      "pathname": "/resume-probe.rsc",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/resume-probe": {
+      "id": "/resume-probe",
+      "filePath": ".next/server/app/resume-probe/page.js",
+      "pathname": "/resume-probe",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
     "/rewritten.rsc": {
       "id": "/rewritten.rsc",
       "filePath": ".next/server/app/rewritten/page.js",
@@ -69,6 +111,20 @@
       "id": "/rewritten",
       "filePath": ".next/server/app/rewritten/page.js",
       "pathname": "/rewritten",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/shell-cache.rsc": {
+      "id": "/shell-cache.rsc",
+      "filePath": ".next/server/app/shell-cache/page.js",
+      "pathname": "/shell-cache.rsc",
+      "type": "APP_PAGE",
+      "runtime": "nodejs"
+    },
+    "/shell-cache": {
+      "id": "/shell-cache",
+      "filePath": ".next/server/app/shell-cache/page.js",
+      "pathname": "/shell-cache",
       "type": "APP_PAGE",
       "runtime": "nodejs"
     },
@@ -86,6 +142,48 @@
       "type": "APP_PAGE",
       "runtime": "nodejs"
     },
+    "/api/cache-probe": {
+      "id": "/api/cache-probe",
+      "filePath": ".next/server/app/api/cache-probe/route.js",
+      "pathname": "/api/cache-probe",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/cache-probe.rsc": {
+      "id": "/api/cache-probe.rsc",
+      "filePath": ".next/server/app/api/cache-probe/route.js",
+      "pathname": "/api/cache-probe.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/catalog": {
+      "id": "/api/catalog",
+      "filePath": ".next/server/app/api/catalog/route.js",
+      "pathname": "/api/catalog",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/catalog.rsc": {
+      "id": "/api/catalog.rsc",
+      "filePath": ".next/server/app/api/catalog/route.js",
+      "pathname": "/api/catalog.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/form-redirect": {
+      "id": "/api/form-redirect",
+      "filePath": ".next/server/app/api/form-redirect/route.js",
+      "pathname": "/api/form-redirect",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/form-redirect.rsc": {
+      "id": "/api/form-redirect.rsc",
+      "filePath": ".next/server/app/api/form-redirect/route.js",
+      "pathname": "/api/form-redirect.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
     "/api/hello": {
       "id": "/api/hello",
       "filePath": ".next/server/app/api/hello/route.js",
@@ -98,6 +196,76 @@
       "filePath": ".next/server/app/api/hello/route.js",
       "pathname": "/api/hello.rsc",
       "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/revalidate": {
+      "id": "/api/revalidate",
+      "filePath": ".next/server/app/api/revalidate/route.js",
+      "pathname": "/api/revalidate",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/revalidate.rsc": {
+      "id": "/api/revalidate.rsc",
+      "filePath": ".next/server/app/api/revalidate/route.js",
+      "pathname": "/api/revalidate.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/rewrite-body-source": {
+      "id": "/api/rewrite-body-source",
+      "filePath": ".next/server/app/api/rewrite-body-source/route.js",
+      "pathname": "/api/rewrite-body-source",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/rewrite-body-source.rsc": {
+      "id": "/api/rewrite-body-source.rsc",
+      "filePath": ".next/server/app/api/rewrite-body-source/route.js",
+      "pathname": "/api/rewrite-body-source.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/rewrite-query-array": {
+      "id": "/api/rewrite-query-array",
+      "filePath": ".next/server/app/api/rewrite-query-array/route.js",
+      "pathname": "/api/rewrite-query-array",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/rewrite-query-array.rsc": {
+      "id": "/api/rewrite-query-array.rsc",
+      "filePath": ".next/server/app/api/rewrite-query-array/route.js",
+      "pathname": "/api/rewrite-query-array.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/tiny-png": {
+      "id": "/api/tiny-png",
+      "filePath": ".next/server/app/api/tiny-png/route.js",
+      "pathname": "/api/tiny-png",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/api/tiny-png.rsc": {
+      "id": "/api/tiny-png.rsc",
+      "filePath": ".next/server/app/api/tiny-png/route.js",
+      "pathname": "/api/tiny-png.rsc",
+      "type": "APP_ROUTE",
+      "runtime": "nodejs"
+    },
+    "/_error": {
+      "id": "/_error",
+      "filePath": ".next/server/pages/_error.js",
+      "pathname": "/_error",
+      "type": "PAGES",
+      "runtime": "nodejs"
+    },
+    "/fallback-cache/[slug]": {
+      "id": "/fallback-cache/[slug]",
+      "filePath": ".next/server/pages/fallback-cache/[slug].js",
+      "pathname": "/fallback-cache/[slug]",
+      "type": "PAGES",
       "runtime": "nodejs"
     }
   }

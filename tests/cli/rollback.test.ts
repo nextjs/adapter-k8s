@@ -89,6 +89,45 @@ describe("runRollback — CDN invalidation", () => {
     );
   });
 
+  it("M13: passes the rolled-away-from build's RECORDED tag and carries cdnTags in the swapped state", async () => {
+    // Each build's tag is recorded at ITS deploy; rollback must hand the recorded value
+    // to invalidation (never re-derive) and preserve the map — both builds stay in play.
+    const cdnTags = { buildn: `build-${"ef".repeat(32)}`, buildm: `build-${"0a".repeat(32)}` };
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      cdnTags,
+    } as never);
+    vi.mocked(execCapture).mockImplementation(capture(false) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    expect(invalidateCdnBuildTag).toHaveBeenCalledWith(
+      expect.objectContaining({ buildId: "buildn", recordedTag: cdnTags.buildn }),
+    );
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      { buildId: "buildm", previousBuildId: "buildn", cdnTags },
+      RELEASE,
+    );
+  });
+
+  it("M13: legacy state without cdnTags rolls back with no recordedTag (full-purge fallback)", async () => {
+    vi.mocked(execCapture).mockImplementation(capture(false) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    expect(invalidateCdnBuildTag).toHaveBeenCalledWith(
+      expect.objectContaining({ buildId: "buildn", recordedTag: undefined }),
+    );
+    // No cdnTags key invented for the swapped state.
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      { buildId: "buildm", previousBuildId: "buildn" },
+      RELEASE,
+    );
+  });
+
   it("does NOT invalidate anything when the selector switch fails", async () => {
     vi.mocked(execCapture).mockImplementation(capture(true) as never);
 

@@ -5,6 +5,7 @@
 // "Named export 'detectDomainLocale' not found". Import the CJS default (module.exports)
 // and destructure; both bundle formats resolve the symbols this way.
 import NextRouting from "@next/routing";
+import type { ResolveRoutesParams } from "@next/routing";
 const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
@@ -31,6 +32,13 @@ export const INTERNAL_DISPATCH_HEADERS = [
   // and runs middleware itself. This closes the middleware-bypass class regardless of why
   // an upstream failed to evaluate (TLA-wrapped module, missing file, no callable, spoof).
   "x-mw-evaluated",
+  // Rewrite invocation target: the internal handler URL (path + merged query with repeated
+  // destination keys restored) and its query record. Stamped by the routing extension and the
+  // cross-pool proxy so the receiving pool invokes the handler with the REWRITTEN URL while
+  // req.url keeps the public one — without these, a trusted-dispatch request loses the
+  // rewrite-added query (the handler sees only the client's original search params).
+  "x-invoke-path",
+  "x-invoke-query",
 ] as const;
 
 // Recognized `x-mw-evaluated` verdicts that authorize the pool to skip its own middleware.
@@ -712,4 +720,156 @@ export function resolveRscOutput(
   if (poolAssignments[rscCandidate]) return rscCandidate;
 
   return matchedPathname;
+}
+
+// --- Rewrite invocation target (shared) ---------------------------------------
+// A middleware/next.config rewrite changes the URL the HANDLER must run against
+// (pathname and/or query) while the public request URL is preserved for the
+// client. Both resolvers must derive the same internal invocation target:
+// Phase 1 (pool-server/resolve.ts) attaches it to the local resolution as
+// invokePath/invocationQuery; Phase 2 (routing-service/handler.ts) transports
+// it over the trusted dispatch headers x-invoke-path/x-invoke-query. These
+// helpers are the single derivation for both; the behaviors they pin
+// (URLSearchParams.set collapse restoration, nxtP/_rsc filtering, sentinel
+// handling) are documented on each function.
+
+/** Drop @next/routing internal capture params (dynamic-route captures nxtP*, the
+ * RSC union query _rsc) so they don't leak into handler URLs or client-facing
+ * rewrite headers. */
+export function filterInternalQuery(
+  query: Record<string, string | string[]> | undefined,
+): Record<string, string | string[]> | undefined {
+  if (!query) return undefined;
+  const out: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(query)) {
+    if (k.startsWith("nxtP") || k === "_rsc") continue;
+    const values = Array.isArray(v) ? v : [v];
+    if (values.some((value) => /^\$nxtP/.test(value))) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+export function mergeInvocationQuery(
+  resolvedQuery: Record<string, string | string[]> | undefined,
+  targetQuery: Record<string, string | string[]> | undefined,
+): Record<string, string | string[]> | undefined {
+  if (!resolvedQuery && !targetQuery) return undefined;
+  return filterInternalQuery({ ...resolvedQuery, ...targetQuery });
+}
+
+/** Serialize a resolved query (Record<string, string | string[]>) to a "?a=b&..."
+ * string, preserving repeated keys. Empty → "". */
+export function buildQueryString(query: Record<string, string | string[]> | undefined): string {
+  if (!query) return "";
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query)) {
+    if (Array.isArray(value)) for (const v of value) params.append(key, v);
+    else params.append(key, value);
+  }
+  const s = params.toString();
+  return s ? `?${s}` : "";
+}
+
+/**
+ * @next/routing currently applies a rewrite destination with URLSearchParams.set(), which
+ * collapses `?items=1&items=2` to the last value. Next's request contract exposes repeated
+ * destination keys as string[], so reconstruct only keys that (a) are repeated in a rewrite
+ * which matched this public pathname and (b) currently equal that rewrite's final value. The
+ * latter guard prevents an unrelated matching rule from replacing middleware/user query data.
+ */
+export function restoreRepeatedRewriteQuery(
+  requestUrl: URL,
+  routes: ResolveRoutesParams["routes"],
+  query: Record<string, string | string[]> | undefined,
+): Record<string, string | string[]> | undefined {
+  if (!query) return undefined;
+
+  const out = { ...query };
+  const candidates = [
+    ...routes.beforeMiddleware,
+    ...routes.beforeFiles,
+    ...routes.afterFiles,
+    ...routes.fallback,
+  ];
+  for (const route of candidates) {
+    if (!route.destination || (route.status && route.status >= 300 && route.status < 400)) continue;
+    let match: RegExpMatchArray | null = null;
+    try {
+      match = requestUrl.pathname.match(new RegExp(route.sourceRegex));
+    } catch {
+      continue;
+    }
+    if (!match) continue;
+
+    let destination = route.destination;
+    for (let index = 1; index < match.length; index++) {
+      const value = match[index];
+      if (value !== undefined) {
+        destination = destination.replaceAll(`$${index}`, () => value);
+      }
+    }
+    for (const [name, value] of Object.entries(match.groups ?? {})) {
+      if (value !== undefined) destination = destination.replaceAll(`$${name}`, () => value);
+    }
+    const rawQuery = destination.split("?", 2)[1];
+    if (!rawQuery) continue;
+    const repeated = new Map<string, string[]>();
+    for (const [key, value] of new URLSearchParams(rawQuery)) {
+      const values = repeated.get(key) ?? [];
+      values.push(value);
+      repeated.set(key, values);
+    }
+    for (const [key, values] of repeated) {
+      if (values.length > 1 && out[key] === values.at(-1)) out[key] = values;
+    }
+  }
+  return out;
+}
+
+/**
+ * Derive the internal handler-invocation target for a resolved route. Returns
+ * invokePath (path+query string, locale-stripped) only when it differs from the
+ * public request URL, and the merged invocation query record. RSC and Pages-data
+ * requests intentionally get NO invokePath: their flight/JSON rendering already
+ * resolved the right handler+params, and the client reconciles rewrites via the
+ * x-nextjs-rewritten-path/-query (App) or x-nextjs-rewrite (Pages) response
+ * headers instead. Mirrors pool-server/resolve.ts — keep the two in lockstep.
+ */
+export function computeRewriteInvocation(args: {
+  originalUrl: URL;
+  addedLocale: string | null;
+  isRscRequest: boolean;
+  isDataRequest: boolean;
+  routes: ResolveRoutesParams["routes"];
+  resolvedQuery: Record<string, string | string[]> | undefined;
+  invocationTarget: { pathname?: string; query?: Record<string, string | string[]> } | undefined;
+  resolvedPathname: string | undefined;
+}): {
+  invokePath: string | undefined;
+  invocationQuery: Record<string, string | string[]> | undefined;
+} {
+  const invocationQuery = restoreRepeatedRewriteQuery(
+    args.originalUrl,
+    args.routes,
+    mergeInvocationQuery(args.resolvedQuery, args.invocationTarget?.query),
+  );
+  let invokePath: string | undefined;
+  const targetPathRaw = args.invocationTarget?.pathname ?? args.resolvedPathname;
+  // An unmatched optional catch-all is represented internally as `/$nxtP<param>`.
+  // It is a routing sentinel, never a handler URL.
+  const hasUnresolvedDynamicSentinel =
+    targetPathRaw?.includes("$nxtP") || /%24nxtP/i.test(targetPathRaw ?? "");
+  if (targetPathRaw && !hasUnresolvedDynamicSentinel && !args.isRscRequest && !args.isDataRequest) {
+    let targetPath = targetPathRaw;
+    if (args.addedLocale) {
+      const pfx = `/${args.addedLocale}`;
+      if (targetPath === pfx) targetPath = "/";
+      else if (targetPath.startsWith(pfx + "/")) targetPath = targetPath.slice(pfx.length);
+    }
+    const qs = buildQueryString(invocationQuery);
+    const candidate = targetPath + qs;
+    if (candidate !== args.originalUrl.pathname + args.originalUrl.search) invokePath = candidate;
+  }
+  return { invokePath, invocationQuery };
 }

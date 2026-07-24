@@ -16,6 +16,17 @@ const STATE_NAMESPACE = "default";
 export interface AdapterState {
   buildId: string;
   previousBuildId: string | null;
+  /**
+   * M13 (2026-07-22 stale-apex incident): the exact Cache-Tag each build's pool-server
+   * stamps on CDN-cacheable responses, keyed by buildId and recorded at that build's
+   * deploy. Cutover/rollback invalidation uses the RECORDED tag for the outgoing build —
+   * never a re-derivation under the current code, which may not match what the (older)
+   * outgoing build's pods actually stamped. Absent key (or absent map, for states written
+   * before recording existed) means the outgoing build's tag provenance is unknown and
+   * invalidation falls back to a full `--path=/*` purge. Pruned by deploy to the two
+   * builds still in play.
+   */
+  cdnTags?: Record<string, string>;
 }
 
 // Thrown when the local file was written but the cluster ConfigMap mirror failed.

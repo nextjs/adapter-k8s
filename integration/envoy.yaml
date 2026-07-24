@@ -1,24 +1,18 @@
-## Envoy config for local integration testing.
+## Envoy config for local integration testing (`adapter-k8s emulate`).
 ##
-## Two modes:
-## 1. With ext_proc: Client :8080 → Envoy → ext_proc (:8443) → Pool Server (:3000)
-## 2. Without ext_proc: Client :8080 → Envoy → Pool Server (:3000)
+## Client :8080 → Envoy → ext_proc (routing service, :8443, gRPC/h2c) → Pool Server (:3000)
 ##
-## Currently runs WITHOUT ext_proc. The pool server handles routing locally via
-## resolveRoutes, so the app works correctly without an ext_proc filter here.
+## The ext_proc filter below mirrors the production GXLB traffic-extension callout:
+## request headers only (the GCP extension never buffers bodies), fail-CLOSED
+## (failure_mode_allow: false — same posture as the emitted extension chain default),
+## with routing-header mutations allowed so the service can stamp the internal
+## dispatch vocabulary (x-output-id, x-invoke-path, …) and the shared secret that
+## makes the pool trust them (Phase 2). `emulate` generates that secret per run and
+## injects INTERNAL_HEADER_SECRET into both child processes.
 ##
-## The routing service now speaks real protobuf over gRPC via connectrpc
-## (@connectrpc/connect-node) using protobuf-es types generated from the upstream
-## Envoy protos (buf.build/envoyproxy/envoy → src/routing-service/protos). It can
-## therefore be wired as a real ext_proc filter. This is NOT enabled below, and
-## end-to-end wire-compatibility with a real Envoy/GCP ext_proc caller is
-## UNVALIDATED (only the converter + protobuf codec are round-tripped in unit
-## tests). The App Hosting adapter uses this same stack, validated against a live
-## deployment; this adapter needs the equivalent smoke test.
-##
-## TODO: Add the ext_proc HTTP filter + ext_proc cluster (routing service on
-## :8443, HTTP/2) to the filter_chain and validate end-to-end against this Envoy
-## before relying on the ext_proc path.
+## Wire-compatibility of the connectrpc/protobuf-es ext_proc server with a real
+## Envoy was validated end-to-end through THIS config (see the emulate smoke flow);
+## the same stack serves the live GXLB callout in production.
 
 static_resources:
   listeners:
@@ -46,6 +40,30 @@ static_resources:
                             cluster: pool_server
                             timeout: 60s
                 http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: routing_service
+                        timeout: 5s
+                      # Production parity: the GXLB traffic extension sends request
+                      # headers only and fails closed. Body/response phases are
+                      # skipped; the routing service still answers an unexpected
+                      # phase with a phase-matching CONTINUE (config-skew guard).
+                      failure_mode_allow: false
+                      message_timeout: 5s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SKIP
+                        request_body_mode: NONE
+                        response_body_mode: NONE
+                        request_trailer_mode: SKIP
+                        response_trailer_mode: SKIP
+                      mutation_rules:
+                        # The service rewrites :path for rewrites and stamps the
+                        # x-* dispatch vocabulary; both need routing mutations.
+                        allow_all_routing: true
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -64,3 +82,23 @@ static_resources:
                     socket_address:
                       address: 127.0.0.1
                       port_value: 3000
+
+    - name: routing_service
+      connect_timeout: 5s
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      # The emulated routing service runs plaintext h2c (gRPC needs HTTP/2).
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http2_protocol_options: {}
+      load_assignment:
+        cluster_name: routing_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8443
