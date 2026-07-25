@@ -12,6 +12,7 @@ import {
   negotiateImageMimeType,
   resizeForRequestedWidth,
   validateImageSizeAndQuality,
+  validateImageUrlParam,
   DEFAULT_IMAGE_DEVICE_SIZES,
   DEFAULT_IMAGE_QUALITIES,
   DEFAULT_IMAGE_SIZES,
@@ -631,5 +632,145 @@ describe("w/q validation (port of ImageOptimizerCache.validateParams, isDev: fal
     expect(check("w=384&q=0", noQualities)).toEqual({
       errorMessage: '"q" parameter (quality) must be an integer between 1 and 100',
     });
+  });
+});
+
+describe("url validation (port of ImageOptimizerCache.validateParams, the `url` half)", () => {
+  // Every body and every ORDER assertion below was read off `next start` 16.3.0-canary.84
+  // (@next/swc 16.2.10) on a scratch copy of Next's own test/e2e/image-optimizer fixture,
+  // 2026-07-25, with `images.remotePatterns` allowing image-optimization-test.vercel.app and
+  // the on-disk image cache cleared between runs. Raw measurements are in the report for
+  // this change; the interesting property of this gate is that the body a client sees is a
+  // function of the ORDER, so the order is pinned as hard as the strings.
+  const allowAll = {
+    hasLocalMatch: () => true,
+    isRemoteAllowed: () => true,
+  };
+  const denyRemote = {
+    hasLocalMatch: () => true,
+    isRemoteAllowed: () => false,
+  };
+  const check = (query: string, checks = allowAll) =>
+    validateImageUrlParam(new URLSearchParams(query), checks);
+
+  it.each([
+    // [query, next start's exact 400 body]
+    ["w=384&q=75", '"url" parameter is required'],
+    ["url=&w=384&q=75", '"url" parameter is required'],
+    // Repeated `url` parses to an array upstream, so array-ness beats presence: even
+    // `?url=&url=` is "cannot be an array", never "is required".
+    ["url=%2Fa.png&url=%2Fb.png", '"url" parameter cannot be an array'],
+    ["url=&url=", '"url" parameter cannot be an array'],
+    ["url=%2F%2Fexample.com%2Fa.png", '"url" parameter cannot be a protocol-relative URL (//)'],
+    ["url=%2F_next%2Fimage", '"url" parameter cannot be recursive'],
+    ["url=%2F_next%2Fimage%3Furl%3D%2Fa.png", '"url" parameter cannot be recursive'],
+    ["url=%2F_next%2Fimage%2F", '"url" parameter cannot be recursive'],
+    ["url=%2F_next%2Fimage%2Ffoo", '"url" parameter cannot be recursive'],
+    // Unanchored upstream regex: a nested optimizer path is recursive too.
+    ["url=%2Ffoo%2F_next%2Fimage", '"url" parameter cannot be recursive'],
+    // …and the check DECODES first, so an encoded separator does not evade it. The old
+    // `imageUrl.split("?")[0] === "/_next/image"` test answered 404 here, i.e. it
+    // self-fetched a url whose only purpose is to re-enter the optimizer.
+    ["url=%2F_next%252Fimage", '"url" parameter cannot be recursive'],
+    ["url=http%3A%2F%2F%5B", '"url" parameter is invalid'],
+    ["url=test.png", '"url" parameter is invalid'],
+    ["url=%5Ctest.png", '"url" parameter is invalid'],
+    ["url=%20", '"url" parameter is invalid'],
+    // A non-http(s) scheme is INVALID upstream, not "not allowed" — the adapter used to
+    // route these into the remote allowlist and answered "image host not allowed".
+    ["url=file%3A%2F%2F%2Fetc%2Fpasswd", '"url" parameter is invalid'],
+    ["url=data%3Aimage%2Fpng%3Bbase64%2CiVBOR", '"url" parameter is invalid'],
+    ["url=ftp%3A%2F%2Fexample.com%2Fa.png", '"url" parameter is invalid'],
+  ])("rejects ?%s with next start's exact body", (query, errorMessage) => {
+    expect(check(query)).toEqual({ errorMessage });
+  });
+
+  it("caps `url` at 3072 bytes (the boundary is inclusive)", () => {
+    // Without this gate the over-long url fell through to the self-fetch path and came back
+    // as a 404 whose body echoed all 3073 characters.
+    expect(check(`url=${encodeURIComponent("/" + "a".repeat(3072))}`)).toEqual({
+      errorMessage: '"url" parameter is too long',
+    });
+    // 3072 exactly is accepted by the gate (it then 400s further down the pipeline as
+    // "The requested resource isn't a valid image." — measured).
+    const atLimit = "/" + "a".repeat(3071);
+    expect(check(`url=${encodeURIComponent(atLimit)}`)).toEqual({
+      url: atLimit,
+      isAbsolute: false,
+      pathname: atLimit,
+    });
+  });
+
+  it("checks `url` BEFORE `w`/`q` (upstream order — observable in the body)", () => {
+    // `next start` answers ?url=/_next/image&w=16&q=75 with "cannot be recursive"; the
+    // adapter answered '"w" parameter (width) of 16 is not allowed' because it validated
+    // w/q first. The two gates are separate functions, so the order lives at the call site
+    // — this asserts the `url` gate is INDEPENDENT of w/q being absent or invalid.
+    expect(check("url=%2F_next%2Fimage&w=16&q=75")).toEqual({
+      errorMessage: '"url" parameter cannot be recursive',
+    });
+    expect(check("w=16&q=75")).toEqual({ errorMessage: '"url" parameter is required' });
+  });
+
+  it("reports a rejected localPatterns / remotePatterns match as `is not allowed`", () => {
+    expect(check("url=https%3A%2F%2Fexample.com%2Fa.png", denyRemote)).toEqual({
+      errorMessage: '"url" parameter is not allowed',
+    });
+    expect(
+      check("url=%2Fa.png", { hasLocalMatch: () => false, isRemoteAllowed: () => true }),
+    ).toEqual({ errorMessage: '"url" parameter is not allowed' });
+  });
+
+  it("hands the allowlists the values upstream hands them", () => {
+    // localPatterns sees the RAW url (upstream builds `new URL(url, 'http://n')` itself, and
+    // its `search` clause depends on the query surviving); the remote check sees the parsed
+    // URL. Getting either input wrong silently widens or narrows the allowlist.
+    const seen: { local: string[]; remote: string[] } = { local: [], remote: [] };
+    validateImageUrlParam(new URLSearchParams("url=%2Fa.png%3Fv%3D2"), {
+      hasLocalMatch: (value) => {
+        seen.local.push(value);
+        return true;
+      },
+      isRemoteAllowed: () => true,
+    });
+    validateImageUrlParam(new URLSearchParams("url=https%3A%2F%2Fh.example%2Fa.png%3Fv%3D2"), {
+      hasLocalMatch: () => true,
+      isRemoteAllowed: (target) => {
+        seen.remote.push(target.href);
+        return true;
+      },
+    });
+    expect(seen.local).toEqual(["/a.png?v=2"]);
+    expect(seen.remote).toEqual(["https://h.example/a.png?v=2"]);
+  });
+
+  it("returns the DECODED pathname for a local url (query/fragment/whitespace removed)", () => {
+    // This is the value the caller resolves on disk. Upstream resolves a local source
+    // through `new URL(url, base)` in both `matchLocalPattern` and `fetchInternalImage`, so
+    // `/test.png#a`, `/test.png?` and a trailing newline all name public/test.png there —
+    // the adapter used to look for a literal `public/test.png#a` and 400 on the miss.
+    for (const url of ["/test.png", "/test.png?", "/test.png#a", "/test.png\n"]) {
+      const result = validateImageUrlParam(new URLSearchParams([["url", url]]), allowAll);
+      expect(result).toMatchObject({ isAbsolute: false, pathname: "/test.png" });
+    }
+    // Single decode, matching decodePublicPathname: `%20` in the url is a literal space in
+    // the filename, and a `%2F` stays one path segment for resolveWithinRoot to judge.
+    expect(check("url=%2Fhello%2520world.jpg")).toMatchObject({
+      pathname: "/hello world.jpg",
+    });
+    expect(check("url=%2F..%252F..%252Fetc")).toMatchObject({ pathname: "/../../etc" });
+  });
+
+  it("400s a malformed percent-escape instead of reproducing upstream's 500", () => {
+    // The one deliberate divergence in this function: upstream lets the URIError from
+    // `decodeURIComponent` escape validateParams and answers 500 "Internal Server Error"
+    // (measured). A crash is not something to mirror.
+    expect(check("url=%2F%25zz.png")).toEqual({ errorMessage: '"url" parameter is invalid' });
+  });
+
+  it("accepts an absolute url and returns the parsed target (no second parse downstream)", () => {
+    const result = check("url=https%3A%2F%2Fh.example%2Fa.png");
+    expect(result).toMatchObject({ url: "https://h.example/a.png", isAbsolute: true });
+    expect((result as { target: URL }).target.hostname).toBe("h.example");
   });
 });

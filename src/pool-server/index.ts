@@ -41,7 +41,9 @@ import {
   imageContentDisposition,
   imageEtag,
   imageMaxAge,
+  type ImageLocalPattern,
   validateImageSizeAndQuality,
+  validateImageUrlParam,
   isOptimizableImageContentType,
   negotiateImageFormat,
   resizeForRequestedWidth,
@@ -394,6 +396,14 @@ interface ImageRemotePattern {
 interface ImageConfig {
   remotePatterns: ImageRemotePattern[];
   domains: string[];
+  // `images.localPatterns` — the allowlist for RELATIVE `?url=` values. `undefined` means
+  // "no localPatterns configured", which upstream's `hasLocalMatch` treats as allow-all.
+  // Next's RESOLVED config is never actually undefined: it materializes
+  // `[{ pathname: "**", search: "" }]`, and that `search: ""` is live behavior rather than a
+  // formality — it is why `next start` answers `?url=/test.png%3Ffoo%3D1` with
+  // `400 "url" parameter is not allowed` (measured 2026-07-25). An explicitly EMPTY list
+  // rejects every local image, exactly as `[].some(...)` does upstream.
+  localPatterns: ImageLocalPattern[] | undefined;
   // Allowed optimization widths — the union bounds the `w` param so a client can't drive
   // Sharp into an unbounded allocation. Default to Next's defaults when unconfigured.
   // An explicitly EMPTY list means "no width allowed" (valid config: `imageSizes: []`),
@@ -491,6 +501,7 @@ function loadImageConfig(cwd: string): ImageConfig {
   const config: ImageConfig = {
     remotePatterns: [],
     domains: [],
+    localPatterns: undefined,
     deviceSizes: [...DEFAULT_IMAGE_DEVICE_SIZES],
     imageSizes: [...DEFAULT_IMAGE_SIZES],
     qualities: [...DEFAULT_IMAGE_QUALITIES],
@@ -507,12 +518,28 @@ function loadImageConfig(cwd: string): ImageConfig {
       const images = rsf?.config?.images ?? {};
       if (Array.isArray(images.remotePatterns)) config.remotePatterns = images.remotePatterns;
       if (Array.isArray(images.domains)) config.domains = images.domains;
+      // PRESENCE again, not truthiness: absent ⇒ allow every local image (upstream's
+      // `!localPatterns` short-circuit); present-but-empty ⇒ allow none. Entries are kept
+      // only in the shape upstream's `matchLocalPattern` reads, so a junk entry can neither
+      // widen the allowlist nor throw inside the matcher.
+      if (Array.isArray(images.localPatterns)) {
+        config.localPatterns = images.localPatterns.filter(
+          (pattern: unknown): pattern is ImageLocalPattern =>
+            typeof pattern === "object" &&
+            pattern !== null &&
+            ((pattern as ImageLocalPattern).pathname === undefined ||
+              typeof (pattern as ImageLocalPattern).pathname === "string") &&
+            ((pattern as ImageLocalPattern).search === undefined ||
+              typeof (pattern as ImageLocalPattern).search === "string"),
+        );
+      }
       // PRESENCE, not truthiness: `imageSizes: []` is valid config meaning "only
       // deviceSizes are allowed", and falling back to Next's default list for it would
       // silently WIDEN the accepted width set past what the app configured. Entries are
       // filtered to the shape Next's config schema guarantees (int 1..10000) because they
       // bound a sharp allocation.
-      if (Array.isArray(images.deviceSizes)) config.deviceSizes = toAllowedSizes(images.deviceSizes);
+      if (Array.isArray(images.deviceSizes))
+        config.deviceSizes = toAllowedSizes(images.deviceSizes);
       if (Array.isArray(images.imageSizes)) config.imageSizes = toAllowedSizes(images.imageSizes);
       // `images.qualities` (schema: 1..20 ints in 1..100, so never legitimately empty).
       // An unreadable/empty list keeps Next's default [75] rather than disabling the
@@ -737,6 +764,94 @@ function pathnameMatchesPattern(pathname: string, pattern: string): boolean {
   return new RegExp(re).test(pathname);
 }
 
+// `images.localPatterns` uses picomatch globs, and upstream compiles them with the very
+// module Next ships (`next/dist/compiled/picomatch`, `makeRe(pattern, { dot: true })`). Use
+// that same module, resolved from the APP (the pool already resolves several next/dist
+// modules this way), so the allowlist cannot drift from upstream's on glob syntax the
+// repo's own `*`/`**` translator doesn't cover (braces, char classes, extglobs). Loaded once
+// and cached — success OR failure.
+type PicomatchMakeRe = (glob: string, options: { dot: boolean }) => RegExp;
+let picomatchMakeRe: PicomatchMakeRe | null | undefined;
+function loadPicomatchMakeReOnce(): PicomatchMakeRe | null {
+  if (picomatchMakeRe !== undefined) return picomatchMakeRe;
+  picomatchMakeRe = null;
+  try {
+    const appRequire = createRequire(path.join(process.cwd(), "package.json"));
+    const picomatch = appRequire("next/dist/compiled/picomatch") as {
+      makeRe?: PicomatchMakeRe;
+    };
+    if (typeof picomatch.makeRe === "function") picomatchMakeRe = picomatch.makeRe;
+  } catch (err) {
+    // Degrade to the repo's own glob translator rather than failing the allowlist in either
+    // direction. Loud, because the fallback only approximates picomatch.
+    console.warn(
+      "[pool-server] could not load next/dist/compiled/picomatch — images.localPatterns will " +
+        "be matched with the adapter's approximate `*`/`**` translator:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return picomatchMakeRe;
+}
+
+const localPatternMatchers = new Map<string, (pathname: string) => boolean>();
+function localPathnameMatcher(glob: string): (pathname: string) => boolean {
+  const cached = localPatternMatchers.get(glob);
+  if (cached) return cached;
+  const makeRe = loadPicomatchMakeReOnce();
+  let matcher: (pathname: string) => boolean = (pathname) => pathnameMatchesPattern(pathname, glob);
+  if (makeRe) {
+    try {
+      const re = makeRe(glob, { dot: true });
+      matcher = (pathname) => re.test(pathname);
+    } catch {
+      // An unparseable glob keeps the fallback; it must not throw out of the optimizer.
+    }
+  }
+  localPatternMatchers.set(glob, matcher);
+  return matcher;
+}
+
+// Upstream's `hasLocalMatch` + `matchLocalPattern` (shared/lib/match-local-pattern.ts):
+// no configured patterns ⇒ every local image is allowed; otherwise the url must match one
+// pattern on BOTH `search` (exact string compare, so the default `search: ""` forbids a
+// query string on a local image url) and `pathname` (picomatch glob, default `**`).
+function hasLocalImageMatch(
+  urlPathAndQuery: string,
+  patterns: ImageLocalPattern[] | undefined,
+): boolean {
+  if (!patterns) return true;
+  let url: URL;
+  try {
+    // Upstream's base is literally `http://n`; it also NORMALIZES the pathname, which is
+    // what makes `?url=/../../etc/passwd` a `/etc/passwd` miss upstream rather than a
+    // traversal. The adapter keeps its own resolveWithinRoot guard regardless.
+    url = new URL(urlPathAndQuery, "http://n");
+  } catch {
+    return false;
+  }
+  return patterns.some((pattern) => {
+    if (pattern.search !== undefined && pattern.search !== url.search) return false;
+    return localPathnameMatcher(pattern.pathname ?? "**")(url.pathname);
+  });
+}
+
+// `next start` sends NO Content-Type on ANY /_next/image error — next-server answers the
+// validateParams 400 with `res.body(msg).send()` and every ImageError through the same
+// path, so the wire is `400 Bad Request` + `Transfer-Encoding: chunked` + the body and
+// nothing else (measured with curl against `next start` 2026-07-25). The adapter used to
+// stamp `content-type: text/plain` on all of them.
+//
+// Dropping it is safe HERE and only here because every body routed through this helper is a
+// FIXED string: the three error paths that used to interpolate the request's own `?url=`
+// value (`Image not found: <url>`, `Failed to fetch external image: <url>`, and the
+// unbounded 3 kB echo the missing length cap allowed) were replaced with upstream's
+// non-reflecting wording in the same pass. Do not reintroduce request-controlled text in an
+// error body without also restoring a Content-Type.
+function sendImageError(res: ServerResponse, status: number, body: string): void {
+  res.writeHead(status, {});
+  res.end(body);
+}
+
 // True only if `target` matches the app's configured remotePatterns/domains allowlist.
 function isExternalImageAllowed(target: URL, config: ImageConfig): boolean {
   if (target.protocol !== "http:" && target.protocol !== "https:") return false;
@@ -766,6 +881,19 @@ type FetchedImage = {
   cacheControl: string | null;
   body: Buffer;
 };
+
+// Why a discriminated KIND rather than the human string this used to return: the string was
+// interpolated straight into the 400 body (`Bad Request: image fetch timed out`), which both
+// leaked an internal reason to the client and made every upstream failure a 400 where
+// `next start` distinguishes 400 / 413 / 504 / 508 / the upstream's own status. The kind is
+// mapped to (status, upstream body) at the one call site; the reason is logged, not sent.
+type ImageFetchErrorKind =
+  | "not-allowed"
+  | "timed-out"
+  | "too-many-redirects"
+  | "too-large"
+  | "fetch-failed"
+  | "redirect-without-location";
 
 // A DNS lookup that ONLY yields public addresses. Passed to http(s).request so
 // the address the socket actually connects to is the one we validated — closing
@@ -808,82 +936,114 @@ function pinnedPublicLookup(
 async function fetchExternalImageSafely(
   initial: URL,
   config: ImageConfig,
-): Promise<FetchedImage | { error: string }> {
+): Promise<FetchedImage | { error: ImageFetchErrorKind }> {
   const MAX_REDIRECTS = 3;
   const { request: httpsRequest } = await import("node:https");
   const { request: httpRequest2 } = await import("node:http");
   let target = initial;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    if (!isExternalImageAllowed(target, config)) return { error: "image host not allowed" };
+    if (!isExternalImageAllowed(target, config)) return { error: "not-allowed" };
     if (target.protocol !== "https:" && target.protocol !== "http:") {
-      return { error: "image host not allowed" };
+      return { error: "not-allowed" };
     }
     // Pre-check keeps a fast, clear rejection; the pinned lookup below is the
     // actual guarantee for the connection that happens.
     if (!(await hostResolvesToPublicOnly(target.hostname))) {
-      return { error: "image host not allowed" };
+      return { error: "not-allowed" };
     }
 
     const request = target.protocol === "https:" ? httpsRequest : httpRequest2;
-    const result = await new Promise<FetchedImage | { error: string } | { redirect: string }>(
-      (resolve) => {
-        const req = request(
-          target.toString(),
-          { lookup: pinnedPublicLookup, timeout: 15_000 },
-          (imgRes) => {
-            const status = imgRes.statusCode ?? 502;
-            if (status >= 300 && status < 400) {
-              imgRes.resume(); // drain
-              const location = imgRes.headers.location;
-              if (!location) return resolve({ error: "redirect without location" });
-              return resolve({ redirect: location });
+    const result = await new Promise<
+      FetchedImage | { error: ImageFetchErrorKind } | { redirect: string }
+    >((resolve) => {
+      const req = request(
+        target.toString(),
+        { lookup: pinnedPublicLookup, timeout: 15_000 },
+        (imgRes) => {
+          const status = imgRes.statusCode ?? 502;
+          if (status >= 300 && status < 400) {
+            imgRes.resume(); // drain
+            const location = imgRes.headers.location;
+            if (!location) return resolve({ error: "redirect-without-location" });
+            return resolve({ redirect: location });
+          }
+          const chunks: Buffer[] = [];
+          let total = 0;
+          imgRes.on("data", (c: Buffer) => {
+            total += c.length;
+            if (total > MAX_BODY_BYTES) {
+              imgRes.destroy();
+              resolve({ error: "too-large" });
+              return;
             }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            imgRes.on("data", (c: Buffer) => {
-              total += c.length;
-              if (total > MAX_BODY_BYTES) {
-                imgRes.destroy();
-                resolve({ error: "image exceeds size limit" });
-                return;
-              }
-              chunks.push(c);
-            });
-            imgRes.on("end", () =>
-              resolve({
-                ok: status >= 200 && status < 300,
-                status,
-                contentType: imgRes.headers["content-type"] ?? "image/jpeg",
-                cacheControl: imgRes.headers["cache-control"] ?? null,
-                body: Buffer.concat(chunks),
-              }),
-            );
-            imgRes.on("error", () => resolve({ error: "image fetch failed" }));
-          },
-        );
-        req.on("timeout", () => {
-          req.destroy();
-          resolve({ error: "image fetch timed out" });
-        });
-        req.on("error", () => resolve({ error: "image fetch failed" }));
-        req.end();
-      },
-    );
+            chunks.push(c);
+          });
+          imgRes.on("end", () =>
+            resolve({
+              ok: status >= 200 && status < 300,
+              status,
+              contentType: imgRes.headers["content-type"] ?? "image/jpeg",
+              cacheControl: imgRes.headers["cache-control"] ?? null,
+              body: Buffer.concat(chunks),
+            }),
+          );
+          imgRes.on("error", () => resolve({ error: "fetch-failed" }));
+        },
+      );
+      req.on("timeout", () => {
+        req.destroy();
+        resolve({ error: "timed-out" });
+      });
+      req.on("error", () => resolve({ error: "fetch-failed" }));
+      req.end();
+    });
 
     if ("redirect" in result) {
-      if (hop === MAX_REDIRECTS) return { error: "too many redirects" };
+      if (hop === MAX_REDIRECTS) return { error: "too-many-redirects" };
       try {
         target = new URL(result.redirect, target);
       } catch {
-        return { error: "invalid redirect location" };
+        // Upstream's guard is `URL.canParse(location, href)`; an unparseable Location makes
+        // it fall through to the `!res.ok` branch, i.e. the same "upstream response is
+        // invalid" verdict a missing Location gets.
+        return { error: "redirect-without-location" };
       }
       continue; // re-validate the new target at the top of the loop
     }
     return result;
   }
-  return { error: "too many redirects" };
+  return { error: "too-many-redirects" };
 }
+
+// Upstream's status + body for each way an external fetch can fail
+// (`fetchExternalImage`, measured where reachable — e.g. an allowlisted host answering 404
+// gives `404 "url" parameter is valid but upstream response is invalid`, and a private-IP
+// target gives `400 "url" parameter is not allowed`). ImageError coerces any status < 400
+// to 500, which is why a redirect with an unusable Location lands on 500.
+const IMAGE_FETCH_ERROR_RESPONSE: Record<ImageFetchErrorKind, { status: number; body: string }> = {
+  "not-allowed": { status: 400, body: '"url" parameter is not allowed' },
+  "timed-out": {
+    status: 504,
+    body: '"url" parameter is valid but upstream response timed out',
+  },
+  "too-many-redirects": {
+    status: 508,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+  "too-large": {
+    status: 413,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+  "fetch-failed": {
+    status: 500,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+  "redirect-without-location": {
+    status: 500,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+};
 
 // middleware-manifest.json keys app-router edge functions by their SOURCE page path,
 // which KEEPS route groups and parallel-route slots — `app/(group)/twitter-image.tsx`
@@ -1701,13 +1861,21 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Basic image optimization: /_next/image?url=...&w=...&q=...
     // Fetches the source image and serves it (with optimization if Sharp is available).
     if (url.pathname === "/_next/image") {
-      const imageUrl = url.searchParams.get("url");
-
-      if (!imageUrl) {
-        res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Bad Request: missing url parameter");
+      // The `url` gate FIRST, then `w`/`q` — upstream's order, and observable: with
+      // `?url=/_next/image&w=16` `next start` answers "cannot be recursive" while the
+      // adapter used to answer `"w" parameter (width) of 16 is not allowed`. See
+      // validateImageUrlParam for the port, the measurements, and what each branch guards
+      // (the recursion cap, the 3072-byte length cap, the protocol-relative refusal, and
+      // both allowlists).
+      const urlParam = validateImageUrlParam(url.searchParams, {
+        hasLocalMatch: (value) => hasLocalImageMatch(value, imageConfig.localPatterns),
+        isRemoteAllowed: (target) => isExternalImageAllowed(target, imageConfig),
+      });
+      if ("errorMessage" in urlParam) {
+        sendImageError(res, 400, urlParam.errorMessage);
         return;
       }
+      const imageUrl = urlParam.url;
 
       // Validate w/q against Next's resolved image config before they reach Sharp — see
       // validateImageSizeAndQuality for the port and the measurements. Two things ride on
@@ -1716,20 +1884,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // so the allowed sets are the amplification bound as much as they are parity.
       const params = validateImageSizeAndQuality(url.searchParams, imageConfig);
       if ("errorMessage" in params) {
-        res.writeHead(400, { "content-type": "text/plain" });
-        // Byte-for-byte the body `next start` sends. (It sends no Content-Type at all on
-        // these 400s; text/plain is kept here so a browser can't sniff the message.)
-        res.end(params.errorMessage);
+        // Byte-for-byte the body `next start` sends, and — like every other optimizer error
+        // — with no Content-Type at all (see sendImageError).
+        sendImageError(res, 400, params.errorMessage);
         return;
       }
       const { width, quality } = params;
-      // Reject self-referential optimizer URLs (…?url=/_next/image…): they loop back into
-      // this handler and recurse until the pod exhausts sockets/memory.
-      if (imageUrl.split("?")[0] === "/_next/image") {
-        res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Bad Request: recursive image url");
-        return;
-      }
 
       try {
         // Resolve the image: internal (relative) or external (absolute URL)
@@ -1744,15 +1904,20 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // /_next/static/**/media is immutable, so the optimized derivative is too.
         let isStaticSource = false;
 
-        if (imageUrl.startsWith("/")) {
-          // Internal image: read from filesystem. Confine the path to public/ or
-          // .next/static/ — a raw `?url=/../../etc/passwd` must not traverse out.
-          const decodedImagePath = decodePublicPathname(imageUrl);
-          if (decodedImagePath === null) {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end("Bad Request: malformed image path");
-            return;
-          }
+        // Upstream's own `isAbsolute`, decided once by validateImageUrlParam, rather than a
+        // second `startsWith("/")` test that could drift from the one that validated it.
+        if (!urlParam.isAbsolute) {
+          // Internal image: read from filesystem. The path is the url's DECODED PATHNAME
+          // (validateImageUrlParam), not the raw url — which is upstream's derivation and
+          // the reason `?url=/test.png%23a`, `?url=/test.png%3F` and a trailing `%0A` all
+          // resolve to public/test.png the way `next start` does instead of 400ing on a
+          // literal `public/test.png#a` miss. resolveWithinRoot below stays the traversal
+          // guard, and still has work to do: WHATWG normalization collapses `..` AND
+          // `%2e%2e` dot segments (both are "double-dot path segments" to the parser, so
+          // `/%2e%2e/x` becomes `/x` — measured), but an ENCODED SEPARATOR does not decode
+          // until afterwards, so `/..%2f..%2fpackage.json` reaches here intact and must be
+          // refused. Pinned by test in tests/pool-server/index.image.test.ts.
+          const decodedImagePath = urlParam.pathname;
           const publicRoot = path.join(process.cwd(), "public");
           const staticRoot = path.join(process.cwd(), ".next", "static");
           const publicFile = resolveWithinRoot(publicRoot, decodedImagePath);
@@ -1765,8 +1930,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             publicFile === null ||
             (decodedImagePath.startsWith("/_next/static/") && staticFile === null)
           ) {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end("Bad Request: invalid image path");
+            // No exact upstream counterpart: upstream NORMALIZES `..` away in
+            // `new URL(url, "http://n")` and then simply misses the file, answering
+            // `400 The requested resource isn't a valid image.`. This adapter refuses the
+            // traversal outright instead of normalizing it, so it borrows upstream's
+            // closest 400 wording rather than inventing one.
+            sendImageError(res, 400, '"url" parameter is not allowed');
             return;
           }
 
@@ -1796,25 +1965,35 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               redirect: "manual",
             });
             if (imgRes.status >= 300 && imgRes.status < 400) {
-              res.writeHead(502, { "content-type": "text/plain" });
-              res.end("Failed to fetch image: redirect not followed");
+              // Adapter-specific, so the adapter's own wording stays: upstream's internal
+              // fetch is in-process and has no redirect to refuse, and 502 says what
+              // happened (an upstream we would not follow) better than upstream's generic
+              // 500. Only the Content-Type is dropped, for consistency with every other
+              // optimizer error.
+              sendImageError(res, 502, "Failed to fetch image: redirect not followed");
               return;
             }
-            if (!imgRes.ok) {
-              res.writeHead(imgRes.status, { "content-type": "text/plain" });
-              res.end(`Image not found: ${imageUrl}`);
-              return;
-            }
+            // Deliberately NO `!imgRes.ok` rejection: upstream's `fetchInternalImage` only
+            // checks that a status exists and that the body is non-empty, so a route
+            // answering 404/500 flows on to the byte sniff and comes back as
+            // `400 The requested resource isn't a valid image.` — measured for a missing
+            // local file (`?url=/does-not-exist.png`) and for a `%00` in the path, both of
+            // which this adapter used to answer with a 404 whose body ECHOED the url.
+            // isOptimizableImageContentType below, not this branch, is what keeps an error
+            // page's bytes from ever being served back.
             const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
             if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
-              res.writeHead(413, { "content-type": "text/plain" });
-              res.end("Image too large");
+              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
               return;
             }
             const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
             if (streamedBody === null) {
-              res.writeHead(413, { "content-type": "text/plain" });
-              res.end("Image too large");
+              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
+              return;
+            }
+            if (streamedBody.length === 0) {
+              // Upstream's `mocked.res.buffers.length === 0` branch.
+              sendImageError(res, 400, '"url" parameter is valid but internal response is invalid');
               return;
             }
             imageBuffer = streamedBody;
@@ -1827,23 +2006,29 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         } else {
           // External image: only fetch allowlisted http(s) hosts, and only after
           // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
-          let target: URL;
-          try {
-            target = new URL(imageUrl);
-          } catch {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end("Bad Request: invalid image url");
-            return;
-          }
-          const fetched = await fetchExternalImageSafely(target, imageConfig);
+          // The URL was parsed, protocol-checked and allowlist-checked by
+          // validateImageUrlParam above; fetchExternalImageSafely re-checks the allowlist
+          // (and the public-address rule) for the initial target AND every redirect hop.
+          const fetched = await fetchExternalImageSafely(urlParam.target, imageConfig);
           if ("error" in fetched) {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end(`Bad Request: ${fetched.error}`);
+            // The reason is logged, never sent — see IMAGE_FETCH_ERROR_RESPONSE.
+            console.error(`[pool-server] /_next/image upstream fetch failed: ${fetched.error}`);
+            const mapped = IMAGE_FETCH_ERROR_RESPONSE[fetched.error];
+            sendImageError(res, mapped.status, mapped.body);
             return;
           }
           if (!fetched.ok) {
-            res.writeHead(502, { "content-type": "text/plain" });
-            res.end(`Failed to fetch external image: ${imageUrl}`);
+            // Upstream forwards the UPSTREAM's status here (an allowlisted host answering
+            // 404 gives a 404, measured), and ImageError coerces anything < 400 to 500.
+            console.error(
+              `[pool-server] /_next/image upstream responded ${fetched.status} for an ` +
+                `allowlisted external image`,
+            );
+            sendImageError(
+              res,
+              fetched.status >= 400 ? fetched.status : 500,
+              '"url" parameter is valid but upstream response is invalid',
+            );
             return;
           }
           imageBuffer = fetched.body;
@@ -1876,9 +2061,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // sharp choking on it further down, and never passthrough (serving an HTML body
         // back under its own content type would make /_next/image an XSS channel).
         if (!isOptimizableImageContentType(contentType)) {
-          res.writeHead(400, { "content-type": "text/plain" });
           // Byte-for-byte the body `next start` sends for this case.
-          res.end("The requested resource isn't a valid image.");
+          sendImageError(res, 400, "The requested resource isn't a valid image.");
           return;
         }
 
@@ -1889,9 +2073,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // handling: the verdict must not depend on the optimizer being present.
         if (contentType.toLowerCase().includes("svg")) {
           if (!imageConfig.dangerouslyAllowSVG) {
-            res.writeHead(400, { "content-type": "text/plain" });
             // Byte-for-byte the body `next start` sends for this case.
-            res.end('"url" parameter is valid but image type is not allowed');
+            sendImageError(res, 400, '"url" parameter is valid but image type is not allowed');
             return;
           }
           // The SVG branch is not special-cased for headers any more: `next start` sends
@@ -1942,9 +2125,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // and where the safety conditions on that fallback are spelled out.
         const sharp = loadSharpOnce();
         if (!sharp) {
-          // The load failure (with its cause) was logged once by loadSharpOnce.
-          res.writeHead(503, { "content-type": "text/plain" });
-          res.end("Image optimization unavailable");
+          // The load failure (with its cause) was logged once by loadSharpOnce. No upstream
+          // counterpart — upstream cannot start without sharp — so the wording is the
+          // adapter's own; only the absent Content-Type is borrowed.
+          sendImageError(res, 503, "Image optimization unavailable");
           return;
         }
         try {
@@ -2060,15 +2244,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             `[pool-server] /_next/image failed to process ${imageUrl} (${contentType}):`,
             message,
           );
-          res.writeHead(502, { "content-type": "text/plain" });
-          res.end("Failed to process image");
+          sendImageError(res, 502, "Failed to process image");
         }
         return;
       } catch (err) {
         console.error("Image optimization error:", err);
         if (!res.headersSent) {
-          res.writeHead(500, { "content-type": "text/plain" });
-          res.end("Image optimization failed");
+          sendImageError(res, 500, "Image optimization failed");
         }
         return;
       }

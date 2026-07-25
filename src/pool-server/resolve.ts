@@ -2,8 +2,9 @@
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
 import {
-  buildQueryString,
+  applyRewriteSignalHeaders,
   computeRewriteInvocation,
+  computeRewriteSignalHeaders,
   getRscConfig,
   isRscRequest,
   lookupPool,
@@ -15,7 +16,7 @@ import {
   queryFromUrl,
   resolveOutputPathname,
   resolveRscOutput,
-  stripAddedLocale,
+  sanitizeRouteMatches,
   type MiddlewareMatcher,
 } from "../routing-common.js";
 
@@ -524,29 +525,28 @@ export function createLocalResolver(
       // client protocols:
       //   - App Router (RSC): x-nextjs-rewritten-path + x-nextjs-rewritten-query
       //   - Pages Router (_next/data): x-nextjs-rewrite: <path?query>
-      // invocationTarget carries the clean rewritten pathname (e.g.
-      // /blog/from-middleware); its query holds the user-visible params PLUS
-      // internal routing captures (nxtP*, _rsc) — filter those so the headers
-      // match `next start`.
-      // App Router RSC rewrites: the flight render already resolved the right
-      // handler+params, but the client router needs x-nextjs-rewritten-path /
-      // -query to reconcile its URL state (otherwise router.query reflects the
-      // ORIGINAL request path). invocationTarget carries the clean rewritten
-      // pathname; filter internal capture params (nxtP*, _rsc) from its query.
       // (Pages Router _next/data rewrite signalling is a separate bucket — its
       // double-resolve path makes the header capture unreliable here.)
+      //
+      // N19: the App Router derivation is the SHARED computeRewriteSignalHeaders
+      // (routing-common.ts), which carries the upstream evidence for every rule it
+      // encodes. The ext_proc edge (Phase 2, the production path) emitted NOTHING here
+      // for next.config rewrites — proven against `next start` — because upstream splits
+      // the emission between the middleware adapter (which both tiers already transport)
+      // and the router-server layer this adapter replaces. One derivation, both tiers.
+      const signal = computeRewriteSignalHeaders({
+        originalUrl: prep.originalUrl,
+        addedLocale: prep.addedLocale,
+        isRscRequest: isRscReq,
+        invocationTarget: resolution.invocationTarget,
+        invocationQuery,
+      });
       let resolvedHeaders = resolution.resolvedHeaders ?? undefined;
-      if (isRscReq && resolution.invocationTarget?.pathname) {
-        const rwPath = stripAddedLocale(resolution.invocationTarget.pathname, prep.addedLocale);
-        const rwQs = buildQueryString(invocationQuery);
-        const pathChanged = rwPath !== prep.originalUrl.pathname;
-        const queryChanged = rwQs !== prep.originalUrl.search;
-        if (pathChanged || queryChanged) {
-          resolvedHeaders = new Headers(resolvedHeaders ?? undefined);
-          if (pathChanged) resolvedHeaders.set("x-nextjs-rewritten-path", rwPath);
-          if (queryChanged)
-            resolvedHeaders.set("x-nextjs-rewritten-query", rwQs.replace(/^\?/, ""));
-        }
+      if (signal.rewrittenPath !== undefined || signal.rewrittenQuery !== undefined) {
+        resolvedHeaders = applyRewriteSignalHeaders(
+          new Headers(resolvedHeaders ?? undefined),
+          signal,
+        );
       }
 
       return {
@@ -611,21 +611,6 @@ function isSameDeploymentRewrite(requestUrl: URL, rewriteUrl: URL): boolean {
     loopback.has(requestUrl.hostname) &&
     loopback.has(rewriteUrl.hostname)
   );
-}
-
-function sanitizeRouteMatches(
-  matches: Record<string, string> | null | undefined,
-): Record<string, string> | null {
-  if (!matches) return null;
-  const unresolvedValues = new Set(
-    Object.values(matches).filter((value) => /^\$nxtP[^/]*$/.test(value)),
-  );
-  if (unresolvedValues.size === 0) return matches;
-
-  const sanitized = Object.fromEntries(
-    Object.entries(matches).filter(([, value]) => !unresolvedValues.has(value)),
-  );
-  return Object.keys(sanitized).length > 0 ? sanitized : null;
 }
 
 export type LocalResolver = ReturnType<typeof createLocalResolver>;

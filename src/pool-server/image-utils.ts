@@ -102,6 +102,111 @@ const ANIMATABLE_CONTENT_TYPES = new Set(["image/webp", "image/png", "image/gif"
 // advertises AVIF, and AVIF encoding is several times slower per request.
 export const DEFAULT_IMAGE_FORMATS = ["image/webp"] as const;
 
+// --- `url` validation (ImageOptimizerCache.validateParams, the `url` half) --------
+//
+// A faithful port of upstream's `url` gate, in upstream's ORDER, because the body a client
+// sees depends on it: presence → array-ness → length → protocol-relative → then the
+// local/absolute split (recursive, localPatterns / URL-parse, protocol, remote allowlist).
+// This whole block runs BEFORE the `w`/`q` gate upstream, so `?url=/_next/image&w=16` is
+// `"url" parameter cannot be recursive`, NOT `"w" parameter (width) of 16 is not allowed`
+// (measured against `next start` 2026-07-25 on test/e2e/image-optimizer's fixture).
+//
+// This is not only wording parity. Three of these branches are gates the adapter did not
+// have at all, each of which previously fell through to the self-fetch path:
+//   • the 3072-byte length cap — a `?url=/aaa…(3073)` used to come back as a 404 whose body
+//     ECHOED the whole 3 kB url; upstream 400s it before any I/O.
+//   • the repeated-`url` case — `?url=/test.png&url=/test.jpg` was first-wins 200 here and
+//     is a 400 upstream.
+//   • `//host/x`, which `startsWith("/")` classified as LOCAL and handed to the loopback
+//     self-fetch, where upstream refuses it outright.
+export interface ImageLocalPattern {
+  pathname?: string;
+  search?: string;
+}
+
+export type ImageUrlValidation =
+  | { errorMessage: string }
+  // `pathname` is the url's DECODED pathname — query and fragment removed, trailing
+  // whitespace stripped, `..` segments resolved — which is the value upstream resolves a
+  // local source against (`matchLocalPattern` and `fetchInternalImage` both go through
+  // `new URL(url, base)`). Callers must use it, not the raw url, for the disk lookup.
+  | { url: string; isAbsolute: false; pathname: string }
+  | { url: string; isAbsolute: true; target: URL };
+
+/**
+ * Next's `ImageOptimizerCache.validateParams` for the `url` half, production mode. Returns
+ * the exact `errorMessage` Next sends as the 400 body, or the accepted url (plus the parsed
+ * `URL` for the absolute case, so the caller doesn't re-parse what was just validated).
+ *
+ * The two allowlist decisions are INJECTED rather than reimplemented here: `hasLocalMatch`
+ * wraps `images.localPatterns` (upstream's picomatch glob) and `isRemoteAllowed` is the same
+ * `images.domains`/`remotePatterns` predicate `fetchExternalImageSafely` re-applies to every
+ * redirect hop. One implementation each, checked here for parity and there for safety.
+ */
+export function validateImageUrlParam(
+  params: URLSearchParams,
+  checks: {
+    hasLocalMatch: (urlPathAndQuery: string) => boolean;
+    isRemoteAllowed: (target: URL) => boolean;
+  },
+): ImageUrlValidation {
+  // Array-ness before presence, for the same reason as `w`/`q`: upstream tests the whole
+  // PARSED value, and a repeated param parses to a non-empty (therefore truthy) array. So
+  // `?url=&url=/a.png` is "cannot be an array" upstream, not "is required".
+  if (params.getAll("url").length > 1) {
+    return { errorMessage: '"url" parameter cannot be an array' };
+  }
+  const url = params.get("url");
+  if (!url) return { errorMessage: '"url" parameter is required' };
+  if (url.length > 3072) return { errorMessage: '"url" parameter is too long' };
+  if (url.startsWith("//")) {
+    return { errorMessage: '"url" parameter cannot be a protocol-relative URL (//)' };
+  }
+
+  if (url.startsWith("/")) {
+    // Upstream: `/\/_next\/image($|\/)/.test(decodeURIComponent(parseUrl(url).pathname))`.
+    // Three things about that expression are load-bearing and were all measured:
+    //   • it runs on the PATHNAME, so `?url=/_next/image?url=/test.png` is recursive;
+    //   • it DECODES first, so `?url=/_next%2Fimage` is recursive too (the adapter's old
+    //     `imageUrl.split("?")[0] === "/_next/image"` answered 404 for that one, i.e. it
+    //     self-fetched a url whose whole point is to re-enter this handler);
+    //   • it is not anchored at the start and admits a trailing segment, so
+    //     `/_next/image/foo` and `/foo/_next/image` are recursive as well.
+    let pathname: string;
+    try {
+      pathname = decodeURIComponent(new URL(url, "http://n").pathname);
+    } catch {
+      // A malformed percent-escape (`?url=/%zz.png`). Upstream lets the URIError escape
+      // validateParams and answers 500 "Internal Server Error" — a crash is not something
+      // to reproduce, so this is the one deliberate divergence in this function: the same
+      // 400 upstream gives every other unparseable url.
+      return { errorMessage: '"url" parameter is invalid' };
+    }
+    if (/\/_next\/image($|\/)/.test(pathname)) {
+      return { errorMessage: '"url" parameter cannot be recursive' };
+    }
+    if (!checks.hasLocalMatch(url)) return { errorMessage: '"url" parameter is not allowed' };
+    return { url, isAbsolute: false, pathname };
+  }
+
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return { errorMessage: '"url" parameter is invalid' };
+  }
+  // Upstream reports a non-http(s) scheme as INVALID, not "not allowed" — `file:`, `data:`
+  // and `ftp:` all answer `"url" parameter is invalid` (measured). The adapter used to
+  // route them into the allowlist check and answered "image host not allowed".
+  if (target.protocol !== "http:" && target.protocol !== "https:") {
+    return { errorMessage: '"url" parameter is invalid' };
+  }
+  if (!checks.isRemoteAllowed(target)) {
+    return { errorMessage: '"url" parameter is not allowed' };
+  }
+  return { url, isAbsolute: true, target };
+}
+
 // --- `w` / `q` validation (ImageOptimizerCache.validateParams) -------------------
 //
 // A faithful port of Next's own gate, and NOT merely cosmetic parity: every distinct

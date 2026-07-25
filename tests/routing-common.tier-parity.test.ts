@@ -78,6 +78,12 @@ interface TierInvocation {
   invokePath: string | undefined;
   invocationQuery: Record<string, string | string[]> | undefined;
   outputId: string | undefined;
+  // N19: the client-facing App Router rewrite signal. Phase 1 puts it straight on the
+  // resolution's response headers; Phase 2 has no response phase (the ext_proc filter only
+  // mutates the REQUEST), so it rides inside the secret-gated `x-resolved-headers` JSON that
+  // the pool applies to the response. Both must produce the same two values.
+  rewrittenPath: string | null | undefined;
+  rewrittenQuery: string | null | undefined;
 }
 
 /**
@@ -118,16 +124,29 @@ async function bothTiers(args: {
     setHeaders.find((h) => h.header?.key === key)?.header?.value;
   const rawQuery = dispatch("x-invoke-query");
 
+  const rawResolvedHeaders = dispatch("x-resolved-headers");
+  const p2ResolvedHeaders: Record<string, string | string[]> = rawResolvedHeaders
+    ? JSON.parse(rawResolvedHeaders)
+    : {};
+  const p2Header = (name: string): string | undefined => {
+    const value = p2ResolvedHeaders[name];
+    return Array.isArray(value) ? value.join(", ") : value;
+  };
+
   return {
     phase1: {
       invokePath: p1.invokePath,
       invocationQuery: p1.invocationQuery,
       outputId: p1.matchedPathname,
+      rewrittenPath: p1.resolvedHeaders?.get("x-nextjs-rewritten-path"),
+      rewrittenQuery: p1.resolvedHeaders?.get("x-nextjs-rewritten-query"),
     },
     phase2: {
       invokePath: dispatch("x-invoke-path"),
       invocationQuery: rawQuery ? JSON.parse(rawQuery) : undefined,
       outputId: dispatch("x-output-id"),
+      rewrittenPath: p2Header("x-nextjs-rewritten-path"),
+      rewrittenQuery: p2Header("x-nextjs-rewritten-query"),
     },
   };
 }
@@ -144,6 +163,11 @@ function expectTiersAgree(r: { phase1: TierInvocation; phase2: TierInvocation })
   expect(r.phase2.invokePath).toEqual(r.phase1.invokePath);
   expect(normalize(r.phase2.invocationQuery)).toEqual(normalize(r.phase1.invocationQuery));
   expect(r.phase2.outputId).toEqual(r.phase1.outputId);
+  // N19. Phase 1 reads an absent header as `null` (Headers.get) while Phase 2 reads an absent
+  // JSON key as `undefined`; both mean "not emitted". Everything else must match byte for byte.
+  const signal = (v: string | null | undefined) => v ?? undefined;
+  expect(signal(r.phase2.rewrittenPath)).toEqual(signal(r.phase1.rewrittenPath));
+  expect(signal(r.phase2.rewrittenQuery)).toEqual(signal(r.phase1.rewrittenQuery));
 }
 
 describe("Phase 1 / Phase 2 rewrite-invocation parity", () => {
@@ -365,6 +389,203 @@ describe("Phase 1 / Phase 2 rewrite-invocation parity", () => {
   });
 });
 
+/**
+ * N19. `x-nextjs-rewritten-path` / `x-nextjs-rewritten-query` — the BROWSER-FACING App Router
+ * rewrite signal (upstream `client/route-params.ts` getRenderedPathname/getRenderedSearch read
+ * them off the RSC fetch `Response`; `build/generate-routes-manifest.ts` declares both names to
+ * adapters as `rewriteHeaders`).
+ *
+ * THE BUG THESE PIN: upstream emits the signal from two layers — `server/web/adapter.ts` for
+ * middleware rewrites (which lands in the middleware response headers both tiers already
+ * transport) and `server/lib/router-utils/resolve-routes.ts` for next.config rewrites (the
+ * router-server layer this adapter replaces). Only Phase 1 re-emitted the second class, so a
+ * next.config rewrite lost its client signalling on the PRODUCTION path (Envoy → ext_proc →
+ * pool) while looking perfect in the e2e harness, which starts the pool alone. Verified live
+ * against `next start`: `/rewrite-query-array` answered p=/api/rewrite-query-array
+ * q=item=one&item=two on `next start` and Phase 1, and NOTHING through the edge.
+ */
+describe("Phase 1 / Phase 2 client rewrite-signal parity", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** RSC-request variant of bothTiers: the signal is RSC-only on both tiers (mirroring the
+   * `isRSCRequest` / `isRSCRequestHeader` guards at both upstream emission sites). */
+  const rscTiers = (args: Parameters<typeof bothTiers>[0]) => {
+    const rscHeader = args.manifest.routeGraph.rsc?.header ?? "rsc";
+    return bothTiers({ ...args, headers: { [rscHeader]: "1", ...(args.headers ?? {}) } });
+  };
+
+  it("emits the rewrite signal for a next.config rewrite on BOTH tiers (repeated query keys)", async () => {
+    const r = await rscTiers({
+      manifest: withRewrite(makeManifest(), "/api/hello?item=one&item=two"),
+      target: "/rewrite-source",
+      resolution: {
+        resolvedPathname: "/api/hello",
+        // Collapsed query — what @next/routing reports for the destination above.
+        resolvedQuery: { item: "two" },
+        invocationTarget: { pathname: "/api/hello", query: { item: "two" } },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenPath).toBe("/api/hello");
+    // No leading "?" — upstream slices it off before setting the header.
+    expect(r.phase1.rewrittenQuery).toBe("item=one&item=two");
+    expect(r.phase2.rewrittenPath).toBe("/api/hello");
+    expect(r.phase2.rewrittenQuery).toBe("item=one&item=two");
+  });
+
+  it("filters internal capture params ($nxtP*, _rsc) out of the signalled query on both tiers", async () => {
+    const r = await rscTiers({
+      manifest: withRewrite(makeManifest(), "/api/hello?keep=1"),
+      target: "/rewrite-source",
+      resolution: {
+        resolvedPathname: "/api/hello",
+        resolvedQuery: {
+          nxtPslug: "hello", // internal capture KEY
+          rest: "$nxtPrest", // unmatched optional catch-all SENTINEL VALUE
+          _rsc: "abc12", // the RSC union query
+          keep: "1",
+        },
+        invocationTarget: { pathname: "/api/hello", query: { keep: "1" } },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenQuery).toBe("keep=1");
+  });
+
+  it("percent-encodes the signalled query identically on both tiers", async () => {
+    const r = await rscTiers({
+      manifest: withRewrite(makeManifest(), "/api/hello?q=caf%C3%A9&q=au%20lait"),
+      target: "/rewrite-source",
+      resolution: {
+        resolvedPathname: "/api/hello",
+        resolvedQuery: { q: "au lait", plus: "a+b", slash: "x/y", amp: "a&b" },
+        invocationTarget: { pathname: "/api/hello", query: { q: "au lait" } },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenQuery).toBe("q=caf%C3%A9&q=au+lait&plus=a%2Bb&slash=x%2Fy&amp=a%26b");
+  });
+
+  it("keeps a percent-encoded rewrite target pathname byte-identical in the signal", async () => {
+    const r = await rscTiers({
+      manifest: withRewrite(
+        makeManifest({
+          pathnames: ["/", "/blog/[slug]"],
+          poolAssignments: { "/": "ssr", "/blog/[slug]": "ssr" },
+        }),
+        "/blog/caf%C3%A9",
+      ),
+      target: "/rewrite-source",
+      resolution: {
+        resolvedPathname: "/blog/[slug]",
+        resolvedQuery: {},
+        invocationTarget: { pathname: "/blog/caf%C3%A9", query: {} },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenPath).toBe("/blog/caf%C3%A9");
+    expect(r.phase1.rewrittenQuery).toBeFalsy();
+  });
+
+  it("strips the internally-added i18n locale from the signalled path on both tiers", async () => {
+    const r = await rscTiers({
+      manifest: withRewrite(
+        makeManifest({
+          i18n: { locales: ["en", "fr"], defaultLocale: "en" } as never,
+          pathnames: ["/", "/rewritten"],
+          poolAssignments: { "/": "ssr", "/rewritten": "ssr" },
+        }),
+        "/rewritten",
+      ),
+      target: "/rewrite-source",
+      resolution: {
+        // prefixRequestLocale prefixed the internal URL; the CLIENT must never see /en.
+        resolvedPathname: "/en/rewritten",
+        resolvedQuery: {},
+        invocationTarget: { pathname: "/en/rewritten", query: {} },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenPath).toBe("/rewritten");
+  });
+
+  it("signals a query-only rewrite (path unchanged ⇒ no path header) on both tiers", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/", "/rewrite-source"],
+      poolAssignments: { "/": "ssr", "/rewrite-source": "ssr" },
+    });
+    const r = await rscTiers({
+      manifest: withRewrite(manifest, "/rewrite-source?key=value"),
+      target: "/rewrite-source",
+      resolution: {
+        resolvedPathname: "/rewrite-source",
+        resolvedQuery: { key: "value" },
+        invocationTarget: { pathname: "/rewrite-source", query: { key: "value" } },
+      },
+    });
+    expectTiersAgree(r);
+    // Upstream compares each component independently (requestURL.pathname !==
+    // destination.pathname / requestURL.search !== destination.search).
+    expect(r.phase1.rewrittenPath).toBeFalsy();
+    expect(r.phase1.rewrittenQuery).toBe("key=value");
+  });
+
+  it("emits NO signal for a document (non-RSC) request even though it IS rewritten", async () => {
+    const r = await bothTiers({
+      manifest: withRewrite(makeManifest(), "/api/hello?item=one&item=two"),
+      target: "/rewrite-source",
+      resolution: {
+        resolvedPathname: "/api/hello",
+        resolvedQuery: { item: "two" },
+        invocationTarget: { pathname: "/api/hello", query: { item: "two" } },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenPath).toBeFalsy();
+    expect(r.phase1.rewrittenQuery).toBeFalsy();
+    // A document request is instead served through the rewritten INVOCATION path.
+    expect(r.phase1.invokePath).toBe("/api/hello?item=one&item=two");
+  });
+
+  it("emits NO signal when routing did not rewrite (both tiers)", async () => {
+    const r = await rscTiers({
+      manifest: makeManifest(),
+      target: "/about?foo=1",
+      resolution: {
+        resolvedPathname: "/about",
+        resolvedQuery: { foo: "1" },
+        invocationTarget: { pathname: "/about", query: { foo: "1" } },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenPath).toBeFalsy();
+    expect(r.phase1.rewrittenQuery).toBeFalsy();
+  });
+
+  it("never signals an unresolved optional-catch-all sentinel to the client", async () => {
+    // `/%24nxtPslug` is a @next/routing sentinel, not a public URL. Sending it as
+    // x-nextjs-rewritten-path hands the client router a pathname whose segment count does not
+    // match the route tree — the exact failure upstream's client/route-params.ts documents.
+    const r = await rscTiers({
+      manifest: makeManifest({
+        pathnames: ["/[[...slug]]"],
+        poolAssignments: { "/[[...slug]]": "ssr" },
+      }),
+      target: "/",
+      resolution: {
+        resolvedPathname: "/[[...slug]]",
+        resolvedQuery: { nxtPslug: "$nxtPslug" },
+        invocationTarget: { pathname: "/%24nxtPslug", query: { nxtPslug: "$nxtPslug" } },
+      },
+    });
+    expectTiersAgree(r);
+    expect(r.phase1.rewrittenPath).toBeFalsy();
+    expect(r.phase1.rewrittenQuery).toBeFalsy();
+  });
+});
+
 describe("Phase 1 / Phase 2 output-key parity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -470,6 +691,10 @@ describe("no tier re-declares a shared routing helper", () => {
     "buildQueryString",
     "queryFromUrl",
     "computeRewriteInvocation",
+    // N19: the client-facing rewrite signal. Phase 2 had NO derivation at all (the bug); a
+    // private copy in either tier is the drift that would silently un-fix it.
+    "computeRewriteSignalHeaders",
+    "applyRewriteSignalHeaders",
     "stripAddedLocale",
     "isRscRequest",
     "resolveOutputPathname",

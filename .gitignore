@@ -19,3 +19,9 @@ tests/**/*.d.ts
 tests/**/*.d.ts.map
 /vitest.config.d.ts
 /vitest.config.d.ts.map
+
+# Emulation scratch: `adapter-k8s emulate` copies these out of the (ignored)
+# .k8s-adapter/ build output on every run and always overwrites them, so the
+# contents are pure generated output — tracking them only churned a regenerated
+# build id into every diff. No code reads them; the dir is recreated as needed.
+fixtures/*/config/

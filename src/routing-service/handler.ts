@@ -7,7 +7,9 @@ import {
   type HeaderMutationEntry,
 } from "./response-builders.js";
 import {
+  applyRewriteSignalHeaders,
   computeRewriteInvocation,
+  computeRewriteSignalHeaders,
   getRscConfig,
   grantsSharedCacheFreshness,
   isRscRequest,
@@ -19,6 +21,7 @@ import {
   resolveOutputPathname,
   resolveRscOutput,
   rscCacheBustingUnvalidated,
+  sanitizeRouteMatches,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
 } from "../routing-common.js";
@@ -515,10 +518,60 @@ export function createRequestHandler(
       clear.delete(key);
     };
 
-    // next.config headers() + middleware response headers → carried as one JSON header and
-    // applied to the RESPONSE by the pool (NOT emitted as request-header mutations).
-    if (resolution.resolvedHeaders) {
-      const serialized = serializeResolvedHeaders(resolution.resolvedHeaders);
+    // Rewrite invocation target: when routing rewrote the URL (middleware or next.config
+    // rewrites), the pool must invoke the handler with the REWRITTEN path+query while the
+    // public :path is preserved for the client. Without this transport, a trusted-dispatch
+    // request runs the handler against the ORIGINAL URL and every rewrite-added query param
+    // (e.g. a destination's repeated `?item=one&item=two`) is silently dropped. Same
+    // derivation as pool-server/resolve.ts (shared computeRewriteInvocation).
+    const rscRequest = isRscRequest(headers, rscConfig);
+    const invocation = computeRewriteInvocation({
+      originalUrl: prep.originalUrl,
+      addedLocale: prep.addedLocale,
+      isRscRequest: rscRequest,
+      isDataRequest: prep.isDataRequest,
+      routes: manifest.routeGraph,
+      resolvedQuery: resolution.resolvedQuery,
+      invocationTarget: resolution.invocationTarget,
+      resolvedPathname: resolution.resolvedPathname,
+    });
+
+    // N19. next.config headers() + middleware response headers → carried as one JSON header
+    // and applied to the RESPONSE by the pool (NOT emitted as request-header mutations).
+    //
+    // The App Router client-facing rewrite signal rides in the SAME slot, because it is a
+    // RESPONSE header the browser reads (routing-common.ts computeRewriteSignalHeaders carries
+    // the upstream evidence) and this ext_proc filter only processes the REQUEST phase —
+    // server.ts echoes `responseHeaders` untouched, so the edge cannot set a response header
+    // itself. Riding in `x-resolved-headers` also means the signal inherits that header's
+    // secret gating for free: the pool strips the whole internal dispatch vocabulary unless the
+    // internal-secret compare succeeds, so a client cannot forge its own rewrite signal.
+    //
+    // Upstream sets these headers in TWO layers and the adapter replaces exactly one:
+    // middleware rewrites get them from `server/web/adapter.ts` on the middleware Response
+    // (already inside resolution.resolvedHeaders here), while next.config rewrites get them
+    // from `server/lib/router-utils/resolve-routes.ts` — the router-server layer this tier
+    // replaces. That second class was silently missing at the edge: PROVEN against real
+    // `next start` (`/rewrite-query-array` → p=/api/rewrite-query-array q=item=one&item=two on
+    // `next start` and Phase 1, but nothing at all through Envoy+ext_proc). The pool's Phase-1
+    // resolver emitted it, so the whole e2e harness — which starts only the pool — was blind.
+    const signal = computeRewriteSignalHeaders({
+      originalUrl: prep.originalUrl,
+      addedLocale: prep.addedLocale,
+      isRscRequest: rscRequest,
+      invocationTarget: resolution.invocationTarget,
+      invocationQuery: invocation.invocationQuery,
+    });
+    const hasSignal = signal.rewrittenPath !== undefined || signal.rewrittenQuery !== undefined;
+    if (resolution.resolvedHeaders || hasSignal) {
+      // Overwrite rather than defer to whatever middleware already set, so both tiers land on
+      // the one shared derivation (Phase 1 does the same) instead of one tier trusting the
+      // middleware adapter's value and the other computing its own.
+      const responseHeaders = applyRewriteSignalHeaders(
+        new Headers(resolution.resolvedHeaders ?? undefined),
+        signal,
+      );
+      const serialized = serializeResolvedHeaders(responseHeaders);
       if (serialized) setDispatch("x-resolved-headers", serialized);
     }
 
@@ -541,26 +594,15 @@ export function createRequestHandler(
     // bypassing local resolveRoutes() (avoids double resolution + middleware)
     setDispatch("x-output-id", outputId);
     setDispatch("x-matched-pathname", outputId);
-    if (resolution.routeMatches) {
-      setDispatch("x-route-matches", JSON.stringify(resolution.routeMatches));
+    // Sanitized with the SHARED helper, exactly as Phase 1 does before it attaches
+    // routeMatches to a local resolution: the edge must not be the tier that ships the
+    // unresolved-dynamic sentinel over the wire and leaves the pool to catch it.
+    const sanitizedRouteMatches = sanitizeRouteMatches(resolution.routeMatches);
+    if (sanitizedRouteMatches) {
+      setDispatch("x-route-matches", JSON.stringify(sanitizedRouteMatches));
     }
 
-    // Rewrite invocation target: when routing rewrote the URL (middleware or next.config
-    // rewrites), the pool must invoke the handler with the REWRITTEN path+query while the
-    // public :path is preserved for the client. Without this transport, a trusted-dispatch
-    // request runs the handler against the ORIGINAL URL and every rewrite-added query param
-    // (e.g. a destination's repeated `?item=one&item=two`) is silently dropped. Same
-    // derivation as pool-server/resolve.ts (shared computeRewriteInvocation).
-    const invocation = computeRewriteInvocation({
-      originalUrl: prep.originalUrl,
-      addedLocale: prep.addedLocale,
-      isRscRequest: isRscRequest(headers, rscConfig),
-      isDataRequest: prep.isDataRequest,
-      routes: manifest.routeGraph,
-      resolvedQuery: resolution.resolvedQuery,
-      invocationTarget: resolution.invocationTarget,
-      resolvedPathname: resolution.resolvedPathname,
-    });
+    // Transport the rewrite invocation target computed above.
     if (invocation.invokePath) {
       setDispatch("x-invoke-path", invocation.invokePath);
     }

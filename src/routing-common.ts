@@ -847,6 +847,40 @@ export function filterInternalQuery(
   return out;
 }
 
+/**
+ * Drop @next/routing captures whose value is still the unresolved-dynamic SENTINEL
+ * (`$nxtP<param>`) — the same artifact filterInternalQuery removes from a query and
+ * computeRewriteInvocation / computeRewriteSignalHeaders refuse to put in a path. Entries are
+ * removed by VALUE, so every alias of one unresolved capture (@next/routing emits both the
+ * positional `"1"` and the named `nxtPslug`) goes together; an all-sentinel map becomes null.
+ *
+ * CALLED BY BOTH TIERS (pool-server/resolve.ts Phase 1, routing-service/handler.ts Phase 2).
+ * Phase 2 previously stamped `x-route-matches` unsanitized and relied entirely on
+ * pool-server/dispatch.ts extractRouteParams re-filtering per value at the far end. That
+ * compensation is real and complete today — it is pinned in
+ * tests/pool-server/route-matches-sanitization.test.ts — but it made the invariant depend on a
+ * consumer two hops away, and two OTHER consumers already read routeMatches raw (dispatch.ts
+ * forwards it verbatim as requestMeta.routeMatches, and the edge-param path reads
+ * `resolution.routeMatches?.[key]` for the nxtP transport query). Sanitizing at the source is
+ * what makes those safe by construction rather than by coincidence.
+ *
+ * The test is `/^\$nxtP/`, matching filterInternalQuery above and dispatch.ts
+ * extractRouteParams — one sentinel shape, three sites. (It was `/^\$nxtP[^/]*$/` while this
+ * lived privately in resolve.ts, which kept `$nxtPslug/nested`; extractRouteParams dropped it
+ * anyway, so no params change.)
+ */
+export function sanitizeRouteMatches(
+  matches: Record<string, string> | null | undefined,
+): Record<string, string> | null {
+  if (!matches) return null;
+  const unresolvedValues = new Set(Object.values(matches).filter((value) => /^\$nxtP/.test(value)));
+  if (unresolvedValues.size === 0) return matches;
+  const sanitized = Object.fromEntries(
+    Object.entries(matches).filter(([, value]) => !unresolvedValues.has(value)),
+  );
+  return Object.keys(sanitized).length > 0 ? sanitized : null;
+}
+
 export function mergeInvocationQuery(
   resolvedQuery: Record<string, string | string[]> | undefined,
   targetQuery: Record<string, string | string[]> | undefined,
@@ -999,6 +1033,90 @@ export function computeRewriteInvocation(args: {
     if (candidate !== args.originalUrl.pathname + args.originalUrl.search) invokePath = candidate;
   }
   return { invokePath, invocationQuery };
+}
+
+/**
+ * N19. App Router rewrite signalling for the CLIENT: `x-nextjs-rewritten-path` /
+ * `x-nextjs-rewritten-query`.
+ *
+ * These are BROWSER-FACING response headers, not internal dispatch vocabulary. The client
+ * reads them straight off the `Response` object of its own RSC fetch — see upstream
+ * `packages/next/src/client/route-params.ts` (`getRenderedPathname` / `getRenderedSearch`,
+ * `response.headers.get(NEXT_REWRITTEN_{PATH,QUERY}_HEADER)`), consumed by
+ * `client/flight-data-helpers.ts` (`createInitialRSCPayloadFromFallbackPrerender`) and
+ * `client/components/segment-cache/cache.ts`. Without them the router's URL state and its
+ * parsed client params stay on the ORIGINAL request path after a rewrite, and
+ * `client/route-params.ts` explicitly names a wrong/missing header as the cause of a
+ * segment-count mismatch. Next's routes-manifest even declares the two names to adapters
+ * (`build/generate-routes-manifest.ts` → `rewriteHeaders.pathHeader/queryHeader`), which is
+ * the contract this adapter is satisfying.
+ *
+ * Upstream emits them from TWO places, and the adapter replaces exactly one of them:
+ *   • middleware rewrites — `server/web/adapter.ts` sets them on the middleware `Response`
+ *     itself, so they arrive inside the middleware response headers both tiers already
+ *     transport (Phase 2 via the secret-gated `x-resolved-headers` JSON). That is why the
+ *     middleware case never looked broken at the edge.
+ *   • next.config rewrites — `server/lib/router-utils/resolve-routes.ts` sets them in the
+ *     router-server, which is precisely the layer this adapter replaces. Nothing re-emitted
+ *     them at the ext_proc edge, so a config rewrite lost its client signalling on the
+ *     PRODUCTION path while Phase 1 (pool-local resolution) emitted it correctly.
+ *
+ * RSC-only, mirroring both upstream sites (`isRSCRequest` / `isRSCRequestHeader` guards): a
+ * document request re-renders under the rewritten route anyway and upstream sends nothing.
+ * Each header is emitted only when its component actually changed against the public request
+ * URL, again mirroring upstream (`requestURL.pathname !== destination.pathname` /
+ * `requestURL.search !== destination.search`).
+ *
+ * CALLED BY BOTH RESOLVERS (pool-server/resolve.ts Phase 1, routing-service/handler.ts
+ * Phase 2). Don't reintroduce a private copy in either tier — the Phase-2 gap this closes is
+ * the same class of bug as the four private helper copies routing-common.ts was created for.
+ */
+export function computeRewriteSignalHeaders(args: {
+  originalUrl: URL;
+  addedLocale: string | null;
+  isRscRequest: boolean;
+  invocationTarget: { pathname?: string } | undefined;
+  invocationQuery: Record<string, string | string[]> | undefined;
+}): { rewrittenPath?: string; rewrittenQuery?: string } {
+  const targetPathname = args.invocationTarget?.pathname;
+  if (!args.isRscRequest || !targetPathname) return {};
+  // An unmatched optional catch-all is represented internally as `/$nxtP<param>` (sometimes
+  // percent-encoded). It is a routing sentinel, never a public URL — the same guard
+  // computeRewriteInvocation applies to invokePath. Leaking it here would hand the client
+  // router a pathname whose segment count does not match the route tree, which is exactly the
+  // failure `client/route-params.ts` documents ("could happen if the x-nextjs-rewritten-path
+  // header is incorrectly set").
+  if (targetPathname.includes("$nxtP") || /%24nxtP/i.test(targetPathname)) return {};
+
+  const rewrittenPath = stripAddedLocale(targetPathname, args.addedLocale);
+  const rewrittenSearch = buildQueryString(args.invocationQuery);
+  const signal: { rewrittenPath?: string; rewrittenQuery?: string } = {};
+  if (rewrittenPath !== args.originalUrl.pathname) signal.rewrittenPath = rewrittenPath;
+  // The header carries the query WITHOUT the leading "?" (upstream slices it off).
+  if (rewrittenSearch !== args.originalUrl.search) {
+    signal.rewrittenQuery = rewrittenSearch.replace(/^\?/, "");
+  }
+  return signal;
+}
+
+/** The two client-facing rewrite-signal header names, in one place so neither tier spells
+ * them itself. Values come from upstream `client/components/app-router-headers.ts`
+ * (NEXT_REWRITTEN_PATH_HEADER / NEXT_REWRITTEN_QUERY_HEADER) and are re-declared to adapters
+ * in the routes manifest as `rewriteHeaders.pathHeader` / `.queryHeader`. */
+export const REWRITTEN_PATH_HEADER = "x-nextjs-rewritten-path";
+export const REWRITTEN_QUERY_HEADER = "x-nextjs-rewritten-query";
+
+/** Apply a computeRewriteSignalHeaders() verdict onto a response-header set. Returns the
+ * same Headers instance for chaining; a `{}` verdict is a no-op. */
+export function applyRewriteSignalHeaders(
+  headers: Headers,
+  signal: { rewrittenPath?: string; rewrittenQuery?: string },
+): Headers {
+  if (signal.rewrittenPath !== undefined) headers.set(REWRITTEN_PATH_HEADER, signal.rewrittenPath);
+  if (signal.rewrittenQuery !== undefined) {
+    headers.set(REWRITTEN_QUERY_HEADER, signal.rewrittenQuery);
+  }
+  return headers;
 }
 
 // N9: the concrete route selected by routing may retain an i18n locale prefix while the

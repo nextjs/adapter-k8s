@@ -384,10 +384,15 @@ describe("image optimizer parity — default config", () => {
         headers: { accept: "image/avif,image/webp,image/*" },
       });
       expect(res.status).toBe(400);
+      const body = await res.text();
       // Byte-for-byte the body `next start` sends for this case (verified 2026-07-24).
-      expect(await res.text()).toBe("The requested resource isn't a valid image.");
+      expect(body).toBe("The requested resource isn't a valid image.");
       // Whatever happens, the HTML body must not be echoed back to the client.
-      expect(res.headers.get("content-type")).toBe("text/plain");
+      expect(body).not.toContain("alert(1)");
+      // No Content-Type at all — `next start` sends none on any optimizer error (measured
+      // 2026-07-25 with curl: `400 Bad Request` + chunked + the body, nothing else). Safe
+      // because every optimizer error body is a fixed string; see sendImageError.
+      expect(res.headers.get("content-type")).toBeNull();
     }
   });
 
@@ -565,8 +570,8 @@ describe("image optimizer parity — default config", () => {
   //
   // Every body below was read off `next start` 16.2.10 on a copy of Next's own
   // test/e2e/image-optimizer fixture (2026-07-25, default images config, image cache
-  // cleared). `next start` sends no Content-Type on these; the adapter adds text/plain so
-  // the message can't be sniffed, which is the only intentional difference.
+  // cleared). `next start` sends no Content-Type on these, and neither does the adapter
+  // any more — pinned below.
   //
   // This is not cosmetic parity. `w=16` and `q=50` used to return 200, and each additional
   // accepted (w, q) pair is one more CDN cache entry and one more sharp encode — an
@@ -595,16 +600,16 @@ describe("image optimizer parity — default config", () => {
   ])("400s ?%s with next start's exact body", async (query, expected) => {
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/mislabeled.jpg&${query}`);
     expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toBeNull();
     expect(await res.text()).toBe(expected);
   });
 
   it("still serves the allowed (w, q) pairs the default config permits", async () => {
     // The floor of imageSizes is 32 (not 16), and 75 is the only default quality.
     for (const query of ["w=32&q=75", "w=384&q=75", "w=3840&q=75"]) {
-      const res = await fetch(
-        `http://127.0.0.1:${port}/_next/image?url=/mislabeled.jpg&${query}`,
-        { headers: { accept: "image/webp" } },
-      );
+      const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/mislabeled.jpg&${query}`, {
+        headers: { accept: "image/webp" },
+      });
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toBe("image/webp");
     }
@@ -667,8 +672,189 @@ describe("image optimizer parity — default config", () => {
     // 400s this case outright, and the adapter must not serve the bytes under a guess.
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/html-as.png&w=384&q=75`);
     expect(res.status).toBe(502);
-    expect(res.headers.get("content-type")).toBe("text/plain");
+    expect(res.headers.get("content-type")).toBeNull();
     expect(await res.text()).not.toContain("alert(1)");
+  });
+
+  // --- `url` rejection at the server boundary (validateParams, the `url` half) ------
+  //
+  // The unit-level table lives in image-utils.test.ts; these pin the wiring: the gate runs
+  // BEFORE w/q, the 400 carries no Content-Type, and the branches that used to fall through
+  // to the loopback self-fetch now stop here. Bodies measured against `next start` on a
+  // scratch copy of Next's test/e2e/image-optimizer fixture, 2026-07-25.
+  it.each([
+    ["", '"url" parameter is required'],
+    ["url=", '"url" parameter is required'],
+    ["url=/mislabeled.jpg&url=/evil.png", '"url" parameter cannot be an array'],
+    ["url=//example.com/a.png", '"url" parameter cannot be a protocol-relative URL (//)'],
+    ["url=/_next/image", '"url" parameter cannot be recursive'],
+    ["url=/_next/image/foo", '"url" parameter cannot be recursive'],
+    ["url=/_next%2Fimage", '"url" parameter cannot be recursive'],
+    // remotePatterns is empty in this app, so every absolute host is refused.
+    ["url=https://example.com/a.png", '"url" parameter is not allowed'],
+    ["url=file:///etc/passwd", '"url" parameter is invalid'],
+    ["url=test.png", '"url" parameter is invalid'],
+  ])("400s ?%s with next start's exact body and NO Content-Type", async (query, expected) => {
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?${query}&w=384&q=75`);
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toBeNull();
+    expect(await res.text()).toBe(expected);
+  });
+
+  it("caps the `url` length instead of echoing it back in a 404", async () => {
+    // Before: 404 with a ~3 kB body that repeated the whole attacker-supplied url.
+    const res = await fetch(
+      `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent("/" + "a".repeat(3072))}&w=384&q=75`,
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe('"url" parameter is too long');
+  });
+
+  it("validates `url` before `w`/`q` (upstream order)", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/_next/image&w=16&q=75`);
+    expect(res.status).toBe(400);
+    // The old order answered '"w" parameter (width) of 16 is not allowed' here.
+    expect(await res.text()).toBe('"url" parameter cannot be recursive');
+  });
+
+  it("resolves a local url by its PATHNAME (fragment / trailing newline stripped)", async () => {
+    // `next start` serves all three of these as the same image (its internal fetch parses
+    // the url); the adapter used to look for a literal `public/mislabeled.jpg#a` on disk and
+    // answered 400 "The requested resource isn't a valid image." on the miss.
+    for (const url of ["/mislabeled.jpg", "/mislabeled.jpg#a", "/mislabeled.jpg\n"]) {
+      const res = await fetch(
+        `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent(url)}&w=384&q=75`,
+        { headers: { accept: "image/png" } },
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+    }
+  });
+
+  it("still refuses a traversal whose separators survive URL normalization", async () => {
+    // The disk path now comes from `new URL(url, "http://n").pathname`, which collapses BOTH
+    // `..` and `%2e%2e` dot segments (WHATWG treats them alike) — but an ENCODED SEPARATOR
+    // (`%2f`) is not a separator to the parser, so `/..%2f..%2fx` survives normalization and
+    // only becomes a traversal when decodePublicPathname decodes it. resolveWithinRoot is
+    // the guard for exactly that class and must keep firing.
+    //
+    // `next start` also 400s all of these; it reaches its 400 by MISSING the file rather
+    // than by refusing the path, hence the different body (the documented divergence — the
+    // status, and the fact that nothing outside public/ is ever served, are parity).
+    for (const url of [
+      "/..%2f..%2fpackage.json",
+      "/%2e%2e%2F%2e%2e%2Fpackage.json",
+      "/_next/static/..%2f..%2fpackage.json",
+    ]) {
+      const res = await fetch(
+        `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent(url)}&w=384&q=75`,
+      );
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).toBe('"url" parameter is not allowed');
+      expect(body).not.toContain("dependencies");
+    }
+  });
+
+  it("normalizes a dot-segment traversal away instead of serving it (next start parity)", async () => {
+    // `/%2e%2e/%2e%2e/package.json` and `/../../package.json` both normalize to
+    // `/package.json` inside public/, which does not exist — `next start` answers exactly
+    // this 400 for every form (measured 2026-07-25). What must never happen is a 200
+    // carrying the repo's package.json.
+    for (const url of [
+      "/../../package.json",
+      "/%2e%2e/%2e%2e/package.json",
+      "/_next/static/%2e%2e/%2e%2e/package.json",
+    ]) {
+      const res = await fetch(
+        `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent(url)}&w=384&q=75`,
+      );
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).toBe("The requested resource isn't a valid image.");
+      expect(body).not.toContain("dependencies");
+    }
+  });
+
+  it("400s a missing local source the way next start does (no url echo, no 404)", async () => {
+    // Upstream's fetchInternalImage does NOT check res.ok: the 404 page's bytes reach the
+    // sniff gate and come back as this 400. The adapter used to answer
+    // `404 Image not found: <url>`, reflecting the request into the body.
+    for (const url of ["/does-not-exist.png", "/mislabeled\u0000.jpg"]) {
+      const res = await fetch(
+        `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent(url)}&w=384&q=75`,
+      );
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).toBe("The requested resource isn't a valid image.");
+      expect(body).not.toContain("does-not-exist");
+    }
+  });
+});
+
+describe("image optimizer parity — images.localPatterns", () => {
+  const booter = makeBooter();
+  let port: number;
+
+  beforeAll(async () => {
+    // Next's RESOLVED config always materializes this, even for an app that never mentions
+    // localPatterns (read straight out of a real .next/required-server-files.json,
+    // 2026-07-25). The `search: ""` clause is live behavior, not a formality.
+    ({ port } = await booter.boot({ localPatterns: [{ pathname: "**", search: "" }] }));
+  }, 60_000);
+
+  afterAll(async () => {
+    await booter.cleanup();
+  });
+
+  it('rejects a local url carrying a query string (the default `search: ""`)', async () => {
+    // `next start` answers ?url=/test.png%3Ffoo%3D1 with exactly this (measured); the
+    // adapter had no localPatterns support at all and answered
+    // `404 Image not found: /test.png?foo=1`.
+    const res = await fetch(
+      `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent("/mislabeled.jpg?foo=1")}&w=384&q=75`,
+    );
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toBeNull();
+    expect(await res.text()).toBe('"url" parameter is not allowed');
+  });
+
+  it('still serves a url whose query is EMPTY (search is `""` for `/x?`)', async () => {
+    // `new URL("/x?", "http://n").search === ""`, so upstream serves it — measured 200.
+    const res = await fetch(
+      `http://127.0.0.1:${port}/_next/image?url=${encodeURIComponent("/mislabeled.jpg?")}&w=384&q=75`,
+      { headers: { accept: "image/png" } },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+  });
+
+  it("honors a restrictive pathname glob with the same picomatch Next uses", async () => {
+    await booter.cleanup();
+    ({ port } = await booter.boot({ localPatterns: [{ pathname: "/assets/**" }] }));
+    const denied = await fetch(
+      `http://127.0.0.1:${port}/_next/image?url=/mislabeled.jpg&w=384&q=75`,
+    );
+    expect(denied.status).toBe(400);
+    expect(await denied.text()).toBe('"url" parameter is not allowed');
+  });
+
+  it("allows every local image when localPatterns is ABSENT (upstream short-circuit)", async () => {
+    await booter.cleanup();
+    ({ port } = await booter.boot({ dangerouslyAllowSVG: false }));
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/mislabeled.jpg&w=384&q=75`, {
+      headers: { accept: "image/png" },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("allows NOTHING when localPatterns is an explicitly empty list", async () => {
+    // `[].some(...)` is false upstream, so an empty list is "no local images", not "all".
+    await booter.cleanup();
+    ({ port } = await booter.boot({ localPatterns: [] }));
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/mislabeled.jpg&w=384&q=75`);
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe('"url" parameter is not allowed');
   });
 });
 
@@ -761,9 +947,11 @@ describe("image optimizer parity — non-default images config", () => {
     try {
       const { port: p2 } = await solo.boot({ imageSizes: [16, 33], qualities: [40, 75] });
       const ok = async (query: string) =>
-        (await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&${query}`, {
-          headers: { accept: "image/webp" },
-        })).status;
+        (
+          await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&${query}`, {
+            headers: { accept: "image/webp" },
+          })
+        ).status;
       // Opted-in sizes/qualities are accepted (w=16 is legal HERE, and only here) …
       expect(await ok("w=16&q=40")).toBe(200);
       expect(await ok("w=33&q=75")).toBe(200);
@@ -785,9 +973,11 @@ describe("image optimizer parity — non-default images config", () => {
     try {
       const { port: p2 } = await solo.boot({ imageSizes: [] });
       const status = async (query: string) =>
-        (await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&${query}`, {
-          headers: { accept: "image/webp" },
-        })).status;
+        (
+          await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&${query}`, {
+            headers: { accept: "image/webp" },
+          })
+        ).status;
       expect(await status("w=640&q=75")).toBe(200); // deviceSizes still apply
       expect(await status("w=384&q=75")).toBe(400); // a default imageSize — now rejected
       expect(await status("w=32&q=75")).toBe(400);

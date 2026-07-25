@@ -2408,29 +2408,31 @@ export function createDispatcher(options: DispatcherOptions) {
               // params access) is rendered dynamically by upstream, and running it non-minimal
               // made Next resume a fallback shell upstream deliberately skips
               // (app-dir/fallback-shells).
-              ((entrypointOwnsPprShell || incrementalCacheShared) &&
-                (!!handlerPprInfo || handlerPprRootParams)) ||
-              (emulatePlatformCache &&
-                !!dispatchStaticAsset?.prerender &&
-                !dispatchStaticAsset.ppr) ||
-              // N13: a concrete path served through an SSG/ISR app template has no build
-              // artifact of its own (`/rewrite/not-broken` behind `/rewrite/[slug]`).
-              // Minimal mode makes the entrypoint re-render it every time and emit NO
-              // x-nextjs-cache, so the harness — which stands Next's filesystem cache in
-              // for the platform cache — never observes the MISS→HIT transition
-              // `next start` reports. PPR keeps its own gate above; Pages Router keeps
-              // minimal mode (its fallback-shell emulation owns that lifecycle).
-              // `!handlerPprCapable` as well as `!handlerPprInfo`: a PPR template with no
-              // build shell is still PPR, and `asset.ppr` is only set on outputs that carry a
-              // postponed state, so the concrete `foo` prerender under a PPR `[slug]` looks
-              // exactly like a plain SSG instance here. Without this rung, fallback-shells'
-              // `without-suspense`/`without-io` routes were flipped non-minimal by THIS clause
-              // even after the N16 gate above was narrowed.
-              (emulatePlatformCache &&
-                !handlerPprInfo &&
-                !handlerPprCapable &&
-                handlerOutputInfo?.type === "APP_PAGE" &&
-                emulatedSsgTemplates.has(handlerPathname))
+              (
+                ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                  (!!handlerPprInfo || handlerPprRootParams)) ||
+                (emulatePlatformCache &&
+                  !!dispatchStaticAsset?.prerender &&
+                  !dispatchStaticAsset.ppr) ||
+                // N13: a concrete path served through an SSG/ISR app template has no build
+                // artifact of its own (`/rewrite/not-broken` behind `/rewrite/[slug]`).
+                // Minimal mode makes the entrypoint re-render it every time and emit NO
+                // x-nextjs-cache, so the harness — which stands Next's filesystem cache in
+                // for the platform cache — never observes the MISS→HIT transition
+                // `next start` reports. PPR keeps its own gate above; Pages Router keeps
+                // minimal mode (its fallback-shell emulation owns that lifecycle).
+                // `!handlerPprCapable` as well as `!handlerPprInfo`: a PPR template with no
+                // build shell is still PPR, and `asset.ppr` is only set on outputs that carry a
+                // postponed state, so the concrete `foo` prerender under a PPR `[slug]` looks
+                // exactly like a plain SSG instance here. Without this rung, fallback-shells'
+                // `without-suspense`/`without-io` routes were flipped non-minimal by THIS clause
+                // even after the N16 gate above was narrowed.
+                (emulatePlatformCache &&
+                  !handlerPprInfo &&
+                  !handlerPprCapable &&
+                  handlerOutputInfo?.type === "APP_PAGE" &&
+                  emulatedSsgTemplates.has(handlerPathname))
+              )
             ),
             normalizePrerenderCacheControl:
               !!dispatchStaticAsset?.prerender && handlerOutputInfo?.type === "PAGES",
