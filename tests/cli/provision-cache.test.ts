@@ -159,4 +159,54 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     expect(endpoint.authString).toBe("s3cr3t-auth");
     expect(endpoint.caCert).toBe("CA-PEM");
   });
+
+  it("ABORTS when the AUTH posture of an existing instance cannot be determined (null ≠ proceed)", async () => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      // describeInstanceAuth: gcloud itself fails → null → must not reuse the instance blind.
+      [
+        "--format=json(authEnabled,transitEncryptionMode)",
+        { exitCode: 1, stdout: "", stderr: "permission denied" },
+      ],
+    ]);
+    await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
+      /Could not verify the AUTH \/ in-transit-encryption posture/,
+    );
+    // Never reached for a credential fetch or a create.
+    const joined = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(
+      joined.some((a) => a.includes("get-auth-string") || a.includes("instances create")),
+    ).toBe(false);
+  });
+
+  it("also aborts when the AUTH describe returns unparseable output", async () => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      ["--format=json(authEnabled,transitEncryptionMode)", ok("SET LEGACY\n")],
+    ]);
+    await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
+      /Could not verify the AUTH \/ in-transit-encryption posture/,
+    );
+  });
+
+  it("caps the instance create with a timeout (no infinite deploy hang)", async () => {
+    let describes = 0;
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) => {
+      const joined = args.join(" ");
+      if (joined.includes("--format=value(state,host,port)")) {
+        describes += 1;
+        return describes === 1
+          ? { exitCode: 1, stdout: "", stderr: "not found" }
+          : ok("READY 10.0.0.1 6379");
+      }
+      return ok();
+    });
+    await provisionMemorystore(OPTS);
+    const createCall = vi
+      .mocked(exec.execCapture)
+      .mock.calls.find(([, args]) => args.includes("create"));
+    expect(createCall?.[2]).toEqual({ timeoutMs: 20 * 60 * 1000 });
+  });
 });

@@ -19,4 +19,3 @@ describe("static asset HTTP validators", () => {
     expect(ifNoneMatchMatches('"other"', etag)).toBe(false);
   });
 });
-

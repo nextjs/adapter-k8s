@@ -1,5 +1,6 @@
 // src/manifest.ts
 import path from "node:path";
+import { readFileSync, statSync } from "node:fs";
 import type {
   AdapterOutputs,
   BuildCompleteContext,
@@ -7,6 +8,7 @@ import type {
   RoutingManifest,
 } from "./types.js";
 import type { RouteHasCondition } from "./routing-common.js";
+import { assertSafePathname } from "./emit/templates/utils.js";
 
 // Build-time middleware matcher shape (outputs.middleware.config.matchers).
 interface MiddlewareMatcherBuild {
@@ -54,6 +56,58 @@ function caseInsensitiveSources<T extends { sourceRegex: string }>(routes: T[]):
       ? { ...route, sourceRegex: `(?i:${route.sourceRegex})` }
       : route,
   );
+}
+
+// builtAt is embedded in the chart ConfigMap and every Docker build context, so a
+// wall-clock stamp makes two chart generations of the SAME build byte-different —
+// busting Docker layer caches and violating the clean chart-regeneration invariant
+// (regenerating must be a no-op when nothing changed). Derivation, in order:
+//   1. SOURCE_DATE_EPOCH (the reproducible-builds standard, seconds since epoch) when set;
+//   2. the mtime of .next/BUILD_ID — written once per `next build`, so it is stable
+//      across chart regenerations of the same build output;
+//   3. Date.now() only when neither exists (synthetic build contexts, unit tests).
+// Consumers (pool-server dispatch.ts ISR anchor) parse this with a NaN fallback —
+// keep the ISO-8601 format.
+function stableBuiltAt(projectDir: string): string {
+  const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
+  if (sourceDateEpoch && /^\d+$/.test(sourceDateEpoch)) {
+    return new Date(Number(sourceDateEpoch) * 1000).toISOString();
+  }
+  try {
+    return statSync(path.join(projectDir, ".next", "BUILD_ID")).mtime.toISOString();
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+// N16. The adapter's PRERENDER outputs expose `config.renderingMode` and the fallback shell the
+// build emitted, but NOT `fallbackRootParams` — the build's own record of which ROOT params were
+// still unresolved when it declined to emit that shell. That field is the ONLY thing separating
+// the two reasons a PPR route can have `fallback: null`, and the pool has to treat them
+// oppositely (see the pprCapableRoutes doc comment in types.ts). Read it from
+// .next/prerender-manifest.json, whose `dynamicRoutes` map is also the authoritative list of
+// route TEMPLATES — concrete generateStaticParams prerenders live under `routes`, so membership
+// here doubles as the "this is a template, not an instance" test.
+function readDynamicRouteFallbackRootParams(projectDir: string): Map<string, string[]> {
+  const byRoute = new Map<string, string[]>();
+  try {
+    const manifest = JSON.parse(
+      readFileSync(path.join(projectDir, ".next", "prerender-manifest.json"), "utf-8"),
+    ) as { dynamicRoutes?: Record<string, { fallbackRootParams?: unknown }> };
+    for (const [route, entry] of Object.entries(manifest.dynamicRoutes ?? {})) {
+      byRoute.set(
+        route,
+        Array.isArray(entry?.fallbackRootParams)
+          ? entry.fallbackRootParams.filter((param): param is string => typeof param === "string")
+          : [],
+      );
+    }
+  } catch {
+    // No prerender manifest (synthetic build contexts, unit tests) — no route is recorded as
+    // PPR-capable-without-shell, which leaves every route in minimal mode. That is the
+    // pre-N16 behavior, i.e. this degrades toward the conservative side.
+  }
+  return byRoute;
 }
 
 export function buildRoutingManifest({
@@ -116,6 +170,12 @@ export function buildRoutingManifest({
 
   // Detect PPR routes from prerenders — only include entries with both values present
   const pprRoutes: RoutingManifest["pprRoutes"] = {};
+  // N16: PPR-capable route TEMPLATES whose build emitted NO fallback shell, each tagged with the
+  // unresolved ROOT params that stopped it. See the types.ts doc comment — the pool needs both
+  // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
+  // flavour (the only flavour that must run NON-minimal).
+  const pprCapableRoutes: Record<string, { rootParams: string[] }> = {};
+  const dynamicRouteRootParams = readDynamicRouteFallbackRootParams(projectDir);
   for (const prerender of outputs.prerenders) {
     const config = prerender.config as Record<string, unknown>;
     const fb = (
@@ -129,6 +189,19 @@ export function buildRoutingManifest({
         };
       }
     ).fallback;
+    // N16: PPR-capable but with NO build-emitted shell (`fallback: null`). Deliberately DISJOINT
+    // from pprRoutes: shell-bearing entries are handled via handlerPprInfo. Restricted to
+    // prerender-manifest `dynamicRoutes` members, i.e. route TEMPLATES: an earlier revision keyed
+    // this by every PARTIALLY_STATIC output, which pulled in the concrete generateStaticParams
+    // prerenders (`/without-io/foo`) and `/_global-error` and flipped them non-minimal.
+    const rootParams = dynamicRouteRootParams.get(prerender.pathname);
+    if (
+      config.renderingMode === "PARTIALLY_STATIC" &&
+      !(fb?.postponedState && fb.filePath) &&
+      rootParams !== undefined
+    ) {
+      pprCapableRoutes[prerender.pathname] = { rootParams };
+    }
     if (config.renderingMode === "PARTIALLY_STATIC" && fb?.postponedState && fb.filePath) {
       // Shell cache tags come from the build's initialHeaders (x-next-cache-tags = the
       // `_N_T_/…` implicit path tags). The pool checks them against the shared Valkey manifest
@@ -167,26 +240,40 @@ export function buildRoutingManifest({
     }
   }
 
+  // Every emitted pathname ends up spliced into quoted YAML in the HTTPRoute
+  // prefix rules (gateway.ts) — reject `"`/`\`/control characters at the source.
+  const pathnames = collectOutputPathnames(outputs);
+  for (const pathname of pathnames) {
+    assertSafePathname(pathname);
+  }
+
   return {
     // rsc is inside routeGraph per design doc §5.3
     routeGraph: {
-      beforeMiddleware: routing.beforeMiddleware,
-      // Rewrites/redirects/headers match case-insensitively in Next (path-to-regexp
-      // `sensitive: false`), but @next/routing compiles the baked sourceRegex with
-      // no flags, so `/Rewrite-1` would miss `/rewrite-1`. Wrap each source in an
-      // inline case-insensitive group so both the pool and the ext_proc routing
-      // service match the way `next start` does. Named capture groups are preserved.
+      // Rewrites/redirects/headers/onMatch match case-insensitively in `next start`
+      // (path-to-regexp `sensitive: false` — filesystem.js buildCustomRoute passes
+      // experimental.caseSensitiveRoutes, default false), but @next/routing's
+      // matchRoute compiles the baked sourceRegex with no flags, so `/Rewrite-1`
+      // would miss `/rewrite-1`. Wrap each custom-route source in an inline
+      // case-insensitive group so both the pool and the ext_proc routing service
+      // match the way `next start` does. Named capture groups are preserved.
+      beforeMiddleware: caseInsensitiveSources(routing.beforeMiddleware),
       beforeFiles: caseInsensitiveSources(routing.beforeFiles),
       afterFiles: caseInsensitiveSources(routing.afterFiles),
+      // dynamicRoutes stay case-SENSITIVE: `next start` matches dynamic PAGE routes
+      // via getRouteRegex (route-regex.js) which compiles `new RegExp(...)` with no
+      // flags — verified: /BLOG/hello does not match /blog/[slug] upstream. Only
+      // custom routes are case-insensitive, so only they get the wrap.
       dynamicRoutes: routing.dynamicRoutes,
-      onMatch: routing.onMatch,
-      fallback: routing.fallback,
+      onMatch: caseInsensitiveSources(routing.onMatch),
+      fallback: caseInsensitiveSources(routing.fallback),
       shouldNormalizeNextData: routing.shouldNormalizeNextData,
       rsc: routing.rsc,
     },
-    pathnames: collectOutputPathnames(outputs),
+    pathnames,
     i18n: i18n ?? null,
     buildId,
+    builtAt: stableBuiltAt(projectDir),
     basePath,
     trailingSlash,
     middleware: outputs.middleware
@@ -206,6 +293,10 @@ export function buildRoutingManifest({
       : null,
     poolAssignments,
     pprRoutes,
+    // Sorted so two chart generations of the same build are byte-identical.
+    pprCapableRoutes: Object.fromEntries(
+      Object.entries(pprCapableRoutes).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
     nextVersion,
   };
 }

@@ -6,12 +6,14 @@ import { isIP } from "node:net";
 import dns from "node:dns/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { PoolManifest, RoutingManifest } from "../types.js";
+import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.js";
 import {
   getRscConfig,
   manifestNextConfig,
   matchesMiddleware,
   MW_EVALUATED_TRUSTED,
+  parseRequestUrl,
+  rscCacheBustingUnvalidated,
   rscParentCandidates,
   templateOutputCandidates,
   type MiddlewareMatcher,
@@ -21,15 +23,35 @@ import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
-import { createDispatcher, getContentType } from "./dispatch.js";
+import {
+  createDispatcher,
+  getContentType,
+  mergeResolvedHeadersIntoHeadersArg,
+} from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
 import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
 import { decodePublicPathname } from "./public-files.js";
-import { resizeForRequestedWidth } from "./image-utils.js";
-import { createPoolServer } from "./server.js";
+import {
+  DEFAULT_IMAGE_FORMATS,
+  detectImageContentType,
+  DEFAULT_IMAGE_DEVICE_SIZES,
+  DEFAULT_IMAGE_QUALITIES,
+  DEFAULT_IMAGE_SIZES,
+  imageCacheControl,
+  imageContentDisposition,
+  imageEtag,
+  imageMaxAge,
+  type ImageLocalPattern,
+  validateImageSizeAndQuality,
+  validateImageUrlParam,
+  isOptimizableImageContentType,
+  negotiateImageFormat,
+  resizeForRequestedWidth,
+} from "./image-utils.js";
+import { createPoolServer, filterWriteHeadHeadersArg } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
-import { forcedCdnCacheControl } from "./cache-policy.js";
+import { explicitCacheControlWins, forcedCdnCacheControl } from "./cache-policy.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -58,6 +80,105 @@ async function ensureNextNodeEnvironment(): Promise<void> {
   );
 }
 
+// Run the app's `instrumentation.js` `register()` hook before the pool serves anything,
+// which is what `next start` does — and the ordering, not just the fact of registration,
+// is the point: an app that sets up a tracer provider, monkey-patches `node:http`, or
+// installs an error reporter in `register()` expects that to have happened before the
+// first request is handled.
+//
+// What `next start` actually does (Next 16.2, verified in source and on a live server):
+//   • `NextNodeServer.prepareImpl()` → `runInstrumentationHookIfAvailable()` →
+//     `ensureInstrumentationRegistered(dir, distDir)`
+//     (server/lib/router-utils/instrumentation-globals.external.ts), which requires
+//     `<distDir>/server/instrumentation.js` and awaits its `register()`.
+//   • Ordering: `startServer` binds the port immediately but QUEUES every request behind
+//     `handlersPromise`, which resolves only after `render-server`'s `initializeImpl`
+//     awaits `server.prepare()`. Measured with a `register()` that sleeps 1500 ms: port
+//     accepting at +98 ms, register start +124 ms, register DONE +1626 ms, and the first
+//     response only at +1674 ms — with the hook's completion flag already set. So
+//     `register()` is awaited to completion before the first request is served.
+//   • Exactly once per process: the promise is memoized in a module-level
+//     `registerInstrumentationPromise` (`calls=1` on the probe, same pid as the request
+//     handler). There is no per-worker duplication in `next start`.
+//   • Missing file: `getInstrumentationModule` swallows ENOENT / MODULE_NOT_FOUND /
+//     ERR_MODULE_NOT_FOUND, so an app without instrumentation is a silent no-op.
+//   • A THROWING `register()`: the process does NOT exit. `next start` logs
+//     "Failed to prepare server" plus an unhandledRejection and stays up — but the
+//     rejected promise is memoized, so every subsequent request 500s forever (measured:
+//     3/3 `/api/*` and `/` → 500 "Internal Server Error", process alive after 6 s).
+//
+// The adapter goes through upstream's own `ensureInstrumentationRegistered` rather than
+// requiring `.next/server/instrumentation.js` itself, for one decisive reason: Next ALSO
+// calls it lazily from `RouteModule.prepare()` on the entrypoint path the pool dispatches
+// into. Both call sites resolve to the same file
+// (`<app>/node_modules/next/dist/server/lib/router-utils/instrumentation-globals.external.js`
+// — verified identical, and `require()` here shares the CJS cache entry with
+// route-module's `await import()`), so they share the memoized promise: registering here
+// guarantees exactly-once and cannot double-register, whereas a hand-rolled loader would
+// run `register()` a second time (an OTEL SDK started twice is a real failure).
+// Reusing it also keeps `afterRegistration()` — the cache-components tracer patch that
+// runs immediately after `register()` upstream.
+//
+// Failure policy: log loudly, do NOT block startup. The pod keeps answering `/healthz`,
+// static assets and `/_next/image`, while Next's own per-request
+// `ensureInstrumentationRegistered` re-awaits the same rejected promise and 500s the
+// routes it owns — i.e. `next start`'s observable behavior on the app's own routes,
+// without an instrumentation bug turning into a CrashLoopBackOff.
+async function registerInstrumentationHook(): Promise<void> {
+  // distDir is `.next` everywhere in the pool (staging, manifests, the edge sandbox);
+  // upstream passes a project-relative distDir here too.
+  const distDir = ".next";
+  const cwd = process.cwd();
+  // `ensureInstrumentationRegistered` already tolerates a missing hook, but checking first
+  // keeps the "no instrumentation" case from depending on error-code sniffing at all.
+  if (!existsSync(path.join(cwd, distDir, "server", "instrumentation.js"))) return;
+
+  // Resolving the registrar and RUNNING it fail for different reasons and must not share a
+  // diagnostic: "the app's hook threw" and "this Next version moved the registrar" call for
+  // different fixes. If the registrar can't be found, do NOT fall back to requiring the hook
+  // directly — that would break the shared memo with RouteModule.prepare and run register()
+  // a second time. Next's lazy path still runs it on the first request: late, but once.
+  const MODULE_ID = "next/dist/server/lib/router-utils/instrumentation-globals.external";
+  let ensureInstrumentationRegistered:
+    | ((projectDir: string, distDir: string) => Promise<void>)
+    | undefined;
+  try {
+    const appRequire = createRequire(path.join(cwd, "package.json"));
+    ({ ensureInstrumentationRegistered } = appRequire(MODULE_ID) as {
+      ensureInstrumentationRegistered?: (projectDir: string, distDir: string) => Promise<void>;
+    });
+  } catch (err) {
+    console.error(
+      `[pool-server] could not load ${MODULE_ID} from the app — instrumentation register() ` +
+        `will run lazily on the first request instead of at startup:`,
+      err,
+    );
+    return;
+  }
+  if (typeof ensureInstrumentationRegistered !== "function") {
+    console.error(
+      `[pool-server] ${MODULE_ID} does not export ensureInstrumentationRegistered — ` +
+        `instrumentation register() will run lazily on the first request instead of at startup`,
+    );
+    return;
+  }
+
+  try {
+    // Awaited: a hook that never settles holds the pod out of readiness, which fails the
+    // blue/green gate rather than cutting traffic to a half-initialized build. `next start`
+    // is equivalent — its requests queue behind the same unresolved promise.
+    await ensureInstrumentationRegistered(cwd, distDir);
+    console.log("[pool-server] instrumentation register() completed");
+  } catch (err) {
+    console.error(
+      "[pool-server] instrumentation register() FAILED — the pool will keep serving " +
+        "/healthz and static assets, but Next re-awaits this same rejected registration " +
+        "per request, so app routes will 500 (this is what next start does too):",
+      err,
+    );
+  }
+}
+
 // DoS backstop: the pool buffers request/image bodies fully in memory (the
 // loopback handler needs a fixed-length body, and middleware may read it). Cap
 // the buffer well above any legitimate payload so app-level limits
@@ -79,17 +200,48 @@ async function readRequestBody(
   req: NodeJS.ReadableStream,
   maxBytes = MAX_BODY_BYTES,
 ): Promise<Buffer | null> {
+  const stream = req as NodeJS.ReadableStream & {
+    on: (event: string, cb: (...args: never[]) => void) => unknown;
+    off: (event: string, cb: (...args: never[]) => void) => unknown;
+    once: (event: string, cb: (...args: never[]) => void) => unknown;
+    pause?: () => void;
+  };
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buf.length;
-    if (total > maxBytes) {
-      (req as NodeJS.ReadableStream & { destroy?: (e?: Error) => void }).destroy?.();
-      throw new BodyTooLargeError();
-    }
-    chunks.push(buf);
-  }
+  // Explicit listener pump instead of `for await`: an early exit from a stream async
+  // iterator DESTROYS the stream (and, for IncomingMessage, the socket), which turned
+  // a deliverable 413 into an ECONNRESET the client couldn't read. On oversize we
+  // pause and throw; the caller writes 413 + `connection: close` and only then
+  // destroys the socket after the response has been flushed.
+  await new Promise<void>((resolve, reject) => {
+    const onData = (chunk: Buffer | string): void => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buf.length;
+      if (total > maxBytes) {
+        cleanup();
+        stream.pause?.();
+        reject(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(buf);
+    };
+    const onEnd = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    const cleanup = (): void => {
+      stream.off("data", onData);
+      stream.off("end", onEnd);
+      stream.off("error", onError);
+    };
+    stream.on("data", onData);
+    stream.once("end", onEnd);
+    stream.once("error", onError);
+  });
   return chunks.length > 0 ? Buffer.concat(chunks) : null;
 }
 
@@ -126,6 +278,95 @@ function parseResolvedHeaders(raw: string | undefined): Headers | undefined {
   }
 }
 
+// Every cache-control observable on the response at writeHead time: from the headers
+// ARGUMENT (object, tuple-array, and flat-array forms — the same shapes the strip
+// wrappers handle) and from the setHeader map. The forced-cache skip below must see a
+// `no-store` in ANY of them: dispatch's resolved-header merge may have replaced the
+// argument copy while a setHeader copy still records the handler's own verdict (or
+// vice versa), and missing one would let a weaker resolved value uncork a response
+// the app declared uncacheable.
+function observedCacheControls(args: unknown[], res: ServerResponse): string[] {
+  const found: string[] = [];
+  for (let i = 1; i < args.length; i++) {
+    const arg = args[i];
+    if (!arg || typeof arg !== "object") continue;
+    if (Array.isArray(arg)) {
+      if (arg.length > 0 && !Array.isArray(arg[0])) {
+        // Flat form: even offsets are names, odd offsets are values.
+        for (let j = 0; j + 1 < arg.length; j += 2) {
+          if (String(arg[j]).toLowerCase() === "cache-control") found.push(String(arg[j + 1]));
+        }
+      } else {
+        for (const entry of arg as [unknown, unknown][]) {
+          if (String(entry[0]).toLowerCase() === "cache-control") found.push(String(entry[1]));
+        }
+      }
+    } else {
+      for (const [key, value] of Object.entries(arg as Record<string, unknown>)) {
+        if (key.toLowerCase() === "cache-control") {
+          found.push(Array.isArray(value) ? value.join(", ") : String(value));
+        }
+      }
+    }
+  }
+  const fromMap = res.getHeader("cache-control");
+  if (fromMap !== undefined) {
+    found.push(Array.isArray(fromMap) ? fromMap.join(", ") : String(fromMap));
+  }
+  return found;
+}
+
+// LAST-RESORT public/ file serving from disk. The canonical path for public files is the
+// static-assets manifest via dispatcher.dispatch (which merges the resolved routing
+// verdict — next.config headers() / middleware headers — over the adapter's mutable
+// default); this fallback exists only for a file that is on disk but missing from the
+// manifest (stale or absent static-assets.json, e.g. emulate/bootstrap setups or a
+// canonical-encoding miss), so a build inconsistency degrades to the old serve instead
+// of a 404. It applies the SAME resolved-header merge dispatch would have, then stamps
+// the CDN cache tag from the EFFECTIVE cache-control (mutable cacheable ⇒ tagged,
+// uncacheable ⇒ never — the final-Cache-Control rule).
+function servePublicFileFromDisk(
+  req: IncomingMessage,
+  res: ServerResponse,
+  requestPathname: string,
+  resolvedHeaders: Headers | undefined,
+  buildId: string,
+): boolean {
+  const decodedPathname = decodePublicPathname(requestPathname);
+  const publicFile = decodedPathname
+    ? resolveWithinRoot(path.join(process.cwd(), "public"), decodedPathname)
+    : null;
+  if (!publicFile || !existsSync(publicFile) || statSync(publicFile).isDirectory()) {
+    return false;
+  }
+  const content = readFileSync(publicFile);
+  const etag = staticAssetEtag(content);
+  let responseHeaders: Record<string, string | string[]> = {
+    "content-type": getContentType(decodedPathname!),
+    "cache-control": "public, max-age=3600",
+    etag,
+  };
+  if (resolvedHeaders) {
+    responseHeaders = mergeResolvedHeadersIntoHeadersArg(
+      resolvedHeaders,
+      responseHeaders,
+    ) as Record<string, string | string[]>;
+  }
+  Object.assign(
+    responseHeaders,
+    cdnCacheTag(String(responseHeaders["cache-control"] ?? ""), buildId),
+  );
+  const effectiveEtag = String(responseHeaders["etag"] ?? etag);
+  if (ifNoneMatchMatches(req.headers["if-none-match"], effectiveEtag)) {
+    res.writeHead(304, responseHeaders);
+    res.end();
+    return true;
+  }
+  res.writeHead(200, responseHeaders);
+  res.end(req.method === "HEAD" ? undefined : content);
+  return true;
+}
+
 function addRequestMeta(req: Record<PropertyKey, unknown>, key: string, value: unknown): void {
   const meta = (req[NEXT_REQUEST_META] as Record<string, unknown> | undefined) ?? {};
   meta[key] = value;
@@ -155,15 +396,103 @@ interface ImageRemotePattern {
 interface ImageConfig {
   remotePatterns: ImageRemotePattern[];
   domains: string[];
+  // `images.localPatterns` — the allowlist for RELATIVE `?url=` values. `undefined` means
+  // "no localPatterns configured", which upstream's `hasLocalMatch` treats as allow-all.
+  // Next's RESOLVED config is never actually undefined: it materializes
+  // `[{ pathname: "**", search: "" }]`, and that `search: ""` is live behavior rather than a
+  // formality — it is why `next start` answers `?url=/test.png%3Ffoo%3D1` with
+  // `400 "url" parameter is not allowed` (measured 2026-07-25). An explicitly EMPTY list
+  // rejects every local image, exactly as `[].some(...)` does upstream.
+  localPatterns: ImageLocalPattern[] | undefined;
   // Allowed optimization widths — the union bounds the `w` param so a client can't drive
   // Sharp into an unbounded allocation. Default to Next's defaults when unconfigured.
+  // An explicitly EMPTY list means "no width allowed" (valid config: `imageSizes: []`),
+  // which is why absence and emptiness must stay distinguishable at load time.
   deviceSizes: number[];
   imageSizes: number[];
+  // Allowed `q` values (`images.qualities`, default [75]). Each accepted quality is its
+  // own CDN cache entry and its own sharp encode, so the set bounds amplification as much
+  // as it enforces parity. `undefined` only when the build config couldn't be read.
+  qualities: number[] | undefined;
+  // `next start` parity: SVG through /_next/image is a 400 unless the app opted in via
+  // images.dangerouslyAllowSVG, and even then Next serves it with Content-Disposition:
+  // attachment + this CSP so a crafted SVG can't run script in the site's origin.
+  dangerouslyAllowSVG: boolean;
+  // Sent on EVERY optimizer 200, not only the SVG branch — Next's setResponseHeaders
+  // stamps both unconditionally. A `<img src>` can't execute the CSP anyway, but a user
+  // who navigates straight to an optimizer URL gets the same sandbox `next start` gives.
+  contentSecurityPolicy: string;
+  contentDispositionType: "attachment" | "inline";
+  // Output formats the optimizer may negotiate into. Next's default is webp-ONLY: a
+  // browser advertising `image/avif,image/webp` gets WebP unless the app opts into AVIF.
+  // (Also the cheaper default — AVIF encoding costs several times more CPU per request.)
+  formats: string[];
+  // Freshness floor for optimizer responses (`public, max-age=<ttl>, must-revalidate`).
+  minimumCacheTTL: number;
 }
 
-// Next.js defaults (used when required-server-files.json omits them).
-const DEFAULT_DEVICE_SIZES = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
-const DEFAULT_IMAGE_SIZES = [16, 32, 48, 64, 96, 128, 256, 384];
+// Load sharp exactly once per process and cache the verdict — success OR failure.
+// esbuild bundles sharp's JS into pool-server.cjs, and its __commonJS wrapper
+// registers the module record BEFORE evaluating it: when the native binding is
+// missing (no @img/sharp-* in the container), the FIRST require throws but every
+// LATER require returns the broken partially-initialized module. Live this showed
+// up as one honest 503 ("sharp is unavailable") followed by an endless stream of
+// misleading 502s from deep inside the pipeline (build XchOtaGFu6GdFrcdujVc0).
+// Memoizing the first attempt keeps the failure mode consistent and logs WHY once.
+type SharpModule = (input: Buffer) => SharpPipeline;
+type SharpPipeline = {
+  resize: (w: number | undefined, h: undefined, o: { withoutEnlargement: true }) => SharpPipeline;
+  timeout: (o: { seconds: number }) => SharpPipeline;
+  rotate: () => SharpPipeline;
+  avif: (o: { quality: number; effort: number }) => SharpPipeline;
+  webp: (o: { quality: number }) => SharpPipeline;
+  png: (o: { quality: number }) => SharpPipeline;
+  jpeg: (o: { quality: number; mozjpeg: true }) => SharpPipeline;
+  gif: () => SharpPipeline;
+  tiff: () => SharpPipeline;
+  toBuffer: () => Promise<Buffer>;
+};
+let sharpLoadAttempted = false;
+let sharpModule: SharpModule | null = null;
+function loadSharpOnce(): SharpModule | null {
+  if (sharpLoadAttempted) return sharpModule;
+  sharpLoadAttempted = true;
+  try {
+    // In the production CJS bundle `require` exists (and esbuild has inlined sharp's
+    // JS behind it). Under the ESM source loader (vitest) it is undefined — resolve
+    // from the app dir instead, the same way the pool resolves next/dist modules.
+    sharpModule =
+      typeof require === "function"
+        ? (require("sharp") as SharpModule)
+        : (createRequire(path.join(process.cwd(), "package.json"))("sharp") as SharpModule);
+  } catch (err) {
+    sharpModule = null;
+    console.error(
+      "[pool-server] sharp failed to load — /_next/image will refuse to serve unoptimized (production images always ship sharp; check the image build):",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return sharpModule;
+}
+
+// Next's default images.contentSecurityPolicy (config-shared) — applied to every
+// optimizer 200 when the app doesn't configure its own.
+const DEFAULT_IMAGE_CSP = "script-src 'none'; frame-src 'none'; sandbox;";
+// Next's default images.minimumCacheTTL (4 hours). The optimizer's Cache-Control floor.
+const DEFAULT_MINIMUM_CACHE_TTL = 14400;
+// Formats the pipeline can actually emit as a NEGOTIATED output. Next documents only
+// these two for images.formats, and an unrecognized entry must not reach sharp.
+const SUPPORTED_IMAGE_FORMATS = new Set(["image/avif", "image/webp"]);
+
+// Keep only the values Next's config schema admits for deviceSizes/imageSizes (integers
+// 1..10000). These bound a sharp allocation, so a junk entry must not become an allowed
+// width; an all-junk list becomes an empty set, which rejects every `w` (fail closed).
+function toAllowedSizes(values: unknown[]): number[] {
+  return values.filter(
+    (value): value is number =>
+      typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10000,
+  );
+}
 
 // Read the app's image config (external-host allowlist + allowed sizes) from the build
 // output. Next.js writes the resolved config to .next/required-server-files.json. When it's
@@ -172,8 +501,15 @@ function loadImageConfig(cwd: string): ImageConfig {
   const config: ImageConfig = {
     remotePatterns: [],
     domains: [],
-    deviceSizes: DEFAULT_DEVICE_SIZES,
-    imageSizes: DEFAULT_IMAGE_SIZES,
+    localPatterns: undefined,
+    deviceSizes: [...DEFAULT_IMAGE_DEVICE_SIZES],
+    imageSizes: [...DEFAULT_IMAGE_SIZES],
+    qualities: [...DEFAULT_IMAGE_QUALITIES],
+    dangerouslyAllowSVG: false,
+    contentSecurityPolicy: DEFAULT_IMAGE_CSP,
+    contentDispositionType: "attachment",
+    formats: [...DEFAULT_IMAGE_FORMATS],
+    minimumCacheTTL: DEFAULT_MINIMUM_CACHE_TTL,
   };
   try {
     const rsfPath = path.join(cwd, ".next", "required-server-files.json");
@@ -182,15 +518,151 @@ function loadImageConfig(cwd: string): ImageConfig {
       const images = rsf?.config?.images ?? {};
       if (Array.isArray(images.remotePatterns)) config.remotePatterns = images.remotePatterns;
       if (Array.isArray(images.domains)) config.domains = images.domains;
-      if (Array.isArray(images.deviceSizes) && images.deviceSizes.length)
-        config.deviceSizes = images.deviceSizes;
-      if (Array.isArray(images.imageSizes) && images.imageSizes.length)
-        config.imageSizes = images.imageSizes;
+      // PRESENCE again, not truthiness: absent ⇒ allow every local image (upstream's
+      // `!localPatterns` short-circuit); present-but-empty ⇒ allow none. Entries are kept
+      // only in the shape upstream's `matchLocalPattern` reads, so a junk entry can neither
+      // widen the allowlist nor throw inside the matcher.
+      if (Array.isArray(images.localPatterns)) {
+        config.localPatterns = images.localPatterns.filter(
+          (pattern: unknown): pattern is ImageLocalPattern =>
+            typeof pattern === "object" &&
+            pattern !== null &&
+            ((pattern as ImageLocalPattern).pathname === undefined ||
+              typeof (pattern as ImageLocalPattern).pathname === "string") &&
+            ((pattern as ImageLocalPattern).search === undefined ||
+              typeof (pattern as ImageLocalPattern).search === "string"),
+        );
+      }
+      // PRESENCE, not truthiness: `imageSizes: []` is valid config meaning "only
+      // deviceSizes are allowed", and falling back to Next's default list for it would
+      // silently WIDEN the accepted width set past what the app configured. Entries are
+      // filtered to the shape Next's config schema guarantees (int 1..10000) because they
+      // bound a sharp allocation.
+      if (Array.isArray(images.deviceSizes))
+        config.deviceSizes = toAllowedSizes(images.deviceSizes);
+      if (Array.isArray(images.imageSizes)) config.imageSizes = toAllowedSizes(images.imageSizes);
+      // `images.qualities` (schema: 1..20 ints in 1..100, so never legitimately empty).
+      // An unreadable/empty list keeps Next's default [75] rather than disabling the
+      // check — the narrow direction.
+      if (Array.isArray(images.qualities)) {
+        const qualities = images.qualities.filter(
+          (value: unknown): value is number =>
+            typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 100,
+        );
+        if (qualities.length) config.qualities = qualities;
+      }
+      config.dangerouslyAllowSVG = images.dangerouslyAllowSVG === true;
+      if (typeof images.contentSecurityPolicy === "string" && images.contentSecurityPolicy)
+        config.contentSecurityPolicy = images.contentSecurityPolicy;
+      if (images.contentDispositionType === "inline") config.contentDispositionType = "inline";
+      // Validate at the point of consumption: these two steer a response header and the
+      // encoder, so keep only values this pipeline can honor. An unrecognized `formats`
+      // entry is dropped (never handed to sharp); an all-unrecognized list falls back to
+      // Next's default rather than disabling negotiation entirely.
+      if (Array.isArray(images.formats)) {
+        const supported = images.formats.filter(
+          (format: unknown): format is string =>
+            typeof format === "string" && SUPPORTED_IMAGE_FORMATS.has(format.toLowerCase()),
+        );
+        if (supported.length) config.formats = supported;
+      }
+      if (
+        typeof images.minimumCacheTTL === "number" &&
+        Number.isSafeInteger(images.minimumCacheTTL) &&
+        images.minimumCacheTTL >= 0
+      ) {
+        config.minimumCacheTTL = images.minimumCacheTTL;
+      }
     }
   } catch {
-    // No image config — external images denied by default, sizes fall back to defaults.
+    // No image config — external images denied by default, sizes fall back to defaults,
+    // SVG stays denied (fail-safe direction).
   }
   return config;
+}
+
+// Emit an optimizer 200 (or a 304) exactly the way Next's `setResponseHeaders` /
+// `sendResponse` do. EVERY /_next/image success — re-encoded, format-passthrough, and the
+// allowed-SVG branch — goes through here, because `next start` sends the same header set
+// for all of them: Vary, Cache-Control, ETag (with If-None-Match honored), Content-Type,
+// Content-Disposition and the images CSP. Previously only the SVG branch carried
+// Content-Disposition/CSP, nothing carried an ETag, and the Cache-Control was a hardcoded
+// `max-age=60`.
+//
+// Two adapter-specific concerns layered on top of parity:
+//   • the CDN deploy tag (M13). These responses are now genuinely CDN-cacheable and their
+//     URL is NOT content-addressed (`?url=/logo.png&w=384` serves whatever the current
+//     build's public/logo.png is), so a cutover must be able to purge them — cdnCacheTag
+//     stamps the recorded deploy tag whenever the effective Cache-Control lets a shared
+//     cache store the response, and returns {} for the `immutable` static-media case and
+//     for anything uncacheable. It is applied to the 304 too: a CDN revalidation that
+//     refreshes an entry from a tagless 304 would leave an untagged, un-invalidatable
+//     entry behind, which is exactly the stale-apex failure M13 documents.
+//   • middleware. Nothing here can defeat `forcedCdnCacheControl`: when middleware's
+//     matcher covers /_next/image the writeHead wrapper installed earlier in the request
+//     strips this Cache-Control AND the cache-tag and forces `no-cache`, so a CDN hit can
+//     never bypass the ext_proc callout. The wrapper is installed before this handler
+//     runs and sits under every write below (verified by test).
+function sendImageResponse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  {
+    body,
+    contentType,
+    sourceUrl,
+    isStatic,
+    maxAge,
+    config,
+    buildId,
+  }: {
+    body: Buffer;
+    contentType: string;
+    sourceUrl: string;
+    isStatic: boolean;
+    maxAge: number;
+    config: ImageConfig;
+    buildId: string | undefined;
+  },
+): void {
+  const cacheControl = imageCacheControl(maxAge, isStatic);
+  const etag = imageEtag(body);
+  const cacheTag = cdnCacheTag(cacheControl, buildId);
+  // RFC 7232: a 304 repeats the headers that govern caching (Cache-Control, ETag, Vary)
+  // and omits the representation metadata. This is what `next start` sends, verified.
+  if (ifNoneMatchMatches(req.headers["if-none-match"] as string | undefined, etag)) {
+    res.writeHead(304, {
+      vary: "Accept",
+      "cache-control": cacheControl,
+      etag,
+      ...cacheTag,
+    });
+    res.end();
+    return;
+  }
+  res.writeHead(200, {
+    // The bytes depend on the client's Accept — without Vary, Cloud CDN caches whichever
+    // variant the first visitor got and serves it to everyone.
+    vary: "Accept",
+    "cache-control": cacheControl,
+    etag,
+    "content-type": contentType,
+    // Next sends this on every optimizer 200, not just SVG: an optimizer URL is never a
+    // page, so a browser that navigates to one downloads it instead of rendering it.
+    "content-disposition": imageContentDisposition(
+      sourceUrl,
+      contentType,
+      config.contentDispositionType,
+    ),
+    "content-security-policy": config.contentSecurityPolicy,
+    // Explicit, exactly as Next sets it — and required for HEAD: Node marks a HEAD
+    // response as having no body and then emits NEITHER Content-Length nor
+    // Transfer-Encoding, so a HEAD that should report the payload size reported nothing
+    // (measured against `next start`, which answers HEAD with Content-Length: 6224 for
+    // the fixture's /test.png at w=384).
+    "content-length": String(body.length),
+    ...cacheTag,
+  });
+  res.end(req.method === "HEAD" ? undefined : body);
 }
 
 // True when the app has a classic incremental cacheHandler registered (next.config.cacheHandler).
@@ -292,6 +764,94 @@ function pathnameMatchesPattern(pathname: string, pattern: string): boolean {
   return new RegExp(re).test(pathname);
 }
 
+// `images.localPatterns` uses picomatch globs, and upstream compiles them with the very
+// module Next ships (`next/dist/compiled/picomatch`, `makeRe(pattern, { dot: true })`). Use
+// that same module, resolved from the APP (the pool already resolves several next/dist
+// modules this way), so the allowlist cannot drift from upstream's on glob syntax the
+// repo's own `*`/`**` translator doesn't cover (braces, char classes, extglobs). Loaded once
+// and cached — success OR failure.
+type PicomatchMakeRe = (glob: string, options: { dot: boolean }) => RegExp;
+let picomatchMakeRe: PicomatchMakeRe | null | undefined;
+function loadPicomatchMakeReOnce(): PicomatchMakeRe | null {
+  if (picomatchMakeRe !== undefined) return picomatchMakeRe;
+  picomatchMakeRe = null;
+  try {
+    const appRequire = createRequire(path.join(process.cwd(), "package.json"));
+    const picomatch = appRequire("next/dist/compiled/picomatch") as {
+      makeRe?: PicomatchMakeRe;
+    };
+    if (typeof picomatch.makeRe === "function") picomatchMakeRe = picomatch.makeRe;
+  } catch (err) {
+    // Degrade to the repo's own glob translator rather than failing the allowlist in either
+    // direction. Loud, because the fallback only approximates picomatch.
+    console.warn(
+      "[pool-server] could not load next/dist/compiled/picomatch — images.localPatterns will " +
+        "be matched with the adapter's approximate `*`/`**` translator:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+  return picomatchMakeRe;
+}
+
+const localPatternMatchers = new Map<string, (pathname: string) => boolean>();
+function localPathnameMatcher(glob: string): (pathname: string) => boolean {
+  const cached = localPatternMatchers.get(glob);
+  if (cached) return cached;
+  const makeRe = loadPicomatchMakeReOnce();
+  let matcher: (pathname: string) => boolean = (pathname) => pathnameMatchesPattern(pathname, glob);
+  if (makeRe) {
+    try {
+      const re = makeRe(glob, { dot: true });
+      matcher = (pathname) => re.test(pathname);
+    } catch {
+      // An unparseable glob keeps the fallback; it must not throw out of the optimizer.
+    }
+  }
+  localPatternMatchers.set(glob, matcher);
+  return matcher;
+}
+
+// Upstream's `hasLocalMatch` + `matchLocalPattern` (shared/lib/match-local-pattern.ts):
+// no configured patterns ⇒ every local image is allowed; otherwise the url must match one
+// pattern on BOTH `search` (exact string compare, so the default `search: ""` forbids a
+// query string on a local image url) and `pathname` (picomatch glob, default `**`).
+function hasLocalImageMatch(
+  urlPathAndQuery: string,
+  patterns: ImageLocalPattern[] | undefined,
+): boolean {
+  if (!patterns) return true;
+  let url: URL;
+  try {
+    // Upstream's base is literally `http://n`; it also NORMALIZES the pathname, which is
+    // what makes `?url=/../../etc/passwd` a `/etc/passwd` miss upstream rather than a
+    // traversal. The adapter keeps its own resolveWithinRoot guard regardless.
+    url = new URL(urlPathAndQuery, "http://n");
+  } catch {
+    return false;
+  }
+  return patterns.some((pattern) => {
+    if (pattern.search !== undefined && pattern.search !== url.search) return false;
+    return localPathnameMatcher(pattern.pathname ?? "**")(url.pathname);
+  });
+}
+
+// `next start` sends NO Content-Type on ANY /_next/image error — next-server answers the
+// validateParams 400 with `res.body(msg).send()` and every ImageError through the same
+// path, so the wire is `400 Bad Request` + `Transfer-Encoding: chunked` + the body and
+// nothing else (measured with curl against `next start` 2026-07-25). The adapter used to
+// stamp `content-type: text/plain` on all of them.
+//
+// Dropping it is safe HERE and only here because every body routed through this helper is a
+// FIXED string: the three error paths that used to interpolate the request's own `?url=`
+// value (`Image not found: <url>`, `Failed to fetch external image: <url>`, and the
+// unbounded 3 kB echo the missing length cap allowed) were replaced with upstream's
+// non-reflecting wording in the same pass. Do not reintroduce request-controlled text in an
+// error body without also restoring a Content-Type.
+function sendImageError(res: ServerResponse, status: number, body: string): void {
+  res.writeHead(status, {});
+  res.end(body);
+}
+
 // True only if `target` matches the app's configured remotePatterns/domains allowlist.
 function isExternalImageAllowed(target: URL, config: ImageConfig): boolean {
   if (target.protocol !== "http:" && target.protocol !== "https:") return false;
@@ -312,7 +872,28 @@ function isExternalImageAllowed(target: URL, config: ImageConfig): boolean {
 // against the allowlist and the public-address check. `fetch`'s default redirect:"follow"
 // would let an allowlisted host 302 to an internal/metadata address, bypassing the SSRF
 // guards — so we intercept each Location and re-run the same checks before following it.
-type FetchedImage = { ok: boolean; status: number; contentType: string; body: Buffer };
+type FetchedImage = {
+  ok: boolean;
+  status: number;
+  contentType: string;
+  // The upstream's own Cache-Control. Next raises the optimizer response's max-age to the
+  // upstream's when it is longer than images.minimumCacheTTL, so it has to travel back.
+  cacheControl: string | null;
+  body: Buffer;
+};
+
+// Why a discriminated KIND rather than the human string this used to return: the string was
+// interpolated straight into the 400 body (`Bad Request: image fetch timed out`), which both
+// leaked an internal reason to the client and made every upstream failure a 400 where
+// `next start` distinguishes 400 / 413 / 504 / 508 / the upstream's own status. The kind is
+// mapped to (status, upstream body) at the one call site; the reason is logged, not sent.
+type ImageFetchErrorKind =
+  | "not-allowed"
+  | "timed-out"
+  | "too-many-redirects"
+  | "too-large"
+  | "fetch-failed"
+  | "redirect-without-location";
 
 // A DNS lookup that ONLY yields public addresses. Passed to http(s).request so
 // the address the socket actually connects to is the one we validated — closing
@@ -355,83 +936,149 @@ function pinnedPublicLookup(
 async function fetchExternalImageSafely(
   initial: URL,
   config: ImageConfig,
-): Promise<FetchedImage | { error: string }> {
+): Promise<FetchedImage | { error: ImageFetchErrorKind }> {
   const MAX_REDIRECTS = 3;
   const { request: httpsRequest } = await import("node:https");
   const { request: httpRequest2 } = await import("node:http");
   let target = initial;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    if (!isExternalImageAllowed(target, config)) return { error: "image host not allowed" };
+    if (!isExternalImageAllowed(target, config)) return { error: "not-allowed" };
     if (target.protocol !== "https:" && target.protocol !== "http:") {
-      return { error: "image host not allowed" };
+      return { error: "not-allowed" };
     }
     // Pre-check keeps a fast, clear rejection; the pinned lookup below is the
     // actual guarantee for the connection that happens.
     if (!(await hostResolvesToPublicOnly(target.hostname))) {
-      return { error: "image host not allowed" };
+      return { error: "not-allowed" };
     }
 
     const request = target.protocol === "https:" ? httpsRequest : httpRequest2;
-    const result = await new Promise<FetchedImage | { error: string } | { redirect: string }>(
-      (resolve) => {
-        const req = request(
-          target.toString(),
-          { lookup: pinnedPublicLookup, timeout: 15_000 },
-          (imgRes) => {
-            const status = imgRes.statusCode ?? 502;
-            if (status >= 300 && status < 400) {
-              imgRes.resume(); // drain
-              const location = imgRes.headers.location;
-              if (!location) return resolve({ error: "redirect without location" });
-              return resolve({ redirect: location });
+    const result = await new Promise<
+      FetchedImage | { error: ImageFetchErrorKind } | { redirect: string }
+    >((resolve) => {
+      const req = request(
+        target.toString(),
+        { lookup: pinnedPublicLookup, timeout: 15_000 },
+        (imgRes) => {
+          const status = imgRes.statusCode ?? 502;
+          if (status >= 300 && status < 400) {
+            imgRes.resume(); // drain
+            const location = imgRes.headers.location;
+            if (!location) return resolve({ error: "redirect-without-location" });
+            return resolve({ redirect: location });
+          }
+          const chunks: Buffer[] = [];
+          let total = 0;
+          imgRes.on("data", (c: Buffer) => {
+            total += c.length;
+            if (total > MAX_BODY_BYTES) {
+              imgRes.destroy();
+              resolve({ error: "too-large" });
+              return;
             }
-            const chunks: Buffer[] = [];
-            let total = 0;
-            imgRes.on("data", (c: Buffer) => {
-              total += c.length;
-              if (total > MAX_BODY_BYTES) {
-                imgRes.destroy();
-                resolve({ error: "image exceeds size limit" });
-                return;
-              }
-              chunks.push(c);
-            });
-            imgRes.on("end", () =>
-              resolve({
-                ok: status >= 200 && status < 300,
-                status,
-                contentType: imgRes.headers["content-type"] ?? "image/jpeg",
-                body: Buffer.concat(chunks),
-              }),
-            );
-            imgRes.on("error", () => resolve({ error: "image fetch failed" }));
-          },
-        );
-        req.on("timeout", () => {
-          req.destroy();
-          resolve({ error: "image fetch timed out" });
-        });
-        req.on("error", () => resolve({ error: "image fetch failed" }));
-        req.end();
-      },
-    );
+            chunks.push(c);
+          });
+          imgRes.on("end", () =>
+            resolve({
+              ok: status >= 200 && status < 300,
+              status,
+              contentType: imgRes.headers["content-type"] ?? "image/jpeg",
+              cacheControl: imgRes.headers["cache-control"] ?? null,
+              body: Buffer.concat(chunks),
+            }),
+          );
+          imgRes.on("error", () => resolve({ error: "fetch-failed" }));
+        },
+      );
+      req.on("timeout", () => {
+        req.destroy();
+        resolve({ error: "timed-out" });
+      });
+      req.on("error", () => resolve({ error: "fetch-failed" }));
+      req.end();
+    });
 
     if ("redirect" in result) {
-      if (hop === MAX_REDIRECTS) return { error: "too many redirects" };
+      if (hop === MAX_REDIRECTS) return { error: "too-many-redirects" };
       try {
         target = new URL(result.redirect, target);
       } catch {
-        return { error: "invalid redirect location" };
+        // Upstream's guard is `URL.canParse(location, href)`; an unparseable Location makes
+        // it fall through to the `!res.ok` branch, i.e. the same "upstream response is
+        // invalid" verdict a missing Location gets.
+        return { error: "redirect-without-location" };
       }
       continue; // re-validate the new target at the top of the loop
     }
     return result;
   }
-  return { error: "too many redirects" };
+  return { error: "too-many-redirects" };
 }
 
-async function main() {
+// Upstream's status + body for each way an external fetch can fail
+// (`fetchExternalImage`, measured where reachable — e.g. an allowlisted host answering 404
+// gives `404 "url" parameter is valid but upstream response is invalid`, and a private-IP
+// target gives `400 "url" parameter is not allowed`). ImageError coerces any status < 400
+// to 500, which is why a redirect with an unusable Location lands on 500.
+const IMAGE_FETCH_ERROR_RESPONSE: Record<ImageFetchErrorKind, { status: number; body: string }> = {
+  "not-allowed": { status: 400, body: '"url" parameter is not allowed' },
+  "timed-out": {
+    status: 504,
+    body: '"url" parameter is valid but upstream response timed out',
+  },
+  "too-many-redirects": {
+    status: 508,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+  "too-large": {
+    status: 413,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+  "fetch-failed": {
+    status: 500,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+  "redirect-without-location": {
+    status: 500,
+    body: '"url" parameter is valid but upstream response is invalid',
+  },
+};
+
+// middleware-manifest.json keys app-router edge functions by their SOURCE page path,
+// which KEEPS route groups and parallel-route slots — `app/(group)/twitter-image.tsx`
+// is stored as `/(group)/twitter-image-1ow20b/route`. The edge route runner looks
+// functions up by the URL pathname (`/twitter-image-1ow20b`), which never contains
+// those segments, so EVERY edge route under a route group threw "Edge function not
+// found in middleware-manifest.json" → 500 (app-dir/metadata-dynamic-routes' grouped
+// `twitter-image` did exactly this while the ungrouped `/twitter-image2` worked).
+//
+// Return a lookup that tries the literal key first and then a group/slot-stripped
+// index. Only keys that actually change are indexed, so a manifest without groups adds
+// nothing, a real key can never be shadowed by a stripped one, and an ambiguous
+// collision (two groups collapsing to one URL — which Next itself rejects at build
+// time) keeps the FIRST entry rather than silently flipping between builds.
+export function createEdgeFunctionLookup<T>(
+  functions: Record<string, T>,
+): (key: string) => T | undefined {
+  const stripped = new Map<string, T>();
+  for (const [key, entry] of Object.entries(functions)) {
+    // N17: anchor both strips to a WHOLE segment — an interception marker is GLUED to its
+    // segment (`(...)post`, `(.)modal`) and IS part of the route id; only `(group)` and
+    // `@slot` segments are invisible in the URL. Unanchored, the group pattern also ate the
+    // marker: `/foo/@modal/(...)post/[id]/page` collapsed to `/foo/[id]/page`, so every
+    // intercepting EDGE route 500'd (function never found) AND the bogus key could shadow a
+    // real `/foo/[id]`. Mirrors handler-loader.ts entryKeyToPathname.
+    const bare = key.replace(/\/\([^/]*\)(?=\/|$)/g, "").replace(/\/@[^/]+(?=\/|$)/g, "");
+    if (bare !== key && !(bare in functions) && !stripped.has(bare)) stripped.set(bare, entry);
+  }
+  return (key: string) => functions[key] ?? stripped.get(key);
+}
+
+// Boot the pool server. Exported (instead of a self-invoking main) so the startup
+// smoke test can boot against a synthetic staged dir; the module self-runs only when
+// executed directly (see the guard at the bottom).
+export async function startPoolServer(): Promise<ReturnType<typeof createPoolServer>> {
   // A rejected fire-and-forget shouldn't take the pod down — log and continue (per-request
   // failures are already caught by the request handler).
   process.on("unhandledRejection", (reason) => {
@@ -478,6 +1125,14 @@ async function main() {
     console.log("[pool-server] Valkey use-cache handler registered (build " + buildId + ")");
   }
 
+  // `instrumentation.js` register(), awaited before anything is served — see
+  // registerInstrumentationHook. Placed here deliberately: AFTER the node-env shims and the
+  // cache-handler install (both must precede any app module, and the hook IS app code), and
+  // BEFORE the HTTP server is created, so a hook that patches `node:http` or installs a
+  // tracer provider sees a clean process. That is a strictly stronger ordering guarantee
+  // than `next start`, which binds the port first and queues arriving requests.
+  await registerInstrumentationHook();
+
   const port = parseInt(process.env.PORT ?? "3000", 10);
   const releaseName = process.env.RELEASE_NAME ?? "nextjs";
   const configDir = process.env.CONFIG_DIR ?? "/config";
@@ -498,9 +1153,22 @@ async function main() {
 
   // Load static assets manifest
   const staticAssetsPath = path.join(configDir, "static-assets.json");
-  const staticAssets = existsSync(staticAssetsPath)
+  const staticAssets: StaticAssetEntry[] = existsSync(staticAssetsPath)
     ? JSON.parse(readFileSync(staticAssetsPath, "utf-8"))
     : [];
+  // Whether dispatch's static-manifest lookup would find this pathname (a SUBSET of
+  // dispatch's own candidates — exact, trailing-slash variant, and the "/index" root
+  // alias — so `true` here guarantees dispatch finds an entry). Public files now live
+  // in the manifest (see emit/static-assets.ts), so a covered pathname must flow
+  // through dispatcher.dispatch, which merges the resolved routing verdict; the disk
+  // fallback (servePublicFileFromDisk) is reserved for pathnames this returns false for.
+  const staticManifestCovers = (pathname: string): boolean =>
+    staticAssets.some(
+      (a) =>
+        a.pathname === pathname ||
+        a.pathname === (pathname.endsWith("/") ? pathname.slice(0, -1) : pathname + "/") ||
+        (pathname === "/" && a.pathname === "/index"),
+    );
 
   // Allowlist for external /_next/image sources (SSRF guard).
   const imageConfig = loadImageConfig(process.cwd());
@@ -527,7 +1195,7 @@ async function main() {
   // 404, mirroring `next start` — our loopback handler invocation doesn't
   // reproduce that check on its own.
   const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
-  const strictDynamicRoutes: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[] = [];
+  const strictDynamicRoutes: { pageRegex: RegExp }[] = [];
   const prerenderedPaths = new Set<string>();
   if (existsSync(prerenderManifestPath)) {
     try {
@@ -557,10 +1225,6 @@ async function main() {
         if (route.fallback === false && typeof route.routeRegex === "string") {
           strictDynamicRoutes.push({
             pageRegex: new RegExp(route.routeRegex),
-            dataRegex:
-              typeof route.dataRouteRegex === "string"
-                ? new RegExp(route.dataRouteRegex)
-                : undefined,
           });
         }
       }
@@ -765,6 +1429,8 @@ async function main() {
     | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
     | null = null;
   if (edgeSandboxRun && Object.keys(middlewareManifest.functions).length > 0) {
+    const lookupEdgeFunction = createEdgeFunctionLookup(middlewareManifest.functions);
+
     edgeRouteRunner = (params) => {
       // Look up the edge function in the manifest by pathname. Pages-router
       // entries are keyed by the bare pathname; app-router pages/route handlers
@@ -776,9 +1442,9 @@ async function main() {
       for (const name of [params.name, ...rscParentCandidates(params.name, rsc)]) {
         const base = name === "/" ? "" : name;
         fnEntry =
-          middlewareManifest.functions[name] ??
-          middlewareManifest.functions[`${base}/page`] ??
-          middlewareManifest.functions[`${base}/route`];
+          lookupEdgeFunction(name) ??
+          lookupEdgeFunction(`${base}/page`) ??
+          lookupEdgeFunction(`${base}/route`);
         if (fnEntry) break;
       }
       if (!fnEntry) {
@@ -876,6 +1542,10 @@ async function main() {
   // source of truth so the three safety-critical flags below can never diverge.
   const emulateNextServer =
     process.env.NEXT_ENABLE_ADAPTER === "1" && process.env.VALKEY_URL === undefined;
+  // Build-pinned RSC negotiation config (header name + output suffixes). Hoisted so the N18
+  // `_rsc` validation below reads the SAME header names the dispatcher negotiates on — an app
+  // with a custom RSC header must not silently skip the check.
+  const poolRscConfig = getRscConfig(routingManifest);
   const dispatcher = createDispatcher({
     handlerLoader,
     poolName,
@@ -884,7 +1554,8 @@ async function main() {
     releaseName,
     edgeRouteRunner,
     pprRoutes: routingManifest.pprRoutes,
-    rscConfig: getRscConfig(routingManifest),
+    pprCapableRoutes: routingManifest.pprCapableRoutes,
+    rscConfig: poolRscConfig,
     outputIds: Object.keys(poolManifest.outputs),
     strictDynamicRoutes,
     prerenderedPaths,
@@ -892,6 +1563,10 @@ async function main() {
     internalSecret,
     basePath: routingManifest.basePath ?? "",
     i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
+    // Build timestamp anchoring the ISR seed-freshness window. Newer adapters write it
+    // into the routing manifest; read defensively — older manifests (and any build
+    // without it) fall back to pod-start anchoring inside the dispatcher.
+    builtAt: (routingManifest as { builtAt?: string }).builtAt,
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
@@ -921,7 +1596,23 @@ async function main() {
   const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
 
   handleRequest = async (req, res) => {
-    const url = new URL(req.url!, `http://${req.headers.host ?? "localhost"}`);
+    let url: URL;
+    try {
+      // N10 (SECURITY): the authority must come from Host, never from the request target.
+      // `new URL("//evil.example/x", base)` read the target as protocol-relative — it parsed
+      // with host `evil.example`, so the pool served `/x` under the key `//evil.example/x`
+      // (CDN key/content confusion) and emitted `Location: http://evil.example/x` for any
+      // rule redirect (open redirect) — and threw outright for a bare `//`, which became a
+      // 400 where `next start` 308s to `/`. parseRequestUrl splices the target after a
+      // VALIDATED authority, so `//…` stays a path and collapseSlashesRedirect normalizes it.
+      url = parseRequestUrl(req.url ?? "/", req.headers.host);
+    } catch {
+      // A malformed Host header (or absolute-form request-target) must not become a
+      // 500 — it's the client's own protocol error.
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Bad Request");
+      return;
+    }
 
     // When middleware's `matcher` covers this path, it must run BEFORE the
     // filesystem fast paths — Next runs middleware for matched static/public
@@ -938,40 +1629,138 @@ async function main() {
       !!(middlewareModule || edgeMiddlewareRunner) &&
       matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
 
-    // Force the CDN caching verdict for two kinds of route (non-matched routes keep their
-    // origin Cache-Control):
+    // next.config headers() + middleware response headers, serialized by the routing
+    // extension (secret-gated: server.ts already stripped the header unless the request
+    // proved trust). Parsed ONCE here — the forced cache-policy wrapper below must see an
+    // explicit app-owned cache-control before any response is written, and the Phase-2
+    // dispatch reuses the same parse. Deleted immediately so it can never leak to handlers.
+    const extResolvedHeaders = parseResolvedHeaders(
+      req.headers["x-resolved-headers"] as string | undefined,
+    );
+    delete req.headers["x-resolved-headers"];
+
+    // The explicit app-owned cache-control for this request, if any: from the routing
+    // extension's resolved verdict (Phase 2, above) or from local resolution (Phase 1
+    // fills this in after resolve()). The forced-cache wrapper reads it lazily at
+    // writeHead time — every response write happens after the owning phase populated it.
+    let appCacheControl: string | null = extResolvedHeaders?.get("cache-control") ?? null;
+
+    // Force the CDN caching verdict for three kinds of request (anything else keeps its origin
+    // Cache-Control):
     //   • PPR routes stream a per-request dynamic resume onto the shell, so the response must
     //     never be edge-cached — `no-store`. Chunked encoding alone does NOT stop Cloud CDN
     //     from caching (proven), so this override is required. The routing service marks these
     //     with the trusted internal `x-nextjs-ppr` dispatch header.
     //   • Middleware-matched routes must reach the ext_proc extension every request (the
     //     verdict can change), so they must revalidate — `no-cache` (App Hosting model).
-    // `no-store` wins when a route is both PPR and middleware-matched.
+    //   • N18 (SECURITY) RSC requests whose `_rsc` cache-busting param does not authenticate
+    //     their RSC headers — `no-store`. THE POOL IS THE RIGHT TIER for this, deliberately:
+    //     it is the only one every request reaches (invariant #1: a request arriving without
+    //     trusted dispatch headers is fully re-resolved here) AND the only one that owns the
+    //     response's Cache-Control and Cache-Tag. The ext_proc routing service is post-cache on
+    //     GXLB (docs/superpowers/plans/gcp-edge-compute-cdn-findings.md — the same ordering fact
+    //     `forcedCdnCacheControl`'s middleware rule exists for), and it never sees a Phase-1
+    //     request at all, so a check there alone would leave the invariant unenforced. It DOES
+    //     cover its own immediate responses (middleware-authored bodies and rule redirects never
+    //     touch a pool) — see routing-service/handler.ts.
+    //     Restricted to GET/HEAD: no other method's response is shared-cacheable, and leaving
+    //     POST alone keeps server actions (which carry router state headers) untouched.
+    // `no-store` wins when a request falls into more than one of these.
+    const rscHeadersUnvalidated =
+      (req.method === "GET" || req.method === "HEAD") &&
+      rscCacheBustingUnvalidated({
+        header: (name) => req.headers[name],
+        searchParams: url.searchParams,
+        rsc: poolRscConfig,
+      });
     const isPprRoute = req.headers["x-nextjs-ppr"] === "1";
     const forcedCacheControl = forcedCdnCacheControl({
       isPprRoute,
       middlewareCovers,
       emulateNextServer,
+      rscHeadersUnvalidated,
     });
     if (forcedCacheControl) {
       const originalWriteHead = res.writeHead.bind(res);
-      res.writeHead = function forceCacheControl(...args: unknown[]) {
-        for (const arg of args) {
-          if (arg && typeof arg === "object" && !Array.isArray(arg)) {
-            for (const key of Object.keys(arg as Record<string, unknown>)) {
-              // forcedCacheControl is always no-cache/no-store (uncacheable), so a serve site's
-              // preliminary cache-control AND its CDN cache-tag are both moot — strip both, so a
-              // tag never lands on a response the CDN won't cache (the final-Cache-Control rule).
-              const lower = key.toLowerCase();
-              if (lower === "cache-control" || lower === "cache-tag")
-                delete (arg as Record<string, unknown>)[key];
+      // Cache-control values seen BEFORE a later wrapper rewrote the headers argument.
+      // dispatch's resolved-header merge stacks OVER this wrapper and MUTATES the
+      // argument in place (replacing the serve site's cache-control with the resolved
+      // value) — so by the time forceCacheControl runs, a handler's own `no-store` has
+      // already been overwritten there. The writeHead setter below prefixes every
+      // later-stacked wrapper with a recorder that snapshots the serve site's values
+      // first; the never-weaken-`no-store` rule depends on this record.
+      const preMergeCacheControls: string[] = [];
+      const forceWriteHead = function forceCacheControl(...args: unknown[]) {
+        // An EXPLICIT app-owned cache-control (next.config headers() / middleware response
+        // headers, carried by the resolved routing verdict) overrides the middleware-matched
+        // `no-cache` default — the app took ownership of the cache decision, matching
+        // `next start`, which serves the headers() value on matched responses.
+        // explicitCacheControlWins pins the precedence: never for the PPR `no-store`
+        // verdict, and never weakening a response that itself declares `no-store`.
+        if (
+          explicitCacheControlWins({
+            forced: forcedCacheControl,
+            resolvedCacheControl: appCacheControl,
+            responseCacheControls: [...preMergeCacheControls, ...observedCacheControls(args, res)],
+          })
+        ) {
+          // dispatch's resolved-header merge only rewrites a headers ARGUMENT — a serve
+          // site that used setHeader (or passed no headers arg) still needs the explicit
+          // value stamped. And the CDN cache tag must be reconciled with the EFFECTIVE
+          // cache-control (M13 rule: mutable cacheable ⇒ deploy-tagged so cutover can
+          // invalidate it; uncacheable ⇒ never tagged): strip any tag a serve site
+          // stamped from its pre-merge default, then re-derive from the app value.
+          for (let i = 1; i < args.length; i++) {
+            const arg = args[i];
+            if (arg && typeof arg === "object") {
+              args[i] = filterWriteHeadHeadersArg(
+                arg,
+                (name) => name.toLowerCase() === "cache-tag",
+              );
             }
+          }
+          res.removeHeader("cache-tag");
+          res.setHeader("cache-control", appCacheControl!);
+          const reconciledTag = cdnCacheTag(appCacheControl!, buildId)["cache-tag"];
+          if (reconciledTag) res.setHeader("cache-tag", reconciledTag);
+          return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
+        }
+        // forcedCacheControl is always no-cache/no-store (uncacheable), so a serve site's
+        // preliminary cache-control AND its CDN cache-tag are both moot — strip both, so a
+        // tag never lands on a response the CDN won't cache (the final-Cache-Control rule).
+        // The headers argument may be an object, a tuple array, or a FLAT array
+        // ([name1, value1, …]) — filterWriteHeadHeadersArg handles every shape Node
+        // accepts (a tuple-only filter let the flat form sail past).
+        for (let i = 1; i < args.length; i++) {
+          const arg = args[i];
+          if (arg && typeof arg === "object") {
+            args[i] = filterWriteHeadHeadersArg(arg, (name) =>
+              ["cache-control", "cache-tag"].includes(name.toLowerCase()),
+            );
           }
         }
         res.removeHeader("cache-tag");
         res.setHeader("cache-control", forcedCacheControl);
         return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
       } as typeof res.writeHead;
+      // Accessor instead of a plain assignment: later wrappers install themselves with
+      // `res.writeHead = wrapped(res.writeHead.bind(res))` (dispatch's resolved-header
+      // merge does exactly this), and the merge mutates the headers argument before this
+      // wrapper can read it. The setter re-wraps anything stacked later with the
+      // pre-merge cache-control recorder; the getter keeps normal stacking intact.
+      let stackedWriteHead: typeof res.writeHead = forceWriteHead;
+      Object.defineProperty(res, "writeHead", {
+        configurable: true,
+        get() {
+          return stackedWriteHead;
+        },
+        set(next: typeof res.writeHead) {
+          stackedWriteHead = function recordPreMergeCacheControls(...args: unknown[]) {
+            preMergeCacheControls.push(...observedCacheControls(args, res));
+            return (next as (...a: unknown[]) => ServerResponse).apply(res, args);
+          } as typeof res.writeHead;
+        },
+      });
     }
 
     // Serve _next/static/* and _next/data/* directly from filesystem.
@@ -1058,66 +1847,77 @@ async function main() {
         // it negotiates JSON. Keep req.url untouched and use this URL only to
         // locate the owning page/dynamic template.
         pagesDataRoutingUrl = new URL(url);
-        pagesDataRoutingUrl.pathname = pagePath;
+        // N11: with `trailingSlash: true` the page form of a data URL must carry the slash.
+        // Next's own add-slash 308 rule (routeGraph.beforeMiddleware) would otherwise fire on
+        // the slash-less page path and answer the DATA request with a redirect to the HTML
+        // page, breaking client-side navigation. Mirrors prepareRequest's data-URL mapping.
+        pagesDataRoutingUrl.pathname =
+          routingManifest.trailingSlash && pagePath !== "/" && !pagePath.endsWith("/")
+            ? `${pagePath}/`
+            : pagePath;
       }
     }
 
     // Basic image optimization: /_next/image?url=...&w=...&q=...
     // Fetches the source image and serves it (with optimization if Sharp is available).
     if (url.pathname === "/_next/image") {
-      const imageUrl = url.searchParams.get("url");
-      const width = parseInt(url.searchParams.get("w") ?? "0", 10);
-      const quality = parseInt(url.searchParams.get("q") ?? "75", 10);
+      // The `url` gate FIRST, then `w`/`q` — upstream's order, and observable: with
+      // `?url=/_next/image&w=16` `next start` answers "cannot be recursive" while the
+      // adapter used to answer `"w" parameter (width) of 16 is not allowed`. See
+      // validateImageUrlParam for the port, the measurements, and what each branch guards
+      // (the recursion cap, the 3072-byte length cap, the protocol-relative refusal, and
+      // both allowlists).
+      const urlParam = validateImageUrlParam(url.searchParams, {
+        hasLocalMatch: (value) => hasLocalImageMatch(value, imageConfig.localPatterns),
+        isRemoteAllowed: (target) => isExternalImageAllowed(target, imageConfig),
+      });
+      if ("errorMessage" in urlParam) {
+        sendImageError(res, 400, urlParam.errorMessage);
+        return;
+      }
+      const imageUrl = urlParam.url;
 
-      if (!imageUrl) {
-        res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Bad Request: missing url parameter");
+      // Validate w/q against Next's resolved image config before they reach Sharp — see
+      // validateImageSizeAndQuality for the port and the measurements. Two things ride on
+      // this: an unbounded `w` (w=999999) drives Sharp into a huge allocation, and every
+      // ACCEPTED (w, q) pair is an additional CDN cache entry plus an additional encode,
+      // so the allowed sets are the amplification bound as much as they are parity.
+      const params = validateImageSizeAndQuality(url.searchParams, imageConfig);
+      if ("errorMessage" in params) {
+        // Byte-for-byte the body `next start` sends, and — like every other optimizer error
+        // — with no Content-Type at all (see sendImageError).
+        sendImageError(res, 400, params.errorMessage);
         return;
       }
-
-      // Validate w/q against Next's resolved image config before they reach Sharp. An
-      // unbounded `w` (e.g. w=999999) drives Sharp into a huge allocation — a trivial
-      // resource-exhaustion vector. Width must be an allowed device/image size; quality 1..100.
-      const allowedWidths = new Set<number>([
-        ...(imageConfig?.deviceSizes ?? []),
-        ...(imageConfig?.imageSizes ?? []),
-      ]);
-      if (
-        !Number.isFinite(width) ||
-        width <= 0 ||
-        (allowedWidths.size > 0 && !allowedWidths.has(width))
-      ) {
-        res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Bad Request: invalid or unallowed width");
-        return;
-      }
-      if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
-        res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Bad Request: invalid quality");
-        return;
-      }
-      // Reject self-referential optimizer URLs (…?url=/_next/image…): they loop back into
-      // this handler and recurse until the pod exhausts sockets/memory.
-      if (imageUrl.split("?")[0] === "/_next/image") {
-        res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Bad Request: recursive image url");
-        return;
-      }
+      const { width, quality } = params;
 
       try {
         // Resolve the image: internal (relative) or external (absolute URL)
         let imageBuffer: Buffer;
         let contentType: string;
+        let selfFetchContentType: string | null = null;
+        // The upstream's own Cache-Control, when there is an upstream (a route-served or
+        // external image). Next raises the response's max-age to it when it asks for
+        // longer than images.minimumCacheTTL.
+        let upstreamCacheControl: string | null = null;
+        // Next's `isStatic`: a build-emitted, content-addressed source under
+        // /_next/static/**/media is immutable, so the optimized derivative is too.
+        let isStaticSource = false;
 
-        if (imageUrl.startsWith("/")) {
-          // Internal image: read from filesystem. Confine the path to public/ or
-          // .next/static/ — a raw `?url=/../../etc/passwd` must not traverse out.
-          const decodedImagePath = decodePublicPathname(imageUrl);
-          if (decodedImagePath === null) {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end("Bad Request: malformed image path");
-            return;
-          }
+        // Upstream's own `isAbsolute`, decided once by validateImageUrlParam, rather than a
+        // second `startsWith("/")` test that could drift from the one that validated it.
+        if (!urlParam.isAbsolute) {
+          // Internal image: read from filesystem. The path is the url's DECODED PATHNAME
+          // (validateImageUrlParam), not the raw url — which is upstream's derivation and
+          // the reason `?url=/test.png%23a`, `?url=/test.png%3F` and a trailing `%0A` all
+          // resolve to public/test.png the way `next start` does instead of 400ing on a
+          // literal `public/test.png#a` miss. resolveWithinRoot below stays the traversal
+          // guard, and still has work to do: WHATWG normalization collapses `..` AND
+          // `%2e%2e` dot segments (both are "double-dot path segments" to the parser, so
+          // `/%2e%2e/x` becomes `/x` — measured), but an ENCODED SEPARATOR does not decode
+          // until afterwards, so `/..%2f..%2fpackage.json` reaches here intact and must be
+          // refused. Pinned by test in tests/pool-server/index.image.test.ts.
+          const decodedImagePath = urlParam.pathname;
           const publicRoot = path.join(process.cwd(), "public");
           const staticRoot = path.join(process.cwd(), ".next", "static");
           const publicFile = resolveWithinRoot(publicRoot, decodedImagePath);
@@ -1130,10 +1930,21 @@ async function main() {
             publicFile === null ||
             (decodedImagePath.startsWith("/_next/static/") && staticFile === null)
           ) {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end("Bad Request: invalid image path");
+            // No exact upstream counterpart: upstream NORMALIZES `..` away in
+            // `new URL(url, "http://n")` and then simply misses the file, answering
+            // `400 The requested resource isn't a valid image.`. This adapter refuses the
+            // traversal outright instead of normalizing it, so it borrows upstream's
+            // closest 400 wording rather than inventing one.
+            sendImageError(res, 400, '"url" parameter is not allowed');
             return;
           }
+
+          // Matches Next's `isStatic` check (`${basePath}/_next/static/media` and the
+          // `immutable/media` variant), evaluated on the DECODED path so an encoded
+          // prefix can't claim immutability for a public/ file.
+          isStaticSource =
+            decodedImagePath.startsWith("/_next/static/media/") ||
+            decodedImagePath.startsWith("/_next/static/immutable/media/");
 
           if (existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
             imageBuffer = readFileSync(publicFile);
@@ -1145,140 +1956,314 @@ async function main() {
             // size cap so an oversized body can't exhaust memory.
             const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
             const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
-            const imgRes = await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
-            if (!imgRes.ok) {
-              res.writeHead(imgRes.status, { "content-type": "text/plain" });
-              res.end(`Image not found: ${imageUrl}`);
+            const imgRes = await fetch(selfUrl, {
+              signal: AbortSignal.timeout(5000),
+              // The EXTERNAL path re-validates every redirect hop against the SSRF
+              // allowlist; this loopback fetch has no such machinery. Refuse redirects
+              // outright rather than let a same-origin route bounce the optimizer to
+              // an unvetted target (or back into the optimizer itself).
+              redirect: "manual",
+            });
+            if (imgRes.status >= 300 && imgRes.status < 400) {
+              // Adapter-specific, so the adapter's own wording stays: upstream's internal
+              // fetch is in-process and has no redirect to refuse, and 502 says what
+              // happened (an upstream we would not follow) better than upstream's generic
+              // 500. Only the Content-Type is dropped, for consistency with every other
+              // optimizer error.
+              sendImageError(res, 502, "Failed to fetch image: redirect not followed");
               return;
             }
+            // Deliberately NO `!imgRes.ok` rejection: upstream's `fetchInternalImage` only
+            // checks that a status exists and that the body is non-empty, so a route
+            // answering 404/500 flows on to the byte sniff and comes back as
+            // `400 The requested resource isn't a valid image.` — measured for a missing
+            // local file (`?url=/does-not-exist.png`) and for a `%00` in the path, both of
+            // which this adapter used to answer with a 404 whose body ECHOED the url.
+            // isOptimizableImageContentType below, not this branch, is what keeps an error
+            // page's bytes from ever being served back.
             const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
             if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
-              res.writeHead(413, { "content-type": "text/plain" });
-              res.end("Image too large");
+              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
               return;
             }
             const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
             if (streamedBody === null) {
-              res.writeHead(413, { "content-type": "text/plain" });
-              res.end("Image too large");
+              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
+              return;
+            }
+            if (streamedBody.length === 0) {
+              // Upstream's `mocked.res.buffers.length === 0` branch.
+              sendImageError(res, 400, '"url" parameter is valid but internal response is invalid');
               return;
             }
             imageBuffer = streamedBody;
+            // A route-served image has no meaningful extension (e.g. /api/tiny-png) —
+            // the response's own Content-Type is the fallback, not an extension guess.
+            selfFetchContentType = imgRes.headers.get("content-type");
+            upstreamCacheControl = imgRes.headers.get("cache-control");
           }
-          contentType = getContentType(decodedImagePath);
+          contentType = selfFetchContentType ?? getContentType(decodedImagePath);
         } else {
           // External image: only fetch allowlisted http(s) hosts, and only after
           // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
-          let target: URL;
-          try {
-            target = new URL(imageUrl);
-          } catch {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end("Bad Request: invalid image url");
-            return;
-          }
-          const fetched = await fetchExternalImageSafely(target, imageConfig);
+          // The URL was parsed, protocol-checked and allowlist-checked by
+          // validateImageUrlParam above; fetchExternalImageSafely re-checks the allowlist
+          // (and the public-address rule) for the initial target AND every redirect hop.
+          const fetched = await fetchExternalImageSafely(urlParam.target, imageConfig);
           if ("error" in fetched) {
-            res.writeHead(400, { "content-type": "text/plain" });
-            res.end(`Bad Request: ${fetched.error}`);
+            // The reason is logged, never sent — see IMAGE_FETCH_ERROR_RESPONSE.
+            console.error(`[pool-server] /_next/image upstream fetch failed: ${fetched.error}`);
+            const mapped = IMAGE_FETCH_ERROR_RESPONSE[fetched.error];
+            sendImageError(res, mapped.status, mapped.body);
             return;
           }
           if (!fetched.ok) {
-            res.writeHead(502, { "content-type": "text/plain" });
-            res.end(`Failed to fetch external image: ${imageUrl}`);
+            // Upstream forwards the UPSTREAM's status here (an allowlisted host answering
+            // 404 gives a 404, measured), and ImageError coerces anything < 400 to 500.
+            console.error(
+              `[pool-server] /_next/image upstream responded ${fetched.status} for an ` +
+                `allowlisted external image`,
+            );
+            sendImageError(
+              res,
+              fetched.status >= 400 ? fetched.status : 500,
+              '"url" parameter is valid but upstream response is invalid',
+            );
             return;
           }
           imageBuffer = fetched.body;
           contentType = fetched.contentType;
+          upstreamCacheControl = fetched.cacheControl;
         }
 
-        // Try to optimize with Sharp if available
-        try {
-          const sharp = require("sharp");
-          const q = quality || 75;
-          const accept = String(req.headers["accept"] ?? "");
-          // Negotiate the output format like Next's optimizer: prefer avif/webp when the client
-          // accepts them, otherwise PRESERVE the source format (a PNG stays PNG — do not force
-          // JPEG). Animated/vector formats sharp shouldn't re-encode are passed through as-is.
-          let pipeline = resizeForRequestedWidth(sharp(imageBuffer), width || undefined);
-          let outType: string;
-          if (accept.includes("image/avif")) {
-            pipeline = pipeline.avif({ quality: q });
-            outType = "image/avif";
-          } else if (accept.includes("image/webp")) {
-            pipeline = pipeline.webp({ quality: q });
-            outType = "image/webp";
-          } else if (contentType.includes("png")) {
-            pipeline = pipeline.png();
-            outType = "image/png";
-          } else if (contentType.includes("gif") || contentType.includes("svg")) {
-            res.writeHead(200, {
-              "content-type": contentType,
-              "cache-control": "public, max-age=60, must-revalidate",
-            });
-            res.end(imageBuffer);
+        // `public, max-age=<maxAge>, must-revalidate` — Next's floor is
+        // images.minimumCacheTTL (default 14400), raised to the upstream's own max-age
+        // when the upstream asks for longer. The previous hardcoded `max-age=60` made
+        // every optimizer response effectively uncacheable at the CDN: a 60-second
+        // freshness window means the pool re-decodes and re-encodes the same image for
+        // essentially every visitor.
+        const imageMaxAgeSeconds = imageMaxAge(imageConfig.minimumCacheTTL, upstreamCacheControl);
+
+        // `next start` parity: Next derives the source format from the BYTES
+        // (detectContentType), never from the URL or the upstream header — an
+        // extensionless route serving a PNG must stay PNG through negotiation
+        // (deriving it from the URL re-encoded /api/tiny-png's PNG to JPEG), and the
+        // SVG gate below must fire on actual SVG bytes even under a lying name.
+        // Where Next 400s an unrecognized signature outright (after a sharp-metadata
+        // second guess we don't have), we keep the header/extension fallback — the
+        // `image/*` gate immediately below still rejects anything non-image, and the
+        // encode path fails closed on bytes sharp can't read.
+        const sniffedContentType = detectImageContentType(imageBuffer);
+        contentType = sniffedContentType ?? contentType;
+
+        // `next start` parity, and Next's FIRST check: a source that isn't an image at
+        // all (a text/html route, a PDF) is a 400 with this exact body — not a 502 from
+        // sharp choking on it further down, and never passthrough (serving an HTML body
+        // back under its own content type would make /_next/image an XSS channel).
+        if (!isOptimizableImageContentType(contentType)) {
+          // Byte-for-byte the body `next start` sends for this case.
+          sendImageError(res, 400, "The requested resource isn't a valid image.");
+          return;
+        }
+
+        // `next start` parity: SVG never goes through the optimizer by default — Next
+        // 400s it unless images.dangerouslyAllowSVG is set, and then serves it with
+        // Content-Disposition: attachment plus the configured CSP so a crafted SVG
+        // can't run script in the site's origin. This gate runs BEFORE any sharp
+        // handling: the verdict must not depend on the optimizer being present.
+        if (contentType.toLowerCase().includes("svg")) {
+          if (!imageConfig.dangerouslyAllowSVG) {
+            // Byte-for-byte the body `next start` sends for this case.
+            sendImageError(res, 400, '"url" parameter is valid but image type is not allowed');
             return;
-          } else {
-            pipeline = pipeline.jpeg({ quality: q });
-            outType = "image/jpeg";
+          }
+          // The SVG branch is not special-cased for headers any more: `next start` sends
+          // the same Content-Disposition/CSP/ETag/Cache-Control set on every optimizer
+          // 200, SVG included (the filename now carries the real source name and `.svg`
+          // instead of the placeholder `attachment; filename="image"`).
+          sendImageResponse(req, res, {
+            body: imageBuffer,
+            contentType,
+            sourceUrl: imageUrl,
+            isStatic: isStaticSource,
+            maxAge: imageMaxAgeSeconds,
+            config: imageConfig,
+            buildId,
+          });
+          return;
+        }
+
+        const accept = String(req.headers["accept"] ?? "");
+        // Negotiate the output format like Next's optimizer (see image-utils). This runs
+        // BEFORE the sharp gate on purpose: Next's BYPASS_TYPES (ICO/BMP/ICNS/JXL/HEIC)
+        // and animated sources are returned verbatim and need no optimizer at all —
+        // several of them sharp cannot even decode — so requiring sharp here would 503 a
+        // request `next start` answers 200. The type driving this decision is byte-sniffed
+        // (above), never the URL, so passthrough can't be steered by a lying extension;
+        // the ANIMATION decision is likewise made on the bytes.
+        const { encode, contentType: outType } = negotiateImageFormat(accept, contentType, {
+          formats: imageConfig.formats,
+          sourceBytes: imageBuffer,
+        });
+        if (encode === "passthrough") {
+          sendImageResponse(req, res, {
+            body: imageBuffer,
+            contentType: outType,
+            sourceUrl: imageUrl,
+            isStatic: isStaticSource,
+            maxAge: imageMaxAgeSeconds,
+            config: imageConfig,
+            buildId,
+          });
+          return;
+        }
+
+        // Optimize with Sharp. A MISSING sharp still fails closed with a 503: it means the
+        // image stack is broken (production images always ship sharp), not that unvalidated
+        // passthrough is safe. A sharp that loads but cannot DECODE the input falls back to
+        // the source bytes — see the catch below, which is where `next start` parity lives
+        // and where the safety conditions on that fallback are spelled out.
+        const sharp = loadSharpOnce();
+        if (!sharp) {
+          // The load failure (with its cause) was logged once by loadSharpOnce. No upstream
+          // counterpart — upstream cannot start without sharp — so the wording is the
+          // adapter's own; only the absent Content-Type is borrowed.
+          sendImageError(res, 503, "Image optimization unavailable");
+          return;
+        }
+        try {
+          // Both are already validated against the app's allowed sets (q is 1..100 and in
+          // images.qualities; w is one of deviceSizes/imageSizes), so no defaulting here.
+          const q = quality;
+          // Encoder options mirror Next's `optimizeImage` exactly — they are not cosmetic.
+          // Measured on the upstream image-optimizer fixture at w=384/q=75 vs `next start`:
+          // a bare `.png()` produced 21319 B where Next produces 5513 B, and `.jpeg()`
+          // without mozjpeg 2913 B vs 1989 B. `.rotate()` applies EXIF orientation before
+          // the resize (Next does the same, in this order), and `.timeout()` bounds a
+          // pathological decode the same 7 seconds Next allows.
+          let pipeline = resizeForRequestedWidth(
+            sharp(imageBuffer).timeout({ seconds: 7 }).rotate(),
+            width,
+          );
+          switch (encode) {
+            case "avif":
+              // Next deliberately encodes AVIF 20 quality points lower than the request
+              // asks and at effort 3 — AVIF at the same nominal quality is both larger
+              // and dramatically slower than WebP.
+              pipeline = pipeline.avif({ quality: Math.max(q - 20, 1), effort: 3 });
+              break;
+            case "webp":
+              pipeline = pipeline.webp({ quality: q });
+              break;
+            case "png":
+              pipeline = pipeline.png({ quality: q });
+              break;
+            case "gif":
+              // Reached only for a PROVEN-static GIF whose client negotiated no other
+              // format: Next re-encodes it as GIF rather than passing the source through.
+              // Upstream sets no encoder at all here (`optimizeImage`'s if-chain covers
+              // only avif/webp/png/jpeg) and relies on sharp writing back the input
+              // format; `.gif()` is byte-identical for a GIF input — both 1629 B for the
+              // fixture's /test.gif at w=384, matching `next start`.
+              pipeline = pipeline.gif();
+              break;
+            case "tiff":
+              // Same story as GIF: upstream leaves the encoder unset and sharp writes TIFF
+              // back. `.tiff()` reproduces it byte-for-byte (2962 B for /test.tiff at
+              // w=384/q=75, exactly `next start`), where the old `default: jpeg` fallthrough
+              // silently converted the source to JPEG (1918 B).
+              pipeline = pipeline.tiff();
+              break;
+            default:
+              pipeline = pipeline.jpeg({ quality: q, mozjpeg: true });
           }
           const optimized = await pipeline.toBuffer();
-          res.writeHead(200, {
-            "content-type": outType,
-            "cache-control": "public, max-age=60, must-revalidate",
+          sendImageResponse(req, res, {
+            body: optimized,
+            contentType: outType,
+            sourceUrl: imageUrl,
+            isStatic: isStaticSource,
+            maxAge: imageMaxAgeSeconds,
+            config: imageConfig,
+            buildId,
           });
-          res.end(optimized);
-        } catch {
-          // Sharp not available — serve unoptimized
-          res.writeHead(200, {
-            "content-type": contentType,
-            "cache-control": "public, max-age=60, must-revalidate",
-          });
-          res.end(imageBuffer);
+        } catch (err) {
+          // Sharp loaded but could not process the input. `next start` FALLS BACK to the
+          // source bytes here — "If we fail to optimize, fallback to the original image"
+          // in imageOptimizer's catch — and that is not a corner case: it is the only way
+          // upstream serves a JPEG 2000 at all (sharp/libvips answers "Input buffer
+          // contains unsupported image format" for it, and image/jp2 is NOT in
+          // BYPASS_TYPES). Measured on the fixture, `?url=/test.jp2&w=384&q=75`:
+          // `next start` → 200 image/jp2, 242 B (the upstream bytes); the adapter used to
+          // answer 502. The comment that previously sat here claimed upstream had no such
+          // path — it was simply wrong about upstream.
+          //
+          // The fallback removed earlier WAS a real XSS vector, so it comes back with the
+          // two conditions that vector needed and this one does not have:
+          //   • the type must have been BYTE-SNIFFED (detectImageContentType). Upstream's
+          //     `upstreamType` is always byte-derived — a source whose bytes match nothing
+          //     is a 400 there — so gating on the sniff is upstream's own semantics, and it
+          //     is what keeps an attacker-influenced `Content-Type`/extension guess (an
+          //     HTML body from an allowlisted remote host named `.png`) on the 502 path
+          //     instead of being echoed back under a type nobody verified.
+          //   • it goes through sendImageResponse, so it carries the same
+          //     `Content-Disposition: attachment` + images CSP + Vary/ETag set as every
+          //     other optimizer 200 (SVG never reaches here at all — the
+          //     dangerouslyAllowSVG gate 400s or serves it far above).
+          // maxAge is images.minimumCacheTTL, NOT the upstream-raised value: upstream's
+          // fallback deliberately ignores a longer upstream max-age (verified — a route
+          // serving jp2 with `Cache-Control: public, max-age=99999` still answers
+          // `max-age=14400, must-revalidate`, while the same route serving TIFF, which
+          // optimizes successfully, answers `max-age=99999`).
+          const message = err instanceof Error ? err.message : String(err);
+          if (sniffedContentType) {
+            // Loud: upstream is silent here, but a pod quietly serving unoptimized
+            // originals is exactly the kind of regression that hides for months.
+            console.warn(
+              `[pool-server] /_next/image could not optimize ${imageUrl} (${contentType}) — ` +
+                `serving the source bytes as next start does: ${message}`,
+            );
+            sendImageResponse(req, res, {
+              body: imageBuffer,
+              contentType: sniffedContentType,
+              sourceUrl: imageUrl,
+              isStatic: isStaticSource,
+              maxAge: imageConfig.minimumCacheTTL,
+              config: imageConfig,
+              buildId,
+            });
+            return;
+          }
+          // No signature matched, so the only candidate type is the upstream header or the
+          // URL's extension — a guess. Upstream 400s this case before sharp ever runs; the
+          // adapter keeps the guess for the format decision but refuses to SERVE bytes
+          // under it. Log the actual failure: the live 502s for /api/tiny-png were
+          // undebuggable without it (the cause turned out to be a broken sharp module, see
+          // loadSharpOnce — but a genuinely corrupt input lands here too).
+          console.error(
+            `[pool-server] /_next/image failed to process ${imageUrl} (${contentType}):`,
+            message,
+          );
+          sendImageError(res, 502, "Failed to process image");
         }
         return;
       } catch (err) {
         console.error("Image optimization error:", err);
         if (!res.headersSent) {
-          res.writeHead(500, { "content-type": "text/plain" });
-          res.end("Image optimization failed");
+          sendImageError(res, 500, "Image optimization failed");
         }
         return;
       }
     }
 
-    // Serve public directory files (favicon.ico, robots.txt, etc.)
-    // In production, CDN/GCS serves these. In standalone/emulate, pool server must.
-    if (
-      !middlewareCovers &&
-      !url.pathname.startsWith("/_next/") &&
-      !url.pathname.startsWith("/api/")
-    ) {
-      const decodedPublicPathname = decodePublicPathname(url.pathname);
-      const publicPath = decodedPublicPathname
-        ? resolveWithinRoot(path.join(process.cwd(), "public"), decodedPublicPathname)
-        : null;
-      if (publicPath && existsSync(publicPath) && !statSync(publicPath).isDirectory()) {
-        const content = readFileSync(publicPath);
-        const etag = staticAssetEtag(content);
-        const responseHeaders = {
-          "content-type": getContentType(decodedPublicPathname!),
-          "cache-control": "public, max-age=3600",
-          etag,
-          // Mutable public file cached at the CDN — tag it so a deploy/rollback can invalidate
-          // the outgoing build's copy (its content can change at the same URL across builds).
-          ...cdnCacheTag("public, max-age=3600", buildId),
-        };
-        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
-          res.writeHead(304, responseHeaders);
-          res.end();
-          return;
-        }
-        res.writeHead(200, responseHeaders);
-        res.end(req.method === "HEAD" ? undefined : content);
-        return;
-      }
-    }
+    // public/ files deliberately have NO pre-routing fast path here. They are in the
+    // static-assets manifest (see emit/static-assets.ts), so Phase 2 serves them via
+    // dispatcher.dispatch and Phase 1 via resolve() → dispatch — both of which merge the
+    // resolved routing verdict (next.config headers() / middleware response headers)
+    // over the adapter's `public, max-age=3600` + deploy-tag default. A pre-parse disk
+    // serve here returned the hardcoded default and silently dropped headers() and
+    // middleware headers. servePublicFileFromDisk remains as the last resort for files
+    // the manifest missed (both phases, below).
 
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
@@ -1292,8 +2277,23 @@ async function main() {
         req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
     } catch (err) {
       if (err instanceof BodyTooLargeError) {
-        res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+        // readRequestBody deliberately left the socket alive (paused, not destroyed):
+        // destroying first turns the 413 into an ECONNRESET the client can't read.
+        // Say we're closing, flush the response, and only then tear the socket down
+        // so the remainder of the oversized upload can't pin the connection.
+        res.writeHead(413, {
+          "content-type": "text/plain; charset=utf-8",
+          connection: "close",
+        });
         res.end("Payload Too Large");
+        // 'finish' never fires if the socket dies first (client gone mid-flush) —
+        // listen for 'close' too so the paused oversized upload can't pin the
+        // connection. destroy() on an already-destroyed socket is a no-op.
+        const teardown = () => {
+          if (!req.destroyed) req.destroy();
+        };
+        res.once("finish", teardown);
+        res.once("close", teardown);
         return;
       }
       throw err;
@@ -1351,20 +2351,47 @@ async function main() {
       }
       const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
 
-      // next.config headers() + middleware response headers, serialized by the routing
-      // extension. The dispatcher merges these into the response (they'd otherwise be dropped
-      // on this path). Delete the header after parsing so it doesn't leak to the handler.
-      const resolvedHeaders = parseResolvedHeaders(
-        req.headers["x-resolved-headers"] as string | undefined,
-      );
-      delete req.headers["x-resolved-headers"];
+      // Public files flow through dispatch via the static manifest (which merges
+      // extResolvedHeaders — parsed and deleted above — into the response). Disk is the
+      // LAST resort for a public file the manifest missed: without it a stale/absent
+      // static-assets.json would turn the file into a 404 (dispatch has already written
+      // its verdict by the time it misses, so this check must come first).
+      if (
+        !handlerLoader.has(extOutputId) &&
+        !staticManifestCovers(extOutputId) &&
+        servePublicFileFromDisk(req, res, extOutputId, extResolvedHeaders, buildId)
+      ) {
+        return;
+      }
+
+      // Rewrite invocation target stamped by the routing extension / cross-pool proxy
+      // (secret-gated members of INTERNAL_DISPATCH_HEADERS, stripped from untrusted
+      // clients in server.ts): the pool supplies the REWRITE TARGET to the generated
+      // entrypoint as requestMeta (query / params / resolvedPathname) — the loopback
+      // request URL itself stays the PUBLIC one, mirroring Next's base-server, because
+      // req.url is what feeds req.url / router.asPath / usePathname. See
+      // dispatch.ts invokeLocalHandlerOverHttp. Trusted input, but a malformed query
+      // from an extension bug must not 500 the request — the invoker recovers the
+      // query from the invocation path itself.
+      const extInvokePath = req.headers["x-invoke-path"] as string | undefined;
+      let extInvocationQuery: Record<string, string | string[]> | undefined;
+      const extInvokeQueryRaw = req.headers["x-invoke-query"] as string | undefined;
+      if (extInvokeQueryRaw) {
+        try {
+          extInvocationQuery = JSON.parse(extInvokeQueryRaw);
+        } catch {
+          extInvocationQuery = undefined;
+        }
+      }
 
       await dispatcher.dispatch(req, res, {
         kind: "route",
         pool,
         matchedPathname: extOutputId, // Use outputId/pathname from header
         routeMatches,
-        resolvedHeaders,
+        resolvedHeaders: extResolvedHeaders,
+        ...(extInvokePath ? { invokePath: extInvokePath } : {}),
+        ...(extInvocationQuery ? { invocationQuery: extInvocationQuery } : {}),
       });
       return;
     }
@@ -1376,31 +2403,25 @@ async function main() {
       req.method ?? "GET",
       createBufferedStream(bodyBuffer),
     );
+    // The explicit app-owned cache-control discovered by local resolution (next.config
+    // headers() / middleware response headers) — the forced-cache wrapper reads this at
+    // writeHead time, which always happens after this point (Phase 2 populated it from
+    // x-resolved-headers instead and returned above).
+    if (appCacheControl === null && "resolvedHeaders" in resolution) {
+      appCacheControl = resolution.resolvedHeaders?.get("cache-control") ?? null;
+    }
     if (resolution.kind === "route" && !handlerLoader.has(resolution.matchedPathname)) {
       const resolvedPathname = resolution.invokePath
         ? new URL(resolution.invokePath, url).pathname
         : resolution.matchedPathname;
-      const publicRoot = path.join(process.cwd(), "public");
-      const decodedResolvedPathname = decodePublicPathname(resolvedPathname);
-      const publicFile = decodedResolvedPathname
-        ? resolveWithinRoot(publicRoot, decodedResolvedPathname)
-        : null;
-      if (publicFile && existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
-        const content = readFileSync(publicFile);
-        const etag = staticAssetEtag(content);
-        const responseHeaders = {
-          "content-type": getContentType(decodedResolvedPathname!),
-          "cache-control": "public, max-age=3600",
-          etag,
-          ...cdnCacheTag("public, max-age=3600", buildId),
-        };
-        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
-          res.writeHead(304, responseHeaders);
-          res.end();
-          return;
-        }
-        res.writeHead(200, responseHeaders);
-        res.end(req.method === "HEAD" ? undefined : content);
+      // Manifest-covered pathnames flow through dispatch, which serves the manifest
+      // entry and merges resolution.resolvedHeaders over the adapter default. Disk is
+      // the LAST resort for a public file the manifest missed (or a rewrite target the
+      // manifest can't key) — it applies the same resolved-header merge itself.
+      if (
+        !staticManifestCovers(resolution.matchedPathname) &&
+        servePublicFileFromDisk(req, res, resolvedPathname, resolution.resolvedHeaders, buildId)
+      ) {
         return;
       }
     }
@@ -1425,9 +2446,20 @@ async function main() {
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+
+  return server;
 }
 
-main().catch((err) => {
-  console.error("Pool server failed to start:", err);
-  process.exit(1);
-});
+// Self-run only when executed directly (node dist/pool-server.cjs), never on import
+// (tests import startPoolServer). The production bundle is CJS, where require.main
+// identifies the entry module; require/module are undefined under the ESM source
+// loader (vitest), so the guard is false there even with this module imported.
+// (import.meta is intentionally NOT used: esbuild leaves it empty in CJS output.)
+const isDirectRun =
+  typeof require !== "undefined" && typeof module !== "undefined" && require.main === module;
+if (isDirectRun) {
+  startPoolServer().catch((err) => {
+    console.error("Pool server failed to start:", err);
+    process.exit(1);
+  });
+}

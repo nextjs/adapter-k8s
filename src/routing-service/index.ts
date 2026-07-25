@@ -11,11 +11,38 @@ import { createRoutingServer, startHealthServer } from "./server.js";
 // extract it). When TLS_CERT_FILE/TLS_KEY_FILE are configured but absent (the deployment points
 // them at an emptyDir such as /tmp/tls), mint a self-signed pair with openssl. Parent dirs are
 // created so a read-only /app is tolerated. Any failure — openssl missing, unwritable path —
-// falls back to the existing plaintext h2c behavior (emulate parity) instead of crashing.
-function ensureTlsIdentity(): void {
+// CRASHES the process: a plaintext h2c server still passes the TCP/health probes (they don't
+// speak TLS), so the pod would stay in the NEG looking healthy while every ext_proc callout
+// (which requires HTTP/2 over TLS) silently fails.
+//
+// Fail-closed is UNCONDITIONAL here:
+//  - exactly one of TLS_CERT_FILE/TLS_KEY_FILE set (env/chart skew) → crash. Half a TLS
+//    config is a broken deployment, and falling through used to start plaintext h2c with
+//    no opt-in at all.
+//  - neither set → crash unless ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1. Plaintext is
+//    ALWAYS an explicit opt-in, set only by the CLI's local-emulation path (emulate.ts).
+export function ensureTlsIdentity(): void {
   const certFile = process.env.TLS_CERT_FILE;
   const keyFile = process.env.TLS_KEY_FILE;
-  if (!certFile || !keyFile) return;
+  if (!certFile || !keyFile) {
+    if (certFile || keyFile) {
+      // Exactly one of the pair is set — env/chart skew. Never fall through to
+      // plaintext (and the opt-in does not rescue a half-configured TLS identity).
+      throw new Error(
+        `Routing service: TLS misconfiguration — exactly one of TLS_CERT_FILE/TLS_KEY_FILE ` +
+          `is set (TLS_CERT_FILE=${certFile ? JSON.stringify(certFile) : "unset"}, ` +
+          `TLS_KEY_FILE=${keyFile ? JSON.stringify(keyFile) : "unset"}). Set both (GKE) or ` +
+          `neither with ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1 (local emulation only).`,
+      );
+    }
+    if (process.env.ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT === "1") return;
+    throw new Error(
+      `Routing service: TLS_CERT_FILE/TLS_KEY_FILE are not configured. GCP ext_proc callouts ` +
+        `require HTTP/2 over TLS — refusing to start plaintext (the pod would look healthy ` +
+        `while every callout fails). Set both TLS_CERT_FILE and TLS_KEY_FILE, or set ` +
+        `ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1 to opt in to plaintext (local emulation only).`,
+    );
+  }
   if (existsSync(certFile) && existsSync(keyFile)) return;
   const release = process.env.RELEASE_NAME ?? "nextjs";
   const namespace = process.env.NAMESPACE ?? "default";
@@ -48,8 +75,19 @@ function ensureTlsIdentity(): void {
     );
     console.log(`Routing service: generated self-signed TLS identity at ${certFile}`);
   } catch (err) {
-    console.warn(
-      `Routing service: could not generate TLS identity (${err instanceof Error ? err.message : String(err)}); falling back to plaintext h2c`,
+    const detail = err instanceof Error ? err.message : String(err);
+    if (process.env.ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT === "1") {
+      console.warn(
+        `Routing service: could not generate TLS identity (${detail}); ` +
+          `ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1 is set — starting plaintext h2c anyway.`,
+      );
+      return;
+    }
+    throw new Error(
+      `Routing service: could not generate TLS identity (${detail}). GCP ext_proc callouts ` +
+        `require HTTP/2 over TLS — refusing to start plaintext (the pod would look healthy ` +
+        `while every callout fails). Set ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1 to override ` +
+        `(local emulation only).`,
     );
   }
 }
@@ -110,7 +148,7 @@ async function main() {
   // Create handler and server. Mint the TLS identity first so createRoutingServer sees the
   // cert files (or their deliberate absence, after a generation failure) when it picks its
   // transport.
-  const handler = createRequestHandler(manifest, middlewareModule);
+  const handler = createRequestHandler(manifest, middlewareModule, { timeoutMs });
   ensureTlsIdentity();
   const server = createRoutingServer({ handler, port, failOpen, timeoutMs });
 
@@ -134,7 +172,13 @@ async function main() {
   process.on("SIGINT", shutdown);
 }
 
-main().catch((err) => {
-  console.error("Routing service failed to start:", err);
-  process.exit(1);
-});
+// Run main() only when executed directly (node dist/routing-service.cjs) — the
+// bundle is CJS, where require.main === module identifies the entry. Under ESM
+// (vitest imports of the helpers above) require is undefined and the guard is
+// false, so importing this module never starts a server.
+if (typeof require !== "undefined" && require.main === module) {
+  main().catch((err) => {
+    console.error("Routing service failed to start:", err);
+    process.exit(1);
+  });
+}

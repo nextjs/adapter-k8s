@@ -117,6 +117,42 @@ function continueResponse(): ProcessingResponse {
   });
 }
 
+// Answer an unexpected (non-request_headers) callout phase with the response case
+// that MATCHES the request's phase, with a default-CONTINUE verdict. A fully-empty
+// ProcessingResponse (no oneof set) may itself be treated as a protocol error by
+// Envoy — the spec expects requestBody → BodyResponse, responseHeaders →
+// HeadersResponse, *Trailers → TrailersResponse. This keeps the existing
+// don't-stall behavior (exactly one response per request message) while speaking
+// the phase Envoy asked about.
+function phaseEchoResponse(req: ProcessingRequest): ProcessingResponse {
+  const commonContinue = { response: { status: CommonResponse_ResponseStatus.CONTINUE } };
+  switch (req.request.case) {
+    case "responseHeaders":
+      return create(ProcessingResponseSchema, {
+        response: { case: "responseHeaders", value: commonContinue },
+      });
+    case "requestBody":
+      return create(ProcessingResponseSchema, {
+        response: { case: "requestBody", value: commonContinue },
+      });
+    case "responseBody":
+      return create(ProcessingResponseSchema, {
+        response: { case: "responseBody", value: commonContinue },
+      });
+    case "requestTrailers":
+      return create(ProcessingResponseSchema, {
+        response: { case: "requestTrailers", value: {} },
+      });
+    case "responseTrailers":
+      return create(ProcessingResponseSchema, {
+        response: { case: "responseTrailers", value: {} },
+      });
+    default:
+      // Unknown/unset phase — nothing to echo; an empty response is the best we can do.
+      return create(ProcessingResponseSchema, {});
+  }
+}
+
 function internalError500(): ProcessingResponse {
   return create(ProcessingResponseSchema, {
     response: {
@@ -163,7 +199,14 @@ export function createProcessHandler(
   ): AsyncGenerator<ProcessingResponse> {
     for await (const req of requests) {
       const requestHeaders = requestHeadersToPlain(req);
-      if (!requestHeaders) continue;
+      if (!requestHeaders) {
+        // Unexpected phase (we negotiate REQUEST_HEADERS only, but a config skew
+        // could deliver body/response phases): ext_proc requires one response per
+        // request message — answer with the phase-matching CONTINUE response
+        // instead of going silent and stalling the stream.
+        yield phaseEchoResponse(req);
+        continue;
+      }
       try {
         const result = await withTimeout(handler(requestHeaders), timeoutMs);
         yield plainResponseToProto(result);

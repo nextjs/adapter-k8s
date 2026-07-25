@@ -58,6 +58,18 @@ describe("renderRouteExtUpdateJob", () => {
     expect(c).toMatch(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/);
   });
 
+  it("pins the cloud-sdk image by immutable digest (mutable :slim tag must not return)", () => {
+    // The Job runs gcloud under a privileged Workload-Identity SA — a mutable tag lets
+    // a registry-side tag move change what executes with those permissions.
+    const yaml = renderRouteExtUpdateJob({
+      releaseName: "my-app",
+      projectId: "my-project",
+      region: "us-central1",
+      buildId: "abc123",
+    });
+    expect(yaml).toMatch(/cloud-sdk:slim@sha256:[0-9a-f]{64}/);
+  });
+
   it("ships the hardened job/pod posture (ttl, non-root, read-only FS, gcloud config home)", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
@@ -196,8 +208,6 @@ describe("renderRouteExtConfigMap", () => {
     const yaml = renderRouteExtConfigMap({
       releaseName: "my-app",
       extensionChainJson: chainJson,
-      projectId: "my-project",
-      region: "us-central1",
     });
 
     expect(yaml).toContain("kind: ConfigMap");
@@ -235,8 +245,6 @@ describe("renderRouteExtConfigMap", () => {
     const yaml = renderRouteExtConfigMap({
       releaseName: "my-app",
       extensionChainJson: chainJson,
-      projectId: "my-project",
-      region: "us-central1",
     });
 
     // The scalar must be single-quoted with only '' quote pairs inside (valid YAML).

@@ -14,12 +14,35 @@
 //
 // Watermarks are absolute milliseconds since the epoch, matching Next.
 
+import { warnOnce } from "./stream-codec.js";
+
+/**
+ * Retention for the shared tag-manifest hash itself (M11), refreshed on every write by
+ * `UPDATE_TAGS_SCRIPT`. Mirrors the entry-key policy (`DURABLE_TTL_SECONDS`): without it,
+ * every deploy's build-namespaced manifest (`k8s:<buildId>:tags`) lived FOREVER — entry keys
+ * were TTL-bounded but manifests were not, so the keyspace grew without bound across deploys.
+ */
+export const TAG_MANIFEST_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+/**
+ * How far a client-clock watermark may run ahead of the Valkey SERVER clock before the script
+ * clamps it (L16). Watermarks are client-computed (`stale`/`expired`), but entries they are
+ * compared against were written by OTHER replicas' clocks: a fast-clock replica's far-future
+ * watermark would instantly invalidate entries its peers wrote after the revalidation (or, for
+ * a hard expire, sit in the future and fail to invalidate until the clock caught up). 60s
+ * absorbs normal NTP jitter; anything beyond it is a broken pod clock, and clamping bounds the
+ * blast radius to a 60s over/under-invalidation window.
+ */
+export const MAX_CLOCK_SKEW_MS = 60_000;
+
 /**
  * Atomic last-event-wins merge for the shared tag manifest, used by both the V2 and the classic
- * incremental handlers. ARGV is `[field, json, field, json, …]`; each field is overwritten only
- * when the incoming event is `>=` the stored one, so a concurrent older revalidation from
- * another replica can't clobber a newer one. Runs atomically (Redis/Valkey execute a script to
- * completion without interleaving).
+ * incremental handlers. KEYS[1] is the manifest key; ARGV is `[field, json, field, json, …,
+ * ttlSeconds]` (the trailing TTL refreshes the manifest key's own retention, M11). Each field is
+ * overwritten only when the incoming event is `>=` the stored one, so a concurrent older
+ * revalidation from another replica can't clobber a newer one. Runs atomically (Redis/Valkey
+ * execute a script to completion without interleaving). Returns the number of events whose
+ * watermarks had to be clamped for clock skew (L16) — callers warnOnce when it is > 0.
  *
  * The merge clock is the VALKEY SERVER's (`TIME`), not the client-supplied `at`: replicas'
  * clocks skew, and a backward-stepping replica would otherwise stamp an older `at` on a newer
@@ -29,12 +52,29 @@
  * watermarks stay client-computed: they are compared against entry timestamps, which are
  * themselves client clocks. The client still sends its own `at` (see `computeTagUpdate`) as a
  * fallback for any path where the script can't run its rewrite.
+ *
+ * The winning event is merged into the stored state PER DIMENSION (M12), not written over it:
+ * an event only replaces the watermarks it SETS, preserving stored ones it didn't — exactly
+ * Next's read-modify-write (`{...existing, stale: now}` keeps a stored `expired`). The old
+ * whole-field replace let `revalidateTag('t', profileWithoutExpire)` (an event with only
+ * `{stale, at}`) erase a hard-expire `expired` watermark from an earlier `revalidateTag('t')`,
+ * so entries Next would hard-regenerate kept serving stale-with-revalidate.
+ *
+ * Merge semantics per dimension, for a winning event E over stored state S:
+ *   - `stale`:   E's if set, else S's (a hard expire never erases a profile's SWR watermark).
+ *   - `expired`: E's if set, else S's (a profile without `expire` never erases a hard expire;
+ *                a later hard expire — `expired = now` — replaces a profile's future expiry,
+ *                which is what makes the invalidation immediate, matching Next).
+ *   - `at`:      always the server time — the LEW ordering key.
  */
 export const UPDATE_TAGS_SCRIPT = `
+local ttlSeconds = tonumber(ARGV[#ARGV])
+local pairCount = #ARGV - 1
 local t = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)
+local clamped = 0
 local i = 1
-while i <= #ARGV do
+while i <= pairCount do
   local field = ARGV[i]
   local incoming = ARGV[i + 1]
   local existing = redis.call('HGET', KEYS[1], field)
@@ -42,20 +82,59 @@ while i <= #ARGV do
   local okNew, nw = pcall(cjson.decode, incoming)
   if okNew and type(nw) == 'table' then
     nw.at = now
-    incoming = cjson.encode(nw)
-  end
-  if existing then
-    local okCur, cur = pcall(cjson.decode, existing)
-    if okCur and okNew then
-      local curAt = tonumber(cur.at) or 0
-      if now < curAt then write = false end
+    -- L16: clamp fast-clock watermarks to the server clock + bound. A profiled event's
+    -- expired watermark legitimately sits far in the future (now + expire*1000), so shift it
+    -- by the same amount as its stale base — the intended duration is preserved while the
+    -- base is pinned to server time. A hard expire has no stale; its expired watermark IS the
+    -- event time, so any value past the bound is pure skew.
+    if type(nw.stale) == 'number' and nw.stale > now + ${MAX_CLOCK_SKEW_MS} then
+      local shift = nw.stale - now - ${MAX_CLOCK_SKEW_MS}
+      nw.stale = nw.stale - shift
+      if type(nw.expired) == 'number' then nw.expired = nw.expired - shift end
+      clamped = clamped + 1
+    elseif nw.stale == nil and type(nw.expired) == 'number' and nw.expired > now + ${MAX_CLOCK_SKEW_MS} then
+      nw.expired = now + ${MAX_CLOCK_SKEW_MS}
+      clamped = clamped + 1
     end
+    if existing then
+      local okCur, cur = pcall(cjson.decode, existing)
+      if okCur and type(cur) == 'table' then
+        local curAt = tonumber(cur.at) or 0
+        if now < curAt then
+          write = false
+        else
+          -- M12: per-dimension merge (see the TS docstring) — never whole-field replace.
+          if nw.stale == nil then nw.stale = cur.stale end
+          if nw.expired == nil then nw.expired = cur.expired end
+        end
+      end
+    end
+    if write then incoming = cjson.encode(nw) end
   end
   if write then redis.call('HSET', KEYS[1], field, incoming) end
   i = i + 2
 end
-return 1
+-- M11: bound the manifest's own lifetime, refreshed on each write (entry keys are TTL-bounded;
+-- the manifest must be too, or every deploy leaks a build-namespaced hash forever).
+if ttlSeconds and ttlSeconds > 0 then redis.call('EXPIRE', KEYS[1], ttlSeconds) end
+return clamped
 `;
+
+/**
+ * Surface the L16 clamp count returned by `UPDATE_TAGS_SCRIPT`: when it is > 0, some replica's
+ * clock ran more than `MAX_CLOCK_SKEW_MS` ahead of the Valkey server and its watermarks were
+ * clamped server-side. The clamp keeps the damage bounded; the warning makes the broken clock
+ * observable. Once per process — a skewed replica would otherwise log on every revalidation.
+ */
+export function warnOnClockSkewClamp(clamped: unknown): void {
+  if (typeof clamped === "number" && clamped > 0) {
+    warnOnce(
+      "clock-skew-clamp",
+      `[valkey-cache] a replica clock is more than ${MAX_CLOCK_SKEW_MS}ms ahead of the Valkey server clock; ` +
+        "tag-invalidation watermarks were clamped server-side — check pod clock sync (ntp/chrony)",
+    );
+  }
+}
 
 /** Per-tag revalidation watermarks (absolute ms). */
 export interface TagState {
@@ -157,6 +236,14 @@ export function maxExpiration(tags: readonly string[], manifest: TagManifest): n
  * `expired` watermark to `now + expire*1000` when a duration/profile is supplied, else to
  * `now` (immediate expiry — the no-durations default). Returns the new state to persist,
  * preserving any existing fields.
+ *
+ * The handlers call this with `existing = undefined` and let `UPDATE_TAGS_SCRIPT` merge the
+ * event into the stored state server-side (M12) — per dimension, an event replaces only the
+ * watermarks it SETS (`stale` + maybe `expired` for a profiled call, `expired` for a hard
+ * call) and preserves the rest. That is exactly Next's in-memory read-modify-write
+ * (`tagsManifest.set(tag, { ...existingEntry, stale: now })`), made atomic across replicas:
+ * a profiled revalidation without `expire` never erases a stored hard-expire watermark, and
+ * a later hard expire replaces a stored future expiry (making the invalidation immediate).
  */
 export function computeTagUpdate(
   existing: TagState | undefined,

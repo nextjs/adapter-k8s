@@ -10,13 +10,23 @@ import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
 import {
   INTERNAL_SECRET_HEADER,
+  localeAlignedRouteParamPathname,
+  queryFromUrl,
+  requestTargetPathname,
   rscParentCandidates,
   stripBasePath,
   templateOutputCandidates,
+  trailingSlashVariants,
   type RscConfig,
 } from "../routing-common.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
+// The pool-server bundle is esbuild-bundled, so cross-importing the emit-side sanitizer
+// is fine — and REQUIRED: this module previously carried a local copy that stripped
+// trailing hyphens BEFORE truncating to 63 chars, so a >63-char name with a hyphen at
+// the cut kept its trailing hyphen → invalid DNS hostname → cross-pool proxy dial
+// failure. The emit version truncates first, then strips, so it can't regress that.
+import { sanitizeK8sName } from "../emit/templates/utils.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -56,6 +66,20 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
 // attacker-chosen origin into the relative-vs-absolute Location comparison below.
 const FORWARDED_HOST_RE = /^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/;
 
+// Effective public scheme of a request that reached this pool. TLS terminates at the load
+// balancer (GXLB) which stamps x-forwarded-proto, so the pool's own socket is always plain
+// http — the forwarded value is the only witness of the client's real scheme. Only the two
+// real schemes are honored — a spoofed value (e.g. `javascript:`) becomes http.
+function requestProtocol(req: IncomingMessage): "http" | "https" {
+  const forwardedProto = req.headers["x-forwarded-proto"];
+  const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
+    ?.split(",")[0]
+    ?.trim();
+  return forwardedProtoValue === "https" || forwardedProtoValue === "http"
+    ? forwardedProtoValue
+    : "http";
+}
+
 function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
   const forwardedHost = req.headers["x-forwarded-host"];
   const forwardedHostValue = Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost;
@@ -65,15 +89,7 @@ function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
       : undefined) ??
     req.headers.host ??
     "localhost";
-  const forwardedProto = req.headers["x-forwarded-proto"];
-  const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
-    ?.split(",")[0]
-    ?.trim();
-  // Only the two real schemes are honored — a spoofed value (e.g. `javascript:`) becomes http.
-  const protocol =
-    forwardedProtoValue === "https" || forwardedProtoValue === "http"
-      ? forwardedProtoValue
-      : "http";
+  const protocol = requestProtocol(req);
   try {
     const requestOrigin = new URL(`${protocol}://${host}`).origin;
     return target.origin === requestOrigin
@@ -88,8 +104,9 @@ function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
 }
 
 // Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
-// unequal-length buffers). Mirrors secretsMatch in server.ts.
-function timingSafeStringEqual(a: string, b: string): boolean {
+// unequal-length buffers). Canonical implementation — server.ts imports this one; keep a
+// single copy so the two secret checks can never drift.
+export function timingSafeStringEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
@@ -149,9 +166,128 @@ function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
 // Swallow socket errors on a client stream. A mid-response client disconnect emits an
 // 'error' on req/res; with no listener Node rethrows it as an uncaught 'error' event and
 // takes the whole process down. There's nothing to recover — the connection is gone.
-function guardStreamErrors(stream: IncomingMessage | ServerResponse): void {
+// Exported so server.ts can attach the same guard at the single per-request choke point
+// (the static/public/image fast paths in index.ts write responses without one).
+export function guardStreamErrors(stream: IncomingMessage | ServerResponse): void {
   if (typeof (stream as { on?: unknown }).on === "function") {
     stream.on("error", () => undefined);
+  }
+}
+
+// Marker for a deliberate upstream teardown after the CLIENT hung up. The teardown
+// surfaces as an 'error' event on the proxied request; without the marker it was
+// reported as `cross-pool proxy failed: socket hang up` at error level — a client
+// closing a tab is not an upstream failure and must not page anyone.
+class ClientAbortError extends Error {
+  constructor() {
+    super("client disconnected before the proxied response completed");
+    this.name = "ClientAbortError";
+  }
+}
+
+// Cancel an upstream request when the client connection dies before the response
+// completes — otherwise a wedged/slow upstream keeps running into a dead socket.
+// Guarded because unit-test response doubles don't implement the EventEmitter surface.
+function abortOnClientClose(res: ServerResponse, abort: () => void): void {
+  if (typeof (res as { on?: unknown }).on === "function") {
+    res.on("close", () => {
+      if (!res.writableEnded) abort();
+    });
+  }
+}
+
+// Bounded wait for proxied upstreams (external rewrites + cross-pool). A wedged target
+// must not pin the client connection and this pod's sockets until the server-wide
+// requestTimeout (300s default) fires.
+const PROXY_TIMEOUT_MS = 30_000;
+
+// RFC 9110 §7.6.1 hop-by-hop headers describe a single transport-level connection.
+// Forwarding an upstream's `connection`/`transfer-encoding`/etc. to our client
+// mis-describes framing WE own (and a `connection: close` from the target would
+// wrongly tear down our client keep-alive). Strip them at both proxy boundaries.
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "transfer-encoding",
+  "keep-alive",
+  "te",
+  "trailer",
+  "upgrade",
+]);
+
+function stripHopByHopHeaders(
+  headers: IncomingMessage["headers"],
+): Record<string, string | string[]> {
+  const out: Record<string, string | string[]> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined || HOP_BY_HOP_HEADERS.has(name.toLowerCase())) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+// Same principle on the REQUEST side: the client's hop-by-hop headers describe the
+// client↔pool connection, not the new pool↔upstream connection we are about to open.
+// RFC 9110 §7.6.1 additionally lets the incoming Connection header NOMINATE arbitrary
+// headers as connection-scoped — those must be dropped too, or a client can tunnel a
+// header past the boundary (`connection: x-anything` + `x-anything: …`). Node sets its
+// own connection semantics (keep-alive/close, framing) on the outbound request.
+function stripRequestHopByHopHeaders(
+  headers: IncomingMessage["headers"],
+): Record<string, string | string[] | undefined> {
+  const nominated = new Set<string>();
+  const connection = headers["connection"];
+  for (const value of Array.isArray(connection) ? connection : connection ? [connection] : []) {
+    for (const token of value.split(",")) {
+      const name = token.trim().toLowerCase();
+      if (name) nominated.add(name);
+    }
+  }
+  const out: Record<string, string | string[] | undefined> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    const lower = name.toLowerCase();
+    if (HOP_BY_HOP_HEADERS.has(lower) || nominated.has(lower)) continue;
+    out[name] = value;
+  }
+  return out;
+}
+
+// Delete a header from a plain headers object regardless of the casing it was written
+// with (build-time manifest headers keep their original casing; Node lowercases live ones).
+function deleteHeaderCaseInsensitive(
+  headers: Record<string, string | string[] | undefined>,
+  name: string,
+): void {
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === lower) delete headers[key];
+  }
+}
+
+// Restate honest framing headers on a forwarded request: drop any client-supplied
+// content-length/transfer-encoding, then set content-length from the ACTUAL buffered
+// body when there is one. Forwarding the client's declared length without the bytes
+// (forged `Content-Length: 100` on a GET) makes the receiving server await a body
+// that never arrives — hanging the invocation until the 300s requestTimeout, an
+// unauthenticated resource pin. Delete case-insensitively (Node lowercases incoming
+// names, but invocation headers may not be).
+function restateFramingHeaders(
+  headers: Record<string, string | string[] | undefined>,
+  bufferedBody: Buffer | undefined,
+  method: string | undefined,
+  setExplicitEmpty: boolean,
+): void {
+  for (const key of Object.keys(headers)) {
+    const lower = key.toLowerCase();
+    if (lower === "content-length" || lower === "transfer-encoding") {
+      delete headers[key];
+    }
+  }
+  if (bufferedBody && bufferedBody.length > 0) {
+    headers["content-length"] = String(bufferedBody.length);
+  } else if (setExplicitEmpty && method !== "GET" && method !== "HEAD") {
+    // Body was consumed but empty — send an explicit empty body.
+    headers["content-length"] = "0";
   }
 }
 
@@ -189,7 +325,8 @@ async function writeChunkSafely(res: ServerResponse, chunk: Buffer): Promise<boo
   return !res.writableEnded && !res.destroyed;
 }
 
-function mergeResponseHeaders(
+// Exported for unit tests (PPR shell/resume set-cookie merge is pinned there).
+export function mergeResponseHeaders(
   prefix: Record<string, string | string[]> | undefined,
   response: IncomingMessage["headers"],
 ): Record<string, string | string[] | undefined> {
@@ -202,10 +339,102 @@ function mergeResponseHeaders(
   for (const headers of [prefix, response]) {
     if (!headers) continue;
     for (const [name, value] of Object.entries(headers)) {
-      merged[name.toLowerCase()] = value;
+      const lower = name.toLowerCase();
+      // Set-Cookie is the one header that must never be folded: the PPR shell and the
+      // resume stream are two responses merged into one client answer, and each may
+      // carry its own cookies. Wholesale replacement (the normal rule above) silently
+      // drops the shell's cookies — append instead.
+      if (lower === "set-cookie" && merged["set-cookie"] !== undefined) {
+        const existing = merged["set-cookie"];
+        const combined = Array.isArray(existing) ? [...existing] : [existing!];
+        if (Array.isArray(value)) combined.push(...value);
+        else if (value !== undefined) combined.push(value);
+        merged["set-cookie"] = combined;
+      } else {
+        merged[lower] = value;
+      }
     }
   }
   return merged;
+}
+
+// Merge the resolved routing verdict (next.config headers() + middleware response
+// headers) into the headers argument a serve site passed to writeHead. Node accepts
+// THREE shapes there: an object map, an array of [name, value] tuples, and a FLAT
+// array [name1, value1, name2, value2] (the request.rawHeaders layout). The array
+// forms never enter an Object.keys loop usefully (it yields indices), which silently
+// dropped middleware headers — normalize arrays to tuples and merge pairwise.
+// Set-Cookie is APPENDED (both the serve site's and middleware's cookies must
+// survive); any other resolved header REPLACES the serve site's value, because
+// next.config headers() and explicit middleware response headers are the final
+// public response policy in Next's router-server — adapter defaults (including
+// static/public cache-control) must not silently win over that app-owned value.
+// Name comparison is case-insensitive (Node and Web Headers normalize differently).
+export function mergeResolvedHeadersIntoHeadersArg(
+  resolvedHeaders: Headers,
+  headersArg: unknown,
+): unknown {
+  if (headersArg === undefined || headersArg === null) return headersArg;
+
+  if (Array.isArray(headersArg)) {
+    const pairs: [string, unknown][] = [];
+    if (headersArg.length > 0 && !Array.isArray(headersArg[0])) {
+      // Flat form: even offsets are names, odd offsets are values.
+      for (let i = 0; i + 1 < headersArg.length; i += 2) {
+        pairs.push([String(headersArg[i]), headersArg[i + 1]]);
+      }
+    } else {
+      for (const entry of headersArg as [unknown, unknown][]) {
+        pairs.push([String(entry[0]), entry[1]]);
+      }
+    }
+    for (const [key, value] of resolvedHeaders.entries()) {
+      if (key.toLowerCase() === "set-cookie") {
+        for (const c of value.split(/,(?=[^;]*=)/)) {
+          pairs.push(["set-cookie", c.trim()]);
+        }
+      } else {
+        for (let i = pairs.length - 1; i >= 0; i--) {
+          if (pairs[i]![0].toLowerCase() === key.toLowerCase()) pairs.splice(i, 1);
+        }
+        pairs.push([key, value]);
+      }
+    }
+    // Tuple form back to Node — it accepts tuples regardless of the input shape.
+    return pairs;
+  }
+
+  if (typeof headersArg === "object") {
+    const handlerHeaders = headersArg as Record<string, string | string[]>;
+    for (const [key, value] of resolvedHeaders.entries()) {
+      if (key.toLowerCase() === "set-cookie") {
+        const existingKey = Object.keys(handlerHeaders).find(
+          (name) => name.toLowerCase() === "set-cookie",
+        );
+        const existing = existingKey ? handlerHeaders[existingKey] : undefined;
+        const arr: string[] = [];
+        if (existing) {
+          if (Array.isArray(existing)) arr.push(...existing);
+          else arr.push(existing);
+        }
+        for (const c of value.split(/,(?=[^;]*=)/)) {
+          arr.push(c.trim());
+        }
+        if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
+        handlerHeaders["set-cookie"] = arr;
+      } else {
+        for (const existingKey of Object.keys(handlerHeaders)) {
+          if (existingKey.toLowerCase() === key.toLowerCase()) {
+            delete handlerHeaders[existingKey];
+          }
+        }
+        handlerHeaders[key] = value;
+      }
+    }
+    return handlerHeaders;
+  }
+
+  return headersArg;
 }
 
 async function writeInnerResponse(
@@ -234,6 +463,25 @@ async function writeInnerResponse(
     );
   const effectivePrefix = handlerRenderedDocument ? undefined : prefix;
   const headers = mergeResponseHeaders(effectivePrefix?.headers, innerRes.headers);
+  // The same HTTP field must not be forwarded twice. On a shared-cache MISS, Next's generated
+  // app-page template appends the freshly captured cache-entry headers onto a response whose
+  // streaming render already set them (React's onHeaders `link` preload budget being the
+  // observable victim: the loopback response carries two identical `link` fields, which Node
+  // folds into one comma-joined value of double the length — blowing the app's configured
+  // reactMaxHeadersLength budget at the client). Collapse EXACT-duplicate repeats using the
+  // raw (unfolded) header list; distinct values and set-cookie are never touched.
+  const rawHeaders = innerRes.rawHeaders ?? [];
+  const seenRawValues = new Map<string, string[]>();
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const name = rawHeaders[i]!.toLowerCase();
+    const values = seenRawValues.get(name) ?? [];
+    values.push(rawHeaders[i + 1]!);
+    seenRawValues.set(name, values);
+  }
+  for (const [name, values] of seenRawValues) {
+    if (name === "set-cookie" || values.length < 2) continue;
+    if (values.every((v) => v === values[0])) headers[name] = values[0]!;
+  }
   // Next uses this header to transport cache tags between its entrypoint and incremental cache.
   // It is internal bookkeeping, can expose route/tag structure, and `next start` removes it before
   // the public response. The adapter owns that server boundary, so never forward it to clients.
@@ -245,7 +493,22 @@ async function writeInnerResponse(
   // incremental responses. In adapter deploy mode the platform cache owns ISR,
   // while the browser-facing response must always revalidate. Next marks this
   // response class explicitly, so avoid altering SSR, APIs, or user headers.
-  if (normalizePrerenderCacheControl || headers["x-nextjs-cache"] !== undefined) {
+  // `x-nextjs-prerender` marks the same class: a cache-miss render of a prerenderable
+  // route carries it WITHOUT `x-nextjs-cache`, and its `cache-control: s-maxage=31536000`
+  // previously passed through untagged — Cloud CDN stored it for a year and tag-based
+  // cutover invalidation could never purge it (M13 stale-apex incident, stamping side).
+  // Only CDN-storable directives are rewritten: a prerender-marked response the entry
+  // already declared uncacheable (PPR documents are `private, no-cache, no-store`) keeps
+  // that stricter verdict — this guard exists to stop long-lived leaks, not to loosen.
+  const innerCacheControl = String(headers["cache-control"] ?? "");
+  const prerenderLeaksCacheable =
+    headers["x-nextjs-prerender"] !== undefined &&
+    !/\b(?:no-store|no-cache|private)\b/i.test(innerCacheControl);
+  if (
+    normalizePrerenderCacheControl ||
+    headers["x-nextjs-cache"] !== undefined ||
+    prerenderLeaksCacheable
+  ) {
     headers["cache-control"] = "public, max-age=0, must-revalidate";
     delete headers["cache-tag"];
   }
@@ -317,6 +580,7 @@ async function invokeLocalHandlerOverHttp({
   invocationPath,
   routeParamPathname,
   invocationQuery,
+  mergeInvocationQueryIntoUrl = false,
   responsePrefix,
   invocationHeaders,
   discardResponse,
@@ -344,6 +608,10 @@ async function invokeLocalHandlerOverHttp({
   routeParamPathname?: string;
   /** Query resolved by @next/routing, excluding internal capture placeholders. */
   invocationQuery?: Record<string, string | string[]>;
+  /** App ROUTE handlers only: fold the rewrite's invocation query onto the PUBLIC request URL.
+   * `NextRequestAdapter.fromNodeNextRequest` builds `request.nextUrl` purely from the request
+   * URL, so this is the only channel a route handler has for rewrite-added search params. */
+  mergeInvocationQueryIntoUrl?: boolean;
   /** Build-time PPR shell prepended to the handler's resumed render stream. */
   responsePrefix?: {
     filePath: string;
@@ -410,9 +678,13 @@ async function invokeLocalHandlerOverHttp({
             ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
               NEXT_REQUEST_META
             ] as { postponed?: string } | undefined) ?? {};
+          // The scheme must come from the validated x-forwarded-proto witness: TLS terminates
+          // at the load balancer, so hardcoding `http://` here made every absolute redirect a
+          // generated App Route entry derives from request.url/nextUrl (initURL below) escape
+          // to `http://` on an https deployment (live 307 form-redirect regression).
           const publicRequestUrl = new URL(
             req.url ?? "/",
-            `http://${req.headers.host ?? "localhost"}`,
+            `${requestProtocol(req)}://${req.headers.host ?? "localhost"}`,
           );
           const publicRequestPathname = publicRequestUrl.pathname;
           const concreteInvocationPath = invocationPath
@@ -447,16 +719,10 @@ async function invokeLocalHandlerOverHttp({
           }
           if (invocationPath) {
             const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
-            const query: Record<string, string | string[]> = {};
-            for (const [key, value] of target.searchParams) {
-              const previous = query[key];
-              query[key] =
-                previous === undefined
-                  ? value
-                  : Array.isArray(previous)
-                    ? [...previous, value]
-                    : [previous, value];
-            }
+            // Shared with both resolvers (routing-common.ts) — this was a byte-identical
+            // third copy of the repeated-key accumulation, the same duplication class that
+            // let Phase 2's output resolution drift from Phase 1's.
+            const query = queryFromUrl(target);
             invocationMeta = {
               ...invocationMeta,
               query: invocationQuery ?? query,
@@ -527,21 +793,48 @@ async function invokeLocalHandlerOverHttp({
 
       const reqHeaders = toNodeHeaders(req);
       Object.assign(reqHeaders, invocationHeaders);
-      // We forward a fixed-length buffered body, so drop any transfer-encoding the
-      // original request carried (e.g. `chunked`). Node's HTTP parser rejects a request
-      // that has BOTH transfer-encoding and content-length, yielding a spurious 400
-      // before the handler runs. Delete case-insensitively.
-      for (const key of Object.keys(reqHeaders)) {
-        if (key.toLowerCase() === "transfer-encoding") {
-          delete reqHeaders[key];
+      // We forward a fixed-length buffered body (or none), so restate the framing:
+      // Node's HTTP parser rejects a request carrying BOTH transfer-encoding and
+      // content-length (spurious 400 before the handler runs), and a forged
+      // content-length with no body (e.g. `Content-Length: 100` on a GET) makes the
+      // loopback server await bytes that never arrive — hanging the invocation until
+      // the 300s requestTimeout, an unauthenticated resource pin.
+      restateFramingHeaders(reqHeaders, bufferedBody, req.method, true);
+
+      // The loopback request URL is the PUBLIC request URL, verbatim. This mirrors Next's own
+      // boundary into a generated entrypoint: `BaseServer.renderToResponseWithComponentsImpl`
+      // sets `request.url = initURL.pathname + initURL.search` — the URL the CLIENT asked for,
+      // reconstructed from requestMeta.initURL — immediately before calling the entry, and
+      // carries the rewrite target only through requestMeta (`query`, `params`, and the
+      // `resolvedPathname`/`rewrittenPathname` the entry recomputes). Passing the rewrite
+      // DESTINATION here instead leaked it into everything user code sees, because generated
+      // entries derive `req.url`/`request.nextUrl`/`resolvedAsPath` from
+      // `new URL(innerReq.url, initURL)`: `/blog-post-2` (rewritten to
+      // `/blog/post-2?hello=world`) rendered `req.url` and `router.asPath` as
+      // `/blog/post-2?hello=world`, `/rewrite-source/foo` as `/rewrite-target?path=foo`, and
+      // `usePathname()` on a rewritten App page returned the destination. Empirically pinned
+      // against `next start` (Next 16.2.10, upstream getserversideprops/getinitialprops/
+      // app-dir-hooks fixtures): the public URL is `req.url`/`asPath`/`usePathname`, while the
+      // destination surfaces only as `resolvedUrl` and as merged `query`/`params`.
+      let loopbackPath = req.url ?? "/";
+      if (mergeInvocationQueryIntoUrl && invocationPath && invocationQuery) {
+        // App ROUTE (route.ts) entries are the single exception: their request has no
+        // requestMeta channel for search params (NextRequestAdapter reads the URL only), so a
+        // rewrite-added query has nowhere else to travel. Fold it onto the PUBLIC pathname —
+        // the identical treatment the edge App Route path in this file already applies. This is
+        // a deliberate, bounded divergence from `next start` (which drops these params); route
+        // handlers expose no asPath/usePathname/resolvedUrl, so nothing observable regresses.
+        const queryStart = loopbackPath.indexOf("?");
+        const rawPath = queryStart === -1 ? loopbackPath : loopbackPath.slice(0, queryStart);
+        const params = new URLSearchParams(
+          queryStart === -1 ? "" : loopbackPath.slice(queryStart + 1),
+        );
+        for (const [key, value] of Object.entries(invocationQuery)) {
+          params.delete(key);
+          for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
         }
-      }
-      // Ensure content-length matches the buffered body (the original stream is consumed)
-      if (bufferedBody) {
-        reqHeaders["content-length"] = String(bufferedBody.length);
-      } else if (req.method !== "GET" && req.method !== "HEAD") {
-        // Body was consumed but no buffer — send empty body
-        reqHeaders["content-length"] = "0";
+        const search = params.toString();
+        loopbackPath = search ? `${rawPath}?${search}` : rawPath;
       }
 
       const clientReq = httpRequest(
@@ -549,7 +842,7 @@ async function invokeLocalHandlerOverHttp({
           hostname: "127.0.0.1",
           port: address.port,
           method: req.method,
-          path: req.url,
+          path: loopbackPath,
           headers: reqHeaders,
         },
         (clientRes) => {
@@ -594,6 +887,17 @@ async function invokeLocalHandlerOverHttp({
       clientReq.once("error", (error) => {
         server.close(() => reject(error));
       });
+
+      // If the outer client goes away while the handler is still computing, cancel the
+      // loopback request instead of letting the invocation run to completion into a
+      // dead socket. Skipped for discardResponse: that invocation is deliberately
+      // detached background work (E2E PPR shell fill) that shares the outer res
+      // object and must outlive the client response.
+      if (!discardResponse) {
+        abortOnClientClose(res, () =>
+          clientReq.destroy(new Error("client disconnected during handler invocation")),
+        );
+      }
 
       if (bufferedBody && bufferedBody.length > 0) {
         clientReq.end(bufferedBody);
@@ -840,13 +1144,6 @@ async function serveNotFound(
   }
 }
 
-function sanitizeK8sName(name: string): string {
-  let sanitized = name.toLowerCase().replace(/[^a-z0-9]/g, "-");
-  if (!/^[a-z]/.test(sanitized)) sanitized = `b-${sanitized}`;
-  sanitized = sanitized.replace(/-+$/, "");
-  return sanitized.slice(0, 63);
-}
-
 // Edge route runner: uses Next.js's edge sandbox to execute edge-compiled route handlers.
 // Returns a web Response which we convert back to Node's ServerResponse.
 type EdgeRouteRunner = (params: {
@@ -874,6 +1171,13 @@ export interface DispatcherOptions {
       tags?: string[];
     }
   >;
+  /** N16: PPR-capable route templates with no build-emitted fallback shell (`fallback: null`),
+   * each tagged with the unresolved ROOT params that stopped the build from emitting one. See the
+   * RoutingManifest doc comment in types.ts — only the root-param flavour runs NON-minimal; the
+   * rest merely need to be recognized as PPR so N13 leaves them alone.
+   * `| undefined` is explicit: under exactOptionalPropertyTypes the index.ts wiring passes
+   * `routingManifest.pprCapableRoutes` straight through, and older manifests have no such key. */
+  pprCapableRoutes?: Record<string, { rootParams: string[] }> | undefined;
   /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
    * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
@@ -886,9 +1190,15 @@ export interface DispatcherOptions {
   outputIds?: string[];
   /** Dynamic routes with fallback:false / dynamicParams:false — a matching path
    * not in prerenderedPaths must 404 (mirrors `next start`). */
-  strictDynamicRoutes?: { pageRegex: RegExp; dataRegex?: RegExp | undefined }[];
+  strictDynamicRoutes?: { pageRegex: RegExp }[];
   prerenderedPaths?: Set<string>;
   buildIdForData?: string;
+  /** Build timestamp (ISO) from the routing manifest — anchors the ISR seed-freshness
+   * window to build time rather than pod start. Absent in older manifests → pod start. */
+  builtAt?: string | undefined;
+  /** Bounded wait for proxied upstreams (external rewrite / cross-pool). Defaults to
+   * PROXY_TIMEOUT_MS; injectable so tests don't wait out the real budget. */
+  proxyTimeoutMs?: number | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
@@ -924,6 +1234,7 @@ export function createDispatcher(options: DispatcherOptions) {
     localHandlerInvoker = invokeLocalHandlerOverHttp,
     edgeRouteRunner = null,
     pprRoutes = {},
+    pprCapableRoutes: pprCapableRouteMap = {},
     rscConfig,
     outputIds = [],
     strictDynamicRoutes = [],
@@ -937,10 +1248,46 @@ export function createDispatcher(options: DispatcherOptions) {
     revalidate,
     basePath = "",
     i18nLocales = [],
+    builtAt,
+    proxyTimeoutMs = PROXY_TIMEOUT_MS,
   } = options;
 
-  const deployedAt = Date.now();
+  // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
+  // (re)started long after the build must not re-serve a stale seed as "fresh" for
+  // another full revalidate window. Older manifests carry no builtAt — fall back to
+  // pod start (the previous behavior). A garbage timestamp parses to NaN → same fallback.
+  const builtAtMs = builtAt ? Date.parse(builtAt) : Number.NaN;
+  const deployedAt = Number.isFinite(builtAtMs) ? builtAtMs : Date.now();
   const entrypointOwnsPprCache = incrementalCacheShared || entrypointOwnsPprShell;
+  // N16: every shell-less PPR template (used only to recognize the route as PPR), and the
+  // root-param subset that must actually run NON-minimal. Splitting these was the fix for
+  // app-dir/fallback-shells: treating ALL shell-less PPR templates as non-minimal made Next
+  // resume a fallback shell for `without-suspense`/`without-io` routes, which upstream renders
+  // dynamically (it answered `x-nextjs-postponed: 1` and a build-time root layout).
+  const pprCapableRoutes = new Set(Object.keys(pprCapableRouteMap));
+  const pprRootParamRoutes = new Set(
+    Object.entries(pprCapableRouteMap)
+      .filter(([, entry]) => (entry.rootParams?.length ?? 0) > 0)
+      .map(([route]) => route),
+  );
+  // N13, NEXT_ENABLE_ADAPTER-only (emulatePlatformCache): dynamic-route templates that own
+  // at least one BUILD-TIME prerender (generateStaticParams) — the SSG/ISR app routes whose
+  // concrete instances a real platform cache would materialize. The harness has no platform
+  // cache, so those requests must run NON-minimal and let Next's own filesystem incremental
+  // cache own them and report x-nextjs-cache MISS/STALE/HIT like `next start`. Precomputed
+  // once; only the membership test runs per request.
+  const emulatedSsgTemplates = emulatePlatformCache
+    ? new Set(
+        staticAssets
+          .filter((asset) => asset.prerender && !asset.ppr)
+          .flatMap((asset) => templateOutputCandidates(asset.pathname, outputIds)),
+      )
+    : new Set<string>();
+  // NEXT_ENABLE_ADAPTER-only bookkeeping (unreachable in production — the add site is
+  // gated on emulatePlatformCache): one shell-served marker per concrete URL. Cap it so
+  // a long-lived harness pod crawling many URLs can't grow it without bound. Eviction
+  // only means the harness re-serves a build shell for that URL; production never sees it.
+  const MAX_SERVED_FALLBACK_SHELLS = 10_000;
   const servedFallbackShells = new Set<string>();
 
   // Pages entrypoints call requestMeta.render404 when getStaticProps/getServerSideProps returns
@@ -1087,7 +1434,9 @@ export function createDispatcher(options: DispatcherOptions) {
       // Pages Router uses this response header to interpret middleware data-request
       // preflights and retain the matched route template. Next's router-server sets
       // it for both static and dynamic data routes.
-      const requestPathname = req.url ? new URL(req.url, "http://localhost").pathname : "";
+      // N10: requestTargetPathname, not `new URL(target, base)` — a `//…` target would
+      // otherwise throw (bare `//`) or be misread as an authority. See routing-common.
+      const requestPathname = req.url ? requestTargetPathname(req.url) : "";
       const isPagesDataRequest = requestPathname.startsWith(`${basePath}/_next/data/`);
       if (resolution.kind === "route" && isPagesDataRequest) {
         const publicMatchedPathname = stripBasePath(resolution.matchedPathname, basePath);
@@ -1107,42 +1456,15 @@ export function createDispatcher(options: DispatcherOptions) {
         const resolvedHeaders = resolution.resolvedHeaders;
         const origWriteHead = res.writeHead.bind(res);
         (res as any).writeHead = (status: number, ...args: any[]) => {
-          // writeHead(status, headers) or writeHead(status, msg, headers)
+          // writeHead(status, headers) or writeHead(status, msg, headers). The headers
+          // argument may be an object OR an array (tuple/flat) — the merge helper
+          // handles every shape Node accepts.
           const headersArgIdx = typeof args[0] === "string" ? 1 : 0;
-          const handlerHeaders = args[headersArgIdx] as
-            | Record<string, string | string[]>
-            | undefined;
-
-          if (handlerHeaders) {
-            for (const [key, value] of resolvedHeaders.entries()) {
-              if (key.toLowerCase() === "set-cookie") {
-                const existingKey = Object.keys(handlerHeaders).find(
-                  (name) => name.toLowerCase() === "set-cookie",
-                );
-                const existing = existingKey ? handlerHeaders[existingKey] : undefined;
-                const arr: string[] = [];
-                if (existing) {
-                  if (Array.isArray(existing)) arr.push(...existing);
-                  else arr.push(existing);
-                }
-                for (const c of value.split(/,(?=[^;]*=)/)) {
-                  arr.push(c.trim());
-                }
-                if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
-                handlerHeaders["set-cookie"] = arr;
-              } else {
-                // next.config headers() and explicit middleware response headers are the final
-                // public response policy in Next's router-server. Adapter defaults (including
-                // static/public cache-control) must not silently replace that app-owned value.
-                // Compare case-insensitively because Node and Web Headers normalize differently.
-                for (const existingKey of Object.keys(handlerHeaders)) {
-                  if (existingKey.toLowerCase() === key.toLowerCase()) {
-                    delete handlerHeaders[existingKey];
-                  }
-                }
-                handlerHeaders[key] = value;
-              }
-            }
+          if (args[headersArgIdx] !== undefined && args[headersArgIdx] !== null) {
+            args[headersArgIdx] = mergeResolvedHeadersIntoHeadersArg(
+              resolvedHeaders,
+              args[headersArgIdx],
+            );
           }
           return origWriteHead(status, ...args);
         };
@@ -1188,14 +1510,20 @@ export function createDispatcher(options: DispatcherOptions) {
         isPagesDataRequest &&
         req.headers["x-middleware-prefetch"]
       ) {
-        const rewrittenDataPath = resolution.resolvedHeaders?.get("x-nextjs-rewrite");
-        const dataPagePath = pagesDataPathToPagePath(
-          rewrittenDataPath
-            ? new URL(rewrittenDataPath, "http://localhost").pathname
-            : requestPathname,
-          basePath,
-          buildIdForData || buildId,
-        );
+        // N12: `x-nextjs-rewrite` carries the PUBLIC page path of the rewrite destination
+        // (`next start` parity — see pagesRewriteSignalPath in resolve.ts). Accept the
+        // legacy `/_next/data/<buildId>/….json` form too: parse a data URL when it is
+        // one, otherwise treat the path itself as the page path — otherwise every
+        // prefetch would bail even when the rewrite target IS prerendered.
+        const rewrittenTarget = resolution.resolvedHeaders?.get("x-nextjs-rewrite");
+        const rewrittenPathname = rewrittenTarget
+          ? new URL(rewrittenTarget, "http://localhost").pathname
+          : undefined;
+        const dataPagePath =
+          rewrittenPathname !== undefined
+            ? (pagesDataPathToPagePath(rewrittenPathname, basePath, buildIdForData || buildId) ??
+              rewrittenPathname)
+            : pagesDataPathToPagePath(requestPathname, basePath, buildIdForData || buildId);
         const isPrerendered =
           dataPagePath !== null &&
           staticAssets.some(
@@ -1245,11 +1573,15 @@ export function createDispatcher(options: DispatcherOptions) {
         const isReadMethod = req.method === "GET" || req.method === "HEAD";
         const isPreviewRequest = (req.headers.cookie ?? "").includes("__prerender_bypass=");
         // Handler-less prerenders (pages SSG emits no function) are served from
-        // the manifest file for ANY method — upstream serves SSG pages on POST
-        // too — but only when this pool owns the route; a wrong-pool guess must
-        // fall through so proxyToPool can recover (PPR shells especially must
-        // not be served incomplete by a non-owning pool). Build assets and
-        // public/ files stay GET/HEAD-only: upstream 404s writes to them.
+        // the manifest file for GET/HEAD only. A POST to a fully-static page 405s
+        // below — that IS upstream behavior: `next start` answers non-GET/HEAD on a
+        // static Pages prerender with 405 + `Allow: GET, HEAD` (verified against the
+        // Next 16.2 renderToResponse path; the "upstream serves SSG on POST too" note
+        // that used to live here was wrong). The serve itself stays restricted to
+        // this pool's own routes; a wrong-pool guess must fall through so proxyToPool
+        // can recover (PPR shells especially must not be served incomplete by a
+        // non-owning pool). Build assets and public/ files stay GET/HEAD-only too:
+        // upstream 404s writes to them.
         const serveHandlerlessPrerender =
           staticAsset?.prerender && !hasHandler && resolution.pool === poolName;
         // A concrete non-PPR prerender under a dynamic template is the initial response-cache
@@ -1390,6 +1722,10 @@ export function createDispatcher(options: DispatcherOptions) {
               // per concrete URL; after the data request materializes the page, later documents
               // invoke Next's filesystem-cache stand-in. The explicit index.ts gate makes this
               // process-local marker unreachable in production.
+              if (servedFallbackShells.size >= MAX_SERVED_FALLBACK_SHELLS) {
+                const oldest = servedFallbackShells.values().next().value;
+                if (oldest !== undefined) servedFallbackShells.delete(oldest);
+              }
               servedFallbackShells.add(requestPathname);
             }
             const content = readFileSync(fullPath);
@@ -1410,7 +1746,11 @@ export function createDispatcher(options: DispatcherOptions) {
               },
               assetHeaders || {},
             );
-            if (req.headers.rsc === "1") {
+            // Use the CONFIGURED RSC negotiation header (usually "rsc") — the isRSC
+            // check at the top of this section already does; hardcoding "rsc" here
+            // would skip Vary augmentation for apps with a custom RSC header name.
+            const rscRequestHeader = rscConfig?.header ?? "rsc";
+            if (req.headers[rscRequestHeader] === "1") {
               const varyKey = Object.keys(headers).find((name) => name.toLowerCase() === "vary");
               const existingVary = varyKey ? headers[varyKey] : undefined;
               const varyTokens = new Set(
@@ -1423,7 +1763,7 @@ export function createDispatcher(options: DispatcherOptions) {
               // Next's router-server normally adds these fields above static serving; a direct
               // adapter entrypoint has no such layer, so lock the protocol at this boundary.
               for (const token of [
-                "rsc",
+                rscRequestHeader,
                 "next-router-state-tree",
                 "next-router-prefetch",
                 "next-router-segment-prefetch",
@@ -1455,9 +1795,12 @@ export function createDispatcher(options: DispatcherOptions) {
               // to build-time seeds and fallback shells, which bypass the entrypoint entirely.
               // This is production behavior, not an E2E-only environment-variable exception.
               headers["cache-control"] = "public, max-age=0, must-revalidate";
-              delete headers["cache-tag"];
+              deleteHeaderCaseInsensitive(headers, "cache-tag");
             }
-            delete headers["x-next-cache-tags"];
+            // Manifest headers preserve build-time casing (e.g. `X-Next-Cache-Tags`,
+            // `Cache-Tag`) — a literal lowercase delete leaks the internal header to
+            // clients whenever the build cased it differently.
+            deleteHeaderCaseInsensitive(headers, "x-next-cache-tags");
             // Stamp the CDN cache tag from the EFFECTIVE cache-control (after assetHeaders
             // may have overridden it), and apply it last so it can't itself be overridden.
             // Mutable static (SSG HTML / public files) → tagged; immutable/max-age=0 → not.
@@ -1494,18 +1837,15 @@ export function createDispatcher(options: DispatcherOptions) {
           const location = resolution.resolvedHeaders?.has("location")
             ? middlewareRedirectLocation(req, resolution.url)
             : resolution.url.toString();
-          if (req.headers.rsc === "1") {
-            // App Router flight requests cannot follow an HTTP redirect as an RSC payload. Next's
-            // router-server converts it to a successful response carrying the internal redirect
-            // field; the client router performs the navigation without a CORS/document fallback.
-            delete headers["location"];
-            headers["x-nextjs-redirect"] = location;
-            res.writeHead(200, headers);
-          } else {
-            headers["location"] = location;
-            res.writeHead(resolution.status, headers);
-          }
-          res.end();
+          // N15: no RSC special-case — `next start` answers RSC redirects with the real 3xx and
+          // the App Router flight client follows it (fetch-server-response.ts reads
+          // response.redirected). `x-nextjs-redirect` is a PAGES-router protocol (written under
+          // isNextDataRequest, read by shared/lib/router/router.ts); emitting it for App Router
+          // stranded the flight client, which then fell back to a document load.
+          headers["location"] = location;
+          if (resolution.status === 308) headers["Refresh"] = `0;url=${location}`;
+          res.writeHead(resolution.status, headers);
+          res.end(req.method === "HEAD" ? undefined : location);
           return;
         }
 
@@ -1540,26 +1880,49 @@ export function createDispatcher(options: DispatcherOptions) {
               }
             )[NEXT_REQUEST_META]?.actionBody;
 
+            // Hop-by-hop headers (and anything the client's Connection header
+            // nominated) describe the client↔pool connection — strip them before
+            // forwarding; Node sets its own connection semantics on this request.
+            // Then the same forged-framing guard as the loopback invocation: a
+            // client-declared content-length with no body would make the upstream
+            // await bytes that never arrive (hang until its own timeout).
+            const forwardHeaders: Record<string, string | string[] | undefined> = {
+              ...stripRequestHopByHopHeaders(req.headers),
+              host: target.host,
+            };
+            restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);
+
             const proxyReq = proxyMod.request(
               {
                 hostname: target.hostname,
                 port: target.port || (target.protocol === "https:" ? 443 : 80),
                 path: target.pathname + target.search,
                 method: req.method,
-                headers: {
-                  ...req.headers,
-                  host: target.host,
-                },
+                headers: forwardHeaders,
+                timeout: proxyTimeoutMs,
               },
               (proxyRes) => {
-                res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+                res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
                 // pipeline handles errors on either end (e.g. client disconnect) and
                 // cleans up both streams, unlike a bare .pipe().
                 pipeline(proxyRes, res, () => resolve());
               },
             );
 
+            proxyReq.on("timeout", () => {
+              proxyReq.destroy(new Error(`external rewrite to ${target.origin} timed out`));
+            });
+
             proxyReq.on("error", (err) => {
+              // A client abort is our own deliberate teardown, not an upstream failure —
+              // log it at info level and skip the 502 (the client is gone anyway).
+              if (err instanceof ClientAbortError) {
+                console.log(
+                  `[pool-server] external rewrite to ${target.origin}${target.pathname} aborted: client disconnected`,
+                );
+                resolve();
+                return;
+              }
               // The dial error stays in the server log — the client body must not leak
               // upstream error detail (connection failures reveal internal topology/targets).
               console.error(
@@ -1572,6 +1935,10 @@ export function createDispatcher(options: DispatcherOptions) {
               }
               resolve();
             });
+
+            // Client disconnected before the upstream answered — cancel the upstream
+            // request rather than letting it run to completion into a dead socket.
+            abortOnClientClose(res, () => proxyReq.destroy(new ClientAbortError()));
 
             if (bufferedBody && bufferedBody.length > 0) {
               proxyReq.end(bufferedBody);
@@ -1625,10 +1992,27 @@ export function createDispatcher(options: DispatcherOptions) {
               // Keep the encoded value; malformed escapes will simply fail the
               // prerender-manifest membership check below.
             }
+            // i18n requests arrive locale-prefixed (/en/blog/x — including data URLs
+            // converted above), while the strict-route regexes and prerendered set are
+            // unprefixed. Strip the prefix so a locale-prefixed request for a
+            // non-generated path still hits the fallback:false 404 instead of sailing
+            // past the regex and rendering a path the app declared must not exist.
+            if (i18nLocales.length > 0) {
+              const firstSegment = pagePath.split("/", 2)[1]?.toLowerCase();
+              if (firstSegment && i18nLocales.some((l) => l.toLowerCase() === firstSegment)) {
+                pagePath = pagePath.slice(firstSegment.length + 1) || "/";
+              }
+            }
             const isBypass = isVerifiedPreviewRequest(req);
             if (
               !isBypass &&
-              !prerenderedPaths.has(pagePath) &&
+              // N11: with `trailingSlash: true` the request path carries a slash while
+              // prerender-manifest routes are keyed WITHOUT one — comparing the raw path
+              // made every fallback:false prerender 404 (upstream normalizes the slash
+              // before this membership test). Reached whenever the concrete seed isn't
+              // served, i.e. the harness always AND production once a revalidate window
+              // expires, so this was a live 404 for trailingSlash+fallback:false apps.
+              !trailingSlashVariants(pagePath).some((variant) => prerenderedPaths.has(variant)) &&
               strictDynamicRoutes.some((r) => r.pageRegex.test(pagePath))
             ) {
               await serveNotFound(
@@ -1677,7 +2061,15 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // If this output belongs to another pool, proxy the request
           if (resolution.pool !== poolName && !handlerLoader.has(handlerPathname)) {
-            return proxyToPool(req, res, resolution, releaseName, buildId, internalSecret);
+            return proxyToPool(
+              req,
+              res,
+              resolution,
+              releaseName,
+              buildId,
+              internalSecret,
+              proxyTimeoutMs,
+            );
           }
 
           // If no handler exists for this output, fall through to 404
@@ -1829,6 +2221,13 @@ export function createDispatcher(options: DispatcherOptions) {
               if (!res.headersSent) {
                 res.writeHead(500, { "content-type": "text/plain" });
                 res.end("Internal Server Error");
+              } else if (!res.writableEnded) {
+                // The edge stream threw AFTER writeHead — a clean 500 is impossible,
+                // but leaving the response open hangs the client until the server-wide
+                // timeout. Terminate it instead (mirrors the loopback handler's
+                // fail-safe mid-stream behavior).
+                if (typeof res.destroy === "function") res.destroy();
+                else res.end();
               }
             }
             return;
@@ -1857,6 +2256,24 @@ export function createDispatcher(options: DispatcherOptions) {
           ]
             .map((candidate) => pprRoutes[candidate])
             .find((candidate) => candidate !== undefined);
+          // N16: PPR-capable without a build-emitted shell (`fallback: null`). Same candidate
+          // ladder as handlerPprInfo — an RSC request's output id carries the `.rsc` suffix, so
+          // the base route must be recovered before the lookup (LOAD-BEARING: without the
+          // rscParentCandidates rungs the document request was fixed but the flight request
+          // still truncated). `handlerPprCapable` only says "this route is PPR" (it keeps N13
+          // off); `handlerPprRootParams` is the narrower signal that flips minimal mode.
+          const pprCapableCandidates = [
+            resolution.matchedPathname,
+            handlerPathname,
+            ...rscParentCandidates(resolution.matchedPathname, rscConfig),
+            ...rscParentCandidates(handlerPathname, rscConfig),
+          ];
+          const handlerPprCapable = pprCapableCandidates.some((candidate) =>
+            pprCapableRoutes.has(candidate),
+          );
+          const handlerPprRootParams = pprCapableCandidates.some((candidate) =>
+            pprRootParamRoutes.has(candidate),
+          );
           // A concrete non-PPR prerender under a PPR-capable dynamic handler is a blocking/static
           // branch of that route, not permission to reuse the handler template's generic shell.
           // Falling through to the generic postponed state leaks build-time layouts into requests
@@ -1940,9 +2357,25 @@ export function createDispatcher(options: DispatcherOptions) {
             // NEXT_ENABLE_ADAPTER filesystem-cache harness; it does not alter req.url or caching.
             ...(resolution.matchedPathname !== handlerPathname &&
             !resolution.matchedPathname.includes("[")
-              ? { routeParamPathname: resolution.matchedPathname }
+              ? {
+                  // N9: align the locale prefix with the chosen template first — see
+                  // localeAlignedRouteParamPathname. Handing `/en-US` to `/[[...slug]]`
+                  // made the locale itself the first catch-all param.
+                  routeParamPathname: localeAlignedRouteParamPathname(
+                    resolution.matchedPathname,
+                    handlerPathname,
+                    i18nLocales,
+                  ),
+                }
               : {}),
             ...(resolution.invocationQuery ? { invocationQuery: resolution.invocationQuery } : {}),
+            // App ROUTE handlers read search params from the request URL only — there is no
+            // requestMeta channel for them (see mergeInvocationQueryIntoUrl). Every other entry
+            // kind receives the rewrite query through requestMeta.query and must keep the public
+            // URL byte-exact so req.url / router.asPath / usePathname match `next start`.
+            ...(handlerOutputInfo?.type === "APP_ROUTE"
+              ? { mergeInvocationQueryIntoUrl: true }
+              : {}),
             ...(i18nLocales.length > 0 ? { i18nLocales } : {}),
             ...(pprResponsePrefix ? { responsePrefix: pprResponsePrefix } : {}),
             ...(pprInvocationHeaders ? { invocationHeaders: pprInvocationHeaders } : {}),
@@ -1956,9 +2389,50 @@ export function createDispatcher(options: DispatcherOptions) {
             // Use handler capability rather than `manifestPprInfo` here. A concrete document can
             // intentionally suppress build-token injection while a dynamic RSC request for the
             // same PPR-capable handler still needs Next's local cache to recover its RDC.
+            // PPR routes when a classic incremental cacheHandler is registered
+            // (incrementalCacheShared — production Valkey) must ALSO run non-minimal: minimal
+            // mode makes the entrypoint answer a document request with the bare postponed shell
+            // plus `x-nextjs-postponed: 1` and expects the PLATFORM to run the resume dance —
+            // which this adapter does not implement for the entry-owned shell (the build-token
+            // injection above is deliberately gated off when the entry owns the shell). Every
+            // PPR document was therefore served as an unfinished shell (dynamic holes never
+            // streamed) on live. Non-minimal mode lets Next itself do the shell lookup +
+            // resume join against the SHARED Valkey-backed incremental cache — the same
+            // ownership model the entrypointOwnsPprShell harness case uses with its
+            // filesystem cache, and cross-replica correct because revalidateTag writes
+            // through the same registered handler.
             minimalMode: !(
-              (entrypointOwnsPprShell && !!handlerPprInfo) ||
-              (emulatePlatformCache && !!dispatchStaticAsset?.prerender && !dispatchStaticAsset.ppr)
+              // N16: a shell-bearing PPR template, or one the build left shell-less because
+              // ROOT params were unresolved. NOT every shell-less PPR template: a route whose
+              // shell was unemittable for any other reason (no Suspense boundary above the
+              // params access) is rendered dynamically by upstream, and running it non-minimal
+              // made Next resume a fallback shell upstream deliberately skips
+              // (app-dir/fallback-shells).
+              (
+                ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                  (!!handlerPprInfo || handlerPprRootParams)) ||
+                (emulatePlatformCache &&
+                  !!dispatchStaticAsset?.prerender &&
+                  !dispatchStaticAsset.ppr) ||
+                // N13: a concrete path served through an SSG/ISR app template has no build
+                // artifact of its own (`/rewrite/not-broken` behind `/rewrite/[slug]`).
+                // Minimal mode makes the entrypoint re-render it every time and emit NO
+                // x-nextjs-cache, so the harness — which stands Next's filesystem cache in
+                // for the platform cache — never observes the MISS→HIT transition
+                // `next start` reports. PPR keeps its own gate above; Pages Router keeps
+                // minimal mode (its fallback-shell emulation owns that lifecycle).
+                // `!handlerPprCapable` as well as `!handlerPprInfo`: a PPR template with no
+                // build shell is still PPR, and `asset.ppr` is only set on outputs that carry a
+                // postponed state, so the concrete `foo` prerender under a PPR `[slug]` looks
+                // exactly like a plain SSG instance here. Without this rung, fallback-shells'
+                // `without-suspense`/`without-io` routes were flipped non-minimal by THIS clause
+                // even after the N16 gate above was narrowed.
+                (emulatePlatformCache &&
+                  !handlerPprInfo &&
+                  !handlerPprCapable &&
+                  handlerOutputInfo?.type === "APP_PAGE" &&
+                  emulatedSsgTemplates.has(handlerPathname))
+              )
             ),
             normalizePrerenderCacheControl:
               !!dispatchStaticAsset?.prerender && handlerOutputInfo?.type === "PAGES",
@@ -1980,37 +2454,90 @@ function proxyToPool(
   releaseName: string,
   buildId: string,
   internalSecret?: string,
+  proxyTimeoutMs: number = PROXY_TIMEOUT_MS,
 ): Promise<void> {
   return new Promise((resolve) => {
     const targetHost = sanitizeK8sName(`${releaseName}-${resolution.pool}-${buildId}`);
+    const bufferedBody = (
+      req as IncomingMessage & {
+        [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+      }
+    )[NEXT_REQUEST_META]?.actionBody;
+
+    // Hop-by-hop headers (and anything the client's Connection header nominated) are
+    // stripped before forwarding — they describe the client↔pool connection, and Node
+    // sets its own connection semantics on the outbound request.
+    const forwardHeaders: Record<string, string | string[] | undefined> = {
+      ...stripRequestHopByHopHeaders(req.headers),
+      "x-output-id": resolution.matchedPathname,
+      "x-matched-pathname": resolution.matchedPathname,
+      "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
+      // Rewrite invocation target (path+query with repeated destination keys restored). The
+      // public req.url is forwarded as-is above — and stays the entrypoint's req.url — so
+      // without these the target pool's dispatch has no rewrite target at all: the handler
+      // would run with the ORIGINAL route's params and the rewrite-added query would be
+      // silently dropped (same wire vocabulary the ext_proc routing service stamps).
+      ...(resolution.invokePath ? { "x-invoke-path": resolution.invokePath } : {}),
+      ...(resolution.invocationQuery
+        ? { "x-invoke-query": JSON.stringify(resolution.invocationQuery) }
+        : {}),
+      // This pool already ran the middleware stage in its Phase-1 resolve before deciding
+      // to proxy; assert it so the target pool trusts the skip instead of re-running
+      // middleware (which would double-apply cookies/redirects). Without this, the target's
+      // x-mw-evaluated gate would fall through to a second evaluation.
+      "x-mw-evaluated": "ran",
+      ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
+    };
+    // Same forged-framing guard as the loopback invocation: the target pool would
+    // otherwise await body bytes that never arrive (hang until requestTimeout).
+    restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);
+    // This pool's Phase-1 routing verdict (next.config headers() + middleware response
+    // headers) is deliberately NOT forwarded in the x-resolved-headers slot: the
+    // resolvedHeaders on this resolution already installed the writeHead merge wrapper
+    // on the OUTER res (dispatch() line above), which applies them to the relayed
+    // response. Forwarding them too made the target pool's dispatcher merge them a
+    // second time — the client received middleware's Set-Cookie twice. The pool that
+    // ran the resolve is the single application point.
+
     const proxyReq = httpRequest(
       {
         hostname: targetHost,
         port: 3000,
         path: req.url,
         method: req.method,
-        headers: {
-          ...req.headers,
-          "x-output-id": resolution.matchedPathname,
-          "x-matched-pathname": resolution.matchedPathname,
-          "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
-          // This pool already ran the middleware stage in its Phase-1 resolve before deciding
-          // to proxy; assert it so the target pool trusts the skip instead of re-running
-          // middleware (which would double-apply cookies/redirects). Without this, the target's
-          // x-mw-evaluated gate would fall through to a second evaluation.
-          "x-mw-evaluated": "ran",
-          ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
-        },
+        headers: forwardHeaders,
+        timeout: proxyTimeoutMs,
       },
       (proxyRes) => {
-        res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+        // The timeout option is an IDLE timeout that stays armed while the response
+        // streams — a cross-pool SSE/streaming response quiet for >proxyTimeoutMs (or
+        // stalled on client backpressure) was destroyed mid-stream, while the same
+        // route served same-pool has no such cap (parity break). Disarm it once
+        // response headers arrive; the cap still bounds connect/headers, and
+        // client-abort propagation plus the server-wide requestTimeout still bound
+        // the streaming phase.
+        proxyReq.setTimeout(0);
+        res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
         // pipeline handles errors on either end (e.g. client disconnect) and cleans up
         // both streams, unlike a bare .pipe().
         pipeline(proxyRes, res, () => resolve());
       },
     );
 
+    proxyReq.on("timeout", () => {
+      proxyReq.destroy(new Error(`cross-pool proxy to pool "${resolution.pool}" timed out`));
+    });
+
     proxyReq.on("error", (err) => {
+      // A client abort is our own deliberate teardown, not a pool failure — log it at
+      // info level and skip the 502 (the client is gone anyway).
+      if (err instanceof ClientAbortError) {
+        console.log(
+          `[pool-server] cross-pool proxy to pool "${resolution.pool}" aborted: client disconnected`,
+        );
+        resolve();
+        return;
+      }
       // Pool name + dial error stay in the server log — the client body must not leak
       // pool topology or internal hostnames.
       console.error(
@@ -2024,16 +2551,17 @@ function proxyToPool(
       resolve();
     });
 
-    const bufferedBody = (
-      req as IncomingMessage & {
-        [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-      }
-    )[NEXT_REQUEST_META]?.actionBody;
+    // Client disconnected before the target pool answered — cancel the upstream request.
+    abortOnClientClose(res, () => proxyReq.destroy(new ClientAbortError()));
 
     if (bufferedBody) {
       proxyReq.end(bufferedBody);
-    } else {
+    } else if (req.method !== "GET" && req.method !== "HEAD") {
+      // GET/HEAD carry no body: piping the raw stream would wait for bytes that
+      // (with a forged content-length) never arrive — hang. End immediately instead.
       pipeline(req, proxyReq, () => undefined);
+    } else {
+      proxyReq.end();
     }
   });
 }

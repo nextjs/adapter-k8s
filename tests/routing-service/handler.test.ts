@@ -1,5 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { create } from "@bufbuild/protobuf";
 import { createRequestHandler } from "../../src/routing-service/handler.js";
+import { createProcessHandler } from "../../src/routing-service/server.js";
+import {
+  ProcessingRequestSchema,
+  CommonResponse_ResponseStatus,
+  type ProcessingRequest,
+  type ProcessingResponse as ProtoProcessingResponse,
+} from "../../src/routing-service/protos/envoy/service/ext_proc/v3/external_processor_pb.js";
 import { mockRouting } from "../helpers/mock-outputs.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
@@ -33,6 +41,7 @@ function makeManifest(overrides: Partial<RoutingManifest> = {}): RoutingManifest
     pathnames: ["/", "/about", "/api/hello"],
     i18n: null,
     buildId: "test123",
+    builtAt: "2026-01-01T00:00:00.000Z",
     basePath: "",
     middleware: null,
     poolAssignments: { "/": "ssr", "/about": "ssr", "/api/hello": "api" },
@@ -121,7 +130,9 @@ describe("createRequestHandler", () => {
     expect(response.immediateResponse!.status!.code).toBe(307);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
     const loc = setHeaders.find((h) => h.header.key === "location");
-    expect(loc!.header.value).toBe("https://app.example.com/login");
+    // N15: same-origin Locations are RELATIVIZED so the edge matches both the pool
+    // (middlewareRedirectLocation) and `next start`, which reports a relative path.
+    expect(loc!.header.value).toBe("/login");
     // And it must NOT fall through to the normal dispatch path.
     expect(response.requestHeaders).toBeUndefined();
   });
@@ -137,7 +148,9 @@ describe("createRequestHandler", () => {
     expect(response.immediateResponse!.status!.code).toBe(308);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
     const loc = setHeaders.find((h) => h.header.key === "location");
-    expect(loc!.header.value).toBe("https://app.example.com/login");
+    expect(loc!.header.value).toBe("/login");
+    // `next start` pairs a 308 with `Refresh: 0;url=<location>` (router-server.ts).
+    expect(setHeaders.find((h) => h.header.key === "Refresh")!.header.value).toBe("0;url=/login");
   });
 
   it("returns 502 for external rewrites", async () => {
@@ -423,6 +436,251 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
   });
 });
 
+describe("createRequestHandler ingress hygiene", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delete process.env.INTERNAL_HEADER_SECRET;
+  });
+
+  it("strips client-spoofed internal dispatch headers before resolveRoutes sees them", async () => {
+    // Egress mutations only overwrite the keys they set — without ingress stripping,
+    // a client-sent x-output-id / x-mw-evaluated would flow into resolveRoutes and
+    // middleware as attacker-controlled input.
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    await handler([
+      ...makeHeaders("/about"),
+      { key: "x-output-id", value: "/../../etc" },
+      { key: "x-matched-pathname", value: "/spoofed" },
+      { key: "x-route-matches", value: "{}" },
+      { key: "x-mw-evaluated", value: "ran" },
+      { key: "x-resolved-headers", value: "{}" },
+      { key: "x-internal-secret", value: "guessed" },
+      { key: "x-upstream-pool", value: "api" },
+      { key: "x-nextjs-ppr", value: "1" },
+    ]);
+
+    const seenHeaders = vi.mocked(resolveRoutes).mock.calls[0]![0].headers as Headers;
+    for (const key of [
+      "x-output-id",
+      "x-matched-pathname",
+      "x-route-matches",
+      "x-mw-evaluated",
+      "x-resolved-headers",
+      "x-internal-secret",
+      "x-upstream-pool",
+      "x-nextjs-ppr",
+    ]) {
+      expect(seenHeaders.get(key), key).toBeNull();
+    }
+    // …while legitimate client headers pass through untouched.
+    expect(seenHeaders.get("host")).toBe("app.example.com");
+  });
+
+  it("never leaks the :path query string into the dispatch fallback pathname", async () => {
+    // resolveRoutes returning nothing -> the fallback must be the PARSED pathname;
+    // the raw :path carries "?query", which would corrupt x-output-id/x-upstream-pool.
+    const manifest = makeManifest({
+      poolAssignments: { "/about": "ssr" },
+      pathnames: ["/about"],
+    });
+    const handler = createRequestHandler(manifest, null);
+    vi.mocked(resolveRoutes).mockResolvedValue({} as any);
+
+    const response = await handler(makeHeaders("/about?x=1"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-output-id")!.header.value).toBe("/about");
+    expect(setHeaders.find((h) => h.header.key === "x-output-id")!.header.value).not.toContain(
+      "x=1",
+    );
+  });
+
+  it("deletes x-nextjs-data for non-data requests (pool resolver parity)", async () => {
+    // The header is a client hint, not proof of the /_next/data protocol — the pool
+    // resolver deletes it for non-data requests (resolve.ts); the edge must match.
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    await handler([...makeHeaders("/about"), { key: "x-nextjs-data", value: "1" }]);
+    const seenHeaders = vi.mocked(resolveRoutes).mock.calls[0]![0].headers as Headers;
+    expect(seenHeaders.get("x-nextjs-data")).toBeNull();
+  });
+
+  it("keeps x-nextjs-data for genuine /_next/data requests", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    await handler([
+      ...makeHeaders("/_next/data/test123/about.json"),
+      { key: "x-nextjs-data", value: "1" },
+    ]);
+    const seenHeaders = vi.mocked(resolveRoutes).mock.calls[0]![0].headers as Headers;
+    expect(seenHeaders.get("x-nextjs-data")).toBe("1");
+  });
+});
+
+describe("createRequestHandler shed signal (timeout wiring)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("aborts the middleware request signal when the per-request budget expires", async () => {
+    // The withTimeout shed (server.ts) rejects the response on timeout; the signal
+    // handed to middleware must abort too, so middleware awaiting a slow upstream is
+    // cancelled instead of racing detached. A never-aborted controller was the bug.
+    let capturedSignal: AbortSignal | undefined;
+    const adapterFn = vi.fn(async ({ request }: any) => {
+      capturedSignal = request.signal;
+      await new Promise<void>((resolve) => {
+        request.signal.addEventListener("abort", () => resolve());
+      });
+      return { response: new Response("ok") };
+    });
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+
+    const handler = createRequestHandler(makeManifest(), middlewareModule, { timeoutMs: 10 });
+    await handler(makeHeaders("/about"));
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal!.aborted).toBe(true);
+  });
+
+  it("aborts Path 3 (direct handler) middleware via the Request signal when the budget expires", async () => {
+    // Path 3 builds a real Request — previously without `signal:`, so middleware on
+    // this path kept running detached after the server-side shed. The three-path
+    // split itself is a hard invariant; only the signal wiring changed.
+    let captured: AbortSignal | undefined;
+    const handlerFn = vi.fn(async (req: Request) => {
+      captured = req.signal;
+      await new Promise<void>((resolve) => req.signal.addEventListener("abort", () => resolve()));
+      return new Response("ok");
+    });
+    // No `default` export → Path 1 skipped; no default.default → Path 2 skipped;
+    // `middleware` export → Path 3 runs.
+    const middlewareModule = { middleware: handlerFn };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+
+    const handler = createRequestHandler(makeManifest(), middlewareModule as any, {
+      timeoutMs: 10,
+    });
+    await handler(makeHeaders("/about"));
+    expect(handlerFn).toHaveBeenCalledTimes(1);
+    expect(captured).toBeDefined();
+    expect(captured!.aborted).toBe(true);
+  });
+
+  it("aborts Path 2 (legacy default.default) middleware via request.signal when the budget expires", async () => {
+    // Next's legacy adapter (dist/server/web/adapter.js) forwards params.request.signal
+    // into the NextRequest init — the shed budget must reach legacy middleware too.
+    let captured: AbortSignal | undefined;
+    const legacyFn = vi.fn(async ({ request }: any) => {
+      captured = request.signal;
+      await new Promise<void>((resolve) =>
+        request.signal.addEventListener("abort", () => resolve()),
+      );
+      return { response: new Response("ok") };
+    });
+    // `default` is an OBJECT (not callable) → Path 1 skipped; default.default → Path 2.
+    const middlewareModule = { default: { default: legacyFn } };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+
+    const handler = createRequestHandler(makeManifest(), middlewareModule as any, {
+      timeoutMs: 10,
+    });
+    await handler(makeHeaders("/about"));
+    expect(legacyFn).toHaveBeenCalledTimes(1);
+    expect(captured).toBeDefined();
+    expect(captured!.aborted).toBe(true);
+  });
+
+  it("does not mint a fresh timeout budget on the trailing-slash retry (same shed signal)", async () => {
+    // The i18n trailing-slash retry recurses into handleRequest while the
+    // server-side withTimeout keeps the ORIGINAL clock — a fresh
+    // AbortSignal.timeout would hand the retried middleware a full new window.
+    const signals: AbortSignal[] = [];
+    const adapterFn = vi.fn(async ({ request }: any) => {
+      signals.push(request.signal);
+      return { response: new Response("ok") };
+    });
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    let call = 0;
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      call++;
+      if (call === 1) {
+        // Pure internal trailing-slash artifact: locale-stripped target == request
+        // path, status 308 → normalizeResolvedRedirect returns kind "retry".
+        return {
+          redirect: { url: new URL("https://app.example.com/en/about"), status: 308 },
+        } as any;
+      }
+      return {
+        resolvedPathname: "/en/about",
+        invocationTarget: { pathname: "/en/about", query: {} },
+      } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+
+    const manifest = makeManifest({
+      i18n: { locales: ["en"], defaultLocale: "en" } as any,
+      poolAssignments: { "/about": "ssr" },
+      pathnames: ["/about"],
+    });
+    const handler = createRequestHandler(manifest, middlewareModule, { timeoutMs: 5000 });
+    await handler(makeHeaders("/about"));
+    expect(signals).toHaveLength(2);
+    // Same signal object across the retry — the budget is shared, not re-minted.
+    expect(signals[1]).toBe(signals[0]);
+  });
+});
+
 describe("createRequestHandler pool lookup (Fix B)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -565,6 +823,71 @@ describe("createRequestHandler middleware matcher + fail-closed (ext_proc parity
     expect(adapterFn).toHaveBeenCalledTimes(1);
   });
 
+  it("runs middleware (never a trusted skip) when the matcher regexp cannot compile", async () => {
+    // CRITICAL: an uncompilable matcher used to be skipped → matchesMiddleware false →
+    // mwEvaluated "skip-nomatch" (a TRUSTED verdict) → the pool skipped its own
+    // middleware too. Fail-safe: treat it as matched, run middleware, stamp "ran".
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapterFn = vi.fn().mockResolvedValue({ response: new Response("ok") });
+      const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+      vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+        await params.invokeMiddleware({
+          url: params.url,
+          headers: params.headers,
+          requestBody: params.requestBody,
+        });
+        return {
+          resolvedPathname: "/about",
+          invocationTarget: { pathname: "/about", query: {} },
+        } as any;
+      });
+      vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+      const manifest = makeManifest({
+        middleware: {
+          filePath: "middleware.js",
+          // Compiles on a Node-24 build machine, not in an older serving runtime —
+          // stand-in here is a regexp invalid everywhere.
+          matchers: [{ regexp: "(?i:handler-level-bad", originalSource: "/x" }],
+        },
+      });
+      const handler = createRequestHandler(manifest, middlewareModule);
+      const response = await handler(makeHeaders("/about"));
+      expect(adapterFn).toHaveBeenCalledTimes(1);
+      const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+      const mw = setHeaders.find((h) => h.header.key === "x-mw-evaluated");
+      expect(mw!.header.value).toBe("ran");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("fails CLOSED with a 500 when a genuine middleware exception occurs while the shed signal is live but unaborted", async () => {
+    // With a timeout budget configured (shedSignal exists but has NOT fired), a real
+    // crash must still take the unconditional fail-closed 500 — the abort-rethrow
+    // classification must not widen to ordinary errors just because a signal is present.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const throwing = vi.fn().mockRejectedValue(new TypeError("boom"));
+      const middlewareModule = { default: throwing, middleware: vi.fn() };
+      vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+        const r = await params.invokeMiddleware({
+          url: params.url,
+          headers: params.headers,
+          requestBody: params.requestBody,
+        });
+        expect(r).toEqual({ bodySent: true });
+        return { middlewareResponded: true } as any;
+      });
+      const manifest = makeManifest({ middleware: { filePath: "middleware.js" } });
+      const handler = createRequestHandler(manifest, middlewareModule, { timeoutMs: 60_000 });
+      const res = (await handler(makeHeaders("/about"))) as any;
+      expect(res.immediateResponse?.status?.code).toBe(500);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
   it("fails CLOSED with a 500 when middleware throws", async () => {
     const throwing = vi.fn().mockRejectedValue(new Error("boom"));
     const middlewareModule = { default: throwing, middleware: vi.fn() };
@@ -583,5 +906,511 @@ describe("createRequestHandler middleware matcher + fail-closed (ext_proc parity
     const res = (await handler(makeHeaders("/about"))) as any;
     // buildImmediateResponse(500,...) — assert the exact status code is carried.
     expect(res.immediateResponse?.status?.code).toBe(500);
+  });
+});
+
+// P2 fix: a shed-abort (the per-request budget expiring while signal-aware middleware
+// is in flight) is NOT a middleware crash. The middleware catch rethrows abort-shaped
+// errors so the rejection crosses resolveRoutes (which awaits invokeMiddleware bare) →
+// handleRequest → createProcessHandler (server.ts), where the configured failOpen
+// policy decides CONTINUE vs 500. Previously the abort was classified as a crash and
+// answered with an unconditional 500, making `failOpen: true` a no-op for the most
+// common timeout shape. Genuine middleware exceptions keep the fail-closed 500.
+describe("createRequestHandler shed-abort → server fail policy (P2)", () => {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  let errSpy: any;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    errSpy.mockRestore();
+  });
+
+  function calloutFor(headers: HeaderValue[]): ProcessingRequest {
+    return create(ProcessingRequestSchema, {
+      request: {
+        case: "requestHeaders",
+        value: {
+          headers: {
+            headers: headers.map((h) => ({ key: h.key, rawValue: enc.encode(h.value ?? "") })),
+          },
+        },
+      },
+    });
+  }
+
+  async function* once<T>(value: T): AsyncGenerator<T> {
+    yield value;
+  }
+
+  async function first(
+    gen: AsyncGenerator<ProtoProcessingResponse>,
+  ): Promise<ProtoProcessingResponse> {
+    for await (const r of gen) return r;
+    throw new Error("stream yielded no response");
+  }
+
+  // Mirrors the real @next/routing resolveRoutes: invokeMiddleware is awaited BARE
+  // (no try/catch — verified against dist/index.js `const L=await i({...})`), so a
+  // rejection from the invoke closure rejects the resolveRoutes promise, which
+  // rejects handleRequest, which is the promise createProcessHandler observes.
+  function propagatingResolveRoutes() {
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return {
+        resolvedPathname: "/about",
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+  }
+
+  // Signal-aware middleware: rejects with the abort reason when the shed fires —
+  // the same shape a signal-respecting fetch()/NextResponse produces.
+  const rejectOnAbort = (signal: AbortSignal) =>
+    new Promise<never>((_, reject) => {
+      if (signal.aborted) return reject(signal.reason);
+      signal.addEventListener("abort", () => reject(signal.reason));
+    });
+
+  const wasLoggedAsMiddlewareCrash = () =>
+    errSpy.mock.calls.some((c: unknown[]) => String(c[0]).includes("Middleware execution failed"));
+
+  it("Path 1 (web adapter): shed-abort + failOpen:true → CONTINUE, not an immediate 500", async () => {
+    propagatingResolveRoutes();
+    const adapterFn = vi.fn(async ({ request }: any) => rejectOnAbort(request.signal));
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    const handler = createRequestHandler(makeManifest(), middlewareModule, { timeoutMs: 10 });
+    const proc = createProcessHandler(handler, true, 0);
+
+    const response = await first(proc(once(calloutFor(makeHeaders("/about")))));
+    expect(response.response.case).toBe("requestHeaders");
+    if (response.response.case !== "requestHeaders") throw new Error("wrong case");
+    expect(response.response.value.response!.status).toBe(CommonResponse_ResponseStatus.CONTINUE);
+    expect(adapterFn).toHaveBeenCalledTimes(1);
+    // ...and it was NOT classified as a middleware crash.
+    expect(wasLoggedAsMiddlewareCrash()).toBe(false);
+  });
+
+  it("Path 1 (web adapter): shed-abort + failOpen:false → the SERVER's policy 500, not the middleware 500", async () => {
+    propagatingResolveRoutes();
+    const adapterFn = vi.fn(async ({ request }: any) => rejectOnAbort(request.signal));
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    const handler = createRequestHandler(makeManifest(), middlewareModule, { timeoutMs: 10 });
+    const proc = createProcessHandler(handler, false, 0);
+
+    const response = await first(proc(once(calloutFor(makeHeaders("/about")))));
+    expect(response.response.case).toBe("immediateResponse");
+    if (response.response.case !== "immediateResponse") throw new Error("wrong case");
+    expect(response.response.value.status!.code).toBe(500);
+    // Distinguish the paths: the server's internalError500 carries the body
+    // "Internal routing error" and no content-type header; the middleware 500
+    // (buildImmediateResponse) sets content-type text/plain and an empty body.
+    expect(dec.decode(response.response.value.body)).toBe("Internal routing error");
+    const ct = (response.response.value.headers?.setHeaders ?? []).find(
+      (h) => h.header!.key === "content-type",
+    );
+    expect(ct).toBeUndefined();
+    expect(wasLoggedAsMiddlewareCrash()).toBe(false);
+  });
+
+  it("Path 3 (direct handler): shed-abort + failOpen:true → CONTINUE", async () => {
+    propagatingResolveRoutes();
+    // No callable `default` → Path 1 skipped; no default.default → Path 2 skipped.
+    const handlerFn = vi.fn(async (req: Request) => rejectOnAbort(req.signal));
+    const middlewareModule = { middleware: handlerFn };
+    const handler = createRequestHandler(makeManifest(), middlewareModule as any, {
+      timeoutMs: 10,
+    });
+    const proc = createProcessHandler(handler, true, 0);
+
+    const response = await first(proc(once(calloutFor(makeHeaders("/about")))));
+    expect(response.response.case).toBe("requestHeaders");
+    if (response.response.case !== "requestHeaders") throw new Error("wrong case");
+    expect(response.response.value.response!.status).toBe(CommonResponse_ResponseStatus.CONTINUE);
+    expect(handlerFn).toHaveBeenCalledTimes(1);
+    expect(wasLoggedAsMiddlewareCrash()).toBe(false);
+  });
+
+  it("Path 2 (legacy default.default): shed-abort + failOpen:true → CONTINUE", async () => {
+    propagatingResolveRoutes();
+    const legacyFn = vi.fn(async ({ request }: any) => rejectOnAbort(request.signal));
+    // `default` is an OBJECT (not callable) → Path 1 skipped; default.default → Path 2.
+    const middlewareModule = { default: { default: legacyFn } };
+    const handler = createRequestHandler(makeManifest(), middlewareModule as any, {
+      timeoutMs: 10,
+    });
+    const proc = createProcessHandler(handler, true, 0);
+
+    const response = await first(proc(once(calloutFor(makeHeaders("/about")))));
+    expect(response.response.case).toBe("requestHeaders");
+    if (response.response.case !== "requestHeaders") throw new Error("wrong case");
+    expect(response.response.value.response!.status).toBe(CommonResponse_ResponseStatus.CONTINUE);
+    expect(legacyFn).toHaveBeenCalledTimes(1);
+    expect(wasLoggedAsMiddlewareCrash()).toBe(false);
+  });
+
+  it("rejects the handler promise with the TimeoutError abort reason (not a resolved 500)", async () => {
+    propagatingResolveRoutes();
+    const adapterFn = vi.fn(async ({ request }: any) => rejectOnAbort(request.signal));
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    const handler = createRequestHandler(makeManifest(), middlewareModule, { timeoutMs: 10 });
+    // AbortSignal.timeout() aborts with a DOMException named "TimeoutError".
+    await expect(handler(makeHeaders("/about"))).rejects.toMatchObject({ name: "TimeoutError" });
+  });
+
+  it("rethrows an abort wrapped one level deep in `cause` (no shed signal configured)", async () => {
+    propagatingResolveRoutes();
+    const wrapped = new Error("upstream fetch failed", {
+      cause: new DOMException("This operation was aborted", "AbortError"),
+    });
+    const adapterFn = vi.fn().mockRejectedValue(wrapped);
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    const handler = createRequestHandler(makeManifest(), middlewareModule);
+    await expect(handler(makeHeaders("/about"))).rejects.toThrow("upstream fetch failed");
+    expect(wasLoggedAsMiddlewareCrash()).toBe(false);
+  });
+
+  it("rethrows a non-abort-shaped error raised after the shed signal actually fired", async () => {
+    // Middleware that reacts to the abort by throwing its own error: the shed signal
+    // itself reporting aborted routes it to the server policy — the request budget is
+    // already blown, so the failure mode belongs to the shed, not the middleware.
+    propagatingResolveRoutes();
+    const adapterFn = vi.fn(async ({ request }: any) => {
+      await new Promise<void>((resolve) =>
+        request.signal.addEventListener("abort", () => resolve()),
+      );
+      throw new Error("upstream died mid-shed");
+    });
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    const handler = createRequestHandler(makeManifest(), middlewareModule, { timeoutMs: 10 });
+    await expect(handler(makeHeaders("/about"))).rejects.toThrow("upstream died mid-shed");
+  });
+
+  it("a plain TypeError still gets the unconditional middleware 500 even under failOpen:true", async () => {
+    propagatingResolveRoutes();
+    const adapterFn = vi.fn().mockRejectedValue(new TypeError("boom"));
+    const middlewareModule = { default: adapterFn, middleware: vi.fn() };
+    const handler = createRequestHandler(makeManifest(), middlewareModule, { timeoutMs: 10_000 });
+    const proc = createProcessHandler(handler, true, 0);
+
+    const response = await first(proc(once(calloutFor(makeHeaders("/about")))));
+    expect(response.response.case).toBe("immediateResponse");
+    if (response.response.case !== "immediateResponse") throw new Error("wrong case");
+    expect(response.response.value.status!.code).toBe(500);
+    // The middleware-500 marker: content-type is set by buildImmediateResponse.
+    const ct = (response.response.value.headers?.setHeaders ?? []).find(
+      (h) => h.header!.key === "content-type",
+    );
+    expect(ct).toBeDefined();
+    expect(wasLoggedAsMiddlewareCrash()).toBe(true);
+  });
+});
+
+describe("rewrite invocation transport (x-invoke-path / x-invoke-query)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function rewriteManifest(): RoutingManifest {
+    const manifest = makeManifest({
+      pathnames: ["/", "/about", "/api/hello", "/rewrite-source"],
+      poolAssignments: { "/": "ssr", "/about": "ssr", "/api/hello": "api" },
+    });
+    // next.config rewrite whose destination carries a REPEATED query key. @next/routing
+    // applies destinations with URLSearchParams.set (collapses to the last value), so the
+    // handler must restore the repetition before stamping the transport header.
+    manifest.routeGraph.afterFiles = [
+      {
+        source: "/rewrite-source",
+        sourceRegex: "^\\/rewrite-source(?:\\/)?$",
+        destination: "/api/hello?item=one&item=two",
+      },
+    ] as any;
+    return manifest;
+  }
+
+  it("stamps the rewritten invocation target with repeated destination keys restored", async () => {
+    const handler = createRequestHandler(rewriteManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/api/hello",
+      // Collapsed query — what @next/routing currently reports for the destination above.
+      invocationTarget: { pathname: "/api/hello", query: { item: "two" } },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const response = await handler(makeHeaders("/rewrite-source"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    const invokePath = setHeaders.find((h) => h.header.key === "x-invoke-path");
+    expect(invokePath!.header.value).toBe("/api/hello?item=one&item=two");
+    const invokeQuery = setHeaders.find((h) => h.header.key === "x-invoke-query");
+    expect(JSON.parse(invokeQuery!.header.value!)).toEqual({ item: ["one", "two"] });
+    // Stamped keys must not simultaneously be cleared.
+    const removeHeaders = response.requestHeaders!.response!.headerMutation!.removeHeaders ?? [];
+    expect(removeHeaders).not.toContain("x-invoke-path");
+    expect(removeHeaders).not.toContain("x-invoke-query");
+  });
+
+  it("clears (never stamps) the invocation transport when routing did not rewrite", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const response = await handler(makeHeaders("/about"));
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-invoke-path")).toBeUndefined();
+    expect(setHeaders.find((h) => h.header.key === "x-invoke-query")).toBeUndefined();
+    // A client-smuggled value must be actively removed on the way in.
+    const removeHeaders = response.requestHeaders!.response!.headerMutation!.removeHeaders ?? [];
+    expect(removeHeaders).toContain("x-invoke-path");
+    expect(removeHeaders).toContain("x-invoke-query");
+  });
+
+  it("does not stamp an invocation target for RSC requests (client reconciles via headers)", async () => {
+    const manifest = rewriteManifest();
+    const handler = createRequestHandler(manifest, null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/api/hello",
+      invocationTarget: { pathname: "/api/hello", query: { item: "two" } },
+      routeMatches: undefined,
+      resolvedHeaders: undefined,
+    } as any);
+
+    const rscHeader = manifest.routeGraph.rsc?.header ?? "rsc";
+    const response = await handler([
+      ...makeHeaders("/rewrite-source"),
+      { key: rscHeader, value: "1" },
+    ]);
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-invoke-path")).toBeUndefined();
+  });
+});
+
+// N15: RSC redirects keep the real 3xx (next start parity).
+//
+// Measured against `next start` (Next 16.3.0-canary.84, app-dir/rsc-query-routing fixture):
+//   curl -H 'RSC: 1' '/redirect/source?_rsc=abc123'
+//     → HTTP/1.1 308 Permanent Redirect
+//       location: /redirect/dest?_rsc=abc123
+//       Refresh: 0;url=/redirect/dest?_rsc=abc123
+//   — no `x-nextjs-redirect` on ANY response, RSC or not. `x-nextjs-redirect` is a PAGES-router
+//   protocol: written only at server/web/adapter.ts under `if (isNextDataRequest)`, read only by
+//   shared/lib/router/router.ts. The App Router flight client follows the real redirect
+//   (client/components/router-reducer/fetch-server-response.ts reads response.redirected /
+//   response.url), so emitting a 200 + x-nextjs-redirect stranded it into a document load.
+describe("RSC redirects keep the real 3xx (next start parity)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function rscHeaders(path: string): HeaderValue[] {
+    return [...makeHeaders(path), { key: "rsc", value: "1" }];
+  }
+
+  it("answers a same-origin header-only redirect with the real 3xx and a RELATIVE location", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
+      status: 307,
+    } as any);
+
+    const response = await handler(rscHeaders("/rsc-redirect-origin?_rsc=probe"));
+    expect(response.immediateResponse).toBeDefined();
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+    // Same-origin target → RELATIVE path, exactly like `next start`; and the request query is
+    // carried onto the query-less target so `_rsc` survives the hop.
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe(
+      "/rewritten?_rsc=probe",
+    );
+  });
+
+  it("keeps an absolute location for a cross-origin redirect", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://other.example.com/away" }),
+      status: 307,
+    } as any);
+
+    const response = await handler(rscHeaders("/rsc-redirect-origin"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe(
+      "https://other.example.com/away",
+    );
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+  });
+
+  it("keeps rule redirects on the real 3xx for RSC requests, with Refresh on 308", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      redirect: { url: new URL("https://app.example.com/new"), status: 308 },
+    } as any);
+
+    const response = await handler(rscHeaders("/old"));
+    expect(response.immediateResponse!.status!.code).toBe(308);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe("/new");
+    expect(setHeaders.find((h) => h.header.key === "Refresh")!.header.value).toBe("0;url=/new");
+  });
+
+  it("treats a non-RSC redirect identically (no RSC special-case remains)", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
+      status: 307,
+    } as any);
+
+    const response = await handler(makeHeaders("/rsc-redirect-origin"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe("/rewritten");
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+  });
+
+  it("preserves middleware Set-Cookie on the RSC redirect response", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    const resolvedHeaders = new Headers({ location: "https://app.example.com/rewritten" });
+    resolvedHeaders.append("set-cookie", "session=abc; Path=/");
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders,
+      status: 307,
+    } as any);
+
+    const response = await handler(rscHeaders("/rsc-redirect-origin"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    const setHeaders = response.immediateResponse!.headers!.setHeaders!;
+    const cookie = setHeaders.find((h) => h.header.key === "set-cookie");
+    expect(cookie!.header.value).toBe("session=abc; Path=/");
+  });
+});
+
+// N18 (SECURITY): the ext_proc tier authors two response classes that never touch a pool — a
+// middleware-authored body and a rule/middleware redirect — and copies their headers verbatim
+// from the middleware `Response` / next.config `headers()` verdict. If such a response carries a
+// shared-cacheable Cache-Control while the request's `_rsc` does not authenticate its RSC
+// headers, it becomes exactly the poisonable entry Next's own check exists to prevent. The pool
+// enforces the invariant for every other response (pool-server/cache-policy.ts).
+//
+// Narrow by design: only a Cache-Control that grants a shared cache an unrevalidated window is
+// downgraded. Cloud CDN runs USE_ORIGIN_HEADERS (nothing is stored without an explicit
+// directive), so we never stamp `no-store` where there was no Cache-Control at all.
+describe("N18: ext_proc immediate responses and the `_rsc` cache-busting param", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Recorded hash (see tests/routing-common.rsc-cache-busting.test.ts): for `rsc: 1` alone the
+  // expected `_rsc` is the EMPTY string, i.e. the bare `?_rsc` form.
+  function rscReq(path: string, extra: Record<string, string> = {}): HeaderValue[] {
+    return [
+      ...makeHeaders(path),
+      { key: "rsc", value: "1" },
+      ...Object.entries(extra).map(([key, value]) => ({ key, value })),
+    ];
+  }
+
+  function headerValue(
+    response: Awaited<ReturnType<ReturnType<typeof createRequestHandler>>>,
+    key: string,
+  ) {
+    return response.immediateResponse!.headers!.setHeaders!.find(
+      (h) => h.header.key.toLowerCase() === key,
+    )?.header.value;
+  }
+
+  // A middleware module that answers the request itself with a shared-cacheable directive,
+  // wired the way the other middleware tests here do (resolveRoutes must actually invoke it).
+  function cacheableMiddlewareHandler() {
+    const middlewareModule = {
+      default: vi.fn().mockResolvedValue({
+        response: new Response("gated", {
+          status: 200,
+          headers: { "cache-control": "public, s-maxage=600", "content-type": "text/plain" },
+        }),
+      }),
+    };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return { middlewareResponded: true } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+    return createRequestHandler(makeManifest(), middlewareModule);
+  }
+
+  it("downgrades a shared-cacheable middleware response for an unvalidated RSC request", async () => {
+    const response = await cacheableMiddlewareHandler()(rscReq("/gated"));
+    expect(response.immediateResponse!.status!.code).toBe(200);
+    expect(headerValue(response, "cache-control")).toBe("no-store");
+  });
+
+  it("leaves the SAME middleware response alone when `_rsc` validates", async () => {
+    const response = await cacheableMiddlewareHandler()(rscReq("/gated?_rsc"));
+    expect(headerValue(response, "cache-control")).toBe("public, s-maxage=600");
+  });
+
+  it("leaves a DOCUMENT request alone (the check is scoped to RSC requests)", async () => {
+    const response = await cacheableMiddlewareHandler()(
+      makeHeaders("/gated?_rsc=DEADBEEFdeadbeef"),
+    );
+    expect(headerValue(response, "cache-control")).toBe("public, s-maxage=600");
+  });
+
+  it("downgrades a shared-cacheable redirect verdict for an unvalidated RSC request", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({
+        location: "https://app.example.com/rewritten",
+        "cache-control": "public, max-age=3600",
+      }),
+      status: 307,
+    } as any);
+    const response = await handler(rscReq("/old?_rsc=DEADBEEFdeadbeef"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    expect(headerValue(response, "cache-control")).toBe("no-store");
+    // The redirect itself is untouched.
+    expect(headerValue(response, "location")).toBe("/rewritten?_rsc=DEADBEEFdeadbeef");
+  });
+
+  it("never invents a Cache-Control where the verdict had none", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
+      status: 307,
+    } as any);
+    const response = await handler(rscReq("/old"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    expect(headerValue(response, "cache-control")).toBeUndefined();
+  });
+
+  it("keeps an already-uncacheable directive verbatim (no gratuitous rewriting)", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({
+        location: "https://app.example.com/rewritten",
+        "cache-control": "private, max-age=0, must-revalidate",
+      }),
+      status: 307,
+    } as any);
+    const response = await handler(rscReq("/old"));
+    expect(headerValue(response, "cache-control")).toBe("private, max-age=0, must-revalidate");
   });
 });

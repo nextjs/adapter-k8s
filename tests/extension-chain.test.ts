@@ -38,7 +38,6 @@ describe("generateExtensionChain", () => {
       releaseName: "my-app",
       namespace: "default",
       projectId: "my-project",
-      region: "us-central1",
       timeout: "5s",
       failureModeAllow: false,
     });
@@ -57,7 +56,6 @@ describe("generateExtensionChain", () => {
       releaseName: "my-app",
       namespace: "default",
       projectId: "my-project",
-      region: "us-central1",
       timeout: "5s",
       failureModeAllow: true,
     });

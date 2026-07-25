@@ -11,10 +11,14 @@ export function renderHPA({
   releaseName: string;
 }): string {
   const deploymentName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
+  // The HPA's own name appends "-hpa" — reserve room for it inside the 63-char
+  // limit (a 63-char deployment name would otherwise yield a 67-char HPA name
+  // the API server rejects). scaleTargetRef still uses the exact Deployment name.
+  const hpaName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`, "-hpa");
   return `apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: ${deploymentName}-hpa
+  name: ${hpaName}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

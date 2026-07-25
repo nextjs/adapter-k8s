@@ -27,6 +27,7 @@ export function classifyIntoPools(
 
   for (const [poolName, poolConfig] of Object.entries(config.pools)) {
     const matched: FunctionOutput[] = [];
+    const specsWithCandidates = new Set<string>();
 
     for (const routeSpec of poolConfig.routes) {
       let candidates: FunctionOutput[];
@@ -43,12 +44,32 @@ export function classifyIntoPools(
         ].filter((o) => minimatch(o.pathname, routeSpec));
       }
 
+      if (candidates.length > 0) specsWithCandidates.add(routeSpec);
+
       for (const output of candidates) {
         if (!assigned.has(output.id)) {
           assigned.add(output.id);
           matched.push(output);
         }
       }
+    }
+
+    // A zero-output pool still gets a Deployment/HPA/Service and a share of the
+    // HTTPRoute rule budget — deployed empty, it serves nothing and silently
+    // drains the 16-rule cap. Almost always a typo'd route pattern, so say which
+    // patterns matched nothing (vs. claimed by an earlier pool, first-match-wins).
+    if (matched.length === 0) {
+      const unmatched = poolConfig.routes.filter((spec) => !specsWithCandidates.has(spec));
+      console.warn(
+        `[adapter-k8s] Pool "${poolName}" matched no outputs and will be deployed empty. ` +
+          (unmatched.length > 0
+            ? `Route patterns that matched no output: ${unmatched
+                .map((s) => JSON.stringify(s))
+                .join(", ")}. `
+            : `Every route pattern matched only outputs already claimed by earlier pools ` +
+              `(first-match-wins). `) +
+          `Check the pools."${poolName}".routes entries in your adapter config.`,
+      );
     }
 
     pools.set(poolName, {

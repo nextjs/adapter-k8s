@@ -15,4 +15,3 @@ export function ifNoneMatchMatches(value: string | undefined, etag: string): boo
     return normalized === "*" || normalized === etag;
   });
 }
-

@@ -24,7 +24,6 @@ export function renderValuesYaml({
         registry: imageRegistry,
         repository: "nextjs-app",
         tag: buildId,
-        pullPolicy: "IfNotPresent",
       },
       // Empty by default: the deploy CLI passes `--set global.networkPolicy.podCidrs=
       // {..}` when it can discover the cluster's pod CIDRs; an empty list renders no

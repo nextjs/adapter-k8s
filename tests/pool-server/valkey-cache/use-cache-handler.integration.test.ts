@@ -1,7 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { Redis } from "ioredis";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { bufferToStream } from "../../../src/pool-server/valkey-cache/stream-codec.js";
+import {
+  computeTagUpdate,
+  MAX_CLOCK_SKEW_MS,
+  TAG_MANIFEST_TTL_SECONDS,
+  UPDATE_TAGS_SCRIPT,
+} from "../../../src/pool-server/valkey-cache/tag-manifest.js";
 import type { CacheEntry } from "../../../src/pool-server/valkey-cache/types.js";
 import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
 
@@ -224,5 +230,137 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     await early.updateTags(["u"]); // hard-expire, arrives first
     await late.updateTags(["u"], { expire: 300 }); // arrives LATER → wins
     expect(await early.getExpiration(["u"])).toBe(9000 + 300_000);
+  });
+
+  it("M11: the tag manifest hash itself carries the durable TTL (refreshed per write)", async () => {
+    const client = newClient();
+    const h = new ValkeyCacheHandler({ client, buildId: "mttl", now: () => 1000 });
+    await h.updateTags(["t"]);
+    // Entry keys were always TTL-bounded; the manifest must be too (30 days), or every deploy
+    // leaks a build-namespaced hash forever.
+    const ttl = await client.ttl("k8s:mttl:tags");
+    expect(ttl).toBeGreaterThan(29 * 24 * 60 * 60);
+    expect(ttl).toBeLessThanOrEqual(30 * 24 * 60 * 60);
+  });
+
+  it("M12 hard→profile: a profiled revalidation WITHOUT expire preserves a stored hard-expire", async () => {
+    // The pre-fix bug: the profiled event `{stale, at}` REPLACED the whole hash field, erasing
+    // the earlier hard expire — entries Next would hard-regenerate kept serving stale (SWR).
+    const clock = { t: 1000 };
+    const h = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "mrg-hp",
+      now: () => clock.t,
+    });
+    await h.set("k", Promise.resolve(makeEntry("v1", { timestamp: 500, tags: ["t"] })));
+
+    await h.updateTags(["t"]); // hard expire at 1000
+    clock.t = 2000;
+    await h.updateTags(["t"], {}); // profiled, no expire → only {stale, at}
+
+    // The hard-expire watermark survived the merge: getExpiration still reports it, and the
+    // entry is EXPIRED (dropped), not merely stale.
+    expect(await h.getExpiration(["t"])).toBe(1000);
+    expect(await h.get("k", [])).toBeUndefined();
+  });
+
+  // L16 clamp cases: these are the only suite-wide exercises of the Lua clamp BRANCH against a
+  // real server — every other test's injected clock sits far BEHIND the server clock, so the
+  // clamp never fires there. The Docker container shares the host kernel clock, so bracketing
+  // the eval with Date.now() bounds the server's TIME tightly (±ms truncation → 5ms slack).
+
+  it("L16 hard expire: a client clock 120s ahead is clamped to serverNow + MAX_CLOCK_SKEW_MS", async () => {
+    const raw = newClient();
+    const key = "k8s:skew-hard:tags";
+    const clientNow = Date.now() + 120_000;
+    // A hard expire (no durations): `expired` IS the (skewed) event time, no `stale` base.
+    const event = JSON.stringify(computeTagUpdate(undefined, clientNow));
+    const before = Date.now();
+    const clamped = await raw.eval(
+      UPDATE_TAGS_SCRIPT,
+      1,
+      key,
+      "t",
+      event,
+      String(TAG_MANIFEST_TTL_SECONDS),
+    );
+    const after = Date.now();
+    // The script reports the clamp to the caller (feeds warnOnClockSkewClamp).
+    expect(Number(clamped)).toBe(1);
+    const stored = JSON.parse((await raw.hget(key, "t"))!);
+    // `expired` landed at serverNow + MAX_CLOCK_SKEW_MS, far below the skewed watermark.
+    expect(stored.expired).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
+    expect(stored.expired).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
+    expect(stored.expired).toBeLessThan(clientNow);
+    // `at` was rewritten to the SERVER clock, not the skewed client clock.
+    expect(stored.at).toBeLessThanOrEqual(after + 5);
+  });
+
+  it("L16 profiled: the shift pins the stale base but preserves the profile duration exactly", async () => {
+    const raw = newClient();
+    const key = "k8s:skew-profile:tags";
+    const clientNow = Date.now() + 120_000;
+    // Profiled event: stale = clientNow (skewed), expired = clientNow + 300_000. The clamp must
+    // SHIFT both by the same amount — pinning the base to the server bound while keeping the
+    // intended 300s duration — not truncate `expired` to the bound.
+    const event = JSON.stringify(computeTagUpdate(undefined, clientNow, { expire: 300 }));
+    const before = Date.now();
+    const clamped = await raw.eval(
+      UPDATE_TAGS_SCRIPT,
+      1,
+      key,
+      "t",
+      event,
+      String(TAG_MANIFEST_TTL_SECONDS),
+    );
+    const after = Date.now();
+    expect(Number(clamped)).toBe(1);
+    const stored = JSON.parse((await raw.hget(key, "t"))!);
+    expect(stored.stale).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
+    expect(stored.stale).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
+    expect(stored.expired - stored.stale).toBe(300_000);
+  });
+
+  it("L16 via the handler: updateTags on a fast-clock replica clamps and warns once", async () => {
+    // Same branch through the production path: the handler's eval return feeds
+    // warnOnClockSkewClamp (warnOnce is per-process — this is the only handler-level clamp in
+    // the suite, so the warning must fire here).
+    const raw = newClient();
+    const h = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "skew-handler",
+      now: () => Date.now() + 120_000,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      const before = Date.now();
+      await h.updateTags(["t"]);
+      const after = Date.now();
+      expect(warn.mock.calls.some((c) => /clock/i.test(String(c[0])))).toBe(true);
+      const stored = JSON.parse((await raw.hget("k8s:skew-handler:tags", "t"))!);
+      expect(stored.expired).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
+      expect(stored.expired).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("M12 profile→hard: a later hard expire wins immediately and keeps the stale watermark", async () => {
+    const clock = { t: 1000 };
+    const h = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "mrg-ph",
+      now: () => clock.t,
+    });
+    await h.set("k", Promise.resolve(makeEntry("v1", { timestamp: 500, tags: ["t"] })));
+
+    await h.updateTags(["t"], { expire: 300 }); // stale=1000, expired=1000+300_000 (future)
+    clock.t = 2000;
+    await h.updateTags(["t"]); // hard expire at 2000
+
+    // The later event's `expired` (immediate) replaced the profile's future expiry — the entry
+    // is dropped NOW, not SWR-served for another 300s.
+    expect(await h.getExpiration(["t"])).toBe(2000);
+    expect(await h.get("k", [])).toBeUndefined();
   });
 });

@@ -3,6 +3,17 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import boxen from "boxen";
 import { execCapture } from "./exec.js";
+import { sanitizeK8sName } from "../emit/templates/utils.js";
+
+// Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
+// WHICH file is corrupt.
+function readJsonFile(filePath: string): Record<string, unknown> {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf-8"));
+  } catch (err) {
+    throw new Error(`Failed to parse ${filePath}: ${(err as Error).message}`);
+  }
+}
 
 export async function runDescribe(options: {
   projectDir: string;
@@ -10,13 +21,18 @@ export async function runDescribe(options: {
 }): Promise<void> {
   const { projectDir, releaseName } = options;
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
-  const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : null;
+  const infra = existsSync(infraPath)
+    ? (readJsonFile(infraPath) as {
+        projectId?: string;
+        region?: string;
+        hosts?: string[];
+      } | null)
+    : null;
 
-  // Read state from cluster ConfigMap (works for CI/CD + local)
-  const { readState } = await import("./state.js");
-  const state = await readState(projectDir, releaseName);
-
-  // Ensure kubectl is pointing at the right cluster
+  // Ensure kubectl is pointing at the right cluster BEFORE reading state — readState
+  // prefers the cluster ConfigMap, and with kubectl still pinned to a stale context it
+  // would read (or miss) state on the WRONG cluster (the bug class AGENTS.md invariant 6
+  // covers; rollback was fixed for it, describe had the same ordering flaw).
   if (infra?.projectId && infra?.region) {
     const credResult = await execCapture("gcloud", [
       "container",
@@ -34,6 +50,10 @@ export async function runDescribe(options: {
       process.exit(1);
     }
   }
+
+  // Read state from cluster ConfigMap (works for CI/CD + local)
+  const { readState } = await import("./state.js");
+  const state = await readState(projectDir, releaseName);
   const hosts: string[] = infra?.hosts ?? [];
   const projectId: string = infra?.projectId ?? "unknown";
   const region: string = infra?.region ?? "unknown";
@@ -75,10 +95,14 @@ export async function runDescribe(options: {
   const deploymentsResult = await execCapture("kubectl", [
     "get",
     "deployments",
+    // The release lives in the literal "default" namespace (same pin as deploy/
+    // rollback/state) — a kubeconfig namespace override would otherwise show nothing.
+    "-n",
+    "default",
     "-l",
     `app.kubernetes.io/name=${releaseName}`,
     "-o",
-    'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.spec.template.spec.containers[0].image}{"\\n"}{end}',
+    'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.spec.template.spec.containers[0].image}|{.metadata.labels.app\\.kubernetes\\.io/version}{"\\n"}{end}',
   ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
 
   interface DeployInfo {
@@ -89,30 +113,27 @@ export async function runDescribe(options: {
     role: "current" | "previous" | "old";
   }
 
-  const currentBuildLower = buildId
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .slice(0, 12);
-  const previousBuildLower =
-    previousBuildId
-      ?.toLowerCase()
-      .replace(/[^a-z0-9]/g, "")
-      .slice(0, 12) ?? "";
+  // Classify by EXACT version label (the same sanitizeK8sName value the chart stamps).
+  // A 12-char normalized-prefix substring match previously mislabeled an old build
+  // sharing that prefix as "current" — deploy's own comments record that technique
+  // 503'ing production during cutover.
+  const currentBuildLabel = state?.buildId ? sanitizeK8sName(state.buildId) : null;
+  const previousBuildLabel = state?.previousBuildId ? sanitizeK8sName(state.previousBuildId) : null;
 
   const deployments: DeployInfo[] = [];
   if (deploymentsResult.exitCode === 0 && deploymentsResult.stdout.trim()) {
     for (const line of deploymentsResult.stdout.trim().split("\n")) {
-      const [name, status, image] = line.split("|");
+      const [name, status, image, versionLabel] = line.split("|");
       if (!name) continue;
       const shortName = name.replace(`${releaseName}-`, "");
-      const nameLower = name.toLowerCase();
       const isRouting = shortName === "routing-service";
 
       let role: DeployInfo["role"] = "old";
-      const nameAlpha = nameLower.replace(/[^a-z0-9]/g, "");
-      if (isRouting || nameAlpha.includes(currentBuildLower)) {
+      if (isRouting) {
         role = "current";
-      } else if (previousBuildLower && nameAlpha.includes(previousBuildLower)) {
+      } else if (currentBuildLabel && versionLabel === currentBuildLabel) {
+        role = "current";
+      } else if (previousBuildLabel && versionLabel === previousBuildLabel) {
         role = "previous";
       }
 

@@ -17,9 +17,15 @@
 //                              percent-decoded lookup.
 //  - rscParentCandidates:      .rsc / segment payloads dispatch to the parent
 //                              page handler.
+//  - stripAddedLocale /         the de-duplicated helpers behind the single
+//    queryFromUrl /             rewrite-invocation derivation both tiers now
+//    isRscRequest /             share (see routing-common.tier-parity.test.ts
+//    resolveOutputPathname:     for the cross-tier assertions).
 import { describe, it, expect } from "vitest";
 import {
   collapseSlashesRedirect,
+  isRscRequest,
+  localeAlignedRouteParamPathname,
   normalizeI18nRedirect,
   normalizeLocationRedirect,
   normalizeMatchedPathname,
@@ -27,7 +33,10 @@ import {
   preferConcreteOutput,
   prefixRequestLocale,
   prepareRequest,
+  queryFromUrl,
+  resolveOutputPathname,
   rscParentCandidates,
+  stripAddedLocale,
   stripBasePath,
   templateOutputCandidates,
 } from "../src/routing-common.js";
@@ -423,6 +432,18 @@ describe("templateOutputCandidates", () => {
     const both = ["/x/[...all]", "/x/[one]"];
     expect(templateOutputCandidates("/x/only", both)[0]).toBe("/x/[one]");
   });
+
+  // N9: i18n expands one Pages route per locale, so a locale-prefixed concrete path
+  // matches both the prefixed and unprefixed template at identical weight. Manifest
+  // key order must not decide it — the locale-prefixed template has to win, or the
+  // locale segment becomes the first catch-all param.
+  it("prefers a locale-prefixed template over the bare root catch-all", () => {
+    const i18nIds = ["/[[...slug]]", "/en-US/[[...slug]]", "/nl-NL/[[...slug]]"];
+    expect(templateOutputCandidates("/en-US", i18nIds)[0]).toBe("/en-US/[[...slug]]");
+    expect(templateOutputCandidates("/nl-NL/another", i18nIds)[0]).toBe("/nl-NL/[[...slug]]");
+    const catchAllIds = ["/[...slug]", "/nl-NL/[...slug]", "/en/[...slug]"];
+    expect(templateOutputCandidates("/nl-NL/hello", catchAllIds)[0]).toBe("/nl-NL/[...slug]");
+  });
 });
 
 describe("prepareRequest / normalizeResolvedRedirect (shared orchestration)", () => {
@@ -505,5 +526,227 @@ describe("prepareRequest / normalizeResolvedRedirect (shared orchestration)", ()
         basePath: "",
       }),
     ).toBeNull();
+  });
+
+  // N15: rule redirects from next.config `redirects()` compile to a ROUTE carrying a Location
+  // header and no destination. Upstream carries the REQUEST query onto such a target when the
+  // target has none (@next/routing >= 16.3 resolveRedirectLocationWithRequestQuery); we depend on
+  // 16.2.x, which does not, so routing-common mirrors it.
+  //
+  // Measured against `next start` (Next 16.3.0-canary.84, app-dir/rsc-query-routing fixture,
+  // `redirects()` /redirect/source → /redirect/dest):
+  //   GET /redirect/source?_rsc=abc123  → 308 location: /redirect/dest?_rsc=abc123
+  //   GET /redirect/source?foo=1        → 308 location: /redirect/dest?foo=1
+  //   GET /redirect/source              → 308 location: /redirect/dest
+  describe("rule-redirect request-query carry (N15)", () => {
+    const plain = { i18n: null, basePath: "" };
+
+    function normalize(
+      requestPath: string,
+      location: string,
+      opts?: { middlewareAuthored?: boolean },
+    ) {
+      const prep = prepareRequest(url(requestPath), new Headers(), plain);
+      if (prep.kind !== "ok") throw new Error("expected ok");
+      const out = normalizeResolvedRedirect(
+        { resolvedHeaders: new Headers({ location }), status: 308 },
+        prep,
+        plain,
+        opts,
+      );
+      if (out?.kind !== "redirect") throw new Error("expected redirect");
+      return out.url.pathname + out.url.search;
+    }
+
+    it("carries the RSC cache-busting param onto a query-less target", () => {
+      expect(normalize("/redirect/source?_rsc=abc123", "/redirect/dest")).toBe(
+        "/redirect/dest?_rsc=abc123",
+      );
+    });
+
+    it("carries an arbitrary request query onto a query-less target", () => {
+      expect(normalize("/redirect/source?foo=1", "/redirect/dest")).toBe("/redirect/dest?foo=1");
+      expect(normalize("/redirect/source?foo=1&bar=2", "/redirect/dest")).toBe(
+        "/redirect/dest?foo=1&bar=2",
+      );
+    });
+
+    it("does NOT overwrite a target that already carries a query", () => {
+      expect(normalize("/redirect/source?foo=1", "/redirect/dest?keep=me")).toBe(
+        "/redirect/dest?keep=me",
+      );
+    });
+
+    it("is a no-op when the request has no query", () => {
+      expect(normalize("/redirect/source", "/redirect/dest")).toBe("/redirect/dest");
+    });
+
+    // A middleware-authored Location's target is authoritative — an unguarded carry broke
+    // e2e/middleware-redirects with ERR_TOO_MANY_REDIRECTS (the carried query re-matched the
+    // middleware's own source condition).
+    it("never carries onto a middleware-authored Location", () => {
+      expect(normalize("/protected?foo=1", "/login", { middlewareAuthored: true })).toBe("/login");
+      expect(normalize("/protected?_rsc=abc123", "/login", { middlewareAuthored: true })).toBe(
+        "/login",
+      );
+    });
+  });
+});
+
+// N9: a pool may hold only the UNPREFIXED template (multi-pool splits), where
+// templateOutputCandidates' tie-break cannot help — the locale must be stripped from
+// the param path so it doesn't land in the catch-all params.
+describe("localeAlignedRouteParamPathname", () => {
+  const locales = ["en-US", "nl-NL", "nl", "fr"];
+
+  it("keeps the concrete path when the handler template carries the same locale", () => {
+    expect(localeAlignedRouteParamPathname("/nl-NL/hello", "/nl-NL/[...slug]", locales)).toBe(
+      "/nl-NL/hello",
+    );
+    expect(localeAlignedRouteParamPathname("/en-US", "/en-US/[[...slug]]", locales)).toBe("/en-US");
+  });
+
+  it("strips the locale when the handler template does not carry it", () => {
+    expect(localeAlignedRouteParamPathname("/nl-NL/hello", "/[...slug]", locales)).toBe("/hello");
+    expect(localeAlignedRouteParamPathname("/en-US", "/[[...slug]]", locales)).toBe("/");
+  });
+
+  it("leaves non-locale paths untouched", () => {
+    expect(localeAlignedRouteParamPathname("/blog/hello", "/blog/[slug]", locales)).toBe(
+      "/blog/hello",
+    );
+    expect(localeAlignedRouteParamPathname("/blog/hello", "/[...slug]", locales)).toBe(
+      "/blog/hello",
+    );
+    expect(localeAlignedRouteParamPathname("/nl-BE/x", "/[...slug]", locales)).toBe("/nl-BE/x");
+  });
+});
+
+// --- De-duplicated helpers (were private copies / open-coded in one or both tiers) -------
+// Cross-tier equality is asserted in tests/routing-common.tier-parity.test.ts; these pin the
+// per-helper edge cases that made the copies worth removing.
+
+describe("stripAddedLocale", () => {
+  it("strips the locale WE added, at a segment boundary only", () => {
+    expect(stripAddedLocale("/en/about", "en")).toBe("/about");
+    expect(stripAddedLocale("/en", "en")).toBe("/");
+    // "/english" is NOT under "/en" — a prefix match without the boundary would corrupt it.
+    expect(stripAddedLocale("/english/x", "en")).toBe("/english/x");
+    expect(stripAddedLocale("/enx", "en")).toBe("/enx");
+  });
+
+  it("is a no-op when no locale was auto-added, or the path carries a different one", () => {
+    expect(stripAddedLocale("/en/about", null)).toBe("/en/about");
+    expect(stripAddedLocale("/en/about", undefined)).toBe("/en/about");
+    expect(stripAddedLocale("/fr/about", "en")).toBe("/fr/about");
+  });
+
+  it("keeps a percent-encoded remainder byte-identical", () => {
+    expect(stripAddedLocale("/en/caf%C3%A9", "en")).toBe("/caf%C3%A9");
+  });
+});
+
+describe("queryFromUrl", () => {
+  it("collapses repeated keys into an array, preserving order", () => {
+    expect(queryFromUrl(new URL("http://x/y?a=1&a=2&a=3&b=4"))).toEqual({
+      a: ["1", "2", "3"],
+      b: "4",
+    });
+  });
+
+  it("decodes percent-encoding and treats a valueless key as empty string", () => {
+    expect(queryFromUrl(new URL("http://x/y?q=caf%C3%A9+au+lait&empty=&bare"))).toEqual({
+      q: "café au lait",
+      empty: "",
+      bare: "",
+    });
+  });
+
+  it("returns an empty record for a query-less URL", () => {
+    expect(queryFromUrl(new URL("http://x/y"))).toEqual({});
+  });
+});
+
+describe("isRscRequest", () => {
+  const rsc = { header: "rsc", suffix: ".rsc" };
+
+  it("is true only for an exact '1' on the manifest's negotiation header", () => {
+    expect(isRscRequest(new Headers({ rsc: "1" }), rsc)).toBe(true);
+    expect(isRscRequest(new Headers({ rsc: "0" }), rsc)).toBe(false);
+    expect(isRscRequest(new Headers({ rsc: "true" }), rsc)).toBe(false);
+    expect(isRscRequest(new Headers(), rsc)).toBe(false);
+  });
+
+  it("is false when the build has no rsc config", () => {
+    expect(isRscRequest(new Headers({ rsc: "1" }), undefined)).toBe(false);
+  });
+});
+
+describe("resolveOutputPathname", () => {
+  const poolAssignments = { "/gssp": "ssr", "/[slug]": "ssr", "/featured": "ssr" };
+
+  it("prefers a concrete output for the REWRITE TARGET over a dynamic template", () => {
+    expect(
+      resolveOutputPathname({
+        requestPathname: "/rewrite-1",
+        resolvedPathname: "/[slug]",
+        invocationTargetPathname: "/gssp",
+        poolAssignments,
+      }),
+    ).toBe("/gssp");
+  });
+
+  it("does not let the public pathname's own output undo a rewrite", () => {
+    // `/featured` is both a real output and a rewrite source pointing elsewhere.
+    expect(
+      resolveOutputPathname({
+        requestPathname: "/featured",
+        resolvedPathname: "/[slug]",
+        invocationTargetPathname: "/gssp",
+        poolAssignments,
+      }),
+    ).toBe("/gssp");
+  });
+
+  it("prefers a concrete output for the request path when nothing was rewritten", () => {
+    expect(
+      resolveOutputPathname({
+        requestPathname: "/gssp",
+        resolvedPathname: "/[slug]",
+        invocationTargetPathname: "/gssp",
+        poolAssignments,
+      }),
+    ).toBe("/gssp");
+    // No invocation target at all: the request path is the match.
+    expect(
+      resolveOutputPathname({
+        requestPathname: "/gssp",
+        resolvedPathname: "/[slug]",
+        invocationTargetPathname: undefined,
+        poolAssignments,
+      }),
+    ).toBe("/gssp");
+  });
+
+  it("keeps the dynamic template when no concrete output exists", () => {
+    expect(
+      resolveOutputPathname({
+        requestPathname: "/blog/anything",
+        resolvedPathname: "/[slug]",
+        invocationTargetPathname: "/blog/anything",
+        poolAssignments,
+      }),
+    ).toBe("/[slug]");
+  });
+
+  it("falls back to the request pathname when routing resolved nothing", () => {
+    expect(
+      resolveOutputPathname({
+        requestPathname: "/unknown",
+        resolvedPathname: undefined,
+        invocationTargetPathname: undefined,
+        poolAssignments,
+      }),
+    ).toBe("/unknown");
   });
 });

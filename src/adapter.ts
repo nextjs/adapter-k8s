@@ -1,5 +1,5 @@
 // src/adapter.ts
-import { writeFile, mkdir, copyFile, cp, rm, realpath } from "node:fs/promises";
+import { writeFile, mkdir, copyFile, cp, rm, realpath, readdir, lstat } from "node:fs/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -35,12 +35,15 @@ function resolveDepDir(dep: string, projectDir: string): string | undefined {
 }
 
 // Whether the app defines LEGACY EDGE middleware (`middleware.ts`). A node-based incremental
-// `cacheHandler` (ioredis) gets bundled by Turbopack INTO the edge middleware runtime, where it
-// can't evaluate — so the adapter skips registering that handler when edge middleware is present.
+// `cacheHandler` (the adapter's bundled zero-dep RESP2 client over node:net/node:tls) gets
+// bundled by Turbopack INTO the edge middleware runtime, where it can't evaluate — so the
+// adapter skips registering that handler when edge middleware is present.
 // The modern `proxy.ts` runs on Node (no edge bundle) and is NOT matched here, so it gets the full
 // handler. (The V2 `use cache` handler, registered via the global symbol, is unaffected either way
 // and always shares `use cache` entries cross-replica.)
-function hasEdgeMiddleware(projectDir: string): boolean {
+// Exported (with the staging helpers below) for hermetic unit tests — see
+// tests/adapter-staging.test.ts. No behavior change.
+export function hasEdgeMiddleware(projectDir: string): boolean {
   const names = [
     "middleware.ts",
     "middleware.js",
@@ -64,6 +67,10 @@ import {
   assertSafeBuildId,
   assertSafeImageRegistry,
   assertSafeNamespace,
+  assertSafeProjectId,
+  assertSafeRegion,
+  findBuildIdNameCollision,
+  K8S_NAMESPACE,
 } from "./emit/templates/utils.js";
 import {
   generateDockerfile,
@@ -95,14 +102,12 @@ async function writeOutputFile(
 // Resolve and copy .next/node_modules/ — Turbopack creates symlinks to
 // real node_modules packages. Docker COPY doesn't follow symlinks outside
 // the build context, so we resolve each symlink and copy the real content.
-async function resolveAndCopyExternals(src: string, dest: string): Promise<void> {
+export async function resolveAndCopyExternals(src: string, dest: string): Promise<void> {
   if (!existsSync(src)) return;
   // Always rebuild — previous builds may have left stale symlinks
-  const { rm } = await import("node:fs/promises");
   if (existsSync(dest)) await rm(dest, { recursive: true, force: true });
   await mkdir(dest, { recursive: true });
 
-  const { readdir, lstat, readlink } = await import("node:fs/promises");
   const entries = await readdir(src);
 
   for (const entry of entries) {
@@ -138,7 +143,11 @@ async function resolveAndCopyExternals(src: string, dest: string): Promise<void>
 // which is already the common layout) keep their repoRoot-relative key, which lands them
 // where the upward walk expects. Sibling-workspace-package assets remain a known gap
 // (warned about at build time). When repoRoot === projectDir this is a no-op.
-function assetDestPath(projectDir: string, repoRootRelativeKey: string, absAsset: string): string {
+export function assetDestPath(
+  projectDir: string,
+  repoRootRelativeKey: string,
+  absAsset: string,
+): string {
   const abs = path.isAbsolute(absAsset) ? absAsset : path.resolve(projectDir, absAsset);
   if (abs === projectDir || abs.startsWith(projectDir + path.sep)) {
     return path.relative(projectDir, abs);
@@ -147,9 +156,9 @@ function assetDestPath(projectDir: string, repoRootRelativeKey: string, absAsset
 }
 
 // Track staged paths per build to avoid redundant work and loops
-const stagedPaths = new Set<string>();
+export const stagedPaths = new Set<string>();
 
-async function stageFile(
+export async function stageFile(
   projectDir: string,
   sourcePath: string,
   destRelativePath: string,
@@ -197,6 +206,117 @@ async function stageFile(
       (err as Error).message,
     );
   }
+}
+
+// Sharp's native runtime packages for the emitted pool container platform: the pool
+// base image is node:*-slim (linux glibc) and GKE's default node pools are amd64, so
+// the container needs the linux-x64 pair. esbuild inlines sharp's JS into
+// pool-server.cjs, but the binding stays a RUNTIME require
+// (`@img/sharp-linux-x64/sharp.node`, which in turn dlopens libvips from
+// `@img/sharp-libvips-linux-x64`). Build XchOtaGFu6GdFrcdujVc0 shipped without either
+// — every containerized /_next/image failed the sharp load (503 "sharp is
+// unavailable") while local runs resolved the binding by walking up to the repo's own
+// node_modules, which masked the gap.
+export const SHARP_RUNTIME_PACKAGES = [
+  "@img/sharp-linux-x64",
+  "@img/sharp-libvips-linux-x64",
+] as const;
+
+// Resolver for sharp and its platform packages. resolveDepDir asks for
+// `${dep}/package.json`, which the @img/* packages BLOCK via their exports maps
+// (they export "./package", not "./package.json") — ERR_PACKAGE_PATH_NOT_EXPORTED
+// would silently skip staging on every build. Resolve the exported "./package"
+// subpath instead (sharp itself exports both), adapter-first like resolveDepDir.
+// Falls back to the sibling layout next to the resolved sharp package: npm hoists
+// @img/* beside sharp, and pnpm links a package's deps as virtual-store siblings.
+export function resolveSharpDepDir(dep: string, projectDir: string): string | undefined {
+  const fromFiles = [
+    path.join(_dirname, "index.js"), // adapter package (dist/)
+    path.join(projectDir, "package.json"), // app root
+  ];
+  for (const fromFile of fromFiles) {
+    try {
+      return path.dirname(createRequire(fromFile).resolve(`${dep}/package`));
+    } catch {
+      // try the next resolution root
+    }
+  }
+  if (dep !== "sharp") {
+    // Check the sibling of EVERY resolvable sharp copy — the adapter-first copy may
+    // simply not have this platform package installed while the app root's does.
+    for (const fromFile of fromFiles) {
+      try {
+        const sharpDir = path.dirname(createRequire(fromFile).resolve("sharp/package"));
+        const sibling = path.join(sharpDir, "..", ...dep.split("/"));
+        if (existsSync(path.join(sibling, "package.json"))) return sibling;
+      } catch {
+        // try the next resolution root
+      }
+    }
+  }
+  return undefined;
+}
+
+// Stage sharp's linux-x64 native packages into the pool's traced-assets context.
+// npm installs platform-specific optional packages for the BUILD host only, so a
+// darwin/arm64 host won't have the linux-x64 pair at all — in that case fall back to
+// reporting the app's resolved sharp version so the caller can emit an npm-install
+// step into the pool Dockerfile (running inside the image resolves the correct
+// platform packages natively). `staged: false` with no version means sharp is not
+// resolvable at all; image optimization will be unavailable in the container.
+export async function stageSharpRuntimePackages(
+  projectDir: string,
+  poolName: string,
+  resolveDep: (dep: string, projectDir: string) => string | undefined = resolveSharpDepDir,
+): Promise<{ staged: boolean; sharpVersion?: string }> {
+  const resolved = SHARP_RUNTIME_PACKAGES.map((pkg) => ({ pkg, dir: resolveDep(pkg, projectDir) }));
+  if (resolved.every(({ dir }) => dir !== undefined && existsSync(dir))) {
+    for (const { pkg, dir } of resolved) {
+      await stageFile(projectDir, dir!, `node_modules/${pkg}`, poolName);
+    }
+    return { staged: true };
+  }
+  const sharpDir = resolveDep("sharp", projectDir);
+  const sharpPkgJson = sharpDir ? path.join(sharpDir, "package.json") : undefined;
+  if (sharpPkgJson && existsSync(sharpPkgJson)) {
+    try {
+      const version = (JSON.parse(readFileSync(sharpPkgJson, "utf-8")) as { version?: unknown })
+        .version;
+      if (typeof version === "string" && version.length > 0) {
+        return { staged: false, sharpVersion: version };
+      }
+    } catch {
+      // Unreadable/corrupt sharp package.json — fall through to the warning below.
+    }
+  }
+  console.warn(
+    `[adapter-k8s] Could not resolve sharp's linux-x64 runtime packages ` +
+      `(${SHARP_RUNTIME_PACKAGES.join(", ")}) or a local sharp install — ` +
+      `/_next/image optimization will be UNAVAILABLE (503) in the "${poolName}" pool container.`,
+  );
+  return { staged: false };
+}
+
+// releaseName comes from infrastructure.json (written by init, so it matches the gcloud
+// resource names — IP, gateway, etc.) with a project-dir-basename fallback. The fallback
+// is capped at 40 chars to mirror assertSafeReleaseName's limit — an over-long directory
+// basename otherwise flows into template rendering and fails there with a far less
+// actionable error. An all-symbols basename sanitizes to "" — fall back to "nextjs"
+// (the `??` on infra.releaseName used to be dead: .replace() never yields null/undefined).
+function deriveReleaseName(projectDir: string): string {
+  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : {};
+  return (
+    infra.releaseName ??
+    (path
+      .basename(projectDir)
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "-")
+      // Cap BEFORE stripping edge hyphens — the slice can land on one.
+      .slice(0, 40)
+      .replace(/^-+|-+$/g, "") ||
+      "nextjs")
+  );
 }
 
 export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
@@ -251,7 +371,17 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     }
 
     if (!configNormalized) {
-      validateConfig(config);
+      // Pass the release name (when derivable) so validateConfig can enforce the
+      // COMBINED release+pool length budget — the per-field 40-char caps alone
+      // permit composed resource names whose build id truncates away entirely.
+      let releaseNameForBudget: string | undefined;
+      try {
+        releaseNameForBudget = deriveReleaseName(projectDir);
+      } catch {
+        // Corrupt infrastructure.json — skip the combined check here; onBuildComplete
+        // reads the same file and surfaces the parse error with context.
+      }
+      validateConfig(config, releaseNameForBudget);
       config = applyDefaults(config);
       configNormalized = true;
     }
@@ -265,6 +395,39 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
       // Use process.cwd() which is the project root during build.
       const cfg = await ensureConfig(process.cwd());
+
+      // N14: `deploymentId` (Next's skew protection) makes Next return a CONSTANT build id
+      // — literally `build-TfctsWXpff2fKS` for every build, forever (see getBuildId in
+      // next/src/build/index.ts: with skew protection the deployment-id header identifies
+      // the version instead). This adapter keys blue/green on the build id: Deployment /
+      // Service / HPA / HealthCheckPolicy names, the routing-manifest snapshot, the
+      // adapter-k8s.dev/build-id label, and the CDN cutover cache-tag. A constant build id
+      // makes consecutive deploys share every one of those names, so a "new" build would
+      // adopt the serving Deployment mid-cutover instead of standing up beside it. The
+      // composed-name collision guard in onBuildComplete would abort the deploy anyway;
+      // fail here instead, at the point where the cause is visible and fixable.
+      // WARN, don't throw: a build is not a deploy. The Next.js e2e deploy harness sets
+      // NEXT_DEPLOYMENT_ID (→ config.deploymentId) on purpose to exercise `?dpl=` asset
+      // versioning, and it never runs `adapter-k8s deploy` — it drives the pool server
+      // directly, where a constant build id is harmless. The hazard is real only at CUTOVER,
+      // so `adapter-k8s deploy` refuses it there (see the build-id collision guard in
+      // src/cli/deploy.ts, which aborts on identical composed names).
+      if ((nextConfig as { deploymentId?: string }).deploymentId) {
+        console.warn(
+          "[adapter-k8s] next.config `deploymentId` is set — you almost certainly do not need " +
+            "it here, and it breaks blue/green. Next pins the build id to a CONSTANT when " +
+            "deploymentId is set (getBuildId in next/src/build/index.ts), and this adapter " +
+            "derives every blue/green resource name, the build-id label, the CDN cutover " +
+            "cache-tag, AND the Valkey cache namespace (`k8s:<buildId>:`) from the build id — " +
+            "so consecutive deploys would collide and even share cache entries. " +
+            "`adapter-k8s deploy` refuses the cutover. You lose nothing by removing it: skew " +
+            "protection is ALREADY active via the per-build build id (the RSC payload carries " +
+            "it and the client hard-reloads on mismatch — see fetch-server-response.ts; " +
+            "deploymentId only substitutes a different token for that same check), and " +
+            "`?dpl=` asset versioning is moot because this adapter enables immutable " +
+            "(content-addressed) assets, which suppress it.",
+        );
+      }
 
       const modified: Record<string, unknown> = {
         ...nextConfig,
@@ -366,13 +529,60 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // build with a clear message instead of injecting into any of those sinks.
       assertSafeBuildId(buildId);
 
+      // Config and release name are needed by the collision guard below (and the
+      // rest of the build); resolve them before any artifact is touched.
+      const cfg = await ensureConfig(projectDir);
+      const releaseName = deriveReleaseName(projectDir);
+
+      // Blue/green requires the new and current builds to have DISTINCT sanitized K8s
+      // names: resource names, pod labels, and the active-Service selector all derive
+      // from `${releaseName}-${poolName}-${buildId}` truncated to 63 chars (59 for the
+      // -hpa/-hcp variants). Compare the COMPOSED truncated names — comparing
+      // sanitizeK8sName(buildId) alone misses the case where a long release+pool
+      // prefix truncates the build id away entirely, making EVERY consecutive deploy
+      // collide. The deploy CLI performs the same composed-name check against cluster
+      // state; catching it at build time fails before any artifact is emitted.
+      // Best-effort read: no state file (first deploy) means no comparison. Only the
+      // read/parse sits inside the try — the comparison and its throw are OUTSIDE, so
+      // the catch can never swallow the guard's own error (the old shape re-threw by
+      // matching a message prefix; a reworded message would have no-op'd the guard).
+      let previousBuildId: string | null = null;
+      try {
+        const statePath = path.join(projectDir, ".k8s-adapter", "state.json");
+        if (existsSync(statePath)) {
+          const state = JSON.parse(readFileSync(statePath, "utf-8")) as {
+            buildId?: unknown;
+          };
+          if (typeof state.buildId === "string") previousBuildId = state.buildId;
+        }
+      } catch {
+        // Unreadable/corrupt state.json: ignore — the deploy-side check is authoritative.
+      }
+      if (previousBuildId !== null) {
+        const collision = findBuildIdNameCollision(
+          releaseName,
+          Object.keys(cfg.pools),
+          buildId,
+          previousBuildId,
+        );
+        if (collision !== null) {
+          throw new Error(
+            `[adapter-k8s] build id sanitizes to the same K8s name as the previous build: ` +
+              `"${buildId}" and "${previousBuildId}" both produce the ${collision.kind} name ` +
+              `"${collision.name}" after sanitization and 63-char truncation (release ` +
+              `"${releaseName}") — blue/green resource names, pod labels, and the ` +
+              `active-Service selector would collide. Choose a distinct generateBuildId, ` +
+              `or shorten the release/pool names so more of the build id survives.`,
+          );
+        }
+      }
+
       // Regenerate the Helm chart from a clean slate. Chart files are named per
       // pool/build; without wiping, a removed pool's Deployment/Service or a
       // stale template from a prior build survives and gets re-applied by the
       // next `helm upgrade`. Only the generated chart dir is cleared — staged
       // build contexts and injected previous-build templates live elsewhere and
       // are managed by their own steps.
-      const { rm } = await import("node:fs/promises");
       const chartDir = path.join(projectDir, OUTPUT_DIR, "chart");
       if (existsSync(chartDir)) await rm(chartDir, { recursive: true, force: true });
 
@@ -435,7 +645,6 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         ),
       );
 
-      const cfg = await ensureConfig(projectDir);
       stagedPaths.clear();
 
       // 1. Classify outputs into pools
@@ -458,22 +667,18 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const staticManifest = buildStaticManifest(outputs, projectDir, nextConfig.basePath ?? "");
 
       // 4. Generate Helm chart
-      // Read releaseName from infrastructure.json (written by init) so it matches
-      // the gcloud resource names (IP, gateway, etc.)
+      // releaseName was derived up top (deriveReleaseName — infrastructure.json with a
+      // capped basename fallback); infrastructure.json also carries namespace/registry/
+      // project values consumed below.
       const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
       const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : {};
-      const releaseName =
-        infra.releaseName ??
-        path
-          .basename(projectDir)
-          .toLowerCase()
-          .replace(/[^a-z0-9]/g, "-") ??
-        "nextjs";
 
       // Phase 2 artifacts (Route Extension) — computed before Helm chart so extensionChain is available
       const celExpression = generateCelExpression({
         outputs,
         dynamicRoutes: routing.dynamicRoutes,
+        // request.path at the LB includes the basePath — the CEL must too.
+        basePath: nextConfig.basePath ?? "",
       });
 
       const failureModeAllow = determineFailureMode(outputs, cfg.routingService?.failureMode);
@@ -483,12 +688,28 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // infrastructure.json is operator/CI-managed state, but a tampered or hand-edited
       // value here flows into helm --set, resource names, and chart YAML — validate at
       // the point of consumption and fail the build rather than emit an unsafe chart.
-      const namespace = infra.namespace ?? "default";
+      const namespace = infra.namespace ?? K8S_NAMESPACE;
       try {
         assertSafeNamespace(namespace);
       } catch (err) {
         throw new Error(
           `[adapter-k8s] Unsafe namespace in .k8s-adapter/infrastructure.json: ${(err as Error).message}`,
+        );
+      }
+      // The namespace feeds ONLY the ext_proc extension-chain authority
+      // (`<release>-routing-service.<namespace>.svc.cluster.local`, extension-chain.ts)
+      // — every kubectl/helm call in the CLI pins the literal K8S_NAMESPACE, and init
+      // binds Workload Identity to default/<release>-deploy-sa. A non-default value
+      // here would land workloads in "default" while the GXLB callout targets the
+      // other namespace: every edge callout fails, and diagnostics chase the "wrong"
+      // resources. Fail fast at build time instead of emitting a skewed chain.
+      if (namespace !== K8S_NAMESPACE) {
+        throw new Error(
+          `[adapter-k8s] Unsupported namespace "${namespace}" in ` +
+            `.k8s-adapter/infrastructure.json: this adapter version deploys only to the ` +
+            `"${K8S_NAMESPACE}" namespace (init binds Workload Identity to ` +
+            `${K8S_NAMESPACE}/<release>-deploy-sa and every kubectl/helm call pins it). ` +
+            `Remove "namespace" from infrastructure.json.`,
         );
       }
 
@@ -506,12 +727,34 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       }
       const imageRegistry = configuredRegistry ?? "REGISTRY";
 
+      // projectId/region flow into the extension-chain JSON, which the route-ext
+      // ConfigMap template re-interpolates into quoted YAML scalars (service,
+      // authority) — validate at the source so a tampered infrastructure.json
+      // fails the build instead of injecting into the chart downstream.
+      if (infra.projectId !== undefined) {
+        try {
+          assertSafeProjectId(infra.projectId);
+        } catch (err) {
+          throw new Error(
+            `[adapter-k8s] Unsafe projectId in .k8s-adapter/infrastructure.json: ${(err as Error).message}`,
+          );
+        }
+      }
+      if (infra.region !== undefined) {
+        try {
+          assertSafeRegion(infra.region);
+        } catch (err) {
+          throw new Error(
+            `[adapter-k8s] Unsafe region in .k8s-adapter/infrastructure.json: ${(err as Error).message}`,
+          );
+        }
+      }
+
       const extensionChain = generateExtensionChain({
         celExpression,
         releaseName,
         namespace,
         projectId: infra.projectId ?? "",
-        region: infra.region ?? "",
         timeout: gkeProvider.serviceExtensions?.routeExtension?.timeout
           ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
           : "5s",
@@ -684,9 +927,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         await writeOutputFile(
           projectDir,
           "Dockerfile",
+          // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts)
+          // — Node >= 24 is required for the manifest's inline (?i:) regexes (N24).
           generateDockerfile({
             containerStrategy: "shared-image",
-            nodeVersion: "22",
             buildId,
           }),
           absSharedStageDir,
@@ -811,6 +1055,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           }
           await stageFile(projectDir, nextRoutingDir, "node_modules/@next/routing", poolName);
 
+          // Stage sharp's native linux-x64 packages (see stageSharpRuntimePackages) —
+          // pool-server.cjs inlines sharp's JS but requires the platform binding at
+          // runtime, and the traced-assets context otherwise ships no @img/* at all.
+          const sharpStaging = await stageSharpRuntimePackages(projectDir, poolName);
+
           // Keep .env secrets out of the pool image. The Dockerfile's
           // `COPY context/ .` runs from this pool dir (the docker build
           // context), so the .dockerignore lives here alongside the Dockerfile.
@@ -871,8 +1120,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             `Dockerfile`,
             generatePoolDockerfile({
               poolName,
-              nodeVersion: "22",
               buildId,
+              // Build host lacked linux-x64 sharp packages — install in-image instead,
+              // pinned to the app's sharp so the native ABI matches the inlined JS.
+              ...(!sharpStaging.staged && sharpStaging.sharpVersion
+                ? { installSharpVersion: sharpStaging.sharpVersion }
+                : {}),
             }),
             poolDir,
           );
@@ -909,7 +1162,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         await writeOutputFile(
           projectDir,
           "Dockerfile",
-          generateRoutingServiceDockerfile({ nodeVersion: "22", buildId }),
+          generateRoutingServiceDockerfile({ buildId }),
           routingServiceDir,
         );
 

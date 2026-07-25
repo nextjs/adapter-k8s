@@ -19,6 +19,7 @@
 
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
+import { wallClockNow } from "./stream-codec.js";
 
 export class RespError extends Error {
   constructor(message: string) {
@@ -58,8 +59,13 @@ export interface ValkeyClient {
 }
 
 export interface RespClientOptions {
-  /** `redis://host:port` or `rediss://host:port` (TLS). Userinfo (`redis://:pass@host`) is
-   * honored as the AUTH password when `password` isn't given explicitly. */
+  /** `redis://host:port` or `rediss://host:port` (TLS). IPv6 literals use URL brackets:
+   * `redis://[::1]:6379` (N7). Userinfo is honored as AUTH when `password` isn't given
+   * explicitly: `redis://:pass@host` sends `AUTH pass`, `redis://user:pass@host` sends the ACL
+   * form `AUTH user pass` (N3), and `redis://user@host` (an ACL `nopass` user) sends
+   * `AUTH user ""` (N7). A DB index in the URL path (`redis://host/1`) is NOT honored — the
+   * cache keyspace is namespaced by build id and always uses DB 0; a warning is logged once
+   * per process (N4). */
   url: string;
   /** AUTH string, sent before any command. Takes precedence over URL userinfo. */
   password?: string | undefined;
@@ -71,6 +77,9 @@ export interface RespClientOptions {
   /** Reject if the TCP/TLS connection isn't established within this window (a blackholed endpoint
    * has no connect timeout of its own and would otherwise hang the first command's render). */
   connectTimeoutMs?: number;
+  /** How long the circuit breaker stays open after a connect/command failure (L17): during the
+   * window, commands fail fast instead of each paying a fresh connect + connectTimeoutMs. */
+  circuitBreakerMs?: number;
   /** Maximum size of a single reply frame in bytes (default 64 MiB). A server-advertised bulk
    * length or array that would exceed this is a protocol error: the connection is destroyed and
    * all in-flight commands fail (we never buffer an unbounded/untrustworthy advertised length). */
@@ -84,6 +93,15 @@ const DEFAULT_MAX_REPLY_BYTES = 64 * 1024 * 1024;
 /** Total buffered-but-unparsed bytes are capped at a multiple of the frame cap: pipelined replies
  * (MULTI, concurrent commands) legitimately stack several frames behind the head one. */
 const MAX_BUFFERED_FACTOR = 4;
+/**
+ * Default circuit-breaker window (L17). During a Valkey outage, every command would otherwise
+ * pay a fresh TCP/TLS connect plus up to `connectTimeoutMs` before failing — per cache read,
+ * per render, amplifying the outage's latency cost across the whole pool. After any
+ * connect/command failure the breaker stays open for this window and commands fail fast (the
+ * handlers degrade to a cache miss); the first command past the window probes a fresh
+ * connection, so recovery is automatic and uncoordinated.
+ */
+const DEFAULT_CIRCUIT_BREAKER_MS = 1_500;
 
 function encodeCommand(args: Arg[]): Buffer {
   const parts: Buffer[] = [Buffer.from(`*${args.length}\r\n`)];
@@ -231,8 +249,11 @@ class RespClient implements ValkeyClient {
   private readonly caCert: string | undefined;
   private readonly commandTimeoutMs: number;
   private readonly connectTimeoutMs: number;
+  private readonly circuitBreakerMs: number;
   private readonly maxReplyBytes: number;
   private readonly maxBufferedBytes: number;
+  /** L17: while the wall clock (wallClockNow, N8) is below this, commands fail fast instead of reconnecting. */
+  private circuitOpenUntil = 0;
 
   constructor(options: RespClientOptions) {
     this.url = options.url;
@@ -240,6 +261,7 @@ class RespClient implements ValkeyClient {
     this.caCert = options.caCert;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 5000;
     this.connectTimeoutMs = options.connectTimeoutMs ?? 5000;
+    this.circuitBreakerMs = options.circuitBreakerMs ?? DEFAULT_CIRCUIT_BREAKER_MS;
     this.maxReplyBytes = options.maxReplyBytes ?? DEFAULT_MAX_REPLY_BYTES;
     this.maxBufferedBytes = this.maxReplyBytes * MAX_BUFFERED_FACTOR;
   }
@@ -315,13 +337,28 @@ class RespClient implements ValkeyClient {
   // command timeout, and on a reply-protocol violation — destroying is deliberate: a late or
   // mistramed reply after we've shifted the queue would map to the wrong caller, so we resync
   // from a clean slate and let the next command reconnect.
-  private failAll(error: Error): void {
+  //
+  // `fromConnectFailure` is set by the connect path (ensureConnected's rejection handler): a
+  // failed connect never has queued commands, but it absolutely warrants the breaker.
+  private failAll(error: Error, fromConnectFailure = false): void {
     const socket = this.socket;
     this.socket = undefined;
     this.connecting = undefined;
     this.inboundChunks = [];
     this.inboundBytes = 0;
     this.neededBytes = 0;
+    // Open the circuit breaker (L17) — but only when the failure actually cost something: a
+    // connect failure, or in-flight commands that just paid for it (`queue.length > 0`, checked
+    // BEFORE the queue is drained below). A server-initiated close with an EMPTY queue (server
+    // `timeout`, NAT/proxy idle reaping — routine in k8s) is benign (N7): pre-breaker the client
+    // reconnected transparently on the next command, and opening here made that next cache read
+    // fail fast for circuitBreakerMs even though an immediate reconnect would have succeeded.
+    if (this.circuitBreakerMs > 0 && (fromConnectFailure || this.queue.length > 0)) {
+      // N8: wallClockNow, not Date.now — a patched Date.now throwing INSIDE ensureConnection
+      // corrupted the connect state ("Connection closed" on every later command), silently
+      // killing freshness checks. These circuit-breaker clock reads are load-bearing.
+      this.circuitOpenUntil = wallClockNow() + this.circuitBreakerMs;
+    }
     if (socket) {
       socket.removeAllListeners();
       socket.destroy();
@@ -335,7 +372,10 @@ class RespClient implements ValkeyClient {
 
   private async connect(): Promise<void> {
     const parsed = new URL(this.url);
-    const host = parsed.hostname;
+    // N7: `URL.hostname` keeps the brackets on an IPv6 literal (`redis://[::1]:6379` →
+    // `"[::1]"`). Unbracketed, `net.isIP` recognizes it (so the L18 SNI skip below applies)
+    // and `net.connect` gets a connectable address instead of resolving `"[::1]"` as a DNS name.
+    const host = parsed.hostname.replace(/^\[|\]$/g, "");
     const port = parsed.port ? Number(parsed.port) : 6379;
     const useTls = parsed.protocol === "rediss:";
     // Honor URL userinfo (`redis://:secret@host`) when no explicit password is configured (L6) —
@@ -348,20 +388,56 @@ class RespClient implements ValkeyClient {
         userinfoPassword = parsed.password; // malformed percent-encoding: use it verbatim
       }
     }
+    // N3: the userinfo USERNAME (`redis://user:pass@host`) selects the ACL identity — it was
+    // previously dropped, so ACL-user deployments AUTHed as `default` and got NOAUTH.
+    let userinfoUsername: string | undefined;
+    if (parsed.username) {
+      try {
+        userinfoUsername = decodeURIComponent(parsed.username);
+      } catch {
+        userinfoUsername = parsed.username; // malformed percent-encoding: use it verbatim
+      }
+    }
+    // N4: a DB index in the URL path (`redis://host/1`) is silently ignored by design — the
+    // cache keyspace is namespaced by build id, so everything lives in DB 0. Warn once rather
+    // than dropping it silently (SELECT is deliberately unimplemented: multi-DB is deprecated
+    // upstream and the build-id namespace already provides the wanted isolation).
+    if (parsed.pathname && parsed.pathname !== "/") warnDbIndexOnce();
     const password = this.password ?? userinfoPassword;
     if (password && !useTls) warnPlaintextAuthOnce();
 
     // Lazy dynamic import keeps `node:net`/`node:tls` out of module eval (edge-eval-safe).
     // With a configured CA (Memorystore in-transit encryption), pin verification to it — its
     // CA is not publicly rooted, so the default trust store would reject the handshake.
+    const net = await import("node:net");
     const socket: Socket | TLSSocket = useTls
       ? (await import("node:tls")).connect({
           host,
           port,
-          servername: host,
+          // L18: SNI is a DNS-name extension, so it is omitted for IP-literal hosts —
+          // `rediss://<ip>` (a Memorystore VPC endpoint) is the normal production shape.
+          // Certificate verification still runs, matched against the cert's IP subjectAltName.
+          //
+          // The failure originally reported here was a hard throw (ERR_INVALID_ARG_VALUE) on an
+          // IP `servername`, making `rediss://<ip>` unconnectable. Both measurements, 2026-07:
+          //   • Node 20 / 22 / 24 (what `engines` allows and what the emitted images pin):
+          //     NO throw — only DEP0123 ("Setting the TLS ServerName to an IP address is not
+          //     permitted by RFC 6066. This will be ignored in a future version."), SNI is still
+          //     sent, and the handshake completes.
+          //   • Node 25 / 26: the deprecation has become a hard `ERR_INVALID_ARG_VALUE` throw.
+          // So the throw is real, just AHEAD of our supported range — this skip is what keeps
+          // `rediss://<ip>` working when a build host or base image moves to Node 25+, and it is
+          // RFC 6066 correctness meanwhile (a server may reject an IP SNI outright). Nothing in
+          // the CURRENT runtime enforces it, though: deleting it would keep connecting on 20-24
+          // and only break later.
+          // That is why `resp-client-tls.integration.test.ts` asserts SNI absence ON THE WIRE
+          // (parsing the ClientHello through a TCP relay in front of a real Valkey TLS listener)
+          // instead of merely asserting that an IP endpoint connects — a behavioral test would
+          // pass either way and this skip would rot unnoticed.
+          ...(net.isIP(host) ? {} : { servername: host }),
           ...(this.caCert ? { ca: this.caCert } : {}),
         })
-      : (await import("node:net")).connect({ host, port });
+      : net.connect({ host, port });
     socket.setNoDelay(true);
     socket.on("data", (chunk: Buffer) => this.onData(chunk));
 
@@ -407,8 +483,16 @@ class RespClient implements ValkeyClient {
     socket.on("close", () => this.failAll(new Error("Valkey connection closed")));
 
     // AUTH before any user command. connect() stays pending (so ensureConnected keeps gating user
-    // commands) until AUTH's reply lands; its own command timeout bounds it.
-    if (password) await this.write(["AUTH", password]);
+    // commands) until AUTH's reply lands; its own command timeout bounds it. ACL form (N3) when
+    // the URL carried a username, single-arg legacy form otherwise. A username WITHOUT a password
+    // (`redis://user@host`, an ACL `nopass` user) still sends the ACL form with an empty-string
+    // password — the server accepts it for `nopass` users; previously the username was silently
+    // dropped and no AUTH was sent at all, so the connection ran as `default` (N7).
+    if (userinfoUsername) {
+      await this.write(["AUTH", userinfoUsername, password ?? ""]);
+    } else if (password) {
+      await this.write(["AUTH", password]);
+    }
   }
 
   private ensureConnected(): Promise<void> {
@@ -418,12 +502,23 @@ class RespClient implements ValkeyClient {
     // await the connect promise — not take the socket fast path and race ahead of AUTH.
     if (this.connecting) return this.connecting;
     if (this.socket && !this.socket.destroyed) return Promise.resolve();
+    // Circuit breaker (L17): a recent connect/command failure means reconnecting right now would
+    // very likely pay the full connect timeout again — per cache read, per render. Fail fast;
+    // the handlers treat a rejected command as a cache miss. The window is short and only a
+    // fresh attempt past it can close the breaker, so recovery needs no probe traffic.
+    if (wallClockNow() < this.circuitOpenUntil) {
+      return Promise.reject(
+        new Error("Valkey circuit breaker open after a recent failure; failing fast"),
+      );
+    }
     this.connecting = this.connect().then(
       () => {
         this.connecting = undefined;
+        this.circuitOpenUntil = 0;
       },
       (error: unknown) => {
-        this.failAll(error instanceof Error ? error : new Error(String(error)));
+        // Connect failures open the breaker even with an empty queue (see failAll).
+        this.failAll(error instanceof Error ? error : new Error(String(error)), true);
         throw error;
       },
     );
@@ -536,6 +631,18 @@ function warnPlaintextAuthOnce(): void {
   console.warn(
     "[valkey-cache] a Valkey password is configured over a plaintext redis:// connection — " +
       "AUTH and all cache content cross the network in cleartext; use rediss:// (TLS) instead",
+  );
+}
+
+let warnedDbIndex = false;
+
+/** One-time warning (N4): a `redis://host/1`-style DB index in the URL is ignored by design. */
+function warnDbIndexOnce(): void {
+  if (warnedDbIndex) return;
+  warnedDbIndex = true;
+  console.warn(
+    "[valkey-cache] a DB index in the Valkey URL (redis://host/<n>) is unsupported and ignored — " +
+      "the cache keyspace is namespaced by build id and always uses DB 0",
   );
 }
 

@@ -1,8 +1,8 @@
-// Managed cache provisioning: a Memorystore instance (Redis engine — wire-compatible with the
-// ioredis client the pool uses, same as Valkey) reachable privately from the GKE pods. Used
-// when `cache.enabled` is set without a BYO `cache.url`. The instance's endpoint is injected
-// into the pods via the `${releaseName}-valkey` Secret (created imperatively at deploy time,
-// since the private IP is only known after provisioning).
+// Managed cache provisioning: a Memorystore instance (Redis engine — wire-compatible with
+// the pool's zero-dep RESP2 client, same as Valkey) reachable privately from the GKE pods.
+// Used when `cache.enabled` is set without a BYO `cache.url`. The instance's endpoint is
+// injected into the pods via the `${releaseName}-valkey` Secret, which deploy renders into
+// the chart (Helm-owned) once provisioning reveals the private IP.
 import { execCapture } from "./exec.js";
 
 export interface ProvisionCacheOptions {
@@ -229,7 +229,19 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     // worse, plaintext creds would be expected on a path the operator believes is secured).
     if (auth) {
       const details = await describeInstanceAuth(name, region, projectId);
-      if (details && !(details.authEnabled && details.transitEncryption)) {
+      // "Couldn't tell" is NOT "proceed": a null here means the describe failed (or
+      // returned nothing parseable), and reusing the instance blind could hand the pods a
+      // rediss:// endpoint on an instance that doesn't enforce AUTH. Abort with guidance.
+      if (!details) {
+        throw new Error(
+          `Could not verify the AUTH / in-transit-encryption posture of the existing ` +
+            `Memorystore instance ${name} (gcloud describe failed or returned nothing). ` +
+            `cache.memorystore.auth is enabled and AUTH is creation-only, so refusing to ` +
+            `guess. Check \`gcloud redis instances describe ${name} --region ${region} ` +
+            `--project ${projectId}\` and re-run the deploy.`,
+        );
+      }
+      if (!(details.authEnabled && details.transitEncryption)) {
         throw new Error(
           `Memorystore instance ${name} already exists WITHOUT AUTH / in-transit encryption, ` +
             `but cache.memorystore.auth is enabled. AUTH can only be set at creation: either ` +
@@ -251,26 +263,32 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     `    Creating Memorystore ${name} (${sizeGb}GB, tier ${gcpTier}` +
       `${auth ? ", AUTH + in-transit encryption" : ""}) — this takes a few minutes…`,
   );
-  const create = await execCapture("gcloud", [
-    "redis",
-    "instances",
-    "create",
-    name,
-    "--size",
-    String(sizeGb),
-    "--region",
-    region,
-    "--network",
-    network,
-    "--tier",
-    gcpTier,
-    "--connect-mode",
-    "DIRECT_PEERING",
-    ...(auth ? ["--auth-enabled", "--transit-encryption-mode", "SERVER_AUTHENTICATION"] : []),
-    "--project",
-    projectId,
-    "--quiet",
-  ]);
+  const create = await execCapture(
+    "gcloud",
+    [
+      "redis",
+      "instances",
+      "create",
+      name,
+      "--size",
+      String(sizeGb),
+      "--region",
+      region,
+      "--network",
+      network,
+      "--tier",
+      gcpTier,
+      "--connect-mode",
+      "DIRECT_PEERING",
+      ...(auth ? ["--auth-enabled", "--transit-encryption-mode", "SERVER_AUTHENTICATION"] : []),
+      "--project",
+      projectId,
+      "--quiet",
+    ],
+    // Instance creation waits on a long-running GCP operation (typically 5-15 min);
+    // without a cap a wedged operation would hang the deploy forever.
+    { timeoutMs: 20 * 60 * 1000 },
+  );
   if (create.exitCode !== 0 && !/already exists/i.test(create.stderr)) {
     // A concurrent run may have created it first ("already exists") — in that case fall through
     // to wait for READY rather than failing the deploy.

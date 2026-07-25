@@ -150,12 +150,15 @@ describe("routes", () => {
     expect(t(a.body)).not.toBe(t(b.body));
   });
 
-  it("decodes an encoded slash once inside an ordinary dynamic parameter", async () => {
-    // The adapter receives the capture in URL-encoded form and must pass the decoded value to the
-    // generated entrypoint. Double encoding here breaks both route params and revalidation keys.
+  it("preserves an encoded slash inside an ordinary dynamic parameter (next start parity)", async () => {
+    // Next 16.2's getParamValue re-encodes route params before user code sees them
+    // (get-dynamic-param.js: `value = encodeURIComponent(value)`), so `next start`
+    // renders the ENCODED form — verified empirically on 16.2.10, where the marker is
+    // `encoded-key:<!-- -->%2Flive%2Fprobe` under every invocation shape. The adapter
+    // must match next start, not the decoded form this test previously pinned.
     const r = await req("/encoded-key/%2Flive%2Fprobe");
     expect(r.status).toBe(200);
-    expect(r.body).toContain("encoded-key:/live/probe");
+    expect(r.body).toMatch(/encoded-key:(<!-- -->)?%2Flive%2Fprobe/);
   });
 
   it("preserves React's Link-header budget across a PPR shell and resume", async () => {
@@ -177,9 +180,12 @@ describe("routes", () => {
     const first = await req(`/fallback-cache/${slug}`);
     const second = await req(`/fallback-cache/${slug}`);
     expect(first.status).toBe(200);
-    expect(first.body).toContain(`fallback-cache-materialized:${slug}`);
+    // React interposes a `<!-- -->` comment between static text and the interpolated
+    // slug in the SSR HTML; tolerate it (same parity note as the encoded-key test).
+    const materialized = new RegExp(`fallback-cache-materialized:(<!-- -->)?${slug}`);
+    expect(first.body).toMatch(materialized);
     expect(first.body).not.toContain("fallback-cache-shell");
-    expect(second.body).toContain(`fallback-cache-materialized:${slug}`);
+    expect(second.body).toMatch(materialized);
   });
 
   it("finishes tag invalidation work before releasing the request lifecycle", async () => {
@@ -217,13 +223,21 @@ describe("middleware at the ext_proc edge (traffic extension, after the CDN cach
     expect(r.body).toContain("Rewritten by middleware");
   });
 
-  it("translates a middleware redirect into an RSC navigation response", async () => {
+  // N15: this previously asserted 200 + `x-nextjs-redirect: /rewritten` — OUR OWN invented
+  // behavior, corrected here to `next start` parity. `next start` answers an RSC request that
+  // hits a redirect with the REAL 3xx + `location` (measured: `curl -H 'RSC: 1'
+  // /redirect/source?_rsc=abc123` → 308 + `location: /redirect/dest?_rsc=abc123`), and never
+  // emits `x-nextjs-redirect` for App Router at all — that header is a Pages-router protocol
+  // (written under isNextDataRequest, read only by shared/lib/router/router.ts). The flight
+  // client follows the real redirect via response.redirected. The middleware-authored target is
+  // authoritative, so the request query is NOT carried onto it (unlike rule redirects).
+  it("emits the real 3xx for a middleware redirect on an RSC request", async () => {
     const r = await req("/rsc-redirect-origin?_rsc=probe", {
       headers: { rsc: "1" },
     });
-    expect(r.status).toBe(200);
-    expect(r.headers.get("location")).toBeNull();
-    expect(r.headers.get("x-nextjs-redirect")).toBe("/rewritten");
+    expect(r.status).toBe(307);
+    expect(r.headers.get("location")).toBe("/rewritten");
+    expect(r.headers.get("x-nextjs-redirect")).toBeNull();
   });
 
   it("stamps matched responses with its marker header", async () => {
@@ -243,6 +257,14 @@ describe("middleware at the ext_proc edge (traffic extension, after the CDN cach
 });
 
 describe("rewrite query semantics", () => {
+  // DELIBERATE divergence from `next start`, not parity: verified on Next 16.2.10,
+  // `next start` returns `{"items":[]}` here, because App Route handlers read only
+  // the request URL and have no `query` requestMeta channel (unlike Pages, which
+  // gets asPath/resolvedUrl/query metadata). The adapter folds a rewrite's
+  // destination query onto the public pathname for APP_ROUTE outputs only — the
+  // same treatment dispatch.ts already applied on the edge path — so a rewrite's
+  // query reaches route handlers instead of vanishing. Nothing observable
+  // regresses: route handlers expose no asPath/usePathname/resolvedUrl.
   it("preserves repeated destination values as an ordered array", async () => {
     const r = await req("/rewrite-query-array");
     expect(r.status).toBe(200);
@@ -251,15 +273,27 @@ describe("rewrite query semantics", () => {
 });
 
 describe("Cloud CDN", () => {
-  it("serves and optimizes a public image whose filename contains a space", async () => {
+  it("decodes a space-containing public filename through the optimizer (SVG → 400 parity)", async () => {
     const direct = await req("/image%20probe.svg");
     expect(direct.status).toBe(200);
     expect(direct.headers.get("content-type")).toContain("image/svg");
 
     // The optimizer query decodes once to `/image%20probe.svg`; filesystem resolution must perform
     // the URL-path decode exactly once more to find the literal-space public file.
+    //
+    // This test previously expected 200, which contradicts `next start`: the fixture does not set
+    // images.dangerouslyAllowSVG, and Next REJECTS an SVG source through /_next/image in that
+    // default config. Verified empirically 2026-07-24 against `next start` on this exact fixture
+    // (Next 16.2.x): GET /_next/image?url=%2Fimage%2520probe.svg&w=640&q=75 → HTTP 400, body
+    // `"url" parameter is valid but image type is not allowed` (the 200 expectation predated the
+    // adapter's dangerouslyAllowSVG gate, which pinned parity). The 400-with-type-body still
+    // proves the double-encoded space decoded correctly: a mis-decoded path yields a 404
+    // ("Image not found"), and a malformed one a different 400 ("malformed image path").
     const optimized = await req("/_next/image?url=%2Fimage%2520probe.svg&w=640&q=75");
-    expect(optimized.status).toBe(200);
+    expect(optimized.status).toBe(400);
+    // toContain (not toBe): the exact byte-for-byte body is pinned by the unit tests;
+    // builds deployed before this branch prefix it with "Bad Request: ".
+    expect(optimized.body).toContain('"url" parameter is valid but image type is not allowed');
   });
 
   it("does not upscale an image smaller than the requested optimizer width", async () => {
@@ -308,7 +342,11 @@ describe("Cloud CDN", () => {
     expect(rsc.headers.get("content-type")).not.toBe(html.headers.get("content-type"));
   });
 
-  it("edge-caches immutable static assets", async () => {
+  // Actual edge-cache HITs only exist behind Cloud CDN; `adapter-k8s emulate`
+  // (http://localhost) has no CDN tier, so this one test is live-only. Every other
+  // assertion in this suite — including the rest of this describe — passes against
+  // the emulation.
+  it.skipIf(!BASE.startsWith("https://"))("edge-caches immutable static assets", async () => {
     const home = await req("/");
     const asset = home.body.match(/\/_next\/static\/[^"']+\.js/)?.[0];
     expect(asset, "expected a hashed static asset in the home page").toBeTruthy();

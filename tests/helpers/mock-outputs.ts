@@ -31,6 +31,32 @@ export function mockAppRoute(
   };
 }
 
+export function mockPage(overrides: Partial<AdapterOutput["PAGES"]> = {}): AdapterOutput["PAGES"] {
+  return {
+    id: overrides.id ?? `/pages${overrides.pathname ?? "/page"}`,
+    filePath: overrides.filePath ?? `/dist/server/pages${overrides.pathname ?? "/page"}.js`,
+    pathname: overrides.pathname ?? "/page",
+    runtime: overrides.runtime ?? "nodejs",
+    assets: overrides.assets ?? {},
+    type: "PAGES" as any, // AdapterOutputType.PAGES
+    config: overrides.config ?? {},
+  } as AdapterOutput["PAGES"];
+}
+
+export function mockPagesApi(
+  overrides: Partial<AdapterOutput["PAGES_API"]> = {},
+): AdapterOutput["PAGES_API"] {
+  return {
+    id: overrides.id ?? `/pages${overrides.pathname ?? "/api/hello"}`,
+    filePath: overrides.filePath ?? `/dist/server/pages${overrides.pathname ?? "/api/hello"}.js`,
+    pathname: overrides.pathname ?? "/api/hello",
+    runtime: overrides.runtime ?? "nodejs",
+    assets: overrides.assets ?? {},
+    type: "PAGES_API" as any, // AdapterOutputType.PAGES_API
+    config: overrides.config ?? {},
+  } as AdapterOutput["PAGES_API"];
+}
+
 export function mockStaticFile(
   overrides: Partial<AdapterOutput["STATIC_FILE"]> = {},
 ): AdapterOutput["STATIC_FILE"] {

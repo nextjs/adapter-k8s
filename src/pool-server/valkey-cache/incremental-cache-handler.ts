@@ -14,13 +14,15 @@
 // `get` returns null when the entry's tags have been revalidated since it was stored (Next then
 // regenerates), so the per-process `tags-manifest.external` check Next also runs is irrelevant here.
 import type { ValkeyClient } from "./client.js";
-import { logErrorRateLimited, maxCacheEntryBytes, warnOnce } from "./stream-codec.js";
+import { logErrorRateLimited, maxCacheEntryBytes, wallClockNow, warnOnce } from "./stream-codec.js";
 import {
   areTagsExpired,
   areTagsStale,
   computeTagUpdate,
   parseTagState,
+  TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
+  warnOnClockSkewClamp,
   type TagState,
 } from "./tag-manifest.js";
 
@@ -39,6 +41,22 @@ export const DURABLE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 // arbitrary content — drop over-limit tags rather than storing/looking-up unbounded lists.
 const MAX_TAGS_PER_ENTRY = 128;
 const MAX_TAG_LENGTH = 256;
+
+/**
+ * Bound a tag list for storage (L9): drop empty/over-long tags and cap the count, keeping the
+ * first well-formed tags in declared order. Shared by both handlers (N5) — the V2 `use cache`
+ * handler stored `entry.tags` uncapped, so a route emitting thousands of cache tags would push
+ * an unbounded list into every entry's meta and every freshness HMGET.
+ */
+export function capTags(raw: readonly string[]): string[] {
+  const tags: string[] = [];
+  for (const tag of raw) {
+    if (typeof tag !== "string" || tag.length === 0 || tag.length > MAX_TAG_LENGTH) continue;
+    tags.push(tag);
+    if (tags.length >= MAX_TAGS_PER_ENTRY) break;
+  }
+  return tags;
+}
 
 // Minimal structural mirror of Next's classic CacheHandler contract (avoids a compile-time
 // dependency on Next internals). `value` is an `IncrementalCacheValue`; we serialize its binary
@@ -165,13 +183,7 @@ function extractTags(value: Record<string, unknown> | null, ctx: SetCtx): string
   }
   // Cap count and per-tag length (L9): over-limit tags are dropped, keeping the first
   // well-formed ones in declared order.
-  const tags: string[] = [];
-  for (const tag of raw) {
-    if (typeof tag !== "string" || tag.length === 0 || tag.length > MAX_TAG_LENGTH) continue;
-    tags.push(tag);
-    if (tags.length >= MAX_TAGS_PER_ENTRY) break;
-  }
-  return tags;
+  return capTags(raw);
 }
 
 /**
@@ -186,7 +198,8 @@ export class ValkeyIncrementalCacheHandler {
 
   constructor(options: ValkeyIncrementalCacheOptions) {
     this.client = options.client;
-    this.now = options.now ?? Date.now;
+    // N8: never Date.now — patched to throw inside tracked static renders (see wallClockNow).
+    this.now = options.now ?? wallClockNow;
     // Same build-namespaced tag keyspace as the V2 handler, so `revalidateTag` is shared.
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;
@@ -256,6 +269,17 @@ export class ValkeyIncrementalCacheHandler {
       const ttlSeconds = hasNumericLifetime
         ? Math.max(revalidate ?? 0, ctx.cacheControl?.expire ?? 0, 1) + RETENTION_MARGIN_SECONDS
         : DURABLE_TTL_SECONDS;
+      // N6: a non-finite numeric lifetime (`revalidate: Infinity` / NaN — `typeof` says
+      // "number" for both) would produce a non-finite SET EX argument, which Valkey rejects —
+      // the write fails and the entry is silently never cached. Refuse to cache it instead,
+      // mirroring the V2 handler's H4 guard.
+      if (!Number.isFinite(ttlSeconds)) {
+        warnOnce(
+          "nonfinite-lifetime",
+          "[valkey-cache] refusing to cache an incremental entry with a non-finite revalidate/expire; treating it as uncacheable",
+        );
+        return;
+      }
       const entry: StoredEntry = {
         value: encodeValue(data),
         tags,
@@ -286,7 +310,16 @@ export class ValkeyIncrementalCacheHandler {
       const args: string[] = [];
       for (const tag of list)
         args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
-      await this.client.eval(UPDATE_TAGS_SCRIPT, 1, this.tagsKey, ...args);
+      // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
+      // the per-build manifest's lifetime the same way entry keys are bounded.
+      const clamped = await this.client.eval(
+        UPDATE_TAGS_SCRIPT,
+        1,
+        this.tagsKey,
+        ...args,
+        String(TAG_MANIFEST_TTL_SECONDS),
+      );
+      warnOnClockSkewClamp(clamped);
     } catch (error) {
       // Best-effort; a missed manifest write means a revalidation is skipped, not a crash — but
       // it must be OBSERVABLE (M1). Rate-limited so a Valkey outage doesn't spam per-request logs.

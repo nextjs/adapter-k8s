@@ -20,7 +20,15 @@ NEXTJS_DIR="${NEXTJS_DIR:-${WORKSPACE}/next.js}"
 TEST_PATTERN="${1:-}"
 NEXTJS_REF="${2:-canary}"
 TEST_GROUP="${3:-1/1}"
-TEST_RETRIES="${NEXT_TEST_RETRIES:-0}"
+# Match upstream CI (.github/workflows/integration_tests_reusable.yml `num_retries: 2`) so
+# our pass/fail numbers are comparable to Next's own. This was 0 while the adapter still had
+# ~1000 failures — retrying a wall of real failures only burned wall-clock. Now that the
+# residual count is small, retries filter deploy-casualty and browser-timing flake instead.
+# CAVEAT: retries also MASK genuinely intermittent failures (upstream's own
+# cache-components-allow-otel-spans TODO notes its failure "is masked in CI because of the
+# built-in jest retry"). When comparing runs, grep the run log for `finished on retry [1-9]`
+# to see what only passed on a retry, and use `--retries 0` when hunting a specific flake.
+TEST_RETRIES="${NEXT_TEST_RETRIES:-2}"
 ADAPTER_MANIFEST="${ADAPTER_DIR}/test/deploy-tests-manifest.adapter-k8s.json"
 NEXT_TEST_FILTERS="test/deploy-tests-manifest.json"
 

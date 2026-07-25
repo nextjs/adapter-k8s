@@ -11,7 +11,38 @@ import { runTail } from "./tail.js";
 import { runEmulate } from "./emulate.js";
 import { assertSafeReleaseName } from "../emit/templates/utils.js";
 
-function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
+// Boolean flags NEVER consume the following argument. The old parser let `--dry-run foo`
+// swallow `foo` as the flag's string value, and every consumer checks
+// `flags["dry-run"] === true` — so a stray positional silently DISABLED the dry-run
+// guard on destroy/deploy (the dangerous direction for an irreversible command).
+const BOOLEAN_FLAGS = new Set([
+  "dry-run",
+  "skip-build",
+  "skip-push",
+  "yes",
+  "y",
+  "allow-no-network-policy",
+  "standard",
+  "help",
+  "h",
+]);
+
+// Value flags REQUIRE a value — a missing value is a hard error, never a silent `true`
+// (a `--project-id` that parsed as boolean would later crash deep inside init).
+const VALUE_FLAGS = new Set([
+  "project-id",
+  "region",
+  "host",
+  "bucket",
+  "registry",
+  "release-name",
+  "port",
+]);
+
+export function parseArgs(argv: string[]): {
+  command: string;
+  flags: Record<string, string | boolean>;
+} {
   const args = argv.slice(2);
   const command = args[0] ?? "help";
   const flags: Record<string, string | boolean> = {};
@@ -19,17 +50,66 @@ function parseArgs(argv: string[]): { command: string; flags: Record<string, str
   for (let i = 1; i < args.length; i++) {
     const arg = args[i]!;
     if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      const nextArg = args[i + 1];
-      if (nextArg && !nextArg.startsWith("--")) {
-        flags[key] = nextArg;
-        i++;
-      } else {
+      let key = arg.slice(2);
+      // Support the --flag=value form (previously `--project-id=x` registered a flag
+      // literally named "project-id=x" that no consumer reads).
+      let inlineValue: string | undefined;
+      const eq = key.indexOf("=");
+      if (eq !== -1) {
+        inlineValue = key.slice(eq + 1);
+        key = key.slice(0, eq);
+      }
+      if (BOOLEAN_FLAGS.has(key)) {
+        if (inlineValue !== undefined) {
+          console.warn(`Warning: --${key} is a boolean flag; ignoring "=${inlineValue}"`);
+        }
         flags[key] = true;
+      } else if (VALUE_FLAGS.has(key)) {
+        if (inlineValue !== undefined) {
+          if (!inlineValue) throw new Error(`Flag --${key} requires a non-empty value`);
+          flags[key] = inlineValue;
+        } else {
+          const nextArg = args[i + 1];
+          if (!nextArg || nextArg.startsWith("-")) {
+            throw new Error(`Flag --${key} requires a value (e.g. --${key}=VALUE)`);
+          }
+          flags[key] = nextArg;
+          i++;
+        }
+      } else {
+        // Unknown flag — warn so a typo (e.g. `--dryrun`) is visible instead of silently
+        // registering a flag nobody reads. Never consume the next arg: we cannot know
+        // whether it was meant as this flag's value or as a positional.
+        console.warn(`Warning: unknown flag --${key} (ignored)`);
       }
     } else if (arg.startsWith("-") && arg.length > 1) {
       // Short flags (e.g. -y) are always booleans.
-      flags[arg.slice(1)] = true;
+      const key = arg.slice(1);
+      if (BOOLEAN_FLAGS.has(key)) {
+        flags[key] = true;
+      } else {
+        console.warn(`Warning: unknown flag -${key} (ignored)`);
+      }
+    } else {
+      console.warn(`Warning: unexpected argument "${arg}" (ignored)`);
+    }
+  }
+
+  // --help / -h were recognized boolean flags that no command consumed, so
+  // `adapter-k8s deploy --help` ran a REAL deploy. Route them to the help printer
+  // instead of dispatching the command.
+  if (flags["help"] === true || flags["h"] === true) {
+    return { command: "help", flags };
+  }
+
+  // Validate --port at the boundary: parseInt("abc", 10) is NaN, which would otherwise
+  // flow into emulate's Envoy listener config and readiness probe silently.
+  if (flags["port"] !== undefined) {
+    const p = Number(flags["port"]);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      throw new Error(
+        `Flag --port must be an integer between 1 and 65535 (got "${flags["port"]}")`,
+      );
     }
   }
 
@@ -53,18 +133,24 @@ Commands:
   destroy    Tear down all resources
 
 Options:
-  --project-id <id>       GCP project ID
+  --project-id <id>        GCP project ID (init)
   --region <region>        GCP region (default: us-central1)
   --host <hostname>        Application hostname(s), comma-separated (e.g. app.example.com,api.example.com)
-  --bucket <name>          GCS bucket name for static assets
-  --registry <url>         Container registry URL
+  --bucket <name>          GCS bucket name for static assets (init)
+  --registry <url>         Container registry URL (init)
   --release-name <name>    Helm release name (default: current directory name)
-  --skip-build             Skip next build (use existing artifacts)
-  --skip-push              Skip docker build + push
+  --standard               Provision a GKE Standard cluster instead of Autopilot (init)
+  --skip-build             Skip next build (deploy, emulate)
+  --skip-push              Skip docker build + push (deploy)
+  --port <port>            Listener port for the local Envoy proxy (emulate; default: 8080)
+  --yes, -y                Skip the confirmation prompt (destroy)
   --allow-no-network-policy  Deploy even if the cluster pod CIDR can't be discovered
-                             (NetworkPolicies skipped — the routing service stays
-                             reachable from in-cluster pods; not recommended)
+                              (NetworkPolicies skipped — the routing service stays
+                              reachable from in-cluster pods; not recommended)
   --dry-run                Show what would be done without executing
+
+Flags may be given as --flag value or --flag=value. Boolean flags (e.g. --dry-run)
+never take a value.
   `);
 }
 
@@ -101,8 +187,14 @@ async function main(): Promise<void> {
       if (typeof infra.releaseName === "string" && infra.releaseName) {
         persistedReleaseName = infra.releaseName;
       }
-    } catch {
-      // Malformed infrastructure.json — fall back to the directory default.
+    } catch (err) {
+      // Malformed infrastructure.json — fall back to the directory default, but name
+      // the file: a corrupt file silently flipping the derived release name would
+      // target the wrong cluster.
+      console.warn(
+        `Warning: could not parse ${infraPath} (${(err as Error).message}) — ` +
+          `falling back to the directory-name release default.`,
+      );
     }
   }
   const releaseName =
@@ -150,6 +242,9 @@ async function main(): Promise<void> {
         releaseName,
         projectDir,
         dryRun,
+        // --standard opts out of the Autopilot default (Standard clusters get
+        // --enable-network-policy, which Autopilot rejects).
+        autopilot: flags["standard"] !== true,
       });
       break;
     }
@@ -170,7 +265,8 @@ async function main(): Promise<void> {
       await runEmulate({
         projectDir,
         skipBuild: flags["skip-build"] === true,
-        port: flags["port"] ? parseInt(flags["port"] as string, 10) : 8080,
+        // --port was range-validated in parseArgs.
+        port: flags["port"] !== undefined ? Number(flags["port"]) : 8080,
       });
       break;
     }
@@ -219,7 +315,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error("\nError:", err.message);
-  process.exit(1);
-});
+// Run main() only when this module is the CLI entry point — unit tests import parseArgs
+// and must not trigger a real CLI invocation (or its process.exit) as a side effect.
+// Vitest sets VITEST in its workers; the bundled bin never does.
+if (!process.env.VITEST) {
+  main().catch((err) => {
+    console.error("\nError:", err.message);
+    process.exit(1);
+  });
+}

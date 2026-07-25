@@ -336,4 +336,94 @@ describe("runInit", () => {
     // dry-run must not scaffold .gitignore
     expect(existsSync(path.join(tmpDir, ".gitignore"))).toBe(false);
   });
+
+  it("fails loudly when bucket creation 409s and the bucket is FOREIGN (not visible)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    // The GCS bucket namespace is global: HTTP 409 means "name taken", not "we own it".
+    // The old substring matcher treated the 409 as already-exists and init declared
+    // success while later static-asset uploads failed against a stranger's bucket.
+    execCapture.mockImplementation(async (_cmd, args) => {
+      if (args.includes("buckets") && args.includes("create")) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "HTTPError 409: The requested bucket name is not available",
+        };
+      }
+      if (args.includes("buckets") && args.includes("describe")) {
+        return { exitCode: 1, stdout: "", stderr: "not found" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await expect(runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 })).rejects.toThrow(
+      /not visible from project/,
+    );
+  });
+
+  it("skips bucket creation when the 409'd bucket is verified accessible (ours)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockImplementation(async (_cmd, args) => {
+      if (args.includes("buckets") && args.includes("create")) {
+        return { exitCode: 1, stdout: "", stderr: "HTTPError 409: conflict" };
+      }
+      if (args.includes("buckets") && args.includes("describe")) {
+        return { exitCode: 0, stdout: VALID.bucket, stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+
+    const printed = vi
+      .mocked(console.log)
+      .mock.calls.map((c) => String(c[0]))
+      .join("\n");
+    expect(printed).toContain("verified accessible");
+    // Init completed: infrastructure.json was generated.
+    expect(scaffold.generateInfrastructureJson).toHaveBeenCalled();
+  });
+
+  it("warns loudly when the GKE image-pull IAM grants fail (ImagePullBackOff precursor)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockScaffold();
+    execCapture.mockImplementation(async (_cmd, args) => {
+      if (args.includes("projects") && args.includes("describe")) {
+        return { exitCode: 0, stdout: "123456789", stderr: "" };
+      }
+      if (args.includes("roles/artifactregistry.reader")) {
+        return { exitCode: 1, stdout: "", stderr: "PERMISSION_DENIED" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    // Non-fatal by design — but the warning MUST fire (silence meant ImagePullBackOff
+    // at deploy was the first symptom).
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).toContain("artifactregistry.reader");
+    expect(warned).toContain("ImagePullBackOff");
+  });
+
+  it("warns loudly when the project-number lookup fails (reader grants skipped)", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockScaffold();
+    execCapture.mockImplementation(async (_cmd, args) => {
+      if (args.includes("projects") && args.includes("describe")) {
+        return { exitCode: 1, stdout: "", stderr: "PERMISSION_DENIED" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await runInit({ ...VALID, projectDir: tmpDir, iamRetryDelayMs: 0 });
+
+    const warned = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).toContain("project number");
+    expect(warned).toContain("ImagePullBackOff");
+  });
 });

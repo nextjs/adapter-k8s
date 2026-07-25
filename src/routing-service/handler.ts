@@ -7,20 +7,39 @@ import {
   type HeaderMutationEntry,
 } from "./response-builders.js";
 import {
+  applyRewriteSignalHeaders,
+  computeRewriteInvocation,
+  computeRewriteSignalHeaders,
+  getRscConfig,
+  grantsSharedCacheFreshness,
+  isRscRequest,
   lookupPool,
   manifestNextConfig,
   matchesMiddleware,
-  normalizeMatchedPathname,
   normalizeResolvedRedirect,
-  preferConcreteOutput,
   prepareRequest,
+  resolveOutputPathname,
   resolveRscOutput,
+  rscCacheBustingUnvalidated,
+  sanitizeRouteMatches,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
-  type RscConfig,
 } from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
+
+// Abort-shaped errors raised by the request-shed signal: AbortSignal.timeout()
+// aborts with a DOMException named "TimeoutError", a manual controller.abort()
+// yields "AbortError", and middleware (e.g. a fetch wrapper) may re-wrap either —
+// so also check `cause` one level deep for the same shapes.
+function isAbortError(err: unknown): boolean {
+  const shaped = (e: unknown): boolean =>
+    typeof e === "object" &&
+    e !== null &&
+    ((e as { name?: unknown }).name === "AbortError" ||
+      (e instanceof DOMException && e.name === "TimeoutError"));
+  return shaped(err) || shaped((err as { cause?: unknown } | null | undefined)?.cause);
+}
 
 function getHeader(headers: HeaderValue[], key: string): string | undefined {
   const h = headers.find((h) => h.key === key);
@@ -49,28 +68,88 @@ function serializeResolvedHeaders(resolved: Headers): string | null {
   return JSON.stringify(obj);
 }
 
+// N18 (SECURITY). Almost every response is authored by a pool, which owns the forced-cache
+// verdict (pool-server/index.ts + cache-policy.ts) and therefore enforces the RSC
+// `_rsc`-validation invariant for the whole dataplane. Two response classes never touch a pool:
+// a middleware-authored body and a rule/middleware redirect, both returned from here as ext_proc
+// IMMEDIATE responses with their headers copied verbatim from the middleware `Response` /
+// next.config `headers()` verdict. Those headers can carry a shared-cacheable Cache-Control, so
+// an unvalidated RSC request could still mint a storable entry. Downgrade it here.
+//
+// Narrow on purpose: only a Cache-Control that actually grants a shared cache an unrevalidated
+// window is replaced. We do NOT stamp `no-store` onto responses that had no Cache-Control —
+// Cloud CDN runs USE_ORIGIN_HEADERS (it stores nothing without an explicit directive), so adding
+// a header there would change observable behavior for zero security gain. Never 307s: same
+// fail-safe reasoning as routing-common.ts `rscCacheBustingUnvalidated`.
+function withRscCacheBustingGuard(
+  headers: Record<string, string>,
+  unvalidatedRscRequest: boolean,
+): Record<string, string> {
+  if (!unvalidatedRscRequest) return headers;
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== "cache-control") continue;
+    if (grantsSharedCacheFreshness(headers[key]!)) headers[key] = "no-store";
+  }
+  return headers;
+}
+
 export function createRequestHandler(
   manifest: RoutingManifest,
   middlewareModule: LoadedModule | null,
+  opts?: { timeoutMs?: number },
 ) {
   // Shared secret authenticating the internal dispatch headers to the pool. Present in GKE
   // (injected from a Secret); absent in emulate/tests, where the pool trusts nothing over the
   // wire and re-resolves locally. Read once — the deployment env is fixed for the process.
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
-  const rscConfig = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
+  const rscConfig = getRscConfig(manifest);
+  // Per-request budget mirrored from the server's withTimeout shed — when it fires,
+  // this signal aborts so middleware awaiting a slow upstream is actually cancelled
+  // instead of racing a shed response it can no longer influence. 0 disables.
+  const timeoutMs = opts?.timeoutMs ?? 0;
 
-  return async function handleRequest(requestHeaders: HeaderValue[]): Promise<ProcessingResponse> {
-    const path = getHeader(requestHeaders, ":path") ?? "/";
+  return async function handleRequest(
+    requestHeaders: HeaderValue[],
+    // Internal (trailing-slash retry only): the shed signal of the ORIGINAL request,
+    // so the retry spends the remaining budget instead of minting a fresh full window
+    // while the server-side withTimeout keeps the original clock.
+    inheritedShedSignal?: AbortSignal,
+  ): Promise<ProcessingResponse> {
+    const rawPath = getHeader(requestHeaders, ":path") ?? "/";
     const method = getHeader(requestHeaders, ":method") ?? "GET";
     const scheme = getHeader(requestHeaders, ":scheme") ?? "https";
     const authority = getHeader(requestHeaders, ":authority") ?? "localhost";
-    const url = new URL(`${scheme}://${authority}${path}`);
+    const url = new URL(`${scheme}://${authority}${rawPath}`);
 
+    // Ingress hygiene: a client can send any x-* header, and the egress mutations
+    // below only overwrite the keys they set — so strip the whole internal dispatch
+    // vocabulary (plus the secret) BEFORE anything else sees it. Spoofed values must
+    // never reach resolveRoutes or middleware (an auth middleware reading a spoofed
+    // x-output-id / x-mw-evaluated would be deciding on attacker input). The pool
+    // applies the same strip-unless-secret discipline server-side.
     const headers = new Headers(
       requestHeaders
-        .filter((h) => !h.key.startsWith(":"))
+        .filter(
+          (h) =>
+            !h.key.startsWith(":") &&
+            !(INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.key.toLowerCase()) &&
+            h.key.toLowerCase() !== INTERNAL_SECRET_HEADER,
+        )
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
+
+    // N18 (SECURITY): does this request's `_rsc` authenticate its RSC headers? Read off the
+    // ORIGINAL public URL and the client's own headers, before prepareRequest can rewrite either.
+    // Only consulted for the immediate responses this tier authors itself (see
+    // withRscCacheBustingGuard); pool-bound requests are enforced by the pool, which is the tier
+    // that owns Cache-Control and is the only one every request reaches.
+    const unvalidatedRscRequest =
+      (method === "GET" || method === "HEAD") &&
+      rscCacheBustingUnvalidated({
+        header: (name) => headers.get(name) ?? undefined,
+        searchParams: url.searchParams,
+        rsc: rscConfig,
+      });
 
     // Shared request normalization (decode-400, slash-collapse 308, locale
     // prefixing) — one sequence with the pool resolver (routing-common.ts).
@@ -82,6 +161,24 @@ export function createRequestHandler(
       return buildImmediateResponse(prep.status, { location: prep.url.toString() });
     }
     const resolveUrl = prep.url;
+    // Fallback pathname for dispatch when resolution yields none. NEVER the raw
+    // :path — that includes the query string, so "?x=1" would leak into the
+    // x-output-id/x-upstream-pool derivation. resolveUrl is the prepared
+    // (locale-prefixed) URL, matching the pool resolver's url.pathname fallback.
+    const fallbackPathname = resolveUrl.pathname;
+
+    // x-nextjs-data is a client hint, not proof of a data request — Next only
+    // honors it after the URL matches the build-scoped /_next/data protocol.
+    // Mirrors the pool resolver (resolve.ts): drop it for non-data requests.
+    if (!prep.isDataRequest) headers.delete("x-nextjs-data");
+
+    // The shed signal handed to middleware: aborts when the per-request budget
+    // expires (server.ts's withTimeout shed uses the same budget), so middleware
+    // awaiting a slow upstream is actually cancelled instead of racing a shed
+    // response it can no longer influence. AbortSignal.timeout is unref'd and
+    // self-cleaning — no manual timer to clear on the many return paths below.
+    const shedSignal =
+      inheritedShedSignal ?? (timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined);
 
     // Body-capable requests (non-GET/HEAD) with middleware are NOT resolved at the edge: the
     // header-phase ext_proc callout never sees the request body, so body-reading middleware
@@ -197,7 +294,10 @@ export function createRequestHandler(
                     method,
                     headers: requestHeaders,
                     body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                    signal: new AbortController().signal,
+                    // Wired to the request-time shed budget — a previously
+                    // never-aborted controller meant the timeout shed rejected the
+                    // response but the middleware kept running detached.
+                    signal: shedSignal ?? new AbortController().signal,
                     nextConfig: manifestNextConfig(manifest),
                     waitUntil,
                   },
@@ -223,6 +323,12 @@ export function createRequestHandler(
                     method,
                     headers: requestHeaders,
                     body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                    // Next's legacy adapter (next/dist/server/web/adapter.js) forwards
+                    // params.request.signal into the NextRequest init, so the shed
+                    // budget reaches legacy middleware through the same field Path 1
+                    // uses — without it, legacy middleware keeps running detached
+                    // after the server-side timeout shed rejects the response.
+                    signal: shedSignal ?? new AbortController().signal,
                     destination: "document",
                     credentials: "same-origin",
                     bodyUsed: false,
@@ -250,6 +356,9 @@ export function createRequestHandler(
                   headers: new Headers(
                     [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                   ),
+                  // Shed budget must abort Path 3 middleware too — the Request ctor
+                  // adopts this signal as request.signal for the handler to observe.
+                  signal: shedSignal ?? null,
                   duplex: "half",
                 };
                 if (method !== "GET" && method !== "HEAD") {
@@ -263,7 +372,7 @@ export function createRequestHandler(
                     ? result
                     : result?.response instanceof Response
                       ? result.response
-                    : null;
+                      : null;
               }
 
               // ext_proc is the platform invocation for Node middleware. Keep it alive until
@@ -281,6 +390,16 @@ export function createRequestHandler(
               }
               return {};
             } catch (err) {
+              // Shed-abort ≠ middleware crash. When the per-request budget expires,
+              // the shed signal aborts signal-aware middleware and the rejection must
+              // be answered by the SERVER's configured fail-open/fail-closed policy
+              // (createProcessHandler in server.ts), not the unconditional fail-closed
+              // 500 below — that one exists for genuine middleware crashes (auth must
+              // not be bypassed). Rethrow: resolveRoutes awaits invokeMiddleware bare,
+              // so this rejects the handleRequest promise the server observes.
+              // Previously the abort was classified as a crash, making `failOpen: true`
+              // a no-op for signal-aware middleware exceeding timeoutMs.
+              if (isAbortError(err) || shedSignal?.aborted) throw err;
               console.error("[routing-service] Middleware execution failed:", err);
               middlewareThrew = true;
               return { bodySent: true };
@@ -296,7 +415,9 @@ export function createRequestHandler(
     // Redirects (rule/detection + Location-in-resolvedHeaders) — shared
     // normalization with the pool resolver. Forward resolvedHeaders (middleware
     // Set-Cookie, custom redirect headers) so the edge matches the pool phase.
-    const redirect = normalizeResolvedRedirect(resolution, prep, manifest);
+    const redirect = normalizeResolvedRedirect(resolution, prep, manifest, {
+      middlewareAuthored: middlewareResponse != null,
+    });
     if (redirect) {
       if (redirect.kind === "retry") {
         // Spurious internal trailing-slash redirect — resolve the real target.
@@ -305,9 +426,13 @@ export function createRequestHandler(
             ? { ...h, value: redirect.retryUrl.pathname + redirect.retryUrl.search }
             : h,
         );
-        return handleRequest(retried);
+        // Carry the ORIGINAL shed signal into the retry: the server-side withTimeout
+        // (server.ts) keeps the first request's clock across this recursion, so a
+        // fresh AbortSignal.timeout here would give the retried middleware a full
+        // new budget that outlives the shed response.
+        return handleRequest(retried, shedSignal);
       }
-      const responseHeaders: Record<string, string> = { location: redirect.url.toString() };
+      const responseHeaders: Record<string, string> = {};
       const setCookies = redirect.resolvedHeaders?.getSetCookie?.() ?? [];
       if (redirect.resolvedHeaders) {
         for (const [key, value] of redirect.resolvedHeaders.entries()) {
@@ -316,7 +441,25 @@ export function createRequestHandler(
           responseHeaders[key] = value;
         }
       }
-      return buildImmediateResponse(redirect.status, responseHeaders, undefined, setCookies);
+      // N15: no RSC special-case — `next start` answers RSC redirects with the real 3xx and the
+      // App Router flight client follows it (fetch-server-response.ts reads response.redirected).
+      // `x-nextjs-redirect` is a PAGES-router protocol (written under isNextDataRequest, read by
+      // shared/lib/router/router.ts); emitting it for App Router stranded the flight client,
+      // which then fell back to a document load. Same-origin Locations are relativized so both
+      // tiers match (the pool already relativizes via middlewareRedirectLocation) and so the
+      // shape matches `next start`, which reports a RELATIVE path for same-origin targets.
+      const sameOrigin = redirect.url.origin === url.origin;
+      const location = sameOrigin
+        ? redirect.url.pathname + redirect.url.search + redirect.url.hash
+        : redirect.url.toString();
+      responseHeaders["location"] = location;
+      if (redirect.status === 308) responseHeaders["Refresh"] = `0;url=${location}`;
+      return buildImmediateResponse(
+        redirect.status,
+        withRscCacheBustingGuard(responseHeaders, unvalidatedRscRequest),
+        undefined,
+        setCookies,
+      );
     }
 
     if (resolution.middlewareResponded && middlewareResponse != null) {
@@ -329,7 +472,12 @@ export function createRequestHandler(
         respHeaders[key] = value;
       }
       const setCookies = mwRes.headers.getSetCookie();
-      return buildImmediateResponse(mwRes.status, respHeaders, await mwRes.text(), setCookies);
+      return buildImmediateResponse(
+        mwRes.status,
+        withRscCacheBustingGuard(respHeaders, unvalidatedRscRequest),
+        await mwRes.text(),
+        setCookies,
+      );
     }
 
     if (resolution.externalRewrite) {
@@ -345,15 +493,19 @@ export function createRequestHandler(
     // Pool ownership is looked up on the BASE pathname (RSC variants live in the same pool as
     // their page). The output id, however, must be the RSC-mapped variant so the handler
     // returns a flight payload instead of HTML — mirrors pool-server/resolve.ts.
-    let basePathname = normalizeMatchedPathname(
-      resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? path,
-      manifest.poolAssignments,
-    );
-    // Concrete prerendered outputs win over dynamic templates (decoded lookup).
-    // Mirrors pool-server/resolve.ts.
-    basePathname =
-      preferConcreteOutput(resolveUrl.pathname, basePathname, manifest.poolAssignments) ??
-      basePathname;
+    //
+    // Output-key resolution is now the SHARED implementation (routing-common.ts
+    // resolveOutputPathname). This tier used to hand-mirror it and had drifted: it only ever
+    // preferred a concrete output for the PUBLIC request pathname, never for the rewrite
+    // INVOCATION TARGET, so a rewrite whose destination also matched a dynamic route
+    // (`/rewrite-1` → `/gssp`, resolvedPathname `/[slug]`) dispatched the `[slug]` template at
+    // the edge while the pool's Phase-1 resolver dispatched `/gssp`.
+    const basePathname = resolveOutputPathname({
+      requestPathname: resolveUrl.pathname,
+      resolvedPathname: resolution.resolvedPathname,
+      invocationTargetPathname: resolution.invocationTarget?.pathname,
+      poolAssignments: manifest.poolAssignments,
+    });
     const outputId = resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
 
     const mutations: HeaderMutationEntry[] = [];
@@ -366,10 +518,60 @@ export function createRequestHandler(
       clear.delete(key);
     };
 
-    // next.config headers() + middleware response headers → carried as one JSON header and
-    // applied to the RESPONSE by the pool (NOT emitted as request-header mutations).
-    if (resolution.resolvedHeaders) {
-      const serialized = serializeResolvedHeaders(resolution.resolvedHeaders);
+    // Rewrite invocation target: when routing rewrote the URL (middleware or next.config
+    // rewrites), the pool must invoke the handler with the REWRITTEN path+query while the
+    // public :path is preserved for the client. Without this transport, a trusted-dispatch
+    // request runs the handler against the ORIGINAL URL and every rewrite-added query param
+    // (e.g. a destination's repeated `?item=one&item=two`) is silently dropped. Same
+    // derivation as pool-server/resolve.ts (shared computeRewriteInvocation).
+    const rscRequest = isRscRequest(headers, rscConfig);
+    const invocation = computeRewriteInvocation({
+      originalUrl: prep.originalUrl,
+      addedLocale: prep.addedLocale,
+      isRscRequest: rscRequest,
+      isDataRequest: prep.isDataRequest,
+      routes: manifest.routeGraph,
+      resolvedQuery: resolution.resolvedQuery,
+      invocationTarget: resolution.invocationTarget,
+      resolvedPathname: resolution.resolvedPathname,
+    });
+
+    // N19. next.config headers() + middleware response headers → carried as one JSON header
+    // and applied to the RESPONSE by the pool (NOT emitted as request-header mutations).
+    //
+    // The App Router client-facing rewrite signal rides in the SAME slot, because it is a
+    // RESPONSE header the browser reads (routing-common.ts computeRewriteSignalHeaders carries
+    // the upstream evidence) and this ext_proc filter only processes the REQUEST phase —
+    // server.ts echoes `responseHeaders` untouched, so the edge cannot set a response header
+    // itself. Riding in `x-resolved-headers` also means the signal inherits that header's
+    // secret gating for free: the pool strips the whole internal dispatch vocabulary unless the
+    // internal-secret compare succeeds, so a client cannot forge its own rewrite signal.
+    //
+    // Upstream sets these headers in TWO layers and the adapter replaces exactly one:
+    // middleware rewrites get them from `server/web/adapter.ts` on the middleware Response
+    // (already inside resolution.resolvedHeaders here), while next.config rewrites get them
+    // from `server/lib/router-utils/resolve-routes.ts` — the router-server layer this tier
+    // replaces. That second class was silently missing at the edge: PROVEN against real
+    // `next start` (`/rewrite-query-array` → p=/api/rewrite-query-array q=item=one&item=two on
+    // `next start` and Phase 1, but nothing at all through Envoy+ext_proc). The pool's Phase-1
+    // resolver emitted it, so the whole e2e harness — which starts only the pool — was blind.
+    const signal = computeRewriteSignalHeaders({
+      originalUrl: prep.originalUrl,
+      addedLocale: prep.addedLocale,
+      isRscRequest: rscRequest,
+      invocationTarget: resolution.invocationTarget,
+      invocationQuery: invocation.invocationQuery,
+    });
+    const hasSignal = signal.rewrittenPath !== undefined || signal.rewrittenQuery !== undefined;
+    if (resolution.resolvedHeaders || hasSignal) {
+      // Overwrite rather than defer to whatever middleware already set, so both tiers land on
+      // the one shared derivation (Phase 1 does the same) instead of one tier trusting the
+      // middleware adapter's value and the other computing its own.
+      const responseHeaders = applyRewriteSignalHeaders(
+        new Headers(resolution.resolvedHeaders ?? undefined),
+        signal,
+      );
+      const serialized = serializeResolvedHeaders(responseHeaders);
       if (serialized) setDispatch("x-resolved-headers", serialized);
     }
 
@@ -378,7 +580,7 @@ export function createRequestHandler(
       lookupPool(
         manifest.poolAssignments,
         resolution.resolvedPathname,
-        resolution.invocationTarget?.pathname ?? path,
+        resolution.invocationTarget?.pathname ?? fallbackPathname,
         i18nLocales,
       ) ?? "default";
     setDispatch("x-upstream-pool", pool);
@@ -392,8 +594,20 @@ export function createRequestHandler(
     // bypassing local resolveRoutes() (avoids double resolution + middleware)
     setDispatch("x-output-id", outputId);
     setDispatch("x-matched-pathname", outputId);
-    if (resolution.routeMatches) {
-      setDispatch("x-route-matches", JSON.stringify(resolution.routeMatches));
+    // Sanitized with the SHARED helper, exactly as Phase 1 does before it attaches
+    // routeMatches to a local resolution: the edge must not be the tier that ships the
+    // unresolved-dynamic sentinel over the wire and leaves the pool to catch it.
+    const sanitizedRouteMatches = sanitizeRouteMatches(resolution.routeMatches);
+    if (sanitizedRouteMatches) {
+      setDispatch("x-route-matches", JSON.stringify(sanitizedRouteMatches));
+    }
+
+    // Transport the rewrite invocation target computed above.
+    if (invocation.invokePath) {
+      setDispatch("x-invoke-path", invocation.invokePath);
+    }
+    if (invocation.invocationQuery && Object.keys(invocation.invocationQuery).length > 0) {
+      setDispatch("x-invoke-query", JSON.stringify(invocation.invocationQuery));
     }
 
     if (basePathname in manifest.pprRoutes) {

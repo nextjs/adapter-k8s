@@ -12,6 +12,9 @@ export function renderService({
   releaseName: string;
 }): string {
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
+  // The HealthCheckPolicy's own name appends "-hcp" — reserve room for it inside
+  // the 63-char limit. targetRef still uses the exact Service name.
+  const hcpName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`, "-hcp");
   const safeBuildId = sanitizeK8sName(buildId);
   return `apiVersion: v1
 kind: Service
@@ -33,7 +36,7 @@ spec:
 apiVersion: networking.gke.io/v1
 kind: HealthCheckPolicy
 metadata:
-  name: ${name}-hcp
+  name: ${hcpName}
 spec:
   default:
     checkIntervalSec: 15
@@ -62,6 +65,8 @@ export function renderActiveService({
   releaseName: string;
 }): string {
   const stableName = sanitizeK8sName(`${releaseName}-${poolName}`);
+  // Same "-hcp" suffix reservation as the versioned Service above.
+  const stableHcpName = sanitizeK8sName(`${releaseName}-${poolName}`, "-hcp");
   return `apiVersion: v1
 kind: Service
 metadata:
@@ -82,7 +87,7 @@ spec:
 apiVersion: networking.gke.io/v1
 kind: HealthCheckPolicy
 metadata:
-  name: ${stableName}-hcp
+  name: ${stableHcpName}
 spec:
   default:
     checkIntervalSec: 15

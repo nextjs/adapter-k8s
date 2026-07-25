@@ -1,9 +1,11 @@
 // src/cli/deploy.ts
 import path from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState } from "./state.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
+import { cdnTagForBuildId } from "../cdn-tags.js";
+import { retainLiveRoutingManifest } from "./rollback.js";
 import { renderDeployment } from "../emit/templates/deployment.js";
 import { renderService } from "../emit/templates/service.js";
 import { renderHPA } from "../emit/templates/hpa.js";
@@ -12,6 +14,10 @@ import { provisionMemorystore, buildDeleteMemorystoreCommand } from "./provision
 import { isAlreadyGoneError } from "./destroy.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
+import {
+  routingManifestSnapshotName,
+  routingServiceDeploymentName,
+} from "../emit/templates/routing-manifest-configmap.js";
 // Import the SAME sanitizer that stamps pod names and version labels (deployment.ts /
 // service.ts). The blue/green cutover patches the active Service selector to this exact
 // value, so it MUST match the pod label byte-for-byte — a divergent local copy that
@@ -19,10 +25,16 @@ import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 import {
   assertSafeBuildId,
+  findBuildIdNameCollision,
   assertSafeImageRegistry,
   assertSafeNamespace,
   assertSafeProjectId,
   assertSafeRegion,
+  poolResourceNames,
+  // init binds Workload Identity to [default/<release>-deploy-sa]; the release lives
+  // in the literal "default" namespace. Pin it on every kubectl/helm call instead of
+  // trusting whatever namespace the operator's context happens to have.
+  K8S_NAMESPACE,
 } from "../emit/templates/utils.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import type { GcloudCommand } from "./init.js";
@@ -126,6 +138,17 @@ export function assertSafePoolName(poolName: string): void {
         `(lowercase letters, digits, hyphens). Refusing to use it in file paths.`,
     );
   }
+  // "routing-service" is the reserved routing-tier Deployment name (<release>-routing-service,
+  // updated in place per build, verified/reverted separately from pools). A pool with this
+  // name would collide with it: readiness checks, cleanup classification, and rollback's
+  // edge revert all key off that exact name.
+  if (poolName === "routing-service") {
+    throw new Error(
+      `Invalid pool name "routing-service" in build-metadata.json: reserved for the routing ` +
+        `tier (<release>-routing-service). Rename the pool (check the adapter's route ` +
+        `classification config) and rebuild.`,
+    );
+  }
 }
 
 export function buildHelmUpgradeArgs(options: {
@@ -155,6 +178,11 @@ export function buildHelmUpgradeArgs(options: {
     // Cache Secrets are Helm-owned in every enabled mode. This adopts Secrets created by older
     // adapter versions that provisioned managed-cache credentials imperatively with kubectl.
     "--take-ownership",
+    // The release lives in the namespace init binds Workload Identity to — pin it rather
+    // than installing into whatever namespace the operator's context happens to have.
+    "--namespace",
+    "default",
+    "--create-namespace",
     "--set",
     `global.image.tag=${buildId}`,
     "--set",
@@ -242,7 +270,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "or create .k8s-adapter/infrastructure.json manually.",
     );
   }
-  const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+  let infra: Record<string, string | undefined>;
+  try {
+    infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+  } catch (err) {
+    throw new Error(
+      `Failed to parse ${infraPath}: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Fix the file by hand or regenerate it with \`npx adapter-k8s init\`.`,
+    );
+  }
 
   // H2: infrastructure.json values reach the privileged route-ext Job script
   // (projectId/region), extension-chain authority/YAML (namespace), and helm --set
@@ -250,7 +286,31 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   if (infra.projectId) assertSafeProjectId(infra.projectId);
   if (infra.region) assertSafeRegion(infra.region);
   if (infra.namespace) assertSafeNamespace(infra.namespace);
+  // Same fail-fast as build time (adapter.ts): every kubectl/helm call below pins
+  // K8S_NAMESPACE, but the build-time extension chain derives the ext_proc authority
+  // from infra.namespace — honoring any other value would put the workloads in
+  // "default" while the GXLB callout targets the other namespace, failing every edge
+  // callout. Reject instead of deploying skewed. (Deploy-time too, not just build
+  // time: --skip-build deploys ship a chart built elsewhere, possibly before this
+  // guard existed.)
+  if (infra.namespace !== undefined && infra.namespace !== K8S_NAMESPACE) {
+    throw new Error(
+      `Unsupported namespace "${infra.namespace}" in .k8s-adapter/infrastructure.json: ` +
+        `this adapter version deploys only to the "${K8S_NAMESPACE}" namespace (init binds ` +
+        `Workload Identity to ${K8S_NAMESPACE}/<release>-deploy-sa and every kubectl/helm ` +
+        `call pins it). Remove "namespace" from infrastructure.json.`,
+    );
+  }
   if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
+  // Without a registry, docker tags and the helm --set image registry can't be formed —
+  // fail with a pointer to the fix instead of a raw TypeError deep in the deploy.
+  if (!infra.containerRegistry) {
+    throw new Error(
+      "infrastructure.json is missing containerRegistry — image tags cannot be formed. " +
+        "Run `npx adapter-k8s init` to regenerate it, or set containerRegistry in " +
+        ".k8s-adapter/infrastructure.json.",
+    );
+  }
 
   // 0. Ensure kubectl is pointing at the right cluster
   if (!dryRun && infra.projectId && infra.region && releaseName) {
@@ -314,7 +374,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Managed cache: provision Memorystore and inject its discovered endpoint into the Helm chart.
   // This keeps the Valkey Secret Helm-owned in both managed and BYO modes, so switching modes
   // updates one resource instead of crossing the kubectl/Helm ownership boundary.
-  if (metadata.cacheManaged && !dryRun) {
+  //
+  // Pre-`cacheManaged` build artifacts (older adapter versions) carry cacheEnabled but no
+  // cacheManaged flag at all. A `--skip-build` deploy over such an artifact must treat
+  // enabled-with-unknown-mode as MANAGED: falling into the teardown branch below would
+  // delete a live managed Memorystore out from under the serving build. (Provisioning is
+  // idempotent, so re-running the managed branch against an existing instance is safe.)
+  const cacheManaged: boolean = metadata.cacheManaged ?? metadata.cacheEnabled === true;
+  if (cacheManaged && !dryRun) {
     // Fail loudly rather than silently shipping without a shared cache: managed provisioning
     // needs the project + region. (BYO cache sets cache.url and never reaches this branch.)
     if (!infra.projectId || !infra.region) {
@@ -361,22 +428,43 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       }),
       { mode: 0o600 },
     );
+    // writeFileSync's mode only applies when CREATING the file — an existing file keeps
+    // its old mode, so a previously world-readable secret file would stay that way.
+    chmodSync(secretPath, 0o600);
     console.log(`    Cache Secret ${releaseName}-valkey staged for Helm → ${url}`);
-  } else if (!metadata.cacheEnabled && !dryRun) {
-    // Cache disabled (not just BYO — cacheEnabled distinguishes them). Tear down a previously
-    // provisioned managed instance and its Secret, so new pods stop receiving VALKEY_URL (the pod
-    // template always mounts the optional Secret) and the paid Memorystore isn't left running.
-    // Idempotent: no-ops when nothing was ever provisioned.
-    const secretDelete = await execCapture("kubectl", [
-      "delete",
-      "secret",
-      `${releaseName}-valkey`,
-      "--ignore-not-found",
-    ]);
-    if (secretDelete.stdout.trim()) console.log(`\n  → Removed cache Secret ${releaseName}-valkey`);
+  } else if (!cacheManaged && !dryRun) {
+    // The current build is NOT using the managed cache (disabled entirely, or BYO via
+    // cache.url). If a managed Memorystore was previously provisioned for this release
+    // (infra.cacheRegion persisted at provision time), tear it down — otherwise the
+    // managed→BYO switch silently leaks the paid instance (the teardown used to fire
+    // only when the cache was fully disabled). BYO-from-the-start never sets
+    // infra.cacheRegion, so this stays a no-op there.
+    if (!metadata.cacheEnabled) {
+      // Cache fully disabled: also remove the Secret so new pods stop receiving
+      // VALKEY_URL (the pod template always mounts the optional Secret). Not done for
+      // BYO: the chart then carries its own Helm-owned valkey-secret.yaml instead.
+      const secretDelete = await execCapture("kubectl", [
+        "delete",
+        "secret",
+        `${releaseName}-valkey`,
+        "-n",
+        K8S_NAMESPACE,
+        "--ignore-not-found",
+      ]);
+      if (secretDelete.stdout.trim())
+        console.log(`\n  → Removed cache Secret ${releaseName}-valkey`);
+    }
     if (infra.cacheRegion) {
-      console.log("  → Deleting managed cache (Memorystore) — cache is disabled...");
-      const del = buildDeleteMemorystoreCommand(releaseName, infra.cacheRegion, infra.projectId);
+      console.log(
+        `  → Deleting managed cache (Memorystore) — ${metadata.cacheEnabled ? "switched to bring-your-own cache" : "cache is disabled"}...`,
+      );
+      // projectId is only absent when infrastructure.json is hand-broken; the delete then
+      // fails gcloud-side and lands in the warn path below (the instance stays billed).
+      const del = buildDeleteMemorystoreCommand(
+        releaseName,
+        infra.cacheRegion,
+        infra.projectId ?? "",
+      );
       const res = await execCapture(del.command, del.args);
       if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
         delete infra.cacheRegion;
@@ -489,6 +577,49 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   const previousBuildId = state?.buildId ?? null;
   // H2: previousBuildId is spliced into a helm --set assignment below.
   if (previousBuildId) assertSafeBuildId(previousBuildId);
+  // The build-time collision guard (adapter.ts) can't see deploy-time state: if any of
+  // this build's COMPOSED resource names sanitizes to the SAME K8s name as the
+  // currently-serving build's, the two builds' resources become indistinguishable —
+  // pods carry identical version labels (split-brain cutover), retained previous-build
+  // manifests overwrite the serving ones, and cleanup deletes the wrong build.
+  // Comparing the bare sanitized build ids is NOT enough: names collide on the COMPOSED
+  // truncated form — a long `<release>-<pool>-` prefix can push the differing part of
+  // the build id past the 63-char boundary even when the ids differ well inside their
+  // own 63 chars. Compare exactly what the templates emit: the pool Deployment/Service
+  // name, its suffix-reserving -hpa/-hcp variants (their truncation boundary sits 4
+  // chars earlier), and the routing-manifest snapshot name. Refuse to deploy on any
+  // collision while the build ids differ.
+  // N14: an IDENTICAL build id is the `deploymentId` (skew-protection) signature — Next pins
+  // the build id to a constant when next.config sets it, so every deploy reuses the serving
+  // build's names and a cutover would adopt the running Deployment instead of standing up
+  // beside it. The composed-name guard below can't see this case (it requires differing ids),
+  // so name the cause here rather than letting helm silently upgrade in place.
+  if (previousBuildId && previousBuildId === buildId) {
+    throw new Error(
+      `Build id "${buildId}" is IDENTICAL to the currently-serving build, so blue/green ` +
+        `cutover is impossible — the new release would adopt the running Deployment in ` +
+        `place, and both builds would share the \`k8s:${buildId}:\` cache namespace. The ` +
+        `usual cause is \`deploymentId\` in next.config: Next then pins the build id to a ` +
+        `constant for every build. Remove it — skew protection is already active via the ` +
+        `per-build build id, and immutable assets already handle asset versioning — or set ` +
+        `a \`generateBuildId\` that changes per build.`,
+    );
+  }
+  if (previousBuildId && previousBuildId !== buildId) {
+    // Same helper as the build-time guard in adapter.ts so both sides agree on the
+    // full composed-name set (pool Deployment/Service, -hpa/-hcp variants, snapshot).
+    const collision = findBuildIdNameCollision(releaseName, pools, buildId, previousBuildId);
+    if (collision) {
+      throw new Error(
+        `Build id "${buildId}" collides with the currently-serving build "${previousBuildId}" ` +
+          `after Kubernetes name sanitization: the ${collision.kind} "${collision.name}" would ` +
+          `be named identically for BOTH builds (lowercasing/truncation to the 63-char name ` +
+          `limit erased the difference), so the cutover could not distinguish them. Choose a ` +
+          `build id that still differs within the truncated name (see generateBuildId in ` +
+          `next.config), or shorten the release/pool names.`,
+      );
+    }
+  }
 
   const overridesFile = path.join(projectDir, ".k8s-adapter", "helm", "values.override.yaml");
   const helmArgs = buildHelmUpgradeArgs({
@@ -512,18 +643,48 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // its current replica count — NOT 0 — so `helm upgrade` doesn't scale it to zero while
       // the active Service still selects it, which would black-hole the origin on every
       // deploy until the new pods are ready and the selector switches. It keeps serving
-      // through the rollout; it is scaled to 0 only after state is committed (step 7e).
+      // through the rollout; it is scaled to 0 only after state is committed (step 7f).
+      // Default replica count: used for dry-run (no cluster read) and for a previous
+      // Deployment that no longer exists (NotFound branch below).
       let prevReplicas = 2;
       if (!dryRun) {
         const r = await execCapture("kubectl", [
           "get",
           "deployment",
           poolPrevName,
+          "-n",
+          K8S_NAMESPACE,
           "-o",
           "jsonpath={.spec.replicas}",
         ]);
         const n = parseInt(r.stdout?.trim() ?? "", 10);
-        if (r.exitCode === 0 && Number.isFinite(n) && n > 0) prevReplicas = n;
+        if (r.exitCode !== 0 && isAlreadyGoneError(r.stderr)) {
+          // State names a previous build whose Deployment is GONE (deleted manually /
+          // cluster partially recovered). Nothing is serving from it, so there is no
+          // live count to mirror — warn and render the retained manifest at the
+          // default instead of aborting. Aborting here would brick every future
+          // deploy of the release (the state ConfigMap keeps naming the deleted
+          // build) with nothing to protect: the abort below exists for the case
+          // where a live count EXISTS but could not be read.
+          console.warn(
+            `  ! Previous deployment ${poolPrevName} (build ${previousBuildId}) not found — ` +
+              `it appears to have been deleted. Nothing is serving from it; rendering its ` +
+              `retained manifest at the default ${prevReplicas} replicas.`,
+          );
+        } else if (r.exitCode !== 0 || !Number.isFinite(n) || n <= 0) {
+          // Abort rather than guess: the probe previously defaulted to 2 on ANY failure,
+          // so a serving build at 5 replicas would be silently scaled DOWN to 2 by the
+          // retained manifest mid-deploy.
+          throw new Error(
+            `Could not read the live replica count for the currently-serving deployment ` +
+              `${poolPrevName} (kubectl exited ${r.exitCode}` +
+              `${r.exitCode === 0 ? `, replicas=${JSON.stringify(r.stdout?.trim())}` : `: ${r.stderr.trim()}`}). ` +
+              `The retained manifest must mirror the live count; refusing to guess. Fix ` +
+              `kubectl access and re-run the deploy.`,
+          );
+        } else {
+          prevReplicas = n;
+        }
       }
 
       // Render retained resources through the same canonical templates as a normal build.
@@ -561,6 +722,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
+  // 6-pre. Retain the OUTGOING build's routing manifest as a build-named snapshot
+  // ConfigMap BEFORE helm overwrites the stable `<release>-routing-manifest` one — the
+  // routing tier is updated in place per build, and rollback re-points it at the
+  // snapshot. The snapshot keys off what the routing Deployment is ACTUALLY serving
+  // (image tag + mounted ConfigMap), so it stays correct across intervening rollbacks.
+  // Best-effort for transient failures (warns, does not block) — but a snapshot NAME
+  // collision with a DIFFERENT build's retained manifest throws (see
+  // retainLiveRoutingManifest) rather than silently clobbering the rollback target.
+  if (!dryRun) {
+    await retainLiveRoutingManifest(releaseName);
+  }
+
   console.log("\n  → Running helm upgrade...");
   if (!dryRun) {
     await execOrThrow("helm", helmArgs);
@@ -575,6 +748,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "httproute",
       `${releaseName}-routes`,
+      "-n",
+      K8S_NAMESPACE,
       "-o",
       "jsonpath={.spec.rules[*].filters[*].extensionRef.kind}",
     ]);
@@ -608,25 +783,42 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const newDeployResult = await execCapture("kubectl", [
       "get",
       "deployments",
+      "-n",
+      K8S_NAMESPACE,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
       "-o",
       'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
     ]);
     // The routing service carries the same version label but is a stable in-place Deployment,
-    // verified separately below — exclude it here.
+    // verified separately below — exclude it here by EXACT name (a substring match would
+    // also exclude a pool deployment that merely contains "routing-service" in its name).
+    const routingDeploy = routingServiceDeploymentName(releaseName);
     const newDeploys = (newDeployResult.stdout?.trim().split("\n") ?? []).filter(
-      (n) => n && !n.includes("routing-service"),
+      (n) => n && n !== routingDeploy,
     );
 
     for (const deployName of newDeploys) {
       console.log(`    Waiting for ${deployName}...`);
-      await execCapture("kubectl", [
+      const rollout = await execCapture("kubectl", [
         "rollout",
         "status",
         `deployment/${deployName}`,
+        "-n",
+        K8S_NAMESPACE,
         "--timeout=120s",
       ]);
+      // The pod-health gate below is the real readiness gate, but don't walk into it on
+      // an already-failed rollout — the exit code was previously discarded, so a stuck
+      // deployment burned the whole 2-minute health budget before failing.
+      if (rollout.exitCode !== 0) {
+        throw new Error(
+          `Deployment ${deployName} did not finish rolling out within 120s. Traffic was ` +
+            `NOT switched — the previous build is still serving.\n` +
+            `${(rollout.stderr || rollout.stdout).trim()}\n` +
+            `Inspect: kubectl logs deployment/${deployName} -n ${K8S_NAMESPACE} --tail=40`,
+        );
+      }
     }
 
     // 7a-bis. The routing service (ext_proc edge) is a stable Deployment updated in place
@@ -634,11 +826,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // (e.g. a missing @next/routing) crashloop undetected for months while Kubernetes kept
     // the old ReplicaSet serving stale edge code and the deploy reported success. Verify it
     // actually rolls out; a stuck rollout is fatal.
-    const routingDeploy = sanitizeK8sName(`${releaseName}-routing-service`);
     const rsExists = await execCapture("kubectl", [
       "get",
       "deployment",
       routingDeploy,
+      "-n",
+      K8S_NAMESPACE,
       "--ignore-not-found",
       "-o",
       "name",
@@ -649,13 +842,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "rollout",
         "status",
         `deployment/${routingDeploy}`,
+        "-n",
+        K8S_NAMESPACE,
         "--timeout=120s",
       ]);
       if (rsRollout.exitCode !== 0) {
         throw new Error(
           `Routing service (${routingDeploy}) did not become healthy — the ext_proc edge would ` +
             `keep serving the previous build.\n${(rsRollout.stderr || rsRollout.stdout).trim()}\n` +
-            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service --tail=40`,
+            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${K8S_NAMESPACE} --tail=40`,
         );
       }
     }
@@ -670,13 +865,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "wait",
         "--for=condition=complete",
         `job/${currentRouteExtJob}`,
+        "-n",
+        K8S_NAMESPACE,
         "--timeout=600s",
       ]);
       if (wait.exitCode !== 0) {
         throw new Error(
           `ext_proc registration job (${currentRouteExtJob}) did not complete; refusing traffic ` +
             `cutover because middleware may not be wired.\n${(wait.stderr || wait.stdout).trim()}\n` +
-            `Inspect: kubectl logs job/${currentRouteExtJob}`,
+            `Inspect: kubectl logs job/${currentRouteExtJob} -n ${K8S_NAMESPACE}`,
         );
       }
       console.log("  → ext_proc traffic extension registration job completed ✓");
@@ -694,16 +891,19 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       const podsResult = await execCapture("kubectl", [
         "get",
         "pods",
+        "-n",
+        K8S_NAMESPACE,
         "-l",
-        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
+        // The routing service shares the version label; exclude it by its component label
+        // (exact — a name substring match would also drop pool pods named similarly).
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
         "-o",
         'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}{"\\n"}{end}',
       ]);
       if (podsResult.exitCode === 0) {
         for (const line of podsResult.stdout.trim().split("\n")) {
           const [podName, ready] = line.split("|");
-          // Only new-build pods carry this version label; exclude the routing service (shares it).
-          if (!podName || podName.includes("routing-service")) continue;
+          if (!podName) continue; // selector already scoped to this build's pool pods
           checkedCount++;
           if (ready !== "True") allHealthy = false;
         }
@@ -719,13 +919,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
 
     if (!newBuildHealthy) {
-      console.error(`\n  DEPLOY FAILED: New build did not become healthy within 3 minutes.`);
+      console.error(`\n  DEPLOY FAILED: New build did not become healthy within 2 minutes.`);
       console.error(`  The previous build is still serving traffic. No cutover performed.\n`);
 
       // Try to get more diagnostic info
       const newPods = await execCapture("kubectl", [
         "get",
         "pods",
+        "-n",
+        K8S_NAMESPACE,
         "-l",
         `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
         "-o",
@@ -741,6 +943,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           const healthzResult = await execCapture("kubectl", [
             "exec",
             podName,
+            "-n",
+            K8S_NAMESPACE,
             "--",
             "node",
             "-e",
@@ -750,7 +954,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             console.error(`  Healthz: ${healthzResult.stdout.trim()}`);
           }
           // Get last error from logs
-          const logsResult = await execCapture("kubectl", ["logs", podName, "--tail=20"]);
+          const logsResult = await execCapture("kubectl", [
+            "logs",
+            podName,
+            "-n",
+            K8S_NAMESPACE,
+            "--tail=20",
+          ]);
           if (logsResult.exitCode === 0) {
             const errorLines = logsResult.stdout
               .split("\n")
@@ -799,6 +1009,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "patch",
         "service",
         activeServiceName,
+        "-n",
+        K8S_NAMESPACE,
         "--type=json",
         // Impersonate helm as the field manager so the next helm upgrade (server-side
         // apply, manager "helm") does not conflict on the selector field we flip here.
@@ -839,6 +1051,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "patch",
             "service",
             serviceName,
+            "-n",
+            K8S_NAMESPACE,
             "--type=json",
             "--field-manager=helm",
             "-p",
@@ -879,33 +1093,24 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       process.exit(1);
     }
 
-    // 7d. Traffic switched. Invalidate the PREVIOUS build's Cloud CDN entries (best-effort,
-    // non-fatal) BEFORE persisting state, so the writeState-failure recovery path — where the
-    // new origin is already live — still clears the outgoing build's stale CDN content.
-    const cdnFilterPath = path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml");
-    if (existsSync(cdnFilterPath) && infra.projectId) {
-      try {
-        await invalidateCdnBuildTag({
-          projectId: infra.projectId,
-          releaseName,
-          outputDir,
-          buildId: previousBuildId ?? undefined,
-          run: execCapture,
-          log: (m) => console.log(m),
-        });
-      } catch (err) {
-        console.log(
-          `  ! CDN invalidation error (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
-    // 7e. Commit deploy state — ONLY now, after a confirmed cutover, so a failed deploy
-    // never records a never-serving build as current. Traffic has already switched; if the
-    // cluster ConfigMap write fails we surface it loudly (local was updated) rather than
-    // silently diverging for the next deploy/rollback.
+    // 7d. Commit deploy state IMMEDIATELY after the confirmed cutover — before anything
+    // else post-switch. Every extra step between the selector patch and this write is a
+    // Ctrl-C window in which traffic serves the new build while state still names the old
+    // one (the next deploy/rollback would then target the wrong build). Committing ONLY
+    // after a confirmed cutover still holds: a failed deploy never records a never-serving
+    // build as current. Traffic has already switched; if the cluster ConfigMap write fails
+    // we surface it loudly (local was updated) rather than silently diverging.
     try {
-      await writeState(projectDir, { buildId, previousBuildId }, releaseName);
+      // M13: record the exact Cache-Tag THIS build's pool-server stamps (derived HERE,
+      // at its deploy — the only moment code and pods agree), and carry the outgoing
+      // build's recorded tag verbatim (it stays the rollback target; re-deriving its tag
+      // under newer code is exactly the M13 failure). Pruned to the two builds in play.
+      const cdnTags: Record<string, string> = {};
+      if (previousBuildId && state?.cdnTags?.[previousBuildId]) {
+        cdnTags[previousBuildId] = state.cdnTags[previousBuildId];
+      }
+      cdnTags[buildId] = cdnTagForBuildId(buildId);
+      await writeState(projectDir, { buildId, previousBuildId, cdnTags }, releaseName);
     } catch (err) {
       console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
       console.error(`  ${err instanceof Error ? err.message : String(err)}`);
@@ -918,24 +1123,85 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       process.exit(1);
     }
 
-    // 7e. State is durable and traffic has switched, so it is now safe to scale the previous
-    // build down to 0. It served through the rollout and remains as the rollback target.
-    if (previousBuildId && previousBuildId !== buildId) {
-      for (const poolName of pools) {
-        const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
-        await execOrThrow("kubectl", [
-          "delete",
-          "hpa",
-          `${poolPrevName}-hpa`,
-          "--ignore-not-found",
-        ]);
-        await execOrThrow("kubectl", ["scale", `deployment/${poolPrevName}`, "--replicas=0"]);
+    // 7e. State is durable. Now invalidate the PREVIOUS build's Cloud CDN entries
+    // (best-effort, non-fatal; TTL self-heals) so its stale content stops serving.
+    // Deliberately post-cutover — the new origin must be live before the old entries
+    // are dropped — but after the state commit (7d) so a failure here can't leave
+    // cluster state pointing at the outgoing build.
+    const cdnFilterPath = path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml");
+    if (existsSync(cdnFilterPath) && infra.projectId) {
+      try {
+        await invalidateCdnBuildTag({
+          projectId: infra.projectId,
+          releaseName,
+          outputDir,
+          buildId: previousBuildId ?? undefined,
+          // M13: the tag recorded when the OUTGOING build deployed — never re-derived
+          // here. Absent (pre-recording state) → cdn-invalidate purges --path=/*.
+          recordedTag: previousBuildId ? state?.cdnTags?.[previousBuildId] : undefined,
+          run: execCapture,
+          log: (m) => console.log(m),
+        });
+      } catch (err) {
+        console.log(
+          `  ! CDN invalidation error (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
-      console.log(`  → Previous build scaled to 0 (kept for rollback)`);
     }
 
-    // 7f. Clean up old deployments.
-    // The previous build was scaled to 0 in step 7e above (kept as the rollback target).
+    // 7f. State is durable and traffic has switched, so it is now safe to scale the previous
+    // build down to 0. It served through the rollout and remains as the rollback target.
+    // Best-effort: success is already durable (7d) — a failure here warns instead of
+    // failing the whole deploy (the previous build just keeps burning replicas until the
+    // next deploy or a manual scale-down).
+    if (previousBuildId && previousBuildId !== buildId) {
+      let scaleDownFailed = false;
+      for (const poolName of pools) {
+        // The HPA name must come from the SAME suffix-reserving helper the template
+        // uses (hpa.ts truncates the base at 59, then appends "-hpa") — concatenating
+        // "-hpa" onto the 63-truncated deployment name diverges past that boundary
+        // (and can exceed 63 chars), so this delete silently missed the real HPA and
+        // the autoscaler rescaled the parked previous build right back up.
+        const { deployment: poolPrevName, hpa: poolPrevHpa } = poolResourceNames(
+          releaseName,
+          poolName,
+          previousBuildId,
+        );
+        const hpaDelete = await execCapture("kubectl", [
+          "delete",
+          "hpa",
+          poolPrevHpa,
+          "-n",
+          K8S_NAMESPACE,
+          "--ignore-not-found",
+        ]);
+        const scaleDown = await execCapture("kubectl", [
+          "scale",
+          `deployment/${poolPrevName}`,
+          "-n",
+          K8S_NAMESPACE,
+          "--replicas=0",
+        ]);
+        if (hpaDelete.exitCode !== 0 || scaleDown.exitCode !== 0) {
+          scaleDownFailed = true;
+          console.warn(
+            `  ! Could not scale down ${poolPrevName}: ` +
+              `${(scaleDown.stderr || hpaDelete.stderr).trim() || "unknown error"}`,
+          );
+        }
+      }
+      if (scaleDownFailed) {
+        console.warn(
+          `  ! Previous build ${previousBuildId} was NOT fully scaled to 0 — it keeps its ` +
+            `replicas until the next deploy. Scale it down manually when convenient.`,
+        );
+      } else {
+        console.log(`  → Previous build scaled to 0 (kept for rollback)`);
+      }
+    }
+
+    // 7g. Clean up old deployments.
+    // The previous build was scaled to 0 in step 7f above (kept as the rollback target).
     // Delete anything that isn't the current or previous build. Classify by EXACT deployment name
     // (reconstructed with the same sanitizer the template uses) rather than a 12-char normalized
     // substring — a shared prefix between two build ids could otherwise delete the wrong build.
@@ -949,6 +1215,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const allDeploys = await execCapture("kubectl", [
       "get",
       "deployments",
+      "-n",
+      K8S_NAMESPACE,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -956,7 +1224,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     ]);
     if (allDeploys.exitCode === 0) {
       for (const name of allDeploys.stdout.trim().split("\n")) {
-        if (!name || name.includes("routing-service")) continue;
+        // The routing tier is a stable in-place Deployment — never a cleanup candidate.
+        // EXACT name match: a substring match would also spare (or, elsewhere, drop) a
+        // pool deployment that merely contains "routing-service" in its name.
+        if (!name || name === routingDeploy) continue;
         // Keep current build
         if (currentDeployNames.has(name)) continue;
         // Keep previous build (rollback target)
@@ -976,11 +1247,25 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         }
         // Delete everything else
         console.log(`  → Deleting old build: ${name}`);
-        await execCapture("kubectl", ["delete", "deployment", name]);
-        await execCapture("kubectl", ["delete", "service", name]).catch(() => {});
-        await execCapture("kubectl", ["delete", "healthcheckpolicy", `${name}-hcp`]).catch(
+        await execCapture("kubectl", ["delete", "deployment", name, "-n", K8S_NAMESPACE]);
+        await execCapture("kubectl", ["delete", "service", name, "-n", K8S_NAMESPACE]).catch(
           () => {},
         );
+        // This build's raw release/pool/buildId parts are unknowable here (`name` is a
+        // cluster-listed deployment of a build state no longer tracks), so the HCP name
+        // can't go through poolResourceNames. Re-sanitizing the deployment name with the
+        // "-hcp" suffix reproduces the template's name exactly: for a base past the
+        // 59-char boundary, re-truncating the 63-char deployment name to 59 yields the
+        // same prefix the template truncated to (any trailing hyphens the template's
+        // strip removed beyond 59 are re-stripped here). Bare `${name}-hcp` diverged
+        // there — and could exceed 63 chars, an invalid name kubectl rejects.
+        await execCapture("kubectl", [
+          "delete",
+          "healthcheckpolicy",
+          sanitizeK8sName(name, "-hcp"),
+          "-n",
+          K8S_NAMESPACE,
+        ]).catch(() => {});
       }
     }
 
@@ -991,6 +1276,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const oldJobs = await execCapture("kubectl", [
       "get",
       "jobs",
+      "-n",
+      K8S_NAMESPACE,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
       "-o",
@@ -999,7 +1286,39 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (oldJobs.exitCode === 0) {
       for (const jobName of oldJobs.stdout.trim().split("\n")) {
         if (!jobName || jobName === currentRouteExtJob) continue;
-        await execCapture("kubectl", ["delete", "job", jobName]);
+        await execCapture("kubectl", ["delete", "job", jobName, "-n", K8S_NAMESPACE]);
+      }
+    }
+
+    // Prune retained routing-manifest snapshot ConfigMaps that belong to neither the
+    // current nor the previous build. Deploy and rollback each retain one (up to ~1 MiB
+    // of etcd apiece) and nothing else ever deleted them, so they accumulated
+    // unboundedly. Classify by EXACT snapshot name (the same helper that named them);
+    // mirror the deployment cleanup's conservatism above — with no known previous
+    // build, non-current snapshots can't be classified as safe to delete, so keep them.
+    // Best-effort: state is already committed (7d), a failure here only leaks storage.
+    if (previousBuildId) {
+      const keepSnapshots = new Set([
+        routingManifestSnapshotName(releaseName, buildId),
+        routingManifestSnapshotName(releaseName, previousBuildId),
+      ]);
+      const snapshots = await execCapture("kubectl", [
+        "get",
+        "configmaps",
+        "-n",
+        K8S_NAMESPACE,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s,` +
+          `app.kubernetes.io/component=routing-manifest-snapshot`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ]);
+      if (snapshots.exitCode === 0) {
+        for (const cmName of snapshots.stdout.trim().split("\n")) {
+          if (!cmName || keepSnapshots.has(cmName)) continue;
+          console.log(`  → Deleting old routing-manifest snapshot: ${cmName}`);
+          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", K8S_NAMESPACE]);
+        }
       }
     }
   }

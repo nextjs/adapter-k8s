@@ -1,5 +1,5 @@
 // src/cli/state.ts
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { spawn } from "node:child_process";
@@ -7,10 +7,26 @@ import { spawn } from "node:child_process";
 const STATE_DIR = ".k8s-adapter";
 const STATE_FILE = "state.json";
 const CONFIGMAP_NAME_SUFFIX = "-adapter-state";
+// init binds Workload Identity to [<namespace>/${releaseName}-deploy-sa] with the literal
+// namespace "default" — the release (and therefore this ConfigMap) lives there. Pin it:
+// reading/writing via whatever namespace the operator's context happens to have can
+// silently target the wrong namespace.
+const STATE_NAMESPACE = "default";
 
 export interface AdapterState {
   buildId: string;
   previousBuildId: string | null;
+  /**
+   * M13 (2026-07-22 stale-apex incident): the exact Cache-Tag each build's pool-server
+   * stamps on CDN-cacheable responses, keyed by buildId and recorded at that build's
+   * deploy. Cutover/rollback invalidation uses the RECORDED tag for the outgoing build —
+   * never a re-derivation under the current code, which may not match what the (older)
+   * outgoing build's pods actually stamped. Absent key (or absent map, for states written
+   * before recording existed) means the outgoing build's tag provenance is unknown and
+   * invalidation falls back to a full `--path=/*` purge. Pruned by deploy to the two
+   * builds still in play.
+   */
+  cdnTags?: Record<string, string>;
 }
 
 // Thrown when the local file was written but the cluster ConfigMap mirror failed.
@@ -24,12 +40,15 @@ export class ClusterStateWriteError extends Error {
   }
 }
 
-// Read state: try cluster ConfigMap first, fall back to local file
+// Read state: try cluster ConfigMap first, fall back to local file.
+// `localOnly` skips the cluster read entirely — required for dry-run paths (L13: the
+// kubectl context may point anywhere, and pinning it would mutate the kubeconfig).
 export async function readState(
   projectDir: string,
   releaseName?: string,
+  opts?: { localOnly?: boolean },
 ): Promise<AdapterState | null> {
-  if (releaseName) {
+  if (releaseName && !opts?.localOnly) {
     const clusterState = await readClusterState(releaseName);
     if (clusterState) return clusterState;
   }
@@ -53,10 +72,18 @@ export async function writeState(
   state: AdapterState,
   releaseName?: string,
 ): Promise<void> {
-  // Write local file
+  // Write local file atomically (tmp + rename): a crash mid-write previously could
+  // leave a truncated state.json that readState then silently treated as "no deploys".
+  // No cross-process deploy lockfile, deliberately: commits are single short writes
+  // sequenced after cutover, and a lock abandoned by a killed deploy would brick every
+  // later deploy until manually removed — a worse failure mode than the lost-update
+  // race, which the cluster-side health/cutover gates already serialize in practice.
   const dir = path.join(projectDir, STATE_DIR);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path.join(dir, STATE_FILE), JSON.stringify(state, null, 2));
+  const target = path.join(dir, STATE_FILE);
+  const tmp = path.join(dir, `${STATE_FILE}.tmp`);
+  writeFileSync(tmp, JSON.stringify(state, null, 2));
+  renameSync(tmp, target);
 
   // Write to cluster ConfigMap (throws ClusterStateWriteError on failure)
   if (releaseName) {
@@ -70,6 +97,8 @@ async function readClusterState(releaseName: string): Promise<AdapterState | nul
     "get",
     "configmap",
     cmName,
+    "-n",
+    STATE_NAMESPACE,
     "-o",
     "jsonpath={.data.state\\.json}",
   ]).catch(() => null);
@@ -100,7 +129,7 @@ data:
 `;
 
   return new Promise<void>((resolve, reject) => {
-    const child = spawn("kubectl", ["apply", "-f", "-"], {
+    const child = spawn("kubectl", ["apply", "-n", STATE_NAMESPACE, "-f", "-"], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 

@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import readline from "node:readline";
 import { execCapture } from "./exec.js";
 import { deployExtRoleId } from "./init.js";
+import { sanitizeForTerminal } from "./terminal.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -188,12 +189,90 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // destroy incomplete and cause a non-zero exit + preserved local state.
   const failures: string[] = [];
 
-  // 1. Helm uninstall
+  // Pin kubectl at THIS release's cluster before any cluster mutation — helm uninstall
+  // and the state-ConfigMap delete otherwise run against whatever context happens to be
+  // current, and destroying the wrong cluster's release is unrecoverable. Every other
+  // command (deploy/rollback/doctor) already does this; destroy historically did not.
+  // Dry-run must not mutate the operator's kubeconfig (L13).
+  if (!dryRun && projectId && region) {
+    const clusterName = `${releaseName}-cluster`;
+    console.log(`  → Connecting to GKE cluster "${clusterName}"...`);
+    const cred = await execCapture("gcloud", [
+      "container",
+      "clusters",
+      "get-credentials",
+      clusterName,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--quiet",
+    ]);
+    if (cred.exitCode !== 0) {
+      throw new Error(
+        `Failed to connect to cluster "${clusterName}" — aborting destroy before any ` +
+          `deletion: ${cred.stderr.trim() || `exit ${cred.exitCode}`}`,
+      );
+    }
+  } else if (dryRun) {
+    if (projectId && region) {
+      console.log(
+        `  [dry-run] Skipping "gcloud container clusters get-credentials" (it would mutate your kubeconfig).`,
+      );
+    } else {
+      console.log(
+        `  [dry-run] infrastructure.json is missing projectId/region — kubectl context ` +
+          `pinning is impossible. A real destroy would target whatever kubectl context is ` +
+          `current (and ask you to confirm it).`,
+      );
+    }
+  } else {
+    // C1: context pinning is IMPOSSIBLE (infrastructure.json missing, or missing
+    // projectId/region), so the cluster-side teardown below (helm uninstall, state
+    // ConfigMaps) would run against whatever kubectl context happens to be current —
+    // the exact wrong-cluster failure the pinning above was added to close. Surface
+    // the current context loudly and require explicit confirmation (--yes skips it,
+    // same as the destruction gate).
+    const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+    // L14: the context name is kubeconfig-sourced — strip terminal control chars.
+    const currentContext =
+      ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+    console.warn(
+      `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
+        `NOT be pinned to this release's cluster.\n` +
+        `      The cluster-side teardown (helm uninstall, adapter ConfigMaps) will run ` +
+        `against your CURRENT kubectl context:\n` +
+        `      ${currentContext || "(no current context / kubectl unavailable)"}\n`,
+    );
+    if (!yes) {
+      if (!process.stdin.isTTY) {
+        throw new Error(
+          "Refusing to destroy against an unpinned kubectl context non-interactively. " +
+            "Re-run with --yes (or -y) only if the context above is the intended cluster, " +
+            "or restore projectId/region in .k8s-adapter/infrastructure.json so the " +
+            "context can be pinned.",
+        );
+      }
+      const answer = await promptConfirmation(
+        `  Type "yes" to confirm this kubectl context is the intended cluster: `,
+      );
+      if (answer.trim() !== "yes") {
+        throw new Error(
+          "Destroy aborted: the current kubectl context was not confirmed as the " +
+            "intended cluster. No resources were deleted.",
+        );
+      }
+      console.log("");
+    }
+  }
+
+  // 1. Helm uninstall. The release lives in the "default" namespace — the same one init
+  // binds Workload Identity to — so pin it instead of trusting the context's namespace.
   if (dryRun) {
-    console.log(`  [dry-run] helm uninstall ${releaseName}`);
+    console.log(`  [dry-run] helm uninstall ${releaseName} --namespace default`);
   } else {
     console.log("  → Running helm uninstall...");
-    const res = await execCapture("helm", ["uninstall", releaseName]);
+    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", "default"]);
     if (res.exitCode !== 0) {
       if (isAlreadyGoneError(res.stderr)) {
         console.log("    (release not found or already uninstalled)");
@@ -203,6 +282,34 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         );
         failures.push(`helm release "${releaseName}"`);
       }
+    }
+  }
+
+  // 1b. Delete the adapter-written ConfigMaps helm doesn't own: the deploy-state
+  // ConfigMap (state.ts writes it via kubectl apply) and any retained routing-manifest
+  // snapshot ConfigMaps (rollback/deploy retention). A stale state ConfigMap otherwise
+  // survives destroy and resurrects the destroyed build as "previous" on the next
+  // deploy of this release name. Best-effort: warn, don't fail the destroy.
+  const cmDeleteArgs = [
+    "delete",
+    "configmap",
+    "-n",
+    "default",
+    "-l",
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s`,
+    "--ignore-not-found",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${cmDeleteArgs.join(" ")}`);
+  } else {
+    const res = await execCapture("kubectl", cmDeleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete adapter state ConfigMaps: ` +
+          `${res.stderr.trim() || `exit ${res.exitCode}`}. Delete them manually ` +
+          `(kubectl delete configmap -n default -l app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
+      );
     }
   }
 

@@ -259,4 +259,50 @@ describe("createProcessHandler fail behavior (Fix D)", () => {
     if (r2!.response.case !== "immediateResponse") throw new Error("wrong case");
     expect(r2!.response.value.status!.code).toBe(500);
   });
+
+  it("answers unexpected phases by echoing the phase-matching CONTINUE response", async () => {
+    // We only negotiate REQUEST_HEADERS, but a config skew can deliver other phases —
+    // silence would stall the bidi stream, and a fully-EMPTY ProcessingResponse (no
+    // oneof set) may itself be a protocol error for Envoy. Each phase must get its
+    // matching response case with a default-CONTINUE verdict, and the routing
+    // handler must NOT be invoked for any of them.
+    const handler = vi.fn();
+    const proc = createProcessHandler(handler, true);
+
+    const requestBodyCallout = create(ProcessingRequestSchema, {
+      request: { case: "requestBody", value: { body: enc.encode("x") } },
+    });
+    const [bodyRes] = await collect(proc(once(requestBodyCallout)));
+    expect(bodyRes!.response.case).toBe("requestBody");
+    if (bodyRes!.response.case !== "requestBody") throw new Error("wrong case");
+    expect(bodyRes!.response.value.response!.status).toBe(CommonResponse_ResponseStatus.CONTINUE);
+
+    const responseHeadersCallout = create(ProcessingRequestSchema, {
+      request: { case: "responseHeaders", value: { headers: { headers: [] } } },
+    });
+    const [rhRes] = await collect(proc(once(responseHeadersCallout)));
+    expect(rhRes!.response.case).toBe("responseHeaders");
+    if (rhRes!.response.case !== "responseHeaders") throw new Error("wrong case");
+    expect(rhRes!.response.value.response!.status).toBe(CommonResponse_ResponseStatus.CONTINUE);
+
+    const responseBodyCallout = create(ProcessingRequestSchema, {
+      request: { case: "responseBody", value: { body: enc.encode("y") } },
+    });
+    const [rbRes] = await collect(proc(once(responseBodyCallout)));
+    expect(rbRes!.response.case).toBe("responseBody");
+
+    const requestTrailersCallout = create(ProcessingRequestSchema, {
+      request: { case: "requestTrailers", value: {} },
+    });
+    const [rtRes] = await collect(proc(once(requestTrailersCallout)));
+    expect(rtRes!.response.case).toBe("requestTrailers");
+
+    const responseTrailersCallout = create(ProcessingRequestSchema, {
+      request: { case: "responseTrailers", value: {} },
+    });
+    const [resTrRes] = await collect(proc(once(responseTrailersCallout)));
+    expect(resTrRes!.response.case).toBe("responseTrailers");
+
+    expect(handler).not.toHaveBeenCalled();
+  });
 });
