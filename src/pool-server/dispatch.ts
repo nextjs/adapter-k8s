@@ -10,9 +10,13 @@ import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
 import {
   INTERNAL_SECRET_HEADER,
+  localeAlignedRouteParamPathname,
+  queryFromUrl,
+  requestTargetPathname,
   rscParentCandidates,
   stripBasePath,
   templateOutputCandidates,
+  trailingSlashVariants,
   type RscConfig,
 } from "../routing-common.js";
 import { cdnCacheTag } from "../cdn-tags.js";
@@ -576,6 +580,7 @@ async function invokeLocalHandlerOverHttp({
   invocationPath,
   routeParamPathname,
   invocationQuery,
+  mergeInvocationQueryIntoUrl = false,
   responsePrefix,
   invocationHeaders,
   discardResponse,
@@ -603,6 +608,10 @@ async function invokeLocalHandlerOverHttp({
   routeParamPathname?: string;
   /** Query resolved by @next/routing, excluding internal capture placeholders. */
   invocationQuery?: Record<string, string | string[]>;
+  /** App ROUTE handlers only: fold the rewrite's invocation query onto the PUBLIC request URL.
+   * `NextRequestAdapter.fromNodeNextRequest` builds `request.nextUrl` purely from the request
+   * URL, so this is the only channel a route handler has for rewrite-added search params. */
+  mergeInvocationQueryIntoUrl?: boolean;
   /** Build-time PPR shell prepended to the handler's resumed render stream. */
   responsePrefix?: {
     filePath: string;
@@ -710,16 +719,10 @@ async function invokeLocalHandlerOverHttp({
           }
           if (invocationPath) {
             const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
-            const query: Record<string, string | string[]> = {};
-            for (const [key, value] of target.searchParams) {
-              const previous = query[key];
-              query[key] =
-                previous === undefined
-                  ? value
-                  : Array.isArray(previous)
-                    ? [...previous, value]
-                    : [previous, value];
-            }
+            // Shared with both resolvers (routing-common.ts) — this was a byte-identical
+            // third copy of the repeated-key accumulation, the same duplication class that
+            // let Phase 2's output resolution drift from Phase 1's.
+            const query = queryFromUrl(target);
             invocationMeta = {
               ...invocationMeta,
               query: invocationQuery ?? query,
@@ -798,20 +801,48 @@ async function invokeLocalHandlerOverHttp({
       // the 300s requestTimeout, an unauthenticated resource pin.
       restateFramingHeaders(reqHeaders, bufferedBody, req.method, true);
 
+      // The loopback request URL is the PUBLIC request URL, verbatim. This mirrors Next's own
+      // boundary into a generated entrypoint: `BaseServer.renderToResponseWithComponentsImpl`
+      // sets `request.url = initURL.pathname + initURL.search` — the URL the CLIENT asked for,
+      // reconstructed from requestMeta.initURL — immediately before calling the entry, and
+      // carries the rewrite target only through requestMeta (`query`, `params`, and the
+      // `resolvedPathname`/`rewrittenPathname` the entry recomputes). Passing the rewrite
+      // DESTINATION here instead leaked it into everything user code sees, because generated
+      // entries derive `req.url`/`request.nextUrl`/`resolvedAsPath` from
+      // `new URL(innerReq.url, initURL)`: `/blog-post-2` (rewritten to
+      // `/blog/post-2?hello=world`) rendered `req.url` and `router.asPath` as
+      // `/blog/post-2?hello=world`, `/rewrite-source/foo` as `/rewrite-target?path=foo`, and
+      // `usePathname()` on a rewritten App page returned the destination. Empirically pinned
+      // against `next start` (Next 16.2.10, upstream getserversideprops/getinitialprops/
+      // app-dir-hooks fixtures): the public URL is `req.url`/`asPath`/`usePathname`, while the
+      // destination surfaces only as `resolvedUrl` and as merged `query`/`params`.
+      let loopbackPath = req.url ?? "/";
+      if (mergeInvocationQueryIntoUrl && invocationPath && invocationQuery) {
+        // App ROUTE (route.ts) entries are the single exception: their request has no
+        // requestMeta channel for search params (NextRequestAdapter reads the URL only), so a
+        // rewrite-added query has nowhere else to travel. Fold it onto the PUBLIC pathname —
+        // the identical treatment the edge App Route path in this file already applies. This is
+        // a deliberate, bounded divergence from `next start` (which drops these params); route
+        // handlers expose no asPath/usePathname/resolvedUrl, so nothing observable regresses.
+        const queryStart = loopbackPath.indexOf("?");
+        const rawPath = queryStart === -1 ? loopbackPath : loopbackPath.slice(0, queryStart);
+        const params = new URLSearchParams(
+          queryStart === -1 ? "" : loopbackPath.slice(queryStart + 1),
+        );
+        for (const [key, value] of Object.entries(invocationQuery)) {
+          params.delete(key);
+          for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
+        }
+        const search = params.toString();
+        loopbackPath = search ? `${rawPath}?${search}` : rawPath;
+      }
+
       const clientReq = httpRequest(
         {
           hostname: "127.0.0.1",
           port: address.port,
           method: req.method,
-          // A middleware/config rewrite must reach the entrypoint as the REQUEST URL, not just
-          // as request-meta: generated App Route/App Page entries derive request.url/nextUrl
-          // from `new URL(innerReq.url, initURL)`, so keeping the public req.url here dropped
-          // the rewrite destination's query entirely (repeated `?item=one&item=two` rewrite
-          // params never reached the handler). This mirrors Next's own router-server, which
-          // invokes the render server with the rewritten URL while initURL keeps the public
-          // origin. invocationPath is already locale-stripped and carries the merged
-          // source+destination query with repeated keys restored (resolve.ts invokePath).
-          path: invocationPath ?? req.url,
+          path: loopbackPath,
           headers: reqHeaders,
         },
         (clientRes) => {
@@ -1140,6 +1171,13 @@ export interface DispatcherOptions {
       tags?: string[];
     }
   >;
+  /** N16: PPR-capable route templates with no build-emitted fallback shell (`fallback: null`),
+   * each tagged with the unresolved ROOT params that stopped the build from emitting one. See the
+   * RoutingManifest doc comment in types.ts — only the root-param flavour runs NON-minimal; the
+   * rest merely need to be recognized as PPR so N13 leaves them alone.
+   * `| undefined` is explicit: under exactOptionalPropertyTypes the index.ts wiring passes
+   * `routingManifest.pprCapableRoutes` straight through, and older manifests have no such key. */
+  pprCapableRoutes?: Record<string, { rootParams: string[] }> | undefined;
   /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
    * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
@@ -1196,6 +1234,7 @@ export function createDispatcher(options: DispatcherOptions) {
     localHandlerInvoker = invokeLocalHandlerOverHttp,
     edgeRouteRunner = null,
     pprRoutes = {},
+    pprCapableRoutes: pprCapableRouteMap = {},
     rscConfig,
     outputIds = [],
     strictDynamicRoutes = [],
@@ -1220,6 +1259,30 @@ export function createDispatcher(options: DispatcherOptions) {
   const builtAtMs = builtAt ? Date.parse(builtAt) : Number.NaN;
   const deployedAt = Number.isFinite(builtAtMs) ? builtAtMs : Date.now();
   const entrypointOwnsPprCache = incrementalCacheShared || entrypointOwnsPprShell;
+  // N16: every shell-less PPR template (used only to recognize the route as PPR), and the
+  // root-param subset that must actually run NON-minimal. Splitting these was the fix for
+  // app-dir/fallback-shells: treating ALL shell-less PPR templates as non-minimal made Next
+  // resume a fallback shell for `without-suspense`/`without-io` routes, which upstream renders
+  // dynamically (it answered `x-nextjs-postponed: 1` and a build-time root layout).
+  const pprCapableRoutes = new Set(Object.keys(pprCapableRouteMap));
+  const pprRootParamRoutes = new Set(
+    Object.entries(pprCapableRouteMap)
+      .filter(([, entry]) => (entry.rootParams?.length ?? 0) > 0)
+      .map(([route]) => route),
+  );
+  // N13, NEXT_ENABLE_ADAPTER-only (emulatePlatformCache): dynamic-route templates that own
+  // at least one BUILD-TIME prerender (generateStaticParams) — the SSG/ISR app routes whose
+  // concrete instances a real platform cache would materialize. The harness has no platform
+  // cache, so those requests must run NON-minimal and let Next's own filesystem incremental
+  // cache own them and report x-nextjs-cache MISS/STALE/HIT like `next start`. Precomputed
+  // once; only the membership test runs per request.
+  const emulatedSsgTemplates = emulatePlatformCache
+    ? new Set(
+        staticAssets
+          .filter((asset) => asset.prerender && !asset.ppr)
+          .flatMap((asset) => templateOutputCandidates(asset.pathname, outputIds)),
+      )
+    : new Set<string>();
   // NEXT_ENABLE_ADAPTER-only bookkeeping (unreachable in production — the add site is
   // gated on emulatePlatformCache): one shell-served marker per concrete URL. Cap it so
   // a long-lived harness pod crawling many URLs can't grow it without bound. Eviction
@@ -1371,7 +1434,9 @@ export function createDispatcher(options: DispatcherOptions) {
       // Pages Router uses this response header to interpret middleware data-request
       // preflights and retain the matched route template. Next's router-server sets
       // it for both static and dynamic data routes.
-      const requestPathname = req.url ? new URL(req.url, "http://localhost").pathname : "";
+      // N10: requestTargetPathname, not `new URL(target, base)` — a `//…` target would
+      // otherwise throw (bare `//`) or be misread as an authority. See routing-common.
+      const requestPathname = req.url ? requestTargetPathname(req.url) : "";
       const isPagesDataRequest = requestPathname.startsWith(`${basePath}/_next/data/`);
       if (resolution.kind === "route" && isPagesDataRequest) {
         const publicMatchedPathname = stripBasePath(resolution.matchedPathname, basePath);
@@ -1445,14 +1510,20 @@ export function createDispatcher(options: DispatcherOptions) {
         isPagesDataRequest &&
         req.headers["x-middleware-prefetch"]
       ) {
-        const rewrittenDataPath = resolution.resolvedHeaders?.get("x-nextjs-rewrite");
-        const dataPagePath = pagesDataPathToPagePath(
-          rewrittenDataPath
-            ? new URL(rewrittenDataPath, "http://localhost").pathname
-            : requestPathname,
-          basePath,
-          buildIdForData || buildId,
-        );
+        // N12: `x-nextjs-rewrite` carries the PUBLIC page path of the rewrite destination
+        // (`next start` parity — see pagesRewriteSignalPath in resolve.ts). Accept the
+        // legacy `/_next/data/<buildId>/….json` form too: parse a data URL when it is
+        // one, otherwise treat the path itself as the page path — otherwise every
+        // prefetch would bail even when the rewrite target IS prerendered.
+        const rewrittenTarget = resolution.resolvedHeaders?.get("x-nextjs-rewrite");
+        const rewrittenPathname = rewrittenTarget
+          ? new URL(rewrittenTarget, "http://localhost").pathname
+          : undefined;
+        const dataPagePath =
+          rewrittenPathname !== undefined
+            ? (pagesDataPathToPagePath(rewrittenPathname, basePath, buildIdForData || buildId) ??
+              rewrittenPathname)
+            : pagesDataPathToPagePath(requestPathname, basePath, buildIdForData || buildId);
         const isPrerendered =
           dataPagePath !== null &&
           staticAssets.some(
@@ -1766,18 +1837,15 @@ export function createDispatcher(options: DispatcherOptions) {
           const location = resolution.resolvedHeaders?.has("location")
             ? middlewareRedirectLocation(req, resolution.url)
             : resolution.url.toString();
-          if (req.headers.rsc === "1") {
-            // App Router flight requests cannot follow an HTTP redirect as an RSC payload. Next's
-            // router-server converts it to a successful response carrying the internal redirect
-            // field; the client router performs the navigation without a CORS/document fallback.
-            delete headers["location"];
-            headers["x-nextjs-redirect"] = location;
-            res.writeHead(200, headers);
-          } else {
-            headers["location"] = location;
-            res.writeHead(resolution.status, headers);
-          }
-          res.end();
+          // N15: no RSC special-case — `next start` answers RSC redirects with the real 3xx and
+          // the App Router flight client follows it (fetch-server-response.ts reads
+          // response.redirected). `x-nextjs-redirect` is a PAGES-router protocol (written under
+          // isNextDataRequest, read by shared/lib/router/router.ts); emitting it for App Router
+          // stranded the flight client, which then fell back to a document load.
+          headers["location"] = location;
+          if (resolution.status === 308) headers["Refresh"] = `0;url=${location}`;
+          res.writeHead(resolution.status, headers);
+          res.end(req.method === "HEAD" ? undefined : location);
           return;
         }
 
@@ -1938,7 +2006,13 @@ export function createDispatcher(options: DispatcherOptions) {
             const isBypass = isVerifiedPreviewRequest(req);
             if (
               !isBypass &&
-              !prerenderedPaths.has(pagePath) &&
+              // N11: with `trailingSlash: true` the request path carries a slash while
+              // prerender-manifest routes are keyed WITHOUT one — comparing the raw path
+              // made every fallback:false prerender 404 (upstream normalizes the slash
+              // before this membership test). Reached whenever the concrete seed isn't
+              // served, i.e. the harness always AND production once a revalidate window
+              // expires, so this was a live 404 for trailingSlash+fallback:false apps.
+              !trailingSlashVariants(pagePath).some((variant) => prerenderedPaths.has(variant)) &&
               strictDynamicRoutes.some((r) => r.pageRegex.test(pagePath))
             ) {
               await serveNotFound(
@@ -2182,6 +2256,24 @@ export function createDispatcher(options: DispatcherOptions) {
           ]
             .map((candidate) => pprRoutes[candidate])
             .find((candidate) => candidate !== undefined);
+          // N16: PPR-capable without a build-emitted shell (`fallback: null`). Same candidate
+          // ladder as handlerPprInfo — an RSC request's output id carries the `.rsc` suffix, so
+          // the base route must be recovered before the lookup (LOAD-BEARING: without the
+          // rscParentCandidates rungs the document request was fixed but the flight request
+          // still truncated). `handlerPprCapable` only says "this route is PPR" (it keeps N13
+          // off); `handlerPprRootParams` is the narrower signal that flips minimal mode.
+          const pprCapableCandidates = [
+            resolution.matchedPathname,
+            handlerPathname,
+            ...rscParentCandidates(resolution.matchedPathname, rscConfig),
+            ...rscParentCandidates(handlerPathname, rscConfig),
+          ];
+          const handlerPprCapable = pprCapableCandidates.some((candidate) =>
+            pprCapableRoutes.has(candidate),
+          );
+          const handlerPprRootParams = pprCapableCandidates.some((candidate) =>
+            pprRootParamRoutes.has(candidate),
+          );
           // A concrete non-PPR prerender under a PPR-capable dynamic handler is a blocking/static
           // branch of that route, not permission to reuse the handler template's generic shell.
           // Falling through to the generic postponed state leaks build-time layouts into requests
@@ -2265,9 +2357,25 @@ export function createDispatcher(options: DispatcherOptions) {
             // NEXT_ENABLE_ADAPTER filesystem-cache harness; it does not alter req.url or caching.
             ...(resolution.matchedPathname !== handlerPathname &&
             !resolution.matchedPathname.includes("[")
-              ? { routeParamPathname: resolution.matchedPathname }
+              ? {
+                  // N9: align the locale prefix with the chosen template first — see
+                  // localeAlignedRouteParamPathname. Handing `/en-US` to `/[[...slug]]`
+                  // made the locale itself the first catch-all param.
+                  routeParamPathname: localeAlignedRouteParamPathname(
+                    resolution.matchedPathname,
+                    handlerPathname,
+                    i18nLocales,
+                  ),
+                }
               : {}),
             ...(resolution.invocationQuery ? { invocationQuery: resolution.invocationQuery } : {}),
+            // App ROUTE handlers read search params from the request URL only — there is no
+            // requestMeta channel for them (see mergeInvocationQueryIntoUrl). Every other entry
+            // kind receives the rewrite query through requestMeta.query and must keep the public
+            // URL byte-exact so req.url / router.asPath / usePathname match `next start`.
+            ...(handlerOutputInfo?.type === "APP_ROUTE"
+              ? { mergeInvocationQueryIntoUrl: true }
+              : {}),
             ...(i18nLocales.length > 0 ? { i18nLocales } : {}),
             ...(pprResponsePrefix ? { responsePrefix: pprResponsePrefix } : {}),
             ...(pprInvocationHeaders ? { invocationHeaders: pprInvocationHeaders } : {}),
@@ -2294,8 +2402,35 @@ export function createDispatcher(options: DispatcherOptions) {
             // filesystem cache, and cross-replica correct because revalidateTag writes
             // through the same registered handler.
             minimalMode: !(
-              ((entrypointOwnsPprShell || incrementalCacheShared) && !!handlerPprInfo) ||
-              (emulatePlatformCache && !!dispatchStaticAsset?.prerender && !dispatchStaticAsset.ppr)
+              // N16: a shell-bearing PPR template, or one the build left shell-less because
+              // ROOT params were unresolved. NOT every shell-less PPR template: a route whose
+              // shell was unemittable for any other reason (no Suspense boundary above the
+              // params access) is rendered dynamically by upstream, and running it non-minimal
+              // made Next resume a fallback shell upstream deliberately skips
+              // (app-dir/fallback-shells).
+              ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                (!!handlerPprInfo || handlerPprRootParams)) ||
+              (emulatePlatformCache &&
+                !!dispatchStaticAsset?.prerender &&
+                !dispatchStaticAsset.ppr) ||
+              // N13: a concrete path served through an SSG/ISR app template has no build
+              // artifact of its own (`/rewrite/not-broken` behind `/rewrite/[slug]`).
+              // Minimal mode makes the entrypoint re-render it every time and emit NO
+              // x-nextjs-cache, so the harness — which stands Next's filesystem cache in
+              // for the platform cache — never observes the MISS→HIT transition
+              // `next start` reports. PPR keeps its own gate above; Pages Router keeps
+              // minimal mode (its fallback-shell emulation owns that lifecycle).
+              // `!handlerPprCapable` as well as `!handlerPprInfo`: a PPR template with no
+              // build shell is still PPR, and `asset.ppr` is only set on outputs that carry a
+              // postponed state, so the concrete `foo` prerender under a PPR `[slug]` looks
+              // exactly like a plain SSG instance here. Without this rung, fallback-shells'
+              // `without-suspense`/`without-io` routes were flipped non-minimal by THIS clause
+              // even after the N16 gate above was narrowed.
+              (emulatePlatformCache &&
+                !handlerPprInfo &&
+                !handlerPprCapable &&
+                handlerOutputInfo?.type === "APP_PAGE" &&
+                emulatedSsgTemplates.has(handlerPathname))
             ),
             normalizePrerenderCacheControl:
               !!dispatchStaticAsset?.prerender && handlerOutputInfo?.type === "PAGES",
@@ -2336,8 +2471,9 @@ function proxyToPool(
       "x-matched-pathname": resolution.matchedPathname,
       "x-route-matches": resolution.routeMatches ? JSON.stringify(resolution.routeMatches) : "",
       // Rewrite invocation target (path+query with repeated destination keys restored). The
-      // public req.url is forwarded as-is above, so without these the target pool's dispatch
-      // would invoke the handler with the ORIGINAL URL and the rewrite-added query would be
+      // public req.url is forwarded as-is above — and stays the entrypoint's req.url — so
+      // without these the target pool's dispatch has no rewrite target at all: the handler
+      // would run with the ORIGINAL route's params and the rewrite-added query would be
       // silently dropped (same wire vocabulary the ext_proc routing service stamps).
       ...(resolution.invokePath ? { "x-invoke-path": resolution.invokePath } : {}),
       ...(resolution.invocationQuery

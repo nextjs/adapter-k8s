@@ -17,7 +17,11 @@ function entryKeyToPathname(entryKey: string): string | null {
   else if (name.startsWith("pages/") || name === "pages") name = name.slice("pages".length);
   else return null;
   // Route groups `(group)` and parallel-route slots `@slot` are invisible in the URL.
-  name = name.replace(/\/\([^/]+\)/g, "").replace(/\/@[^/]+/g, "");
+  // N17: anchor both strips to a WHOLE segment. `(group)` and `@slot` are invisible in the URL,
+  // but an interception marker is GLUED to its segment (`(...)post`, `(.)modal`) and must
+  // survive — unanchored, `/foo/@modal/(...)post/[id]/page` collapsed to `/foo/[id]/page`, so
+  // the interception route was never found AND the bogus key could shadow a real `/foo/[id]`.
+  name = name.replace(/\/\([^/]*\)(?=\/|$)/g, "").replace(/\/@[^/]+(?=\/|$)/g, "");
   // App Router entries end in the file kind; the route itself is the dirname.
   name = name.replace(/\/(route|page)$/, "");
   if (!name.startsWith("/")) name = `/${name}`;

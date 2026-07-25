@@ -467,4 +467,92 @@ describe("pool-server response cache-control precedence", () => {
     expect(res.headers.get("cache-control")).toBe("no-store");
     expect(res.headers.get("cache-tag")).toBeNull();
   });
+
+  // ---- N18 (SECURITY): the `_rsc` cache-busting param gates SHARED CACHEABILITY -----------
+  //
+  // Next validates `_rsc` against the RSC request headers and 307s a mismatch, because a CDN
+  // that ignores Vary would otherwise let one header set poison the entry another header set
+  // reads ("Neglecting to do this properly can lead to cache poisoning attacks on certain
+  // CDNs" — base-server.ts). That check is behind `!this.minimalMode`; the adapter runs every
+  // entrypoint in minimal mode, so the pool enforces it here. We do NOT 307 (see
+  // routing-common.ts `rscCacheBustingUnvalidated`): the response is still correct for its own
+  // headers, it just may not be STORED. Poisoning requires storage.
+  //
+  // `/probe.txt` is the sharpest probe available in this staged app: without the check it is
+  // served `public, max-age=3600` WITH a deploy cache-tag — a cacheable, tagged entry.
+  // Hash inputs and expectations are the recorded `next start` values; the derivation itself is
+  // proven in tests/routing-common.rsc-cache-busting.test.ts.
+
+  it("an RSC request with NO _rsc gets no-store and loses its cache tag", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/probe.txt`, { headers: { rsc: "1" } });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("probe body");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("cache-tag")).toBeNull();
+  });
+
+  it("an RSC request with a FORGED _rsc gets no-store and loses its cache tag", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/probe.txt?_rsc=DEADBEEFdeadbeef`, {
+      headers: { rsc: "1", "next-router-state-tree": "%5B%22%22%2C%7B%7D%5D" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("cache-tag")).toBeNull();
+  });
+
+  it("a VALID bare `?_rsc` (no hash inputs) keeps the cacheable headers — no false positives", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/probe.txt?_rsc`, { headers: { rsc: "1" } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("public, max-age=3600");
+    expect(res.headers.get("cache-tag")).toBe(BUILD_TAG);
+  });
+
+  it("a VALID hashed _rsc keeps the cacheable headers (modern and legacy forms)", async () => {
+    const headers = { rsc: "1", "next-router-state-tree": "%5B%22%22%2C%7B%7D%5D" };
+    for (const param of ["OxBCQ2sR9P8GlKR3", "1tccy"]) {
+      const res = await fetch(`http://127.0.0.1:${port}/probe.txt?_rsc=${param}`, { headers });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("public, max-age=3600");
+      expect(res.headers.get("cache-tag")).toBe(BUILD_TAG);
+    }
+  });
+
+  it("a hash bound to a DIFFERENT header set is rejected (the poisoning attempt itself)", async () => {
+    // `_rsc` is the hash for prefetch=1 + segment=/_tree; the request sends a different
+    // segment. Same URL, different content — exactly what must not become a shared entry.
+    const res = await fetch(`http://127.0.0.1:${port}/probe.txt?_rsc=_i_aeImnuN6u1u1r`, {
+      headers: {
+        rsc: "1",
+        "next-router-prefetch": "1",
+        "next-router-segment-prefetch": "/_index",
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("cache-tag")).toBeNull();
+  });
+
+  it("a DOCUMENT request is untouched by the check, even with a forged _rsc", async () => {
+    // Recorded `next start` behavior: no `rsc: 1` header ⇒ no validation, 200 as normal.
+    const res = await fetch(`http://127.0.0.1:${port}/probe.txt?_rsc=DEADBEEFdeadbeef`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("public, max-age=3600");
+    expect(res.headers.get("cache-tag")).toBe(BUILD_TAG);
+  });
+
+  it("an unvalidated RSC request cannot be made cacheable by an app cache-control", async () => {
+    // The forced `no-store` must outrank next.config headers() / middleware response headers
+    // carried in the resolved verdict — the same rule that protects the PPR verdict.
+    const res = await fetch(`http://127.0.0.1:${port}/mw-covered`, {
+      headers: {
+        rsc: "1",
+        "x-output-id": "/mw-covered",
+        "x-mw-evaluated": "ran",
+        "x-resolved-headers": JSON.stringify({ "cache-control": "public, max-age=1234" }),
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("cache-tag")).toBeNull();
+  });
 });

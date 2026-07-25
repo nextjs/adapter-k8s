@@ -387,13 +387,18 @@ describe("generateHelmChart", () => {
     });
 
     // The template is always in the chart; the helm `if` guard renders nothing until the
-    // deploy CLI sets global.networkPolicy.podCidrs.
+    // deploy CLI sets global.networkPolicy.podCidrs (or the operator opts into the
+    // strict allowlist, which needs no pod CIDR — N19).
     const netpol = result["templates/network-policy.yaml"];
     expect(netpol).toBeDefined();
-    expect(netpol).toContain("{{- if .Values.global.networkPolicy.podCidrs }}");
+    expect(netpol).toContain(
+      "{{- if or .Values.global.networkPolicy.podCidrs .Values.global.networkPolicy.strict }}",
+    );
     expect(netpol).toContain("kind: NetworkPolicy");
 
-    // values.yaml carries the empty default the CLI overrides with --set.
+    // values.yaml carries the empty default the CLI overrides with --set. `strict` and
+    // `nodeCidrs` are deliberately ABSENT (nil is falsy in helm) so the emitted posture
+    // is the broad one unless an operator sets them explicitly.
     const values = JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{")));
     expect(values.global.networkPolicy).toEqual({ podCidrs: [] });
   });

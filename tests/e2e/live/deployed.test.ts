@@ -223,13 +223,21 @@ describe("middleware at the ext_proc edge (traffic extension, after the CDN cach
     expect(r.body).toContain("Rewritten by middleware");
   });
 
-  it("translates a middleware redirect into an RSC navigation response", async () => {
+  // N15: this previously asserted 200 + `x-nextjs-redirect: /rewritten` — OUR OWN invented
+  // behavior, corrected here to `next start` parity. `next start` answers an RSC request that
+  // hits a redirect with the REAL 3xx + `location` (measured: `curl -H 'RSC: 1'
+  // /redirect/source?_rsc=abc123` → 308 + `location: /redirect/dest?_rsc=abc123`), and never
+  // emits `x-nextjs-redirect` for App Router at all — that header is a Pages-router protocol
+  // (written under isNextDataRequest, read only by shared/lib/router/router.ts). The flight
+  // client follows the real redirect via response.redirected. The middleware-authored target is
+  // authoritative, so the request query is NOT carried onto it (unlike rule redirects).
+  it("emits the real 3xx for a middleware redirect on an RSC request", async () => {
     const r = await req("/rsc-redirect-origin?_rsc=probe", {
       headers: { rsc: "1" },
     });
-    expect(r.status).toBe(200);
-    expect(r.headers.get("location")).toBeNull();
-    expect(r.headers.get("x-nextjs-redirect")).toBe("/rewritten");
+    expect(r.status).toBe(307);
+    expect(r.headers.get("location")).toBe("/rewritten");
+    expect(r.headers.get("x-nextjs-redirect")).toBeNull();
   });
 
   it("stamps matched responses with its marker header", async () => {
@@ -249,6 +257,14 @@ describe("middleware at the ext_proc edge (traffic extension, after the CDN cach
 });
 
 describe("rewrite query semantics", () => {
+  // DELIBERATE divergence from `next start`, not parity: verified on Next 16.2.10,
+  // `next start` returns `{"items":[]}` here, because App Route handlers read only
+  // the request URL and have no `query` requestMeta channel (unlike Pages, which
+  // gets asPath/resolvedUrl/query metadata). The adapter folds a rewrite's
+  // destination query onto the public pathname for APP_ROUTE outputs only — the
+  // same treatment dispatch.ts already applied on the edge path — so a rewrite's
+  // query reaches route handlers instead of vanishing. Nothing observable
+  // regresses: route handlers expose no asPath/usePathname/resolvedUrl.
   it("preserves repeated destination values as an ordered array", async () => {
     const r = await req("/rewrite-query-array");
     expect(r.status).toBe(200);

@@ -2,16 +2,21 @@
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
 import {
+  buildQueryString,
+  computeRewriteInvocation,
+  getRscConfig,
+  isRscRequest,
   lookupPool,
   manifestNextConfig,
   matchesMiddleware,
-  normalizeMatchedPathname,
+  mergeInvocationQuery,
   normalizeResolvedRedirect,
-  preferConcreteOutput,
   prepareRequest,
+  queryFromUrl,
+  resolveOutputPathname,
   resolveRscOutput,
+  stripAddedLocale,
   type MiddlewareMatcher,
-  type RscConfig,
 } from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
@@ -365,7 +370,9 @@ export function createLocalResolver(
 
       // 1. Redirects (rule/detection + Location-in-resolvedHeaders) — shared
       // normalization with the ext_proc edge (routing-common.ts).
-      const redirect = normalizeResolvedRedirect(resolution, prep, manifest);
+      const redirect = normalizeResolvedRedirect(resolution, prep, manifest, {
+        middlewareAuthored: middlewareResponse != null,
+      });
       if (redirect) {
         if (redirect.kind === "retry") {
           // Spurious internal trailing-slash redirect — resolve the real target.
@@ -413,7 +420,7 @@ export function createLocalResolver(
           if (prep.isDataRequest) {
             resolvedHeaders?.set(
               "x-nextjs-rewrite",
-              pagesDataRewritePath(resolution.externalRewrite, manifest),
+              pagesRewriteSignalPath(resolution.externalRewrite, manifest),
             );
           }
           return {
@@ -455,43 +462,25 @@ export function createLocalResolver(
         return { kind: "not-found", resolvedHeaders: resolution.resolvedHeaders ?? undefined };
       }
 
-      let baseMatchedPathname = normalizeMatchedPathname(
-        resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? matchedPathname,
-        manifest.poolAssignments,
-      );
-      // Concrete outputs win over dynamic templates (decoded lookup). Check the
-      // invocation target first: a rewrite to a concrete page (`/rewrite-1` ->
-      // `/gssp`) makes @next/routing report resolvedPathname `/[slug]` (the
-      // rewrite destination also matches the dynamic route) with an
-      // invocationTarget of `/gssp` — the real page. Preferring the concrete
-      // output for the target routes to `/gssp` instead of the `[slug]` handler.
-      // Fall back to the original request path for the non-rewrite case.
-      const concreteInvocationOutput = preferConcreteOutput(
-        matchedPathname,
-        baseMatchedPathname,
-        manifest.poolAssignments,
-      );
-      // Only consult the public request pathname when routing did not rewrite
-      // it. A beforeFiles rewrite is allowed to override a real filesystem
-      // sibling (`/featured` -> `/some-team`); preferring `/featured` here
-      // would silently undo that rewrite. When the invocation target differs,
-      // it is authoritative even if it ultimately resolves through a dynamic
-      // handler template.
-      const requestWasRewritten = matchedPathname !== url.pathname;
-      baseMatchedPathname =
-        concreteInvocationOutput ??
-        (!requestWasRewritten
-          ? preferConcreteOutput(url.pathname, baseMatchedPathname, manifest.poolAssignments)
-          : undefined) ??
-        baseMatchedPathname;
+      // Output-key resolution (normalize → prefer a concrete output over a dynamic
+      // template) — ONE implementation with the ext_proc edge
+      // (routing-common.ts resolveOutputPathname), which carries the reasoning for
+      // each step. The edge used to hand-mirror this and had drifted.
+      const baseMatchedPathname = resolveOutputPathname({
+        requestPathname: url.pathname,
+        resolvedPathname: resolution.resolvedPathname,
+        invocationTargetPathname: resolution.invocationTarget?.pathname,
+        poolAssignments: manifest.poolAssignments,
+      });
 
       // For RSC requests, resolve to the .rsc / segment-prefetch output variant so the handler
       // returns a flight payload instead of HTML. Shared with the ext_proc edge path
       // (routing-service/handler.ts) so both resolvers map RSC identically.
+      const rscConfig = getRscConfig(manifest);
       const finalMatchedPathname = resolveRscOutput(
         baseMatchedPathname,
         headers,
-        (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc,
+        rscConfig,
         manifest.poolAssignments,
       );
 
@@ -512,32 +501,21 @@ export function createLocalResolver(
       // router.query reflects the ORIGINAL request path. This is the core of
       // "middleware rewrites work behind a CDN": the client-transition (flight)
       // path must carry the rewrite signal, not just the direct render.
-      const rscHeader = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc?.header;
-      const isRscReq = rscHeader ? headers.get(rscHeader) === "1" : false;
-      const isDataReq = prep.isDataRequest;
-      const invocationQuery = restoreRepeatedRewriteQuery(
-        prep.originalUrl,
-        manifest.routeGraph,
-        mergeInvocationQuery(resolution.resolvedQuery, resolution.invocationTarget?.query),
-      );
-      let invokePath: string | undefined;
-      const targetPathRaw = resolution.invocationTarget?.pathname ?? resolution.resolvedPathname;
-      // An unmatched optional catch-all is represented internally as
-      // `/$nxtP<param>`. It is a routing sentinel, never a handler URL.
-      const hasUnresolvedDynamicSentinel =
-        targetPathRaw?.includes("$nxtP") || /%24nxtP/i.test(targetPathRaw ?? "");
-      if (targetPathRaw && !hasUnresolvedDynamicSentinel && !isRscReq && !isDataReq) {
-        let targetPath = targetPathRaw;
-        if (prep.addedLocale) {
-          const pfx = `/${prep.addedLocale}`;
-          if (targetPath === pfx) targetPath = "/";
-          else if (targetPath.startsWith(pfx + "/")) targetPath = targetPath.slice(pfx.length);
-        }
-        const qs = buildQueryString(invocationQuery);
-        const candidate = targetPath + qs;
-        if (candidate !== prep.originalUrl.pathname + prep.originalUrl.search)
-          invokePath = candidate;
-      }
+      // ONE derivation with the ext_proc edge, which transports the same two values over
+      // x-invoke-path / x-invoke-query (routing-common.ts computeRewriteInvocation). The pool
+      // used to carry a hand-mirrored copy of this block plus private copies of every helper
+      // it calls — that is exactly the drift routing-common.ts exists to prevent.
+      const isRscReq = isRscRequest(headers, rscConfig);
+      const { invokePath, invocationQuery } = computeRewriteInvocation({
+        originalUrl: prep.originalUrl,
+        addedLocale: prep.addedLocale,
+        isRscRequest: isRscReq,
+        isDataRequest: prep.isDataRequest,
+        routes: manifest.routeGraph,
+        resolvedQuery: resolution.resolvedQuery,
+        invocationTarget: resolution.invocationTarget,
+        resolvedPathname: resolution.resolvedPathname,
+      });
 
       // Middleware/config rewrites must be signalled to the client on the
       // negotiation requests it makes during a client-side navigation, or the
@@ -559,12 +537,7 @@ export function createLocalResolver(
       // double-resolve path makes the header capture unreliable here.)
       let resolvedHeaders = resolution.resolvedHeaders ?? undefined;
       if (isRscReq && resolution.invocationTarget?.pathname) {
-        let rwPath = resolution.invocationTarget.pathname;
-        if (prep.addedLocale) {
-          const pfx = `/${prep.addedLocale}`;
-          if (rwPath === pfx) rwPath = "/";
-          else if (rwPath.startsWith(pfx + "/")) rwPath = rwPath.slice(pfx.length);
-        }
+        const rwPath = stripAddedLocale(resolution.invocationTarget.pathname, prep.addedLocale);
         const rwQs = buildQueryString(invocationQuery);
         const pathChanged = rwPath !== prep.originalUrl.pathname;
         const queryChanged = rwQs !== prep.originalUrl.search;
@@ -590,88 +563,22 @@ export function createLocalResolver(
   };
 }
 
-function mergeInvocationQuery(
-  resolvedQuery: Record<string, string | string[]> | undefined,
-  targetQuery: Record<string, string | string[]> | undefined,
-): Record<string, string | string[]> | undefined {
-  if (!resolvedQuery && !targetQuery) return undefined;
-  return filterInternalQuery({ ...resolvedQuery, ...targetQuery });
-}
-
-function restoreRepeatedRewriteQuery(
-  requestUrl: URL,
-  routes: RoutingManifest["routeGraph"],
-  query: Record<string, string | string[]> | undefined,
-): Record<string, string | string[]> | undefined {
-  if (!query) return undefined;
-
-  // @next/routing currently applies a rewrite destination with URLSearchParams.set(), which
-  // collapses `?items=1&items=2` to the last value. Next's request contract exposes repeated
-  // destination keys as string[], so reconstruct only keys that (a) are repeated in a rewrite
-  // which matched this public pathname and (b) currently equal that rewrite's final value. The
-  // latter guard prevents an unrelated matching rule from replacing middleware/user query data.
-  const out = { ...query };
-  const candidates = [
-    ...routes.beforeMiddleware,
-    ...routes.beforeFiles,
-    ...routes.afterFiles,
-    ...routes.fallback,
-  ];
-  for (const route of candidates) {
-    if (!route.destination || (route.status && route.status >= 300 && route.status < 400)) continue;
-    let match: RegExpMatchArray | null = null;
-    try {
-      match = requestUrl.pathname.match(new RegExp(route.sourceRegex));
-    } catch {
-      continue;
-    }
-    if (!match) continue;
-
-    let destination = route.destination;
-    for (let index = 1; index < match.length; index++) {
-      const value = match[index];
-      if (value !== undefined) {
-        destination = destination.replaceAll(`$${index}`, () => value);
-      }
-    }
-    for (const [name, value] of Object.entries(match.groups ?? {})) {
-      if (value !== undefined) destination = destination.replaceAll(`$${name}`, () => value);
-    }
-    const rawQuery = destination.split("?", 2)[1];
-    if (!rawQuery) continue;
-    const repeated = new Map<string, string[]>();
-    for (const [key, value] of new URLSearchParams(rawQuery)) {
-      const values = repeated.get(key) ?? [];
-      values.push(value);
-      repeated.set(key, values);
-    }
-    for (const [key, values] of repeated) {
-      if (values.length > 1 && out[key] === values.at(-1)) out[key] = values;
-    }
-  }
-  return out;
-}
-
-function queryFromUrl(url: URL): Record<string, string | string[]> {
-  const query: Record<string, string | string[]> = {};
-  for (const [key, value] of url.searchParams) {
-    const previous = query[key];
-    query[key] =
-      previous === undefined
-        ? value
-        : Array.isArray(previous)
-          ? [...previous, value]
-          : [previous, value];
-  }
-  return query;
-}
-
 /**
- * Pages Router clients expect middleware rewrite metadata in the same data-URL
- * namespace as the request. Next's web adapter does this by assigning buildId
- * to the rewritten NextURL before serializing x-nextjs-rewrite.
+ * N12. Pages Router clients read middleware rewrite metadata from `x-nextjs-rewrite`.
+ * `next start` puts the PUBLIC PAGE path there, NOT a `/_next/data/<buildId>/….json` URL:
+ * router-server strips the data prefix before middleware runs (server/lib/router-utils/
+ * resolve-routes.ts, `middleware_next_data`), so NextURL.buildId is empty when
+ * server/web/adapter.ts serializes the destination — verified against `next start`
+ * 16.3.0-canary.84 for concrete pages (`/target`), dynamic pages (`/from-middleware`)
+ * and app (`/headers`) destinations alike.
+ *
+ * This is not cosmetic: the client copies the value verbatim into `routeInfo.resolvedAs`
+ * (getMiddlewareData → getRouteInfo) and `_bfl()` tests resolvedAs against the
+ * client-router filter to decide whether the destination is an App Router route needing a
+ * HARD navigation. A data-URL value is never in that filter, so a Pages→App middleware
+ * rewrite soft-navigated to the Pages match and rendered the wrong router's page.
  */
-function pagesDataRewritePath(target: URL, manifest: RoutingManifest): string {
+function pagesRewriteSignalPath(target: URL, manifest: RoutingManifest): string {
   let pagePath = target.pathname;
   if (
     manifest.basePath &&
@@ -680,8 +587,7 @@ function pagesDataRewritePath(target: URL, manifest: RoutingManifest): string {
     pagePath = pagePath.slice(manifest.basePath.length) || "/";
   }
   if (pagePath !== "/" && pagePath.endsWith("/")) pagePath = pagePath.slice(0, -1);
-  const dataPath = pagePath === "/" ? "/index" : pagePath;
-  return `${manifest.basePath}/_next/data/${manifest.buildId}${dataPath}.json${target.search}`;
+  return `${pagePath === "/" ? manifest.basePath || "/" : `${manifest.basePath}${pagePath}`}${target.search}`;
 }
 
 function mergeHeaders(
@@ -720,35 +626,6 @@ function sanitizeRouteMatches(
     Object.entries(matches).filter(([, value]) => !unresolvedValues.has(value)),
   );
   return Object.keys(sanitized).length > 0 ? sanitized : null;
-}
-
-// Drop @next/routing internal capture params (dynamic-route captures nxtP*, the
-// RSC union query _rsc) so they don't leak into client-facing rewrite headers.
-function filterInternalQuery(
-  query: Record<string, string | string[]> | undefined,
-): Record<string, string | string[]> | undefined {
-  if (!query) return undefined;
-  const out: Record<string, string | string[]> = {};
-  for (const [k, v] of Object.entries(query)) {
-    if (k.startsWith("nxtP") || k === "_rsc") continue;
-    const values = Array.isArray(v) ? v : [v];
-    if (values.some((value) => /^\$nxtP/.test(value))) continue;
-    out[k] = v;
-  }
-  return out;
-}
-
-// Serialize a resolved query (Record<string, string | string[]>) to a "?a=b&..."
-// string, preserving repeated keys. Empty → "".
-function buildQueryString(query: Record<string, string | string[]> | undefined): string {
-  if (!query) return "";
-  const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(query)) {
-    if (Array.isArray(value)) for (const v of value) params.append(key, v);
-    else params.append(key, value);
-  }
-  const s = params.toString();
-  return s ? `?${s}` : "";
 }
 
 export type LocalResolver = ReturnType<typeof createLocalResolver>;

@@ -25,7 +25,19 @@ delete process.env.NEXT_ENABLE_ADAPTER;
 // warning about its unhandled-rejection filter being uninstalled.
 process.env.NEXT_UNHANDLED_REJECTION_FILTER = "silent";
 
-const { startPoolServer } = await import("../../src/pool-server/index.js");
+const { startPoolServer, createEdgeFunctionLookup } =
+  await import("../../src/pool-server/index.js");
+
+// public/test.jp2 from Next's own test/e2e/image-optimizer fixture, byte-for-byte.
+// sharp/libvips cannot decode it, and image/jp2 is not one of Next's BYPASS_TYPES, so it
+// is the canonical way to reach imageOptimizer's fallback-to-the-original-image path.
+const JP2_BODY = Buffer.from(
+  "AAAADGpQICANCocKAAAAFGZ0eXBqcDIgAAAAAGpwMiAAAAAtanAyaAAAABZpaGRyAAAAAQAAAAEABA8HAAAA" +
+    "AAAPY29scgEAAAAAABAAAAClanAyY/9P/1EAMgAAAAAAAQAAAAEAAAAAAAAAAAAAAAEAAAABAAAAAAAAAAAA" +
+    "BA8BAQ8BAQ8BAQ8BAf9SAAwAAAABAAAEBAAB/1wABECA/2QAJQABQ3JlYXRlZCBieSBPcGVuSlBFRyB2ZXJz" +
+    "aW9uIDIuNS4w/5AACgAAAAAAKgAB/5PH/gwGAtsPx/4MBgBEH8/8MAwEFxfP/DAMA0HP/9k=",
+  "base64",
+);
 
 interface StagedDir {
   dir: string;
@@ -42,6 +54,7 @@ function writeStagedDir(withMiddleware: boolean): StagedDir {
   writeFileSync(path.join(dir, "package.json"), "{}");
   writeFileSync(path.join(dir, "public", "hello.txt"), "hello static");
   writeFileSync(path.join(dir, "public", "corrupt.png"), "this is not actually a png");
+
   writeFileSync(
     path.join(dir, "handlers", "hello.mjs"),
     `export function handler(req, res) {
@@ -57,6 +70,24 @@ function writeStagedDir(withMiddleware: boolean): StagedDir {
        res.statusCode = 302;
        res.setHeader("location", "/hello.txt");
        res.end();
+     }
+    `,
+  );
+  // A route serving JPEG-2000 bytes with a LONG upstream max-age. sharp cannot decode
+  // image/jp2, so this exercises the optimizer's fallback-to-source path together with
+  // upstream's deliberate maxAge choice there. `next start` (verified 2026-07-25 with the
+  // same bytes served from a pages API route at `Cache-Control: public, max-age=99999`)
+  // answers 200 image/jp2 with `public, max-age=14400, must-revalidate` — the
+  // images.minimumCacheTTL floor, NOT the upstream's longer value — while the same route
+  // serving TIFF, which optimizes successfully, DOES get `max-age=99999`.
+  writeFileSync(
+    path.join(dir, "handlers", "upstream-jp2.mjs"),
+    `export function handler(req, res) {
+       res.writeHead(200, {
+         "content-type": "image/jp2",
+         "cache-control": "public, max-age=99999",
+       });
+       res.end(Buffer.from(${JSON.stringify(JP2_BODY.toString("base64"))}, "base64"));
      }
     `,
   );
@@ -97,6 +128,12 @@ function writeStagedDir(withMiddleware: boolean): StagedDir {
           pathname: "/array-headers",
           type: "PAGES",
         },
+        "/upstream-jp2": {
+          id: "/upstream-jp2",
+          filePath: "handlers/upstream-jp2.mjs",
+          pathname: "/upstream-jp2",
+          type: "PAGES",
+        },
       },
     }),
   );
@@ -113,7 +150,7 @@ function writeStagedDir(withMiddleware: boolean): StagedDir {
         shouldNormalizeNextData: true,
         rsc: { header: "rsc", suffix: ".rsc" },
       },
-      pathnames: ["/hello", "/redirect-img", "/array-headers"],
+      pathnames: ["/hello", "/redirect-img", "/array-headers", "/upstream-jp2"],
       i18n: null,
       buildId: "smokebuild1",
       basePath: "",
@@ -126,6 +163,7 @@ function writeStagedDir(withMiddleware: boolean): StagedDir {
         "/hello": "main",
         "/redirect-img": "main",
         "/array-headers": "main",
+        "/upstream-jp2": "main",
       },
       pprRoutes: {},
       nextVersion: "16.2.10",
@@ -295,12 +333,32 @@ describe("pool-server startup smoke test", () => {
     expect(raw).not.toContain("500");
   });
 
-  it("502s (never passthrough) when sharp fails on corrupt image bytes", async () => {
+  it("502s (never passthrough) when sharp fails on bytes whose type is only a GUESS", async () => {
+    // `corrupt.png` is the text "this is not actually a png": NO magic signature matches,
+    // so the only candidate content type is the `.png` extension — a guess. Upstream 400s
+    // this case before sharp runs (its `upstreamType` is always byte-derived, and a source
+    // that sniffs to nothing is "The requested resource isn't a valid image."), so the
+    // fallback-to-source path added for jp2 must NOT extend here: serving unvalidated bytes
+    // under a guessed image type is exactly the XSS channel that fallback was removed for.
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/corrupt.png&w=640&q=75`);
     expect(res.status).toBe(502);
     // The raw bytes must NOT be served back under a guessed content-type.
     expect(res.headers.get("content-type")).not.toBe("image/png");
     expect(await res.text()).not.toContain("this is not actually a png");
+  });
+
+  it("clamps the fallback's max-age to minimumCacheTTL even when the upstream asks for more", async () => {
+    // The optimizer self-fetches /upstream-jp2 (image/jp2, `max-age=99999`), sharp cannot
+    // decode it, and upstream's catch returns the source bytes with
+    // `maxAge: images.minimumCacheTTL` — NOT the upstream-raised value it uses on the
+    // success path. Measured on `next start`: 200 image/jp2 + `max-age=14400`.
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/upstream-jp2&w=640&q=75`, {
+      headers: { accept: "image/webp" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/jp2");
+    expect(res.headers.get("cache-control")).toBe("public, max-age=14400, must-revalidate");
+    expect(Buffer.from(await res.arrayBuffer()).equals(JP2_BODY)).toBe(true);
   });
 
   it("refuses to follow redirects on the internal image self-fetch", async () => {
@@ -325,12 +383,22 @@ describe("pool-server startup smoke test", () => {
         .toBuffer(),
     );
 
+    // images.formats defaults to ['image/webp'] (next start parity), so a browser that
+    // advertises AVIF still gets WebP until the app opts in. This assertion previously
+    // pinned image/avif, which is what negotiation produced when it ignored the config.
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/real.png&w=640&q=75`, {
       headers: { accept: "image/avif,image/webp,image/*" },
     });
     expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toBe("image/avif");
+    expect(res.headers.get("content-type")).toBe("image/webp");
     expect(res.headers.get("vary")?.toLowerCase()).toContain("accept");
+
+    // The negotiated variant is Accept-dependent, so its validator must be too.
+    const plain = await fetch(`http://127.0.0.1:${port}/_next/image?url=/real.png&w=640&q=75`, {
+      headers: { accept: "*/*" },
+    });
+    expect(plain.headers.get("content-type")).toBe("image/png");
+    expect(plain.headers.get("etag")).not.toBe(res.headers.get("etag"));
   });
 
   it("applies the forced PPR cache policy over array-form writeHead headers", async () => {
@@ -356,5 +424,70 @@ describe("pool-server startup smoke test", () => {
       process.env.CONFIG_DIR = previousConfigDir;
       rmSync(stagedB.dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("edge function manifest lookup (route groups / parallel slots)", () => {
+  // Real keys from app-dir/metadata-dynamic-routes' middleware-manifest.json: the
+  // grouped route keeps `(group)` in its manifest key while its URL does not, so the
+  // pathname lookup missed it and the runner threw → 500 for /twitter-image-1ow20b
+  // (the ungrouped /twitter-image2 was fine, which is why only one route failed).
+  const functions = {
+    "/(group)/twitter-image-1ow20b/route": { name: "app/(group)/twitter-image-1ow20b/route" },
+    "/twitter-image2/route": { name: "app/twitter-image2/route" },
+  };
+
+  it("resolves a grouped edge route by its URL-shaped key", () => {
+    const lookup = createEdgeFunctionLookup(functions);
+    expect(lookup("/twitter-image-1ow20b/route")?.name).toBe(
+      "app/(group)/twitter-image-1ow20b/route",
+    );
+    // The literal manifest key must keep working too.
+    expect(lookup("/(group)/twitter-image-1ow20b/route")?.name).toBe(
+      "app/(group)/twitter-image-1ow20b/route",
+    );
+    expect(lookup("/twitter-image2/route")?.name).toBe("app/twitter-image2/route");
+  });
+
+  it("strips parallel-route slots as well, and still misses unknown routes", () => {
+    const lookup = createEdgeFunctionLookup({
+      "/dashboard/@modal/(overview)/settings/page": { name: "slotted" },
+    });
+    expect(lookup("/dashboard/settings/page")?.name).toBe("slotted");
+    expect(lookup("/nope/page")).toBeUndefined();
+  });
+
+  // N17: an interception marker is GLUED to its segment and IS part of the adapter's output
+  // id, unlike a whole-segment `(group)`. The unanchored group pattern ate it, collapsing
+  // `/foo/@modal/(...)post/[id]/page` to `/foo/[id]/page` — so every intercepting EDGE route
+  // 500'd, and the bogus alias could shadow a real `/foo/[id]`.
+  it("keeps the (...) interception marker while stripping the @slot", () => {
+    const lookup = createEdgeFunctionLookup({
+      "/foo/@modal/(...)post/[id]/page": { name: "intercepted" },
+      "/foo/[id]/page": { name: "ordinary" },
+    });
+    expect(lookup("/foo/(...)post/[id]/page")?.name).toBe("intercepted");
+    // The ordinary sibling must NOT resolve to the interception function.
+    expect(lookup("/foo/[id]/page")?.name).toBe("ordinary");
+  });
+
+  it("preserves sibling-level interception markers", () => {
+    const lookup = createEdgeFunctionLookup({
+      "/feed/@modal/(..)photos/[id]/page": { name: "sibling" },
+      "/baz/@modal/(.)modal/page": { name: "same-level" },
+    });
+    expect(lookup("/feed/(..)photos/[id]/page")?.name).toBe("sibling");
+    expect(lookup("/baz/(.)modal/page")?.name).toBe("same-level");
+  });
+
+  it("never lets a stripped alias shadow a real manifest key", () => {
+    // If an app genuinely has both `/x/route` and `/(g)/x/route`, the literal entry owns
+    // the URL — the stripped alias must not replace it.
+    const lookup = createEdgeFunctionLookup({
+      "/(g)/x/route": { name: "grouped" },
+      "/x/route": { name: "literal" },
+    });
+    expect(lookup("/x/route")?.name).toBe("literal");
+    expect(lookup("/(g)/x/route")?.name).toBe("grouped");
   });
 });

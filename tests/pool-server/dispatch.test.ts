@@ -261,6 +261,44 @@ describe("createDispatcher", () => {
     expect(localHandlerInvoker).toHaveBeenCalledOnce();
   });
 
+  // N12: the wire form resolve.ts now emits (`next start` parity) is the bare public page
+  // path. Both forms must resolve to the same prerender, or every prefetch would bail.
+  it("does not bail middleware prefetches rewritten to a prerender (bare page-path form)", async () => {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(vi.fn()),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [
+        {
+          pathname: "/ssg/hello",
+          filePath: ".next/server/pages/ssg/hello.html",
+          cacheControl: "public, max-age=0, must-revalidate",
+          prerender: true,
+        },
+      ],
+      localHandlerInvoker,
+    });
+
+    await dispatcher.dispatch(
+      mockReq("/_next/data/test123/to-ssg.json", { "x-middleware-prefetch": "1" }),
+      mockRes(),
+      {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/ssg/[slug]",
+        routeMatches: { slug: "hello" },
+        resolvedHeaders: new Headers({ "x-nextjs-rewrite": "/ssg/hello" }),
+      },
+    );
+
+    expect(localHandlerInvoker).toHaveBeenCalledOnce();
+  });
+
   it("provides a render404 callback that renders the custom not-found entrypoint", async () => {
     const pageHandler = vi.fn();
     const notFoundHandler = vi.fn((_req: IncomingMessage, res: ServerResponse) => {
@@ -2867,7 +2905,14 @@ describe("createDispatcher", () => {
       expect(res._headers["set-cookie"]).toEqual(["a=1", "b=2"]);
     });
 
-    it("translates an RSC redirect into the App Router redirect header", async () => {
+    // N15: RSC redirects keep the REAL 3xx — measured against `next start` 16.3.0-canary.84:
+    //   curl -H 'RSC: 1' /redirect/source?_rsc=abc123
+    //   → 308 + `location: /redirect/dest?_rsc=abc123` + `Refresh: 0;url=…`, no
+    //     x-nextjs-redirect anywhere. The App Router flight client follows it
+    //     (fetch-server-response.ts reads response.redirected); x-nextjs-redirect is a
+    //     PAGES-router protocol (written under isNextDataRequest in server/web/adapter.ts,
+    //     read only by shared/lib/router/router.ts).
+    it("keeps the real 3xx on an RSC redirect (next start parity)", async () => {
       const dispatcher = createDispatcher({
         handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
         poolName: "ssr",
@@ -2883,9 +2928,46 @@ describe("createDispatcher", () => {
         resolvedHeaders: new Headers({ location: "/target" }),
       });
 
-      expect(res._status).toBe(200);
-      expect(res._headers["location"]).toBeUndefined();
-      expect(res._headers["x-nextjs-redirect"]).toBe("/target");
+      expect(res._status).toBe(307);
+      expect(res._headers["location"]).toBe("/target");
+      expect(res._headers["x-nextjs-redirect"]).toBeUndefined();
+      // 307 carries no Refresh — only 308 does (measured).
+      expect(res._headers["Refresh"]).toBeUndefined();
+    });
+
+    // `next start` sets `Refresh: 0;url=<location>` for the PERMANENT redirect status only
+    // (router-server.ts: `if (statusCode === RedirectStatusCode.PermanentRedirect)`), and ends
+    // the response with the location string as the body.
+    it("adds Refresh on a 308 redirect only, and echoes the location as the body", async () => {
+      const dispatcher = createDispatcher({
+        handlerLoader: { load: vi.fn(), has: vi.fn(), get: vi.fn() } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+      });
+
+      const res308 = mockRes();
+      await dispatcher.dispatch(mockReq("/old", { rsc: "1" }), res308, {
+        kind: "redirect",
+        url: new URL("http://localhost/target"),
+        status: 308,
+        resolvedHeaders: new Headers({ location: "/target" }),
+      });
+      expect(res308._status).toBe(308);
+      expect(res308._headers["location"]).toBe("/target");
+      expect(res308._headers["Refresh"]).toBe("0;url=/target");
+
+      for (const status of [301, 302, 303, 307]) {
+        const res = mockRes();
+        await dispatcher.dispatch(mockReq("/old"), res, {
+          kind: "redirect",
+          url: new URL("http://localhost/target"),
+          status,
+          resolvedHeaders: new Headers({ location: "/target" }),
+        });
+        expect(res._status).toBe(status);
+        expect(res._headers["Refresh"]).toBeUndefined();
+      }
     });
 
     // L2: middlewareRedirectLocation consumes client-supplied x-forwarded-host/-proto.

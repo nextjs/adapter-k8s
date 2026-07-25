@@ -91,6 +91,36 @@ describe("resolveRouteHandlerExport", () => {
       expect(resolveRouteHandlerExport({}, "/blog/[slug]")).toBe(dynamic);
     });
 
+    // N17: `(group)` and `@slot` are invisible in the URL, but an INTERCEPTION marker is glued
+    // to its segment (`(...)post`, `(.)modal`, `(..)(..)b`) and is part of the route id. The
+    // old unanchored strips (`/\/\([^/]+\)/g`) ate `(...)post` whole, collapsing
+    // `app/feed/@modal/(..)photo/[id]/page` to `/feed/[id]` — the interception route was never
+    // found, AND the bogus key could shadow a real `/feed/[id]`.
+    it("preserves interception markers while still stripping whole-segment groups/slots", () => {
+      const intercepted = () => "intercepted";
+      const plain = () => "plain";
+      (globalThis as Record<string, unknown>)._ENTRIES = {
+        "middleware_app/feed/@modal/(..)photo/[id]/page": { default: intercepted },
+        "middleware_app/feed/[id]/page": { default: plain },
+      };
+      // The interception marker survives, so its own route id resolves...
+      expect(resolveRouteHandlerExport({}, "/feed/(..)photo/[id]")).toBe(intercepted);
+      // ...and it does not shadow the real sibling route.
+      expect(resolveRouteHandlerExport({}, "/feed/[id]")).toBe(plain);
+    });
+
+    it("keeps a leading-segment interception marker like (..)(..)b", () => {
+      const fn = () => "double-up";
+      const other = () => "other";
+      (globalThis as Record<string, unknown>)._ENTRIES = {
+        "middleware_app/(..)(..)b/page": { default: fn },
+        "middleware_app/(group)/c/page": { default: other },
+      };
+      expect(resolveRouteHandlerExport({}, "/(..)(..)b")).toBe(fn);
+      // A whole-segment route group is still invisible in the URL.
+      expect(resolveRouteHandlerExport({}, "/c")).toBe(other);
+    });
+
     it("throws on genuine ambiguity: several entries and none match the route", () => {
       const other = () => "other";
       (globalThis as Record<string, unknown>)._ENTRIES = {
@@ -105,7 +135,7 @@ describe("resolveRouteHandlerExport", () => {
       // preserve the pre-keying behavior for one-edge-route pools.
       const only = () => "only";
       (globalThis as Record<string, unknown>)._ENTRIES = {
-        "some_unexpected_key_format": { default: only },
+        some_unexpected_key_format: { default: only },
       };
       expect(resolveRouteHandlerExport({}, "/api/edge")).toBe(only);
     });

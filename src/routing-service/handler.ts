@@ -8,17 +8,19 @@ import {
 } from "./response-builders.js";
 import {
   computeRewriteInvocation,
+  getRscConfig,
+  grantsSharedCacheFreshness,
+  isRscRequest,
   lookupPool,
   manifestNextConfig,
   matchesMiddleware,
-  normalizeMatchedPathname,
   normalizeResolvedRedirect,
-  preferConcreteOutput,
   prepareRequest,
+  resolveOutputPathname,
   resolveRscOutput,
+  rscCacheBustingUnvalidated,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
-  type RscConfig,
 } from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
@@ -63,6 +65,31 @@ function serializeResolvedHeaders(resolved: Headers): string | null {
   return JSON.stringify(obj);
 }
 
+// N18 (SECURITY). Almost every response is authored by a pool, which owns the forced-cache
+// verdict (pool-server/index.ts + cache-policy.ts) and therefore enforces the RSC
+// `_rsc`-validation invariant for the whole dataplane. Two response classes never touch a pool:
+// a middleware-authored body and a rule/middleware redirect, both returned from here as ext_proc
+// IMMEDIATE responses with their headers copied verbatim from the middleware `Response` /
+// next.config `headers()` verdict. Those headers can carry a shared-cacheable Cache-Control, so
+// an unvalidated RSC request could still mint a storable entry. Downgrade it here.
+//
+// Narrow on purpose: only a Cache-Control that actually grants a shared cache an unrevalidated
+// window is replaced. We do NOT stamp `no-store` onto responses that had no Cache-Control —
+// Cloud CDN runs USE_ORIGIN_HEADERS (it stores nothing without an explicit directive), so adding
+// a header there would change observable behavior for zero security gain. Never 307s: same
+// fail-safe reasoning as routing-common.ts `rscCacheBustingUnvalidated`.
+function withRscCacheBustingGuard(
+  headers: Record<string, string>,
+  unvalidatedRscRequest: boolean,
+): Record<string, string> {
+  if (!unvalidatedRscRequest) return headers;
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== "cache-control") continue;
+    if (grantsSharedCacheFreshness(headers[key]!)) headers[key] = "no-store";
+  }
+  return headers;
+}
+
 export function createRequestHandler(
   manifest: RoutingManifest,
   middlewareModule: LoadedModule | null,
@@ -72,7 +99,7 @@ export function createRequestHandler(
   // (injected from a Secret); absent in emulate/tests, where the pool trusts nothing over the
   // wire and re-resolves locally. Read once — the deployment env is fixed for the process.
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
-  const rscConfig = (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
+  const rscConfig = getRscConfig(manifest);
   // Per-request budget mirrored from the server's withTimeout shed — when it fires,
   // this signal aborts so middleware awaiting a slow upstream is actually cancelled
   // instead of racing a shed response it can no longer influence. 0 disables.
@@ -107,6 +134,19 @@ export function createRequestHandler(
         )
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
+
+    // N18 (SECURITY): does this request's `_rsc` authenticate its RSC headers? Read off the
+    // ORIGINAL public URL and the client's own headers, before prepareRequest can rewrite either.
+    // Only consulted for the immediate responses this tier authors itself (see
+    // withRscCacheBustingGuard); pool-bound requests are enforced by the pool, which is the tier
+    // that owns Cache-Control and is the only one every request reaches.
+    const unvalidatedRscRequest =
+      (method === "GET" || method === "HEAD") &&
+      rscCacheBustingUnvalidated({
+        header: (name) => headers.get(name) ?? undefined,
+        searchParams: url.searchParams,
+        rsc: rscConfig,
+      });
 
     // Shared request normalization (decode-400, slash-collapse 308, locale
     // prefixing) — one sequence with the pool resolver (routing-common.ts).
@@ -372,7 +412,9 @@ export function createRequestHandler(
     // Redirects (rule/detection + Location-in-resolvedHeaders) — shared
     // normalization with the pool resolver. Forward resolvedHeaders (middleware
     // Set-Cookie, custom redirect headers) so the edge matches the pool phase.
-    const redirect = normalizeResolvedRedirect(resolution, prep, manifest);
+    const redirect = normalizeResolvedRedirect(resolution, prep, manifest, {
+      middlewareAuthored: middlewareResponse != null,
+    });
     if (redirect) {
       if (redirect.kind === "retry") {
         // Spurious internal trailing-slash redirect — resolve the real target.
@@ -396,25 +438,25 @@ export function createRequestHandler(
           responseHeaders[key] = value;
         }
       }
-      // App Router flight requests cannot follow an HTTP redirect as an RSC payload: Next's
-      // router-server converts it into a SUCCESSFUL response carrying the internal
-      // x-nextjs-redirect field, and the client router performs the navigation. The edge must
-      // do the same translation the pool dispatcher does — an ext_proc 307 with a Location
-      // reaches the RSC client as an opaque cross-document redirect and breaks the soft
-      // navigation. Middleware-authored redirects (Location present in resolvedHeaders) are
-      // relativized when same-origin, matching the pool's middlewareRedirectLocation and
-      // `next start` (which reports a RELATIVE path for same-origin targets); rule redirects
-      // keep their absolute form — mirrors pool-server/dispatch.ts, keep the two in lockstep.
-      if (headers.get(rscConfig?.header ?? "rsc") === "1") {
-        const sameOrigin = redirect.url.origin === url.origin;
-        responseHeaders["x-nextjs-redirect"] =
-          redirect.resolvedHeaders?.has("location") && sameOrigin
-            ? redirect.url.pathname + redirect.url.search + redirect.url.hash
-            : redirect.url.toString();
-        return buildImmediateResponse(200, responseHeaders, undefined, setCookies);
-      }
-      responseHeaders["location"] = redirect.url.toString();
-      return buildImmediateResponse(redirect.status, responseHeaders, undefined, setCookies);
+      // N15: no RSC special-case — `next start` answers RSC redirects with the real 3xx and the
+      // App Router flight client follows it (fetch-server-response.ts reads response.redirected).
+      // `x-nextjs-redirect` is a PAGES-router protocol (written under isNextDataRequest, read by
+      // shared/lib/router/router.ts); emitting it for App Router stranded the flight client,
+      // which then fell back to a document load. Same-origin Locations are relativized so both
+      // tiers match (the pool already relativizes via middlewareRedirectLocation) and so the
+      // shape matches `next start`, which reports a RELATIVE path for same-origin targets.
+      const sameOrigin = redirect.url.origin === url.origin;
+      const location = sameOrigin
+        ? redirect.url.pathname + redirect.url.search + redirect.url.hash
+        : redirect.url.toString();
+      responseHeaders["location"] = location;
+      if (redirect.status === 308) responseHeaders["Refresh"] = `0;url=${location}`;
+      return buildImmediateResponse(
+        redirect.status,
+        withRscCacheBustingGuard(responseHeaders, unvalidatedRscRequest),
+        undefined,
+        setCookies,
+      );
     }
 
     if (resolution.middlewareResponded && middlewareResponse != null) {
@@ -427,7 +469,12 @@ export function createRequestHandler(
         respHeaders[key] = value;
       }
       const setCookies = mwRes.headers.getSetCookie();
-      return buildImmediateResponse(mwRes.status, respHeaders, await mwRes.text(), setCookies);
+      return buildImmediateResponse(
+        mwRes.status,
+        withRscCacheBustingGuard(respHeaders, unvalidatedRscRequest),
+        await mwRes.text(),
+        setCookies,
+      );
     }
 
     if (resolution.externalRewrite) {
@@ -443,15 +490,19 @@ export function createRequestHandler(
     // Pool ownership is looked up on the BASE pathname (RSC variants live in the same pool as
     // their page). The output id, however, must be the RSC-mapped variant so the handler
     // returns a flight payload instead of HTML — mirrors pool-server/resolve.ts.
-    let basePathname = normalizeMatchedPathname(
-      resolution.resolvedPathname ?? resolution.invocationTarget?.pathname ?? fallbackPathname,
-      manifest.poolAssignments,
-    );
-    // Concrete prerendered outputs win over dynamic templates (decoded lookup).
-    // Mirrors pool-server/resolve.ts.
-    basePathname =
-      preferConcreteOutput(resolveUrl.pathname, basePathname, manifest.poolAssignments) ??
-      basePathname;
+    //
+    // Output-key resolution is now the SHARED implementation (routing-common.ts
+    // resolveOutputPathname). This tier used to hand-mirror it and had drifted: it only ever
+    // preferred a concrete output for the PUBLIC request pathname, never for the rewrite
+    // INVOCATION TARGET, so a rewrite whose destination also matched a dynamic route
+    // (`/rewrite-1` → `/gssp`, resolvedPathname `/[slug]`) dispatched the `[slug]` template at
+    // the edge while the pool's Phase-1 resolver dispatched `/gssp`.
+    const basePathname = resolveOutputPathname({
+      requestPathname: resolveUrl.pathname,
+      resolvedPathname: resolution.resolvedPathname,
+      invocationTargetPathname: resolution.invocationTarget?.pathname,
+      poolAssignments: manifest.poolAssignments,
+    });
     const outputId = resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
 
     const mutations: HeaderMutationEntry[] = [];
@@ -503,7 +554,7 @@ export function createRequestHandler(
     const invocation = computeRewriteInvocation({
       originalUrl: prep.originalUrl,
       addedLocale: prep.addedLocale,
-      isRscRequest: rscConfig ? headers.get(rscConfig.header) === "1" : false,
+      isRscRequest: isRscRequest(headers, rscConfig),
       isDataRequest: prep.isDataRequest,
       routes: manifest.routeGraph,
       resolvedQuery: resolution.resolvedQuery,

@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -35,6 +35,35 @@ describe("createK8sAdapter config normalization", () => {
 
     expect((adapter as any).config.containerStrategy).toBe("traced-assets");
     expect((adapter as any).config.provider.gke.cdn.enabled).toBe(false);
+  });
+
+  // N14: Next pins the build id to the constant `build-TfctsWXpff2fKS` whenever
+  // deploymentId is set (getBuildId in next/src/build/index.ts), and every blue/green
+  // resource name + the CDN cutover cache-tag derive from the build id — so consecutive
+  // deploys would collide. WARN at build time (the Next e2e deploy harness sets
+  // NEXT_DEPLOYMENT_ID deliberately and never cuts over); deploy refuses the cutover.
+  it("warns about next.config deploymentId but still builds", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = createK8sAdapter(validConfig);
+      await expect(
+        adapter.modifyConfig!({ deploymentId: "dpl-abc123" } as any, {} as any),
+      ).resolves.toBeDefined();
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/deploymentId.*build id/s);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("does not warn without deploymentId", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = createK8sAdapter(validConfig);
+      await expect(adapter.modifyConfig!({} as any, {} as any)).resolves.toBeDefined();
+      expect(warn.mock.calls.flat().join(" ")).not.toMatch(/deploymentId/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

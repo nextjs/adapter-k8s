@@ -463,6 +463,178 @@ describe("buildRoutingManifest", () => {
     expect(manifest.pprRoutes["/partial"]).toBeUndefined();
   });
 
+  // N16: `pprRoutes` only carries routes whose build emitted a fallback shell. A PPR-capable
+  // route with `fallback: null` still answers with a postponed shell in minimal mode (measured:
+  // 1705 B + `x-nextjs-postponed: 1`, no `$RC(` resume, vs `next start`'s 7973 B complete
+  // document), so the pool needs a separate list. It is keyed by template with the prerender
+  // manifest's `fallbackRootParams` attached, because only the root-param flavour may run
+  // NON-minimal — see the RoutingManifest doc comment.
+  describe("pprCapableRoutes (N16)", () => {
+    let dir: string;
+
+    beforeEach(() => {
+      dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-ppr-capable-"));
+      mkdirSync(path.join(dir, ".next"), { recursive: true });
+    });
+
+    afterEach(() => {
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    function writePrerenderManifest(manifest: {
+      dynamicRoutes?: Record<string, { fallbackRootParams?: unknown }>;
+      routes?: Record<string, unknown>;
+    }) {
+      writeFileSync(
+        path.join(dir, ".next", "prerender-manifest.json"),
+        JSON.stringify(manifest),
+        "utf-8",
+      );
+    }
+
+    function build(prerenders: ReturnType<typeof mockPrerender>[]) {
+      const outputs = mockOutputs({
+        appPages: [mockAppPage({ pathname: "/x/[id]" })],
+        prerenders,
+      });
+      const pools = new Map<string, PoolDefinition>([
+        ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
+      ]);
+      return buildRoutingManifest({
+        routing: mockRouting(),
+        outputs,
+        pools,
+        buildId: "test123",
+        basePath: "",
+        i18n: null,
+        nextVersion: "16.2.0",
+        projectDir: dir,
+      });
+    }
+
+    it("includes a PARTIALLY_STATIC template with fallback: null, which pprRoutes omits", () => {
+      writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
+      const manifest = build([
+        mockPrerender({
+          pathname: "/x/[id]",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+      ]);
+      expect(manifest.pprCapableRoutes).toEqual({ "/x/[id]": { rootParams: [] } });
+      expect(manifest.pprRoutes["/x/[id]"]).toBeUndefined();
+    });
+
+    // The ROOT params that stopped the build from emitting a shell travel with the entry: they
+    // are the only reason the pool may run such a route non-minimal, because upstream keeps
+    // unknown root branches blocking and renders a runtime shell per root-param value.
+    it("carries the prerender manifest's fallbackRootParams", () => {
+      writePrerenderManifest({
+        dynamicRoutes: { "/[lang]/x/[id]": { fallbackRootParams: ["lang"] } },
+      });
+      const manifest = build([
+        mockPrerender({
+          pathname: "/[lang]/x/[id]",
+          sourcePage: "/[lang]/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+      ]);
+      expect(manifest.pprCapableRoutes).toEqual({ "/[lang]/x/[id]": { rootParams: ["lang"] } });
+    });
+
+    // DISJOINT from pprRoutes, not a superset: a shell-bearing entry is already driven
+    // non-minimal via handlerPprInfo.
+    it("EXCLUDES routes that already have a build-emitted shell (disjoint from pprRoutes)", () => {
+      writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
+      const manifest = build([
+        mockPrerender({
+          pathname: "/x/[id]",
+          sourcePage: "/x/[id]",
+          fallback: { filePath: "/app/dist/x.html", postponedState: "abc" },
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+      ]);
+      expect(manifest.pprCapableRoutes).toEqual({});
+      expect(manifest.pprRoutes["/x/[id]"]).toBeDefined();
+    });
+
+    // Only prerender-manifest `dynamicRoutes` members are TEMPLATES. Concrete
+    // generateStaticParams instances (`routes`) and the `.rsc`/`.segments/` flight variants are
+    // PARTIALLY_STATIC with no fallback of their own; listing them flipped them to non-minimal,
+    // which resumed fallback shells upstream expects NOT to be resumed
+    // (app-dir/fallback-shells regressed 5 tests).
+    it("excludes concrete prerenders and the .rsc / .segments/ flight variants", () => {
+      writePrerenderManifest({
+        dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } },
+        routes: { "/x/foo": {} },
+      });
+      const manifest = build([
+        mockPrerender({
+          pathname: "/x/[id]",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+        mockPrerender({
+          pathname: "/x/foo",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+        mockPrerender({
+          pathname: "/x/[id].rsc",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+        mockPrerender({
+          pathname: "/x/[id].segments/_tree.segment.rsc",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+      ]);
+      expect(manifest.pprCapableRoutes).toEqual({ "/x/[id]": { rootParams: [] } });
+    });
+
+    it("excludes non-PPR rendering modes", () => {
+      writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
+      const manifest = build([
+        mockPrerender({
+          pathname: "/x/[id]",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "STATIC" as any },
+        }),
+      ]);
+      expect(manifest.pprCapableRoutes).toEqual({});
+    });
+
+    // Missing/unreadable manifest must fail toward minimal mode (pre-N16 behavior), never
+    // toward "every PPR route is root-param-capable".
+    it("is empty when the prerender manifest is absent", () => {
+      const manifest = build([
+        mockPrerender({
+          pathname: "/x/[id]",
+          sourcePage: "/x/[id]",
+          // @ts-ignore - mock property
+          fallback: null,
+          config: { renderingMode: "PARTIALLY_STATIC" as any },
+        }),
+      ]);
+      expect(manifest.pprCapableRoutes).toEqual({});
+    });
+  });
+
   it("places rsc inside routeGraph", () => {
     const outputs = mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] });
     const pools = new Map<string, PoolDefinition>([

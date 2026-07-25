@@ -672,8 +672,13 @@ describe("createLocalResolver", () => {
       expect(result.invokePath).toBeUndefined();
       expect(result.invocationQuery).toEqual({ some: "middleware" });
       expect(result.resolvedHeaders?.get("x-first")).toBe("yes");
+      // N12: the PUBLIC page path, not a data URL — `next start` emits the bare page path
+      // because router-server strips /_next/data/<buildId> before middleware runs, so
+      // NextURL.buildId is empty at serialization time. The client copies this verbatim
+      // into routeInfo.resolvedAs and _bfl() tests it against the client-router filter to
+      // decide whether a HARD navigation is needed (Pages→App rewrites).
       expect(result.resolvedHeaders?.get("x-nextjs-rewrite")).toBe(
-        "/_next/data/test123/blog/from-middleware.json?some=middleware",
+        "/blog/from-middleware?some=middleware",
       );
     }
   });

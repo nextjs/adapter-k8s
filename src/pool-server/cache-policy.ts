@@ -1,13 +1,31 @@
+import { grantsSharedCacheFreshness } from "../routing-common.js";
+
 export function forcedCdnCacheControl({
   isPprRoute,
   middlewareCovers,
   emulateNextServer,
+  rscHeadersUnvalidated = false,
 }: {
   isPprRoute: boolean;
   middlewareCovers: boolean;
   emulateNextServer: boolean;
+  /**
+   * N18 (SECURITY): this is an RSC request whose `_rsc` cache-busting param does not
+   * authenticate its RSC headers (routing-common.ts `rscCacheBustingUnvalidated`).
+   */
+  rscHeadersUnvalidated?: boolean;
 }): "no-store" | "no-cache" | null {
   if (isPprRoute) return "no-store";
+  // N18 (SECURITY): an RSC response whose content varies with headers a shared cache may ignore,
+  // requested with a `_rsc` that doesn't match those headers, must never be STORABLE — that is
+  // the whole poisoning primitive (`next start` answers such a request 307; we answer it
+  // correctly but unstorably — see rscCacheBustingUnvalidated for why). `no-store`, not
+  // `no-cache`: `no-cache` still permits storage-plus-revalidation, and it must outrank the
+  // middleware verdict below AND any app-supplied Cache-Control (explicitCacheControlWins
+  // returns false for every forced value except `no-cache`, which is what makes that hold).
+  // NOT exempted under `emulateNextServer` — `next start` does not serve a cacheable response
+  // to these requests either, so `no-store` is *closer* to parity than the origin value.
+  if (rscHeadersUnvalidated) return "no-store";
   // In production, GXLB executes middleware after Cloud CDN. A cache hit would bypass middleware,
   // so every matched response must revalidate even if app code supplies a public cache directive.
   // NEXT_ENABLE_ADAPTER is different: it is Next's local deploy-test harness with no CDN or Valkey,
@@ -50,14 +68,7 @@ export function explicitCacheControlWins({
   return true;
 }
 
-// True when the directive gives a shared cache a window in which it may serve hits
-// without revalidating — i.e. a positive s-maxage (or max-age when s-maxage is absent)
-// and neither no-cache nor private to veto storage. Middleware-covered routes must
-// never get such a window: CDN hits inside it skip the ext_proc callout entirely.
-function grantsSharedCacheFreshness(cacheControl: string): boolean {
-  if (/\bno-cache\b/i.test(cacheControl) || /\bprivate\b/i.test(cacheControl)) return false;
-  const sMaxAge = /\bs-maxage=(\d+)/i.exec(cacheControl);
-  const maxAge = /\bmax-age=(\d+)/i.exec(cacheControl);
-  const shared = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : 0;
-  return shared > 0;
-}
+// `grantsSharedCacheFreshness` — "the directive gives a shared cache a window in which it may
+// serve hits without revalidating" — now lives in routing-common.ts: the routing-service tier
+// needs the same predicate for the N18 RSC invariant, and two copies could drift. Middleware-
+// covered routes must never get such a window: CDN hits inside it skip the ext_proc callout.

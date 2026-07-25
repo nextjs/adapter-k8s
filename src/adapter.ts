@@ -396,6 +396,39 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // Use process.cwd() which is the project root during build.
       const cfg = await ensureConfig(process.cwd());
 
+      // N14: `deploymentId` (Next's skew protection) makes Next return a CONSTANT build id
+      // — literally `build-TfctsWXpff2fKS` for every build, forever (see getBuildId in
+      // next/src/build/index.ts: with skew protection the deployment-id header identifies
+      // the version instead). This adapter keys blue/green on the build id: Deployment /
+      // Service / HPA / HealthCheckPolicy names, the routing-manifest snapshot, the
+      // adapter-k8s.dev/build-id label, and the CDN cutover cache-tag. A constant build id
+      // makes consecutive deploys share every one of those names, so a "new" build would
+      // adopt the serving Deployment mid-cutover instead of standing up beside it. The
+      // composed-name collision guard in onBuildComplete would abort the deploy anyway;
+      // fail here instead, at the point where the cause is visible and fixable.
+      // WARN, don't throw: a build is not a deploy. The Next.js e2e deploy harness sets
+      // NEXT_DEPLOYMENT_ID (→ config.deploymentId) on purpose to exercise `?dpl=` asset
+      // versioning, and it never runs `adapter-k8s deploy` — it drives the pool server
+      // directly, where a constant build id is harmless. The hazard is real only at CUTOVER,
+      // so `adapter-k8s deploy` refuses it there (see the build-id collision guard in
+      // src/cli/deploy.ts, which aborts on identical composed names).
+      if ((nextConfig as { deploymentId?: string }).deploymentId) {
+        console.warn(
+          "[adapter-k8s] next.config `deploymentId` is set — you almost certainly do not need " +
+            "it here, and it breaks blue/green. Next pins the build id to a CONSTANT when " +
+            "deploymentId is set (getBuildId in next/src/build/index.ts), and this adapter " +
+            "derives every blue/green resource name, the build-id label, the CDN cutover " +
+            "cache-tag, AND the Valkey cache namespace (`k8s:<buildId>:`) from the build id — " +
+            "so consecutive deploys would collide and even share cache entries. " +
+            "`adapter-k8s deploy` refuses the cutover. You lose nothing by removing it: skew " +
+            "protection is ALREADY active via the per-build build id (the RSC payload carries " +
+            "it and the client hard-reloads on mismatch — see fetch-server-response.ts; " +
+            "deploymentId only substitutes a different token for that same check), and " +
+            "`?dpl=` asset versioning is moot because this adapter enables immutable " +
+            "(content-addressed) assets, which suppress it.",
+        );
+      }
+
       const modified: Record<string, unknown> = {
         ...nextConfig,
         compress: false,

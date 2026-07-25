@@ -589,6 +589,22 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // name, its suffix-reserving -hpa/-hcp variants (their truncation boundary sits 4
   // chars earlier), and the routing-manifest snapshot name. Refuse to deploy on any
   // collision while the build ids differ.
+  // N14: an IDENTICAL build id is the `deploymentId` (skew-protection) signature — Next pins
+  // the build id to a constant when next.config sets it, so every deploy reuses the serving
+  // build's names and a cutover would adopt the running Deployment instead of standing up
+  // beside it. The composed-name guard below can't see this case (it requires differing ids),
+  // so name the cause here rather than letting helm silently upgrade in place.
+  if (previousBuildId && previousBuildId === buildId) {
+    throw new Error(
+      `Build id "${buildId}" is IDENTICAL to the currently-serving build, so blue/green ` +
+        `cutover is impossible — the new release would adopt the running Deployment in ` +
+        `place, and both builds would share the \`k8s:${buildId}:\` cache namespace. The ` +
+        `usual cause is \`deploymentId\` in next.config: Next then pins the build id to a ` +
+        `constant for every build. Remove it — skew protection is already active via the ` +
+        `per-build build id, and immutable assets already handle asset versioning — or set ` +
+        `a \`generateBuildId\` that changes per build.`,
+    );
+  }
   if (previousBuildId && previousBuildId !== buildId) {
     // Same helper as the build-time guard in adapter.ts so both sides agree on the
     // full composed-name set (pool Deployment/Service, -hpa/-hcp variants, snapshot).

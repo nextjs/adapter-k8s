@@ -157,6 +157,25 @@ export interface RoutingManifest {
       expire?: number;
     }
   >;
+  /**
+   * PPR-capable route TEMPLATES (`renderingMode: PARTIALLY_STATIC`) whose build emitted NO
+   * fallback shell (`fallback: null`), keyed by template pathname. Disjoint from `pprRoutes`,
+   * which carries only the shell-BEARING templates.
+   *
+   * `rootParams` is the prerender manifest's `fallbackRootParams` — the ROOT params still
+   * unresolved when the build declined to emit the shell. The two flavours must be handled
+   * OPPOSITELY (see dispatch.ts minimalMode):
+   *   - non-empty (`/[lang]/posts/[id]`): upstream keeps unknown root branches blocking and
+   *     renders a runtime shell per root-param value, so the pool must run the route NON-minimal
+   *     and let Next own that shell lifecycle.
+   *   - empty (`/without-io/[slug]` with no Suspense boundary above the params access): the
+   *     shell was unemittable for a reason that makes upstream do a plain dynamic render, so the
+   *     pool must keep the route MINIMAL. Running it non-minimal makes Next resume a fallback
+   *     shell that upstream deliberately does not resume (app-dir/fallback-shells).
+   * Membership of EITHER flavour also marks the route as PPR, which keeps it out of the
+   * emulated-SSG non-minimal flip (dispatch.ts N13).
+   */
+  pprCapableRoutes?: Record<string, { rootParams: string[] }>;
   nextVersion: string;
 }
 

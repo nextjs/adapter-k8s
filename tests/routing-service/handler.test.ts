@@ -130,7 +130,9 @@ describe("createRequestHandler", () => {
     expect(response.immediateResponse!.status!.code).toBe(307);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
     const loc = setHeaders.find((h) => h.header.key === "location");
-    expect(loc!.header.value).toBe("https://app.example.com/login");
+    // N15: same-origin Locations are RELATIVIZED so the edge matches both the pool
+    // (middlewareRedirectLocation) and `next start`, which reports a relative path.
+    expect(loc!.header.value).toBe("/login");
     // And it must NOT fall through to the normal dispatch path.
     expect(response.requestHeaders).toBeUndefined();
   });
@@ -146,7 +148,9 @@ describe("createRequestHandler", () => {
     expect(response.immediateResponse!.status!.code).toBe(308);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
     const loc = setHeaders.find((h) => h.header.key === "location");
-    expect(loc!.header.value).toBe("https://app.example.com/login");
+    expect(loc!.header.value).toBe("/login");
+    // `next start` pairs a 308 with `Refresh: 0;url=<location>` (router-server.ts).
+    expect(setHeaders.find((h) => h.header.key === "Refresh")!.header.value).toBe("0;url=/login");
   });
 
   it("returns 502 for external rewrites", async () => {
@@ -1080,7 +1084,9 @@ describe("createRequestHandler shed-abort → server fail policy (P2)", () => {
     // already blown, so the failure mode belongs to the shed, not the middleware.
     propagatingResolveRoutes();
     const adapterFn = vi.fn(async ({ request }: any) => {
-      await new Promise<void>((resolve) => request.signal.addEventListener("abort", () => resolve()));
+      await new Promise<void>((resolve) =>
+        request.signal.addEventListener("abort", () => resolve()),
+      );
       throw new Error("upstream died mid-shed");
     });
     const middlewareModule = { default: adapterFn, middleware: vi.fn() };
@@ -1183,13 +1189,28 @@ describe("rewrite invocation transport (x-invoke-path / x-invoke-query)", () => 
     } as any);
 
     const rscHeader = manifest.routeGraph.rsc?.header ?? "rsc";
-    const response = await handler([...makeHeaders("/rewrite-source"), { key: rscHeader, value: "1" }]);
+    const response = await handler([
+      ...makeHeaders("/rewrite-source"),
+      { key: rscHeader, value: "1" },
+    ]);
     const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
     expect(setHeaders.find((h) => h.header.key === "x-invoke-path")).toBeUndefined();
   });
 });
 
-describe("RSC redirect translation (x-nextjs-redirect)", () => {
+// N15: RSC redirects keep the real 3xx (next start parity).
+//
+// Measured against `next start` (Next 16.3.0-canary.84, app-dir/rsc-query-routing fixture):
+//   curl -H 'RSC: 1' '/redirect/source?_rsc=abc123'
+//     → HTTP/1.1 308 Permanent Redirect
+//       location: /redirect/dest?_rsc=abc123
+//       Refresh: 0;url=/redirect/dest?_rsc=abc123
+//   — no `x-nextjs-redirect` on ANY response, RSC or not. `x-nextjs-redirect` is a PAGES-router
+//   protocol: written only at server/web/adapter.ts under `if (isNextDataRequest)`, read only by
+//   shared/lib/router/router.ts. The App Router flight client follows the real redirect
+//   (client/components/router-reducer/fetch-server-response.ts reads response.redirected /
+//   response.url), so emitting a 200 + x-nextjs-redirect stranded it into a document load.
+describe("RSC redirects keep the real 3xx (next start parity)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -1198,7 +1219,7 @@ describe("RSC redirect translation (x-nextjs-redirect)", () => {
     return [...makeHeaders(path), { key: "rsc", value: "1" }];
   }
 
-  it("translates a same-origin middleware redirect into a 200 RSC navigation response", async () => {
+  it("answers a same-origin header-only redirect with the real 3xx and a RELATIVE location", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
@@ -1207,17 +1228,17 @@ describe("RSC redirect translation (x-nextjs-redirect)", () => {
 
     const response = await handler(rscHeaders("/rsc-redirect-origin?_rsc=probe"));
     expect(response.immediateResponse).toBeDefined();
-    // Flight requests cannot follow an HTTP redirect — Next answers 200 with the internal
-    // navigation field and the client router performs the redirect (next start parity).
-    expect(response.immediateResponse!.status!.code).toBe(200);
+    expect(response.immediateResponse!.status!.code).toBe(307);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
-    expect(setHeaders.find((h) => h.header.key === "location")).toBeUndefined();
-    const nav = setHeaders.find((h) => h.header.key === "x-nextjs-redirect");
-    // Same-origin middleware target → RELATIVE path, exactly like `next start`.
-    expect(nav!.header.value).toBe("/rewritten");
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+    // Same-origin target → RELATIVE path, exactly like `next start`; and the request query is
+    // carried onto the query-less target so `_rsc` survives the hop.
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe(
+      "/rewritten?_rsc=probe",
+    );
   });
 
-  it("keeps an absolute x-nextjs-redirect for a cross-origin middleware redirect", async () => {
+  it("keeps an absolute location for a cross-origin redirect", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       resolvedHeaders: new Headers({ location: "https://other.example.com/away" }),
@@ -1225,27 +1246,29 @@ describe("RSC redirect translation (x-nextjs-redirect)", () => {
     } as any);
 
     const response = await handler(rscHeaders("/rsc-redirect-origin"));
-    expect(response.immediateResponse!.status!.code).toBe(200);
+    expect(response.immediateResponse!.status!.code).toBe(307);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
-    const nav = setHeaders.find((h) => h.header.key === "x-nextjs-redirect");
-    expect(nav!.header.value).toBe("https://other.example.com/away");
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe(
+      "https://other.example.com/away",
+    );
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
   });
 
-  it("translates rule redirects for RSC requests with their absolute form", async () => {
+  it("keeps rule redirects on the real 3xx for RSC requests, with Refresh on 308", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       redirect: { url: new URL("https://app.example.com/new"), status: 308 },
     } as any);
 
     const response = await handler(rscHeaders("/old"));
-    expect(response.immediateResponse!.status!.code).toBe(200);
+    expect(response.immediateResponse!.status!.code).toBe(308);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
-    const nav = setHeaders.find((h) => h.header.key === "x-nextjs-redirect");
-    expect(nav!.header.value).toBe("https://app.example.com/new");
-    expect(setHeaders.find((h) => h.header.key === "location")).toBeUndefined();
+    expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe("/new");
+    expect(setHeaders.find((h) => h.header.key === "Refresh")!.header.value).toBe("0;url=/new");
   });
 
-  it("leaves non-RSC redirects untouched (real Location, real status)", async () => {
+  it("treats a non-RSC redirect identically (no RSC special-case remains)", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
@@ -1255,13 +1278,11 @@ describe("RSC redirect translation (x-nextjs-redirect)", () => {
     const response = await handler(makeHeaders("/rsc-redirect-origin"));
     expect(response.immediateResponse!.status!.code).toBe(307);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
-    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe(
-      "https://app.example.com/rewritten",
-    );
+    expect(setHeaders.find((h) => h.header.key === "location")!.header.value).toBe("/rewritten");
     expect(setHeaders.find((h) => h.header.key === "x-nextjs-redirect")).toBeUndefined();
   });
 
-  it("preserves middleware Set-Cookie on the translated RSC response", async () => {
+  it("preserves middleware Set-Cookie on the RSC redirect response", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     const resolvedHeaders = new Headers({ location: "https://app.example.com/rewritten" });
     resolvedHeaders.append("set-cookie", "session=abc; Path=/");
@@ -1271,9 +1292,125 @@ describe("RSC redirect translation (x-nextjs-redirect)", () => {
     } as any);
 
     const response = await handler(rscHeaders("/rsc-redirect-origin"));
-    expect(response.immediateResponse!.status!.code).toBe(200);
+    expect(response.immediateResponse!.status!.code).toBe(307);
     const setHeaders = response.immediateResponse!.headers!.setHeaders!;
     const cookie = setHeaders.find((h) => h.header.key === "set-cookie");
     expect(cookie!.header.value).toBe("session=abc; Path=/");
+  });
+});
+
+// N18 (SECURITY): the ext_proc tier authors two response classes that never touch a pool — a
+// middleware-authored body and a rule/middleware redirect — and copies their headers verbatim
+// from the middleware `Response` / next.config `headers()` verdict. If such a response carries a
+// shared-cacheable Cache-Control while the request's `_rsc` does not authenticate its RSC
+// headers, it becomes exactly the poisonable entry Next's own check exists to prevent. The pool
+// enforces the invariant for every other response (pool-server/cache-policy.ts).
+//
+// Narrow by design: only a Cache-Control that grants a shared cache an unrevalidated window is
+// downgraded. Cloud CDN runs USE_ORIGIN_HEADERS (nothing is stored without an explicit
+// directive), so we never stamp `no-store` where there was no Cache-Control at all.
+describe("N18: ext_proc immediate responses and the `_rsc` cache-busting param", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // Recorded hash (see tests/routing-common.rsc-cache-busting.test.ts): for `rsc: 1` alone the
+  // expected `_rsc` is the EMPTY string, i.e. the bare `?_rsc` form.
+  function rscReq(path: string, extra: Record<string, string> = {}): HeaderValue[] {
+    return [
+      ...makeHeaders(path),
+      { key: "rsc", value: "1" },
+      ...Object.entries(extra).map(([key, value]) => ({ key, value })),
+    ];
+  }
+
+  function headerValue(
+    response: Awaited<ReturnType<ReturnType<typeof createRequestHandler>>>,
+    key: string,
+  ) {
+    return response.immediateResponse!.headers!.setHeaders!.find(
+      (h) => h.header.key.toLowerCase() === key,
+    )?.header.value;
+  }
+
+  // A middleware module that answers the request itself with a shared-cacheable directive,
+  // wired the way the other middleware tests here do (resolveRoutes must actually invoke it).
+  function cacheableMiddlewareHandler() {
+    const middlewareModule = {
+      default: vi.fn().mockResolvedValue({
+        response: new Response("gated", {
+          status: 200,
+          headers: { "cache-control": "public, s-maxage=600", "content-type": "text/plain" },
+        }),
+      }),
+    };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return { middlewareResponded: true } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+    return createRequestHandler(makeManifest(), middlewareModule);
+  }
+
+  it("downgrades a shared-cacheable middleware response for an unvalidated RSC request", async () => {
+    const response = await cacheableMiddlewareHandler()(rscReq("/gated"));
+    expect(response.immediateResponse!.status!.code).toBe(200);
+    expect(headerValue(response, "cache-control")).toBe("no-store");
+  });
+
+  it("leaves the SAME middleware response alone when `_rsc` validates", async () => {
+    const response = await cacheableMiddlewareHandler()(rscReq("/gated?_rsc"));
+    expect(headerValue(response, "cache-control")).toBe("public, s-maxage=600");
+  });
+
+  it("leaves a DOCUMENT request alone (the check is scoped to RSC requests)", async () => {
+    const response = await cacheableMiddlewareHandler()(
+      makeHeaders("/gated?_rsc=DEADBEEFdeadbeef"),
+    );
+    expect(headerValue(response, "cache-control")).toBe("public, s-maxage=600");
+  });
+
+  it("downgrades a shared-cacheable redirect verdict for an unvalidated RSC request", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({
+        location: "https://app.example.com/rewritten",
+        "cache-control": "public, max-age=3600",
+      }),
+      status: 307,
+    } as any);
+    const response = await handler(rscReq("/old?_rsc=DEADBEEFdeadbeef"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    expect(headerValue(response, "cache-control")).toBe("no-store");
+    // The redirect itself is untouched.
+    expect(headerValue(response, "location")).toBe("/rewritten?_rsc=DEADBEEFdeadbeef");
+  });
+
+  it("never invents a Cache-Control where the verdict had none", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({ location: "https://app.example.com/rewritten" }),
+      status: 307,
+    } as any);
+    const response = await handler(rscReq("/old"));
+    expect(response.immediateResponse!.status!.code).toBe(307);
+    expect(headerValue(response, "cache-control")).toBeUndefined();
+  });
+
+  it("keeps an already-uncacheable directive verbatim (no gratuitous rewriting)", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedHeaders: new Headers({
+        location: "https://app.example.com/rewritten",
+        "cache-control": "private, max-age=0, must-revalidate",
+      }),
+      status: 307,
+    } as any);
+    const response = await handler(rscReq("/old"));
+    expect(headerValue(response, "cache-control")).toBe("private, max-age=0, must-revalidate");
   });
 });

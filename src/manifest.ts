@@ -1,6 +1,6 @@
 // src/manifest.ts
 import path from "node:path";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import type {
   AdapterOutputs,
   BuildCompleteContext,
@@ -80,6 +80,36 @@ function stableBuiltAt(projectDir: string): string {
   }
 }
 
+// N16. The adapter's PRERENDER outputs expose `config.renderingMode` and the fallback shell the
+// build emitted, but NOT `fallbackRootParams` — the build's own record of which ROOT params were
+// still unresolved when it declined to emit that shell. That field is the ONLY thing separating
+// the two reasons a PPR route can have `fallback: null`, and the pool has to treat them
+// oppositely (see the pprCapableRoutes doc comment in types.ts). Read it from
+// .next/prerender-manifest.json, whose `dynamicRoutes` map is also the authoritative list of
+// route TEMPLATES — concrete generateStaticParams prerenders live under `routes`, so membership
+// here doubles as the "this is a template, not an instance" test.
+function readDynamicRouteFallbackRootParams(projectDir: string): Map<string, string[]> {
+  const byRoute = new Map<string, string[]>();
+  try {
+    const manifest = JSON.parse(
+      readFileSync(path.join(projectDir, ".next", "prerender-manifest.json"), "utf-8"),
+    ) as { dynamicRoutes?: Record<string, { fallbackRootParams?: unknown }> };
+    for (const [route, entry] of Object.entries(manifest.dynamicRoutes ?? {})) {
+      byRoute.set(
+        route,
+        Array.isArray(entry?.fallbackRootParams)
+          ? entry.fallbackRootParams.filter((param): param is string => typeof param === "string")
+          : [],
+      );
+    }
+  } catch {
+    // No prerender manifest (synthetic build contexts, unit tests) — no route is recorded as
+    // PPR-capable-without-shell, which leaves every route in minimal mode. That is the
+    // pre-N16 behavior, i.e. this degrades toward the conservative side.
+  }
+  return byRoute;
+}
+
 export function buildRoutingManifest({
   routing,
   outputs,
@@ -140,6 +170,12 @@ export function buildRoutingManifest({
 
   // Detect PPR routes from prerenders — only include entries with both values present
   const pprRoutes: RoutingManifest["pprRoutes"] = {};
+  // N16: PPR-capable route TEMPLATES whose build emitted NO fallback shell, each tagged with the
+  // unresolved ROOT params that stopped it. See the types.ts doc comment — the pool needs both
+  // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
+  // flavour (the only flavour that must run NON-minimal).
+  const pprCapableRoutes: Record<string, { rootParams: string[] }> = {};
+  const dynamicRouteRootParams = readDynamicRouteFallbackRootParams(projectDir);
   for (const prerender of outputs.prerenders) {
     const config = prerender.config as Record<string, unknown>;
     const fb = (
@@ -153,6 +189,19 @@ export function buildRoutingManifest({
         };
       }
     ).fallback;
+    // N16: PPR-capable but with NO build-emitted shell (`fallback: null`). Deliberately DISJOINT
+    // from pprRoutes: shell-bearing entries are handled via handlerPprInfo. Restricted to
+    // prerender-manifest `dynamicRoutes` members, i.e. route TEMPLATES: an earlier revision keyed
+    // this by every PARTIALLY_STATIC output, which pulled in the concrete generateStaticParams
+    // prerenders (`/without-io/foo`) and `/_global-error` and flipped them non-minimal.
+    const rootParams = dynamicRouteRootParams.get(prerender.pathname);
+    if (
+      config.renderingMode === "PARTIALLY_STATIC" &&
+      !(fb?.postponedState && fb.filePath) &&
+      rootParams !== undefined
+    ) {
+      pprCapableRoutes[prerender.pathname] = { rootParams };
+    }
     if (config.renderingMode === "PARTIALLY_STATIC" && fb?.postponedState && fb.filePath) {
       // Shell cache tags come from the build's initialHeaders (x-next-cache-tags = the
       // `_N_T_/…` implicit path tags). The pool checks them against the shared Valkey manifest
@@ -244,6 +293,10 @@ export function buildRoutingManifest({
       : null,
     poolAssignments,
     pprRoutes,
+    // Sorted so two chart generations of the same build are byte-identical.
+    pprCapableRoutes: Object.fromEntries(
+      Object.entries(pprCapableRoutes).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
     nextVersion,
   };
 }

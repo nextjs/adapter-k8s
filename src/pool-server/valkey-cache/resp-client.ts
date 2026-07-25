@@ -414,10 +414,26 @@ class RespClient implements ValkeyClient {
       ? (await import("node:tls")).connect({
           host,
           port,
-          // L18: SNI is a DNS-name extension — Node THROWS (ERR_INVALID_ARG_VALUE) when
-          // `servername` is an IP literal, which made `rediss://<ip>` (e.g. a Memorystore
-          // VPC endpoint) unconnectable. Skip SNI for IP hosts; certificate verification
-          // still runs, matched against the cert's IP subjectAltName.
+          // L18: SNI is a DNS-name extension, so it is omitted for IP-literal hosts —
+          // `rediss://<ip>` (a Memorystore VPC endpoint) is the normal production shape.
+          // Certificate verification still runs, matched against the cert's IP subjectAltName.
+          //
+          // The failure originally reported here was a hard throw (ERR_INVALID_ARG_VALUE) on an
+          // IP `servername`, making `rediss://<ip>` unconnectable. Both measurements, 2026-07:
+          //   • Node 20 / 22 / 24 (what `engines` allows and what the emitted images pin):
+          //     NO throw — only DEP0123 ("Setting the TLS ServerName to an IP address is not
+          //     permitted by RFC 6066. This will be ignored in a future version."), SNI is still
+          //     sent, and the handshake completes.
+          //   • Node 25 / 26: the deprecation has become a hard `ERR_INVALID_ARG_VALUE` throw.
+          // So the throw is real, just AHEAD of our supported range — this skip is what keeps
+          // `rediss://<ip>` working when a build host or base image moves to Node 25+, and it is
+          // RFC 6066 correctness meanwhile (a server may reject an IP SNI outright). Nothing in
+          // the CURRENT runtime enforces it, though: deleting it would keep connecting on 20-24
+          // and only break later.
+          // That is why `resp-client-tls.integration.test.ts` asserts SNI absence ON THE WIRE
+          // (parsing the ClientHello through a TCP relay in front of a real Valkey TLS listener)
+          // instead of merely asserting that an IP endpoint connects — a behavioral test would
+          // pass either way and this skip would rot unnoticed.
           ...(net.isIP(host) ? {} : { servername: host }),
           ...(this.caCert ? { ca: this.caCert } : {}),
         })
