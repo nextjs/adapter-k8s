@@ -41,6 +41,37 @@ Treat it as a way to evaluate and validate Next.js-on-GKE semantics today, not a
 - A GKE cluster (Autopilot or Standard)
 - `gcloud`, `kubectl`, `helm`, `docker` in PATH
 
+The **emitted** container images run Node 24 and that is a floor, not a preference: the generated
+routing manifest embeds inline regexp modifiers (`(?i:…)`) that V8 only accepts from Node 23, and
+an older base throws at manifest load and 500s every request. `assertSupportedNodeVersion` fails
+the build rather than letting that reach production.
+
+### Reserved paths
+
+Two pathnames belong to the platform and your app may not own them:
+
+| Path       | Used by                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| `/healthz` | Liveness. "This process answers HTTP" — never gate traffic on it                             |
+| `/readyz`  | Readiness. The kubelet probe, the Gateway HealthCheckPolicy, and the blue/green cutover gate |
+
+A route, static output, or `public/` file at either path **fails the build** with a message naming
+the collision. That is deliberate: those paths are read as the pod's own verdict, so a static 200
+at `/readyz` would promote a pod whose instrumentation `register()` threw, and an authenticated or
+failing route there would keep a healthy pod permanently unready so no deploy could cut over.
+Rename to something like `/health` or `/api/ready`.
+
+### Image provenance
+
+`deploy` resolves every image it pushes to its immutable `@sha256:` digest and deploys that, with
+`imagePullPolicy: IfNotPresent` — a mutable tag would let a retag change what a pool runs on its
+next restart or scale-up, and these pods hold the internal dispatch secret and the cache
+credentials in env. If a digest cannot be resolved the deploy continues on the tag and says so.
+
+The **base** image is tracked by tag (`node:24-slim`) so you keep receiving upstream security
+patches. For reproducible builds, pin it yourself with `ADAPTER_K8S_NODE_BASE_DIGEST=sha256:…`,
+which is interpolated into every emitted `FROM` — and which you then own updating.
+
 ## Quick Start
 
 ### 1. Install
@@ -74,7 +105,12 @@ export default createK8sAdapter({
       gateway: {
         type: "gateway-api",
         className: "gke-l7-global-external-managed",
-        hosts: [{ hostname: "app.example.com", tls: { enabled: true, managedCert: true } }],
+        hosts: [
+          {
+            hostname: "app.example.com",
+            tls: { enabled: true, managedCert: true },
+          },
+        ],
       },
     },
   },
@@ -109,10 +145,10 @@ The deploy flow:
 
 1. `next build` (adapter generates artifacts in `.k8s-adapter/output/`)
 2. Provision the managed cache (Memorystore) and write its connection Secret -- only when `cache.enabled` with no `url` (idempotent; reuses an existing instance, waits for it to be ready)
-3. `docker build` + `push` per pool + the routing service
+3. `docker build` + `push` per pool + the routing service, then resolve each pushed image to its immutable `@sha256:` digest and deploy that rather than the mutable `:<buildId>` tag
 4. `helm upgrade --install` with the generated chart (attaches the Cloud CDN filter to the HTTPRoute when CDN is enabled)
 5. Wait for the new pool + routing-service Deployments to roll out
-6. Verify each new pod is serving (`/healthz` checked directly on the pod -- not via GCP LB health)
+6. Verify each new pod is serving (`/readyz` checked directly on the pod -- not via GCP LB health). `/readyz` is the readiness verdict: it answers 503 until instrumentation registration has not failed and at least one route module imported, so a build whose `register()` threw cannot pass the gate the way a hardcoded `/healthz` 200 would
 7. Patch active Service selectors to route traffic to the new build (blue/green cutover)
 8. Invalidate the previous build's Cloud CDN cache tag (when CDN is enabled) so the new build never serves the old build's stale same-URL content from the edge -- best-effort and non-fatal (TTL self-heals)
 9. Keep the previous build at 0 replicas (rollback target)
@@ -146,9 +182,17 @@ Build, push images, and deploy via Helm with zero-downtime blue/green cutover.
 npx adapter-k8s deploy [--skip-build] [--skip-push] [--dry-run]
 ```
 
+| Flag                           | Description                                                                                                                                                      |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--skip-build` / `--skip-push` | Reuse the existing build output / already-pushed images                                                                                                          |
+| `--allow-no-network-policy`    | Deploy even when the cluster pod CIDR cannot be discovered, i.e. **without** the chart's NetworkPolicies. Deploy aborts rather than silently shipping unisolated |
+| `--allow-unretained-manifest`  | Deploy even when the outgoing build's routing manifest cannot be retained (rollback to it becomes image-only; recorded in state so `doctor` reports it)          |
+| `--yes`, `-y`                  | Skip the confirmation prompt when the kubectl context is unpinned (required non-interactively)                                                                   |
+| `--dry-run`                    | Show what would be done without executing                                                                                                                        |
+
 ### `rollback`
 
-Roll back to the previous deployment. The previous build is kept at 0 replicas after each deploy, so rollback is a scale + selector patch -- no image pull or build needed. When CDN is enabled, it also invalidates the outgoing build's cache tag on cutover.
+Roll back to the previous deployment. The previous build is kept at 0 replicas after each deploy, so the pools need no rebuild -- rollback scales them up and patches the active Service selector back. It also reverts the **routing tier**: the routing-service Deployment is patched to the target build's image _and_ the retained per-build routing-manifest snapshot, because the edge's manifest decides route classification and middleware coverage for that build. (The outgoing build's manifest is snapshotted first, which is what makes the roll-forward symmetric.) When CDN is enabled, the outgoing build's cache tag is invalidated on cutover.
 
 ```bash
 npx adapter-k8s rollback [--dry-run]
@@ -268,7 +312,7 @@ provider: {
     cdn: {
       enabled: true,
       bucket: 'my-project-nextjs-static',
-      // cacheMode: 'USE_ORIGIN_HEADERS',   // default -- honor the app's Cache-Control
+      // cacheMode: 'USE_ORIGIN_HEADERS',   // the only supported value -- honor the app's Cache-Control
       // cacheKeyHeaders: [...],            // override the cache-key header set
       // invalidateOnDeploy: true,          // default -- purge the previous build's cache tag on cutover
     },
@@ -296,7 +340,7 @@ cache: {
     region: 'us-central1',
     sizeGb: 1,
     tier: 'BASIC',
-    // auth: true,                    // recommended — Redis AUTH + in-transit encryption
+    // auth: false,                  // DEFAULT IS ON — set false only to opt out (warns every deploy)
   },
   // — or bring your own, and the adapter provisions nothing —
   // url: 'redis://my-valkey.internal:6379',
@@ -304,7 +348,7 @@ cache: {
 },
 ```
 
-> **Secure the cache endpoint.** Without `auth: true`, the managed instance has no AUTH and no in-transit encryption — any workload that can reach the VPC endpoint can read and write the shared cache (and cached pages can carry PII). With `auth: true` the instance is created with AUTH + TLS (`SERVER_AUTHENTICATION`), and the pods connect over `rediss://` with the instance AUTH string and server CA injected from the connection Secret (`VALKEY_AUTH` / `VALKEY_CA_CERT`). AUTH can only be set at instance creation, so enable it before the first deploy (or destroy the instance first). Treat one Memorystore instance as one tenant: cache keys are namespaced by build id, but that namespace is **not** a security boundary — don't point two unrelated applications at the same instance.
+> **Cache AUTH is on by default.** Memorystore's own defaults are `authEnabled: false` and transit encryption disabled, and the chart's NetworkPolicies govern ingress only — so a plaintext instance is readable _and writable_ by any workload with VPC reachability, which means reading every cached page and injecting content into the site by overwriting cached HTML/RSC. The adapter therefore creates instances **with** AUTH + TLS (`SERVER_AUTHENTICATION`); pods connect over `rediss://` with the AUTH string and server CA injected from the connection Secret (`VALKEY_AUTH` / `VALKEY_CA_CERT`). Three states, because AUTH is **creation-only**: leave `auth` unset (recommended) and new instances get it while a pre-existing plaintext instance is reused with a loud per-deploy warning rather than a forced cache wipe; set `auth: true` to _require_ it and refuse to reuse an instance that lacks it; set `auth: false` to opt out, which warns on every deploy. To secure an existing plaintext instance you must destroy and recreate it. Treat one Memorystore instance as one tenant: cache keys are namespaced by build id, but that namespace is **not** a security boundary — don't point two unrelated applications at the same instance.
 
 > **Don't commit a BYO cache password.** `adapter.config.mjs` is typically checked into git — a literal `cache.password` there leaks the cache's AUTH string into your repository history. Prefer the managed path (`memorystore` with `auth: true`; its AUTH string only ever lives in the cluster Secret), or inject the secret at runtime (`password: process.env.VALKEY_PASSWORD`). The generated connection Secret under `.k8s-adapter/` is kept out of git either way (init scaffolds the ignore) — the config file itself is the exposure.
 
@@ -359,11 +403,26 @@ What the generated infrastructure does by default:
 
   **The trade.** In exchange for closing the VPC to the dataplane you accept: (1) Google publishes these ranges but guarantees nothing — "Google Cloud can implement new probers automatically without notification" — so a future range addition would show up as unhealthy backends, not as a warning; (2) IPv6 ranges are included unconditionally (inert on single-stack clusters) so a dual-stack cluster needs no second knob; (3) the node range you supply is usually the whole cluster subnet, so any VM sharing it keeps its current reach — give the cluster its own subnet if that matters; (4) `hostNetwork` pods are exempt from NetworkPolicy in _both_ postures. Strict mode never names the pod CIDR, so it does not depend on pod-CIDR discovery and renders even with `--allow-no-network-policy`. It is **off by default** because the default posture is what every existing deploy is running and what the live e2e cluster is validated against; enabling it is a deploy-time flag, so reverting is a redeploy, not a rebuild.
 
-- **A shared secret authenticates internal routing headers** between the routing service and pools (`INTERNAL_HEADER_SECRET`, 32 random bytes per deploy, delivered only via a Kubernetes Secret, compared in constant time). Dispatch headers from any other source are stripped.
+- **A shared secret authenticates internal routing headers** between the routing service and pools (`INTERNAL_HEADER_SECRET`, delivered only via a Kubernetes Secret, compared in constant time). Dispatch headers from any other source are stripped. The value is **derived deterministically per build** -- `HMAC-SHA256(key, "<release>\0<buildId>")`, where the key comes from `ADAPTER_K8S_INTERNAL_SECRET_KEY` or a 32-byte `.k8s-adapter/internal-secret.key` created on first build (mode `0600`) -- so re-emitting a build is byte-identical and a deploy never rotates the secret out from under the pods currently serving. (A rotation is not free: for the rollout window the old pods stop trusting dispatch headers and re-resolve locally, which runs middleware twice per request.)
 - **HTTPS redirect.** When TLS is enabled, the chart emits an HTTP→HTTPS `RequestRedirect` route so plaintext HTTP is never served.
 - **Secrets never touch command lines, logs, or git** (init scaffolds `.k8s-adapter/` into `.gitignore`; secret-bearing chart files are written `0600`).
 - **Input validation at every boundary**: release name, hostnames, registry, namespace, and the build id are charset-validated before they reach Helm values, YAML, or the privileged registration Job. A custom `generateBuildId()` outside `[A-Za-z0-9._-]` fails the build.
-- **Least-privilege deploy identity.** The deploy service account gets a release-scoped custom IAM role for traffic-extension registration and repository-scoped Artifact Registry access — not project-wide LB admin.
+- **Least-privilege deploy identity.** The deploy service account gets a release-scoped custom IAM role for traffic-extension registration plus repository-scoped Artifact Registry **writer** — not project-wide LB admin, not `repoAdmin` (which would allow retagging an already-deployed build), and no project-wide `compute.viewer` (the custom role already carries the `forwardingRules.list` it was there for). This matters because the identity is assumable by anyone who can create a Pod in the namespace via Workload Identity, so its blast radius is the ceiling on that exposure. **Residual:** releases deploy into the shared `default` namespace, so pod-creation there still means assuming this identity and reading the namespace's Secrets. Per-release namespace isolation plus an admission policy restricting KSA selection is the remaining work.
+
+## What is verified, and how
+
+- **1,900 unit tests** covering the adapter, both runtime tiers, the emitted templates (several
+  rendered through **real `helm`**, because the questions are what helm does with the file), and
+  the CLI.
+- **The upstream Next.js e2e suite** runs against the pool server: 3,348 passing / 4 failing, with
+  every remaining failure traced to a non-adapter cause. Note what this does _not_ cover — the
+  harness starts the **pool only**, no Envoy and no ext_proc, so it validates local resolution
+  (the fail-safe tier) rather than the edge.
+- **`adapter-k8s emulate`** is the only automated coverage of the ext_proc path.
+- **A live GKE deployment** exercises deploy → rollback → roll-forward with a 24-check live suite.
+  This is the layer that finds the things the others structurally cannot: the most recent run
+  caught a rollback that named a manifest snapshot after the wrong build, because the routing pod
+  refused to start on a manifest that did not match its own image.
 
 ## Architecture
 
@@ -377,8 +436,8 @@ What the generated infrastructure does by default:
 |                                |                                    |
 |                    +-----------v------------+                       |
 |                    |   Traffic Extension    |  CEL match condition  |
-|                    |       (ext_proc)       |  skips /_next/static/, |
-|                    |  Routing Service:      |  /404, /500           |
+|                    |       (ext_proc)       |  skips /_next/static/ |
+|                    |  Routing Service:      |  + uncovered public/  |
 |                    |    @next/routing       |                       |
 |                    |    middleware /        |                       |
 |                    |    rewrites / redirects|                       |
@@ -402,7 +461,7 @@ What the generated infrastructure does by default:
 ### Request Flow
 
 1. Request arrives at the load balancer and hits **Cloud CDN**. A cache hit is served immediately -- middleware does not run for cached responses.
-2. On a **cache miss**, the **traffic extension** fires on the way to origin. Its **CEL match condition** excludes static assets and error pages (`/_next/static/*`, `/404`, `/500`) so those skip the ext_proc callout entirely.
+2. On a **cache miss**, the **traffic extension** fires on the way to origin. Its **CEL match condition** excludes `/_next/static/*` plus every `public/` file _not_ covered by a middleware matcher, so those skip the ext_proc callout entirely. A file that middleware might match is never excluded -- an uncompilable matcher counts as a match -- because the cost of an extra callout is latency while the cost of a wrong exclusion is a middleware bypass at the edge.
 3. The **routing service** (ext_proc over HTTP/2 + TLS) resolves the route via `@next/routing`, executes middleware/rewrites/redirects, and sets the `x-upstream-pool` header.
 4. The **HTTPRoute** routes to the correct pool based on `x-upstream-pool`.
 5. The **pool server** loads the handler module via `import()` and invokes it with `(req, res, ctx)`. Middleware-covered routes are served `Cache-Control: no-cache` so the CDN never caches them ahead of their middleware.
@@ -415,13 +474,15 @@ Traffic cutover sequence:
 
 1. Helm creates the new Deployment + versioned Service (old build still serving)
 2. New pods pass Kubernetes readiness probes
-3. Each new pod is verified serving via `/healthz` (checked directly on the pod, not via GCP LB backend health)
+3. Each new pod is verified serving via `/readyz` (checked directly on the pod, not via GCP LB backend health)
 4. Active Service selector patched to the new build's pod label (traffic shifts). The selector value comes from the same sanitizer that stamps the pod label, so it always matches -- a mismatch would drain the Service to zero endpoints, and `doctor`'s "Active Service endpoints" check guards against exactly that.
 5. Previous build scaled to 0 (kept for rollback)
 
 The selector flip itself is atomic, but the load balancer reprograms the standalone NEG asynchronously, so expect a brief (typically a few seconds) window where the LB is catching up to the new endpoints before it is fully settled.
 
-To roll back: `npx adapter-k8s rollback` scales up the previous build, waits for it to be ready, patches the active Service selector back to it, and scales down the current build. Rollback is symmetric -- running it again rolls forward to the build you came from.
+To roll back: `npx adapter-k8s rollback` scales up the previous build, waits for it to be ready, reverts the routing tier to that build (image + its retained routing-manifest snapshot), patches the active Service selector back, and scales down the current build. Rollback is symmetric -- running it again rolls forward to the build you came from.
+
+Two notes on the routing-tier revert. The routing pod **refuses to start** on a manifest whose content does not match the one its image was built with, so a mismatched (image, manifest) pair fails loudly instead of silently serving another build's route classification -- worth knowing, because that is what a stuck routing rollout usually means. And a reverted edge is pinned by tag rather than digest, since the revert reconstructs the reference from the target build id; a rolled-back edge is therefore one step less immutable than a freshly deployed one.
 
 ### Generated Artifacts
 
@@ -447,6 +508,7 @@ After `next build`, the adapter writes to `.k8s-adapter/output/`:
 |       +-- routing-manifest-configmap.yaml
 |       +-- internal-secret.yaml         Shared secret for internal dispatch headers
 |       +-- valkey-secret.yaml           Cache connection secret (BYO url; managed is created at deploy)
+|       +-- network-policy.yaml           Default-deny ingress per tier (when pod CIDR known)
 |       +-- deploy-service-account.yaml
 +-- pools/{pool}/
 |   +-- Dockerfile
