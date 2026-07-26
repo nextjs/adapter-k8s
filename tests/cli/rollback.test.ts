@@ -424,11 +424,16 @@ describe("runRollback — routing service revert", () => {
     expect(patchBody).toContain(`"image":"${REGISTRY}/routing-service:buildm"`);
     expect(patchBody).toContain(`"configMap":{"name":"${SNAP_M}"}`);
 
-    // 3. ...and its rollout was awaited.
-    const rolloutArgs = vi.mocked(execOrThrow).mock.calls.map(([, args]) => args.join(" "));
+    // 3. ...and its rollout was awaited. Through execCapture, not execOrThrow: the exit code
+    // is needed, because a failed rollout must RESTORE the edge rather than throw with the
+    // Deployment already patched (which left the tiers split — observed live).
+    const rolloutArgs = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
     expect(
       rolloutArgs.some((a) => a.includes("rollout status deployment/rel-routing-service")),
     ).toBe(true);
+    // The wait is long enough that a timeout means "stuck", not "busy" — a real Autopilot
+    // rollout logged several `1 of 2 updated` cycles before converging.
+    expect(rolloutArgs.some((a) => a.includes("--timeout=300s"))).toBe(true);
 
     // 4. The edge revert happens BEFORE any pool Service selector patch.
     const patchOrder = deployPatch![0]
@@ -1347,5 +1352,177 @@ describe("revertRoutingServiceToBuild — env stays truthful", () => {
     expect(body).toContain("routing-service:target-build");
     expect(body).toContain("NEXT_BUILD_ID");
     expect(body).toContain("target-build");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A failed routing rollout must not leave the tiers split.
+//
+// OBSERVED LIVE: the revert patched the Deployment, `rollout status` timed out, and the
+// function threw — leaving the pools on one build and the edge rolled (or half-rolled) to
+// another. The site stayed up only because maxUnavailable 0 keeps the old ReplicaSet serving;
+// with `failureMode: closed` a routing outage in that window is 500s on every request.
+// ---------------------------------------------------------------------------
+describe("revertRoutingServiceToBuild — failed rollout restores the edge", () => {
+  const PRIOR_IMAGE = `gcr.io/p/routing-service@sha256:${"a".repeat(64)}`;
+
+  function mockCluster(opts: { rolloutFails: boolean; restoreFails?: boolean }) {
+    let patches = 0;
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      if (j.includes("get deployment") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: PRIOR_IMAGE,
+                      env: [{ name: "NEXT_BUILD_ID", value: "prior-build" }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "rollout") {
+        return opts.rolloutFails
+          ? { exitCode: 1, stdout: "", stderr: "timed out waiting for the condition" }
+          : { exitCode: 0, stdout: "successfully rolled out", stderr: "" };
+      }
+      if (args[0] === "patch") {
+        patches++;
+        // patch #1 is the revert; patch #2 is the restore
+        if (patches === 2 && opts.restoreFails) {
+          return { exitCode: 1, stdout: "", stderr: "conflict" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+    return () => patches;
+  }
+
+  it("restores the PRIOR spec verbatim and says the tiers still agree", async () => {
+    mockCluster({ rolloutFails: true });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target",
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/did not roll out.*restored to what it was serving before/s);
+
+    // The restore reproduces the literal reference — reconstructing it from the build id
+    // would silently downgrade a digest-pinned edge to a tag.
+    const restore = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .at(-1)!;
+    const body = restore[1][restore[1].length - 1]!;
+    expect(body).toContain(PRIOR_IMAGE);
+    expect(body).toContain("prior-build");
+  });
+
+  it("says so explicitly when the restore ALSO fails — that is a different situation", async () => {
+    mockCluster({ rolloutFails: true, restoreFails: true });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target",
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/could NOT be restored.*DIFFERENT builds/s);
+  });
+
+  it("does not patch twice when the rollout succeeds", async () => {
+    const patchCount = mockCluster({ rolloutFails: false });
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target",
+      registry: "gcr.io/p",
+    });
+    expect(patchCount()).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rolled-back edge should be as immutable as a freshly deployed one. The revert used to
+// reconstruct `<registry>/routing-service:<buildId>` — a TAG — so rolling back silently undid
+// digest pinning, which is the mutable-tag exposure that pinning exists to close (the deploy
+// identity can retag, and these pods hold the internal dispatch secret in env).
+// ---------------------------------------------------------------------------
+describe("revertRoutingServiceToBuild — digest pinning", () => {
+  const DIGEST = `sha256:${"e".repeat(64)}`;
+
+  function mockCluster() {
+    // mock.calls accumulate across tests in this file — clear so the assertions below see only
+    // the patches this test provoked.
+    vi.mocked(execCapture).mockClear();
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      if (j.includes("get deployment") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    { name: "routing-service", image: "gcr.io/p/routing-service:cur" },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+  }
+
+  const patchBody = () =>
+    vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .map((c) => c[1][c[1].length - 1]!)
+      .join("\n");
+
+  it("pins by digest when the deploy recorded one", async () => {
+    mockCluster();
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target",
+      registry: "gcr.io/p",
+      targetImageDigest: DIGEST,
+    });
+    expect(patchBody()).toContain(`routing-service@${DIGEST}`);
+    expect(patchBody()).not.toContain("routing-service:target");
+  });
+
+  it("falls back to the tag for a build with no recorded digest, and warns", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    mockCluster();
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "legacy",
+      registry: "gcr.io/p",
+    });
+    expect(patchBody()).toContain("routing-service:legacy");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reverting the edge by\s+TAG/i));
+    warn.mockRestore();
   });
 });

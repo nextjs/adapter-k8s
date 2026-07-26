@@ -69,6 +69,18 @@ export interface AdapterState {
    * unqualified "Rollback ready: PASS". Pruned to the two builds still in play.
    */
   unretainedManifestBuilds?: string[];
+  /**
+   * Per-build immutable routing-service image digest (`<buildId>` -> `sha256:…`), recorded at
+   * the deploy that pushed it.
+   *
+   * Rollback reconstructs the routing image reference from the target build id, which can only
+   * produce a TAG — so a rolled-back edge was one step less immutable than a freshly deployed
+   * one, exactly the mutable-tag exposure digest pinning exists to close (the deploy identity
+   * can retag, and these pods hold the internal dispatch secret). With the digest recorded here
+   * the revert can pin properly. Absent for builds deployed before this existed, and for those
+   * the tag remains the only option. Pruned to the two builds still in play, like `cdnTags`.
+   */
+  routingImageDigests?: Record<string, string>;
 }
 
 // Thrown when the local file was written but the cluster ConfigMap mirror failed.

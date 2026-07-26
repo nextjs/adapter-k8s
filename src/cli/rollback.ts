@@ -35,6 +35,12 @@ interface RoutingServingConfig {
    * NEXT_BUILD_ID env, with the tag as the pre-digest fallback.
    */
   imageTag: string;
+  /**
+   * The literal image reference the Deployment carries (tag- or digest-pinned). Kept verbatim
+   * so a failed revert can be restored to exactly what was there — reconstructing it from the
+   * build id would silently downgrade a digest-pinned edge to a tag.
+   */
+  image: string;
   /** ConfigMap the routing-manifest volume currently mounts. */
   manifestConfigMap: string;
 }
@@ -160,7 +166,10 @@ export async function readRoutingServingConfig(
         `so the manifest it serves cannot be identified`,
     };
   }
-  return { status: "read", config: { imageTag: tag, manifestConfigMap: cmName } };
+  return {
+    status: "read",
+    config: { imageTag: tag, image: typeof image === "string" ? image : "", manifestConfigMap: cmName },
+  };
 }
 
 /**
@@ -330,8 +339,14 @@ export async function revertRoutingServiceToBuild(opts: {
   releaseName: string;
   targetBuildId: string;
   registry: string | undefined;
+  /**
+   * The target build's recorded routing-image digest (`AdapterState.routingImageDigests`), when
+   * one exists. Without it the reference can only be a TAG, which leaves a rolled-back edge one
+   * step less immutable than a freshly deployed one.
+   */
+  targetImageDigest?: string | undefined;
 }): Promise<void> {
-  const { releaseName, targetBuildId, registry } = opts;
+  const { releaseName, targetBuildId, registry, targetImageDigest } = opts;
   const deployName = routingServiceDeploymentName(releaseName);
   // N68: same distinction as retention — a read failure here used to return silently, i.e.
   // report "this release has no routing tier" and let the caller believe the edge was
@@ -355,6 +370,15 @@ export async function revertRoutingServiceToBuild(opts: {
         `re-run the rollback. Traffic was NOT switched.`,
     );
   }
+
+  // Exactly what the edge is serving BEFORE this function changes anything, so a failed
+  // rollout can be put back (see the rollout wait below). `exists.status` is "read" here:
+  // "failed" threw and "absent" returned, both above.
+  const priorSpec: RoutingSpecSnapshot = {
+    buildId: exists.config.imageTag || null,
+    image: exists.config.image || null,
+    manifestConfigMap: exists.config.manifestConfigMap || null,
+  };
 
   // Retain the manifest we are about to roll AWAY from, so the symmetric roll-forward
   // can restore it (its stable-ConfigMap content is otherwise lost on the next deploy).
@@ -381,7 +405,18 @@ export async function revertRoutingServiceToBuild(opts: {
     );
   }
 
-  const image = `${registry}/routing-service:${targetBuildId}`;
+  // Digest when the deploy that pushed this build recorded one; tag otherwise (a build from
+  // before digests were recorded, where the tag is all that identifies it).
+  const image = targetImageDigest
+    ? `${registry}/routing-service@${targetImageDigest}`
+    : `${registry}/routing-service:${targetBuildId}`;
+  if (!targetImageDigest) {
+    console.warn(
+      `  ! No recorded routing-image digest for build ${targetBuildId} — reverting the edge by ` +
+        `TAG. A retag of that tag would change what the edge runs on its next restart; the ` +
+        `next deploy records a digest so a later rollback can pin it.`,
+    );
+  }
   const patch = {
     spec: {
       template: {
@@ -444,14 +479,101 @@ export async function revertRoutingServiceToBuild(opts: {
   // A stuck routing rollout is fatal (same posture as deploy's 7a-bis): with
   // maxUnavailable 0 the old ReplicaSet keeps serving, but reporting success while the
   // edge cannot roll would repeat the historical crashloop-for-months incident.
-  await execOrThrow("kubectl", [
+  //
+  // OBSERVED LIVE: this used to throw here having ALREADY patched the Deployment, which left
+  // the tiers split — pools serving one build, the edge rolled (or half-rolled) to another.
+  // The site stayed up only because maxUnavailable 0 keeps the old ReplicaSet serving; with
+  // `failureMode: closed` a routing outage in that window is 500s on every request. So a
+  // failed rollout now RESTORES the edge to exactly the spec it had before this function
+  // touched it, and says which of the two states the operator is in.
+  const rollout = await execCapture("kubectl", [
     "rollout",
     "status",
     `deployment/${deployName}`,
     "-n",
     K8S_NAMESPACE,
-    "--timeout=120s",
+    `--timeout=${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s`,
   ]);
+  if (rollout.exitCode !== 0) {
+    const detail = rollout.stderr.trim() || rollout.stdout.trim() || `exit ${rollout.exitCode}`;
+    const restored = await restoreRoutingSpec(deployName, priorSpec);
+    throw new Error(
+      `The routing service did not roll out to build ${targetBuildId} within ` +
+        `${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s: ${detail}\n` +
+        (restored
+          ? `  The edge was restored to what it was serving before (${priorSpec.buildId ?? "unknown build"}), ` +
+            `so the pools and the edge still agree. Traffic was NOT switched.`
+          : `  !! The edge could NOT be restored, so the pools and the edge may now be on ` +
+            `DIFFERENT builds. Check \`kubectl -n ${K8S_NAMESPACE} describe deployment ` +
+            `${deployName}\` and the routing pod logs — a manifest that does not match the ` +
+            `image makes the pod refuse to start on purpose.`) +
+        `\n  Traffic was NOT switched.`,
+    );
+  }
+}
+
+/**
+ * How long to wait for the routing Deployment to roll. 120s was too short for a real Autopilot
+ * cluster: every successful revert observed live logged several `1 of 2 new replicas have been
+ * updated` cycles before converging, which means a slow-but-healthy rollout was
+ * indistinguishable from a genuinely stuck one. Raised so the timeout means "stuck", not "busy".
+ */
+const ROUTING_ROLLOUT_TIMEOUT_SECONDS = 300;
+
+/** The routing Deployment fields this module patches, captured before patching them. */
+interface RoutingSpecSnapshot {
+  buildId: string | null;
+  image: string | null;
+  manifestConfigMap: string | null;
+}
+
+/**
+ * Put the routing Deployment back to `prior` after a failed rollout. Best-effort by design —
+ * the caller reports either outcome, because "restored" and "possibly split" are different
+ * situations for whoever is holding the pager. Returns false when nothing could be restored.
+ */
+async function restoreRoutingSpec(
+  deployName: string,
+  prior: RoutingSpecSnapshot,
+): Promise<boolean> {
+  if (!prior.image) return false;
+  const patch = {
+    spec: {
+      template: {
+        spec: {
+          containers: [
+            {
+              name: "routing-service",
+              image: prior.image,
+              ...(prior.buildId ? { env: [{ name: "NEXT_BUILD_ID", value: prior.buildId }] } : {}),
+            },
+          ],
+          ...(prior.manifestConfigMap
+            ? {
+                volumes: [
+                  {
+                    name: ROUTING_MANIFEST_VOLUME_NAME,
+                    configMap: { name: prior.manifestConfigMap },
+                  },
+                ],
+              }
+            : {}),
+        },
+      },
+    },
+  };
+  const res = await execCapture("kubectl", [
+    "patch",
+    "deployment",
+    deployName,
+    "-n",
+    K8S_NAMESPACE,
+    "--type=strategic",
+    "--field-manager=helm",
+    "-p",
+    JSON.stringify(patch),
+  ]);
+  return res.exitCode === 0;
 }
 
 /**
@@ -935,6 +1057,7 @@ export async function runRollback(options: {
     releaseName,
     targetBuildId: previousBuildId,
     registry: infra?.containerRegistry,
+    targetImageDigest: state.routingImageDigests?.[previousBuildId],
   });
 
   // 4. Switch traffic: patch active Service selectors to the previous build.
@@ -1021,6 +1144,7 @@ export async function runRollback(options: {
         releaseName,
         targetBuildId: currentBuildId,
         registry: infra?.containerRegistry,
+        targetImageDigest: state.routingImageDigests?.[currentBuildId],
       });
       edgeRestored = true;
     } catch (err) {

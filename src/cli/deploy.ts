@@ -1402,6 +1402,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         releaseName,
         targetBuildId: previousBuildId,
         registry: infra.containerRegistry,
+        targetImageDigest: state?.routingImageDigests?.[previousBuildId],
       });
       return { attempted: true, restored: true, error: "" };
     } catch (err) {
@@ -2078,6 +2079,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         cdnTags[previousBuildId] = recordedPrevTag;
       }
       cdnTags[buildId] = cdnTagForBuildId(buildId);
+      // Same shape and pruning as cdnTags: keep the two builds still in play, so a rollback
+      // to either can pin the routing image by digest instead of reconstructing a tag.
+      const routingImageDigests: Record<string, string> = {};
+      const recordedPrevDigest = previousBuildId
+        ? state?.routingImageDigests?.[previousBuildId]
+        : undefined;
+      if (previousBuildId && recordedPrevDigest) {
+        routingImageDigests[previousBuildId] = recordedPrevDigest;
+      }
+      if (imageDigests.routingService) {
+        routingImageDigests[buildId] = imageDigests.routingService;
+      }
       // N30: carry (and prune to the builds in play) the record of which builds have NO
       // retained routing manifest, so doctor can qualify "rollback ready" honestly.
       const unretainedManifestBuilds = [
@@ -2090,6 +2103,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           buildId,
           previousBuildId,
           cdnTags,
+          ...(Object.keys(routingImageDigests).length > 0 ? { routingImageDigests } : {}),
           // The build this deploy just installed serves /readyz, so the NEXT deploy can flip
           // the load balancer's HealthCheckPolicy to readiness without stranding it.
           readinessPathSupported: true,
