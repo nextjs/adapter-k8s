@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureTlsIdentity } from "../../src/routing-service/index.js";
+import {
+  assertManifestMatchesImage,
+  ensureTlsIdentity,
+} from "../../src/routing-service/index.js";
 
 // ensureTlsIdentity: a routing service that can't mint its TLS identity must CRASH
 // (throw) rather than start plaintext — an h2c server passes the health probes while
@@ -114,5 +117,100 @@ describe("ensureTlsIdentity", () => {
     }
     expect(existsSync(cert)).toBe(true);
     expect(existsSync(key)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S1 (SECURITY) — the mounted routing manifest must match the one the IMAGE shipped with.
+//
+// The routing service reads its manifest from CONFIG_DIR, which the pod spec points at the
+// MUTABLE `<release>-routing-manifest` ConfigMap, while the pool reads the copy baked into its
+// own image. The manifest carries the middleware matchers, so anyone with `configmaps/update`
+// could rewrite them so nothing matches: the edge then stamps the TRUSTED
+// `x-mw-evaluated: skip-nomatch` verdict together with the internal secret, and the pool skips
+// its own middleware too — auth bypass at both tiers. BAKED_CONFIG_DIR names the staged copy at
+// a path the mount cannot shadow, and a mismatch must be fatal.
+// ---------------------------------------------------------------------------
+describe("assertManifestMatchesImage (S1)", () => {
+  let dir: string;
+  let saved: string | undefined;
+
+  const MANIFEST = {
+    version: 1,
+    basePath: "",
+    middleware: { matchers: [{ regexp: "^/gated$", originalSource: "/gated" }] },
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "routing-manifest-pin-"));
+    saved = process.env.BAKED_CONFIG_DIR;
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env.BAKED_CONFIG_DIR;
+    else process.env.BAKED_CONFIG_DIR = saved;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(sub: string, value: unknown): string {
+    const d = path.join(dir, sub);
+    mkdirSync(d, { recursive: true });
+    const p = path.join(d, "routing-manifest.json");
+    writeFileSync(p, typeof value === "string" ? value : JSON.stringify(value, null, 2));
+    return p;
+  }
+
+  it("accepts a mounted manifest identical to the baked one", () => {
+    const mounted = write("config", MANIFEST);
+    process.env.BAKED_CONFIG_DIR = path.join(dir, "baked");
+    write("baked", MANIFEST);
+    expect(() => assertManifestMatchesImage(mounted)).not.toThrow();
+  });
+
+  it("accepts a reformatted copy — content is compared, not bytes", () => {
+    // helm's block scalar and kubectl's re-serialization both reshape whitespace; a
+    // byte-for-byte comparison would fail every legitimate deploy.
+    const mounted = write("config", JSON.stringify(MANIFEST));
+    process.env.BAKED_CONFIG_DIR = path.join(dir, "baked");
+    write("baked", MANIFEST);
+    expect(() => assertManifestMatchesImage(mounted)).not.toThrow();
+  });
+
+  it("REFUSES a manifest whose matchers were tampered with (the bypass)", () => {
+    const tampered = {
+      ...MANIFEST,
+      middleware: { matchers: [{ regexp: "^/zzz-never$", originalSource: "/zzz-never" }] },
+    };
+    const mounted = write("config", tampered);
+    process.env.BAKED_CONFIG_DIR = path.join(dir, "baked");
+    write("baked", MANIFEST);
+    expect(() => assertManifestMatchesImage(mounted)).toThrow(/Routing manifest mismatch/);
+  });
+
+  it("REFUSES when BAKED_CONFIG_DIR is set but the baked copy is missing (broken image)", () => {
+    const mounted = write("config", MANIFEST);
+    process.env.BAKED_CONFIG_DIR = path.join(dir, "absent");
+    expect(() => assertManifestMatchesImage(mounted)).toThrow(/does not exist/);
+  });
+
+  it("REFUSES when either copy is unparseable rather than assuming a match", () => {
+    const mounted = write("config", "{not json");
+    process.env.BAKED_CONFIG_DIR = path.join(dir, "baked");
+    write("baked", MANIFEST);
+    expect(() => assertManifestMatchesImage(mounted)).toThrow(/Could not verify/);
+  });
+
+  it("skips verification when BAKED_CONFIG_DIR is unset (emulate/tests)", () => {
+    // An attacker cannot reach this branch: the var is baked into the image and the pod runs
+    // with a read-only root filesystem.
+    const mounted = write("config", MANIFEST);
+    delete process.env.BAKED_CONFIG_DIR;
+    expect(() => assertManifestMatchesImage(mounted)).not.toThrow();
+  });
+
+  it("is a no-op when CONFIG_DIR *is* the baked dir (no mount in play)", () => {
+    const baked = write("baked", MANIFEST);
+    process.env.BAKED_CONFIG_DIR = path.join(dir, "baked");
+    expect(() => assertManifestMatchesImage(baked)).not.toThrow();
   });
 });

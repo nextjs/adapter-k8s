@@ -37,6 +37,18 @@ const RATE_LIMIT_MS = 60_000;
 const lastErrorAt = new Map<string, number>();
 
 /**
+ * Clear the once-per-process / once-per-60s suppression state. Test seam only: both are
+ * deliberately process-global (that is the whole point of `warnOnce` and `logErrorRateLimited`),
+ * which otherwise makes a suite's log-count assertions depend on file and test ORDER — the first
+ * test to touch a failure class silently consumes the one log line every later test wants to
+ * assert on. Not called by any production path.
+ */
+export function resetLogSuppressionForTests(): void {
+  warnedKeys.clear();
+  lastErrorAt.clear();
+}
+
+/**
  * Wall-clock milliseconds WITHOUT `Date.now()` (N8). Under cacheComponents, Next patches
  * `Date.now` to THROW `DYNAMIC_SERVER_USAGE` when called synchronously inside a tracked
  * static render — and this cache stack runs inside renders, so every clock read here must

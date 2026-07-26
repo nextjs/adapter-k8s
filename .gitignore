@@ -25,3 +25,13 @@ tests/**/*.d.ts.map
 # contents are pure generated output — tracking them only churned a regenerated
 # build id into every diff. No code reads them; the dir is recreated as needed.
 fixtures/*/config/
+
+# Review finding #58: the pool-server suites mkdtemp their staged apps INSIDE the repo root
+# (createRequire(<staged>/package.json) has to resolve the repo's `next`), so an interrupted
+# run leaves them behind — and the e2e harness packs the adapter from the working tree, which
+# means leftovers can ride into a deploy.
+.smoke-stage-*/
+.headers-stage-*/
+.harden-stage-*/
+.image-stage-*/
+.instr-stage-*/

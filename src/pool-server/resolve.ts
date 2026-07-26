@@ -11,6 +11,7 @@ import {
   manifestNextConfig,
   matchesMiddleware,
   mergeInvocationQuery,
+  middlewareAuthoredRedirect,
   normalizeResolvedRedirect,
   prepareRequest,
   queryFromUrl,
@@ -76,12 +77,22 @@ export function createLocalResolver(
       requestBody: ReadableStream<Uint8Array>,
       rewriteDepth = 0,
       middlewareAlreadyRan = false,
+      // N40b (SECURITY). The mutated request headers of the pass that is CONTINUING into this
+      // one (the i18n trailing-slash retry below). Middleware deliberately does not run again
+      // on a continuation, so this set is not re-derivable — and dropping it silently undid
+      // `NextResponse.next({ request: { headers } })` on that path: an auth middleware's header
+      // deletion / credential injection was reverted to the client's own headers, while the pool
+      // still skipped its middleware. Same defect the ext_proc tier had at
+      // routing-service/handler.ts (both tiers fixed together, on purpose — the retry path is
+      // asserted identical in tests/routing-common.tier-parity.test.ts). The same-deployment
+      // rewrite continuation below already propagated it via its result merge.
+      inheritedMiddlewareRequestHeaders?: Headers | undefined,
     ): Promise<ResolveResult> {
       let middlewareResponse: Response | null = null;
       // Captures the mutated request headers from responseToMiddlewareResult.
       // This includes x-middleware-set-cookie, x-middleware-override-headers,
       // and x-middleware-request-* modifications — all applied in one place.
-      let middlewareRequestHeaders: Headers | null = null;
+      let middlewareRequestHeaders: Headers | null = inheritedMiddlewareRequestHeaders ?? null;
       // Fail CLOSED: a middleware that throws must become a 500, never a silent
       // "middleware passed". Otherwise a crashing/incompatible middleware would
       // bypass the auth, redirects, and rewrites it implements. Mirrors Next's
@@ -131,15 +142,29 @@ export function createLocalResolver(
                 //
                 // 0. Edge sandbox: use Next.js's built-in edge runtime sandbox
                 //    (for middleware compiled with edge runtime target).
+                // G. Generated handler: handler(Request, ctx) — the DOCUMENTED Node
+                //    middleware entrypoint of a real 16.2 artifact
+                //    (`{ default: { default: adapterWrapper, handler } }`), whose wrapper
+                //    bakes the build's own basePath/i18n into request.nextUrl.
                 // 1. Web adapter: default({ handler, request, page }) — Node middleware
                 //    Returns raw NextResponse with x-middleware-* headers intact.
-                // 2. Legacy: default.default({ request }) — older Next.js Edge output
-                //    Pre-processes response (strips x-middleware-* headers).
+                // 2. Legacy: default.default({ request }) — older Next.js Edge output.
                 // 3. Direct handler: handler(request, { waitUntil }) — raw handler fn
                 //
-                // Web adapter MUST be tried first — the legacy path strips control
-                // headers from the response, causing responseToMiddlewareResult to
-                // misinterpret the result (sets bodySent=true incorrectly).
+                // ORDER IS LOAD-BEARING and the three invocation paths must stay SEPARATE:
+                // invoking a compatibility wrapper with the wrong shape silently returns
+                // next() and bypasses the user's proxy. routing-service/handler.ts carries
+                // the same ladder minus path 0 (it runs Node middleware only).
+                //
+                // COMMENT CORRECTION (N40): this used to justify the order with "the legacy
+                // path strips control headers from the response, causing
+                // responseToMiddlewareResult to misinterpret the result (sets
+                // bodySent=true incorrectly)". MEASURED FALSE on 16.2.10: for the same
+                // request, path 2 and the generated handler return byte-identical control
+                // headers (`x-middleware-next: 1`, `x-middleware-override-headers`, every
+                // `x-middleware-request-*`). The real reason to prefer the earlier paths is
+                // the nextUrl normalization above — path 2 only sees basePath/i18n if the
+                // caller hands it `nextConfig`.
 
                 try {
                   // A same-origin middleware rewrite continues route resolution internally. It
@@ -293,6 +318,13 @@ export function createLocalResolver(
                           method,
                           headers: requestHeaders,
                           body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
+                          // N40: the legacy adapter builds request.nextUrl from this too
+                          // (MEASURED on 16.2.10: without it a basePath+i18n app's middleware
+                          // sees `/docs/about` instead of `/about`, locale "" instead of "en").
+                          // Path 1 already passed it; path 2 did not, so a build that only
+                          // exposes `default.default` got an un-normalized nextUrl on BOTH
+                          // tiers. Same value, same helper, all three paths.
+                          nextConfig: manifestNextConfig(manifest),
                           destination: "document",
                           credentials: "same-origin",
                           bodyUsed: false,
@@ -372,7 +404,10 @@ export function createLocalResolver(
       // 1. Redirects (rule/detection + Location-in-resolvedHeaders) — shared
       // normalization with the ext_proc edge (routing-common.ts).
       const redirect = normalizeResolvedRedirect(resolution, prep, manifest, {
-        middlewareAuthored: middlewareResponse != null,
+        // N40: a plain `NextResponse.next()` is NOT a middleware-authored redirect — the
+        // shared discriminator requires a `location` header. Passing `middlewareResponse !=
+        // null` made the N15 request-query carry inert for every app with middleware.
+        middlewareAuthored: middlewareAuthoredRedirect(middlewareResponse),
       });
       if (redirect) {
         if (redirect.kind === "retry") {
@@ -381,7 +416,20 @@ export function createLocalResolver(
           // it: re-invoking would both double-apply middleware and consume the POST
           // body stream a second time (`ReadableStream is locked` → 500), exactly
           // like the same-deployment rewrite continuation below.
-          return this.resolve(redirect.retryUrl, headers, method, requestBody, 0, true);
+          //
+          // N40b (SECURITY): the middleware's mutated request headers must ride along, or the
+          // continuation returns a route with NO middlewareRequestHeaders and dispatch.ts
+          // installs nothing — the handler then sees the client's original headers even though
+          // middleware asked for a replacement set (and cannot be re-run to ask again).
+          return this.resolve(
+            redirect.retryUrl,
+            headers,
+            method,
+            requestBody,
+            0,
+            true,
+            middlewareRequestHeaders ?? undefined,
+          );
         }
         return {
           kind: "redirect",

@@ -295,6 +295,36 @@ describe("buildRoutingManifest", () => {
         rmSync(projectDir, { recursive: true, force: true });
       }
     });
+
+    // N50 (review #33): `.next` was hardcoded here too, so with a custom `distDir` the
+    // BUILD_ID mtime anchor silently missed and builtAt fell back to Date.now() — the
+    // manifest (embedded in the chart ConfigMap AND every Docker context) then differed on
+    // every regeneration of the same build.
+    it("uses ctx.distDir for the BUILD_ID anchor (custom distDir)", () => {
+      delete process.env.SOURCE_DATE_EPOCH;
+      const projectDir = mkdtempSync(path.join(os.tmpdir(), "manifest-distdir-"));
+      try {
+        const distDir = path.join(projectDir, "build");
+        mkdirSync(distDir, { recursive: true });
+        writeFileSync(path.join(distDir, "BUILD_ID"), "test123");
+        const past = new Date("2026-02-03T04:05:06Z");
+        utimesSync(path.join(distDir, "BUILD_ID"), past, past);
+        const manifest = buildRoutingManifest({
+          routing: mockRouting(),
+          outputs: mockOutputs({}),
+          pools: new Map<string, PoolDefinition>(),
+          buildId: "test123",
+          basePath: "",
+          i18n: null,
+          nextVersion: "16.2.0",
+          projectDir,
+          distDir,
+        });
+        expect(manifest.builtAt).toBe(past.toISOString());
+      } finally {
+        rmSync(projectDir, { recursive: true, force: true });
+      }
+    });
   });
 
   it("rejects pathnames that would break out of the HTTPRoute quoted YAML scalar", () => {

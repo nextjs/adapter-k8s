@@ -4,6 +4,7 @@ import path from "node:path";
 import { execCapture } from "./exec.js";
 import { generateAdapterConfig, generateInfrastructureJson } from "./scaffold.js";
 import { gkeVersionAtLeast, MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
+import { sanitizeForTerminal } from "./terminal.js";
 import {
   assertSafeBucketName,
   assertSafeHostname,
@@ -234,27 +235,15 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
-  // 5. Grant Artifact Registry repo admin specifically on the new repo
-  commands.push({
-    description: "Grant Artifact Registry repo admin on nextjs repository",
-    command: "gcloud",
-    args: [
-      "artifacts",
-      "repositories",
-      "add-iam-policy-binding",
-      "nextjs",
-      "--location",
-      region,
-      "--member",
-      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
-      "--role",
-      "roles/artifactregistry.repoAdmin",
-      "--project",
-      projectId,
-      "--condition=None",
-      "--quiet",
-    ],
-  });
+  // 5. S6/S27 (SECURITY). `roles/artifactregistry.repoAdmin` USED TO BE GRANTED HERE and has
+  // been removed. The CLI only ever pushes images, which `roles/artifactregistry.writer`
+  // (granted above) already covers; repoAdmin additionally allows deleting and RETAGGING
+  // artifacts. That matters because this SA is impersonable by anyone who can create a Pod in
+  // the namespace (Workload Identity binding below), images are deployed by mutable tag, and
+  // the pods hold INTERNAL_HEADER_SECRET — so retag rights turned pod-creation into
+  // dispatch-secret theft on the next restart. Do not reinstate it: if a future command needs
+  // to delete artifacts, grant it for that command, scoped to the repo, not to the workload
+  // identity.
 
   // --- Deploy Service Account (Workload Identity for Helm hook Jobs) ---
   // M9: the route-ext update Job gets a release-scoped CUSTOM role (created/updated
@@ -277,21 +266,11 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
-  commands.push({
-    description: "Grant deploy SA compute.viewer role (forwarding rule discovery)",
-    command: "gcloud",
-    args: [
-      "projects",
-      "add-iam-policy-binding",
-      projectId,
-      "--member",
-      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
-      "--role",
-      "roles/compute.viewer",
-      "--condition=None",
-      "--quiet",
-    ],
-  });
+  // S6/S27 (SECURITY). The project-wide `roles/compute.viewer` grant that used to sit here has
+  // been removed. Its stated purpose — forwarding-rule discovery — is already covered by the
+  // release-scoped custom role's own `compute.forwardingRules.list`; what the broad role added
+  // was project-wide get/list on EVERY compute resource, which is pure reconnaissance value for
+  // anyone who impersonates this SA through the Workload Identity binding below.
 
   // Allow the K8s SA to impersonate the GCP deploy SA via Workload Identity
   commands.push({
@@ -579,10 +558,10 @@ export async function runInit(options: InitOptions): Promise<void> {
           ...extRoleArgs,
         ]);
         if (updated.exitCode !== 0) {
-          throw new Error(`Updating custom IAM role ${extRoleId} failed:\n${updated.stderr}`);
+          throw new Error(`Updating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(updated.stderr)}`);
         }
       } else {
-        throw new Error(`Creating custom IAM role ${extRoleId} failed:\n${created.stderr}`);
+        throw new Error(`Creating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(created.stderr)}`);
       }
     }
   }
@@ -645,7 +624,7 @@ export async function runInit(options: InitOptions): Promise<void> {
             `${cmd.description} failed, and gs://${bucket} is not visible from project ` +
               `${projectId}. The GCS bucket namespace is shared by all GCP users — the name ` +
               `is likely owned by someone else. Re-run with a different --bucket name.\n` +
-              `Original error:\n${result.stderr}`,
+              `Original error:\n${sanitizeForTerminal(result.stderr)}`,
           );
         }
       } else if (isAlreadyExists) {

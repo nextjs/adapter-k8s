@@ -9,6 +9,8 @@ import {
   buildHelmUpgradeArgs,
   assertSafePoolName,
   discoverClusterPodCidr,
+  discoverServingBuildId,
+  resolveImageDigest,
 } from "../../src/cli/deploy.js";
 
 describe("buildDockerCommands", () => {
@@ -202,7 +204,7 @@ describe("discoverClusterPodCidr (fail-closed NetworkPolicy discovery)", () => {
     vi.mocked(exec.execCapture).mockReset();
   });
 
-  const OPTS = { clusterName: "my-app-cluster", region: "us-central1", projectId: "proj" };
+  const OPTS = { clusterName: "my-app-cluster", region: "us-central1", projectId: "proj-12345" };
 
   it("returns the discovered CIDR", async () => {
     vi.mocked(exec.execCapture).mockResolvedValue({
@@ -249,5 +251,138 @@ describe("discoverClusterPodCidr (fail-closed NetworkPolicy discovery)", () => {
     await expect(
       discoverClusterPodCidr({ ...OPTS, allowNoNetworkPolicy: true }),
     ).resolves.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// First-upgrade probe migration. `helm upgrade` rewrites the stable HealthCheckPolicy BEFORE
+// the cutover, while the ACTIVE pods are still the OUTGOING build's — and a build produced by
+// an adapter from before /readyz existed answers only /healthz. Flipping the load balancer to
+// /readyz in that window can mark every serving endpoint unhealthy, i.e. the upgrade itself
+// causes the outage. So the probe stays on /healthz for one cycle unless recorded state says
+// the live build serves /readyz.
+// ---------------------------------------------------------------------------
+describe("buildHelmUpgradeArgs — poolHealthCheckPath", () => {
+  const base = {
+    releaseName: "my-app",
+    chartPath: "/tmp/chart",
+    buildId: "b2",
+    registry: "gcr.io/proj-12345",
+  };
+
+  it("omits the override for a fresh install (no previous build to strand)", () => {
+    const args = buildHelmUpgradeArgs({ ...base, previousBuildId: null });
+    expect(args.join(" ")).not.toContain("poolHealthCheckPath");
+  });
+
+  it("keeps the LB on /healthz for one cycle when the override is requested", () => {
+    const args = buildHelmUpgradeArgs({
+      ...base,
+      previousBuildId: "b1",
+      poolHealthCheckPath: "/healthz",
+    });
+    expect(args).toContain("poolHealthCheckPath=/healthz");
+  });
+
+  it("omits it once the outgoing build is known to serve /readyz", () => {
+    const args = buildHelmUpgradeArgs({ ...base, previousBuildId: "b1" });
+    expect(args.join(" ")).not.toContain("poolHealthCheckPath");
+  });
+
+  it("validates the path — it lands in a bare YAML scalar in the HealthCheckPolicy", () => {
+    expect(() =>
+      buildHelmUpgradeArgs({
+        ...base,
+        previousBuildId: "b1",
+        poolHealthCheckPath: '/readyz"\n      injected: yes',
+      }),
+    ).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveImageDigest — RepoDigests belongs to the image ID, so one local image tagged and
+// pushed to several repositories carries an entry per repository. Taking index 0 and pairing
+// its digest with the repository being deployed can name a manifest that does not exist there,
+// leaving the new pods in ImagePullBackOff.
+// ---------------------------------------------------------------------------
+describe("resolveImageDigest", () => {
+  const DIGEST_A = `sha256:${"a".repeat(64)}`;
+  const DIGEST_B = `sha256:${"b".repeat(64)}`;
+
+  function mockInspect(stdout: string, exitCode = 0) {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode, stdout, stderr: "" });
+  }
+
+  it("selects the entry whose repository matches the pushed image", async () => {
+    mockInspect(
+      `other.registry/nextjs-app-ssr@${DIGEST_B}\ngcr.io/proj/nextjs-app-ssr@${DIGEST_A}\n`,
+    );
+    await expect(resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1")).resolves.toBe(DIGEST_A);
+  });
+
+  it("returns null when no entry matches, rather than guessing", async () => {
+    mockInspect(`other.registry/nextjs-app-ssr@${DIGEST_B}\n`);
+    await expect(resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1")).resolves.toBeNull();
+  });
+
+  it("returns null (deploy warns, does not fail) when inspect fails or reports nothing", async () => {
+    mockInspect("", 1);
+    await expect(resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1")).resolves.toBeNull();
+    mockInspect("\n");
+    await expect(resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1")).resolves.toBeNull();
+  });
+
+  it("rejects a malformed digest", async () => {
+    mockInspect("gcr.io/proj/nextjs-app-ssr@sha256:nope\n");
+    await expect(resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1")).resolves.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// discoverServingBuildId recovers the live build when deploy state is missing or corrupt. It
+// read the build id out of the image tag, which broke once images became digest-pinned:
+// per-pool images yield different digest hexes, so the "Deployments disagree" guard aborted
+// every recovery on a deployment created by the normal path.
+// ---------------------------------------------------------------------------
+describe("discoverServingBuildId — digest-pinned images", () => {
+  const jsonpathLine = (name: string, image: string, buildId = "") =>
+    `${name}|${image}|${buildId}`;
+
+  function mockKubectl(deploymentLines: string[]) {
+    vi.mocked(exec.execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      // First call lists the stable active Services (name|component|version selector);
+      // second lists the Deployments carrying that version label.
+      if (args.includes("svc")) {
+        return { exitCode: 0, stdout: "rel-ssr|ssr|b-42\nrel-api|api|b-42\n", stderr: "" };
+      }
+      return { exitCode: 0, stdout: deploymentLines.join("\n"), stderr: "" };
+    }) as never);
+  }
+
+  it("uses NEXT_BUILD_ID when the images are digest-pinned", async () => {
+    const d = `sha256:${"a".repeat(64)}`;
+    mockKubectl([
+      jsonpathLine("rel-ssr-b42", `gcr.io/p/nextjs-app-ssr@${d}`, "b-42"),
+      jsonpathLine("rel-api-b42", `gcr.io/p/nextjs-app-api@sha256:${"c".repeat(64)}`, "b-42"),
+    ]);
+    await expect(discoverServingBuildId("rel")).resolves.toBe("b-42");
+  });
+
+  it("still works for pre-digest Deployments with no env (tag fallback)", async () => {
+    // The recovered id must still sanitize to the Service's version selector ("b-42").
+    mockKubectl([
+      jsonpathLine("rel-ssr-b42", "gcr.io/p/nextjs-app-ssr:b-42"),
+      jsonpathLine("rel-api-b42", "gcr.io/p/nextjs-app-api:b-42"),
+    ]);
+    await expect(discoverServingBuildId("rel")).resolves.toBe("b-42");
+  });
+
+  it("still refuses when Deployments genuinely disagree about the build", async () => {
+    mockKubectl([
+      jsonpathLine("rel-ssr-b42", "gcr.io/p/nextjs-app-ssr:one", "one"),
+      jsonpathLine("rel-api-b42", "gcr.io/p/nextjs-app-api:two", "two"),
+    ]);
+    await expect(discoverServingBuildId("rel")).rejects.toThrow();
   });
 });

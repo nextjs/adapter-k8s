@@ -51,7 +51,9 @@ describe("renderHTTPRoute rule cap", () => {
 
     // Every pool's header rule must survive.
     for (let i = 0; i < 8; i++) {
-      expect(yaml).toContain(`value: pool${i}`);
+      // N61: the header match value is QUOTED (an unquoted "on"/"no"/"123" pool name
+      // would render a YAML boolean/int the apiserver refuses as an HTTPHeaderMatch value).
+      expect(yaml).toContain(`value: "pool${i}"`);
     }
     // The catch-all rule must survive.
     expect(yaml).toContain('value: "/"');
@@ -240,5 +242,139 @@ describe("releaseName validation in gateway templates", () => {
         routingManifest: makeManifest({}),
       }),
     ).toThrow(/Invalid releaseName/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N74 — catchAllPool must be a function of manifest CONTENT, not key order.
+// ---------------------------------------------------------------------------
+describe("N74: deterministic catch-all pool selection", () => {
+  it("prefers the pool owning the ROOT DYNAMIC template over the /_not-found pool", () => {
+    const pools = makePools(3); // pool0 (default), pool1, pool2
+    // The two candidates in BOTH insertion orders. Previously the first key to match won,
+    // so every unmatched request landed on whichever of the two classification inserted
+    // first — and they routinely live in different pools.
+    const notFoundFirst = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      routingManifest: makeManifest({ "/_not-found": "pool1", "/[slug]": "pool2" }),
+    });
+    const dynamicFirst = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      routingManifest: makeManifest({ "/[slug]": "pool2", "/_not-found": "pool1" }),
+    });
+    // Same emitted route either way — and it is the root-dynamic owner, which is what
+    // actually serves arbitrary unmatched paths (/_not-found only serves the 404).
+    expect(notFoundFirst).toBe(dynamicFirst);
+    const catchAll = notFoundFirst.slice(notFoundFirst.lastIndexOf('value: "/"'));
+    expect(catchAll).toContain("name: nextjs-pool2");
+  });
+
+  it("falls back to the /_not-found pool when there is no root dynamic template", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(3),
+      routingManifest: makeManifest({ "/about": "pool1", "/_not-found": "pool1" }),
+    });
+    const catchAll = yaml.slice(yaml.lastIndexOf('value: "/"'));
+    expect(catchAll).toContain("name: nextjs-pool1");
+  });
+
+  it("picks deterministically among MULTIPLE root dynamic templates (sorted, not insertion order)", () => {
+    const a = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(3),
+      routingManifest: makeManifest({ "/[slug]": "pool1", "/[...rest]": "pool2" }),
+    });
+    const b = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(3),
+      routingManifest: makeManifest({ "/[...rest]": "pool2", "/[slug]": "pool1" }),
+    });
+    expect(a).toBe(b);
+    // "/[...rest]" sorts before "/[slug]", so pool2 wins in both orders.
+    expect(a.slice(a.lastIndexOf('value: "/"'))).toContain("name: nextjs-pool2");
+  });
+
+  it("falls back to the first pool when the manifest names no catch-all candidate", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(2),
+      routingManifest: makeManifest({ "/about": "pool1" }),
+    });
+    expect(yaml.slice(yaml.lastIndexOf('value: "/"'))).toContain("name: nextjs-pool0");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N76 — the 16-rule budget must not depend on manifest key order.
+// ---------------------------------------------------------------------------
+describe("N76: sortedPrefixes is a total order", () => {
+  it("emits the same rules for the same prefixes in a different key order", () => {
+    // 20 equal-length prefixes, so length alone leaves them in insertion order: which ones
+    // survived the budget used to depend on manifest ORDERING rather than content.
+    const names = Array.from({ length: 20 }, (_, i) => `/p${String(i).padStart(2, "0")}`);
+    const forward: Record<string, string> = {};
+    const reverse: Record<string, string> = {};
+    for (const n of names) forward[`${n}/page`] = "pool1";
+    for (const n of [...names].reverse()) reverse[`${n}/page`] = "pool1";
+
+    const a = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(3),
+      routingManifest: makeManifest(forward),
+    });
+    const b = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(3),
+      routingManifest: makeManifest(reverse),
+    });
+    expect(a).toBe(b);
+    // Lexicographic tie-break: the lowest-numbered prefixes survive.
+    expect(a).toContain('value: "/p00"');
+    expect(a).not.toContain('value: "/p19"');
+  });
+
+  it("still puts longer prefixes first (Gateway API precedence)", () => {
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(2),
+      routingManifest: makeManifest({ "/a/x": "pool1", "/longer/y": "pool1" }),
+    });
+    expect(yaml.indexOf('value: "/longer"')).toBeLessThan(yaml.indexOf('value: "/a"'));
+  });
+});
+
+describe("hostname validation at the consumption point", () => {
+  it("renderGateway and renderHTTPRoute both reject an unsafe hostname", () => {
+    const bad: HostConfig[] = [{ hostname: 'x"\n  foo: bar', tls: { enabled: false } }];
+    expect(() => renderGateway({ releaseName: "nextjs", hosts: bad })).toThrow(/Invalid hostname/);
+    expect(() =>
+      renderHTTPRoute({
+        releaseName: "nextjs",
+        hosts: bad,
+        pools: makePools(1),
+        routingManifest: makeManifest({}),
+      }),
+    ).toThrow(/Invalid hostname/);
+  });
+
+  it("renderHTTPRoute rejects an unsafe pool name (it is a header match value)", () => {
+    const pools = new Map<string, PoolDefinition>([
+      ["-bad", { name: "-bad", outputs: [], config: { routes: ["appPages"] } }],
+    ]);
+    expect(() =>
+      renderHTTPRoute({ releaseName: "nextjs", hosts, pools, routingManifest: makeManifest({}) }),
+    ).toThrow(/Invalid pool name/);
   });
 });

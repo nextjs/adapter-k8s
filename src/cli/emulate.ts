@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execCapture, execOrThrow } from "./exec.js";
+import { sanitizeForTerminal } from "./terminal.js";
 
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
@@ -200,12 +201,20 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   });
 
   poolServer.stdout?.on("data", (d) => {
-    for (const line of d.toString().split("\n").filter(Boolean)) {
+    for (const raw of d.toString().split("\n").filter(Boolean)) {
+      // S28: child output carries remote-influenced text (middleware error messages echo
+      // request header values, Envoy warnings echo upstream data) — strip control sequences
+      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+      const line = sanitizeForTerminal(raw);
       console.log(`  ${GREEN}pool-server${RESET}       ${DIM}│${RESET} ${line}`);
     }
   });
   poolServer.stderr?.on("data", (d) => {
-    for (const line of d.toString().split("\n").filter(Boolean)) {
+    for (const raw of d.toString().split("\n").filter(Boolean)) {
+      // S28: child output carries remote-influenced text (middleware error messages echo
+      // request header values, Envoy warnings echo upstream data) — strip control sequences
+      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+      const line = sanitizeForTerminal(raw);
       console.error(`  ${GREEN}pool-server${RESET}       ${DIM}│${RESET} ${RED}${line}${RESET}`);
     }
   });
@@ -237,12 +246,20 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   });
 
   routingService.stdout?.on("data", (d) => {
-    for (const line of d.toString().split("\n").filter(Boolean)) {
+    for (const raw of d.toString().split("\n").filter(Boolean)) {
+      // S28: child output carries remote-influenced text (middleware error messages echo
+      // request header values, Envoy warnings echo upstream data) — strip control sequences
+      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+      const line = sanitizeForTerminal(raw);
       console.log(`  ${CYAN}routing-service${RESET}   ${DIM}│${RESET} ${line}`);
     }
   });
   routingService.stderr?.on("data", (d) => {
-    for (const line of d.toString().split("\n").filter(Boolean)) {
+    for (const raw of d.toString().split("\n").filter(Boolean)) {
+      // S28: child output carries remote-influenced text (middleware error messages echo
+      // request header values, Envoy warnings echo upstream data) — strip control sequences
+      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+      const line = sanitizeForTerminal(raw);
       console.error(`  ${CYAN}routing-service${RESET}   ${DIM}│${RESET} ${RED}${line}${RESET}`);
     }
   });
@@ -334,12 +351,20 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     children.push(envoyChild);
 
     envoyChild.stdout?.on("data", (d) => {
-      for (const line of d.toString().split("\n").filter(Boolean)) {
+      for (const raw of d.toString().split("\n").filter(Boolean)) {
+      // S28: child output carries remote-influenced text (middleware error messages echo
+      // request header values, Envoy warnings echo upstream data) — strip control sequences
+      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+      const line = sanitizeForTerminal(raw);
         console.log(`  ${YELLOW}envoy${RESET}             ${DIM}│${RESET} ${line}`);
       }
     });
     envoyChild.stderr?.on("data", (d) => {
-      for (const line of d.toString().split("\n").filter(Boolean)) {
+      for (const raw of d.toString().split("\n").filter(Boolean)) {
+      // S28: child output carries remote-influenced text (middleware error messages echo
+      // request header values, Envoy warnings echo upstream data) — strip control sequences
+      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+      const line = sanitizeForTerminal(raw);
         console.error(`  ${YELLOW}envoy${RESET}             ${DIM}│${RESET} ${line}`);
       }
     });

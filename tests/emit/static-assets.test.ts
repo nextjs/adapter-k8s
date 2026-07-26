@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { buildStaticManifest } from "../../src/emit/static-assets.js";
+import { cdnCacheTag } from "../../src/cdn-tags.js";
 import type { AdapterOutputs } from "../../src/types.js";
 
 function outputs(over: Partial<AdapterOutputs> = {}): AdapterOutputs {
@@ -37,7 +38,9 @@ describe("buildStaticManifest", () => {
     );
     const fav = m.find((e) => e.pathname === "/favicon.ico")!;
     expect(fav.filePath).toBe("public/favicon.ico");
-    expect(fav.cacheControl).toBe("public, max-age=3600");
+    // N50: parity with `next start` — measured on 16.2.10, a non-`_next/static` file is
+    // served by `send` with no maxAge, i.e. `Cache-Control: public, max-age=0`.
+    expect(fav.cacheControl).toBe("public, max-age=0, must-revalidate");
     expect(fav.prerender).toBeUndefined();
     const imm = m.find((e) => e.pathname === "/_next/static/x.js")!;
     expect(imm.cacheControl).toBe("public, max-age=31536000, immutable");
@@ -174,7 +177,7 @@ describe("buildStaticManifest", () => {
       const sw = m.find((e) => e.pathname === "/sw-revalidation-probe.js")!;
       expect(sw).toBeDefined();
       expect(sw.filePath).toBe("public/sw-revalidation-probe.js");
-      expect(sw.cacheControl).toBe("public, max-age=3600");
+      expect(sw.cacheControl).toBe("public, max-age=0, must-revalidate");
       expect(sw.prerender).toBeUndefined();
       const nested = m.find((e) => e.pathname === "/nested/deep.txt")!;
       expect(nested.filePath).toBe("public/nested/deep.txt");
@@ -191,6 +194,58 @@ describe("buildStaticManifest", () => {
       expect(img).toBeDefined();
       // filePath stays decoded — it addresses the real file on disk.
       expect(img.filePath).toBe("public/image probe.svg");
+    });
+
+    // N50 (review, Medium): `public, max-age=3600` was NOT what `next start` sends.
+    // Measured against real `next start` (Next 16.2.10, arbiter run in scratch):
+    //   GET /probe.txt  → Cache-Control: public, max-age=0   (+ weak ETag, Last-Modified)
+    //   GET /sw.js      → Cache-Control: public, max-age=0
+    //   GET /_next/static/chunks/<hash>.js → public, max-age=31536000, immutable
+    // router-server.ts sets Cache-Control only for `nextStaticFolder` matches; public files
+    // fall through to `send` with no maxAge (its default is 0). Behind Cloud CDN plus
+    // browser caches, an hour-long max-age meant a replaced logo.png — or a cached 404 for
+    // a path that just became valid — stayed stale for up to an hour past cutover, and
+    // deploy-time cache-tag invalidation reaches the CDN but never the clients.
+    it("matches `next start` for public files (max-age=0, revalidated via ETag)", () => {
+      const m = buildStaticManifest(outputs(), projDir);
+      for (const e of m) {
+        expect(e.cacheControl).toBe("public, max-age=0, must-revalidate");
+        expect(e.cacheControl).not.toContain("3600");
+      }
+    });
+
+    // The deliberate choice (see the MUTABLE_FILE_CACHE_CONTROL comment): NO `s-maxage`, so
+    // `cdnCacheTag` yields no cache-tag and Cloud CDN stores nothing for a public file. A CDN
+    // entry for a public file is precisely the object that can be served without the
+    // middleware tier running (invariant 2), and `next start` sends no shared-cache directive
+    // (invariant 4). Pinned so a future "let's keep the CDN TTL" edit has to argue with a test.
+    it("emits no shared-cache freshness for public files, so no CDN entry to invalidate", () => {
+      const m = buildStaticManifest(outputs(), projDir);
+      for (const e of m) {
+        expect(e.cacheControl).not.toMatch(/s-maxage/);
+        expect(cdnCacheTag(e.cacheControl, "b12345")).toEqual({});
+      }
+    });
+
+    // N50 (review, Medium): canonicalPublicPathname ran the name through the WHATWG URL
+    // parser, which MAPS `\` to `/` and STRIPS tab/CR/LF instead of encoding them. So
+    // `public/a\b.svg` was keyed "/a/b.svg" — colliding with a real `public/a/b.svg` (the
+    // dedup then drops one) or making /a/b.svg serve the backslash file — and
+    // `public/a<TAB>b.svg` was keyed "/ab.svg", a pathname no request can ever produce.
+    it("percent-encodes backslashes and C0 controls instead of letting URL() fold them", () => {
+      const pub = path.join(projDir, "public");
+      writeFileSync(path.join(pub, "a\\b.svg"), "<svg/>"); // literal backslash in the name
+      writeFileSync(path.join(pub, "c\td.svg"), "<svg/>"); // literal tab in the name
+      mkdirSync(path.join(pub, "a"), { recursive: true });
+      writeFileSync(path.join(pub, "a", "b.svg"), "<svg>real</svg>");
+
+      const m = buildStaticManifest(outputs(), projDir);
+      const byPath = new Map(m.map((e) => [e.pathname, e.filePath]));
+      expect(byPath.get("/a%5Cb.svg")).toBe("public/a\\b.svg");
+      expect(byPath.get("/c%09d.svg")).toBe("public/c\td.svg");
+      // The real nested file keeps the unambiguous key, and nothing collides with it.
+      expect(byPath.get("/a/b.svg")).toBe("public/a/b.svg");
+      expect(m.filter((e) => e.pathname === "/a/b.svg")).toHaveLength(1);
     });
 
     it("does not duplicate a public pathname already present in outputs.staticFiles", () => {
@@ -230,5 +285,23 @@ describe("buildStaticManifest", () => {
       PROJ,
     );
     expect(m.map((e) => e.pathname)).toEqual(["/b", "/z.txt"]); // /a skipped, sorted
+  });
+
+  // N50 (review, Low): `localeCompare` makes the order ICU-dependent — a small-icu Node
+  // and a full-icu Node produce DIFFERENT bytes for the same build, and that file ships
+  // inside the image (and into the chart's Docker context), so the same build stops being
+  // reproducible across build hosts. Sort by code point instead.
+  it("sorts by code point, not locale collation", () => {
+    const names = ["/b.txt", "/B.txt", "/a.txt", "/_x.txt", "/-y.txt", "/A.txt"];
+    const m = buildStaticManifest(
+      outputs({
+        staticFiles: names.map((pathname) => ({ pathname, filePath: `${PROJ}${pathname}` })) as any,
+      }),
+      PROJ,
+    );
+    expect(m.map((e) => e.pathname)).toEqual([...names].sort());
+    // Locale collation would order these differently (case-insensitive-ish, punctuation
+    // partially ignored) — pin that the emitted order is NOT the ICU one.
+    expect(m.map((e) => e.pathname)).not.toEqual([...names].sort((a, b) => a.localeCompare(b)));
   });
 });

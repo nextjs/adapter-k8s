@@ -471,3 +471,295 @@ describe("servedFallbackShells bound", () => {
     },
   );
 });
+
+// N31: HEAD on a manifest-served asset wrote no length and then `res.end(undefined)`. Node marks
+// a HEAD response body-less and emits NEITHER Content-Length NOR Transfer-Encoding, so the client
+// learned nothing about the size — where `next start` answers HEAD with the real Content-Length
+// (measured 2026-07-25: 13 for a public file, 309404 for a build chunk). Third instance of the
+// bug the image optimizer already documents and fixed.
+describe("manifest static serve reports Content-Length", () => {
+  let tmpDir: string;
+  const origCwd = process.cwd;
+
+  beforeEach(() => {
+    tmpDir = path.join(os.tmpdir(), `dispatch-len-test-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    process.cwd = () => tmpDir;
+    writeFileSync(path.join(tmpDir, "asset.txt"), "twelve bytes");
+  });
+
+  afterEach(() => {
+    process.cwd = origCwd;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function assetDispatcher() {
+    return createDispatcher({
+      handlerLoader: noopHandlerLoader(),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [
+        {
+          pathname: "/asset.txt",
+          filePath: "asset.txt",
+          cacheControl: "public, max-age=0, must-revalidate",
+        },
+      ],
+    });
+  }
+
+  const assetResolution: ResolveResult = {
+    kind: "route",
+    pool: "ssr",
+    matchedPathname: "/asset.txt",
+    routeMatches: null,
+    resolvedHeaders: undefined,
+  };
+
+  it("stamps content-length on a GET", async () => {
+    const res = mockRes();
+    await dispatcher200(assetDispatcher(), res, "GET");
+    expect(res._headers["content-length"]).toBe("12");
+    expect(res._body).toBe("twelve bytes");
+  });
+
+  it("stamps content-length on a HEAD and sends no body", async () => {
+    const res = mockRes();
+    await dispatcher200(assetDispatcher(), res, "HEAD");
+    expect(res._headers["content-length"]).toBe("12");
+    expect(res._body).toBe("");
+  });
+
+  async function dispatcher200(
+    dispatcher: ReturnType<typeof createDispatcher>,
+    res: ReturnType<typeof mockRes>,
+    method: string,
+  ) {
+    const req = mockReq("/asset.txt");
+    (req as { method: string }).method = method;
+    await dispatcher.dispatch(req, res as unknown as ServerResponse, assetResolution);
+    expect(res._status).toBe(200);
+  }
+});
+
+// N38 (SECURITY): `(req.headers.cookie ?? "").includes("__prerender_bypass=")` — an UNAUTHENTICATED
+// substring — disabled the concrete-prerender-seed fast path and the Pages fallback-shell path.
+// Any client could send `Cookie: __prerender_bypass=` and force a full render per request: cheap
+// CPU amplification, and a way to keep a shared cache seed from ever being used. The timing-safe
+// verifier for exactly these two credentials (isVerifiedPreviewRequest) already lived ~400 lines
+// above in the same file; upstream's scheme is an exact match against the build's random
+// previewModeId, which is what it implements.
+describe("prerender seed bypass requires a VERIFIED preview credential", () => {
+  let tmpDir: string;
+  const origCwd = process.cwd;
+  const savedPreviewId = process.env.__NEXT_PREVIEW_MODE_ID;
+
+  beforeEach(() => {
+    tmpDir = path.join(os.tmpdir(), `dispatch-preview-test-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    process.cwd = () => tmpDir;
+    writeFileSync(path.join(tmpDir, "seed.html"), "<html>seed</html>");
+    process.env.__NEXT_PREVIEW_MODE_ID = "the-real-preview-id";
+  });
+
+  afterEach(() => {
+    process.cwd = origCwd;
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (savedPreviewId === undefined) delete process.env.__NEXT_PREVIEW_MODE_ID;
+    else process.env.__NEXT_PREVIEW_MODE_ID = savedPreviewId;
+  });
+
+  function makeDispatcher(localHandlerInvoker: ReturnType<typeof vi.fn>) {
+    return createDispatcher({
+      handlerLoader: noopHandlerLoader((p) => p === "/blog/[slug]"),
+      poolName: "ssr",
+      buildId: "test123",
+      outputIds: ["/blog/[slug]"],
+      staticAssets: [
+        {
+          pathname: "/blog/first",
+          filePath: "seed.html",
+          cacheControl: "public, max-age=0, must-revalidate",
+          prerender: true,
+          revalidate: 3600,
+        },
+      ],
+      localHandlerInvoker,
+      builtAt: new Date().toISOString(),
+    });
+  }
+
+  const seedResolution: ResolveResult = {
+    kind: "route",
+    pool: "ssr",
+    matchedPathname: "/blog/first",
+    routeMatches: { slug: "first" },
+    resolvedHeaders: undefined,
+  };
+
+  async function dispatchWithCookie(cookie: string | undefined) {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const res = mockRes();
+    await makeDispatcher(localHandlerInvoker).dispatch(
+      mockReq("/blog/first", cookie ? { cookie } : {}),
+      res as unknown as ServerResponse,
+      seedResolution,
+    );
+    return { res, localHandlerInvoker };
+  }
+
+  it("RED TEAM: a bare `__prerender_bypass=` cookie does NOT bypass the seed", async () => {
+    const { res, localHandlerInvoker } = await dispatchWithCookie("__prerender_bypass=");
+    expect(res._body).toContain("seed");
+    expect(localHandlerInvoker).not.toHaveBeenCalled();
+  });
+
+  it("RED TEAM: a wrong-value bypass cookie of the same length does NOT bypass the seed", async () => {
+    const { res, localHandlerInvoker } = await dispatchWithCookie(
+      "__prerender_bypass=the-real-preview-XX",
+    );
+    expect(res._body).toContain("seed");
+    expect(localHandlerInvoker).not.toHaveBeenCalled();
+  });
+
+  it("RED TEAM: the substring in an unrelated cookie name does NOT bypass the seed", async () => {
+    const { res, localHandlerInvoker } = await dispatchWithCookie(
+      "not__prerender_bypass=whatever; other=1",
+    );
+    expect(res._body).toContain("seed");
+    expect(localHandlerInvoker).not.toHaveBeenCalled();
+  });
+
+  it("an authentic bypass cookie DOES render fresh instead of serving the seed", async () => {
+    const { res, localHandlerInvoker } = await dispatchWithCookie(
+      "__prerender_bypass=the-real-preview-id",
+    );
+    expect(res._body).not.toContain("seed");
+    expect(localHandlerInvoker).toHaveBeenCalledOnce();
+  });
+
+  it("serves the seed when there is no cookie at all", async () => {
+    const { res, localHandlerInvoker } = await dispatchWithCookie(undefined);
+    expect(res._body).toContain("seed");
+    expect(localHandlerInvoker).not.toHaveBeenCalled();
+  });
+});
+
+// N39: `x-next-cache-tags` is Next's internal transport between an entrypoint and the incremental
+// cache. It exposes route/tag structure and `next start` removes it before the public response.
+// dispatch deleted it on two boundaries with an explicit "never forward it to clients" comment,
+// but every web-`Response` boundary — edge routes, `Response`-returning handlers,
+// render404/renderError, and the middleware-response case — passed it straight through.
+describe("x-next-cache-tags never reaches a client on the web-Response boundaries", () => {
+  it("strips it from a middleware-authored Response", async () => {
+    const dispatcher = createDispatcher({
+      handlerLoader: noopHandlerLoader(),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+    });
+    const res = mockRes();
+    await dispatcher.dispatch(
+      mockReq("/anything"),
+      res as unknown as ServerResponse,
+      {
+        kind: "middleware-response",
+        response: new Response("mw body", {
+          status: 200,
+          headers: {
+            "x-next-cache-tags": "_N_T_/blog/secret,_N_T_/internal",
+            "x-keep-me": "1",
+          },
+        }),
+      } as unknown as ResolveResult,
+    );
+    expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+    expect(res._headers["x-keep-me"]).toBe("1");
+  });
+
+  it("strips it from a redirect's resolved headers", async () => {
+    const dispatcher = createDispatcher({
+      handlerLoader: noopHandlerLoader(),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+    });
+    const res = mockRes();
+    await dispatcher.dispatch(
+      mockReq("/go"),
+      res as unknown as ServerResponse,
+      {
+        kind: "redirect",
+        status: 307,
+        url: new URL("http://localhost/dest"),
+        resolvedHeaders: new Headers({
+          location: "/dest",
+          "x-next-cache-tags": "_N_T_/secret",
+        }),
+      } as unknown as ResolveResult,
+    );
+    expect(res._status).toBe(307);
+    expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+  });
+});
+
+// N43: the PPR document-vs-flight test hardcoded `req.headers.rsc` while every neighbouring check
+// uses the build-pinned `rscConfig.header`. An app with a custom RSC header name would have the
+// HTML shell prepended to a flight stream — a corrupt payload, not a degraded one.
+describe("PPR document detection uses the configured RSC header", () => {
+  let tmpDir: string;
+  const origCwd = process.cwd;
+
+  beforeEach(() => {
+    tmpDir = path.join(os.tmpdir(), `dispatch-rsc-test-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    process.cwd = () => tmpDir;
+    writeFileSync(path.join(tmpDir, "shell.html"), "<html>shell</html>");
+  });
+
+  afterEach(() => {
+    process.cwd = origCwd;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function makeDispatcher(localHandlerInvoker: ReturnType<typeof vi.fn>) {
+    return createDispatcher({
+      handlerLoader: noopHandlerLoader((p) => p === "/ppr"),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      rscConfig: { header: "x-custom-rsc", suffix: ".rsc" },
+      pprRoutes: { "/ppr": { postponedState: "state", fallbackFilePath: "shell.html" } },
+      localHandlerInvoker,
+    });
+  }
+
+  const pprResolution: ResolveResult = {
+    kind: "route",
+    pool: "ssr",
+    matchedPathname: "/ppr",
+    routeMatches: null,
+    resolvedHeaders: undefined,
+  };
+
+  it("does NOT prepend the shell to a flight request that uses the custom header", async () => {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    await makeDispatcher(localHandlerInvoker).dispatch(
+      mockReq("/ppr", { "x-custom-rsc": "1" }),
+      mockRes() as unknown as ServerResponse,
+      pprResolution,
+    );
+    expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    expect(localHandlerInvoker.mock.calls[0]![0].responsePrefix).toBeUndefined();
+  });
+
+  it("still prepends the shell to a real document request", async () => {
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    await makeDispatcher(localHandlerInvoker).dispatch(
+      mockReq("/ppr"),
+      mockRes() as unknown as ServerResponse,
+      pprResolution,
+    );
+    expect(localHandlerInvoker.mock.calls[0]![0].responsePrefix?.filePath).toContain("shell.html");
+  });
+});

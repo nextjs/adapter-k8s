@@ -32,7 +32,11 @@ export interface RoutingServerOptions {
 }
 
 const encoder = new TextEncoder();
-const toBytes = (s: string): Uint8Array => encoder.encode(s);
+// N40: a body that is ALREADY bytes must pass through untouched. Encoding a string is only
+// correct for the text responses this tier authors itself; re-encoding a middleware-authored
+// binary body mangled every byte >= 0x80 into U+FFFD (3 bytes each).
+const toBytes = (s: string | Uint8Array): Uint8Array =>
+  typeof s === "string" ? encoder.encode(s) : s;
 
 // --- Boundary converters -------------------------------------------------
 // The handler (fixes A-D) works with the plain internal ext-proc-types shape.

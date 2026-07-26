@@ -1,6 +1,12 @@
 // src/emit/templates/gateway.ts
 import type { HostConfig, PoolDefinition, RoutingManifest } from "../../types.js";
-import { sanitizeK8sName, assertSafeReleaseName, assertSafePathname } from "./utils.js";
+import {
+  sanitizeK8sName,
+  assertSafeReleaseName,
+  assertSafePathname,
+  assertSafeHostname,
+  assertSafePoolName,
+} from "./utils.js";
 
 export function renderGateway({
   releaseName,
@@ -10,6 +16,11 @@ export function renderGateway({
   hosts: HostConfig[];
 }): string {
   assertSafeReleaseName(releaseName);
+  // Sanitize at the point of consumption (AGENTS.md): renderHTTPRoute splices every
+  // hostname into a double-quoted YAML scalar and renderGateway's certmap annotation is
+  // derived per host upstream. Only config.ts checked them before, which leaves a direct
+  // `generateHelmChart`/`renderHTTPRoute` caller unguarded.
+  for (const host of hosts) assertSafeHostname(host.hostname);
   const hasTls = hosts.some((h) => h.tls?.enabled);
 
   const annotations: Record<string, string> = {};
@@ -73,6 +84,8 @@ export function renderHTTPRoute({
   cdnFilterName?: string | undefined;
 }): string {
   assertSafeReleaseName(releaseName);
+  for (const host of hosts) assertSafeHostname(host.hostname);
+  for (const poolName of pools.keys()) assertSafePoolName(poolName);
 
   // GKE allows one ExtensionRef filter per rule; attaching the same filter from every
   // rule is fine (the limit is per rule, not per filter). The name is already sanitized
@@ -137,7 +150,14 @@ export function renderHTTPRoute({
     }
   }
 
-  const sortedPrefixes = [...prefixToPool.keys()].sort((a, b) => b.length - a.length);
+  // N76. Longest prefix first (Gateway API's own precedence), then LEXICOGRAPHIC to make
+  // it a total order. Sorting by length alone left equal-length prefixes in
+  // `poolAssignments` insertion order, so which prefixes survived the 16-rule budget below
+  // depended on manifest KEY ORDER rather than manifest content — the emitted HTTPRoute
+  // was not a pure function of the build.
+  const sortedPrefixes = [...prefixToPool.keys()].sort(
+    (a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0),
+  );
 
   const pathPrefixRulesAll: {
     path: string;
@@ -149,16 +169,29 @@ export function renderHTTPRoute({
     matchType: "PathPrefix",
   }));
 
-  let catchAllPool = defaultPoolName;
-  for (const [pathname, poolName] of Object.entries(routingManifest.poolAssignments) as [
-    string,
-    string,
-  ][]) {
-    if (pathname.startsWith("/[") || pathname.startsWith("/[[") || pathname === "/_not-found") {
-      catchAllPool = poolName;
-      break;
-    }
+  // N74. The catch-all rule owns every unmatched request, so picking the wrong pool costs a
+  // `proxyToPool` cross-pool hop on all of them. This used to take the FIRST
+  // `poolAssignments` key matching "root dynamic template OR /_not-found", i.e. whichever
+  // of the two classification happened to insert first — and those two frequently live in
+  // different pools, so the emitted HTTPRoute was non-deterministic with respect to
+  // manifest ORDERING rather than manifest content.
+  //
+  // Deterministic and priority-ordered instead: the pool owning a ROOT DYNAMIC TEMPLATE
+  // (`/[slug]`, `/[...rest]`) wins, because that template is what actually serves arbitrary
+  // unmatched paths; `/_not-found` is the fallback, since it only serves the 404. Within
+  // each tier the candidate pathnames are sorted, so equal-priority ties resolve the same
+  // way on every build regardless of key order.
+  const rootDynamic: string[] = [];
+  const notFound: string[] = [];
+  for (const pathname of Object.keys(routingManifest.poolAssignments)) {
+    if (pathname.startsWith("/[")) rootDynamic.push(pathname);
+    else if (pathname === "/_not-found") notFound.push(pathname);
   }
+  const catchAllSource = [...rootDynamic.sort(), ...notFound][0];
+  const catchAllPool =
+    catchAllSource !== undefined
+      ? (routingManifest.poolAssignments[catchAllSource] as string)
+      : defaultPoolName;
 
   const catchAllRule = {
     path: "/",
@@ -177,7 +210,10 @@ export function renderHTTPRoute({
     return `    - matches:
         - headers:
             - name: x-upstream-pool
-              value: ${poolName}
+              # N61: QUOTED. An unquoted pool name like "on"/"no"/"y"/"off"/"true"/"123"
+              # renders a YAML boolean/int here; "helm template" accepts it and the
+              # apiserver then rejects the chart (HTTPHeaderMatch.value is a string).
+              value: "${poolName}"
       backendRefs:
         - name: ${backendName}
           port: 3000${filtersYaml}`;

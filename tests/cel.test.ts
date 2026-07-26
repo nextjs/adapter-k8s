@@ -438,3 +438,112 @@ describe("generateCelExpression with basePath", () => {
     expect(cel).toContain("request.path.startsWith('/docs/fr/blog/')");
   });
 });
+
+describe("generateCelExpression public/ files and query-bearing paths (N40)", () => {
+  const mw = (matchers: { sourceRegex: string }[]) =>
+    ({
+      id: "middleware",
+      filePath: "/dist/server/middleware.js",
+      pathname: "/middleware",
+      type: 8 as any,
+      config: { matchers },
+    }) as any;
+
+  it("emits exclusions for public/ files, which outputs.staticFiles never contains", () => {
+    // THE BUG THIS PINS: the loop iterated `outputs.staticFiles`, which for a real build holds
+    // only build outputs and /_next/static/* — Next never enumerates public/ as an adapter
+    // output, which is why `collectPublicPathnames` exists. MEASURED on fixtures/main (whose
+    // matcher explicitly excludes cdn-probe.txt and header-priority.txt): the emitted
+    // expression was exactly `!(request.path.startsWith('/_next/static/'))` — zero per-file
+    // exclusions, so the documented percent-encoding machinery never ran on a public file and
+    // the oversize warning's advice was unactionable.
+    const outputs = mockOutputs({
+      staticFiles: [mockStaticFile({ pathname: "/_next/static/chunk.js" })],
+      middleware: mw([
+        // fixtures/main's real matcher shape: a catch-all that carves out two public files.
+        { sourceRegex: "^(?:/((?!_next/static|cdn-probe.txt|header-priority.txt).*))$" },
+      ]),
+    });
+    const withPublic = generateCelExpression({
+      outputs,
+      dynamicRoutes: [],
+      publicPathnames: ["/cdn-probe.txt", "/header-priority.txt", "/middleware-cache-probe.txt"],
+    });
+    // The two files the matcher carves out are excluded …
+    expect(withPublic).toContain("request.path == '/cdn-probe.txt'");
+    expect(withPublic).toContain("request.path == '/header-priority.txt'");
+    // … and the one it covers is NOT (excluding it would bypass middleware at the edge).
+    expect(withPublic).not.toContain("middleware-cache-probe");
+
+    // Omitting publicPathnames reproduces the OLD (measured) output exactly.
+    const without = generateCelExpression({ outputs, dynamicRoutes: [] });
+    expect(without).toBe("!(request.path.startsWith('/_next/static/'))");
+  });
+
+  it("runs the percent-encoding and quote-escaping machinery on public/ files too", () => {
+    const cel = generateCelExpression({
+      outputs: mockOutputs({ staticFiles: [], middleware: mw([]) }),
+      dynamicRoutes: [],
+      publicPathnames: ["/image probe.svg", "/o'brien.txt", "/café.txt"],
+      basePath: "/docs",
+    });
+    expect(cel).toContain("request.path == '/docs/image%20probe.svg'");
+    expect(cel).toContain("request.path == '/docs/o\\'brien.txt'");
+    expect(cel).toContain("request.path == '/docs/caf%C3%A9.txt'");
+  });
+
+  it("de-duplicates a pathname present in both staticFiles and publicPathnames", () => {
+    const cel = generateCelExpression({
+      outputs: mockOutputs({
+        staticFiles: [mockStaticFile({ pathname: "/robots.txt" })],
+        middleware: mw([]),
+      }),
+      dynamicRoutes: [],
+      publicPathnames: ["/robots.txt"],
+    });
+    expect(cel.match(/robots\.txt/g)).toHaveLength(2); // one `==` + one `startsWith(…?)`
+  });
+
+  it("matches an exact path that carries a query string (both request.path readings)", () => {
+    // `request.url_path` — the Envoy attribute that strips the query — is NOT in GCP's
+    // documented Service Extensions attribute set (headers, method, host, path, query, scheme,
+    // backend_service_*), so using it risks the match condition being rejected when the
+    // extension is updated. Emit a form that is correct whether or not `request.path` carries
+    // the query: under the path-only reading the second term can never fire (a path cannot hold
+    // a raw '?'); under Envoy's documented path-plus-query reading it catches `/x.txt?v=1`,
+    // which a bare `==` silently missed.
+    const exclusion = generateCelExpression({
+      outputs: mockOutputs({ staticFiles: [], middleware: mw([]) }),
+      dynamicRoutes: [],
+      publicPathnames: ["/sw.js"],
+    });
+    expect(exclusion).toContain("(request.path == '/sw.js' || request.path.startsWith('/sw.js?'))");
+
+    // Same treatment for the no-middleware ISR inclusion terms.
+    const inclusion = generateCelExpression({
+      outputs: mockOutputs({
+        appPages: [mockAppPage({ pathname: "/pricing" })],
+        prerenders: [
+          mockPrerender({
+            pathname: "/pricing",
+            sourcePage: "/pricing",
+            fallback: { filePath: "/dist/pricing.html", initialRevalidate: 60 } as any,
+          }),
+        ],
+      }),
+      dynamicRoutes: [],
+    });
+    expect(inclusion).toContain(
+      "(request.path == '/pricing' || request.path.startsWith('/pricing?'))",
+    );
+  });
+
+  it("keeps the query-suffix literal escaped identically to the equality literal", () => {
+    const cel = generateCelExpression({
+      outputs: mockOutputs({ staticFiles: [], middleware: mw([]) }),
+      dynamicRoutes: [],
+      publicPathnames: ["/o'brien.txt"],
+    });
+    expect(cel).toContain("request.path.startsWith('/o\\'brien.txt?')");
+  });
+});

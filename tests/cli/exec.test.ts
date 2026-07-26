@@ -258,10 +258,7 @@ describe("buildWindowsCmdInvocation", () => {
   });
 
   it("double-escapes args for node_modules/.bin cmd shims", () => {
-    const plan = buildWindowsCmdInvocation(
-      "C:\\proj\\node_modules\\.bin\\next.cmd",
-      ["a&b"],
-    );
+    const plan = buildWindowsCmdInvocation("C:\\proj\\node_modules\\.bin\\next.cmd", ["a&b"]);
     expect(plan.args[3]).toContain("^^^&");
   });
 

@@ -496,9 +496,9 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
       expect(await c.get("tls:big")).toBe(big);
     });
 
-    it("runs the tag-manifest UPDATE_TAGS_SCRIPT EVAL over TLS, clamp count included", async () => {
-      // The same L16 clamp branch the plaintext suite covers, driven over TLS: a client clock
-      // 120s ahead must come back clamped to serverNow + MAX_CLOCK_SKEW_MS with `clamped == 1`.
+    it("runs the tag-manifest UPDATE_TAGS_SCRIPT EVAL over TLS, skew count included", async () => {
+      // The same N78 rebase branch the plaintext suite covers, driven over TLS: a client clock
+      // 120s ahead must come back rebased onto the SERVER clock with `clamped == 1`.
       const c = newClient(hostUrl);
       const key = "k8s:tls-skew:tags";
       const clientNow = Date.now() + 120_000;
@@ -515,14 +515,18 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
       const after = Date.now();
       expect(Number(clamped)).toBe(1);
       const stored = JSON.parse((await c.hmget(key, "t"))[0]!);
-      expect(stored.expired).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
-      expect(stored.expired).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
-      expect(stored.expired).toBeLessThan(clientNow);
+      expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
+      expect(stored.expired).toBeLessThanOrEqual(after + 5);
+      expect(stored.expired).toBeLessThan(clientNow - MAX_CLOCK_SKEW_MS);
       expect(await c.ttl(key)).toBeGreaterThan(29 * 24 * 60 * 60); // M11 TTL applied over TLS too
     });
 
     it("V2 handler over TLS: set/get, updateTags/getExpiration, and cross-replica revalidation", async () => {
-      const clock = { t: 1000 };
+      // N78: the manifest is stamped from Valkey's own TIME, so the injected clocks track the real
+      // clock and the entry is written 5s "ago" (a sub-millisecond client-vs-server margin would
+      // be a coin flip).
+      const t0 = Date.now();
+      const clock = { t: t0 };
       const a = new ValkeyCacheHandler({
         client: newClient(hostUrl),
         buildId: "tls-v2",
@@ -534,36 +538,42 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
         now: () => clock.t,
       });
 
-      await a.set("page", Promise.resolve(makeEntry("v1", { timestamp: 1000, tags: ["tls-tag"] })));
+      await a.set(
+        "page",
+        Promise.resolve(makeEntry("v1", { timestamp: t0 - 5000, tags: ["tls-tag"] })),
+      );
       const fresh = await b.get("page", []);
       expect(fresh).toBeDefined();
       expect(fresh?.revalidate).toBe(60);
       expect(await readStream(fresh!.value)).toBe("v1");
 
       // Profiled revalidation: a future `expired` watermark is reported but does not drop the entry.
-      clock.t = 2000;
+      clock.t = t0 + 1000;
       await a.updateTags(["tls-tag"], { expire: 300 });
-      expect(await b.getExpiration(["tls-tag"])).toBe(2000 + 300_000);
+      const expiration = await b.getExpiration(["tls-tag"]);
+      expect(expiration).toBeGreaterThanOrEqual(t0 + 300_000 - 50);
+      expect(expiration).toBeLessThanOrEqual(Date.now() + 300_000 + 50);
       expect((await b.get("page", []))?.revalidate).toBe(-1); // stale, still served
 
       // Hard revalidation on A is visible LIVE on B (no refreshTags) — the whole point of the
       // shared manifest, now proven over TLS.
-      clock.t = 3000;
+      clock.t = t0 + 2000;
       await a.updateTags(["tls-tag"]);
       expect(await b.get("page", [])).toBeUndefined();
     });
 
     it("incremental handler over TLS (IP endpoint): revalidateTag on A drops the shell on B", async () => {
-      const clock = { t: 1000 };
+      // N78: see the V2-over-TLS note — anchored clocks, entry written 5s "ago".
+      const offset = { ms: -5000 };
       const a = new ValkeyIncrementalCacheHandler({
         client: newClient(ipUrl, TLS_PASSWORD),
         buildId: "tls-inc",
-        now: () => clock.t,
+        now: () => Date.now() + offset.ms,
       });
       const b = new ValkeyIncrementalCacheHandler({
         client: newClient(ipUrl, TLS_PASSWORD),
         buildId: "tls-inc",
-        now: () => clock.t,
+        now: () => Date.now() + offset.ms,
       });
 
       await a.set("/shell", appPageEntry("SHELL-TLS", "catalog"), {});
@@ -576,8 +586,9 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
         "seg:SHELL-TLS",
       );
 
-      clock.t = 2000;
+      offset.ms = 0;
       await a.revalidateTag("catalog");
+      offset.ms = 1000;
       expect(await b.get("/shell", {})).toBeNull();
     });
 

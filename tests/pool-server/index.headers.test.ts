@@ -299,8 +299,58 @@ describe("pool-server response cache-control precedence", () => {
     const res = await fetch(`http://127.0.0.1:${port}/stale.txt`);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("stale body");
-    expect(res.headers.get("cache-control")).toBe("public, max-age=3600");
-    expect(res.headers.get("cache-tag")).toBe(BUILD_TAG);
+    // N31: `next start` answers a public/ file `public, max-age=0` (measured 2026-07-25 against
+    // Next 16.2.10 — `Cache-Control: public, max-age=0`, `Content-Length: 13`, a weak ETag). The
+    // disk last resort used to answer `public, max-age=3600`, so a browser copy outlived a
+    // deploy of the same URL and no cache-tag could purge it (a browser cache has no tags).
+    expect(res.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
+    // And with no shared-cache freshness window there is nothing at the CDN to tag: cdnCacheTag
+    // returns {} for max-age=0, which is the M13 "tag only what the CDN can store" rule.
+    expect(res.headers.get("cache-tag")).toBeNull();
+    // N31: Content-Length is present (and HEAD reports it) — see the HEAD case below.
+    expect(res.headers.get("content-length")).toBe(String("stale body".length));
+  });
+
+  // N31: all three disk/manifest serve sites `writeHead` without a length and then
+  // `res.end(HEAD ? undefined : content)`. Node marks a HEAD response body-less and emits
+  // NEITHER Content-Length NOR Transfer-Encoding, so HEAD reported no size at all where
+  // `next start` sends the real one (measured: `Content-Length: 13` for a public file, 309404
+  // for a build chunk). This is the same bug the image optimizer fixed and never propagated.
+  it("HEAD on the public-file disk last resort reports Content-Length and no body", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/stale.txt`, { method: "HEAD" });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-length")).toBe(String("stale body".length));
+    expect(res.headers.get("transfer-encoding")).toBeNull();
+    expect(await res.text()).toBe("");
+  });
+
+  // N31: `next start` gates every static output on GET/HEAD (`res.setHeader('Allow',
+  // ['GET','HEAD']); res.statusCode = 405` in router-server, before serveStatic). Measured:
+  // POST/PUT/DELETE on a public file → 405. The adapter answered 200 with the whole body and
+  // the deploy cache-tag, having read and discarded the request body. This disk path is the
+  // live one for fixtures/main, whose static-assets.json carries no public/ entries.
+  it("405s a write to a public file served from disk, with Allow and no body", async () => {
+    for (const method of ["POST", "PUT", "DELETE", "PATCH", "OPTIONS"]) {
+      const res = await fetch(`http://127.0.0.1:${port}/stale.txt`, {
+        method,
+        ...(method === "POST" || method === "PUT" || method === "PATCH"
+          ? { body: "should never be stored" }
+          : {}),
+      });
+      expect(res.status, method).toBe(405);
+      expect(res.headers.get("allow"), method).toBe("GET, HEAD");
+      expect(res.headers.get("cache-tag"), method).toBeNull();
+      expect(await res.text(), method).toBe("");
+    }
+  });
+
+  it("a write to a path with NO public file still falls through to routing (not a 405)", async () => {
+    // `next start` 405s only once a static output matched; an unknown path is the router's.
+    const res = await fetch(`http://127.0.0.1:${port}/no-such-public-file.txt`, {
+      method: "POST",
+      body: "x",
+    });
+    expect(res.status).not.toBe(405);
   });
 
   it("Phase 2: the disk last resort still merges resolved headers", async () => {

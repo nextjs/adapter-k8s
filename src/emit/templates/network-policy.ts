@@ -1,5 +1,5 @@
 // src/emit/templates/network-policy.ts
-import { assertSafeReleaseName } from "./utils.js";
+import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./utils.js";
 
 // Default-deny-by-allowlist NetworkPolicies for the two workload tiers, gated on the
 // deploy CLI discovering the cluster's pod CIDRs (`--set global.networkPolicy.podCidrs=
@@ -161,6 +161,10 @@ export function renderNetworkPolicies({
   poolNames: string[];
 }): string {
   assertSafeReleaseName(releaseName);
+  // N61. Pool names reach LABEL VALUES and label SELECTORS below; they are quoted at every
+  // interpolation (an unquoted "on"/"no"/"true" renders a YAML boolean the apiserver
+  // refuses to unmarshal into map[string]string) and charset-checked here.
+  for (const poolName of poolNames) assertSafePoolName(poolName);
 
   // The CIDR list is only ever expanded by helm from values the deploy CLI sets; keep
   // the `range` at column 0 so the rendered `- "cidr"` lines indent under `except:`.
@@ -190,12 +194,12 @@ kind: NetworkPolicy
 metadata:
   name: ${releaseName}-routing-service
   labels:
-    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: routing-service
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: ${releaseName}
+      app.kubernetes.io/name: "${releaseName}"
       app.kubernetes.io/component: routing-service
   policyTypes:
     - Ingress
@@ -228,8 +232,8 @@ ${broadFrom}
     .map(
       (p) => `        - podSelector:
             matchLabels:
-              app.kubernetes.io/name: ${releaseName}
-              app.kubernetes.io/component: ${p}`,
+              app.kubernetes.io/name: "${releaseName}"
+              app.kubernetes.io/component: "${p}"`,
     )
     .join("\n");
 
@@ -239,15 +243,19 @@ ${broadFrom}
     (poolName) => `apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: ${releaseName}-${poolName}
+  # N61: through sanitizeK8sName like every OTHER name in the chart — this was the one
+  # resource name built by bare concatenation, so a composed name past the 63-char cap (or
+  # one needing a trailing-hyphen strip) produced a name the API server rejects.
+  name: ${sanitizeK8sName(`${releaseName}-${poolName}`)}
   labels:
-    app.kubernetes.io/name: ${releaseName}
-    app.kubernetes.io/component: ${poolName}
+    app.kubernetes.io/name: "${releaseName}"
+    # N61: QUOTED — see the label comment in deployment.ts.
+    app.kubernetes.io/component: "${poolName}"
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: ${releaseName}
-      app.kubernetes.io/component: ${poolName}
+      app.kubernetes.io/name: "${releaseName}"
+      app.kubernetes.io/component: "${poolName}"
   policyTypes:
     - Ingress
   ingress:

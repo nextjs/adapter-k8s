@@ -293,3 +293,139 @@ describe("applyDefaults", () => {
     expect(result.routeExtension?.mode).toBe("auto");
   });
 });
+
+// ---------------------------------------------------------------------------
+// N60 (SECURITY) — resource/scaling validation. Nothing under `pools.*.resources`,
+// `pools.*.scaling`, `routingService.resources` or `routingService.scaling` was validated:
+// not here, not in the templates. VERIFIED by rendering — a memoryLimit of
+// `512Mi"\n      hostNetwork: true\n      …` produced VALID YAML with `hostNetwork: true`
+// on the pod, which per N19 (network-policy.ts) voids BOTH NetworkPolicy postures.
+// ---------------------------------------------------------------------------
+describe("N60: resource and scaling validation", () => {
+  const withPool = (pool: Record<string, unknown>): K8sAdapterConfig =>
+    ({
+      pools: { ssr: { routes: ["appPages"], ...pool } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    }) as K8sAdapterConfig;
+
+  const withRoutingService = (routingService: Record<string, unknown>): K8sAdapterConfig =>
+    ({ ...withPool({}), routingService }) as K8sAdapterConfig;
+
+  const POD_SPEC_INJECTION =
+    '512Mi"\n      hostNetwork: true\n      shareProcessNamespace: true\n      _pad: "';
+
+  it("rejects the verified pod-spec injection payload in every pool resource field", () => {
+    for (const field of ["cpu", "memory", "cpuLimit", "memoryLimit"]) {
+      expect(() =>
+        validateConfig(withPool({ resources: { [field]: POD_SPEC_INJECTION } })),
+      ).toThrow(/Invalid Kubernetes quantity/);
+      expect(() =>
+        validateConfig(withPool({ resources: { [field]: POD_SPEC_INJECTION } })),
+      ).toThrow(new RegExp(`pool "ssr"\\.resources\\.${field}`));
+    }
+  });
+
+  it("rejects the UNQUOTED routing-tier sink payload (needed no quote-escaping at all)", () => {
+    expect(() =>
+      validateConfig(
+        withRoutingService({ resources: { cpu: "250m\n              INJECTED: yes" } }),
+      ),
+    ).toThrow(/routingService\.resources\.cpu/);
+    for (const field of ["memory", "cpuLimit", "memoryLimit"]) {
+      expect(() =>
+        validateConfig(withRoutingService({ resources: { [field]: POD_SPEC_INJECTION } })),
+      ).toThrow(/Invalid Kubernetes quantity/);
+    }
+  });
+
+  it("accepts the quantity forms an operator actually writes", () => {
+    expect(() =>
+      validateConfig(
+        withPool({
+          resources: { cpu: "250m", memory: "512Mi", cpuLimit: "2", memoryLimit: "1Gi" },
+        }),
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateConfig(withRoutingService({ resources: { cpu: "1.5", memory: "2Gi" } })),
+    ).not.toThrow();
+  });
+
+  it("requires integer scaling values (the HPA sink is a bare YAML scalar)", () => {
+    expect(() =>
+      validateConfig(withPool({ scaling: { min: "1\n  INJECTED: yes", max: 3, targetCPU: 80 } })),
+    ).toThrow(/pool "ssr"\.scaling\.min/);
+    expect(() =>
+      validateConfig(withPool({ scaling: { min: 1.5, max: 3, targetCPU: 80 } })),
+    ).toThrow(/scaling\.min/);
+    expect(() => validateConfig(withPool({ scaling: { min: 1, max: 3, targetCPU: 0 } }))).toThrow(
+      /scaling\.targetCPU/,
+    );
+    // >100 is VALID: averageUtilization is a percentage of REQUESTED cpu, so a pool that
+    // requests 250m and runs happily at 500m targets 200. The old cap rejected working configs.
+    expect(() =>
+      validateConfig(withRoutingService({ scaling: { min: 2, max: 10, targetCPU: 150 } })),
+    ).not.toThrow();
+    expect(() =>
+      validateConfig(withRoutingService({ scaling: { min: 2, max: 10, targetCPU: 10_001 } })),
+    ).toThrow(/routingService\.scaling\.targetCPU/);
+    expect(() =>
+      validateConfig(withPool({ scaling: { min: 2, max: 10, targetCPU: 70 } })),
+    ).not.toThrow();
+  });
+
+  it("rejects scaling.min > scaling.max (the API server would reject the HPA)", () => {
+    expect(() => validateConfig(withPool({ scaling: { min: 5, max: 2, targetCPU: 80 } }))).toThrow(
+      /scaling\.min \(5\) is greater than pool "ssr"\.scaling\.max \(2\)/,
+    );
+    expect(() =>
+      validateConfig(withRoutingService({ scaling: { min: 9, max: 3, targetCPU: 70 } })),
+    ).toThrow(/routingService\.scaling\.min \(9\) is greater than/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N61 — pool-name charset.
+// ---------------------------------------------------------------------------
+describe("N61: pool-name charset", () => {
+  const withName = (name: string): K8sAdapterConfig =>
+    ({
+      pools: { [name]: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    }) as K8sAdapterConfig;
+
+  it("rejects a leading or trailing hyphen (invalid K8s label value)", () => {
+    // The old /^[a-z0-9-]+$/ accepted both.
+    expect(() => validateConfig(withName("-api"))).toThrow(/Invalid pool name/);
+    expect(() => validateConfig(withName("api-"))).toThrow(/Invalid pool name/);
+  });
+
+  it("still accepts YAML-boolean-looking names — the TEMPLATES quote them (N61)", () => {
+    // Tightening the charset to exclude "on"/"no"/"true" would break real configs for no
+    // reason; the fix is that every interpolation of a pool name is now quoted, which is
+    // what the apiserver decode path actually requires.
+    for (const n of ["on", "no", "y", "off", "true"]) {
+      expect(() => validateConfig(withName(n))).not.toThrow();
+    }
+  });
+
+  it("keeps the informative 40-char budget message ahead of the charset check", () => {
+    expect(() => validateConfig(withName("a".repeat(41)))).toThrow(/too long.*max 40/);
+  });
+});

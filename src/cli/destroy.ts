@@ -5,6 +5,7 @@ import readline from "node:readline";
 import { execCapture } from "./exec.js";
 import { deployExtRoleId } from "./init.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -17,16 +18,42 @@ export interface DestroyOptions {
 // Distinguish "the resource is already gone" (idempotent success) from genuine
 // failures (auth, permission, network). Only the former should be treated as
 // already-deleted; the latter must be surfaced so destroy doesn't silently succeed.
+// N28: the positive needles are substrings, so they also matched failures that merely
+// CONTAIN them — `error dialing backend: 404 page not found ("no such host")` is a
+// connectivity failure, not a deletion, and deploy used this predicate to decide "nothing is
+// serving from the previous build" (then scaled a build serving N≫2 down to 2 mid-deploy).
+// Any auth/connectivity/quota marker now vetoes "gone", and the bare "404"/"no such" needles
+// are removed: a naked 404 with no other evidence is not proof of absence. Callers that CAN
+// key on a machine-readable signal must do so instead — deploy's retained-manifest probe now
+// uses `--ignore-not-found` (exit 0 + empty stdout).
+const NOT_GONE_MARKERS = [
+  "permission",
+  "forbidden",
+  "unauthorized",
+  "unauthenticated",
+  "credential",
+  "invalid_grant",
+  "dial tcp",
+  "no such host",
+  "connection refused",
+  "unable to connect",
+  "i/o timeout",
+  "timed out",
+  "quota",
+  "rate limit",
+  "service unavailable",
+];
+
 export function isAlreadyGoneError(stderr: string): boolean {
   const s = stderr.toLowerCase();
+  if (NOT_GONE_MARKERS.some((m) => s.includes(m))) return false;
   return (
     s.includes("notfound") ||
+    s.includes("not_found") ||
     s.includes("not found") ||
     s.includes("does not exist") ||
     s.includes("was not found") ||
-    s.includes("release: not found") ||
-    s.includes("no such") ||
-    s.includes("404")
+    s.includes("release: not found")
   );
 }
 
@@ -133,6 +160,8 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
 
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
+  // S13: validate before any of these reach a gcloud/kubectl argv.
+  assertSafeInfrastructure(infra);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
 
@@ -211,7 +240,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     if (cred.exitCode !== 0) {
       throw new Error(
         `Failed to connect to cluster "${clusterName}" — aborting destroy before any ` +
-          `deletion: ${cred.stderr.trim() || `exit ${cred.exitCode}`}`,
+          `deletion: ${sanitizeForTerminal(cred.stderr.trim()) || `exit ${cred.exitCode}`}`,
       );
     }
   } else if (dryRun) {
@@ -235,8 +264,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     // same as the destruction gate).
     const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
     // L14: the context name is kubeconfig-sourced — strip terminal control chars.
-    const currentContext =
-      ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+    const currentContext = ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
     console.warn(
       `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
         `NOT be pinned to this release's cluster.\n` +
@@ -278,7 +306,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         console.log("    (release not found or already uninstalled)");
       } else {
         console.warn(
-          `    WARNING: helm uninstall failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+          `    WARNING: helm uninstall failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
         );
         failures.push(`helm release "${releaseName}"`);
       }
@@ -306,7 +334,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete adapter state ConfigMaps: ` +
-          `${res.stderr.trim() || `exit ${res.exitCode}`}. Delete them manually ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
           `(kubectl delete configmap -n default -l app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
       );

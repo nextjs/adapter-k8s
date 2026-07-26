@@ -9,6 +9,7 @@ import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
 import {
+  INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   localeAlignedRouteParamPathname,
   queryFromUrl,
@@ -45,7 +46,16 @@ function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> 
 function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | string[]> {
   const headers: Record<string, string | string[]> = {};
   for (const [key, value] of webHeaders.entries()) {
-    if (key.toLowerCase() === "set-cookie") continue;
+    const lower = key.toLowerCase();
+    if (lower === "set-cookie") continue;
+    // N39: Next transports cache tags between an entrypoint and the incremental cache in this
+    // header. It is internal bookkeeping, it exposes route/tag structure, and `next start` removes
+    // it before the public response. writeInnerResponse and the manifest serve each deleted it
+    // with an explicit "never forward it to clients" comment, but EVERY web-`Response` boundary —
+    // edge routes, `Response`-returning handlers, render404/renderError, rule/middleware redirects
+    // and middleware-authored bodies — passed it through. One rule, at the single conversion point
+    // all of them share.
+    if (lower === "x-next-cache-tags") continue;
     headers[key] = value;
   }
   const setCookies =
@@ -196,10 +206,32 @@ function abortOnClientClose(res: ServerResponse, abort: () => void): void {
   }
 }
 
+/**
+ * S19. Absolute cap on a proxied exchange, connect through response body — as opposed to
+ * PROXY_TIMEOUT_MS, which is an IDLE timeout a slow-drip upstream never trips. Generous
+ * (10 min) because a legitimate streamed response may run long; the point is that it is
+ * FINITE, so sockets and request state cannot accumulate without bound.
+ */
+export const PROXY_ABSOLUTE_DEADLINE_MS = 600_000;
+
 // Bounded wait for proxied upstreams (external rewrites + cross-pool). A wedged target
 // must not pin the client connection and this pod's sockets until the server-wide
 // requestTimeout (300s default) fires.
 const PROXY_TIMEOUT_MS = 30_000;
+
+// N37: the same bound for a LOCAL handler invocation, which had none. The only bounded waits were
+// proxyTimeoutMs (proxied upstreams only) and the server-wide `requestTimeout`, which measures
+// request RECEIPT and not handler runtime — so a handler that never answered held a listening
+// loopback server, an ephemeral port, its pendingWaitUntil set and the client socket for as long
+// as the process lived. This bounds TIME TO THE RESPONSE HEAD only, and is disarmed once the
+// entrypoint answers: the same discipline proxyToPool applies to its own idle timeout, and for the
+// same reason — capping the streaming phase would kill SSE and long PPR resumes that a same-pool
+// route is expected to serve. Generous by default (a blocking SSG render on a cold pod is
+// legitimately slow); the point is that it is finite.
+const HANDLER_TIMEOUT_MS = Math.max(
+  1_000,
+  parseInt(process.env.ADAPTER_K8S_HANDLER_TIMEOUT_MS ?? "", 10) || 60_000,
+);
 
 // RFC 9110 §7.6.1 hop-by-hop headers describe a single transport-level connection.
 // Forwarding an upstream's `connection`/`transfer-encoding`/etc. to our client
@@ -452,9 +484,19 @@ async function writeInnerResponse(
   // a resume tail (which needs the persisted shell prepended), or a complete HTML document (the
   // partial-fallback chain already replayed its prelude). Peek at the first chunk before committing
   // headers so we do not concatenate two documents for the latter shape.
+  //
+  // N36: peek ONLY when there is a shell to decide about. This wait used to be unconditional,
+  // which withheld the response head until the handler produced its first BODY byte — measured
+  // 1213 ms to headers for a handler that flushes at 0 ms and writes at 1200 ms, where
+  // `next start` sends the head at +14 ms (so an EventSource/SSE consumer connects immediately
+  // instead of hanging until the first event). Nothing else in this function needs the chunk:
+  // `handlerRenderedDocument` is already gated on `!!prefix`.
   const iterator = innerRes[Symbol.asyncIterator]();
-  const first = await iterator.next();
-  const firstChunk = first.done ? undefined : Buffer.from(first.value as Buffer);
+  let firstChunk: Buffer | undefined;
+  if (prefix) {
+    const first = await iterator.next();
+    firstChunk = first.done ? undefined : Buffer.from(first.value as Buffer);
+  }
   const handlerRenderedDocument =
     !!prefix &&
     !!firstChunk &&
@@ -501,18 +543,38 @@ async function writeInnerResponse(
   // already declared uncacheable (PPR documents are `private, no-cache, no-store`) keeps
   // that stricter verdict — this guard exists to stop long-lived leaks, not to loosen.
   const innerCacheControl = String(headers["cache-control"] ?? "");
+  const uncacheableAlready = /\b(?:no-store|no-cache|private)\b/i.test(innerCacheControl);
   const prerenderLeaksCacheable =
-    headers["x-nextjs-prerender"] !== undefined &&
-    !/\b(?:no-store|no-cache|private)\b/i.test(innerCacheControl);
+    headers["x-nextjs-prerender"] !== undefined && !uncacheableAlready;
+  // N30 (SECURITY/CACHE): `x-nextjs-postponed` marks the same leak class and was NOT in this
+  // guard. A postponed response is an UNFINISHED shell whose dynamic holes stream per request,
+  // and it need carry neither `x-nextjs-cache` nor `x-nextjs-prerender` — so a minimal-mode
+  // entrypoint's `s-maxage=31536000` passed straight through, untagged, and Cloud CDN kept an
+  // incomplete document for a year that no cutover tag invalidation could purge (M13 class).
+  // `next start` answers a PPR document `private, no-cache, no-store, max-age=0,
+  // must-revalidate` (measured). Same one-directional rule as the prerender guard above: a
+  // response the entry already declared uncacheable keeps its stricter verdict.
+  const postponedLeaksCacheable =
+    headers["x-nextjs-postponed"] !== undefined && !uncacheableAlready;
   if (
     normalizePrerenderCacheControl ||
     headers["x-nextjs-cache"] !== undefined ||
-    prerenderLeaksCacheable
+    prerenderLeaksCacheable ||
+    postponedLeaksCacheable
   ) {
     headers["cache-control"] = "public, max-age=0, must-revalidate";
     delete headers["cache-tag"];
   }
   outerRes.writeHead(forceStatus ?? effectivePrefix?.status ?? innerRes.statusCode ?? 200, headers);
+  // N36: writeHead alone does not put the head on the wire — Node holds the header bytes until
+  // the first body write, so a stream whose first chunk is seconds away still had its head
+  // withheld even after the peek was removed. In `next start` the app's own `res.flushHeaders()`
+  // acts on the socket response directly; here the app flushed the LOOPBACK response, so the
+  // adapter has to carry that flush across the boundary. (No-op when a prefix body follows
+  // immediately below, and harmless for fixed-length responses beyond one extra small segment.)
+  if (typeof (outerRes as { flushHeaders?: unknown }).flushHeaders === "function") {
+    outerRes.flushHeaders();
+  }
   if (effectivePrefix && !(await writeChunkSafely(outerRes, effectivePrefix.body))) {
     innerRes.destroy();
     return;
@@ -592,6 +654,7 @@ async function invokeLocalHandlerOverHttp({
   renderError,
   revalidate,
   i18nLocales,
+  handlerTimeoutMs = HANDLER_TIMEOUT_MS,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -641,6 +704,8 @@ async function invokeLocalHandlerOverHttp({
   revalidate?: Revalidate;
   /** Pages i18n locale prefixes are protocol routing state, not dynamic page params. */
   i18nLocales?: string[];
+  /** N37: bound on time-to-response-head for this invocation. See HANDLER_TIMEOUT_MS. */
+  handlerTimeoutMs?: number;
 }): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const pendingWaitUntil = new Set<Promise<void>>();
@@ -837,6 +902,22 @@ async function invokeLocalHandlerOverHttp({
         loopbackPath = search ? `${rawPath}?${search}` : rawPath;
       }
 
+      // N37: arm the invocation deadline. It covers everything up to the entrypoint's response
+      // HEAD — including the loopback dial — and is disarmed the moment those headers arrive, so
+      // a legitimately long stream is untouched. On expiry the loopback request is destroyed
+      // (which closes the ephemeral server and releases the port through the error path below)
+      // and the client gets a 504 if nothing has been written yet.
+      let invocationTimedOut = false;
+      const invocationDeadline = setTimeout(() => {
+        invocationTimedOut = true;
+        console.error(
+          `[pool-server] handler for ${matchedPathname} did not respond within ` +
+            `${handlerTimeoutMs}ms — aborting the invocation`,
+        );
+        clientReq.destroy(new Error(`handler invocation timed out after ${handlerTimeoutMs}ms`));
+      }, handlerTimeoutMs);
+      invocationDeadline.unref?.();
+
       const clientReq = httpRequest(
         {
           hostname: "127.0.0.1",
@@ -846,6 +927,7 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
+          clearTimeout(invocationDeadline);
           const closeThenSettle = (onError: (error: unknown) => void): void => {
             // App Router wires after() through res.on("close"). Close the loopback response first
             // so that callback can register its waitUntil promise, then drain the complete batch.
@@ -885,6 +967,21 @@ async function invokeLocalHandlerOverHttp({
       );
 
       clientReq.once("error", (error) => {
+        clearTimeout(invocationDeadline);
+        // N37: a deadline abort is the adapter's own teardown, not an entrypoint crash — answer
+        // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
+        // invocations share the outer `res` with a response already sent to the client, so they
+        // must never write; they just release the socket and the port.
+        if (invocationTimedOut) {
+          if (!discardResponse && !res.headersSent) {
+            res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+            res.end("Gateway Timeout");
+          } else if (!discardResponse && !res.writableEnded) {
+            res.end();
+          }
+          server.close(() => resolve());
+          return;
+        }
         server.close(() => reject(error));
       });
 
@@ -1199,6 +1296,9 @@ export interface DispatcherOptions {
   /** Bounded wait for proxied upstreams (external rewrite / cross-pool). Defaults to
    * PROXY_TIMEOUT_MS; injectable so tests don't wait out the real budget. */
   proxyTimeoutMs?: number | undefined;
+  /** N37: bound on time-to-response-head for a LOCAL handler invocation. Defaults to
+   * HANDLER_TIMEOUT_MS (ADAPTER_K8S_HANDLER_TIMEOUT_MS); injectable for the same reason. */
+  handlerTimeoutMs?: number | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
@@ -1250,6 +1350,7 @@ export function createDispatcher(options: DispatcherOptions) {
     i18nLocales = [],
     builtAt,
     proxyTimeoutMs = PROXY_TIMEOUT_MS,
+    handlerTimeoutMs = HANDLER_TIMEOUT_MS,
   } = options;
 
   // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
@@ -1571,7 +1672,15 @@ export function createDispatcher(options: DispatcherOptions) {
         );
         dispatchStaticAsset = staticAsset;
         const isReadMethod = req.method === "GET" || req.method === "HEAD";
-        const isPreviewRequest = (req.headers.cookie ?? "").includes("__prerender_bypass=");
+        // N38 (SECURITY): a VERIFIED credential, not a cookie-name substring. This gate used to be
+        // `(req.headers.cookie ?? "").includes("__prerender_bypass=")`, so any client — including
+        // one sending `Cookie: not__prerender_bypass=x` — disabled the seed/shell fast paths and
+        // forced a full render on every request (cheap CPU amplification, plus a way to keep a
+        // shared-cache seed from ever being used). isVerifiedPreviewRequest implements upstream's
+        // actual scheme: a constant-time match against this build's random previewModeId, for the
+        // bypass cookie AND the on-demand-revalidate header, and never honored when the build
+        // produced no preview identity.
+        const isPreviewRequest = isVerifiedPreviewRequest(req);
         // Handler-less prerenders (pages SSG emits no function) are served from
         // the manifest file for GET/HEAD only. A POST to a fully-static page 405s
         // below — that IS upstream behavior: `next start` answers non-GET/HEAD on a
@@ -1699,6 +1808,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 discardResponse: true,
                 render404: render404FromEntrypoint,
                 renderError: renderErrorFromEntrypoint,
+                handlerTimeoutMs,
                 ...(revalidate ? { revalidate } : {}),
               }),
             )
@@ -1813,6 +1923,11 @@ export function createDispatcher(options: DispatcherOptions) {
               res.end();
               return;
             }
+            // N31: REQUIRED for HEAD — Node marks a HEAD response body-less and then emits NEITHER
+            // Content-Length NOR Transfer-Encoding, so HEAD reported no size where `next start`
+            // sends the real one (measured). Third instance of the bug sendImageResponse already
+            // documents. Stamped after the manifest headers so it always describes these bytes.
+            headers["content-length"] = String(content.length);
             res.writeHead(staticAsset.status ?? 200, headers);
             res.end(req.method === "HEAD" ? undefined : content);
             return;
@@ -1912,6 +2027,25 @@ export function createDispatcher(options: DispatcherOptions) {
             proxyReq.on("timeout", () => {
               proxyReq.destroy(new Error(`external rewrite to ${target.origin} timed out`));
             });
+
+            // S19 (AVAILABILITY). `timeout` above is an IDLE timeout — an upstream that emits
+            // one byte just inside each interval holds a client socket, an upstream socket and
+            // this request's state indefinitely, and repeating it exhausts file descriptors and
+            // memory. The image fetch grew an absolute deadline for exactly this shape (N35);
+            // the proxy path did not. Bound the WHOLE exchange, connect through body.
+            const absoluteDeadline = setTimeout(() => {
+              proxyReq.destroy(
+                new Error(
+                  `external rewrite to ${target.origin} exceeded the ${PROXY_ABSOLUTE_DEADLINE_MS}ms absolute deadline`,
+                ),
+              );
+            }, PROXY_ABSOLUTE_DEADLINE_MS);
+            // Never hold the event loop open on its own account.
+            absoluteDeadline.unref?.();
+            // Cleared on the PROXY request's close, which covers both normal completion and
+            // an abort. Deliberately not also on `res` close: if the client hangs up while the
+            // upstream keeps trickling, letting the deadline fire is the point.
+            proxyReq.on("close", () => clearTimeout(absoluteDeadline));
 
             proxyReq.on("error", (err) => {
               // A client abort is our own deliberate teardown, not an upstream failure —
@@ -2319,9 +2453,12 @@ export function createDispatcher(options: DispatcherOptions) {
               // the client receives the single `[shell][resume]` response required by the PPR
               // protocol. RSC requests consume only the resumed flight stream and must not get
               // HTML prepended.
+              // N43: the BUILD-PINNED RSC header name, as every neighbouring check uses. With
+              // `req.headers.rsc` hardcoded, an app with a custom RSC header name had the HTML
+              // shell prepended to a flight stream — a corrupt payload, not a degraded one.
               const isDocumentRequest =
                 req.method === "GET" &&
-                req.headers.rsc !== "1" &&
+                req.headers[rscConfig?.header ?? "rsc"] !== "1" &&
                 req.headers["next-router-prefetch"] !== "1";
               if (isDocumentRequest) {
                 pprResponsePrefix = {
@@ -2438,6 +2575,7 @@ export function createDispatcher(options: DispatcherOptions) {
               !!dispatchStaticAsset?.prerender && handlerOutputInfo?.type === "PAGES",
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
+            handlerTimeoutMs,
             ...(revalidate ? { revalidate } : {}),
           });
           return;
@@ -2446,6 +2584,21 @@ export function createDispatcher(options: DispatcherOptions) {
     },
   };
 }
+
+/**
+ * S15: the dispatch headers `proxyToPool` sets ITSELF. Everything else in the vocabulary is
+ * removed from the forwarded request, because this hop attaches the internal secret and would
+ * otherwise promote leftovers to trusted input at the sibling pool.
+ */
+const ASSERTED_BY_THIS_HOP: Record<string, true> = {
+  "x-output-id": true,
+  "x-matched-pathname": true,
+  "x-route-matches": true,
+  "x-mw-evaluated": true,
+  "x-invoke-path": true,
+  "x-invoke-query": true,
+  [INTERNAL_SECRET_HEADER]: true,
+};
 
 function proxyToPool(
   req: IncomingMessage,
@@ -2488,6 +2641,18 @@ function proxyToPool(
       "x-mw-evaluated": "ran",
       ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
     };
+    // S15 (SECURITY). Drop any dispatch header this hop did not itself assert. `req.headers`
+    // was replaced wholesale a few lines up with the middleware's FINAL request-header set,
+    // and the request below carries INTERNAL_SECRET_HEADER — so whatever survives the spread
+    // arrives at the sibling pool as TRUSTED input. The explicit assignments above cover only
+    // six of the ten names: `x-resolved-headers` (which the receiving pool merges into the
+    // RESPONSE), `x-upstream-pool`, `x-nextjs-ppr` and `x-mw-request-headers` used to ride
+    // through unguarded. Deleted AFTER the assignments so this is an allowlist of exactly what
+    // this hop asserts, not a filter that a new header can slip past.
+    for (const h of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) {
+      if (!(h in ASSERTED_BY_THIS_HOP)) delete forwardHeaders[h];
+    }
+
     // Same forged-framing guard as the loopback invocation: the target pool would
     // otherwise await body bytes that never arrive (hang until requestTimeout).
     restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);

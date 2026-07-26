@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { sanitizeForTerminal } from "./terminal.js";
 
 export interface ExecResult {
   exitCode: number;
@@ -157,26 +158,66 @@ function armTimeout(
   return () => clearTimeout(timer);
 }
 
-// Run a command with inherited stdio (output streams to terminal)
+/**
+ * Run a command, streaming its output to the terminal.
+ *
+ * S28 (SECURITY). This used `stdio: "inherit"`, which hands the child our raw file descriptors
+ * — so helm/gcloud/kubectl output reached the operator's terminal without passing through
+ * `sanitizeForTerminal`. L14 established the rule for pod logs (a cluster-sourced string can
+ * carry CSI/OSC sequences that rewrite the terminal, forge output, or hide an earlier warning)
+ * but the biggest source of externally-influenced text — an admission-webhook message, a
+ * gcloud API error echoing a request value — bypassed it entirely. Pipe and filter instead,
+ * line by line, so the streaming behaviour is unchanged and the escapes are gone.
+ */
 export function exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
     const plan = planSpawn(command, args);
     const child = spawn(plan.command, plan.args, {
-      stdio: "inherit",
+      stdio: ["inherit", "pipe", "pipe"],
       cwd: options?.cwd,
       shell: false, // M2: never a shell we don't escape for (see buildWindowsCmdInvocation)
       windowsVerbatimArguments: plan.windowsVerbatimArguments,
     });
+    // S28: forward line-by-line through the sanitizer. Partial lines are held until their
+    // newline arrives so a control sequence cannot be split across two chunks and slip
+    // through; whatever is left at EOF is flushed.
+    const forward = (
+      src: NodeJS.ReadableStream | null,
+      dest: NodeJS.WriteStream,
+    ): (() => void) => {
+      let pending = "";
+      src?.setEncoding("utf8");
+      src?.on("data", (chunk: string) => {
+        pending += chunk;
+        const lastBreak = pending.lastIndexOf("\n");
+        if (lastBreak === -1) return;
+        dest.write(sanitizeForTerminal(pending.slice(0, lastBreak + 1)));
+        pending = pending.slice(lastBreak + 1);
+      });
+      return () => {
+        if (pending) {
+          dest.write(sanitizeForTerminal(pending));
+          pending = "";
+        }
+      };
+    };
+    const flushOut = forward(child.stdout, process.stdout);
+    const flushErr = forward(child.stderr, process.stderr);
+
     let timedOut = false;
     const disarm = armTimeout(child, options?.timeoutMs, () => {
       timedOut = true;
     });
     child.on("error", (err) => {
       disarm();
+      flushOut();
+      flushErr();
       reject(err);
     });
     child.on("close", (code) => {
       disarm();
+      flushOut();
+      flushErr();
       resolve({
         exitCode: timedOut ? TIMEOUT_EXIT_CODE : (code ?? 1),
         ...(timedOut ? { timedOut } : {}),

@@ -9,6 +9,7 @@ import {
   HEALTH_CHECK_PROBE_CIDRS,
   STRICT_INGRESS_CIDRS,
 } from "../../../src/emit/templates/network-policy.js";
+import { sanitizeK8sName } from "../../../src/emit/templates/utils.js";
 
 type Values = { podCidrs?: string[]; strict?: boolean; nodeCidrs?: string[] };
 
@@ -162,7 +163,7 @@ describe("renderNetworkPolicies — default (broad) posture", () => {
     expect(routingDoc).toContain("name: my-app-routing-service");
     // Selects the routing-service pods by their deployment labels.
     expect(routingDoc).toMatch(
-      /podSelector:\n    matchLabels:\n      app\.kubernetes\.io\/name: my-app\n      app\.kubernetes\.io\/component: routing-service/,
+      /podSelector:\n    matchLabels:\n      app\.kubernetes\.io\/name: "my-app"\n      app\.kubernetes\.io\/component: routing-service/,
     );
     // Ingress from anywhere EXCEPT the pod CIDRs (LB + Google health checks arrive with
     // non-pod source IPs; in-cluster pods are blocked).
@@ -188,7 +189,7 @@ describe("renderNetworkPolicies — default (broad) posture", () => {
 
     const poolDoc = docs.find((d) => d.includes("name: my-app-ssr"))!;
     expect(poolDoc).toBeDefined();
-    expect(poolDoc).toContain("app.kubernetes.io/component: ssr");
+    expect(poolDoc).toContain('app.kubernetes.io/component: "ssr"');
     // Rule (a): LB traffic — same ipBlock-except-CIDRs as the routing tier.
     expect(poolDoc).toContain("- ipBlock:");
     expect(poolDoc).toContain("cidr: 0.0.0.0/0");
@@ -196,10 +197,10 @@ describe("renderNetworkPolicies — default (broad) posture", () => {
     // Rule (b): cross-pool proxy traffic comes from SIBLING POOL pods (proxyToPool) —
     // one podSelector per pool component of this release. Both `from` entries form a union.
     expect(poolDoc).toMatch(
-      /- podSelector:\n            matchLabels:\n              app\.kubernetes\.io\/name: my-app\n              app\.kubernetes\.io\/component: ssr/,
+      /- podSelector:\n            matchLabels:\n              app\.kubernetes\.io\/name: "my-app"\n              app\.kubernetes\.io\/component: "ssr"/,
     );
     expect(poolDoc).toMatch(
-      /- podSelector:\n            matchLabels:\n              app\.kubernetes\.io\/name: my-app\n              app\.kubernetes\.io\/component: api/,
+      /- podSelector:\n            matchLabels:\n              app\.kubernetes\.io\/name: "my-app"\n              app\.kubernetes\.io\/component: "api"/,
     );
     // The routing service never originates pool traffic: its component must NOT be
     // allowed into pools (a compromised ext_proc pod can't reach the dataplane directly).
@@ -285,8 +286,8 @@ describe("renderNetworkPolicies — strict (opt-in) posture", () => {
     expect(poolDoc).toContain("port: 3000");
     expect(poolDoc).not.toContain("port: 8443");
     // Cross-pool proxying survives the tightening…
-    expect(poolDoc).toContain("app.kubernetes.io/component: ssr");
-    expect(poolDoc).toContain("app.kubernetes.io/component: api");
+    expect(poolDoc).toContain('app.kubernetes.io/component: "ssr"');
+    expect(poolDoc).toContain('app.kubernetes.io/component: "api"');
     // …and the routing tier is still not allowed to originate pool traffic.
     const podSelectorBlocks =
       poolDoc.match(/- podSelector:[\s\S]*?(?=\n        - |\n      ports:)/g) ?? [];
@@ -398,5 +399,44 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
     const { ok, out } = render(["global.networkPolicy.strict=true"]);
     expect(ok).toBe(false);
     expect(out).toMatch(/strict requires global\.networkPolicy\.nodeCidrs/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N61 — quoted pool names, sanitized resource name.
+// ---------------------------------------------------------------------------
+describe("N61: pool names in NetworkPolicy labels, selectors, and the resource name", () => {
+  it("quotes every interpolated pool name so a YAML-boolean name survives the apiserver decode", () => {
+    const template = renderNetworkPolicies({ releaseName: "my-app", poolNames: ["on", "no"] });
+    // Every `component:` line carrying a pool name is quoted; the routing tier's literal
+    // `routing-service` is not a pool name and stays bare (it can never be a YAML scalar
+    // ambiguity).
+    const bare = template.match(/component: (on|off|no|yes|y|n|true|false|[0-9]+)\s*$/gm) ?? [];
+    expect(bare).toHaveLength(0);
+    expect(template).toContain('app.kubernetes.io/component: "on"');
+    expect(template).toContain('app.kubernetes.io/component: "no"');
+  });
+
+  it("routes the policy name through sanitizeK8sName, like every other name in the chart", () => {
+    // This was the ONE resource name built by bare concatenation. A 40-char release plus a
+    // 40-char pool composes past the 63-char cap, which the API server rejects outright.
+    const releaseName = "r".repeat(40);
+    const poolName = "p".repeat(40);
+    const template = renderNetworkPolicies({ releaseName, poolNames: [poolName] });
+    const names = [...template.matchAll(/^  name: (\S+)$/gm)].map((m) => m[1]!);
+    for (const name of names) {
+      expect(name.length).toBeLessThanOrEqual(63);
+      expect(name).toMatch(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/);
+    }
+    expect(names).toContain(sanitizeK8sName(`${releaseName}-${poolName}`));
+  });
+
+  it("rejects an unsafe pool name at the consumption point", () => {
+    expect(() => renderNetworkPolicies({ releaseName: "my-app", poolNames: ["-bad"] })).toThrow(
+      /Invalid pool name/,
+    );
+    expect(() =>
+      renderNetworkPolicies({ releaseName: "my-app", poolNames: ['x"\n  y: z'] }),
+    ).toThrow(/Invalid pool name/);
   });
 });

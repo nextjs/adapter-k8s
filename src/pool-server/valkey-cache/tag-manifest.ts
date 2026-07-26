@@ -25,15 +25,86 @@ import { warnOnce } from "./stream-codec.js";
 export const TAG_MANIFEST_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 /**
- * How far a client-clock watermark may run ahead of the Valkey SERVER clock before the script
- * clamps it (L16). Watermarks are client-computed (`stale`/`expired`), but entries they are
- * compared against were written by OTHER replicas' clocks: a fast-clock replica's far-future
- * watermark would instantly invalidate entries its peers wrote after the revalidation (or, for
- * a hard expire, sit in the future and fail to invalidate until the clock caught up). 60s
- * absorbs normal NTP jitter; anything beyond it is a broken pod clock, and clamping bounds the
- * blast radius to a 60s over/under-invalidation window.
+ * How far a replica's clock may differ from the Valkey SERVER clock before the skew is reported
+ * (L16/N78). The script REBASES every watermark onto the server clock regardless of the size of the
+ * difference (see `UPDATE_TAGS_SCRIPT`); this constant only decides when the divergence is large
+ * enough to be a broken pod clock worth logging. 60s absorbs normal NTP jitter.
  */
 export const MAX_CLOCK_SKEW_MS = 60_000;
+
+/**
+ * Upstream per-tag length limits (`packages/next/src/lib/constants.ts`), N79. These are two
+ * DIFFERENT limits and conflating them is what made entries un-invalidatable:
+ *   - `NEXT_CACHE_TAG_MAX_LENGTH = 256` — enforced by `cacheTag()` / `validateTags` on tags the
+ *     app declares explicitly. A longer explicit tag is already dropped by Next itself.
+ *   - `NEXT_CACHE_SOFT_TAG_MAX_LENGTH = 1024` — the bound `revalidatePath` applies, i.e. the
+ *     limit that governs the IMPLICIT tags Next generates for every route.
+ */
+export const MAX_EXPLICIT_TAG_LENGTH = 256;
+export const MAX_SOFT_TAG_LENGTH = 1024;
+/** `NEXT_CACHE_IMPLICIT_TAG_ID` — the prefix on Next's derived per-path tags. */
+const IMPLICIT_TAG_PREFIX = "_N_T_";
+/** `NEXT_CACHE_ROOT_PARAM_TAG_ID` — private markers on a `use cache` coarse/redirect entry. */
+const ROOT_PARAM_TAG_PREFIX = "_N_RP_";
+
+/**
+ * Whether a tag is one of Next's private root-param markers. These are not user tags at all: the
+ * `use cache` wrapper reads them back off the COARSE entry to learn which root params belong in
+ * the specific cache key (`use-cache-wrapper.ts`, "Check if this is a redirect entry"). Losing
+ * them makes the reader see `paramNames.size === 0` and serve the redirect entry's placeholder
+ * body — a single `0x00` byte — as the cache hit.
+ */
+export function isRootParamTag(tag: string): boolean {
+  return tag.startsWith(ROOT_PARAM_TAG_PREFIX);
+}
+
+/** The applicable upstream length limit for one tag (N79). */
+export function maxTagLength(tag: string): number {
+  return tag.startsWith(IMPLICIT_TAG_PREFIX) || isRootParamTag(tag)
+    ? MAX_SOFT_TAG_LENGTH
+    : MAX_EXPLICIT_TAG_LENGTH;
+}
+
+/**
+ * Upper bound on how many tags one `updateTags`/`revalidateTag` call may push into the EVAL argv
+ * (N83). Next's own `revalidateTag` takes one tag at a time; the array form comes from the classic
+ * handler's `revalidateTag(tags[])`, which Next calls with the route's tag list.
+ */
+const MAX_MANIFEST_TAGS_PER_CALL = 256;
+
+/**
+ * N83: the one filter both handlers use before a tag reaches the manifest keyspace. Previously the
+ * classic handler `.filter(Boolean)`-ed its input while the V2 handler only rejected an empty
+ * ARRAY — so a `""` tag from the V2 path became a real hash field, and neither path bounded the
+ * per-tag length or the argv size. Same charset/length rules as `capTags`, so a tag that can be
+ * STORED with an entry is exactly a tag that can be REVALIDATED.
+ */
+export function filterManifestTags(tags: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const tag of tags) {
+    if (typeof tag !== "string" || tag.length === 0) continue;
+    if (tag.length > maxTagLength(tag)) continue;
+    out.push(tag);
+  }
+  return out;
+}
+
+/**
+ * Split validated tags into EVAL-sized batches.
+ *
+ * This used to be a truncation inside filterManifestTags: past MAX_MANIFEST_TAGS_PER_CALL the
+ * remaining tags were silently DROPPED, so a `revalidateTag`/`updateTags` call with more than
+ * 256 tags never invalidated the tail — those entries stayed fresh until their durable TTL
+ * expired, with nothing logged. The bound exists to keep one EVAL's argv reasonable, and that
+ * is a reason to send several commands, not to discard work the caller asked for.
+ */
+export function chunkManifestTags(tags: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  for (let i = 0; i < tags.length; i += MAX_MANIFEST_TAGS_PER_CALL) {
+    chunks.push(tags.slice(i, i + MAX_MANIFEST_TAGS_PER_CALL));
+  }
+  return chunks;
+}
 
 /**
  * Atomic last-event-wins merge for the shared tag manifest, used by both the V2 and the classic
@@ -48,10 +119,34 @@ export const MAX_CLOCK_SKEW_MS = 60_000;
  * clocks skew, and a backward-stepping replica would otherwise stamp an older `at` on a newer
  * event and have its invalidation silently dropped by the merge. The script rewrites the
  * incoming state's `at` to the server time before comparing/storing, so "last event" means
- * "last to reach the server" — a single monotonic clock for ordering. The `stale`/`expired`
- * watermarks stay client-computed: they are compared against entry timestamps, which are
- * themselves client clocks. The client still sends its own `at` (see `computeTagUpdate`) as a
- * fallback for any path where the script can't run its rewrite.
+ * "last to reach the server" — a single monotonic clock for ordering.
+ *
+ * N78: the `stale`/`expired` WATERMARKS are rebased onto the same server clock, by shifting them
+ * by `serverNow - clientAt`. They used to stay client-computed with only a one-sided ceiling
+ * (clamped when more than MAX_CLOCK_SKEW_MS in the FUTURE), which lost hard `revalidateTag`s
+ * outright on an unsynced fleet. Probed against real Valkey, before the fix:
+ *   • a pod 5 minutes BEHIND: stored `{"expired": now-300000}` — there was no floor, so the
+ *     watermark sat 5 minutes in the past and invalidated NOTHING written recently
+ *     (`expired > entryTimestamp` false for every current entry).
+ *   • a pod 5 minutes AHEAD: the hard expire was clamped to `now + 60000` and carries no `stale`,
+ *     so `expired <= now` was false for a full minute — the entry read back `revalidate: 60`,
+ *     i.e. FRESH, not even stale-while-revalidate.
+ * Shifting by the delta fixes both directions at once and is exactly "stamp from Valkey's own
+ * TIME" for the two shapes that matter: a hard event carries `expired == at`, so it lands on the
+ * server's now; a profiled event carries `stale == at` and `expired == at + expire*1000`, so its
+ * base lands on the server's now and the intended duration is preserved bit-for-bit.
+ *
+ * RESIDUAL, deliberately not "fixed" here: watermarks are now server-clocked, but entry
+ * `timestamp`/`lastModified` values are still stamped by the WRITING replica's clock, so an entry
+ * written by a pod whose clock runs ahead can still read as newer than a watermark and survive a
+ * hard `revalidateTag`. The obvious patch — comparing with a tolerance
+ * (`expiredAt > entryTimestamp - MAX_CLOCK_SKEW_MS`) — is worse than the bug: after ANY hard
+ * revalidation, the entry that Next regenerates lands inside the tolerance window too, so it is
+ * immediately invalidated again, and the route re-renders on every request for a full
+ * MAX_CLOCK_SKEW_MS. Distinguishing "written 30s after the event" from "written by a 30s-fast
+ * clock" is not possible without a clock the two share; closing it properly means stamping entry
+ * timestamps from Valkey's `TIME` too (a per-process learned offset), which is a design change,
+ * not a bug fix. The skew warning below is what makes the precondition visible meanwhile.
  *
  * The winning event is merged into the stored state PER DIMENSION (M12), not written over it:
  * an event only replaces the watermarks it SETS, preserving stored ones it didn't — exactly
@@ -81,21 +176,22 @@ while i <= pairCount do
   local write = true
   local okNew, nw = pcall(cjson.decode, incoming)
   if okNew and type(nw) == 'table' then
-    nw.at = now
-    -- L16: clamp fast-clock watermarks to the server clock + bound. A profiled event's
-    -- expired watermark legitimately sits far in the future (now + expire*1000), so shift it
-    -- by the same amount as its stale base — the intended duration is preserved while the
-    -- base is pinned to server time. A hard expire has no stale; its expired watermark IS the
-    -- event time, so any value past the bound is pure skew.
-    if type(nw.stale) == 'number' and nw.stale > now + ${MAX_CLOCK_SKEW_MS} then
-      local shift = nw.stale - now - ${MAX_CLOCK_SKEW_MS}
-      nw.stale = nw.stale - shift
-      if type(nw.expired) == 'number' then nw.expired = nw.expired - shift end
-      clamped = clamped + 1
-    elseif nw.stale == nil and type(nw.expired) == 'number' and nw.expired > now + ${MAX_CLOCK_SKEW_MS} then
-      nw.expired = now + ${MAX_CLOCK_SKEW_MS}
+    -- N78: rebase EVERY client-computed watermark onto the Valkey server clock by shifting it by
+    -- the client's offset from that clock. 'at' is the event's client timestamp, and both
+    -- computeTagUpdate shapes are anchored to it (hard: expired == at; profiled: stale == at and
+    -- expired == at + expire*1000), so a single shift pins the base to server time in BOTH
+    -- directions (a behind clock is dragged forward, an ahead clock back) while preserving a
+    -- profile's intended duration exactly. Report the shift as a clamp when it exceeds the skew
+    -- bound so a broken pod clock stays observable.
+    local clientAt = tonumber(nw.at)
+    local shift = 0
+    if clientAt then shift = now - clientAt end
+    if shift > ${MAX_CLOCK_SKEW_MS} or shift < -${MAX_CLOCK_SKEW_MS} then
       clamped = clamped + 1
     end
+    if type(nw.stale) == 'number' then nw.stale = nw.stale + shift end
+    if type(nw.expired) == 'number' then nw.expired = nw.expired + shift end
+    nw.at = now
     if existing then
       local okCur, cur = pcall(cjson.decode, existing)
       if okCur and type(cur) == 'table' then
@@ -121,17 +217,19 @@ return clamped
 `;
 
 /**
- * Surface the L16 clamp count returned by `UPDATE_TAGS_SCRIPT`: when it is > 0, some replica's
- * clock ran more than `MAX_CLOCK_SKEW_MS` ahead of the Valkey server and its watermarks were
- * clamped server-side. The clamp keeps the damage bounded; the warning makes the broken clock
- * observable. Once per process — a skewed replica would otherwise log on every revalidation.
+ * Surface the skew count returned by `UPDATE_TAGS_SCRIPT`: when it is > 0, some replica's clock
+ * differed from the Valkey server's by more than `MAX_CLOCK_SKEW_MS` (in EITHER direction — N78
+ * rebases behind clocks as well as ahead ones) and its watermarks were rebased server-side. The
+ * rebasing keeps the invalidation correct; the warning makes the broken clock observable, which
+ * matters because entry timestamps are NOT rebased (see the script's RESIDUAL note). Once per
+ * process — a skewed replica would otherwise log on every revalidation.
  */
 export function warnOnClockSkewClamp(clamped: unknown): void {
   if (typeof clamped === "number" && clamped > 0) {
     warnOnce(
       "clock-skew-clamp",
-      `[valkey-cache] a replica clock is more than ${MAX_CLOCK_SKEW_MS}ms ahead of the Valkey server clock; ` +
-        "tag-invalidation watermarks were clamped server-side — check pod clock sync (ntp/chrony)",
+      `[valkey-cache] a replica clock differs from the Valkey server clock by more than ${MAX_CLOCK_SKEW_MS}ms; ` +
+        "tag-invalidation watermarks were rebased server-side — check pod clock sync (ntp/chrony)",
     );
   }
 }

@@ -13,8 +13,17 @@ export interface ValkeyConfig {
 
 /**
  * Create the shared Valkey connection. Valkey is wire-compatible with Redis, so our RESP2 client
- * speaks to it directly (GKE → Memorystore-for-Valkey now; a bundled Valkey `StatefulSet` later —
- * the handler only ever sees this connection).
+ * speaks to it directly (a bundled Valkey `StatefulSet` would work the same way — the handler only
+ * ever sees this connection).
+ *
+ * N77 — the endpoint must be a SINGLE endpoint, not a Redis Cluster. This client implements no
+ * `MOVED`/`ASK` redirection, so against a multi-shard deployment every command for a non-local slot
+ * comes back as an error. What the CLI actually provisions is **Memorystore for Redis**, which
+ * exposes one endpoint (including in its HA tier) — that is why this works. This comment used to
+ * name *Memorystore for Valkey*, which is cluster-only and therefore the one Google product this
+ * code cannot talk to; the mismatch mattered because a `-MOVED` reply used to surface as a plain
+ * `RespError` straight into the handlers' catch blocks, i.e. a permanently dead cache with no
+ * signal. `resp-client.ts` now logs a `MOVED`/`ASK` reply loudly (once) instead.
  *
  * The client connects lazily on first command, so importing the handler never blocks pool
  * bootstrap, and a brief Valkey blip surfaces as a rejected command (which the handler catches and

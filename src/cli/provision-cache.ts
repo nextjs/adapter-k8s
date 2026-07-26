@@ -188,16 +188,42 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     network = "default",
     sizeGb = 1,
     tier,
-    auth = false,
+    auth,
     dryRun,
     log = console.log,
   } = opts;
   const name = cacheInstanceName(releaseName);
 
+  // S8 (SECURITY). AUTH + in-transit encryption now default ON. Memorystore's own defaults are
+  // authEnabled=false / transitEncryption=disabled, so the previous `auth = false` handed every
+  // deployment a plaintext, unauthenticated cache reachable by any workload with VPC
+  // reachability — and the emitted NetworkPolicies are Ingress-only, so nothing constrained
+  // that path. From there a compromised sibling workload can enumerate `k8s:<buildId>:` keys,
+  // overwrite cached HTML/RSC (content injection into the production site) or drop tags
+  // wholesale. Only a `// Recommended` comment in types.ts documented the risk.
+  //
+  // Three states, because AUTH is CREATION-ONLY and an existing instance cannot be retrofitted:
+  //  - explicit `true`  → require it; refuse to reuse an instance that lacks it (unchanged).
+  //  - unset (default)  → create WITH it, but tolerate a pre-existing instance that lacks it
+  //                       (loudly). Otherwise the new default would hard-fail every existing
+  //                       deployment on upgrade and demand a cache wipe, which is not a
+  //                       migration this change is entitled to force.
+  //  - explicit `false` → opt out, and say so on every deploy.
+  const authExplicit = auth === true;
+  const authOptedOut = auth === false;
+  const wantAuthOnCreate = !authOptedOut;
+  if (authOptedOut) {
+    log(
+      `    ! cache.memorystore.auth is explicitly false — the instance will accept UNAUTHENTICATED, ` +
+        `unencrypted connections from anything that can reach it on the VPC. Any workload there ` +
+        `can read every cached page and overwrite cache entries.`,
+    );
+  }
+
   if (dryRun) {
     log(
       `    [dry-run] provision Memorystore ${name} (${sizeGb}GB, ${region}, network ${network}` +
-        `${auth ? ", AUTH + in-transit encryption" : ""})`,
+        `${wantAuthOnCreate ? ", AUTH + in-transit encryption" : ""})`,
     );
     return { host: "0.0.0.0", port: 6379 };
   }
@@ -213,8 +239,8 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
   ]);
 
   // Attach the AUTH string + CA to a ready endpoint when AUTH mode is on.
-  const withAuth = async (endpoint: CacheEndpoint): Promise<CacheEndpoint> => {
-    if (!auth) return endpoint;
+  const withAuth = async (endpoint: CacheEndpoint, hasAuth = wantAuthOnCreate): Promise<CacheEndpoint> => {
+    if (!hasAuth) return endpoint;
     const [authString, caCert] = await Promise.all([
       fetchAuthString(name, region, projectId),
       fetchServerCaCert(name, region, projectId),
@@ -227,7 +253,7 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     // AUTH + in-transit encryption are creation-only: refuse to silently reuse an instance
     // that doesn't enforce them (the pods would get a rediss:// endpoint they can't use, or
     // worse, plaintext creds would be expected on a path the operator believes is secured).
-    if (auth) {
+    if (wantAuthOnCreate) {
       const details = await describeInstanceAuth(name, region, projectId);
       // "Couldn't tell" is NOT "proceed": a null here means the describe failed (or
       // returned nothing parseable), and reusing the instance blind could hand the pods a
@@ -236,12 +262,12 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
         throw new Error(
           `Could not verify the AUTH / in-transit-encryption posture of the existing ` +
             `Memorystore instance ${name} (gcloud describe failed or returned nothing). ` +
-            `cache.memorystore.auth is enabled and AUTH is creation-only, so refusing to ` +
-            `guess. Check \`gcloud redis instances describe ${name} --region ${region} ` +
-            `--project ${projectId}\` and re-run the deploy.`,
+            `AUTH is creation-only, so refusing to guess. Check \`gcloud redis instances ` +
+            `describe ${name} --region ${region} --project ${projectId}\` and re-run the deploy.`,
         );
       }
-      if (!(details.authEnabled && details.transitEncryption)) {
+      const secured = details.authEnabled && details.transitEncryption;
+      if (!secured && authExplicit) {
         throw new Error(
           `Memorystore instance ${name} already exists WITHOUT AUTH / in-transit encryption, ` +
             `but cache.memorystore.auth is enabled. AUTH can only be set at creation: either ` +
@@ -249,6 +275,24 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
             `cache.memorystore.auth: false.`,
         );
       }
+      if (!secured) {
+        // S8: pre-existing instance from before AUTH became the default. Continue rather than
+        // demand a cache wipe, but never quietly — this is a live exposure, and the operator
+        // is the only one who can schedule the recreate that fixes it.
+        log(
+          `    ! Memorystore ${name} predates the AUTH default and has AUTH / in-transit ` +
+            `encryption DISABLED (creation-only, so it cannot be enabled in place). Any ` +
+            `workload that can reach it on the VPC can read and overwrite the shared cache. ` +
+            `To fix: \`adapter-k8s destroy\` the instance and redeploy, which recreates it ` +
+            `with AUTH. To silence this, set cache.memorystore.auth: false.`,
+        );
+      }
+      if (existing.state === "READY" && existing.host) {
+        log(`    Reusing Memorystore ${name} at ${existing.host}:${existing.port}`);
+        return withAuth({ host: existing.host, port: existing.port }, secured);
+      }
+      log(`    Memorystore ${name} exists (state=${existing.state}); waiting for READY…`);
+      return withAuth(await waitForReady(name, region, projectId, log), secured);
     }
     if (existing.state === "READY" && existing.host) {
       log(`    Reusing Memorystore ${name} at ${existing.host}:${existing.port}`);
@@ -261,7 +305,7 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
   const gcpTier = (tier ?? "").toUpperCase() === "STANDARD_HA" ? "standard_ha" : "basic";
   log(
     `    Creating Memorystore ${name} (${sizeGb}GB, tier ${gcpTier}` +
-      `${auth ? ", AUTH + in-transit encryption" : ""}) — this takes a few minutes…`,
+      `${wantAuthOnCreate ? ", AUTH + in-transit encryption" : ""}) — this takes a few minutes…`,
   );
   const create = await execCapture(
     "gcloud",
@@ -280,7 +324,9 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
       gcpTier,
       "--connect-mode",
       "DIRECT_PEERING",
-      ...(auth ? ["--auth-enabled", "--transit-encryption-mode", "SERVER_AUTHENTICATION"] : []),
+      ...(wantAuthOnCreate
+        ? ["--auth-enabled", "--transit-encryption-mode", "SERVER_AUTHENTICATION"]
+        : []),
       "--project",
       projectId,
       "--quiet",

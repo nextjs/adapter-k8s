@@ -1,11 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   areTagsExpired,
+  chunkManifestTags,
   areTagsStale,
   computeTagUpdate,
   evaluateEntry,
+  filterManifestTags,
+  isRootParamTag,
   MAX_CLOCK_SKEW_MS,
+  MAX_EXPLICIT_TAG_LENGTH,
+  MAX_SOFT_TAG_LENGTH,
   maxExpiration,
+  maxTagLength,
   parseTagState,
   TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
@@ -133,21 +139,37 @@ describe("UPDATE_TAGS_SCRIPT (M12: per-dimension merge, not whole-field replace)
   });
 });
 
-describe("UPDATE_TAGS_SCRIPT (L16: fast-clock watermarks are clamped to the server clock)", () => {
-  it("clamps stale/hard-expired watermarks past the skew bound and reports the count", () => {
-    const bound = String(MAX_CLOCK_SKEW_MS);
+describe("UPDATE_TAGS_SCRIPT (N78: watermarks are rebased onto the Valkey server clock)", () => {
+  // The script itself runs against real Valkey in the Docker-gated integration suite (both skew
+  // directions, plus the handler path). These source assertions are the hermetic guard: they pin
+  // the SHAPE of the rebase so the fix cannot be quietly reverted on a machine without Docker.
+  it("shifts every client watermark by the client's offset from the server clock", () => {
     expect(MAX_CLOCK_SKEW_MS).toBe(60_000);
-    expect(UPDATE_TAGS_SCRIPT).toContain(`nw.stale > now + ${bound}`);
-    // A hard expire (no stale) has its expired watermark clamped directly.
-    expect(UPDATE_TAGS_SCRIPT).toContain(`nw.expired = now + ${bound}`);
-    // A profiled event's expired watermark is SHIFTED with its stale base (duration preserved).
-    expect(UPDATE_TAGS_SCRIPT).toContain("nw.expired = nw.expired - shift");
-    // The script returns the clamp count so callers can warn.
+    const bound = String(MAX_CLOCK_SKEW_MS);
+    // The shift is derived from the event's own client timestamp...
+    expect(UPDATE_TAGS_SCRIPT).toContain("local clientAt = tonumber(nw.at)");
+    expect(UPDATE_TAGS_SCRIPT).toContain("if clientAt then shift = now - clientAt end");
+    // ...and applied to BOTH watermarks, so a hard expire lands on the server's `now` and a
+    // profiled event keeps its duration.
+    expect(UPDATE_TAGS_SCRIPT).toContain(
+      "if type(nw.stale) == 'number' then nw.stale = nw.stale + shift end",
+    );
+    expect(UPDATE_TAGS_SCRIPT).toContain(
+      "if type(nw.expired) == 'number' then nw.expired = nw.expired + shift end",
+    );
+    // The old one-sided ceiling is gone: it had no floor, so a behind clock's watermark stayed in
+    // the past and invalidated nothing, and a hard expire from an ahead clock was parked 60s in
+    // the FUTURE with no `stale`, so entries read back fresh for a minute.
+    expect(UPDATE_TAGS_SCRIPT).not.toContain(`nw.expired = now + ${bound}`);
+    expect(UPDATE_TAGS_SCRIPT).not.toContain("nw.stale = nw.stale - shift");
+    // Both directions are reported as skew (the old test only had the ahead direction).
+    expect(UPDATE_TAGS_SCRIPT).toContain(`shift > ${bound} or shift < -${bound}`);
+    // The script returns the skew count so callers can warn.
     expect(UPDATE_TAGS_SCRIPT).toContain("return clamped");
   });
 });
 
-describe("warnOnClockSkewClamp (L16)", () => {
+describe("warnOnClockSkewClamp (L16/N78)", () => {
   it("warns once when the script reports clamping, silently otherwise", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     warnOnClockSkewClamp(0);
@@ -157,6 +179,9 @@ describe("warnOnClockSkewClamp (L16)", () => {
     warnOnClockSkewClamp(2);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(String(warn.mock.calls[0]?.[0])).toMatch(/clock/);
+    // N78 rebases behind clocks too, so the message must not claim "ahead".
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/differs from the Valkey server clock/);
+    expect(String(warn.mock.calls[0]?.[0])).not.toMatch(/ahead of/);
     warnOnClockSkewClamp(1); // once per process
     expect(warn).toHaveBeenCalledTimes(1);
   });
@@ -195,6 +220,55 @@ describe("parseTagState (L5: corrupt manifest fields degrade safely)", () => {
     expect(parseTagState(JSON.stringify({ stale: "x", expired: null, at: 7 }))).toEqual({
       at: 7,
     });
+  });
+});
+
+describe("N79: per-tag length limits mirror upstream's TWO constants", () => {
+  it("uses NEXT_CACHE_SOFT_TAG_MAX_LENGTH for the tags Next generates itself", () => {
+    // packages/next/src/lib/constants.ts: NEXT_CACHE_TAG_MAX_LENGTH = 256 (explicit `cacheTag()`),
+    // NEXT_CACHE_SOFT_TAG_MAX_LENGTH = 1024 (what `revalidatePath` bounds, i.e. implicit tags).
+    expect(MAX_EXPLICIT_TAG_LENGTH).toBe(256);
+    expect(MAX_SOFT_TAG_LENGTH).toBe(1024);
+    expect(maxTagLength("_N_T_/blog/post")).toBe(MAX_SOFT_TAG_LENGTH);
+    expect(maxTagLength("_N_RP_lang")).toBe(MAX_SOFT_TAG_LENGTH);
+    expect(maxTagLength("products")).toBe(MAX_EXPLICIT_TAG_LENGTH);
+  });
+
+  it("identifies Next's private root-param markers", () => {
+    expect(isRootParamTag("_N_RP_lang")).toBe(true);
+    expect(isRootParamTag("_N_T_/lang")).toBe(false);
+    expect(isRootParamTag("lang")).toBe(false);
+  });
+});
+
+describe("N83: filterManifestTags is the single filter both handlers use", () => {
+  it("drops empty and non-string tags (an empty tag must never become a manifest field)", () => {
+    expect(filterManifestTags(["a", "", "b"])).toEqual(["a", "b"]);
+    expect(filterManifestTags([undefined, null, 1, {}] as unknown as string[])).toEqual([]);
+  });
+
+  it("applies each tag's own upstream length limit, like capTags does", () => {
+    const longExplicit = "x".repeat(MAX_EXPLICIT_TAG_LENGTH + 1);
+    const longImplicit = `_N_T_/${"y".repeat(MAX_EXPLICIT_TAG_LENGTH + 1)}`;
+    const tooLongImplicit = `_N_T_/${"z".repeat(MAX_SOFT_TAG_LENGTH)}`;
+    expect(filterManifestTags([longExplicit, longImplicit, tooLongImplicit, "ok"])).toEqual([
+      longImplicit, // 262 chars, but implicit → allowed up to 1024
+      "ok",
+    ]);
+  });
+
+  it("bounds the EVAL argv by CHUNKING, never by dropping tags", () => {
+    // This used to truncate at 256 and silently discard the rest, so a revalidateTag over a
+    // large tag list left the tail fresh until its durable TTL expired — with nothing logged.
+    // The argv bound is a reason to send several commands, not to drop work.
+    const tags = Array.from({ length: 1000 }, (_, i) => `t-${i}`);
+    const filtered = filterManifestTags(tags);
+    expect(filtered).toHaveLength(1000);
+    const chunks = chunkManifestTags(filtered);
+    expect(chunks.length).toBe(4);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(256);
+    // Every tag survives, exactly once, in order.
+    expect(chunks.flat()).toEqual(tags);
   });
 });
 

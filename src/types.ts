@@ -71,12 +71,21 @@ export interface K8sAdapterConfig {
       sizeGb?: number;
       tier?: "BASIC" | "STANDARD_HA";
       /**
-       * Enable Redis AUTH + in-transit encryption (SERVER_AUTHENTICATION) on the managed
-       * instance. The pods then connect over `rediss://` with the instance AUTH string and
-       * server CA injected as `VALKEY_AUTH` / `VALKEY_CA_CERT`. Recommended — without it any
-       * workload that can reach the VPC endpoint can read/write the shared cache. NOTE: AUTH
-       * can only be set at instance creation; an existing non-AUTH instance must be recreated
-       * (`destroy` removes it) before enabling.
+       * Redis AUTH + in-transit encryption (SERVER_AUTHENTICATION) on the managed instance.
+       * The pods connect over `rediss://` with the instance AUTH string and server CA injected
+       * as `VALKEY_AUTH` / `VALKEY_CA_CERT`.
+       *
+       * S8: DEFAULTS TO ON (leave unset). Memorystore's own defaults are authEnabled=false and
+       * transitEncryption=disabled, and the chart's NetworkPolicies govern Ingress only — so a
+       * plaintext instance is readable and WRITABLE by any workload with VPC reachability,
+       * which means reading every cached page and injecting content into the production site by
+       * overwriting cached HTML/RSC.
+       *
+       * AUTH is CREATION-ONLY, so the three states differ:
+       *  - unset (recommended): create new instances with AUTH; a pre-existing instance without
+       *    it is reused with a loud per-deploy warning rather than a forced cache wipe.
+       *  - `true`: require it — refuse to reuse an instance that lacks it.
+       *  - `false`: explicit opt-out, warned about on every deploy.
        */
       auth?: boolean;
     };

@@ -17,14 +17,100 @@ export const NEXTJS_VARY_HEADERS = [
   "Next-Url",
 ] as const;
 
-// The routing extension's dispatch verdict must partition the cache as well: the pool
-// dispatches directly on these request headers, so a middleware rewrite / A/B pool choice
-// can produce a different cacheable body for the same public URL. The extension mutates
-// them before the CDN cache lookup, so they are visible to the cache key.
-// x-matched-pathname always duplicates x-output-id; the shared secret must never be keyed.
+// S10 (SECURITY/CORRECTNESS). The dispatch headers are NOT in the cache key, and must not be.
+//
+// This block used to add them, justified by "the extension mutates them before the CDN cache
+// lookup, so they are visible to the cache key". That is false on this load balancer, and this
+// repo had already proven it: docs/superpowers/plans/gcp-edge-compute-cdn-findings.md (Status:
+// Definitive, triangulated against the live GCP API and the verbatim processing-order text)
+// records that the cache lookup happens AFTER edge extensions while traffic extensions run
+// LAST — measured on the metal as "cached key + gate → 200 | ext_proc is post-cache → cache
+// hits bypass it". pool-server/index.ts states the same ordering correctly.
+//
+// Two consequences followed, and both are fixed by removing them:
+//   • SECURITY. At lookup time these headers hold whatever the CLIENT sent — handler.ts's
+//     scrub happens afterwards and cannot help. So any client could mint unbounded distinct
+//     CDN entries for any cacheable URL by varying x-output-id, evicting hot entries and
+//     forcing an origin fetch per request (cache-busting / origin amplification).
+//   • CORRECTNESS. Partitioning the cache by the extension's verdict is unachievable by
+//     construction on a post-cache extension, so the entries bought nothing. Responses whose
+//     body genuinely depends on a middleware verdict are forced no-cache anyway
+//     (cache-policy.ts) — that is why middleware routes reach the extension at all.
+//
+// If a verdict ever does need to partition the cache, it has to ride in something the
+// PRE-cache request already distinguishes — the path or query — not a header the extension
+// stamps afterwards.
+//
+// The classification below is kept (and still enforced) because it is what makes that
+// reasoning explicit for the next header someone adds: every dispatch header must be declared
+// NEVER_KEYED, and `assertCacheKeyClassification` fails the render on an unclassified one.
+export const NEVER_KEYED_DISPATCH_HEADERS: readonly string[] = [
+  // Duplicates x-output-id — keying it only splits identical entries.
+  "x-matched-pathname",
+  // REQUEST-SCOPED: the middleware's whole final request-header set, cookie included.
+  "x-mw-request-headers",
+  // S10: every remaining dispatch header. The extension that sets them runs AFTER the cache
+  // lookup, so at lookup time their values are the client's — keying on them hands an
+  // anonymous client control of the cache key while partitioning nothing.
+  "x-output-id",
+  "x-route-matches",
+  "x-upstream-pool",
+  "x-nextjs-ppr",
+  "x-resolved-headers",
+  "x-mw-evaluated",
+  "x-invoke-path",
+  "x-invoke-query",
+];
+
+/**
+ * S10: deliberately EMPTY. A dispatch header could only belong in the cache key if its value
+ * were established before the cache lookup — and on this load balancer the extension that
+ * establishes them runs after it. Kept as the explicit other half of the classification so
+ * `assertCacheKeyClassification` still forces a decision on any header added later; putting
+ * one back here needs a documented pre-cache mechanism, not just a rationale.
+ */
+export const KEYED_DISPATCH_HEADERS: readonly string[] = [];
+
+/**
+ * Every dispatch header must be classified exactly once. Throws with the offending name so a
+ * new header in routing-common.ts is a loud build failure rather than a silent cache-key
+ * change (either a shattered hit rate, or two distinct responses sharing one entry).
+ */
+export function assertCacheKeyClassification(): void {
+  const keyed = new Set(KEYED_DISPATCH_HEADERS);
+  const never = new Set(NEVER_KEYED_DISPATCH_HEADERS);
+  for (const header of INTERNAL_DISPATCH_HEADERS) {
+    const inKeyed = keyed.has(header);
+    const inNever = never.has(header);
+    if (inKeyed === inNever) {
+      throw new Error(
+        `Internal dispatch header "${header}" is ${inKeyed ? "in BOTH" : "in NEITHER"} ` +
+          `KEYED_DISPATCH_HEADERS and NEVER_KEYED_DISPATCH_HEADERS (gcp-http-filter.ts). ` +
+          `Classify it: put it in KEYED_DISPATCH_HEADERS only if the POOL dispatches on it ` +
+          `and two values yield two different cacheable bodies; put it in ` +
+          `NEVER_KEYED_DISPATCH_HEADERS if it duplicates another key, or if it can carry ` +
+          `REQUEST-SCOPED data (cookies, credentials, per-user headers) — such a header ` +
+          `makes the Cloud CDN cache key per-user.`,
+      );
+    }
+  }
+  for (const header of [...keyed, ...never]) {
+    if (!(INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(header)) {
+      throw new Error(
+        `"${header}" is classified in gcp-http-filter.ts but is not an internal dispatch ` +
+          `header any more (routing-common.ts INTERNAL_DISPATCH_HEADERS). Remove it.`,
+      );
+    }
+  }
+}
+
 export const DEFAULT_CDN_CACHE_KEY_HEADERS: string[] = [
   ...NEXTJS_VARY_HEADERS,
-  ...INTERNAL_DISPATCH_HEADERS.filter((h) => h !== "x-matched-pathname"),
+  // Emitted in INTERNAL_DISPATCH_HEADERS order so the rendered list stays stable when the
+  // classification arrays are reordered.
+  ...INTERNAL_DISPATCH_HEADERS.filter((h) =>
+    (KEYED_DISPATCH_HEADERS as readonly string[]).includes(h),
+  ),
 ];
 
 // Header names are spliced into YAML; reject anything outside plain token chars.
@@ -40,6 +126,22 @@ export function renderCdnFilter({
   cacheKeyHeaders?: string[] | undefined;
 }): string {
   assertSafeReleaseName(releaseName);
+  // S12 (SECURITY). `cacheMode` is only a TypeScript literal union — nothing checks it at
+  // runtime, and it arrives from the user's next.config via provider.gke.cdn. It is emitted as
+  // a BARE YAML scalar below, so a value containing a newline plus `---` appends an entire
+  // extra Kubernetes document that `helm upgrade` then applies with the deployer's permissions.
+  // Only one mode is supported, so compare against it rather than charset-checking.
+  if (cacheMode !== "USE_ORIGIN_HEADERS") {
+    throw new Error(
+      `Invalid cdn.cacheMode ${JSON.stringify(cacheMode)}: the only supported value is ` +
+        `"USE_ORIGIN_HEADERS" (it is interpolated into a bare YAML scalar in the emitted ` +
+        `GCPHTTPFilter).`,
+    );
+  }
+  // N40b. Fail the build if a dispatch header was added without deciding whether it belongs
+  // in the cache key. Checked here (not only in a test) because this is the render that
+  // produces the GCPHTTPFilter, and the default list is derived from that classification.
+  assertCacheKeyClassification();
   for (const header of cacheKeyHeaders) {
     if (!HEADER_NAME_RE.test(header)) {
       throw new Error(`Invalid CDN cache-key header "${header}": must match ${HEADER_NAME_RE}.`);

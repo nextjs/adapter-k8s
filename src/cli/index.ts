@@ -22,6 +22,7 @@ const BOOLEAN_FLAGS = new Set([
   "yes",
   "y",
   "allow-no-network-policy",
+  "allow-unretained-manifest",
   "standard",
   "help",
   "h",
@@ -143,7 +144,10 @@ Options:
   --skip-build             Skip next build (deploy, emulate)
   --skip-push              Skip docker build + push (deploy)
   --port <port>            Listener port for the local Envoy proxy (emulate; default: 8080)
-  --yes, -y                Skip the confirmation prompt (destroy)
+  --yes, -y                Skip the confirmation prompt (destroy; deploy's unpinned-context guard)
+  --allow-unretained-manifest  Deploy even if the outgoing build's routing manifest cannot
+                              be retained (rollback to it becomes image-only; recorded in
+                              deploy state so doctor can report it)
   --allow-no-network-policy  Deploy even if the cluster pod CIDR can't be discovered
                               (NetworkPolicies skipped — the routing service stays
                               reachable from in-cluster pods; not recommended)
@@ -256,6 +260,10 @@ async function main(): Promise<void> {
         skipBuild: flags["skip-build"] === true,
         skipPush: flags["skip-push"] === true,
         allowNoNetworkPolicy: flags["allow-no-network-policy"] === true,
+        // N30 / N29: opt out of the fatal routing-manifest retention, and skip the
+        // unpinned-kubectl-context confirmation in CI.
+        allowUnretainedManifest: flags["allow-unretained-manifest"] === true,
+        yes: flags["yes"] === true || flags["y"] === true,
         dryRun,
       });
       break;

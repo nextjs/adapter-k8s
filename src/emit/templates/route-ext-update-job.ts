@@ -4,6 +4,7 @@ import {
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeBuildId,
+  K8S_NAMESPACE,
 } from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
@@ -21,11 +22,19 @@ export function renderRouteExtUpdateJob({
   projectId,
   region,
   buildId,
+  documentDigest,
 }: {
   releaseName: string;
   projectId: string;
   region: string;
   buildId: string;
+  /**
+   * S9. SHA-256 of the route-extension.yaml body this chart rendered
+   * (routeExtDocumentDigest()). The Job refuses to import a mounted document that does not
+   * hash to this. Optional so a direct caller without the ConfigMap in hand still renders a
+   * working Job — the field checks below remain as a floor.
+   */
+  documentDigest?: string;
 }): string {
   // These are spliced unescaped into a `/bin/sh -c` script that runs under a
   // privileged Workload-Identity service account. Validate against a safe charset
@@ -41,7 +50,7 @@ kind: Job
 metadata:
   name: ${routeExtJobName(releaseName, buildId)}
   labels:
-    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: route-ext-job
   annotations:
     # The Job name carries only a digest of the build id — record the full id for
@@ -163,6 +172,74 @@ spec:
               awk '/FORWARDING_RULE_PLACEHOLDER/{while((getline l < "/tmp/fr_list.yaml")>0) print l; next} {print}' \
                 /config/route-extension.yaml > /tmp/ext.yaml
               cat /tmp/ext.yaml
+              # N73 (SECURITY). /config is an operator-mutable ConfigMap, and this Job
+              # imports whatever it finds there under a Workload Identity holding
+              # networkservices.lbTrafficExtensions.* + compute.backendServices.update.
+              # A rewritten \`service\`/\`authority\` would point this LB's callout at a
+              # DIFFERENT backend — i.e. insert a middleware tier that sees and rewrites
+              # every request. Both values are fully determined by the release name,
+              # project, and the single supported namespace, so verify them against the
+              # values this Job was RENDERED with instead of trusting the mount. (The
+              # residual IAM exposure — the binding is project-wide, so any principal who
+              # can create a pod in "${K8S_NAMESPACE}" can set
+              # serviceAccountName: ${releaseName}-deploy-sa and inherit it — needs a
+              # resource condition on the binding in cli/init.ts; that is tracked
+              # separately.)
+              # S9 (SECURITY). WHOLE-DOCUMENT verification. The field checks below were the
+              # only ones, and they left forwardingRules, celExpression, timeout, failOpen,
+              # supportedEvents and loadBalancingScheme unverified — so a
+              # ConfigMap carrying a VICTIM load balancer's forwarding rules plus the three
+              # expected strings passed, and this Job attached the app's own verified
+              # extension to someone else's LB (their traffic through this routing service,
+              # its verdicts onto their requests). Pin the mount to the exact bytes the chart
+              # rendered instead: everything is then covered, including fields added later.
+              #
+              # Hashed BEFORE the placeholder expansion, because the forwarding rules are
+              # discovered from gcloud in this Job, not read from the mount — which is only
+              # true while the placeholder is the sole source of them, so require it.
+              EXPECT_DIGEST="${documentDigest ?? ""}"
+              if [ -n "$EXPECT_DIGEST" ]; then
+                if ! grep -q 'FORWARDING_RULE_PLACEHOLDER' /config/route-extension.yaml; then
+                  echo "ERROR: route-extension.yaml carries no FORWARDING_RULE_PLACEHOLDER."
+                  echo "Refusing to import: forwarding rules must come from this Job's own"
+                  echo "discovery, never from the mounted ConfigMap."
+                  exit 1
+                fi
+                GOT_DIGEST=$(sha256sum /config/route-extension.yaml | cut -d" " -f1)
+                if [ "$GOT_DIGEST" != "$EXPECT_DIGEST" ]; then
+                  echo "ERROR: route-extension.yaml does not match the rendered chart."
+                  echo "  expected sha256: $EXPECT_DIGEST"
+                  echo "  found sha256:    $GOT_DIGEST"
+                  echo "Refusing to import: the mounted ConfigMap was modified after render."
+                  exit 1
+                fi
+                echo "route-extension.yaml matches the rendered chart (sha256) ✓"
+              fi
+              EXPECT_SERVICE="projects/${projectId}/global/backendServices/${releaseName}-routing-service"
+              EXPECT_AUTHORITY="${releaseName}-routing-service.${K8S_NAMESPACE}.svc.cluster.local"
+              GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
+              GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
+              if [ "$GOT_SERVICE" != "$EXPECT_SERVICE" ]; then
+                echo "ERROR: route-extension.yaml service mismatch."
+                echo "  expected: $EXPECT_SERVICE"
+                echo "  found:    $GOT_SERVICE"
+                echo "Refusing to import: the mounted ConfigMap would attach this app's"
+                echo "ext_proc callout to a backend service it does not own."
+                exit 1
+              fi
+              if [ "$GOT_AUTHORITY" != "$EXPECT_AUTHORITY" ]; then
+                echo "ERROR: route-extension.yaml authority mismatch."
+                echo "  expected: $EXPECT_AUTHORITY"
+                echo "  found:    $GOT_AUTHORITY"
+                exit 1
+              fi
+              # The extension name is this release's by construction; a mismatch means the
+              # mount was replaced wholesale.
+              if ! grep -q '^name: "${releaseName}-traffic-ext"$' /tmp/ext.yaml; then
+                echo "ERROR: route-extension.yaml is not for ${releaseName}-traffic-ext."
+                exit 1
+              fi
+              echo "route-extension.yaml verified against rendered service/authority ✓"
               gcloud service-extensions lb-traffic-extensions import \
                 ${releaseName}-traffic-ext \
                 --project=${projectId} \

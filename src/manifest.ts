@@ -63,18 +63,21 @@ function caseInsensitiveSources<T extends { sourceRegex: string }>(routes: T[]):
 // busting Docker layer caches and violating the clean chart-regeneration invariant
 // (regenerating must be a no-op when nothing changed). Derivation, in order:
 //   1. SOURCE_DATE_EPOCH (the reproducible-builds standard, seconds since epoch) when set;
-//   2. the mtime of .next/BUILD_ID — written once per `next build`, so it is stable
+//   2. the mtime of <distDir>/BUILD_ID — written once per `next build`, so it is stable
 //      across chart regenerations of the same build output;
 //   3. Date.now() only when neither exists (synthetic build contexts, unit tests).
 // Consumers (pool-server dispatch.ts ISR anchor) parse this with a NaN fallback —
 // keep the ISO-8601 format.
-function stableBuiltAt(projectDir: string): string {
+// N50 (review #33): distDir is passed in (ctx.distDir) rather than assuming `.next` —
+// with a custom distDir the anchor silently missed and every regeneration re-stamped
+// Date.now().
+function stableBuiltAt(distDir: string): string {
   const sourceDateEpoch = process.env.SOURCE_DATE_EPOCH;
   if (sourceDateEpoch && /^\d+$/.test(sourceDateEpoch)) {
     return new Date(Number(sourceDateEpoch) * 1000).toISOString();
   }
   try {
-    return statSync(path.join(projectDir, ".next", "BUILD_ID")).mtime.toISOString();
+    return statSync(path.join(distDir, "BUILD_ID")).mtime.toISOString();
   } catch {
     return new Date().toISOString();
   }
@@ -85,14 +88,14 @@ function stableBuiltAt(projectDir: string): string {
 // still unresolved when it declined to emit that shell. That field is the ONLY thing separating
 // the two reasons a PPR route can have `fallback: null`, and the pool has to treat them
 // oppositely (see the pprCapableRoutes doc comment in types.ts). Read it from
-// .next/prerender-manifest.json, whose `dynamicRoutes` map is also the authoritative list of
+// <distDir>/prerender-manifest.json, whose `dynamicRoutes` map is also the authoritative list of
 // route TEMPLATES — concrete generateStaticParams prerenders live under `routes`, so membership
 // here doubles as the "this is a template, not an instance" test.
-function readDynamicRouteFallbackRootParams(projectDir: string): Map<string, string[]> {
+function readDynamicRouteFallbackRootParams(distDir: string): Map<string, string[]> {
   const byRoute = new Map<string, string[]>();
   try {
     const manifest = JSON.parse(
-      readFileSync(path.join(projectDir, ".next", "prerender-manifest.json"), "utf-8"),
+      readFileSync(path.join(distDir, "prerender-manifest.json"), "utf-8"),
     ) as { dynamicRoutes?: Record<string, { fallbackRootParams?: unknown }> };
     for (const [route, entry] of Object.entries(manifest.dynamicRoutes ?? {})) {
       byRoute.set(
@@ -120,6 +123,7 @@ export function buildRoutingManifest({
   trailingSlash,
   nextVersion,
   projectDir,
+  distDir,
 }: {
   routing: BuildCompleteContext["routing"];
   outputs: AdapterOutputs;
@@ -130,7 +134,13 @@ export function buildRoutingManifest({
   trailingSlash: boolean;
   nextVersion: string;
   projectDir: string;
+  /**
+   * Absolute dist directory (ctx.distDir). Defaults to `<projectDir>/.next` for synthetic
+   * build contexts and unit tests that predate the parameter.
+   */
+  distDir?: string;
 }): RoutingManifest {
+  const resolvedDistDir = distDir ?? path.join(projectDir, ".next");
   // Build pool assignments: pathname → pool name.
   // Also track output id → pool so prerenders can inherit their parent's pool.
   const poolAssignments: Record<string, string> = {};
@@ -175,7 +185,7 @@ export function buildRoutingManifest({
   // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
   // flavour (the only flavour that must run NON-minimal).
   const pprCapableRoutes: Record<string, { rootParams: string[] }> = {};
-  const dynamicRouteRootParams = readDynamicRouteFallbackRootParams(projectDir);
+  const dynamicRouteRootParams = readDynamicRouteFallbackRootParams(resolvedDistDir);
   for (const prerender of outputs.prerenders) {
     const config = prerender.config as Record<string, unknown>;
     const fb = (
@@ -273,7 +283,7 @@ export function buildRoutingManifest({
     pathnames,
     i18n: i18n ?? null,
     buildId,
-    builtAt: stableBuiltAt(projectDir),
+    builtAt: stableBuiltAt(resolvedDistDir),
     basePath,
     trailingSlash,
     middleware: outputs.middleware

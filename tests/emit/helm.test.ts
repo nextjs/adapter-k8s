@@ -1,6 +1,10 @@
 // tests/emit/helm.test.ts
 import { describe, it, expect } from "vitest";
-import { generateHelmChart, SECRET_CHART_FILES } from "../../src/emit/helm.js";
+import {
+  assertSecretChartFilesComplete,
+  generateHelmChart,
+  SECRET_CHART_FILES,
+} from "../../src/emit/helm.js";
 import { sanitizeK8sName } from "../../src/emit/templates/utils.js";
 import type { PoolDefinition, K8sAdapterConfig, RoutingManifest } from "../../src/types.js";
 
@@ -16,6 +20,96 @@ const mockManifest: RoutingManifest = {
   pprRoutes: {},
   nextVersion: "16.2.0",
 };
+
+// Strict SemVer 2.0.0 (the grammar helm's chart-version validation enforces —
+// numeric prerelease identifiers may not have leading zeros and no identifier may
+// be empty). Used by the N50 chart-version tests below.
+const SEMVER_RE =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+
+const chartVersion = (chart: Record<string, string>): string =>
+  chart["Chart.yaml"].match(/^version: (.*)$/m)![1];
+
+const minimalPools = () =>
+  new Map<string, PoolDefinition>([
+    ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
+  ]);
+
+const chartFor = (buildId: string) =>
+  generateHelmChart({
+    pools: minimalPools(),
+    buildId,
+    nextVersion: "16.2.0",
+    config: {
+      pools: { ssr: { routes: ["appPages"] } },
+      provider: { gke: {} },
+    } as K8sAdapterConfig,
+    imageRegistry: "gcr.io/my-project",
+    routingManifest: { ...mockManifest, buildId },
+    internalSecret: "deadbeef",
+  });
+
+// N50 (review #23): safeVersionSuffix preserved `.`, so a date-style build id rendered
+// `version: 0.1.0-2026.07.25` — SemVer forbids leading zeros in a NUMERIC prerelease
+// identifier, so real helm fails with
+//   Error: validation: chart.metadata.version "0.1.0-2026.07.25" is invalid
+// on EVERY helm invocation (template, upgrade, rollback), after the build and the image
+// push. `slice(0, 32)` could also land on a `.`, producing an EMPTY trailing identifier
+// (`0.1.0-1.2.`), which is invalid for the same reason. BUILD_ID_RE deliberately permits
+// `.`, so this is reachable from a plain `generateBuildId: () => "2026.07.25"`.
+// N67. renderRouteExtConfigMap now REJECTS a chain array that is empty / has more than one
+// chain-or-extension, and rejects an extension with no explicit boolean `failOpen` (the old
+// `?? true` default was the middleware-BYPASS direction in the file that configures the
+// fail-CLOSED posture). These tests only need "an extension chain is present", so they use
+// the smallest chain the generator actually produces.
+const MINIMAL_CHAIN_JSON = JSON.stringify([
+  {
+    name: "nextjs-routing",
+    matchCondition: { celExpression: "true" },
+    extensions: [
+      {
+        name: "routing-service",
+        authority: "nextjs-routing-service.default.svc.cluster.local",
+        service: "projects/p-123456/global/backendServices/nextjs-routing-service",
+        timeout: "5s",
+        supportedEvents: ["REQUEST_HEADERS"],
+        failOpen: false,
+      },
+    ],
+  },
+]);
+
+describe("chart version is always valid SemVer (N50)", () => {
+  it.each([
+    ["2026.07.25", "date-style build id with leading-zero segments"],
+    ["1.2.", "trailing dot (empty prerelease identifier)"],
+    ["07", "purely numeric with a leading zero"],
+    ["v1.0.0-rc.1", "semver-ish build id"],
+    ["a".repeat(40), "40-char build id"],
+    ["1234567890".repeat(4), "40-char all-numeric build id"],
+    ["___", "all-separator build id (suffix sanitizes to empty)"],
+    ["feature.branch_name-2", "mixed separators"],
+  ])("renders valid SemVer for %s (%s)", (buildId) => {
+    const version = chartVersion(chartFor(buildId));
+    expect(version).toMatch(SEMVER_RE);
+    // Prerelease identifiers must be non-empty and free of dots (we collapse to `-`).
+    const prerelease = version.slice("0.1.0-".length);
+    expect(prerelease).not.toContain(".");
+    expect(prerelease.length).toBeGreaterThan(0);
+  });
+
+  it("keeps the version stable across renders and distinct per build id", () => {
+    expect(chartVersion(chartFor("2026.07.25"))).toBe(chartVersion(chartFor("2026.07.25")));
+    // Two ids that collapse to the same sanitized suffix still differ (digest tail).
+    expect(chartVersion(chartFor("a.b"))).not.toBe(chartVersion(chartFor("a_b")));
+  });
+
+  it("caps the version suffix (helm has no length limit, but names derived from it do)", () => {
+    expect(chartVersion(chartFor("x".repeat(200).slice(0, 128))).length).toBeLessThanOrEqual(
+      "0.1.0-".length + 32,
+    );
+  });
+});
 
 describe("generateHelmChart", () => {
   it("translates flat pool resource settings into Kubernetes requests and limits", () => {
@@ -47,6 +141,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
     const values = JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{")));
 
@@ -89,6 +184,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
 
     expect(result["Chart.yaml"]).toContain("name:");
@@ -129,7 +225,8 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
-      extensionChainJson: "[]",
+      extensionChainJson: MINIMAL_CHAIN_JSON,
+      infrastructure: { projectId: "my-project", region: "us-central1" },
       internalSecret: "deadbeef",
     });
 
@@ -152,24 +249,27 @@ describe("generateHelmChart", () => {
     }
   });
 
-  it("generates a random internal secret when none is supplied", () => {
-    const pools = new Map<string, PoolDefinition>([
-      ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
-    ]);
-    const args = {
-      pools,
-      buildId: "abc123",
-      nextVersion: "16.2.0",
-      config: {
-        pools: { ssr: { routes: ["appPages"] } },
-        provider: { gke: {} },
-      } as K8sAdapterConfig,
-      imageRegistry: "gcr.io/my-project",
-      routingManifest: mockManifest,
-    };
-    const a = generateHelmChart(args)["templates/internal-secret.yaml"];
-    const b = generateHelmChart(args)["templates/internal-secret.yaml"];
-    expect(a).not.toEqual(b); // random per render
+  // N50 (review #20): the internal dispatch secret used to be minted with
+  // randomBytes(32) on every render because adapter.ts never passed one. Re-emitting the
+  // chart for the SAME build then produced a DIFFERENT secret while the running pods kept
+  // the old one — they stop trusting dispatch headers and middleware runs TWICE per
+  // request (rate-limit counters, analytics) for the whole rollout window. It also
+  // defeated the only audit for invariant 5 (diff a regenerated chart against what was
+  // applied). The secret is now derived per build by the caller (adapter.ts
+  // deriveInternalSecret) and is a REQUIRED argument here, so no render can invent one.
+  it("uses the supplied internal secret verbatim and renders identically every time", () => {
+    const a = chartFor("abc123")["templates/internal-secret.yaml"];
+    const b = chartFor("abc123")["templates/internal-secret.yaml"];
+    expect(a).toEqual(b);
+    expect(a).toContain('secret: "deadbeef"');
+    // Every non-values chart file is byte-stable across renders (values.yaml carries a
+    // wall-clock "# Generated:" header owned by templates/values-yaml.ts).
+    const first = chartFor("abc123");
+    const second = chartFor("abc123");
+    for (const key of Object.keys(first)) {
+      if (key === "values.yaml") continue;
+      expect(second[key]).toEqual(first[key]);
+    }
   });
 
   it("generates header-based HTTPRoute rules for pools", () => {
@@ -195,6 +295,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
 
     const httpRoute = result["templates/http-route.yaml"];
@@ -216,6 +317,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
       extensionChainJson: JSON.stringify([
         {
           name: "nextjs-routing",
@@ -243,6 +345,79 @@ describe("generateHelmChart", () => {
     expect(result["templates/route-ext-update-job.yaml"]).toBeDefined();
   });
 
+  // N50 (review, Medium): the route-extension update Job and its ServiceAccount used to
+  // vanish with a bare `if (projectId && region)` and no else — the chart installed the
+  // routing service but NEVER registered the GXLB traffic extension, so the edge kept the
+  // previous build's chain (or none) while the deploy reported success. Refuse to render a
+  // chain that cannot be registered.
+  it("throws when an extension chain is requested without projectId/region", () => {
+    const args = {
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+      internalSecret: "deadbeef",
+      extensionChainJson: MINIMAL_CHAIN_JSON,
+    };
+    expect(() => generateHelmChart(args)).toThrow(/projectId.*region/s);
+    expect(() => generateHelmChart({ ...args, infrastructure: { projectId: "p-123456" } })).toThrow(
+      /region/,
+    );
+    expect(() => generateHelmChart({ ...args, infrastructure: { region: "us-central1" } })).toThrow(
+      /projectId/,
+    );
+    expect(() =>
+      generateHelmChart({
+        ...args,
+        infrastructure: { projectId: "p-123456", region: "us-central1" },
+      }),
+    ).not.toThrow();
+  });
+
+  // N72 (templates-agent handoff): app images are otherwise pinned by a MUTABLE tag while the
+  // deploy SA holds artifactregistry.repoAdmin, so a retag changes what a pool runs on its
+  // next scale-up (existing nodes keep the cached layer) — a rollout and a scale-up can then
+  // execute different code under one build id. `imageDigests` is the pass-through seam; the
+  // digest itself can only be resolved AFTER `docker push`, i.e. by the deploy step.
+  it("threads image digests into the pool and routing-service Deployments", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const withDigest = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+      internalSecret: "deadbeef",
+      extensionChainJson: MINIMAL_CHAIN_JSON,
+      infrastructure: { projectId: "p-123456", region: "us-central1" },
+      imageDigests: { ssr: digest, routingService: digest },
+    });
+    expect(withDigest["templates/ssr-deployment.yaml"]).toContain(`@${digest}`);
+    expect(withDigest["templates/ssr-deployment.yaml"]).toContain("imagePullPolicy: IfNotPresent");
+    expect(withDigest["templates/routing-service-deployment.yaml"]).toContain(`@${digest}`);
+
+    // Without a RENDER-TIME digest the template defers to values (S7): `deploy` sets
+    // `pools.<pool>.image.digest` after `docker push` resolves it, and helm then picks the
+    // digest + IfNotPresent, or the tag + Always so a retag can never be silently served
+    // from a node's cached layer. Both arms are proven against real helm in
+    // tests/emit/templates/image-digest.test.ts.
+    const withoutDigest = chartFor("abc123");
+    expect(withoutDigest["templates/ssr-deployment.yaml"]).not.toContain("@sha256:");
+    expect(withoutDigest["templates/ssr-deployment.yaml"]).toContain(
+      '{{ with (index .Values.pools "ssr").image.digest }}IfNotPresent{{ else }}Always{{ end }}',
+    );
+    expect(withoutDigest["values.yaml"]).toContain('"digest": ""');
+  });
+
   it("generates one deployment per pool", () => {
     const pools = new Map<string, PoolDefinition>([
       ["ssr", { name: "ssr", outputs: [], config: { routes: ["appPages"] } }],
@@ -259,6 +434,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
 
     expect(result["templates/ssr-deployment.yaml"]).toBeDefined();
@@ -289,6 +465,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
 
     const filter = result["templates/cdn-http-filter.yaml"];
@@ -365,6 +542,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
     expect(result["templates/cdn-http-filter.yaml"]).toBeUndefined();
     expect(result["templates/http-route.yaml"]).toBeUndefined();
@@ -384,6 +562,7 @@ describe("generateHelmChart", () => {
       } as K8sAdapterConfig,
       imageRegistry: "gcr.io/my-project",
       routingManifest: mockManifest,
+      internalSecret: "deadbeef",
     });
 
     // The template is always in the chart; the helm `if` guard renders nothing until the
@@ -437,7 +616,46 @@ describe("generateHelmChart", () => {
         } as K8sAdapterConfig,
         imageRegistry: "gcr.io/my-project",
         routingManifest: oversizedManifest,
+        internalSecret: "deadbeef",
       }),
     ).toThrow(/too large to embed in a ConfigMap/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S25 — SECRET_CHART_FILES was an unverified hardcoded pair, and adapter.ts derives file mode
+// 0600 from membership in it, so a third secret-bearing template would have been written
+// world-readable with nothing failing anywhere.
+// ---------------------------------------------------------------------------
+describe("S25: secret-bearing templates are all mode-gated", () => {
+  it("every rendered `kind: Secret` template is in SECRET_CHART_FILES", () => {
+    const chart = chartFor("abc123");
+    const secretFiles = Object.entries(chart)
+      .filter(([name, body]) => name.startsWith("templates/") && /^kind: Secret$/m.test(body))
+      .map(([name]) => name);
+    expect(secretFiles.length).toBeGreaterThan(0);
+    for (const name of secretFiles) expect(SECRET_CHART_FILES.has(name)).toBe(true);
+  });
+
+  it("the guard REJECTS a new Secret template that was not added to the set", () => {
+    expect(() =>
+      assertSecretChartFilesComplete({
+        "templates/new-thing.yaml": "apiVersion: v1\nkind: Secret\nmetadata:\n  name: x\n",
+      }),
+    ).toThrow(/not listed in SECRET_CHART_FILES/);
+  });
+
+  it("the guard REJECTS a listed file that stopped being a Secret", () => {
+    expect(() =>
+      assertSecretChartFilesComplete({
+        "templates/internal-secret.yaml": "apiVersion: v1\nkind: ConfigMap\n",
+      }),
+    ).toThrow(/no longer renders a Secret/);
+  });
+
+  it("ignores non-template chart files", () => {
+    expect(() =>
+      assertSecretChartFilesComplete({ "values.yaml": "kind: Secret\n" }),
+    ).not.toThrow();
   });
 });

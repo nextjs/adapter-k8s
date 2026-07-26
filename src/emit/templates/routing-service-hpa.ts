@@ -1,3 +1,5 @@
+import { assertSafeReleaseName, assertSafeReplicaCount, assertSafeTargetCPU } from "./utils.js";
+
 export function renderRoutingServiceHPA({
   releaseName,
   minReplicas = 2,
@@ -9,6 +11,20 @@ export function renderRoutingServiceHPA({
   maxReplicas?: number;
   targetCPU?: number;
 }): string {
+  // Sanitize at the point of consumption (AGENTS.md). N60: all three numbers below are
+  // interpolated as BARE YAML scalars straight from `next.config`
+  // (`routingService.scaling`), so a string carrying a newline injects a sibling key into
+  // the HPA spec — the same class as the resource-quantity sinks.
+  assertSafeReleaseName(releaseName);
+  assertSafeReplicaCount(minReplicas, "routingService.scaling.min");
+  assertSafeReplicaCount(maxReplicas, "routingService.scaling.max");
+  assertSafeTargetCPU(targetCPU, "routingService.scaling.targetCPU");
+  if (minReplicas > maxReplicas) {
+    throw new Error(
+      `routingService.scaling.min (${minReplicas}) is greater than ` +
+        `routingService.scaling.max (${maxReplicas}): the API server rejects such an HPA.`,
+    );
+  }
   return `apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
