@@ -20,7 +20,7 @@ At deploy time, the CLI builds images, pushes them, and runs `helm upgrade` with
 
 With a shared cache configured, the pool servers register a Valkey-backed `use cache` handler so **cache components and Partial Prerendering (PPR)** work correctly across replicas: cached entries are shared, and `revalidateTag` / `revalidatePath` on one pod is seen by all. (Next's default `use cache` store is per-process, which diverges the moment you run more than one replica.) See [Distributed Cache](#distributed-cache-cache-components--ppr).
 
-> **Where middleware runs relative to the CDN.** On GCP's global external Application Load Balancer, ext*proc is only supported as a **traffic extension**, which runs **after** the Cloud CDN cache. Cache \_hits* are served without invoking middleware; the routing service runs on cache _misses_ on the way to origin. Pool servers therefore send `Cache-Control: no-cache` on middleware-covered routes so those responses are never cached ahead of the middleware that gates them. (Route extensions -- which would run pre-cache -- are not supported on this load balancer.)
+> **Where middleware runs relative to the CDN.** On GCP's global external Application Load Balancer, ext_proc is only supported as a **traffic extension**, which runs **after** the Cloud CDN cache. Cache *hits* are served without invoking middleware; the routing service runs on cache *misses* on the way to origin. Pool servers therefore send `Cache-Control: no-cache` on middleware-covered routes so those responses are never cached ahead of the middleware that gates them. (Route extensions -- which would run pre-cache -- are not supported on this load balancer.)
 
 ## Project Status
 
@@ -148,7 +148,7 @@ The deploy flow:
 3. `docker build` + `push` per pool + the routing service, then resolve each pushed image to its immutable `@sha256:` digest and deploy that rather than the mutable `:<buildId>` tag
 4. `helm upgrade --install` with the generated chart (attaches the Cloud CDN filter to the HTTPRoute when CDN is enabled)
 5. Wait for the new pool + routing-service Deployments to roll out
-6. Verify each new pod is serving (`/readyz` checked directly on the pod -- not via GCP LB health). `/readyz` is the readiness verdict: it answers 503 until instrumentation registration has not failed and at least one route module imported, so a build whose `register()` threw cannot pass the gate the way a hardcoded `/healthz` 200 would
+6. Verify each new pod is serving (`/readyz` checked directly on the pod -- not via GCP LB health). `/readyz` is the readiness verdict: it answers 503 until instrumentation registration has succeeded and at least one route module has imported, so a build whose `register()` threw cannot pass the gate the way a hardcoded `/healthz` 200 would
 7. Patch active Service selectors to route traffic to the new build (blue/green cutover)
 8. Invalidate the previous build's Cloud CDN cache tag (when CDN is enabled) so the new build never serves the old build's stale same-URL content from the edge -- best-effort and non-fatal (TTL self-heals)
 9. Keep the previous build at 0 replicas (rollback target)
