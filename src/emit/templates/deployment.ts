@@ -78,6 +78,7 @@ export function renderDeployment({
   resources,
   replicas,
   readinessPath = POOL_READINESS_PATH,
+  internalSecretRef,
 }: {
   poolName: string;
   buildId: string;
@@ -122,6 +123,17 @@ export function renderDeployment({
    * `/healthz` — a readiness endpoint that can legitimately 503 must never restart a pod.
    */
   readinessPath?: string;
+  /**
+   * N87. The internal dispatch Secret this pod template resolves INTERNAL_HEADER_SECRET from,
+   * as a LITERAL. Same rationale as `resources`/`readinessPath` above: for a RETAINED
+   * previous-build render, deploy mirrors what the live pod template actually references. A
+   * build deployed before per-build Secret names references the legacy stable name, and
+   * stamping the derived per-build name onto it would point the SERVING build's pods at a
+   * Secret nobody rendered (CreateContainerConfigError on every new pod, before cutover).
+   * Omitted ⇒ the name derived from this render's own build id, which is what a normal build
+   * wants.
+   */
+  internalSecretRef?: string;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -135,7 +147,16 @@ export function renderDeployment({
 
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
-  const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
+  // N87: the dispatch secret is referenced by a BUILD-SCOPED name, so this pod template
+  // resolves its own build's secret even when it restarts inside another build's deploy
+  // window (a stable name let a restarted old pod pick up the NEW build's secret and trust
+  // its middleware verdict — see internal-secret.ts).
+  const internalSecretEnv = renderInternalSecretEnv(
+    releaseName,
+    buildId,
+    "            ",
+    internalSecretRef,
+  );
   // Always emit the Valkey env — the secret refs are `optional: true`, so this is inert when no
   // cache is configured (the pool only registers the handler when VALKEY_URL is actually set).
   // Emitting it unconditionally keeps the pod template identical whether or not the cache is on,

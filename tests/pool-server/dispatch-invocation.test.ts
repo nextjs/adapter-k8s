@@ -494,6 +494,174 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
       expect(calls).toHaveLength(1);
       expect(calls[0].minimalMode).toBe(true);
     });
+
+    // N16c: `wouldPostpone` is recorded on `pprCapableRoutes` entries (manifest.ts
+    // indexPrerenderGroups reads the same-groupId `.rsc` sibling's `fallback.postponedState`) but
+    // it is DELIBERATELY NOT a rung of the minimalMode gate. It was added as one, to fix
+    // `/novel/early-span` (1,358 bytes ending in an empty closed `<!--$--><!--/$-->` boundary,
+    // where `next start` returns 7,658 bytes of resolved content) — and MEASURED against upstream:
+    //
+    //   with the rung:    app-dir/fallback-shells  8 passed / 5 failed
+    //   without the rung: app-dir/fallback-shells 13 passed / 0 failed
+    //   (and cache-components-allow-otel-spans stayed 3/1 either way — the rung only traded
+    //    `early-span` for `prerendering at runtime` in the same file.)
+    //
+    // So the signal does not discriminate: fallback-shells' never-postponing routes carry sibling
+    // postponed state too, and flipping non-minimal on it re-breaks them exactly like the blunt
+    // `|| handlerPprCapable` fix that preceded it. The truth table below pins that the bit is
+    // INERT at the gate; the real fix has to implement the platform's half of the resume
+    // (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md, option B).
+    describe("wouldPostpone truth table (N16c: inert at the gate)", () => {
+      // (has build shell, has root params, wouldPostpone) → expected minimalMode.
+      // A build never emits shell-bearing AND pprCapableRoutes for the same template — manifest.ts
+      // keeps the two maps disjoint and tests that — but the rows are included anyway to pin that
+      // `wouldPostpone` never moves the answer in either direction.
+      const rows: Array<[boolean, boolean, boolean, boolean]> = [
+        // hasShell, rootParams, wouldPostpone, expected minimalMode
+        [false, false, false, true], // fallback-shells without-io/without-suspense: MINIMAL
+        [false, false, true, true], // early-span: STILL minimal — the rung was measured out (above)
+        [false, true, false, false], // unresolved root params (the live shell-less reason)
+        [false, true, true, false], // …and wouldPostpone does not subtract from it
+        [true, false, false, false], // shell-bearing, via handlerPprInfo
+        [true, false, true, false],
+        [true, true, false, false],
+        [true, true, true, false],
+      ];
+
+      for (const [hasShell, hasRootParams, wouldPostpone, expected] of rows) {
+        it(`shell=${hasShell} rootParams=${hasRootParams} wouldPostpone=${wouldPostpone} → minimalMode=${expected}`, async () => {
+          const { calls, invoker } = invokerCapture();
+          const dispatcher = createDispatcher({
+            handlerLoader: handlerLoaderFor("/x/[id]", vi.fn(), "APP_PAGE"),
+            poolName: "ssr",
+            buildId: "test123",
+            staticAssets: [],
+            pprRoutes: hasShell
+              ? {
+                  "/x/[id]": {
+                    postponedState: "token",
+                    // incrementalCacheShared owns the shell, so nothing is read from disk here.
+                    fallbackFilePath: ".next/server/app/x/[id].html",
+                  },
+                }
+              : {},
+            pprCapableRoutes: {
+              "/x/[id]": { rootParams: hasRootParams ? ["lang"] : [], wouldPostpone },
+            },
+            incrementalCacheShared: true,
+            rscConfig,
+            localHandlerInvoker: invoker as any,
+          });
+          await dispatcher.dispatch(
+            mockReq("/x/1"),
+            mockRes(),
+            routeResolution({ matchedPathname: "/x/[id]" }),
+          );
+          expect(calls).toHaveLength(1);
+          expect(calls[0].minimalMode).toBe(expected);
+        });
+      }
+
+      // The `.rsc` flight path is pinned for the root-param rung at line 404 above. Here it pins
+      // the N16c *negative*: the parent-recovery ladder does find the base route, and its
+      // `wouldPostpone` bit still does not flip the flight request non-minimal. Kept explicitly so
+      // a future re-attempt at the rung has to change this test and read the measurement above.
+      it("stays minimal for a .rsc flight output whose BASE route wouldPostpone", async () => {
+        const { calls, invoker } = invokerCapture();
+        const dispatcher = createDispatcher({
+          handlerLoader: handlerLoaderFor("/x/[id]", vi.fn(), "APP_PAGE"),
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          pprRoutes: {},
+          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } },
+          entrypointOwnsPprShell: true,
+          rscConfig,
+          localHandlerInvoker: invoker as any,
+        });
+        await dispatcher.dispatch(
+          mockReq("/x/1", { rsc: "1" }),
+          mockRes(),
+          routeResolution({ matchedPathname: "/x/[id].rsc" }),
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].minimalMode).toBe(true);
+      });
+
+      // The gate is still conditioned on someone owning the shell cache. With no resume owner
+      // there is nothing to hand the shell lifecycle to, so wouldPostpone alone must not flip it.
+      it("stays minimal for a wouldPostpone route when no cache owner is configured", async () => {
+        const { calls, invoker } = invokerCapture();
+        const dispatcher = createDispatcher({
+          handlerLoader: handlerLoaderFor("/x/[id]", vi.fn(), "APP_PAGE"),
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          pprRoutes: {},
+          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } },
+          incrementalCacheShared: false,
+          entrypointOwnsPprShell: false,
+          rscConfig,
+          localHandlerInvoker: invoker as any,
+        });
+        await dispatcher.dispatch(
+          mockReq("/x/1"),
+          mockRes(),
+          routeResolution({ matchedPathname: "/x/[id]" }),
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].minimalMode).toBe(true);
+      });
+
+      // Back-compat: a manifest built before N16b carries only `rootParams`. A missing bit must
+      // degrade to the pre-N16b behavior (minimal), never be read as "would postpone".
+      it("treats a pre-N16b entry with no wouldPostpone key as minimal", async () => {
+        const { calls, invoker } = invokerCapture();
+        const dispatcher = createDispatcher({
+          handlerLoader: handlerLoaderFor("/x/[id]", vi.fn(), "APP_PAGE"),
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          pprRoutes: {},
+          pprCapableRoutes: { "/x/[id]": { rootParams: [] } },
+          incrementalCacheShared: true,
+          rscConfig,
+          localHandlerInvoker: invoker as any,
+        });
+        await dispatcher.dispatch(
+          mockReq("/x/1"),
+          mockRes(),
+          routeResolution({ matchedPathname: "/x/[id]" }),
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].minimalMode).toBe(true);
+      });
+
+      // A wouldPostpone template has NO shell file, so nothing may be injected or prepended —
+      // the whole point of running non-minimal is that Next owns the shell lifecycle.
+      it("injects no postponed token and prepends no shell for a wouldPostpone route", async () => {
+        const { calls, invoker } = invokerCapture();
+        const dispatcher = createDispatcher({
+          handlerLoader: handlerLoaderFor("/x/[id]", vi.fn(), "APP_PAGE"),
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          pprRoutes: {},
+          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } },
+          incrementalCacheShared: true,
+          rscConfig,
+          localHandlerInvoker: invoker as any,
+        });
+        await dispatcher.dispatch(
+          mockReq("/x/1"),
+          mockRes(),
+          routeResolution({ matchedPathname: "/x/[id]" }),
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0].responsePrefix).toBeUndefined();
+        expect(calls[0].invocationHeaders).toBeUndefined();
+      });
+    });
   });
 
   it("keeps non-PPR handlers minimal when incrementalCacheShared is set", async () => {

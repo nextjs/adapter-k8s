@@ -33,6 +33,14 @@ import {
   routingManifestSnapshotName,
   routingServiceDeploymentName,
 } from "../emit/templates/routing-manifest-configmap.js";
+// N87: internal dispatch Secrets are per BUILD and annotated `helm.sh/resource-policy: keep`,
+// so deploy owns both halves of their lifecycle — migrating the legacy stable-named one past
+// `helm upgrade`, and pruning the ones nothing references any more.
+import {
+  INTERNAL_SECRET_COMPONENT,
+  internalSecretName,
+  legacyInternalSecretName,
+} from "../emit/templates/internal-secret.js";
 // Import the SAME sanitizer that stamps pod names and version labels (deployment.ts /
 // service.ts). The blue/green cutover patches the active Service selector to this exact
 // value, so it MUST match the pod label byte-for-byte — a divergent local copy that
@@ -96,6 +104,15 @@ export interface DeployOptions {
 // `path:` scalar. Used to vet the readiness path read back from a LIVE Deployment before
 // it is mirrored into the retained manifest (renderDeployment interpolates it bare).
 const LIVE_PROBE_PATH_RE = /^\/[A-Za-z0-9._~/-]{0,128}$/;
+
+/**
+ * N87. Charset gate for the live pod template's INTERNAL_HEADER_SECRET secretKeyRef name,
+ * mirrored into the retained previous-build render. Same reason as LIVE_PROBE_PATH_RE: the
+ * value comes from the cluster and reaches a bare YAML scalar. DNS-1123 subdomain minus dots
+ * (every name this adapter emits goes through sanitizeK8sName), matching the validator the
+ * template itself applies.
+ */
+const LIVE_SECRET_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$/;
 
 // N29: same shape as destroy's confirmation prompt (that file's copy is not exported).
 function promptConfirmation(question: string): Promise<string> {
@@ -191,7 +208,7 @@ export async function discoverServingBuildId(releaseName: string): Promise<strin
     // last colon yields the digest hex — per-pool images then disagree and this recovery
     // aborted on every deployment created by the normal path. The image is still read as the
     // pre-digest fallback.
-    'jsonpath={range .items[*]}{.metadata.name}|{.spec.template.spec.containers[0].image}|' +
+    "jsonpath={range .items[*]}{.metadata.name}|{.spec.template.spec.containers[0].image}|" +
       '{range .spec.template.spec.containers[0].env[?(@.name=="NEXT_BUILD_ID")]}{.value}{end}' +
       '{"\\n"}{end}',
   ]);
@@ -1132,6 +1149,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           ephemeralStorage?: string;
         };
         readinessPath?: string;
+        internalSecretRef?: string;
       } = {};
       if (!dryRun) {
         // N28: ONE machine-readable probe. `--ignore-not-found` makes a genuinely absent
@@ -1159,7 +1177,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "|{.spec.template.spec.containers[0].resources.requests['ephemeral-storage']}" +
             "|{.spec.template.spec.containers[0].resources.limits.cpu}" +
             "|{.spec.template.spec.containers[0].resources.limits.memory}" +
-            "|{.spec.template.spec.containers[0].readinessProbe.httpGet.path}",
+            "|{.spec.template.spec.containers[0].readinessProbe.httpGet.path}|" +
+            // N87: WHICH internal dispatch Secret the live pod template resolves. Per-build
+            // now, but a build deployed by an older adapter references the legacy stable name
+            // — re-rendering it with the derived name would repoint the SERVING build's pods
+            // at a Secret nobody rendered. The `range` form tolerates a container with no such
+            // env (an even older build) instead of failing the whole jsonpath.
+            '{range .spec.template.spec.containers[0].env[?(@.name=="INTERNAL_HEADER_SECRET")]}' +
+            "{.valueFrom.secretKeyRef.name}{end}",
         ]);
         if (r.exitCode !== 0) {
           // Abort rather than guess: the probe previously defaulted to 2 on ANY failure,
@@ -1182,6 +1207,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           cpuLimField,
           memLimField,
           readinessPathField,
+          internalSecretRefField,
         ] = r.stdout.trim().split("|");
         if (!foundName) {
           // N31: no Deployment for this pool in the previous build. Two very different
@@ -1279,7 +1305,22 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             ...(readinessPathField && LIVE_PROBE_PATH_RE.test(readinessPathField)
               ? { readinessPath: readinessPathField }
               : {}),
+            // N87: mirror the live secretKeyRef. Cluster-sourced and spliced into a bare YAML
+            // scalar, so it is charset-checked here; anything unexpected falls back to the
+            // derived per-build name rather than aborting the deploy (same posture as the
+            // readiness path above).
+            ...(internalSecretRefField && LIVE_SECRET_NAME_RE.test(internalSecretRefField)
+              ? { internalSecretRef: internalSecretRefField }
+              : {}),
           };
+          if (internalSecretRefField && !LIVE_SECRET_NAME_RE.test(internalSecretRefField)) {
+            console.warn(
+              `  ! Live INTERNAL_HEADER_SECRET secretKeyRef ${JSON.stringify(
+                internalSecretRefField,
+              )} on ${poolPrevName} is not a plain Secret name — the retained manifest will use ` +
+                `the per-build default instead of mirroring it.`,
+            );
+          }
           if (readinessPathField && !LIVE_PROBE_PATH_RE.test(readinessPathField)) {
             console.warn(
               `  ! Live readiness path ${JSON.stringify(readinessPathField)} on ` +
@@ -1366,6 +1407,78 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `the edge keeps this build's routing manifest and mismatched routes fall back to ` +
           `pool-local re-resolution (invariant 1).`,
       );
+    }
+  }
+
+  // 6-pre-bis (N87). Preserve the LEGACY stable-named internal dispatch Secret across this
+  // upgrade. Internal secrets are now per-BUILD (`<release>-ihs-<build>-<digest>`,
+  // emit/templates/internal-secret.ts), so the first upgrade under that scheme removes
+  // `<release>-internal-header-secret` from the chart — and helm prunes what the chart no
+  // longer renders. The build being REPLACED still references that name in its pod template:
+  // pruning it would leave the rollback target unable to start a single pod
+  // (CreateContainerConfigError on a missing secretKeyRef), and would do the same to any
+  // outgoing pod that restarts inside this deploy window — while it is still carrying 100% of
+  // traffic. `helm.sh/resource-policy: keep` on the LIVE object is what helm checks, so
+  // annotating it here is enough; the sweep in step 7g deletes it once no Deployment
+  // references it. A READ failure is not "absent" (the N68 lesson): nothing has been changed
+  // yet at this point, so abort cleanly rather than upgrade over an unknown.
+  {
+    const legacySecret = legacyInternalSecretName(releaseName);
+    const keepAnnotation = "helm.sh/resource-policy=keep";
+    if (dryRun) {
+      console.log(
+        `    [dry-run] kubectl annotate secret ${legacySecret} -n ${K8S_NAMESPACE} ` +
+          `${keepAnnotation} --overwrite (if it exists)`,
+      );
+    } else {
+      const found = await execCapture("kubectl", [
+        "get",
+        "secret",
+        legacySecret,
+        "-n",
+        K8S_NAMESPACE,
+        "--ignore-not-found",
+        "-o",
+        "name",
+      ]);
+      if (found.exitCode !== 0) {
+        throw new Error(
+          `Could not determine whether the legacy internal dispatch Secret ${legacySecret} ` +
+            `exists (kubectl exited ${found.exitCode}: ${found.stderr.trim()}). ` +
+            `--ignore-not-found makes a genuinely absent Secret exit 0, so this is a ` +
+            `connectivity/RBAC failure. Refusing to run \`helm upgrade\`: if that Secret DOES ` +
+            `exist, helm would prune it and the build it belongs to could no longer start a ` +
+            `pod — bricking the rollback target. Nothing was changed; fix kubectl access and ` +
+            `re-run.`,
+        );
+      }
+      if (found.stdout.trim()) {
+        const annotated = await execCapture("kubectl", [
+          "annotate",
+          "secret",
+          legacySecret,
+          "-n",
+          K8S_NAMESPACE,
+          keepAnnotation,
+          "--overwrite",
+        ]);
+        if (annotated.exitCode !== 0) {
+          throw new Error(
+            `Could not annotate the legacy internal dispatch Secret ${legacySecret} with ` +
+              `helm.sh/resource-policy=keep (kubectl exited ${annotated.exitCode}: ` +
+              `${annotated.stderr.trim()}). \`helm upgrade\` would prune it, leaving the ` +
+              `outgoing build unable to start a pod (its pod template references that Secret ` +
+              `by name) — so both a restart inside this deploy window and a rollback to it ` +
+              `would fail. Nothing was changed; fix kubectl access and re-run.`,
+          );
+        }
+        // Says "legacy", not "the outgoing build's": this step runs on EVERY deploy while that
+        // Secret exists, and after the first migration the outgoing build is already on a
+        // per-build name — so the Secret being annotated here belongs to some OLDER build still
+        // retained. Nothing is leaked by re-annotating; step 7g deletes it once no Deployment
+        // references it, and that is the line to look for.
+        console.log(`  → Preserved the legacy internal dispatch Secret (${legacySecret})`);
+      }
     }
   }
 
@@ -2335,6 +2448,94 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           if (!cmName || keepSnapshots.has(cmName)) continue;
           console.log(`  → Deleting old routing-manifest snapshot: ${cmName}`);
           await execCapture("kubectl", ["delete", "configmap", cmName, "-n", K8S_NAMESPACE]);
+        }
+      }
+    }
+
+    // N87. Prune internal dispatch Secrets that no Deployment references any more. Each
+    // build renders its OWN Secret (`<release>-ihs-<build>-<digest>`) annotated
+    // `helm.sh/resource-policy: keep`, so helm never prunes them — deliberately: the
+    // retained previous build's pods reference theirs BY NAME and a missing secretKeyRef is
+    // CreateContainerConfigError, so pruning on upgrade would brick both a restart in the
+    // deploy window and the rollback. Keeping them makes GC this step's job (the
+    // routing-manifest snapshots accumulated unboundedly for exactly the same reason).
+    //
+    // Classify by what is actually REFERENCED, not by build id: that covers the current
+    // build, the retained previous build, the LEGACY stable-named Secret still needed by a
+    // pre-N87 rollback target, the builds whose Deployments were just deleted above, and
+    // leftovers from an earlier incarnation of this release name — with no assumption about
+    // which builds exist. Conservative on every failure: an unreadable or unparseable
+    // reference set skips the sweep entirely, because deleting a Secret a live pod template
+    // needs would brick that build's restarts. Best-effort — state is already committed
+    // (7d), so a failure here only leaks a handful of 64-byte Secrets.
+    const deploySpecs = await execCapture("kubectl", [
+      "get",
+      "deployments",
+      "-n",
+      K8S_NAMESPACE,
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      "json",
+    ]);
+    let referencedSecrets: Set<string> | null = null;
+    if (deploySpecs.exitCode === 0 && deploySpecs.stdout.trim()) {
+      try {
+        const parsed = JSON.parse(deploySpecs.stdout) as {
+          items?: {
+            spec?: {
+              template?: {
+                spec?: {
+                  containers?: { env?: { valueFrom?: { secretKeyRef?: { name?: string } } }[] }[];
+                };
+              };
+            };
+          }[];
+        };
+        // Every secretKeyRef, not only the internal one — a superset is harmless here
+        // because only Secrets carrying the internal-secret component label are candidates.
+        referencedSecrets = new Set(
+          (parsed.items ?? []).flatMap((d) =>
+            (d.spec?.template?.spec?.containers ?? []).flatMap((c) =>
+              (c.env ?? [])
+                .map((e) => e.valueFrom?.secretKeyRef?.name)
+                .filter((n): n is string => typeof n === "string" && n.length > 0),
+            ),
+          ),
+        );
+        // Belt and braces: this deploy's own Secret is referenced by definition, and the
+        // pod templates it belongs to may not be listed yet on a slow API read.
+        referencedSecrets.add(internalSecretName(releaseName, buildId));
+        if (previousBuildId) {
+          referencedSecrets.add(internalSecretName(releaseName, previousBuildId));
+        }
+      } catch {
+        referencedSecrets = null;
+      }
+    }
+    if (referencedSecrets === null) {
+      console.warn(
+        `  ! Could not read which Secrets the release's Deployments reference ` +
+          `(kubectl exit ${deploySpecs.exitCode}) — skipping the internal-secret prune. ` +
+          `Old per-build dispatch Secrets stay until the next successful deploy.`,
+      );
+    } else {
+      const internalSecrets = await execCapture("kubectl", [
+        "get",
+        "secrets",
+        "-n",
+        K8S_NAMESPACE,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ]);
+      if (internalSecrets.exitCode === 0) {
+        for (const secretName of internalSecrets.stdout.trim().split("\n")) {
+          if (!secretName || referencedSecrets.has(secretName)) continue;
+          console.log(`  → Deleting unreferenced internal dispatch Secret: ${secretName}`);
+          await execCapture("kubectl", ["delete", "secret", secretName, "-n", K8S_NAMESPACE]);
         }
       }
     }

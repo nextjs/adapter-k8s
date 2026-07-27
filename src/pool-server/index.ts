@@ -58,6 +58,7 @@ import {
   validateImageUrlParam,
   isOptimizableImageContentType,
   negotiateImageFormat,
+  negotiateImageMimeType,
   resizeForRequestedWidth,
 } from "./image-utils.js";
 import {
@@ -784,60 +785,227 @@ function loadImageConfig(cwd: string): ImageConfig {
 //     runs and sits under every write below (verified by test).
 
 /**
- * S16 (AVAILABILITY). Bounded concurrency for image decode/encode.
+ * S16 → S32 (AVAILABILITY). Admission control for `/_next/image`, taken BEFORE the source is
+ * read rather than before the encode.
  *
- * `/_next/image` had no process-wide budget at all: every request buffered its full source
- * (up to MAX_IMAGE_BYTES) and handed it to sharp, so N concurrent misses held N source buffers
- * plus N libvips working sets on a pod whose default memory limit is 512 MiB. A single client
- * can generate the whole variant space (every public image × every configured width × every
- * Accept) and never repeat a key, so nothing upstream throttles it either.
+ * S16 put a 4-slot semaphore in front of sharp, because `/_next/image` had no process-wide
+ * budget at all and a single client can walk the whole variant space (every public image ×
+ * every configured width × every Accept) without ever repeating a key, so nothing upstream
+ * throttles it either. S32 is the correction to that fix: the source read/fetch happened FIRST
+ * (`imageBuffer` was assigned before the acquire), so what S16 actually bounded was concurrent
+ * *encodes* — resident source memory stayed bounded only by queue depth × MAX_IMAGE_BYTES,
+ * every waiter parked on the semaphore holding its own full copy, with the 5 s shed deadline as
+ * the only cap on how long. On a pod whose default memory limit is 512 MiB that is still an OOM
+ * path, merely a slower one, and an OOMKill under traffic is read by the blue/green gate as a
+ * healthy pod dying — an unauthenticated way to fail a deploy, not just to degrade one. Same
+ * reasoning as the N34 request-body budget, and this budget is deliberately built in its shape.
  *
- * A semaphore, not a queue-forever: waiters have a deadline, and a request that cannot get a
- * slot in time is shed with 503 rather than parked holding its source buffer. That keeps the
- * failure mode "some image requests are refused under load" instead of "the pod OOMs and takes
- * every route down with it".
+ * So admission now covers source acquisition AND encode as ONE gate — a queued request holds
+ * nothing but its request state — with two knobs, because a slot count alone does not bound
+ * bytes:
+ *   • MAX_CONCURRENT_IMAGE_OPTIMIZATIONS — how many sources may be in flight at once, which is
+ *     what bounds concurrent libvips working sets.
+ *   • MAX_INFLIGHT_IMAGE_BYTES — a process-wide byte budget over those sources. Admission
+ *     reserves the WORST CASE (MAX_IMAGE_BYTES), because the size of a source is unknowable
+ *     before reading it, and trues the reservation down (or up) to the real size once the bytes
+ *     are in hand. Without this knob the memory bound would be slots × MAX_IMAGE_BYTES
+ *     (4 × 20 MiB by default) with no way to tighten it independently of concurrency.
  *
- * NOTE (deliberate scope): this bounds concurrent WORK, it does not deduplicate or cache
- * RESULTS. Upstream Next keeps derivatives in ImageOptimizerCache and single-flights identical
- * in-flight keys; this adapter re-encodes every miss. That is a real inefficiency and is
- * tracked separately — it needs a cache keyed on (source identity, w, q, accept) with its own
- * eviction policy, which is a larger change than a safety bound.
+ * Still a semaphore, not a queue-forever: waiters have a deadline, and a request that cannot be
+ * admitted in time is shed with 503 *before it has read anything*. The failure mode stays "some
+ * image requests are refused under load" rather than "the pod OOMs and takes every route down
+ * with it".
+ *
+ * One consequence of gating the read rather than the encode: the passthrough answers — allowed
+ * SVG, BYPASS_TYPES, animated sources — now need admission too, where under S16 they were served
+ * without ever touching the semaphore. That is the point rather than a side effect. They buffer
+ * a full source exactly like an encoded one does, so they were the cheapest way to drive the
+ * unbounded path; the cost is that a saturated pod can now shed a request `next start` would
+ * answer, which is the same trade the encode semaphore already made.
+ *
+ * Admission is released when the optimization completes, NOT when the response finishes writing
+ * (which is what the N34 body budget does, deliberately, for the request bodies it charges).
+ * The difference is which resource is scarce: N34 holds a byte charge because the buffer it
+ * charged for stays resident for the whole response, whereas holding a CONCURRENCY slot across
+ * the response write would let four slow readers pin the entire optimizer while holding no
+ * source memory at all. What outlives release here is the encoded derivative, a fraction of the
+ * source it came from.
  */
-const MAX_CONCURRENT_IMAGE_ENCODES = 4;
-const IMAGE_ENCODE_QUEUE_DEADLINE_MS = 5_000;
-let activeImageEncodes = 0;
-const imageEncodeWaiters: Array<() => void> = [];
+const MAX_CONCURRENT_IMAGE_OPTIMIZATIONS = Math.max(
+  1,
+  parseInt(process.env.ADAPTER_K8S_MAX_CONCURRENT_IMAGE_OPTIMIZATIONS ?? "", 10) || 4,
+);
+// The budget can never be smaller than one maximal source, or a single legitimate request could
+// never be admitted at all (the same floor MAX_INFLIGHT_BODY_BYTES applies to MAX_BODY_BYTES).
+const MAX_INFLIGHT_IMAGE_BYTES = Math.max(
+  MAX_IMAGE_BYTES,
+  parseInt(process.env.ADAPTER_K8S_MAX_INFLIGHT_IMAGE_BYTES ?? "", 10) || 67_108_864, // 64 MiB
+);
+const IMAGE_ADMISSION_DEADLINE_MS = Math.max(
+  1,
+  parseInt(process.env.ADAPTER_K8S_IMAGE_ADMISSION_DEADLINE_MS ?? "", 10) || 5_000,
+);
+let activeImageOptimizations = 0;
+let reservedImageBytes = 0;
+const imageAdmissionWaiters: Array<() => void> = [];
+// Counters, not gauges: the shed count is the signal that the pod is refusing image work, and
+// the join count is what proves the single-flight below is actually collapsing duplicates. Both
+// are read by tests (asserting on admission accounting is reliable where heap assertions are
+// not) and both are cheap enough to keep in production.
+let admittedImageOptimizations = 0;
+let shedImageOptimizations = 0;
+let joinedImageOptimizations = 0;
 
-async function acquireImageEncodeSlot(): Promise<boolean> {
-  if (activeImageEncodes < MAX_CONCURRENT_IMAGE_ENCODES) {
-    activeImageEncodes++;
-    return true;
+interface ImageAdmission {
+  /**
+   * Replace this admission's worst-case reservation with the number of source bytes actually
+   * held. Called as soon as the source is in hand; it can move the charge UP as well as down —
+   * the disk-read path is not bounded by MAX_IMAGE_BYTES (a build-emitted public file is not
+   * attacker-supplied, and upstream does not cap a local read either), so the honest charge for
+   * one of those may exceed the reservation. Going over budget only blocks further admissions;
+   * it never retroactively refuses work already in flight.
+   */
+  settleSourceBytes(bytes: number): void;
+  release(): void;
+}
+
+// Admit from the head, and stop at the first waiter that does not fit rather than scanning past
+// it for one that does: strict FIFO is what keeps a request for a large source from being
+// starved indefinitely by a stream of small ones. Called on every release AND on every true-up,
+// since a true-up can free budget without freeing a slot.
+function pumpImageAdmissionQueue(): void {
+  while (
+    imageAdmissionWaiters.length > 0 &&
+    activeImageOptimizations < MAX_CONCURRENT_IMAGE_OPTIMIZATIONS &&
+    reservedImageBytes + MAX_IMAGE_BYTES <= MAX_INFLIGHT_IMAGE_BYTES
+  ) {
+    imageAdmissionWaiters.shift()!();
   }
-  return new Promise<boolean>((resolve) => {
+}
+
+function grantImageAdmission(): ImageAdmission {
+  activeImageOptimizations++;
+  admittedImageOptimizations++;
+  let charged = MAX_IMAGE_BYTES;
+  reservedImageBytes += charged;
+  let released = false;
+  return {
+    settleSourceBytes(bytes: number): void {
+      if (released) return;
+      reservedImageBytes += bytes - charged;
+      charged = bytes;
+      pumpImageAdmissionQueue();
+    },
+    release(): void {
+      if (released) return;
+      released = true;
+      activeImageOptimizations--;
+      reservedImageBytes -= charged;
+      pumpImageAdmissionQueue();
+    },
+  };
+}
+
+async function acquireImageAdmission(): Promise<ImageAdmission | null> {
+  if (
+    imageAdmissionWaiters.length === 0 &&
+    activeImageOptimizations < MAX_CONCURRENT_IMAGE_OPTIMIZATIONS &&
+    reservedImageBytes + MAX_IMAGE_BYTES <= MAX_INFLIGHT_IMAGE_BYTES
+  ) {
+    return grantImageAdmission();
+  }
+  return new Promise<ImageAdmission | null>((resolve) => {
     let settled = false;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      const idx = imageEncodeWaiters.indexOf(admit);
-      if (idx !== -1) imageEncodeWaiters.splice(idx, 1);
-      resolve(false);
-    }, IMAGE_ENCODE_QUEUE_DEADLINE_MS);
+      const idx = imageAdmissionWaiters.indexOf(admit);
+      if (idx !== -1) imageAdmissionWaiters.splice(idx, 1);
+      shedImageOptimizations++;
+      resolve(null);
+    }, IMAGE_ADMISSION_DEADLINE_MS);
     timer.unref?.();
     function admit(): void {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      activeImageEncodes++;
-      resolve(true);
+      resolve(grantImageAdmission());
     }
-    imageEncodeWaiters.push(admit);
+    imageAdmissionWaiters.push(admit);
   });
 }
 
-function releaseImageEncodeSlot(): void {
-  activeImageEncodes--;
-  const next = imageEncodeWaiters.shift();
-  if (next) next();
+/**
+ * What one unit of shared optimizer work produces. It is a VALUE rather than a write to `res`
+ * because S32(b) lets N requests share it: everything that depends on the individual request
+ * (If-None-Match → 304, HEAD, and the error body) is applied by each caller afterwards.
+ */
+type ImageOptimizationOutcome =
+  | { kind: "image"; body: Buffer; contentType: string; isStatic: boolean; maxAge: number }
+  | { kind: "error"; status: number; body: string };
+
+/**
+ * S32(b). Single-flight on a PRE-I/O key, so concurrent identical requests share one fetch and
+ * one encode instead of N of each.
+ *
+ * The key is the request shape known before any I/O: normalized `?url=`, width, quality and the
+ * NEGOTIATED output mime. Deliberately not source identity (ETag/Last-Modified/final redirected
+ * URL): those are known only after fetching — FetchedImage does not even carry them — so a key
+ * built from them cannot dedupe the fetch, which is the expensive half. It is upstream's model
+ * too: `ImageOptimizerCache.getCacheKey` is URL-based and uses source validators as
+ * *revalidation* metadata, not as key material.
+ *
+ * Sharing is safe because the work is client-independent by construction: the local branch reads
+ * from disk, and a middleware-covered or route-served source is self-fetched over loopback with
+ * NONE of the client's headers (see the self-fetch below), so two clients requesting the same
+ * key already received byte-identical output before this existed. The window is only the
+ * in-flight one — nothing is retained after the promise settles, so a source that changes
+ * between requests behaves exactly as it did.
+ */
+const inflightImageOptimizations = new Map<string, Promise<ImageOptimizationOutcome>>();
+
+function runOrJoinImageOptimization(
+  key: string,
+  run: () => Promise<ImageOptimizationOutcome>,
+): Promise<ImageOptimizationOutcome> {
+  const joined = inflightImageOptimizations.get(key);
+  if (joined) {
+    joinedImageOptimizations++;
+    return joined;
+  }
+  // The map entry is cleared on BOTH outcomes, so a rejection cannot poison the key for the
+  // life of the process: the next request re-runs the work. Every waiter awaits this same
+  // promise, which is also why a rejection here is never an unhandled one.
+  const started = run().finally(() => {
+    inflightImageOptimizations.delete(key);
+  });
+  inflightImageOptimizations.set(key, started);
+  return started;
+}
+
+/**
+ * The S32 admission/single-flight accounting, exported for tests. Asserting on this is the
+ * reliable way to pin a memory bound — a heap assertion is flaky, and a test that only counted
+ * encodes would pass while a duplicated FETCH (the expensive half) went unnoticed.
+ */
+export function imageOptimizerAdmissionStats(): {
+  active: number;
+  queued: number;
+  reservedBytes: number;
+  admitted: number;
+  shed: number;
+  joined: number;
+  inflightKeys: number;
+} {
+  return {
+    active: activeImageOptimizations,
+    queued: imageAdmissionWaiters.length,
+    reservedBytes: reservedImageBytes,
+    admitted: admittedImageOptimizations,
+    shed: shedImageOptimizations,
+    joined: joinedImageOptimizations,
+    inflightKeys: inflightImageOptimizations.size,
+  };
 }
 
 /**
@@ -2451,8 +2619,20 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         return;
       }
       const { width, quality } = params;
+      const accept = String(req.headers["accept"] ?? "");
 
-      try {
+      // The optimizer pipeline as ONE unit of work: acquire the source, sniff it, negotiate the
+      // output format, encode. It takes its admission (S32) as an argument because the source
+      // read below is the thing being bounded, and it RETURNS an outcome instead of writing to
+      // `res` because up to N requests share this one run (runOrJoinImageOptimization).
+      //
+      // It reads the leader request's `accept` — sound, and not an accident of who arrived
+      // first: the single-flight key pins negotiateImageMimeType(accept, formats), which is the
+      // only thing negotiation consults the header for, so every request sharing a key
+      // negotiates the same output.
+      const optimizeImage = async (
+        admission: ImageAdmission,
+      ): Promise<ImageOptimizationOutcome> => {
         // Resolve the image: internal (relative) or external (absolute URL)
         let imageBuffer: Buffer;
         let contentType: string;
@@ -2496,8 +2676,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // `400 The requested resource isn't a valid image.`. This adapter refuses the
             // traversal outright instead of normalizing it, so it borrows upstream's
             // closest 400 wording rather than inventing one.
-            sendImageError(res, 400, '"url" parameter is not allowed');
-            return;
+            return { kind: "error", status: 400, body: '"url" parameter is not allowed' };
           }
 
           // Matches Next's `isStatic` check (`${basePath}/_next/static/media` and the
@@ -2563,8 +2742,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               // happened (an upstream we would not follow) better than upstream's generic
               // 500. Only the Content-Type is dropped, for consistency with every other
               // optimizer error.
-              sendImageError(res, 502, "Failed to fetch image: redirect not followed");
-              return;
+              return {
+                kind: "error",
+                status: 502,
+                body: "Failed to fetch image: redirect not followed",
+              };
             }
             // Deliberately NO `!imgRes.ok` rejection: upstream's `fetchInternalImage` only
             // checks that a status exists and that the body is non-empty, so a route
@@ -2576,18 +2758,27 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // page's bytes from ever being served back.
             const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
             if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
-              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
-              return;
+              return {
+                kind: "error",
+                status: 413,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
             }
             const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
             if (streamedBody === null) {
-              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
-              return;
+              return {
+                kind: "error",
+                status: 413,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
             }
             if (streamedBody.length === 0) {
               // Upstream's `mocked.res.buffers.length === 0` branch.
-              sendImageError(res, 400, '"url" parameter is valid but internal response is invalid');
-              return;
+              return {
+                kind: "error",
+                status: 400,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
             }
             imageBuffer = streamedBody;
             // A route-served image has no meaningful extension (e.g. /api/tiny-png) —
@@ -2607,8 +2798,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // The reason is logged, never sent — see IMAGE_FETCH_ERROR_RESPONSE.
             console.error(`[pool-server] /_next/image upstream fetch failed: ${fetched.error}`);
             const mapped = IMAGE_FETCH_ERROR_RESPONSE[fetched.error];
-            sendImageError(res, mapped.status, mapped.body);
-            return;
+            return { kind: "error", status: mapped.status, body: mapped.body };
           }
           if (!fetched.ok) {
             // Upstream forwards the UPSTREAM's status here (an allowlisted host answering
@@ -2617,17 +2807,21 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               `[pool-server] /_next/image upstream responded ${fetched.status} for an ` +
                 `allowlisted external image`,
             );
-            sendImageError(
-              res,
-              fetched.status >= 400 ? fetched.status : 500,
-              '"url" parameter is valid but upstream response is invalid',
-            );
-            return;
+            return {
+              kind: "error",
+              status: fetched.status >= 400 ? fetched.status : 500,
+              body: '"url" parameter is valid but upstream response is invalid',
+            };
           }
           imageBuffer = fetched.body;
           contentType = fetched.contentType;
           upstreamCacheControl = fetched.cacheControl;
         }
+
+        // S32: the source is resident from here on, so replace the worst-case reservation with
+        // what it actually costs. One call for every branch above — a disk read, a loopback
+        // self-fetch and an external fetch all end up holding exactly one buffer.
+        admission.settleSourceBytes(imageBuffer.length);
 
         // `public, max-age=<maxAge>, must-revalidate` — Next's floor is
         // images.minimumCacheTTL (default 14400), raised to the upstream's own max-age
@@ -2655,8 +2849,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // back under its own content type would make /_next/image an XSS channel).
         if (!isOptimizableImageContentType(contentType)) {
           // Byte-for-byte the body `next start` sends for this case.
-          sendImageError(res, 400, "The requested resource isn't a valid image.");
-          return;
+          return {
+            kind: "error",
+            status: 400,
+            body: "The requested resource isn't a valid image.",
+          };
         }
 
         // `next start` parity: SVG never goes through the optimizer by default — Next
@@ -2667,26 +2864,25 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         if (contentType.toLowerCase().includes("svg")) {
           if (!imageConfig.dangerouslyAllowSVG) {
             // Byte-for-byte the body `next start` sends for this case.
-            sendImageError(res, 400, '"url" parameter is valid but image type is not allowed');
-            return;
+            return {
+              kind: "error",
+              status: 400,
+              body: '"url" parameter is valid but image type is not allowed',
+            };
           }
           // The SVG branch is not special-cased for headers any more: `next start` sends
           // the same Content-Disposition/CSP/ETag/Cache-Control set on every optimizer
           // 200, SVG included (the filename now carries the real source name and `.svg`
           // instead of the placeholder `attachment; filename="image"`).
-          sendImageResponse(req, res, {
+          return {
+            kind: "image",
             body: imageBuffer,
             contentType,
-            sourceUrl: imageUrl,
             isStatic: isStaticSource,
             maxAge: imageMaxAgeSeconds,
-            config: imageConfig,
-            buildId,
-          });
-          return;
+          };
         }
 
-        const accept = String(req.headers["accept"] ?? "");
         // Negotiate the output format like Next's optimizer (see image-utils). This runs
         // BEFORE the sharp gate on purpose: Next's BYPASS_TYPES (ICO/BMP/ICNS/JXL/HEIC)
         // and animated sources are returned verbatim and need no optimizer at all —
@@ -2699,16 +2895,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           sourceBytes: imageBuffer,
         });
         if (encode === "passthrough") {
-          sendImageResponse(req, res, {
+          return {
+            kind: "image",
             body: imageBuffer,
             contentType: outType,
-            sourceUrl: imageUrl,
             isStatic: isStaticSource,
             maxAge: imageMaxAgeSeconds,
-            config: imageConfig,
-            buildId,
-          });
-          return;
+          };
         }
 
         // Optimize with Sharp. A MISSING sharp still fails closed with a 503: it means the
@@ -2721,15 +2914,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // The load failure (with its cause) was logged once by loadSharpOnce. No upstream
           // counterpart — upstream cannot start without sharp — so the wording is the
           // adapter's own; only the absent Content-Type is borrowed.
-          sendImageError(res, 503, "Image optimization unavailable");
-          return;
+          return { kind: "error", status: 503, body: "Image optimization unavailable" };
         }
-        // S16: bound concurrent decode/encode work. A request that cannot get a slot within
-        // the deadline is shed rather than parked holding its full source buffer.
-        if (!(await acquireImageEncodeSlot())) {
-          sendImageError(res, 503, "Image optimization unavailable");
-          return;
-        }
+        // S32: no acquire here any more. The slot that used to be taken at THIS point — after
+        // the source was already resident — is now taken by the caller before any of the above
+        // runs, which is the whole correction (see the admission block).
         try {
           // Both are already validated against the app's allowed sets (q is 1..100 and in
           // images.qualities; w is one of deviceSizes/imageSizes), so no defaulting here.
@@ -2777,15 +2966,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               pipeline = pipeline.jpeg({ quality: q, mozjpeg: true });
           }
           const optimized = await pipeline.toBuffer();
-          sendImageResponse(req, res, {
+          return {
+            kind: "image",
             body: optimized,
             contentType: outType,
-            sourceUrl: imageUrl,
             isStatic: isStaticSource,
             maxAge: imageMaxAgeSeconds,
-            config: imageConfig,
-            buildId,
-          });
+          };
         } catch (err) {
           // Sharp loaded but could not process the input. `next start` FALLS BACK to the
           // source bytes here — "If we fail to optimize, fallback to the original image"
@@ -2805,7 +2992,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           //     is what keeps an attacker-influenced `Content-Type`/extension guess (an
           //     HTML body from an allowlisted remote host named `.png`) on the 502 path
           //     instead of being echoed back under a type nobody verified.
-          //   • it goes through sendImageResponse, so it carries the same
+          //   • it is returned as a normal `image` outcome, so it goes through
+          //     sendImageResponse and carries the same
           //     `Content-Disposition: attachment` + images CSP + Vary/ETag set as every
           //     other optimizer 200 (SVG never reaches here at all — the
           //     dangerouslyAllowSVG gate 400s or serves it far above).
@@ -2822,16 +3010,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               `[pool-server] /_next/image could not optimize ${loggableImageUrl} (${contentType}) — ` +
                 `serving the source bytes as next start does: ${message}`,
             );
-            sendImageResponse(req, res, {
+            return {
+              kind: "image",
               body: imageBuffer,
               contentType: sniffedContentType,
-              sourceUrl: imageUrl,
               isStatic: isStaticSource,
               maxAge: imageConfig.minimumCacheTTL,
-              config: imageConfig,
-              buildId,
-            });
-            return;
+            };
           }
           // No signature matched, so the only candidate type is the upstream header or the
           // URL's extension — a guess. Upstream 400s this case before sharp ever runs; the
@@ -2843,12 +3028,42 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             `[pool-server] /_next/image failed to process ${loggableImageUrl} (${contentType}):`,
             message,
           );
-          sendImageError(res, 502, "Failed to process image");
-        } finally {
-          // S16: always give the slot back — every branch above either responds or throws.
-          releaseImageEncodeSlot();
+          return { kind: "error", status: 502, body: "Failed to process image" };
         }
-        return;
+      };
+
+      // S32(b): the single-flight key, built from what is known BEFORE any I/O. The url
+      // component is the exact string the I/O below will use — the raw `?url=` for a local
+      // source (the loopback self-fetch replays it verbatim, query included) and the
+      // WHATWG-normalized target for an absolute one (which is the string
+      // fetchExternalImageSafely requests). Nothing here is normalized more aggressively than
+      // the I/O is, so two requests can only share a key if they would have done the same work.
+      // `width`/`quality` are validated integers and the mime comes from a fixed set, so the
+      // leading fields cannot contain the separator and the key is unambiguous however exotic
+      // the url is.
+      const outputMimeForKey = negotiateImageMimeType(accept, imageConfig.formats) ?? "source";
+      const optimizeKey = `${width}|${quality}|${outputMimeForKey}|${
+        urlParam.isAbsolute ? urlParam.target.toString() : urlParam.url
+      }`;
+
+      let outcome: ImageOptimizationOutcome;
+      try {
+        outcome = await runOrJoinImageOptimization(optimizeKey, async () => {
+          // S32(a): admission BEFORE the source read, so a queued request holds nothing but its
+          // request state. Only the request that actually runs the work takes a slot; the ones
+          // that join an in-flight key hold no source memory at all and so need none.
+          const admission = await acquireImageAdmission();
+          if (!admission) {
+            // Shed rather than park: same 503 the encode semaphore used to answer with, now
+            // answered before a single byte of source has been read.
+            return { kind: "error", status: 503, body: "Image optimization unavailable" };
+          }
+          try {
+            return await optimizeImage(admission);
+          } finally {
+            admission.release();
+          }
+        });
       } catch (err) {
         console.error("Image optimization error:", err);
         if (!res.headersSent) {
@@ -2856,6 +3071,22 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         }
         return;
       }
+      if (outcome.kind === "error") {
+        sendImageError(res, outcome.status, outcome.body);
+        return;
+      }
+      // Everything request-SPECIFIC happens here, outside the shared work: If-None-Match → 304,
+      // HEAD, and the Content-Disposition filename (derived from `?url=`, which is in the key).
+      sendImageResponse(req, res, {
+        body: outcome.body,
+        contentType: outcome.contentType,
+        sourceUrl: imageUrl,
+        isStatic: outcome.isStatic,
+        maxAge: outcome.maxAge,
+        config: imageConfig,
+        buildId,
+      });
+      return;
     }
 
     // public/ files deliberately have NO pre-routing fast path here. They are in the

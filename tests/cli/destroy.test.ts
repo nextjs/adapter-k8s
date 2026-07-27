@@ -203,12 +203,58 @@ describe("runDestroy — confirmation gate (L12)", () => {
     expect(out).toContain(
       "[dry-run] gcloud storage rm -r gs://deploy-project-nextjs-static --quiet",
     );
-    expect(out).toContain("[dry-run] gcloud iam service-accounts delete");
+    // S6: init creates TWO release-scoped service accounts, so destroy must plan BOTH. Leaving
+    // `<release>-cli` behind would leave a live identity holding bucket objectAdmin + Artifact
+    // Registry writer for a release that no longer exists.
+    expect(out).toContain(
+      "[dry-run] gcloud iam service-accounts delete my-app-deploy@deploy-project.iam.gserviceaccount.com",
+    );
+    expect(out).toContain(
+      "[dry-run] gcloud iam service-accounts delete my-app-cli@deploy-project.iam.gserviceaccount.com",
+    );
     expect(out).toContain("[dry-run] gcloud service-extensions lb-traffic-extensions delete");
     expect(out).toContain("[dry-run] gcloud compute backend-services delete");
     expect(out).toContain("[dry-run] gcloud compute health-checks delete");
     expect(out).toContain("[dry-run] gcloud compute addresses delete");
     expect(out).toContain(`[dry-run] gcloud iam roles delete ${deployExtRoleId("my-app")}`);
+  });
+
+  it("deletes BOTH service accounts for real (not only the deploy one)", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    const deleted = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(
+        ([cmd, args]) =>
+          cmd === "gcloud" &&
+          args[0] === "iam" &&
+          args[1] === "service-accounts" &&
+          args[2] === "delete",
+      )
+      .map(([, args]) => args[3]);
+    expect(deleted).toEqual([
+      "my-app-deploy@deploy-project.iam.gserviceaccount.com",
+      "my-app-cli@deploy-project.iam.gserviceaccount.com",
+    ]);
+  });
+
+  it("treats a missing CLI service account as normal, not a failure", async () => {
+    // The expected state for any release inited BEFORE the S6 split: `<release>-cli` was never
+    // created, so its deletion 404s and must not be reported as a leftover resource.
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) => {
+      if (
+        args.includes("service-accounts") &&
+        args.includes("my-app-cli@deploy-project.iam.gserviceaccount.com")
+      ) {
+        return { exitCode: 1, stdout: "", stderr: "NOT_FOUND: Unknown service account" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    const out = printedOutput();
+    expect(out).toContain("(service account not found or already deleted)");
+    expect(out).not.toContain("WARNING: service account deletion failed");
+    expect(out).not.toContain('my-app-cli@deploy-project.iam.gserviceaccount.com"');
   });
 
   it("dry-run skips the confirmation gate entirely", async () => {
@@ -468,5 +514,65 @@ describe("runDestroy — unpinnable kubectl context (C1)", () => {
     const out = printedOutput();
     expect(out).toContain("could NOT be pinned");
     expect(out).toContain("gke_other-project_us-west1_some-cluster");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N87: the per-build internal-dispatch Secrets carry `helm.sh/resource-policy: keep` on purpose —
+// a build's secret must outlive the upgrade that renders the next build's one, or the retained
+// rollback target's pods cannot start. That means `helm uninstall` deliberately does NOT remove
+// them, so destroy must. The ConfigMap sweep does not cover them: different kind, and these are
+// helm-owned (`managed-by: Helm`) rather than carrying the adapter's own managed-by label.
+// ---------------------------------------------------------------------------
+describe("destroy: retained internal-dispatch Secrets", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-destroy-secret-"));
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ projectId: "deploy-project", region: "us-central1" }),
+    );
+    vi.clearAllMocks();
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("sweeps them by component label, which helm uninstall leaves behind", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const del = vi
+      .mocked(exec.execCapture)
+      .mock.calls.map(([, args]) => args)
+      .find((a) => a[0] === "delete" && a[1] === "secret");
+    expect(del).toBeDefined();
+    const joined = del!.join(" ");
+    expect(joined).toContain("app.kubernetes.io/component=internal-secret");
+    expect(joined).toContain("app.kubernetes.io/name=my-app");
+    // Absence is not a failure — a release that never deployed has none.
+    expect(del).toContain("--ignore-not-found");
+  });
+
+  it("warns rather than failing the destroy when the sweep cannot run", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.mocked(exec.execCapture).mockImplementation((async (_c: string, args: string[]) => {
+      if (args[0] === "delete" && args[1] === "secret") {
+        return { exitCode: 1, stdout: "", stderr: "forbidden" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/could not delete the internal-dispatch Secrets/),
+    );
+    warn.mockRestore();
   });
 });

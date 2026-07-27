@@ -1269,12 +1269,16 @@ export interface DispatcherOptions {
     }
   >;
   /** N16: PPR-capable route templates with no build-emitted fallback shell (`fallback: null`),
-   * each tagged with the unresolved ROOT params that stopped the build from emitting one. See the
-   * RoutingManifest doc comment in types.ts — only the root-param flavour runs NON-minimal; the
-   * rest merely need to be recognized as PPR so N13 leaves them alone.
+   * each tagged with the unresolved ROOT params that stopped the build from emitting one, plus
+   * (N16b) whether the build render postponed at all. See the RoutingManifest doc comment in
+   * types.ts — the root-param flavour and the would-postpone flavour each run NON-minimal for a
+   * DIFFERENT documented reason; the remainder merely need to be recognized as PPR so N13 leaves
+   * them alone.
+   * `wouldPostpone` is optional: manifests built before N16b carry only `rootParams`, and a
+   * missing bit must degrade to the pre-N16b behavior (minimal), never to non-minimal.
    * `| undefined` is explicit: under exactOptionalPropertyTypes the index.ts wiring passes
    * `routingManifest.pprCapableRoutes` straight through, and older manifests have no such key. */
-  pprCapableRoutes?: Record<string, { rootParams: string[] }> | undefined;
+  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone?: boolean }> | undefined;
   /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
    * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
@@ -2540,13 +2544,34 @@ export function createDispatcher(options: DispatcherOptions) {
             // through the same registered handler.
             minimalMode: !(
               // N16: a shell-bearing PPR template, or one the build left shell-less because
-              // ROOT params were unresolved. NOT every shell-less PPR template: a route whose
-              // shell was unemittable for any other reason (no Suspense boundary above the
-              // params access) is rendered dynamically by upstream, and running it non-minimal
-              // made Next resume a fallback shell upstream deliberately skips
-              // (app-dir/fallback-shells).
+              // ROOT params were unresolved. N16b adds the third case: shell-less because the
+              // shell would have been EMPTY, which the build reports by putting the postponed
+              // state on the template's `.rsc` sibling — upstream prerenders and then resumes
+              // those, so minimal mode served them as an empty closed Suspense boundary (1,358 B
+              // vs 7,658 B from `next start`).
+              // Still NOT every shell-less PPR template: a route that never postponed at all
+              // (no Suspense boundary above the params access) is rendered dynamically by
+              // upstream, and running it non-minimal made Next resume a fallback shell upstream
+              // deliberately skips (app-dir/fallback-shells).
               (
                 ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                  // N16c. `pprCapableRoutes[route].wouldPostpone` is DELIBERATELY NOT a rung
+                  // here, and is not even read into a local. The manifest computes it
+                  // (manifest.ts) and it is real — the build does put a postponed state on a
+                  // PARTIALLY_STATIC template's same-group `.rsc` sibling — but MEASURED on the
+                  // e2e suite it does not DISCRIMINATE, so adding it here is indistinguishable
+                  // from the blunter
+                  // `|| handlerPprCapable` that was rejected earlier:
+                  //   with the rung:    fallback-shells 8 passed / 5 failed
+                  //   without the rung: fallback-shells 13 passed / 0 failed
+                  // and in both cases otel-spans stays 3/1 — `early-span` starts passing
+                  // while `prerendering at runtime` starts failing, because flipping those
+                  // routes non-minimal also changes their MISS→HIT caching.
+                  // fallback-shells' `without-io` / `not wrapped in Suspense` routes carry a
+                  // sibling postponed state too, so the signal cannot separate "upstream
+                  // prerenders then resumes this" from "upstream renders this dynamically".
+                  // The truncation bug it was meant to fix is therefore still open; see
+                  // docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md.
                   (!!handlerPprInfo || handlerPprRootParams)) ||
                 (emulatePlatformCache &&
                   !!dispatchStaticAsset?.prerender &&

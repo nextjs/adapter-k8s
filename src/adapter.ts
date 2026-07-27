@@ -962,6 +962,23 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // assets and drops the `?dpl` skew token from their URLs (mutable assets like service workers
       // keep it), and the adapter serves them per Next's own header policy (see static-asset-headers).
       // Respect an explicit user opt-out.
+      //
+      // DELIBERATELY FORWARD-LOOKING, and a silent no-op below Next 16.3.
+      // `experimental.supportsImmutableAssets` is the 16.3 key; it does not exist in 16.2.10's config
+      // schema, where the equivalent knob is `experimental.immutableAssetToken` — a string that
+      // SUPPLIES a `?dpl=` token, i.e. the INVERSE intent, and which 16.3.0-canary removes again.
+      // So we set the 16.3 key unconditionally and do NOT backport the 16.2 one:
+      //   * on 16.3 this is correct (content-addressed assets, `?dpl=` suppressed);
+      //   * on 16.2 Next ignores the unknown key without warning and emits no
+      //     `/_next/static/immutable/` directory — harmless, because with no `deploymentId`
+      //     configured the `?dpl=` suffix is empty there anyway (build/define-env.js:89);
+      //   * setting `immutableAssetToken` on 16.2 would ADD the token we do not want, and would be
+      //     dead config the moment 16.3 lands.
+      // Do NOT, however, reason from "this adapter enables immutable assets" when explaining 16.2
+      // behaviour — below 16.3 it enables nothing. What actually versions asset URLs on both is
+      // Turbopack's content-derived chunk naming (measured: a one-line client-component change moved
+      // `07-7zvnown312.js` → `3v9mo0_pueesb.js`), which is also why no `?dpl=` token is needed.
+      // See docs/superpowers/specs/2026-07-26-phase7-skew-protection.md (version-support policy).
       {
         const userImmutable = (
           nextConfig.experimental as { supportsImmutableAssets?: boolean } | undefined

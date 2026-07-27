@@ -29,6 +29,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { routingManifestSnapshotName } from "../../src/emit/templates/routing-manifest-configmap.js";
 import { poolResourceNames } from "../../src/emit/templates/utils.js";
 import { renderHPA } from "../../src/emit/templates/hpa.js";
+import {
+  internalSecretName,
+  legacyInternalSecretName,
+} from "../../src/emit/templates/internal-secret.js";
 
 const PROJECT = "/proj";
 const RELEASE = "rel";
@@ -1352,6 +1356,192 @@ describe("revertRoutingServiceToBuild — env stays truthful", () => {
     expect(body).toContain("routing-service:target-build");
     expect(body).toContain("NEXT_BUILD_ID");
     expect(body).toContain("target-build");
+  });
+});
+
+// N87 (SECURITY). The internal dispatch secret is per BUILD, so the edge's secretKeyRef has to
+// move with the image for the same reason NEXT_BUILD_ID does: a reverted edge still presenting
+// the rolled-away-from build's secret is rejected by the rolled-back pools, which then re-resolve
+// every request locally — fail-safe (invariant 1), but middleware runs TWICE per request for as
+// long as the rollback lasts.
+describe("revertRoutingServiceToBuild — the dispatch secret moves with the image", () => {
+  const TARGET = "target-build";
+  const TARGET_SECRET = internalSecretName("rel", TARGET);
+  const LEGACY_SECRET = legacyInternalSecretName("rel");
+
+  /** `existingSecrets` = the Secret names `kubectl get secret --ignore-not-found` finds. */
+  function mockCluster(opts: { existingSecrets: string[]; liveSecretRef?: string | null }) {
+    const patches: string[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "secret") {
+        const name = args[2]!;
+        return opts.existingSecrets.includes(name)
+          ? { exitCode: 0, stdout: `secret/${name}\n`, stderr: "" }
+          : { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "deployment" && args.includes("json")) {
+        const liveRef = opts.liveSecretRef === undefined ? LEGACY_SECRET : opts.liveSecretRef;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:current",
+                      env: [
+                        { name: "NEXT_BUILD_ID", value: "current" },
+                        ...(liveRef
+                          ? [
+                              {
+                                name: "INTERNAL_HEADER_SECRET",
+                                valueFrom: { secretKeyRef: { name: liveRef, key: "secret" } },
+                              },
+                            ]
+                          : []),
+                      ],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "patch") {
+        patches.push(args[args.length - 1]!);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+    return patches;
+  }
+
+  it("repoints the secretKeyRef at the TARGET build's Secret", async () => {
+    const patches = mockCluster({ existingSecrets: [TARGET_SECRET, LEGACY_SECRET] });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    const body = patches.join("\n");
+    expect(body).toContain("INTERNAL_HEADER_SECRET");
+    expect(body).toContain(TARGET_SECRET);
+  });
+
+  it("falls back to the LEGACY stable name for a build deployed before per-build names", async () => {
+    // deploy preserves that Secret (`helm.sh/resource-policy: keep`), and it is the one a
+    // pre-N87 target build's pods actually hold.
+    const patches = mockCluster({
+      existingSecrets: [LEGACY_SECRET],
+      liveSecretRef: "rel-ihs-newer",
+    });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    expect(patches.join("\n")).toContain(LEGACY_SECRET);
+  });
+
+  it("leaves the env alone (with a warning) when the target has no Secret at all", async () => {
+    // Pointing a container at a missing Secret is CreateContainerConfigError — that would turn
+    // a degraded edge into a dead one.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const patches = mockCluster({ existingSecrets: [] });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    expect(patches.join("\n")).not.toContain("INTERNAL_HEADER_SECRET");
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/No internal dispatch Secret found for build/);
+  });
+
+  it("restores the PRIOR secretKeyRef when the reverted rollout fails", async () => {
+    // The revert may already have moved the ref; restoring the image without it would leave the
+    // edge on a secret the (unchanged) pools do not share.
+    const patches: string[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "secret") {
+        return { exitCode: 0, stdout: `secret/${args[2]}\n`, stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "deployment" && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:current",
+                      env: [
+                        { name: "NEXT_BUILD_ID", value: "current" },
+                        {
+                          name: "INTERNAL_HEADER_SECRET",
+                          valueFrom: { secretKeyRef: { name: "rel-ihs-current", key: "secret" } },
+                        },
+                      ],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "rollout") {
+        return { exitCode: 1, stdout: "", stderr: "timed out waiting for the condition" };
+      }
+      if (args[0] === "patch") {
+        patches.push(args[args.length - 1]!);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: TARGET,
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/did not roll out/);
+
+    expect(patches.at(-1)).toContain("rel-ihs-current");
+  });
+
+  it("does not patch the ref to itself when it is already correct", async () => {
+    const patches = mockCluster({
+      existingSecrets: [TARGET_SECRET],
+      liveSecretRef: TARGET_SECRET,
+    });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    expect(patches.join("\n")).not.toContain("INTERNAL_HEADER_SECRET");
   });
 });
 

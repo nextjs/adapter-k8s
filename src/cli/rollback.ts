@@ -19,6 +19,13 @@ import {
   routingManifestSnapshotName,
   routingServiceDeploymentName,
 } from "../emit/templates/routing-manifest-configmap.js";
+// N87: internal dispatch secrets are per BUILD, so reverting the edge has to move its
+// secretKeyRef with the image (see revertRoutingServiceToBuild).
+import {
+  INTERNAL_SECRET_KEY,
+  internalSecretName,
+  legacyInternalSecretName,
+} from "../emit/templates/internal-secret.js";
 import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
@@ -43,6 +50,13 @@ interface RoutingServingConfig {
   image: string;
   /** ConfigMap the routing-manifest volume currently mounts. */
   manifestConfigMap: string;
+  /**
+   * N87: the Secret the routing container resolves INTERNAL_HEADER_SECRET from. Internal
+   * dispatch secrets are per BUILD, so this moves with the image exactly like NEXT_BUILD_ID;
+   * captured so a failed revert can be restored to the ref it actually had. `null` when the
+   * Deployment carries no such env (an adapter version predating the injection).
+   */
+  internalSecretRef: string | null;
 }
 
 /**
@@ -128,9 +142,17 @@ export async function readRoutingServingConfig(
   // now makes the routing pod fail its startup parity check (S1) instead of silently serving.
   // The env carries the FULL, unsanitized id, which is exactly what the snapshot name needs.
   const envEntries = Array.isArray(routingContainer?.env)
-    ? (routingContainer.env as { name?: string; value?: string }[])
+    ? (routingContainer.env as {
+        name?: string;
+        value?: string;
+        valueFrom?: { secretKeyRef?: { name?: string } };
+      }[])
     : [];
   const envBuildId = envEntries.find((e) => e?.name === "NEXT_BUILD_ID")?.value;
+  // N87: which per-build internal dispatch Secret the edge is currently resolving.
+  const internalSecretRef =
+    envEntries.find((e) => e?.name === "INTERNAL_HEADER_SECRET")?.valueFrom?.secretKeyRef?.name ??
+    null;
   // A TAG-pinned image names its own build, and the image is what actually runs — so when the
   // reference carries a tag, that tag wins. The env is the source only for a DIGEST-pinned
   // image, where the reference cannot name a build at all.
@@ -168,7 +190,12 @@ export async function readRoutingServingConfig(
   }
   return {
     status: "read",
-    config: { imageTag: tag, image: typeof image === "string" ? image : "", manifestConfigMap: cmName },
+    config: {
+      imageTag: tag,
+      image: typeof image === "string" ? image : "",
+      manifestConfigMap: cmName,
+      internalSecretRef,
+    },
   };
 }
 
@@ -378,6 +405,7 @@ export async function revertRoutingServiceToBuild(opts: {
     buildId: exists.config.imageTag || null,
     image: exists.config.image || null,
     manifestConfigMap: exists.config.manifestConfigMap || null,
+    internalSecretRef: exists.config.internalSecretRef,
   };
 
   // Retain the manifest we are about to roll AWAY from, so the symmetric roll-forward
@@ -417,6 +445,48 @@ export async function revertRoutingServiceToBuild(opts: {
         `next deploy records a digest so a later rollback can pin it.`,
     );
   }
+  // N87: the internal dispatch secret is per BUILD, so the edge's secretKeyRef must move with
+  // the image for the same reason NEXT_BUILD_ID does — otherwise a reverted edge presents the
+  // rolled-away-from build's secret to the rolled-back pools, which reject it and re-resolve
+  // every request locally (fail-safe per invariant 1, but middleware then runs TWICE per
+  // request for as long as the rollback lasts — and a rollback is not the moment to double
+  // the middleware bill). Only patched when the target's Secret actually EXISTS: pointing a
+  // container at a missing Secret is CreateContainerConfigError, i.e. it would turn a
+  // degraded edge into a dead one. A build deployed before per-build names used the legacy
+  // stable name, which deploy preserves (`helm.sh/resource-policy: keep`), so try that too.
+  let targetSecretRef: string | null = null;
+  for (const candidate of [
+    internalSecretName(releaseName, targetBuildId),
+    legacyInternalSecretName(releaseName),
+  ]) {
+    const got = await execCapture("kubectl", [
+      "get",
+      "secret",
+      candidate,
+      "-n",
+      K8S_NAMESPACE,
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (got.exitCode === 0 && got.stdout.trim()) {
+      targetSecretRef = candidate;
+      break;
+    }
+  }
+  if (!targetSecretRef) {
+    console.warn(
+      `  ! No internal dispatch Secret found for build ${targetBuildId} ` +
+        `(${internalSecretName(releaseName, targetBuildId)}). The edge keeps its current ` +
+        `secret, so the rolled-back pools will reject its dispatch headers and re-resolve ` +
+        `every request locally — correct (invariant 1), but middleware runs twice per request ` +
+        `until the next deploy.`,
+    );
+  } else if (targetSecretRef === priorSpec.internalSecretRef) {
+    // Already pointing at the right Secret (e.g. a legacy release where both builds share
+    // the stable name) — leave the env alone rather than patching it to itself.
+    targetSecretRef = null;
+  }
   const patch = {
     spec: {
       template: {
@@ -436,7 +506,21 @@ export async function revertRoutingServiceToBuild(opts: {
               // (assertManifestMatchesImage) and crash-looped, which is how the corruption
               // surfaced rather than silently serving mismatched routes. A strategic-merge
               // patch matches env entries by `name`, so this replaces just this one variable.
-              env: [{ name: "NEXT_BUILD_ID", value: targetBuildId }],
+              env: [
+                { name: "NEXT_BUILD_ID", value: targetBuildId },
+                // N87: same merge-by-name semantics; the live entry carries only `valueFrom`,
+                // so this replaces the Secret it resolves from and nothing else.
+                ...(targetSecretRef
+                  ? [
+                      {
+                        name: "INTERNAL_HEADER_SECRET",
+                        valueFrom: {
+                          secretKeyRef: { name: targetSecretRef, key: INTERNAL_SECRET_KEY },
+                        },
+                      },
+                    ]
+                  : []),
+              ],
             },
           ],
           ...(haveSnapshot
@@ -525,6 +609,8 @@ interface RoutingSpecSnapshot {
   buildId: string | null;
   image: string | null;
   manifestConfigMap: string | null;
+  /** N87: the per-build internal dispatch Secret the container resolved from. */
+  internalSecretRef: string | null;
 }
 
 /**
@@ -545,7 +631,29 @@ async function restoreRoutingSpec(
             {
               name: "routing-service",
               image: prior.image,
-              ...(prior.buildId ? { env: [{ name: "NEXT_BUILD_ID", value: prior.buildId }] } : {}),
+              // N87: the secretKeyRef is part of "what it was serving" too — the revert above
+              // may have moved it, and leaving it on the target build's Secret while the image
+              // goes back would put the restored edge on a secret the pools do not share.
+              ...(prior.buildId || prior.internalSecretRef
+                ? {
+                    env: [
+                      ...(prior.buildId ? [{ name: "NEXT_BUILD_ID", value: prior.buildId }] : []),
+                      ...(prior.internalSecretRef
+                        ? [
+                            {
+                              name: "INTERNAL_HEADER_SECRET",
+                              valueFrom: {
+                                secretKeyRef: {
+                                  name: prior.internalSecretRef,
+                                  key: INTERNAL_SECRET_KEY,
+                                },
+                              },
+                            },
+                          ]
+                        : []),
+                    ],
+                  }
+                : {}),
             },
           ],
           ...(prior.manifestConfigMap

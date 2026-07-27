@@ -126,7 +126,11 @@ export function generateHelmChart({
 }): Record<string, string> {
   const files: Record<string, string> = {};
   const secret = internalSecret;
-  files["templates/internal-secret.yaml"] = renderInternalSecret({ releaseName, secret });
+  // N87: per-BUILD Secret name (and therefore one Secret per live build, annotated
+  // `helm.sh/resource-policy: keep`). The FILENAME stays `templates/internal-secret.yaml`
+  // so SECRET_CHART_FILES / assertSecretChartFilesComplete above are unaffected and the
+  // file still lands mode 0600.
+  files["templates/internal-secret.yaml"] = renderInternalSecret({ releaseName, buildId, secret });
   // BYO cache: emit the Valkey connection Secret from config. Managed Memorystore instead
   // creates this Secret imperatively at deploy time (URL known only after provisioning).
   if (config.cache?.enabled && config.cache.url) {

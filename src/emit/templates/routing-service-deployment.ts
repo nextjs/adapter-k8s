@@ -109,7 +109,11 @@ export function renderRoutingServiceDeployment({
       ? "IfNotPresent"
       : `{{ with .Values.routingService.image.digest }}IfNotPresent{{ else }}Always{{ end }}`;
 
-  const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
+  // N87: build-scoped secret name (see internal-secret.ts). The routing tier is a single
+  // in-place Deployment, so this moves with the image on every deploy — and rollback patches
+  // it back alongside NEXT_BUILD_ID, or the reverted edge would present the rolled-away-from
+  // build's secret to the rolled-back pools.
+  const internalSecretEnv = renderInternalSecretEnv(releaseName, buildId, "            ");
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:

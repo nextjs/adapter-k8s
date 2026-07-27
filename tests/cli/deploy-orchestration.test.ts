@@ -36,6 +36,10 @@ import { routingManifestSnapshotName } from "../../src/emit/templates/routing-ma
 import { poolResourceNames } from "../../src/emit/templates/utils.js";
 import { renderHPA } from "../../src/emit/templates/hpa.js";
 import { cdnTagForBuildId } from "../../src/cdn-tags.js";
+import {
+  internalSecretName,
+  legacyInternalSecretName,
+} from "../../src/emit/templates/internal-secret.js";
 
 const PROJECT = "/proj";
 const RELEASE = "rel";
@@ -115,6 +119,9 @@ const DEFAULT_PREV_LIVE = {
   cpuLimit: "1500m",
   memoryLimit: "3Gi",
   readinessPath: "/healthz",
+  // N87: a previous build deployed BEFORE per-build Secret names — it references the legacy
+  // stable name, which the retained render must mirror rather than repoint.
+  internalSecretRef: legacyInternalSecretName(RELEASE),
 };
 
 /**
@@ -148,11 +155,74 @@ function happyCluster(
     newBuildHpa?: { min?: number; max: number } | null;
     newBuildHpaReadFails?: boolean;
     newBuildHpaPatchFails?: boolean;
+    // N87: internal dispatch Secret lifecycle. The legacy stable-named Secret (migrated past
+    // helm upgrade), and the per-build ones the post-cutover sweep prunes.
+    legacySecretPresent?: boolean;
+    legacySecretProbeFails?: boolean;
+    legacyAnnotateFails?: boolean;
+    /** Names the `component=internal-secret` listing reports. */
+    internalSecretsInCluster?: string[];
+    /** Secret names the release's Deployments reference; `"invalid"` = unparseable output. */
+    referencedSecrets?: string[] | "invalid" | "unreadable";
   } = {},
 ) {
   return vi.fn(async (_cmd: string, args: string[]) => {
     const j = args.join(" ");
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+    // N87 (before the generic `secret` branch below, which answers the cache-Secret delete).
+    if (args[0] === "get" && args[1] === "secret" && args.includes("--ignore-not-found")) {
+      if (overrides.legacySecretProbeFails) {
+        return { exitCode: 1, stdout: "", stderr: "Unable to connect to the server" };
+      }
+      const name = args[2]!;
+      return overrides.legacySecretPresent ? ok(`secret/${name}\n`) : ok("");
+    }
+    if (args[0] === "annotate" && args[1] === "secret") {
+      events.push(`annotate:${args[2]}:${args.find((a) => a.includes("resource-policy"))}`);
+      if (overrides.legacyAnnotateFails) {
+        return { exitCode: 1, stdout: "", stderr: "secrets is forbidden" };
+      }
+      return ok();
+    }
+    if (args[0] === "delete" && args[1] === "secret") {
+      events.push(`delete-secret:${args[2]}`);
+      return ok();
+    }
+    if (args.includes("secrets")) {
+      return ok(`${(overrides.internalSecretsInCluster ?? []).join("\n")}\n`);
+    }
+    if (args.includes("deployments") && args.includes("json")) {
+      if (overrides.referencedSecrets === "unreadable") {
+        return { exitCode: 1, stdout: "", stderr: "Unable to connect to the server" };
+      }
+      if (overrides.referencedSecrets === "invalid") return ok("not json at all");
+      const refs = overrides.referencedSecrets ?? [];
+      return ok(
+        JSON.stringify({
+          items: [
+            {
+              spec: {
+                template: {
+                  spec: {
+                    containers: [
+                      {
+                        env: [
+                          { name: "NEXT_BUILD_ID", value: "buildn" },
+                          ...refs.map((name) => ({
+                            name: "INTERNAL_HEADER_SECRET",
+                            valueFrom: { secretKeyRef: { name, key: "secret" } },
+                          })),
+                        ],
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          ],
+        }),
+      );
+    }
     if (args.includes("get-credentials")) {
       events.push("get-credentials");
       return ok();
@@ -195,6 +265,7 @@ function happyCluster(
           live.cpuLimit,
           live.memoryLimit,
           live.readinessPath,
+          live.internalSecretRef,
         ].join("|"),
       );
     }
@@ -1442,6 +1513,143 @@ describe("runDeploy — N32: stale *-prev-*.yaml never survives into another dep
   });
 });
 
+// N87 (SECURITY). Internal dispatch Secrets are per BUILD and annotated
+// `helm.sh/resource-policy: keep`, so deploy owns both ends of their lifecycle: the legacy
+// stable-named Secret must survive the first upgrade under the new scheme (the outgoing build's
+// pods reference it BY NAME and cannot start without it — that is the rollback target), and the
+// kept Secrets must be pruned once nothing references them.
+describe("runDeploy — N87: per-build internal dispatch Secret lifecycle", () => {
+  let events: string[];
+  const LEGACY = legacyInternalSecretName(RELEASE);
+  const CURRENT_SECRET = internalSecretName(RELEASE, "buildn");
+  const PREVIOUS_SECRET = internalSecretName(RELEASE, "buildm");
+  const STALE_SECRET = internalSecretName(RELEASE, "oldx");
+  /** Delete events for INTERNAL secrets only — the cache Secret cleanup shares the shape. */
+  const internalDeletes = new Set(
+    [LEGACY, CURRENT_SECRET, PREVIOUS_SECRET, STALE_SECRET].map((n) => `delete-secret:${n}`),
+  );
+
+  beforeEach(() => {
+    events = [];
+    standardBeforeEach(events);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("annotates the legacy Secret keep BEFORE helm upgrade, so helm cannot prune it", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { legacySecretPresent: true }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const annotate = events.findIndex((e) => e.startsWith(`annotate:${LEGACY}:`));
+    expect(annotate).toBeGreaterThanOrEqual(0);
+    expect(events[annotate]).toContain("helm.sh/resource-policy=keep");
+    // Order is the whole point: helm prunes what the chart no longer renders, and the
+    // annotation is only honored if it is on the LIVE object first.
+    expect(annotate).toBeLessThan(events.indexOf("helm"));
+  });
+
+  it("does nothing when there is no legacy Secret (a release already on per-build names)", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { legacySecretPresent: false }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events.filter((e) => e.startsWith("annotate:"))).toEqual([]);
+    expect(events).toContain("helm");
+  });
+
+  it("aborts BEFORE helm upgrade when the legacy Secret cannot be READ", async () => {
+    // The N68 lesson: a read failure is not "absent". Upgrading here could prune a Secret the
+    // outgoing build needs, and nothing has been changed yet — so abort cleanly.
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { legacySecretProbeFails: true }) as never,
+    );
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/legacy internal dispatch Secret .* could not|Could not determine whether/);
+    expect(events).not.toContain("helm");
+  });
+
+  it("aborts BEFORE helm upgrade when the legacy Secret cannot be ANNOTATED", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { legacySecretPresent: true, legacyAnnotateFails: true }) as never,
+    );
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/helm\.sh\/resource-policy=keep/);
+    expect(events).not.toContain("helm");
+  });
+
+  it("prunes only the internal Secrets no Deployment references any more", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        internalSecretsInCluster: [CURRENT_SECRET, PREVIOUS_SECRET, STALE_SECRET, LEGACY],
+        // The legacy one is still referenced here — a pre-N87 rollback target's pods resolve
+        // it, so it must survive exactly as long as they do.
+        referencedSecrets: [CURRENT_SECRET, PREVIOUS_SECRET, LEGACY],
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events).toContain(`delete-secret:${STALE_SECRET}`);
+    expect(events).not.toContain(`delete-secret:${CURRENT_SECRET}`);
+    expect(events).not.toContain(`delete-secret:${PREVIOUS_SECRET}`);
+    expect(events).not.toContain(`delete-secret:${LEGACY}`);
+  });
+
+  it("prunes the legacy Secret once nothing references it", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        internalSecretsInCluster: [CURRENT_SECRET, PREVIOUS_SECRET, LEGACY],
+        referencedSecrets: [],
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events).toContain(`delete-secret:${LEGACY}`);
+    // Belt and braces: this deploy's own Secret and the retained rollback target's are
+    // referenced by definition, whatever the cluster listing says.
+    expect(events).not.toContain(`delete-secret:${CURRENT_SECRET}`);
+    expect(events).not.toContain(`delete-secret:${PREVIOUS_SECRET}`);
+  });
+
+  for (const referencedSecrets of ["invalid", "unreadable"] as const) {
+    it(`deletes nothing when the reference set is ${referencedSecrets}`, async () => {
+      // Deleting a Secret a live pod template needs would brick that build's restarts, so an
+      // unusable reference set skips the sweep entirely (it only leaks 64-byte Secrets).
+      vi.mocked(execCapture).mockImplementation(
+        happyCluster(events, {
+          internalSecretsInCluster: [CURRENT_SECRET, PREVIOUS_SECRET, STALE_SECRET, LEGACY],
+          referencedSecrets,
+        }) as never,
+      );
+
+      await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+      // (the unrelated `delete-secret:rel-valkey` is the cache-disabled Secret cleanup)
+      expect(events.filter((e) => internalDeletes.has(e))).toEqual([]);
+    });
+  }
+
+  it("dry-run touches no Secret at all", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { legacySecretPresent: true }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true, dryRun: true });
+
+    expect(events.filter((e) => e.startsWith("annotate:"))).toEqual([]);
+    expect(events.filter((e) => internalDeletes.has(e))).toEqual([]);
+  });
+});
+
 describe("runDeploy — N33: domain checks run before the completion banner", () => {
   let events: string[];
   beforeEach(() => {
@@ -1492,6 +1700,49 @@ describe("runDeploy — N66: the retained previous Deployment mirrors what is RU
     standardBeforeEach(events);
   });
   afterEach(() => vi.restoreAllMocks());
+
+  // N87. The previous build may predate per-build Secret names, in which case its pods resolve
+  // the legacy stable-named Secret. Stamping the derived per-build name onto the retained render
+  // would repoint the pod template of the build serving 100% of traffic at a Secret nobody
+  // rendered — CreateContainerConfigError on every new pod, before cutover. Same failure shape
+  // as the containerStrategy flip this suite exists for.
+  it("mirrors the live INTERNAL_HEADER_SECRET secretKeyRef instead of deriving it", async () => {
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const yaml = retainedYaml();
+    expect(yaml).toContain(`name: ${legacyInternalSecretName(RELEASE)}`);
+    expect(yaml).not.toContain(internalSecretName(RELEASE, "buildm"));
+  });
+
+  it("derives the per-build Secret name when the live template already carries one", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { internalSecretRef: internalSecretName(RELEASE, "buildm") },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(retainedYaml()).toContain(`name: ${internalSecretName(RELEASE, "buildm")}`);
+  });
+
+  it("falls back to the derived name (with a warning) for an unusable live ref", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { internalSecretRef: 'x"\n              hostNetwork: true' },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const yaml = retainedYaml();
+    expect(yaml).toContain(`name: ${internalSecretName(RELEASE, "buildm")}`);
+    expect(yaml).not.toContain("hostNetwork");
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/not a plain Secret name/);
+  });
 
   it("renders the live image + all four quantities as LITERALS, with no .Values left", async () => {
     // Everything the retained render resolved from `.Values` resolved against the NEW

@@ -188,24 +188,47 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  * comparison — the same fallback an uncompilable pattern already took — rather than throwing,
  * because a matcher that cannot be evaluated must never silently widen coverage.
  *
+ * The degrade is a RUNTIME last resort, not the intended way an author learns about this. The
+ * shape is fully known at build time, so `manifest.ts` runs the same predicate
+ * (`unsafeConditionPattern`, below — ONE definition, so the two cannot drift) and FAILS the build
+ * naming the matcher. A pod-log warning about silently narrowed matcher coverage is a bad channel
+ * for a config mistake; `next build` is the right one. Reaching the degrade path therefore means
+ * a manifest built before that check existed, or one hand-edited afterwards.
+ *
  * KNOWN LIMIT, stated rather than implied: this does not catch alternation-overlap patterns
  * such as `(a|aa)+`, which backtrack for the same reason without matching the shape above.
  * Catching those needs real automaton analysis (or an RE2-style engine). What is bounded here
  * is the common, accidental form; an app that deliberately writes a pathological matcher can
- * still hurt itself.
+ * still hurt itself. The build-time half inherits exactly this limit — it shares the predicate,
+ * so it is not a second, broader net. See
+ * docs/superpowers/specs/2026-07-26-smaller-open-items.md §2 for why broadening the shape check
+ * was rejected on its own and what a real bound (a deadline, or a non-backtracking engine) needs.
  */
 const conditionRegexCache = new Map<string, RegExp | null>();
 const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
+
+/**
+ * Why this has/missing pattern must not be evaluated as a regexp, or `null` if it is fine.
+ * The returned string is a sentence fragment, usable in both the runtime warning and the
+ * build-time error. Shared by both tiers and by the build so there is a single definition of
+ * "pathological" (the two-resolver-tier drift problem this module exists to prevent).
+ */
+export function unsafeConditionPattern(value: string): string | null {
+  return NESTED_QUANTIFIER_RE.test(value)
+    ? "a quantified group containing another quantifier can backtrack exponentially against a " +
+        "request-controlled value, blocking the event loop"
+    : null;
+}
 
 export function conditionRegex(value: string): RegExp | null {
   const cached = conditionRegexCache.get(value);
   if (cached !== undefined) return cached;
   let compiled: RegExp | null = null;
-  if (NESTED_QUANTIFIER_RE.test(value)) {
+  const unsafe = unsafeConditionPattern(value);
+  if (unsafe) {
     console.warn(
       `[adapter-k8s] Refusing to evaluate middleware matcher condition ${JSON.stringify(value)} ` +
-        `as a regular expression: a quantified group containing another quantifier can ` +
-        `backtrack exponentially against a request-controlled value, blocking the event loop. ` +
+        `as a regular expression: ${unsafe}. ` +
         `Falling back to exact string comparison for this condition.`,
     );
   } else {

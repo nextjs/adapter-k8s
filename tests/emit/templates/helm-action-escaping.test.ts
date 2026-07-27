@@ -101,7 +101,7 @@ describe.skipIf(!helmAvailable())("real helm: opaque chart data is inert (S5)", 
 
   it("the Secret template is inert too (its value comes from gcloud output)", () => {
     const { ok, out } = helmRender(
-      renderInternalSecret({ releaseName: "nextjs", secret: "{{ mul 7 6 }}" }),
+      renderInternalSecret({ releaseName: "nextjs", buildId: "abc123", secret: "{{ mul 7 6 }}" }),
     );
     expect(ok).toBe(true);
     expect(out).toContain("{{ mul 7 6 }}");

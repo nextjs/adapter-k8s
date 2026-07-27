@@ -1,8 +1,94 @@
 {
+  "_doc": [
+    "Adapter-specific overlay on Next.js's own test/deploy-tests-manifest.json, merged by",
+    "test/get-test-filter.js (NEXT_EXTERNAL_TESTS_FILTERS takes a comma-separated list).",
+    "Version-2 semantics: `suites.<file>.failed[]` holds FULL test names, which the runner turns",
+    "into a negated --testNamePattern; `rules.exclude[]` drops whole files before they are built.",
+    "Both merge additively with upstream's entries, and an exact-filename exclude wins over an",
+    "inclusion. Unknown keys (like this one) are ignored by the parser.",
+    "",
+    "ONLY record a failure here once its cause is understood and is NOT the adapter's. Anything",
+    "listed stops being visible, so an entry added on a hunch hides a real bug — which is exactly",
+    "why cache-components-allow-otel-spans is deliberately absent below."
+  ],
   "version": 2,
-  "suites": {},
+  "suites": {
+    "test/e2e/app-dir/expire-time/expire-time.test.ts": {
+      "_reason": [
+        "The adapter is MORE correct than the deploy target this expectation was written for.",
+        "Upstream's own comment marks the Vercel behaviour as the deviation, and the test asserts",
+        "it. The adapter does a blocking revalidation when the entry has expired, which is what",
+        "`expire` means; asserting otherwise would mean regressing to match a known-wrong target.",
+        "Deploy and build both succeed here — only the assertion diverges — so this is a",
+        "case-level exclusion rather than a file exclusion."
+      ],
+      "failed": [
+        "expire-time should do a blocking revalidation when the cache entry has expired"
+      ]
+    }
+  },
   "rules": {
     "include": [],
-    "exclude": []
+    "exclude": [
+      "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
+    ]
+  },
+  "_excludeReasons": {
+    "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts": [
+      "Upstream Turbopack panic, not an adapter failure: the BUILD aborts with",
+      "`FATAL: An unexpected Turbopack error occurred` and writes a Rust panic log, failing to",
+      "parse ordinary JSX (`return <p>hello world</p>;`) in the fixture. Excluded at FILE level",
+      "rather than case level because the deploy never completes — a case exclusion would still",
+      "pay for the build and still emit a panic log every run."
+    ]
+  },
+  "_notRecorded": {
+    "test/e2e/app-dir/cache-components-allow-otel-spans/cache-components-allow-otel-spans.test.ts": [
+      "`should allow creating Spans from a tracer acquired before provider registration` —",
+      "INVESTIGATED 2026-07-26 and CONFIRMED AN ADAPTER BUG. Do not record it here; it must stay",
+      "visible until fixed.",
+      "",
+      "Evidence (same build, served two ways, /novel/early-span):",
+      "  next start          -> 200, 7658 bytes, contains `class=\"result\"` and `>42<`",
+      "  adapter pool server -> 200, 1358 bytes, neither, in 21ms",
+      "The pool server's shell ends `<!--$--><!--/$-->`: an EMPTY, already-closed Suspense",
+      "boundary — no fallback, no content — where upstream renders the resolved content. 21ms vs",
+      "the ~1000ms the sibling pages take is the same story: the dynamic half never ran.",
+      "",
+      "Not an instrumentation-ordering problem, which was the first hypothesis: the log shows",
+      "`instrumentation register() completed` before serving and the page returns 200, so the",
+      "component's `if (!tracer) throw` never fired — the tracer was there.",
+      "",
+      "Narrow: /novel/server and /novel/fallback have dynamic holes on the same route pattern and",
+      "both resume correctly (11940 and 2422 bytes, results present). The one thing early-span",
+      "does differently is wrap its returned JSX in an OTEL `context.with(ctx, async () => ...)`,",
+      "so the suspect is the resume path losing that async context.",
+      "",
+      "Predates the security work (it is in the previous phase's failure notes verbatim).",
+      "",
+      "LOCALIZED 2026-07-26 to one line: the minimalMode gate in pool-server/dispatch.ts. It goes",
+      "non-minimal only for `(entrypointOwnsPprShell || incrementalCacheShared) && (handlerPprInfo",
+      "|| handlerPprRootParams)`, and this route has neither a build shell nor root params, so it",
+      "stays MINIMAL — which is the case the gate's own comment describes: minimal mode answers a",
+      "document with the bare postponed shell plus `x-nextjs-postponed: 1` and expects the PLATFORM",
+      "to run the resume dance, which this adapter does not implement for an entry-owned shell.",
+      "",
+      "MEASURED, do not repeat: adding `|| handlerPprCapable` to that gate DOES fix early-span, but",
+      "it is not the fix. It breaks a sibling in the same file (`prerendering at runtime - inside a",
+      "Cache Components`) and re-breaks app-dir/fallback-shells with 5 failures — `without IO should",
+      "start and not postpone the response` plus four `page not wrapped in Suspense` cases. That is",
+      "the same regression the gate was narrowed to avoid.",
+      "",
+      "What a real fix needs: a discriminator between a shell-less PPR route whose dynamic hole IS",
+      "behind a Suspense boundary (early-span — upstream prerenders then resumes it in one blocking",
+      "navigation) and one that has no Suspense boundary above the params access (fallback-shells'",
+      "without-suspense/without-io — upstream renders those fully dynamically and never postpones).",
+      "rootParams does not separate them; both are empty. Either derive that from the build output,",
+      "or implement the resume dance for an entry-owned shell so minimal mode stops being a",
+      "truncation. Designed work, not a patch.",
+      "Reproduce: run this single test with NEXT_TEST_SKIP_CLEANUP=1 and a no-op",
+      "NEXT_TEST_CLEANUP_SCRIPT_PATH, then curl /novel/early-span on the preserved pool server",
+      "and diff it against `next start` on the same .next directory."
+    ]
   }
 }

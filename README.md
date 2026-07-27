@@ -407,11 +407,19 @@ What the generated infrastructure does by default:
 - **HTTPS redirect.** When TLS is enabled, the chart emits an HTTP→HTTPS `RequestRedirect` route so plaintext HTTP is never served.
 - **Secrets never touch command lines, logs, or git** (init scaffolds `.k8s-adapter/` into `.gitignore`; secret-bearing chart files are written `0600`).
 - **Input validation at every boundary**: release name, hostnames, registry, namespace, and the build id are charset-validated before they reach Helm values, YAML, or the privileged registration Job. A custom `generateBuildId()` outside `[A-Za-z0-9._-]` fails the build.
-- **Least-privilege deploy identity.** The deploy service account gets a release-scoped custom IAM role for traffic-extension registration plus repository-scoped Artifact Registry **writer** — not project-wide LB admin, not `repoAdmin` (which would allow retagging an already-deployed build), and no project-wide `compute.viewer` (the custom role already carries the `forwardingRules.list` it was there for). This matters because the identity is assumable by anyone who can create a Pod in the namespace via Workload Identity, so its blast radius is the ceiling on that exposure. **Residual:** releases deploy into the shared `default` namespace, so pod-creation there still means assuming this identity and reading the namespace's Secrets. Per-release namespace isolation plus an admission policy restricting KSA selection is the remaining work.
+- **Two deploy identities, split by whether a Pod can assume them.** Only one identity is Workload-Identity-bound, and it holds as little as possible:
+  - `<release>-deploy` — **assumable by anyone who can create a Pod in the namespace**, because the route-extension registration Job runs as it. It gets a release-scoped custom IAM role for traffic-extension registration and nothing else: no project-wide LB admin, and no project-wide `compute.viewer` (the custom role already carries the `forwardingRules.list` it was there for).
+  - `<release>-cli` — bucket `objectAdmin` and repository-scoped Artifact Registry **writer**, and **no Workload Identity binding**, so no Pod can assume it. `docker push` is a CLI operation and the in-cluster Job never pushes an image. Not `repoAdmin`, which would allow retagging an already-deployed build — the pods hold `INTERNAL_HEADER_SECRET`, so retag rights would have turned pod-creation into dispatch-secret theft on the next restart. (The bucket grant is currently forward-looking: `init` provisions the bucket and `destroy` removes it, but **nothing writes to it yet** — static assets are served by the pool pods from their own per-build images. The grant belongs on this identity rather than the Workload-Identity-bound one for when an upload path lands.)
+
+  `init` is idempotent and grants the CLI SA **before** revoking the same two roles from the deploy SA, so a failed grant can never leave the release with neither identity holding the permission; absent bindings on a fresh init are skipped rather than failed.
+
+  > **If CI impersonates a service account, point it at `<release>-cli`.** A pipeline that authenticated as `<release>-deploy` to upload assets or push images loses those permissions the next time `init` runs. Human operators are unaffected — the CLI normally runs under the operator's own credentials.
+
+  **Residual:** releases still deploy into the shared `default` namespace, so pod-creation there means assuming the deploy identity and reading the namespace's Secrets. The split shrinks what that is worth; it does not close it. Removing the in-cluster identity altogether (moving the Job's reconciliation into the CLI) is now the preferred fix over per-release namespaces plus an admission policy — see `docs/superpowers/specs/2026-07-26-per-release-namespace-isolation.md`.
 
 ## What is verified, and how
 
-- **1,900 unit tests** covering the adapter, both runtime tiers, the emitted templates (several
+- **1,976 unit tests** covering the adapter, both runtime tiers, the emitted templates (several
   rendered through **real `helm`**, because the questions are what helm does with the file), and
   the CLI.
 - **The upstream Next.js e2e suite** runs against the pool server: 3,348 passing / 4 failing, with

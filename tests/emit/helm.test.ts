@@ -6,6 +6,7 @@ import {
   SECRET_CHART_FILES,
 } from "../../src/emit/helm.js";
 import { sanitizeK8sName } from "../../src/emit/templates/utils.js";
+import { internalSecretName } from "../../src/emit/templates/internal-secret.js";
 import type { PoolDefinition, K8sAdapterConfig, RoutingManifest } from "../../src/types.js";
 
 const mockManifest: RoutingManifest = {
@@ -230,11 +231,20 @@ describe("generateHelmChart", () => {
       internalSecret: "deadbeef",
     });
 
+    // N87: the Secret name carries the build id, so a pod can only ever resolve its OWN
+    // build's secret (a stable name let a restarted old pod pick up the new build's value
+    // and trust its middleware verdict).
+    const expectedSecretName = internalSecretName("nextjs", "abc123");
+    expect(expectedSecretName).toContain("abc123");
     const secretFile = result["templates/internal-secret.yaml"];
     expect(secretFile).toBeDefined();
     expect(secretFile).toContain("kind: Secret");
-    expect(secretFile).toContain("name: nextjs-internal-header-secret");
+    expect(secretFile).toContain(`name: ${expectedSecretName}`);
     expect(secretFile).toContain('secret: "deadbeef"');
+    // It must outlive the upgrade that renders the NEXT build's Secret — the retained
+    // previous build's pods reference it by name and cannot start without it.
+    expect(secretFile).toContain("helm.sh/resource-policy: keep");
+    expect(secretFile).toContain('adapter-k8s/build-id: "abc123"');
 
     // Both deployments must read INTERNAL_HEADER_SECRET from that Secret via secretKeyRef.
     for (const file of [
@@ -244,7 +254,7 @@ describe("generateHelmChart", () => {
       const content = result[file];
       expect(content).toContain("name: INTERNAL_HEADER_SECRET");
       expect(content).toContain("secretKeyRef:");
-      expect(content).toContain("name: nextjs-internal-header-secret");
+      expect(content).toContain(`name: ${expectedSecretName}`);
       expect(content).toContain("key: secret");
     }
   });

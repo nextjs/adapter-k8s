@@ -58,6 +58,37 @@ export function deployExtRoleId(releaseName: string): string {
   return `nextjs_deploy_ext_${releaseName.replace(/-/g, "_")}`.slice(0, 64);
 }
 
+/**
+ * S6 (SECURITY). TWO identities, deliberately.
+ *
+ * `<release>-deploy` is the WORKLOAD-IDENTITY-BOUND one: `<release>-deploy-sa` in the
+ * cluster namespace maps to it (emit/templates/deploy-service-account.ts), so anyone who can
+ * create a Pod in that namespace can assume it — that is the open residual from the security
+ * review. Its ONLY in-cluster consumer is the route-extension update Job, whose required
+ * permissions are exactly DEPLOY_EXT_ROLE_PERMISSIONS. So it now holds nothing else.
+ *
+ * `<release>-cli` is for the work the CLI does under its OWN credentials — uploading static
+ * assets to the bucket and pushing images to Artifact Registry. It is NOT bound to any
+ * Kubernetes ServiceAccount, so no Pod can assume it, which is the whole point of the split:
+ * bucket object-admin and registry-writer used to sit on the impersonable identity next to
+ * `roles/iam.workloadIdentityUser`, so pod-creation in the namespace conferred write access to
+ * both (and, with the mutable image tags of the day, a path to dispatch-secret theft — see the
+ * repoAdmin note below).
+ *
+ * The WI-bound identity keeps its name so an existing release keeps working untouched: the
+ * KSA annotation, `destroy`'s SA deletion and any existing binding all still resolve. The
+ * split is expressed by MOVING the two grants to the new identity and revoking them from the
+ * old one, which is also what makes a re-run of `init` over an existing release converge.
+ */
+export function deployServiceAccountEmail(releaseName: string, projectId: string): string {
+  return `${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`;
+}
+
+/** The CLI-only identity (bucket + registry writes). Never Workload-Identity-bound. */
+export function cliServiceAccountEmail(releaseName: string, projectId: string): string {
+  return `${releaseName}-cli@${projectId}.iam.gserviceaccount.com`;
+}
+
 export function buildInitGcloudCommands(options: {
   projectId: string;
   region: string;
@@ -68,6 +99,10 @@ export function buildInitGcloudCommands(options: {
 }): GcloudCommand[] {
   const { projectId, region, bucket, releaseName, hosts = [], autopilot = true } = options;
   const commands: GcloudCommand[] = [];
+  // S6: the impersonable Job identity and the CLI-only one. See the doc comments above —
+  // every grant below is deliberate about WHICH of the two it lands on.
+  const deploySa = deployServiceAccountEmail(releaseName, projectId);
+  const cliSa = cliServiceAccountEmail(releaseName, projectId);
 
   // 0. Enable required APIs
   commands.push({
@@ -177,7 +212,7 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
-  // 2. Create deploy service account
+  // 2. Create the Workload-Identity-bound deploy service account (the route-extension Job).
   commands.push({
     description: "Create deploy service account",
     command: "gcloud",
@@ -194,9 +229,29 @@ export function buildInitGcloudCommands(options: {
     ],
   });
 
-  // 3. Grant storage admin on bucket
+  // 2b. S6 (SECURITY). Create the CLI-only identity that carries the storage/registry writes.
+  // Separate from the deploy SA because that one is assumable by any Pod in the release's
+  // namespace (Workload Identity); this one is bound to nothing in the cluster.
   commands.push({
-    description: "Grant storage admin on bucket",
+    description: "Create CLI service account (bucket + registry writes, no Workload Identity)",
+    command: "gcloud",
+    args: [
+      "iam",
+      "service-accounts",
+      "create",
+      `${releaseName}-cli`,
+      "--project",
+      projectId,
+      "--display-name",
+      `${releaseName} adapter CLI SA (asset upload + image push)`,
+      "--quiet",
+    ],
+  });
+
+  // 3. Grant storage admin on bucket — to the CLI SA (S6: the CLI uploads static assets; the
+  // in-cluster Job has no business writing to the bucket).
+  commands.push({
+    description: "Grant storage admin on bucket (CLI SA)",
     command: "gcloud",
     args: [
       "storage",
@@ -204,7 +259,7 @@ export function buildInitGcloudCommands(options: {
       "add-iam-policy-binding",
       `gs://${bucket}`,
       "--member",
-      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      `serviceAccount:${cliSa}`,
       "--role",
       "roles/storage.objectAdmin",
       "--condition=None",
@@ -213,9 +268,10 @@ export function buildInitGcloudCommands(options: {
   });
 
   // 4. Grant Artifact Registry writer on the repository only (M9: least privilege —
-  // pushing images must not require project-wide writer).
+  // pushing images must not require project-wide writer), to the CLI SA (S6: `docker push`
+  // is a CLI operation; the Job never pushes an image).
   commands.push({
-    description: "Grant Artifact Registry writer on nextjs repository",
+    description: "Grant Artifact Registry writer on nextjs repository (CLI SA)",
     command: "gcloud",
     args: [
       "artifacts",
@@ -225,7 +281,54 @@ export function buildInitGcloudCommands(options: {
       "--location",
       region,
       "--member",
-      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      `serviceAccount:${cliSa}`,
+      "--role",
+      "roles/artifactregistry.writer",
+      "--project",
+      projectId,
+      "--condition=None",
+      "--quiet",
+    ],
+  });
+
+  // 4b. S6 (SECURITY). Revoke the same two grants from the WORKLOAD-IDENTITY-BOUND deploy SA,
+  // which is where they used to live. Without this the split is cosmetic on every release that
+  // already exists: `init` is idempotent and re-run routinely, and the old bindings would
+  // simply persist alongside the new ones — leaving pod-creation in the namespace equal to
+  // bucket + registry write, exactly the residual this removes.
+  //
+  // Ordered AFTER the grants above so a failed grant (fatal) can never leave the release with
+  // neither identity holding the permission. Absent bindings are the NORMAL case on a fresh
+  // init and are skipped, not failed (see the remove-iam-policy-binding branch in runInit) —
+  // that is what makes a re-run converge instead of erroring.
+  commands.push({
+    description: "Revoke bucket object-admin from the deploy SA (moved to the CLI SA)",
+    command: "gcloud",
+    args: [
+      "storage",
+      "buckets",
+      "remove-iam-policy-binding",
+      `gs://${bucket}`,
+      "--member",
+      `serviceAccount:${deploySa}`,
+      "--role",
+      "roles/storage.objectAdmin",
+      "--condition=None",
+      "--quiet",
+    ],
+  });
+  commands.push({
+    description: "Revoke Artifact Registry writer from the deploy SA (moved to the CLI SA)",
+    command: "gcloud",
+    args: [
+      "artifacts",
+      "repositories",
+      "remove-iam-policy-binding",
+      "nextjs",
+      "--location",
+      region,
+      "--member",
+      `serviceAccount:${deploySa}`,
       "--role",
       "roles/artifactregistry.writer",
       "--project",
@@ -258,7 +361,7 @@ export function buildInitGcloudCommands(options: {
       "add-iam-policy-binding",
       projectId,
       "--member",
-      `serviceAccount:${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      `serviceAccount:${deploySa}`,
       "--role",
       `projects/${projectId}/roles/${deployExtRoleId(releaseName)}`,
       "--condition=None",
@@ -272,7 +375,10 @@ export function buildInitGcloudCommands(options: {
   // was project-wide get/list on EVERY compute resource, which is pure reconnaissance value for
   // anyone who impersonates this SA through the Workload Identity binding below.
 
-  // Allow the K8s SA to impersonate the GCP deploy SA via Workload Identity
+  // Allow the K8s SA to impersonate the GCP deploy SA via Workload Identity.
+  // S6: this binding is why the deploy SA must stay minimal — it is what makes the identity
+  // assumable from inside the cluster. The CLI SA above deliberately gets NO such binding, so
+  // the storage/registry permissions it now holds are not reachable from a Pod.
   commands.push({
     description: "Bind K8s SA to GCP SA via Workload Identity",
     command: "gcloud",
@@ -280,7 +386,7 @@ export function buildInitGcloudCommands(options: {
       "iam",
       "service-accounts",
       "add-iam-policy-binding",
-      `${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`,
+      deploySa,
       "--role",
       "roles/iam.workloadIdentityUser",
       "--member",
@@ -604,6 +710,16 @@ export async function runInit(options: InitOptions): Promise<void> {
         cmd.args.includes("create") &&
         cmd.args.includes(`gs://${bucket}`);
       const isIamBinding = cmd.command === "gcloud" && cmd.args.includes("add-iam-policy-binding");
+      // S6: the two revocations that MOVE bucket/registry write off the Workload-Identity-bound
+      // deploy SA. "There is no such binding" is the normal outcome on a fresh init (and on
+      // every re-run after the first), so it must be a skip, not a failure — `init` is
+      // idempotent and re-run routinely, and a non-convergent step would brick it. Anything
+      // else (permission denied, wrong project, a transient policy conflict) still fails or
+      // retries exactly like an addition.
+      const isIamRemoval =
+        cmd.command === "gcloud" && cmd.args.includes("remove-iam-policy-binding");
+      const bindingAbsent = (stderr: string): boolean =>
+        /not found|NOT_FOUND|does not exist|no matching/i.test(stderr);
 
       if (isBucketCreate) {
         // Verify the existing bucket is visible to THIS project before skipping; a
@@ -629,7 +745,9 @@ export async function runInit(options: InitOptions): Promise<void> {
         }
       } else if (isAlreadyExists) {
         console.log(`    (already exists — skipping)`);
-      } else if (isIamBinding) {
+      } else if (isIamRemoval && bindingAbsent(result.stderr)) {
+        console.log(`    (no such binding — nothing to revoke)`);
+      } else if (isIamBinding || isIamRemoval) {
         // IAM bindings routinely fail transiently right after their target is created — a
         // just-created service account is not yet propagated ("does not exist"), or the policy
         // read-modify-write conflicts. This is eventual consistency, so retry with backoff
@@ -642,7 +760,10 @@ export async function runInit(options: InitOptions): Promise<void> {
           result = await execCapture(cmd.command, cmd.args);
           ok =
             result.exitCode === 0 ||
-            /already exists|ALREADY_EXISTS|already own it/.test(result.stderr);
+            /already exists|ALREADY_EXISTS|already own it/.test(result.stderr) ||
+            // S6: a revocation that now reports the binding as absent has converged — the
+            // first attempt may well have applied it before the policy read raced.
+            (isIamRemoval && bindingAbsent(result.stderr));
         }
         if (!ok) {
           throw new Error(`${cmd.description} failed after retries:\n${result.stderr}`);
@@ -652,6 +773,23 @@ export async function runInit(options: InitOptions): Promise<void> {
       }
     }
   }
+
+  // 2z. S6 (SECURITY). Say which identity is which — the split changes what CI must present,
+  // and the revocations above are silent otherwise. Printed for dry-run too.
+  console.log(
+    `\n  ℹ This release has TWO GCP service accounts, deliberately:\n` +
+      `      ${cliServiceAccountEmail(releaseName, projectId)}\n` +
+      `        Bucket object-admin + Artifact Registry writer. Used by THIS CLI (asset upload,\n` +
+      `        image push) under your own or your CI's credentials. Bound to no Kubernetes\n` +
+      `        ServiceAccount, so no Pod can assume it.\n` +
+      `      ${deployServiceAccountEmail(releaseName, projectId)}\n` +
+      `        The in-cluster route-extension Job ONLY: the release-scoped traffic-extension\n` +
+      `        role (${deployExtRoleId(releaseName)}) and nothing else. It is Workload-Identity\n` +
+      `        bound, i.e. assumable by anyone who can create a Pod in the release's namespace —\n` +
+      `        which is exactly why the storage/registry grants no longer live on it.\n` +
+      `    If a CI pipeline authenticates AS the deploy SA to push images or upload assets, point\n` +
+      `    it at the CLI SA instead — init has just revoked those two grants from the deploy SA.`,
+  );
 
   // 2a-pre. Surface pre-traffic-extension routing resources that init can't fix in place.
   if (!dryRun) {

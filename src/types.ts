@@ -183,8 +183,31 @@ export interface RoutingManifest {
    *     shell that upstream deliberately does not resume (app-dir/fallback-shells).
    * Membership of EITHER flavour also marks the route as PPR, which keeps it out of the
    * emulated-SSG non-minimal flip (dispatch.ts N13).
+   *
+   * `wouldPostpone` (N16b) records whether the BUILD render of this template postponed, derived
+   * from the same-`groupId` `.rsc` PRERENDER sibling — the only output carrying the postponed
+   * state when the template's own shell was suppressed (`hasEmptyStaticShell` demotes the route to
+   * BLOCKING_STATIC_RENDER). See `indexPrerenderGroups` in manifest.ts for the upstream
+   * references. The flag is per-TEMPLATE: concrete generateStaticParams params live in their own
+   * prerender groups and are answered by their own `pprRoutes` entry at higher precedence, so the
+   * template-level bit could only ever have decided requests for params with no build artifact of
+   * their own.
+   *
+   * N16c: IT IS NOT CONSUMED. It was added as a third rung of the minimalMode gate, to fix
+   * `/[slug]/early-span` (1,358 bytes with an empty closed `<!--$--><!--/$-->` boundary against
+   * 7,658 bytes of resolved content from `next start` on the same build) — then MEASURED against
+   * upstream and removed:
+   *   with the rung:    app-dir/fallback-shells  8 passed / 5 failed
+   *   without the rung: app-dir/fallback-shells 13 passed / 0 failed
+   * i.e. the bit does not discriminate the two flavours. fallback-shells' never-postponing routes
+   * carry sibling postponed state as well, so flipping non-minimal on it re-breaks them in exactly
+   * the way the blunt `|| handlerPprCapable` fix did. Truncation on shell-less PPR templates is
+   * therefore STILL OPEN, and the remaining fix is to implement the platform's half of the resume
+   * rather than to delegate it — docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md.
+   * Kept on the manifest because it is a correct, cheap build-time observation that option B needs;
+   * do not re-wire it into the gate without re-running the two suites above.
    */
-  pprCapableRoutes?: Record<string, { rootParams: string[] }>;
+  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone: boolean }>;
   nextVersion: string;
 }
 
