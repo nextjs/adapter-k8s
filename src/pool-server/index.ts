@@ -613,13 +613,14 @@ interface ImageConfig {
 }
 
 // Load sharp exactly once per process and cache the verdict — success OR failure.
-// esbuild bundles sharp's JS into pool-server.cjs, and its __commonJS wrapper
-// registers the module record BEFORE evaluating it: when the native binding is
-// missing (no @img/sharp-* in the container), the FIRST require throws but every
-// LATER require returns the broken partially-initialized module. Live this showed
-// up as one honest 503 ("sharp is unavailable") followed by an endless stream of
-// misleading 502s from deep inside the pipeline (build XchOtaGFu6GdFrcdujVc0).
-// Memoizing the first attempt keeps the failure mode consistent and logs WHY once.
+// sharp is EXTERNAL in the pool bundle (canary.97 post-mortem: inlining the adapter
+// repo's pack-time sharp JS next to the APP's staged @img binaries cross-versioned the
+// pair and 503'd every /_next/image the moment upstream bumped sharp) — the require
+// resolves the APP's own staged sharp at runtime. Memoization still matters: when the
+// native binding is missing, the FIRST require throws but a broken partially-initialized
+// module can be returned to LATER requires. Live this showed up as one honest 503
+// followed by misleading 502s (build XchOtaGFu6GdFrcdujVc0). Memoizing keeps the failure
+// mode consistent and logs WHY once.
 type SharpModule = (input: Buffer) => SharpPipeline;
 type SharpPipeline = {
   resize: (w: number | undefined, h: undefined, o: { withoutEnlargement: true }) => SharpPipeline;
@@ -2594,7 +2595,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
     // Basic image optimization: /_next/image?url=...&w=...&q=...
     // Fetches the source image and serves it (with optimization if Sharp is available).
-    if (url.pathname === "/_next/image") {
+    // Both forms: a custom images.loaderFile commonly emits `/_next/image/?url=…` (the
+    // upstream loader-config fixture does), and `trailingSlash: true` apps mirror it. The
+    // exact match silently bypassed the optimizer for the slash form (canary.97 catch-up ②).
+    if (url.pathname === "/_next/image" || url.pathname === "/_next/image/") {
       // The `url` gate FIRST, then `w`/`q` — upstream's order, and observable: with
       // `?url=/_next/image&w=16` `next start` answers "cannot be recursive" while the
       // adapter used to answer `"w" parameter (width) of 16 is not allowed`. See

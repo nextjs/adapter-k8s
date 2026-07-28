@@ -672,39 +672,122 @@ export const SHARP_RUNTIME_PACKAGES = [
   "@img/sharp-libvips-linux-x64",
 ] as const;
 
-// Resolver for sharp and its platform packages. resolveDepDir asks for
-// `${dep}/package.json`, which the @img/* packages BLOCK via their exports maps
-// (they export "./package", not "./package.json") — ERR_PACKAGE_PATH_NOT_EXPORTED
-// would silently skip staging on every build. Resolve the exported "./package"
-// subpath instead (sharp itself exports both), adapter-first like resolveDepDir.
-// Falls back to the sibling layout next to the resolved sharp package: npm hoists
-// @img/* beside sharp, and pnpm links a package's deps as virtual-store siblings.
+// Resolver for sharp and its platform packages. Three resolution shapes must all work
+// (they have all shipped): legacy sharp@0.34 has NO exports map (`package.json` resolves),
+// the @img/* packages export "./package" but NOT "./package.json", and sharp@0.35 gained
+// an exports map with NEITHER subpath — for that one, resolve the package ENTRY and walk
+// up to its package.json. APP-FIRST (canary.97 image-cluster post-mortem): the pool
+// bundle no longer inlines sharp's JS, so the version that matters is the one the APP's
+// next install brought — resolving adapter-first staged a different generation's
+// binaries than the app's sharp JS expects and 503'd every /_next/image.
 export function resolveSharpDepDir(dep: string, projectDir: string): string | undefined {
   const fromFiles = [
-    path.join(_dirname, "index.js"), // adapter package (dist/)
-    path.join(projectDir, "package.json"), // app root
+    path.join(projectDir, "package.json"), // app root (authoritative version)
+    path.join(_dirname, "index.js"), // adapter package (dist/) fallback
   ];
   for (const fromFile of fromFiles) {
+    const req = createRequire(fromFile);
+    for (const subpath of [`${dep}/package`, `${dep}/package.json`]) {
+      try {
+        return path.dirname(req.resolve(subpath));
+      } catch {
+        // exports map blocks this subpath — try the next shape
+      }
+    }
     try {
-      return path.dirname(createRequire(fromFile).resolve(`${dep}/package`));
+      // Exports map without any package.json subpath (sharp@0.35): resolve the entry and
+      // walk up to the directory whose package.json names this dep.
+      let dir = path.dirname(req.resolve(dep));
+      for (let i = 0; i < 6; i++) {
+        const pkgJson = path.join(dir, "package.json");
+        if (existsSync(pkgJson)) {
+          try {
+            if ((JSON.parse(readFileSync(pkgJson, "utf-8")) as { name?: string }).name === dep) {
+              return dir;
+            }
+          } catch {
+            // unreadable package.json — keep walking
+          }
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
     } catch {
-      // try the next resolution root
+      // not resolvable from this root at all
     }
   }
   if (dep !== "sharp") {
-    // Check the sibling of EVERY resolvable sharp copy — the adapter-first copy may
-    // simply not have this platform package installed while the app root's does.
+    // Check the sibling of EVERY resolvable sharp copy — one root's copy may simply not
+    // have this platform package installed while another root's does.
     for (const fromFile of fromFiles) {
       try {
-        const sharpDir = path.dirname(createRequire(fromFile).resolve("sharp/package"));
+        const sharpDir = resolveSharpDepDir("sharp", projectDir);
+        if (!sharpDir) break;
         const sibling = path.join(sharpDir, "..", ...dep.split("/"));
         if (existsSync(path.join(sibling, "package.json"))) return sibling;
+        void fromFile;
+        break;
       } catch {
         // try the next resolution root
       }
     }
   }
   return undefined;
+}
+
+/**
+ * Stage a JS package and its transitive PRODUCTION dependency tree into the pool context
+ * (BFS over `dependencies`; `optionalDependencies` — the platform-specific @img binaries —
+ * are staged separately and platform-filtered). Written for sharp (canary.97 image-cluster
+ * post-mortem): the pool bundle marks sharp external, so the container must carry the
+ * APP's own sharp JS and everything it requires at runtime.
+ */
+async function stagePackageTree(
+  projectDir: string,
+  rootName: string,
+  rootDir: string,
+  poolName: string,
+  isShared: boolean,
+): Promise<void> {
+  const queue: Array<[string, string]> = [[rootName, rootDir]];
+  const seen = new Set<string>([rootName]);
+  while (queue.length > 0) {
+    const [name, dir] = queue.shift()!;
+    await stageFile(projectDir, dir, `node_modules/${name}`, poolName, isShared);
+    let deps: string[] = [];
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
+        dependencies?: Record<string, string>;
+      };
+      deps = Object.keys(pkg.dependencies ?? {});
+    } catch {
+      continue;
+    }
+    for (const dep of deps) {
+      if (seen.has(dep)) continue;
+      seen.add(dep);
+      // Resolve the dep relative to its dependent first (nested installs), then the app.
+      const req = createRequire(path.join(dir, "package.json"));
+      let depDir: string | undefined;
+      for (const subpath of [`${dep}/package.json`, `${dep}/package`]) {
+        try {
+          depDir = path.dirname(req.resolve(subpath));
+          break;
+        } catch {
+          // next shape
+        }
+      }
+      depDir ??= resolveSharpDepDir(dep, projectDir);
+      if (depDir) queue.push([dep, depDir]);
+      else {
+        console.warn(
+          `[adapter-k8s] could not resolve "${dep}" (dependency of "${name}") while staging ` +
+            `the sharp runtime tree — /_next/image may fail to load sharp in the container.`,
+        );
+      }
+    }
+  }
 }
 
 // Stage sharp's linux-x64 native packages into the pool's traced-assets context.
@@ -721,10 +804,18 @@ export async function stageSharpRuntimePackages(
   isShared: boolean = false,
 ): Promise<{ staged: boolean; sharpVersion?: string }> {
   const resolved = SHARP_RUNTIME_PACKAGES.map((pkg) => ({ pkg, dir: resolveDep(pkg, projectDir) }));
-  if (resolved.every(({ dir }) => dir !== undefined && existsSync(dir))) {
+  const sharpJsDir = resolveDep("sharp", projectDir);
+  if (
+    resolved.every(({ dir }) => dir !== undefined && existsSync(dir)) &&
+    sharpJsDir !== undefined &&
+    existsSync(sharpJsDir)
+  ) {
     for (const { pkg, dir } of resolved) {
       await stageFile(projectDir, dir!, `node_modules/${pkg}`, poolName, isShared);
     }
+    // The version-skew killer (canary.97): stage the APP's sharp JS + its runtime dep tree
+    // next to the binaries it was installed with. pool-server.cjs marks sharp external.
+    await stagePackageTree(projectDir, "sharp", sharpJsDir, poolName, isShared);
     return { staged: true };
   }
   const sharpDir = resolveDep("sharp", projectDir);

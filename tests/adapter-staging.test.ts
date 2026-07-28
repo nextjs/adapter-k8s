@@ -496,9 +496,15 @@ describe("stageSharpRuntimePackages", () => {
   };
 
   it("stages both linux-x64 packages into the pool context when resolvable", async () => {
-    const dirs = new Map(SHARP_RUNTIME_PACKAGES.map((p) => [p, writePkg(p)]));
+    // Canary.97 contract: sharp's own JS package must stage WITH the binaries (the pool
+    // bundle marks sharp external), so the resolver must also map "sharp".
+    const dirs = new Map([
+      ...SHARP_RUNTIME_PACKAGES.map((p) => [p, writePkg(p)] as const),
+      ["sharp", writePkg("sharp", "0.35.0")] as const,
+    ]);
     const result = await stageSharpRuntimePackages(tmpDir, "ssr", (dep) => dirs.get(dep));
     expect(result).toEqual({ staged: true });
+    expect(existsSync(path.join(poolCtx(), "node_modules", "sharp", "package.json"))).toBe(true);
     for (const pkg of SHARP_RUNTIME_PACKAGES) {
       const staged = path.join(poolCtx(), "node_modules", pkg);
       expect(existsSync(path.join(staged, "native.bin"))).toBe(true);

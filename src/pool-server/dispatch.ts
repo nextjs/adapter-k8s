@@ -486,6 +486,9 @@ async function writeInnerResponse(
   // (shell) body. Headers were already sent with the shell, so the tail's headers are
   // discarded; a failed/errored tail (null or status >= 400) degrades to shell-only.
   resumeSuffix?: Promise<IncomingMessage | null>,
+  // A build-time fallback artifact backs this route (pprRoutes membership) — feeds the
+  // x-vercel-cache verdict when the entrypoint owns the serve (see the classifier below).
+  buildFallbackBacked = false,
 ): Promise<void> {
   // A direct adapter entrypoint can produce either of two valid shapes from postponed state:
   // a resume tail (which needs the persisted shell prepended), or a complete HTML document (the
@@ -535,6 +538,26 @@ async function writeInnerResponse(
   // It is internal bookkeeping, can expose route/tag structure, and `next start` removes it before
   // the public response. The adapter owns that server boundary, so never forward it to clients.
   delete headers["x-next-cache-tags"];
+  // Platform cache status (plans/prerender-matrix-catchup.md Phase 1). The pool IS the
+  // platform in the deploy harness and in production, and upstream's prerender-matrix suite
+  // asserts `x-vercel-cache` with these semantics: PRERENDER = a BUILD fallback artifact
+  // answered a never-seen key (the prepended shell); HIT = a stored entry answered (Next's
+  // cache said HIT/STALE — STALE still served stored bytes); MISS = blocking generation
+  // with no servable fallback (an Option-D live resume is exactly that: no build artifact
+  // existed, the document rendered per-request). An entrypoint-supplied verdict wins.
+  if (headers["x-vercel-cache"] === undefined) {
+    const nextCache = String(headers["x-nextjs-cache"] ?? "");
+    headers["x-vercel-cache"] = effectivePrefix
+      ? "PRERENDER"
+      : nextCache === "HIT" || nextCache === "STALE"
+        ? "HIT"
+        : nextCache === "MISS" && buildFallbackBacked
+          ? // Non-minimal first render of a route a BUILD fallback artifact backs: Next
+            // reports MISS (it rendered and cached just now), but the platform contract
+            // calls a fallback-backed first serve PRERENDER (matrix iteration 2).
+            "PRERENDER"
+          : "MISS";
+  }
   // The combined response is shell bytes followed by resume bytes, so neither
   // component's content length describes the final body.
   if (effectivePrefix || resumeSuffix) delete headers["content-length"];
@@ -677,6 +700,7 @@ async function invokeLocalHandlerOverHttp({
   i18nLocales,
   handlerTimeoutMs = HANDLER_TIMEOUT_MS,
   capturePostponedState = false,
+  buildFallbackBacked = false,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -740,6 +764,8 @@ async function invokeLocalHandlerOverHttp({
    * touched, which is what the build-time signal could not provide (rev 3).
    */
   capturePostponedState?: boolean;
+  /** pprRoutes membership: a build fallback artifact backs this route (x-vercel-cache). */
+  buildFallbackBacked?: boolean;
 }): Promise<void> {
   // Option D applies only to MINIMAL invocations: a non-minimal render is resumed inline by
   // Next itself (app-page.ts:2038), so capturing there would only risk a duplicate resume.
@@ -1054,6 +1080,7 @@ async function invokeLocalHandlerOverHttp({
               : undefined,
             normalizePrerenderCacheControl,
             resumeSuffix,
+            buildFallbackBacked,
           )
             .then(() => closeThenSettle(reject))
             .catch((error) => {
@@ -1259,6 +1286,35 @@ type LocalHandlerInvoker = typeof invokeLocalHandlerOverHttp;
 // (`/_not-found`), Pages Router handler (`/404`), a prerendered Pages Router `/404.html` from the
 // static manifest, then plain text. Previously only `/_not-found` was attempted, so a pages-router
 // app with a custom `pages/404` (which prerenders to a static `404.html`) got a bare "Not Found".
+// Mirrors upstream next/src/server/lib/is-non-html-sec-fetch-dest.ts (canary.97): request
+// destinations that cannot display HTML. Excludes `document`/`iframe` (HTML-capable) and
+// `empty` (fetch()/XHR, including RSC requests) — and absent headers, which must keep full
+// handler semantics.
+const NON_HTML_SEC_FETCH_DESTS = new Set([
+  "audio",
+  "audioworklet",
+  "font",
+  "image",
+  "json",
+  "manifest",
+  "paintworklet",
+  "report",
+  "script",
+  "serviceworker",
+  "sharedworker",
+  "style",
+  "track",
+  "video",
+  "webidentity",
+  "worker",
+  "xslt",
+]);
+
+function isNonHtmlSecFetchDest(req: IncomingMessage): boolean {
+  const dest = req.headers["sec-fetch-dest"];
+  return typeof dest === "string" && NON_HTML_SEC_FETCH_DESTS.has(dest);
+}
+
 async function serveNotFound(
   handlerLoader: HandlerLoader,
   localHandlerInvoker: LocalHandlerInvoker,
@@ -1268,6 +1324,39 @@ async function serveNotFound(
   bufferedBody: Buffer | undefined,
   basePath = "",
 ): Promise<void> {
+  // Deploy contract (upstream not-found-non-document, canary.97): for non-HTML subresource
+  // requests (sec-fetch-dest: image/font/manifest/…) the deployed routing layer serves the
+  // PRERENDERED App Router /_not-found "without invoking Next.js" (the upstream test's own
+  // comment — Vercel's CDN behavior). Invoking the /_not-found entrypoint instead runs
+  // base-server's new isNonHtmlSecFetchDest branch, which answers text/plain — `next start`
+  // semantics, where the deploy branch asserts text/html from the prerender. Deliberately
+  // SCOPED to that request class: document/RSC/fetch requests keep the proven handler path
+  // (fresh render, draft-capable). Two prerender sources, in order: the static-assets
+  // manifest entry, then the build artifact on disk — the build's INJECTED /_not-found has
+  // no source file, so its adapter output carries no fallback.filePath and no asset entry
+  // is emitted, but `.next/server/app/_not-found.html` is always staged with the app.
+  if (isNonHtmlSecFetchDest(req)) {
+    const prerenderedNotFound = staticAssets.find(
+      (a) =>
+        (a.pathname === (basePath ? `${basePath}/_not-found` : "/_not-found") ||
+          a.pathname === "/_not-found") &&
+        (a as { prerender?: boolean }).prerender,
+    );
+    const candidates = [
+      ...(prerenderedNotFound ? [path.resolve(process.cwd(), prerenderedNotFound.filePath)] : []),
+      path.join(process.cwd(), ".next", "server", "app", "_not-found.html"),
+    ];
+    for (const fullPath of candidates) {
+      if (existsSync(fullPath) && !res.writableEnded) {
+        res.writeHead(404, {
+          "content-type": "text/html; charset=utf-8",
+          ...(prerenderedNotFound?.headers as Record<string, string> | undefined),
+        });
+        res.end(readFileSync(fullPath));
+        return;
+      }
+    }
+  }
   const notFoundPaths = [
     ...(basePath ? [`${basePath}/_not-found`, `${basePath}/404`] : []),
     "/_not-found",
@@ -2716,6 +2805,7 @@ export function createDispatcher(options: DispatcherOptions) {
               !req.headers["x-next-resume-state-length"] &&
               req.headers["next-resume"] !== "1" &&
               pprCapableCandidates.some((candidate) => pprCapableResumeRoutes.has(candidate)),
+            buildFallbackBacked: !!pprInfo,
             ...(revalidate ? { revalidate } : {}),
           });
           return;
