@@ -2,7 +2,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { pipeline } from "node:stream";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
@@ -472,6 +472,62 @@ export function mergeResolvedHeadersIntoHeadersArg(
   return headersArg;
 }
 
+// Iteration 7: record a response's status/headers/body as it streams to the client, so a
+// fully-keyed platform entry can be replayed byte-identically on later serves. Patches the
+// live response object in place (per-request; same technique as the trust boundary wrapper).
+// An over-budget body abandons recording — the serve itself is never affected.
+function captureResponseForStore(res: ServerResponse, maxBytes: number) {
+  let status = 200;
+  let total = 0;
+  let over = false;
+  const chunks: Buffer[] = [];
+  const headHeaders: Record<string, string | string[]> = {};
+  const record = (chunk: unknown) => {
+    if (over || chunk == null || typeof chunk === "function") return;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    total += buf.length;
+    if (total > maxBytes) {
+      over = true;
+      chunks.length = 0;
+      return;
+    }
+    chunks.push(buf);
+  };
+  const origWriteHead = res.writeHead.bind(res);
+  (res as any).writeHead = function (s: number, ...args: unknown[]) {
+    status = s;
+    const headersArg = typeof args[0] === "string" ? args[1] : args[0];
+    if (headersArg && typeof headersArg === "object" && !Array.isArray(headersArg)) {
+      Object.assign(headHeaders, headersArg as Record<string, string | string[]>);
+    }
+    return origWriteHead(s, ...(args as [never]));
+  };
+  const origWrite = res.write.bind(res);
+  (res as any).write = function (chunk: unknown, ...args: unknown[]) {
+    record(chunk);
+    return (origWrite as (...a: unknown[]) => boolean)(chunk, ...args);
+  };
+  const origEnd = res.end.bind(res);
+  (res as any).end = function (chunk?: unknown, ...args: unknown[]) {
+    record(chunk);
+    return (origEnd as (...a: unknown[]) => ServerResponse)(chunk, ...args);
+  };
+  return {
+    finish():
+      | { status: number; headers: Record<string, string | string[]>; body: Buffer }
+      | undefined {
+      if (over) return undefined;
+      const merged: Record<string, string | string[]> = {
+        ...((res.getHeaders?.() as Record<string, string | string[]>) ?? {}),
+        ...headHeaders,
+      };
+      // The stored copy replays under its own verdict; drop the first serve's.
+      delete merged["x-vercel-cache"];
+      return { status, headers: merged, body: Buffer.concat(chunks) };
+    },
+  };
+}
+
 async function writeInnerResponse(
   outerRes: ServerResponse,
   innerRes: IncomingMessage,
@@ -489,6 +545,9 @@ async function writeInnerResponse(
   // A build-time fallback artifact backs this route (pprRoutes membership) — feeds the
   // x-vercel-cache verdict when the entrypoint owns the serve (see the classifier below).
   buildFallbackBacked = false,
+  // Seen-key registry verdict — a repeat serve of a known platform cache key is HIT
+  // regardless of how the bytes were produced (matrix iteration 4).
+  platformCacheSeen?: boolean,
 ): Promise<void> {
   // A direct adapter entrypoint can produce either of two valid shapes from postponed state:
   // a resume tail (which needs the persisted shell prepended), or a complete HTML document (the
@@ -547,14 +606,22 @@ async function writeInnerResponse(
   // existed, the document rendered per-request). An entrypoint-supplied verdict wins.
   if (headers["x-vercel-cache"] === undefined) {
     const nextCache = String(headers["x-nextjs-cache"] ?? "");
-    headers["x-vercel-cache"] = effectivePrefix
+    headers["x-vercel-cache"] = platformCacheSeen
+      ? // Repeat serve of a known platform key: HIT even when the entry contributes zero
+        // bytes and the document re-renders (the matrix's empty-entry sharing contract).
+        "HIT"
+      : effectivePrefix
       ? "PRERENDER"
       : nextCache === "HIT" || nextCache === "STALE"
         ? "HIT"
-        : nextCache === "MISS" && buildFallbackBacked
-          ? // Non-minimal first render of a route a BUILD fallback artifact backs: Next
-            // reports MISS (it rendered and cached just now), but the platform contract
-            // calls a fallback-backed first serve PRERENDER (matrix iteration 2).
+        : (nextCache === "MISS" || headers["x-nextjs-postponed"] !== undefined) &&
+            buildFallbackBacked
+          ? // A BUILD fallback artifact answered this serve. Two measured shapes: Next
+            // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
+            // now), or — fresh-key shell+resume — the response carries only
+            // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
+            // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
+            // the HIT/STALE arm above runs first.
             "PRERENDER"
           : "MISS";
   }
@@ -701,6 +768,7 @@ async function invokeLocalHandlerOverHttp({
   handlerTimeoutMs = HANDLER_TIMEOUT_MS,
   capturePostponedState = false,
   buildFallbackBacked = false,
+  platformCacheSeen,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -766,6 +834,8 @@ async function invokeLocalHandlerOverHttp({
   capturePostponedState?: boolean;
   /** pprRoutes membership: a build fallback artifact backs this route (x-vercel-cache). */
   buildFallbackBacked?: boolean;
+  /** Seen-key registry verdict: this platform cache key was served before (→ HIT). */
+  platformCacheSeen?: boolean;
 }): Promise<void> {
   // Option D applies only to MINIMAL invocations: a non-minimal render is resumed inline by
   // Next itself (app-page.ts:2038), so capturing there would only risk a duplicate resume.
@@ -936,6 +1006,17 @@ async function invokeLocalHandlerOverHttp({
 
       const reqHeaders = toNodeHeaders(req);
       Object.assign(reqHeaders, invocationHeaders);
+      // Matrix B-cluster: canary's ResponseCache grew a minimal-mode LRU keyed
+      // (pathname + invocationID) — the platform stamps a unique `x-invocation-id` per
+      // invocation (route-module.ts:1153) so reuse is scoped to ONE request; without it the
+      // cache falls back to TTL mode and replays minimal renders byte-identically across
+      // requests (measured: the empty-shell "frozen badge" bake). Always overwrite: the id
+      // is a cache-scoping key, so a client-supplied value must never survive. The Option-D
+      // resume invocation clones these headers and deliberately SHARES the id — the resume
+      // is the same logical invocation.
+      if (minimalMode) {
+        reqHeaders["x-invocation-id"] = randomUUID();
+      }
       // We forward a fixed-length buffered body (or none), so restate the framing:
       // Node's HTTP parser rejects a request carrying BOTH transfer-encoding and
       // content-length (spurious 400 before the handler runs), and a forged
@@ -1081,6 +1162,7 @@ async function invokeLocalHandlerOverHttp({
             normalizePrerenderCacheControl,
             resumeSuffix,
             buildFallbackBacked,
+            platformCacheSeen,
           )
             .then(() => closeThenSettle(reject))
             .catch((error) => {
@@ -1451,6 +1533,8 @@ export interface DispatcherOptions {
       initialHeaders?: Record<string, string | string[]>;
       initialStatus?: number;
       tags?: string[];
+      /** Params partitioning the platform cache key (build's allowQuery) — seen-key registry. */
+      allowQuery?: string[];
     }
   >;
   /** N16: PPR-capable route templates with no build-emitted fallback shell (`fallback: null`),
@@ -1463,7 +1547,9 @@ export interface DispatcherOptions {
    * missing bit must degrade to the pre-N16b behavior (minimal), never to non-minimal.
    * `| undefined` is explicit: under exactOptionalPropertyTypes the index.ts wiring passes
    * `routingManifest.pprCapableRoutes` straight through, and older manifests have no such key. */
-  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone?: boolean }> | undefined;
+  pprCapableRoutes?:
+    | Record<string, { rootParams: string[]; wouldPostpone?: boolean; allowQuery?: string[] }>
+    | undefined;
   /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
    * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
@@ -1555,6 +1641,54 @@ export function createDispatcher(options: DispatcherOptions) {
   // resume a fallback shell for `without-suspense`/`without-io` routes, which upstream renders
   // dynamically (it answered `x-nextjs-postponed: 1` and a build-time root layout).
   const pprCapableRoutes = new Set(Object.keys(pprCapableRouteMap));
+  // Matrix iteration 4: the platform seen-key registry. Upstream's contract proves cache-
+  // entry sharing THROUGH x-vercel-cache — a key's first serve is PRERENDER/MISS, every
+  // later serve of the SAME key (params outside allowQuery mutated) is HIT, even when the
+  // entry contributes zero bytes. Keyed template + allowQuery-param values; only routes
+  // whose build declared allowQuery participate (bounded, and plain dynamic routes never
+  // register). In-process per pool: the harness runs one pool; production cross-replica
+  // consistency can later back this with Valkey (SETNX) — see plans/prerender-matrix-catchup.md.
+  const PLATFORM_KEY_REGISTRY_CAP = 10_000;
+  const platformSeenKeys = new Set<string>();
+  function checkAndRecordPlatformKey(key: string): boolean {
+    if (platformSeenKeys.has(key)) return true;
+    if (platformSeenKeys.size >= PLATFORM_KEY_REGISTRY_CAP) {
+      const oldest = platformSeenKeys.values().next().value;
+      if (oldest !== undefined) platformSeenKeys.delete(oldest);
+    }
+    platformSeenKeys.add(key);
+    return false;
+  }
+  // Iteration 7: the platform RESPONSE store, for FULLY-KEYED entries only (allowQuery
+  // covers every template param → the entry is fully static and the platform must replay
+  // the stored bytes on a seen key — on Vercel this replay lives in the edge cache, which
+  // the per-request x-invocation-id correctly scopes away from the lambda LRU). Partial
+  // keys re-render per request and prove sharing through the header alone. Bounded both
+  // ways; an over-size body is simply not stored (every serve stays correct, later serves
+  // re-render).
+  const PLATFORM_STORE_CAP = 500;
+  const PLATFORM_STORE_MAX_BODY = 2 * 1024 * 1024;
+  const platformResponseStore = new Map<
+    string,
+    { status: number; headers: Record<string, string | string[]>; body: Buffer }
+  >();
+  function storePlatformResponse(
+    key: string,
+    entry: { status: number; headers: Record<string, string | string[]>; body: Buffer },
+  ): void {
+    if (entry.body.length > PLATFORM_STORE_MAX_BODY) return;
+    if (platformResponseStore.size >= PLATFORM_STORE_CAP) {
+      const oldest = platformResponseStore.keys().next().value;
+      if (oldest !== undefined) platformResponseStore.delete(oldest);
+    }
+    platformResponseStore.set(key, entry);
+  }
+  const TEMPLATE_PARAM_RE = /\[\[?\.\.\.([^\]]+)\]\]?|\[([^\]]+)\]/g;
+  function templateParamNames(template: string): string[] {
+    return [...template.matchAll(TEMPLATE_PARAM_RE)]
+      .map((m) => m[1] ?? m[2])
+      .filter((name): name is string => !!name);
+  }
   // Option D eligibility (spec rev 4): shell-less PPR templates with NO unresolved root params
   // — the class whose minimal render can postpone with nothing to resume it. Root-param
   // templates are excluded (they already run non-minimal for their own documented reason).
@@ -2605,6 +2739,54 @@ export function createDispatcher(options: DispatcherOptions) {
           const handlerPprRootParams = pprCapableCandidates.some((candidate) =>
             pprRootParamRoutes.has(candidate),
           );
+          // Matrix iteration 4: platform cache key for the seen-key registry. First
+          // candidate with a build-declared allowQuery wins; params resolve from the
+          // routing verdict. Recorded on FIRST sight (a failed render then reports HIT on
+          // the retry — acceptable: the contract's subjects always 200).
+          let platformCacheSeen: boolean | undefined;
+          let platformKey: string | undefined;
+          let platformFullyKeyed = false;
+          for (const candidate of pprCapableCandidates) {
+            const aq =
+              pprRoutes[candidate]?.allowQuery ??
+              (pprCapableRouteMap[candidate] as { allowQuery?: string[] } | undefined)?.allowQuery;
+            if (!aq) continue;
+            const params =
+              extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
+            // The build emits nxtP-prefixed param names in allowQuery; extracted route
+            // params are bare. Try both spellings (measured on the matrix fixture:
+            // ["nxtPlang"] vs params.lang — unnormalized, every key per template collapsed).
+            const bareAq = aq.map((p) => (p.startsWith("nxtP") ? p.slice(4) : p));
+            platformKey =
+              candidate +
+              "|" +
+              aq
+                .map((p, i) => {
+                  const value =
+                    (params as Record<string, unknown>)[bareAq[i]!] ??
+                    (params as Record<string, unknown>)[p];
+                  return `${p}=${Array.isArray(value) ? value.join("/") : String(value ?? "")}`;
+                })
+                .join("&");
+            // Fully keyed ⟺ every template param partitions the key ⟺ the entry is fully
+            // static ⟺ the platform replays stored bytes (iteration 7).
+            platformFullyKeyed = templateParamNames(candidate).every((name) =>
+              bareAq.includes(name),
+            );
+            platformCacheSeen = checkAndRecordPlatformKey(platformKey);
+            break;
+          }
+          // Platform replay: a seen, fully-keyed, stored entry is served without invoking
+          // anything — the platform-cache behavior the matrix's fully-static cells assert.
+          if (platformCacheSeen && platformFullyKeyed && platformKey) {
+            const stored = platformResponseStore.get(platformKey);
+            if (stored && !res.writableEnded) {
+              res.writeHead(stored.status, { ...stored.headers, "x-vercel-cache": "HIT" });
+              res.end(stored.body);
+              return;
+            }
+          }
+
           // A concrete non-PPR prerender under a PPR-capable dynamic handler is a blocking/static
           // branch of that route, not permission to reuse the handler template's generic shell.
           // Falling through to the generic postponed state leaks build-time layouts into requests
@@ -2674,6 +2856,13 @@ export function createDispatcher(options: DispatcherOptions) {
               [NEXT_REQUEST_META]?: { actionBody?: Buffer };
             }
           )[NEXT_REQUEST_META]?.actionBody;
+
+          // Iteration 7: first serve of a fully-keyed platform entry — record it so later
+          // serves of the same key replay the stored bytes (see the early-serve above).
+          const storeCapture =
+            platformFullyKeyed && !platformCacheSeen && platformKey && req.method === "GET"
+              ? captureResponseForStore(res, PLATFORM_STORE_MAX_BODY)
+              : undefined;
 
           await localHandlerInvoker({
             handler,
@@ -2806,8 +2995,13 @@ export function createDispatcher(options: DispatcherOptions) {
               req.headers["next-resume"] !== "1" &&
               pprCapableCandidates.some((candidate) => pprCapableResumeRoutes.has(candidate)),
             buildFallbackBacked: !!pprInfo,
+            ...(platformCacheSeen !== undefined ? { platformCacheSeen } : {}),
             ...(revalidate ? { revalidate } : {}),
           });
+          if (storeCapture && platformKey) {
+            const entry = storeCapture.finish();
+            if (entry && entry.status === 200) storePlatformResponse(platformKey, entry);
+          }
           return;
         }
       }

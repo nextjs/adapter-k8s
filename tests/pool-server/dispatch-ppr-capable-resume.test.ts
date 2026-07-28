@@ -248,3 +248,46 @@ describe("shell-less PPR capable route: live postpone → canonical resume → a
     expect(res._body).toBe("<shell>");
   });
 });
+
+describe("minimal invocations carry a fresh x-invocation-id (matrix B-cluster)", () => {
+  // Canary's ResponseCache grew a minimal-mode LRU with compound keys
+  // (pathname + invocationID, response-cache/index.ts:134) — the platform contract is a
+  // unique `x-invocation-id` header per invocation (route-module.ts:1153), which scopes
+  // reuse to one request (Vercel stamps one per lambda invocation). Without it the cache
+  // falls back to TTL mode and REPLAYS minimal renders byte-identically across requests —
+  // measured live as the matrix's empty-shell "frozen badge" failures. The pool stamps a
+  // fresh UUID on every minimal loopback invocation.
+  it("stamps a unique x-invocation-id per minimal invocation", async () => {
+    const ids: Array<string | undefined> = [];
+    const handler: NodeHandler = (req, res) => {
+      ids.push(req.headers["x-invocation-id"] as string | undefined);
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<p>fresh</p>");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(mockReq("/novel/early-span"), mockRes(), routeResolution());
+    await dispatcher.dispatch(mockReq("/novel/early-span"), mockRes(), routeResolution());
+    expect(ids[0]).toBeTruthy();
+    expect(ids[1]).toBeTruthy();
+    expect(ids[0]).not.toBe(ids[1]);
+  });
+
+  it("never lets a client-supplied x-invocation-id through", async () => {
+    // A client controlling the cache-scoping key could pin itself to another request's
+    // invocation scope; the pool's stamp must always win.
+    let seen: string | undefined;
+    const handler: NodeHandler = (req, res) => {
+      seen = req.headers["x-invocation-id"] as string | undefined;
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<p>x</p>");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(
+      mockReq("/novel/early-span", { "x-invocation-id": "attacker-chosen" }),
+      mockRes(),
+      routeResolution(),
+    );
+    expect(seen).toBeTruthy();
+    expect(seen).not.toBe("attacker-chosen");
+  });
+});

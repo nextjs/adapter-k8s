@@ -164,6 +164,9 @@ export interface RoutingManifest {
       /** Shell revalidate/expire (seconds) from the build; reserved for shell seeding. */
       revalidate?: number;
       expire?: number;
+      /** Params that PARTITION the platform cache key (build's config.allowQuery);
+       * never-enumerable params are excluded. Feeds dispatch's seen-key registry. */
+      allowQuery?: string[];
     }
   >;
   /**
@@ -216,7 +219,7 @@ export interface RoutingManifest {
    * Kept on the manifest because it is a correct, cheap build-time observation that option B needs;
    * do not re-wire it into the gate without re-running the two suites above.
    */
-  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone: boolean }>;
+  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }>;
   nextVersion: string;
 }
 

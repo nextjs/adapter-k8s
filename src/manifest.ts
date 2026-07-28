@@ -294,7 +294,7 @@ export function buildRoutingManifest({
   // unresolved ROOT params that stopped it. See the types.ts doc comment — the pool needs both
   // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
   // flavour (the only flavour that must run NON-minimal).
-  const pprCapableRoutes: Record<string, { rootParams: string[]; wouldPostpone: boolean }> = {};
+  const pprCapableRoutes: Record<string, { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }> = {};
   // Survey Tier 2 #7 (plans/lessons-from-sibling-adapters.md): PARTIALLY_STATIC prerenders whose
   // fallback carries a postponedState but NO filePath — the shell-less `.rsc` postponed-state
   // siblings (build-complete.js:986-991, the dynamic-RSC prefetch responses for PPR routes).
@@ -349,7 +349,17 @@ export function buildRoutingManifest({
       // Shell-BEARING templates are handled via pprRoutes/handlerPprInfo and are deliberately
       // DISJOINT from this map, so keep the existing `fallback: null` restriction.
       if (!(fb?.postponedState && fb.filePath)) {
-        pprCapableRoutes[prerender.pathname] = { rootParams, wouldPostpone };
+        pprCapableRoutes[prerender.pathname] = {
+          rootParams,
+          wouldPostpone,
+          // Matrix iteration 5: shell-less templates partition the platform cache key too
+          // (the with-root same-entry cells prove sharing through the header alone).
+          ...(Array.isArray(config.allowQuery)
+            ? {
+                allowQuery: config.allowQuery.filter((q): q is string => typeof q === "string"),
+              }
+            : {}),
+        };
       }
     }
     if (
@@ -395,6 +405,12 @@ export function buildRoutingManifest({
         ...(tags && tags.length > 0 ? { tags } : {}),
         ...(typeof fb.initialRevalidate === "number" ? { revalidate: fb.initialRevalidate } : {}),
         ...(typeof fb.initialExpiration === "number" ? { expire: fb.initialExpiration } : {}),
+        // Matrix iteration 4: the build's statement of which params PARTITION the platform
+        // cache key (never-enumerable params are excluded). Dispatch's seen-key registry
+        // computes HIT-vs-PRERENDER from exactly this list.
+        ...(Array.isArray(config.allowQuery)
+          ? { allowQuery: config.allowQuery.filter((q): q is string => typeof q === "string") }
+          : {}),
       };
     }
   }

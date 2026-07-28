@@ -1054,3 +1054,38 @@ describe("pprStatePrerenders (survey Tier 2 #7)", () => {
     expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
   });
 });
+
+// Matrix iteration 4 (plans/prerender-matrix-catchup.md): the platform cache key must
+// exclude never-enumerable params, and `config.allowQuery` is the build's own statement of
+// which params PARTITION the key. Emit it on both PPR maps so dispatch can compute keys.
+describe("allowQuery on PPR manifest entries (matrix key registry)", () => {
+  it("carries allowQuery on shell-bearing pprRoutes entries", () => {
+    const outputs = mockOutputs({
+      appPages: [mockAppPage({ pathname: "/m/[lang]/[id]" })],
+      prerenders: [
+        mockPrerender({
+          pathname: "/m/[lang]/[id]",
+          fallback: { filePath: "/app/dist/m.html", postponedState: "st" },
+          config: {
+            renderingMode: "PARTIALLY_STATIC" as any,
+            allowQuery: ["lang"],
+          },
+        }),
+      ],
+    });
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
+    ]);
+    const manifest = buildRoutingManifest({
+      routing: mockRouting(),
+      outputs,
+      pools,
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+    expect((manifest.pprRoutes["/m/[lang]/[id]"] as any)?.allowQuery).toEqual(["lang"]);
+  });
+});
