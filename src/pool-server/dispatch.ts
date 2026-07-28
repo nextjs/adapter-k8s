@@ -2746,11 +2746,25 @@ export function createDispatcher(options: DispatcherOptions) {
           let platformCacheSeen: boolean | undefined;
           let platformKey: string | undefined;
           let platformFullyKeyed = false;
+          // Byte-replay eligibility is NARROWER than key membership (iteration 8, measured
+          // against the canary.97 suite): only SHELL-LESS templates (pprCapableRoutes-
+          // sourced keys — the matrix's fully-static empty-shell class) and only DOCUMENT
+          // requests. Shell-bearing routes replay through Next's own cache (and carry the
+          // tag/revalidate surfaces the store must never serve stale); RSC/segment
+          // requests have variant payloads the document-keyed store would corrupt.
+          let platformStoreEligible = false;
+          const platformDocumentRequest =
+            req.method === "GET" &&
+            req.headers[rscConfig?.header ?? "rsc"] !== "1" &&
+            req.headers["next-router-prefetch"] !== "1" &&
+            req.headers["next-router-segment-prefetch"] === undefined;
           for (const candidate of pprCapableCandidates) {
-            const aq =
-              pprRoutes[candidate]?.allowQuery ??
-              (pprCapableRouteMap[candidate] as { allowQuery?: string[] } | undefined)?.allowQuery;
+            const capableAq = (
+              pprCapableRouteMap[candidate] as { allowQuery?: string[] } | undefined
+            )?.allowQuery;
+            const aq = pprRoutes[candidate]?.allowQuery ?? capableAq;
             if (!aq) continue;
+            platformStoreEligible = capableAq !== undefined && platformDocumentRequest;
             const params =
               extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
             // The build emits nxtP-prefixed param names in allowQuery; extracted route
@@ -2778,7 +2792,7 @@ export function createDispatcher(options: DispatcherOptions) {
           }
           // Platform replay: a seen, fully-keyed, stored entry is served without invoking
           // anything — the platform-cache behavior the matrix's fully-static cells assert.
-          if (platformCacheSeen && platformFullyKeyed && platformKey) {
+          if (platformCacheSeen && platformFullyKeyed && platformStoreEligible && platformKey) {
             const stored = platformResponseStore.get(platformKey);
             if (stored && !res.writableEnded) {
               res.writeHead(stored.status, { ...stored.headers, "x-vercel-cache": "HIT" });
@@ -2860,7 +2874,7 @@ export function createDispatcher(options: DispatcherOptions) {
           // Iteration 7: first serve of a fully-keyed platform entry — record it so later
           // serves of the same key replay the stored bytes (see the early-serve above).
           const storeCapture =
-            platformFullyKeyed && !platformCacheSeen && platformKey && req.method === "GET"
+            platformFullyKeyed && !platformCacheSeen && platformKey && platformStoreEligible
               ? captureResponseForStore(res, PLATFORM_STORE_MAX_BODY)
               : undefined;
 

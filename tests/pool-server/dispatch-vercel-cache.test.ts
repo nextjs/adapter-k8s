@@ -389,3 +389,77 @@ describe("x-vercel-cache iteration 7: platform response store for fully-keyed en
     expect(r2._body).toBe("<p>render-2</p>");
   });
 });
+
+describe("x-vercel-cache iteration 8: response store scoping (canary.97 regression fixes)", () => {
+  // The store's first cut replayed too much (measured: segment-cache suites got DOCUMENT
+  // bytes for RSC/segment requests; cache-tag suites got pre-invalidation bodies). Scope:
+  // capture/replay ONLY document requests on SHELL-LESS templates (pprCapableRoutes-sourced
+  // keys — the matrix's fully-static empty-shell class). Shell-bearing (pprRoutes) routes
+  // already replay correctly via Next's own cache; tag-bearing routes live there too.
+  function shellBearingDispatcher(counter: { n: number }) {
+    const handler: NodeHandler = (_req, res) => {
+      counter.n++;
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(`<p>render-${counter.n}</p>`);
+    };
+    return createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(handler),
+        has: vi.fn((p: string) => p === "/m/[lang]/[id]"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE", filePath: "x.js" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprRoutes: {
+        "/m/[lang]/[id]": {
+          postponedState: "s",
+          fallbackFilePath: "f.html",
+          allowQuery: ["nxtPlang", "nxtPid"],
+        },
+      },
+      incrementalCacheShared: true,
+    } as any);
+  }
+  const matchRes = (lang: string, id: string) =>
+    ({
+      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang, id }, resolvedHeaders: undefined,
+    }) as any;
+
+  it("never byte-replays for shell-bearing (pprRoutes-sourced) keys", async () => {
+    const counter = { n: 0 };
+    const d = shellBearingDispatcher(counter);
+    await d.dispatch(mockReq("/m/en/one"), mockRes(), matchRes("en", "one"));
+    const r2 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r2, matchRes("en", "one"));
+    expect(counter.n).toBe(2); // rendered both times — Next's own cache owns replay here
+    expect(r2._body).toBe("<p>render-2</p>");
+  });
+
+  it("never byte-replays for RSC requests even on eligible keys", async () => {
+    const counter = { n: 0 };
+    const handler: NodeHandler = (_req, res) => {
+      counter.n++;
+      res.writeHead(200, { "content-type": "text/x-component" });
+      res.end(`flight-${counter.n}`);
+    };
+    const d = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(handler),
+        has: vi.fn((p: string) => p === "/m/[lang]/[id]"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE", filePath: "x.js" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprCapableRoutes: { "/m/[lang]/[id]": { rootParams: [], allowQuery: ["nxtPlang", "nxtPid"] } },
+      rscConfig: { header: "rsc", suffix: ".rsc" },
+    } as any);
+    await d.dispatch(mockReq("/m/en/one", { rsc: "1" }), mockRes(), matchRes("en", "one"));
+    const r2 = mockRes();
+    await d.dispatch(mockReq("/m/en/one", { rsc: "1" }), r2, matchRes("en", "one"));
+    expect(counter.n).toBe(2);
+    expect(r2._body).toBe("flight-2");
+  });
+});
