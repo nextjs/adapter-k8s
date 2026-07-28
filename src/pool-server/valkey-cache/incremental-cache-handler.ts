@@ -40,6 +40,11 @@ const RETENTION_MARGIN_SECONDS = 60;
 // handler caps its key TTL at the same bound (M7).
 export const DURABLE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
+// Single-flight revalidation lock lifetime. Long enough to cover any sane background
+// re-render; short enough that a crashed winner only delays the NEXT revalidation attempt,
+// never the serving of the (stale-but-valid) entry. Mirrors adapter-aws's 30s default.
+const REVALIDATE_LOCK_TTL_SECONDS = 30;
+
 /**
  * Total budget for one entry's stored tag list (N79). A byte budget, not a count: the point of the
  * bound is to keep entry meta and the freshness HMGET argv bounded, and 128 tags of 1024 chars is
@@ -382,6 +387,10 @@ export class ValkeyIncrementalCacheHandler {
     return `${this.prefix}inc:${cacheKey}`;
   }
 
+  private revalidateLockKey(cacheKey: string): string {
+    return `${this.prefix}inc-revalidate-lock:${cacheKey}`;
+  }
+
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
     try {
       const raw = await this.client.get(this.entryKey(cacheKey));
@@ -402,9 +411,34 @@ export class ValkeyIncrementalCacheHandler {
       }
       // A stale (SWR) tag must make Next serve this value and revalidate BEHIND the request —
       // never block on a fresh render (N80, see `staleByTagLastModified`).
+      //
+      // Single-flight (survey Tier 1 #5, plans/lessons-from-sibling-adapters.md): without a
+      // lock, EVERY replica that reads a tag-stale entry gets the stale-signalling
+      // lastModified and every one of them re-renders — N pods, N renders, one shared store
+      // (adapter-aws locks the same way before enqueueing, router.ts:772-805; adapter-bun
+      // built the lock table and forgot to call it). Only the reader that wins a short-TTL
+      // NX lock is told "stale"; the rest see the entry as fresh and keep serving it while
+      // the winner revalidates (its `set` releases the lock early; the TTL bounds a crashed
+      // winner). A lock-acquire FAILURE fails open to the stale signal — at worst the old
+      // stampede, never a lost revalidation.
       const staleByTag = areTagsStale(tags, entry.lastModified, manifest);
+      let signalStale = staleByTag;
+      if (staleByTag) {
+        try {
+          const acquired = await this.client.set(
+            this.revalidateLockKey(cacheKey),
+            "1",
+            "NX",
+            "EX",
+            REVALIDATE_LOCK_TTL_SECONDS,
+          );
+          signalStale = acquired !== null;
+        } catch {
+          signalStale = true;
+        }
+      }
       return {
-        lastModified: staleByTag ? staleByTagLastModified(entry, now) : entry.lastModified,
+        lastModified: signalStale ? staleByTagLastModified(entry, now) : entry.lastModified,
         value: decodeValue(entry.value),
       };
     } catch (error) {
@@ -486,6 +520,9 @@ export class ValkeyIncrementalCacheHandler {
         return;
       }
       await this.client.set(this.entryKey(cacheKey), serialized, "EX", entry.ttlSeconds);
+      // A completed re-render releases the single-flight revalidation lock early (see `get`);
+      // best-effort — the lock's own TTL is the backstop.
+      this.client.del(this.revalidateLockKey(cacheKey)).catch(() => undefined);
     } catch (error) {
       // Cache write failure must not break the response — but it must be observable (N81, see
       // the matching comment in `get`).
@@ -511,8 +548,8 @@ export class ValkeyIncrementalCacheHandler {
         for (const tag of chunk) {
           args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
         }
-      // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
-      // the per-build manifest's lifetime the same way entry keys are bounded.
+        // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
+        // the per-build manifest's lifetime the same way entry keys are bounded.
         const clamped = await this.client.eval(
           UPDATE_TAGS_SCRIPT,
           1,

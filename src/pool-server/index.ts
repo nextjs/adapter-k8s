@@ -30,6 +30,7 @@ import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import {
   createDispatcher,
   getContentType,
+  isVerifiedPreviewRequest,
   mergeResolvedHeadersIntoHeadersArg,
 } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
@@ -2550,7 +2551,17 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         const filePath = dataPath.endsWith(".json")
           ? resolveWithinRoot(path.join(process.cwd(), ".next", "server", "pages"), dataPath)
           : null;
-        if (dataPageIsPrerendered && filePath && existsSync(filePath)) {
+        // Draft mode bypasses the static serve (survey Tier 1 #2): an AUTHENTICATED
+        // `__prerender_bypass` cookie (validated constant-time against the build's
+        // previewModeId, same gate as the strict-404 yield in dispatch.ts) must fall through
+        // to a live render, exactly as `next start` does. An invalid cookie value changes
+        // nothing — honoring arbitrary values would let any client bust this tier.
+        if (
+          dataPageIsPrerendered &&
+          filePath &&
+          existsSync(filePath) &&
+          !isVerifiedPreviewRequest(req)
+        ) {
           const content = readFileSync(filePath);
           res.writeHead(200, {
             "content-type": "application/json; charset=utf-8",

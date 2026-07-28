@@ -880,6 +880,23 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     return config;
   }
 
+  interface ExperimentalWithServerActions {
+    serverActions?: { allowedOrigins?: string[] };
+  }
+
+  // A user may paste a URL ("https://App.Example.com/path") where a hostname is expected;
+  // Next's allowedOrigins matches host[:port] values (globs allowed — gateway wildcards like
+  // `*.example.com` pass through). Scheme and path are stripped, the host lowercased.
+  function normalizeDeploymentHost(value: string | undefined): string | undefined {
+    if (!value) return undefined;
+    const host = value
+      .trim()
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
+      .split("/", 1)[0]
+      ?.toLowerCase();
+    return host || undefined;
+  }
+
   const adapter: NextAdapter = {
     name: "k8s",
 
@@ -1003,6 +1020,43 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           parallelServerCompiles: false,
           parallelServerBuildTraces: false,
           webpackBuildWorker: false,
+        };
+      }
+
+      // Server Action origin trust (survey Tier 1 #1 — plans/lessons-from-sibling-adapters.md).
+      // Next's Server Action CSRF check compares the request Origin against the host Next
+      // believes it serves; behind Envoy + Cloud CDN the pool sees the pod/service host, so
+      // browser POSTs from the public hostname 403 in production while passing in emulate.
+      // trustHostHeader additionally makes Pages `res.revalidate()` and absolute-URL derivation
+      // trust x-forwarded-host (both reference adapters set it; aws adapter.ts:164-197).
+      // Unlike aws there is no first-deploy chicken-and-egg: the gateway config already declares
+      // the public hostnames. ADAPTER_K8S_DEPLOYMENT_HOST covers hosts in front of the gateway
+      // (a CDN domain, a tunnel) without a config edit.
+      {
+        const allowedOrigins = new Set<string>(
+          ((nextConfig.experimental as ExperimentalWithServerActions | undefined)?.serverActions
+            ?.allowedOrigins ?? []) as string[],
+        );
+        for (const host of cfg.provider?.gke?.gateway?.hosts ?? []) {
+          const normalized = normalizeDeploymentHost(host.hostname);
+          if (normalized) allowedOrigins.add(normalized);
+        }
+        const envHost = normalizeDeploymentHost(process.env.ADAPTER_K8S_DEPLOYMENT_HOST);
+        if (envHost) allowedOrigins.add(envHost);
+        const existingServerActions = ((
+          nextConfig.experimental as ExperimentalWithServerActions | undefined
+        )?.serverActions ?? {}) as Record<string, unknown>;
+        modified.experimental = {
+          ...((modified.experimental as Record<string, unknown>) ?? {}),
+          trustHostHeader: true,
+          ...(allowedOrigins.size > 0
+            ? {
+                serverActions: {
+                  ...existingServerActions,
+                  allowedOrigins: [...allowedOrigins],
+                },
+              }
+            : {}),
         };
       }
 

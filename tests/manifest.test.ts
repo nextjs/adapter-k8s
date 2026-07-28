@@ -978,3 +978,79 @@ describe("buildRoutingManifest", () => {
     expect((manifest as any).rsc).toBeUndefined();
   });
 });
+
+// Survey Tier 2 #7 (plans/lessons-from-sibling-adapters.md): the build emits PARTIALLY_STATIC
+// PRERENDER outputs whose fallback carries a postponedState but NO filePath — the shell-less
+// `.rsc` postponed-state siblings (dynamic-RSC prefetch responses for PPR routes,
+// build-complete.js:986-991). `pprRoutes` deliberately requires a shell and `pprCapableRoutes`
+// only admits route TEMPLATES (prerender-manifest dynamicRoutes members), so these outputs were
+// dropped from the manifest entirely — the resume implementation cannot see them. The Vercel
+// adapter registers them gated on `allowQuery.length === 0` (outputs.ts:652-673): with no
+// route-param variance the postponed state is shareable across requests; with params it is not
+// and must cold-render.
+describe("pprStatePrerenders (survey Tier 2 #7)", () => {
+  function manifestWith(prerender: Record<string, unknown>) {
+    const outputs = mockOutputs({
+      appPages: [mockAppPage({ pathname: "/novel" })],
+      prerenders: [mockPrerender(prerender as any)],
+    });
+    const pools = new Map<string, PoolDefinition>([
+      ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
+    ]);
+    return buildRoutingManifest({
+      routing: mockRouting(),
+      outputs,
+      pools,
+      buildId: "test123",
+      basePath: "",
+      i18n: null,
+      nextVersion: "16.2.0",
+      projectDir: "/app",
+    });
+  }
+
+  it("registers a filePath-less postponed-state prerender when allowQuery is empty", () => {
+    const manifest = manifestWith({
+      pathname: "/novel.rsc",
+      groupId: 7,
+      fallback: { postponedState: "ppr-state-bytes" },
+      config: { renderingMode: "PARTIALLY_STATIC" as any, allowQuery: [] },
+    });
+    expect((manifest as any).pprStatePrerenders).toEqual({
+      "/novel.rsc": { postponedState: "ppr-state-bytes" },
+    });
+    // Disjoint from the shell-bearing map — nothing here has a shell to serve.
+    expect(manifest.pprRoutes["/novel.rsc"]).toBeUndefined();
+  });
+
+  it("refuses one whose allowQuery names route params (state is param-dependent, must cold-render)", () => {
+    const manifest = manifestWith({
+      pathname: "/novel/[id].rsc",
+      groupId: 8,
+      fallback: { postponedState: "param-dependent-state" },
+      config: { renderingMode: "PARTIALLY_STATIC" as any, allowQuery: ["id"] },
+    });
+    expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
+  });
+
+  it("refuses one with no allowQuery at all (variance unknown — conservative)", () => {
+    const manifest = manifestWith({
+      pathname: "/novel.rsc",
+      groupId: 9,
+      fallback: { postponedState: "state" },
+      config: { renderingMode: "PARTIALLY_STATIC" as any },
+    });
+    expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
+  });
+
+  it("leaves shell-bearing prerenders in pprRoutes only", () => {
+    const manifest = manifestWith({
+      pathname: "/dashboard",
+      groupId: 10,
+      fallback: { filePath: "/app/dist/dashboard.html", postponedState: "abc" },
+      config: { renderingMode: "PARTIALLY_STATIC" as any, allowQuery: [] },
+    });
+    expect(manifest.pprRoutes["/dashboard"]).toBeDefined();
+    expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
+  });
+});

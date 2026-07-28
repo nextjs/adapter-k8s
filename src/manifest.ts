@@ -295,6 +295,15 @@ export function buildRoutingManifest({
   // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
   // flavour (the only flavour that must run NON-minimal).
   const pprCapableRoutes: Record<string, { rootParams: string[]; wouldPostpone: boolean }> = {};
+  // Survey Tier 2 #7 (plans/lessons-from-sibling-adapters.md): PARTIALLY_STATIC prerenders whose
+  // fallback carries a postponedState but NO filePath — the shell-less `.rsc` postponed-state
+  // siblings (build-complete.js:986-991, the dynamic-RSC prefetch responses for PPR routes).
+  // `pprRoutes` requires a shell and `pprCapableRoutes` only admits route templates, so these
+  // were dropped from the manifest entirely and the resume implementation could not see them.
+  // Gated on `allowQuery === []` per the reference adapter (adapter-vercel outputs.ts:652-673):
+  // with no route-param variance the state is shareable across requests; with params (or with
+  // variance unknown) it is not and the route must cold-render instead.
+  const pprStatePrerenders: RoutingManifest["pprStatePrerenders"] = {};
   const dynamicRouteRootParams = readDynamicRouteFallbackRootParams(resolvedDistDir);
   const prerenderGroups = indexPrerenderGroups(outputs);
   for (const prerender of outputs.prerenders) {
@@ -342,6 +351,15 @@ export function buildRoutingManifest({
       if (!(fb?.postponedState && fb.filePath)) {
         pprCapableRoutes[prerender.pathname] = { rootParams, wouldPostpone };
       }
+    }
+    if (
+      config.renderingMode === "PARTIALLY_STATIC" &&
+      fb?.postponedState &&
+      !fb.filePath &&
+      Array.isArray(config.allowQuery) &&
+      config.allowQuery.length === 0
+    ) {
+      pprStatePrerenders[prerender.pathname] = { postponedState: fb.postponedState };
     }
     if (config.renderingMode === "PARTIALLY_STATIC" && fb?.postponedState && fb.filePath) {
       // Shell cache tags come from the build's initialHeaders (x-next-cache-tags = the
@@ -437,6 +455,10 @@ export function buildRoutingManifest({
       : null,
     poolAssignments,
     pprRoutes,
+    // Sorted for byte-identical chart regeneration, like pprCapableRoutes below.
+    pprStatePrerenders: Object.fromEntries(
+      Object.entries(pprStatePrerenders).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
     // Sorted so two chart generations of the same build are byte-identical.
     pprCapableRoutes: Object.fromEntries(
       Object.entries(pprCapableRoutes).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),

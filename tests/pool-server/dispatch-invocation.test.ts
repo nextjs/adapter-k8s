@@ -804,3 +804,27 @@ describe("emulated platform cache: SSG app templates", () => {
     expect(calls[0].minimalMode).toBe(true);
   });
 });
+
+// Survey batch 2 (plans/lessons-from-sibling-adapters.md Tier 3 #22, adapter-bun rule 3):
+// a pages-router fallback page's FIRST miss streams through Next's private no-store branch
+// while carrying `x-nextjs-cache: MISS` — the response bytes themselves are the fully
+// cacheable page. Left as-is, Cloud CDN would treat a cacheable page as permanently
+// uncacheable. The x-nextjs-cache branch of the rewrite deliberately outranks the
+// keep-stricter-verdict guard (unlike the x-nextjs-prerender/postponed branches above,
+// where private marks genuinely per-request bytes).
+describe("pages-router fallback first-MISS cache-control (survey Tier 3 #22)", () => {
+  it("rewrites the private first-MISS verdict on an x-nextjs-cache-marked response to public must-revalidate", async () => {
+    const handler: NodeHandler = (_req, res) => {
+      res.writeHead(200, {
+        "x-nextjs-cache": "MISS",
+        "cache-control": "private, no-cache, no-store, max-age=0, must-revalidate",
+        "content-type": "text/html",
+      });
+      res.end("<p>fallback page</p>");
+    };
+    const dispatcher = makeDispatcher(handler);
+    const res = mockRes();
+    await dispatcher.dispatch(mockReq("/fallback/first-miss"), res, routeResolution());
+    expect(res._headers["cache-control"]).toBe("public, max-age=0, must-revalidate");
+  });
+});

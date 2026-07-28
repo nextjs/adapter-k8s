@@ -154,7 +154,10 @@ function readCookieValue(cookieHeader: string, name: string): string | undefined
 //    Mode `__next_preview_data` JWT — the bypass cookie carries no HMAC — so an exact,
 //    constant-time equality against the random build-time id IS the complete upstream scheme.
 // When the build produced no preview identity, neither credential is ever honored.
-function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
+// Exported: index.ts's `_next/data` static fast path must yield to an authenticated
+// draft-mode request the same way this file's strict-404 gate does (survey Tier 1 #2 —
+// `next start` renders fresh in draft mode; the staged prerender must not be served).
+export function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
   const previewModeId = process.env.__NEXT_PREVIEW_MODE_ID;
   if (!previewModeId) return false;
   const revalidateHeader = req.headers["x-prerender-revalidate"];

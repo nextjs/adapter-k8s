@@ -29,6 +29,10 @@ class FakeValkeyClient implements ValkeyClient {
   }
   async set(key: string, value: string | Buffer, ...args: Arg[]): Promise<string | null> {
     if (this.setError) throw this.setError;
+    // Honor NX like real Valkey: no write and a null reply when the key exists.
+    if (args.some((a) => String(a).toUpperCase() === "NX") && this.strings.has(key)) {
+      return null;
+    }
     this.strings.set(key, String(value));
     this.setArgs.push({ key, value: String(value), args });
     return "OK";
@@ -473,5 +477,82 @@ describe("N6: non-finite lifetimes are refused (never reach Valkey)", () => {
     await h.set("/ok", appPageEntry("P"), { revalidate: 60 });
     expect(client.setArgs).toHaveLength(1);
     expect(client.setArgs[0]!.args).toEqual(["EX", 120]); // 60 + 60s retention margin
+  });
+});
+
+// Survey Tier 3 #16: `set(key, null)` is a REAL cached value (Next stores null for
+// not-found responses). It must round-trip as a hit carrying `value: null` — collapsing it
+// into a miss makes Next re-render the known-empty result on every request, forever.
+describe("negative caching (survey Tier 3 #16)", () => {
+  it("round-trips set(key, null) as a cache HIT with value null, distinct from a miss", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "neg1", now: () => 5000 });
+    await h.set("/gone", null, {});
+    const hit = await h.get("/gone");
+    expect(hit).not.toBeNull(); // a HIT...
+    expect(hit!.value).toBeNull(); // ...whose cached value is the negative result
+    expect(await h.get("/never-stored")).toBeNull(); // and a true miss stays a miss
+  });
+});
+
+// Survey Tier 1 #5: single-flight revalidation. When a profiled (SWR) tag revalidation marks
+// an entry stale, EVERY replica that reads it gets the stale-signalling lastModified and every
+// one of them triggers a background re-render — N pods, N renders, one Valkey. The first
+// reader must take a short-TTL NX lock and be the only one told "stale"; concurrent readers
+// are told "fresh" and keep serving the stale-but-valid value while the winner revalidates.
+describe("single-flight revalidation lock (survey Tier 1 #5)", () => {
+  async function staleEntry(client: FakeValkeyClient) {
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "sf1", now: () => 1_000_000 });
+    await h.set("/page", appPageEntry("P", "tag-a"), {
+      cacheControl: { revalidate: 60, expire: 600 },
+    });
+    // Profile-carrying revalidateTag → stale (SWR), not expired. Issued AFTER the entry was
+    // written (later clock) — an invalidation at the same instant as the write is not stale.
+    const later = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "sf1",
+      now: () => 1_500_000,
+    });
+    await later.revalidateTag("tag-a", { expire: 3600 });
+    // Advance the clock past the write so the tag update outdates the entry.
+    return new ValkeyIncrementalCacheHandler({ client, buildId: "sf1", now: () => 2_000_000 });
+  }
+
+  it("signals stale to exactly one reader; concurrent readers see the entry as fresh", async () => {
+    const client = new FakeValkeyClient();
+    const h = await staleEntry(client);
+    const first = await h.get("/page");
+    const second = await h.get("/page");
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    // The winner gets the shifted lastModified (one second past the route's 60s revalidate
+    // window at now=2,000,000 — see staleByTagLastModified): Next computes "past revalidate
+    // window" from it and revalidates behind the request.
+    expect(first!.lastModified).toBe(2_000_000 - 60_000 - 1_000);
+    // The loser sees the entry's own lastModified — fresh, no duplicate revalidation.
+    expect(second!.lastModified).toBe(1_000_000);
+  });
+});
+
+// Survey batch 2 (Tier 3 #18): variant-fanout on invalidation. adapter-aws fans a
+// revalidation out across a route's HTML + `.rsc` + segment outputs via groupId; our
+// equivalent mechanism is the SHARED implicit path tag (`_N_T_/route`) every variant of a
+// route carries. Pin that one hard revalidateTag misses ALL variants — if tag extraction or
+// the manifest check ever stops covering a variant class, a revalidated page would keep
+// serving its stale RSC payload (hydration mismatch: fresh HTML, stale flight data).
+describe("variant fanout via shared implicit path tags (survey Tier 3 #18)", () => {
+  it("hard revalidateTag on the implicit path tag misses the HTML entry AND its .rsc sibling", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "fan1", now: () => 1_000_000 });
+    await h.set("/route", appPageEntry("<html>", "_N_T_/route"), {});
+    await h.set("/route.rsc", appPageEntry("flight-bytes", "_N_T_/route"), {});
+    const later = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "fan1",
+      now: () => 2_000_000,
+    });
+    await later.revalidateTag("_N_T_/route");
+    expect(await later.get("/route")).toBeNull();
+    expect(await later.get("/route.rsc")).toBeNull();
   });
 });

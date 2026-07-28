@@ -171,3 +171,33 @@ describe("generateRoutingServiceDockerfile", () => {
     expect(result).toContain("TLS_KEY_FILE=/tmp/tls/tls-key.pem");
   });
 });
+
+// Survey batch 2 audits (plans/lessons-from-sibling-adapters.md Tier 5 #26/#28):
+// (a) NEXT_ADAPTER_PATH is a BUILD-machine env that activates adapter hooks; carried into the
+//     runtime image it changes Next's request-handling branches (adapter-bun deletes it at boot
+//     for exactly this reason). The emitted Dockerfiles must never bake it in.
+// (b) Four of five official deploy-* templates ship images with no public/ at all (the runner
+//     stage never copies it). Ours copies the whole staged context, which includes public/ —
+//     pin that the context COPY survives refactors.
+describe("emitted Dockerfile hygiene (survey batch 2)", () => {
+  const dockerfiles = () => [
+    generateDockerfile({ containerStrategy: "shared-image", buildId: "abc123" }),
+    generatePoolDockerfile({ poolName: "ssr", buildId: "abc123" }),
+    generateRoutingServiceDockerfile({ buildId: "abc123" }),
+  ];
+
+  it("never bakes NEXT_ADAPTER_PATH into a runtime image", () => {
+    for (const dockerfile of dockerfiles()) {
+      expect(dockerfile).not.toContain("NEXT_ADAPTER_PATH");
+    }
+  });
+
+  it("copies the staged build context (which carries public/) into app images", () => {
+    expect(generateDockerfile({ containerStrategy: "shared-image", buildId: "abc123" })).toMatch(
+      /^COPY --chown=node:node \. \.$/m,
+    );
+    expect(generatePoolDockerfile({ poolName: "ssr", buildId: "abc123" })).toMatch(
+      /^COPY --chown=node:node context\/ \.$/m,
+    );
+  });
+});

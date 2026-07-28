@@ -167,6 +167,15 @@ export interface RoutingManifest {
     }
   >;
   /**
+   * Shell-less PARTIALLY_STATIC prerenders carrying ONLY a postponed state (the `.rsc`
+   * postponed-state siblings, build-complete.js:986-991), keyed by output pathname. Registered
+   * only when the build's `allowQuery` is empty — no route-param variance, so the state is
+   * shareable across requests (adapter-vercel outputs.ts:652-673). Disjoint from `pprRoutes`
+   * (those have shells) and from `pprCapableRoutes` (those are route templates). Reserved for
+   * the resume implementation; nothing consumes it yet.
+   */
+  pprStatePrerenders?: Record<string, { postponedState: string }>;
+  /**
    * PPR-capable route TEMPLATES (`renderingMode: PARTIALLY_STATIC`) whose build emitted NO
    * fallback shell (`fallback: null`), keyed by template pathname. Disjoint from `pprRoutes`,
    * which carries only the shell-BEARING templates.

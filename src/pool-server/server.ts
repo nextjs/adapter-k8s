@@ -259,6 +259,19 @@ export function createPoolServer(options: PoolServerOptions) {
     }
   });
 
+  // Keep-alive must outlive the proxy tier's upstream idle timeout (Envoy in front of this
+  // pool, and Node's default is 5s): when the pool closes an idle socket the proxy just chose
+  // for a new request, the client sees an intermittent 502 (and e2e runs see `socket hang up`).
+  // 75s mirrors adapter-bun and common ingress defaults; the emitted Envoy/route config must
+  // keep its upstream idle timeout STRICTLY below this. headersTimeout must exceed
+  // keepAliveTimeout or Node still reaps a kept-alive socket that is merely waiting for the
+  // next request line.
+  const keepAliveEnv = Number(process.env.ADAPTER_K8S_KEEP_ALIVE_TIMEOUT_MS);
+  const keepAliveTimeout =
+    Number.isFinite(keepAliveEnv) && keepAliveEnv > 0 ? keepAliveEnv : 75_000;
+  server.keepAliveTimeout = keepAliveTimeout;
+  server.headersTimeout = keepAliveTimeout + 1_000;
+
   return {
     start(): Promise<{ port: number }> {
       return new Promise((resolve, reject) => {
@@ -268,6 +281,14 @@ export function createPoolServer(options: PoolServerOptions) {
           if (!addr || typeof addr === "string") {
             reject(new Error("Failed to get server address"));
             return;
+          }
+          // Next's forwarded Server Action redirects fetch against __NEXT_PRIVATE_ORIGIN. In a
+          // multi-replica pool an unset origin resolves through service DNS and can land the
+          // internal fetch on a DIFFERENT pod — pin it to this process. Never a wildcard bind
+          // address (0.0.0.0/:: are valid binds but invalid fetch targets), and never override
+          // an operator-provided value.
+          if (!process.env.__NEXT_PRIVATE_ORIGIN) {
+            process.env.__NEXT_PRIVATE_ORIGIN = `http://127.0.0.1:${addr.port}`;
           }
           console.log(`Pool server listening on port ${addr.port}`);
           resolve({ port: addr.port });
