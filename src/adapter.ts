@@ -20,16 +20,24 @@ const _dirname =
       ? __dirname
       : process.cwd();
 
-// Resolve a dependency's directory, preferring the ADAPTER package (where the dep is
-// declared, e.g. @next/routing) over the app root. Strict package managers (pnpm) do not
-// expose the adapter's transitive deps from the app root, so app-first resolution turns a
-// valid install into "cannot find module". App-root is kept as a fallback for hoisted
-// layouts (npm) and for a symlinked adapter checkout.
-function resolveDepDir(dep: string, projectDir: string): string | undefined {
-  const fromFiles = [
-    path.join(_dirname, "index.js"), // adapter package (dist/)
-    path.join(projectDir, "package.json"), // app root
-  ];
+// Resolve a dependency's directory. The preferred resolution root depends on who OWNS the
+// dep:
+//   - "adapter" (default): deps the adapter declares (e.g. @next/routing). Strict package
+//     managers (pnpm) do not expose the adapter's transitive deps from the app root, so
+//     app-first resolution turns a valid install into "cannot find module". App-root is
+//     kept as a fallback for hoisted layouts (npm) and for a symlinked adapter checkout.
+//   - "app": deps the APP declares (e.g. next). The app's copy is the version its build
+//     output requires at runtime; with a symlinked adapter checkout, adapter-first would
+//     silently stage the ADAPTER repo's copy — a version skew between build and image.
+//     Adapter-root is kept as a fallback for layouts where the app root cannot resolve it.
+function resolveDepDir(
+  dep: string,
+  projectDir: string,
+  owner: "adapter" | "app" = "adapter",
+): string | undefined {
+  const adapterRoot = path.join(_dirname, "index.js"); // adapter package (dist/)
+  const appRoot = path.join(projectDir, "package.json"); // app root
+  const fromFiles = owner === "app" ? [appRoot, adapterRoot] : [adapterRoot, appRoot];
   for (const fromFile of fromFiles) {
     try {
       return path.dirname(createRequire(fromFile).resolve(`${dep}/package.json`));
@@ -1802,8 +1810,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // N50 (review, Low): `<projectDir>/node_modules/next` under an existsSync guard
           // silently staged NOTHING in a hoisted workspace (npm/yarn put `next` at the
           // workspace root), which is a "Cannot find module 'next/...'" crash in the pool.
-          // Resolve it the same way @next/routing is resolved, and fail loudly.
-          const nextPkgDir = resolveDepDir("next", projectDir);
+          // Resolve via createRequire like @next/routing — but app-first: `next` is the
+          // app's dependency and the app's version is the one its build output needs.
+          const nextPkgDir = resolveDepDir("next", projectDir, "app");
           if (!nextPkgDir || !existsSync(nextPkgDir)) {
             throw new Error(
               `[adapter-k8s] Could not resolve the "next" package from ${projectDir}. The pool ` +

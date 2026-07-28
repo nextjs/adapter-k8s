@@ -195,6 +195,22 @@ describe("pool build context staging", () => {
     });
   });
 
+  // `next` is the APP's dependency: the staged copy must be the version the app builds
+  // against, not whatever the adapter package happens to resolve. With a symlinked adapter
+  // checkout (or these tests), adapter-first resolution shipped the ADAPTER repo's `next`
+  // into the pool image — a silent version skew between build and runtime.
+  it("stages the app's own next package, not the adapter's (app-first resolution)", async () => {
+    seedProject();
+    writeFile(
+      "node_modules/next/package.json",
+      JSON.stringify({ name: "next", version: "0.0.0-app-local" }),
+    );
+    await build();
+
+    const staged = JSON.parse(readFileSync(poolContext("node_modules/next/package.json"), "utf-8"));
+    expect(staged.version).toBe("0.0.0-app-local");
+  });
+
   // N50 (review #32, reproduced): the pool context dirs were never wiped and `stageFile`
   // copies with `cp(..., { recursive: true })`, which MERGES — so a chunk (or a route
   // handler, or a public file) deleted from the source kept shipping inside every subsequent
