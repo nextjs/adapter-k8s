@@ -51,9 +51,16 @@ afterEach(() => {
 });
 
 describe("modifyConfig Server Action origin trust (survey Tier 1 #1)", () => {
-  it("sets experimental.trustHostHeader so res.revalidate() and absolute URLs work behind the LB", async () => {
+  it("does NOT set experimental.trustHostHeader (unneeded here; build-baked, unmeasured benefit)", async () => {
+    // trustHostHeader is baked into the BUILD via define-env.ts, so its blast radius is the
+    // whole compiled output, not just the api-resolver paths it helps. The res.revalidate()
+    // invariant it exists for (adapter-aws sets it) is already satisfied here by the pool's
+    // requestMeta.revalidate channel — the full suite passes 3,342/0 without the flag
+    // (2026-07-28, canary 63375cd1). Absent a measured need, a build-wide define stays out.
+    // (A 2026-07-28 bisect briefly blamed it for middleware-rewrites failures; that was
+    // disproven — those were a Next-ref artifact — but the flag remains unjustified.)
     const modified = await modify(adapterWithHosts(["example.com"]));
-    expect(modified.experimental?.trustHostHeader).toBe(true);
+    expect(modified.experimental?.trustHostHeader).toBeUndefined();
   });
 
   it("allows Server Action POSTs from every configured gateway hostname", async () => {

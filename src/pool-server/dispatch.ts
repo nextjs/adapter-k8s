@@ -482,6 +482,10 @@ async function writeInnerResponse(
     status?: number;
   },
   normalizePrerenderCacheControl = false,
+  // Option D: a pending canonical-resume response whose body is APPENDED after the inner
+  // (shell) body. Headers were already sent with the shell, so the tail's headers are
+  // discarded; a failed/errored tail (null or status >= 400) degrades to shell-only.
+  resumeSuffix?: Promise<IncomingMessage | null>,
 ): Promise<void> {
   // A direct adapter entrypoint can produce either of two valid shapes from postponed state:
   // a resume tail (which needs the persisted shell prepended), or a complete HTML document (the
@@ -533,7 +537,7 @@ async function writeInnerResponse(
   delete headers["x-next-cache-tags"];
   // The combined response is shell bytes followed by resume bytes, so neither
   // component's content length describes the final body.
-  if (effectivePrefix) delete headers["content-length"];
+  if (effectivePrefix || resumeSuffix) delete headers["content-length"];
   // Entrypoints emit origin-oriented s-maxage/private cache directives for
   // incremental responses. In adapter deploy mode the platform cache owns ISR,
   // while the browser-facing response must always revalidate. Next marks this
@@ -594,6 +598,20 @@ async function writeInnerResponse(
       // Client is gone — stop reading the inner response and let it be discarded.
       innerRes.destroy();
       return;
+    }
+  }
+  if (resumeSuffix) {
+    const tail = await resumeSuffix.catch(() => null);
+    if (tail && (tail.statusCode ?? 500) < 400) {
+      for await (const chunk of tail) {
+        if (!(await writeChunkSafely(outerRes, chunk as Buffer))) {
+          tail.destroy();
+          return;
+        }
+      }
+    } else if (tail) {
+      // Error tail: never forward the body, but drain it so the loopback socket closes.
+      tail.resume();
     }
   }
   if (!outerRes.writableEnded) outerRes.end();
@@ -658,6 +676,7 @@ async function invokeLocalHandlerOverHttp({
   revalidate,
   i18nLocales,
   handlerTimeoutMs = HANDLER_TIMEOUT_MS,
+  capturePostponedState = false,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -709,8 +728,26 @@ async function invokeLocalHandlerOverHttp({
   i18nLocales?: string[];
   /** N37: bound on time-to-response-head for this invocation. See HANDLER_TIMEOUT_MS. */
   handlerTimeoutMs?: number;
+  /**
+   * Rev-4 "Option D" (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md):
+   * shell-less PPR-capable route running MINIMAL. Swap the inert onCacheEntryV2 stub for a
+   * capturing one (same signature, still returns false — the callback's PRESENCE is part of
+   * the measured baseline and must never vary, only its body). If the render then postpones
+   * (`x-nextjs-postponed: 1`), the pool performs the platform half itself: POST the captured
+   * state back to the same entrypoint with `next-resume: 1` (the canonical resume contract,
+   * app-page.ts:384-406 — gated on header+method, NOT on minimal mode) and append the resumed
+   * stream after the shell. Runtime discrimination: a render that does not postpone is never
+   * touched, which is what the build-time signal could not provide (rev 3).
+   */
+  capturePostponedState?: boolean;
 }): Promise<void> {
+  // Option D applies only to MINIMAL invocations: a non-minimal render is resumed inline by
+  // Next itself (app-page.ts:2038), so capturing there would only risk a duplicate resume.
+  const captureActive = capturePostponedState && minimalMode;
   await new Promise<void>((resolve, reject) => {
+    // Option D: the postponed state of a live minimal-mode render, observed (never consumed)
+    // through the documented onCacheEntryV2 callback. Written at most once per invocation.
+    let capturedPostponed: string | undefined;
     const pendingWaitUntil = new Set<Promise<void>>();
     const trackWaitUntil = (waitable: Promise<unknown>): void => {
       const observed: Promise<void> = Promise.resolve(waitable)
@@ -817,7 +854,19 @@ async function invokeLocalHandlerOverHttp({
               // Cache Components entrypoints use the presence of the documented V2 callback to
               // select adapter/minimal-mode cache semantics (including RDC generation). Returning
               // false means the adapter observed the entry but did not write the HTTP response.
-              onCacheEntryV2: async () => false,
+              // Option D: for eligible shell-less PPR routes the same callback also OBSERVES the
+              // entry's postponed state (capture only — still returns false, and the callback is
+              // present either way so Next's presence-keyed branches cannot vary by eligibility).
+              onCacheEntryV2: captureActive
+                ? async (entry: unknown) => {
+                    const postponed = (entry as { value?: { postponed?: unknown } } | undefined)
+                      ?.value?.postponed;
+                    if (typeof postponed === "string" && postponed.length > 0) {
+                      capturedPostponed = postponed;
+                    }
+                    return false;
+                  }
+                : async () => false,
               ...(render404 ? { render404 } : {}),
               ...(revalidate ? { revalidate } : {}),
             },
@@ -949,6 +998,49 @@ async function invokeLocalHandlerOverHttp({
               .catch((error) => server.close(() => reject(error)));
             return;
           }
+          // Option D: the render postponed and the state was captured — start the canonical
+          // resume NOW, in parallel with streaming the shell (the App Hosting model). POST,
+          // same loopback URL, `next-resume: 1`, raw state as the body (app-page.ts:384-406).
+          // Failure resolves null: the client gets the shell alone, never an error tail.
+          let resumeSuffix: Promise<IncomingMessage | null> | undefined;
+          if (
+            captureActive &&
+            clientRes.headers["x-nextjs-postponed"] === "1" &&
+            capturedPostponed
+          ) {
+            const stateBody = Buffer.from(capturedPostponed, "utf8");
+            const resumeHeaders = { ...reqHeaders, "next-resume": "1" };
+            restateFramingHeaders(resumeHeaders, stateBody, "POST", true);
+            resumeSuffix = new Promise<IncomingMessage | null>((resolveResume) => {
+              const resumeDeadline = setTimeout(() => {
+                console.error(
+                  `[pool-server] PPR resume for ${matchedPathname} did not respond within ` +
+                    `${handlerTimeoutMs}ms — serving the shell alone`,
+                );
+                resumeReq.destroy();
+                resolveResume(null);
+              }, handlerTimeoutMs);
+              resumeDeadline.unref?.();
+              const resumeReq = httpRequest(
+                {
+                  hostname: "127.0.0.1",
+                  port: address.port,
+                  method: "POST",
+                  path: loopbackPath,
+                  headers: resumeHeaders,
+                },
+                (resumeRes) => {
+                  clearTimeout(resumeDeadline);
+                  resolveResume(resumeRes);
+                },
+              );
+              resumeReq.once("error", () => {
+                clearTimeout(resumeDeadline);
+                resolveResume(null);
+              });
+              resumeReq.end(stateBody);
+            });
+          }
           void writeInnerResponse(
             res,
             clientRes,
@@ -961,6 +1053,7 @@ async function invokeLocalHandlerOverHttp({
                 }
               : undefined,
             normalizePrerenderCacheControl,
+            resumeSuffix,
           )
             .then(() => closeThenSettle(reject))
             .catch((error) => {
@@ -1373,6 +1466,14 @@ export function createDispatcher(options: DispatcherOptions) {
   // resume a fallback shell for `without-suspense`/`without-io` routes, which upstream renders
   // dynamically (it answered `x-nextjs-postponed: 1` and a build-time root layout).
   const pprCapableRoutes = new Set(Object.keys(pprCapableRouteMap));
+  // Option D eligibility (spec rev 4): shell-less PPR templates with NO unresolved root params
+  // — the class whose minimal render can postpone with nothing to resume it. Root-param
+  // templates are excluded (they already run non-minimal for their own documented reason).
+  const pprCapableResumeRoutes = new Set(
+    Object.entries(pprCapableRouteMap)
+      .filter(([, entry]) => (entry.rootParams?.length ?? 0) === 0)
+      .map(([route]) => route),
+  );
   const pprRootParamRoutes = new Set(
     Object.entries(pprCapableRouteMap)
       .filter(([, entry]) => (entry.rootParams?.length ?? 0) > 0)
@@ -2604,6 +2705,17 @@ export function createDispatcher(options: DispatcherOptions) {
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
             handlerTimeoutMs,
+            // Option D (spec rev 4): shell-less PPR template with no root params — if this
+            // MINIMAL render postpones live, the invoker captures the state and performs the
+            // canonical POST resume itself. Excluded: shell-bearing routes (their injection
+            // path above owns the dance), Server Actions (the x-next-resume-state-length body
+            // framing is theirs), and requests that already ARE resumes.
+            capturePostponedState:
+              !handlerPprInfo &&
+              !req.headers["next-action"] &&
+              !req.headers["x-next-resume-state-length"] &&
+              req.headers["next-resume"] !== "1" &&
+              pprCapableCandidates.some((candidate) => pprCapableResumeRoutes.has(candidate)),
             ...(revalidate ? { revalidate } : {}),
           });
           return;

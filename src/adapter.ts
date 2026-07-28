@@ -1046,9 +1046,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         const existingServerActions = ((
           nextConfig.experimental as ExperimentalWithServerActions | undefined
         )?.serverActions ?? {}) as Record<string, unknown>;
+        // Deliberately NOT experimental.trustHostHeader, though the aws reference adapter sets
+        // it: it is baked into the build via define-env.ts, so its blast radius is the whole
+        // compiled output. The res.revalidate() invariant it exists for is already satisfied
+        // by the pool's requestMeta.revalidate channel, and the full upstream suite passes
+        // 3,342/0 without it (2026-07-28). Absent a measured need, a build-wide define stays
+        // out; if it is ever reconsidered, land it alone and re-run the full suite.
         modified.experimental = {
           ...((modified.experimental as Record<string, unknown>) ?? {}),
-          trustHostHeader: true,
           ...(allowedOrigins.size > 0
             ? {
                 serverActions: {

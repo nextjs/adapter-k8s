@@ -15,7 +15,15 @@ is deliberately last). Favor correct, bounded behavior over throughput.
 - `npm run build` — clean + declaration types + esbuild bundles (adapter, pool-server,
   cache-handler, routing-service, cli) + buf proto codegen
 - `npm test` — unit tests (vitest; hermetic — Docker-gated integration tests skip without Docker)
-- `npm run test:e2e` — local e2e harness (`scripts/e2e-local.sh`)
+- `npm run test:e2e` — local e2e harness (`scripts/e2e-local.sh`). **A full run should take
+  ~16-17 min. If it doesn't, the invocation is wrong:** the script auto-builds+packs the
+  adapter ONCE and exports `ADAPTER_K8S_PREBUILT_TARBALL` (never let per-deploy rebuilds
+  happen), and concurrency comes from `NEXT_TEST_CONCURRENCY` (default 4 — do NOT raise it;
+  c=16 was measured to produce ~205 browser/image contention failures on this machine).
+  Pin the Next ref explicitly (2nd arg) — see the run-mechanics section of the
+  project_e2e_run_baseline memory for known-bad refs and flake buckets before triaging
+  failures. Never edit src/ or scripts/ while a run is in flight (deploys re-pack from the
+  working tree).
 - `npm run test:e2e:live` (and per-fixture variants) — live e2e against real GKE; needs env vars
   and deployed fixtures. Don't run casually.
 - `npm run lint` / `npm run fmt` — oxlint / oxfmt
