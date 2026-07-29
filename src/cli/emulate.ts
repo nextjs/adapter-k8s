@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { execCapture, execOrThrow } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { resolveContainerCli, CONTAINER_CLI_CANDIDATES } from "./container-runtime.js";
 
 const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
@@ -64,6 +65,10 @@ interface EmulateOptions {
 export async function runEmulate(options: EmulateOptions): Promise<void> {
   const { projectDir, skipBuild, port = 8080 } = options;
   const children: ChildProcess[] = [];
+  // S24: emulate only needs a runtime for the optional Valkey container. Resolve it once and
+  // reuse; a host with none simply falls back to the in-process cache below, as it already
+  // did when `docker` was missing.
+  const containerCli = await resolveContainerCli().catch(() => null);
   // Per-port container name: two concurrent `emulate` runs on different ports used to
   // share the hardcoded name `adapter-k8s-envoy`, so one's cleanup (docker rm -f)
   // killed the other's proxy.
@@ -124,13 +129,13 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   const valkeyPort = port + 8299; // default 8080 → 16379, clear of a local :6379
   let valkeyUrl: string | undefined;
   if (cacheEnabled) {
-    const dockerCheck = await execCapture("docker", ["version", "--format", "ok"]).catch(
-      () => null,
-    );
-    if (dockerCheck && dockerCheck.exitCode === 0) {
+    const dockerCheck = containerCli
+      ? await execCapture(containerCli, ["version", "--format", "ok"]).catch(() => null)
+      : null;
+    if (containerCli && dockerCheck && dockerCheck.exitCode === 0) {
       console.log(`${DIM}[valkey]${RESET} Starting on :${valkeyPort} (docker)...`);
-      await execCapture("docker", ["rm", "-f", valkeyContainerName]).catch(() => null);
-      const run = await execCapture("docker", [
+      await execCapture(containerCli, ["rm", "-f", valkeyContainerName]).catch(() => null);
+      const run = await execCapture(containerCli, [
         "run",
         "-d",
         "--rm",
@@ -143,7 +148,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       if (run.exitCode === 0) {
         // Readiness: PING until PONG (image pull + boot can take a few seconds).
         for (let i = 0; i < 30; i++) {
-          const ping = await execCapture("docker", [
+          const ping = await execCapture(containerCli, [
             "exec",
             valkeyContainerName,
             "valkey-cli",
@@ -230,7 +235,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   // the process with a bare stack — fail cleanly instead.
   poolServer.on("error", (err) => {
     console.error(`${RED}Failed to start pool server: ${err.message}${RESET}`);
-    cleanup(children, [envoyContainerName, valkeyContainerName]);
+    cleanup(children, [envoyContainerName, valkeyContainerName], containerCli);
     process.exit(1);
   });
 
@@ -275,7 +280,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
 
   routingService.on("error", (err) => {
     console.error(`${RED}Failed to start routing service: ${err.message}${RESET}`);
-    cleanup(children, [envoyContainerName, valkeyContainerName]);
+    cleanup(children, [envoyContainerName, valkeyContainerName], containerCli);
     process.exit(1);
   });
 
@@ -324,10 +329,18 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       envoyChild = spawn("envoy", ["-c", envoyYaml, "--log-level", "warn"], {
         stdio: ["ignore", "pipe", "pipe"],
       });
+    } else if (!containerCli) {
+      // No local envoy binary AND no container runtime. Envoy is best-effort here (requests
+      // can go straight to the pool server), so say so plainly instead of dying.
+      console.log(
+        `${YELLOW}[envoy]${RESET} No envoy binary and no container runtime ` +
+          `(${CONTAINER_CLI_CANDIDATES.join("/")}) — continuing without proxy. ` +
+          `Requests go to pool server on :3000`,
+      );
     } else {
-      console.log(`${DIM}[envoy]${RESET} Starting on :${port} (docker)...`);
+      console.log(`${DIM}[envoy]${RESET} Starting on :${port} (${containerCli})...`);
       envoyChild = spawn(
-        "docker",
+        containerCli,
         [
           "run",
           "--rm",
@@ -350,7 +363,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     // A missing envoy/docker binary surfaces as a spawn "error" event — an uncaught
     // "error" event crashes the whole process. Envoy is best-effort (requests can go
     // straight to the pool server), so degrade instead of dying.
-    envoyChild.on("error", (err) => {
+    envoyChild?.on("error", (err) => {
       console.error(
         `${YELLOW}[envoy]${RESET} Failed to start: ${err.message} — continuing without proxy. ` +
           `Requests go to pool server on :3000`,
@@ -362,9 +375,9 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       if (envoyIdx >= 0) ports.splice(envoyIdx, 1);
     });
 
-    children.push(envoyChild);
+    if (envoyChild) children.push(envoyChild);
 
-    envoyChild.stdout?.on("data", (d) => {
+    envoyChild?.stdout?.on("data", (d) => {
       for (const raw of d.toString().split("\n").filter(Boolean)) {
       // S28: child output carries remote-influenced text (middleware error messages echo
       // request header values, Envoy warnings echo upstream data) — strip control sequences
@@ -373,7 +386,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
         console.log(`  ${YELLOW}envoy${RESET}             ${DIM}│${RESET} ${line}`);
       }
     });
-    envoyChild.stderr?.on("data", (d) => {
+    envoyChild?.stderr?.on("data", (d) => {
       for (const raw of d.toString().split("\n").filter(Boolean)) {
       // S28: child output carries remote-influenced text (middleware error messages echo
       // request header values, Envoy warnings echo upstream data) — strip control sequences
@@ -417,12 +430,12 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     // Check for crashes — Envoy failing is non-fatal, pool/routing crashing is fatal
     if (poolServer.exitCode !== null) {
       console.error(`${RED}Pool server crashed. Check logs above.${RESET}`);
-      cleanup(children, [envoyContainerName, valkeyContainerName]);
+      cleanup(children, [envoyContainerName, valkeyContainerName], containerCli);
       process.exit(1);
     }
     if (routingService.exitCode !== null) {
       console.error(`${RED}Routing service crashed. Check logs above.${RESET}`);
-      cleanup(children, [envoyContainerName, valkeyContainerName]);
+      cleanup(children, [envoyContainerName, valkeyContainerName], containerCli);
       process.exit(1);
     }
     if (envoyChild && envoyChild.exitCode !== null) {
@@ -443,7 +456,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
       `${RED}Timed out after 30s waiting for services on port(s): ${ports.join(", ")}. ` +
         `Check the logs above.${RESET}`,
     );
-    cleanup(children, [envoyContainerName, valkeyContainerName]);
+    cleanup(children, [envoyContainerName, valkeyContainerName], containerCli);
     process.exit(1);
   }
 
@@ -463,7 +476,7 @@ ${GREEN}${BOLD}Ready!${RESET}
   // --- 7. Keep alive + cleanup ---
   const shutdown = () => {
     console.log(`\n${DIM}Shutting down...${RESET}`);
-    cleanup(children, [envoyContainerName, valkeyContainerName]);
+    cleanup(children, [envoyContainerName, valkeyContainerName], containerCli);
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
@@ -481,13 +494,14 @@ ${GREEN}${BOLD}Ready!${RESET}
   await new Promise(() => {});
 }
 
-function cleanup(children: ChildProcess[], containerNames: string[]) {
+function cleanup(children: ChildProcess[], containerNames: string[], containerCli: string | null) {
   for (const child of children) {
     child.kill("SIGTERM");
   }
-  // Kill docker containers (envoy, valkey) if running. Ignore a spawn error here —
-  // docker may not even be installed (envoy may have run as a local binary and the
-  // cache fallback needs no container), and an unhandled "error" event during
-  // cleanup would mask the real failure.
-  spawn("docker", ["rm", "-f", ...containerNames], { stdio: "ignore" }).on("error", () => {});
+  // Kill the containers (envoy, valkey) if running. Ignore a spawn error here — no runtime
+  // may be installed at all (envoy may have run as a local binary and the cache fallback
+  // needs no container), and an unhandled "error" event during cleanup would mask the real
+  // failure.
+  if (!containerCli) return;
+  spawn(containerCli, ["rm", "-f", ...containerNames], { stdio: "ignore" }).on("error", () => {});
 }

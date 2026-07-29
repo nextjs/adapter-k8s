@@ -4,6 +4,7 @@ import { resolve4, resolveCname } from "node:dns/promises";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { checkContainerRuntime } from "./container-runtime.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
@@ -224,7 +225,9 @@ export async function runDoctor(options: {
   results.push(await checkTool("gcloud", ["--version"]));
   results.push(await checkTool("kubectl", ["version", "--client", "-o", "yaml"]));
   results.push(await checkTool("helm", ["version", "--short"]));
-  results.push(await checkTool("docker", ["--version"]));
+  // S24: any of docker/podman/nerdctl works, so check for a usable runtime rather than
+  // failing a podman-only host over a missing `docker` binary.
+  results.push(await checkContainerRuntime());
 
   // --- Local config ---
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");

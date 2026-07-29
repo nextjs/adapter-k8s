@@ -28,6 +28,13 @@ export interface ExecOptions {
    * hangs the CLI forever (there was previously no timeout anywhere).
    */
   timeoutMs?: number;
+  /**
+   * Extra environment for the child, merged over `process.env`. Added for the buildkit probe
+   * (container-runtime.ts), which must try nerdctl's rootless BUILDKIT_HOST candidates —
+   * buildctl otherwise defaults to the root socket and reports failure for a working
+   * rootless daemon.
+   */
+  env?: Record<string, string>;
 }
 
 // M2: never route arguments through a shell we don't escape for. The old blanket
@@ -238,6 +245,7 @@ function spawnCapture(
     const child = spawn(plan.command, plan.args, {
       stdio: [stdin !== undefined ? "pipe" : "inherit", "pipe", "pipe"],
       cwd: options?.cwd,
+      ...(options?.env ? { env: { ...process.env, ...options.env } } : {}),
       shell: false, // M2: never a shell we don't escape for (see buildWindowsCmdInvocation)
       windowsVerbatimArguments: plan.windowsVerbatimArguments,
     });

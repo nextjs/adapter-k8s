@@ -39,7 +39,7 @@ Treat it as a way to evaluate and validate Next.js-on-GKE semantics today, not a
 - Node.js >= 20.9.0
 - Next.js >= 16.2.0
 - A GKE cluster (Autopilot or Standard)
-- `gcloud`, `kubectl`, `helm`, `docker` in PATH
+- `gcloud`, `kubectl`, `helm` in PATH, plus a container runtime -- `docker`, `podman`, or `nerdctl` (see [Container runtimes](#container-runtimes))
 
 The **emitted** container images run Node 24 and that is a floor, not a preference: the generated
 routing manifest embeds inline regexp modifiers (`(?i:…)`) that V8 only accepts from Node 23, and
@@ -145,7 +145,7 @@ The deploy flow:
 
 1. `next build` (adapter generates artifacts in `.k8s-adapter/output/`)
 2. Provision the managed cache (Memorystore) and write its connection Secret -- only when `cache.enabled` with no `url` (idempotent; reuses an existing instance, waits for it to be ready)
-3. `docker build` + `push` per pool + the routing service, then resolve each pushed image to its immutable `@sha256:` digest and deploy that rather than the mutable `:<buildId>` tag
+3. `build` + `push` per pool + the routing service (pinned to `linux/amd64`), then resolve each pushed image to its immutable `@sha256:` digest -- **from the registry** -- and deploy that rather than the mutable `:<buildId>` tag. An image that cannot be pinned aborts the deploy unless `--allow-mutable-tags` is passed
 4. `helm upgrade --install` with the generated chart (attaches the Cloud CDN filter to the HTTPRoute when CDN is enabled)
 5. Wait for the new pool + routing-service Deployments to roll out
 6. Verify each new pod is serving (`/readyz` checked directly on the pod -- not via GCP LB health). `/readyz` is the readiness verdict: it answers 503 until instrumentation registration has succeeded and at least one route module has imported, so a build whose `register()` threw cannot pass the gate the way a hardcoded `/healthz` 200 would
@@ -176,7 +176,7 @@ npx adapter-k8s init --project-id <id> --host <hostname>
 
 ### `deploy`
 
-Build, push images, and deploy via Helm with zero-downtime blue/green cutover.
+Build, push images, and deploy via Helm with zero-downtime blue/green cutover. Uses docker, podman, or nerdctl -- see [Container runtimes](#container-runtimes).
 
 ```bash
 npx adapter-k8s deploy [--skip-build] [--skip-push] [--dry-run]
@@ -187,6 +187,7 @@ npx adapter-k8s deploy [--skip-build] [--skip-push] [--dry-run]
 | `--skip-build` / `--skip-push` | Reuse the existing build output / already-pushed images                                                                                                          |
 | `--allow-no-network-policy`    | Deploy even when the cluster pod CIDR cannot be discovered, i.e. **without** the chart's NetworkPolicies. Deploy aborts rather than silently shipping unisolated |
 | `--allow-unretained-manifest`  | Deploy even when the outgoing build's routing manifest cannot be retained (rollback to it becomes image-only; recorded in state so `doctor` reports it)          |
+| `--allow-mutable-tags`         | Deploy by image tag when no immutable digest can be resolved. Aborts by default: running by tag lets a registry retag change the code on pods holding the internal dispatch secret |
 | `--yes`, `-y`                  | Skip the confirmation prompt when the kubectl context is unpinned (required non-interactively)                                                                   |
 | `--dry-run`                    | Show what would be done without executing                                                                                                                        |
 
@@ -208,7 +209,7 @@ Run health checks across your entire stack.
 npx adapter-k8s doctor
 ```
 
-Checks prerequisites (gcloud/kubectl/helm/docker), GCP resources (IP, bucket, registry, auth), Kubernetes resources (Gateway, HTTPRoute, deployments with rollout awareness), active Service endpoints (that each active Service's selector actually matches ready pods -- catches a mis-patched cutover before it 503s), LB backend health, ext_proc traffic-extension wiring (registered across all forwarding rules, NEG attached, backend scheme, TCP health check), and per-host DNS + TLS certificate status.
+Checks prerequisites (gcloud/kubectl/helm + a usable container runtime -- it reports whichever of docker/podman/nerdctl will actually be used, rather than failing a podman-only host), GCP resources (IP, bucket, registry, auth), Kubernetes resources (Gateway, HTTPRoute, deployments with rollout awareness), active Service endpoints (that each active Service's selector actually matches ready pods -- catches a mis-patched cutover before it 503s), LB backend health, ext_proc traffic-extension wiring (registered across all forwarding rules, NEG attached, backend scheme, TCP health check), and per-host DNS + TLS certificate status.
 
 `doctor` resolves the release name from `.k8s-adapter/infrastructure.json`, so it targets the deployed release regardless of the current directory name (override with `--release-name`).
 
@@ -220,7 +221,7 @@ Run the full adapter infrastructure locally: Envoy, routing service (ext_proc), 
 npx adapter-k8s emulate [--skip-build] [--port 8080]
 ```
 
-Replicates the GKE request flow on your machine: `Client → Envoy (:8080) → Routing Service (:8443) → Pool Server (:3000)`. Uses Docker for Envoy if no local binary is found. Falls back to pool-server-only mode if Envoy is unavailable.
+Replicates the GKE request flow on your machine: `Client → Envoy (:8080) → Routing Service (:8443) → Pool Server (:3000)`. Runs Envoy in a container if no local binary is found, using whichever runtime is resolved. Falls back to pool-server-only mode when neither is available.
 
 ### `describe`
 
@@ -301,6 +302,48 @@ containerStrategy: 'traced-assets',
 // Single image for all pools -- simpler CI/CD, one image to scan
 containerStrategy: 'shared-image',
 ```
+
+### Container runtimes
+
+The deploy builds and pushes images with whichever runtime it finds, probing in order:
+
+| runtime   | requires                                                                              |
+| --------- | ------------------------------------------------------------------------------------- |
+| `docker`  | a reachable daemon                                                                    |
+| `podman`  | a reachable daemon                                                                    |
+| `nerdctl` | containerd **and** buildkit reachable from your user -- containerd alone cannot build |
+
+All three are validated by deploying this repo's e2e fixture to a live GKE cluster, not just by
+unit tests. Only the portable verb set is used (`build`, `push`, `inspect`, `run`, `rm`, `exec`),
+which all three accept with identical flags.
+
+```bash
+ADAPTER_K8S_CONTAINER_CLI=podman npx adapter-k8s deploy   # force one
+ADAPTER_K8S_TARGET_PLATFORM=linux/arm64 npx adapter-k8s deploy  # for T2A ARM node pools
+```
+
+Builds are pinned to `--platform=linux/amd64` by default, because a host-native build on Apple
+Silicon otherwise produces arm64 images that fail with `exec format error` on GKE's x86 nodes --
+at rollout, not at build time.
+
+Resolution happens in **preflight**, before anything with side effects. A runtime that cannot
+build fails the deploy immediately rather than after provisioning the cache and rewriting your
+registry credentials. An explicit `ADAPTER_K8S_CONTAINER_CLI` is checked too: it selects which
+runtime to use, not whether it needs to work.
+
+**Image digests come from the registry, not the local daemon.** This matters for correctness, not
+just preference: podman converts the manifest on push, so its local `RepoDigest` is *not* the
+digest the registry stored (measured with podman 6.0.1 against Artifact Registry -- podman
+reported `e04a0a5b…` where the registry held `27fa476b…`). Deploying the local value produces
+`ImagePullBackOff`. kubelet pulls from the registry, so the registry is the authority; the local
+daemon is consulted only when the registry is unreachable.
+
+**nerdctl notes.** buildkit is a separate daemon from containerd, and a `buildkitd` running as
+root is not reachable by a rootless `nerdctl` -- its socket lives at `/run/buildkit/buildkitd.sock`
+while nerdctl looks under `$XDG_RUNTIME_DIR`. If `nerdctl build` fails,
+`containerd-rootless-setuptool.sh install-buildkit-containerd` sets up the rootless daemon; on a
+host without CNI plugins it needs `--containerd-worker-net=host`. `BUILDKIT_HOST` is honoured if
+you set it.
 
 ### Cloud CDN
 
@@ -549,11 +592,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: NEXT_ADAPTER_PATH=@next-community/adapter-k8s npx next build
+      # Any of docker/podman/nerdctl works; --platform matters on ARM builders.
       - run: |
-          docker build -t $REGISTRY/nextjs-app-default:$BUILD_ID \
+          docker build --platform=linux/amd64 -t $REGISTRY/nextjs-app-default:$BUILD_ID \
             .k8s-adapter/output/pools/default
           docker push $REGISTRY/nextjs-app-default:$BUILD_ID
-          docker build -f .k8s-adapter/output/routing-service/Dockerfile \
+          docker build --platform=linux/amd64 -f .k8s-adapter/output/routing-service/Dockerfile \
             -t $REGISTRY/routing-service:$BUILD_ID \
             .k8s-adapter/output/routing-service
           docker push $REGISTRY/routing-service:$BUILD_ID
@@ -563,7 +607,7 @@ jobs:
             --set global.image.registry=$REGISTRY
 ```
 
-The Helm chart is self-contained -- it includes the traffic-extension registration Job that attaches the routing-service NEG and registers the ext_proc extension, so `helm upgrade` wires the load balancer for you. The blue/green cutover (patching each active Service selector to the new build's pod label) is the one step the CLI performs outside Helm; replicate it with `kubectl patch service <release>-<pool> --type=json -p '[{"op":"replace","path":"/spec/selector/app.kubernetes.io~1version","value":"<sanitized-build-id>"}]'`. The CLI is a convenience wrapper -- everything it does can be done with `docker`, `helm`, and `gcloud` directly.
+The Helm chart is self-contained -- it includes the traffic-extension registration Job that attaches the routing-service NEG and registers the ext_proc extension, so `helm upgrade` wires the load balancer for you. The blue/green cutover (patching each active Service selector to the new build's pod label) is the one step the CLI performs outside Helm; replicate it with `kubectl patch service <release>-<pool> --type=json -p '[{"op":"replace","path":"/spec/selector/app.kubernetes.io~1version","value":"<sanitized-build-id>"}]'`. The CLI is a convenience wrapper -- everything it does can be done with a container runtime, `helm`, and `gcloud` directly. One thing to carry over if you do: resolve each image's digest from the **registry** (`gcloud artifacts docker images describe <ref> --format='value(image_summary.digest)'`) rather than from the local daemon, and deploy that. podman's local `RepoDigest` does not match what the registry stores, and deploying it yields `ImagePullBackOff`.
 
 ## Implementation Status
 
