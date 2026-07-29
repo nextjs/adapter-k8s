@@ -103,7 +103,13 @@ import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./ut
 // posture that behaves the SAME on both implementations: it never names the pod range
 // at all, so it does not depend on `podCidrs` discovery being correct or complete.
 //
-// WHY NOT DEFAULT — the kubelet. `nodeCidrs` is REQUIRED when strict is on, and the
+// S22 — NOW THE DEFAULT. `deploy` discovers the node range (discoverClusterNodeCidrs:
+// cluster subnetwork -> its primary range, VERIFIED live: nodes 10.128.15.x inside
+// 10.128.0.0/20), so the requirement below no longer costs the operator anything. The
+// broad posture never bounded the dispatch secret: it isolates in-cluster PODS only, while
+// any VPC peer could reach :8443, read x-internal-secret out of the ext_proc header
+// mutation, and replay trusted dispatch headers to a pool. Kept below for why nodeCidrs is
+// REQUIRED whenever strict is on — the kubelet. `nodeCidrs` is REQUIRED when strict is on, and the
 // template `fail`s without it, because the broad posture is silently also allowing
 // something the LB ranges do not cover: kubelet's liveness/readiness probes
 // (deployment.ts probes :3000, routing-service-deployment.ts probes :8081) originate

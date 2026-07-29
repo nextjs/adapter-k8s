@@ -206,7 +206,10 @@ export async function runDoctor(options: {
         "--quiet",
       ]);
       if (credResult.exitCode !== 0) {
-        console.error(`Failed to connect to cluster "${clusterName}": ${credResult.stderr.trim()}`);
+        // L14: gcloud stderr is externally influenced; strip control sequences before printing.
+        console.error(
+          `Failed to connect to cluster "${clusterName}": ${sanitizeForTerminal(credResult.stderr.trim())}`,
+        );
         console.error(
           `Verify: gcloud container clusters get-credentials ${clusterName} --region ${infraCtx.region} --project ${infraCtx.projectId}`,
         );
@@ -274,12 +277,19 @@ export async function runDoctor(options: {
     });
   }
   if (state) {
-    results.push({ name: "Current build", status: "pass", message: state.buildId });
+    // L14: both build ids come from the cluster-backed deploy state, whose validation
+    // requires only a nonempty string, and the central result printer emits messages
+    // verbatim — so a namespace actor able to edit the ConfigMap could forge health output.
+    results.push({
+      name: "Current build",
+      status: "pass",
+      message: sanitizeForTerminal(state.buildId),
+    });
     if (state.previousBuildId) {
       results.push({
         name: "Previous build",
         status: "pass",
-        message: `${state.previousBuildId} (rollback target)`,
+        message: `${sanitizeForTerminal(state.previousBuildId)} (rollback target)`,
       });
     }
   } else {

@@ -168,6 +168,30 @@ describe("invalidateCdnBuildTag", () => {
     expect(call).toContain("um");
   });
 
+  it("L14/S21: strips terminal control sequences from captured gcloud stderr", async () => {
+    // Cloud API errors echo request-derived text, so gcloud stderr is externally influenced.
+    // Truncating to 200 chars bounds the LENGTH but removes no CSI/OSC/C0 byte, and this
+    // logger is console.log on the deploy path — a crafted error could repaint the operator's
+    // terminal and forge the "invalidation complete" line right next to it.
+    const { run } = fakeRunner([
+      ...happyRoutes.slice(0, 3),
+      ["invalidate-cdn-cache", fail("\x1b[2Jforged\x07 \x1b[31mERROR\x1b[0m")],
+    ]);
+    await invalidateCdnBuildTag({
+      projectId: "proj-12345",
+      releaseName: "rel",
+      outputDir: dir,
+      buildId: "old42",
+      run,
+      log,
+    });
+    const all = logs.join("\n");
+    expect(all).toContain("CDN invalidation failed");
+    expect(all).toContain("forged"); // the text survives...
+    // oxlint-disable-next-line no-control-regex -- asserting control chars are GONE
+    expect(all).not.toMatch(/\x1b|\x07/); // ...the escapes do not
+  });
+
   it("M13: falls back to a full --path=/* purge when no tag was recorded for the outgoing build", async () => {
     // The stale-apex incident: entries written by a pre-recording adapter carry unknown
     // or NO Cache-Tag (untagged prerender HTML at s-maxage=31536000). No tag selector can

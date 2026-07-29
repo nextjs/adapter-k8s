@@ -57,11 +57,25 @@ export function renderValuesYaml({
         repository: "nextjs-app",
         tag: buildId,
       },
-      // Empty by default: the deploy CLI passes `--set global.networkPolicy.podCidrs=
-      // {..}` when it can discover the cluster's pod CIDRs; an empty list renders no
-      // NetworkPolicies (the templates are wrapped in a helm `if` guard).
+      // Empty CIDR lists by default: the deploy CLI passes `--set global.networkPolicy.
+      // podCidrs={..}` / `nodeCidrs={..}` from cluster discovery (discoverClusterPodCidr,
+      // discoverClusterNodeCidrs), both fail-closed.
+      //
+      // S22: `strict: true` is the DEFAULT posture — a positive allowlist of the Google
+      // load-balancer and health-check ranges plus the cluster's node range, rather than the
+      // broad `0.0.0.0/0 except <pod CIDR>` denylist. The broad posture only ever isolated
+      // in-cluster PODS: every VPC peer, VM and hostNetwork pod could still reach
+      // routing-service:8443, and that service answers an ordinary ext_proc call with the
+      // internal dispatch secret in its header mutation — so a VPC-reachable caller could
+      // read the secret and replay trusted dispatch headers straight to a pool, skipping
+      // middleware. Strict was not the default before only because `nodeCidrs` had to be
+      // supplied by hand (kubelet probes come from the node IP, and without that range
+      // Calico leaves every pod unready); deploy now discovers it, so the secure posture
+      // costs the operator nothing. `--allow-no-network-policy` remains the explicit opt-out.
       networkPolicy: {
         podCidrs: [] as string[],
+        nodeCidrs: [] as string[],
+        strict: true,
       },
     },
     pools: Object.fromEntries(

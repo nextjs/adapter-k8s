@@ -7,7 +7,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execCapture, execOrThrow } from "./exec.js";
@@ -20,6 +20,40 @@ const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 const CYAN = "\x1b[36m";
 const RESET = "\x1b[0m";
+
+/**
+ * The checked-in Envoy config hardcodes the listener on 8080, so `--port N` used to change only
+ * the readiness check and the banner — Envoy kept listening on 8080, the wait on N timed out
+ * after 30s, and the whole stack was torn down. Render a port-substituted copy instead, and
+ * return its path (the source path unchanged when no substitution is needed).
+ *
+ * Asserting exactly one occurrence keeps this honest: the cluster ports (3000 pool, 8443 routing
+ * service) must never be rewritten, so a config edit that introduces another literal 8080 fails
+ * loudly here rather than silently mis-substituting.
+ *
+ * S20: the copy goes in a fresh `mkdtemp` directory, NOT the predictable
+ * `/tmp/adapter-k8s-envoy-<port>.yaml` it used to use. A plain `writeFileSync` to a
+ * world-guessable name follows whatever is already there: a sticky /tmp stops another local user
+ * deleting your files, not creating a name that does not exist yet, so they could pre-place a
+ * symlink and have the operator's own run write Envoy YAML through it into any file the operator
+ * can write. mkdtemp creates a private (0700) directory that cannot already exist.
+ */
+export function renderEnvoyConfigForPort(envoyYamlSource: string, port: number): string {
+  if (!existsSync(envoyYamlSource) || port === 8080) return envoyYamlSource;
+  const source = readFileSync(envoyYamlSource, "utf-8");
+  const matches = source.match(/port_value: 8080\b/g) ?? [];
+  if (matches.length !== 1) {
+    throw new Error(
+      `[adapter-k8s] emulate cannot retarget Envoy to port ${port}: expected exactly one ` +
+        `"port_value: 8080" in ${envoyYamlSource}, found ${matches.length}. Update emulate.ts ` +
+        `alongside the config.`,
+    );
+  }
+  const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-envoy-"));
+  const rendered = path.join(dir, "envoy.yaml");
+  writeFileSync(rendered, source.replace(/port_value: 8080\b/, `port_value: ${port}`));
+  return rendered;
+}
 
 interface EmulateOptions {
   projectDir: string;
@@ -271,27 +305,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     ? envoyConfig
     : path.join(distDir, "..", "integration", "envoy.yaml");
 
-  // The checked-in config hardcodes the listener on 8080, so `--port N` used to change only
-  // the readiness check and the banner — Envoy kept listening on 8080, the wait on N timed
-  // out after 30s, and the whole stack was torn down. Render a port-substituted copy instead.
-  // Asserting exactly one occurrence keeps this honest: the cluster ports (3000 pool, 8443
-  // routing service) must never be rewritten, so a config edit that introduces another
-  // literal 8080 fails loudly here rather than silently mis-substituting.
-  let envoyYaml = envoyYamlSource;
-  if (existsSync(envoyYamlSource) && port !== 8080) {
-    const source = readFileSync(envoyYamlSource, "utf-8");
-    const matches = source.match(/port_value: 8080\b/g) ?? [];
-    if (matches.length !== 1) {
-      throw new Error(
-        `[adapter-k8s] emulate cannot retarget Envoy to port ${port}: expected exactly one ` +
-          `"port_value: 8080" in ${envoyYamlSource}, found ${matches.length}. Update emulate.ts ` +
-          `alongside the config.`,
-      );
-    }
-    const rendered = path.join(os.tmpdir(), `adapter-k8s-envoy-${port}.yaml`);
-    writeFileSync(rendered, source.replace(/port_value: 8080\b/, `port_value: ${port}`));
-    envoyYaml = rendered;
-  }
+  const envoyYaml = renderEnvoyConfigForPort(envoyYamlSource, port);
 
   let envoyChild: ChildProcess | null = null;
 

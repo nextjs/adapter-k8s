@@ -451,6 +451,53 @@ describe("writeState — N22/N23: exec.ts only, and last-writer-wins is closed",
     expect(err.message).toMatch(/quota exceeded/);
   });
 
+  it("S19: refuses to commit over a generation that moved since this deploy read it", async () => {
+    // N23's resourceVersion precondition closes BLIND writes, but not read-modify-write
+    // staleness: deploy C reads state at generation 5, deploy B commits generation 6 during
+    // C's rollout window, and C then re-reads at commit time — picking up B's CURRENT
+    // resourceVersion, so the precondition is satisfied and C writes {buildId: C,
+    // previousBuildId: A} at generation 7. B is orphaned exactly as the N23 comment
+    // describes: its resources exist, state never mentions it, and rollback targets A.
+    // basedOnGeneration is the generation this deploy READ, so a cluster generation above it
+    // means someone else committed in between and this write must lose.
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({ buildId: "B", previousBuildId: "A", generation: 6 }),
+    );
+    writeLocal(tmpDir, { buildId: "A", previousBuildId: null, generation: 5 });
+
+    const err = await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "A", basedOnGeneration: 5 },
+      "rel",
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ClusterStateWriteError);
+    expect(err.concurrent).toBe(true);
+    expect(err.message).toMatch(/generation 6/);
+    // Nothing was written to the cluster...
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    // ...and the LOCAL file was not advanced either. readState takes the newer of the two
+    // copies, so stamping a higher local generation here would make this loser's stale view
+    // beat the winner's committed state on the very next read.
+    expect(localState(tmpDir)).toMatchObject({ buildId: "A", generation: 5 });
+  });
+
+  it("S19: commits normally when the generation is unchanged since the deploy read it", async () => {
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({ buildId: "B", previousBuildId: "A", generation: 5 }),
+    );
+    vi.mocked(execCaptureStdin).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "B", basedOnGeneration: 5 },
+      "rel",
+    );
+
+    expect(localState(tmpDir)).toMatchObject({ buildId: "C", generation: 6 });
+    expect(vi.mocked(execCaptureStdin)).toHaveBeenCalled();
+  });
+
   it("N30: round-trips the unretained-manifest degradation record", async () => {
     vi.mocked(execCapture).mockResolvedValue(CLUSTER_ABSENT);
     await writeState(

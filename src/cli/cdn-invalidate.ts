@@ -1,6 +1,7 @@
 // src/cli/cdn-invalidate.ts
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
+import { sanitizeForTerminal } from "./terminal.js";
 import { RECORDED_CDN_TAG_PATTERN } from "../cdn-tags.js";
 
 export type Runner = (
@@ -177,8 +178,10 @@ export async function invalidateCdnBuildTag(opts: {
     if (r.exitCode !== 0) {
       failures++;
       opts.log(
+        // L14: gcloud stderr echoes request-derived text, so it is externally influenced.
+        // Truncation bounds the length; only the sanitizer removes the escapes.
         `  ! CDN invalidation failed for ${urlMap} (non-fatal; TTL self-heals): ` +
-          `${r.stderr.trim().slice(0, 200)}`,
+          `${sanitizeForTerminal(r.stderr.trim()).slice(0, 200)}`,
       );
     }
   }

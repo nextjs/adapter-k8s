@@ -311,6 +311,42 @@ export async function writeState(
     }
   }
 
+  // S19: the resourceVersion precondition below closes BLIND writes, but not read-modify-
+  // write staleness, which is the same lost update by a slower route. Deploy C reads state
+  // at generation 5; deploy B commits generation 6 inside C's rollout window; C reaches this
+  // point, re-reads, and picks up B's CURRENT resourceVersion — so the precondition passes
+  // and C commits {buildId: C, previousBuildId: A}. B is orphaned precisely as N23 above
+  // describes: its resources exist, state never mentions it, nothing scales it to 0, and
+  // rollback targets A. Comparing the generation SEMANTICALLY is what closes it: this write
+  // is based on `basedOnGeneration`, so a cluster sitting above that is a commit this deploy
+  // never saw, and the honest outcome is to lose rather than to overwrite.
+  //
+  // Deliberately BEFORE the local write: readState takes the newer of cluster and local, so
+  // stamping a higher local generation for a write we are about to refuse would let this
+  // loser's stale view beat the winner's committed state on the very next read — the exact
+  // failure N21 exists to prevent, arriving from the other side.
+  //
+  // A null basedOnGeneration means the caller observed NO prior state (first deploy, or a
+  // legacy record with no generation). There is nothing to compare, so the check does not
+  // apply; the resourceVersion precondition is the only guard on that path.
+  if (
+    !clusterReadError &&
+    basedOnGeneration !== null &&
+    Number.isFinite(basedOnGeneration) &&
+    clusterGeneration > basedOnGeneration
+  ) {
+    throw new ClusterStateWriteError(
+      `Deploy state moved while this operation was running: it started from generation ` +
+        `${basedOnGeneration}, but the cluster ConfigMap is now at generation ` +
+        `${clusterGeneration}. Another deploy or rollback committed in the meantime, and ` +
+        `writing over it would orphan that build — its resources would exist while state ` +
+        `never mentions it, so nothing would scale it down and rollback would target the ` +
+        `wrong build. Nothing was written. Re-read the current state (\`adapter-k8s ` +
+        `describe\`) and re-run once the concurrent operation has settled.`,
+      { concurrent: true },
+    );
+  }
+
   const generation =
     Math.max(
       localExisting ? generationOf(localExisting) : 0,

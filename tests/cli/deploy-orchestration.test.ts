@@ -228,6 +228,11 @@ function happyCluster(
       return ok();
     }
     if (j.includes("clusterIpv4Cidr")) return ok("10.4.0.0/14\n");
+    // S22: strict-posture node-range discovery — cluster subnetwork, then its primary
+    // range, then any extra node-pool subnets (empty here: one subnet, like Autopilot).
+    if (j.includes("value(subnetwork)")) return ok("default\n");
+    if (j.includes("ipCidrRange")) return ok("10.128.0.0/20\n");
+    if (args.includes("node-pools")) return ok("\n");
     if (args.includes("addresses") && args.includes("describe")) {
       return { exitCode: 1, stdout: "", stderr: "not found" }; // → create via execOrThrow
     }
@@ -1975,7 +1980,8 @@ describe("runDeploy — N64: the cutover gate requires the outgoing build's capa
   });
 
   it("a pool with no live predecessor imposes no capacity expectation", async () => {
-    // First deploy: nothing to match, so the gate keeps its "all pods ready" semantics.
+    // First deploy: nothing to MATCH, so the gate asks only for the S18 floor of one ready
+    // pod per configured pool rather than a predecessor's count.
     vi.mocked(readState).mockResolvedValue(null as never);
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, { readyPerPool: { ssr: 1 } }) as never,
@@ -1985,6 +1991,30 @@ describe("runDeploy — N64: the cutover gate requires the outgoing build's capa
 
     expect(events).toContain("patch:rel-ssr");
     expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+  });
+
+  it("S18: a NEW pool with zero ready pods blocks cutover even when its sibling is full", async () => {
+    // capacityTargets was seeded ONLY from previousReplicasByPool, which has no entry for a
+    // pool that is new in this build (or for any pool on a first deploy). A pool with zero
+    // pods therefore contributed no expectation, `checkedCount > 0` was satisfied by the
+    // sibling's pods, and the gate passed — then cutover patched EVERY active Service to the
+    // new build, leaving the new pool's Service with no endpoints and serving 503s. Every
+    // configured pool must show at least one ready pod before the selector flip.
+    setupFs({ metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue(null as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { readyPerPool: { ssr: 3, api: 0 } }) as never,
+    );
+
+    vi.useFakeTimers();
+    const run = runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    const assertion = expect(run).rejects.toThrow(/process\.exit:1/);
+    for (let i = 0; i < 30; i++) await vi.advanceTimersByTimeAsync(5000);
+    await assertion;
+
+    expect(printedErrors()).toContain("api: 0/1 ready");
+    expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 });
 

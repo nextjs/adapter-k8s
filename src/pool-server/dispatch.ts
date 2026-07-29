@@ -2752,8 +2752,20 @@ export function createDispatcher(options: DispatcherOptions) {
           // requests. Shell-bearing routes replay through Next's own cache (and carry the
           // tag/revalidate surfaces the store must never serve stale); RSC/segment
           // requests have variant payloads the document-keyed store would corrupt.
+          //
+          // S17 (SECURITY): and only under emulatePlatformCache — i.e. NEVER in production.
+          // The store is a process-local stand-in for the CDN edge cache, but its key is
+          // `template|param=value` and nothing else: no cookies, no Authorization, no
+          // middleware-injected identity. Capture rejects nothing either — not `Set-Cookie`,
+          // not `Cache-Control: private`. A PPR route that personalizes inside a dynamic
+          // hole would serve one visitor's document, and their session cookie, to the next.
+          // A real deployment has Cloud CDN for the sharing this emulates and Valkey for
+          // the entries worth keeping; neither is a per-pod Map. The x-vercel-cache HEADER
+          // is unaffected in both postures — it comes from the seen-key registry, which
+          // records key strings only and never response bytes.
           let platformStoreEligible = false;
           const platformDocumentRequest =
+            emulatePlatformCache &&
             req.method === "GET" &&
             req.headers[rscConfig?.header ?? "rsc"] !== "1" &&
             req.headers["next-router-prefetch"] !== "1" &&

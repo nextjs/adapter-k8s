@@ -419,6 +419,8 @@ export function buildHelmUpgradeArgs(options: {
   previousBuildId: string | null;
   overridesFile?: string;
   podCidrs?: string | null;
+  /** S22: node/subnet range(s) for the strict posture's kubelet allowance. */
+  nodeCidrs?: string | null;
   /** S7: `<pool>` → `sha256:…`, plus the reserved key `routingService`. */
   imageDigests?: Record<string, string>;
   /**
@@ -436,6 +438,7 @@ export function buildHelmUpgradeArgs(options: {
     previousBuildId,
     overridesFile,
     podCidrs,
+    nodeCidrs,
     imageDigests,
     poolHealthCheckPath,
   } = options;
@@ -503,6 +506,18 @@ export function buildHelmUpgradeArgs(options: {
   if (podCidrs) {
     args.push("--set", `global.networkPolicy.podCidrs={${podCidrs}}`);
   }
+  // S22: the strict posture's kubelet allowance. Same brace-list shape.
+  if (nodeCidrs) {
+    args.push("--set", `global.networkPolicy.nodeCidrs={${nodeCidrs}}`);
+  } else {
+    // values.yaml defaults `strict: true`, and the chart `fail`s at RENDER time when strict
+    // is on without nodeCidrs (VERIFIED against real helm: an empty list is falsy, so
+    // `and .strict (not .nodeCidrs)` fires). The only way to get here is the opt-out —
+    // discovery returned null under --allow-no-network-policy — and that flag promises a
+    // deploy WITHOUT policies, not a hard failure. So turn strict off explicitly, which
+    // (with podCidrs also absent) leaves the outer guard rendering nothing at all.
+    args.push("--set", "global.networkPolicy.strict=false");
+  }
 
   if (overridesFile && existsSync(overridesFile)) {
     args.push("-f", overridesFile);
@@ -541,8 +556,6 @@ export async function discoverClusterPodCidr({
     "--format=value(clusterIpv4Cidr)",
   ]);
   const discovered = cidrResult.exitCode === 0 ? cidrResult.stdout.trim() : "";
-  // One or more comma-separated IPv4 CIDRs — anything else would corrupt the helm list.
-  const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d{1,2})*$/;
   if (CIDR_LIST_RE.test(discovered)) return discovered;
 
   if (allowNoNetworkPolicy) {
@@ -559,6 +572,151 @@ export async function discoverClusterPodCidr({
       `The chart's NetworkPolicies require it; refusing to deploy without network isolation. ` +
       `Fix cluster access, or pass --allow-no-network-policy to explicitly deploy without them.`,
   );
+}
+
+/** One or more comma-separated IPv4 CIDRs — anything else would corrupt the helm list. */
+const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d{1,2})*$/;
+
+/**
+ * S22: discover the range(s) the cluster's NODES draw their IPs from, for the strict
+ * NetworkPolicy posture's kubelet allowance. Same fail-closed contract as
+ * `discoverClusterPodCidr`.
+ *
+ * Node IPs come from the cluster subnetwork's PRIMARY range — NOT from `clusterIpv4Cidr`,
+ * which is the pods' secondary range. VERIFIED against a live Autopilot cluster: subnetwork
+ * `default` → `10.128.0.0/20` with nodes at `10.128.15.211/215/216`, while pods sat at
+ * `10.17.0.x` inside `clusterIpv4Cidr` `10.17.0.0/17`. So it takes two lookups: the cluster
+ * resource names its subnet but does not carry that subnet's range.
+ *
+ * Standard clusters may additionally attach node pools to their OWN subnets, so those are
+ * unioned in. That enumeration is best-effort on purpose: MEASURED on Autopilot, `gcloud
+ * container node-pools list` exits non-zero with "Autopilot node pools cannot be accessed or
+ * modified", and Autopilot runs every node in the cluster subnetwork anyway — so a failure
+ * there must not be fatal when the cluster subnet already resolved.
+ *
+ * Getting this WRONG is not silent: under Calico an allowlist missing the kubelet's source
+ * range leaves every pod permanently unready, which fails the deploy loudly at rollout. That
+ * is the right direction to fail, but it is still a broken deploy — hence fail-closed here
+ * rather than a guess.
+ */
+export async function discoverClusterNodeCidrs({
+  clusterName,
+  region,
+  projectId,
+  allowNoNetworkPolicy = false,
+}: {
+  clusterName: string;
+  region: string;
+  projectId: string;
+  allowNoNetworkPolicy?: boolean;
+}): Promise<string | null> {
+  const bail = (detail: string): null => {
+    if (allowNoNetworkPolicy) {
+      console.warn(
+        `  ! Could not discover the cluster node range (${detail}) — continuing WITHOUT ` +
+          `NetworkPolicies (--allow-no-network-policy). The routing service is reachable ` +
+          `from any in-cluster pod AND from any VPC peer, which means the internal dispatch ` +
+          `secret can be read out of its ext_proc response and replayed to a pool to bypass ` +
+          `middleware; re-run without the flag once the cluster is describable.`,
+      );
+      return null;
+    }
+    throw new Error(
+      `Could not discover the node range for cluster "${clusterName}" (${detail}). The ` +
+        `chart's strict NetworkPolicies require it — kubelet's liveness/readiness probes ` +
+        `come from the NODE ip, and an allowlist without it leaves every pod unready — so ` +
+        `refusing to deploy without network isolation. Fix cluster access, or pass ` +
+        `--allow-no-network-policy to explicitly deploy without them.`,
+    );
+  };
+
+  const subnetResult = await execCapture("gcloud", [
+    "container",
+    "clusters",
+    "describe",
+    clusterName,
+    "--region",
+    region,
+    "--project",
+    projectId,
+    "--format=value(subnetwork)",
+  ]);
+  const subnet = subnetResult.exitCode === 0 ? subnetResult.stdout.trim() : "";
+  // The subnet name reaches gcloud argv; keep it to the GCP resource-name charset.
+  if (!/^[a-z][-a-z0-9]{0,62}$/.test(subnet)) {
+    return bail(
+      subnetResult.exitCode !== 0
+        ? `gcloud exited ${subnetResult.exitCode}`
+        : subnet
+          ? `unexpected value ${JSON.stringify(subnet)}`
+          : "empty output",
+    );
+  }
+
+  // Distinguish "could not read it" from "read something unusable" — the operator fixes
+  // those two differently (cluster/IAM access vs. an unexpected gcloud output shape).
+  const rangeOf = async (
+    subnetName: string,
+  ): Promise<{ cidr: string } | { error: string }> => {
+    const r = await execCapture("gcloud", [
+      "compute",
+      "networks",
+      "subnets",
+      "describe",
+      subnetName,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=value(ipCidrRange)",
+    ]);
+    if (r.exitCode !== 0) {
+      return { error: `subnet "${subnetName}": gcloud exited ${r.exitCode}` };
+    }
+    const value = r.stdout.trim();
+    if (CIDR_LIST_RE.test(value)) return { cidr: value };
+    return {
+      error: value
+        ? `subnet "${subnetName}": unexpected value ${JSON.stringify(value)}`
+        : `subnet "${subnetName}": empty output`,
+    };
+  };
+
+  const primary = await rangeOf(subnet);
+  if ("error" in primary) return bail(primary.error);
+
+  const cidrs = [primary.cidr];
+  // Best-effort: Standard clusters can put node pools in other subnets. Blocked on
+  // Autopilot, where it is also unnecessary.
+  const poolsResult = await execCapture("gcloud", [
+    "container",
+    "node-pools",
+    "list",
+    "--cluster",
+    clusterName,
+    "--region",
+    region,
+    "--project",
+    projectId,
+    "--format=value(networkConfig.subnetwork)",
+  ]);
+  if (poolsResult.exitCode === 0) {
+    const extra = new Set(
+      poolsResult.stdout
+        .split("\n")
+        .map((line) => line.trim().split("/").pop() ?? "")
+        .filter((name) => name && name !== subnet && /^[a-z][-a-z0-9]{0,62}$/.test(name)),
+    );
+    for (const name of extra) {
+      const range = await rangeOf(name);
+      // A node pool we CAN see but whose subnet we cannot read is a real gap in the
+      // allowlist — those nodes' kubelets would be denied. Fail rather than half-cover.
+      if ("error" in range) return bail(`node pool ${range.error}`);
+      if (!cidrs.includes(range.cidr)) cidrs.push(range.cidr);
+    }
+  }
+
+  return cidrs.join(",");
 }
 
 export async function runDeploy(options: DeployOptions): Promise<void> {
@@ -686,10 +844,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 0b. Discover the cluster pod CIDR for chart-rendered NetworkPolicies (fail-closed —
-  // see discoverClusterPodCidr).
+  // see discoverClusterPodCidr), and the node range the STRICT posture needs for kubelet
+  // (S22 — discoverClusterNodeCidrs). Strict is the default, and the only reason it was not
+  // is that `nodeCidrs` had to be supplied by hand; discovering it removes that cost
+  // entirely, so the secure posture is what an ordinary deploy gets.
   let podCidr: string | null = null;
+  let nodeCidr: string | null = null;
   if (!dryRun && infra.projectId && infra.region && releaseName) {
     podCidr = await discoverClusterPodCidr({
+      clusterName: `${releaseName}-cluster`,
+      region: infra.region,
+      projectId: infra.projectId,
+      allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
+    });
+    nodeCidr = await discoverClusterNodeCidrs({
       clusterName: `${releaseName}-cluster`,
       region: infra.region,
       projectId: infra.projectId,
@@ -831,7 +999,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       } else {
         console.warn(
           `    Warning: could not delete ${del.desc} in ${infra.cacheRegion} — it may still be ` +
-            `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ${res.stderr.trim()}`,
+            `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ` +
+            // L14: gcloud stderr is externally influenced.
+            `${sanitizeForTerminal(res.stderr.trim())}`,
         );
       }
     }
@@ -941,7 +1111,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // NOT a version problem. `--ignore-not-found` returns exit 0 for a genuinely absent
       // CRD, so a non-zero exit is always a connectivity/auth failure. Don't send the user
       // to upgrade a cluster they can't even reach.
-      const detail = crdCheck.stderr.trim();
+      // L14: kubectl surfaces apiserver/admission text, which is externally influenced.
+      const detail = sanitizeForTerminal(crdCheck.stderr.trim());
       throw new Error(
         `Cloud CDN is enabled (cdn.enabled: true) but the GCPHTTPFilter CRD check could not ` +
           `reach the cluster (kubectl exited ${crdCheck.exitCode}). Check your kubectl context ` +
@@ -981,7 +1152,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // Deployment currently serving traffic, and sets activeBuildId to a build with zero
     // ready pods). discoverServingBuildId throws with a repair message when the live
     // build can't be established — deploy must never guess here.
-    console.warn(`\n  ! Committed deploy state could not be determined:\n    ${stateUnavailable}`);
+    // L14: the message wraps cluster-sourced read errors.
+    console.warn(
+      `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
+    );
     previousBuildId = await discoverServingBuildId(releaseName);
     console.warn(
       `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
@@ -1064,6 +1238,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     previousBuildId,
     overridesFile,
     podCidrs: podCidr,
+    nodeCidrs: nodeCidr,
     imageDigests,
     // First-upgrade probe migration. `helm upgrade` rewrites the stable HealthCheckPolicy
     // BEFORE the cutover, while the ACTIVE pods are still the OUTGOING build's — and a build
@@ -1630,7 +1805,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           [
             `Deployment ${deployName} did not finish rolling out within 120s. Traffic was ` +
               `NOT switched — the previous build's pools are still serving.`,
-            `${(rollout.stderr || rollout.stdout).trim()}`,
+            // L14: kubectl rollout output carries controller/admission messages.
+            `${sanitizeForTerminal((rollout.stderr || rollout.stdout).trim())}`,
             `Inspect: kubectl logs deployment/${deployName} -n ${K8S_NAMESPACE} --tail=40`,
             ...edgeStatusLines(edge),
           ].join("\n"),
@@ -1700,7 +1876,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           [
             `ext_proc registration job (${currentRouteExtJob}) did not complete; refusing ` +
               `traffic cutover because middleware may not be wired.`,
-            `${(wait.stderr || wait.stdout).trim()}`,
+            // L14: kubectl wait output carries controller/admission messages.
+            `${sanitizeForTerminal((wait.stderr || wait.stdout).trim())}`,
             `Inspect: kubectl logs job/${currentRouteExtJob} -n ${K8S_NAMESPACE}`,
             ...edgeStatusLines(edge),
           ].join("\n"),
@@ -1771,7 +1948,19 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // N67: the per-pool count the gate at 7b requires. Starts at the outgoing build's live
     // count and is only ever LOWERED — to a ceiling we could not raise, because asking for
     // more than the autoscaler permits is unreachable by construction.
-    const capacityTargets = new Map(previousReplicasByPool);
+    //
+    // S18: seeded from EVERY configured pool at a floor of one, not only from pools with a
+    // live predecessor. previousReplicasByPool has no entry for a pool that is new in this
+    // build, nor for any pool on a first deploy, so those pools used to contribute no
+    // expectation at all: a sibling's ready pods satisfied `checkedCount > 0`, the gate
+    // passed, and cutover then patched EVERY active Service to the new build — leaving the
+    // new pool's Service with zero endpoints and serving 503s. One ready pod is the weakest
+    // claim worth making ("something in this pool is actually serving"), and for pools that
+    // DO have a predecessor the real count below overwrites it immediately.
+    const capacityTargets = new Map<string, number>(pools.map((poolName) => [poolName, 1]));
+    for (const [poolName, replicas] of previousReplicasByPool) {
+      capacityTargets.set(poolName, replicas);
+    }
 
     const shortfalls: string[] = [];
     for (const [poolName, outgoing] of previousReplicasByPool) {
@@ -2153,7 +2342,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       );
       for (const f of patchFailures) {
         console.error(
-          `    - pool "${f.pool}" (service ${f.service}): ${f.stderr || "unknown error"}`,
+          // L14: the patch stderr is apiserver-sourced.
+          `    - pool "${f.pool}" (service ${f.service}): ` +
+            `${sanitizeForTerminal(f.stderr) || "unknown error"}`,
         );
       }
       if (revertFailures.length > 0) {
@@ -2235,7 +2426,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // deploy that exits here must not leave a widened autoscaler for the operator to find.
       await restoreWidenedHpas();
       console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
-      console.error(`  ${err instanceof Error ? err.message : String(err)}`);
+      // L14: the error wraps cluster-sourced write/read failures.
+      console.error(`  ${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}`);
       console.error(
         `  The new build IS serving, but the cluster ConfigMap was not updated. Restore`,
       );

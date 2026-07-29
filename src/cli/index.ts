@@ -1,5 +1,6 @@
 // src/cli/index.ts
 import path from "node:path";
+import { sanitizeForTerminal } from "./terminal.js";
 import { existsSync, readFileSync } from "node:fs";
 import { runInit } from "./init.js";
 import { runDeploy } from "./deploy.js";
@@ -328,7 +329,11 @@ async function main(): Promise<void> {
 // Vitest sets VITEST in its workers; the bundled bin never does.
 if (!process.env.VITEST) {
   main().catch((err) => {
-    console.error("\nError:", err.message);
+    // L14: this is the LAST sink for every thrown message, and those messages routinely
+    // embed captured kubectl/gcloud output. Sanitize here as a backstop so a path that
+    // forgets to strip control sequences at the point of capture still cannot repaint the
+    // operator's terminal on the way out.
+    console.error("\nError:", sanitizeForTerminal(String(err?.message ?? err)));
     process.exit(1);
   });
 }

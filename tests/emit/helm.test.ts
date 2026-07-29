@@ -585,11 +585,18 @@ describe("generateHelmChart", () => {
     );
     expect(netpol).toContain("kind: NetworkPolicy");
 
-    // values.yaml carries the empty default the CLI overrides with --set. `strict` and
-    // `nodeCidrs` are deliberately ABSENT (nil is falsy in helm) so the emitted posture
-    // is the broad one unless an operator sets them explicitly.
+    // S22: values.yaml carries the empty CIDR defaults the CLI overrides with --set, and
+    // `strict: true` — the SECURE posture is the default. It was previously off only because
+    // `nodeCidrs` had to be hand-supplied; deploy now discovers that range
+    // (discoverClusterNodeCidrs), so the broad posture costs nothing to leave behind.
+    //
+    // Why it matters: the broad posture is `0.0.0.0/0 except <pod CIDR>`, which admits every
+    // VPC peer, VM and hostNetwork pod to routing-service:8443. That service answers an
+    // ordinary ext_proc call with the internal dispatch secret in its header mutation, so a
+    // VPC-reachable caller can read the secret and replay trusted dispatch headers to a pool
+    // to skip middleware. Pod-level isolation alone never closed that.
     const values = JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{")));
-    expect(values.global.networkPolicy).toEqual({ podCidrs: [] });
+    expect(values.global.networkPolicy).toEqual({ podCidrs: [], nodeCidrs: [], strict: true });
   });
 
   it("marks the secret-bearing templates for mode-0600 writes (M4)", () => {

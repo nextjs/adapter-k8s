@@ -9,6 +9,7 @@ import {
   buildHelmUpgradeArgs,
   assertSafePoolName,
   discoverClusterPodCidr,
+  discoverClusterNodeCidrs,
   discoverServingBuildId,
   resolveImageDigest,
 } from "../../src/cli/deploy.js";
@@ -176,6 +177,33 @@ describe("buildHelmUpgradeArgs — NetworkPolicy pod CIDRs", () => {
     expect(args).toContain("global.networkPolicy.podCidrs={10.4.0.0/14}");
   });
 
+  it("S22: appends the nodeCidrs helm value as a brace list when provided", () => {
+    const args = buildHelmUpgradeArgs({ ...base, nodeCidrs: "10.128.0.0/20" });
+    expect(args).toContain("global.networkPolicy.nodeCidrs={10.128.0.0/20}");
+  });
+
+  it("S22: disables strict when no node range was discovered (--allow-no-network-policy)", () => {
+    // values.yaml defaults strict ON, and the chart `fail`s at RENDER time when strict is set
+    // without nodeCidrs (VERIFIED against real helm: an empty list is falsy, so
+    // `and .strict (not .nodeCidrs)` fires). So the opt-out path — where discovery returned
+    // null and podCidrs is null too — must turn strict OFF explicitly, or
+    // `--allow-no-network-policy` would hard-fail the deploy instead of deploying without
+    // policies, which is the opposite of what the flag promises.
+    const args = buildHelmUpgradeArgs({ ...base, podCidrs: null, nodeCidrs: null });
+    expect(args).toContain("global.networkPolicy.strict=false");
+  });
+
+  it("S22: leaves strict at its secure default whenever the node range IS known", () => {
+    const args = buildHelmUpgradeArgs({ ...base, podCidrs: "10.4.0.0/14", nodeCidrs: "10.128.0.0/20" });
+    expect(args.join(" ")).not.toContain("networkPolicy.strict=false");
+    expect(args).toContain("global.networkPolicy.nodeCidrs={10.128.0.0/20}");
+  });
+
+  it("S22: omits the nodeCidrs helm value when not discovered", () => {
+    const args = buildHelmUpgradeArgs({ ...base, nodeCidrs: null });
+    expect(args.join(" ")).not.toContain("networkPolicy.nodeCidrs");
+  });
+
   it("omits the podCidrs helm value when not discovered", () => {
     const args = buildHelmUpgradeArgs({ ...base, podCidrs: null });
     expect(args.join(" ")).not.toContain("networkPolicy.podCidrs");
@@ -250,6 +278,89 @@ describe("discoverClusterPodCidr (fail-closed NetworkPolicy discovery)", () => {
     });
     await expect(
       discoverClusterPodCidr({ ...OPTS, allowNoNetworkPolicy: true }),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("discoverClusterNodeCidrs (S22: strict posture needs the kubelet's source range)", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  const OPTS = { clusterName: "my-app-cluster", region: "us-central1", projectId: "proj-12345" };
+
+  // Node IPs come from the cluster subnetwork's PRIMARY range, not from clusterIpv4Cidr
+  // (that is the pods' secondary range). VERIFIED on a live Autopilot cluster: subnetwork
+  // "default" → 10.128.0.0/20, nodes at 10.128.15.211/215/216; pods at 10.17.0.x inside
+  // clusterIpv4Cidr 10.17.0.0/17. Two lookups, because the cluster resource names the
+  // subnet but does not carry its range.
+  it("resolves the cluster subnetwork, then that subnet's primary range", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "default\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "10.128.0.0/20\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "\n", stderr: "" }); // no extra pools
+
+    await expect(discoverClusterNodeCidrs(OPTS)).resolves.toBe("10.128.0.0/20");
+
+    const first = vi.mocked(exec.execCapture).mock.calls[0]?.[1];
+    expect(first).toContain("--format=value(subnetwork)");
+    const second = vi.mocked(exec.execCapture).mock.calls[1]?.[1];
+    expect(second).toContain("--format=value(ipCidrRange)");
+    expect(second).toContain("default");
+  });
+
+  it("unions any additional node-pool subnets on Standard clusters", async () => {
+    // Standard clusters can attach node pools to their own subnets, so the cluster's
+    // subnetwork alone can miss the nodes running the pool pods.
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "default\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "10.128.0.0/20\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "default\nother-subnet\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "10.200.0.0/20\n", stderr: "" });
+
+    await expect(discoverClusterNodeCidrs(OPTS)).resolves.toBe("10.128.0.0/20,10.200.0.0/20");
+  });
+
+  it("Autopilot blocks node-pool enumeration — the cluster subnet still suffices", async () => {
+    // MEASURED: `gcloud container node-pools list` on Autopilot exits non-zero with
+    // "Autopilot node pools cannot be accessed or modified". Autopilot runs every node in
+    // the cluster subnetwork, so that failure must not be fatal.
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "default\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "10.128.0.0/20\n", stderr: "" })
+      .mockResolvedValueOnce({
+        exitCode: 1,
+        stdout: "",
+        stderr: "Autopilot node pools cannot be accessed or modified.",
+      });
+
+    await expect(discoverClusterNodeCidrs(OPTS)).resolves.toBe("10.128.0.0/20");
+  });
+
+  it("throws when the subnet range cannot be established (fail-closed)", async () => {
+    // Rendering strict WITHOUT this range makes the template `fail`, and guessing it wrong
+    // leaves every pod unready under Calico. Neither is something to paper over.
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "default\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "forbidden" });
+
+    await expect(discoverClusterNodeCidrs(OPTS)).rejects.toThrow(
+      /refusing to deploy without network isolation/,
+    );
+  });
+
+  it("throws on a malformed range rather than corrupting the helm list", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "default\n", stderr: "" })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "10.128.0.0/20 SET LEGACY\n", stderr: "" });
+
+    await expect(discoverClusterNodeCidrs(OPTS)).rejects.toThrow(/unexpected value/);
+  });
+
+  it("--allow-no-network-policy opts out: warns and returns null", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "nope" });
+    await expect(
+      discoverClusterNodeCidrs({ ...OPTS, allowNoNetworkPolicy: true }),
     ).resolves.toBeNull();
   });
 });

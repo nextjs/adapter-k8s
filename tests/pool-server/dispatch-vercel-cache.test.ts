@@ -356,6 +356,10 @@ describe("x-vercel-cache iteration 7: platform response store for fully-keyed en
       buildId: "test123",
       staticAssets: [],
       pprCapableRoutes: { "/m/[lang]/[id]": { rootParams: [], allowQuery } },
+      // S17: byte-replay is harness-only. These cells are the upstream prerender matrix's,
+      // so they run in the harness posture; the production posture is pinned separately
+      // below ("platform response store is E2E-only").
+      emulatePlatformCache: true,
     } as any);
   }
   const matchRes = (lang: string, id: string) =>
@@ -419,6 +423,9 @@ describe("x-vercel-cache iteration 8: response store scoping (canary.97 regressi
         },
       },
       incrementalCacheShared: true,
+      // Harness posture, so what excludes this route is the shell-bearing scoping under
+      // test — not the S17 production gate.
+      emulatePlatformCache: true,
     } as any);
   }
   const matchRes = (lang: string, id: string) =>
@@ -455,11 +462,95 @@ describe("x-vercel-cache iteration 8: response store scoping (canary.97 regressi
       staticAssets: [],
       pprCapableRoutes: { "/m/[lang]/[id]": { rootParams: [], allowQuery: ["nxtPlang", "nxtPid"] } },
       rscConfig: { header: "rsc", suffix: ".rsc" },
+      // Harness posture: the RSC exclusion under test must hold on its own merits.
+      emulatePlatformCache: true,
     } as any);
     await d.dispatch(mockReq("/m/en/one", { rsc: "1" }), mockRes(), matchRes("en", "one"));
     const r2 = mockRes();
     await d.dispatch(mockReq("/m/en/one", { rsc: "1" }), r2, matchRes("en", "one"));
     expect(counter.n).toBe(2);
     expect(r2._body).toBe("flight-2");
+  });
+});
+
+describe("platform response store is E2E-only (production must never byte-replay)", () => {
+  // SECURITY. The store is a process-local stand-in for Cloud CDN's edge cache: it captures a
+  // whole response (headers AND body) under a key of `template|param=value` and replays it to
+  // the next request on that key. That key carries no request identity — no cookies, no
+  // Authorization, no middleware-injected headers — and capture rejects nothing, not
+  // `Set-Cookie` and not `Cache-Control: private`. A PPR route that personalizes inside a
+  // dynamic hole would therefore serve one visitor's document to the next.
+  //
+  // Every other platform stand-in in this dispatcher is already gated on emulatePlatformCache
+  // (index.ts: NEXT_ENABLE_ADAPTER=1 AND no VALKEY_URL — "MUST NOT be true in a real
+  // deployment"). The store belongs behind the same gate: upstream's prerender matrix needs
+  // the replay, production must never have it. The x-vercel-cache HEADER stays truthful in
+  // both postures — it is derived from the seen-key registry, which stores no response bytes.
+  function dispatcherFor(counter: { n: number }, options: Record<string, unknown>) {
+    const handler: NodeHandler = (_req, res) => {
+      counter.n++;
+      res.writeHead(200, { "content-type": "text/html", "set-cookie": `sid=user-${counter.n}` });
+      res.end(`<p>render-${counter.n}</p>`);
+    };
+    return createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(handler),
+        has: vi.fn((p: string) => p === "/m/[lang]/[id]"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE", filePath: "x.js" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprCapableRoutes: {
+        "/m/[lang]/[id]": { rootParams: [], allowQuery: ["nxtPlang", "nxtPid"] },
+      },
+      ...options,
+    } as any);
+  }
+  const matchRes = (lang: string, id: string) =>
+    ({
+      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang, id }, resolvedHeaders: undefined,
+    }) as any;
+
+  it("re-renders per request in the production posture (emulatePlatformCache off)", async () => {
+    const counter = { n: 0 };
+    const d = dispatcherFor(counter, {});
+    const r1 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r1, matchRes("en", "one"));
+    const r2 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r2, matchRes("en", "one"));
+    expect(counter.n).toBe(2);
+    expect(r2._body).toBe("<p>render-2</p>");
+  });
+
+  it("never replays another request's Set-Cookie in the production posture", async () => {
+    const counter = { n: 0 };
+    const d = dispatcherFor(counter, {});
+    await d.dispatch(mockReq("/m/en/one"), mockRes(), matchRes("en", "one"));
+    const r2 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r2, matchRes("en", "one"));
+    expect(r2._headers["set-cookie"]).toEqual(["sid=user-2"]);
+  });
+
+  it("still reports the sharing verdict through x-vercel-cache without the store", async () => {
+    const counter = { n: 0 };
+    const d = dispatcherFor(counter, {});
+    const r1 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r1, matchRes("en", "one"));
+    expect(r1._headers["x-vercel-cache"]).toBe("MISS");
+    const r2 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r2, matchRes("en", "one"));
+    expect(r2._headers["x-vercel-cache"]).toBe("HIT");
+  });
+
+  it("replays under the harness posture (emulatePlatformCache on)", async () => {
+    const counter = { n: 0 };
+    const d = dispatcherFor(counter, { emulatePlatformCache: true });
+    await d.dispatch(mockReq("/m/en/one"), mockRes(), matchRes("en", "one"));
+    const r2 = mockRes();
+    await d.dispatch(mockReq("/m/en/one"), r2, matchRes("en", "one"));
+    expect(counter.n).toBe(1);
+    expect(r2._body).toBe("<p>render-1</p>");
   });
 });

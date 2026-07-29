@@ -391,7 +391,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
             console.log("    (bucket not found or already deleted)");
           } else {
             console.warn(
-              `    WARNING: bucket deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+              `    WARNING: bucket deletion failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
             );
             failures.push(`GCS bucket "${infra.gcsBucket}"`);
           }
@@ -431,7 +431,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
             console.log("    (service account not found or already deleted)");
           } else {
             console.warn(
-              `    WARNING: service account deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+              `    WARNING: service account deletion failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
             );
             failures.push(`service account "${saEmail}"`);
           }
@@ -463,7 +463,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
               console.log("    (not found or already deleted)");
             } else {
               console.warn(
-                `    WARNING: deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+                `    WARNING: deletion failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
               );
               failures.push(desc);
             }

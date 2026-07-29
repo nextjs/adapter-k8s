@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import boxen from "boxen";
 import { execCapture } from "./exec.js";
+import { sanitizeForTerminal } from "./terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
@@ -49,7 +50,10 @@ export async function runDescribe(options: {
       "--quiet",
     ]);
     if (credResult.exitCode !== 0) {
-      console.error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
+      // L14: gcloud stderr is externally influenced; strip control sequences before printing.
+      console.error(
+        `Failed to connect to cluster: ${sanitizeForTerminal(credResult.stderr.trim())}`,
+      );
       process.exit(1);
     }
   }
@@ -68,8 +72,11 @@ export async function runDescribe(options: {
   const hosts: string[] = infra?.hosts ?? [];
   const projectId: string = infra?.projectId ?? "unknown";
   const region: string = infra?.region ?? "unknown";
-  const buildId = state?.buildId ?? "none";
-  const previousBuildId = state?.previousBuildId ?? null;
+  // L14: both come from the cluster-backed deploy state, whose validation requires only a
+  // nonempty string — a namespace actor who can edit the ConfigMap could otherwise inject
+  // CSI/OSC bytes into this deliberately ANSI-formatted report and forge convincing status.
+  const buildId = sanitizeForTerminal(state?.buildId ?? "none");
+  const previousBuildId = state?.previousBuildId ? sanitizeForTerminal(state.previousBuildId) : null;
 
   // Read generated CEL expression from build output
   const celPath = path.join(projectDir, ".k8s-adapter", "output", "cel-expression.txt");
