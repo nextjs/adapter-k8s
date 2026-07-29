@@ -65,6 +65,7 @@ import {
   K8S_NAMESPACE,
 } from "../emit/templates/utils.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { resolveContainerCli, targetPlatform } from "./container-runtime.js";
 import type { GcloudCommand } from "./init.js";
 
 export interface DeployOptions {
@@ -275,10 +276,21 @@ export interface DockerCommandOptions {
   registry: string;
   outputDir: string;
   containerStrategy: "traced-assets" | "shared-image";
+  /**
+   * S24: which container CLI to shell out to. Defaults to docker for compatibility; the
+   * deploy resolves the real one via resolveContainerCli(). Every verb used here — build,
+   * push — is accepted identically by podman and nerdctl.
+   */
+  containerCli?: string;
 }
 
 export function buildDockerCommands(options: DockerCommandOptions): GcloudCommand[] {
   const { pools, buildId, registry, outputDir, containerStrategy } = options;
+  const cli = options.containerCli ?? "docker";
+  // S24: pin the build architecture. Without it a host-native build on Apple Silicon
+  // produces arm64 images that fail with `exec format error` on GKE's x86 nodes — and only
+  // at rollout, not at build time. Never passed to `push`, which has no such flag.
+  const platformArg = `--platform=${targetPlatform()}`;
   const commands: GcloudCommand[] = [];
 
   // 0. Configure docker authentication for the registry host
@@ -295,12 +307,12 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
     const tag = `${registry}/nextjs-app:${buildId}`;
     commands.push({
       description: `Build shared image`,
-      command: "docker",
-      args: ["build", "-t", tag, `${outputDir}/shared-context`],
+      command: cli,
+      args: ["build", platformArg, "-t", tag, `${outputDir}/shared-context`],
     });
     commands.push({
       description: `Push shared image`,
-      command: "docker",
+      command: cli,
       args: ["push", tag],
     });
   } else {
@@ -308,12 +320,12 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
       const tag = `${registry}/nextjs-app-${pool}:${buildId}`;
       commands.push({
         description: `Build ${pool} image`,
-        command: "docker",
-        args: ["build", "-t", tag, `${outputDir}/pools/${pool}`],
+        command: cli,
+        args: ["build", platformArg, "-t", tag, `${outputDir}/pools/${pool}`],
       });
       commands.push({
         description: `Push ${pool} image`,
-        command: "docker",
+        command: cli,
         args: ["push", tag],
       });
     }
@@ -323,9 +335,10 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   const routingTag = `${registry}/routing-service:${buildId}`;
   commands.push({
     description: "Build routing service image",
-    command: "docker",
+    command: cli,
     args: [
       "build",
+      platformArg,
       "-f",
       `${outputDir}/routing-service/Dockerfile`,
       "-t",
@@ -335,7 +348,7 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   });
   commands.push({
     description: "Push routing service image",
-    command: "docker",
+    command: cli,
     args: ["push", routingTag],
   });
 
@@ -406,11 +419,20 @@ export async function resolveDeployImageDigests(opts: {
   refs: Array<[string, string]>;
   projectId: string;
   allowMutableTags?: boolean;
+  containerCli?: string;
 }): Promise<Record<string, string>> {
   const digests: Record<string, string> = {};
   const unresolved: string[] = [];
   for (const [key, ref] of opts.refs) {
-    const digest = (await resolveImageDigest(ref)) ?? (await resolveRegistryDigest(ref, opts.projectId));
+    // S25: REGISTRY FIRST. kubelet pulls from the registry, so the registry's digest is the
+    // only one that can actually be deployed. The local daemon merely usually agrees —
+    // MEASURED with podman 6.0.1, it does not: podman converts the manifest on push, so its
+    // RepoDigest describes the local copy and pointing a Deployment at it yields
+    // ImagePullBackOff (observed live: podman said e04a0a5b…, the registry held 27fa476b…,
+    // and the rollout failed). The local probe stays as the offline/unreachable fallback.
+    const digest =
+      (await resolveRegistryDigest(ref, opts.projectId)) ??
+      (await resolveImageDigest(ref, opts.containerCli ?? "docker"));
     if (digest) digests[key] = digest;
     else unresolved.push(ref);
   }
@@ -468,12 +490,16 @@ export async function resolveRegistryDigest(
   return /^sha256:[a-f0-9]{64}$/.test(digest) ? digest : null;
 }
 
-export async function resolveImageDigest(imageRef: string): Promise<string | null> {
+export async function resolveImageDigest(
+  imageRef: string,
+  containerCli: string = "docker",
+): Promise<string | null> {
   // ALL RepoDigests, not just index 0: they belong to the image ID, and one local image tagged
   // and pushed to more than one repository carries an entry per repository. Taking the first and
   // pairing its digest with THIS repository could reference a manifest that does not exist
   // there, leaving the new pods in ImagePullBackOff. Select the entry whose repository matches.
-  const res = await execCapture("docker", [
+  // podman and nerdctl both implement `inspect --format` with the same Go template fields.
+  const res = await execCapture(containerCli, [
     "inspect",
     "--format",
     "{{range .RepoDigests}}{{println .}}{{end}}",
@@ -954,6 +980,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     });
   }
 
+  // S24: resolved in preflight below; the build/push commands and the digest probe all use
+  // it. With --skip-push we never probe, and the registry answers for digests (S23), so
+  // docker stays as a harmless placeholder.
+  let containerCli = "docker";
+
+  // 0c. S24: resolve the container runtime BEFORE anything with side effects. Observed with
+  // nerdctl: resolution used to live down in the push branch, so a host whose runtime cannot
+  // build still provisioned Memorystore and rewrote the docker credential config before
+  // dying on the first `build`. A runtime we cannot build with is a preflight failure.
+  if (!dryRun && !skipPush) {
+    containerCli = await resolveContainerCli();
+    if (containerCli !== "docker") console.log(`\n  Container runtime: ${containerCli}`);
+  }
+
   // 1. Run next build (adapter's onBuildComplete generates artifacts)
   if (!skipBuild) {
     console.log("\n  → Running next build...");
@@ -1111,6 +1151,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       registry: infra.containerRegistry,
       outputDir: ".k8s-adapter/output",
       containerStrategy,
+      containerCli,
     });
 
     for (const cmd of dockerCommands) {
@@ -1142,6 +1183,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         refs,
         projectId: infra.projectId,
         allowMutableTags: allowMutableTags ?? false,
+        containerCli,
       }),
     );
     const pinned = Object.keys(imageDigests).length;

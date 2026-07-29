@@ -37,6 +37,52 @@ describe("buildDockerCommands", () => {
     expect(commands[2]!.args).toContain(`${registry}/nextjs-app-ssr:abc123`);
   });
 
+  it("S24: uses the resolved container CLI, not a hardcoded docker", () => {
+    const commands = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry: "reg/nextjs",
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+      containerCli: "podman",
+    });
+    const buildAndPush = commands.filter((c) => c.command !== "gcloud");
+    expect(buildAndPush.length).toBeGreaterThan(0);
+    expect(buildAndPush.every((c) => c.command === "podman")).toBe(true);
+  });
+
+  it("S24: defaults to docker when no CLI is supplied", () => {
+    const commands = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry: "reg/nextjs",
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+    });
+    expect(commands.filter((c) => c.command !== "gcloud").every((c) => c.command === "docker")).toBe(
+      true,
+    );
+  });
+
+  it("S24: pins every build to the target platform", () => {
+    // A host-native build on Apple Silicon yields arm64 images that die with `exec format
+    // error` on GKE's x86 nodes — after a rollout, not at build time.
+    const commands = buildDockerCommands({
+      pools: ["ssr", "api"],
+      buildId: "abc123",
+      registry: "reg/nextjs",
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+    });
+    const builds = commands.filter((c) => c.args.includes("build"));
+    expect(builds.length).toBe(3); // 2 pools + routing service
+    for (const b of builds) expect(b.args).toContain("--platform=linux/amd64");
+    // ...and never on a push, which takes no such flag.
+    for (const p of commands.filter((c) => c.args.includes("push"))) {
+      expect(p.args.join(" ")).not.toContain("--platform");
+    }
+  });
+
   it("generates single docker build for shared-image strategy with auth", () => {
     const registry = "us-central1-docker.pkg.dev/my-project/nextjs";
     const commands = buildDockerCommands({
@@ -341,21 +387,57 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     stderr: "",
   });
 
-  it("prefers the local daemon when it knows the digest (no registry round-trip)", async () => {
-    vi.mocked(exec.execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
-      if (args.includes("inspect")) {
-        const ref = args[args.length - 1]!;
-        return dockerOk(ref, ref.includes("routing") ? SHA_B : SHA_A);
+  // NOTE: this originally asserted the OPPOSITE — local-first, with the registry as fallback
+  // and an explicit "no registry round-trip" check. Running a real podman deploy disproved
+  // that premise (see the S25 cases below): podman's local RepoDigest is not the digest the
+  // registry stores, and deploying it fails the rollout. Registry-first is the contract now.
+  it("uses the local daemon's digest when it agrees with the registry", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") {
+        const ref = args.find((a) => a.includes("/")) ?? "";
+        return { exitCode: 0, stdout: (ref.includes("routing") ? SHA_B : SHA_A) + "\n", stderr: "" };
       }
-      return { exitCode: 1, stdout: "", stderr: "should not be called" };
+      const ref = args[args.length - 1]!;
+      return dockerOk(ref, ref.includes("routing") ? SHA_B : SHA_A);
     }) as never);
 
     await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).resolves.toEqual({
       ssr: SHA_A,
       routingService: SHA_B,
     });
-    const gcloudCalls = vi.mocked(exec.execCapture).mock.calls.filter(([c]) => c === "gcloud");
-    expect(gcloudCalls).toHaveLength(0);
+  });
+
+  it("S25: prefers the REGISTRY over the local daemon (podman reports a different digest)", async () => {
+    // MEASURED with podman 6.0.1 against Artifact Registry: podman converts the manifest on
+    // push, so its local RepoDigest is NOT the digest the registry stored —
+    //   podman inspect : sha256:e04a0a5b…
+    //   registry       : sha256:27fa476b…
+    // Deploying the local one produced ImagePullBackOff and a failed rollout on a live
+    // cluster. The registry is what kubelet pulls from, so the registry is the truth; the
+    // local daemon is only a fallback for when the registry cannot be reached.
+    const LOCAL = "sha256:" + "e".repeat(64);
+    const REGISTRY = "sha256:" + "7".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") return { exitCode: 0, stdout: REGISTRY + "\n", stderr: "" };
+      const ref = args[args.length - 1]!;
+      return { exitCode: 0, stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`, stderr: "" };
+    }) as never);
+
+    const out = await resolveDeployImageDigests({ refs: REFS, projectId: "proj" });
+    expect(out.ssr).toBe(REGISTRY);
+    expect(out.routingService).toBe(REGISTRY);
+  });
+
+  it("S25: falls back to the local daemon when the registry is unreachable", async () => {
+    const LOCAL = "sha256:" + "e".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") return { exitCode: 1, stdout: "", stderr: "offline" };
+      const ref = args[args.length - 1]!;
+      return { exitCode: 0, stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`, stderr: "" };
+    }) as never);
+
+    const out = await resolveDeployImageDigests({ refs: REFS, projectId: "proj" });
+    expect(out.ssr).toBe(LOCAL);
   });
 
   it("falls back to the registry when the local daemon has no RepoDigest", async () => {
