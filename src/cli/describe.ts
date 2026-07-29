@@ -3,7 +3,9 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import boxen from "boxen";
 import { execCapture } from "./exec.js";
+import { sanitizeForTerminal } from "./terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
+import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 // Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
 // WHICH file is corrupt.
@@ -28,6 +30,8 @@ export async function runDescribe(options: {
         hosts?: string[];
       } | null)
     : null;
+  // S13: validate before any of these reach a gcloud/kubectl argv.
+  assertSafeInfrastructure(infra);
 
   // Ensure kubectl is pointing at the right cluster BEFORE reading state — readState
   // prefers the cluster ConfigMap, and with kubectl still pinned to a stale context it
@@ -46,19 +50,33 @@ export async function runDescribe(options: {
       "--quiet",
     ]);
     if (credResult.exitCode !== 0) {
-      console.error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
+      // L14: gcloud stderr is externally influenced; strip control sequences before printing.
+      console.error(
+        `Failed to connect to cluster: ${sanitizeForTerminal(credResult.stderr.trim())}`,
+      );
       process.exit(1);
     }
   }
 
   // Read state from cluster ConfigMap (works for CI/CD + local)
-  const { readState } = await import("./state.js");
-  const state = await readState(projectDir, releaseName);
+  const { readState, StateUnavailableError } = await import("./state.js");
+  // N20: state reads now throw when state is indeterminate. describe is diagnostic — report
+  // and continue rather than crashing the one command an operator runs to inspect a release.
+  const state = await readState(projectDir, releaseName).catch((err: unknown) => {
+    if (!(err instanceof StateUnavailableError)) throw err;
+    console.warn(
+      `  ! Deploy state could not be determined: ${(err as Error).message.split("\n")[0]}`,
+    );
+    return null;
+  });
   const hosts: string[] = infra?.hosts ?? [];
   const projectId: string = infra?.projectId ?? "unknown";
   const region: string = infra?.region ?? "unknown";
-  const buildId = state?.buildId ?? "none";
-  const previousBuildId = state?.previousBuildId ?? null;
+  // L14: both come from the cluster-backed deploy state, whose validation requires only a
+  // nonempty string — a namespace actor who can edit the ConfigMap could otherwise inject
+  // CSI/OSC bytes into this deliberately ANSI-formatted report and forge convincing status.
+  const buildId = sanitizeForTerminal(state?.buildId ?? "none");
+  const previousBuildId = state?.previousBuildId ? sanitizeForTerminal(state.previousBuildId) : null;
 
   // Read generated CEL expression from build output
   const celPath = path.join(projectDir, ".k8s-adapter", "output", "cel-expression.txt");

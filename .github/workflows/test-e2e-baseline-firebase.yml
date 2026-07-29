@@ -31,4 +31,8 @@ jobs:
         env:
           FIREBASE_TOOLS_BASELINE_VERSION: ${{ inputs.firebaseToolsVersion }}
           NEXTJS_REF: ${{ inputs.nextjsRef }}
-        run: bash scripts/e2e-firebase-baseline.sh "" "${{ inputs.nextjsRef }}"
+        # Read the ref through the env mapping above, never `${{ }}` inside the run script:
+        # GitHub substitutes the expression BEFORE bash sees it, so a value containing a quote
+        # can close the argument and append its own commands, with the job's runner context and
+        # the credential actions/checkout persisted.
+        run: bash scripts/e2e-firebase-baseline.sh "" "$NEXTJS_REF"

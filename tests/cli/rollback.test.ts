@@ -3,22 +3,36 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import path from "node:path";
 
 vi.mock("../../src/cli/exec.js");
-vi.mock("../../src/cli/state.js");
+// Only the two state FUNCTIONS are mocked (same shape as deploy-orchestration.test.ts), so
+// the N69 suite below can swap the REAL writeState back in and exercise its generation
+// arithmetic through rollback's actual call site.
+vi.mock("../../src/cli/state.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/state.js")>();
+  return { ...actual, readState: vi.fn(), writeState: vi.fn() };
+});
 vi.mock("../../src/cli/cdn-invalidate.js");
 vi.mock("node:fs");
 
 import {
+  planRollbackCapacity,
+  readRoutingServingConfig,
+  revertRoutingServiceToBuild,
   retainLiveRoutingManifest,
   runRollback,
+  ROLLBACK_MIN_REPLICAS,
   SNAPSHOT_BUILD_ID_ANNOTATION,
 } from "../../src/cli/rollback.js";
 import { execCapture, execCaptureStdin, execOrThrow } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { routingManifestSnapshotName } from "../../src/emit/templates/routing-manifest-configmap.js";
 import { poolResourceNames } from "../../src/emit/templates/utils.js";
 import { renderHPA } from "../../src/emit/templates/hpa.js";
+import {
+  internalSecretName,
+  legacyInternalSecretName,
+} from "../../src/emit/templates/internal-secret.js";
 
 const PROJECT = "/proj";
 const RELEASE = "rel";
@@ -65,7 +79,7 @@ describe("runRollback — CDN invalidation", () => {
       (p) => p === infraPath || p === metaPath || p === cdnFilter,
     );
     vi.mocked(readFileSync).mockImplementation((p) => {
-      if (p === infraPath) return '{"projectId":"proj","region":"us-central1"}';
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
       if (p === metaPath) return '{"pools":["ssr"]}';
       return "";
     });
@@ -85,7 +99,7 @@ describe("runRollback — CDN invalidation", () => {
 
     expect(invalidateCdnBuildTag).toHaveBeenCalledTimes(1);
     expect(invalidateCdnBuildTag).toHaveBeenCalledWith(
-      expect.objectContaining({ buildId: "buildn", releaseName: RELEASE, projectId: "proj" }),
+      expect.objectContaining({ buildId: "buildn", releaseName: RELEASE, projectId: "proj-12345" }),
     );
   });
 
@@ -107,7 +121,8 @@ describe("runRollback — CDN invalidation", () => {
     );
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn", cdnTags },
+      // N69: rollback passes the generation it READ as writeState's floor.
+      { buildId: "buildm", previousBuildId: "buildn", cdnTags, basedOnGeneration: null },
       RELEASE,
     );
   });
@@ -123,7 +138,7 @@ describe("runRollback — CDN invalidation", () => {
     // No cdnTags key invented for the swapped state.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn" },
+      { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
       RELEASE,
     );
   });
@@ -203,7 +218,7 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
     vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
     vi.mocked(readFileSync).mockImplementation((p) => {
-      if (p === infraPath) return '{"projectId":"proj","region":"us-central1"}';
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
       if (p === metaPath) return '{"pools":["ssr"]}';
       return "";
     });
@@ -242,10 +257,11 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
 
     await runRollback({ projectDir: PROJECT, releaseName: LONG_RELEASE });
 
-    // Existence probe looked for the HPA the template rendered.
+    // Existence probe looked for the HPA the template rendered. (N26 also probes the
+    // CURRENT build's HPA for its live capacity, so match the target's name explicitly.)
     const getHpa = vi
       .mocked(execCapture)
-      .mock.calls.find(([, a]) => a[0] === "get" && a[1] === "hpa");
+      .mock.calls.find(([, a]) => a[0] === "get" && a[1] === "hpa" && a.includes(prevNames.hpa));
     expect(getHpa?.[1]).toContain(prevNames.hpa);
     // Recreation targeted the previous Deployment and named the HPA like the template.
     const autoscale = vi.mocked(execOrThrow).mock.calls.find(([, a]) => a[0] === "autoscale");
@@ -266,7 +282,7 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
     // The rollback completed: state swapped to the previous build.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: PREV, previousBuildId: CURR },
+      { buildId: PREV, previousBuildId: CURR, basedOnGeneration: null },
       LONG_RELEASE,
     );
   });
@@ -285,7 +301,7 @@ describe("runRollback — state read ordering", () => {
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
     vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
     vi.mocked(readFileSync).mockImplementation((p) => {
-      if (p === infraPath) return '{"projectId":"proj","region":"us-central1"}';
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
       if (p === metaPath) return '{"pools":["ssr"]}';
       return "";
     });
@@ -374,7 +390,7 @@ describe("runRollback — routing service revert", () => {
     vi.mocked(readFileSync).mockImplementation((p) => {
       if (p === infraPath)
         return JSON.stringify({
-          projectId: "proj",
+          projectId: "proj-12345",
           region: "us-central1",
           containerRegistry: REGISTRY,
         });
@@ -412,11 +428,16 @@ describe("runRollback — routing service revert", () => {
     expect(patchBody).toContain(`"image":"${REGISTRY}/routing-service:buildm"`);
     expect(patchBody).toContain(`"configMap":{"name":"${SNAP_M}"}`);
 
-    // 3. ...and its rollout was awaited.
-    const rolloutArgs = vi.mocked(execOrThrow).mock.calls.map(([, args]) => args.join(" "));
+    // 3. ...and its rollout was awaited. Through execCapture, not execOrThrow: the exit code
+    // is needed, because a failed rollout must RESTORE the edge rather than throw with the
+    // Deployment already patched (which left the tiers split — observed live).
+    const rolloutArgs = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
     expect(
       rolloutArgs.some((a) => a.includes("rollout status deployment/rel-routing-service")),
     ).toBe(true);
+    // The wait is long enough that a timeout means "stuck", not "busy" — a real Autopilot
+    // rollout logged several `1 of 2 updated` cycles before converging.
+    expect(rolloutArgs.some((a) => a.includes("--timeout=300s"))).toBe(true);
 
     // 4. The edge revert happens BEFORE any pool Service selector patch.
     const patchOrder = deployPatch![0]
@@ -453,7 +474,7 @@ describe("runRollback — routing service revert", () => {
     // The rollback still completes the pool switch.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn" },
+      { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
       RELEASE,
     );
   });
@@ -550,7 +571,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     vi.mocked(readFileSync).mockImplementation((p) => {
       if (p === infraPath)
         return JSON.stringify({
-          projectId: "proj",
+          projectId: "proj-12345",
           region: "us-central1",
           containerRegistry: REGISTRY,
         });
@@ -704,12 +725,162 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
     expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
   });
 
+  it("N30: reports no-routing-tier distinctly from a FAILURE (deploy's abort depends on it)", async () => {
+    // Both used to be `null`, so deploy could only warn — while a failed retention
+    // permanently destroys the rollback target's manifest once helm overwrites the stable
+    // ConfigMap.
+    vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+      status: "no-routing-tier",
+    });
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+  });
+
+  it("N68: absence is proven by --ignore-not-found, not by an empty/failed read", async () => {
+    // The ONE machine-readable absence signal: with --ignore-not-found a genuinely absent
+    // routing Deployment exits 0 with empty stdout, so every other outcome is a failure.
+    vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+
+    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+      status: "no-routing-tier",
+    });
+    const read = vi
+      .mocked(execCapture)
+      .mock.calls.find(([, a]) => a.includes("deployment") && a.includes("rel-routing-service"))!;
+    expect(read[1]).toContain("--ignore-not-found");
+  });
+
+  it("N68: a routing Deployment that cannot be READ is a failure, NOT 'no routing tier'", async () => {
+    // The read error used to collapse into the same `null` as genuine absence, so deploy
+    // classified it as no-routing-tier, treated retention as "nothing to retain", and let
+    // helm overwrite the stable routing-manifest ConfigMap — destroying the rollback
+    // snapshot the fail-closed retention guard exists to protect.
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployment") && args.includes("rel-routing-service")) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: 'deployments.apps "rel-routing-service" is forbidden',
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    const result = await retainLiveRoutingManifest("rel");
+    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({ reason: expect.stringContaining("is forbidden") });
+    // Nothing was snapshotted, and nothing was invented.
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+  });
+
+  it("N68: unparseable routing-Deployment JSON is a failure", async () => {
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployment") && args.includes("rel-routing-service")) {
+        return { exitCode: 0, stdout: "<html>proxy error</html>", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    const result = await retainLiveRoutingManifest("rel");
+    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({ reason: expect.stringContaining("not valid JSON") });
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+  });
+
+  it("N68: a routing Deployment missing its container/manifest volume is a failure", async () => {
+    // Present but unrecognizable: the snapshot cannot be named (no image tag) or sourced
+    // (no mounted ConfigMap), which is a retention failure — never "nothing to retain".
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployment") && args.includes("rel-routing-service")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: { template: { spec: { containers: [{ name: "sidecar" }], volumes: [] } } },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    const result = await retainLiveRoutingManifest("rel");
+    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({
+      reason: expect.stringContaining("rel-routing-service"),
+    });
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+  });
+
+  it("N68: a readable routing tier is retained", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      retainCapture({ existingSnapshotAnnotation: undefined }) as never,
+    );
+
+    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+      status: "retained",
+      snapshotName: SNAP_N,
+    });
+  });
+
+  it("N30: reports a failed apply as failed, with a reason", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      retainCapture({ existingSnapshotAnnotation: undefined }) as never,
+    );
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "etcdserver: request is too large",
+    } as never);
+
+    const result = await retainLiveRoutingManifest("rel");
+    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({ reason: expect.stringContaining("too large") });
+  });
+
+  it("N30: reports a failure when the live routing-manifest ConfigMap is unreadable", async () => {
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      if (j.includes("get deployment rel-routing-service") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    { name: "routing-service", image: `${REGISTRY}/routing-service:buildn` },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (j.includes("get configmap rel-routing-manifest")) {
+        return { exitCode: 1, stdout: "", stderr: "configmaps is forbidden" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    const result = await retainLiveRoutingManifest("rel");
+    expect(result.status).toBe("failed");
+    expect(result).toMatchObject({ reason: expect.stringContaining("forbidden") });
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+  });
+
   it("overwrites a snapshot stamped with the SAME build id (idempotent re-retention)", async () => {
     vi.mocked(execCapture).mockImplementation(
       retainCapture({ existingSnapshotAnnotation: "buildn" }) as never,
     );
 
-    await expect(retainLiveRoutingManifest("rel")).resolves.toBe(SNAP_N);
+    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+      status: "retained",
+      snapshotName: SNAP_N,
+    });
     expect(vi.mocked(execCaptureStdin)).toHaveBeenCalledTimes(1);
   });
 
@@ -718,7 +889,10 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
       retainCapture({ existingSnapshotAnnotation: null }) as never,
     );
 
-    await expect(retainLiveRoutingManifest("rel")).resolves.toBe(SNAP_N);
+    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+      status: "retained",
+      snapshotName: SNAP_N,
+    });
     const applied = JSON.parse(vi.mocked(execCaptureStdin).mock.calls[0]![2] as string);
     expect(applied.metadata.annotations[SNAPSHOT_BUILD_ID_ANNOTATION]).toBe("buildn");
     expect(applied.metadata.labels["app.kubernetes.io/managed-by"]).toBe("adapter-k8s");
@@ -737,7 +911,7 @@ describe("runRollback — serving gate", () => {
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
     vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
     vi.mocked(readFileSync).mockImplementation((p) => {
-      if (p === infraPath) return '{"projectId":"proj","region":"us-central1"}';
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
       if (p === metaPath) return '{"pools":["ssr"]}';
       return "";
     });
@@ -807,5 +981,738 @@ describe("runRollback — serving gate", () => {
     expect(calls.some((a) => a.includes("patch"))).toBe(false);
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     expect(invalidateCdnBuildTag).not.toHaveBeenCalled();
+  });
+});
+
+describe("planRollbackCapacity — N26: a rollback comes back at the capacity that was serving", () => {
+  const CHART_DEFAULTS = { min: 1, max: 3, targetCPU: 80 };
+
+  it("never returns fewer than the historical floor", () => {
+    expect(
+      planRollbackCapacity(
+        { specReplicas: 1, readyReplicas: 1, hpaDesired: null, hpaMax: 3 },
+        CHART_DEFAULTS,
+      ),
+    ).toEqual({ replicas: ROLLBACK_MIN_REPLICAS, min: ROLLBACK_MIN_REPLICAS, max: 3 });
+  });
+
+  it("matches a build serving 20 under load, and lifts the HPA ceiling with it", () => {
+    // The finding: rollback scaled the target to a hardcoded 2 with an HPA capped at the
+    // chart default max 3 — self-inflicted overload during an incident.
+    const plan = planRollbackCapacity(
+      { specReplicas: 20, readyReplicas: 20, hpaDesired: 20, hpaMax: 30 },
+      CHART_DEFAULTS,
+    );
+    expect(plan).toEqual({ replicas: 20, min: 20, max: 30 });
+  });
+
+  it("uses the HPA's desired count when .spec.replicas lags behind it", () => {
+    const plan = planRollbackCapacity(
+      { specReplicas: 4, readyReplicas: 4, hpaDesired: 11, hpaMax: 12 },
+      CHART_DEFAULTS,
+    );
+    expect(plan.replicas).toBe(11);
+    expect(plan.max).toBeGreaterThanOrEqual(12);
+  });
+
+  it("degrades to the configured floor when nothing could be read", () => {
+    const plan = planRollbackCapacity(
+      { specReplicas: null, readyReplicas: null, hpaDesired: null, hpaMax: null },
+      { min: 4, max: 8, targetCPU: 60 },
+    );
+    expect(plan).toEqual({ replicas: 4, min: 4, max: 8 });
+  });
+});
+
+describe("runRollback — N26: scales the target to the current build's live capacity", () => {
+  /** Cluster where the CURRENT build (buildn) runs 9 pods with an HPA desiring 9, max 12. */
+  function loadedCluster(opts: { hpaExists?: boolean; capacityReadFails?: boolean } = {}) {
+    return vi.fn(async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+      if (args.includes("deployments")) return ok("rel-ssr-buildm|0\nrel-ssr-buildn|9");
+      if (j.includes("jsonpath={.metadata.name}|{.spec.replicas}|{.status.readyReplicas}")) {
+        if (opts.capacityReadFails) return { exitCode: 1, stdout: "", stderr: "forbidden" };
+        return ok("rel-ssr-buildn|9|9");
+      }
+      if (j.includes("jsonpath={.metadata.name}|{.status.desiredReplicas}|{.spec.maxReplicas}")) {
+        if (opts.capacityReadFails) return { exitCode: 1, stdout: "", stderr: "forbidden" };
+        return ok("rel-ssr-buildn-hpa|9|12");
+      }
+      // The rollback target's HPA existence probe (`-o name`).
+      if (args[0] === "get" && args[1] === "hpa") {
+        return ok(opts.hpaExists ? "horizontalpodautoscaler.autoscaling/rel-ssr-buildm-hpa\n" : "");
+      }
+      if (args.includes("pods")) return ok("rel-ssr-buildm-abc\n");
+      if (args.includes("exec")) return ok();
+      return ok();
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+    } as never);
+    vi.mocked(writeState).mockResolvedValue(undefined as never);
+    vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
+    vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
+      if (p === metaPath) return '{"pools":["ssr"]}';
+      return "";
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("scales up to 9 (not 2) and creates the HPA with min 9 / max 12, BEFORE any selector flip", async () => {
+    vi.mocked(execCapture).mockImplementation(loadedCluster() as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const scale = vi
+      .mocked(execOrThrow)
+      .mock.calls.find(([, a]) => a[0] === "scale" && a[1] === "deployment/rel-ssr-buildm");
+    expect(scale?.[1]).toContain("--replicas=9");
+    const autoscale = vi.mocked(execOrThrow).mock.calls.find(([, a]) => a[0] === "autoscale");
+    expect(autoscale?.[1]).toContain("--min=9");
+    expect(autoscale?.[1]).toContain("--max=12");
+    // Capacity is restored before traffic arrives.
+    const scaleOrder =
+      vi.mocked(execOrThrow).mock.invocationCallOrder[
+        vi.mocked(execOrThrow).mock.calls.indexOf(scale!)
+      ]!;
+    const svcPatchIdx = vi
+      .mocked(execCapture)
+      .mock.calls.findIndex(([, a]) => a.includes("patch") && a.includes("service"));
+    expect(vi.mocked(execCapture).mock.invocationCallOrder[svcPatchIdx]!).toBeGreaterThan(
+      scaleOrder,
+    );
+  });
+
+  it("WIDENS an existing HPA on the rollback target instead of leaving it at min 1 / max 3", async () => {
+    vi.mocked(execCapture).mockImplementation(loadedCluster({ hpaExists: true }) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const patch = vi
+      .mocked(execCapture)
+      .mock.calls.find(([, a]) => a.includes("patch") && a.includes("hpa"));
+    expect(patch).toBeDefined();
+    expect(patch![1][patch![1].length - 1]).toContain('"minReplicas":9');
+    expect(patch![1][patch![1].length - 1]).toContain('"maxReplicas":12');
+    // No autoscale create when one already exists.
+    expect(vi.mocked(execOrThrow).mock.calls.some(([, a]) => a[0] === "autoscale")).toBe(false);
+  });
+
+  it("still rolls back (with a warning) when the live capacity cannot be read", async () => {
+    // Aborting here would strand the operator on a broken build — the opposite trade-off
+    // from deploy's scale-DOWN probe, which must abort.
+    vi.mocked(execCapture).mockImplementation(loadedCluster({ capacityReadFails: true }) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const scale = vi
+      .mocked(execOrThrow)
+      .mock.calls.find(([, a]) => a[0] === "scale" && a[1] === "deployment/rel-ssr-buildm");
+    expect(scale?.[1]).toContain(`--replicas=${ROLLBACK_MIN_REPLICAS}`);
+    expect(
+      vi
+        .mocked(console.warn)
+        .mock.calls.some((c) =>
+          String(c[0]).includes("Could not read the current build's live capacity"),
+        ),
+    ).toBe(true);
+    expect(vi.mocked(writeState)).toHaveBeenCalled();
+  });
+});
+
+describe("runRollback — N69: the generation floor travels through rollback's state write", () => {
+  const STATE_CM = `${RELEASE}-adapter-state`;
+  const localStatePath = path.join(PROJECT, ".k8s-adapter", "state.json");
+
+  /**
+   * A rollback that cuts over cleanly and THEN loses the cluster: the deploy-state
+   * ConfigMap can no longer be read (or written). Everything else succeeds.
+   */
+  function clusterOutageOnStateWrite() {
+    return vi.fn(async (_cmd: string, args: string[]) => {
+      const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+      if (args.includes("configmap") && args.includes(STATE_CM)) {
+        return { exitCode: 1, stdout: "", stderr: "Unable to connect to the server" };
+      }
+      if (args.includes("deployments")) return ok("rel-ssr-buildm|2\nrel-ssr-buildn|2");
+      if (args.includes("pods")) return ok("rel-ssr-buildm-abc\n");
+      if (args.includes("exec")) return ok();
+      return ok();
+    });
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    // The REAL writeState, driven through rollback's own call site.
+    const realState =
+      await vi.importActual<typeof import("../../src/cli/state.js")>("../../src/cli/state.js");
+    vi.mocked(writeState).mockImplementation(realState.writeState);
+    vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "Unable to connect to the server",
+    } as never);
+    vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
+    // A FRESH CI CHECKOUT: `.k8s-adapter/` is gitignored, so there is no local state file to
+    // carry the generation forward — the payload's floor is the only thing that can.
+    vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
+      if (p === metaPath) return '{"pools":["ssr"]}';
+      return "";
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as never);
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("records a generation ABOVE the state it read when the cluster write fails", async () => {
+    // Deploy passes the generation it read as writeState's floor; rollback did NOT, so the
+    // local file was stamped generation 1 while the stale cluster record sat at 7 — and
+    // readState prefers the HIGHER generation, so the next operation read the stale cluster
+    // record and pointed traffic back at a build this rollback had already switched away
+    // from (the re-drain hazard the generation mechanism exists to prevent).
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      generation: 7,
+    } as never);
+    vi.mocked(execCapture).mockImplementation(clusterOutageOnStateWrite() as never);
+
+    await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    // The local file (written atomically via <state.json>.tmp) carries the swapped builds
+    // AND a generation above the one that was read.
+    const write = vi
+      .mocked(writeFileSync)
+      .mock.calls.find(([p]) => String(p) === `${localStatePath}.tmp`)!;
+    const written = JSON.parse(String(write[1]));
+    expect(written).toMatchObject({ buildId: "buildm", previousBuildId: "buildn" });
+    expect(written.generation).toBeGreaterThan(7);
+    // The operator was told the cluster copy is stale, not that the rollback was clean.
+    expect(
+      vi
+        .mocked(console.error)
+        .mock.calls.map((c) => String(c[0]))
+        .join("\n"),
+    ).toContain("persisting state failed");
+  });
+
+  it("still stamps a generation with no prior state generation (legacy state)", async () => {
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+    } as never);
+    vi.mocked(execCapture).mockImplementation(clusterOutageOnStateWrite() as never);
+
+    await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    const write = vi
+      .mocked(writeFileSync)
+      .mock.calls.find(([p]) => String(p) === `${localStatePath}.tmp`)!;
+    expect(JSON.parse(String(write[1])).generation).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The routing tier's BUILD ID names the retained manifest snapshot. Reading it out of the image
+// reference broke when images became digest-pinned: `…/routing-service@sha256:<hex>` sliced
+// after the last colon yields the DIGEST HEX, so the snapshot was named after the digest while
+// rollback and cleanup looked for snapshots named after state build ids — a later failed deploy
+// or rollback then could not restore the target manifest, and pairing the old image with the
+// newer manifest now makes the routing pod fail its startup parity check.
+// ---------------------------------------------------------------------------
+describe("readRoutingServingConfig — build id source", () => {
+  function deploymentJson(image: string, opts: { env?: boolean } = {}) {
+    return JSON.stringify({
+      spec: {
+        template: {
+          spec: {
+            containers: [
+              {
+                name: "routing-service",
+                image,
+                ...(opts.env === false ? {} : { env: [{ name: "NEXT_BUILD_ID", value: "b-42" }] }),
+              },
+            ],
+            volumes: [{ name: "routing-manifest", configMap: { name: "rel-routing-manifest" } }],
+          },
+        },
+      },
+    });
+  }
+
+  function mockKubectl(stdout: string) {
+    vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout, stderr: "" } as never);
+  }
+
+  it("reads NEXT_BUILD_ID, not the digest, for a digest-pinned image", async () => {
+    mockKubectl(deploymentJson(`gcr.io/p/routing-service@sha256:${"a".repeat(64)}`));
+    const read = await readRoutingServingConfig("rel");
+    expect(read.status).toBe("read");
+    expect(read.status === "read" && read.config.imageTag).toBe("b-42");
+  });
+
+  it("falls back to the tag for a pre-digest Deployment (no env)", async () => {
+    mockKubectl(deploymentJson("gcr.io/p/routing-service:legacy-build", { env: false }));
+    const read = await readRoutingServingConfig("rel");
+    expect(read.status === "read" && read.config.imageTag).toBe("legacy-build");
+  });
+
+  it("prefers the IMAGE TAG over the env — the image is what actually runs", async () => {
+    // VERIFIED ON THE LIVE CLUSTER as data corruption, which is why the order is pinned here.
+    // `rollback` patches the routing Deployment's image; before this fix it left NEXT_BUILD_ID
+    // at whatever the last `helm upgrade` stamped. Reading the env first therefore reported the
+    // rolled-AWAY-from build as "currently serving", so the next rollback's retention step
+    // copied the mounted manifest into a snapshot named for the WRONG build — overwriting that
+    // build's rollback target. The routing pod then failed assertManifestMatchesImage and
+    // crash-looped (which is how it surfaced instead of silently serving mismatched routes).
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    mockKubectl(deploymentJson("gcr.io/p/routing-service:actually-serving-this"));
+    const read = await readRoutingServingConfig("rel");
+    expect(read.status === "read" && read.config.imageTag).toBe("actually-serving-this");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/disagree/));
+    warn.mockRestore();
+  });
+
+  it("never treats a digest as a build id, even with no env to fall back to", async () => {
+    mockKubectl(
+      deploymentJson(`gcr.io/p/routing-service@sha256:${"b".repeat(64)}`, { env: false }),
+    );
+    const read = await readRoutingServingConfig("rel");
+    // Unidentifiable is a FAILURE — retention must not proceed under a wrong name.
+    expect(read.status).toBe("failed");
+  });
+});
+
+// The revert must move NEXT_BUILD_ID WITH the image, so the env never describes a build the
+// pod is not running. See the corruption chain in readRoutingServingConfig's tests above.
+describe("revertRoutingServiceToBuild — env stays truthful", () => {
+  it("patches NEXT_BUILD_ID alongside the image", async () => {
+    const patches: string[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "patch") {
+        const i = args.findIndex((a) => a === "-p" || a === "--patch");
+        if (i !== -1 && args[i + 1]) patches.push(args[i + 1]!);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "deployment") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:current",
+                      env: [{ name: "NEXT_BUILD_ID", value: "current" }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      // snapshot lookup + everything else succeeds
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target-build",
+      registry: "gcr.io/p",
+    });
+
+    const body = patches.join("\n");
+    expect(body).toContain("routing-service:target-build");
+    expect(body).toContain("NEXT_BUILD_ID");
+    expect(body).toContain("target-build");
+  });
+});
+
+// N87 (SECURITY). The internal dispatch secret is per BUILD, so the edge's secretKeyRef has to
+// move with the image for the same reason NEXT_BUILD_ID does: a reverted edge still presenting
+// the rolled-away-from build's secret is rejected by the rolled-back pools, which then re-resolve
+// every request locally — fail-safe (invariant 1), but middleware runs TWICE per request for as
+// long as the rollback lasts.
+describe("revertRoutingServiceToBuild — the dispatch secret moves with the image", () => {
+  const TARGET = "target-build";
+  const TARGET_SECRET = internalSecretName("rel", TARGET);
+  const LEGACY_SECRET = legacyInternalSecretName("rel");
+
+  /** `existingSecrets` = the Secret names `kubectl get secret --ignore-not-found` finds. */
+  function mockCluster(opts: { existingSecrets: string[]; liveSecretRef?: string | null }) {
+    const patches: string[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "secret") {
+        const name = args[2]!;
+        return opts.existingSecrets.includes(name)
+          ? { exitCode: 0, stdout: `secret/${name}\n`, stderr: "" }
+          : { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "deployment" && args.includes("json")) {
+        const liveRef = opts.liveSecretRef === undefined ? LEGACY_SECRET : opts.liveSecretRef;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:current",
+                      env: [
+                        { name: "NEXT_BUILD_ID", value: "current" },
+                        ...(liveRef
+                          ? [
+                              {
+                                name: "INTERNAL_HEADER_SECRET",
+                                valueFrom: { secretKeyRef: { name: liveRef, key: "secret" } },
+                              },
+                            ]
+                          : []),
+                      ],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "patch") {
+        patches.push(args[args.length - 1]!);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+    return patches;
+  }
+
+  it("repoints the secretKeyRef at the TARGET build's Secret", async () => {
+    const patches = mockCluster({ existingSecrets: [TARGET_SECRET, LEGACY_SECRET] });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    const body = patches.join("\n");
+    expect(body).toContain("INTERNAL_HEADER_SECRET");
+    expect(body).toContain(TARGET_SECRET);
+  });
+
+  it("falls back to the LEGACY stable name for a build deployed before per-build names", async () => {
+    // deploy preserves that Secret (`helm.sh/resource-policy: keep`), and it is the one a
+    // pre-N87 target build's pods actually hold.
+    const patches = mockCluster({
+      existingSecrets: [LEGACY_SECRET],
+      liveSecretRef: "rel-ihs-newer",
+    });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    expect(patches.join("\n")).toContain(LEGACY_SECRET);
+  });
+
+  it("leaves the env alone (with a warning) when the target has no Secret at all", async () => {
+    // Pointing a container at a missing Secret is CreateContainerConfigError — that would turn
+    // a degraded edge into a dead one.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const patches = mockCluster({ existingSecrets: [] });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    expect(patches.join("\n")).not.toContain("INTERNAL_HEADER_SECRET");
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/No internal dispatch Secret found for build/);
+  });
+
+  it("restores the PRIOR secretKeyRef when the reverted rollout fails", async () => {
+    // The revert may already have moved the ref; restoring the image without it would leave the
+    // edge on a secret the (unchanged) pools do not share.
+    const patches: string[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "secret") {
+        return { exitCode: 0, stdout: `secret/${args[2]}\n`, stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "deployment" && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:current",
+                      env: [
+                        { name: "NEXT_BUILD_ID", value: "current" },
+                        {
+                          name: "INTERNAL_HEADER_SECRET",
+                          valueFrom: { secretKeyRef: { name: "rel-ihs-current", key: "secret" } },
+                        },
+                      ],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "rollout") {
+        return { exitCode: 1, stdout: "", stderr: "timed out waiting for the condition" };
+      }
+      if (args[0] === "patch") {
+        patches.push(args[args.length - 1]!);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: TARGET,
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/did not roll out/);
+
+    expect(patches.at(-1)).toContain("rel-ihs-current");
+  });
+
+  it("does not patch the ref to itself when it is already correct", async () => {
+    const patches = mockCluster({
+      existingSecrets: [TARGET_SECRET],
+      liveSecretRef: TARGET_SECRET,
+    });
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: TARGET,
+      registry: "gcr.io/p",
+    });
+
+    expect(patches.join("\n")).not.toContain("INTERNAL_HEADER_SECRET");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A failed routing rollout must not leave the tiers split.
+//
+// OBSERVED LIVE: the revert patched the Deployment, `rollout status` timed out, and the
+// function threw — leaving the pools on one build and the edge rolled (or half-rolled) to
+// another. The site stayed up only because maxUnavailable 0 keeps the old ReplicaSet serving;
+// with `failureMode: closed` a routing outage in that window is 500s on every request.
+// ---------------------------------------------------------------------------
+describe("revertRoutingServiceToBuild — failed rollout restores the edge", () => {
+  const PRIOR_IMAGE = `gcr.io/p/routing-service@sha256:${"a".repeat(64)}`;
+
+  function mockCluster(opts: { rolloutFails: boolean; restoreFails?: boolean }) {
+    let patches = 0;
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      if (j.includes("get deployment") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: PRIOR_IMAGE,
+                      env: [{ name: "NEXT_BUILD_ID", value: "prior-build" }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "rollout") {
+        return opts.rolloutFails
+          ? { exitCode: 1, stdout: "", stderr: "timed out waiting for the condition" }
+          : { exitCode: 0, stdout: "successfully rolled out", stderr: "" };
+      }
+      if (args[0] === "patch") {
+        patches++;
+        // patch #1 is the revert; patch #2 is the restore
+        if (patches === 2 && opts.restoreFails) {
+          return { exitCode: 1, stdout: "", stderr: "conflict" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+    return () => patches;
+  }
+
+  it("restores the PRIOR spec verbatim and says the tiers still agree", async () => {
+    mockCluster({ rolloutFails: true });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target",
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/did not roll out.*restored to what it was serving before/s);
+
+    // The restore reproduces the literal reference — reconstructing it from the build id
+    // would silently downgrade a digest-pinned edge to a tag.
+    const restore = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .at(-1)!;
+    const body = restore[1][restore[1].length - 1]!;
+    expect(body).toContain(PRIOR_IMAGE);
+    expect(body).toContain("prior-build");
+  });
+
+  it("says so explicitly when the restore ALSO fails — that is a different situation", async () => {
+    mockCluster({ rolloutFails: true, restoreFails: true });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target",
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/could NOT be restored.*DIFFERENT builds/s);
+  });
+
+  it("does not patch twice when the rollout succeeds", async () => {
+    const patchCount = mockCluster({ rolloutFails: false });
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target",
+      registry: "gcr.io/p",
+    });
+    expect(patchCount()).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The rolled-back edge should be as immutable as a freshly deployed one. The revert used to
+// reconstruct `<registry>/routing-service:<buildId>` — a TAG — so rolling back silently undid
+// digest pinning, which is the mutable-tag exposure that pinning exists to close (the deploy
+// identity can retag, and these pods hold the internal dispatch secret in env).
+// ---------------------------------------------------------------------------
+describe("revertRoutingServiceToBuild — digest pinning", () => {
+  const DIGEST = `sha256:${"e".repeat(64)}`;
+
+  function mockCluster() {
+    // mock.calls accumulate across tests in this file — clear so the assertions below see only
+    // the patches this test provoked.
+    vi.mocked(execCapture).mockClear();
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      if (j.includes("get deployment") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    { name: "routing-service", image: "gcr.io/p/routing-service:cur" },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+  }
+
+  const patchBody = () =>
+    vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .map((c) => c[1][c[1].length - 1]!)
+      .join("\n");
+
+  it("pins by digest when the deploy recorded one", async () => {
+    mockCluster();
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target",
+      registry: "gcr.io/p",
+      targetImageDigest: DIGEST,
+    });
+    expect(patchBody()).toContain(`routing-service@${DIGEST}`);
+    expect(patchBody()).not.toContain("routing-service:target");
+  });
+
+  it("falls back to the tag for a build with no recorded digest, and warns", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    mockCluster();
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "legacy",
+      registry: "gcr.io/p",
+    });
+    expect(patchBody()).toContain("routing-service:legacy");
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reverting the edge by\s+TAG/i));
+    warn.mockRestore();
   });
 });

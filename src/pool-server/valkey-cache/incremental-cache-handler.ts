@@ -19,6 +19,10 @@ import {
   areTagsExpired,
   areTagsStale,
   computeTagUpdate,
+  chunkManifestTags,
+  filterManifestTags,
+  isRootParamTag,
+  maxTagLength,
   parseTagState,
   TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
@@ -36,26 +40,150 @@ const RETENTION_MARGIN_SECONDS = 60;
 // handler caps its key TTL at the same bound (M7).
 export const DURABLE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
-// Bounds for the tag list stored with an entry (L9). Next's own `cacheTag()` enforces the
-// 256-char per-tag limit, but a route handler can set `x-next-cache-tags` manually with
-// arbitrary content — drop over-limit tags rather than storing/looking-up unbounded lists.
-const MAX_TAGS_PER_ENTRY = 128;
-const MAX_TAG_LENGTH = 256;
+// Single-flight revalidation lock lifetime. Long enough to cover any sane background
+// re-render; short enough that a crashed winner only delays the NEXT revalidation attempt,
+// never the serving of the (stale-but-valid) entry. Mirrors adapter-aws's 30s default.
+const REVALIDATE_LOCK_TTL_SECONDS = 30;
 
 /**
- * Bound a tag list for storage (L9): drop empty/over-long tags and cap the count, keeping the
- * first well-formed tags in declared order. Shared by both handlers (N5) — the V2 `use cache`
- * handler stored `entry.tags` uncapped, so a route emitting thousands of cache tags would push
- * an unbounded list into every entry's meta and every freshness HMGET.
+ * Total budget for one entry's stored tag list (N79). A byte budget, not a count: the point of the
+ * bound is to keep entry meta and the freshness HMGET argv bounded, and 128 tags of 1024 chars is
+ * a bigger list than 500 tags of 40. 64 KiB is far above anything Next generates (a handful of
+ * implicit tags plus the app's declared ones) and far below "unbounded".
+ *
+ * N79 follow-up (review): the budget is spent in UTF-8 BYTES (`Buffer.byteLength`), not in
+ * `String#length`. What lands in the entry JSON and in the freshness `HMGET` argv is the encoded
+ * form, so a non-ASCII tag costs 2–4 bytes per UTF-16 unit — an explicit `cacheTag()` of Cyrillic
+ * or CJK text counts up to 3x what `.length` reports, and a list "within budget" by `.length`
+ * could be ~3x over it on the wire. (Per-tag LIMITS still use `.length`: `maxTagLength` mirrors
+ * upstream's own `NEXT_CACHE_*_MAX_LENGTH` checks, which are `.length`-based.)
+ */
+const MAX_TAG_BYTES_PER_ENTRY = 64 * 1024;
+/**
+ * Defensive count cap on the private root-param markers, which are otherwise never dropped. Next
+ * emits one per root layout param (a handful); this only stops a hand-written
+ * `x-next-cache-tags: _N_RP_a,_N_RP_b,…` from making the "never drop" rule unbounded. It is also
+ * what makes the budget relaxation below a BOUNDED relaxation.
+ */
+const MAX_ROOT_PARAM_TAGS = 256;
+
+/** One tag's cost against the budget: its UTF-8 bytes plus one separator byte. */
+function tagCostBytes(tag: string): number {
+  return Buffer.byteLength(tag, "utf8") + 1;
+}
+
+/**
+ * Bound a tag list for storage (L9/N5/N79): drop malformed tags and bound the total bytes, keeping
+ * declared order. Shared by both handlers.
+ *
+ * N79 — this used to apply a flat 256-char limit and a flat 128-tag cap, and both were wrong for
+ * tags NEXT ITSELF generates:
+ *
+ *   • The 256-char limit is `NEXT_CACHE_TAG_MAX_LENGTH`, which upstream applies only to EXPLICIT
+ *     `cacheTag()` values. Implicit path tags are `_N_T_` + `encodeCacheTag(pathname)`, which
+ *     percent-encodes every non-ASCII byte and is bounded by `NEXT_CACHE_SOFT_TAG_MAX_LENGTH`
+ *     (1024). A measured 63-char Cyrillic pathname expands to a 348-char tag; a 300-char ASCII
+ *     path is a 305-char tag. Probed against real Valkey: such an entry was stored with `tags: []`
+ *     — so NOTHING, not `revalidatePath` and not `revalidateTag`, could ever invalidate it, for
+ *     the 30 days of `DURABLE_TTL_SECONDS` (`revalidate: false` and PPR shells take exactly that
+ *     path). Fixed by applying each tag's real upstream limit (`maxTagLength`).
+ *
+ *   • The 128-count cap kept declared order, and Next appends the private `_N_RP_*` root-param
+ *     markers LAST (`use-cache-wrapper.ts`, `rootParamTags` spread after `fullEntry.tags`). So an
+ *     entry with ≥128 tags lost exactly those markers — measured: 132 tags in, 128 stored, both
+ *     `_N_RP_*` gone — and the reader then finds `paramNames.size === 0` and serves the COARSE
+ *     redirect entry's body (a single `0x00` byte) as the cache hit. Fixed by never dropping a
+ *     root-param tag and by bounding total bytes instead of truncating the tail.
+ *
+ * A tag still over its own upstream limit after all that is dropped: upstream cannot target it
+ * either (`revalidatePath` refuses a path longer than `NEXT_CACHE_SOFT_TAG_MAX_LENGTH`), so
+ * storing it would only cost bytes.
+ *
+ * N79 follow-up (review) — the budget is now a real UPPER BOUND, which it was not: reserved
+ * `_N_RP_*` markers were pushed unconditionally, so once the reserved set alone exceeded the
+ * budget, `remainingBudget` went negative and the returned list simply blew past the advertised
+ * cap (with `.length` used as the cost, a non-ASCII list blew past it even without any markers).
+ *
+ * The deliberate resolution when the RESERVED set alone is over budget: raise the budget to fit
+ * exactly the reserved markers (leaving nothing for ordinary tags) and warn once — NEVER silently
+ * truncate them. Dropping an `_N_RP_*` marker is the bug this whole path exists to prevent: the
+ * reader then finds `paramNames.size === 0` and serves a coarse redirect entry's `0x00`
+ * placeholder byte as a cache hit. So the honest bound is
+ *   `max(MAX_TAG_BYTES_PER_ENTRY, reserved bytes)`
+ * with `reserved bytes` itself bounded by `MAX_ROOT_PARAM_TAGS` markers of at most
+ * `NEXT_CACHE_SOFT_TAG_MAX_LENGTH` UTF-16 units each (≤ 256 × (3·1024 + 1) ≈ 768 KiB worst case,
+ * and ~4 KiB for anything Next actually emits — one marker per root layout param, ASCII names).
+ * Bounded and loud beats silently correct-looking.
  */
 export function capTags(raw: readonly string[]): string[] {
-  const tags: string[] = [];
+  const wellFormed: string[] = [];
+  let rootParamCount = 0;
   for (const tag of raw) {
-    if (typeof tag !== "string" || tag.length === 0 || tag.length > MAX_TAG_LENGTH) continue;
+    if (typeof tag !== "string" || tag.length === 0) continue;
+    if (tag.length > maxTagLength(tag)) continue;
+    if (isRootParamTag(tag) && ++rootParamCount > MAX_ROOT_PARAM_TAGS) {
+      // The one case where a marker IS dropped. Never silent: this is the shape that made the
+      // reader serve a coarse entry's placeholder body as a hit.
+      warnOnce(
+        "cap-tags-root-param-count",
+        `[valkey-cache] an entry declared more than ${MAX_ROOT_PARAM_TAGS} private root-param ` +
+          `tags (_N_RP_*); the excess is dropped. Next emits one per root layout param, so this ` +
+          `indicates a forged x-next-cache-tags header.`,
+      );
+      continue;
+    }
+    wellFormed.push(tag);
+  }
+  // Reserve the root-param markers' bytes up front: they are load-bearing metadata (see
+  // `isRootParamTag`) and must survive even when the rest of the list is over budget.
+  let reservedBytes = 0;
+  for (const tag of wellFormed) if (isRootParamTag(tag)) reservedBytes += tagCostBytes(tag);
+  let budget = MAX_TAG_BYTES_PER_ENTRY;
+  if (reservedBytes > budget) {
+    warnOnce(
+      "cap-tags-reserved-over-budget",
+      `[valkey-cache] an entry's private root-param tags (_N_RP_*) alone need ${reservedBytes} ` +
+        `bytes, over the ${MAX_TAG_BYTES_PER_ENTRY}-byte per-entry tag budget. Keeping them all ` +
+        `and raising this entry's budget to ${reservedBytes} bytes: dropping one would make the ` +
+        `reader serve a coarse entry's placeholder body as a cache hit. No ordinary tag is stored ` +
+        `for this entry.`,
+    );
+    budget = reservedBytes;
+  }
+  budget -= reservedBytes;
+  const tags: string[] = [];
+  for (const tag of wellFormed) {
+    if (isRootParamTag(tag)) {
+      tags.push(tag);
+      continue;
+    }
+    const cost = tagCostBytes(tag);
+    // Skip (don't stop): a long tag must not shadow the shorter ones declared after it.
+    if (cost > budget) continue;
+    budget -= cost;
     tags.push(tag);
-    if (tags.length >= MAX_TAGS_PER_ENTRY) break;
   }
   return tags;
+}
+
+/**
+ * N82: `buildId` namespaces the whole cache keyspace (`k8s:<buildId>:…`), so it must not contain
+ * the separator. `NEXT_BUILD_ID` was trusted verbatim at the point of consumption: a `:` in it
+ * would let one build's `k8s:a:tags` key alias another's `k8s:a:tags` — e.g. buildId `a:entry`
+ * makes `k8s:a:entry:tags` collide with build `a`'s entry key for cacheKey `tags`, so one build
+ * reads another build's bytes. AGENTS.md requires validating operator/build-controlled values AT
+ * the point of consumption even when they were validated upstream (the adapter's `modifyConfig`
+ * generates a hashed, safe id — this is the second gate). Failing closed here is deliberate: the
+ * alternative is silently serving another build's cached pages.
+ */
+const SAFE_BUILD_ID = /^[A-Za-z0-9_.-]{1,128}$/;
+export function assertSafeBuildId(buildId: string): void {
+  if (!SAFE_BUILD_ID.test(buildId)) {
+    throw new Error(
+      "[valkey-cache] refusing to use an unsafe build id for the cache keyspace: it must match " +
+        "/^[A-Za-z0-9_.-]{1,128}$/ (a `:` would let one build's keys alias another's)",
+    );
+  }
 }
 
 // Minimal structural mirror of Next's classic CacheHandler contract (avoids a compile-time
@@ -83,6 +211,43 @@ interface StoredEntry {
   lastModified: number;
   /** Retention hint (seconds) for the Valkey key TTL; not the staleness source. */
   ttlSeconds: number;
+  /** N80: the route's own `revalidate` window in seconds (`false` = never time-revalidate), kept
+   * so a stale-by-tag read can be signalled as SWR rather than as a blocking re-render. */
+  revalidateSeconds?: number | false;
+  /** N80: the route's `expire` window in seconds, if it has one. */
+  expireSeconds?: number;
+}
+
+/**
+ * N80: the `lastModified` to report for an entry that a PROFILED (soft) tag revalidation marked
+ * stale. This must not be `-1`.
+ *
+ * `-1` is not "revalidate in the background" — `incremental-cache/index.ts` maps it to
+ * `isStale = -1`, and `response-cache/index.ts` implements that as "do NOT early-resolve with the
+ * stale value", i.e. the user waits for a full render. `FileSystemCache` never returns `-1` for a
+ * merely-stale tag: it returns `null` for an EXPIRED tag and the untouched entry otherwise, letting
+ * `index.ts` set `isStale = true` (serve stale + revalidate in the background). Measured before this
+ * fix: `after profiled revalidateTag: lastModified = -1` — so `revalidateTag(tag, profile)` blocked
+ * here while being instant-with-SWR under `next start`, breaking parity.
+ *
+ * The way to say "stale, serve it, revalidate behind the request" through this interface is a real
+ * `lastModified` that sits just past the route's revalidate window but still inside its expire
+ * window: `index.ts` computes `revalidateAfter = revalidate*1000 + lastModified` and sets
+ * `isStale = true` when that is in the past, and only escalates to `-1` when
+ * `expire*1000 + lastModified` is also past. `-1` remains the answer when SWR is not expressible:
+ * a route with no numeric `revalidate` (`revalidate: false`, PPR shells) has `revalidateAfter ===
+ * false`, so nothing but `-1` can force a revalidation, and an `expire` window too short to hold
+ * the shift genuinely IS past expiry.
+ */
+function staleByTagLastModified(entry: StoredEntry, now: number): number {
+  const revalidate = entry.revalidateSeconds;
+  if (typeof revalidate !== "number") return -1;
+  // One second past the revalidate boundary: `revalidateAfter` lands at `now - 1000 < now`.
+  const shifted = now - revalidate * 1000 - 1000;
+  if (shifted <= 0) return -1;
+  const expire = entry.expireSeconds;
+  if (typeof expire === "number" && expire * 1000 + shifted < now) return -1;
+  return shifted;
 }
 
 /**
@@ -105,6 +270,17 @@ function parseStoredEntry(raw: string): StoredEntry | undefined {
     return undefined;
   }
   if (!("value" in e)) return undefined;
+  // N80: the cache-control window is advisory (it only shapes the stale-by-tag `lastModified`), so
+  // a corrupt/absent value degrades to "unknown" rather than to a miss — but it must never reach
+  // the arithmetic as NaN.
+  if (
+    "revalidateSeconds" in e &&
+    e.revalidateSeconds !== false &&
+    !Number.isFinite(e.revalidateSeconds)
+  ) {
+    delete e.revalidateSeconds;
+  }
+  if ("expireSeconds" in e && !Number.isFinite(e.expireSeconds)) delete e.expireSeconds;
   return e as unknown as StoredEntry;
 }
 
@@ -181,8 +357,8 @@ function extractTags(value: Record<string, unknown> | null, ctx: SetCtx): string
       raw = [];
     }
   }
-  // Cap count and per-tag length (L9): over-limit tags are dropped, keeping the first
-  // well-formed ones in declared order.
+  // Bound the stored list (L9/N79): each tag against its own upstream length limit, the whole
+  // list against a byte budget, and Next's private `_N_RP_*` markers never dropped.
   return capTags(raw);
 }
 
@@ -200,6 +376,8 @@ export class ValkeyIncrementalCacheHandler {
     this.client = options.client;
     // N8: never Date.now — patched to throw inside tracked static renders (see wallClockNow).
     this.now = options.now ?? wallClockNow;
+    // N82: validate at the point of consumption — this is where the build id becomes keyspace.
+    assertSafeBuildId(options.buildId);
     // Same build-namespaced tag keyspace as the V2 handler, so `revalidateTag` is shared.
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;
@@ -207,6 +385,10 @@ export class ValkeyIncrementalCacheHandler {
 
   private entryKey(cacheKey: string): string {
     return `${this.prefix}inc:${cacheKey}`;
+  }
+
+  private revalidateLockKey(cacheKey: string): string {
+    return `${this.prefix}inc-revalidate-lock:${cacheKey}`;
   }
 
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
@@ -227,14 +409,49 @@ export class ValkeyIncrementalCacheHandler {
         this.client.del(this.entryKey(cacheKey)).catch(() => undefined);
         return null; // hard-revalidated → miss → Next regenerates + calls set
       }
-      // A stale (SWR) tag makes Next revalidate in the background; signal via lastModified=-1,
-      // matching file-system-cache's "trigger blocking/background validation" behavior.
+      // A stale (SWR) tag must make Next serve this value and revalidate BEHIND the request —
+      // never block on a fresh render (N80, see `staleByTagLastModified`).
+      //
+      // Single-flight (survey Tier 1 #5, plans/lessons-from-sibling-adapters.md): without a
+      // lock, EVERY replica that reads a tag-stale entry gets the stale-signalling
+      // lastModified and every one of them re-renders — N pods, N renders, one shared store
+      // (adapter-aws locks the same way before enqueueing, router.ts:772-805; adapter-bun
+      // built the lock table and forgot to call it). Only the reader that wins a short-TTL
+      // NX lock is told "stale"; the rest see the entry as fresh and keep serving it while
+      // the winner revalidates (its `set` releases the lock early; the TTL bounds a crashed
+      // winner). A lock-acquire FAILURE fails open to the stale signal — at worst the old
+      // stampede, never a lost revalidation.
       const staleByTag = areTagsStale(tags, entry.lastModified, manifest);
+      let signalStale = staleByTag;
+      if (staleByTag) {
+        try {
+          const acquired = await this.client.set(
+            this.revalidateLockKey(cacheKey),
+            "1",
+            "NX",
+            "EX",
+            REVALIDATE_LOCK_TTL_SECONDS,
+          );
+          signalStale = acquired !== null;
+        } catch {
+          signalStale = true;
+        }
+      }
       return {
-        lastModified: staleByTag ? -1 : entry.lastModified,
+        lastModified: signalStale ? staleByTagLastModified(entry, now) : entry.lastModified,
         value: decodeValue(entry.value),
       };
-    } catch {
+    } catch (error) {
+      // N81: fail open to a miss (Next regenerates) — but SAY SO. This catch was bare, so a
+      // PERMANENT read failure (NOAUTH, WRONGTYPE, a cluster -MOVED, an exhausted breaker, an
+      // invalid URL) produced ZERO log lines while the pool re-rendered everything from scratch
+      // forever. Measured before the fix: four handler operations against a dead Valkey emitted 0
+      // log lines. M1's own rationale in stream-codec.ts says an outage "must still be OBSERVABLE".
+      logErrorRateLimited(
+        "cache-get",
+        "[valkey-cache] incremental cache read failed; treating it as a miss (the pool is rendering uncached)",
+        error,
+      );
       return null;
     }
   }
@@ -285,6 +502,12 @@ export class ValkeyIncrementalCacheHandler {
         tags,
         lastModified: this.now(),
         ttlSeconds: Math.ceil(ttlSeconds),
+        // N80: remember the route's own cache-control window so a stale-by-tag read can express
+        // stale-while-revalidate instead of forcing a blocking render.
+        revalidateSeconds: typeof revalidate === "number" ? revalidate : false,
+        ...(typeof ctx.cacheControl?.expire === "number"
+          ? { expireSeconds: ctx.cacheControl.expire }
+          : {}),
       };
       const serialized = JSON.stringify(entry);
       // M6: skip (and log once) when the serialized entry exceeds the configured cap — an
@@ -297,29 +520,45 @@ export class ValkeyIncrementalCacheHandler {
         return;
       }
       await this.client.set(this.entryKey(cacheKey), serialized, "EX", entry.ttlSeconds);
-    } catch {
-      // Cache write failure must not break the response.
+      // A completed re-render releases the single-flight revalidation lock early (see `get`);
+      // best-effort — the lock's own TTL is the backstop.
+      this.client.del(this.revalidateLockKey(cacheKey)).catch(() => undefined);
+    } catch (error) {
+      // Cache write failure must not break the response — but it must be observable (N81, see
+      // the matching comment in `get`).
+      logErrorRateLimited(
+        "cache-set",
+        "[valkey-cache] incremental cache write failed; the entry was not cached (the pool will re-render it)",
+        error,
+      );
     }
   }
 
   async revalidateTag(tags: string | string[], durations?: { expire?: number }): Promise<void> {
-    const list = (Array.isArray(tags) ? tags : [tags]).filter(Boolean);
+    // N83: one shared filter for both handlers, so a tag that can be stored is a tag that can be
+    // revalidated (and an empty-string tag never becomes a manifest field).
+    const list = filterManifestTags(Array.isArray(tags) ? tags : [tags]);
     if (list.length === 0) return;
     try {
       const now = this.now();
-      const args: string[] = [];
-      for (const tag of list)
-        args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
-      // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
-      // the per-build manifest's lifetime the same way entry keys are bounded.
-      const clamped = await this.client.eval(
-        UPDATE_TAGS_SCRIPT,
-        1,
-        this.tagsKey,
-        ...args,
-        String(TAG_MANIFEST_TTL_SECONDS),
-      );
-      warnOnClockSkewClamp(clamped);
+      // Chunked, not truncated: every tag the caller passed gets invalidated, in as many
+      // EVALs as the per-call argv bound requires.
+      for (const chunk of chunkManifestTags(list)) {
+        const args: string[] = [];
+        for (const tag of chunk) {
+          args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
+        }
+        // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
+        // the per-build manifest's lifetime the same way entry keys are bounded.
+        const clamped = await this.client.eval(
+          UPDATE_TAGS_SCRIPT,
+          1,
+          this.tagsKey,
+          ...args,
+          String(TAG_MANIFEST_TTL_SECONDS),
+        );
+        warnOnClockSkewClamp(clamped);
+      }
     } catch (error) {
       // Best-effort; a missed manifest write means a revalidation is skipped, not a crash — but
       // it must be OBSERVABLE (M1). Rate-limited so a Valkey outage doesn't spam per-request logs.

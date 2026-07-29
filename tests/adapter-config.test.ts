@@ -67,6 +67,74 @@ describe("createK8sAdapter config normalization", () => {
   });
 });
 
+// N50 (review #22): `nextConfig.generateBuildId ?? (() => …)` never fell through, because
+// Next's DEFAULT config value for generateBuildId is a FUNCTION — `() => null`
+// (next/dist/server/config-shared.js). So the adapter's "K8s-friendly" generator had never
+// run for any app: Next's `generateBuildId(config.generateBuildId, nanoid)` saw the null and
+// used a raw 21-char nanoid (uppercase, `_`, `-`). Evidence: the committed fixture output
+// carries `buildId: z84KgootQN1WpGZR3aUBj` while no fixture sets generateBuildId. That id is
+// the DOCKER IMAGE TAG for every emitted image, and a tag must match `[\w][\w.-]*`, so
+// roughly 1 nanoid in 64 begins with `-` and fails `docker build` — after a full build.
+describe("K8s-friendly build id generation (N50)", () => {
+  const generatedId = async (nextConfig: Record<string, unknown>) => {
+    const adapter = createK8sAdapter(validConfig);
+    const modified = (await adapter.modifyConfig!(nextConfig as any, {} as any)) as {
+      generateBuildId: () => Promise<string | null>;
+    };
+    return modified.generateBuildId();
+  };
+
+  it("generates a lowercase-alnum id when the config carries Next's default `() => null`", async () => {
+    const id = await generatedId({ generateBuildId: () => null });
+    expect(id).toMatch(/^b[0-9a-z]+$/);
+    // Docker-tag safe (`[\w][\w.-]*`) — never a leading "-" or ".".
+    expect(id).toMatch(/^[A-Za-z0-9_][A-Za-z0-9._-]*$/);
+  });
+
+  it("generates one when generateBuildId is absent entirely", async () => {
+    expect(await generatedId({})).toMatch(/^b[0-9a-z]+$/);
+  });
+
+  it("honors a real user generateBuildId (sync and async)", async () => {
+    expect(await generatedId({ generateBuildId: () => "git-sha-abc" })).toBe("git-sha-abc");
+    expect(await generatedId({ generateBuildId: async () => "async-id" })).toBe("async-id");
+  });
+
+  it("falls back when the user's generator declines (null/undefined/empty)", async () => {
+    for (const value of [null, undefined, ""]) {
+      expect(await generatedId({ generateBuildId: () => value })).toMatch(/^b[0-9a-z]+$/);
+    }
+  });
+
+  it("produces distinct ids across calls (blue/green names derive from it)", async () => {
+    const ids = new Set<string | null>();
+    for (let i = 0; i < 20; i++) ids.add(await generatedId({}));
+    expect(ids.size).toBeGreaterThan(1);
+  });
+});
+
+// N50 (review #29): `if (existsSync(src))` around the cache-handler copy meant a missing
+// bundle silently dropped `next.config.cacheHandler` — ISR/PPR-shell revalidation stopped
+// being cross-replica with no log line, while build-metadata still advertised the cache and
+// deploy provisioned a Memorystore instance the incremental cache never used.
+describe("cache handler bundle is required when cache.enabled (N50)", () => {
+  it("throws, naming the missing bundle and `npm run build`", async () => {
+    const emptyDir = mkdtempSync(path.join(os.tmpdir(), "adapter-nobundles-"));
+    const saved = process.env.ADAPTER_K8S_BUNDLE_DIR;
+    process.env.ADAPTER_K8S_BUNDLE_DIR = emptyDir;
+    try {
+      const adapter = createK8sAdapter({ ...validConfig, cache: { enabled: true } });
+      await expect(adapter.modifyConfig!({} as any, {} as any)).rejects.toThrow(
+        /Missing adapter runtime bundle.*cache-handler\.cjs.*npm run build/s,
+      );
+    } finally {
+      if (saved === undefined) delete process.env.ADAPTER_K8S_BUNDLE_DIR;
+      else process.env.ADAPTER_K8S_BUNDLE_DIR = saved;
+      rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("buildId validation at build time (H2)", () => {
   // The finalized buildId flows into helm --set values, K8s names/labels, image tags and
   // chart YAML — an unsafe one (e.g. a git branch from a custom generateBuildId) must
@@ -89,6 +157,26 @@ describe("buildId validation at build time (H2)", () => {
       } as any),
     ).rejects.toThrow(/Invalid buildId/);
   });
+
+  // N50 (review #22): BUILD_ID_RE permits a leading "." or "-", which `docker build -t`
+  // rejects with "invalid reference format" — after the whole build. Assert the tighter
+  // Docker-tag charset at the same place the build id is validated.
+  it.each(["-leading-hyphen", ".leading-dot"])(
+    "rejects a build id that is not a valid Docker tag (%s)",
+    async (buildId) => {
+      const adapter = createK8sAdapter(validConfig);
+      await expect(
+        adapter.onBuildComplete!({
+          buildId,
+          routing: {},
+          outputs: {},
+          projectDir: "/nonexistent",
+          config: {},
+          nextVersion: "16.2.0",
+        } as any),
+      ).rejects.toThrow(/cannot be used as a Docker image tag/);
+    },
+  );
 
   it("mentions the generateBuildId contract in the error", async () => {
     const adapter = createK8sAdapter(validConfig);
@@ -195,6 +283,33 @@ describe("onBuildComplete build-time guards", () => {
     await expect(adapter.onBuildComplete!(ctx("abc99999xyz"))).rejects.toThrow(
       /sanitizes to the same K8s name as the previous build/,
     );
+  });
+
+  // N62 (review #25, routing-tier handoff): pools `api` + `api-v2` with buildId `v2` emit the
+  // SAME Service/Deployment name (`<release>-api-v2`) — once as api's versioned object and
+  // once as api-v2's stable one. helm writes both documents and last-writer-wins, so the
+  // HTTPRoute backendRef can resolve to the wrong pool's pods and the cutover patches the
+  // wrong object's selector. The pre-existing guard only ran when state.json held a previous
+  // build id, i.e. never on a first deploy or from a fresh CI checkout (.k8s-adapter/ is
+  // gitignored), so this check must sit outside it.
+  it("fails when two pool names collide within THIS build (no state.json needed)", async () => {
+    const adapter = createK8sAdapter({
+      ...validConfig,
+      pools: { api: { routes: ["appRoutes"] }, "api-v2": { routes: ["appPages"] } },
+    });
+    await adapter.modifyConfig!({} as any, {} as any);
+    await expect(adapter.onBuildComplete!(ctx("v2"))).rejects.toThrow(
+      /pool names collide within build "v2".*emitted TWICE/s,
+    );
+  });
+
+  it("accepts colliding-looking pool names when the build id does not bridge them", async () => {
+    const adapter = createK8sAdapter({
+      ...validConfig,
+      pools: { api: { routes: ["appRoutes"] }, "api-v2": { routes: ["appPages"] } },
+    });
+    await adapter.modifyConfig!({} as any, {} as any);
+    await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
   });
 
   it("accepts a build id that sanitizes distinctly from the previous build", async () => {

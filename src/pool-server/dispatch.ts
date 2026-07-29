@@ -2,13 +2,14 @@
 import { createServer, request as httpRequest } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { pipeline } from "node:stream";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
 import {
+  INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   localeAlignedRouteParamPathname,
   queryFromUrl,
@@ -45,7 +46,16 @@ function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> 
 function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | string[]> {
   const headers: Record<string, string | string[]> = {};
   for (const [key, value] of webHeaders.entries()) {
-    if (key.toLowerCase() === "set-cookie") continue;
+    const lower = key.toLowerCase();
+    if (lower === "set-cookie") continue;
+    // N39: Next transports cache tags between an entrypoint and the incremental cache in this
+    // header. It is internal bookkeeping, it exposes route/tag structure, and `next start` removes
+    // it before the public response. writeInnerResponse and the manifest serve each deleted it
+    // with an explicit "never forward it to clients" comment, but EVERY web-`Response` boundary —
+    // edge routes, `Response`-returning handlers, render404/renderError, rule/middleware redirects
+    // and middleware-authored bodies — passed it through. One rule, at the single conversion point
+    // all of them share.
+    if (lower === "x-next-cache-tags") continue;
     headers[key] = value;
   }
   const setCookies =
@@ -144,7 +154,10 @@ function readCookieValue(cookieHeader: string, name: string): string | undefined
 //    Mode `__next_preview_data` JWT — the bypass cookie carries no HMAC — so an exact,
 //    constant-time equality against the random build-time id IS the complete upstream scheme.
 // When the build produced no preview identity, neither credential is ever honored.
-function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
+// Exported: index.ts's `_next/data` static fast path must yield to an authenticated
+// draft-mode request the same way this file's strict-404 gate does (survey Tier 1 #2 —
+// `next start` renders fresh in draft mode; the staged prerender must not be served).
+export function isVerifiedPreviewRequest(req: IncomingMessage): boolean {
   const previewModeId = process.env.__NEXT_PREVIEW_MODE_ID;
   if (!previewModeId) return false;
   const revalidateHeader = req.headers["x-prerender-revalidate"];
@@ -196,10 +209,32 @@ function abortOnClientClose(res: ServerResponse, abort: () => void): void {
   }
 }
 
+/**
+ * S19. Absolute cap on a proxied exchange, connect through response body — as opposed to
+ * PROXY_TIMEOUT_MS, which is an IDLE timeout a slow-drip upstream never trips. Generous
+ * (10 min) because a legitimate streamed response may run long; the point is that it is
+ * FINITE, so sockets and request state cannot accumulate without bound.
+ */
+export const PROXY_ABSOLUTE_DEADLINE_MS = 600_000;
+
 // Bounded wait for proxied upstreams (external rewrites + cross-pool). A wedged target
 // must not pin the client connection and this pod's sockets until the server-wide
 // requestTimeout (300s default) fires.
 const PROXY_TIMEOUT_MS = 30_000;
+
+// N37: the same bound for a LOCAL handler invocation, which had none. The only bounded waits were
+// proxyTimeoutMs (proxied upstreams only) and the server-wide `requestTimeout`, which measures
+// request RECEIPT and not handler runtime — so a handler that never answered held a listening
+// loopback server, an ephemeral port, its pendingWaitUntil set and the client socket for as long
+// as the process lived. This bounds TIME TO THE RESPONSE HEAD only, and is disarmed once the
+// entrypoint answers: the same discipline proxyToPool applies to its own idle timeout, and for the
+// same reason — capping the streaming phase would kill SSE and long PPR resumes that a same-pool
+// route is expected to serve. Generous by default (a blocking SSG render on a cold pod is
+// legitimately slow); the point is that it is finite.
+const HANDLER_TIMEOUT_MS = Math.max(
+  1_000,
+  parseInt(process.env.ADAPTER_K8S_HANDLER_TIMEOUT_MS ?? "", 10) || 60_000,
+);
 
 // RFC 9110 §7.6.1 hop-by-hop headers describe a single transport-level connection.
 // Forwarding an upstream's `connection`/`transfer-encoding`/etc. to our client
@@ -437,6 +472,62 @@ export function mergeResolvedHeadersIntoHeadersArg(
   return headersArg;
 }
 
+// Iteration 7: record a response's status/headers/body as it streams to the client, so a
+// fully-keyed platform entry can be replayed byte-identically on later serves. Patches the
+// live response object in place (per-request; same technique as the trust boundary wrapper).
+// An over-budget body abandons recording — the serve itself is never affected.
+function captureResponseForStore(res: ServerResponse, maxBytes: number) {
+  let status = 200;
+  let total = 0;
+  let over = false;
+  const chunks: Buffer[] = [];
+  const headHeaders: Record<string, string | string[]> = {};
+  const record = (chunk: unknown) => {
+    if (over || chunk == null || typeof chunk === "function") return;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    total += buf.length;
+    if (total > maxBytes) {
+      over = true;
+      chunks.length = 0;
+      return;
+    }
+    chunks.push(buf);
+  };
+  const origWriteHead = res.writeHead.bind(res);
+  (res as any).writeHead = function (s: number, ...args: unknown[]) {
+    status = s;
+    const headersArg = typeof args[0] === "string" ? args[1] : args[0];
+    if (headersArg && typeof headersArg === "object" && !Array.isArray(headersArg)) {
+      Object.assign(headHeaders, headersArg as Record<string, string | string[]>);
+    }
+    return origWriteHead(s, ...(args as [never]));
+  };
+  const origWrite = res.write.bind(res);
+  (res as any).write = function (chunk: unknown, ...args: unknown[]) {
+    record(chunk);
+    return (origWrite as (...a: unknown[]) => boolean)(chunk, ...args);
+  };
+  const origEnd = res.end.bind(res);
+  (res as any).end = function (chunk?: unknown, ...args: unknown[]) {
+    record(chunk);
+    return (origEnd as (...a: unknown[]) => ServerResponse)(chunk, ...args);
+  };
+  return {
+    finish():
+      | { status: number; headers: Record<string, string | string[]>; body: Buffer }
+      | undefined {
+      if (over) return undefined;
+      const merged: Record<string, string | string[]> = {
+        ...((res.getHeaders?.() as Record<string, string | string[]>) ?? {}),
+        ...headHeaders,
+      };
+      // The stored copy replays under its own verdict; drop the first serve's.
+      delete merged["x-vercel-cache"];
+      return { status, headers: merged, body: Buffer.concat(chunks) };
+    },
+  };
+}
+
 async function writeInnerResponse(
   outerRes: ServerResponse,
   innerRes: IncomingMessage,
@@ -447,14 +538,34 @@ async function writeInnerResponse(
     status?: number;
   },
   normalizePrerenderCacheControl = false,
+  // Option D: a pending canonical-resume response whose body is APPENDED after the inner
+  // (shell) body. Headers were already sent with the shell, so the tail's headers are
+  // discarded; a failed/errored tail (null or status >= 400) degrades to shell-only.
+  resumeSuffix?: Promise<IncomingMessage | null>,
+  // A build-time fallback artifact backs this route (pprRoutes membership) — feeds the
+  // x-vercel-cache verdict when the entrypoint owns the serve (see the classifier below).
+  buildFallbackBacked = false,
+  // Seen-key registry verdict — a repeat serve of a known platform cache key is HIT
+  // regardless of how the bytes were produced (matrix iteration 4).
+  platformCacheSeen?: boolean,
 ): Promise<void> {
   // A direct adapter entrypoint can produce either of two valid shapes from postponed state:
   // a resume tail (which needs the persisted shell prepended), or a complete HTML document (the
   // partial-fallback chain already replayed its prelude). Peek at the first chunk before committing
   // headers so we do not concatenate two documents for the latter shape.
+  //
+  // N36: peek ONLY when there is a shell to decide about. This wait used to be unconditional,
+  // which withheld the response head until the handler produced its first BODY byte — measured
+  // 1213 ms to headers for a handler that flushes at 0 ms and writes at 1200 ms, where
+  // `next start` sends the head at +14 ms (so an EventSource/SSE consumer connects immediately
+  // instead of hanging until the first event). Nothing else in this function needs the chunk:
+  // `handlerRenderedDocument` is already gated on `!!prefix`.
   const iterator = innerRes[Symbol.asyncIterator]();
-  const first = await iterator.next();
-  const firstChunk = first.done ? undefined : Buffer.from(first.value as Buffer);
+  let firstChunk: Buffer | undefined;
+  if (prefix) {
+    const first = await iterator.next();
+    firstChunk = first.done ? undefined : Buffer.from(first.value as Buffer);
+  }
   const handlerRenderedDocument =
     !!prefix &&
     !!firstChunk &&
@@ -486,9 +597,37 @@ async function writeInnerResponse(
   // It is internal bookkeeping, can expose route/tag structure, and `next start` removes it before
   // the public response. The adapter owns that server boundary, so never forward it to clients.
   delete headers["x-next-cache-tags"];
+  // Platform cache status (plans/prerender-matrix-catchup.md Phase 1). The pool IS the
+  // platform in the deploy harness and in production, and upstream's prerender-matrix suite
+  // asserts `x-vercel-cache` with these semantics: PRERENDER = a BUILD fallback artifact
+  // answered a never-seen key (the prepended shell); HIT = a stored entry answered (Next's
+  // cache said HIT/STALE — STALE still served stored bytes); MISS = blocking generation
+  // with no servable fallback (an Option-D live resume is exactly that: no build artifact
+  // existed, the document rendered per-request). An entrypoint-supplied verdict wins.
+  if (headers["x-vercel-cache"] === undefined) {
+    const nextCache = String(headers["x-nextjs-cache"] ?? "");
+    headers["x-vercel-cache"] = platformCacheSeen
+      ? // Repeat serve of a known platform key: HIT even when the entry contributes zero
+        // bytes and the document re-renders (the matrix's empty-entry sharing contract).
+        "HIT"
+      : effectivePrefix
+      ? "PRERENDER"
+      : nextCache === "HIT" || nextCache === "STALE"
+        ? "HIT"
+        : (nextCache === "MISS" || headers["x-nextjs-postponed"] !== undefined) &&
+            buildFallbackBacked
+          ? // A BUILD fallback artifact answered this serve. Two measured shapes: Next
+            // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
+            // now), or — fresh-key shell+resume — the response carries only
+            // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
+            // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
+            // the HIT/STALE arm above runs first.
+            "PRERENDER"
+          : "MISS";
+  }
   // The combined response is shell bytes followed by resume bytes, so neither
   // component's content length describes the final body.
-  if (effectivePrefix) delete headers["content-length"];
+  if (effectivePrefix || resumeSuffix) delete headers["content-length"];
   // Entrypoints emit origin-oriented s-maxage/private cache directives for
   // incremental responses. In adapter deploy mode the platform cache owns ISR,
   // while the browser-facing response must always revalidate. Next marks this
@@ -501,18 +640,38 @@ async function writeInnerResponse(
   // already declared uncacheable (PPR documents are `private, no-cache, no-store`) keeps
   // that stricter verdict — this guard exists to stop long-lived leaks, not to loosen.
   const innerCacheControl = String(headers["cache-control"] ?? "");
+  const uncacheableAlready = /\b(?:no-store|no-cache|private)\b/i.test(innerCacheControl);
   const prerenderLeaksCacheable =
-    headers["x-nextjs-prerender"] !== undefined &&
-    !/\b(?:no-store|no-cache|private)\b/i.test(innerCacheControl);
+    headers["x-nextjs-prerender"] !== undefined && !uncacheableAlready;
+  // N30 (SECURITY/CACHE): `x-nextjs-postponed` marks the same leak class and was NOT in this
+  // guard. A postponed response is an UNFINISHED shell whose dynamic holes stream per request,
+  // and it need carry neither `x-nextjs-cache` nor `x-nextjs-prerender` — so a minimal-mode
+  // entrypoint's `s-maxage=31536000` passed straight through, untagged, and Cloud CDN kept an
+  // incomplete document for a year that no cutover tag invalidation could purge (M13 class).
+  // `next start` answers a PPR document `private, no-cache, no-store, max-age=0,
+  // must-revalidate` (measured). Same one-directional rule as the prerender guard above: a
+  // response the entry already declared uncacheable keeps its stricter verdict.
+  const postponedLeaksCacheable =
+    headers["x-nextjs-postponed"] !== undefined && !uncacheableAlready;
   if (
     normalizePrerenderCacheControl ||
     headers["x-nextjs-cache"] !== undefined ||
-    prerenderLeaksCacheable
+    prerenderLeaksCacheable ||
+    postponedLeaksCacheable
   ) {
     headers["cache-control"] = "public, max-age=0, must-revalidate";
     delete headers["cache-tag"];
   }
   outerRes.writeHead(forceStatus ?? effectivePrefix?.status ?? innerRes.statusCode ?? 200, headers);
+  // N36: writeHead alone does not put the head on the wire — Node holds the header bytes until
+  // the first body write, so a stream whose first chunk is seconds away still had its head
+  // withheld even after the peek was removed. In `next start` the app's own `res.flushHeaders()`
+  // acts on the socket response directly; here the app flushed the LOOPBACK response, so the
+  // adapter has to carry that flush across the boundary. (No-op when a prefix body follows
+  // immediately below, and harmless for fixed-length responses beyond one extra small segment.)
+  if (typeof (outerRes as { flushHeaders?: unknown }).flushHeaders === "function") {
+    outerRes.flushHeaders();
+  }
   if (effectivePrefix && !(await writeChunkSafely(outerRes, effectivePrefix.body))) {
     innerRes.destroy();
     return;
@@ -529,6 +688,20 @@ async function writeInnerResponse(
       // Client is gone — stop reading the inner response and let it be discarded.
       innerRes.destroy();
       return;
+    }
+  }
+  if (resumeSuffix) {
+    const tail = await resumeSuffix.catch(() => null);
+    if (tail && (tail.statusCode ?? 500) < 400) {
+      for await (const chunk of tail) {
+        if (!(await writeChunkSafely(outerRes, chunk as Buffer))) {
+          tail.destroy();
+          return;
+        }
+      }
+    } else if (tail) {
+      // Error tail: never forward the body, but drain it so the loopback socket closes.
+      tail.resume();
     }
   }
   if (!outerRes.writableEnded) outerRes.end();
@@ -592,6 +765,10 @@ async function invokeLocalHandlerOverHttp({
   renderError,
   revalidate,
   i18nLocales,
+  handlerTimeoutMs = HANDLER_TIMEOUT_MS,
+  capturePostponedState = false,
+  buildFallbackBacked = false,
+  platformCacheSeen,
 }: {
   handler: HandlerLoader extends { load(outputId: string): Promise<infer T> } ? T : never;
   req: IncomingMessage;
@@ -641,8 +818,32 @@ async function invokeLocalHandlerOverHttp({
   revalidate?: Revalidate;
   /** Pages i18n locale prefixes are protocol routing state, not dynamic page params. */
   i18nLocales?: string[];
+  /** N37: bound on time-to-response-head for this invocation. See HANDLER_TIMEOUT_MS. */
+  handlerTimeoutMs?: number;
+  /**
+   * Rev-4 "Option D" (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md):
+   * shell-less PPR-capable route running MINIMAL. Swap the inert onCacheEntryV2 stub for a
+   * capturing one (same signature, still returns false — the callback's PRESENCE is part of
+   * the measured baseline and must never vary, only its body). If the render then postpones
+   * (`x-nextjs-postponed: 1`), the pool performs the platform half itself: POST the captured
+   * state back to the same entrypoint with `next-resume: 1` (the canonical resume contract,
+   * app-page.ts:384-406 — gated on header+method, NOT on minimal mode) and append the resumed
+   * stream after the shell. Runtime discrimination: a render that does not postpone is never
+   * touched, which is what the build-time signal could not provide (rev 3).
+   */
+  capturePostponedState?: boolean;
+  /** pprRoutes membership: a build fallback artifact backs this route (x-vercel-cache). */
+  buildFallbackBacked?: boolean;
+  /** Seen-key registry verdict: this platform cache key was served before (→ HIT). */
+  platformCacheSeen?: boolean;
 }): Promise<void> {
+  // Option D applies only to MINIMAL invocations: a non-minimal render is resumed inline by
+  // Next itself (app-page.ts:2038), so capturing there would only risk a duplicate resume.
+  const captureActive = capturePostponedState && minimalMode;
   await new Promise<void>((resolve, reject) => {
+    // Option D: the postponed state of a live minimal-mode render, observed (never consumed)
+    // through the documented onCacheEntryV2 callback. Written at most once per invocation.
+    let capturedPostponed: string | undefined;
     const pendingWaitUntil = new Set<Promise<void>>();
     const trackWaitUntil = (waitable: Promise<unknown>): void => {
       const observed: Promise<void> = Promise.resolve(waitable)
@@ -749,7 +950,19 @@ async function invokeLocalHandlerOverHttp({
               // Cache Components entrypoints use the presence of the documented V2 callback to
               // select adapter/minimal-mode cache semantics (including RDC generation). Returning
               // false means the adapter observed the entry but did not write the HTTP response.
-              onCacheEntryV2: async () => false,
+              // Option D: for eligible shell-less PPR routes the same callback also OBSERVES the
+              // entry's postponed state (capture only — still returns false, and the callback is
+              // present either way so Next's presence-keyed branches cannot vary by eligibility).
+              onCacheEntryV2: captureActive
+                ? async (entry: unknown) => {
+                    const postponed = (entry as { value?: { postponed?: unknown } } | undefined)
+                      ?.value?.postponed;
+                    if (typeof postponed === "string" && postponed.length > 0) {
+                      capturedPostponed = postponed;
+                    }
+                    return false;
+                  }
+                : async () => false,
               ...(render404 ? { render404 } : {}),
               ...(revalidate ? { revalidate } : {}),
             },
@@ -793,6 +1006,17 @@ async function invokeLocalHandlerOverHttp({
 
       const reqHeaders = toNodeHeaders(req);
       Object.assign(reqHeaders, invocationHeaders);
+      // Matrix B-cluster: canary's ResponseCache grew a minimal-mode LRU keyed
+      // (pathname + invocationID) — the platform stamps a unique `x-invocation-id` per
+      // invocation (route-module.ts:1153) so reuse is scoped to ONE request; without it the
+      // cache falls back to TTL mode and replays minimal renders byte-identically across
+      // requests (measured: the empty-shell "frozen badge" bake). Always overwrite: the id
+      // is a cache-scoping key, so a client-supplied value must never survive. The Option-D
+      // resume invocation clones these headers and deliberately SHARES the id — the resume
+      // is the same logical invocation.
+      if (minimalMode) {
+        reqHeaders["x-invocation-id"] = randomUUID();
+      }
       // We forward a fixed-length buffered body (or none), so restate the framing:
       // Node's HTTP parser rejects a request carrying BOTH transfer-encoding and
       // content-length (spurious 400 before the handler runs), and a forged
@@ -837,6 +1061,22 @@ async function invokeLocalHandlerOverHttp({
         loopbackPath = search ? `${rawPath}?${search}` : rawPath;
       }
 
+      // N37: arm the invocation deadline. It covers everything up to the entrypoint's response
+      // HEAD — including the loopback dial — and is disarmed the moment those headers arrive, so
+      // a legitimately long stream is untouched. On expiry the loopback request is destroyed
+      // (which closes the ephemeral server and releases the port through the error path below)
+      // and the client gets a 504 if nothing has been written yet.
+      let invocationTimedOut = false;
+      const invocationDeadline = setTimeout(() => {
+        invocationTimedOut = true;
+        console.error(
+          `[pool-server] handler for ${matchedPathname} did not respond within ` +
+            `${handlerTimeoutMs}ms — aborting the invocation`,
+        );
+        clientReq.destroy(new Error(`handler invocation timed out after ${handlerTimeoutMs}ms`));
+      }, handlerTimeoutMs);
+      invocationDeadline.unref?.();
+
       const clientReq = httpRequest(
         {
           hostname: "127.0.0.1",
@@ -846,6 +1086,7 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
+          clearTimeout(invocationDeadline);
           const closeThenSettle = (onError: (error: unknown) => void): void => {
             // App Router wires after() through res.on("close"). Close the loopback response first
             // so that callback can register its waitUntil promise, then drain the complete batch.
@@ -864,6 +1105,49 @@ async function invokeLocalHandlerOverHttp({
               .catch((error) => server.close(() => reject(error)));
             return;
           }
+          // Option D: the render postponed and the state was captured — start the canonical
+          // resume NOW, in parallel with streaming the shell (the App Hosting model). POST,
+          // same loopback URL, `next-resume: 1`, raw state as the body (app-page.ts:384-406).
+          // Failure resolves null: the client gets the shell alone, never an error tail.
+          let resumeSuffix: Promise<IncomingMessage | null> | undefined;
+          if (
+            captureActive &&
+            clientRes.headers["x-nextjs-postponed"] === "1" &&
+            capturedPostponed
+          ) {
+            const stateBody = Buffer.from(capturedPostponed, "utf8");
+            const resumeHeaders = { ...reqHeaders, "next-resume": "1" };
+            restateFramingHeaders(resumeHeaders, stateBody, "POST", true);
+            resumeSuffix = new Promise<IncomingMessage | null>((resolveResume) => {
+              const resumeDeadline = setTimeout(() => {
+                console.error(
+                  `[pool-server] PPR resume for ${matchedPathname} did not respond within ` +
+                    `${handlerTimeoutMs}ms — serving the shell alone`,
+                );
+                resumeReq.destroy();
+                resolveResume(null);
+              }, handlerTimeoutMs);
+              resumeDeadline.unref?.();
+              const resumeReq = httpRequest(
+                {
+                  hostname: "127.0.0.1",
+                  port: address.port,
+                  method: "POST",
+                  path: loopbackPath,
+                  headers: resumeHeaders,
+                },
+                (resumeRes) => {
+                  clearTimeout(resumeDeadline);
+                  resolveResume(resumeRes);
+                },
+              );
+              resumeReq.once("error", () => {
+                clearTimeout(resumeDeadline);
+                resolveResume(null);
+              });
+              resumeReq.end(stateBody);
+            });
+          }
           void writeInnerResponse(
             res,
             clientRes,
@@ -876,6 +1160,9 @@ async function invokeLocalHandlerOverHttp({
                 }
               : undefined,
             normalizePrerenderCacheControl,
+            resumeSuffix,
+            buildFallbackBacked,
+            platformCacheSeen,
           )
             .then(() => closeThenSettle(reject))
             .catch((error) => {
@@ -885,6 +1172,21 @@ async function invokeLocalHandlerOverHttp({
       );
 
       clientReq.once("error", (error) => {
+        clearTimeout(invocationDeadline);
+        // N37: a deadline abort is the adapter's own teardown, not an entrypoint crash — answer
+        // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
+        // invocations share the outer `res` with a response already sent to the client, so they
+        // must never write; they just release the socket and the port.
+        if (invocationTimedOut) {
+          if (!discardResponse && !res.headersSent) {
+            res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+            res.end("Gateway Timeout");
+          } else if (!discardResponse && !res.writableEnded) {
+            res.end();
+          }
+          server.close(() => resolve());
+          return;
+        }
         server.close(() => reject(error));
       });
 
@@ -1066,6 +1368,35 @@ type LocalHandlerInvoker = typeof invokeLocalHandlerOverHttp;
 // (`/_not-found`), Pages Router handler (`/404`), a prerendered Pages Router `/404.html` from the
 // static manifest, then plain text. Previously only `/_not-found` was attempted, so a pages-router
 // app with a custom `pages/404` (which prerenders to a static `404.html`) got a bare "Not Found".
+// Mirrors upstream next/src/server/lib/is-non-html-sec-fetch-dest.ts (canary.97): request
+// destinations that cannot display HTML. Excludes `document`/`iframe` (HTML-capable) and
+// `empty` (fetch()/XHR, including RSC requests) — and absent headers, which must keep full
+// handler semantics.
+const NON_HTML_SEC_FETCH_DESTS = new Set([
+  "audio",
+  "audioworklet",
+  "font",
+  "image",
+  "json",
+  "manifest",
+  "paintworklet",
+  "report",
+  "script",
+  "serviceworker",
+  "sharedworker",
+  "style",
+  "track",
+  "video",
+  "webidentity",
+  "worker",
+  "xslt",
+]);
+
+function isNonHtmlSecFetchDest(req: IncomingMessage): boolean {
+  const dest = req.headers["sec-fetch-dest"];
+  return typeof dest === "string" && NON_HTML_SEC_FETCH_DESTS.has(dest);
+}
+
 async function serveNotFound(
   handlerLoader: HandlerLoader,
   localHandlerInvoker: LocalHandlerInvoker,
@@ -1075,6 +1406,39 @@ async function serveNotFound(
   bufferedBody: Buffer | undefined,
   basePath = "",
 ): Promise<void> {
+  // Deploy contract (upstream not-found-non-document, canary.97): for non-HTML subresource
+  // requests (sec-fetch-dest: image/font/manifest/…) the deployed routing layer serves the
+  // PRERENDERED App Router /_not-found "without invoking Next.js" (the upstream test's own
+  // comment — Vercel's CDN behavior). Invoking the /_not-found entrypoint instead runs
+  // base-server's new isNonHtmlSecFetchDest branch, which answers text/plain — `next start`
+  // semantics, where the deploy branch asserts text/html from the prerender. Deliberately
+  // SCOPED to that request class: document/RSC/fetch requests keep the proven handler path
+  // (fresh render, draft-capable). Two prerender sources, in order: the static-assets
+  // manifest entry, then the build artifact on disk — the build's INJECTED /_not-found has
+  // no source file, so its adapter output carries no fallback.filePath and no asset entry
+  // is emitted, but `.next/server/app/_not-found.html` is always staged with the app.
+  if (isNonHtmlSecFetchDest(req)) {
+    const prerenderedNotFound = staticAssets.find(
+      (a) =>
+        (a.pathname === (basePath ? `${basePath}/_not-found` : "/_not-found") ||
+          a.pathname === "/_not-found") &&
+        (a as { prerender?: boolean }).prerender,
+    );
+    const candidates = [
+      ...(prerenderedNotFound ? [path.resolve(process.cwd(), prerenderedNotFound.filePath)] : []),
+      path.join(process.cwd(), ".next", "server", "app", "_not-found.html"),
+    ];
+    for (const fullPath of candidates) {
+      if (existsSync(fullPath) && !res.writableEnded) {
+        res.writeHead(404, {
+          "content-type": "text/html; charset=utf-8",
+          ...(prerenderedNotFound?.headers as Record<string, string> | undefined),
+        });
+        res.end(readFileSync(fullPath));
+        return;
+      }
+    }
+  }
   const notFoundPaths = [
     ...(basePath ? [`${basePath}/_not-found`, `${basePath}/404`] : []),
     "/_not-found",
@@ -1169,15 +1533,23 @@ export interface DispatcherOptions {
       initialHeaders?: Record<string, string | string[]>;
       initialStatus?: number;
       tags?: string[];
+      /** Params partitioning the platform cache key (build's allowQuery) — seen-key registry. */
+      allowQuery?: string[];
     }
   >;
   /** N16: PPR-capable route templates with no build-emitted fallback shell (`fallback: null`),
-   * each tagged with the unresolved ROOT params that stopped the build from emitting one. See the
-   * RoutingManifest doc comment in types.ts — only the root-param flavour runs NON-minimal; the
-   * rest merely need to be recognized as PPR so N13 leaves them alone.
+   * each tagged with the unresolved ROOT params that stopped the build from emitting one, plus
+   * (N16b) whether the build render postponed at all. See the RoutingManifest doc comment in
+   * types.ts — the root-param flavour and the would-postpone flavour each run NON-minimal for a
+   * DIFFERENT documented reason; the remainder merely need to be recognized as PPR so N13 leaves
+   * them alone.
+   * `wouldPostpone` is optional: manifests built before N16b carry only `rootParams`, and a
+   * missing bit must degrade to the pre-N16b behavior (minimal), never to non-minimal.
    * `| undefined` is explicit: under exactOptionalPropertyTypes the index.ts wiring passes
    * `routingManifest.pprCapableRoutes` straight through, and older manifests have no such key. */
-  pprCapableRoutes?: Record<string, { rootParams: string[] }> | undefined;
+  pprCapableRoutes?:
+    | Record<string, { rootParams: string[]; wouldPostpone?: boolean; allowQuery?: string[] }>
+    | undefined;
   /** Returns true if any of a PPR shell's baked cache tags have been revalidated since deploy (read
    * live from the shared Valkey manifest). Used only when NO classic incremental cacheHandler is
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
@@ -1199,6 +1571,9 @@ export interface DispatcherOptions {
   /** Bounded wait for proxied upstreams (external rewrite / cross-pool). Defaults to
    * PROXY_TIMEOUT_MS; injectable so tests don't wait out the real budget. */
   proxyTimeoutMs?: number | undefined;
+  /** N37: bound on time-to-response-head for a LOCAL handler invocation. Defaults to
+   * HANDLER_TIMEOUT_MS (ADAPTER_K8S_HANDLER_TIMEOUT_MS); injectable for the same reason. */
+  handlerTimeoutMs?: number | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
@@ -1250,6 +1625,7 @@ export function createDispatcher(options: DispatcherOptions) {
     i18nLocales = [],
     builtAt,
     proxyTimeoutMs = PROXY_TIMEOUT_MS,
+    handlerTimeoutMs = HANDLER_TIMEOUT_MS,
   } = options;
 
   // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
@@ -1265,6 +1641,62 @@ export function createDispatcher(options: DispatcherOptions) {
   // resume a fallback shell for `without-suspense`/`without-io` routes, which upstream renders
   // dynamically (it answered `x-nextjs-postponed: 1` and a build-time root layout).
   const pprCapableRoutes = new Set(Object.keys(pprCapableRouteMap));
+  // Matrix iteration 4: the platform seen-key registry. Upstream's contract proves cache-
+  // entry sharing THROUGH x-vercel-cache — a key's first serve is PRERENDER/MISS, every
+  // later serve of the SAME key (params outside allowQuery mutated) is HIT, even when the
+  // entry contributes zero bytes. Keyed template + allowQuery-param values; only routes
+  // whose build declared allowQuery participate (bounded, and plain dynamic routes never
+  // register). In-process per pool: the harness runs one pool; production cross-replica
+  // consistency can later back this with Valkey (SETNX) — see plans/prerender-matrix-catchup.md.
+  const PLATFORM_KEY_REGISTRY_CAP = 10_000;
+  const platformSeenKeys = new Set<string>();
+  function checkAndRecordPlatformKey(key: string): boolean {
+    if (platformSeenKeys.has(key)) return true;
+    if (platformSeenKeys.size >= PLATFORM_KEY_REGISTRY_CAP) {
+      const oldest = platformSeenKeys.values().next().value;
+      if (oldest !== undefined) platformSeenKeys.delete(oldest);
+    }
+    platformSeenKeys.add(key);
+    return false;
+  }
+  // Iteration 7: the platform RESPONSE store, for FULLY-KEYED entries only (allowQuery
+  // covers every template param → the entry is fully static and the platform must replay
+  // the stored bytes on a seen key — on Vercel this replay lives in the edge cache, which
+  // the per-request x-invocation-id correctly scopes away from the lambda LRU). Partial
+  // keys re-render per request and prove sharing through the header alone. Bounded both
+  // ways; an over-size body is simply not stored (every serve stays correct, later serves
+  // re-render).
+  const PLATFORM_STORE_CAP = 500;
+  const PLATFORM_STORE_MAX_BODY = 2 * 1024 * 1024;
+  const platformResponseStore = new Map<
+    string,
+    { status: number; headers: Record<string, string | string[]>; body: Buffer }
+  >();
+  function storePlatformResponse(
+    key: string,
+    entry: { status: number; headers: Record<string, string | string[]>; body: Buffer },
+  ): void {
+    if (entry.body.length > PLATFORM_STORE_MAX_BODY) return;
+    if (platformResponseStore.size >= PLATFORM_STORE_CAP) {
+      const oldest = platformResponseStore.keys().next().value;
+      if (oldest !== undefined) platformResponseStore.delete(oldest);
+    }
+    platformResponseStore.set(key, entry);
+  }
+  const TEMPLATE_PARAM_RE = /\[\[?\.\.\.([^\]]+)\]\]?|\[([^\]]+)\]/g;
+  function templateParamNames(template: string): string[] {
+    return [...template.matchAll(TEMPLATE_PARAM_RE)]
+      .map((m) => m[1] ?? m[2])
+      .filter((name): name is string => !!name);
+  }
+  // Option D eligibility (spec rev 4): shell-less PPR templates with NO unresolved root params
+  // — the class whose minimal render can postpone with nothing to resume it. Root-param
+  // templates are excluded (they already run non-minimal for their own documented reason).
+  const pprCapableResumeRoutes = new Set(
+    Object.entries(pprCapableRouteMap)
+      .filter(([, entry]) => (entry.rootParams?.length ?? 0) === 0)
+      .map(([route]) => route),
+  );
   const pprRootParamRoutes = new Set(
     Object.entries(pprCapableRouteMap)
       .filter(([, entry]) => (entry.rootParams?.length ?? 0) > 0)
@@ -1571,7 +2003,15 @@ export function createDispatcher(options: DispatcherOptions) {
         );
         dispatchStaticAsset = staticAsset;
         const isReadMethod = req.method === "GET" || req.method === "HEAD";
-        const isPreviewRequest = (req.headers.cookie ?? "").includes("__prerender_bypass=");
+        // N38 (SECURITY): a VERIFIED credential, not a cookie-name substring. This gate used to be
+        // `(req.headers.cookie ?? "").includes("__prerender_bypass=")`, so any client — including
+        // one sending `Cookie: not__prerender_bypass=x` — disabled the seed/shell fast paths and
+        // forced a full render on every request (cheap CPU amplification, plus a way to keep a
+        // shared-cache seed from ever being used). isVerifiedPreviewRequest implements upstream's
+        // actual scheme: a constant-time match against this build's random previewModeId, for the
+        // bypass cookie AND the on-demand-revalidate header, and never honored when the build
+        // produced no preview identity.
+        const isPreviewRequest = isVerifiedPreviewRequest(req);
         // Handler-less prerenders (pages SSG emits no function) are served from
         // the manifest file for GET/HEAD only. A POST to a fully-static page 405s
         // below — that IS upstream behavior: `next start` answers non-GET/HEAD on a
@@ -1699,6 +2139,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 discardResponse: true,
                 render404: render404FromEntrypoint,
                 renderError: renderErrorFromEntrypoint,
+                handlerTimeoutMs,
                 ...(revalidate ? { revalidate } : {}),
               }),
             )
@@ -1813,6 +2254,11 @@ export function createDispatcher(options: DispatcherOptions) {
               res.end();
               return;
             }
+            // N31: REQUIRED for HEAD — Node marks a HEAD response body-less and then emits NEITHER
+            // Content-Length NOR Transfer-Encoding, so HEAD reported no size where `next start`
+            // sends the real one (measured). Third instance of the bug sendImageResponse already
+            // documents. Stamped after the manifest headers so it always describes these bytes.
+            headers["content-length"] = String(content.length);
             res.writeHead(staticAsset.status ?? 200, headers);
             res.end(req.method === "HEAD" ? undefined : content);
             return;
@@ -1912,6 +2358,25 @@ export function createDispatcher(options: DispatcherOptions) {
             proxyReq.on("timeout", () => {
               proxyReq.destroy(new Error(`external rewrite to ${target.origin} timed out`));
             });
+
+            // S19 (AVAILABILITY). `timeout` above is an IDLE timeout — an upstream that emits
+            // one byte just inside each interval holds a client socket, an upstream socket and
+            // this request's state indefinitely, and repeating it exhausts file descriptors and
+            // memory. The image fetch grew an absolute deadline for exactly this shape (N35);
+            // the proxy path did not. Bound the WHOLE exchange, connect through body.
+            const absoluteDeadline = setTimeout(() => {
+              proxyReq.destroy(
+                new Error(
+                  `external rewrite to ${target.origin} exceeded the ${PROXY_ABSOLUTE_DEADLINE_MS}ms absolute deadline`,
+                ),
+              );
+            }, PROXY_ABSOLUTE_DEADLINE_MS);
+            // Never hold the event loop open on its own account.
+            absoluteDeadline.unref?.();
+            // Cleared on the PROXY request's close, which covers both normal completion and
+            // an abort. Deliberately not also on `res` close: if the client hangs up while the
+            // upstream keeps trickling, letting the deadline fire is the point.
+            proxyReq.on("close", () => clearTimeout(absoluteDeadline));
 
             proxyReq.on("error", (err) => {
               // A client abort is our own deliberate teardown, not an upstream failure —
@@ -2274,6 +2739,80 @@ export function createDispatcher(options: DispatcherOptions) {
           const handlerPprRootParams = pprCapableCandidates.some((candidate) =>
             pprRootParamRoutes.has(candidate),
           );
+          // Matrix iteration 4: platform cache key for the seen-key registry. First
+          // candidate with a build-declared allowQuery wins; params resolve from the
+          // routing verdict. Recorded on FIRST sight (a failed render then reports HIT on
+          // the retry — acceptable: the contract's subjects always 200).
+          let platformCacheSeen: boolean | undefined;
+          let platformKey: string | undefined;
+          let platformFullyKeyed = false;
+          // Byte-replay eligibility is NARROWER than key membership (iteration 8, measured
+          // against the canary.97 suite): only SHELL-LESS templates (pprCapableRoutes-
+          // sourced keys — the matrix's fully-static empty-shell class) and only DOCUMENT
+          // requests. Shell-bearing routes replay through Next's own cache (and carry the
+          // tag/revalidate surfaces the store must never serve stale); RSC/segment
+          // requests have variant payloads the document-keyed store would corrupt.
+          //
+          // S17 (SECURITY): and only under emulatePlatformCache — i.e. NEVER in production.
+          // The store is a process-local stand-in for the CDN edge cache, but its key is
+          // `template|param=value` and nothing else: no cookies, no Authorization, no
+          // middleware-injected identity. Capture rejects nothing either — not `Set-Cookie`,
+          // not `Cache-Control: private`. A PPR route that personalizes inside a dynamic
+          // hole would serve one visitor's document, and their session cookie, to the next.
+          // A real deployment has Cloud CDN for the sharing this emulates and Valkey for
+          // the entries worth keeping; neither is a per-pod Map. The x-vercel-cache HEADER
+          // is unaffected in both postures — it comes from the seen-key registry, which
+          // records key strings only and never response bytes.
+          let platformStoreEligible = false;
+          const platformDocumentRequest =
+            emulatePlatformCache &&
+            req.method === "GET" &&
+            req.headers[rscConfig?.header ?? "rsc"] !== "1" &&
+            req.headers["next-router-prefetch"] !== "1" &&
+            req.headers["next-router-segment-prefetch"] === undefined;
+          for (const candidate of pprCapableCandidates) {
+            const capableAq = (
+              pprCapableRouteMap[candidate] as { allowQuery?: string[] } | undefined
+            )?.allowQuery;
+            const aq = pprRoutes[candidate]?.allowQuery ?? capableAq;
+            if (!aq) continue;
+            platformStoreEligible = capableAq !== undefined && platformDocumentRequest;
+            const params =
+              extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
+            // The build emits nxtP-prefixed param names in allowQuery; extracted route
+            // params are bare. Try both spellings (measured on the matrix fixture:
+            // ["nxtPlang"] vs params.lang — unnormalized, every key per template collapsed).
+            const bareAq = aq.map((p) => (p.startsWith("nxtP") ? p.slice(4) : p));
+            platformKey =
+              candidate +
+              "|" +
+              aq
+                .map((p, i) => {
+                  const value =
+                    (params as Record<string, unknown>)[bareAq[i]!] ??
+                    (params as Record<string, unknown>)[p];
+                  return `${p}=${Array.isArray(value) ? value.join("/") : String(value ?? "")}`;
+                })
+                .join("&");
+            // Fully keyed ⟺ every template param partitions the key ⟺ the entry is fully
+            // static ⟺ the platform replays stored bytes (iteration 7).
+            platformFullyKeyed = templateParamNames(candidate).every((name) =>
+              bareAq.includes(name),
+            );
+            platformCacheSeen = checkAndRecordPlatformKey(platformKey);
+            break;
+          }
+          // Platform replay: a seen, fully-keyed, stored entry is served without invoking
+          // anything — the platform-cache behavior the matrix's fully-static cells assert.
+          if (platformCacheSeen && platformFullyKeyed && platformStoreEligible && platformKey) {
+            const stored = platformResponseStore.get(platformKey);
+            if (stored && !res.writableEnded) {
+              res.writeHead(stored.status, { ...stored.headers, "x-vercel-cache": "HIT" });
+              res.end(stored.body);
+              return;
+            }
+          }
+
           // A concrete non-PPR prerender under a PPR-capable dynamic handler is a blocking/static
           // branch of that route, not permission to reuse the handler template's generic shell.
           // Falling through to the generic postponed state leaks build-time layouts into requests
@@ -2319,9 +2858,12 @@ export function createDispatcher(options: DispatcherOptions) {
               // the client receives the single `[shell][resume]` response required by the PPR
               // protocol. RSC requests consume only the resumed flight stream and must not get
               // HTML prepended.
+              // N43: the BUILD-PINNED RSC header name, as every neighbouring check uses. With
+              // `req.headers.rsc` hardcoded, an app with a custom RSC header name had the HTML
+              // shell prepended to a flight stream — a corrupt payload, not a degraded one.
               const isDocumentRequest =
                 req.method === "GET" &&
-                req.headers.rsc !== "1" &&
+                req.headers[rscConfig?.header ?? "rsc"] !== "1" &&
                 req.headers["next-router-prefetch"] !== "1";
               if (isDocumentRequest) {
                 pprResponsePrefix = {
@@ -2340,6 +2882,13 @@ export function createDispatcher(options: DispatcherOptions) {
               [NEXT_REQUEST_META]?: { actionBody?: Buffer };
             }
           )[NEXT_REQUEST_META]?.actionBody;
+
+          // Iteration 7: first serve of a fully-keyed platform entry — record it so later
+          // serves of the same key replay the stored bytes (see the early-serve above).
+          const storeCapture =
+            platformFullyKeyed && !platformCacheSeen && platformKey && platformStoreEligible
+              ? captureResponseForStore(res, PLATFORM_STORE_MAX_BODY)
+              : undefined;
 
           await localHandlerInvoker({
             handler,
@@ -2403,13 +2952,34 @@ export function createDispatcher(options: DispatcherOptions) {
             // through the same registered handler.
             minimalMode: !(
               // N16: a shell-bearing PPR template, or one the build left shell-less because
-              // ROOT params were unresolved. NOT every shell-less PPR template: a route whose
-              // shell was unemittable for any other reason (no Suspense boundary above the
-              // params access) is rendered dynamically by upstream, and running it non-minimal
-              // made Next resume a fallback shell upstream deliberately skips
-              // (app-dir/fallback-shells).
+              // ROOT params were unresolved. N16b adds the third case: shell-less because the
+              // shell would have been EMPTY, which the build reports by putting the postponed
+              // state on the template's `.rsc` sibling — upstream prerenders and then resumes
+              // those, so minimal mode served them as an empty closed Suspense boundary (1,358 B
+              // vs 7,658 B from `next start`).
+              // Still NOT every shell-less PPR template: a route that never postponed at all
+              // (no Suspense boundary above the params access) is rendered dynamically by
+              // upstream, and running it non-minimal made Next resume a fallback shell upstream
+              // deliberately skips (app-dir/fallback-shells).
               (
                 ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                  // N16c. `pprCapableRoutes[route].wouldPostpone` is DELIBERATELY NOT a rung
+                  // here, and is not even read into a local. The manifest computes it
+                  // (manifest.ts) and it is real — the build does put a postponed state on a
+                  // PARTIALLY_STATIC template's same-group `.rsc` sibling — but MEASURED on the
+                  // e2e suite it does not DISCRIMINATE, so adding it here is indistinguishable
+                  // from the blunter
+                  // `|| handlerPprCapable` that was rejected earlier:
+                  //   with the rung:    fallback-shells 8 passed / 5 failed
+                  //   without the rung: fallback-shells 13 passed / 0 failed
+                  // and in both cases otel-spans stays 3/1 — `early-span` starts passing
+                  // while `prerendering at runtime` starts failing, because flipping those
+                  // routes non-minimal also changes their MISS→HIT caching.
+                  // fallback-shells' `without-io` / `not wrapped in Suspense` routes carry a
+                  // sibling postponed state too, so the signal cannot separate "upstream
+                  // prerenders then resumes this" from "upstream renders this dynamically".
+                  // The truncation bug it was meant to fix is therefore still open; see
+                  // docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md.
                   (!!handlerPprInfo || handlerPprRootParams)) ||
                 (emulatePlatformCache &&
                   !!dispatchStaticAsset?.prerender &&
@@ -2438,14 +3008,47 @@ export function createDispatcher(options: DispatcherOptions) {
               !!dispatchStaticAsset?.prerender && handlerOutputInfo?.type === "PAGES",
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
+            handlerTimeoutMs,
+            // Option D (spec rev 4): shell-less PPR template with no root params — if this
+            // MINIMAL render postpones live, the invoker captures the state and performs the
+            // canonical POST resume itself. Excluded: shell-bearing routes (their injection
+            // path above owns the dance), Server Actions (the x-next-resume-state-length body
+            // framing is theirs), and requests that already ARE resumes.
+            capturePostponedState:
+              !handlerPprInfo &&
+              !req.headers["next-action"] &&
+              !req.headers["x-next-resume-state-length"] &&
+              req.headers["next-resume"] !== "1" &&
+              pprCapableCandidates.some((candidate) => pprCapableResumeRoutes.has(candidate)),
+            buildFallbackBacked: !!pprInfo,
+            ...(platformCacheSeen !== undefined ? { platformCacheSeen } : {}),
             ...(revalidate ? { revalidate } : {}),
           });
+          if (storeCapture && platformKey) {
+            const entry = storeCapture.finish();
+            if (entry && entry.status === 200) storePlatformResponse(platformKey, entry);
+          }
           return;
         }
       }
     },
   };
 }
+
+/**
+ * S15: the dispatch headers `proxyToPool` sets ITSELF. Everything else in the vocabulary is
+ * removed from the forwarded request, because this hop attaches the internal secret and would
+ * otherwise promote leftovers to trusted input at the sibling pool.
+ */
+const ASSERTED_BY_THIS_HOP: Record<string, true> = {
+  "x-output-id": true,
+  "x-matched-pathname": true,
+  "x-route-matches": true,
+  "x-mw-evaluated": true,
+  "x-invoke-path": true,
+  "x-invoke-query": true,
+  [INTERNAL_SECRET_HEADER]: true,
+};
 
 function proxyToPool(
   req: IncomingMessage,
@@ -2488,6 +3091,18 @@ function proxyToPool(
       "x-mw-evaluated": "ran",
       ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
     };
+    // S15 (SECURITY). Drop any dispatch header this hop did not itself assert. `req.headers`
+    // was replaced wholesale a few lines up with the middleware's FINAL request-header set,
+    // and the request below carries INTERNAL_SECRET_HEADER — so whatever survives the spread
+    // arrives at the sibling pool as TRUSTED input. The explicit assignments above cover only
+    // six of the ten names: `x-resolved-headers` (which the receiving pool merges into the
+    // RESPONSE), `x-upstream-pool`, `x-nextjs-ppr` and `x-mw-request-headers` used to ride
+    // through unguarded. Deleted AFTER the assignments so this is an allowlist of exactly what
+    // this hop asserts, not a filter that a new header can slip past.
+    for (const h of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) {
+      if (!(h in ASSERTED_BY_THIS_HOP)) delete forwardHeaders[h];
+    }
+
     // Same forged-framing guard as the loopback invocation: the target pool would
     // otherwise await body bytes that never arrive (hang until requestTimeout).
     restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);

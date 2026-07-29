@@ -1,4 +1,4 @@
-import { assertSafeReleaseName } from "./utils.js";
+import { assertSafeReleaseName, escapeHelmActions } from "./utils.js";
 
 // A per-release Secret holding the Valkey connection URL + AUTH string that the pool servers
 // use for the shared `use cache` / PPR cache. It is created imperatively at deploy time — from
@@ -61,10 +61,10 @@ kind: Secret
 metadata:
   name: ${releaseName}-${VALKEY_SECRET_NAME}
   labels:
-    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: valkey-secret
 type: Opaque
 stringData:
-${entries.map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`).join("\n")}
+${entries.map(([k, v]) => `  ${k}: ${escapeHelmActions(JSON.stringify(v))}`).join("\n")}
 `;
 }

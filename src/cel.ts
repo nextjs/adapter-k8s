@@ -13,6 +13,24 @@ export interface CelGenerationInput {
    * middleware-match probe must test the basePath-prefixed pathname too.
    */
   basePath?: string;
+  /**
+   * Pathnames of the app's `public/` files (`collectPublicPathnames(projectDir)`).
+   *
+   * N40: the per-file exclusion loop below iterated `outputs.staticFiles`, which for a real
+   * build holds ONLY build outputs and `/_next/static/*` — Next never enumerates `public/` as
+   * an adapter output (that is exactly why `collectPublicPathnames` exists, and why the
+   * static-asset manifest and the pool's pathname set both call it). MEASURED on
+   * `fixtures/main`, whose matcher explicitly excludes `cdn-probe.txt` and
+   * `header-priority.txt`: the emitted expression was
+   * `!(request.path.startsWith('/_next/static/'))` — zero per-file exclusions. So the
+   * documented percent-encoding machinery never ran on a public file and
+   * `warnIfOversized`'s advice ("reduce the number of public files not covered by
+   * middleware") was unactionable.
+   *
+   * Optional: absent ⇒ the loop sees only `outputs.staticFiles`, i.e. exactly the previous
+   * behavior, so a caller that has no projectDir is unaffected.
+   */
+  publicPathnames?: string[];
 }
 
 /**
@@ -114,6 +132,34 @@ export function extractStaticPrefix(sourceRegex: string): string | null {
   return match?.[1] ?? null;
 }
 
+/**
+ * An exact-path CEL term that is correct whether or not `request.path` carries the query string.
+ *
+ * N40. GCP's CEL matcher language reference
+ * (https://cloud.google.com/service-extensions/docs/cel-matcher-language-reference) documents
+ * `request.path` as "The requested HTTP URL path" and lists `request.query` separately — and it
+ * does NOT document `request.url_path` at all (the documented `request.*` set is headers, method,
+ * host, path, query, scheme, backend_service_name, backend_service_project_number). Envoy, which
+ * these attributes come from, documents `request.path` as "The path portion of the URL" and
+ * `request.url_path` as "The path portion of the URL **without the query string**"
+ * (https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/advanced/attributes) — i.e.
+ * upstream `request.path` DOES include the query, and the attribute that strips it is the one
+ * GCP does not expose. Using `request.url_path` would risk the match condition being rejected
+ * when the extension is updated — a mid-deploy failure, which is the exact class
+ * `CEL_EXPRESSION_WARN_LENGTH` exists to avoid.
+ *
+ * So: stay inside the documented attribute set and accept BOTH readings. Under the path-only
+ * reading the second term can never fire (a path cannot contain a raw `?`); under the
+ * path-plus-query reading it catches `/file.txt?x=1`, which a bare `==` silently missed. Both
+ * directions were already fail-safe (a missed exclusion costs one ext_proc callout; a missed
+ * inclusion falls through to the pool's local resolver), so this is a hit-rate fix, not a
+ * correctness one — and it is pinned by a test rather than left to the next reader to rediscover.
+ */
+function celPathEquals(wirePath: string): string {
+  const literal = escapeCelString(wirePath);
+  return `(request.path == '${literal}' || request.path.startsWith('${literal}?'))`;
+}
+
 // GCP validates the route-extension matchCondition.celExpression only at DEPLOY
 // time — an oversized expression fails the extension update mid-deploy with no
 // build-time signal. The Service Extensions CEL matcher language reference
@@ -129,23 +175,32 @@ function warnIfOversized(expr: string): string {
       `[adapter-k8s] Generated CEL match condition is ${expr.length} characters, over the ` +
         `${CEL_EXPRESSION_WARN_LENGTH}-character budget for GCP Service Extensions match ` +
         `conditions — the route-extension update may be rejected at deploy time. Reduce the ` +
-        `number of public files not covered by middleware (each emits an exclusion) or ` +
-        `consolidate dynamic route prefixes.`,
+        `number of public/ files NOT covered by the middleware matcher (each one emits an ` +
+        `exclusion; widening the matcher to cover them removes it) or consolidate dynamic ` +
+        `route prefixes.`,
     );
   }
   return expr;
 }
 
 export function generateCelExpression(input: CelGenerationInput): string {
-  const { outputs, dynamicRoutes, basePath = "" } = input;
+  const { outputs, dynamicRoutes, basePath = "", publicPathnames = [] } = input;
   const exclusions: string[] = [];
 
   exclusions.push(`request.path.startsWith('${escapeCelString(`${basePath}/_next/static/`)}')`);
 
   const middlewareMatchers = (outputs.middleware as any)?.config?.matchers ?? [];
-  const publicFiles = outputs.staticFiles
-    .filter((f) => !f.pathname.startsWith("/_next/"))
-    .map((f) => f.pathname);
+  // N40: `outputs.staticFiles` carries build outputs (and `/_next/static/*`), never `public/`
+  // files — those are staged separately and enumerated by `collectPublicPathnames`. Union both
+  // so the loop below actually sees the files its comment and the oversize warning describe.
+  const publicFiles = [
+    ...new Set([
+      ...outputs.staticFiles
+        .filter((f) => !f.pathname.startsWith("/_next/"))
+        .map((f) => f.pathname),
+      ...publicPathnames.filter((p) => !p.startsWith("/_next/")),
+    ]),
+  ].sort();
 
   for (const publicPath of publicFiles) {
     // The wire path (and the compiled middleware matcher) carries the basePath,
@@ -176,7 +231,7 @@ export function generateCelExpression(input: CelGenerationInput): string {
       return [...probePaths].some((p) => re.test(p));
     });
     if (!matchedByMiddleware) {
-      exclusions.push(`request.path == '${escapeCelString(wirePath)}'`);
+      exclusions.push(celPathEquals(wirePath));
     }
   }
 
@@ -206,7 +261,7 @@ export function generateCelExpression(input: CelGenerationInput): string {
     for (const prerender of outputs.prerenders) {
       const fallback = prerender.fallback as Record<string, unknown> | undefined;
       if (fallback?.initialRevalidate) {
-        inclusions.push(`request.path == '${escapeCelString(`${basePath}${prerender.pathname}`)}'`);
+        inclusions.push(celPathEquals(`${basePath}${prerender.pathname}`));
       }
     }
     if (inclusions.length === 0) return "false";

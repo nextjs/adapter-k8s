@@ -24,10 +24,13 @@ declare const require: (id: string) => any;
 // One Valkey handler per process, shared across every IncrementalCache instance.
 let sharedHandler: ValkeyIncrementalCacheHandler | undefined;
 
+/** N82: set once the build id was rejected, so the fallback is taken without re-logging. */
+let buildIdRejected = false;
+
 function getValkeyHandler(): ValkeyIncrementalCacheHandler | undefined {
   const url = process.env.VALKEY_URL;
   const buildId = process.env.NEXT_BUILD_ID;
-  if (!url || !buildId) return undefined;
+  if (!url || !buildId || buildIdRejected) return undefined;
   if (!sharedHandler) {
     // Lazy: only reached in the node pool runtime when a cache is configured. Never in edge.
     const client = createValkeyClient({
@@ -35,7 +38,22 @@ function getValkeyHandler(): ValkeyIncrementalCacheHandler | undefined {
       password: process.env.VALKEY_AUTH,
       caCert: process.env.VALKEY_CA_CERT,
     });
-    sharedHandler = new ValkeyIncrementalCacheHandler({ client, buildId });
+    try {
+      sharedHandler = new ValkeyIncrementalCacheHandler({ client, buildId });
+    } catch (error) {
+      // N82: the constructor asserts the build id's charset (a `:` would let one build's keys
+      // alias another's). This runs inside Next's `cacheHandler` construction, i.e. during a
+      // render, so it must not throw out of here — but it must be LOUD and it must NOT fall back
+      // to a shared keyspace. Declining the Valkey handler entirely leaves the file-system cache,
+      // which is per-pod and therefore safe.
+      buildIdRejected = true;
+      console.error(
+        "[valkey-cache] NEXT_BUILD_ID is unsafe for the Valkey cache keyspace; the shared cache " +
+          "is DISABLED for this process and each pod falls back to its local file-system cache",
+        error instanceof Error ? error.message : String(error),
+      );
+      return undefined;
+    }
   }
   return sharedHandler;
 }

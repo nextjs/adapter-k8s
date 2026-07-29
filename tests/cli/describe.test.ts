@@ -22,7 +22,7 @@ describe("runDescribe", () => {
     mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
     writeFileSync(
       path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
-      JSON.stringify({ projectId: "proj", region: "us-central1", hosts: [] }),
+      JSON.stringify({ projectId: "proj-12345", region: "us-central1", hosts: [] }),
     );
     callOrder = [];
     vi.clearAllMocks();

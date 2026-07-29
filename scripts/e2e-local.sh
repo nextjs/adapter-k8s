@@ -29,6 +29,12 @@ TEST_GROUP="${3:-1/1}"
 # built-in jest retry"). When comparing runs, grep the run log for `finished on retry [1-9]`
 # to see what only passed on a retry, and use `--retries 0` when hunting a specific flake.
 TEST_RETRIES="${NEXT_TEST_RETRIES:-2}"
+# 4 is the measured sweet spot for this class of machine, and the concurrency of every
+# recorded baseline run. 1 (the old default) turns a ~17-minute full run into ~10 hours;
+# 16 was measured (2026-07-28) to produce ~205 CONTENTION failures — images decoding to
+# naturalWidth=0, `_next/image` 503s, Playwright websocket ECONNREFUSED — concentrated in
+# browser-heavy suites. If you change this, re-derive the failure baseline first.
+CONCURRENCY="${NEXT_TEST_CONCURRENCY:-4}"
 ADAPTER_MANIFEST="${ADAPTER_DIR}/test/deploy-tests-manifest.adapter-k8s.json"
 NEXT_TEST_FILTERS="test/deploy-tests-manifest.json"
 
@@ -43,6 +49,7 @@ echo "Next.js:  ${NEXTJS_DIR} (ref: ${NEXTJS_REF})"
 echo "Test:     ${TEST_PATTERN:-filtered deploy suite}"
 echo "Group:    ${TEST_GROUP}"
 echo "Retries:  ${TEST_RETRIES}"
+echo "Concurrency: ${CONCURRENCY}"
 echo ""
 
 # --- 1. Clone/fetch Next.js ---
@@ -71,10 +78,25 @@ pnpm install
 echo "Installing Playwright..."
 pnpm playwright install chromium
 
-# --- 4. Build adapter ---
-echo "Building adapter..."
+# --- 4. Build + pack the adapter ONCE for the whole run ---
+# Every deploy then installs this exact tarball (the ADAPTER_K8S_PREBUILT_TARBALL fast
+# path in e2e-deploy.sh). Without it, EVERY deploy rebuilds + repacks the adapter behind
+# a serializing lock — the "why is the suite taking hours" footgun. A caller-provided
+# tarball is respected and the build skipped (that is how to A/B a specific artifact).
+if [ -z "${ADAPTER_K8S_PREBUILT_TARBALL:-}" ]; then
+  echo "Building adapter..."
+  cd "$ADAPTER_DIR"
+  npm run build
+  RUN_PACK_DIR="$(mktemp -d /tmp/adapter-k8s-run-pack-XXXXXX)"
+  trap 'rm -rf "$RUN_PACK_DIR"' EXIT
+  PACK_JSON="$(npm pack --json --ignore-scripts --pack-destination "$RUN_PACK_DIR")"
+  ADAPTER_K8S_PREBUILT_TARBALL="$RUN_PACK_DIR/$(
+    node -e "console.log(JSON.parse(process.argv[1])[0].filename)" "$PACK_JSON"
+  )"
+fi
+export ADAPTER_K8S_PREBUILT_TARBALL
+echo "Adapter tarball (packed once, reused by every deploy): ${ADAPTER_K8S_PREBUILT_TARBALL}"
 cd "$ADAPTER_DIR"
-npm run build
 
 # --- 5. Make scripts executable ---
 chmod +x scripts/e2e-deploy.sh scripts/e2e-logs.sh scripts/e2e-cleanup.sh
@@ -98,8 +120,6 @@ export NEXT_TELEMETRY_DISABLED=1
 export NEXT_TEST_DEPLOY_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-deploy.sh"
 export NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-logs.sh"
 export NEXT_TEST_CLEANUP_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-cleanup.sh"
-
-CONCURRENCY="${NEXT_TEST_CONCURRENCY:-1}"
 
 if [ -n "$TEST_PATTERN" ]; then
   node run-tests.js --test-pattern "$TEST_PATTERN" --retries "$TEST_RETRIES" -c "$CONCURRENCY" --debug

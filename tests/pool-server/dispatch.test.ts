@@ -1,5 +1,5 @@
 // tests/pool-server/dispatch.test.ts
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from "vitest";
 import {
   createDispatcher,
   extractRouteParams,
@@ -1985,6 +1985,18 @@ describe("createDispatcher", () => {
     });
 
     it("bypasses a concrete prerender seed when preview mode is active", async () => {
+      // N38 (SECURITY): the credential must be AUTHENTIC. This test used to send
+      // `__prerender_bypass=preview-token` with no build preview identity configured at all and
+      // still expected the bypass, because the gate was a substring test on the Cookie header —
+      // i.e. it pinned the vulnerability. The value below is the build's real previewModeId, which
+      // is what upstream compares against (see isVerifiedPreviewRequest); the RED TEAM cases for
+      // a bare/wrong/lookalike cookie live in dispatch-hardening.test.ts.
+      const savedPreviewId = process.env.__NEXT_PREVIEW_MODE_ID;
+      process.env.__NEXT_PREVIEW_MODE_ID = "preview-token";
+      onTestFinished(() => {
+        if (savedPreviewId === undefined) delete process.env.__NEXT_PREVIEW_MODE_ID;
+        else process.env.__NEXT_PREVIEW_MODE_ID = savedPreviewId;
+      });
       writeFileSync(path.join(tmpDir, "seed.html"), "<html>non-preview seed</html>");
       const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
       const dispatcher = createDispatcher({

@@ -71,12 +71,21 @@ export interface K8sAdapterConfig {
       sizeGb?: number;
       tier?: "BASIC" | "STANDARD_HA";
       /**
-       * Enable Redis AUTH + in-transit encryption (SERVER_AUTHENTICATION) on the managed
-       * instance. The pods then connect over `rediss://` with the instance AUTH string and
-       * server CA injected as `VALKEY_AUTH` / `VALKEY_CA_CERT`. Recommended — without it any
-       * workload that can reach the VPC endpoint can read/write the shared cache. NOTE: AUTH
-       * can only be set at instance creation; an existing non-AUTH instance must be recreated
-       * (`destroy` removes it) before enabling.
+       * Redis AUTH + in-transit encryption (SERVER_AUTHENTICATION) on the managed instance.
+       * The pods connect over `rediss://` with the instance AUTH string and server CA injected
+       * as `VALKEY_AUTH` / `VALKEY_CA_CERT`.
+       *
+       * S8: DEFAULTS TO ON (leave unset). Memorystore's own defaults are authEnabled=false and
+       * transitEncryption=disabled, and the chart's NetworkPolicies govern Ingress only — so a
+       * plaintext instance is readable and WRITABLE by any workload with VPC reachability,
+       * which means reading every cached page and injecting content into the production site by
+       * overwriting cached HTML/RSC.
+       *
+       * AUTH is CREATION-ONLY, so the three states differ:
+       *  - unset (recommended): create new instances with AUTH; a pre-existing instance without
+       *    it is reused with a loud per-deploy warning rather than a forced cache wipe.
+       *  - `true`: require it — refuse to reuse an instance that lacks it.
+       *  - `false`: explicit opt-out, warned about on every deploy.
        */
       auth?: boolean;
     };
@@ -155,8 +164,20 @@ export interface RoutingManifest {
       /** Shell revalidate/expire (seconds) from the build; reserved for shell seeding. */
       revalidate?: number;
       expire?: number;
+      /** Params that PARTITION the platform cache key (build's config.allowQuery);
+       * never-enumerable params are excluded. Feeds dispatch's seen-key registry. */
+      allowQuery?: string[];
     }
   >;
+  /**
+   * Shell-less PARTIALLY_STATIC prerenders carrying ONLY a postponed state (the `.rsc`
+   * postponed-state siblings, build-complete.js:986-991), keyed by output pathname. Registered
+   * only when the build's `allowQuery` is empty — no route-param variance, so the state is
+   * shareable across requests (adapter-vercel outputs.ts:652-673). Disjoint from `pprRoutes`
+   * (those have shells) and from `pprCapableRoutes` (those are route templates). Reserved for
+   * the resume implementation; nothing consumes it yet.
+   */
+  pprStatePrerenders?: Record<string, { postponedState: string }>;
   /**
    * PPR-capable route TEMPLATES (`renderingMode: PARTIALLY_STATIC`) whose build emitted NO
    * fallback shell (`fallback: null`), keyed by template pathname. Disjoint from `pprRoutes`,
@@ -174,8 +195,31 @@ export interface RoutingManifest {
    *     shell that upstream deliberately does not resume (app-dir/fallback-shells).
    * Membership of EITHER flavour also marks the route as PPR, which keeps it out of the
    * emulated-SSG non-minimal flip (dispatch.ts N13).
+   *
+   * `wouldPostpone` (N16b) records whether the BUILD render of this template postponed, derived
+   * from the same-`groupId` `.rsc` PRERENDER sibling — the only output carrying the postponed
+   * state when the template's own shell was suppressed (`hasEmptyStaticShell` demotes the route to
+   * BLOCKING_STATIC_RENDER). See `indexPrerenderGroups` in manifest.ts for the upstream
+   * references. The flag is per-TEMPLATE: concrete generateStaticParams params live in their own
+   * prerender groups and are answered by their own `pprRoutes` entry at higher precedence, so the
+   * template-level bit could only ever have decided requests for params with no build artifact of
+   * their own.
+   *
+   * N16c: IT IS NOT CONSUMED. It was added as a third rung of the minimalMode gate, to fix
+   * `/[slug]/early-span` (1,358 bytes with an empty closed `<!--$--><!--/$-->` boundary against
+   * 7,658 bytes of resolved content from `next start` on the same build) — then MEASURED against
+   * upstream and removed:
+   *   with the rung:    app-dir/fallback-shells  8 passed / 5 failed
+   *   without the rung: app-dir/fallback-shells 13 passed / 0 failed
+   * i.e. the bit does not discriminate the two flavours. fallback-shells' never-postponing routes
+   * carry sibling postponed state as well, so flipping non-minimal on it re-breaks them in exactly
+   * the way the blunt `|| handlerPprCapable` fix did. Truncation on shell-less PPR templates is
+   * therefore STILL OPEN, and the remaining fix is to implement the platform's half of the resume
+   * rather than to delegate it — docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md.
+   * Kept on the manifest because it is a correct, cheap build-time observation that option B needs;
+   * do not re-wire it into the gate without re-running the two suites above.
    */
-  pprCapableRoutes?: Record<string, { rootParams: string[] }>;
+  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }>;
   nextVersion: string;
 }
 

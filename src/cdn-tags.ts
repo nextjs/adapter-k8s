@@ -53,7 +53,5 @@ export function cdnCacheTag(
   // header dumps. The CDN's freshness lifetime is s-maxage when present, else max-age.
   if (/\b(?:private|no-store|no-cache)\b/i.test(cacheControl)) return {};
   const shared = /\bs-maxage=(\d+)/i.exec(cacheControl) ?? /\bmax-age=(\d+)/i.exec(cacheControl);
-  return shared && parseInt(shared[1]!, 10) > 0
-    ? { "cache-tag": cdnTagForBuildId(buildId) }
-    : {};
+  return shared && parseInt(shared[1]!, 10) > 0 ? { "cache-tag": cdnTagForBuildId(buildId) } : {};
 }

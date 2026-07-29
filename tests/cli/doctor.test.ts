@@ -103,7 +103,7 @@ describe("runDoctor", () => {
     writeFileSync(
       path.join(infraDir(), "infrastructure.json"),
       JSON.stringify({
-        projectId: "proj",
+        projectId: "proj-12345",
         region: "us-central1",
         hosts,
         gcsBucket: "proj-nextjs-static",
@@ -171,8 +171,7 @@ describe("runDoctor", () => {
     stubCluster({
       // name|component lines: two active Services, one per-build (versioned) Service
       // that must NOT be endpoint-checked, and the routing tier which is excluded.
-      services:
-        "rel-ssr|ssr\nrel-api|api\nrel-ssr-buildn|ssr\nrel-routing-service|routing-service",
+      services: "rel-ssr|ssr\nrel-api|api\nrel-ssr-buildn|ssr\nrel-routing-service|routing-service",
       endpoints: "true\ntrue",
     });
 

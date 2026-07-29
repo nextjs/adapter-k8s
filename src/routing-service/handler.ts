@@ -10,23 +10,32 @@ import {
   applyRewriteSignalHeaders,
   computeRewriteInvocation,
   computeRewriteSignalHeaders,
+  fitsPoolHeaderBudget,
   getRscConfig,
   grantsSharedCacheFreshness,
+  headerBlockBytes,
   isRscRequest,
   lookupPool,
   manifestNextConfig,
   matchesMiddleware,
+  middlewareAuthoredRedirect,
   normalizeResolvedRedirect,
+  parseRequestUrl,
   prepareRequest,
   resolveOutputPathname,
   resolveRscOutput,
   rscCacheBustingUnvalidated,
   sanitizeRouteMatches,
+  serializeHeaderMap,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
 } from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
+
+/** The `x-mw-evaluated` vocabulary (routing-common.ts MW_EVALUATED_TRUSTED recognizes the
+ * first three; `error` deliberately does not authorize the pool to skip middleware). */
+type MwEvaluated = "ran" | "skip-nomatch" | "none" | "error";
 
 // Abort-shaped errors raised by the request-shed signal: AbortSignal.timeout()
 // aborts with a DOMException named "TimeoutError", a manual controller.abort()
@@ -49,24 +58,14 @@ function getHeader(headers: HeaderValue[], key: string): string | undefined {
   return undefined;
 }
 
-// Serialize the resolved response headers (next.config `headers()` + middleware response
-// headers) into a single JSON internal header. The pool applies these to the RESPONSE
-// (dispatch.ts merges resolvedHeaders via a writeHead wrapper). Emitting them as individual
-// request-header mutations — as this handler used to — both drops them (they never reach the
-// response) and leaks their values into the upstream request under their real names.
-function serializeResolvedHeaders(resolved: Headers): string | null {
-  const obj: Record<string, string | string[]> = {};
-  for (const [key, value] of resolved.entries()) {
-    // Headers.entries() folds repeated Set-Cookie into one comma-joined value; collect them
-    // separately below so each cookie survives intact.
-    if (key.toLowerCase() === "set-cookie") continue;
-    obj[key] = value;
-  }
-  const cookies = resolved.getSetCookie?.() ?? [];
-  if (cookies.length > 0) obj["set-cookie"] = cookies;
-  if (Object.keys(obj).length === 0) return null;
-  return JSON.stringify(obj);
-}
+// The resolved response headers (next.config `headers()` + middleware response headers) and the
+// middleware's final REQUEST header set are both carried as one JSON internal header each. The
+// pool applies the former to the RESPONSE (dispatch.ts merges resolvedHeaders via a writeHead
+// wrapper) and the latter over `req.headers`. Emitting either as individual request-header
+// mutations — as this handler used to for the response set — both drops them (they never reach
+// the response) and leaks their values into the upstream request under their real names.
+// The wire shape is the SHARED serializeHeaderMap (routing-common.ts), which the pool's
+// parseResolvedHeaders reads back.
 
 // N18 (SECURITY). Almost every response is authored by a pool, which owns the forced-cache
 // verdict (pool-server/index.ts + cache-policy.ts) and therefore enforces the RSC
@@ -93,6 +92,36 @@ function withRscCacheBustingGuard(
   return headers;
 }
 
+/**
+ * S4 (SECURITY). The middleware-covered cache invariant, applied to the responses THIS tier
+ * authors — the same rule the pool enforces in cache-policy.ts, which this tier was missing.
+ *
+ * A middleware-authored body or a middleware/rule redirect is by definition a
+ * middleware-covered response, and the extension is POST-cache on the GXLB
+ * (docs/superpowers/plans/gcp-edge-compute-cdn-findings.md). So any positive shared-cache
+ * freshness on it hands Cloud CDN a window in which it serves that response to OTHER users
+ * without the callout running at all: a cookie-dependent middleware response with
+ * `public, s-maxage=600` and no Set-Cookie became a 600-second cross-user leak. The pool
+ * refuses exactly this via explicitCacheControlWins → grantsSharedCacheFreshness; the two
+ * tiers must not disagree about the same invariant.
+ *
+ * `no-cache` (not `no-store`), matching the pool's forced default for a middleware-covered
+ * route: it keeps the response storable-but-revalidated, so every use still reaches the
+ * extension, while staying as close as possible to what the app asked for. Values that
+ * already force revalidation or uncacheability (`no-store`, `no-cache`, `private`,
+ * `max-age=0`) do not grant freshness and are kept verbatim — including the `no-store` the
+ * RSC guard above may have just stamped. A response with NO Cache-Control is left alone:
+ * Cloud CDN runs USE_ORIGIN_HEADERS and stores nothing without an explicit directive, so
+ * adding a header there would change observable behavior for zero security gain.
+ */
+function withMiddlewareCachePolicy(headers: Record<string, string>): Record<string, string> {
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== "cache-control") continue;
+    if (grantsSharedCacheFreshness(headers[key]!)) headers[key] = "no-cache";
+  }
+  return headers;
+}
+
 export function createRequestHandler(
   manifest: RoutingManifest,
   middlewareModule: LoadedModule | null,
@@ -114,12 +143,55 @@ export function createRequestHandler(
     // so the retry spends the remaining budget instead of minting a fresh full window
     // while the server-side withTimeout keeps the original clock.
     inheritedShedSignal?: AbortSignal,
+    // Internal (trailing-slash retry only). N40: middleware ALREADY ran in the first pass —
+    // it is the same request with the same verdict, so re-invoking it violates Next's
+    // single-pass middleware contract (duplicated Set-Cookie, duplicated waitUntil/after()
+    // side effects, doubled latency inside the ext_proc budget, and a second consume of the
+    // same body stream). pool-server/resolve.ts refuses for exactly this reason
+    // (`middlewareAlreadyRan`); this tier used to re-enter blind. The first pass's
+    // `x-mw-evaluated` verdict rides along so the retry stamps what was actually determined
+    // instead of the pessimistic `error`, which would just move the double execution to the
+    // pool.
+    //
+    // N40b (SECURITY). So do the first pass's MUTATED REQUEST HEADERS. Inheriting the verdict
+    // without them reintroduced exactly the bypass N40 closed, on this one path: the retried
+    // response stamped a trusted `x-mw-evaluated: ran` while `middlewareRequestHeaders` was
+    // re-initialized to undefined, so the pool skipped its own middleware AND kept the ORIGINAL
+    // client headers — an auth middleware's header deletion / credential injection silently
+    // undone by a trailing-slash retry. The verdict and the header set are two halves of one
+    // fact and must travel together.
+    retry?: {
+      middlewareAlreadyRan: true;
+      mwEvaluated: MwEvaluated;
+      middlewareRequestHeaders?: Headers | undefined;
+    },
   ): Promise<ProcessingResponse> {
     const rawPath = getHeader(requestHeaders, ":path") ?? "/";
     const method = getHeader(requestHeaders, ":method") ?? "GET";
     const scheme = getHeader(requestHeaders, ":scheme") ?? "https";
     const authority = getHeader(requestHeaders, ":authority") ?? "localhost";
-    const url = new URL(`${scheme}://${authority}${rawPath}`);
+    // N10/N40 (SECURITY). Both tiers parse the request target through the SHARED
+    // parseRequestUrl: the authority comes from `:authority`/Host and NEVER from the target
+    // (so `//evil.example/x` stays a PATH and the shared repeated-slash 308 normalizes it),
+    // and an authority that is not a bare host — `evil.com/foo`, `user@evil` — is REJECTED
+    // instead of being spliced in verbatim. This tier used to interpolate `:authority`
+    // straight into a template string, so attacker path segments reached detectDomainLocale,
+    // `has: { type: "host" }` matcher gating and the redirect same-origin test. Envoy should
+    // reject such an `:authority` upstream — this is defense-in-depth, and the parity is what
+    // routing-common.ts exists for.
+    let url: URL;
+    try {
+      url = parseRequestUrl(rawPath, authority);
+      // parseRequestUrl resolves against an http:// base (it only needs a valid authority to
+      // splice after). Restore the real wire scheme so same-origin comparisons and emitted
+      // Locations keep https. The setter is a no-op for a non-special scheme, which GXLB never
+      // sends on this filter (:scheme is http or https).
+      if (scheme !== "http") url.protocol = `${scheme}:`;
+    } catch {
+      // A malformed authority is the client's own protocol error, not a 500. Matches the
+      // pool's 400 for the same input (pool-server/index.ts).
+      return buildImmediateResponse(400, { "content-type": "text/plain; charset=utf-8" });
+    }
 
     // Ingress hygiene: a client can send any x-* header, and the egress mutations
     // below only overwrite the keys they set — so strip the whole internal dispatch
@@ -196,6 +268,14 @@ export function createRequestHandler(
     }
 
     let middlewareResponse: Response | undefined;
+    // N40 (SECURITY). Captures the mutated request headers from responseToMiddlewareResult —
+    // the x-middleware-override-headers / x-middleware-request-* / x-middleware-set-cookie
+    // verdict resolved into one authoritative REPLACEMENT set. Transported to the pool as
+    // `x-mw-request-headers` (secret-gated) so Phase 2 installs it the same way Phase 1 does.
+    // N40b: SEEDED FROM THE RETRY, whose first pass already produced this set — see the `retry`
+    // parameter. It is not re-derivable on that path (middleware deliberately does not run
+    // again), so dropping it here is a silent bypass, not a missed optimization.
+    let middlewareRequestHeaders: Headers | undefined = retry?.middlewareRequestHeaders;
     // Fail CLOSED on middleware throw — see pool-server/resolve.ts. A crashing
     // middleware must 500, not silently emit trusted dispatch headers that let
     // the request bypass the auth/redirects/rewrites middleware implements.
@@ -204,9 +284,7 @@ export function createRequestHandler(
     // so the pool can trust the skip instead of inferring "middleware ran" from the presence
     // of routing headers. Pessimistic default `error` while middleware is configured but not
     // yet confirmed to have run (so the pool re-evaluates); `none` when there is no middleware.
-    let mwEvaluated: "ran" | "skip-nomatch" | "none" | "error" = middlewareModule
-      ? "error"
-      : "none";
+    let mwEvaluated: MwEvaluated = retry?.mwEvaluated ?? (middlewareModule ? "error" : "none");
 
     const resolution = await resolveRoutes({
       url: resolveUrl,
@@ -221,15 +299,44 @@ export function createRequestHandler(
       pathnames: manifest.pathnames,
       i18n: (manifest.i18n || undefined) as any,
       routes: manifest.routeGraph,
-      // Next.js middleware modules have multiple shapes depending on compilation
-      // target. The ordering here MUST match pool-server/resolve.ts (paths 1/2/3);
-      // web-adapter first is load-bearing — the legacy path strips control headers
-      // from the response, which makes responseToMiddlewareResult misinterpret it.
-      // The routing-service runs Node middleware only, so there is no edge-sandbox
-      // path 0 here.
+      // Next.js middleware modules have multiple shapes depending on compilation target. The
+      // ladder here MUST match pool-server/resolve.ts, which runs:
+      //
+      //   0. edge sandbox        — pool only (this tier runs Node middleware only)
+      //   G. generated handler   — handler(Request, ctx)
+      //   1. web adapter         — default({ handler, request, page })
+      //   2. legacy              — default.default({ request })
+      //   3. direct handler      — handler(request, { waitUntil })
+      //
+      // The three invocation paths must stay SEPARATE and in this order — invoking a
+      // compatibility wrapper with the wrong shape silently returns next() and bypasses the
+      // user's proxy.
+      //
+      // COMMENT CORRECTIONS (N40), both verified by measurement:
+      //  - this used to claim the ordering "MUST match pool-server/resolve.ts (paths 1/2/3)"
+      //    while OMITTING the generated-handler path the pool tries FIRST. The real Next 16.2
+      //    artifact is `{ default: { default: adapterWrapper, handler } }`, so
+      //    `middlewareModule.default` is an OBJECT: `adapterFn` is null, path 1 (the only
+      //    Phase-2 path that passed `manifestNextConfig`) was UNREACHABLE, and every request
+      //    fell to path 2 with no `nextConfig` at all. Measured on the real artifact for
+      //    `basePath: '/docs'` + i18n: middleware saw `nextUrl.pathname = '/docs/about'`,
+      //    `locale = ''` at the edge versus `/about` / `en` in the pool and under
+      //    `next start` — so a `pathname === '/admin'` gate silently failed to fire in
+      //    production only.
+      //  - it also claimed "the legacy path strips control headers from the response, which
+      //    makes responseToMiddlewareResult misinterpret it". MEASURED FALSE on 16.2.10: for
+      //    the same request the legacy path and the generated handler return byte-identical
+      //    control headers (`x-middleware-next: 1`, `x-middleware-override-headers`, every
+      //    `x-middleware-request-*`). The order is justified by the nextUrl normalization
+      //    above, not by header stripping.
       invokeMiddleware: middlewareModule
         ? async (ctx) => {
             try {
+              // N40: the trailing-slash retry is a CONTINUATION of a request whose middleware
+              // verdict is already in hand. Refuse to re-invoke — same position and same
+              // reasoning as pool-server/resolve.ts's `middlewareAlreadyRan` guard, ahead of
+              // the matcher check so `mwEvaluated` keeps the inherited verdict.
+              if (retry?.middlewareAlreadyRan) return {};
               // Honor the middleware `matcher` config (parity with the pool
               // resolver) — skip middleware for requests it doesn't match.
               if (!matchesMiddleware(manifest.middleware?.matchers, ctx.url, ctx.headers)) {
@@ -238,6 +345,17 @@ export function createRequestHandler(
               }
 
               let response: Response | null = null;
+
+              const nestedDefault =
+                middlewareModule.default && typeof middlewareModule.default === "object"
+                  ? (middlewareModule.default as Record<string, unknown>)
+                  : null;
+              const generatedHandler =
+                typeof middlewareModule.handler === "function"
+                  ? (middlewareModule.handler as (...args: unknown[]) => unknown)
+                  : typeof nestedDefault?.handler === "function"
+                    ? (nestedDefault.handler as (...args: unknown[]) => unknown)
+                    : null;
 
               const adapterFn =
                 typeof middlewareModule.default === "function"
@@ -265,8 +383,10 @@ export function createRequestHandler(
 
               // Manifest declares middleware but no callable export was found — this is the
               // exact silent-bypass state. Leave `mwEvaluated = "error"` so the pool does NOT
-              // trust the skip and re-runs middleware itself.
-              if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
+              // trust the skip and re-runs middleware itself. `generatedHandler` counts: this
+              // tier can now invoke a `handler`-only module, which it previously recognized
+              // (pool-server/resolve.ts hasCallableMiddlewareExport) but could not run.
+              if (!generatedHandler && !adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
               // A callable was found and is about to run — the middleware stage is genuinely
               // evaluated for this request.
               mwEvaluated = "ran";
@@ -282,8 +402,46 @@ export function createRequestHandler(
                 );
               };
 
+              // Path G: the generated handler — `handler(Request, ctx)`. This is the
+              // DOCUMENTED Node middleware entrypoint of a real 16.2 build, and its wrapper
+              // bakes the build's own basePath/i18n into `request.nextUrl`, so middleware sees
+              // the same normalized URL it sees under `next start`. Tried FIRST, exactly as
+              // pool-server/resolve.ts does: for the real artifact shape
+              // (`{ default: { default, handler } }`) every path below either can't fire
+              // (path 1 needs a callable `default`) or normalizes worse.
+              if (generatedHandler) {
+                const requestInit: RequestInit & { duplex?: "half" } = {
+                  method,
+                  headers: new Headers(
+                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
+                  ),
+                  // Shed budget must abort the generated handler too — the Request ctor adopts
+                  // this signal as request.signal for the middleware to observe.
+                  signal: shedSignal ?? null,
+                  duplex: "half",
+                };
+                if (method !== "GET" && method !== "HEAD") {
+                  requestInit.body = ctx.requestBody;
+                }
+                const result = await (generatedHandler as any)(
+                  new Request(ctx.url.toString(), requestInit),
+                  {
+                    waitUntil,
+                    // The generated wrapper resolves the app's own instrumentation/config
+                    // relative to this. Same value the pool passes.
+                    requestMeta: { relativeProjectDir: "." },
+                  },
+                );
+                response =
+                  result instanceof Response
+                    ? result
+                    : result?.response instanceof Response
+                      ? result.response
+                      : null;
+              }
+
               // Path 1: Web adapter (default({ handler, request, page }))
-              if (adapterFn && adapterHandler) {
+              if (!response && adapterFn && adapterHandler) {
                 const requestHeaders = Object.fromEntries(
                   [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
                 );
@@ -329,6 +487,14 @@ export function createRequestHandler(
                     // uses — without it, legacy middleware keeps running detached
                     // after the server-side timeout shed rejects the response.
                     signal: shedSignal ?? new AbortController().signal,
+                    // N40: the legacy adapter builds request.nextUrl from this too. MEASURED
+                    // on the real 16.2.10 artifact: without it a `basePath: '/docs'` + i18n
+                    // app's middleware sees `nextUrl.pathname = '/docs/about'`, `locale = ''`,
+                    // `basePath = ''`; with it, `/about` / `en` / `/docs` — byte-identical to
+                    // the generated handler above and to `next start`. This path was the ONLY
+                    // reachable one at the edge for the real artifact shape, and it passed no
+                    // config at all.
+                    nextConfig: manifestNextConfig(manifest),
                     destination: "document",
                     credentials: "same-origin",
                     bodyUsed: false,
@@ -382,11 +548,19 @@ export function createRequestHandler(
 
               if (response) {
                 middlewareResponse = response;
-                return responseToMiddlewareResult(
-                  response.clone(),
-                  new Headers(ctx.headers),
-                  ctx.url,
-                );
+                // N40 (SECURITY). responseToMiddlewareResult MUTATES the Headers it is handed
+                // into the middleware's FINAL request-header set (applying
+                // x-middleware-override-headers / x-middleware-request-* /
+                // x-middleware-set-cookie). This tier used to construct that object inline and
+                // throw it away, so `NextResponse.next({ request: { headers } })` was a total
+                // no-op at the edge — and because we still stamp `x-mw-evaluated: ran`, the
+                // pool skipped its own middleware and the client's spoofed header reached the
+                // handler unmodified. Capture it and transport it below (x-mw-request-headers),
+                // exactly as pool-server/resolve.ts does for Phase 1.
+                const reqHeaders = new Headers(ctx.headers);
+                const mwResult = responseToMiddlewareResult(response.clone(), reqHeaders, ctx.url);
+                middlewareRequestHeaders = reqHeaders;
+                return mwResult;
               }
               return {};
             } catch (err) {
@@ -416,7 +590,10 @@ export function createRequestHandler(
     // normalization with the pool resolver. Forward resolvedHeaders (middleware
     // Set-Cookie, custom redirect headers) so the edge matches the pool phase.
     const redirect = normalizeResolvedRedirect(resolution, prep, manifest, {
-      middlewareAuthored: middlewareResponse != null,
+      // N40: a plain `NextResponse.next()` is NOT a middleware-authored redirect — the shared
+      // discriminator requires a `location` header. Passing `middlewareResponse != null` made
+      // the N15 request-query carry inert for every app with middleware.
+      middlewareAuthored: middlewareAuthoredRedirect(middlewareResponse),
     });
     if (redirect) {
       if (redirect.kind === "retry") {
@@ -429,8 +606,15 @@ export function createRequestHandler(
         // Carry the ORIGINAL shed signal into the retry: the server-side withTimeout
         // (server.ts) keeps the first request's clock across this recursion, so a
         // fresh AbortSignal.timeout here would give the retried middleware a full
-        // new budget that outlives the shed response.
-        return handleRequest(retried, shedSignal);
+        // new budget that outlives the shed response. And carry the middleware verdict, so
+        // the retry does NOT run middleware a second time (see the `retry` parameter) —
+        // TOGETHER WITH the request headers that pass mutated (N40b), or the retried response
+        // pairs a trusted `x-mw-evaluated: ran` with the client's own headers.
+        return handleRequest(retried, shedSignal, {
+          middlewareAlreadyRan: true,
+          mwEvaluated,
+          middlewareRequestHeaders,
+        });
       }
       const responseHeaders: Record<string, string> = {};
       const setCookies = redirect.resolvedHeaders?.getSetCookie?.() ?? [];
@@ -456,7 +640,11 @@ export function createRequestHandler(
       if (redirect.status === 308) responseHeaders["Refresh"] = `0;url=${location}`;
       return buildImmediateResponse(
         redirect.status,
-        withRscCacheBustingGuard(responseHeaders, unvalidatedRscRequest),
+        // S4: this redirect is a middleware/rule verdict, so it may never carry
+        // shared-cache freshness — a cached 3xx is served without the callout running.
+        withMiddlewareCachePolicy(
+          withRscCacheBustingGuard(responseHeaders, unvalidatedRscRequest),
+        ),
         undefined,
         setCookies,
       );
@@ -469,24 +657,43 @@ export function createRequestHandler(
         // Headers.entries() folds multiple Set-Cookie into one comma-joined
         // value; skip them here and forward each intact via getSetCookie().
         if (key.toLowerCase() === "set-cookie") continue;
+        // N40: never forward the middleware's own content-length. The body below is
+        // re-serialized (and the redirect branch above drops the body entirely), so a
+        // forwarded length can disagree with the bytes actually sent — Envoy then frames a
+        // truncated or stalled response. The redirect branch already skipped it; this one
+        // didn't. Envoy sets the correct length for an immediate response.
+        if (key.toLowerCase() === "content-length") continue;
         respHeaders[key] = value;
       }
       const setCookies = mwRes.headers.getSetCookie();
       return buildImmediateResponse(
         mwRes.status,
-        withRscCacheBustingGuard(respHeaders, unvalidatedRscRequest),
-        await mwRes.text(),
+        // S4: a middleware-AUTHORED body is the middleware-covered case by definition.
+        withMiddlewareCachePolicy(withRscCacheBustingGuard(respHeaders, unvalidatedRscRequest)),
+        // N40: carry the body as BYTES. `await mwRes.text()` decoded it as UTF-8 and
+        // server.ts's `toBytes` re-encoded it, so every byte >= 0x80 in a
+        // middleware-authored binary body became U+FFFD (3 bytes) — measured: an 8-byte PNG
+        // signature arrived as 10 bytes. Phase 1 streams the real body
+        // (pool-server/dispatch.ts), so this was edge-only corruption.
+        new Uint8Array(await mwRes.arrayBuffer()),
         setCookies,
       );
     }
 
     if (resolution.externalRewrite) {
-      return buildImmediateResponse(
-        502,
-        { "content-type": "text/plain; charset=utf-8" },
-        `External rewrites are not supported in adapter-k8s v1. ` +
-          `Attempted rewrite to: ${resolution.externalRewrite.toString()}\n` +
-          `Use a Route Handler to proxy external APIs instead.`,
+      // N40. NEVER author a status the other tier doesn't. Phase 1 returns
+      // `external-rewrite` and pool-server/dispatch.ts PROXIES it, matching `next start`;
+      // this tier used to answer 502 ("not supported in adapter-k8s v1"). Because the CEL
+      // match condition is `!(…)` — i.e. approximately everything — whenever the app has
+      // middleware, a next.config external rewrite worked in the e2e harness (pool only) and
+      // 502'd in production. Hand it to the pool exactly as the body-request backstop above
+      // does: CONTINUE with the whole internal dispatch vocabulary CLEARED and no secret
+      // added, so the pool treats the request as untrusted, re-resolves locally, and owns the
+      // proxy hop. (Middleware runs again in the pool for this request — that is the same
+      // cost the body backstop pays, and it is the fail-safe direction.)
+      return buildHeaderMutationResponse(
+        [],
+        [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER],
       );
     }
 
@@ -571,8 +778,28 @@ export function createRequestHandler(
         new Headers(resolution.resolvedHeaders ?? undefined),
         signal,
       );
-      const serialized = serializeResolvedHeaders(responseHeaders);
+      const serialized = serializeHeaderMap(responseHeaders);
       if (serialized) setDispatch("x-resolved-headers", serialized);
+    }
+
+    // N40 (SECURITY). The middleware's final REQUEST header set — `NextResponse.next({ request:
+    // { headers } })`. `responseToMiddlewareResult` already resolved the override list into it,
+    // so this value is the authoritative REPLACEMENT set the pool installs over `req.headers`
+    // (pool-server/dispatch.ts, same code path Phase 1 feeds via
+    // ResolveResult.middlewareRequestHeaders). Secret-gated like every other name in
+    // INTERNAL_DISPATCH_HEADERS — a client cannot forge its own request-header rewrite, and any
+    // spoofed copy is in the `clear` set above.
+    //
+    // Only stamped when middleware actually ran: on any other path the pool must not be told a
+    // header set is authoritative. Not stamping it is fail-safe in one direction only — the
+    // pool then keeps the client's own headers — which is precisely why the pool must not skip
+    // its own middleware without a trusted `x-mw-evaluated`, and why an unstamped
+    // header-sanitizing middleware was a live bypass.
+    if (middlewareRequestHeaders) {
+      const serializedRequestHeaders = serializeHeaderMap(middlewareRequestHeaders);
+      if (serializedRequestHeaders) {
+        setDispatch("x-mw-request-headers", serializedRequestHeaders);
+      }
     }
 
     const i18nLocales = (manifest.i18n as any)?.locales as string[] | undefined;
@@ -621,6 +848,52 @@ export function createRequestHandler(
     if (internalSecret) {
       mutations.push({ key: INTERNAL_SECRET_HEADER, value: internalSecret });
       clear.delete(INTERNAL_SECRET_HEADER);
+    }
+
+    // N40b (AVAILABILITY). The dispatch headers are ADDITIVE on the wire, and
+    // `x-mw-request-headers` carries the middleware's whole final request-header set while the
+    // client's originals stay put — the pool needs those originals, because index.ts derives the
+    // RSC/preview/forced-cache verdicts from them BEFORE dispatch.ts installs the replacement
+    // set. So the set is duplicated, and a request with ~8 KiB of cookies/auth can cross Node's
+    // 16 KiB `maxHeaderSize` (pool-server/server.ts takes the default) only AFTER ext_proc
+    // processing: MEASURED 8849 bytes → 200 before the extension, 17490 bytes → 431 after.
+    // Node answers that 431 from the parser (HPE_HEADER_OVERFLOW), so the pool never gets the
+    // chance to read the transport header — the request simply stops working.
+    //
+    // The fix is the SAME fail-safe the body-request and external-rewrite backstops above use:
+    // clear the whole dispatch vocabulary, add no secret, and let the pool treat the request as
+    // untrusted and re-resolve it locally (Phase 1 — which re-runs middleware and re-derives the
+    // header mutations in-process, where no wire budget applies). That is strictly better than
+    // the alternatives: dropping just `x-mw-request-headers` would leave a trusted
+    // `x-mw-evaluated: ran` next to un-mutated client headers, i.e. the Finding-1 bypass, and
+    // dropping the client's originals instead would blind the pool's own pre-dispatch header
+    // reads. It also SHRINKS the request rather than growing it, so a request that worked before
+    // the N40 transport keeps working. Cost: middleware runs a second time (in the pool) for
+    // these requests only — the same cost the two backstops above already pay, and the fail-safe
+    // direction for invariant 2 (middleware is never bypassed).
+    const overwritten = new Set(mutations.map((m) => m.key.toLowerCase()));
+    const projectedBytes = headerBlockBytes([
+      // Everything the client sent that this response neither overwrites nor removes, plus the
+      // pseudo-headers (`:path` becomes the upstream request line, which counts against the
+      // same limit).
+      ...requestHeaders
+        .filter((h) => {
+          const k = h.key.toLowerCase();
+          return !overwritten.has(k) && !clear.has(k);
+        })
+        .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
+      ...mutations.map((m) => [m.key, m.value] as [string, string]),
+    ]);
+    if (!fitsPoolHeaderBudget(projectedBytes)) {
+      console.warn(
+        `[routing-service] dispatch headers would exceed the pool's header budget ` +
+          `(${projectedBytes} bytes projected); handing the request to the pool untrusted so it ` +
+          `re-resolves locally`,
+      );
+      return buildHeaderMutationResponse(
+        [],
+        [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER],
+      );
     }
 
     return buildHeaderMutationResponse(mutations, [...clear]);

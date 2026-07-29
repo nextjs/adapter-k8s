@@ -3,8 +3,11 @@ import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import readline from "node:readline";
 import { execCapture } from "./exec.js";
-import { deployExtRoleId } from "./init.js";
+import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
+import { K8S_NAMESPACE } from "../emit/templates/utils.js";
+import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -17,16 +20,42 @@ export interface DestroyOptions {
 // Distinguish "the resource is already gone" (idempotent success) from genuine
 // failures (auth, permission, network). Only the former should be treated as
 // already-deleted; the latter must be surfaced so destroy doesn't silently succeed.
+// N28: the positive needles are substrings, so they also matched failures that merely
+// CONTAIN them — `error dialing backend: 404 page not found ("no such host")` is a
+// connectivity failure, not a deletion, and deploy used this predicate to decide "nothing is
+// serving from the previous build" (then scaled a build serving N≫2 down to 2 mid-deploy).
+// Any auth/connectivity/quota marker now vetoes "gone", and the bare "404"/"no such" needles
+// are removed: a naked 404 with no other evidence is not proof of absence. Callers that CAN
+// key on a machine-readable signal must do so instead — deploy's retained-manifest probe now
+// uses `--ignore-not-found` (exit 0 + empty stdout).
+const NOT_GONE_MARKERS = [
+  "permission",
+  "forbidden",
+  "unauthorized",
+  "unauthenticated",
+  "credential",
+  "invalid_grant",
+  "dial tcp",
+  "no such host",
+  "connection refused",
+  "unable to connect",
+  "i/o timeout",
+  "timed out",
+  "quota",
+  "rate limit",
+  "service unavailable",
+];
+
 export function isAlreadyGoneError(stderr: string): boolean {
   const s = stderr.toLowerCase();
+  if (NOT_GONE_MARKERS.some((m) => s.includes(m))) return false;
   return (
     s.includes("notfound") ||
+    s.includes("not_found") ||
     s.includes("not found") ||
     s.includes("does not exist") ||
     s.includes("was not found") ||
-    s.includes("release: not found") ||
-    s.includes("no such") ||
-    s.includes("404")
+    s.includes("release: not found")
   );
 }
 
@@ -133,6 +162,8 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
 
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
+  // S13: validate before any of these reach a gcloud/kubectl argv.
+  assertSafeInfrastructure(infra);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
 
@@ -211,7 +242,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     if (cred.exitCode !== 0) {
       throw new Error(
         `Failed to connect to cluster "${clusterName}" — aborting destroy before any ` +
-          `deletion: ${cred.stderr.trim() || `exit ${cred.exitCode}`}`,
+          `deletion: ${sanitizeForTerminal(cred.stderr.trim()) || `exit ${cred.exitCode}`}`,
       );
     }
   } else if (dryRun) {
@@ -235,8 +266,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     // same as the destruction gate).
     const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
     // L14: the context name is kubeconfig-sourced — strip terminal control chars.
-    const currentContext =
-      ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+    const currentContext = ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
     console.warn(
       `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
         `NOT be pinned to this release's cluster.\n` +
@@ -278,7 +308,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         console.log("    (release not found or already uninstalled)");
       } else {
         console.warn(
-          `    WARNING: helm uninstall failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+          `    WARNING: helm uninstall failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
         );
         failures.push(`helm release "${releaseName}"`);
       }
@@ -306,9 +336,42 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete adapter state ConfigMaps: ` +
-          `${res.stderr.trim() || `exit ${res.exitCode}`}. Delete them manually ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
           `(kubectl delete configmap -n default -l app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
+      );
+    }
+  }
+
+  // 1c. Delete the per-build internal-dispatch Secrets (N87). These carry
+  // `helm.sh/resource-policy: keep` ON PURPOSE — a build's secret must outlive the upgrade that
+  // renders the next build's one, or the retained rollback target's pods cannot start — which
+  // means `helm uninstall` deliberately does NOT remove them. So destroy has to, and the
+  // ConfigMap sweep above does not cover them: different kind, and these carry
+  // `managed-by: Helm` (helm owns them) rather than the adapter's own managed-by label, so they
+  // are selected by component instead. Without this, a destroyed release leaves its dispatch
+  // secrets in the namespace indefinitely.
+  const secretDeleteArgs = [
+    "delete",
+    "secret",
+    "-n",
+    K8S_NAMESPACE,
+    "-l",
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
+    "--ignore-not-found",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${secretDeleteArgs.join(" ")}`);
+  } else {
+    const res = await execCapture("kubectl", secretDeleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete the internal-dispatch Secrets: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them ` +
+          `manually (kubectl delete secret -n ${K8S_NAMESPACE} -l ` +
+          `app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}); they are retained by ` +
+          `resource-policy and helm uninstall will not remove them.`,
       );
     }
   }
@@ -328,7 +391,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
             console.log("    (bucket not found or already deleted)");
           } else {
             console.warn(
-              `    WARNING: bucket deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+              `    WARNING: bucket deletion failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
             );
             failures.push(`GCS bucket "${infra.gcsBucket}"`);
           }
@@ -336,29 +399,39 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       }
     }
 
-    // Delete service account
+    // Delete the service accounts. S6: init creates TWO — the Workload-Identity-bound
+    // `<release>-deploy` (the route-extension Job) and `<release>-cli`, which holds the bucket
+    // objectAdmin and Artifact Registry writer grants and is bound to nothing in the cluster.
+    // BOTH are release-scoped, so both go here: leaving `<release>-cli` behind would leave a
+    // live identity with write access to a bucket and a registry for a release that no longer
+    // exists, which is the "destroy silently leaves infra" gap in its most sensitive form.
     if (projectId) {
-      const saEmail = `${releaseName}-deploy@${projectId}.iam.gserviceaccount.com`;
-      const saArgs = [
-        "iam",
-        "service-accounts",
-        "delete",
-        saEmail,
-        "--project",
-        projectId,
-        "--quiet",
-      ];
-      if (dryRun) {
-        console.log(`  [dry-run] gcloud ${saArgs.join(" ")}`);
-      } else {
-        console.log(`  → Deleting deploy service account`);
+      for (const { label, saEmail } of [
+        { label: "deploy", saEmail: deployServiceAccountEmail(releaseName, projectId) },
+        { label: "CLI", saEmail: cliServiceAccountEmail(releaseName, projectId) },
+      ]) {
+        const saArgs = [
+          "iam",
+          "service-accounts",
+          "delete",
+          saEmail,
+          "--project",
+          projectId,
+          "--quiet",
+        ];
+        if (dryRun) {
+          console.log(`  [dry-run] gcloud ${saArgs.join(" ")}`);
+          continue;
+        }
+        console.log(`  → Deleting ${label} service account`);
         const res = await execCapture("gcloud", saArgs);
         if (res.exitCode !== 0) {
           if (isAlreadyGoneError(res.stderr)) {
+            // The normal case for `<release>-cli` on a release inited before the S6 split.
             console.log("    (service account not found or already deleted)");
           } else {
             console.warn(
-              `    WARNING: service account deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+              `    WARNING: service account deletion failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
             );
             failures.push(`service account "${saEmail}"`);
           }
@@ -390,7 +463,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
               console.log("    (not found or already deleted)");
             } else {
               console.warn(
-                `    WARNING: deletion failed: ${res.stderr.trim() || `exit ${res.exitCode}`}`,
+                `    WARNING: deletion failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
               );
               failures.push(desc);
             }
@@ -428,7 +501,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // releases and expensive/slow to recreate, so nuking them from a per-release `destroy` is
   // unsafe. Surface them with exact commands instead of silently leaving them AND deleting
   // the state needed to find them (the previous behavior).
-  console.log("\n✓ Removed: Helm release, GCS bucket, deploy service account, and the");
+  console.log("\n✓ Removed: Helm release, GCS bucket, both service accounts, and the");
   console.log("  release-scoped ext_proc resources (traffic extension, routing backend,");
   console.log("  health check, static IP, custom IAM role).\n");
   if (projectId) {

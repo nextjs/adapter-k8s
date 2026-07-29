@@ -37,7 +37,12 @@ export interface CommonResponse {
 export interface ImmediateResponse {
   status?: { code: number };
   headers?: HeaderMutation;
-  body?: string;
+  // N40: a middleware-authored body can be BINARY. A `string` body forced a UTF-8 round-trip
+  // (`await response.text()` here, `TextEncoder.encode` in server.ts) that replaced every byte
+  // >= 0x80 with U+FFFD, so the bytes on the wire no longer matched what middleware returned.
+  // Byte bodies pass through untouched; strings stay supported for the text responses this tier
+  // authors itself.
+  body?: string | Uint8Array;
   grpcStatus?: { status: number };
 }
 

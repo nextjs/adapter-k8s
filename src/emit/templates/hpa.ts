@@ -1,5 +1,10 @@
 // src/emit/templates/hpa.ts
-import { sanitizeK8sName } from "./utils.js";
+import {
+  sanitizeK8sName,
+  assertSafeBuildId,
+  assertSafePoolName,
+  assertSafeReleaseName,
+} from "./utils.js";
 
 export function renderHPA({
   poolName,
@@ -10,6 +15,14 @@ export function renderHPA({
   buildId: string;
   releaseName: string;
 }): string {
+  // Sanitize at the point of consumption (AGENTS.md). The three `.Values` lookups below
+  // are `minReplicas: {{ … }}` style BARE scalars, so the numbers behind them must be
+  // integers — that check lives at their source (values-yaml.ts, N60), since helm resolves
+  // them long after this template is written.
+  assertSafeReleaseName(releaseName);
+  assertSafePoolName(poolName);
+  assertSafeBuildId(buildId);
+
   const deploymentName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   // The HPA's own name appends "-hpa" — reserve room for it inside the 63-char
   // limit (a 63-char deployment name would otherwise yield a 67-char HPA name

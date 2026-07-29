@@ -18,6 +18,8 @@ import os from "node:os";
 import path from "node:path";
 import {
   stageFile,
+  stagingFailures,
+  assertNoStagingFailures,
   resolveAndCopyExternals,
   assetDestPath,
   hasEdgeMiddleware,
@@ -32,11 +34,13 @@ let tmpDir: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-staging-"));
   stagedPaths.clear();
+  stagingFailures.length = 0;
 });
 
 afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
   stagedPaths.clear();
+  stagingFailures.length = 0;
 });
 
 const write = (rel: string, content = "x") => {
@@ -109,6 +113,70 @@ describe("stageFile", () => {
     );
   });
 
+  // N50 (review #9, both outcomes reproduced against the unfixed code):
+  //   (a) `assetDestPath` returned Next's `../`-prefixed traced-asset key verbatim, so the
+  //       file landed OUTSIDE `context/` and `COPY context/ .` never picked it up — a
+  //       silently missing runtime dependency (the sharp-incident shape);
+  //   (b) with enough `../` segments, `cp` OVERWROTE A REPO FILE. Measured on the unfixed
+  //       code: stageFile(projectDir, evil, "../../../../../../package.json") replaced
+  //       <tmp>/package.json with the source's contents.
+  // Next keys traced assets as `path.relative(repoRoot, file)`, so ANY traced file above the
+  // lockfile-detected root produces such a key: a file:/link: dependency, a linked next
+  // checkout, a pnpm store outside the tree, or a narrow outputFileTracingRoot.
+  describe("containment (N50)", () => {
+    it("throws instead of staging outside the build context", async () => {
+      const src = write("dep.js", "OUTSIDE");
+      await expect(stageFile(tmpDir, src, "../escaped.js", "ssr")).rejects.toThrow(
+        /Refusing to stage outside the Docker build context/,
+      );
+      expect(existsSync(path.join(tmpDir, ".k8s-adapter/output/pools/ssr/escaped.js"))).toBe(false);
+    });
+
+    it("cannot overwrite a file in the repository, however many ../ segments", async () => {
+      const victim = write("package.json", '{"real":true}');
+      const evil = write("evil.json", '{"OVERWRITTEN":true}');
+      // 6 segments up from <tmp>/.k8s-adapter/output/pools/ssr/context lands on <tmp>.
+      await expect(
+        stageFile(tmpDir, evil, "../../../../../../package.json", "ssr"),
+      ).rejects.toThrow(/Refusing to stage outside/);
+      expect(readFileSync(victim, "utf-8")).toBe('{"real":true}');
+    });
+
+    it("neutralizes an absolute-looking destination (path.join keeps it relative)", async () => {
+      // path.join (unlike path.resolve) treats a leading "/" as just another separator, so
+      // this cannot escape — pin that, so a future switch to path.resolve is caught here.
+      const src = write("dep.js", "x");
+      await stageFile(tmpDir, src, "/etc/whatever.js", "ssr");
+      expect(
+        existsSync(path.join(tmpDir, ".k8s-adapter/output/pools/ssr/context/etc/whatever.js")),
+      ).toBe(true);
+      expect(existsSync("/etc/whatever.js")).toBe(false);
+    });
+  });
+
+  // N50 (review, Medium): a copy failure was a console.warn and the dest was recorded as
+  // staged BEFORE the copy, so (1) the build stayed green while the image lost a handler and
+  // (2) a later call for the same dest from a different source was skipped as "already done".
+  describe("copy-failure handling (N50)", () => {
+    it("collects the failure, leaves the dest unmarked, and throws at the end of the build", async () => {
+      const src = write("handler.js", "v1");
+      // Make the destination path a DIRECTORY so copyFile fails with EISDIR.
+      const dest = path.join(tmpDir, ".k8s-adapter/output/pools/ssr/context/handler.js");
+      mkdirSync(dest, { recursive: true });
+
+      await stageFile(tmpDir, src, "handler.js", "ssr");
+      expect(stagingFailures).toHaveLength(1);
+      expect(stagingFailures[0]!.dest).toBe("handler.js");
+      // NOT marked as staged — a later call with a working source must still be attempted.
+      expect(stagedPaths.has(dest)).toBe(false);
+
+      expect(() => assertNoStagingFailures()).toThrow(/could not be staged/);
+      // The queue is cleared for the next build.
+      expect(stagingFailures).toHaveLength(0);
+      expect(() => assertNoStagingFailures()).not.toThrow();
+    });
+  });
+
   it("stages each destination only once per build (stagedPaths dedup)", async () => {
     const src = write("src/handler.js", "v1");
     await stageFile(tmpDir, src, "handler.js", "ssr");
@@ -151,6 +219,19 @@ describe("resolveAndCopyExternals", () => {
       resolveAndCopyExternals(path.join(tmpDir, "nope"), path.join(tmpDir, "dest")),
     ).resolves.toBeUndefined();
     expect(existsSync(path.join(tmpDir, "dest"))).toBe(false);
+  });
+
+  // N50 (review, Medium): a dangling symlink made `await realpath(entry)` REJECT, so the
+  // build died with a bare `ENOENT: no such file or directory, realpath '...'` and no
+  // attribution — and the `existsSync(realTarget)` guard written to handle exactly this was
+  // unreachable dead code. Now it fails with the entry and the likely cause.
+  it("fails with an actionable message on a dangling symlink (N50)", async () => {
+    const src = path.join(tmpDir, ".next/node_modules");
+    mkdirSync(src, { recursive: true });
+    symlinkSync(path.join(tmpDir, "node_modules/removed-pkg"), path.join(src, "removed-pkg"));
+    await expect(
+      resolveAndCopyExternals(src, path.join(tmpDir, "staged/node_modules")),
+    ).rejects.toThrow(/Dangling symlink in the Turbopack externals directory.*removed-pkg/s);
   });
 
   it("rebuilds the destination (stale entries from a previous build are removed)", async () => {
@@ -200,6 +281,42 @@ describe("assetDestPath (monorepo rebasing)", () => {
     );
   });
 
+  // N50 (review #9): an asset ABOVE the tracing root used to be returned verbatim, i.e. a
+  // `../`-prefixed destination. It is now rebased so it always stays inside the context.
+  describe("outside-root assets are rebased into the context (N50)", () => {
+    it("re-roots anything under a node_modules segment so Node can still resolve it", () => {
+      expect(
+        assetDestPath(
+          "/repo/app",
+          "../../pnpm-store/v3/node_modules/foo/index.js",
+          "/pnpm-store/v3/node_modules/foo/index.js",
+        ),
+      ).toBe("node_modules/foo/index.js");
+      // The LAST node_modules wins (nested deps keep their nesting).
+      expect(
+        assetDestPath(
+          "/repo/app",
+          "../node_modules/a/node_modules/b/index.js",
+          "/repo/node_modules/a/node_modules/b/index.js",
+        ),
+      ).toBe("node_modules/b/index.js");
+    });
+
+    it("flattens a non-node_modules outside-root asset under .adapter-k8s-external/", () => {
+      const dest = assetDestPath("/repo/app", "../shared/data.json", "/repo/shared/data.json");
+      expect(dest).toBe(path.join(".adapter-k8s-external", "shared", "data.json"));
+      expect(dest.startsWith("..")).toBe(false);
+    });
+
+    it("never returns a path that escapes the context", () => {
+      for (const key of ["../x.js", "../../../../x.js", "..", "../node_modules/p/x.js"]) {
+        const dest = assetDestPath("/repo/app", key, path.resolve("/repo/app", key));
+        expect(path.normalize(dest).startsWith("..")).toBe(false);
+        expect(path.isAbsolute(dest)).toBe(false);
+      }
+    });
+  });
+
   it("is a no-op when repoRoot === projectDir", () => {
     expect(
       assetDestPath(
@@ -229,6 +346,133 @@ describe("hasEdgeMiddleware", () => {
     expect(hasEdgeMiddleware(tmpDir)).toBe(false);
   });
 
+  // N50 (review #34): detection was filename-only, but Next 16 decides by the declared
+  // runtime — `hasNodeMiddleware = staticInfo.runtime === "nodejs" || isProxyFile(page)`
+  // (build/index.ts). A `middleware.ts` with `export const runtime = "nodejs"` is NODE
+  // middleware: there is no edge bundle to poison, so the Valkey incremental cacheHandler
+  // must still be registered. It was not — ISR/PPR-shell revalidation silently stopped being
+  // cross-replica while build-metadata still said cacheEnabled: true.
+  describe("node-runtime middleware is not edge middleware (N50)", () => {
+    it('returns false for middleware.ts declaring runtime = "nodejs"', () => {
+      write("middleware.ts", 'export const runtime = "nodejs";\nexport default function () {}\n');
+      expect(hasEdgeMiddleware(tmpDir)).toBe(false);
+    });
+
+    it("accepts single quotes, let/var, and a type annotation", () => {
+      for (const decl of [
+        "export const runtime = 'nodejs'",
+        'export let runtime = "nodejs"',
+        'export const runtime: "nodejs" = "nodejs"',
+      ]) {
+        rmSync(path.join(tmpDir, "middleware.ts"), { force: true });
+        write("middleware.ts", `${decl};\n`);
+        expect(hasEdgeMiddleware(tmpDir), decl).toBe(false);
+      }
+    });
+
+    it("still reports edge for an explicit edge runtime or no declaration at all", () => {
+      write("middleware.ts", 'export const runtime = "edge";\n');
+      expect(hasEdgeMiddleware(tmpDir)).toBe(true);
+      rmSync(path.join(tmpDir, "middleware.ts"), { force: true });
+      write("middleware.ts", "export default function () {}\n");
+      expect(hasEdgeMiddleware(tmpDir)).toBe(true);
+    });
+
+    it("checks src/middleware.* too", () => {
+      write("src/middleware.js", 'export const runtime = "nodejs";\n');
+      expect(hasEdgeMiddleware(tmpDir)).toBe(false);
+    });
+  });
+
+  // N50 follow-up: the runtime scan ran over RAW source, so a COMMENTED-OUT or QUOTED declaration
+  // read as active. The consequence runs the unsafe way: default-EDGE middleware reported as Node
+  // lets the Node Valkey cacheHandler (node:net/node:tls RESP client) into the edge bundle, where
+  // it cannot resolve. Comments and literal contents must be excluded from the scan, and the
+  // exclusion itself must not be foolable (a `//` inside a string, a `/*` inside a template).
+  describe("comments and string contents are not live code (N50 follow-up)", () => {
+    const edgeCases: [name: string, source: string, edge: boolean][] = [
+      ["an active declaration", 'export const runtime = "nodejs";\n', false],
+      ["a //-commented declaration", '// export const runtime = "nodejs";\n', true],
+      ["an indented //-commented declaration", '  //export const runtime = "nodejs"\n', true],
+      ["a /* */-commented declaration", '/* export const runtime = "nodejs"; */\n', true],
+      [
+        "a multi-line /* */ block",
+        '/*\n * export const runtime = "nodejs";\n */\nexport default function () {}\n',
+        true,
+      ],
+      [
+        "a declaration inside a string literal",
+        `const doc = 'export const runtime = "nodejs"';\nexport default function () {}\n`,
+        true,
+      ],
+      [
+        "a declaration inside a template literal",
+        'const doc = `export const runtime = "nodejs"`;\nexport default function () {}\n',
+        true,
+      ],
+      [
+        "a declaration inside a template literal with a substitution",
+        "const doc = `export const runtime = ${JSON.stringify(x)}`;\nexport default function () {}\n",
+        true,
+      ],
+      // The stripper must not be foolable by the reverse trick either.
+      [
+        "a `//` that is only string CONTENT, not a comment",
+        'const u = "https://example.com";\nexport const runtime = "nodejs";\n',
+        false,
+      ],
+      [
+        "a `/*` that is only template CONTENT, not a comment",
+        'const glob = `/*.js`;\nexport const runtime = "nodejs";\n',
+        false,
+      ],
+      [
+        "an apostrophe inside a // comment",
+        '// don\'t treat this as a string\nexport const runtime = "nodejs";\n',
+        false,
+      ],
+      [
+        "a quote inside a regex literal",
+        'const q = /["\']/;\nexport const runtime = "nodejs";\n',
+        false,
+      ],
+      [
+        "a division operator that is not a regex",
+        'const half = 1 / 2, third = (3) / 4;\nexport const runtime = "nodejs";\n',
+        false,
+      ],
+      // The point of the whole finding: a comment ABOUT the declaration must not hide the real one.
+      [
+        "a genuine declaration after a comment mentioning it",
+        '// we set `export const runtime = "edge"` here for the edge bundle... actually:\n' +
+          'export const runtime = "nodejs";\nexport default function () {}\n',
+        false,
+      ],
+      [
+        "a genuine EDGE declaration after a comment mentioning nodejs",
+        '/* runtime = "nodejs" was tried and reverted */\nexport const runtime = "edge";\n',
+        true,
+      ],
+    ];
+
+    for (const [name, source, edge] of edgeCases) {
+      it(`${edge ? "reports edge" : "reports node"} for ${name}`, () => {
+        rmSync(path.join(tmpDir, "middleware.ts"), { force: true });
+        write("middleware.ts", source);
+        expect(hasEdgeMiddleware(tmpDir), source).toBe(edge);
+      });
+    }
+
+    it("is not fooled by source that forges the scanner's internal literal sentinel", () => {
+      // The scanner lifts literals out as `\uE000<index>\uE000`; source containing that codepoint
+      // must not be able to fabricate one. Here literal #0 IS "nodejs", so an unneutralized
+      // sentinel would make this file (which has no resolvable declaration) read as Node.
+      const S = "\uE000";
+      write("middleware.ts", `const s = "nodejs";\nexport const runtime = ${S}0${S};\n`);
+      expect(hasEdgeMiddleware(tmpDir)).toBe(true);
+    });
+  });
+
   it("returns false when no middleware file exists", () => {
     expect(hasEdgeMiddleware(tmpDir)).toBe(false);
   });
@@ -252,9 +496,15 @@ describe("stageSharpRuntimePackages", () => {
   };
 
   it("stages both linux-x64 packages into the pool context when resolvable", async () => {
-    const dirs = new Map(SHARP_RUNTIME_PACKAGES.map((p) => [p, writePkg(p)]));
+    // Canary.97 contract: sharp's own JS package must stage WITH the binaries (the pool
+    // bundle marks sharp external), so the resolver must also map "sharp".
+    const dirs = new Map([
+      ...SHARP_RUNTIME_PACKAGES.map((p) => [p, writePkg(p)] as const),
+      ["sharp", writePkg("sharp", "0.35.0")] as const,
+    ]);
     const result = await stageSharpRuntimePackages(tmpDir, "ssr", (dep) => dirs.get(dep));
     expect(result).toEqual({ staged: true });
+    expect(existsSync(path.join(poolCtx(), "node_modules", "sharp", "package.json"))).toBe(true);
     for (const pkg of SHARP_RUNTIME_PACKAGES) {
       const staged = path.join(poolCtx(), "node_modules", pkg);
       expect(existsSync(path.join(staged, "native.bin"))).toBe(true);

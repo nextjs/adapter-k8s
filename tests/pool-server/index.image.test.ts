@@ -8,7 +8,14 @@
 // THE REPO ROOT so createRequire(<staged>/package.json) can resolve the repo's
 // `next` (pool-server requires several next/dist modules at boot).
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import path from "node:path";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -114,7 +121,7 @@ const JP2_BODY = Buffer.from(
 
 function writeStagedDir(
   images: Record<string, unknown> | null,
-  options: { middlewareMatcher?: string } = {},
+  options: { middlewareMatcher?: string; middlewareSource?: string; publicFiles?: string[] } = {},
 ): {
   dir: string;
   configDir: string;
@@ -196,7 +203,27 @@ function writeStagedDir(
   );
   // Middleware module: never invoked by these tests, but its COVERAGE is what installs
   // the forced-cache wrapper the /_next/image response must not be able to defeat.
-  writeFileSync(path.join(dir, "mw.mjs"), "export function proxy(request) {}\n");
+  writeFileSync(
+    path.join(dir, "mw.mjs"),
+    options.middlewareSource ?? "export function proxy(request) {}\n",
+  );
+  // S3: real public/ bytes, so the optimizer has a local source to prefer over re-entry —
+  // plus a static-assets manifest entry for each, which is what lets the pool serve them on
+  // the LOOPBACK re-entry the covered path now takes (the disk fast path never needed one).
+  const publicFiles = options.publicFiles ?? [];
+  for (const name of publicFiles) {
+    writeFileSync(path.join(dir, "public", name), ONE_PIXEL_PNG);
+  }
+  writeFileSync(
+    path.join(configDir, "static-assets.json"),
+    JSON.stringify(
+      publicFiles.map((name) => ({
+        pathname: `/${name}`,
+        filePath: `public/${name}`,
+        cacheControl: "public, max-age=0, must-revalidate",
+      })),
+    ),
+  );
   return { dir, configDir };
 }
 
@@ -226,7 +253,11 @@ function makeBooter() {
   return {
     async boot(
       images: Record<string, unknown> | null,
-      options: { middlewareMatcher?: string } = {},
+      options: {
+        middlewareMatcher?: string;
+        middlewareSource?: string;
+        publicFiles?: string[];
+      } = {},
     ): Promise<BootedServer> {
       listenersBefore = Object.fromEntries(
         events.map((e) => [e, process.listeners(e as "SIGTERM") as Function[]]),
@@ -1049,4 +1080,84 @@ describe("image optimizer — middleware coverage must still win over the cachea
       await scoped.cleanup();
     }
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// S3 (SECURITY + PARITY) — a middleware-covered image SOURCE may not be read off disk.
+//
+// The optimizer's local branch did `readFileSync(public/<source>)` with no coverage check,
+// while its siblings (`/_next/static/`, `/_next/data/`) both refuse to short-circuit a covered
+// path. So `GET /_next/image?url=/gated.png` returned the bytes middleware on `/gated.png`
+// denies — and sendImageResponse then made them CDN-cacheable. It is also a parity break:
+// upstream's fetchInternalImage resolves a relative source through `routerServerHandler`, the
+// full pipeline INCLUDING middleware, not a filesystem read. The adapter already has that
+// re-entry (the loopback self-fetch); the fix is to prefer it when the source is covered.
+// ---------------------------------------------------------------------------
+describe("image optimizer — middleware covering the SOURCE path (S3)", () => {
+  const booter = makeBooter();
+  afterAll(async () => {
+    await booter.cleanup();
+  });
+
+  // Denies /gated.png, allows /open.png. Matcher covers both so coverage is not the variable.
+  const MW = `export function proxy(request) {
+  const { pathname } = new URL(request.url);
+  if (pathname === "/gated.png") return new Response("denied", { status: 403 });
+}
+`;
+
+  it("does NOT serve a middleware-denied public image through /_next/image", async () => {
+    const { port } = await booter.boot(null, {
+      middlewareMatcher: "^\\/(gated|open)\\.png$",
+      middlewareSource: MW,
+      publicFiles: ["gated.png", "open.png"],
+    });
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/gated.png&w=640&q=75`);
+    // The re-entry surfaces middleware's 403 as an upstream failure, so the one thing that
+    // must not happen is a 200 carrying the protected bytes.
+    expect(res.status).not.toBe(200);
+    expect(res.headers.get("content-type") ?? "").not.toContain("image/");
+  });
+
+  it("takes the loopback re-entry for a covered source, so middleware actually RUNS", async () => {
+    // The positive half of the fix: a covered source must not merely be refused, it must be
+    // resolved through the pipeline. Middleware records the paths it is invoked for, so the
+    // marker proves the request re-entered the server for the SOURCE path instead of being
+    // read off disk. (Whether the re-entry then yields bytes depends on the app's own routing;
+    // this fixture is an optimizer-parity fixture with no route graph, so serving is covered
+    // by the live suite, not here.)
+    const markers = path.join(REPO_ROOT, `.image-mw-seen-${process.pid}.log`);
+    rmSync(markers, { force: true });
+    try {
+      const { port } = await booter.boot(null, {
+        middlewareMatcher: "^\\/(gated|open)\\.png$",
+        middlewareSource: `import { appendFileSync } from "node:fs";
+export function proxy(request) {
+  const { pathname } = new URL(request.url);
+  appendFileSync(${JSON.stringify(markers)}, pathname + "\\n");
+  if (pathname === "/gated.png") return new Response("denied", { status: 403 });
+}
+`,
+        publicFiles: ["gated.png", "open.png"],
+      });
+      await fetch(`http://127.0.0.1:${port}/_next/image?url=/open.png&w=640&q=75`).catch(
+        () => undefined,
+      );
+      const seen = existsSync(markers) ? readFileSync(markers, "utf-8") : "";
+      expect(seen).toContain("/open.png");
+    } finally {
+      rmSync(markers, { force: true });
+    }
+  });
+
+  it("reads an UNCOVERED source straight from disk (the fast path is intact)", async () => {
+    const { port } = await booter.boot(null, {
+      middlewareMatcher: "^\\/only-this$",
+      middlewareSource: MW,
+      publicFiles: ["gated.png"],
+    });
+    const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/gated.png&w=640&q=75`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type") ?? "").toContain("image/");
+  });
 });

@@ -1,6 +1,11 @@
 // tests/middleware-matcher.test.ts
 import { describe, it, expect, vi } from "vitest";
-import { matchesMiddleware, type MiddlewareMatcher } from "../src/routing-common.js";
+import {
+  conditionRegex,
+  matchesMiddleware,
+  middlewareMayCoverPath,
+  type MiddlewareMatcher,
+} from "../src/routing-common.js";
 
 const url = (p: string, base = "http://ex.com") => new URL(base + p);
 const h = (o: Record<string, string> = {}) => new Headers(o);
@@ -280,5 +285,114 @@ describe("real @next/routing condition semantics", () => {
     // these match — pinning the contrast with our anchored middleware gating above.
     expect((await run("en")).resolvedPathname).toBe("/new");
     expect((await run("french")).resolvedPathname).toBe("/new");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S2 (SECURITY) — middlewareMayCoverPath: source regexps only, has/missing ignored.
+//
+// `matchesMiddleware` is per-REQUEST because has/missing read this request's cookies and
+// headers. The Cloud CDN cache entry whose cacheability it used to decide is SHARED, and the
+// cache key carries neither Cookie nor Authorization — so with a `missing: cookie` matcher the
+// AUTHENTICATED request (which does not match) filled the cache with a shared-cacheable body,
+// and the next UNAUTHENTICATED request (which does match) hit that entry ahead of the
+// post-cache ext_proc callout and got the protected body with middleware never running.
+// Anything whose effect outlives one request must therefore use this predicate.
+// ---------------------------------------------------------------------------
+describe("middlewareMayCoverPath (S2)", () => {
+  const gated = M("/gated", { missing: [{ type: "cookie", key: "session" }] });
+
+  it("ignores `missing` — the same path is covered with AND without the cookie", () => {
+    // This is the whole point: matchesMiddleware disagrees between the two requests…
+    expect(matchesMiddleware([gated], url("/gated"), h())).toBe(true);
+    expect(matchesMiddleware([gated], url("/gated"), h({ cookie: "session=abc" }))).toBe(false);
+    // …while the cache verdict must not.
+    expect(middlewareMayCoverPath([gated], url("/gated"))).toBe(true);
+  });
+
+  it("ignores `has` (the same defect with the roles swapped)", () => {
+    const m = M("/gated", { has: [{ type: "cookie", key: "session" }] });
+    expect(matchesMiddleware([m], url("/gated"), h())).toBe(false);
+    expect(middlewareMayCoverPath([m], url("/gated"))).toBe(true);
+  });
+
+  it("still says false for a path no matcher source covers", () => {
+    // Path-only must not become a blanket "everything is covered" — that would force
+    // `no-cache` on the whole site and defeat edge caching entirely.
+    expect(middlewareMayCoverPath([gated], url("/public"))).toBe(false);
+    expect(middlewareMayCoverPath([gated], url("/_next/static/chunk.js"))).toBe(false);
+  });
+
+  it("covers everything when there are no matchers", () => {
+    expect(middlewareMayCoverPath(undefined, url("/anything"))).toBe(true);
+    expect(middlewareMayCoverPath([], url("/anything"))).toBe(true);
+  });
+
+  it("matches the decoded pathname too (encoded-separator parity with matchesMiddleware)", () => {
+    const m = M("/another/hello");
+    expect(middlewareMayCoverPath([m], url("/another%2fhello"))).toBe(true);
+  });
+
+  it("FAIL-SAFE: an uncompilable matcher source counts as covering the path", () => {
+    // Same reasoning as matchesMiddleware — build-machine vs serving-runtime V8 skew (the
+    // `(?i:)` incident class) must never silently drop a route out of coverage, because the
+    // consequence here is a shared-cacheable response for a route that has middleware.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const broken: MiddlewareMatcher = { regexp: "(?<", originalSource: "/x" };
+    expect(middlewareMayCoverPath([broken], url("/anything"))).toBe(true);
+    warn.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S11 (AVAILABILITY) — has/missing condition values are compiled once and shape-checked.
+//
+// The pattern comes from the app's matcher config; the SUBJECT is an attacker-controlled
+// header/cookie/query/host. `^(a+)+$` against ~28 `a`s plus a mismatch blocks the event loop
+// for seconds, and the routing service's request-shed timer cannot interrupt synchronous CPU
+// work — so repeated tiny requests stall both tiers past their health-check deadlines.
+// ---------------------------------------------------------------------------
+describe("conditionRegex (S11)", () => {
+  it("compiles an ordinary pattern and caches the compiled object", () => {
+    const a = conditionRegex("v[0-9]{1,3}");
+    const b = conditionRegex("v[0-9]{1,3}");
+    expect(a).toBeInstanceOf(RegExp);
+    expect(a).toBe(b); // same object — not recompiled per request
+    expect(a!.test("v12")).toBe(true);
+    expect(a!.test("xv12")).toBe(false); // anchored, matching next start's matchHas
+  });
+
+  it("REFUSES a nested-quantifier pattern (and says so once)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(conditionRegex("(a+)+")).toBeNull();
+    expect(conditionRegex("([a-z]+)*")).toBeNull();
+    expect(conditionRegex("(a*)*")).toBeNull();
+    expect(warn).toHaveBeenCalled();
+    const before = warn.mock.calls.length;
+    conditionRegex("(a+)+"); // cached negative verdict — no second warning
+    expect(warn.mock.calls.length).toBe(before);
+    warn.mockRestore();
+  });
+
+  it("a refused pattern degrades to exact comparison, never to 'matches everything'", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const m = M("/gated", { has: [{ type: "header", key: "x-v", value: "(a+)+" }] });
+    // The literal string still matches; anything else does not.
+    expect(matchesMiddleware([m], url("/gated"), h({ "x-v": "(a+)+" }))).toBe(true);
+    expect(matchesMiddleware([m], url("/gated"), h({ "x-v": "aaaa" }))).toBe(false);
+    warn.mockRestore();
+  });
+
+  it("stays fast on the input that used to block the event loop", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const m = M("/gated", { has: [{ type: "header", key: "x-v", value: "(a+)+" }] });
+    const started = performance.now();
+    matchesMiddleware([m], url("/gated"), h({ "x-v": "a".repeat(40) + "!" }));
+    expect(performance.now() - started).toBeLessThan(250);
+    warn.mockRestore();
+  });
+
+  it("an uncompilable pattern is still tolerated (unchanged fallback)", () => {
+    expect(conditionRegex("(?<")).toBeNull();
   });
 });

@@ -1,7 +1,52 @@
 // src/config.ts
-import type { K8sAdapterConfig } from "./types.js";
+import type { K8sAdapterConfig, PoolConfig } from "./types.js";
 import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
-import { assertSafeHostname } from "./emit/templates/utils.js";
+import {
+  assertSafeHostname,
+  assertSafePoolName,
+  assertSafeQuantity,
+  assertSafeReplicaCount,
+  assertSafeTargetCPU,
+} from "./emit/templates/utils.js";
+
+// N60 (SECURITY). Resource quantities and scaling numbers from `next.config` reach the
+// rendered pod spec / HPA spec with no escaping at either sink (values.yaml -> helm, and
+// the routing tier's direct interpolation). Nothing validated them: `validateConfig`
+// checked only pool names, hosts, and the cache URL. A memoryLimit of
+// `512Mi"\n      hostNetwork: true\n      …` rendered VALID YAML with `hostNetwork: true`
+// on the pod, which voids both NetworkPolicy postures (N19). Validate here AND at each
+// consumption point (values-yaml.ts, deployment.ts, routing-service-deployment.ts,
+// routing-service-hpa.ts) — sanitize-at-consumption is the project convention, and this
+// function is not on the path of a direct `generateHelmChart` caller.
+function validateResources(
+  resources: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string } | undefined,
+  where: string,
+): void {
+  if (!resources) return;
+  const fields = ["cpu", "memory", "cpuLimit", "memoryLimit"] as const;
+  for (const field of fields) {
+    const value = resources[field];
+    if (value !== undefined) assertSafeQuantity(value, `${where}.resources.${field}`);
+  }
+}
+
+function validateScaling(
+  scaling: { min?: number; max?: number; targetCPU?: number } | undefined,
+  where: string,
+): void {
+  if (!scaling) return;
+  if (scaling.min !== undefined) assertSafeReplicaCount(scaling.min, `${where}.scaling.min`);
+  if (scaling.max !== undefined) assertSafeReplicaCount(scaling.max, `${where}.scaling.max`);
+  if (scaling.targetCPU !== undefined) {
+    assertSafeTargetCPU(scaling.targetCPU, `${where}.scaling.targetCPU`);
+  }
+  if (scaling.min !== undefined && scaling.max !== undefined && scaling.min > scaling.max) {
+    throw new Error(
+      `${where}.scaling.min (${scaling.min}) is greater than ${where}.scaling.max ` +
+        `(${scaling.max}): the HorizontalPodAutoscaler would be rejected by the API server.`,
+    );
+  }
+}
 
 // Minimum build-id characters that must survive truncation inside a composed
 // `${releaseName}-${poolName}-${buildId}` resource name. 8 chars of Next's
@@ -33,13 +78,11 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     );
   }
 
-  const poolNameRegex = /^[a-z0-9-]+$/;
-  for (const [name, pool] of Object.entries(config.pools)) {
-    if (!poolNameRegex.test(name)) {
-      throw new Error(
-        `pool name "${name}" is invalid: must be lowercase alphanumeric and hyphens only`,
-      );
-    }
+  for (const [name, pool] of Object.entries(config.pools) as [string, PoolConfig][]) {
+    // N61. Was /^[a-z0-9-]+$/, which admitted a leading/trailing hyphen (an invalid K8s
+    // label value and DNS-1123 name component). assertSafePoolName is the same validator
+    // the templates now call at each consumption point.
+    assertSafePoolName(name);
     // "routing-service" is the reserved routing-tier name: the chart renders the
     // routing tier's Service as `${releaseName}-routing-service`, which is exactly
     // the ACTIVE Service name a pool called "routing-service" would get — two
@@ -93,7 +136,16 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     if (!pool.routes || pool.routes.length === 0) {
       throw new Error(`pool "${name}" must have at least one route`);
     }
+    // N60: pod-spec / HPA-spec injection sinks.
+    validateResources(pool.resources, `pool "${name}"`);
+    validateScaling(pool.scaling, `pool "${name}"`);
   }
+
+  // N60: the routing tier's quantities are interpolated UNQUOTED
+  // (routing-service-deployment.ts) and its scaling numbers as bare scalars
+  // (routing-service-hpa.ts) — the least-escaped sinks in the chart.
+  validateResources(config.routingService?.resources, "routingService");
+  validateScaling(config.routingService?.scaling, "routingService");
 
   if (!config.provider) {
     throw new Error("provider is required in adapter config");

@@ -1,8 +1,10 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RoutingManifest } from "../types.js";
+import { assertValidRoutingManifest } from "../routing-common.js";
 import { createRequestHandler } from "./handler.js";
 import { createRoutingServer, startHealthServer } from "./server.js";
 
@@ -21,6 +23,77 @@ import { createRoutingServer, startHealthServer } from "./server.js";
 //    no opt-in at all.
 //  - neither set → crash unless ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1. Plaintext is
 //    ALWAYS an explicit opt-in, set only by the CLI's local-emulation path (emulate.ts).
+/**
+ * S1 (SECURITY). Refuse to serve a routing manifest that does not match the one this IMAGE
+ * shipped with.
+ *
+ * The routing service reads its manifest from `CONFIG_DIR`, which the pod spec points at the
+ * mutable `<release>-routing-manifest` ConfigMap — while the POOL reads the copy baked into
+ * its own image (no configMap volume, no CONFIG_DIR override). That asymmetry was exploitable:
+ * the manifest carries the middleware `matchers`, so rewriting them so nothing matches makes
+ * `matchesMiddleware` false, the edge stamps the TRUSTED `x-mw-evaluated: skip-nomatch`
+ * verdict *together with the internal secret*, and the pool — which trusts `skip-nomatch`
+ * (MW_EVALUATED_TRUSTED) — skips its own middleware too. Auth bypass at BOTH tiers from
+ * nothing more than `configmaps/update` in the namespace, which is a far weaker grant than
+ * the pod-creation power the route-ext Job's own notes already track. The same edit also
+ * enables arbitrary rule redirects at the load balancer.
+ *
+ * The Dockerfile stages this build's manifest at BAKED_CONFIG_DIR (`/app/config`), a path the
+ * `/config` mount cannot shadow, so the image itself is the authority. Compared by SHA-256 of
+ * the parsed-and-recanonicalized JSON rather than raw bytes: helm's block scalar round-trip
+ * normalizes trailing whitespace, and the retention/snapshot copy is re-serialized by kubectl.
+ *
+ * Fail-closed, and unconditionally so:
+ *  - digest mismatch → throw. A mounted manifest that isn't this build's is either tampering
+ *    or a rollback that reverted the ConfigMap without reverting the image; neither may serve.
+ *  - BAKED_CONFIG_DIR set but the file missing → throw (broken image).
+ *  - BAKED_CONFIG_DIR unset → skip. Only local emulate/tests run without it, and an attacker
+ *    cannot unset it: it is baked into the image and the root filesystem is read-only.
+ */
+export function assertManifestMatchesImage(mountedManifestPath: string): void {
+  const bakedDir = process.env.BAKED_CONFIG_DIR;
+  if (!bakedDir) return; // emulate / tests — no baked copy to compare against
+  const bakedPath = path.join(bakedDir, "routing-manifest.json");
+  if (path.resolve(bakedPath) === path.resolve(mountedManifestPath)) return; // reading the baked copy itself
+  if (!existsSync(bakedPath)) {
+    throw new Error(
+      `BAKED_CONFIG_DIR is set to ${bakedDir} but ${bakedPath} does not exist. The image must ` +
+        `carry the routing manifest it was built with so a mounted manifest can be verified ` +
+        `against it; refusing to start rather than trust the mount.`,
+    );
+  }
+  const digest = (file: string): string => {
+    // Canonicalize before hashing so YAML/kubectl round-tripping cannot fail a legitimate
+    // manifest: only the CONTENT is being compared, not its formatting.
+    const parsed: unknown = JSON.parse(readFileSync(file, "utf-8"));
+    return createHash("sha256").update(JSON.stringify(parsed)).digest("hex");
+  };
+  let mountedDigest: string;
+  let bakedDigest: string;
+  try {
+    mountedDigest = digest(mountedManifestPath);
+    bakedDigest = digest(bakedPath);
+  } catch (err) {
+    throw new Error(
+      `Could not verify the mounted routing manifest against the build's own copy ` +
+        `(${bakedPath}): ${err instanceof Error ? err.message : String(err)}. Refusing to ` +
+        `start — an unverifiable manifest decides whether middleware runs.`,
+    );
+  }
+  if (mountedDigest !== bakedDigest) {
+    throw new Error(
+      `Routing manifest mismatch: ${mountedManifestPath} (sha256 ${mountedDigest.slice(0, 16)}…) ` +
+        `does not match the manifest this image was built with (${bakedPath}, sha256 ` +
+        `${bakedDigest.slice(0, 16)}…). The manifest decides whether this tier stamps the ` +
+        `trusted "middleware already evaluated" verdict, so serving an unrecognized one would ` +
+        `let the pool skip middleware on routes this build says are covered. If this is a ` +
+        `rollback, revert the routing Deployment's IMAGE to the build whose manifest is ` +
+        `mounted (\`adapter-k8s rollback\` does both); if it is not, the ConfigMap has been ` +
+        `modified out of band.`,
+    );
+  }
+}
+
 export function ensureTlsIdentity(): void {
   const certFile = process.env.TLS_CERT_FILE;
   const keyFile = process.env.TLS_KEY_FILE;
@@ -113,7 +186,24 @@ async function main() {
   if (!existsSync(manifestPath)) {
     throw new Error(`Routing manifest not found: ${manifestPath}`);
   }
-  const manifest: RoutingManifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  // N40. Parse errors used to surface as a bare SyntaxError with no context, and a
+  // STRUCTURALLY wrong (but parseable) manifest — or one carrying a route `sourceRegex` this
+  // runtime's V8 rejects — was accepted here and only failed later, inside resolveRoutes, on
+  // every request. With middleware present `failOpen` is false, so that is a 500 on everything
+  // while `/healthz` keeps answering 200 and nothing evicts the pod. Validate at boot, in front
+  // of the readiness gate, exactly as the TLS identity and the middleware module already are.
+  let parsedManifest: unknown;
+  try {
+    parsedManifest = JSON.parse(readFileSync(manifestPath, "utf-8"));
+  } catch (err) {
+    throw new Error(
+      `Routing manifest at ${manifestPath} is not valid JSON: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  assertValidRoutingManifest(parsedManifest, manifestPath);
+  assertManifestMatchesImage(manifestPath);
+  const manifest: RoutingManifest = parsedManifest as RoutingManifest;
 
   // Load middleware module (if present). This MUST mirror the pool's top-level-await
   // unwrap (pool-server resolveMiddlewareModule): Next compiles TLA middleware as

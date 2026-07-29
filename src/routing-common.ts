@@ -43,12 +43,73 @@ export const INTERNAL_DISPATCH_HEADERS = [
   // entirely (the handler would see only the client's original search params).
   "x-invoke-path",
   "x-invoke-query",
+  // N40 (SECURITY). The middleware's FINAL request-header set — what
+  // `NextResponse.next({ request: { headers } })` produces. `responseToMiddlewareResult`
+  // resolves `x-middleware-override-headers` / `x-middleware-request-*` /
+  // `x-middleware-set-cookie` into the Headers it is handed, so the value carried here is
+  // already the authoritative REPLACEMENT set (a header the middleware deleted is simply
+  // absent — merging would resurrect it). Phase 1 captures it in-process
+  // (pool-server/resolve.ts) and pool-server/dispatch.ts installs it over `req.headers`;
+  // Phase 2 had NO transport at all, so a middleware that strips a spoofed `x-user-id` or
+  // stamps `x-authenticated-user` was a total no-op at the edge while `x-mw-evaluated: ran`
+  // told the pool the stage was already done. Secret-gated like every name in this list —
+  // a client must never be able to forge its own request-header rewrite.
+  "x-mw-request-headers",
 ] as const;
 
 // Recognized `x-mw-evaluated` verdicts that authorize the pool to skip its own middleware.
 // `ran` = matched + executed; `skip-nomatch` = middleware exists but matcher didn't match;
 // `none` = the app has no middleware. Anything else (incl. `error` / absent) ⇒ do NOT skip.
 export const MW_EVALUATED_TRUSTED = new Set(["ran", "skip-nomatch", "none"]);
+
+/**
+ * N40b (AVAILABILITY). Node's default `http.maxHeaderSize` — the ceiling on the ENTIRE request
+ * header block a pool pod will parse. The pool server calls `createServer()` with no
+ * `maxHeaderSize` override and the emitted container sets no `--max-http-header-size`
+ * (pool-server/server.ts, src/emit/), so this default is the real limit in production.
+ *
+ * MEASURED (Node 24.11.0, a `createServer()` with no options, raw socket writes):
+ *   - largest accepted header block: 16408 wire bytes (`http.maxHeaderSize` = 16384 plus the
+ *     small slack the llhttp parser allows for the request line/terminator).
+ *   - one byte over, Node answers `431 Request Header Fields Too Large` ITSELF
+ *     (parser error `HPE_HEADER_OVERFLOW`) — the request never reaches the request handler.
+ *
+ * That last fact is why this matters to the routing extension and not just to clients: the
+ * dispatch headers are added AFTER the client's own headers, and `x-mw-request-headers` carries
+ * the middleware's whole final request-header set while the originals stay on the wire (the pool
+ * needs them: index.ts derives RSC/preview/cache verdicts from the client's own headers BEFORE
+ * dispatch.ts installs the replacement set). The set is therefore duplicated, and a request with
+ * ~8 KiB of cookies/auth crossed 16 KiB only after ext_proc processing — MEASURED: 8849 bytes →
+ * 200 before the extension, 17490 bytes → 431 after it. The pool cannot honor a transport header
+ * on a request it is never handed, so the extension must keep the projected block under budget.
+ */
+export const POOL_MAX_HEADER_BYTES = 16 * 1024;
+
+/**
+ * Slack held back from POOL_MAX_HEADER_BYTES for bytes the extension does not see or control:
+ * the HTTP/1.1 request line Envoy writes upstream, and headers Envoy adds after the ext_proc
+ * mutation (`x-request-id`, `x-envoy-*`, `x-forwarded-*`, `via`, GFE trace headers — a few
+ * hundred bytes in practice). Deliberately generous: over-reserving costs a re-resolution in
+ * the pool on a pathologically large request, under-reserving costs a 431.
+ */
+export const POOL_HEADER_BUDGET_RESERVE_BYTES = 2 * 1024;
+
+/**
+ * Wire cost of a header block in HTTP/1.1 framing: `name: value\r\n` per entry. Byte length,
+ * not string length — a cookie or JSON value can carry multi-byte UTF-8.
+ */
+export function headerBlockBytes(entries: Iterable<readonly [string, string]>): number {
+  let total = 0;
+  for (const [key, value] of entries) {
+    total += Buffer.byteLength(key, "utf8") + Buffer.byteLength(value, "utf8") + 4;
+  }
+  return total;
+}
+
+/** Does a projected request header block fit the pool's parser limit (with reserve)? */
+export function fitsPoolHeaderBudget(bytes: number): boolean {
+  return bytes <= POOL_MAX_HEADER_BYTES - POOL_HEADER_BUDGET_RESERVE_BYTES;
+}
 
 // Header carrying the shared secret that authenticates the dispatch headers above.
 // Present only on responses from the trusted routing extension / cross-pool proxy.
@@ -95,17 +156,92 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
   }
   if (actual === null || actual === undefined) return false;
   if (cond.value === undefined) return true; // presence-only
-  try {
-    // Anchored (^…$) on purpose: this evaluates MIDDLEWARE matcher has/missing,
-    // which `next start` runs through matchHas (prepare-destination.js) — and
-    // matchHas anchors (`new RegExp(`^${value}$`)`). @next/routing's own
-    // matchesCondition is unanchored, but it never evaluates middleware matchers
-    // (resolveRoutes defers matcher gating to the invokeMiddleware callback), so
-    // matchHas is the behavior to mirror. See middleware-matcher.test.ts.
-    return new RegExp(`^${cond.value}$`).test(actual);
-  } catch {
-    return cond.value === actual;
+  // Anchored (^…$) on purpose: this evaluates MIDDLEWARE matcher has/missing,
+  // which `next start` runs through matchHas (prepare-destination.js) — and
+  // matchHas anchors (`new RegExp(`^${value}$`)`). @next/routing's own
+  // matchesCondition is unanchored, but it never evaluates middleware matchers
+  // (resolveRoutes defers matcher gating to the invokeMiddleware callback), so
+  // matchHas is the behavior to mirror. See middleware-matcher.test.ts.
+  const re = conditionRegex(cond.value);
+  if (!re) return cond.value === actual;
+  return re.test(actual);
+}
+
+/**
+ * S11 (AVAILABILITY). Compile a has/missing condition value ONCE, and refuse a pattern whose
+ * shape can backtrack catastrophically.
+ *
+ * Two defects lived in the old inline `new RegExp(\`^${cond.value}$\`)`:
+ *  1. It recompiled on EVERY request — a per-request regex compile on the hot path of both
+ *     tiers, for a pattern that is fixed for the life of the process.
+ *  2. The pattern comes from the app's middleware matcher config (copied verbatim into the
+ *     runtime manifest by manifest.ts) while the SUBJECT is an attacker-controlled header,
+ *     cookie, query value or hostname. An app matcher of `^(a+)+$` against ~28 `a`s plus one
+ *     mismatching character blocks the event loop for seconds — and the routing service's own
+ *     request-shed timer cannot interrupt synchronous CPU work (server.ts says so). Repeated
+ *     tiny requests then stall both tiers past their health-check deadlines, so a matcher an
+ *     app author wrote for convenience becomes a remote availability bug.
+ *
+ * The guard is a shape check, not a solver: nested quantifiers (a quantified group that itself
+ * contains a quantifier) are the class that produces exponential backtracking, and no
+ * legitimate has/missing value needs one. A rejected pattern degrades to exact string
+ * comparison — the same fallback an uncompilable pattern already took — rather than throwing,
+ * because a matcher that cannot be evaluated must never silently widen coverage.
+ *
+ * The degrade is a RUNTIME last resort, not the intended way an author learns about this. The
+ * shape is fully known at build time, so `manifest.ts` runs the same predicate
+ * (`unsafeConditionPattern`, below — ONE definition, so the two cannot drift) and FAILS the build
+ * naming the matcher. A pod-log warning about silently narrowed matcher coverage is a bad channel
+ * for a config mistake; `next build` is the right one. Reaching the degrade path therefore means
+ * a manifest built before that check existed, or one hand-edited afterwards.
+ *
+ * KNOWN LIMIT, stated rather than implied: this does not catch alternation-overlap patterns
+ * such as `(a|aa)+`, which backtrack for the same reason without matching the shape above.
+ * Catching those needs real automaton analysis (or an RE2-style engine). What is bounded here
+ * is the common, accidental form; an app that deliberately writes a pathological matcher can
+ * still hurt itself. The build-time half inherits exactly this limit — it shares the predicate,
+ * so it is not a second, broader net. See
+ * docs/superpowers/specs/2026-07-26-smaller-open-items.md §2 for why broadening the shape check
+ * was rejected on its own and what a real bound (a deadline, or a non-backtracking engine) needs.
+ */
+const conditionRegexCache = new Map<string, RegExp | null>();
+const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
+
+/**
+ * Why this has/missing pattern must not be evaluated as a regexp, or `null` if it is fine.
+ * The returned string is a sentence fragment, usable in both the runtime warning and the
+ * build-time error. Shared by both tiers and by the build so there is a single definition of
+ * "pathological" (the two-resolver-tier drift problem this module exists to prevent).
+ */
+export function unsafeConditionPattern(value: string): string | null {
+  return NESTED_QUANTIFIER_RE.test(value)
+    ? "a quantified group containing another quantifier can backtrack exponentially against a " +
+        "request-controlled value, blocking the event loop"
+    : null;
+}
+
+export function conditionRegex(value: string): RegExp | null {
+  const cached = conditionRegexCache.get(value);
+  if (cached !== undefined) return cached;
+  let compiled: RegExp | null = null;
+  const unsafe = unsafeConditionPattern(value);
+  if (unsafe) {
+    console.warn(
+      `[adapter-k8s] Refusing to evaluate middleware matcher condition ${JSON.stringify(value)} ` +
+        `as a regular expression: ${unsafe}. ` +
+        `Falling back to exact string comparison for this condition.`,
+    );
+  } else {
+    try {
+      compiled = new RegExp(`^${value}$`);
+    } catch {
+      compiled = null;
+    }
   }
+  // Cache the verdict — including the negative one, so a rejected or uncompilable pattern
+  // costs one warning and one check for the life of the process, not one per request.
+  conditionRegexCache.set(value, compiled);
+  return compiled;
 }
 
 // Compiled matcher regexps, memoized per matcher OBJECT (matchers come from the
@@ -178,6 +314,46 @@ export function matchesMiddleware(
     const hasOk = (m.has ?? []).every((c) => conditionPresent(c, headers, url));
     const missingOk = (m.missing ?? []).every((c) => !conditionPresent(c, headers, url));
     if (hasOk && missingOk) return true;
+  }
+  return false;
+}
+
+/**
+ * S2 (SECURITY). "Could middleware EVER cover this pathname?" — the source regexps only,
+ * with `has`/`missing` deliberately ignored.
+ *
+ * `matchesMiddleware` is per-REQUEST because `has`/`missing` read the request's own headers,
+ * cookies and query. That is correct for deciding whether to RUN middleware, but it is wrong
+ * for deciding whether a response may be shared-cached, because the two verdicts have
+ * different granularity: the Cloud CDN cache key (gcp-http-filter.ts) contains neither
+ * `Cookie` nor `Authorization`, so both variants of a conditionally-covered URL share ONE
+ * cache entry. With a matcher carrying `missing: [{type:"cookie", key:"session"}]`, an
+ * authenticated request does not match, keeps its origin `public, max-age=…`, and fills the
+ * CDN — and the next unauthenticated request hits that entry BEFORE the post-cache ext_proc
+ * extension and receives the protected body with middleware never running. The `has:`
+ * polarity is the same defect with the roles swapped.
+ *
+ * So every consumer whose decision outlives a single request — the forced CDN cache-control
+ * verdict and the pool's static/data fast paths — must use THIS predicate, and treat a
+ * conditionally-covered path as covered. `matchesMiddleware` stays the gate for actually
+ * running middleware.
+ */
+export function middlewareMayCoverPath(
+  matchers: MiddlewareMatcher[] | undefined,
+  url: URL,
+): boolean {
+  if (!matchers || matchers.length === 0) return true;
+  const paths = [url.pathname];
+  try {
+    const decoded = decodeURIComponent(url.pathname);
+    if (decoded !== url.pathname) paths.push(decoded);
+  } catch {
+    // malformed escape — raw only
+  }
+  for (const m of matchers) {
+    const re = compileMatcherRegex(m);
+    // Same fail-safe as matchesMiddleware: an uncompilable matcher counts as a match.
+    if (!re || paths.some((p) => re.test(p))) return true;
   }
   return false;
 }
@@ -636,6 +812,111 @@ export function manifestNextConfig(manifest: {
 
 export function getRscConfig(manifest: { routeGraph?: unknown }): RscConfig | undefined {
   return (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
+}
+
+/** The `routeGraph` buckets `@next/routing`'s matchRoute walks. Every entry in each of them
+ * carries a `sourceRegex` that gets `new RegExp()`'d PER REQUEST with no try/catch. */
+const ROUTE_GRAPH_BUCKETS = [
+  "beforeMiddleware",
+  "beforeFiles",
+  "afterFiles",
+  "dynamicRoutes",
+  "onMatch",
+  "fallback",
+] as const;
+
+/**
+ * N40. Validate a parsed routing manifest AT BOOT and throw on anything unusable.
+ *
+ * Two failure modes this closes, both of which used to become a per-request 500 with a pod
+ * that stays Ready forever (so nothing evicts it and the blue/green health gate passes):
+ *
+ *  1. A structurally wrong manifest (an empty file, a half-written mount, a hand-edited
+ *     ConfigMap) was consumed by a bare `JSON.parse` and only failed later, deep inside
+ *     resolveRoutes, on the first request.
+ *  2. A route `sourceRegex` the SERVING V8 rejects. `@next/routing`'s matchRoute does
+ *     `new RegExp(entry.sourceRegex)` with NO try/catch — unlike compileMatcherRegex above,
+ *     which has an explicit fail-safe for exactly this build-machine/serving-runtime skew
+ *     (the `(?i:)`-on-older-Node incident). One such route therefore throws on EVERY request
+ *     inside resolveRoutes → the routing service's catch → `failOpen === false` whenever the
+ *     app has middleware → 500 on everything, while `/healthz` keeps answering 200.
+ *
+ * Throwing here puts the failure where the startup path already puts a missing TLS identity
+ * and a missing middleware module: at deploy time, in front of the readiness gate.
+ */
+export function assertValidRoutingManifest(parsed: unknown, source: string): void {
+  const fail = (detail: string): never => {
+    throw new Error(
+      `Invalid routing manifest at ${source}: ${detail}. Refusing to start — an unusable ` +
+        `manifest fails per REQUEST (deep inside resolveRoutes) while /healthz keeps ` +
+        `answering 200, so nothing would evict the pod.`,
+    );
+  };
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    fail(`expected a JSON object, got ${Array.isArray(parsed) ? "an array" : typeof parsed}`);
+  }
+  const m = parsed as Record<string, unknown>;
+  if (typeof m.buildId !== "string" || m.buildId.length === 0) {
+    fail("`buildId` must be a non-empty string");
+  }
+  if (typeof m.basePath !== "string") fail('`basePath` must be a string ("" when unset)');
+  if (!Array.isArray(m.pathnames) || m.pathnames.some((p) => typeof p !== "string")) {
+    fail("`pathnames` must be an array of strings");
+  }
+  for (const key of ["poolAssignments", "pprRoutes"]) {
+    const value = m[key];
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      fail(`\`${key}\` must be an object`);
+    }
+  }
+  const routeGraph = m.routeGraph;
+  if (!routeGraph || typeof routeGraph !== "object" || Array.isArray(routeGraph)) {
+    fail("`routeGraph` must be an object");
+  }
+  const graph = routeGraph as Record<string, unknown>;
+  for (const bucket of ROUTE_GRAPH_BUCKETS) {
+    const entries = graph[bucket];
+    if (entries === undefined) fail(`\`routeGraph.${bucket}\` is missing`);
+    if (!Array.isArray(entries)) fail(`\`routeGraph.${bucket}\` must be an array`);
+    (entries as unknown[]).forEach((entry, i) => {
+      const at = `routeGraph.${bucket}[${i}]`;
+      if (!entry || typeof entry !== "object") fail(`\`${at}\` must be an object`);
+      const sourceRegex = (entry as Record<string, unknown>).sourceRegex;
+      if (typeof sourceRegex !== "string") fail(`\`${at}.sourceRegex\` must be a string`);
+      try {
+        new RegExp(sourceRegex as string);
+      } catch (err) {
+        fail(
+          `\`${at}.sourceRegex\` does not compile in this runtime: ` +
+            `${JSON.stringify(sourceRegex)} — ` +
+            `${err instanceof Error ? err.message : String(err)}. This usually means the ` +
+            `build machine's Node/V8 accepts syntax the serving runtime does not (e.g. ` +
+            `inline-flag groups like "(?i:)" on an older Node). @next/routing's matchRoute ` +
+            `compiles this per request with no try/catch`,
+        );
+      }
+    });
+  }
+  // Middleware matchers are deliberately NOT fatal: compileMatcherRegex treats an
+  // uncompilable matcher as MATCHED (middleware runs for everything), which is degraded but
+  // never a bypass — turning that documented fail-safe into a crash would convert a working
+  // deploy into a failed one. Warn loudly at boot so it is visible before the first request.
+  const middleware = m.middleware as { matchers?: unknown } | null | undefined;
+  if (middleware && Array.isArray(middleware.matchers)) {
+    for (const matcher of middleware.matchers as { regexp?: unknown }[]) {
+      if (typeof matcher?.regexp !== "string") continue;
+      try {
+        new RegExp(matcher.regexp);
+      } catch (err) {
+        console.warn(
+          `[adapter-k8s] routing manifest (${source}): middleware matcher regexp does not ` +
+            `compile in this runtime — middleware will run for EVERY request (fail-safe): ` +
+            `${JSON.stringify(matcher.regexp)} — ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
 }
 
 // Upstream Next normalizes repeated slashes in the request path with a 308 to
@@ -1119,6 +1400,49 @@ export function applyRewriteSignalHeaders(
   return headers;
 }
 
+/**
+ * Serialize a Headers into the JSON object shape carried by the internal dispatch headers
+ * (`x-resolved-headers`, `x-mw-request-headers`) and reconstructed by the pool's
+ * `parseResolvedHeaders`. Returns null when there is nothing to carry, so a caller can skip
+ * the header entirely.
+ *
+ * `Headers.entries()` folds repeated `Set-Cookie` into one comma-joined value, which is lossy
+ * for cookies whose Expires attribute contains a comma — collect those through
+ * `getSetCookie()` so each survives intact. This is ONE implementation on purpose: the edge
+ * writes the wire value and the pool reads it, and the two shapes drifting is the same class
+ * of bug routing-common.ts exists to prevent.
+ */
+export function serializeHeaderMap(headers: Headers): string | null {
+  const obj: Record<string, string | string[]> = {};
+  for (const [key, value] of headers.entries()) {
+    if (key.toLowerCase() === "set-cookie") continue;
+    obj[key] = value;
+  }
+  const cookies = headers.getSetCookie?.() ?? [];
+  if (cookies.length > 0) obj["set-cookie"] = cookies;
+  if (Object.keys(obj).length === 0) return null;
+  return JSON.stringify(obj);
+}
+
+/**
+ * N15/N40. Did MIDDLEWARE author this response's `Location`?
+ *
+ * `@next/routing` surfaces a middleware redirect and a header-only next.config `redirects()`
+ * rule in the SAME `status` + `resolvedHeaders.location` shape, so only the caller can tell
+ * them apart — and the two must be treated differently (`normalizeResolvedRedirect` carries the
+ * request query onto a rule redirect's query-less target, but a middleware target is
+ * authoritative). The discriminator is deliberately NARROW: `middlewareResponse != null` is
+ * true for a plain `NextResponse.next()`, and because a typical matcher covers `/(.*)` that made
+ * the N15 query carry inert for every app with middleware (probed: `redirects()` lost `?foo=1`
+ * from its Location on both tiers). A `location` header is precisely the condition under which
+ * `responseToMiddlewareResult` produces `r.redirect` from the middleware response.
+ */
+export function middlewareAuthoredRedirect(
+  middlewareResponse: Response | null | undefined,
+): boolean {
+  return middlewareResponse != null && middlewareResponse.headers.has("location");
+}
+
 // N9: the concrete route selected by routing may retain an i18n locale prefix while the
 // executable template chosen for it does not carry that literal segment (a pool can hold
 // only the unprefixed template — e.g. a multi-pool split). Handing the prefixed path to
@@ -1148,8 +1472,17 @@ export function localeAlignedRouteParamPathname(
 // redirect — an OPEN REDIRECT. It also threw outright for a bare `//` (empty authority).
 // Splicing the target after a validated authority keeps `//…` a PATH, so the shared
 // repeated-slash 308 (collapseSlashesRedirect) normalizes it exactly as `next start`
-// does, before any handler, cache key, or middleware sees it. The routing-service tier
-// already parsed this way (handler.ts) — the pool was the outlier.
+// does, before any handler, cache key, or middleware sees it.
+//
+// COMMENT CORRECTION (N40): this used to claim "the routing-service tier already parsed this
+// way (handler.ts) — the pool was the outlier". That was true only for the `//evil/x` PATH
+// half. The edge spliced `:authority` VERBATIM into a template string and never ran the
+// malformed-authority check below, so an authority of `evil.com/foo` injected attacker
+// path segments into the URL that feeds detectDomainLocale, `has: { type: "host" }` matcher
+// gating, and the redirect same-origin test. Both tiers now route through this function —
+// which is the only way the claim can be true. (Envoy should reject such an `:authority`
+// upstream, so the edge half is defense-in-depth; the false comment was the part that would
+// have stopped the next reviewer from checking.)
 // Throws (→ 400 at the call site) when the Host header is not a bare authority.
 export function parseRequestUrl(target: string, hostHeader: string | undefined): URL {
   const base = new URL(`http://${hostHeader ?? "localhost"}`);
@@ -1409,14 +1742,41 @@ export function rscCacheBustingUnvalidated(args: {
 
 /**
  * True when this Cache-Control gives a SHARED cache a window in which it may serve hits without
- * revalidating — a positive `s-maxage` (else `max-age`) with neither `no-cache` nor `private` to
- * veto storage. The single derivation for both the middleware invariant
- * (pool-server/cache-policy.ts) and the RSC-validation invariant (routing-service/handler.ts).
+ * revalidating — with neither `no-cache` nor `private` to veto storage. The single derivation for
+ * both the middleware invariant (pool-server/cache-policy.ts) and the RSC-validation invariant
+ * (routing-service/handler.ts).
+ *
+ * Three independent grants, any one of which opens the window:
+ *  - a positive `s-maxage` (else `max-age`) — the plain freshness lifetime;
+ *  - a positive RFC 5861 `stale-while-revalidate` — grants the cache permission to serve a STALE
+ *    hit while it revalidates in the background, i.e. an unrevalidated hit, and it does so
+ *    INDEPENDENTLY of `max-age`. `max-age=0, stale-while-revalidate=600` therefore gave a shared
+ *    cache a 600-second unrevalidated window while passing both consumers of this predicate: the
+ *    N18 RSC guard left an unvalidated RSC response storable, and the pool's middleware invariant
+ *    saw an "explicit safe policy" that isn't one;
+ *  - a positive RFC 5861 `stale-if-error` — same shape for the error case.
+ * `max-age=0` alone still returns false: that is a revalidate-every-time policy, which is what
+ * the middleware invariant wants.
  */
 export function grantsSharedCacheFreshness(cacheControl: string): boolean {
-  if (/\bno-cache\b/i.test(cacheControl) || /\bprivate\b/i.test(cacheControl)) return false;
+  // S24. Only the UNQUALIFIED forms veto storage. RFC 9111 §5.2.2.4/§5.2.2.7 also allow the
+  // argumented response forms — `no-cache="set-cookie"` means only that field must be
+  // revalidated, and the rest of the response may be served fresh for the stated lifetime. A
+  // bare `\bno-cache\b` test matched those too, so `no-cache="set-cookie", s-maxage=600` was
+  // classified as granting no shared freshness and honored verbatim on a middleware-covered
+  // route — a shared cache that implements the qualified semantics then serves unrevalidated
+  // hits for 600s, and because ext_proc is post-cache those hits never reach middleware. The
+  // lookahead requires the directive to END there (`,`, whitespace, or end of string), so an
+  // `=` immediately after it falls through to the freshness checks below.
+  if (/(?:^|[,\s])no-cache(?=$|[,\s])/i.test(cacheControl)) return false;
+  if (/(?:^|[,\s])private(?=$|[,\s])/i.test(cacheControl)) return false;
   const sMaxAge = /\bs-maxage=(\d+)/i.exec(cacheControl);
   const maxAge = /\bmax-age=(\d+)/i.exec(cacheControl);
   const shared = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : 0;
-  return shared > 0;
+  if (shared > 0) return true;
+  // `\b` would match the `max-age` inside `stale-while-revalidate`'s neighbours, so anchor on a
+  // non-token character (or string start) instead — and require the `stale-` prefix explicitly.
+  const staleWhileRevalidate = /(?:^|[^a-z-])stale-while-revalidate=(\d+)/i.exec(cacheControl);
+  const staleIfError = /(?:^|[^a-z-])stale-if-error=(\d+)/i.exec(cacheControl);
+  return Number(staleWhileRevalidate?.[1] ?? 0) > 0 || Number(staleIfError?.[1] ?? 0) > 0;
 }

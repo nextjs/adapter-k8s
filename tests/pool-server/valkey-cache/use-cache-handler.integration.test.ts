@@ -137,10 +137,47 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     expect(await h.get("k", [])).toBeUndefined();
   });
 
+  it("N84: an entry with revalidate <= 0 round-trips (a valid EXPIRE reaches the server)", async () => {
+    // `get` returns `revalidate: -1` for a stale entry, the `use cache` wrapper propagates the
+    // minimum into the ENCLOSING entry, and the old guard then refused to store that outer entry —
+    // so nested caches stopped caching while any inner entry was stale, and
+    // `cacheLife({ revalidate: 0 })` was never cached at all. Measured pre-fix against real Valkey:
+    // `stored entry with revalidate=-1? false`, `revalidate=0? false`.
+    const client = newClient();
+    const t0 = Date.now();
+    const h = new ValkeyCacheHandler({ client, buildId: "n84-int", now: () => t0 });
+    for (const [key, revalidate] of [
+      ["outer", -1],
+      ["zero", 0],
+    ] as const) {
+      await h.set(
+        key,
+        Promise.resolve(makeEntry(`v-${key}`, { timestamp: t0, revalidate, expire: 300 })),
+      );
+      const got = await h.get(key, []);
+      expect(got, `revalidate=${revalidate} must be storable`).toBeDefined();
+      expect(await readStream(got!.value)).toBe(`v-${key}`);
+      // The key really has a TTL — the EXPIRE argument was valid, not NaN/negative.
+      const ttl = await client.ttl(`k8s:n84-int:entry:${key}`);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(360);
+    }
+    // `expire: 0` is still skipped (Next's dynamic entry) — no key, no TTL-less leftover.
+    await h.set("dyn", Promise.resolve(makeEntry("v", { timestamp: t0, expire: 0 })));
+    expect(await h.get("dyn", [])).toBeUndefined();
+    expect(await client.exists("k8s:n84-int:entry:dyn")).toBe(0);
+  });
+
   it("getExpiration returns the max expired watermark for tags", async () => {
-    const h = new ValkeyCacheHandler({ client: newClient(), buildId: "b-exp", now: () => 5000 });
+    // N78: the stored watermark is rebased onto the SERVER clock, so it is `serverNow + 300s`
+    // rather than literally `clientNow + 300s`. With a realistic client clock the two are the same
+    // to within the round trip — which is exactly the invariant worth asserting.
+    const t0 = Date.now();
+    const h = new ValkeyCacheHandler({ client: newClient(), buildId: "b-exp", now: () => t0 });
     await h.updateTags(["x"], { expire: 300 });
-    expect(await h.getExpiration(["x"])).toBe(5000 + 300_000);
+    const expiration = await h.getExpiration(["x"]);
+    expect(expiration).toBeGreaterThanOrEqual(t0 + 300_000 - 50);
+    expect(expiration).toBeLessThanOrEqual(Date.now() + 300_000 + 50);
     expect(await h.getExpiration(["never"])).toBe(0);
   });
 
@@ -161,7 +198,10 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
   });
 
   it("CROSS-REPLICA: updateTags on handler A invalidates get on handler B", async () => {
-    const clock = { t: 1000 };
+    // N78: injected clocks are anchored to the real clock now — the shared manifest is stamped
+    // from Valkey's own TIME, so a client clock 55 years behind (a literal `now: () => 1000`) is
+    // rebased and no longer participates in the comparison. Anchoring is what a real replica does.
+    const clock = { t: Date.now() };
     const a = new ValkeyCacheHandler({
       client: newClient(),
       buildId: "shared-build",
@@ -174,12 +214,15 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     });
 
     // A writes an entry tagged "prod"; B (a different replica) can read it.
-    await a.set("page", Promise.resolve(makeEntry("v1", { timestamp: 1000, tags: ["prod"] })));
+    // The entry is stamped 5s in the past so the SERVER-stamped watermark is unambiguously newer
+    // — comparing a client timestamp with a server one at a sub-millisecond margin is a coin flip.
+    const t0 = clock.t;
+    await a.set("page", Promise.resolve(makeEntry("v1", { timestamp: t0 - 5000, tags: ["prod"] })));
     await b.refreshTags();
     expect(await readStream((await b.get("page", []))!.value)).toBe("v1");
 
     // A revalidates the tag (hard, no duration → immediate expiry) at a later time.
-    clock.t = 2000;
+    clock.t = t0 + 1000;
     await a.updateTags(["prod"]);
 
     // B, on its next request, sees the shared manifest and drops the entry.
@@ -190,17 +233,18 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
   it("CROSS-REPLICA revalidation is visible LIVE without refreshTags", async () => {
     // Reproduces the live bug: a replica that did NOT handle the revalidateTag must still see
     // it immediately (get/getExpiration read the shared manifest live, not a stale snapshot).
+    const t0 = Date.now();
     const a = new ValkeyCacheHandler({
       client: newClient(),
       buildId: "live-build",
-      now: () => 2000,
+      now: () => t0 + 1000,
     });
     const b = new ValkeyCacheHandler({
       client: newClient(),
       buildId: "live-build",
-      now: () => 3000,
+      now: () => t0 + 2000,
     });
-    await a.set("e", Promise.resolve(makeEntry("v1", { timestamp: 1000, tags: ["live"] })));
+    await a.set("e", Promise.resolve(makeEntry("v1", { timestamp: t0 - 5000, tags: ["live"] })));
     expect(await b.get("e", [])).toBeDefined();
 
     await a.updateTags(["live"]); // A revalidates at now=2000 (after the entry's timestamp)
@@ -215,26 +259,45 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     // the OLDER client clock yet still wins, because it reached the server later. (Pre-L7 this
     // merge compared client-stamped `at`s, so a backward-stepping replica's invalidation was
     // silently dropped.)
-    const ahead = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => 9000 });
-    const behind = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => 5000 });
-    await ahead.updateTags(["t"], { expire: 300 }); // expired = 9000 + 300_000, arrives first
-    await behind.updateTags(["t"]); // hard-expire (expired = 5000), arrives LATER → wins
-    expect(await ahead.getExpiration(["t"])).toBe(5000);
+    const t0 = Date.now();
+    const ahead = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "lew",
+      now: () => t0 + 4000,
+    });
+    const behind = new ValkeyCacheHandler({ client: newClient(), buildId: "lew", now: () => t0 });
+    await ahead.updateTags(["t"], { expire: 300 }); // expired = now + 300_000, arrives first
+    await behind.updateTags(["t"]); // hard-expire, arrives LATER → wins
+    // The winning hard expire lands on the SERVER's now (N78), NOT on the behind replica's
+    // `t0` and not on the earlier event's `+300s` future watermark.
+    const expiration = await ahead.getExpiration(["t"]);
+    expect(expiration).toBeGreaterThanOrEqual(t0 - 50);
+    expect(expiration).toBeLessThanOrEqual(Date.now() + 50);
   });
 
   it("updateTags merge: a later-arriving profiled revalidation wins over an earlier hard-expire", async () => {
     // Same server-clock ordering, opposite direction: the hard-expire arrives first, the
     // profiled revalidation (future expiry) arrives later and must not be shadowed by it.
-    const early = new ValkeyCacheHandler({ client: newClient(), buildId: "lew2", now: () => 5000 });
-    const late = new ValkeyCacheHandler({ client: newClient(), buildId: "lew2", now: () => 9000 });
+    const t0 = Date.now();
+    const early = new ValkeyCacheHandler({ client: newClient(), buildId: "lew2", now: () => t0 });
+    const late = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "lew2",
+      now: () => t0 + 4000,
+    });
     await early.updateTags(["u"]); // hard-expire, arrives first
     await late.updateTags(["u"], { expire: 300 }); // arrives LATER → wins
-    expect(await early.getExpiration(["u"])).toBe(9000 + 300_000);
+    // The profile's duration survives the rebase exactly; its base is the server's now.
+    const expiration = await early.getExpiration(["u"]);
+    expect(expiration).toBeGreaterThanOrEqual(t0 + 300_000 - 50);
+    expect(expiration).toBeLessThanOrEqual(Date.now() + 300_000 + 50);
   });
 
   it("M11: the tag manifest hash itself carries the durable TTL (refreshed per write)", async () => {
     const client = newClient();
-    const h = new ValkeyCacheHandler({ client, buildId: "mttl", now: () => 1000 });
+    // N78: an anchored clock (a 1970 clock would be rebased and report skew, consuming the
+    // once-per-process warning this file asserts on elsewhere).
+    const h = new ValkeyCacheHandler({ client, buildId: "mttl", now: () => Date.now() });
     await h.updateTags(["t"]);
     // Entry keys were always TTL-bounded; the manifest must be too (30 days), or every deploy
     // leaks a build-namespaced hash forever.
@@ -246,34 +309,39 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
   it("M12 hard→profile: a profiled revalidation WITHOUT expire preserves a stored hard-expire", async () => {
     // The pre-fix bug: the profiled event `{stale, at}` REPLACED the whole hash field, erasing
     // the earlier hard expire — entries Next would hard-regenerate kept serving stale (SWR).
-    const clock = { t: 1000 };
+    const t0 = Date.now();
+    const clock = { t: t0 };
     const h = new ValkeyCacheHandler({
       client: newClient(),
       buildId: "mrg-hp",
       now: () => clock.t,
     });
-    await h.set("k", Promise.resolve(makeEntry("v1", { timestamp: 500, tags: ["t"] })));
+    await h.set("k", Promise.resolve(makeEntry("v1", { timestamp: t0 - 5000, tags: ["t"] })));
 
-    await h.updateTags(["t"]); // hard expire at 1000
-    clock.t = 2000;
+    const beforeHard = Date.now();
+    await h.updateTags(["t"]); // hard expire, stamped from the server clock (N78)
+    const afterHard = Date.now();
+    clock.t = t0 + 1000;
     await h.updateTags(["t"], {}); // profiled, no expire → only {stale, at}
 
     // The hard-expire watermark survived the merge: getExpiration still reports it, and the
     // entry is EXPIRED (dropped), not merely stale.
-    expect(await h.getExpiration(["t"])).toBe(1000);
+    const expiration = await h.getExpiration(["t"]);
+    expect(expiration).toBeGreaterThanOrEqual(beforeHard - 50);
+    expect(expiration).toBeLessThanOrEqual(afterHard + 50);
     expect(await h.get("k", [])).toBeUndefined();
   });
 
-  // L16 clamp cases: these are the only suite-wide exercises of the Lua clamp BRANCH against a
-  // real server — every other test's injected clock sits far BEHIND the server clock, so the
-  // clamp never fires there. The Docker container shares the host kernel clock, so bracketing
-  // the eval with Date.now() bounds the server's TIME tightly (±ms truncation → 5ms slack).
+  // N78 rebase cases: the only suite-wide exercises of the Lua rebase against a REAL server in
+  // both skew directions. The Docker container shares the host kernel clock, so bracketing the
+  // eval with Date.now() bounds the server's TIME tightly (±ms truncation → 5ms slack).
 
-  it("L16 hard expire: a client clock 120s ahead is clamped to serverNow + MAX_CLOCK_SKEW_MS", async () => {
+  it("N78 hard expire, clock 120s AHEAD: the watermark lands on the server's now, not 60s ahead", async () => {
+    // Pre-fix this was clamped to `serverNow + MAX_CLOCK_SKEW_MS` and carried no `stale`, so
+    // `expired <= now` was false for a full minute and entries read back FRESH.
     const raw = newClient();
     const key = "k8s:skew-hard:tags";
     const clientNow = Date.now() + 120_000;
-    // A hard expire (no durations): `expired` IS the (skewed) event time, no `stale` base.
     const event = JSON.stringify(computeTagUpdate(undefined, clientNow));
     const before = Date.now();
     const clamped = await raw.eval(
@@ -285,24 +353,47 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
       String(TAG_MANIFEST_TTL_SECONDS),
     );
     const after = Date.now();
-    // The script reports the clamp to the caller (feeds warnOnClockSkewClamp).
+    // The script reports the skew to the caller (feeds warnOnClockSkewClamp).
     expect(Number(clamped)).toBe(1);
     const stored = JSON.parse((await raw.hget(key, "t"))!);
-    // `expired` landed at serverNow + MAX_CLOCK_SKEW_MS, far below the skewed watermark.
-    expect(stored.expired).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
-    expect(stored.expired).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
-    expect(stored.expired).toBeLessThan(clientNow);
+    expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
+    expect(stored.expired).toBeLessThanOrEqual(after + 5);
+    expect(stored.expired).toBeLessThan(clientNow - MAX_CLOCK_SKEW_MS);
     // `at` was rewritten to the SERVER clock, not the skewed client clock.
     expect(stored.at).toBeLessThanOrEqual(after + 5);
   });
 
-  it("L16 profiled: the shift pins the stale base but preserves the profile duration exactly", async () => {
+  it("N78 hard expire, clock 5min BEHIND: the watermark is dragged FORWARD to the server's now", async () => {
+    // The missing floor was the worse half of the finding: pre-fix the behind pod stored
+    // `{"expired": now - 300000}`, older than every current entry, so the hard revalidateTag
+    // invalidated NOTHING. Probed against real Valkey: the entry was "STILL SERVED".
+    const raw = newClient();
+    const key = "k8s:skew-behind:tags";
+    const clientNow = Date.now() - 300_000;
+    const event = JSON.stringify(computeTagUpdate(undefined, clientNow));
+    const before = Date.now();
+    const clamped = await raw.eval(
+      UPDATE_TAGS_SCRIPT,
+      1,
+      key,
+      "t",
+      event,
+      String(TAG_MANIFEST_TTL_SECONDS),
+    );
+    const after = Date.now();
+    expect(Number(clamped)).toBe(1);
+    const stored = JSON.parse((await raw.hget(key, "t"))!);
+    expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
+    expect(stored.expired).toBeLessThanOrEqual(after + 5);
+    expect(stored.expired).toBeGreaterThan(clientNow + MAX_CLOCK_SKEW_MS);
+  });
+
+  it("N78 profiled: the base is pinned to server time and the profile duration is exact", async () => {
     const raw = newClient();
     const key = "k8s:skew-profile:tags";
     const clientNow = Date.now() + 120_000;
-    // Profiled event: stale = clientNow (skewed), expired = clientNow + 300_000. The clamp must
-    // SHIFT both by the same amount — pinning the base to the server bound while keeping the
-    // intended 300s duration — not truncate `expired` to the bound.
+    // Profiled event: stale = clientNow (skewed), expired = clientNow + 300_000. Both shift by the
+    // SAME amount — the base is pinned to server time while the intended 300s duration survives.
     const event = JSON.stringify(computeTagUpdate(undefined, clientNow, { expire: 300 }));
     const before = Date.now();
     const clamped = await raw.eval(
@@ -316,21 +407,48 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     const after = Date.now();
     expect(Number(clamped)).toBe(1);
     const stored = JSON.parse((await raw.hget(key, "t"))!);
-    expect(stored.stale).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
-    expect(stored.stale).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
+    expect(stored.stale).toBeGreaterThanOrEqual(before - 5);
+    expect(stored.stale).toBeLessThanOrEqual(after + 5);
     expect(stored.expired - stored.stale).toBe(300_000);
   });
 
-  it("L16 via the handler: updateTags on a fast-clock replica clamps and warns once", async () => {
-    // Same branch through the production path: the handler's eval return feeds
-    // warnOnClockSkewClamp (warnOnce is per-process — this is the only handler-level clamp in
-    // the suite, so the warning must fire here).
+  it("N78 no skew: a well-synced replica's watermarks are effectively untouched", async () => {
     const raw = newClient();
+    const key = "k8s:skew-none:tags";
+    const clientNow = Date.now();
+    const event = JSON.stringify(computeTagUpdate(undefined, clientNow, { expire: 300 }));
+    const clamped = await raw.eval(
+      UPDATE_TAGS_SCRIPT,
+      1,
+      key,
+      "t",
+      event,
+      String(TAG_MANIFEST_TTL_SECONDS),
+    );
+    expect(Number(clamped)).toBe(0); // no skew reported
+    const stored = JSON.parse((await raw.hget(key, "t"))!);
+    expect(Math.abs(stored.stale - clientNow)).toBeLessThan(1000);
+    expect(stored.expired - stored.stale).toBe(300_000);
+  });
+
+  it("N78 via the handler: a fast-clock replica's revalidation bites immediately and warns once", async () => {
+    // Same branch through the production path: the handler's eval return feeds
+    // warnOnClockSkewClamp (warnOnce is per-process — this is the only handler-level skew in the
+    // suite, so the warning must fire here). And the entry must actually be INVALIDATED, which is
+    // what the pre-fix ceiling (a future watermark with no `stale`) prevented for 60s.
+    const raw = newClient();
+    const t0 = Date.now();
     const h = new ValkeyCacheHandler({
       client: newClient(),
       buildId: "skew-handler",
       now: () => Date.now() + 120_000,
     });
+    const reader = new ValkeyCacheHandler({
+      client: newClient(),
+      buildId: "skew-handler",
+      now: () => Date.now(),
+    });
+    await reader.set("k", Promise.resolve(makeEntry("v", { timestamp: t0 - 5000, tags: ["t"] })));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const before = Date.now();
@@ -338,29 +456,36 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
       const after = Date.now();
       expect(warn.mock.calls.some((c) => /clock/i.test(String(c[0])))).toBe(true);
       const stored = JSON.parse((await raw.hget("k8s:skew-handler:tags", "t"))!);
-      expect(stored.expired).toBeGreaterThanOrEqual(before + MAX_CLOCK_SKEW_MS - 5);
-      expect(stored.expired).toBeLessThanOrEqual(after + MAX_CLOCK_SKEW_MS + 5);
+      expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
+      expect(stored.expired).toBeLessThanOrEqual(after + 5);
+      // The whole point: a correctly-clocked replica drops the entry NOW.
+      expect(await reader.get("k", [])).toBeUndefined();
     } finally {
       warn.mockRestore();
     }
   });
 
   it("M12 profile→hard: a later hard expire wins immediately and keeps the stale watermark", async () => {
-    const clock = { t: 1000 };
+    const t0 = Date.now();
+    const clock = { t: t0 };
     const h = new ValkeyCacheHandler({
       client: newClient(),
       buildId: "mrg-ph",
       now: () => clock.t,
     });
-    await h.set("k", Promise.resolve(makeEntry("v1", { timestamp: 500, tags: ["t"] })));
+    await h.set("k", Promise.resolve(makeEntry("v1", { timestamp: t0 - 5000, tags: ["t"] })));
 
-    await h.updateTags(["t"], { expire: 300 }); // stale=1000, expired=1000+300_000 (future)
-    clock.t = 2000;
-    await h.updateTags(["t"]); // hard expire at 2000
+    await h.updateTags(["t"], { expire: 300 }); // stale=now, expired=now+300_000 (future)
+    clock.t = t0 + 1000;
+    const beforeHard = Date.now();
+    await h.updateTags(["t"]); // hard expire, server-stamped
+    const afterHard = Date.now();
 
     // The later event's `expired` (immediate) replaced the profile's future expiry — the entry
     // is dropped NOW, not SWR-served for another 300s.
-    expect(await h.getExpiration(["t"])).toBe(2000);
+    const expiration = await h.getExpiration(["t"]);
+    expect(expiration).toBeGreaterThanOrEqual(beforeHard - 50);
+    expect(expiration).toBeLessThanOrEqual(afterHard + 50);
     expect(await h.get("k", [])).toBeUndefined();
   });
 });

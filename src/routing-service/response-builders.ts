@@ -8,7 +8,9 @@ export interface HeaderMutationEntry {
 export function buildImmediateResponse(
   statusCode: number,
   headers: Record<string, string>,
-  body?: string,
+  // N40: `Uint8Array` for a middleware-authored (possibly binary) body — see
+  // ext-proc-types.ts. A string body is still accepted for this tier's own text responses.
+  body?: string | Uint8Array,
   setCookies?: string[],
 ): ProcessingResponse {
   const setHeaders: HeaderValueOption[] = Object.entries(headers).map(([key, value]) => ({

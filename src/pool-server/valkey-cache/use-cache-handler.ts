@@ -1,5 +1,5 @@
 import type { ValkeyClient } from "./client.js";
-import { capTags, DURABLE_TTL_SECONDS } from "./incremental-cache-handler.js";
+import { assertSafeBuildId, capTags, DURABLE_TTL_SECONDS } from "./incremental-cache-handler.js";
 import { RespError } from "./resp-client.js";
 import {
   bufferToStream,
@@ -12,6 +12,8 @@ import {
 import {
   computeTagUpdate,
   evaluateEntry,
+  chunkManifestTags,
+  filterManifestTags,
   maxExpiration,
   parseTagState,
   TAG_MANIFEST_TTL_SECONDS,
@@ -105,6 +107,8 @@ export class ValkeyCacheHandler implements CacheHandler {
     this.client = options.client;
     // N8: never Date.now — patched to throw inside tracked static renders (see wallClockNow).
     this.now = options.now ?? wallClockNow;
+    // N82: validate at the point of consumption — this is where the build id becomes keyspace.
+    assertSafeBuildId(options.buildId);
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;
     this.pendingSetWaitMs = options.pendingSetWaitMs ?? PENDING_SET_WAIT_MS;
@@ -159,7 +163,16 @@ export class ValkeyCacheHandler implements CacheHandler {
         expire: meta.expire,
         revalidate,
       };
-    } catch {
+    } catch (error) {
+      // N81: fail open to a miss — but SAY SO. This catch was bare, so a PERMANENT read failure
+      // (NOAUTH, WRONGTYPE, a cluster -MOVED, an exhausted breaker, an invalid URL) produced ZERO
+      // log lines while every `use cache` entry was recomputed on every request, forever. Measured
+      // before the fix: four handler operations against a dead Valkey emitted 0 log lines.
+      logErrorRateLimited(
+        "use-cache-get",
+        "[valkey-cache] `use cache` read failed; treating it as a miss (the pool is rendering uncached)",
+        error,
+      );
       return undefined;
     }
   }
@@ -177,21 +190,29 @@ export class ValkeyCacheHandler implements CacheHandler {
     let writeAttempted = false;
     try {
       const entry = await pendingEntry;
-      // H4: a non-finite or non-positive lifetime would produce a NaN/Infinity EXPIRE argument,
-      // which Valkey rejects — while the HSET in the same transaction still applies, leaving the
-      // entry cached FOREVER. Refuse to cache it: an uncacheable entry is a miss + recompute.
-      if (
-        !Number.isFinite(entry.expire) ||
-        !Number.isFinite(entry.revalidate) ||
-        entry.expire <= 0 ||
-        entry.revalidate <= 0
-      ) {
+      // H4: a NON-FINITE lifetime would produce a NaN/Infinity EXPIRE argument, which Valkey
+      // rejects — while the HSET in the same transaction still applies, leaving the entry cached
+      // FOREVER. Refuse those: an uncacheable entry is a miss + recompute.
+      if (!Number.isFinite(entry.expire) || !Number.isFinite(entry.revalidate)) {
         warnOnce(
-          "nonfinite-lifetime",
-          "[valkey-cache] refusing to cache a `use cache` entry with a non-finite or non-positive expire/revalidate; treating it as uncacheable",
+          "nonfinite-lifetime-v2",
+          "[valkey-cache] refusing to cache a `use cache` entry with a non-finite expire/revalidate; treating it as uncacheable",
         );
         return;
       }
+      // N84: `revalidate <= 0` is STORABLE. This guard used to reject it, which broke nested
+      // caches in exactly the situation the cache exists for: `get` above returns
+      // `revalidate: -1` for a stale entry (matching Next's default handler), the `use cache`
+      // wrapper propagates the MINIMUM revalidate of every inner entry into the enclosing store
+      // (`use-cache-wrapper.ts` `propagateCacheLifeAndTagsToRevalidateStore`), and this handler
+      // then refused to store the OUTER entry — so nested caches stopped caching for as long as
+      // any inner entry was stale. It also meant a `cacheLife({ revalidate: 0 })` entry was never
+      // cached at all. Measured before the fix: `stored entry with revalidate=-1? false`,
+      // `revalidate=0? false`. Next's own default handler stores both and skips only
+      // `expire === 0`; `expire < 0` is its eviction sentinel, so both are non-entries here.
+      // The TTL arithmetic below already floors at 1s, so a non-positive revalidate cannot reach
+      // EXPIRE. The old message also said "non-finite" about a perfectly finite `-1`.
+      if (entry.expire <= 0) return;
       const buf = await drainEntryValue(entry, maxCacheEntryBytes());
       if (buf === null) return; // partial/errored/over-cap stream → miss, don't cache
       const meta: StoredMeta = {
@@ -222,11 +243,19 @@ export class ValkeyCacheHandler implements CacheHandler {
       // write instead of assuming success.
       const failure = results.find((result): result is RespError => result instanceof RespError);
       if (failure) throw failure;
-    } catch {
+    } catch (error) {
       // A cache write failure must not break the response. If the write may have partially
       // applied, best-effort DEL the key so a TTL-less partial entry can't live forever (the DEL
       // itself may fail during an outage — bounded by the build-namespaced keyspace's lifetime).
       if (writeAttempted) this.client.del(key).catch(() => undefined);
+      // N81: and it must be observable (see the matching comment in `get`). A rejected entry
+      // promise (a failed render) lands here too, which is why this is rate-limited rather than
+      // per-occurrence.
+      logErrorRateLimited(
+        "use-cache-set",
+        "[valkey-cache] `use cache` write failed; the entry was not cached (the pool will recompute it)",
+        error,
+      );
     } finally {
       // Only clear the gate if it's still ours — an overlapping `set` may have replaced it, and
       // deleting a newer set's gate would let a concurrent `get` skip the required wait.
@@ -265,7 +294,10 @@ export class ValkeyCacheHandler implements CacheHandler {
   }
 
   async updateTags(tags: string[], durations?: { expire?: number }): Promise<void> {
-    if (tags.length === 0) return;
+    // N83: same filter the classic handler and `capTags` use — an empty-string tag must not become
+    // a real manifest field, and the EVAL argv must be bounded.
+    const filtered = filterManifestTags(tags);
+    if (filtered.length === 0) return;
     try {
       const now = this.now();
       // Apply each tag's new state atomically with LAST-EVENT-WINS semantics: the server-side
@@ -276,20 +308,24 @@ export class ValkeyCacheHandler implements CacheHandler {
       // erasing a stored hard-expire watermark — the merge Next's in-memory handler gets for
       // free from being single-process. Passing `undefined` as the base lets the script own
       // the merge; the event carries only the watermarks this call SETS.
-      const args: string[] = [];
-      for (const tag of tags) {
-        args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
-      }
+      // Chunked, not truncated: every tag the caller passed gets invalidated, in as many
+      // EVALs as the per-call argv bound requires.
+      for (const chunk of chunkManifestTags(filtered)) {
+        const args: string[] = [];
+        for (const tag of chunk) {
+          args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
+        }
       // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
       // the per-build manifest's lifetime the same way entry keys are bounded.
-      const clamped = await this.client.eval(
-        UPDATE_TAGS_SCRIPT,
-        1,
-        this.tagsKey,
-        ...args,
-        String(TAG_MANIFEST_TTL_SECONDS),
-      );
-      warnOnClockSkewClamp(clamped);
+        const clamped = await this.client.eval(
+          UPDATE_TAGS_SCRIPT,
+          1,
+          this.tagsKey,
+          ...args,
+          String(TAG_MANIFEST_TTL_SECONDS),
+        );
+        warnOnClockSkewClamp(clamped);
+      }
     } catch (error) {
       // Best-effort: a failed manifest write means a revalidation is missed, not a crash — but
       // it must be OBSERVABLE (M1): a Valkey outage here otherwise silently serves stale entries

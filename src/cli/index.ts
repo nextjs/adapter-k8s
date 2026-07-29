@@ -1,5 +1,6 @@
 // src/cli/index.ts
 import path from "node:path";
+import { sanitizeForTerminal } from "./terminal.js";
 import { existsSync, readFileSync } from "node:fs";
 import { runInit } from "./init.js";
 import { runDeploy } from "./deploy.js";
@@ -22,6 +23,8 @@ const BOOLEAN_FLAGS = new Set([
   "yes",
   "y",
   "allow-no-network-policy",
+  "allow-mutable-tags",
+  "allow-unretained-manifest",
   "standard",
   "help",
   "h",
@@ -143,8 +146,12 @@ Options:
   --skip-build             Skip next build (deploy, emulate)
   --skip-push              Skip docker build + push (deploy)
   --port <port>            Listener port for the local Envoy proxy (emulate; default: 8080)
-  --yes, -y                Skip the confirmation prompt (destroy)
+  --yes, -y                Skip the confirmation prompt (destroy; deploy's unpinned-context guard)
+  --allow-unretained-manifest  Deploy even if the outgoing build's routing manifest cannot
+                              be retained (rollback to it becomes image-only; recorded in
+                              deploy state so doctor can report it)
   --allow-no-network-policy  Deploy even if the cluster pod CIDR can't be discovered
+  --allow-mutable-tags     Deploy by image tag when no digest can be resolved
                               (NetworkPolicies skipped — the routing service stays
                               reachable from in-cluster pods; not recommended)
   --dry-run                Show what would be done without executing
@@ -256,6 +263,11 @@ async function main(): Promise<void> {
         skipBuild: flags["skip-build"] === true,
         skipPush: flags["skip-push"] === true,
         allowNoNetworkPolicy: flags["allow-no-network-policy"] === true,
+        allowMutableTags: flags["allow-mutable-tags"] === true,
+        // N30 / N29: opt out of the fatal routing-manifest retention, and skip the
+        // unpinned-kubectl-context confirmation in CI.
+        allowUnretainedManifest: flags["allow-unretained-manifest"] === true,
+        yes: flags["yes"] === true || flags["y"] === true,
         dryRun,
       });
       break;
@@ -320,7 +332,11 @@ async function main(): Promise<void> {
 // Vitest sets VITEST in its workers; the bundled bin never does.
 if (!process.env.VITEST) {
   main().catch((err) => {
-    console.error("\nError:", err.message);
+    // L14: this is the LAST sink for every thrown message, and those messages routinely
+    // embed captured kubectl/gcloud output. Sanitize here as a backstop so a path that
+    // forgets to strip control sequences at the point of capture still cannot repaint the
+    // operator's terminal on the way out.
+    console.error("\nError:", sanitizeForTerminal(String(err?.message ?? err)));
     process.exit(1);
   });
 }

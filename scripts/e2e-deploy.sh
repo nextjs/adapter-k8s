@@ -156,6 +156,17 @@ if [ -z "${NEXT_PRIVATE_TEST_MODE:-}" ] && [ -n "${NEXT_TEST_MODE:-}" ]; then
   export NEXT_PRIVATE_TEST_MODE="${NEXT_TEST_MODE}"
 fi
 
+# Cache-components bridge (survey batch 2, adapter-bun e2e-deploy.sh:170-176): the upstream
+# harness sets ONE of these two names depending on Next version. If only one is honored, the
+# cache-components/PPR suites silently build WITHOUT cacheComponents and "pass" for the wrong
+# reason. Mirror whichever is set into the other so both spellings are always present.
+if [ -n "${__NEXT_CACHE_COMPONENTS:-}" ] && [ -z "${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS:-}" ]; then
+  export NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS="${__NEXT_CACHE_COMPONENTS}"
+fi
+if [ -n "${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS:-}" ] && [ -z "${__NEXT_CACHE_COMPONENTS:-}" ]; then
+  export __NEXT_CACHE_COMPONENTS="${NEXT_PRIVATE_EXPERIMENTAL_CACHE_COMPONENTS}"
+fi
+
 # --- 2. Install dependencies ---
 # The test harness creates package.json with next/react deps but skips install.
 # The deploy script must install them.

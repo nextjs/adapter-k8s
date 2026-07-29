@@ -285,6 +285,341 @@ describe("reply size caps (M6b) and protocol validation (L8)", () => {
   });
 });
 
+describe("N71: an unsolicited reply frame is a protocol violation, never a queue shift", () => {
+  // Pre-fix, `drainInbound` only looped `while (queue.length > 0)`, so bytes that arrived with an
+  // empty queue were silently RETAINED and shifted every later reply by one frame for the life of
+  // the socket. Probed against the pre-fix client with a server that pushes `+UNSOLICITED\r\n`:
+  //   [idle-push]     GET keyA -> "AAAA-value"   GET keyB -> "UNSOLICITED"
+  //   [double-frame]  GET keyA -> "AAAA-value"   GET keyB -> "UNSOLICITED"
+  // i.e. one key's bytes served under another key — and undetectable by `parseStoredMeta`, because
+  // the bytes are a well-formed entry, just the wrong one. RESP2 has no legal push path here.
+
+  const store: Record<string, string> = { keyA: "AAAA-value", keyB: "BBBB-value" };
+  const reply = (key: string) => {
+    const v = store[key];
+    return v === undefined ? "$-1\r\n" : `$${v.length}\r\n${v}\r\n`;
+  };
+
+  it("drops the connection when bytes arrive while the client is IDLE", async () => {
+    let pushed = false;
+    const server = await startFakeValkey((cmd, socket) => {
+      if (!pushed) {
+        pushed = true;
+        // Push an extra frame shortly AFTER this reply lands, with the queue empty.
+        setTimeout(() => {
+          if (!socket.destroyed) socket.write("+UNSOLICITED\r\n");
+        }, 40);
+      }
+      return [Buffer.from(reply(cmd[1]!))];
+    });
+    // circuitBreakerMs: 0 so the next command reconnects immediately and we observe the RESYNC,
+    // not a breaker rejection.
+    const client = createRespClient({ url: server.url, circuitBreakerMs: 0 });
+    try {
+      expect(await client.get("keyA")).toBe("AAAA-value");
+      await sleep(120); // let the unsolicited frame arrive and tear the connection down
+      // The critical assertion: keyB gets KEY B's value, from a fresh connection.
+      expect(await client.get("keyB")).toBe("BBBB-value");
+      expect(server.connectionCount()).toBe(2);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("drops the connection when an extra frame rides along in the same write", async () => {
+    let first = true;
+    const server = await startFakeValkey((cmd) => {
+      const bytes = reply(cmd[1]!) + (first ? "+UNSOLICITED\r\n" : "");
+      first = false;
+      return [Buffer.from(bytes)];
+    });
+    const client = createRespClient({ url: server.url, circuitBreakerMs: 0 });
+    try {
+      expect(await client.get("keyA")).toBe("AAAA-value");
+      await sleep(20);
+      expect(await client.get("keyB")).toBe("BBBB-value");
+      expect(server.connectionCount()).toBe(2);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("rejects the in-flight command with a protocol error when the extra frame precedes it", async () => {
+    // Same violation observed from the other side: the client has a command in flight when the
+    // stray frame lands, so the frame is attributed to it and the SHAPE assertion catches it
+    // (a `+simple-string` is not a valid GET reply).
+    const server = await startFakeValkey(() => [Buffer.from("+UNSOLICITED\r\n")]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("keyA")).rejects.toThrow(/expected a bulk string/);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+describe("N72: header/inline lines are bounded and inline frames obey the reply cap", () => {
+  it("fails fast on an unterminated inline line instead of buffering quadratically", async () => {
+    // A '+' with no CRLF, ever. Pre-fix `scanFrameEnd` returned `need = buf.length + 1`, so every
+    // 64 KiB chunk re-`Buffer.concat`ed the whole backlog until `maxBufferedBytes` (4x the frame
+    // cap). Measured pre-fix, fail-time vs frame cap: 2 MiB → 116 ms, 4 → 473, 8 → 2084,
+    // 16 → 8844, and at the 64 MiB DEFAULT cap 164_197 ms with 884 MiB peak RSS — an OOMKill
+    // rather than a protocol error. Post-fix it is ~2 ms at every cap.
+    const filler = Buffer.alloc(64 * 1024, 0x41);
+    const server = await startFakeValkey((_cmd, socket) => {
+      const pump = () => {
+        if (socket.destroyed) return;
+        if (socket.write(filler)) setImmediate(pump);
+        else socket.once("drain", pump);
+      };
+      socket.write("+", () => pump());
+      return null;
+    });
+    // Deliberately the DEFAULT 64 MiB frame cap — the configuration whose pre-fix failure took
+    // 164 seconds. A generous 5s bound still discriminates by ~30x.
+    const client = createRespClient({ url: server.url, commandTimeoutMs: 0 });
+    try {
+      const started = Date.now();
+      await expect(client.get("k")).rejects.toThrow(/no CRLF within 8192 bytes/);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  }, 20_000);
+
+  it("counts an inline reply against maxReplyBytes (it used to be exempt)", async () => {
+    const line = `+${"A".repeat(2048)}\r\n`;
+    const server = await startFakeValkey(() => [Buffer.from(line)]);
+    const client = createRespClient({ url: server.url, maxReplyBytes: 1024 });
+    try {
+      await expect(client.get("k")).rejects.toThrow(/inline reply of \d+ bytes exceeds the 1024/);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("still accepts a normal short inline reply", async () => {
+    const server = await startFakeValkey(() => ok());
+    const client = createRespClient({ url: server.url });
+    try {
+      expect(await client.set("k", "v")).toBe("OK");
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+describe("N73: lengths and counts must be plain decimal integers", () => {
+  // Measured pre-fix: `Number.isInteger(Number(line))` accepted `$0x10` (a 16-byte read),
+  // `$1e1` (10 bytes), `$3.0`, `$ 3` and `$+3` (3 bytes each). No desync followed — the scanner
+  // and parser share the coercion, and the `parsed[1] !== scan.end` cross-check catches drift —
+  // but an untrusted stream is only trustworthy while it is EXACTLY RESP2.
+  it.each([
+    ["$0x10", /invalid bulk length "0x10"/],
+    ["$1e1", /invalid bulk length "1e1"/],
+    ["$3.0", /invalid bulk length "3\.0"/],
+    ["$ 3", /invalid bulk length " 3"/],
+    ["$+3", /invalid bulk length "\+3"/],
+    ["*0x2", /invalid array count "0x2"/],
+    ["*2.0", /invalid array count "2\.0"/],
+  ])("rejects %s", async (header, message) => {
+    const server = await startFakeValkey(() => [
+      Buffer.concat([Buffer.from(`${header}\r\n`), Buffer.alloc(32, 0x7a), Buffer.from("\r\n")]),
+    ]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("k")).rejects.toThrow(message);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("still accepts canonical decimal forms, including the RESP nulls", async () => {
+    const server = await startFakeValkey((cmd) => {
+      if (cmd[0] === "GET") return bulk("abc");
+      if (cmd[0] === "TTL") return [Buffer.from(":-1\r\n")];
+      if (cmd[0] === "EVAL") return [Buffer.from("*-1\r\n")];
+      return [Buffer.from("$-1\r\n")];
+    });
+    const client = createRespClient({ url: server.url });
+    try {
+      expect(await client.get("k")).toBe("abc");
+      expect(await client.ttl("k")).toBe(-1);
+      expect(await client.eval("return nil", 0)).toBeNull();
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+describe("N74: reply shapes are asserted, never blind-cast", () => {
+  it("an integer reply to GET is a protocol error, not a RangeError", async () => {
+    // Pre-fix: `(reply as Buffer).toString("utf8")` on a number →
+    // `RangeError: toString() radix argument must be between 2 and 36`, escaping the cache layer.
+    const server = await startFakeValkey(() => [Buffer.from(":42\r\n")]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("k")).rejects.toThrow(RespError);
+      await expect(client.get("k")).rejects.toThrow(/integer reply; expected a bulk string/);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("an array reply to GET does NOT silently become the joined elements", async () => {
+    // Pre-fix this returned `"a,b"` — fabricated entry bytes for whatever key was read.
+    const server = await startFakeValkey(() => [Buffer.from("*2\r\n$1\r\na\r\n$1\r\nb\r\n")]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("k")).rejects.toThrow(/2-element array reply; expected a bulk/);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("HMGET and HGETALL assert their array shape too", async () => {
+    const server = await startFakeValkey((cmd) =>
+      cmd[0] === "HMGET" ? [Buffer.from(":7\r\n")] : [Buffer.from("+OK\r\n")],
+    );
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.hmget("h", "f")).rejects.toThrow(/expected an array/);
+      await expect(client.hgetallBuffer("h")).rejects.toThrow(/expected an array of bulk strings/);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+describe("N75: a null EXEC reply is a failed transaction, not an empty success", () => {
+  it("throws instead of reporting an applied write", async () => {
+    // `*-1` for EXEC means the transaction was DISCARDED. Pre-fix `?? []` turned that into an
+    // empty array, which the V2 handler's per-command failure scan read as success — so an entry
+    // that was never stored was reported as cached.
+    const server = await startFakeValkey((cmd) =>
+      cmd[0] === "EXEC" ? [Buffer.from("*-1\r\n")] : ok(),
+    );
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.multi().hset("h", "f", "v").expire("h", 60).exec()).rejects.toThrow(
+        /transaction was discarded and NOTHING was applied/,
+      );
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("a normal EXEC still returns the per-command replies (H4 inspection)", async () => {
+    const server = await startFakeValkey((cmd) =>
+      cmd[0] === "EXEC" ? [Buffer.from("*2\r\n:1\r\n-ERR nope\r\n")] : ok(),
+    );
+    const client = createRespClient({ url: server.url });
+    try {
+      const results = await client.multi().hset("h", "f", "v").expire("h", 60).exec();
+      expect(results).toHaveLength(2);
+      expect(results[0]).toBe(1);
+      expect(results[1]).toBeInstanceOf(RespError);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+describe("N70 (SECURITY): a URL parse failure never carries the URL", () => {
+  it("rejects with a redacted message, and the rejection has no `input` property", async () => {
+    // `new URL(bad)` throws a TypeError with `code: 'ERR_INVALID_URL'` AND the raw input attached
+    // as `.input`. `logErrorRateLimited(..., error)` → `console.error(msg, error)` inspects own
+    // properties, so a password in the URL reached the pod log — and again every breaker cycle.
+    // Measured pre-fix:
+    //   TypeError: Invalid URL {"code":"ERR_INVALID_URL","input":"redis://:sup3rs3cret@bad host:6379"}
+    const secret = "sup3rs3cret";
+    const client = createRespClient({ url: `redis://:${secret}@bad host:6379` });
+    try {
+      const error = await client.get("k").then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(error).toBeDefined();
+      expect(error!.message).toBe("invalid Valkey URL (redacted)");
+      // Nothing enumerable, nothing inspectable, no `.input`.
+      expect(JSON.stringify(error)).toBe("{}");
+      expect((error as unknown as { input?: string }).input).toBeUndefined();
+      const dumped = `${error!.message} ${JSON.stringify(Object.getOwnPropertyNames(error))} ${JSON.stringify(error)}`;
+      expect(dumped).not.toContain(secret);
+    } finally {
+      await client.quit();
+    }
+  });
+
+  it("also redacts a rejected scheme and an out-of-range port", async () => {
+    for (const url of ["http://:s3cret@127.0.0.1:6379", "redis://:s3cret@127.0.0.1:99999"]) {
+      const client = createRespClient({ url });
+      try {
+        await expect(client.get("k")).rejects.toThrow(/^invalid Valkey URL \(redacted\)$/);
+      } finally {
+        await client.quit();
+      }
+    }
+  });
+
+  it("a valid URL still works (the parse moved to the constructor, N70)", async () => {
+    const server = await startFakeValkey(() => bulk("v"));
+    const client = createRespClient({ url: server.url });
+    try {
+      expect(await client.get("k")).toBe("v");
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+describe("N77: a cluster MOVED/ASK reply fails LOUDLY", () => {
+  it("logs once per process and rejects with an explanatory error", async () => {
+    // Pre-fix a `-MOVED` was a plain RespError straight into the handlers' silent catches, so a
+    // cluster endpoint produced a 100%-dead cache with no signal at all.
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const server = await startFakeValkey(() => [Buffer.from("-MOVED 3999 127.0.0.1:6381\r\n")]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("k")).rejects.toThrow(/cluster redirection is not supported/);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(String(error.mock.calls[0]?.[0])).toMatch(/CLUSTER/);
+      expect(String(error.mock.calls[0]?.[0])).toMatch(/MOVED/);
+      // Once per process, not per command.
+      await expect(client.get("k")).rejects.toThrow(/cluster redirection is not supported/);
+      expect(error).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+
+  it("an ordinary error reply is passed through untouched", async () => {
+    const server = await startFakeValkey(() => [Buffer.from("-WRONGTYPE nope\r\n")]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("k")).rejects.toThrow(/^WRONGTYPE nope$/);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
 describe("AUTH via URL userinfo + plaintext warning (L6)", () => {
   it("honors `redis://:pass@host` userinfo when no explicit password is given, warning once", async () => {
     const server = await startFakeValkey((cmd) => (cmd[0] === "AUTH" ? ok() : bulk("v")));
@@ -680,4 +1015,70 @@ describe("rediss:// TLS (handshake + AUTH + round-trip against a pinned CA)", ()
       rmSync(tmpDir, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe("N76: a failure report is scoped to the connection that produced it", () => {
+  it("an AUTH-time socket failure with the breaker DISABLED still recovers on one reconnect", async () => {
+    // The duplicate-report path: a socket error during AUTH rejects the in-flight AUTH pending
+    // (failAll #1) AND then resolves `connect()`'s rejection, which called `failAll(error, true)`
+    // a second time. With `circuitBreakerMs: 0` there is no breaker window to absorb the second
+    // call, so it could tear down whatever connection `this.socket` pointed at by then. The
+    // generation guard makes report #2 a no-op; what is observable here is that recovery needs
+    // exactly ONE new connection and the recovered connection is not disturbed.
+    let kill = true;
+    const server = await startFakeValkey((cmd, socket) => {
+      if (cmd[0] === "AUTH" && kill) {
+        kill = false;
+        socket.destroy(); // RST during AUTH: rejects the pending AND fails the connect
+        return null;
+      }
+      return cmd[0] === "AUTH" ? ok() : bulk("v");
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => undefined); // plaintext-auth warning
+    const client = createRespClient({
+      url: server.url,
+      password: "s3cret",
+      circuitBreakerMs: 0,
+      commandTimeoutMs: 500,
+      connectTimeoutMs: 500,
+    });
+    try {
+      await expect(client.get("a")).rejects.toThrow();
+      const connsAfterFailure = server.connectionCount();
+      expect(await client.get("b")).toBe("v");
+      expect(server.connectionCount()).toBe(connsAfterFailure + 1);
+      // And the recovered connection is still usable — nothing tore it down behind our back.
+      expect(await client.get("c")).toBe("v");
+      expect(server.connectionCount()).toBe(connsAfterFailure + 1);
+    } finally {
+      await client.quit();
+      await server.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S21 (AVAILABILITY) — an oversized ARRAY must be refused by the FRAMING pass, not the parser.
+//
+// The byte cap is not an element cap: `$-1\r\n` is 5 bytes, so millions of null elements fit
+// well inside a 64 MiB reply. scanFrameEnd would report such a frame COMPLETE and parseReply —
+// which runs OUTSIDE drainInbound's try/catch — would throw, taking the pool process down
+// instead of failing the command and degrading to a cache miss.
+// ---------------------------------------------------------------------------
+describe("S21: RESP array element cap", () => {
+  it("fails the command (RespError) rather than escaping as an uncaught throw", async () => {
+    const count = 2_000_000; // ~10 MB on the wire, far under the byte cap, far over the element cap
+    const server = await startFakeValkey(() => [
+      Buffer.from(`*${count}\r\n`),
+      Buffer.from("$-1\r\n".repeat(count)),
+    ]);
+    const client = createRespClient({ url: server.url });
+    try {
+      await expect(client.get("x")).rejects.toThrow(/element cap/);
+      // Reached only because the throw was converted into a failed command, not a crash.
+      await expect(client.get("y")).rejects.toThrow();
+    } finally {
+      await server.close();
+    }
+  }, 30_000);
 });

@@ -45,7 +45,7 @@
     "build:clean": "rm -rf dist",
     "build:types": "tsc --emitDeclarationOnly --declaration --declarationDir dist",
     "build:adapter": "esbuild ./src/index.ts --bundle --format=esm --platform=node --outfile=./dist/index.js --external:next --external:@next/routing",
-    "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs --external:@next/routing",
+    "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs --external:@next/routing --external:sharp",
     "build:cache-handler": "esbuild ./src/pool-server/valkey-cache/cache-handler-entry.ts --bundle --format=cjs --platform=node --outfile=./dist/cache-handler.cjs --external:next",
     "build:protos": "buf generate && node ./clean_protos.cjs",
     "build:routing-service": "esbuild ./src/routing-service/index.ts --bundle --format=cjs --platform=node --outfile=./dist/routing-service.cjs --external:@next/routing",

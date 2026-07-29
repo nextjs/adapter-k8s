@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { create } from "@bufbuild/protobuf";
 import { createRequestHandler } from "../../src/routing-service/handler.js";
-import { createProcessHandler } from "../../src/routing-service/server.js";
+import { createProcessHandler, plainResponseToProto } from "../../src/routing-service/server.js";
 import {
   ProcessingRequestSchema,
   CommonResponse_ResponseStatus,
@@ -9,6 +9,7 @@ import {
   type ProcessingResponse as ProtoProcessingResponse,
 } from "../../src/routing-service/protos/envoy/service/ext_proc/v3/external_processor_pb.js";
 import { mockRouting } from "../helpers/mock-outputs.js";
+import { INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER } from "../../src/routing-common.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
 
@@ -153,16 +154,29 @@ describe("createRequestHandler", () => {
     expect(setHeaders.find((h) => h.header.key === "Refresh")!.header.value).toBe("0;url=/login");
   });
 
-  it("returns 502 for external rewrites", async () => {
+  it("hands an external rewrite to the pool instead of authoring a 502 (N40)", async () => {
+    // N40. This tier used to answer 502 ("External rewrites are not supported in adapter-k8s
+    // v1"). Phase 1 returns `external-rewrite` and pool-server/dispatch.ts PROXIES it —
+    // measured against `next start`, which proxies too (a `/ext-rewrite` →
+    // `https://example.com/probe` rewrite returned example.com's own page and
+    // `server: cloudflare`). Because the CEL is `!(…)` whenever the app has middleware, the
+    // 502 fired in production for a route that worked in the e2e harness. Never author a
+    // status the other tier doesn't: CONTINUE with the dispatch vocabulary cleared and NO
+    // secret, exactly like the body-request backstop, so the pool re-resolves and owns it.
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       externalRewrite: new URL("https://external.com/api"),
     } as any);
 
     const response = await handler(makeHeaders("/proxy"));
-    expect(response.immediateResponse).toBeDefined();
-    expect(response.immediateResponse!.status!.code).toBe(502);
-    expect(response.immediateResponse!.body).toContain("External rewrites");
+    expect(response.immediateResponse).toBeUndefined();
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    expect(mutation.setHeaders ?? []).toEqual([]);
+    // Every internal dispatch header AND the secret must be removed, or a client could
+    // smuggle a spoofed x-output-id past the extension on this path.
+    expect(new Set(mutation.removeHeaders)).toEqual(
+      new Set([...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]),
+    );
   });
 
   it("sets x-nextjs-ppr header for PPR routes", async () => {
@@ -636,10 +650,19 @@ describe("createRequestHandler shed signal (timeout wiring)", () => {
     expect(captured!.aborted).toBe(true);
   });
 
-  it("does not mint a fresh timeout budget on the trailing-slash retry (same shed signal)", async () => {
+  it("does not mint a fresh timeout budget on the trailing-slash retry, and runs middleware ONCE", async () => {
     // The i18n trailing-slash retry recurses into handleRequest while the
     // server-side withTimeout keeps the ORIGINAL clock — a fresh
-    // AbortSignal.timeout would hand the retried middleware a full new window.
+    // AbortSignal.timeout would hand the retried pass a full new window.
+    //
+    // N40: this test used to assert the middleware saw the SAME signal on BOTH passes
+    // (`signals` length 2). Re-invoking middleware on the retry is itself the bug — it is the
+    // same request with the same verdict, so a second pass duplicates Set-Cookie, duplicates
+    // waitUntil/after() side effects and doubles the latency inside the ext_proc budget.
+    // pool-server/resolve.ts refuses for exactly this reason (`middlewareAlreadyRan`), so the
+    // edge now refuses too: middleware runs ONCE. The no-fresh-budget property is pinned
+    // directly instead, by counting AbortSignal.timeout calls across the recursion.
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
     const signals: AbortSignal[] = [];
     const adapterFn = vi.fn(async ({ request }: any) => {
       signals.push(request.signal);
@@ -675,9 +698,16 @@ describe("createRequestHandler shed signal (timeout wiring)", () => {
     });
     const handler = createRequestHandler(manifest, middlewareModule, { timeoutMs: 5000 });
     await handler(makeHeaders("/about"));
-    expect(signals).toHaveLength(2);
-    // Same signal object across the retry — the budget is shared, not re-minted.
-    expect(signals[1]).toBe(signals[0]);
+    // The retry DID happen (two resolveRoutes passes) …
+    expect(call).toBe(2);
+    // … middleware ran exactly once across it …
+    expect(signals).toHaveLength(1);
+    expect(adapterFn).toHaveBeenCalledTimes(1);
+    // … and no second budget was minted: one AbortSignal.timeout for the whole recursion,
+    // which is the signal middleware observed.
+    expect(timeoutSpy).toHaveBeenCalledTimes(1);
+    expect(signals[0]).toBe(timeoutSpy.mock.results[0]!.value);
+    timeoutSpy.mockRestore();
   });
 });
 
@@ -1362,16 +1392,51 @@ describe("N18: ext_proc immediate responses and the `_rsc` cache-busting param",
     expect(headerValue(response, "cache-control")).toBe("no-store");
   });
 
-  it("leaves the SAME middleware response alone when `_rsc` validates", async () => {
+  // S4 (SECURITY). These two used to assert that `public, s-maxage=600` was PRESERVED once
+  // the N18 RSC check did not apply — i.e. they pinned the vulnerability. A middleware-authored
+  // body is a middleware-covered response by definition, and the extension is post-cache on the
+  // GXLB, so a shared-cacheable one is served to other users with the callout never running
+  // (a cookie-dependent body then leaks for the whole freshness window). The pool already
+  // refuses this via explicitCacheControlWins → grantsSharedCacheFreshness; the edge now does
+  // too. `no-cache`, not `no-store`: storable-but-revalidated still reaches the extension on
+  // every use, and it is what the pool's forced default uses. The N18 distinction the two tests
+  // exist to draw is intact — unvalidated RSC is the stronger `no-store` (above).
+  it("downgrades the SAME middleware response to no-cache when `_rsc` validates", async () => {
     const response = await cacheableMiddlewareHandler()(rscReq("/gated?_rsc"));
-    expect(headerValue(response, "cache-control")).toBe("public, s-maxage=600");
+    expect(headerValue(response, "cache-control")).toBe("no-cache");
   });
 
-  it("leaves a DOCUMENT request alone (the check is scoped to RSC requests)", async () => {
+  it("downgrades a DOCUMENT request too — middleware coverage is not RSC-scoped", async () => {
     const response = await cacheableMiddlewareHandler()(
       makeHeaders("/gated?_rsc=DEADBEEFdeadbeef"),
     );
-    expect(headerValue(response, "cache-control")).toBe("public, s-maxage=600");
+    expect(headerValue(response, "cache-control")).toBe("no-cache");
+  });
+
+  it("keeps a middleware response that already forbids shared freshness verbatim", async () => {
+    // Only a directive that actually grants an unrevalidated shared window is replaced —
+    // an app expressing `public, max-age=0, must-revalidate` (service-worker shape) or
+    // `private` keeps middleware in the loop on every request and is honored as written.
+    for (const cc of ["public, max-age=0, must-revalidate", "private, max-age=600", "no-store"]) {
+      const middlewareModule = {
+        default: vi.fn().mockResolvedValue({
+          response: new Response("gated", { status: 200, headers: { "cache-control": cc } }),
+        }),
+      };
+      vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+        await params.invokeMiddleware({
+          url: params.url,
+          headers: params.headers,
+          requestBody: params.requestBody,
+        });
+        return { middlewareResponded: true } as any;
+      });
+      vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
+      const response = await createRequestHandler(makeManifest(), middlewareModule)(
+        makeHeaders("/gated"),
+      );
+      expect(headerValue(response, "cache-control")).toBe(cc);
+    }
   });
 
   it("downgrades a shared-cacheable redirect verdict for an unvalidated RSC request", async () => {
@@ -1412,5 +1477,268 @@ describe("N18: ext_proc immediate responses and the `_rsc` cache-busting param",
     } as any);
     const response = await handler(rscReq("/old"));
     expect(headerValue(response, "cache-control")).toBe("private, max-age=0, must-revalidate");
+  });
+});
+
+describe("N40: edge-only defects the pool-only e2e harness could never see", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("rejects a malformed :authority with 400 instead of splicing it into the URL", async () => {
+    // The edge used to interpolate `:authority` verbatim into a template string, so
+    // `evil.com/foo` injected attacker path segments into the URL that feeds
+    // detectDomainLocale, `has: { type: "host" }` matcher gating and the redirect same-origin
+    // test. The pool has run everything through parseRequestUrl since N10; the comment there
+    // CLAIMED this tier already did, which was true only for the `//evil/x` path half.
+    const handler = createRequestHandler(makeManifest(), null);
+    const response = await handler([
+      { key: ":path", value: "/about" },
+      { key: ":method", value: "GET" },
+      { key: ":scheme", value: "https" },
+      { key: ":authority", value: "evil.com/foo" },
+    ]);
+    expect(response.immediateResponse!.status!.code).toBe(400);
+    expect(resolveRoutes).not.toHaveBeenCalled();
+  });
+
+  it("keeps the middleware body's bytes and drops its content-length", async () => {
+    // `await mwRes.text()` + server.ts's TextEncoder turned every byte >= 0x80 into U+FFFD
+    // (3 bytes): an 8-byte PNG signature measured 10 bytes on the wire, against a forwarded
+    // `content-length: 8`.
+    const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const middlewareModule = {
+      default: vi.fn(async () => ({
+        response: new Response(PNG, {
+          status: 200,
+          headers: { "content-type": "image/png", "content-length": String(PNG.length) },
+        }),
+      })),
+      middleware: vi.fn(),
+    };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return { middlewareResponded: true } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({ bodySent: true } as any);
+
+    const response = await createRequestHandler(
+      makeManifest(),
+      middlewareModule as any,
+    )(makeHeaders("/icon"));
+    const body = response.immediateResponse!.body;
+    expect(body).toBeInstanceOf(Uint8Array);
+    expect([...(body as Uint8Array)]).toEqual([...PNG]);
+    expect(
+      response.immediateResponse!.headers!.setHeaders!.map((h) => h.header.key.toLowerCase()),
+    ).not.toContain("content-length");
+  });
+
+  it("keeps a text middleware body byte-identical through the proto boundary", async () => {
+    // The proto conversion (server.ts toBytes) must handle BOTH body kinds — a string body is
+    // still encoded, a byte body passes through.
+    const middlewareModule = {
+      default: vi.fn(async () => ({ response: new Response("héllo", { status: 403 }) })),
+      middleware: vi.fn(),
+    };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return { middlewareResponded: true } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockReturnValue({ bodySent: true } as any);
+
+    const plain = await createRequestHandler(
+      makeManifest(),
+      middlewareModule as any,
+    )(makeHeaders("/gated"));
+    const proto = plainResponseToProto(plain as any);
+    if (proto.response.case !== "immediateResponse") throw new Error("wrong case");
+    expect(new TextDecoder().decode(proto.response.value.body)).toBe("héllo");
+    expect([...proto.response.value.body]).toEqual([...new TextEncoder().encode("héllo")]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------
+// N40b: the transport header must not push a request past the POOL's header parser.
+//
+// `x-mw-request-headers` serializes the middleware's COMPLETE final request-header set while the
+// client's originals stay on the wire (the pool reads those originals itself, before dispatch
+// installs the replacement set), so the set is duplicated. Node's default `http.maxHeaderSize` is
+// 16 KiB and pool-server/server.ts takes the default, so a request with ~8 KiB of cookies/auth
+// crossed the limit only AFTER ext_proc processing — and Node answers 431 from the PARSER, so the
+// pool never gets to read the transport header at all. These tests drive a real
+// `createServer()` (hermetic, localhost, default options — the pool's own configuration) with the
+// exact header block Envoy would write, so the limit is MEASURED rather than assumed.
+// ---------------------------------------------------------------------------------------
+describe("N40b: pool header-budget guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** Status line code for a raw request whose header block is `block`, served by a default
+   * `createServer()` — i.e. exactly what a pool pod would answer. 0 = no response at all. */
+  async function statusForBlock(block: [string, string][]): Promise<number> {
+    const { createServer } = await import("node:http");
+    const net = await import("node:net");
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("no port");
+    const wire = `GET /about HTTP/1.1\r\n${block.map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`;
+    const code = await new Promise<number>((resolve) => {
+      const sock = net.connect(address.port, "127.0.0.1", () => sock.write(wire));
+      let buf = "";
+      const finish = (value: number) => {
+        sock.destroy();
+        resolve(value);
+      };
+      // Resolve on the status line rather than on socket close: a 200 keeps the connection
+      // alive (keepAliveTimeout would make every case take 5s).
+      sock.on("data", (d) => {
+        buf += d.toString();
+        if (buf.includes("\r\n")) finish(Number(buf.split(" ")[1] ?? 0));
+      });
+      sock.on("close", () => resolve(Number(buf.split(" ")[1] ?? 0)));
+      sock.on("error", () => finish(0));
+    });
+    await new Promise<void>((r) => server.close(() => r()));
+    return code;
+  }
+
+  /** The upstream header block Envoy writes after applying a header-mutation response:
+   * pseudo-headers become the request line, `removeHeaders` are dropped and `setHeaders` are
+   * OVERWRITE_IF_EXISTS_OR_ADD. */
+  function upstreamBlock(client: HeaderValue[], response: any): [string, string][] {
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    const set: [string, string][] = (mutation.setHeaders ?? []).map((h: any) => [
+      h.header.key,
+      h.header.value,
+    ]);
+    const removed = new Set<string>([
+      ...(mutation.removeHeaders ?? []).map((k: string) => k.toLowerCase()),
+      ...set.map(([k]) => k.toLowerCase()),
+    ]);
+    return [
+      ...client
+        .filter((h) => !h.key.startsWith(":") && !removed.has(h.key.toLowerCase()))
+        .map((h) => [h.key, h.value ?? ""] as [string, string]),
+      ...set,
+    ];
+  }
+
+  /** A realistic cookie-heavy browser request: `bytes` of cookie plus the usual furniture. */
+  function heavyRequest(bytes: number): HeaderValue[] {
+    return [
+      ...makeHeaders("/about"),
+      {
+        key: "user-agent",
+        value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML) Safari",
+      },
+      { key: "accept", value: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
+      { key: "accept-language", value: "en-US,en;q=0.9" },
+      { key: "cookie", value: `session=${"c".repeat(bytes - 8)}` },
+      { key: "authorization", value: `Bearer ${"t".repeat(400)}` },
+      { key: "x-user-id", value: "spoofed-evil" },
+    ];
+  }
+
+  /** Middleware that mutates the request-header set (strips the spoof, adds the identity) and
+   * returns `next()`, so the handler captures a final set to transport. */
+  function mutatingMiddlewareHandler() {
+    const middlewareModule = {
+      default: vi.fn(async () => ({ response: new Response(null, { status: 200 }) })),
+      middleware: vi.fn(),
+    };
+    vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+      await params.invokeMiddleware({
+        url: params.url,
+        headers: params.headers,
+        requestBody: params.requestBody,
+      });
+      return {
+        resolvedPathname: "/about",
+        resolvedQuery: {},
+        invocationTarget: { pathname: "/about", query: {} },
+      } as any;
+    });
+    vi.mocked(responseToMiddlewareResult).mockImplementation(((
+      _res: Response,
+      reqHeaders: Headers,
+    ) => {
+      reqHeaders.delete("x-user-id");
+      reqHeaders.set("x-authenticated-user", "alice");
+      return {};
+    }) as any);
+    return createRequestHandler(makeManifest(), middlewareModule as any);
+  }
+
+  it("MEASUREMENT: the naive full-set stamp makes an 8 KiB-cookie request 431 at the pool", async () => {
+    // The pre-fix wire shape: every client header still present, plus the whole final set again
+    // as JSON. This is the defect — a request that worked before the N40 transport stops working.
+    const client = heavyRequest(8 * 1024);
+    const clientBlock = client
+      .filter((h) => !h.key.startsWith(":"))
+      .map((h) => [h.key, h.value ?? ""] as [string, string]);
+    expect(await statusForBlock(clientBlock)).toBe(200);
+
+    const finalSet = Object.fromEntries(
+      clientBlock.filter(([k]) => k !== "x-user-id").concat([["x-authenticated-user", "alice"]]),
+    );
+    const naive: [string, string][] = [
+      ...clientBlock,
+      ["x-mw-request-headers", JSON.stringify(finalSet)],
+      ["x-mw-evaluated", "ran"],
+      ["x-output-id", "/about"],
+      ["x-matched-pathname", "/about"],
+      ["x-upstream-pool", "ssr"],
+    ];
+    expect(await statusForBlock(naive)).toBe(431);
+  });
+
+  it("hands an over-budget request to the pool UNTRUSTED instead of stamping a 431 into it", async () => {
+    const client = heavyRequest(8 * 1024);
+    const response = await mutatingMiddlewareHandler()(client);
+
+    // No dispatch header is stamped, no secret is added, and the whole vocabulary is cleared —
+    // the same fail-safe the body-request / external-rewrite backstops use, so the pool treats
+    // the request as untrusted and re-resolves it locally (running middleware itself).
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    expect(mutation.setHeaders ?? []).toHaveLength(0);
+    for (const name of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) {
+      expect(mutation.removeHeaders).toContain(name);
+    }
+    // Nothing is silently lost: without `x-mw-evaluated` the pool cannot skip its own
+    // middleware, so the header mutation is re-derived in-process where no wire budget applies.
+    expect(mutation.setHeaders?.find((h) => h.header.key === "x-mw-evaluated")).toBeUndefined();
+
+    // And the request the pool actually receives is SMALLER than the one the client sent, so it
+    // still parses — the property the 431 above violated.
+    expect(await statusForBlock(upstreamBlock(client, response))).toBe(200);
+  });
+
+  it("still stamps the full dispatch set (transport included) for an ordinary request", async () => {
+    // The guard must not fire on normal traffic: a 1 KiB cookie leaves plenty of budget.
+    const client = heavyRequest(1024);
+    const response = await mutatingMiddlewareHandler()(client);
+    const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
+    const dispatch = (key: string) => setHeaders.find((h) => h.header.key === key)?.header.value;
+    expect(dispatch("x-mw-evaluated")).toBe("ran");
+    const transported = dispatch("x-mw-request-headers");
+    expect(transported).toBeDefined();
+    const parsed = JSON.parse(transported!);
+    expect(parsed["x-authenticated-user"]).toBe("alice");
+    expect(parsed).not.toHaveProperty("x-user-id");
+    expect(await statusForBlock(upstreamBlock(client, response))).toBe(200);
   });
 });

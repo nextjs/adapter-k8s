@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  assertProbePathsUnowned,
   sanitizeK8sName,
   assertSafeReleaseName,
   assertSafeProjectId,
@@ -7,14 +8,21 @@ import {
   routingManifestSnapshotName,
   composedBuildResourceNames,
   findBuildIdNameCollision,
+  findEmittedNameCollision,
   poolResourceNames,
+  assertSafeQuantity,
+  assertSafeReplicaCount,
+  assertSafeTargetCPU,
+  assertSafePoolName,
+  assertSafeYamlScalar,
+  assertSafeImageReference,
   K8S_NAMESPACE,
 } from "../../../src/emit/templates/utils.js";
 // The snapshot name must be importable from its historical home too — deploy.ts and
 // rollback.ts import it from routing-manifest-configmap.ts (re-export).
 import { routingManifestSnapshotName as reExportedSnapshotName } from "../../../src/emit/templates/routing-manifest-configmap.js";
 import { renderHPA } from "../../../src/emit/templates/hpa.js";
-import { renderService } from "../../../src/emit/templates/service.js";
+import { renderService, renderActiveService } from "../../../src/emit/templates/service.js";
 
 describe("sanitizeK8sName", () => {
   it("never emits a name ending in a hyphen when truncation lands on one", () => {
@@ -136,10 +144,22 @@ describe("poolResourceNames (single source of truth for template-rendered names)
     const names = poolResourceNames(releaseName, poolName, buildId);
 
     const hpaDoc = renderHPA({ poolName, buildId, releaseName });
-    const [serviceDoc, hcpDoc] = renderService({ poolName, buildId, releaseName }).split("---");
+    const serviceDoc = renderService({ poolName, buildId, releaseName });
     expect(names.hpa).toBe(metadataName(hpaDoc));
-    expect(names.deployment).toBe(metadataName(serviceDoc!));
-    expect(names.hcp).toBe(metadataName(hcpDoc!));
+    expect(names.deployment).toBe(metadataName(serviceDoc));
+    // N75: the VERSIONED Service no longer carries a HealthCheckPolicy (it could never
+    // attach — no Gateway references that Service, so it has no backend service). The
+    // stable per-pool policy from renderActiveService is the one that governs. The `-hcp`
+    // name helper stays: deploy/rollback still clean up policies older builds created, and
+    // it must keep reproducing the 59-char truncation boundary exactly.
+    expect(serviceDoc).not.toContain("kind: HealthCheckPolicy");
+    const [, activeHcpDoc, activePdbDoc] = renderActiveService({ poolName, releaseName }).split(
+      "---",
+    );
+    expect(activeHcpDoc).toContain("kind: HealthCheckPolicy");
+    expect(metadataName(activeHcpDoc!)).toBe(sanitizeK8sName(`${releaseName}-${poolName}`, "-hcp"));
+    expect(activePdbDoc).toContain("kind: PodDisruptionBudget");
+    expect(names.hcp.length).toBeLessThanOrEqual(63);
 
     // The naive CLI reconstruction diverges — that is exactly what the helper prevents.
     expect(`${names.deployment}-hpa`).not.toBe(names.hpa);
@@ -281,5 +301,252 @@ describe("assertSafeRegion", () => {
 
   it("rejects regions with metacharacters", () => {
     expect(() => assertSafeRegion("us-central1;reboot")).toThrow(/Invalid region/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N60 — quantity / integer validators (the two findings where NO validator existed).
+// ---------------------------------------------------------------------------
+describe("assertSafeQuantity", () => {
+  it("accepts the quantity forms a pod spec needs", () => {
+    for (const q of ["1", "0", "1.5", "250m", "100m", "512Mi", "2Gi", "64Ki", "1000", "5T", "2P"]) {
+      expect(() => assertSafeQuantity(q, "x")).not.toThrow();
+    }
+  });
+
+  it("rejects the verified pod-spec injection payloads", () => {
+    // The values.yaml -> helm sink (deployment.ts). Rendered `hostNetwork: true` on the POD
+    // before this validator existed, voiding both NetworkPolicy postures (N19).
+    expect(() =>
+      assertSafeQuantity(
+        '512Mi"\n      hostNetwork: true\n      shareProcessNamespace: true\n      _pad: "',
+        "pool resources.memoryLimit",
+      ),
+    ).toThrow(/Invalid Kubernetes quantity/);
+    // The UNQUOTED routing-tier sink (routing-service-deployment.ts) — needed no escaping
+    // at all; this injected a sibling key on the first try.
+    expect(() =>
+      assertSafeQuantity("250m\n              INJECTED: yes", "routingService.resources.cpu"),
+    ).toThrow(/Invalid Kubernetes quantity/);
+  });
+
+  it("rejects near-miss forms outside the deliberate subset", () => {
+    for (const q of ["", " 1", "1 ", "1e3", "-1", "1.2.3", "512MiB", "$(id)", "1;reboot", "abc"]) {
+      expect(() => assertSafeQuantity(q, "x")).toThrow(/Invalid Kubernetes quantity/);
+    }
+    expect(() => assertSafeQuantity(512 as unknown as string, "x")).toThrow(
+      /Invalid Kubernetes quantity/,
+    );
+  });
+
+  it("names the offending field in the error (operator-actionable)", () => {
+    expect(() => assertSafeQuantity("nope", 'pool "ssr" resources.cpu')).toThrow(
+      /pool "ssr" resources\.cpu/,
+    );
+  });
+});
+
+describe("assertSafeReplicaCount / assertSafeTargetCPU", () => {
+  it("require real integers in range", () => {
+    expect(() => assertSafeReplicaCount(0, "min")).not.toThrow();
+    expect(() => assertSafeReplicaCount(6, "min")).not.toThrow();
+    expect(() => assertSafeReplicaCount(-1, "min")).toThrow(/Invalid min/);
+    expect(() => assertSafeReplicaCount(1.5, "min")).toThrow(/Invalid min/);
+    expect(() => assertSafeReplicaCount("1\n  INJECTED: yes" as unknown as number, "min")).toThrow(
+      /Invalid min/,
+    );
+    expect(() => assertSafeReplicaCount(NaN, "min")).toThrow(/Invalid min/);
+
+    expect(() => assertSafeTargetCPU(70, "t")).not.toThrow();
+    expect(() => assertSafeTargetCPU(0, "t")).toThrow(/Invalid t/);
+    // HPA averageUtilization is a percentage of REQUESTED cpu, so >100 is valid and common
+    // (request 250m, run happily at 500m → 200). The old cap rejected working configs.
+    expect(() => assertSafeTargetCPU(101, "t")).not.toThrow();
+    expect(() => assertSafeTargetCPU(200, "t")).not.toThrow();
+    expect(() => assertSafeTargetCPU(10_001, "t")).toThrow(/Invalid t/);
+  });
+});
+
+describe("assertSafePoolName (N61)", () => {
+  it("accepts normal pool names", () => {
+    for (const n of ["ssr", "api", "api-v2", "a", "p0", "on", "true", "123"]) {
+      expect(() => assertSafePoolName(n)).not.toThrow();
+    }
+  });
+
+  it("rejects edge hyphens (invalid label value / DNS-1123 component)", () => {
+    // The old /^[a-z0-9-]+$/ admitted all of these.
+    for (const n of ["-api", "api-", "-", "--"]) {
+      expect(() => assertSafePoolName(n)).toThrow(/Invalid pool name/);
+    }
+  });
+
+  it("rejects uppercase, dots, and injection payloads", () => {
+    for (const n of ["API", "a.b", "a b", 'x"\n  y: z', "a/b", ""]) {
+      expect(() => assertSafePoolName(n)).toThrow(/Invalid pool name/);
+    }
+  });
+
+  it("leaves the 40-char name-budget message to validateConfig (this cap is the label ceiling)", () => {
+    expect(() => assertSafePoolName("a".repeat(41))).not.toThrow();
+    expect(() => assertSafePoolName("a".repeat(64))).toThrow(/Invalid pool name/);
+  });
+});
+
+describe("assertSafeYamlScalar (N67)", () => {
+  it("accepts the values extension-chain.ts generates", () => {
+    expect(() =>
+      assertSafeYamlScalar("my-app-routing-service.default.svc.cluster.local", "authority"),
+    ).not.toThrow();
+    expect(() =>
+      assertSafeYamlScalar("projects/p/global/backendServices/my-app-routing-service", "service"),
+    ).not.toThrow();
+  });
+
+  it("rejects a scalar breakout, a backslash, and control characters", () => {
+    expect(() => assertSafeYamlScalar('a"\n  failOpen: true', "authority")).toThrow(/Unsafe/);
+    expect(() => assertSafeYamlScalar("a\\b", "service")).toThrow(/Unsafe/);
+    expect(() => assertSafeYamlScalar(5 as unknown as string, "service")).toThrow(/Invalid/);
+  });
+});
+
+describe("assertSafeImageReference (N66)", () => {
+  it("accepts a registry/repo:tag and a digest form", () => {
+    expect(() =>
+      assertSafeImageReference("us-central1-docker.pkg.dev/p/r/nextjs-app-ssr:build1"),
+    ).not.toThrow();
+    expect(() =>
+      assertSafeImageReference(`reg.example.com/p/app@sha256:${"a".repeat(64)}`),
+    ).not.toThrow();
+    expect(() => assertSafeImageReference("localhost:5000/app:v1")).not.toThrow();
+  });
+
+  it("rejects a scheme, a quote breakout, and whitespace", () => {
+    expect(() => assertSafeImageReference("https://reg/app:v1")).toThrow(/Invalid image reference/);
+    expect(() => assertSafeImageReference('reg/app:v1"\n  hostNetwork: true')).toThrow(
+      /Invalid image reference/,
+    );
+    expect(() => assertSafeImageReference("reg/app :v1")).toThrow(/Invalid image reference/);
+  });
+});
+
+describe("findEmittedNameCollision (N62: the FULL emitted-name set)", () => {
+  it("covers the stable per-pool names, not just the versioned ones", () => {
+    // The old guard compared current-vs-previous per pool ONLY, so it never looked at a
+    // versioned name against another pool's stable (active) name.
+    expect(findEmittedNameCollision("nextjs", ["api", "api-v2"], ["v2"])).toEqual({
+      kind: "Deployment/Service",
+      name: "nextjs-api-v2",
+    });
+    // Same shape for the HealthCheckPolicy namespace when only the -hcp variants collide.
+    const releaseName = "r".repeat(40);
+    const hcpOnly = findEmittedNameCollision(
+      releaseName,
+      ["p".repeat(13)],
+      ["aaaabbbb", "aaaacccc"],
+    );
+    expect(hcpOnly).not.toBeNull();
+  });
+
+  it("keeps kinds separate (a Deployment and an HPA may share a name)", () => {
+    expect(findEmittedNameCollision("my-app", ["ssr"], ["foo", "foo-hpa"])).toBeNull();
+    expect(findEmittedNameCollision("my-app", ["ssr"], ["foo", "foo-hcp"])).toBeNull();
+  });
+
+  it("reports a build id that sanitizes into the routing tier's own name", () => {
+    expect(findEmittedNameCollision("nextjs", ["routing"], ["service"])).toEqual({
+      kind: "Deployment/Service",
+      name: "nextjs-routing-service",
+    });
+    // The same pair also collides in the HPA namespace (nextjs-routing-service-hpa), but
+    // the Deployment/Service bucket is checked first, which is the more actionable message.
+  });
+
+  it("is clean for a realistic release", () => {
+    expect(
+      findEmittedNameCollision("nextjs", ["ssr", "api", "static"], ["b12345", "b67890"]),
+    ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S17 — a release name that is a YAML 1.1 boolean must not render a bare scalar.
+// N61 fixed this for the POOL name at every label/selector; the release name stayed bare, and
+// the API server rejects the manifest with "cannot unmarshal bool into … metadata.labels".
+// ---------------------------------------------------------------------------
+describe("S17: release names that are YAML booleans", () => {
+  it("renders quoted in every template that stamps the name label", async () => {
+    const { renderDeployment } = await import("../../../src/emit/templates/deployment.js");
+    const { renderService, renderActiveService } = await import(
+      "../../../src/emit/templates/service.js"
+    );
+    const { renderNetworkPolicies } = await import("../../../src/emit/templates/network-policy.js");
+    for (const releaseName of ["on", "no", "y"]) {
+      const rendered = [
+        renderDeployment({ poolName: "ssr", buildId: "b1", releaseName }),
+        renderService({ poolName: "ssr", buildId: "b1", releaseName }),
+        renderActiveService({ poolName: "ssr", releaseName }),
+        renderNetworkPolicies({ releaseName, poolNames: ["ssr"] }),
+      ].join("\n");
+      expect(rendered).not.toMatch(/app\.kubernetes\.io\/name: (on|no|y|true|false)\s*$/m);
+      expect(rendered).toContain(`app.kubernetes.io/name: "${releaseName}"`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The platform probe paths belong to the platform. The pool server declines to shadow an app
+// that owns /healthz or /readyz (so the route is not silently swallowed), but at runtime those
+// paths ARE the pod's verdict for the kubelet, the Gateway HealthCheckPolicy and the blue/green
+// cutover gate — so a static 200 at /readyz promotes a pod whose instrumentation threw (the
+// exact failure /readyz exists to catch), and an authenticated route there keeps a healthy pod
+// unready forever. Fail the build instead, where the message can say what to rename.
+// ---------------------------------------------------------------------------
+describe("assertProbePathsUnowned", () => {
+  const clean = {
+    pathnames: ["/", "/blog/[slug]", "/api/health"],
+    staticPathnames: ["/_next/static/chunk.js"],
+    publicPathnames: ["/favicon.ico", "/health.txt"],
+  };
+
+  it("passes for an app that owns neither probe path", () => {
+    expect(() => assertProbePathsUnowned(clean)).not.toThrow();
+  });
+
+  it("rejects an app ROUTE at either probe path", () => {
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, pathnames: [...clean.pathnames, "/readyz"] }),
+    ).toThrow(/reserved platform probe path.*\/readyz/s);
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, pathnames: [...clean.pathnames, "/healthz"] }),
+    ).toThrow(/\/healthz/);
+  });
+
+  it("rejects a PUBLIC file too — a static 200 is the dangerous case", () => {
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, publicPathnames: [...clean.publicPathnames, "/readyz"] }),
+    ).toThrow(/public\/ file/);
+  });
+
+  it("rejects a static OUTPUT at a probe path", () => {
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, staticPathnames: ["/readyz"] }),
+    ).toThrow(/static output/);
+  });
+
+  it("compares the basePath-stripped form — probes target the pod, without the basePath", () => {
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, pathnames: ["/docs/readyz"], basePath: "/docs" }),
+    ).toThrow(/\/readyz/);
+    // …and a path that only LOOKS like one under a different prefix is fine.
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, pathnames: ["/other/readyz"], basePath: "/docs" }),
+    ).not.toThrow();
+  });
+
+  it("names every collision, so one build failure fixes both", () => {
+    expect(() =>
+      assertProbePathsUnowned({ ...clean, pathnames: ["/healthz"], publicPathnames: ["/readyz"] }),
+    ).toThrow(/\/healthz.*\/readyz|\/readyz.*\/healthz/s);
   });
 });

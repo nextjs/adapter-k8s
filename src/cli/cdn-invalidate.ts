@@ -1,6 +1,7 @@
 // src/cli/cdn-invalidate.ts
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
+import { sanitizeForTerminal } from "./terminal.js";
 import { RECORDED_CDN_TAG_PATTERN } from "../cdn-tags.js";
 
 export type Runner = (
@@ -19,17 +20,25 @@ const okOut = (r: { exitCode: number; stdout: string }): string =>
   r.exitCode === 0 ? r.stdout.trim() : "";
 
 /**
- * Resolve the Cloud CDN url-map that `invalidate-cdn-cache` targets, deterministically from the
+ * Resolve EVERY Cloud CDN url-map that serves the release, deterministically from the
  * release's reserved static IP (never name-matching — the same anti-collision rule as
- * route-ext-update-job): IP → forwarding rule → target proxy → url-map. Every gcloud call's
- * exitCode is checked, and an unrecognized proxy target type is skipped rather than guessed.
- * Returns the url-map name, or null if any step fails (caller warns and skips — non-fatal).
+ * route-ext-update-job): IP → forwarding rules → target proxies → url-maps. Every gcloud
+ * call's exitCode is checked, and an unrecognized proxy target type is skipped rather
+ * than guessed. Returns the distinct url-map names (empty when nothing could be
+ * resolved; the caller warns and skips — non-fatal).
+ *
+ * N27: this used to `return` on the FIRST url-map it found. `forwarding-rules list`
+ * ordering is unspecified, and the chart provisions BOTH an http:80 and an https:443
+ * forwarding rule on the same IP with different route sets (gateway.ts, plus a separate
+ * `<release>-http-redirect` HTTPRoute). So a cutover could purge the redirect-only map,
+ * report success, and leave every stale entry on the real map serving — the same class as
+ * the M13 stale-apex incident this function exists for. Invalidate all of them.
  */
-export async function resolveCdnUrlMap(
+export async function resolveCdnUrlMaps(
   projectId: string,
   releaseName: string,
   run: Runner,
-): Promise<string | null> {
+): Promise<string[]> {
   const ip = okOut(
     await run("gcloud", [
       "compute",
@@ -41,7 +50,7 @@ export async function resolveCdnUrlMap(
       "--format=value(address)",
     ]),
   );
-  if (!ip) return null;
+  if (!ip) return [];
 
   const frRes = await run("gcloud", [
     "compute",
@@ -51,12 +60,13 @@ export async function resolveCdnUrlMap(
     `--filter=IPAddress=${ip}`,
     "--format=value(target)",
   ]);
-  if (frRes.exitCode !== 0) return null;
+  if (frRes.exitCode !== 0) return [];
 
   const targets = frRes.stdout
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
+  const urlMaps: string[] = [];
   for (const target of targets) {
     const kind = target.includes("targetHttpsProxies")
       ? "target-https-proxies"
@@ -75,9 +85,11 @@ export async function resolveCdnUrlMap(
         "--format=value(urlMap)",
       ]),
     );
-    if (urlMap) return basename(urlMap);
+    if (!urlMap) continue; // this proxy is unreadable — keep going, the others still matter
+    const name = basename(urlMap);
+    if (name && !urlMaps.includes(name)) urlMaps.push(name);
   }
-  return null;
+  return urlMaps;
 }
 
 /**
@@ -120,9 +132,12 @@ export async function invalidateCdnBuildTag(opts: {
     }
   }
 
-  const urlMap = await resolveCdnUrlMap(opts.projectId, opts.releaseName, opts.run);
-  if (!urlMap) {
-    opts.log("  ! CDN invalidation skipped: could not resolve url-map (non-fatal)");
+  const urlMaps = await resolveCdnUrlMaps(opts.projectId, opts.releaseName, opts.run);
+  if (urlMaps.length === 0) {
+    opts.log(
+      "  ! CDN invalidation skipped: could not resolve ANY url-map behind the release IP " +
+        "(non-fatal) — the outgoing build's cached entries keep serving until their TTL",
+    );
     return;
   }
 
@@ -130,40 +145,49 @@ export async function invalidateCdnBuildTag(opts: {
   // cluster ConfigMap and reaches gcloud argv (and Cloud CDN's comma-delimited --tags).
   // A malformed value is treated as "not recorded" — full purge — never spliced in.
   if (opts.recordedTag !== undefined && !RECORDED_CDN_TAG_PATTERN.test(opts.recordedTag)) {
-    opts.log(
-      `  ! Recorded CDN tag for outgoing build is malformed — falling back to a full purge`,
-    );
+    opts.log(`  ! Recorded CDN tag for outgoing build is malformed — falling back to a full purge`);
   }
   const recordedTag =
     opts.recordedTag !== undefined && RECORDED_CDN_TAG_PATTERN.test(opts.recordedTag)
       ? opts.recordedTag
       : undefined;
-  opts.log(
-    recordedTag
-      ? `  → Invalidating CDN cache for outgoing build (tag ${recordedTag}) on ${urlMap}...`
-      : `  → Invalidating CDN cache for outgoing build (no recorded tag — full purge ` +
-          `--path=/*) on ${urlMap}...`,
-  );
-  const r = await opts.run(
-    "gcloud",
-    [
-      "compute",
-      "url-maps",
-      "invalidate-cdn-cache",
-      urlMap,
-      // M13: recorded tag when we have one (precise, cheap); otherwise the outgoing
-      // build's entries carry unknown/no tags and only a path wildcard reaches them.
-      recordedTag ? `--tags=${recordedTag}` : "--path=/*",
-      "--global",
-      `--project=${opts.projectId}`,
-    ], // no --async: wait for the operation to complete
-    { timeoutMs: CDN_INVALIDATE_TIMEOUT_MS },
-  );
-  if (r.exitCode !== 0) {
+  // N27: every url-map behind the release IP, not just the first one found.
+  let failures = 0;
+  for (const urlMap of urlMaps) {
     opts.log(
-      `  ! CDN invalidation failed (non-fatal; TTL self-heals): ${r.stderr.trim().slice(0, 200)}`,
+      recordedTag
+        ? `  → Invalidating CDN cache for outgoing build (tag ${recordedTag}) on ${urlMap}...`
+        : `  → Invalidating CDN cache for outgoing build (no recorded tag — full purge ` +
+            `--path=/*) on ${urlMap}...`,
     );
-  } else {
-    opts.log("  → CDN cache invalidation complete ✓");
+    const r = await opts.run(
+      "gcloud",
+      [
+        "compute",
+        "url-maps",
+        "invalidate-cdn-cache",
+        urlMap,
+        // M13: recorded tag when we have one (precise, cheap); otherwise the outgoing
+        // build's entries carry unknown/no tags and only a path wildcard reaches them.
+        recordedTag ? `--tags=${recordedTag}` : "--path=/*",
+        "--global",
+        `--project=${opts.projectId}`,
+      ], // no --async: wait for the operation to complete
+      { timeoutMs: CDN_INVALIDATE_TIMEOUT_MS },
+    );
+    if (r.exitCode !== 0) {
+      failures++;
+      opts.log(
+        // L14: gcloud stderr echoes request-derived text, so it is externally influenced.
+        // Truncation bounds the length; only the sanitizer removes the escapes.
+        `  ! CDN invalidation failed for ${urlMap} (non-fatal; TTL self-heals): ` +
+          `${sanitizeForTerminal(r.stderr.trim()).slice(0, 200)}`,
+      );
+    }
+  }
+  if (failures === 0) {
+    opts.log(
+      `  → CDN cache invalidation complete ✓ (${urlMaps.length} url-map${urlMaps.length === 1 ? "" : "s"})`,
+    );
   }
 }

@@ -5,6 +5,7 @@ import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
+import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 // The release lives in the literal "default" namespace (init binds Workload Identity
 // there; deploy/rollback/state/destroy all pin it). Pin every kubectl read here too —
@@ -189,6 +190,8 @@ export async function runDoctor(options: {
   const infraPathForCtx = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   if (existsSync(infraPathForCtx)) {
     const infraCtx = readJsonFile<{ projectId?: string; region?: string }>(infraPathForCtx);
+    // S13: validate before these reach a gcloud/kubectl argv.
+    assertSafeInfrastructure(infraCtx);
     if (infraCtx.projectId && infraCtx.region) {
       const clusterName = `${releaseName}-cluster`;
       const credResult = await execCapture("gcloud", [
@@ -203,7 +206,10 @@ export async function runDoctor(options: {
         "--quiet",
       ]);
       if (credResult.exitCode !== 0) {
-        console.error(`Failed to connect to cluster "${clusterName}": ${credResult.stderr.trim()}`);
+        // L14: gcloud stderr is externally influenced; strip control sequences before printing.
+        console.error(
+          `Failed to connect to cluster "${clusterName}": ${sanitizeForTerminal(credResult.stderr.trim())}`,
+        );
         console.error(
           `Verify: gcloud container clusters get-credentials ${clusterName} --region ${infraCtx.region} --project ${infraCtx.projectId}`,
         );
@@ -249,15 +255,41 @@ export async function runDoctor(options: {
   );
 
   // Read state from cluster ConfigMap (works for CI/CD + local), fall back to local file
-  const { readState } = await import("./state.js");
-  const state = await readState(projectDir, releaseName);
+  const { readState, StateUnavailableError } = await import("./state.js");
+  // N20: readState now THROWS when state cannot be determined (rather than silently
+  // reporting "no deploys", which made a transient read failure look like a first deploy).
+  // doctor is the tool those errors tell operators to run, so it must REPORT that as a
+  // failed check rather than crashing.
+  let state: Awaited<ReturnType<typeof readState>> = null;
+  let stateError: string | null = null;
+  try {
+    state = await readState(projectDir, releaseName);
+  } catch (err) {
+    if (!(err instanceof StateUnavailableError)) throw err;
+    stateError = err.message;
+  }
+  if (stateError) {
+    results.push({
+      name: "Deploy state",
+      status: "fail",
+      message: stateError.split("\n")[0]!,
+      fix: "deploy refuses to run until this is repaired (it would otherwise look like a first deploy)",
+    });
+  }
   if (state) {
-    results.push({ name: "Current build", status: "pass", message: state.buildId });
+    // L14: both build ids come from the cluster-backed deploy state, whose validation
+    // requires only a nonempty string, and the central result printer emits messages
+    // verbatim — so a namespace actor able to edit the ConfigMap could forge health output.
+    results.push({
+      name: "Current build",
+      status: "pass",
+      message: sanitizeForTerminal(state.buildId),
+    });
     if (state.previousBuildId) {
       results.push({
         name: "Previous build",
         status: "pass",
-        message: `${state.previousBuildId} (rollback target)`,
+        message: `${sanitizeForTerminal(state.previousBuildId)} (rollback target)`,
       });
     }
   } else {
@@ -710,8 +742,12 @@ export async function runDoctor(options: {
       if (foundPrevious) {
         results.push({
           name: "Rollback ready",
-          status: "pass",
-          message: `Previous build ${state.previousBuildId} available`,
+          // N30: a deploy run with --allow-unretained-manifest records the outgoing build
+          // here; a rollback to it can only revert the routing IMAGE, not the manifest.
+          status: state.unretainedManifestBuilds?.includes(state.previousBuildId) ? "warn" : "pass",
+          message: state.unretainedManifestBuilds?.includes(state.previousBuildId)
+            ? `Previous build ${state.previousBuildId} available, but its routing manifest was NOT retained — rollback would be image-only (the edge keeps the current build's manifest)`
+            : `Previous build ${state.previousBuildId} available`,
         });
       } else {
         results.push({
@@ -1171,15 +1207,17 @@ export async function runDoctor(options: {
 export async function runDomainChecks(options: {
   projectDir: string;
   releaseName: string;
-}): Promise<void> {
+  // N33: deploy prints its completion banner AFTER these checks and exits non-zero when any
+  // FAIL — a release unreachable at its own hostname must not report a successful deploy.
+}): Promise<{ failures: number }> {
   const { projectDir, releaseName } = options;
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
-  if (!existsSync(infraPath)) return;
+  if (!existsSync(infraPath)) return { failures: 0 };
 
   const infra = readJsonFile<{ projectId?: string; hosts?: string[]; host?: string }>(infraPath);
   const projectId: string = infra.projectId ?? "";
   const hosts: string[] = Array.isArray(infra.hosts) ? infra.hosts : infra.host ? [infra.host] : [];
-  if (hosts.length === 0) return;
+  if (hosts.length === 0) return { failures: 0 };
 
   // Resolve Gateway IP (try static IP from gcloud)
   let gatewayIp: string | null = null;
@@ -1243,4 +1281,8 @@ export async function runDomainChecks(options: {
       console.log(`         Fix: ${r.fix}`);
     }
   }
+  // N33: report the count so deploy can downgrade its banner and exit non-zero.
+  return {
+    failures: results.filter((r) => !r.name.startsWith("---") && r.status === "fail").length,
+  };
 }

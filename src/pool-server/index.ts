@@ -1,5 +1,6 @@
 // src/pool-server/index.ts
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { createReadStream, readFileSync, existsSync, realpathSync, statSync } from "node:fs";
+import { pipeline } from "node:stream";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createRequire } from "node:module";
 import { isIP } from "node:net";
@@ -10,12 +11,15 @@ import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.j
 import {
   getRscConfig,
   manifestNextConfig,
-  matchesMiddleware,
+  middlewareMayCoverPath,
+  INTERNAL_DISPATCH_HEADERS,
   MW_EVALUATED_TRUSTED,
   parseRequestUrl,
   rscCacheBustingUnvalidated,
   rscParentCandidates,
+  stripBasePath,
   templateOutputCandidates,
+  trailingSlashVariants,
   type MiddlewareMatcher,
   type RscConfig,
 } from "../routing-common.js";
@@ -26,10 +30,19 @@ import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import {
   createDispatcher,
   getContentType,
+  isVerifiedPreviewRequest,
   mergeResolvedHeadersIntoHeadersArg,
 } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
-import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
+import { ifNoneMatchMatches, staticAssetEtagForFile } from "./http-cache.js";
+
+/**
+ * S14. Above this size a static/public body is STREAMED instead of buffered. Below it the
+ * buffered path stays — it is one syscall and avoids stream setup for the small files that
+ * dominate a build's asset count. The threshold is what keeps N concurrent requests for one
+ * large asset from holding N copies of it resident on a 512 MiB pod.
+ */
+const STREAM_THRESHOLD_BYTES = 512 * 1024;
 import { decodePublicPathname } from "./public-files.js";
 import {
   DEFAULT_IMAGE_FORMATS,
@@ -46,12 +59,24 @@ import {
   validateImageUrlParam,
   isOptimizableImageContentType,
   negotiateImageFormat,
+  negotiateImageMimeType,
   resizeForRequestedWidth,
 } from "./image-utils.js";
-import { createPoolServer, filterWriteHeadHeadersArg } from "./server.js";
+import {
+  applyRequestTrustBoundary,
+  createPoolServer,
+  filterWriteHeadHeadersArg,
+  LIVENESS_PATH,
+  READINESS_PATH,
+  type ReadinessState,
+} from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
 import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
-import { explicitCacheControlWins, forcedCdnCacheControl } from "./cache-policy.js";
+import {
+  createPprRouteMatcher,
+  explicitCacheControlWins,
+  forcedCdnCacheControl,
+} from "./cache-policy.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
@@ -124,14 +149,22 @@ async function ensureNextNodeEnvironment(): Promise<void> {
 // `ensureInstrumentationRegistered` re-awaits the same rejected promise and 500s the
 // routes it owns — i.e. `next start`'s observable behavior on the app's own routes,
 // without an instrumentation bug turning into a CrashLoopBackOff.
-async function registerInstrumentationHook(): Promise<void> {
+//
+// N32: the outcome is REPORTED, not merely logged, so `/readyz` can answer 503 for it — "keeps
+// answering /healthz while every app route 500s" is precisely the state the blue/green gate used
+// to read as a healthy build. "absent" (no hook) and "registrar-missing" (this Next version moved
+// the registrar; Next's own lazy per-request path still runs the hook, once) are both serving
+// states; only "failed" is not.
+type InstrumentationStatus = "ok" | "absent" | "registrar-missing" | "failed";
+
+async function registerInstrumentationHook(): Promise<InstrumentationStatus> {
   // distDir is `.next` everywhere in the pool (staging, manifests, the edge sandbox);
   // upstream passes a project-relative distDir here too.
   const distDir = ".next";
   const cwd = process.cwd();
   // `ensureInstrumentationRegistered` already tolerates a missing hook, but checking first
   // keeps the "no instrumentation" case from depending on error-code sniffing at all.
-  if (!existsSync(path.join(cwd, distDir, "server", "instrumentation.js"))) return;
+  if (!existsSync(path.join(cwd, distDir, "server", "instrumentation.js"))) return "absent";
 
   // Resolving the registrar and RUNNING it fail for different reasons and must not share a
   // diagnostic: "the app's hook threw" and "this Next version moved the registrar" call for
@@ -153,14 +186,14 @@ async function registerInstrumentationHook(): Promise<void> {
         `will run lazily on the first request instead of at startup:`,
       err,
     );
-    return;
+    return "registrar-missing";
   }
   if (typeof ensureInstrumentationRegistered !== "function") {
     console.error(
       `[pool-server] ${MODULE_ID} does not export ensureInstrumentationRegistered — ` +
         `instrumentation register() will run lazily on the first request instead of at startup`,
     );
-    return;
+    return "registrar-missing";
   }
 
   try {
@@ -169,13 +202,16 @@ async function registerInstrumentationHook(): Promise<void> {
     // is equivalent — its requests queue behind the same unresolved promise.
     await ensureInstrumentationRegistered(cwd, distDir);
     console.log("[pool-server] instrumentation register() completed");
+    return "ok";
   } catch (err) {
     console.error(
       "[pool-server] instrumentation register() FAILED — the pool will keep serving " +
         "/healthz and static assets, but Next re-awaits this same rejected registration " +
-        "per request, so app routes will 500 (this is what next start does too):",
+        "per request, so app routes will 500 (this is what next start does too). N32: /readyz " +
+        "now reports 503 for this state so the blue/green gate cannot promote this build:",
       err,
     );
+    return "failed";
   }
 }
 
@@ -189,6 +225,39 @@ const MAX_BODY_BYTES = Math.max(
   parseInt(process.env.ADAPTER_K8S_MAX_BODY_BYTES ?? "", 10) || 26_214_400, // 25 MiB
 );
 
+// N34: the per-request cap above bounds ONE upload; nothing bounded their SUM. ~40 concurrent
+// maximal uploads is a 1 GB spike on a pod whose memory limit is a fraction of that, and the
+// OOMKill that follows is read by the blue/green gate as a healthy pod dying under traffic —
+// i.e. an unauthenticated way to fail a deploy, not just to degrade one. This is a process-wide
+// admission budget: once the bytes currently buffered across all in-flight requests would exceed
+// it, further uploads are refused with 503 + Retry-After rather than accepted into memory.
+// Default 100 MiB (4× the per-request cap, so a single maximal upload always fits).
+const MAX_INFLIGHT_BODY_BYTES = Math.max(
+  MAX_BODY_BYTES,
+  parseInt(process.env.ADAPTER_K8S_MAX_INFLIGHT_BODY_BYTES ?? "", 10) || 104_857_600,
+);
+let inflightBodyBytes = 0;
+
+// N35: ONE cap for every image the optimizer buffers, whatever the source. There were two, and
+// they disagreed: the external fetch used MAX_BODY_BYTES (25 MiB, the REQUEST body cap) while the
+// loopback self-fetch used a local 20 MiB constant — so the same oversize source was a 413 or a
+// 25 MiB allocation depending on which side of `isAbsolute` it arrived on. Both bound the same
+// resource (one pod-memory buffer that sharp then decodes), so they are the same number.
+const MAX_IMAGE_BYTES = Math.max(
+  1,
+  parseInt(process.env.ADAPTER_K8S_MAX_IMAGE_BYTES ?? "", 10) || 20 * 1024 * 1024,
+);
+
+// N35: an ABSOLUTE deadline for the whole external-image fetch, redirect hops included. The
+// per-hop `{ timeout: 15_000 }` below is an IDLE timeout that every arriving byte resets, so a
+// host trickling one byte every 14 s pinned the socket, the growing `chunks[]` (up to the cap
+// above) and the client connection indefinitely — and ×4, because each redirect hop got a fresh
+// idle timer. Upstream's failure mode for a slow upstream is 504, which is what this maps to.
+const IMAGE_FETCH_DEADLINE_MS = Math.max(
+  1000,
+  parseInt(process.env.ADAPTER_K8S_IMAGE_FETCH_DEADLINE_MS ?? "", 10) || 15_000,
+);
+
 class BodyTooLargeError extends Error {
   constructor() {
     super("request body exceeds ADAPTER_K8S_MAX_BODY_BYTES");
@@ -196,8 +265,37 @@ class BodyTooLargeError extends Error {
   }
 }
 
+class BodyBudgetExceededError extends Error {
+  constructor() {
+    super("in-flight request bodies exceed ADAPTER_K8S_MAX_INFLIGHT_BODY_BYTES");
+    this.name = "BodyBudgetExceededError";
+  }
+}
+
+// N34: hold the budget charge for as long as the buffer is actually held — the buffered body is
+// attached to the request as `actionBody` and lives until the response completes, so releasing it
+// the moment the upload finished would bound only bytes IN TRANSIT, not bytes resident.
+function releaseBodyBudgetWhenResponseCompletes(res: ServerResponse, bytes: number): void {
+  if (bytes <= 0) return;
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    inflightBodyBytes -= bytes;
+  };
+  if (typeof (res as { once?: unknown }).once === "function") {
+    res.once("close", release);
+    res.once("finish", release);
+  } else {
+    // A response double with no EventEmitter surface (unit tests) cannot signal completion;
+    // release immediately rather than leaking the charge for the life of the process.
+    release();
+  }
+}
+
 async function readRequestBody(
   req: NodeJS.ReadableStream,
+  res: ServerResponse,
   maxBytes = MAX_BODY_BYTES,
 ): Promise<Buffer | null> {
   const stream = req as NodeJS.ReadableStream & {
@@ -208,40 +306,60 @@ async function readRequestBody(
   };
   const chunks: Buffer[] = [];
   let total = 0;
+  // N34: bytes this read has charged to the process-wide budget. Released immediately if the read
+  // fails, and otherwise when the response completes (the buffer outlives this function).
+  // Charging INCREMENTALLY rather than reserving content-length up front is deliberate: a declared
+  // length is client-controlled and may be absent, forged, or contradicted by chunked framing.
+  let charged = 0;
   // Explicit listener pump instead of `for await`: an early exit from a stream async
   // iterator DESTROYS the stream (and, for IncomingMessage, the socket), which turned
   // a deliverable 413 into an ECONNRESET the client couldn't read. On oversize we
   // pause and throw; the caller writes 413 + `connection: close` and only then
   // destroys the socket after the response has been flushed.
-  await new Promise<void>((resolve, reject) => {
-    const onData = (chunk: Buffer | string): void => {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      total += buf.length;
-      if (total > maxBytes) {
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onData = (chunk: Buffer | string): void => {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buf.length;
+        if (total > maxBytes) {
+          cleanup();
+          stream.pause?.();
+          reject(new BodyTooLargeError());
+          return;
+        }
+        inflightBodyBytes += buf.length;
+        charged += buf.length;
+        if (inflightBodyBytes > MAX_INFLIGHT_BODY_BYTES) {
+          cleanup();
+          stream.pause?.();
+          reject(new BodyBudgetExceededError());
+          return;
+        }
+        chunks.push(buf);
+      };
+      const onEnd = (): void => {
         cleanup();
-        stream.pause?.();
-        reject(new BodyTooLargeError());
-        return;
-      }
-      chunks.push(buf);
-    };
-    const onEnd = (): void => {
-      cleanup();
-      resolve();
-    };
-    const onError = (err: Error): void => {
-      cleanup();
-      reject(err);
-    };
-    const cleanup = (): void => {
-      stream.off("data", onData);
-      stream.off("end", onEnd);
-      stream.off("error", onError);
-    };
-    stream.on("data", onData);
-    stream.once("end", onEnd);
-    stream.once("error", onError);
-  });
+        resolve();
+      };
+      const onError = (err: Error): void => {
+        cleanup();
+        reject(err);
+      };
+      const cleanup = (): void => {
+        stream.off("data", onData);
+        stream.off("end", onEnd);
+        stream.off("error", onError);
+      };
+      stream.on("data", onData);
+      stream.once("end", onEnd);
+      stream.once("error", onError);
+    });
+  } catch (err) {
+    // Nothing is retained on a failed read — release immediately.
+    inflightBodyBytes -= charged;
+    throw err;
+  }
+  releaseBodyBudgetWhenResponseCompletes(res, charged);
   return chunks.length > 0 ? Buffer.concat(chunks) : null;
 }
 
@@ -316,6 +434,27 @@ function observedCacheControls(args: unknown[], res: ServerResponse): string[] {
   return found;
 }
 
+// N31: a disk/manifest asset serve answers GET/HEAD only. `next start`'s router-server gates
+// every static output this way (`res.setHeader('Allow', ['GET','HEAD']); res.statusCode = 405`
+// before serveStatic), and the pool had the gate in exactly one of its three serve sites —
+// dispatch's manifest serve — so POST/PUT/DELETE to a `_next/static` chunk or a public/ file
+// returned 200 with the full body and the deploy cache-tag, after reading and discarding the
+// request body. Measured on both servers 2026-07-25.
+function isReadMethod(method: string | undefined): boolean {
+  return method === "GET" || method === "HEAD";
+}
+
+// `Allow: GET, HEAD` as one field, matching dispatch's existing 405 for a prerender write.
+// `next start` emits the two values as two `Allow` field lines, which RFC 9110 §5.3 defines as
+// equivalent to the comma-joined form. Deliberate divergence on ONE point: `next start` answers
+// OPTIONS on a static output with 400 (its 405 handler re-enters the router to render a `/405`
+// page, and that nested render is what mangles the status — measured); 405 is the status its own
+// gate sets, and the RFC-correct answer, so the adapter reports it for every non-read method.
+function methodNotAllowed(res: ServerResponse): void {
+  res.writeHead(405, { allow: "GET, HEAD", "content-length": "0" });
+  res.end();
+}
+
 // LAST-RESORT public/ file serving from disk. The canonical path for public files is the
 // static-assets manifest via dispatcher.dispatch (which merges the resolved routing
 // verdict — next.config headers() / middleware headers — over the adapter's mutable
@@ -339,11 +478,31 @@ function servePublicFileFromDisk(
   if (!publicFile || !existsSync(publicFile) || statSync(publicFile).isDirectory()) {
     return false;
   }
-  const content = readFileSync(publicFile);
-  const etag = staticAssetEtag(content);
+  // N31: GET/HEAD only, and the existence check comes FIRST so a write to a path with no public
+  // file still falls through to routing (which is `next start`'s ordering: it 405s only once the
+  // static output matched). Measured on `next start`: POST/PUT/DELETE on a public file → 405 with
+  // `Allow: GET, HEAD`; the adapter answered 200 with the full body and the deploy cache-tag.
+  // This is the live path for `fixtures/main`, whose static-assets.json carries no public entries.
+  if (!isReadMethod(req.method)) {
+    methodNotAllowed(res);
+    return true;
+  }
+  // S14: hash once per file per process, and only read the bytes when the digest is not
+  // already known — a conditional request (which these `max-age=0, must-revalidate` responses
+  // invite on essentially every client request) then costs a stat, not a full read plus a full
+  // SHA-1 of the body.
+  const publicStat = statSync(publicFile);
+  const etag = staticAssetEtagForFile(publicFile, publicStat, () => readFileSync(publicFile));
   let responseHeaders: Record<string, string | string[]> = {
     "content-type": getContentType(decodedPathname!),
-    "cache-control": "public, max-age=3600",
+    // N31: `next start` serves a public/ file `public, max-age=0` (measured), NOT a positive
+    // max-age: these files change across deploys at the SAME url, so a browser copy with an
+    // hour of freshness survives a cutover and no cache-tag invalidation can reach it (a
+    // browser cache has no tags). `must-revalidate` is added on top so a shared cache cannot
+    // serve it stale either; the ETag below makes each revalidation a 304. Keep this in step
+    // with the manifest default in emit/static-assets.ts — the manifest is the canonical path
+    // for public files and this disk serve is only the last resort for one it missed.
+    "cache-control": "public, max-age=0, must-revalidate",
     etag,
   };
   if (resolvedHeaders) {
@@ -362,8 +521,22 @@ function servePublicFileFromDisk(
     res.end();
     return true;
   }
+  // N31: Content-Length is REQUIRED for HEAD — see the same fix at the `_next/static` serve
+  // site and in sendImageResponse. Stamped last so it always describes the bytes we send.
+  responseHeaders["content-length"] = String(publicStat.size);
   res.writeHead(200, responseHeaders);
-  res.end(req.method === "HEAD" ? undefined : content);
+  // S14: HEAD needs no body at all, and a body large enough to matter is STREAMED rather than
+  // buffered — `readFileSync` held the whole file resident per concurrent request and blocked
+  // the event loop for the length of the read.
+  if (req.method === "HEAD") {
+    res.end();
+    return true;
+  }
+  if (publicStat.size > STREAM_THRESHOLD_BYTES) {
+    pipeline(createReadStream(publicFile), res, () => undefined);
+    return true;
+  }
+  res.end(readFileSync(publicFile));
   return true;
 }
 
@@ -391,6 +564,14 @@ interface ImageRemotePattern {
   hostname: string;
   port?: string;
   pathname?: string;
+  /**
+   * S18. Next.js defines `remotePatterns.search` as an EXACT query-string restriction
+   * (including the leading `?`, and `""` meaning "no query string at all"). It was dropped
+   * from this type, so `isExternalImageAllowed` compared only protocol/host/port/pathname:
+   * an app allowlisting `/proxy?tenant=public` also allowed `?tenant=private`, i.e. every
+   * other query the upstream honors.
+   */
+  search?: string;
 }
 
 interface ImageConfig {
@@ -432,13 +613,14 @@ interface ImageConfig {
 }
 
 // Load sharp exactly once per process and cache the verdict — success OR failure.
-// esbuild bundles sharp's JS into pool-server.cjs, and its __commonJS wrapper
-// registers the module record BEFORE evaluating it: when the native binding is
-// missing (no @img/sharp-* in the container), the FIRST require throws but every
-// LATER require returns the broken partially-initialized module. Live this showed
-// up as one honest 503 ("sharp is unavailable") followed by an endless stream of
-// misleading 502s from deep inside the pipeline (build XchOtaGFu6GdFrcdujVc0).
-// Memoizing the first attempt keeps the failure mode consistent and logs WHY once.
+// sharp is EXTERNAL in the pool bundle (canary.97 post-mortem: inlining the adapter
+// repo's pack-time sharp JS next to the APP's staged @img binaries cross-versioned the
+// pair and 503'd every /_next/image the moment upstream bumped sharp) — the require
+// resolves the APP's own staged sharp at runtime. Memoization still matters: when the
+// native binding is missing, the FIRST require throws but a broken partially-initialized
+// module can be returned to LATER requires. Live this showed up as one honest 503
+// followed by misleading 502s (build XchOtaGFu6GdFrcdujVc0). Memoizing keeps the failure
+// mode consistent and logs WHY once.
 type SharpModule = (input: Buffer) => SharpPipeline;
 type SharpPipeline = {
   resize: (w: number | undefined, h: undefined, o: { withoutEnlargement: true }) => SharpPipeline;
@@ -603,6 +785,246 @@ function loadImageConfig(cwd: string): ImageConfig {
 //     strips this Cache-Control AND the cache-tag and forces `no-cache`, so a CDN hit can
 //     never bypass the ext_proc callout. The wrapper is installed before this handler
 //     runs and sits under every write below (verified by test).
+
+/**
+ * S16 → S32 (AVAILABILITY). Admission control for `/_next/image`, taken BEFORE the source is
+ * read rather than before the encode.
+ *
+ * S16 put a 4-slot semaphore in front of sharp, because `/_next/image` had no process-wide
+ * budget at all and a single client can walk the whole variant space (every public image ×
+ * every configured width × every Accept) without ever repeating a key, so nothing upstream
+ * throttles it either. S32 is the correction to that fix: the source read/fetch happened FIRST
+ * (`imageBuffer` was assigned before the acquire), so what S16 actually bounded was concurrent
+ * *encodes* — resident source memory stayed bounded only by queue depth × MAX_IMAGE_BYTES,
+ * every waiter parked on the semaphore holding its own full copy, with the 5 s shed deadline as
+ * the only cap on how long. On a pod whose default memory limit is 512 MiB that is still an OOM
+ * path, merely a slower one, and an OOMKill under traffic is read by the blue/green gate as a
+ * healthy pod dying — an unauthenticated way to fail a deploy, not just to degrade one. Same
+ * reasoning as the N34 request-body budget, and this budget is deliberately built in its shape.
+ *
+ * So admission now covers source acquisition AND encode as ONE gate — a queued request holds
+ * nothing but its request state — with two knobs, because a slot count alone does not bound
+ * bytes:
+ *   • MAX_CONCURRENT_IMAGE_OPTIMIZATIONS — how many sources may be in flight at once, which is
+ *     what bounds concurrent libvips working sets.
+ *   • MAX_INFLIGHT_IMAGE_BYTES — a process-wide byte budget over those sources. Admission
+ *     reserves the WORST CASE (MAX_IMAGE_BYTES), because the size of a source is unknowable
+ *     before reading it, and trues the reservation down (or up) to the real size once the bytes
+ *     are in hand. Without this knob the memory bound would be slots × MAX_IMAGE_BYTES
+ *     (4 × 20 MiB by default) with no way to tighten it independently of concurrency.
+ *
+ * Still a semaphore, not a queue-forever: waiters have a deadline, and a request that cannot be
+ * admitted in time is shed with 503 *before it has read anything*. The failure mode stays "some
+ * image requests are refused under load" rather than "the pod OOMs and takes every route down
+ * with it".
+ *
+ * One consequence of gating the read rather than the encode: the passthrough answers — allowed
+ * SVG, BYPASS_TYPES, animated sources — now need admission too, where under S16 they were served
+ * without ever touching the semaphore. That is the point rather than a side effect. They buffer
+ * a full source exactly like an encoded one does, so they were the cheapest way to drive the
+ * unbounded path; the cost is that a saturated pod can now shed a request `next start` would
+ * answer, which is the same trade the encode semaphore already made.
+ *
+ * Admission is released when the optimization completes, NOT when the response finishes writing
+ * (which is what the N34 body budget does, deliberately, for the request bodies it charges).
+ * The difference is which resource is scarce: N34 holds a byte charge because the buffer it
+ * charged for stays resident for the whole response, whereas holding a CONCURRENCY slot across
+ * the response write would let four slow readers pin the entire optimizer while holding no
+ * source memory at all. What outlives release here is the encoded derivative, a fraction of the
+ * source it came from.
+ */
+const MAX_CONCURRENT_IMAGE_OPTIMIZATIONS = Math.max(
+  1,
+  parseInt(process.env.ADAPTER_K8S_MAX_CONCURRENT_IMAGE_OPTIMIZATIONS ?? "", 10) || 4,
+);
+// The budget can never be smaller than one maximal source, or a single legitimate request could
+// never be admitted at all (the same floor MAX_INFLIGHT_BODY_BYTES applies to MAX_BODY_BYTES).
+const MAX_INFLIGHT_IMAGE_BYTES = Math.max(
+  MAX_IMAGE_BYTES,
+  parseInt(process.env.ADAPTER_K8S_MAX_INFLIGHT_IMAGE_BYTES ?? "", 10) || 67_108_864, // 64 MiB
+);
+const IMAGE_ADMISSION_DEADLINE_MS = Math.max(
+  1,
+  parseInt(process.env.ADAPTER_K8S_IMAGE_ADMISSION_DEADLINE_MS ?? "", 10) || 5_000,
+);
+let activeImageOptimizations = 0;
+let reservedImageBytes = 0;
+const imageAdmissionWaiters: Array<() => void> = [];
+// Counters, not gauges: the shed count is the signal that the pod is refusing image work, and
+// the join count is what proves the single-flight below is actually collapsing duplicates. Both
+// are read by tests (asserting on admission accounting is reliable where heap assertions are
+// not) and both are cheap enough to keep in production.
+let admittedImageOptimizations = 0;
+let shedImageOptimizations = 0;
+let joinedImageOptimizations = 0;
+
+interface ImageAdmission {
+  /**
+   * Replace this admission's worst-case reservation with the number of source bytes actually
+   * held. Called as soon as the source is in hand; it can move the charge UP as well as down —
+   * the disk-read path is not bounded by MAX_IMAGE_BYTES (a build-emitted public file is not
+   * attacker-supplied, and upstream does not cap a local read either), so the honest charge for
+   * one of those may exceed the reservation. Going over budget only blocks further admissions;
+   * it never retroactively refuses work already in flight.
+   */
+  settleSourceBytes(bytes: number): void;
+  release(): void;
+}
+
+// Admit from the head, and stop at the first waiter that does not fit rather than scanning past
+// it for one that does: strict FIFO is what keeps a request for a large source from being
+// starved indefinitely by a stream of small ones. Called on every release AND on every true-up,
+// since a true-up can free budget without freeing a slot.
+function pumpImageAdmissionQueue(): void {
+  while (
+    imageAdmissionWaiters.length > 0 &&
+    activeImageOptimizations < MAX_CONCURRENT_IMAGE_OPTIMIZATIONS &&
+    reservedImageBytes + MAX_IMAGE_BYTES <= MAX_INFLIGHT_IMAGE_BYTES
+  ) {
+    imageAdmissionWaiters.shift()!();
+  }
+}
+
+function grantImageAdmission(): ImageAdmission {
+  activeImageOptimizations++;
+  admittedImageOptimizations++;
+  let charged = MAX_IMAGE_BYTES;
+  reservedImageBytes += charged;
+  let released = false;
+  return {
+    settleSourceBytes(bytes: number): void {
+      if (released) return;
+      reservedImageBytes += bytes - charged;
+      charged = bytes;
+      pumpImageAdmissionQueue();
+    },
+    release(): void {
+      if (released) return;
+      released = true;
+      activeImageOptimizations--;
+      reservedImageBytes -= charged;
+      pumpImageAdmissionQueue();
+    },
+  };
+}
+
+async function acquireImageAdmission(): Promise<ImageAdmission | null> {
+  if (
+    imageAdmissionWaiters.length === 0 &&
+    activeImageOptimizations < MAX_CONCURRENT_IMAGE_OPTIMIZATIONS &&
+    reservedImageBytes + MAX_IMAGE_BYTES <= MAX_INFLIGHT_IMAGE_BYTES
+  ) {
+    return grantImageAdmission();
+  }
+  return new Promise<ImageAdmission | null>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const idx = imageAdmissionWaiters.indexOf(admit);
+      if (idx !== -1) imageAdmissionWaiters.splice(idx, 1);
+      shedImageOptimizations++;
+      resolve(null);
+    }, IMAGE_ADMISSION_DEADLINE_MS);
+    timer.unref?.();
+    function admit(): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(grantImageAdmission());
+    }
+    imageAdmissionWaiters.push(admit);
+  });
+}
+
+/**
+ * What one unit of shared optimizer work produces. It is a VALUE rather than a write to `res`
+ * because S32(b) lets N requests share it: everything that depends on the individual request
+ * (If-None-Match → 304, HEAD, and the error body) is applied by each caller afterwards.
+ */
+type ImageOptimizationOutcome =
+  | { kind: "image"; body: Buffer; contentType: string; isStatic: boolean; maxAge: number }
+  | { kind: "error"; status: number; body: string };
+
+/**
+ * S32(b). Single-flight on a PRE-I/O key, so concurrent identical requests share one fetch and
+ * one encode instead of N of each.
+ *
+ * The key is the request shape known before any I/O: normalized `?url=`, width, quality and the
+ * NEGOTIATED output mime. Deliberately not source identity (ETag/Last-Modified/final redirected
+ * URL): those are known only after fetching — FetchedImage does not even carry them — so a key
+ * built from them cannot dedupe the fetch, which is the expensive half. It is upstream's model
+ * too: `ImageOptimizerCache.getCacheKey` is URL-based and uses source validators as
+ * *revalidation* metadata, not as key material.
+ *
+ * Sharing is safe because the work is client-independent by construction: the local branch reads
+ * from disk, and a middleware-covered or route-served source is self-fetched over loopback with
+ * NONE of the client's headers (see the self-fetch below), so two clients requesting the same
+ * key already received byte-identical output before this existed. The window is only the
+ * in-flight one — nothing is retained after the promise settles, so a source that changes
+ * between requests behaves exactly as it did.
+ */
+const inflightImageOptimizations = new Map<string, Promise<ImageOptimizationOutcome>>();
+
+function runOrJoinImageOptimization(
+  key: string,
+  run: () => Promise<ImageOptimizationOutcome>,
+): Promise<ImageOptimizationOutcome> {
+  const joined = inflightImageOptimizations.get(key);
+  if (joined) {
+    joinedImageOptimizations++;
+    return joined;
+  }
+  // The map entry is cleared on BOTH outcomes, so a rejection cannot poison the key for the
+  // life of the process: the next request re-runs the work. Every waiter awaits this same
+  // promise, which is also why a rejection here is never an unhandled one.
+  const started = run().finally(() => {
+    inflightImageOptimizations.delete(key);
+  });
+  inflightImageOptimizations.set(key, started);
+  return started;
+}
+
+/**
+ * The S32 admission/single-flight accounting, exported for tests. Asserting on this is the
+ * reliable way to pin a memory bound — a heap assertion is flaky, and a test that only counted
+ * encodes would pass while a duplicated FETCH (the expensive half) went unnoticed.
+ */
+export function imageOptimizerAdmissionStats(): {
+  active: number;
+  queued: number;
+  reservedBytes: number;
+  admitted: number;
+  shed: number;
+  joined: number;
+  inflightKeys: number;
+} {
+  return {
+    active: activeImageOptimizations,
+    queued: imageAdmissionWaiters.length,
+    reservedBytes: reservedImageBytes,
+    admitted: admittedImageOptimizations,
+    shed: shedImageOptimizations,
+    joined: joinedImageOptimizations,
+    inflightKeys: inflightImageOptimizations.size,
+  };
+}
+
+/**
+ * S26. Origin + pathname only, with a marker when a query string was dropped. Keeps the log
+ * useful for debugging (which source failed) without printing credentials or letting a decoded
+ * newline forge a log line.
+ */
+export function redactImageUrlForLog(url: string): string {
+  try {
+    const parsed = new URL(url, "http://n");
+    const base = url.startsWith("/") ? parsed.pathname : `${parsed.origin}${parsed.pathname}`;
+    return parsed.search ? `${base}?<redacted>` : base;
+  } catch {
+    return "<unparseable url>";
+  }
+}
+
 function sendImageResponse(
   req: IncomingMessage,
   res: ServerResponse,
@@ -681,12 +1103,33 @@ function hasRegisteredCacheHandler(cwd: string): boolean {
   }
 }
 
-// Resolve `relPath` under `root`, returning null if it escapes the root (traversal).
+/**
+ * Resolve `relPath` under `root`, returning null if it escapes the root (traversal).
+ *
+ * S30 (SECURITY). The lexical `path.resolve` check answers "does this PATH STRING stay under
+ * the root", which is not the same question as "does the file it opens stay under the root": a
+ * symlink inside the root whose target is outside it passes lexically, and the subsequent
+ * `readFileSync` follows it. In a deployed image that is unreachable — collectPublicPathnames
+ * skips escaping symlinks at build time, so they never enter the inventory or the staged
+ * context — but it IS reachable under `emulate`/local dev, where the server runs against the
+ * working tree. Resolve the real path and re-check, so containment holds wherever this runs.
+ *
+ * The realpath is only attempted when the file exists; a miss keeps the lexical answer so a
+ * 404 stays a 404 rather than becoming an error.
+ */
 function resolveWithinRoot(root: string, relPath: string): string | null {
   const rel = relPath.startsWith("/") ? relPath : `/${relPath}`;
   const resolved = path.resolve(root, `.${rel}`);
-  if (resolved === root || resolved.startsWith(root + path.sep)) return resolved;
-  return null;
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+  try {
+    const realRoot = realpathSync(root);
+    const realTarget = realpathSync(resolved);
+    if (realTarget !== realRoot && !realTarget.startsWith(realRoot + path.sep)) return null;
+  } catch {
+    // Either the root or the candidate does not exist — the lexical verdict stands and the
+    // caller's own existsSync decides.
+  }
+  return resolved;
 }
 
 function isPrivateIPv4(ip: string): boolean {
@@ -705,32 +1148,129 @@ function isPrivateIPv4(ip: string): boolean {
   return false;
 }
 
-function isPrivateIPv6(ip: string): boolean {
+/**
+ * S23 (SECURITY). Classify an IPv6 address by PARSING it, not by matching prefixes.
+ *
+ * The previous version tested string prefixes and recognized an IPv4-mapped address only in
+ * its DOTTED form (`^::ffff:(\d+\.\d+\.\d+\.\d+)$`). Three gaps followed:
+ *  - the WHATWG URL parser NORMALIZES `[::ffff:169.254.169.254]` to the HEX form
+ *    `::ffff:a9fe:a9fe`, so that branch was dead on anything that came through a URL;
+ *  - `fe80` matched by prefix missed the rest of `fe80::/10` (`fe90::1` read as public);
+ *  - IPv4-compatible (`::a.b.c.d`) and NAT64 (`64:ff9b::/96`) were unclassified — the latter
+ *    is the one that actually routes on a cluster with DNS64/NAT64, no bracket-stripping
+ *    needed.
+ *
+ * Not exploitable as it stood — IPv6 literals die earlier because `URL.hostname` keeps the
+ * brackets and `dns.lookup("[…]")` fails, and glibc renders IPv4-mapped DNS answers dotted,
+ * which the old regex did catch. Both of those are accidents of layers this function does not
+ * control (Node's own `urlToHttpOptions` strips exactly those brackets), which is precisely
+ * why the predicate should not depend on them.
+ */
+function parseIPv6(ip: string): number[] | null {
   let addr = ip.toLowerCase();
   const zone = addr.indexOf("%");
   if (zone !== -1) addr = addr.slice(0, zone);
-  if (addr === "::1" || addr === "::") return true; // loopback / unspecified
-  const mapped = addr.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped && mapped[1]) return isPrivateIPv4(mapped[1]);
-  if (addr.startsWith("fe80")) return true; // link-local
-  if (addr.startsWith("fc") || addr.startsWith("fd")) return true; // unique-local fc00::/7
+  // A trailing dotted quad (`::ffff:1.2.3.4`, `::1.2.3.4`) contributes the low 32 bits.
+  let tail: number[] = [];
+  const dotted = addr.match(/:((?:\d{1,3}\.){3}\d{1,3})$/);
+  if (dotted?.[1]) {
+    const octets = dotted[1].split(".").map((o) => Number(o));
+    if (octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) return null;
+    tail = [(octets[0]! << 8) | octets[1]!, (octets[2]! << 8) | octets[3]!];
+    addr = addr.slice(0, addr.length - dotted[1].length) + "0:0";
+  }
+  const halves = addr.split("::");
+  if (halves.length > 2) return null;
+  const toGroups = (part: string): number[] | null => {
+    if (part === "") return [];
+    const out: number[] = [];
+    for (const g of part.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+      out.push(parseInt(g, 16));
+    }
+    return out;
+  };
+  const head = toGroups(halves[0] ?? "");
+  const rest = halves.length === 2 ? toGroups(halves[1] ?? "") : null;
+  if (!head || (halves.length === 2 && !rest)) return null;
+  let groups: number[];
+  if (halves.length === 2) {
+    const fill = 8 - head.length - rest!.length;
+    if (fill < 0) return null;
+    groups = [...head, ...Array.from({ length: fill }, () => 0), ...rest!];
+  } else {
+    groups = head;
+  }
+  if (groups.length !== 8) return null;
+  if (tail.length === 2) {
+    groups[6] = tail[0]!;
+    groups[7] = tail[1]!;
+  }
+  return groups;
+}
+
+function isPrivateIPv6(ip: string): boolean {
+  const g = parseIPv6(ip);
+  if (!g) return true; // unparseable → unsafe
+  const isZero = (upto: number): boolean => g.slice(0, upto).every((x) => x === 0);
+  // Loopback ::1 and unspecified ::
+  if (isZero(7) && (g[7] === 1 || g[7] === 0)) return true;
+  // IPv4-mapped ::ffff:a.b.c.d — in EITHER spelling, since both parse to the same groups.
+  if (isZero(5) && g[5] === 0xffff) {
+    return isPrivateIPv4(ipv4FromGroups(g));
+  }
+  // IPv4-compatible ::a.b.c.d (deprecated, but classify rather than guess).
+  if (isZero(6) && (g[6] !== 0 || g[7] !== 0)) {
+    return isPrivateIPv4(ipv4FromGroups(g));
+  }
+  // NAT64 well-known prefix 64:ff9b::/96 — routes to the embedded IPv4 wherever a NAT64
+  // gateway exists, which includes IPv6-only GKE clusters using DNS64.
+  if (g[0] === 0x0064 && g[1] === 0xff9b && isZeroRange(g, 2, 6)) {
+    return isPrivateIPv4(ipv4FromGroups(g));
+  }
+  // 6to4 2002::/16 embeds an IPv4 address in the next 32 bits.
+  if (g[0] === 0x2002) {
+    return isPrivateIPv4(`${g[1]! >> 8}.${g[1]! & 0xff}.${g[2]! >> 8}.${g[2]! & 0xff}`);
+  }
+  // Link-local fe80::/10 (the whole range, not just the fe80 prefix).
+  if ((g[0]! & 0xffc0) === 0xfe80) return true;
+  // Unique-local fc00::/7.
+  if ((g[0]! & 0xfe00) === 0xfc00) return true;
+  // Multicast ff00::/8.
+  if ((g[0]! & 0xff00) === 0xff00) return true;
   return false;
 }
 
-function isPrivateAddress(ip: string): boolean {
+/**
+ * Exported for tests: this is a security control (the SSRF address filter) and had NO test
+ * coverage at all — nothing in tests/ referenced 169.254 or exercised these predicates, which
+ * is exactly why the IPv6 gaps in S23 went unnoticed.
+ */
+export function isPrivateAddress(ip: string): boolean {
   const kind = isIP(ip);
   if (kind === 4) return isPrivateIPv4(ip);
   if (kind === 6) return isPrivateIPv6(ip);
   return true; // unparseable → treat as unsafe
 }
 
-// Resolve a hostname and confirm every address it maps to is publicly routable.
-// Blocks SSRF to loopback/private/link-local/metadata targets even when the host is
-// allowlisted by name (defends against DNS-rebind). IP literals are checked directly.
+function ipv4FromGroups(g: number[]): string {
+  return `${g[6]! >> 8}.${g[6]! & 0xff}.${g[7]! >> 8}.${g[7]! & 0xff}`;
+}
+
+function isZeroRange(g: number[], from: number, to: number): boolean {
+  for (let i = from; i < to; i++) if (g[i] !== 0) return false;
+  return true;
+}
+
 async function hostResolvesToPublicOnly(hostname: string): Promise<boolean> {
-  if (isIP(hostname)) return !isPrivateAddress(hostname);
+  // S23: `URL.hostname` keeps the brackets on an IPv6 literal, and Node's own
+  // urlToHttpOptions strips them before connecting — so strip them HERE too and classify the
+  // address, rather than relying on `dns.lookup("[…]")` happening to fail.
+  const bare =
+    hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  if (isIP(bare)) return !isPrivateAddress(bare);
   try {
-    const records = await dns.lookup(hostname, { all: true });
+    const records = await dns.lookup(bare, { all: true });
     if (records.length === 0) return false;
     return records.every((r) => !isPrivateAddress(r.address));
   } catch {
@@ -863,6 +1403,9 @@ function isExternalImageAllowed(target: URL, config: ImageConfig): boolean {
     if (!hostnameMatchesPattern(host, p.hostname)) continue;
     if (p.port && p.port !== target.port) continue;
     if (p.pathname && !pathnameMatchesPattern(target.pathname, p.pathname)) continue;
+    // S18: exact match when configured — upstream compares the whole `search` string, so the
+    // default `search: ""` forbids ANY query on the allowlisted URL.
+    if (p.search !== undefined && p.search !== target.search) continue;
     return true;
   }
   return false;
@@ -941,15 +1484,30 @@ async function fetchExternalImageSafely(
   const { request: httpsRequest } = await import("node:https");
   const { request: httpRequest2 } = await import("node:http");
   let target = initial;
+  // N35: one absolute deadline for the WHOLE fetch, redirect chain included (see
+  // IMAGE_FETCH_DEADLINE_MS). Every wait below is bounded by whatever is left of it.
+  const deadline = Date.now() + IMAGE_FETCH_DEADLINE_MS;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    if (Date.now() >= deadline) return { error: "timed-out" };
     if (!isExternalImageAllowed(target, config)) return { error: "not-allowed" };
     if (target.protocol !== "https:" && target.protocol !== "http:") {
       return { error: "not-allowed" };
     }
     // Pre-check keeps a fast, clear rejection; the pinned lookup below is the
     // actual guarantee for the connection that happens.
-    if (!(await hostResolvesToPublicOnly(target.hostname))) {
+    // S16: inside the deadline. This await sat OUTSIDE it, so c-ares retry time against an
+    // allowlisted domain with dead nameservers added unbounded latency per hop on top of
+    // IMAGE_FETCH_DEADLINE_MS — the one wait in this function the "one absolute deadline for
+    // the WHOLE fetch" comment did not actually cover.
+    const dnsVerdict = await Promise.race([
+      hostResolvesToPublicOnly(target.hostname),
+      new Promise<"deadline">((resolve) =>
+        setTimeout(() => resolve("deadline"), Math.max(0, deadline - Date.now())).unref?.(),
+      ),
+    ]);
+    if (dnsVerdict === "deadline") return { error: "timed-out" };
+    if (!dnsVerdict) {
       return { error: "not-allowed" };
     }
 
@@ -957,30 +1515,37 @@ async function fetchExternalImageSafely(
     const result = await new Promise<
       FetchedImage | { error: ImageFetchErrorKind } | { redirect: string }
     >((resolve) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        resolve({ error: "timed-out" });
+        return;
+      }
       const req = request(
         target.toString(),
-        { lookup: pinnedPublicLookup, timeout: 15_000 },
+        // The idle timeout is KEPT as well — it is the cheaper signal for a dead peer — but it
+        // is now capped by whatever remains of the absolute deadline, so it can never outlive it.
+        { lookup: pinnedPublicLookup, timeout: Math.min(15_000, remaining) },
         (imgRes) => {
           const status = imgRes.statusCode ?? 502;
           if (status >= 300 && status < 400) {
             imgRes.resume(); // drain
             const location = imgRes.headers.location;
-            if (!location) return resolve({ error: "redirect-without-location" });
-            return resolve({ redirect: location });
+            if (!location) return settle({ error: "redirect-without-location" });
+            return settle({ redirect: location });
           }
           const chunks: Buffer[] = [];
           let total = 0;
           imgRes.on("data", (c: Buffer) => {
             total += c.length;
-            if (total > MAX_BODY_BYTES) {
+            if (total > MAX_IMAGE_BYTES) {
               imgRes.destroy();
-              resolve({ error: "too-large" });
+              settle({ error: "too-large" });
               return;
             }
             chunks.push(c);
           });
           imgRes.on("end", () =>
-            resolve({
+            settle({
               ok: status >= 200 && status < 300,
               status,
               contentType: imgRes.headers["content-type"] ?? "image/jpeg",
@@ -988,14 +1553,31 @@ async function fetchExternalImageSafely(
               body: Buffer.concat(chunks),
             }),
           );
-          imgRes.on("error", () => resolve({ error: "fetch-failed" }));
+          imgRes.on("error", () => settle({ error: "fetch-failed" }));
         },
       );
+      // The absolute deadline fires regardless of how much the peer is trickling: destroy the
+      // socket (which also stops `chunks` growing) and report the timeout once.
+      const deadlineTimer = setTimeout(() => {
+        req.destroy();
+        settle({ error: "timed-out" });
+      }, remaining);
+      // `deadlineTimer.unref` keeps a pending fetch from holding the event loop open in tests.
+      deadlineTimer.unref?.();
+      let settled = false;
+      function settle(
+        value: FetchedImage | { error: ImageFetchErrorKind } | { redirect: string },
+      ): void {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        resolve(value);
+      }
       req.on("timeout", () => {
         req.destroy();
-        resolve({ error: "timed-out" });
+        settle({ error: "timed-out" });
       });
-      req.on("error", () => resolve({ error: "fetch-failed" }));
+      req.on("error", () => settle({ error: "fetch-failed" }));
       req.end();
     });
 
@@ -1131,7 +1713,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // BEFORE the HTTP server is created, so a hook that patches `node:http` or installs a
   // tracer provider sees a clean process. That is a strictly stronger ordering guarantee
   // than `next start`, which binds the port first and queues arriving requests.
-  await registerInstrumentationHook();
+  const instrumentationStatus = await registerInstrumentationHook();
 
   const port = parseInt(process.env.PORT ?? "3000", 10);
   const releaseName = process.env.RELEASE_NAME ?? "nextjs";
@@ -1506,6 +2088,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       };
     };
   };
+  // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch
+  // headers and authenticates them with a shared secret (INTERNAL_HEADER_SECRET, injected from
+  // a Secret). When the secret is set the pool trusts dispatch headers only if it matches;
+  // TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test paths).
+  // Declared here (rather than beside the server construction) because `revalidate` below is the
+  // second entrance to the same trust boundary and must be configured identically.
+  const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
+
   let handleRequest: (req: IncomingMessage, res: ServerResponse) => Promise<void>;
   const revalidate = async ({
     urlPath,
@@ -1520,6 +2110,18 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       url: urlPath,
       headers: { host: "127.0.0.1", ...headers },
     });
+    // N33: this is the SECOND door into handleRequest (Pages `res.revalidate()` re-enters the
+    // pipeline in-process), and it used to skip everything createPoolServer installs — the
+    // untrusted-dispatch-header strip, the internal-response-header strip, and guardStreamErrors —
+    // while handleRequest still reads `x-output-id`/`x-mw-evaluated` as trusted. Not exploitable
+    // today (Next builds those internal headers itself) but a trust boundary with two entrances,
+    // one of them unguarded, is one bad `headers` pass-through away from being one. Both callers
+    // now share the same boundary function.
+    applyRequestTrustBoundary(
+      mocked.req as unknown as IncomingMessage,
+      mocked.res as unknown as ServerResponse,
+      { internalSecret, trustInternalHeaders },
+    );
     await handleRequest(
       mocked.req as unknown as IncomingMessage,
       mocked.res as unknown as ServerResponse,
@@ -1546,6 +2148,15 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // `_rsc` validation below reads the SAME header names the dispatcher negotiates on — an app
   // with a custom RSC header must not silently skip the check.
   const poolRscConfig = getRscConfig(routingManifest);
+  // N30 (SECURITY/CACHE): the pool's OWN PPR inventory, so the `no-store` verdict survives every
+  // path that never sees the ext_proc tier's `x-nextjs-ppr` header. See createPprRouteMatcher.
+  const isLocallyKnownPprRoute = createPprRouteMatcher({
+    pprRoutes: routingManifest.pprRoutes,
+    pprCapableRoutes: routingManifest.pprCapableRoutes,
+    basePath: routingManifest.basePath ?? "",
+    i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
+    rscConfig: poolRscConfig,
+  });
   const dispatcher = createDispatcher({
     handlerLoader,
     poolName,
@@ -1589,12 +2200,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       : {}),
   });
 
-  // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch
-  // headers and authenticates them with a shared secret (INTERNAL_HEADER_SECRET, injected from
-  // a Secret). When the secret is set the pool trusts dispatch headers only if it matches;
-  // TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test paths).
-  const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
-
   handleRequest = async (req, res) => {
     let url: URL;
     try {
@@ -1620,14 +2225,50 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // The catch-all matcher excludes /_next/, so normal middleware still lets
     // static assets fast-path. Skip the fast paths in that case and let
     // resolve() run middleware.
-    const mwReqHeaders = new Headers();
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (typeof v === "string") mwReqHeaders.set(k, v);
-      else if (Array.isArray(v)) mwReqHeaders.set(k, v.join(", "));
-    }
-    const middlewareCovers =
+    // S2 (SECURITY). Coverage here is PATH-ONLY — `has`/`missing` deliberately ignored.
+    //
+    // A full `matchesMiddleware` verdict is per-REQUEST, because those conditions read this
+    // request's own cookies and headers. But every consumer in this function decides something
+    // whose effect outlives one request: the forced CDN cache-control verdict, and the
+    // static/`_next/data` fast paths that skip resolution. The CDN entry they govern is SHARED,
+    // and the cache key holds neither `Cookie` nor `Authorization` — so the request that does
+    // NOT match a conditional matcher would fill the cache with a shared-cacheable body that
+    // the request which DOES match then hits, ahead of the post-cache extension, with
+    // middleware never running. Treating a conditionally-covered path as covered is the only
+    // verdict that is correct for a shared consequence.
+    //
+    // The decision to actually RUN middleware is not made here — it belongs to resolve(), which
+    // evaluates the conditions per request as `next start` does. See routing-common.ts
+    // (matchesMiddleware vs middlewareMayCoverPath).
+    const middlewareMayCover =
       !!(middlewareModule || edgeMiddlewareRunner) &&
-      matchesMiddleware(middlewareMatchers, url, mwReqHeaders);
+      middlewareMayCoverPath(middlewareMatchers, url);
+
+    // A path-based assetPrefix (e.g. "/assets") prefixes `_next/static` URLs; strip it so those
+    // requests are served/404'd like un-prefixed ones. (URL assetPrefixes point at a separate host,
+    // so those requests never reach the pool.) Computed here rather than at the serve site because
+    // the PPR verdict below has to know whether this request is a filesystem serve at all.
+    const basePath = routingManifest.basePath ?? "";
+    const staticPathname =
+      assetPrefix && url.pathname.startsWith(assetPrefix + "/_next/static/")
+        ? url.pathname.slice(assetPrefix.length)
+        : url.pathname;
+    // True for a request the pool answers from disk/the static manifest as a PLAIN asset —
+    // `/_next/*` (chunks, data payloads, the optimizer) and manifest entries that are not
+    // prerenders (public/ files, build assets). Prerenders are deliberately NOT plain assets: a
+    // PPR route has a manifest entry of its own and must keep its PPR verdict. Without this
+    // exclusion a root optional catch-all PPR template (`/[[...slug]]`) matches every asset URL
+    // and would force `no-store` onto immutable chunks that `next start` serves `immutable`.
+    const servedAsPlainAsset =
+      staticPathname.startsWith("/_next/") ||
+      stripBasePath(url.pathname, basePath).startsWith("/_next/") ||
+      staticAssets.some(
+        (a) =>
+          !a.prerender &&
+          (a.pathname === url.pathname ||
+            a.pathname ===
+              (url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname + "/")),
+      );
 
     // next.config headers() + middleware response headers, serialized by the routing
     // extension (secret-gated: server.ts already stripped the header unless the request
@@ -1638,6 +2279,23 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       req.headers["x-resolved-headers"] as string | undefined,
     );
     delete req.headers["x-resolved-headers"];
+    // N40 (SECURITY). The middleware's FINAL request-header set, stamped by the routing
+    // extension (routing-service/handler.ts) and secret-gated exactly like
+    // `x-resolved-headers` — server.ts already stripped it unless the request proved trust.
+    // `responseToMiddlewareResult` has already resolved the override list into it, so this is
+    // the authoritative REPLACEMENT set for `req.headers` (a header absent from the set means
+    // DELETED); dispatch.ts installs it that way for Phase 1
+    // (`resolution.middlewareRequestHeaders`) and the Phase-2 branch below now feeds the same
+    // field. Without it, `NextResponse.next({ request: { headers } })` was a total no-op in
+    // production — a middleware that strips a spoofed `x-user-id` or stamps
+    // `x-authenticated-user` accomplished NEITHER at the edge, while `x-mw-evaluated: ran`
+    // told this pool the middleware stage was already complete, so the client's spoofed header
+    // reached the handler unmodified. Parsed with the SAME reader as `x-resolved-headers` (one
+    // wire shape) and deleted immediately so it can never leak to a handler on either phase.
+    const extMwRequestHeaders = parseResolvedHeaders(
+      req.headers["x-mw-request-headers"] as string | undefined,
+    );
+    delete req.headers["x-mw-request-headers"];
 
     // The explicit app-owned cache-control for this request, if any: from the routing
     // extension's resolved verdict (Phase 2, above) or from local resolution (Phase 1
@@ -1649,8 +2307,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Cache-Control):
     //   • PPR routes stream a per-request dynamic resume onto the shell, so the response must
     //     never be edge-cached — `no-store`. Chunked encoding alone does NOT stop Cloud CDN
-    //     from caching (proven), so this override is required. The routing service marks these
-    //     with the trusted internal `x-nextjs-ppr` dispatch header.
+    //     from caching (proven), so this override is required. N30: the verdict is computed
+    //     LOCALLY from this build's PPR inventory; the routing service's `x-nextjs-ppr`
+    //     dispatch header is only a hint that can confirm it, never the sole source.
     //   • Middleware-matched routes must reach the ext_proc extension every request (the
     //     verdict can change), so they must revalidate — `no-cache` (App Hosting model).
     //   • N18 (SECURITY) RSC requests whose `_rsc` cache-busting param does not authenticate
@@ -1673,10 +2332,28 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         searchParams: url.searchParams,
         rsc: poolRscConfig,
       });
-    const isPprRoute = req.headers["x-nextjs-ppr"] === "1";
+    // N30 (SECURITY/CACHE): compute the PPR verdict LOCALLY and treat `x-nextjs-ppr` as a hint.
+    // The header is stamped only by the ext_proc tier, so relying on it lost the verdict on every
+    // pool-only path (ext_proc fail-open, CEL-excluded path, an app with no middleware and hence
+    // no extension at all, a timeout shed, a body request, a cross-pool hop) — and the fail-safe
+    // path then passed the entrypoint's `s-maxage=31536000` through with NO cache-tag, so Cloud
+    // CDN stored an unfinished shell for a year that cutover invalidation could never purge (the
+    // M13 stale-apex class). `next start` answers a PPR document `private, no-cache, no-store,
+    // max-age=0, must-revalidate` (measured, Next 16.2.10). The trusted output id is preferred
+    // when present (it is the exact route the upstream resolved); otherwise the request pathname
+    // is matched against the local PPR inventory. Untrusted dispatch headers were already
+    // stripped in server.ts, so reading x-output-id here cannot be steered by a client.
+    const extPprOutputId = req.headers["x-output-id"];
+    const isPprRoute =
+      req.headers["x-nextjs-ppr"] === "1" ||
+      (typeof extPprOutputId === "string" && isLocallyKnownPprRoute(extPprOutputId)) ||
+      (!servedAsPlainAsset && isLocallyKnownPprRoute(url.pathname));
     const forcedCacheControl = forcedCdnCacheControl({
       isPprRoute,
-      middlewareCovers,
+      // S2: path-only. A conditionally-covered route must be treated as covered here —
+      // the cache entry this decides is shared across requests whose has/missing verdicts
+      // differ, and the cache key cannot partition on a cookie.
+      middlewareCovers: middlewareMayCover,
       emulateNextServer,
       rscHeadersUnvalidated,
     });
@@ -1765,11 +2442,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
     // Serve _next/static/* and _next/data/* directly from filesystem.
     // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
-    const staticPathname =
-      assetPrefix && url.pathname.startsWith(assetPrefix + "/_next/static/")
-        ? url.pathname.slice(assetPrefix.length)
-        : url.pathname;
-    if (!middlewareCovers && staticPathname.startsWith("/_next/static/")) {
+    if (!middlewareMayCover && staticPathname.startsWith("/_next/static/")) {
       const filePath = path.join(
         process.cwd(),
         ".next",
@@ -1777,14 +2450,23 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         staticPathname.slice("/_next/static/".length),
       );
       if (existsSync(filePath)) {
-        const content = readFileSync(filePath);
+        // N31: a build asset answers GET/HEAD only. `next start`'s router-server sets
+        // `Allow: GET, HEAD` and 405s every other method BEFORE serveStatic (measured:
+        // POST/PUT/DELETE on a chunk → 405; the adapter used to answer 200 with the full body
+        // AND the deploy cache-tag, having read and discarded the request body). Placed before
+        // the read so an oversized write to an asset URL is refused without buffering it.
+        if (!isReadMethod(req.method)) {
+          methodNotAllowed(res);
+          return;
+        }
         // Mirror Next's own server: service workers are revalidated (not immutable) and get
         // Service-Worker-Allowed; every other _next/static asset is immutable.
-        const { cacheControl, headers } = nextStaticAssetHeaders(
-          staticPathname,
-          routingManifest.basePath ?? "",
-        );
-        const etag = staticAssetEtag(content);
+        const { cacheControl, headers } = nextStaticAssetHeaders(staticPathname, basePath);
+        // S14: memoized per file — see staticAssetEtagForFile. Build chunks are immutable
+        // within a build, so re-hashing them per request was pure waste (and a full
+        // synchronous read of a multi-hundred-KiB chunk on the event loop each time).
+        const staticStat = statSync(filePath);
+        const etag = staticAssetEtagForFile(filePath, staticStat, () => readFileSync(filePath));
         const responseHeaders = {
           "content-type": getContentType(staticPathname),
           "cache-control": cacheControl,
@@ -1796,8 +2478,24 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           res.end();
           return;
         }
-        res.writeHead(200, responseHeaders);
-        res.end(req.method === "HEAD" ? undefined : content);
+        res.writeHead(200, {
+          ...responseHeaders,
+          // N31: REQUIRED for HEAD — Node marks a HEAD response as body-less and then emits
+          // NEITHER Content-Length NOR Transfer-Encoding, so a HEAD reported no size at all
+          // where `next start` answers with the real Content-Length (measured: 309404 for a
+          // fixture chunk). Same bug the image optimizer already fixed; see sendImageResponse.
+          "content-length": String(staticStat.size),
+        });
+        // S14: HEAD sends no body; a large asset is streamed rather than held resident.
+        if (req.method === "HEAD") {
+          res.end();
+          return;
+        }
+        if (staticStat.size > STREAM_THRESHOLD_BYTES) {
+          pipeline(createReadStream(filePath), res, () => undefined);
+          return;
+        }
+        res.end(readFileSync(filePath));
         return;
       }
       // A missing `/_next/static/*` asset is a plain 404 — these paths are never app routes, so
@@ -1813,10 +2511,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // pathname: GSSP and ISR pages have function outputs keyed by their data
     // URL, and those must go through dispatch so the handler (and its
     // incremental cache) produces the payload.
-    const basePath = routingManifest.basePath ?? "";
     const dataPrefix = `${basePath}/_next/data/${buildId}/`;
     let pagesDataRoutingUrl: URL | undefined;
-    if (!middlewareCovers && url.pathname.startsWith(dataPrefix)) {
+    if (!middlewareMayCover && url.pathname.startsWith(dataPrefix)) {
       const dataPath = url.pathname.slice(dataPrefix.length);
       // Map the data URL to its page: /_next/data/<id>/en/blog/x.json → /en/blog/x
       const pagePathWithoutBase = "/" + dataPath.replace(/\.json$/, "");
@@ -1831,16 +2528,54 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // GSSP/ISR data is owned by a handler (and its incremental cache) —
       // fall through to dispatch for those; serve only truly static SSG data.
       if (!owned) {
-        const filePath = path.join(process.cwd(), ".next", "server", "pages", dataPath);
-        if (existsSync(filePath)) {
+        // N30 (SECURITY): this serve is `.next/server/pages` — the ENTIRE Pages server build.
+        // With no `.json` requirement and no inventory check it was a read primitive over that
+        // directory for anyone who knows the build id (it is public, in every asset URL).
+        // Measured against `next start` on a real fixture: `/_next/data/<id>/_app.js` → 200 with
+        // the compiled server bundle, `_app.js.map` → 200 (⇒ original TypeScript source),
+        // `_app.js.nft.json` → 200 with absolute build-machine paths; `next start` 404s all
+        // three. Note `.json` ALONE is not enough — `_app.js.nft.json` ends in `.json` — so the
+        // page the data URL maps to must also be a real prerender of this build. `next start`
+        // 404s a data URL for a page with no data route too (measured: `/index.json` for a
+        // static `/` with no getStaticProps, and the un-prefixed `/ssg.json` in an i18n app),
+        // which is exactly what this inventory check reproduces.
+        const dataPageIsPrerendered =
+          trailingSlashVariants(pagePath).some((variant) => prerenderedPaths.has(variant)) ||
+          staticAssets.some(
+            (a) =>
+              a.prerender &&
+              (a.pathname === pagePath ||
+                a.pathname === (pagePath === (basePath || "/") ? `${basePath}/index` : pagePath)),
+          );
+        // Containment is re-asserted at the point of consumption even though WHATWG URL
+        // normalization already collapses `..`/`%2e%2e` and never decodes `%2f`.
+        const filePath = dataPath.endsWith(".json")
+          ? resolveWithinRoot(path.join(process.cwd(), ".next", "server", "pages"), dataPath)
+          : null;
+        // Draft mode bypasses the static serve (survey Tier 1 #2): an AUTHENTICATED
+        // `__prerender_bypass` cookie (validated constant-time against the build's
+        // previewModeId, same gate as the strict-404 yield in dispatch.ts) must fall through
+        // to a live render, exactly as `next start` does. An invalid cookie value changes
+        // nothing — honoring arbitrary values would let any client bust this tier.
+        if (
+          dataPageIsPrerendered &&
+          filePath &&
+          existsSync(filePath) &&
+          !isVerifiedPreviewRequest(req)
+        ) {
           const content = readFileSync(filePath);
           res.writeHead(200, {
             "content-type": "application/json; charset=utf-8",
             "cache-control": "public, max-age=0, must-revalidate",
+            "content-length": String(content.length),
           });
-          res.end(content);
+          res.end(req.method === "HEAD" ? undefined : content);
           return;
         }
+        // Anything else falls through to normal resolution exactly as before — deliberately,
+        // not a flat 404: a data route owned by ANOTHER pool has no handler and no file here and
+        // must still reach the cross-pool proxy, and an unknown data URL then gets the app's own
+        // 404 page, which is what `next start` answers (404, text/html, the rendered 404).
       } else {
         // Route lookup operates on the public page pathname, while the Pages
         // entrypoint must still observe the original `/_next/data/...` URL so
@@ -1860,7 +2595,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
     // Basic image optimization: /_next/image?url=...&w=...&q=...
     // Fetches the source image and serves it (with optimization if Sharp is available).
-    if (url.pathname === "/_next/image") {
+    // Both forms: a custom images.loaderFile commonly emits `/_next/image/?url=…` (the
+    // upstream loader-config fixture does), and `trailingSlash: true` apps mirror it. The
+    // exact match silently bypassed the optimizer for the slash form (canary.97 catch-up ②).
+    if (url.pathname === "/_next/image" || url.pathname === "/_next/image/") {
       // The `url` gate FIRST, then `w`/`q` — upstream's order, and observable: with
       // `?url=/_next/image&w=16` `next start` answers "cannot be recursive" while the
       // adapter used to answer `"w" parameter (width) of 16 is not allowed`. See
@@ -1876,6 +2614,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         return;
       }
       const imageUrl = urlParam.url;
+      // S26. What is safe to LOG. `params.get("url")` percent-DECODES, so `imageUrl` carries
+      // the raw query string of an absolute source — routinely a pre-signed credential
+      // (`X-Goog-Signature`, an AWS presign) — and any `%0a` in it has already become a real
+      // newline, i.e. log forging. server.ts logs only the pathname for exactly this reason;
+      // the optimizer's two log lines printed the whole thing.
+      const loggableImageUrl = redactImageUrlForLog(imageUrl);
 
       // Validate w/q against Next's resolved image config before they reach Sharp — see
       // validateImageSizeAndQuality for the port and the measurements. Two things ride on
@@ -1890,8 +2634,20 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         return;
       }
       const { width, quality } = params;
+      const accept = String(req.headers["accept"] ?? "");
 
-      try {
+      // The optimizer pipeline as ONE unit of work: acquire the source, sniff it, negotiate the
+      // output format, encode. It takes its admission (S32) as an argument because the source
+      // read below is the thing being bounded, and it RETURNS an outcome instead of writing to
+      // `res` because up to N requests share this one run (runOrJoinImageOptimization).
+      //
+      // It reads the leader request's `accept` — sound, and not an accident of who arrived
+      // first: the single-flight key pins negotiateImageMimeType(accept, formats), which is the
+      // only thing negotiation consults the header for, so every request sharing a key
+      // negotiates the same output.
+      const optimizeImage = async (
+        admission: ImageAdmission,
+      ): Promise<ImageOptimizationOutcome> => {
         // Resolve the image: internal (relative) or external (absolute URL)
         let imageBuffer: Buffer;
         let contentType: string;
@@ -1935,8 +2691,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // `400 The requested resource isn't a valid image.`. This adapter refuses the
             // traversal outright instead of normalizing it, so it borrows upstream's
             // closest 400 wording rather than inventing one.
-            sendImageError(res, 400, '"url" parameter is not allowed');
-            return;
+            return { kind: "error", status: 400, body: '"url" parameter is not allowed' };
           }
 
           // Matches Next's `isStatic` check (`${basePath}/_next/static/media` and the
@@ -1946,15 +2701,47 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             decodedImagePath.startsWith("/_next/static/media/") ||
             decodedImagePath.startsWith("/_next/static/immutable/media/");
 
-          if (existsSync(publicFile) && !statSync(publicFile).isDirectory()) {
+          // S3 (SECURITY + PARITY). Does middleware cover the SOURCE pathname? If so the disk
+          // read below would serve bytes middleware was supposed to gate: the sibling fast
+          // paths (`/_next/static/`, `/_next/data/`) both refuse to short-circuit a covered
+          // path, and this one did not — so `GET /_next/image?url=/gated.png` returned
+          // `public/gated.png` even when middleware on `/gated.png` denies the request, and
+          // sendImageResponse then made those bytes CDN-cacheable.
+          //
+          // It is also what `next start` does: upstream's fetchInternalImage
+          // (next/server/image-optimizer.ts) resolves a relative source through
+          // `this.routerServerHandler` — the FULL request pipeline, middleware included — not
+          // a filesystem read. Falling through to the loopback self-fetch below is exactly
+          // that re-entry, and it already exists for sources that miss on disk.
+          //
+          // Path-only coverage (middlewareMayCoverPath) is deliberate: the optimizer's own
+          // response is cacheable, so a conditionally-covered source must take the re-entry
+          // for every request, not just the ones whose has/missing match (see S2).
+          const sourceCoveredByMiddleware =
+            !!(middlewareModule || edgeMiddlewareRunner) &&
+            middlewareMayCoverPath(
+              middlewareMatchers,
+              new URL(`${url.origin}${basePath}${decodedImagePath}`),
+            );
+
+          if (
+            !sourceCoveredByMiddleware &&
+            existsSync(publicFile) &&
+            !statSync(publicFile).isDirectory()
+          ) {
             imageBuffer = readFileSync(publicFile);
-          } else if (staticFile && existsSync(staticFile) && !statSync(staticFile).isDirectory()) {
+          } else if (
+            !sourceCoveredByMiddleware &&
+            staticFile &&
+            existsSync(staticFile) &&
+            !statSync(staticFile).isDirectory()
+          ) {
             imageBuffer = readFileSync(staticFile);
           } else {
             // Fetch from ourselves (same-origin relative image, e.g. served by a route).
-            // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and a
-            // size cap so an oversized body can't exhaust memory.
-            const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+            // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and the
+            // SHARED MAX_IMAGE_BYTES cap (N35) so an oversized body can't exhaust memory —
+            // the same number the external path enforces, which it previously did not.
             const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
             const imgRes = await fetch(selfUrl, {
               signal: AbortSignal.timeout(5000),
@@ -1970,8 +2757,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               // happened (an upstream we would not follow) better than upstream's generic
               // 500. Only the Content-Type is dropped, for consistency with every other
               // optimizer error.
-              sendImageError(res, 502, "Failed to fetch image: redirect not followed");
-              return;
+              return {
+                kind: "error",
+                status: 502,
+                body: "Failed to fetch image: redirect not followed",
+              };
             }
             // Deliberately NO `!imgRes.ok` rejection: upstream's `fetchInternalImage` only
             // checks that a status exists and that the body is non-empty, so a route
@@ -1983,18 +2773,27 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // page's bytes from ever being served back.
             const declaredLen = parseInt(imgRes.headers.get("content-length") ?? "", 10);
             if (Number.isFinite(declaredLen) && declaredLen > MAX_IMAGE_BYTES) {
-              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
-              return;
+              return {
+                kind: "error",
+                status: 413,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
             }
             const streamedBody = await readWebBodyWithLimit(imgRes.body, MAX_IMAGE_BYTES);
             if (streamedBody === null) {
-              sendImageError(res, 413, '"url" parameter is valid but internal response is invalid');
-              return;
+              return {
+                kind: "error",
+                status: 413,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
             }
             if (streamedBody.length === 0) {
               // Upstream's `mocked.res.buffers.length === 0` branch.
-              sendImageError(res, 400, '"url" parameter is valid but internal response is invalid');
-              return;
+              return {
+                kind: "error",
+                status: 400,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
             }
             imageBuffer = streamedBody;
             // A route-served image has no meaningful extension (e.g. /api/tiny-png) —
@@ -2014,8 +2813,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // The reason is logged, never sent — see IMAGE_FETCH_ERROR_RESPONSE.
             console.error(`[pool-server] /_next/image upstream fetch failed: ${fetched.error}`);
             const mapped = IMAGE_FETCH_ERROR_RESPONSE[fetched.error];
-            sendImageError(res, mapped.status, mapped.body);
-            return;
+            return { kind: "error", status: mapped.status, body: mapped.body };
           }
           if (!fetched.ok) {
             // Upstream forwards the UPSTREAM's status here (an allowlisted host answering
@@ -2024,17 +2822,21 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               `[pool-server] /_next/image upstream responded ${fetched.status} for an ` +
                 `allowlisted external image`,
             );
-            sendImageError(
-              res,
-              fetched.status >= 400 ? fetched.status : 500,
-              '"url" parameter is valid but upstream response is invalid',
-            );
-            return;
+            return {
+              kind: "error",
+              status: fetched.status >= 400 ? fetched.status : 500,
+              body: '"url" parameter is valid but upstream response is invalid',
+            };
           }
           imageBuffer = fetched.body;
           contentType = fetched.contentType;
           upstreamCacheControl = fetched.cacheControl;
         }
+
+        // S32: the source is resident from here on, so replace the worst-case reservation with
+        // what it actually costs. One call for every branch above — a disk read, a loopback
+        // self-fetch and an external fetch all end up holding exactly one buffer.
+        admission.settleSourceBytes(imageBuffer.length);
 
         // `public, max-age=<maxAge>, must-revalidate` — Next's floor is
         // images.minimumCacheTTL (default 14400), raised to the upstream's own max-age
@@ -2062,8 +2864,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // back under its own content type would make /_next/image an XSS channel).
         if (!isOptimizableImageContentType(contentType)) {
           // Byte-for-byte the body `next start` sends for this case.
-          sendImageError(res, 400, "The requested resource isn't a valid image.");
-          return;
+          return {
+            kind: "error",
+            status: 400,
+            body: "The requested resource isn't a valid image.",
+          };
         }
 
         // `next start` parity: SVG never goes through the optimizer by default — Next
@@ -2074,26 +2879,25 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         if (contentType.toLowerCase().includes("svg")) {
           if (!imageConfig.dangerouslyAllowSVG) {
             // Byte-for-byte the body `next start` sends for this case.
-            sendImageError(res, 400, '"url" parameter is valid but image type is not allowed');
-            return;
+            return {
+              kind: "error",
+              status: 400,
+              body: '"url" parameter is valid but image type is not allowed',
+            };
           }
           // The SVG branch is not special-cased for headers any more: `next start` sends
           // the same Content-Disposition/CSP/ETag/Cache-Control set on every optimizer
           // 200, SVG included (the filename now carries the real source name and `.svg`
           // instead of the placeholder `attachment; filename="image"`).
-          sendImageResponse(req, res, {
+          return {
+            kind: "image",
             body: imageBuffer,
             contentType,
-            sourceUrl: imageUrl,
             isStatic: isStaticSource,
             maxAge: imageMaxAgeSeconds,
-            config: imageConfig,
-            buildId,
-          });
-          return;
+          };
         }
 
-        const accept = String(req.headers["accept"] ?? "");
         // Negotiate the output format like Next's optimizer (see image-utils). This runs
         // BEFORE the sharp gate on purpose: Next's BYPASS_TYPES (ICO/BMP/ICNS/JXL/HEIC)
         // and animated sources are returned verbatim and need no optimizer at all —
@@ -2106,16 +2910,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           sourceBytes: imageBuffer,
         });
         if (encode === "passthrough") {
-          sendImageResponse(req, res, {
+          return {
+            kind: "image",
             body: imageBuffer,
             contentType: outType,
-            sourceUrl: imageUrl,
             isStatic: isStaticSource,
             maxAge: imageMaxAgeSeconds,
-            config: imageConfig,
-            buildId,
-          });
-          return;
+          };
         }
 
         // Optimize with Sharp. A MISSING sharp still fails closed with a 503: it means the
@@ -2128,9 +2929,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // The load failure (with its cause) was logged once by loadSharpOnce. No upstream
           // counterpart — upstream cannot start without sharp — so the wording is the
           // adapter's own; only the absent Content-Type is borrowed.
-          sendImageError(res, 503, "Image optimization unavailable");
-          return;
+          return { kind: "error", status: 503, body: "Image optimization unavailable" };
         }
+        // S32: no acquire here any more. The slot that used to be taken at THIS point — after
+        // the source was already resident — is now taken by the caller before any of the above
+        // runs, which is the whole correction (see the admission block).
         try {
           // Both are already validated against the app's allowed sets (q is 1..100 and in
           // images.qualities; w is one of deviceSizes/imageSizes), so no defaulting here.
@@ -2178,15 +2981,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               pipeline = pipeline.jpeg({ quality: q, mozjpeg: true });
           }
           const optimized = await pipeline.toBuffer();
-          sendImageResponse(req, res, {
+          return {
+            kind: "image",
             body: optimized,
             contentType: outType,
-            sourceUrl: imageUrl,
             isStatic: isStaticSource,
             maxAge: imageMaxAgeSeconds,
-            config: imageConfig,
-            buildId,
-          });
+          };
         } catch (err) {
           // Sharp loaded but could not process the input. `next start` FALLS BACK to the
           // source bytes here — "If we fail to optimize, fallback to the original image"
@@ -2206,7 +3007,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           //     is what keeps an attacker-influenced `Content-Type`/extension guess (an
           //     HTML body from an allowlisted remote host named `.png`) on the 502 path
           //     instead of being echoed back under a type nobody verified.
-          //   • it goes through sendImageResponse, so it carries the same
+          //   • it is returned as a normal `image` outcome, so it goes through
+          //     sendImageResponse and carries the same
           //     `Content-Disposition: attachment` + images CSP + Vary/ETag set as every
           //     other optimizer 200 (SVG never reaches here at all — the
           //     dangerouslyAllowSVG gate 400s or serves it far above).
@@ -2220,19 +3022,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // Loud: upstream is silent here, but a pod quietly serving unoptimized
             // originals is exactly the kind of regression that hides for months.
             console.warn(
-              `[pool-server] /_next/image could not optimize ${imageUrl} (${contentType}) — ` +
+              `[pool-server] /_next/image could not optimize ${loggableImageUrl} (${contentType}) — ` +
                 `serving the source bytes as next start does: ${message}`,
             );
-            sendImageResponse(req, res, {
+            return {
+              kind: "image",
               body: imageBuffer,
               contentType: sniffedContentType,
-              sourceUrl: imageUrl,
               isStatic: isStaticSource,
               maxAge: imageConfig.minimumCacheTTL,
-              config: imageConfig,
-              buildId,
-            });
-            return;
+            };
           }
           // No signature matched, so the only candidate type is the upstream header or the
           // URL's extension — a guess. Upstream 400s this case before sharp ever runs; the
@@ -2241,12 +3040,45 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // undebuggable without it (the cause turned out to be a broken sharp module, see
           // loadSharpOnce — but a genuinely corrupt input lands here too).
           console.error(
-            `[pool-server] /_next/image failed to process ${imageUrl} (${contentType}):`,
+            `[pool-server] /_next/image failed to process ${loggableImageUrl} (${contentType}):`,
             message,
           );
-          sendImageError(res, 502, "Failed to process image");
+          return { kind: "error", status: 502, body: "Failed to process image" };
         }
-        return;
+      };
+
+      // S32(b): the single-flight key, built from what is known BEFORE any I/O. The url
+      // component is the exact string the I/O below will use — the raw `?url=` for a local
+      // source (the loopback self-fetch replays it verbatim, query included) and the
+      // WHATWG-normalized target for an absolute one (which is the string
+      // fetchExternalImageSafely requests). Nothing here is normalized more aggressively than
+      // the I/O is, so two requests can only share a key if they would have done the same work.
+      // `width`/`quality` are validated integers and the mime comes from a fixed set, so the
+      // leading fields cannot contain the separator and the key is unambiguous however exotic
+      // the url is.
+      const outputMimeForKey = negotiateImageMimeType(accept, imageConfig.formats) ?? "source";
+      const optimizeKey = `${width}|${quality}|${outputMimeForKey}|${
+        urlParam.isAbsolute ? urlParam.target.toString() : urlParam.url
+      }`;
+
+      let outcome: ImageOptimizationOutcome;
+      try {
+        outcome = await runOrJoinImageOptimization(optimizeKey, async () => {
+          // S32(a): admission BEFORE the source read, so a queued request holds nothing but its
+          // request state. Only the request that actually runs the work takes a slot; the ones
+          // that join an in-flight key hold no source memory at all and so need none.
+          const admission = await acquireImageAdmission();
+          if (!admission) {
+            // Shed rather than park: same 503 the encode semaphore used to answer with, now
+            // answered before a single byte of source has been read.
+            return { kind: "error", status: 503, body: "Image optimization unavailable" };
+          }
+          try {
+            return await optimizeImage(admission);
+          } finally {
+            admission.release();
+          }
+        });
       } catch (err) {
         console.error("Image optimization error:", err);
         if (!res.headersSent) {
@@ -2254,13 +3086,32 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         }
         return;
       }
+      if (outcome.kind === "error") {
+        sendImageError(res, outcome.status, outcome.body);
+        return;
+      }
+      // Everything request-SPECIFIC happens here, outside the shared work: If-None-Match → 304,
+      // HEAD, and the Content-Disposition filename (derived from `?url=`, which is in the key).
+      sendImageResponse(req, res, {
+        body: outcome.body,
+        contentType: outcome.contentType,
+        sourceUrl: imageUrl,
+        isStatic: outcome.isStatic,
+        maxAge: outcome.maxAge,
+        config: imageConfig,
+        buildId,
+      });
+      return;
     }
 
     // public/ files deliberately have NO pre-routing fast path here. They are in the
     // static-assets manifest (see emit/static-assets.ts), so Phase 2 serves them via
     // dispatcher.dispatch and Phase 1 via resolve() → dispatch — both of which merge the
     // resolved routing verdict (next.config headers() / middleware response headers)
-    // over the adapter's `public, max-age=3600` + deploy-tag default. A pre-parse disk
+    // over the adapter's `public, max-age=0, must-revalidate` + deploy-tag default (N50:
+    // the manifest's public-file default was `max-age=3600`, which `next start` never
+    // sends — measured `public, max-age=0` on 16.2.10 — and it now matches the value this
+    // file already uses at :489). A pre-parse disk
     // serve here returned the hardcoded default and silently dropped headers() and
     // middleware headers. servePublicFileFromDisk remains as the last resort for files
     // the manifest missed (both phases, below).
@@ -2273,19 +3124,32 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
     let bodyBuffer: Buffer | null;
     try {
-      bodyBuffer =
-        req.method === "GET" || req.method === "HEAD" ? null : await readRequestBody(req);
+      bodyBuffer = isReadMethod(req.method) ? null : await readRequestBody(req, res);
     } catch (err) {
-      if (err instanceof BodyTooLargeError) {
+      const overLimit = err instanceof BodyTooLargeError;
+      const overBudget = err instanceof BodyBudgetExceededError;
+      if (overLimit || overBudget) {
         // readRequestBody deliberately left the socket alive (paused, not destroyed):
         // destroying first turns the 413 into an ECONNRESET the client can't read.
         // Say we're closing, flush the response, and only then tear the socket down
         // so the remainder of the oversized upload can't pin the connection.
-        res.writeHead(413, {
+        //
+        // N34: the process-wide budget answers 503 + Retry-After, not 413 — the request itself
+        // was within the per-request limit; the POD is out of admission capacity. That is the
+        // distinction a client (and an operator reading logs) needs, and 503 is the status a
+        // load balancer will retry elsewhere.
+        if (overBudget) {
+          console.warn(
+            `[pool-server] refusing upload: in-flight request bodies would exceed ` +
+              `${MAX_INFLIGHT_BODY_BYTES} bytes (ADAPTER_K8S_MAX_INFLIGHT_BODY_BYTES)`,
+          );
+        }
+        res.writeHead(overBudget ? 503 : 413, {
           "content-type": "text/plain; charset=utf-8",
           connection: "close",
+          ...(overBudget ? { "retry-after": "1", "cache-control": "no-store" } : {}),
         });
-        res.end("Payload Too Large");
+        res.end(overBudget ? "Service Unavailable" : "Payload Too Large");
         // 'finish' never fires if the socket dies first (client gone mid-flush) —
         // listen for 'close' too so the paused oversized upload can't pin the
         // connection. destroy() on an already-destroyed socket is a no-op.
@@ -2384,12 +3248,27 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         }
       }
 
+      // S22. Every dispatch header has now been READ into a local — delete the whole
+      // vocabulary before anything downstream sees it. Only `x-mw-evaluated` (and the two
+      // parsed above) used to be removed, so `x-output-id`, `x-upstream-pool`,
+      // `x-route-matches`, `x-nextjs-ppr`, `x-invoke-path` and `x-invoke-query` reached
+      // Node and edge handlers as ordinary request headers: any app that logs, reflects or
+      // forwards its request headers leaked the internal routing state (including the
+      // rewrite destination and its query). These values are transport, not request data —
+      // the pool passes what handlers need through requestMeta instead.
+      for (const h of INTERNAL_DISPATCH_HEADERS) delete req.headers[h];
+
       await dispatcher.dispatch(req, res, {
         kind: "route",
         pool,
         matchedPathname: extOutputId, // Use outputId/pathname from header
         routeMatches,
         resolvedHeaders: extResolvedHeaders,
+        // N40: the same field Phase 1 populates, so dispatch.ts's existing "apply middleware's
+        // final request-header set as a REPLACEMENT, not a merge" block runs unchanged — and,
+        // being upstream of the cross-pool proxy, the rewritten headers survive a pool hop
+        // exactly as they do in Phase 1.
+        ...(extMwRequestHeaders ? { middlewareRequestHeaders: extMwRequestHeaders } : {}),
         ...(extInvokePath ? { invokePath: extInvokePath } : {}),
         ...(extInvocationQuery ? { invocationQuery: extInvocationQuery } : {}),
       });
@@ -2428,24 +3307,116 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     await dispatcher.dispatch(req, res, resolution);
   };
 
+  // N32: the readiness state behind `/readyz`. `/healthz` proves only that a socket is
+  // listening — see READINESS_PATH in server.ts for the failure this exists to stop.
+  // "serving" means BOTH:
+  //   • the app's instrumentation register() did not throw (a rejected registration is memoized
+  //     by Next and re-awaited per request, so every app route 500s forever), and
+  //   • at least one of this pool's route modules actually `import()`ed. A build whose Next
+  //     output cannot be loaded (missing chunk, broken native dep, TLA that rejects) answered
+  //     /healthz 200 while every route 500'd.
+  let readinessReason =
+    instrumentationStatus === "failed"
+      ? "instrumentation register() failed"
+      : "route modules not yet verified";
+  let routeModulesVerified = false;
+  const readiness = (): ReadinessState => ({
+    ready: instrumentationStatus !== "failed" && routeModulesVerified,
+    reason: readinessReason,
+  });
+
   // Create and start server
   const server = createPoolServer({
     port,
     trustInternalHeaders,
     internalSecret,
     onRequest: handleRequest,
+    readiness,
+    // A probe path the APP owns must not be silently shadowed (it was: the old check also
+    // ignored a query string, so `/healthz` was intercepted and `/healthz?x=1` was not).
+    appOwnsProbePath: (pathname) =>
+      handlerLoader.has(pathname) ||
+      routingManifest.pathnames.includes(pathname) ||
+      staticManifestCovers(pathname),
   });
 
   await server.start();
 
-  // Graceful shutdown
+  // Verify a route module loads. Deliberately AFTER listen: the pod must answer /healthz (so the
+  // kubelet's liveness probe does not restart it mid-verification) while /readyz withholds
+  // traffic. Only NODE outputs are candidates — an edge output's module registers itself in the
+  // process-global `_ENTRIES`, and loading one at boot would change which entry the
+  // handler-loader's single-entry fallback resolves. The load is cached, so the first real
+  // request reuses it.
+  const verifiableOutputs = Object.values(poolManifest.outputs).filter(
+    (output) => output.runtime !== "edge",
+  );
+  if (instrumentationStatus === "failed") {
+    console.error(
+      "[pool-server] NOT READY: instrumentation register() failed — /readyz will report 503 " +
+        "so the blue/green gate cannot promote this build (app routes would 500)",
+    );
+  } else if (verifiableOutputs.length === 0) {
+    // A pool with no Node outputs (pure static, or edge-only) has no module to prove; the
+    // manifests loaded and the handler loader is initialised, which is all "serving" can mean.
+    routeModulesVerified = true;
+    readinessReason = "no node route modules to verify (manifests loaded)";
+    console.log(`[pool-server] READY: ${readinessReason}`);
+  } else {
+    const probe = verifiableOutputs[0]!;
+    try {
+      await handlerLoader.load(probe.id);
+      routeModulesVerified = true;
+      readinessReason = `route module loaded (${probe.id})`;
+      console.log(`[pool-server] READY: ${readinessReason}`);
+    } catch (err) {
+      readinessReason = `route module ${probe.id} failed to load`;
+      console.error(
+        `[pool-server] NOT READY: ${readinessReason} — /readyz will report 503. ` +
+          `Every request for this pool's routes would 500:`,
+        err,
+      );
+    }
+  }
+
+  // Graceful shutdown. Three separate defects lived in the previous three lines:
+  //   • `server.close()` REJECTS with ERR_SERVER_NOT_RUNNING when it is already closing, so a
+  //     second SIGTERM produced an unhandled rejection instead of a clean exit;
+  //   • it never RESOLVES while any connection is open (a streaming response, or an idle
+  //     keep-alive socket), so `process.exit(0)` was unreachable and every rollout waited out
+  //     `terminationGracePeriodSeconds` for SIGKILL;
+  //   • readiness kept reporting 200 while draining, so the load balancer kept sending new work.
+  let shuttingDown = false;
+  const SHUTDOWN_GRACE_MS = Math.max(
+    100,
+    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || 15_000,
+  );
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // Fail readiness FIRST so the LB/kubelet stops routing new requests while in-flight ones
+    // finish. Liveness deliberately stays 200 — a draining pod is not a broken pod.
+    routeModulesVerified = false;
+    readinessReason = "shutting down";
     console.log("Shutting down pool server...");
-    await server.close();
+    // Belt and braces: `stop()` is itself bounded, but an exit path must not depend on any
+    // promise settling. A signal handler that can hang is how the old three lines failed.
+    const hardExit = setTimeout(() => {
+      console.warn(
+        `[pool-server] shutdown did not complete within ${SHUTDOWN_GRACE_MS}ms — exiting anyway`,
+      );
+      process.exit(0);
+    }, SHUTDOWN_GRACE_MS + 1_000);
+    hardExit.unref?.();
+    // Drops idle keep-alive sockets at once, tears down anything still streaming at the halfway
+    // mark, swallows the "already closing" rejection, and always settles — see server.stop().
+    await server.stop({ graceMs: SHUTDOWN_GRACE_MS });
+    clearTimeout(hardExit);
     process.exit(0);
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+  console.log(`[pool-server] liveness ${LIVENESS_PATH}, readiness ${READINESS_PATH}`);
 
   return server;
 }

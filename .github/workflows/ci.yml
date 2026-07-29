@@ -3,8 +3,9 @@ name: ci
 on:
   push:
     branches: [main, jamesdaniels_wip]
+  # No base-branch filter: the filter matches the PR's BASE, which silently skipped
+  # CI for stacked PRs (PRs targeting a feature branch instead of main).
   pull_request:
-    branches: [main, jamesdaniels_wip]
 
 jobs:
   build-and-test:

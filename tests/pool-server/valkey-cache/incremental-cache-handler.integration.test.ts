@@ -119,26 +119,75 @@ describe.skipIf(!dockerAvailable)("ValkeyIncrementalCacheHandler (integration)",
   });
 
   it("CROSS-REPLICA: revalidateTag on A drops the shell on B (closes the shell gap)", async () => {
-    const clock = { t: 1000 };
+    // N78: the manifest is stamped from Valkey's own TIME, so the injected clock tracks the real
+    // clock (`Date.now() + offset`) instead of a literal 1970 value that the script would rebase.
+    // The entry is written 5s "ago" so the server-stamped watermark is unambiguously newer than
+    // it — comparing two clocks with a sub-millisecond margin would be a coin flip.
+    const offset = { ms: -5000 };
+    const clientA = newClient();
     const a = new ValkeyIncrementalCacheHandler({
-      client: newClient(),
+      client: clientA,
       buildId: "shared",
-      now: () => clock.t,
+      now: () => Date.now() + offset.ms,
     });
     const b = new ValkeyIncrementalCacheHandler({
       client: newClient(),
       buildId: "shared",
-      now: () => clock.t,
+      now: () => Date.now() + offset.ms,
     });
 
     await a.set("/page", appPageEntry("v1", "catalog"), {});
     expect(await b.get("/page", {})).not.toBeNull(); // B sees A's shell
 
-    clock.t = 2000;
-    await a.revalidateTag("catalog"); // hard revalidate on A
+    offset.ms = 0;
+    await a.revalidateTag("catalog"); // hard revalidate on A, stamped from the server clock
+    expect((await clientA.hmget("k8s:shared:tags", "catalog"))[0]).toMatch(/"expired":/);
 
     // B, reading the shared manifest live, drops the stale shell → Next regenerates.
+    offset.ms = 1000;
     expect(await b.get("/page", {})).toBeNull();
+  });
+
+  it("N79: a 300-char IMPLICIT path tag is stored AND can still invalidate the entry", async () => {
+    // The end-to-end consequence of the old flat 256-char cap, against real Valkey: the entry was
+    // stored with `tags: []` (measured), so `revalidatePath`/`revalidateTag` could never reach it
+    // and it lived out the full 30-day DURABLE_TTL_SECONDS. `revalidate: false` here is exactly the
+    // shape that gets that retention (a static page / PPR shell).
+    const client = newClient();
+    const offset = { ms: -5000 };
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "n79-int",
+      now: () => Date.now() + offset.ms,
+    });
+    // `_N_T_` + a 300-char pathname — the shape `getImplicitTags` produces, and what a 63-char
+    // Cyrillic path expands to (348 chars measured) once `encodeCacheTag` percent-encodes it.
+    const implicit = `_N_T_/${"a".repeat(299)}`;
+    await h.set("/long", appPageEntry("LONG", implicit), { cacheControl: { revalidate: false } });
+    const stored = JSON.parse((await client.get("k8s:n79-int:inc:/long"))!) as { tags: string[] };
+    expect(stored.tags).toEqual([implicit]);
+    expect(await h.get("/long", {})).not.toBeNull();
+
+    offset.ms = 0;
+    await h.revalidateTag(implicit); // what revalidatePath ultimately calls
+    offset.ms = 1000;
+    expect(await h.get("/long", {})).toBeNull();
+  });
+
+  it("N79: the private _N_RP_* markers survive an entry with more than 128 tags", async () => {
+    const client = newClient();
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "n79-rp",
+      now: () => Date.now(),
+    });
+    const tags = [...Array.from({ length: 130 }, (_, i) => `t-${i}`), "_N_RP_lang", "_N_RP_region"];
+    await h.set("/coarse", appPageEntry("COARSE"), { tags });
+    const stored = JSON.parse((await client.get("k8s:n79-rp:inc:/coarse"))!) as { tags: string[] };
+    expect(stored.tags).toContain("_N_RP_lang");
+    expect(stored.tags).toContain("_N_RP_region");
+    // And the freshness HMGET over that whole list still works against a real server.
+    expect(await h.get("/coarse", {})).not.toBeNull();
   });
 
   it("caches a null value (404) as a real entry, not a delete", async () => {
@@ -176,18 +225,51 @@ describe.skipIf(!dockerAvailable)("ValkeyIncrementalCacheHandler (integration)",
     expect(ttl).toBeGreaterThan(24 * 60 * 60); // durable (days), not the 61s numeric-revalidate floor
   });
 
-  it("SWR: a stale (profiled) tag returns lastModified=-1 rather than dropping the entry", async () => {
-    const clock = { t: 1000 };
+  it("SWR: a stale (profiled) tag keeps serving the entry, signalling background revalidation", async () => {
+    // N80: for a route WITH a numeric revalidate window the signal is a real `lastModified` shifted
+    // just past that window (→ `isStale = true`, serve stale + revalidate behind the request), not
+    // `-1` (→ `isStale = -1`, which response-cache implements as "block on a fresh render").
+    // The clock is `Date.now() + offset` so it always agrees with the SERVER clock the manifest is
+    // stamped from (N78) regardless of how long the surrounding suite takes.
+    const client = newClient();
+    const offset = { ms: -5000 }; // the entry is written 5s "ago" (see the CROSS-REPLICA note)
     const h = new ValkeyIncrementalCacheHandler({
-      client: newClient(),
+      client,
       buildId: "swr",
-      now: () => clock.t,
+      now: () => Date.now() + offset.ms,
     });
-    await h.set("/isr", appPageEntry("isr", "news"), {});
-    clock.t = 2000;
-    await h.revalidateTag("news", { expire: 300 }); // stale=2000, expired=2000+300s (future)
+    await h.set("/isr", appPageEntry("isr", "news"), {
+      cacheControl: { revalidate: 60, expire: 300 },
+    });
+    offset.ms = 0;
+    await h.revalidateTag("news", { expire: 300 }); // stale=now, expired=now+300s (future)
+    // The manifest write is best-effort by design; assert it landed so a swallowed failure can't
+    // masquerade as "the entry wasn't stale".
+    expect((await client.hmget("k8s:swr:tags", "news"))[0]).toMatch(/"stale":/);
+    offset.ms = 2000;
+    const now = Date.now() + offset.ms;
     const got = await h.get("/isr", {});
     expect(got).not.toBeNull();
-    expect(got!.lastModified).toBe(-1); // signals background/blocking revalidation, entry still served
+    expect(got!.lastModified).not.toBe(-1);
+    expect(60 * 1000 + got!.lastModified!).toBeLessThan(now); // revalidateAfter < now
+    expect(300 * 1000 + got!.lastModified!).toBeGreaterThanOrEqual(now); // still inside expire
+  });
+
+  it("SWR falls back to -1 for a route with no numeric revalidate (PPR shell / static)", async () => {
+    // `calculateRevalidate` returns `false` there, so `revalidateAfter` is `false` and nothing but
+    // -1 can force a revalidation — blocking is the only expressible answer (N80).
+    const client = newClient();
+    const offset = { ms: -5000 };
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "swr-static",
+      now: () => Date.now() + offset.ms,
+    });
+    await h.set("/shell", appPageEntry("shell", "news"), { cacheControl: { revalidate: false } });
+    offset.ms = 0;
+    await h.revalidateTag("news", { expire: 300 });
+    expect((await client.hmget("k8s:swr-static:tags", "news"))[0]).toMatch(/"stale":/);
+    offset.ms = 2000;
+    expect((await h.get("/shell", {}))?.lastModified).toBe(-1);
   });
 });

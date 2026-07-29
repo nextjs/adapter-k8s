@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 const COLORS = [
   "\x1b[36m", // cyan
@@ -30,6 +31,8 @@ export async function runTail(options: { projectDir: string; releaseName: string
     let infra: { projectId?: string; region?: string };
     try {
       infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+      // S13: validate before these reach a gcloud/kubectl argv.
+      assertSafeInfrastructure(infra);
     } catch (err) {
       // Name the file — a bare SyntaxError gives no clue WHICH file is corrupt.
       throw new Error(`Failed to parse ${infraPath}: ${(err as Error).message}`);

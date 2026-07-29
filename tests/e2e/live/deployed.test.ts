@@ -367,3 +367,27 @@ describe("Cloud CDN", () => {
     expect(r.headers.get("cache-control") ?? "").toMatch(/no-cache|no-store|private/);
   });
 });
+
+// Shell-less PPR template resume (spec rev-4 "Option D"). fixtures/main/app/novel/[slug]
+// mirrors upstream's early-span shape: PARTIALLY_STATIC dynamic template, empty static shell
+// (fallback: null), pprCapableRoutes with rootParams: []. Before Option D the pool answered
+// non-prerendered params with a ~1.3KB closed EMPTY Suspense boundary in ~20ms — the resolved
+// content never rendered. Option D captures the live render's postponed state and appends the
+// canonical POST resume, so the full document must arrive with the dynamic content resolved.
+describe("shell-less PPR template resume (Option D)", () => {
+  it("serves the resolved dynamic content for a non-prerendered param, not a truncated shell", async () => {
+    const r = await req("/novel/live-probe");
+    expect(r.status).toBe(200);
+    // React comment-separates adjacent JSX text expressions in streamed HTML
+    // (`resolved:<!-- -->live-probe<!-- -->:<!-- -->42`); normalize before matching.
+    expect(r.body.replace(/<!-- -->/g, "")).toContain("resolved:live-probe:42");
+    // The truncation signature was an empty closed boundary: present markup, absent result.
+    expect(r.body).toContain('id="novel-result"');
+  });
+
+  it("still serves the prerendered param as a normal prerender", async () => {
+    const r = await req("/novel/prerendered");
+    expect(r.status).toBe(200);
+    expect(r.body).not.toContain("resolved:");
+  });
+});

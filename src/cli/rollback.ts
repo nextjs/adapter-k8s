@@ -19,6 +19,14 @@ import {
   routingManifestSnapshotName,
   routingServiceDeploymentName,
 } from "../emit/templates/routing-manifest-configmap.js";
+// N87: internal dispatch secrets are per BUILD, so reverting the edge has to move its
+// secretKeyRef with the image (see revertRoutingServiceToBuild).
+import {
+  INTERNAL_SECRET_KEY,
+  internalSecretName,
+  legacyInternalSecretName,
+} from "../emit/templates/internal-secret.js";
+import { assertSafeInfrastructure } from "./infrastructure-validation.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -28,16 +36,58 @@ import {
 export const SNAPSHOT_BUILD_ID_ANNOTATION = "adapter-k8s/build-id";
 
 interface RoutingServingConfig {
-  /** Image tag the routing Deployment currently runs — the build id the edge serves. */
+  /**
+   * The build id the edge currently serves. Named `imageTag` for historical reasons — it is no
+   * longer read FROM the image tag: images are digest-pinned, so it comes from the pod's
+   * NEXT_BUILD_ID env, with the tag as the pre-digest fallback.
+   */
   imageTag: string;
+  /**
+   * The literal image reference the Deployment carries (tag- or digest-pinned). Kept verbatim
+   * so a failed revert can be restored to exactly what was there — reconstructing it from the
+   * build id would silently downgrade a digest-pinned edge to a tag.
+   */
+  image: string;
   /** ConfigMap the routing-manifest volume currently mounts. */
   manifestConfigMap: string;
+  /**
+   * N87: the Secret the routing container resolves INTERNAL_HEADER_SECRET from. Internal
+   * dispatch secrets are per BUILD, so this moves with the image exactly like NEXT_BUILD_ID;
+   * captured so a failed revert can be restored to the ref it actually had. `null` when the
+   * Deployment carries no such env (an adapter version predating the injection).
+   */
+  internalSecretRef: string | null;
 }
 
-// Read what the routing tier is ACTUALLY serving (image tag + manifest source). Returns
-// null when the release has no routing tier (apps without middleware/extension chain) or
-// the Deployment is unreadable — callers treat null as "nothing to retain/revert".
-async function readRoutingServingConfig(releaseName: string): Promise<RoutingServingConfig | null> {
+/**
+ * N68: the outcome of reading the routing tier's serving config. "This release has no
+ * routing tier" and "the routing Deployment could not be read" MUST stay distinct: both
+ * used to collapse into `null`, so a kubectl/RBAC failure, empty output or malformed JSON
+ * was reported to `retainLiveRoutingManifest` as `no-routing-tier` — and deploy then read
+ * that as "nothing to retain" and proceeded, letting `helm upgrade` overwrite the stable
+ * `<release>-routing-manifest` ConfigMap and destroy the rollback snapshot. That is
+ * precisely the outcome the fail-closed retention posture (N30) was written to prevent, via
+ * the same "a swallowed error becomes a meaningful value" route.
+ */
+type RoutingServingRead =
+  | { status: "absent" }
+  | { status: "read"; config: RoutingServingConfig }
+  | { status: "failed"; reason: string };
+
+// Read what the routing tier is ACTUALLY serving (image tag + manifest source).
+// `--ignore-not-found` is THE machine-readable absence signal: a genuinely absent
+// Deployment (an app with no middleware/extension chain) exits 0 with empty stdout, so ANY
+// other outcome — non-zero exit, unparseable JSON, a pod spec without the routing container
+// or the manifest volume — is a read FAILURE and is reported as one. Deliberately not a
+// substring match on stderr (the isAlreadyGoneError class of bug).
+/**
+ * Exported for tests: the build id it reports NAMES the retained manifest snapshot, and getting
+ * it from the image reference broke once images became digest-pinned (see the NEXT_BUILD_ID note
+ * inside).
+ */
+export async function readRoutingServingConfig(
+  releaseName: string,
+): Promise<RoutingServingRead> {
   const deployName = routingServiceDeploymentName(releaseName);
   const res = await execCapture("kubectl", [
     "get",
@@ -45,47 +95,151 @@ async function readRoutingServingConfig(releaseName: string): Promise<RoutingSer
     deployName,
     "-n",
     K8S_NAMESPACE,
+    "--ignore-not-found",
     "-o",
     "json",
   ]);
-  if (res.exitCode !== 0 || !res.stdout.trim()) return null;
-  try {
-    const parsed = JSON.parse(res.stdout);
-    const podSpec = parsed?.spec?.template?.spec;
-    const containers: unknown[] = Array.isArray(podSpec?.containers) ? podSpec.containers : [];
-    const volumes: unknown[] = Array.isArray(podSpec?.volumes) ? podSpec.volumes : [];
-    const image = (containers as { name?: string; image?: string }[]).find(
-      (c) => c?.name === "routing-service",
-    )?.image;
-    const cmName = (volumes as { name?: string; configMap?: { name?: string } }[]).find(
-      (v) => v?.name === ROUTING_MANIFEST_VOLUME_NAME,
-    )?.configMap?.name;
-    if (typeof image !== "string" || typeof cmName !== "string" || !cmName) return null;
-    // Image form: <registry>/routing-service:<buildId> — the tag after the LAST colon.
-    const tag = image.includes(":") ? image.slice(image.lastIndexOf(":") + 1) : "";
-    if (!tag) return null;
-    return { imageTag: tag, manifestConfigMap: cmName };
-  } catch {
-    return null;
+  if (res.exitCode !== 0) {
+    return {
+      status: "failed",
+      reason:
+        `the routing Deployment ${deployName} could not be read (kubectl exited ` +
+        `${res.exitCode}${res.stderr.trim() ? `: ${res.stderr.trim()}` : ""}). ` +
+        `--ignore-not-found makes a genuinely absent Deployment exit 0, so this is a ` +
+        `connectivity/RBAC failure, NOT "this release has no routing tier"`,
+    };
   }
+  if (!res.stdout.trim()) return { status: "absent" };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.stdout);
+  } catch (err) {
+    return {
+      status: "failed",
+      reason:
+        `kubectl returned output for the routing Deployment ${deployName} that is not valid ` +
+        `JSON (${err instanceof Error ? err.message : String(err)})`,
+    };
+  }
+  const podSpec = (parsed as { spec?: { template?: { spec?: unknown } } })?.spec?.template?.spec as
+    | { containers?: unknown; volumes?: unknown }
+    | undefined;
+  const containers: unknown[] = Array.isArray(podSpec?.containers) ? podSpec.containers : [];
+  const volumes: unknown[] = Array.isArray(podSpec?.volumes) ? podSpec.volumes : [];
+  const routingContainer = (
+    containers as { name?: string; image?: string; env?: unknown }[]
+  ).find((c) => c?.name === "routing-service");
+  const image = routingContainer?.image;
+  const cmName = (volumes as { name?: string; configMap?: { name?: string } }[]).find(
+    (v) => v?.name === ROUTING_MANIFEST_VOLUME_NAME,
+  )?.configMap?.name;
+  // The BUILD ID, which names the retained manifest snapshot. Read from the pod's own
+  // NEXT_BUILD_ID env, NOT from the image reference: since images are digest-pinned (S7) the
+  // reference is `<registry>/routing-service@sha256:<hex>`, and slicing after the last colon
+  // yields the DIGEST HEX. That named the snapshot after the digest while rollback and cleanup
+  // looked for snapshots named after state build ids — so a later failed deploy or rollback
+  // could not restore the target manifest, and pairing the old image with the newer manifest
+  // now makes the routing pod fail its startup parity check (S1) instead of silently serving.
+  // The env carries the FULL, unsanitized id, which is exactly what the snapshot name needs.
+  const envEntries = Array.isArray(routingContainer?.env)
+    ? (routingContainer.env as {
+        name?: string;
+        value?: string;
+        valueFrom?: { secretKeyRef?: { name?: string } };
+      }[])
+    : [];
+  const envBuildId = envEntries.find((e) => e?.name === "NEXT_BUILD_ID")?.value;
+  // N87: which per-build internal dispatch Secret the edge is currently resolving.
+  const internalSecretRef =
+    envEntries.find((e) => e?.name === "INTERNAL_HEADER_SECRET")?.valueFrom?.secretKeyRef?.name ??
+    null;
+  // A TAG-pinned image names its own build, and the image is what actually runs — so when the
+  // reference carries a tag, that tag wins. The env is the source only for a DIGEST-pinned
+  // image, where the reference cannot name a build at all.
+  //
+  // Order matters, and getting it backwards is what corrupted a snapshot on the live cluster:
+  // preferring the env made a rollback (which patches the image) read the stale env of a
+  // deployment whose image had already moved. Trusting the tag first is self-correcting even
+  // for a Deployment last patched by an older CLI that did not update the env.
+  const taggedBuildId =
+    typeof image === "string" && image.includes(":") && !image.includes("@sha256:")
+      ? image.slice(image.lastIndexOf(":") + 1)
+      : "";
+  if (taggedBuildId && envBuildId && taggedBuildId !== envBuildId) {
+    console.warn(
+      `  ! The routing Deployment's image tag (${taggedBuildId}) and NEXT_BUILD_ID ` +
+        `(${envBuildId}) disagree. Trusting the image, which is what the pod runs. This means ` +
+        `the Deployment was last patched by an adapter version that moved the image without ` +
+        `the env; the next deploy or rollback re-syncs them.`,
+    );
+  }
+  const tag = taggedBuildId || envBuildId;
+  if (!tag || typeof cmName !== "string" || !cmName) {
+    // Present but unrecognizable: without the image tag the snapshot cannot be NAMED and
+    // without the mounted ConfigMap it cannot be SOURCED. Retention is impossible, which
+    // is a failure — never "nothing to retain".
+    return {
+      status: "failed",
+      reason:
+        `the routing Deployment ${deployName} exists but does not carry a recognizable ` +
+        `"routing-service" build id (NEXT_BUILD_ID env, or a tagged image for a pre-digest ` +
+        `Deployment; image was ${JSON.stringify(image ?? null)}) and ` +
+        `"${ROUTING_MANIFEST_VOLUME_NAME}" volume ConfigMap (${JSON.stringify(cmName ?? null)}), ` +
+        `so the manifest it serves cannot be identified`,
+    };
+  }
+  return {
+    status: "read",
+    config: {
+      imageTag: tag,
+      image: typeof image === "string" ? image : "",
+      manifestConfigMap: cmName,
+      internalSecretRef,
+    },
+  };
 }
+
+/**
+ * N30: the outcome of a retention attempt. `retainLiveRoutingManifest` used to fold "this
+ * release has no routing tier" and "retention FAILED" into the same `null`, so deploy
+ * could only warn — and a failed retention permanently destroys the rollback target's
+ * manifest (helm then overwrites the stable `<release>-routing-manifest` ConfigMap).
+ * Deploy now treats `failed` as fatal unless `--allow-unretained-manifest` is passed.
+ */
+export type RetainManifestResult =
+  | { status: "retained"; snapshotName: string }
+  | { status: "no-routing-tier" }
+  | { status: "failed"; reason: string };
 
 // Snapshot the manifest the routing tier currently serves into a build-named ConfigMap,
 // so a later rollback can revert the edge to exactly this build's manifest. The stable
 // `<release>-routing-manifest` ConfigMap is overwritten by every helm upgrade, and a
 // rollback re-points the Deployment's volume at a snapshot — without this retention the
 // previous build's manifest is unrecoverable and rollback can only revert the image.
-// Best-effort: returns the snapshot name, or null (with a loud log) when it could not be
-// written. Also used by deploy (pre-helm-upgrade) to retain the outgoing build.
+// Returns a RetainManifestResult that distinguishes "no routing tier" from a genuine
+// failure (N30) — deploy's fail-closed posture depends on telling them apart. Also used
+// by deploy (pre-helm-upgrade) to retain the outgoing build.
 export async function retainLiveRoutingManifest(
   releaseName: string,
   log: (msg: string) => void = (m) => console.log(m),
-): Promise<string | null> {
-  const serving = await readRoutingServingConfig(releaseName);
-  if (!serving) return null; // no routing tier on this release
+): Promise<RetainManifestResult> {
+  const read = await readRoutingServingConfig(releaseName);
+  // N68: absence (proven by --ignore-not-found) is the ONLY outcome that means "nothing to
+  // retain". A read failure is a retention failure, which deploy treats as fatal unless
+  // --allow-unretained-manifest — otherwise helm overwrites the stable ConfigMap and the
+  // rollback target's manifest is gone for good.
+  if (read.status === "absent") return { status: "no-routing-tier" };
+  if (read.status === "failed") {
+    log(
+      `  ! Could not retain the routing manifest: ${read.reason}. This is NOT "no routing ` +
+        `tier" — treating it as a retention failure.`,
+    );
+    return { status: "failed", reason: read.reason };
+  }
+  const serving = read.config;
   const snapshotName = routingManifestSnapshotName(releaseName, serving.imageTag);
   // Already serving from this build's snapshot (post-rollback state) — nothing to copy.
-  if (serving.manifestConfigMap === snapshotName) return snapshotName;
+  if (serving.manifestConfigMap === snapshotName) return { status: "retained", snapshotName };
   // Overwrite protection: if a ConfigMap already exists under this snapshot name but is
   // stamped with a DIFFERENT build id, the two builds' snapshot names collide after
   // sanitization — overwriting would destroy that build's only retained manifest.
@@ -140,12 +294,15 @@ export async function retainLiveRoutingManifest(
     }
   }
   if (!data || typeof data !== "object" || Array.isArray(data)) {
+    const reason =
+      `the live routing-manifest ConfigMap ${serving.manifestConfigMap} could not be read ` +
+      `(kubectl exited ${cm.exitCode}${cm.stderr.trim() ? `: ${cm.stderr.trim()}` : ""})`;
     log(
       `  ! Could not retain the routing manifest for build ${serving.imageTag} ` +
         `(ConfigMap ${serving.manifestConfigMap} unreadable) — a rollback to this build ` +
         `would revert the edge image only.`,
     );
-    return null;
+    return { status: "failed", reason };
   }
   const snapshot = {
     apiVersion: "v1",
@@ -173,15 +330,18 @@ export async function retainLiveRoutingManifest(
     JSON.stringify(snapshot),
   );
   if (applied.exitCode !== 0) {
+    const reason = `kubectl apply of snapshot ${snapshotName} failed: ${
+      applied.stderr.trim() || `exit ${applied.exitCode}`
+    }`;
     log(
       `  ! Could not retain the routing manifest for build ${serving.imageTag}: ` +
         `${applied.stderr.trim() || `exit ${applied.exitCode}`} — a rollback to this ` +
         `build would revert the edge image only.`,
     );
-    return null;
+    return { status: "failed", reason };
   }
   log(`  → Retained routing manifest for build ${serving.imageTag} → ${snapshotName}`);
-  return snapshotName;
+  return { status: "retained", snapshotName };
 }
 
 // Revert the routing tier (image AND manifest) to `targetBuildId` and wait for the
@@ -195,24 +355,40 @@ export async function retainLiveRoutingManifest(
 // revert with a loud warning instead of stranding the whole rollback: a manifest skew
 // is absorbed by the pools' fail-safe local re-resolution (invariant 1), whereas a
 // broken deploy that cannot be rolled back at all is an outage.
-async function revertRoutingServiceToBuild(opts: {
+//
+// N25: exported because DEPLOY needs the identical operation. `helm upgrade` overwrites
+// the stable `<release>-routing-manifest` ConfigMap the routing Deployment mounts BY NAME
+// (kubelet volume sync propagates it even to un-rolled routing pods), so every deploy
+// abort after helm left the ext_proc edge on the NEW build while the pools kept serving
+// the previous one — indefinitely, while the error text claimed "The previous build is
+// still serving traffic. No cutover performed."
+export async function revertRoutingServiceToBuild(opts: {
   releaseName: string;
   targetBuildId: string;
   registry: string | undefined;
+  /**
+   * The target build's recorded routing-image digest (`AdapterState.routingImageDigests`), when
+   * one exists. Without it the reference can only be a TAG, which leaves a rolled-back edge one
+   * step less immutable than a freshly deployed one.
+   */
+  targetImageDigest?: string | undefined;
 }): Promise<void> {
-  const { releaseName, targetBuildId, registry } = opts;
+  const { releaseName, targetBuildId, registry, targetImageDigest } = opts;
   const deployName = routingServiceDeploymentName(releaseName);
-  const exists = await execCapture("kubectl", [
-    "get",
-    "deployment",
-    deployName,
-    "-n",
-    K8S_NAMESPACE,
-    "--ignore-not-found",
-    "-o",
-    "name",
-  ]);
-  if (exists.exitCode !== 0 || !exists.stdout.trim()) return; // no routing tier
+  // N68: same distinction as retention — a read failure here used to return silently, i.e.
+  // report "this release has no routing tier" and let the caller believe the edge was
+  // reverted (deploy's abort path prints "the routing edge was reverted") while the edge
+  // kept serving the other build's middleware. Absence is exit 0 + empty stdout; anything
+  // else throws so the caller can say what it does not know.
+  const exists = await readRoutingServingConfig(releaseName);
+  if (exists.status === "failed") {
+    throw new Error(
+      `Could not determine what the routing tier (${deployName}) is serving: ${exists.reason}. ` +
+        `Refusing to guess — treating an unreadable Deployment as "no routing tier" would ` +
+        `silently skip the edge revert and report it as done.`,
+    );
+  }
+  if (exists.status === "absent") return; // no routing tier on this release
 
   if (!registry) {
     throw new Error(
@@ -221,6 +397,16 @@ async function revertRoutingServiceToBuild(opts: {
         `re-run the rollback. Traffic was NOT switched.`,
     );
   }
+
+  // Exactly what the edge is serving BEFORE this function changes anything, so a failed
+  // rollout can be put back (see the rollout wait below). `exists.status` is "read" here:
+  // "failed" threw and "absent" returned, both above.
+  const priorSpec: RoutingSpecSnapshot = {
+    buildId: exists.config.imageTag || null,
+    image: exists.config.image || null,
+    manifestConfigMap: exists.config.manifestConfigMap || null,
+    internalSecretRef: exists.config.internalSecretRef,
+  };
 
   // Retain the manifest we are about to roll AWAY from, so the symmetric roll-forward
   // can restore it (its stable-ConfigMap content is otherwise lost on the next deploy).
@@ -247,12 +433,96 @@ async function revertRoutingServiceToBuild(opts: {
     );
   }
 
-  const image = `${registry}/routing-service:${targetBuildId}`;
+  // Digest when the deploy that pushed this build recorded one; tag otherwise (a build from
+  // before digests were recorded, where the tag is all that identifies it).
+  const image = targetImageDigest
+    ? `${registry}/routing-service@${targetImageDigest}`
+    : `${registry}/routing-service:${targetBuildId}`;
+  if (!targetImageDigest) {
+    console.warn(
+      `  ! No recorded routing-image digest for build ${targetBuildId} — reverting the edge by ` +
+        `TAG. A retag of that tag would change what the edge runs on its next restart; the ` +
+        `next deploy records a digest so a later rollback can pin it.`,
+    );
+  }
+  // N87: the internal dispatch secret is per BUILD, so the edge's secretKeyRef must move with
+  // the image for the same reason NEXT_BUILD_ID does — otherwise a reverted edge presents the
+  // rolled-away-from build's secret to the rolled-back pools, which reject it and re-resolve
+  // every request locally (fail-safe per invariant 1, but middleware then runs TWICE per
+  // request for as long as the rollback lasts — and a rollback is not the moment to double
+  // the middleware bill). Only patched when the target's Secret actually EXISTS: pointing a
+  // container at a missing Secret is CreateContainerConfigError, i.e. it would turn a
+  // degraded edge into a dead one. A build deployed before per-build names used the legacy
+  // stable name, which deploy preserves (`helm.sh/resource-policy: keep`), so try that too.
+  let targetSecretRef: string | null = null;
+  for (const candidate of [
+    internalSecretName(releaseName, targetBuildId),
+    legacyInternalSecretName(releaseName),
+  ]) {
+    const got = await execCapture("kubectl", [
+      "get",
+      "secret",
+      candidate,
+      "-n",
+      K8S_NAMESPACE,
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (got.exitCode === 0 && got.stdout.trim()) {
+      targetSecretRef = candidate;
+      break;
+    }
+  }
+  if (!targetSecretRef) {
+    console.warn(
+      `  ! No internal dispatch Secret found for build ${targetBuildId} ` +
+        `(${internalSecretName(releaseName, targetBuildId)}). The edge keeps its current ` +
+        `secret, so the rolled-back pools will reject its dispatch headers and re-resolve ` +
+        `every request locally — correct (invariant 1), but middleware runs twice per request ` +
+        `until the next deploy.`,
+    );
+  } else if (targetSecretRef === priorSpec.internalSecretRef) {
+    // Already pointing at the right Secret (e.g. a legacy release where both builds share
+    // the stable name) — leave the env alone rather than patching it to itself.
+    targetSecretRef = null;
+  }
   const patch = {
     spec: {
       template: {
         spec: {
-          containers: [{ name: "routing-service", image }],
+          containers: [
+            {
+              name: "routing-service",
+              image,
+              // The pod's NEXT_BUILD_ID must move WITH the image. This patch used to change
+              // only the image (and the volume), leaving the env at whatever the last
+              // `helm upgrade` stamped — and readRoutingServingConfig reads that env to decide
+              // which build the edge is serving. VERIFIED on the live cluster: after a
+              // rollback the env still named the rolled-away-from build, so the NEXT
+              // rollback's retention step copied the mounted manifest into a snapshot named
+              // for the WRONG build — overwriting that build's rollback target with another
+              // build's manifest. The routing pod then failed its startup parity check
+              // (assertManifestMatchesImage) and crash-looped, which is how the corruption
+              // surfaced rather than silently serving mismatched routes. A strategic-merge
+              // patch matches env entries by `name`, so this replaces just this one variable.
+              env: [
+                { name: "NEXT_BUILD_ID", value: targetBuildId },
+                // N87: same merge-by-name semantics; the live entry carries only `valueFrom`,
+                // so this replaces the Secret it resolves from and nothing else.
+                ...(targetSecretRef
+                  ? [
+                      {
+                        name: "INTERNAL_HEADER_SECRET",
+                        valueFrom: {
+                          secretKeyRef: { name: targetSecretRef, key: INTERNAL_SECRET_KEY },
+                        },
+                      },
+                    ]
+                  : []),
+              ],
+            },
+          ],
           ...(haveSnapshot
             ? {
                 volumes: [
@@ -293,14 +563,229 @@ async function revertRoutingServiceToBuild(opts: {
   // A stuck routing rollout is fatal (same posture as deploy's 7a-bis): with
   // maxUnavailable 0 the old ReplicaSet keeps serving, but reporting success while the
   // edge cannot roll would repeat the historical crashloop-for-months incident.
-  await execOrThrow("kubectl", [
+  //
+  // OBSERVED LIVE: this used to throw here having ALREADY patched the Deployment, which left
+  // the tiers split — pools serving one build, the edge rolled (or half-rolled) to another.
+  // The site stayed up only because maxUnavailable 0 keeps the old ReplicaSet serving; with
+  // `failureMode: closed` a routing outage in that window is 500s on every request. So a
+  // failed rollout now RESTORES the edge to exactly the spec it had before this function
+  // touched it, and says which of the two states the operator is in.
+  const rollout = await execCapture("kubectl", [
     "rollout",
     "status",
     `deployment/${deployName}`,
     "-n",
     K8S_NAMESPACE,
-    "--timeout=120s",
+    `--timeout=${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s`,
   ]);
+  if (rollout.exitCode !== 0) {
+    const detail = rollout.stderr.trim() || rollout.stdout.trim() || `exit ${rollout.exitCode}`;
+    const restored = await restoreRoutingSpec(deployName, priorSpec);
+    throw new Error(
+      `The routing service did not roll out to build ${targetBuildId} within ` +
+        `${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s: ${detail}\n` +
+        (restored
+          ? `  The edge was restored to what it was serving before (${priorSpec.buildId ?? "unknown build"}), ` +
+            `so the pools and the edge still agree. Traffic was NOT switched.`
+          : `  !! The edge could NOT be restored, so the pools and the edge may now be on ` +
+            `DIFFERENT builds. Check \`kubectl -n ${K8S_NAMESPACE} describe deployment ` +
+            `${deployName}\` and the routing pod logs — a manifest that does not match the ` +
+            `image makes the pod refuse to start on purpose.`) +
+        `\n  Traffic was NOT switched.`,
+    );
+  }
+}
+
+/**
+ * How long to wait for the routing Deployment to roll. 120s was too short for a real Autopilot
+ * cluster: every successful revert observed live logged several `1 of 2 new replicas have been
+ * updated` cycles before converging, which means a slow-but-healthy rollout was
+ * indistinguishable from a genuinely stuck one. Raised so the timeout means "stuck", not "busy".
+ */
+const ROUTING_ROLLOUT_TIMEOUT_SECONDS = 300;
+
+/** The routing Deployment fields this module patches, captured before patching them. */
+interface RoutingSpecSnapshot {
+  buildId: string | null;
+  image: string | null;
+  manifestConfigMap: string | null;
+  /** N87: the per-build internal dispatch Secret the container resolved from. */
+  internalSecretRef: string | null;
+}
+
+/**
+ * Put the routing Deployment back to `prior` after a failed rollout. Best-effort by design —
+ * the caller reports either outcome, because "restored" and "possibly split" are different
+ * situations for whoever is holding the pager. Returns false when nothing could be restored.
+ */
+async function restoreRoutingSpec(
+  deployName: string,
+  prior: RoutingSpecSnapshot,
+): Promise<boolean> {
+  if (!prior.image) return false;
+  const patch = {
+    spec: {
+      template: {
+        spec: {
+          containers: [
+            {
+              name: "routing-service",
+              image: prior.image,
+              // N87: the secretKeyRef is part of "what it was serving" too — the revert above
+              // may have moved it, and leaving it on the target build's Secret while the image
+              // goes back would put the restored edge on a secret the pools do not share.
+              ...(prior.buildId || prior.internalSecretRef
+                ? {
+                    env: [
+                      ...(prior.buildId ? [{ name: "NEXT_BUILD_ID", value: prior.buildId }] : []),
+                      ...(prior.internalSecretRef
+                        ? [
+                            {
+                              name: "INTERNAL_HEADER_SECRET",
+                              valueFrom: {
+                                secretKeyRef: {
+                                  name: prior.internalSecretRef,
+                                  key: INTERNAL_SECRET_KEY,
+                                },
+                              },
+                            },
+                          ]
+                        : []),
+                    ],
+                  }
+                : {}),
+            },
+          ],
+          ...(prior.manifestConfigMap
+            ? {
+                volumes: [
+                  {
+                    name: ROUTING_MANIFEST_VOLUME_NAME,
+                    configMap: { name: prior.manifestConfigMap },
+                  },
+                ],
+              }
+            : {}),
+        },
+      },
+    },
+  };
+  const res = await execCapture("kubectl", [
+    "patch",
+    "deployment",
+    deployName,
+    "-n",
+    K8S_NAMESPACE,
+    "--type=strategic",
+    "--field-manager=helm",
+    "-p",
+    JSON.stringify(patch),
+  ]);
+  return res.exitCode === 0;
+}
+
+/**
+ * N26: the capacity a rolled-back build must come back at. Rollback used to scale the
+ * target to a hardcoded 2 replicas and (re)create its HPA from the chart defaults
+ * (min 1 / max 3): roll back a build that was serving 20 under load and the site returns
+ * on 2 pods that can autoscale to 3 — a self-inflicted overload during an incident.
+ * Deploy's mirror of this decision (the retained-manifest replica probe) refuses to guess
+ * at all; here the guess is bounded by what the CURRENT build is actually running.
+ *
+ * Pure so the arithmetic is unit-testable without a cluster.
+ */
+export const ROLLBACK_MIN_REPLICAS = 2;
+
+export interface LiveCapacity {
+  /** `.spec.replicas` of the current build's Deployment (null = unreadable/absent). */
+  specReplicas: number | null;
+  /** `.status.readyReplicas` — pods actually serving right now. */
+  readyReplicas: number | null;
+  /** HPA `.status.desiredReplicas` — what the autoscaler had decided under load. */
+  hpaDesired: number | null;
+  /** HPA `.spec.maxReplicas` — the ceiling the current build was allowed to reach. */
+  hpaMax: number | null;
+}
+
+export function planRollbackCapacity(
+  observed: LiveCapacity,
+  scaling: { min: number; max: number; targetCPU: number },
+): { replicas: number; min: number; max: number } {
+  const live = Math.max(
+    observed.specReplicas ?? 0,
+    observed.readyReplicas ?? 0,
+    observed.hpaDesired ?? 0,
+  );
+  const replicas = Math.max(ROLLBACK_MIN_REPLICAS, scaling.min, live);
+  // The HPA must not immediately undo the scale-up (min) and must be able to grow past
+  // where the current build already was (max). The next deploy re-renders the HPA from
+  // config, so this widening is scoped to the incident.
+  return { replicas, min: replicas, max: Math.max(scaling.max, observed.hpaMax ?? 0, replicas) };
+}
+
+/**
+ * Read what the CURRENT build is running, machine-readably: `--ignore-not-found` makes a
+ * genuinely absent Deployment/HPA exit 0 with empty stdout, so a non-zero exit is a real
+ * read failure. A read failure does NOT abort the rollback (the current build may be the
+ * broken thing we are escaping) — it degrades to the configured floor and says so.
+ */
+async function readLiveCapacity(
+  releaseName: string,
+  pool: string,
+  currentBuildId: string,
+): Promise<{ observed: LiveCapacity; unreadable: string[] }> {
+  const { deployment, hpa } = poolResourceNames(releaseName, pool, currentBuildId);
+  const unreadable: string[] = [];
+  const observed: LiveCapacity = {
+    specReplicas: null,
+    readyReplicas: null,
+    hpaDesired: null,
+    hpaMax: null,
+  };
+
+  const dep = await execCapture("kubectl", [
+    "get",
+    "deployment",
+    deployment,
+    "-n",
+    K8S_NAMESPACE,
+    "--ignore-not-found",
+    "-o",
+    "jsonpath={.metadata.name}|{.spec.replicas}|{.status.readyReplicas}",
+  ]);
+  if (dep.exitCode !== 0) unreadable.push(`deployment ${deployment}`);
+  else {
+    const [name, spec, ready] = dep.stdout.trim().split("|");
+    if (name) {
+      const s = parseInt(spec ?? "", 10);
+      const r = parseInt(ready ?? "", 10);
+      if (Number.isFinite(s)) observed.specReplicas = s;
+      if (Number.isFinite(r)) observed.readyReplicas = r;
+    }
+  }
+
+  const hpaRes = await execCapture("kubectl", [
+    "get",
+    "hpa",
+    hpa,
+    "-n",
+    K8S_NAMESPACE,
+    "--ignore-not-found",
+    "-o",
+    "jsonpath={.metadata.name}|{.status.desiredReplicas}|{.spec.maxReplicas}",
+  ]);
+  if (hpaRes.exitCode !== 0) unreadable.push(`hpa ${hpa}`);
+  else {
+    const [name, desired, max] = hpaRes.stdout.trim().split("|");
+    if (name) {
+      const d = parseInt(desired ?? "", 10);
+      const m = parseInt(max ?? "", 10);
+      if (Number.isFinite(d)) observed.hpaDesired = d;
+      if (Number.isFinite(m)) observed.hpaMax = m;
+    }
+  }
+
+  return { observed, unreadable };
 }
 
 export async function runRollback(options: {
@@ -312,6 +797,8 @@ export async function runRollback(options: {
 
   const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
+  // S13: validate before these reach a gcloud/kubectl argv.
+  assertSafeInfrastructure(infra);
 
   // Pin kubectl at THIS release's cluster BEFORE any cluster read — the state ConfigMap
   // read below previously ran against whatever context happened to be current, so a
@@ -488,15 +975,41 @@ export async function runRollback(options: {
     );
   }
 
-  // 1. Scale up every pool's previous deployment
+  // 1. Scale up every pool's previous deployment — to at least the capacity the CURRENT
+  // build is running (N26), never the old hardcoded 2. Done BEFORE any selector flip so
+  // the target is already at size when traffic arrives.
+  const capacityByPool = new Map<string, { replicas: number; min: number; max: number }>();
   for (const previousDeploy of previousDeploys) {
-    console.log(`  → Scaling up previous build: ${previousDeploy.name}`);
+    const scaling = scalingByPool.get(previousDeploy.pool) ?? { min: 1, max: 3, targetCPU: 80 };
+    const { observed, unreadable } = await readLiveCapacity(
+      releaseName,
+      previousDeploy.pool,
+      currentBuildId,
+    );
+    if (unreadable.length > 0) {
+      console.warn(
+        `  ! Could not read the current build's live capacity (${unreadable.join(", ")}) — ` +
+          `scaling ${previousDeploy.name} to the configured floor instead. If the current ` +
+          `build was serving more than that, scale the rollback target up manually.`,
+      );
+    }
+    const plan = planRollbackCapacity(observed, scaling);
+    capacityByPool.set(previousDeploy.pool, plan);
+    const observedNote =
+      observed.specReplicas !== null || observed.hpaDesired !== null
+        ? ` (current build: spec=${observed.specReplicas ?? "?"}, ready=${
+            observed.readyReplicas ?? "?"
+          }, hpaDesired=${observed.hpaDesired ?? "?"})`
+        : "";
+    console.log(
+      `  → Scaling up previous build: ${previousDeploy.name} → ${plan.replicas} replicas${observedNote}`,
+    );
     await execOrThrow("kubectl", [
       "scale",
       `deployment/${previousDeploy.name}`,
       "-n",
       K8S_NAMESPACE,
-      "--replicas=2",
+      `--replicas=${plan.replicas}`,
     ]);
   }
 
@@ -504,8 +1017,17 @@ export async function runRollback(options: {
   // otherwise the autoscaler would immediately raise it back to minReplicas. The name comes
   // from poolResourceNames so the existence probe finds the HPA the template actually
   // rendered (see the divergence note at the discovery loop above).
+  // N26: min/max come from planRollbackCapacity, not the chart defaults — an HPA capped at
+  // the default max 3 would drag a 20-replica workload back down mid-incident. An HPA that
+  // already exists is WIDENED (its min/max could be the parked build's stale values).
   for (const previousDeploy of previousDeploys) {
     const hpaName = previousDeploy.hpa;
+    const scaling = scalingByPool.get(previousDeploy.pool) ?? { min: 1, max: 3, targetCPU: 80 };
+    const plan = capacityByPool.get(previousDeploy.pool) ?? {
+      replicas: ROLLBACK_MIN_REPLICAS,
+      min: scaling.min,
+      max: scaling.max,
+    };
     const hpa = await execCapture("kubectl", [
       "get",
       "hpa",
@@ -517,7 +1039,6 @@ export async function runRollback(options: {
       "name",
     ]);
     if (!hpa.stdout.trim()) {
-      const scaling = scalingByPool.get(previousDeploy.pool) ?? { min: 1, max: 3, targetCPU: 80 };
       await execOrThrow("kubectl", [
         "autoscale",
         "deployment",
@@ -525,10 +1046,31 @@ export async function runRollback(options: {
         "-n",
         K8S_NAMESPACE,
         `--name=${hpaName}`,
-        `--min=${scaling.min}`,
-        `--max=${scaling.max}`,
+        `--min=${plan.min}`,
+        `--max=${plan.max}`,
         `--cpu=${scaling.targetCPU}%`,
       ]);
+    } else {
+      const widen = await execCapture("kubectl", [
+        "patch",
+        "hpa",
+        hpaName,
+        "-n",
+        K8S_NAMESPACE,
+        "--type=merge",
+        // Same field-manager rationale as the Service/Deployment patches: helm owns the
+        // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
+        "--field-manager=helm",
+        "-p",
+        JSON.stringify({ spec: { minReplicas: plan.min, maxReplicas: plan.max } }),
+      ]);
+      if (widen.exitCode !== 0) {
+        console.warn(
+          `  ! Could not raise ${hpaName} to min=${plan.min}/max=${plan.max}: ` +
+            `${widen.stderr.trim() || `exit ${widen.exitCode}`} — the rollback target may ` +
+            `autoscale back below the capacity the current build was serving.`,
+        );
+      }
     }
   }
 
@@ -623,6 +1165,7 @@ export async function runRollback(options: {
     releaseName,
     targetBuildId: previousBuildId,
     registry: infra?.containerRegistry,
+    targetImageDigest: state.routingImageDigests?.[previousBuildId],
   });
 
   // 4. Switch traffic: patch active Service selectors to the previous build.
@@ -709,6 +1252,7 @@ export async function runRollback(options: {
         releaseName,
         targetBuildId: currentBuildId,
         registry: infra?.containerRegistry,
+        targetImageDigest: state.routingImageDigests?.[currentBuildId],
       });
       edgeRestored = true;
     } catch (err) {
@@ -767,6 +1311,22 @@ export async function runRollback(options: {
         // builds in play, and each build's tag is only ever the one recorded at ITS
         // deploy (re-deriving under newer code is exactly the M13 failure).
         ...(state.cdnTags ? { cdnTags: state.cdnTags } : {}),
+        // `readinessPathSupported` is deliberately NOT carried forward. It means "the build
+        // now serving answers /readyz", and after a rollback the serving build is an OLDER
+        // one that may predate it — so dropping it is the conservative answer, and the next
+        // deploy keeps the load balancer on /healthz for one cycle before flipping. OBSERVED
+        // on the live cluster: deploy set it, a rollback cleared it, and the following deploy
+        // therefore probed /healthz again — correct, and self-healing one cycle later. Do not
+        // "fix" this by preserving it: that would point the load balancer at /readyz on a
+        // build that may not serve it, which is the outage this migration exists to avoid.
+        // N69: the generation this write is based on — writeState treats it as a floor, so
+        // the local file stays provably newer than the cluster ConfigMap even when the
+        // pre-write cluster read fails. Rollback used to omit it (deploy did not): in a
+        // fresh CI checkout there is no local state.json to carry the generation forward,
+        // so a post-cutover cluster outage stamped local generation 1 while the stale
+        // cluster record sat at N — and readState prefers the higher generation, so the
+        // next operation re-drained the build this rollback had just switched TO.
+        basedOnGeneration: state.generation ?? null,
       },
       releaseName,
     );

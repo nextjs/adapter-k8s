@@ -1,4 +1,16 @@
-import { sanitizeK8sName } from "./utils.js";
+import {
+  sanitizeK8sName,
+  assertSafeBuildId,
+  assertSafeImageRegistry,
+  assertSafeQuantity,
+  assertSafeReleaseName,
+  UNCONFIGURED_IMAGE_REGISTRY,
+} from "./utils.js";
+import {
+  assertSafeImageDigest,
+  PRESTOP_DRAIN_SECONDS,
+  TERMINATION_GRACE_SECONDS,
+} from "./deployment.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
 
 export interface RoutingServiceResources {
@@ -8,6 +20,33 @@ export interface RoutingServiceResources {
   memoryLimit?: string;
 }
 
+/**
+ * N70. Routing-tier defaults, sized for the cluster type this adapter actually creates.
+ *
+ * The old comment claimed "a full core of burst headroom" (250m request / 1000m limit).
+ * That is false on the default cluster type: `init` defaults `autopilot = true`, and per
+ * "Resource requests in Autopilot"
+ * (https://docs.cloud.google.com/kubernetes-engine/docs/concepts/autopilot-resource-requests)
+ * on a cluster that does not support bursting "GKE sets the `limits` equal to the
+ * `requests`" — so the REQUEST is the ceiling and the headroom does not exist. A
+ * CPU-bound, single-threaded ext_proc server pinned at 250m under load blows past its 4 s
+ * handler budget / the 5 s GCP callout deadline, and the callout policy is fail-CLOSED
+ * whenever the app has middleware, i.e. 500s rather than degradation.
+ *
+ * Same page: the minimum memory request on a general-purpose Autopilot cluster without
+ * bursting is 512 MiB, so the old 256Mi was silently rewritten and the HPA's 70% CPU
+ * target was computed against a request the operator never chose. The memory:CPU ratio
+ * must also stay between 1:1 and 1:6.5 (GiB per vCPU): 500m + 512Mi sits exactly at 1:1.
+ *
+ * Requests are therefore EQUAL to limits by default, which makes the emitted spec mean
+ * the same thing on Autopilot and on Standard. An operator who wants burst on a Standard
+ * cluster sets `routingService.resources.cpuLimit` explicitly.
+ */
+export const DEFAULT_ROUTING_RESOURCES = {
+  cpu: "500m",
+  memory: "512Mi",
+} as const;
+
 export function renderRoutingServiceDeployment({
   releaseName,
   buildId,
@@ -15,6 +54,7 @@ export function renderRoutingServiceDeployment({
   resources,
   failOpen,
   requestTimeoutMs,
+  imageDigest,
 }: {
   releaseName: string;
   buildId: string;
@@ -23,22 +63,63 @@ export function renderRoutingServiceDeployment({
   /** GCP callout-failure policy mirrored to the server: false = fail-closed (500). */
   failOpen?: boolean;
   requestTimeoutMs?: number;
+  /** N72. Immutable digest for the routing image; see renderDeployment's `imageDigest`. */
+  imageDigest?: string;
 }): string {
+  // Sanitize at the point of consumption (AGENTS.md) — this template splices all three
+  // into resource names, a quoted image reference, and `value: "…"` env scalars.
+  assertSafeReleaseName(releaseName);
+  assertSafeBuildId(buildId);
+  // See UNCONFIGURED_IMAGE_REGISTRY — adapter.ts's own "not configured yet" literal, which
+  // deploy replaces via `--set`; exempted by identity so the guard stays strict otherwise.
+  if (imageRegistry !== UNCONFIGURED_IMAGE_REGISTRY) assertSafeImageRegistry(imageRegistry);
+  if (imageDigest !== undefined) assertSafeImageDigest(imageDigest);
+
   const safeBuildId = sanitizeK8sName(buildId);
-  // Defaults are sized for a CPU-bound, single-threaded service running arbitrary
-  // middleware: a full core of burst headroom and enough memory for the middleware
-  // module. Override via config for heavier middleware.
-  const cpuReq = resources?.cpu ?? "250m";
-  const memReq = resources?.memory ?? "256Mi";
-  const cpuLim = resources?.cpuLimit ?? "1000m";
-  const memLim = resources?.memoryLimit ?? "512Mi";
-  const internalSecretEnv = renderInternalSecretEnv(releaseName, "            ");
+  const cpuReq = resources?.cpu ?? DEFAULT_ROUTING_RESOURCES.cpu;
+  const memReq = resources?.memory ?? DEFAULT_ROUTING_RESOURCES.memory;
+  // Default the limits to the requests (see DEFAULT_ROUTING_RESOURCES): an operator who
+  // overrides only `cpu` still gets a spec whose meaning does not change with the cluster's
+  // bursting support.
+  const cpuLim = resources?.cpuLimit ?? cpuReq;
+  const memLim = resources?.memoryLimit ?? memReq;
+  // N60 (SECURITY). These four are interpolated UNQUOTED below, so they needed no
+  // quote-escaping to break out at all: `cpu: "250m\n              INJECTED: yes"`
+  // injected a sibling key into the container's `resources` on the first try, and the
+  // values.yaml sink next door reached `hostNetwork: true` on the pod. Nothing validated
+  // them — not validateConfig, not this template.
+  assertSafeQuantity(cpuReq, "routingService.resources.cpu");
+  assertSafeQuantity(memReq, "routingService.resources.memory");
+  assertSafeQuantity(cpuLim, "routingService.resources.cpuLimit");
+  assertSafeQuantity(memLim, "routingService.resources.memoryLimit");
+  if (requestTimeoutMs !== undefined && !Number.isInteger(requestTimeoutMs)) {
+    throw new Error(
+      `Invalid routingService.requestTimeoutMs ${JSON.stringify(requestTimeoutMs)}: expected ` +
+        `an integer number of milliseconds (it is interpolated into a pod env value).`,
+    );
+  }
+
+  // S7: same values seam as the pool Deployment — the digest is only knowable after push.
+  const imageRef =
+    imageDigest !== undefined
+      ? `${imageRegistry}/routing-service@${imageDigest}`
+      : `${imageRegistry}/routing-service{{ with .Values.routingService.image.digest }}@{{ . }}{{ else }}:${buildId}{{ end }}`;
+  const imagePullPolicy =
+    imageDigest !== undefined
+      ? "IfNotPresent"
+      : `{{ with .Values.routingService.image.digest }}IfNotPresent{{ else }}Always{{ end }}`;
+
+  // N87: build-scoped secret name (see internal-secret.ts). The routing tier is a single
+  // in-place Deployment, so this moves with the image on every deploy — and rollback patches
+  // it back alongside NEXT_BUILD_ID, or the reverted edge would present the rolled-away-from
+  // build's secret to the rolled-back pools.
+  const internalSecretEnv = renderInternalSecretEnv(releaseName, buildId, "            ");
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ${releaseName}-routing-service
   labels:
-    app.kubernetes.io/name: ${releaseName}
+    app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: routing-service
 spec:
   # Zero-downtime rollout behind a standalone NEG. The routing service is the ext_proc
@@ -55,12 +136,12 @@ spec:
   minReadySeconds: 30
   selector:
     matchLabels:
-      app.kubernetes.io/name: ${releaseName}
+      app.kubernetes.io/name: "${releaseName}"
       app.kubernetes.io/component: routing-service
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: ${releaseName}
+        app.kubernetes.io/name: "${releaseName}"
         app.kubernetes.io/component: routing-service
         app.kubernetes.io/version: "${safeBuildId}"
     spec:
@@ -72,12 +153,29 @@ spec:
         fsGroup: 1000
         seccompProfile:
           type: RuntimeDefault
-      # Give a terminating pod time to keep serving in-flight callouts while the LB stops
-      # routing to it (preStop below), before SIGTERM/kill.
-      terminationGracePeriodSeconds: 40
+      # N63. Give a terminating pod time to keep serving in-flight callouts while the LB
+      # stops routing to it (preStop below), before SIGTERM/kill. Was 25s/40s while the
+      # comment above measured a ~90s NEG sync — the value contradicted the measurement.
+      # Now matched to Google's guidance for NEG-backed pods ("Troubleshoot load balancing
+      # in GKE": preStop sleep 120, terminationGracePeriodSeconds 3.5 minutes), which is
+      # also comfortably above the observed drain.
+      terminationGracePeriodSeconds: ${TERMINATION_GRACE_SECONDS}
+      # N65. The tier defaults to 2 replicas that the scheduler is free to co-locate, and
+      # the callout is fail-CLOSED whenever the app has middleware — losing both replicas
+      # is a total 500, not degraded service. Soft (ScheduleAnyway) so a small cluster
+      # never fails to schedule the second replica.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: "${releaseName}"
+              app.kubernetes.io/component: routing-service
       containers:
         - name: routing-service
-          image: "${imageRegistry}/routing-service:${buildId}"
+          image: "${imageRef}"
+          imagePullPolicy: ${imagePullPolicy}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -88,7 +186,7 @@ spec:
               # Keep serving while GCP reprograms the NEG to drain this terminating pod.
               # Without this, in-flight ext_proc callouts land on a pod that's already gone.
               exec:
-                command: ["/bin/sh", "-c", "sleep 25"]
+                command: ["/bin/sh", "-c", "sleep ${PRESTOP_DRAIN_SECONDS}"]
           ports:
             - containerPort: 8443
               name: grpc
@@ -122,7 +220,8 @@ ${internalSecretEnv}
             - name: routing-manifest
               mountPath: /config
             # readOnlyRootFilesystem makes / read-only; the runtime TLS cert
-            # generation writes under /tmp/tls, backed by this emptyDir.
+            # generation writes under /tmp/tls, backed by this emptyDir. NOT in-memory
+            # (that needs \`medium: Memory\`) — node disk, bounded by the sizeLimit below.
             - name: tmp
               mountPath: /tmp
           # httpGet, not a socket check: a wedged event loop still accepts a TCP
@@ -134,25 +233,46 @@ ${internalSecretEnv}
               port: 8081
             initialDelaySeconds: 3
             periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8081
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           resources:
             requests:
-              cpu: ${cpuReq}
-              memory: ${memReq}
+              cpu: "${cpuReq}"
+              memory: "${memReq}"
             limits:
-              cpu: ${cpuLim}
-              memory: ${memLim}
+              cpu: "${cpuLim}"
+              memory: "${memLim}"
       volumes:
         - name: routing-manifest
           configMap:
             name: ${releaseName}-routing-manifest
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ${releaseName}-routing-service-pdb
+  labels:
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: routing-service
+spec:
+  # N65. A single node drain could otherwise evict every routing-service replica through
+  # the eviction API at once. With middleware present the callout is fail-closed, so that
+  # is a total 500 for the release — the one tier where "degraded" is not an option.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "${releaseName}"
+      app.kubernetes.io/component: routing-service
 `;
 }
