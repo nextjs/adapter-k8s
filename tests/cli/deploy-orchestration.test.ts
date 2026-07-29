@@ -227,6 +227,12 @@ function happyCluster(
       events.push("get-credentials");
       return ok();
     }
+    // S23: image-digest pinning is fail-closed, so the harness must answer for it. Local
+    // daemon knows the digest; the registry fallback is never reached on the happy path.
+    if (args.includes("inspect") && j.includes("RepoDigests")) {
+      const ref = args[args.length - 1]!;
+      return ok(`${ref.slice(0, ref.lastIndexOf(":"))}@sha256:${"a".repeat(64)}\n`);
+    }
     if (j.includes("clusterIpv4Cidr")) return ok("10.4.0.0/14\n");
     // S22: strict-posture node-range discovery — cluster subnetwork, then its primary
     // range, then any extra node-pool subnets (empty here: one subnet, like Autopilot).
@@ -445,6 +451,9 @@ describe("runDeploy — orchestration", () => {
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
         readinessPathSupported: true,
+        // S23: the routing image is now pinned to its digest on every path (the harness's
+        // `docker inspect` answers, as a real daemon does after a push), so state records it.
+        routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
@@ -665,6 +674,9 @@ describe("runDeploy — guards and teardown", () => {
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
         readinessPathSupported: true,
+        // S23: the routing image is now pinned to its digest on every path (the harness's
+        // `docker inspect` answers, as a real daemon does after a push), so state records it.
+        routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
@@ -812,6 +824,9 @@ describe("runDeploy — guards and teardown", () => {
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
         readinessPathSupported: true,
+        // S23: the routing image is now pinned to its digest on every path (the harness's
+        // `docker inspect` answers, as a real daemon does after a push), so state records it.
+        routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
@@ -845,6 +860,9 @@ describe("runDeploy — guards and teardown", () => {
         // Carried verbatim + the new build's own recording; buildm0 pruned (out of play).
         cdnTags: { buildm: recordedPrev, buildn: cdnTagForBuildId("buildn") },
         readinessPathSupported: true,
+        // S23: the routing image is now pinned to its digest on every path (the harness's
+        // `docker inspect` answers, as a real daemon does after a push), so state records it.
+        routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
         basedOnGeneration: null,
       },
       RELEASE,
@@ -1459,6 +1477,9 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
         readinessPathSupported: true,
+        // S23: the routing image is now pinned to its digest on every path (the harness's
+        // `docker inspect` answers, as a real daemon does after a push), so state records it.
+        routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },

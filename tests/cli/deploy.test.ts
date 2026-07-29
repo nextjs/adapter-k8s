@@ -10,6 +10,8 @@ import {
   assertSafePoolName,
   discoverClusterPodCidr,
   discoverClusterNodeCidrs,
+  resolveRegistryDigest,
+  resolveDeployImageDigests,
   discoverServingBuildId,
   resolveImageDigest,
 } from "../../src/cli/deploy.js";
@@ -279,6 +281,121 @@ describe("discoverClusterPodCidr (fail-closed NetworkPolicy discovery)", () => {
     await expect(
       discoverClusterPodCidr({ ...OPTS, allowNoNetworkPolicy: true }),
     ).resolves.toBeNull();
+  });
+});
+
+describe("resolveRegistryDigest (S23: the registry is authoritative, not the local daemon)", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  const REF = "us-central1-docker.pkg.dev/proj/nextjs/routing-service:build1";
+
+  // `docker inspect` reports RepoDigests only when the LOCAL daemon recorded a push. podman,
+  // buildx with certain drivers, and any push that did not go through this daemon leave it
+  // empty — and the old code answered that by deploying the MUTABLE tag, on pods that hold
+  // the internal dispatch secret. But the image was just pushed: the registry knows the
+  // digest. VERIFIED live — `gcloud artifacts docker images describe` returned byte-identical
+  // sha256 to `docker inspect` for the same ref.
+  it("resolves the digest from the registry", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "sha256:" + "a".repeat(64) + "\n",
+      stderr: "",
+    });
+    await expect(resolveRegistryDigest(REF, "proj")).resolves.toBe("sha256:" + "a".repeat(64));
+    const args = vi.mocked(exec.execCapture).mock.calls[0]?.[1];
+    expect(args).toContain("--format=value(image_summary.digest)");
+    expect(args).toContain(REF);
+  });
+
+  it("returns null when the registry cannot be reached", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "denied" });
+    await expect(resolveRegistryDigest(REF, "proj")).resolves.toBeNull();
+  });
+
+  it("returns null on a malformed digest rather than passing it to helm", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "not-a-digest\n",
+      stderr: "",
+    });
+    await expect(resolveRegistryDigest(REF, "proj")).resolves.toBeNull();
+  });
+});
+
+describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  const REFS: Array<[string, string]> = [
+    ["ssr", "reg/nextjs-app-ssr:build1"],
+    ["routingService", "reg/routing-service:build1"],
+  ];
+  const SHA_A = "sha256:" + "a".repeat(64);
+  const SHA_B = "sha256:" + "b".repeat(64);
+  const dockerOk = (ref: string, sha: string) => ({
+    exitCode: 0,
+    stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${sha}\n`,
+    stderr: "",
+  });
+
+  it("prefers the local daemon when it knows the digest (no registry round-trip)", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("inspect")) {
+        const ref = args[args.length - 1]!;
+        return dockerOk(ref, ref.includes("routing") ? SHA_B : SHA_A);
+      }
+      return { exitCode: 1, stdout: "", stderr: "should not be called" };
+    }) as never);
+
+    await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).resolves.toEqual({
+      ssr: SHA_A,
+      routingService: SHA_B,
+    });
+    const gcloudCalls = vi.mocked(exec.execCapture).mock.calls.filter(([c]) => c === "gcloud");
+    expect(gcloudCalls).toHaveLength(0);
+  });
+
+  it("falls back to the registry when the local daemon has no RepoDigest", async () => {
+    // The podman / buildx / pushed-elsewhere case. Previously this silently deployed the
+    // mutable tag; now the registry answers it.
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) => {
+      if (cmd === "docker") return { exitCode: 0, stdout: "\n", stderr: "" }; // no RepoDigests
+      return { exitCode: 0, stdout: SHA_A + "\n", stderr: "" };
+    }) as never);
+
+    await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).resolves.toEqual({
+      ssr: SHA_A,
+      routingService: SHA_A,
+    });
+  });
+
+  it("THROWS when neither source can pin an image (no silent mutable-tag deploy)", async () => {
+    // A retag of the mutable tag changes what runs on the next pod start or scale-up, on pods
+    // that receive the internal dispatch secret and the cache credentials. That is an image
+    // integrity failure, not a warning — the repo's own idiom is fail-closed plus an explicit
+    // opt-out flag (cf. --allow-no-network-policy).
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "nope" });
+
+    await expect(
+      resolveDeployImageDigests({ refs: REFS, projectId: "proj" }),
+    ).rejects.toThrow(/--allow-mutable-tags/);
+  });
+
+  it("names the images it could not pin", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "nope" });
+    await expect(
+      resolveDeployImageDigests({ refs: REFS, projectId: "proj" }),
+    ).rejects.toThrow(/routing-service:build1/);
+  });
+
+  it("--allow-mutable-tags opts out: warns and omits the unpinned entries", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "nope" });
+    await expect(
+      resolveDeployImageDigests({ refs: REFS, projectId: "proj", allowMutableTags: true }),
+    ).resolves.toEqual({});
   });
 });
 

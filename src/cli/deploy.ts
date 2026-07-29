@@ -82,6 +82,13 @@ export interface DeployOptions {
    */
   allowNoNetworkPolicy?: boolean;
   /**
+   * S23: explicit opt-out of the fail-closed IMAGE INTEGRITY posture — deploy by mutable tag
+   * when neither the local daemon nor the registry can pin an image to a digest. Without it
+   * an unpinnable image aborts the deploy, because running by tag lets a registry retag
+   * change the code on pods that hold the internal dispatch secret and cache credentials.
+   */
+  allowMutableTags?: boolean;
+  /**
    * N30: explicit opt-out of the fail-closed routing-manifest retention posture. Retention
    * copies the OUTGOING build's routing manifest to a build-named snapshot before
    * `helm upgrade` overwrites the stable ConfigMap; a failure permanently destroys the
@@ -380,6 +387,87 @@ export function assertSafePoolName(poolName: string): void {
  * rather than throwing: a resolvable digest is a hardening win, not a reason to fail a deploy
  * on a daemon that reports RepoDigests differently (podman/buildx shims). The caller says so.
  */
+/**
+ * S23: pin every deployed image to an immutable digest, or refuse the deploy.
+ *
+ * Two sources, local first (fast, offline) then the registry (authoritative). If an image
+ * still cannot be pinned this THROWS, because the alternative — what this used to do — is
+ * deploying the mutable `:${buildId}` tag on pods that receive the internal dispatch secret
+ * and the cache credentials. A registry writer who retags that tag then changes the code
+ * running on the next pod start or scale-up, which is exactly the escalation the split
+ * `<release>-cli` identity exists to prevent (it is deliberately writer, not repoAdmin, for
+ * this reason). Degrading to that silently on a `docker inspect` quirk gives the quirk the
+ * same effect as the attack.
+ *
+ * `--allow-mutable-tags` is the explicit opt-out, mirroring `--allow-no-network-policy`:
+ * fail-closed by default, and an operator who really wants it has to say so.
+ */
+export async function resolveDeployImageDigests(opts: {
+  refs: Array<[string, string]>;
+  projectId: string;
+  allowMutableTags?: boolean;
+}): Promise<Record<string, string>> {
+  const digests: Record<string, string> = {};
+  const unresolved: string[] = [];
+  for (const [key, ref] of opts.refs) {
+    const digest = (await resolveImageDigest(ref)) ?? (await resolveRegistryDigest(ref, opts.projectId));
+    if (digest) digests[key] = digest;
+    else unresolved.push(ref);
+  }
+  if (unresolved.length > 0) {
+    if (!opts.allowMutableTags) {
+      throw new Error(
+        `Could not resolve an immutable digest for: ${unresolved.join(", ")}. Neither ` +
+          `\`docker inspect\` nor the registry could pin these images, so deploying would run ` +
+          `them by TAG — a retag of that tag would change what runs on the next pod start, on ` +
+          `pods that hold the internal dispatch secret and cache credentials. Refusing to ` +
+          `deploy without image integrity. Check registry access (\`gcloud artifacts docker ` +
+          `images describe <ref>\`), or pass --allow-mutable-tags to deploy anyway.`,
+      );
+    }
+    console.warn(
+      `\n  ! Could not resolve an immutable digest for: ${unresolved.join(", ")}.\n` +
+        `    Deploying these by TAG (--allow-mutable-tags), so a retag would change what runs ` +
+        `on the next pod start.`,
+    );
+  }
+  return digests;
+}
+
+/**
+ * S23: resolve an image's digest from the REGISTRY, which is authoritative.
+ *
+ * `resolveImageDigest` below asks the local docker daemon, and that only knows a RepoDigest
+ * when the push went through it — podman, buildx with certain drivers, or an image pushed by
+ * something else all leave it empty. That used to degrade the deploy to a MUTABLE tag on pods
+ * holding the internal dispatch secret, i.e. an ordinary tooling quirk quietly removed image
+ * integrity. The image was just pushed, so ask the registry instead.
+ *
+ * VERIFIED live: `gcloud artifacts docker images describe` returned a byte-identical sha256 to
+ * `docker inspect` for the same reference.
+ *
+ * Returns null (never throws) so the caller owns the fail-closed decision.
+ */
+export async function resolveRegistryDigest(
+  imageRef: string,
+  projectId: string,
+): Promise<string | null> {
+  const res = await execCapture("gcloud", [
+    "artifacts",
+    "docker",
+    "images",
+    "describe",
+    imageRef,
+    "--format=value(image_summary.digest)",
+    `--project=${projectId}`,
+  ]);
+  if (res.exitCode !== 0) return null;
+  const digest = res.stdout.trim();
+  // Validated at the point of consumption: this string reaches a helm --set and then the pod
+  // spec's image reference.
+  return /^sha256:[a-f0-9]{64}$/.test(digest) ? digest : null;
+}
+
 export async function resolveImageDigest(imageRef: string): Promise<string | null> {
   // ALL RepoDigests, not just index 0: they belong to the image ID, and one local image tagged
   // and pushed to more than one repository carries an entry per repository. Taking the first and
@@ -727,6 +815,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     skipPush,
     dryRun,
     allowNoNetworkPolicy,
+    allowMutableTags,
     allowUnretainedManifest,
     yes,
   } = options;
@@ -1012,8 +1101,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   const containerStrategy = metadata.containerStrategy ?? "traced-assets";
 
   // 4. Docker build + push
-  // S7: filled in after the push resolves each image to its immutable digest; empty when
-  // --skip-push (nothing was pushed, so the running images are whatever is already deployed).
+  // S7/S23: filled in below by resolveDeployImageDigests, for BOTH the push and --skip-push
+  // paths (the registry can pin an image this run did not push).
   const imageDigests: Record<string, string> = {};
   if (!skipPush) {
     const dockerCommands = buildDockerCommands({
@@ -1033,34 +1122,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       }
     }
 
-    // S7: now that the registry has assigned them, resolve each pushed image to its immutable
-    // digest and deploy THAT instead of the mutable `:${buildId}` tag.
-    if (!dryRun) {
-      const registry = infra.containerRegistry;
-      const refs: Array<[string, string]> =
-        containerStrategy === "shared-image"
-          ? pools.map((p) => [p, `${registry}/nextjs-app:${buildId}`])
-          : pools.map((p) => [p, `${registry}/nextjs-app-${p}:${buildId}`]);
-      refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
-      const unresolved: string[] = [];
-      for (const [key, ref] of refs) {
-        const digest = await resolveImageDigest(ref);
-        if (digest) imageDigests[key] = digest;
-        else unresolved.push(ref);
-      }
-      if (unresolved.length > 0) {
-        // Not fatal — but the operator should know the deploy is running on mutable tags,
-        // because that is what makes a registry retag able to change running code.
-        console.warn(
-          `\n  ! Could not resolve an immutable digest for: ${unresolved.join(", ")}.\n` +
-            `    These images will be deployed by TAG, so a retag of "${buildId}" would change ` +
-            `what runs on the next pod start. Check that \`docker inspect\` reports RepoDigests ` +
-            `for them after a push.`,
-        );
-      } else {
-        console.log(`    Pinned ${refs.length} image(s) to immutable digests`);
-      }
-    }
+  }
+
+  // S7/S23: pin every image this deploy will run to an immutable digest, and deploy THAT
+  // instead of the mutable `:${buildId}` tag. Runs on the --skip-push path too: those images
+  // were pushed by some earlier step, and "we did not push them" is no reason to run them
+  // unpinned — the registry can still answer for them. Fail-closed inside
+  // resolveDeployImageDigests; --allow-mutable-tags is the opt-out.
+  if (!dryRun && infra.projectId) {
+    const registry = infra.containerRegistry;
+    const refs: Array<[string, string]> =
+      containerStrategy === "shared-image"
+        ? pools.map((p) => [p, `${registry}/nextjs-app:${buildId}`])
+        : pools.map((p) => [p, `${registry}/nextjs-app-${p}:${buildId}`]);
+    refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
+    Object.assign(
+      imageDigests,
+      await resolveDeployImageDigests({
+        refs,
+        projectId: infra.projectId,
+        allowMutableTags: allowMutableTags ?? false,
+      }),
+    );
+    const pinned = Object.keys(imageDigests).length;
+    if (pinned > 0) console.log(`    Pinned ${pinned} image(s) to immutable digests`);
   }
 
   // 5. Pre-flight: ensure static IP exists (Gateway needs it)

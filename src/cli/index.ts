@@ -23,6 +23,7 @@ const BOOLEAN_FLAGS = new Set([
   "yes",
   "y",
   "allow-no-network-policy",
+  "allow-mutable-tags",
   "allow-unretained-manifest",
   "standard",
   "help",
@@ -150,6 +151,7 @@ Options:
                               be retained (rollback to it becomes image-only; recorded in
                               deploy state so doctor can report it)
   --allow-no-network-policy  Deploy even if the cluster pod CIDR can't be discovered
+  --allow-mutable-tags     Deploy by image tag when no digest can be resolved
                               (NetworkPolicies skipped — the routing service stays
                               reachable from in-cluster pods; not recommended)
   --dry-run                Show what would be done without executing
@@ -261,6 +263,7 @@ async function main(): Promise<void> {
         skipBuild: flags["skip-build"] === true,
         skipPush: flags["skip-push"] === true,
         allowNoNetworkPolicy: flags["allow-no-network-policy"] === true,
+        allowMutableTags: flags["allow-mutable-tags"] === true,
         // N30 / N29: opt out of the fatal routing-manifest retention, and skip the
         // unpinned-kubectl-context confirmation in CI.
         allowUnretainedManifest: flags["allow-unretained-manifest"] === true,
