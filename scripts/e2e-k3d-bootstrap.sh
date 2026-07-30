@@ -49,16 +49,33 @@ if ! k3d cluster list 2>/dev/null | grep -q "^${CLUSTER_NAME}"; then
   # --k3s-arg disables Traefik (Envoy Gateway is the ingress under test — two ingresses
   # fight over ports and confuse the topology). The port mapping exposes the Envoy Gateway
   # service via the k3d loadbalancer once the Gateway's Service is of type LoadBalancer.
+  # registries.yaml: containerd inside the node must resolve `localhost:${REGISTRY_PORT}`
+  # (the SAME name the host pushes to and the chart bakes into image references) to the
+  # registry container. `--registry-use` alone only wires the registry's cluster-network
+  # name — measured: every pull of localhost:5511/... died with "dial tcp [::1]:5511:
+  # connect: connection refused" against the node's own loopback.
+  REG_CONF="$(mktemp)"
+  cat > "$REG_CONF" <<EOF
+mirrors:
+  "localhost:${REGISTRY_PORT}":
+    endpoint:
+      # :5000, not :${REGISTRY_PORT} — the registry container LISTENS on 5000 in-network;
+      # ${REGISTRY_PORT} is only the host-side mapping (127.0.0.1:${REGISTRY_PORT}->5000).
+      # Measured: the ${REGISTRY_PORT} endpoint refused every in-cluster pull.
+      - http://k3d-${REGISTRY_NAME}:5000
+EOF
   # --kubeconfig-*=false: cluster create must NOT merge into or switch the global
   # kubeconfig — that is the cross-wire vector the dedicated KUBECONFIG above exists to
   # close, and create's default behavior would reopen it on every fresh bootstrap.
   k3d cluster create "${CLUSTER_NAME}" \
     --registry-use "k3d-${REGISTRY_NAME}:${REGISTRY_PORT}" \
+    --registry-config "$REG_CONF" \
     --port "${HTTP_PORT}:80@loadbalancer" \
     --k3s-arg "--disable=traefik@server:0" \
     --kubeconfig-update-default=false \
     --kubeconfig-switch-context=false \
     --wait
+  rm -f "$REG_CONF"
 else
   echo "→ Cluster ${CLUSTER_NAME} exists"
 fi
@@ -76,13 +93,31 @@ else
   echo "→ Envoy Gateway present"
 fi
 # GatewayClass "eg" — the className the generic provider config expects.
+# mergeGateways: every lane's release creates its OWN Gateway object, but only ONE proxy
+# data plane (and one LoadBalancer service) exists, so k3d's single 8788:80 port mapping
+# serves every lane by Host routing. Without merging, each Gateway spawns its own proxy
+# and its own LB service, and klipper-lb can bind :80 exactly once per node — lane 2's
+# Gateway would sit Pending forever.
 kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: merged-lanes
+  namespace: envoy-gateway-system
+spec:
+  mergeGateways: true
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
   name: eg
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: merged-lanes
+    namespace: envoy-gateway-system
 EOF
 
 # --- 4. Valkey ---

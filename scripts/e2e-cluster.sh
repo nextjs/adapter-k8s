@@ -24,9 +24,12 @@ ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_PATTERN="${1:-}"
 NEXTJS_REF="${2:-v16.3.0-canary.97}"
+# Lane mode: a timing-balanced group ("3/25") instead of a pattern. run-tests.js partitions
+# the full suite; each lane consumes one group serially. Exactly one of pattern/group.
+TEST_GROUP="${3:-}"
 
-if [ -z "$TEST_PATTERN" ]; then
-  echo "ERROR: a test pattern is required (see the header of this script)." >&2
+if [ -z "$TEST_PATTERN" ] && [ -z "$TEST_GROUP" ]; then
+  echo "ERROR: a test pattern (arg 1) or a group (arg 3, e.g. \"3/25\") is required." >&2
   exit 1
 fi
 
@@ -90,4 +93,4 @@ export NEXT_TEST_RETRIES="${NEXT_TEST_RETRIES:-0}"
 
 chmod +x "${ADAPTER_DIR}/scripts/e2e-cluster-deploy.sh" "${ADAPTER_DIR}/scripts/e2e-cluster-cleanup.sh"
 
-exec bash "${SCRIPT_DIR}/e2e-local.sh" "$TEST_PATTERN" "$NEXTJS_REF"
+exec bash "${SCRIPT_DIR}/e2e-local.sh" "$TEST_PATTERN" "$NEXTJS_REF" "${TEST_GROUP:-1/1}"

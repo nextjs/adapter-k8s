@@ -5,6 +5,7 @@ import {
   assertSafeQuantity,
   assertSafeReleaseName,
   UNCONFIGURED_IMAGE_REGISTRY,
+  routingManifestSnapshotName as routingManifestSnapshotNameFor,
 } from "./utils.js";
 import {
   assertSafeImageDigest,
@@ -264,7 +265,12 @@ ${internalSecretEnv}
       volumes:
         - name: routing-manifest
           configMap:
-            name: ${releaseName}-routing-manifest
+            # PER-BUILD, deliberately (2026-07-30): mounting the stable mutable CM raced
+            # kubelet's ConfigMap-update propagation on every deploy — a new pod could mount
+            # the pre-upgrade manifest and the match guard crashed it. A per-build name is a
+            # fresh GET with no propagation window. Rollback re-points to the previous
+            # build's snapshot, which its retained render names automatically.
+            name: ${routingManifestSnapshotNameFor(releaseName, buildId)}
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi

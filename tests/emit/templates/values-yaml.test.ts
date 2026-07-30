@@ -109,6 +109,24 @@ describe("renderValuesYaml", () => {
     // adapter.ts's own "not configured yet" literal stays accepted (deploy --sets over it).
     expect(() => render({}, { imageRegistry: "REGISTRY" })).not.toThrow();
   });
+
+  it("accepts a registry host with a PORT (local/LAN registries)", () => {
+    // `host:port/path` is standard OCI reference syntax — a colon in the FIRST segment is a
+    // port, not a tag; only a colon in the LAST segment is a tag. The validator rejected
+    // every local registry (k3d, kind, a LAN Harbor): found by Phase 2's first-ever deploy,
+    // which died on "localhost:5511/adapter-e2e". The sibling IMAGE_REFERENCE_RE below it
+    // already allowed the port — the two had drifted.
+    expect(() => render({}, { imageRegistry: "localhost:5511/adapter-e2e" })).not.toThrow();
+    expect(() => render({}, { imageRegistry: "registry.lan:5000/team/nextjs" })).not.toThrow();
+    // A tag is still rejected — the tag is the build id, applied separately.
+    expect(() => render({}, { imageRegistry: "ghcr.io/foo/bar:latest" })).toThrow(
+      /Invalid image registry/,
+    );
+    // A port alone (no repo path) with junk stays rejected.
+    expect(() => render({}, { imageRegistry: "localhost:notaport/x" })).toThrow(
+      /Invalid image registry/,
+    );
+  });
 });
 
 describe("poolHealthCheckPath (first-upgrade probe migration)", () => {

@@ -8,7 +8,10 @@ import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
 import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
-import { renderRoutingManifestConfigMap } from "./templates/routing-manifest-configmap.js";
+import {
+  renderRoutingManifestConfigMap,
+  renderRoutingManifestSnapshotConfigMap,
+} from "./templates/routing-manifest-configmap.js";
 import { sanitizeK8sName } from "./templates/utils.js";
 import { renderRoutingServiceDeployment } from "./templates/routing-service-deployment.js";
 import { renderRoutingServiceService } from "./templates/routing-service-service.js";
@@ -182,6 +185,15 @@ export function generateHelmChart({
     releaseName,
     routingManifestJson,
   });
+  // PER-BUILD manifest CM — the one the routing Deployment actually mounts (2026-07-30).
+  // The stable CM above is kept for compatibility: pre-change retained renders and the
+  // revert path still reference it, and it costs one small object per release.
+  files["templates/routing-manifest-snapshot-configmap.yaml"] =
+    renderRoutingManifestSnapshotConfigMap({
+      releaseName,
+      buildId,
+      routingManifestJson,
+    });
 
   // The ingress tier (Gateway + route + any CDN attachment) is the first seam to move behind
   // the provider interface — see plans/multi-provider-aks-eks-generic.md. Emitting nothing when

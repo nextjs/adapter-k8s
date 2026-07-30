@@ -614,6 +614,21 @@ export function assertStagedWithin(stageDir: string, absDest: string, destRelati
   }
 }
 
+
+/**
+ * `config/` inside a build context is the ADAPTER'S reserved namespace — the fresh
+ * routing/pool/static manifests are written there by this build, and the routing image's
+ * manifest-match guard treats that copy as the build's identity. A TRACED asset must never
+ * land there: `adapter-k8s emulate` leaves scratch copies of those very files in
+ * projectDir/config/, Next's tracer sweeps them into the NODE middleware's asset set, and
+ * the asset loops would clobber the fresh manifests with days-old ones. Measured on GKE
+ * 2026-07-30: eight consecutive deploys refused by the guard, staged manifest two days
+ * older than its build.
+ */
+function isReservedContextDest(relDest: string): boolean {
+  return relDest === "config" || relDest.startsWith("config/");
+}
+
 export async function stageFile(
   projectDir: string,
   sourcePath: string,
@@ -1830,13 +1845,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           if (!group || typeof group !== "object") continue;
           for (const [relAsset, absAsset] of Object.entries(group as Record<string, unknown>)) {
             if (typeof absAsset !== "string") continue;
-            await stageFile(
-              projectDir,
-              absAsset,
-              assetDestPath(projectDir, relAsset, absAsset),
-              poolName,
-              isShared,
-            );
+            const relDest = assetDestPath(projectDir, relAsset, absAsset);
+            if (isReservedContextDest(relDest)) continue; // see isReservedContextDest
+            await stageFile(projectDir, absAsset, relDest, poolName, isShared);
           }
         }
       };
@@ -2275,6 +2286,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
             if (typeof absAsset === "string" && existsSync(absAsset)) {
               const relDest = assetDestPath(projectDir, relAsset, absAsset);
+              if (isReservedContextDest(relDest)) continue; // see isReservedContextDest
               const contextRoot = path.join(projectDir, routingServiceContextDir);
               const dest = path.join(contextRoot, relDest);
               // Same containment rule as stageFile (N50, review #9): this branch does its own

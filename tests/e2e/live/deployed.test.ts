@@ -172,20 +172,41 @@ describe("routes", () => {
   });
 
   it("materializes a Pages fallback:true route through the shared platform cache", async () => {
-    // This is the production half of the fallback-cache contract. A real deployment has Valkey,
-    // so it must return materialized content and must never depend on the NEXT_ENABLE_ADAPTER-only
-    // per-process cache marker used by the local Next.js deploy harness. The upstream prerender E2E
-    // separately locks the local first-shell → data-fill → materialized-document lifecycle.
+    // The production half of the fallback-cache contract, updated 2026-07-30 for the
+    // minimal-mode fix: pool pods now run these routes NON-minimal (the `next start` model the
+    // pool harness always validated), so the FIRST document request for a never-seen slug may
+    // legitimately serve the build's fallback SHELL (`isFallback: true`) while the data route
+    // materializes the entry — that shell-first lifecycle IS upstream's platform contract.
+    // (The previous minimal-mode production path block-rendered instead, and this test's old
+    // assertions encoded that; the block-render path also never cached ANYTHING — see the
+    // KNOWN PRODUCTION BUG history in pool-server/dispatch.ts.)
+    // What production must still guarantee: the entry MATERIALIZES into the shared Valkey
+    // cache and subsequent document requests serve it — cross-replica, hence the poll.
     const slug = `live-${Date.now()}`;
     const first = await req(`/fallback-cache/${slug}`);
-    const second = await req(`/fallback-cache/${slug}`);
     expect(first.status).toBe(200);
     // React interposes a `<!-- -->` comment between static text and the interpolated
     // slug in the SSR HTML; tolerate it (same parity note as the encoded-key test).
     const materialized = new RegExp(`fallback-cache-materialized:(<!-- -->)?${slug}`);
-    expect(first.body).toMatch(materialized);
-    expect(first.body).not.toContain("fallback-cache-shell");
-    expect(second.body).toMatch(materialized);
+    // Shell or materialized are both valid first answers; anything else is a real failure.
+    if (!materialized.test(first.body)) {
+      expect(first.body).toContain("fallback-cache-shell");
+      // Materialize via the data route the client would fetch (the harness's own lifecycle);
+      // Next writes the result through the registered handler into Valkey.
+      const dataRes = await req(
+        `/_next/data/${first.body.match(/"buildId":"([^"]+)"/)?.[1]}/fallback-cache/${slug}.json`,
+      );
+      expect(dataRes.status).toBe(200);
+    }
+    const deadline = Date.now() + 30_000;
+    let last = "";
+    while (Date.now() < deadline) {
+      const doc = await req(`/fallback-cache/${slug}`);
+      last = doc.body;
+      if (materialized.test(last)) break;
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+    }
+    expect(last).toMatch(materialized);
   });
 
   it("finishes tag invalidation work before releasing the request lifecycle", async () => {

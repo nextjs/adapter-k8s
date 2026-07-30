@@ -1,5 +1,5 @@
 // src/emit/templates/routing-manifest-configmap.ts
-import { sanitizeK8sName } from "./utils.js";
+import { sanitizeK8sName, routingManifestSnapshotName as routingManifestSnapshotNameLocal } from "./utils.js";
 import { renderConfigMap } from "./configmap.js";
 
 /**
@@ -39,16 +39,40 @@ export function routingServiceDeploymentName(releaseName: string): string {
   return sanitizeK8sName(`${releaseName}-routing-service`);
 }
 
-export function renderRoutingManifestConfigMap({
+/**
+ * The PER-BUILD manifest ConfigMap the routing Deployment actually mounts. Rendered by the
+ * chart itself (not just retained post-hoc by the CLI) so it exists atomically with the
+ * Deployment update that references it. Mounting the stable mutable CM instead was a live
+ * race: kubelet propagates UPDATES to watched ConfigMaps asynchronously (minutes, on a
+ * degraded cluster), so a new routing pod could mount the pre-upgrade manifest and the
+ * match guard crashed it — five consecutive GKE deploys died this way on 2026-07-30. A
+ * never-seen NAME is a fresh GET with no propagation window, the same reason every other
+ * per-build resource (pool Deployments, the N87 dispatch Secret) starts reliably.
+ */
+export function renderRoutingManifestSnapshotConfigMap({
   releaseName,
+  buildId,
   routingManifestJson,
 }: {
   releaseName: string;
+  buildId: string;
   routingManifestJson: string;
 }): string {
-  // A ConfigMap (like any K8s object) must fit under the ~1 MiB etcd object limit.
-  // Fail fast at generation time with an actionable error rather than letting `helm
-  // install`/`kubectl apply` reject it with an opaque server-side error.
+  assertManifestFitsConfigMap(routingManifestJson);
+  const fullName = routingManifestSnapshotNameLocal(releaseName, buildId);
+  // renderConfigMap prefixes the release name; the snapshot name already carries it.
+  const suffix = fullName.slice(releaseName.length + 1);
+  return renderConfigMap({
+    name: suffix,
+    releaseName,
+    data: { "routing-manifest.json": routingManifestJson },
+  });
+}
+
+// A ConfigMap (like any K8s object) must fit under the ~1 MiB etcd object limit.
+// Fail fast at generation time with an actionable error rather than letting `helm
+// install`/`kubectl apply` reject it with an opaque server-side error.
+function assertManifestFitsConfigMap(routingManifestJson: string): void {
   const MAX_CONFIGMAP_BYTES = 950 * 1024; // ~950 KiB, leaves headroom under the ~1 MiB limit
   const routingManifestBytes = Buffer.byteLength(routingManifestJson, "utf8");
   if (routingManifestBytes > MAX_CONFIGMAP_BYTES) {
@@ -59,6 +83,16 @@ export function renderRoutingManifestConfigMap({
         `or split the app across multiple releases.`,
     );
   }
+}
+
+export function renderRoutingManifestConfigMap({
+  releaseName,
+  routingManifestJson,
+}: {
+  releaseName: string;
+  routingManifestJson: string;
+}): string {
+  assertManifestFitsConfigMap(routingManifestJson);
   return renderConfigMap({
     name: "routing-manifest",
     releaseName,
