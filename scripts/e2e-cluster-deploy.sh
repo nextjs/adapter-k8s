@@ -169,7 +169,10 @@ HOST="$(node -e "
 const j = require('${APP_DIR}/.k8s-adapter/infrastructure.json');
 process.stdout.write(j.hosts[0]);
 ")"
-URL="https://${HOST}"
+# Cloud targets serve on https://<host>; the LOCAL Phase-2 cluster serves on a mapped port
+# over plain HTTP (http://<host>.localhost:<port>). The wrapper that knows the topology
+# exports the base URL; the hostname-derived HTTPS form stays the default for cloud runs.
+URL="${ADAPTER_K8S_E2E_BASE_URL:-https://${HOST}}"
 # Require a RUN of consecutive good responses, not one. `deploy` returns once the new
 # rollout is complete, but the previous build's pods are still draining and the routing
 # service is still rolling — measured on this cluster, requests in that window return 503

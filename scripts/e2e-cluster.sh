@@ -56,7 +56,7 @@ HOST="$(node -e "
 
 echo "=== Adapter K8s E2E — CLUSTER topology ==="
 echo "Release:   ${RELEASE}"
-echo "Host:      https://${HOST}"
+echo "Host:      ${ADAPTER_K8S_E2E_BASE_URL:-https://${HOST}}"
 echo "State:     ${CLUSTER_STATE_DIR}"
 echo "Context:   $(kubectl config current-context)"
 echo "Test:      ${TEST_PATTERN}"
