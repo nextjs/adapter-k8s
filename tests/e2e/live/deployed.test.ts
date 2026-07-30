@@ -355,6 +355,23 @@ describe("Cloud CDN", () => {
     await expect(waitForEdgeCache(asset!)).resolves.toBeGreaterThanOrEqual(0);
   });
 
+  // KNOWN GAP, deliberately NOT asserted as cached: a PPR-CAPABLE SHELL-LESS template with no
+  // root params (this fixture's /isr-template/[slug]) runs MINIMAL in production and re-renders
+  // per request. An earlier version of this test asserted x-vercel-cache: HIT here — codex's
+  // trace (2026-07-30) showed that HIT is synthesized by the process-local platformCacheSeen
+  // registry with NO byte replay in production (replay is emulatePlatformCache-only), so the
+  // test passed while proving nothing; the deterministic body hid the re-renders. Real cached
+  // plain-SSG evidence lives in tests/e2e/live/edge.test.ts (byte markers, fixtures/edge).
+  // The shell-less-template caching story is tracked by
+  // docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md; when that lands,
+  // replace this smoke check with a byte-marker cache assertion.
+  it("serves a shell-less PPR-capable template instance (smoke, caching NOT asserted)", async () => {
+    const slug = `live-probe-${Date.now().toString(36)}`;
+    const first = await req(`/isr-template/${slug}`);
+    expect(first.status).toBe(200);
+    expect(first.body).toContain(slug);
+  });
+
   it("keeps middleware-matched App Router HTML OUT of the edge cache (forced no-cache)", async () => {
     // Reality on GXLB: ext_proc runs as a traffic extension AFTER the Cloud CDN cache, so a
     // cache hit is served WITHOUT invoking middleware. Every page route in this app is

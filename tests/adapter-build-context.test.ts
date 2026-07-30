@@ -148,8 +148,15 @@ async function build(overrides: Parameters<typeof ctxFor>[0] = {}, cfg = validCo
 // per-file exclusions and the oversize warning's advice ("reduce the number of public files")
 // was unactionable. adapter.ts now passes `collectPublicPathnames(projectDir)`, the same
 // enumeration the static-asset manifest and the pool's pathname set use.
-describe("CEL public-file exclusions (N40)", () => {
-  it("excludes public files the middleware matcher does not cover, and keeps covered ones in", async () => {
+// N40 originally verified that public/ files were excluded one-by-one, and that a
+// middleware-COVERED file was NOT excluded (excluding it would bypass middleware at the edge).
+// Public-file exclusions were removed 2026-07-29: their URLs are stable so they stay CDN-cached
+// across deploys, they were the term that scaled with app content and blew GCP's 512-char
+// limit, and dropping them deletes the mis-exclusion hazard entirely. The safety property N40
+// existed to protect is now structural — nothing is excluded, so nothing can be mis-excluded —
+// and this test pins that end-to-end through a real build.
+describe("CEL public-file handling (N40, post-exclusion-removal)", () => {
+  it("matches everything, so no file can be mis-excluded", async () => {
     seedProject();
     writeFile("public/uncovered.txt", "not matched by the middleware matcher");
     writeFile("public/covered/inside.txt", "matched by the middleware matcher");
@@ -168,13 +175,18 @@ describe("CEL public-file exclusions (N40)", () => {
     });
 
     const cel = outputFile("cel-expression.txt");
-    expect(cel).toContain("request.path == '/uncovered.txt'");
-    expect(cel).toContain("request.path == '/logo.png'");
+    // No per-file exclusions at all any more — covered or not.
+    expect(cel).not.toContain("/uncovered.txt");
+    expect(cel).not.toContain("/logo.png");
     // A middleware-covered public file must NOT be excluded — an exclusion at the edge is a
     // middleware bypass (invariant 2).
     expect(cel).not.toContain("/covered/inside.txt");
     // The `_next/static` prefix exclusion is still there.
-    expect(cel).toContain("request.path.startsWith('/_next/static/')");
+    // No exclusions at all: the match condition is the constant `true`. An exclusion is a
+    // middleware bypass whenever a matcher covers the excluded path, and the /_next/static/
+    // one never even probed the matchers — so it went too, along with any way to get this
+    // wrong.
+    expect(cel).toBe("true");
   });
 });
 

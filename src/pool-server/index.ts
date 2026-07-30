@@ -1851,6 +1851,61 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     const sandbox = appReq("next/dist/server/web/sandbox") as {
       run: (params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>;
     };
+    // Node-side IncrementalCache for edge invocations on a cold replica (see the wiring note
+    // below). Mirrors NextNodeServer.getIncrementalCache: the app's own IncrementalCache class,
+    // the REGISTERED cacheHandler (required-server-files config, resolved against distDir), and
+    // a minimal prerender-manifest surface. Lazy + memoized; any failure returns undefined,
+    // which is exactly the previous behavior (edge runs with an isolated cache).
+    let fallbackIncrementalCache: unknown;
+    let fallbackIncrementalCacheFailed = false;
+    const getFallbackIncrementalCache = (): unknown => {
+      if (fallbackIncrementalCache !== undefined || fallbackIncrementalCacheFailed) {
+        return fallbackIncrementalCache;
+      }
+      try {
+        const rsf = JSON.parse(
+          readFileSync(path.join(distDir, "required-server-files.json"), "utf-8"),
+        );
+        const cacheHandlerRel: string | undefined = rsf?.config?.cacheHandler;
+        if (!cacheHandlerRel) {
+          fallbackIncrementalCacheFailed = true;
+          return undefined;
+        }
+        const { IncrementalCache } = appReq("next/dist/server/lib/incremental-cache") as {
+          IncrementalCache: new (options: Record<string, unknown>) => unknown;
+        };
+        const CurCacheHandler = appReq(
+          path.isAbsolute(cacheHandlerRel)
+            ? cacheHandlerRel
+            : path.resolve(distDir, cacheHandlerRel),
+        );
+        fallbackIncrementalCache = new IncrementalCache({
+          fs: appReq("next/dist/server/lib/node-fs-methods").nodeFs,
+          dev: false,
+          flushToDisk: false,
+          fetchCache: true,
+          minimalMode: false,
+          serverDistDir: path.join(distDir, "server"),
+          requestHeaders: {},
+          getPrerenderManifest: () => ({
+            version: -1,
+            routes: {},
+            dynamicRoutes: {},
+            notFoundRoutes: [],
+            preview: { previewModeId: "", previewModeSigningKey: "", previewModeEncryptionKey: "" },
+          }),
+          CurCacheHandler: CurCacheHandler?.default ?? CurCacheHandler,
+        });
+      } catch (error) {
+        fallbackIncrementalCacheFailed = true;
+        console.warn(
+          "[pool-server] could not build the fallback IncrementalCache for edge invocations; " +
+            "edge revalidateTag on a cold replica will not reach the shared cache:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      return fallbackIncrementalCache;
+    };
     edgeSandboxRun = (params) =>
       sandbox.run({
         ...params,
@@ -1864,7 +1919,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // invalidate the Node-rendered page cache.
         incrementalCache:
           params.incrementalCache ??
-          (globalThis as typeof globalThis & { __incrementalCache?: unknown }).__incrementalCache,
+          (globalThis as typeof globalThis & { __incrementalCache?: unknown }).__incrementalCache ??
+          // COLD-REPLICA FIX (2026-07-30): `__incrementalCache` is published by NODE
+          // entrypoints on their first invocation, so on a pod where no node route has run
+          // yet an edge function got NO incremental cache here — and inside the sandbox the
+          // bundled cache handler detects EdgeRuntime and goes INERT (cache-handler-entry.ts),
+          // so an edge route handler's `revalidateTag` wrote into a void and the invalidation
+          // was lost cluster-wide. Measured on GKE: upstream app-static's "revalidate tag
+          // correctly with edge route handler" timed out forever. Build a real Node-side
+          // IncrementalCache backed by the registered handler, once, lazily.
+          getFallbackIncrementalCache(),
         clientAssetToken: "",
       });
     console.log("Edge sandbox initialized");

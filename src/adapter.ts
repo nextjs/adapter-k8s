@@ -1296,6 +1296,20 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           const dest = path.join(destDir, "cache-handler.cjs");
           await copyFile(src, dest);
           modified.cacheHandler = dest;
+          // Next keeps a per-process in-memory LRU IN FRONT of any custom cacheHandler
+          // (cacheMaxMemorySize, 50MB default). With replicas that layer is incoherent by
+          // construction: its tag manifest is process-local, so a `revalidateTag` performed
+          // on any OTHER pod — or in an EDGE sandbox even on the SAME pod, which has its own
+          // module graph — never invalidates it, and the entry serves as fresh for its whole
+          // revalidate window. MEASURED on GKE (2026-07-30): upstream app-static's
+          // "revalidate tag correctly with edge route handler" pinned a tagged fetch entry
+          // for 360s; the value was in NO Valkey key (39 scanned) — pure memory-layer serve —
+          // and the harness's keep-alive connection pinned every iteration to the same pod.
+          // The upstream suite only passes the node variant because keep-alive pins it to the
+          // pod that healed itself. Zero disables the layer so the shared handler — whose tag
+          // logic reads the SHARED manifest — is authoritative on every read. In-VPC Valkey
+          // RTT is ~1ms; correctness across replicas is the entire point of the shared cache.
+          modified.cacheMaxMemorySize = 0;
           // The handler's bundled Redis client uses only `node:net`/`node:tls` (loaded lazily),
           // which Next externalizes automatically — so there's no third-party package to mark
           // external or stage into the pool container.
@@ -1551,7 +1565,6 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // expression was `!(request.path.startsWith('/_next/static/'))`, zero per-file
         // exclusions. `collectPublicPathnames` is the same enumeration the static-asset
         // manifest and the pool's pathname set already use, and it is already imported here.
-        publicPathnames: collectPublicPathnames(projectDir),
       });
 
       const failureModeAllow = determineFailureMode(outputs, cfg.routingService?.failureMode);
