@@ -32,6 +32,18 @@ ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="${ADAPTER_DIR}/.k8s-adapter/lane-runs/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$RUN_DIR"
 
+# DEDICATED TMPDIR on the real disk — never tmpfs. The harness creates one full Next app
+# (node_modules included, ~150k inodes) per in-flight suite under os.tmpdir(); two lanes on
+# the default 1M-inode /tmp tmpfs exhausted it mid-pilot (measured: 16 clean deploys, then
+# ENOSPC mass-failed every suite after). The dir is exclusively ours, so wipe it at run
+# start rather than trusting per-suite cleanup to never leak.
+export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
+# Best-effort wipe: a previous run's straggler can still be writing here, and rm -rf races
+# concurrent writes into ENOTEMPTY — which under `set -e` killed the whole run at launch.
+# Stale files only cost disk; a failed wipe must never cost the run.
+rm -rf "$TMPDIR" 2>/dev/null || true
+mkdir -p "$TMPDIR"
+
 echo "=== Phase 2 lane run ==="
 echo "lanes:   ${LANES}"
 echo "groups:  ${FIRST_GROUP}..${LAST_GROUP} of ${TOTAL_GROUPS}"

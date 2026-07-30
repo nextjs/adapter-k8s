@@ -14,10 +14,12 @@ set -euo pipefail
 #   valkey:    single in-cluster pod + Service; shared across lanes safely because the
 #              adapter namespaces every key by build id (k8s:<buildId>:)
 #
-# KNOWN LIMIT, on purpose: k3d's default CNI (flannel) ACCEPTS NetworkPolicies but does not
-# ENFORCE them, so the strict ingress allowlist is decorative here. Fine for framework
-# conformance — enforcement is proven live on Cilium (Scaleway) — but Phase 2 results must
-# never be cited as evidence for the security posture.
+# CORRECTION (2026-07-30, measured): k3s ENFORCES NetworkPolicy even under flannel — it
+# ships a built-in kube-router-based netpol controller. Pilot 3 proved it the hard way:
+# the merged Envoy proxy (owned by the GatewayClass, so unmatched by the per-gateway
+# allowlist peer) was REFUSED by every pool and ext_proc port while the pods sat Ready.
+# So Phase 2 exercises the strict allowlist for real; the earlier "decorative netpol"
+# caveat here was wrong, in the good direction.
 
 CLUSTER_NAME="${E2E_K3D_CLUSTER:-adapter-e2e}"
 REGISTRY_NAME="${E2E_K3D_REGISTRY:-adapter-e2e-registry}"

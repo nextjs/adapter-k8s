@@ -53,14 +53,27 @@ export function renderGenericGateway({
   const wantsTls = hosts.some((h) => h.tls?.enabled);
   const emitHttps = wantsTls && !!tlsSecretName;
 
-  // ONE listener per protocol, named exactly `http` / `https`, with NO hostname.
+  // ONE listener per protocol, named exactly `http` / `https`.
   //
   // An earlier cut emitted a listener per host (`http-0`, `https-0`, …). That broke route
   // attachment silently: renderHTTPRoute binds with `sectionName: http` / `https`, so with
   // multiple hosts NO section matched, the route attached to nothing, and the Gateway still
   // reported programmed. Hostname matching belongs to the HTTPRoute, which already does it —
   // the same division GKE's gateway.ts uses.
-  let listeners = `    - name: http
+  //
+  // SINGLE-host releases additionally stamp the hostname ON the listener (2026-07-30). Under
+  // EnvoyProxy `mergeGateways` — how Phase-2 lanes share one data plane and one host port —
+  // Gateway API requires the (port, protocol, hostname) tuple to be unique across every merged
+  // Gateway, so a hostname-less listener conflicts with every other release's: measured on
+  // k3d, the oldest Gateway kept the slot and every lane's routes reported "no ready
+  // listeners" while Envoy 404'd their traffic. The listener KEEPS the name `http`, so the
+  // sectionName contract above is untouched. Multi-host releases keep the hostname-less
+  // listener (a listener carries at most one hostname) and therefore cannot share a merged
+  // data plane — acceptable: lanes are single-host by construction.
+  const singleHostname =
+    hosts.length === 1 ? `
+      hostname: "${hosts[0]!.hostname}"` : "";
+  let listeners = `    - name: http${singleHostname}
       protocol: HTTP
       port: 80
       allowedRoutes:

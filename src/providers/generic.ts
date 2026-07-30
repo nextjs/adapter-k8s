@@ -137,6 +137,25 @@ export const genericProvider: ProviderAdapter = {
             "gateway.envoyproxy.io/owning-gateway-namespace": RELEASE_NAMESPACE_EXPR,
           },
         },
+        {
+          // MERGED proxies (EnvoyProxy `mergeGateways` — how Phase-2 lanes share one data
+          // plane) are owned by the GatewayCLASS: their pods carry ONLY
+          // `owning-gatewayclass: <class>`, never the per-gateway pair above, so without this
+          // peer a netpol-enforcing CNI refuses every proxy→pool and proxy→ext_proc
+          // connection (measured on k3d: pods Ready, Envoy connection-refused, fail-closed
+          // 500s). TENANCY TRADE, stated plainly: the merged proxy serves every release on
+          // the class, so admitting it admits the SHARED data plane to this release's
+          // ext_proc port — reachability-as-secret narrows to "the class's data plane".
+          // That is inherent to choosing merged gateways; per-release proxy identity does
+          // not exist there. Non-merged deployments are unaffected: peers are OR'd and their
+          // proxies match the stricter peer above.
+          namespace: generic?.gatewayNamespace ?? "envoy-gateway-system",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gatewayclass":
+              generic?.gateway?.className ?? "eg",
+          },
+        },
       ],
     };
   },
