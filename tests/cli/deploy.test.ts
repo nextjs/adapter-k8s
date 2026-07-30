@@ -10,7 +10,9 @@ import {
   assertSafePoolName,
   discoverClusterPodCidr,
   discoverClusterNodeCidrs,
+  discoverNodeCidrsFromCluster,
   resolveRegistryDigest,
+  resolveRegistryDigestAny,
   resolveDeployImageDigests,
   discoverServingBuildId,
   resolveImageDigest,
@@ -59,9 +61,9 @@ describe("buildDockerCommands", () => {
       outputDir: "out",
       containerStrategy: "traced-assets",
     });
-    expect(commands.filter((c) => c.command !== "gcloud").every((c) => c.command === "docker")).toBe(
-      true,
-    );
+    expect(
+      commands.filter((c) => c.command !== "gcloud").every((c) => c.command === "docker"),
+    ).toBe(true);
   });
 
   it("S24: pins every build to the target platform", () => {
@@ -242,7 +244,11 @@ describe("buildHelmUpgradeArgs — NetworkPolicy pod CIDRs", () => {
   });
 
   it("S22: leaves strict at its secure default whenever the node range IS known", () => {
-    const args = buildHelmUpgradeArgs({ ...base, podCidrs: "10.4.0.0/14", nodeCidrs: "10.128.0.0/20" });
+    const args = buildHelmUpgradeArgs({
+      ...base,
+      podCidrs: "10.4.0.0/14",
+      nodeCidrs: "10.128.0.0/20",
+    });
     expect(args.join(" ")).not.toContain("networkPolicy.strict=false");
     expect(args).toContain("global.networkPolicy.nodeCidrs={10.128.0.0/20}");
   });
@@ -330,6 +336,116 @@ describe("discoverClusterPodCidr (fail-closed NetworkPolicy discovery)", () => {
   });
 });
 
+describe("resolveRegistryDigestAny (S28: works on ECR/ACR/Harbor, not just Artifact Registry)", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  const REF = "myregistry.example.com/ns/app:b1";
+  const SHA = "sha256:" + "d".repeat(64);
+
+  it("prefers crane when it is available", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
+      cmd === "crane"
+        ? { exitCode: 0, stdout: SHA + "\n", stderr: "" }
+        : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBe(SHA);
+  });
+
+  it("falls back to skopeo", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
+      cmd === "skopeo"
+        ? { exitCode: 0, stdout: SHA + "\n", stderr: "" }
+        : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "podman")).resolves.toBe(SHA);
+  });
+
+  it("falls back to `docker manifest inspect -v`, which needs no extra tooling", async () => {
+    // VERIFIED against Artifact Registry: `docker manifest inspect -v` reported
+    // sha256:ed188f20… byte-identical to `gcloud artifacts docker images describe`. It queries
+    // the REGISTRY, so unlike `docker inspect` it is not the local daemon's opinion.
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "docker" && args.includes("manifest")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ Descriptor: { digest: SHA, size: 1995 } }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBe(SHA);
+  });
+
+  it("picks the TARGET PLATFORM's child from a manifest LIST, not the first entry", async () => {
+    // This test previously asserted element [0], which encoded a real bug: the order of a
+    // manifest list is the registry's, so an ARM-first list would pin the arm64 child and the
+    // pods would die with `exec format error` on x86 nodes. The child digest is also not the
+    // digest of the index the tag points at. Since the platform we build is fixed
+    // (targetPlatform()), select the matching child explicitly.
+    const ARM = "sha256:" + "a".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) =>
+      cmd === "docker" && args.includes("manifest")
+        ? {
+            exitCode: 0,
+            stdout: JSON.stringify([
+              { Descriptor: { digest: ARM, platform: { os: "linux", architecture: "arm64" } } },
+              { Descriptor: { digest: SHA, platform: { os: "linux", architecture: "amd64" } } },
+            ]),
+            stderr: "",
+          }
+        : { exitCode: 127, stdout: "", stderr: "x" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBe(SHA);
+  });
+
+  it("refuses a manifest LIST with no child for the platform we deploy", async () => {
+    // Pinning an image that cannot run is worse than failing: it deploys, then CrashLoops with
+    // `exec format error` after cutover has begun.
+    const ARM = "sha256:" + "a".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) =>
+      cmd === "docker" && args.includes("manifest")
+        ? {
+            exitCode: 0,
+            stdout: JSON.stringify([
+              { Descriptor: { digest: ARM, platform: { os: "linux", architecture: "arm64" } } },
+            ]),
+            stderr: "",
+          }
+        : { exitCode: 127, stdout: "", stderr: "x" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBeNull();
+  });
+
+  it("does NOT use `docker manifest inspect` for a non-docker runtime", async () => {
+    // nerdctl has no `manifest inspect`, and podman's is for manifest LISTS it manages
+    // locally — neither answers for a remote registry.
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 127,
+      stdout: "",
+      stderr: "x",
+    } as never);
+    await resolveRegistryDigestAny(REF, "nerdctl");
+    const cmds = vi.mocked(exec.execCapture).mock.calls.map(([c]) => c);
+    expect(cmds).not.toContain("nerdctl");
+  });
+
+  it("returns null when no probe can answer, so the caller fails closed", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 127,
+      stdout: "",
+      stderr: "x",
+    } as never);
+    await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBeNull();
+  });
+
+  it("rejects a malformed digest rather than passing it to helm", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
+      cmd === "crane"
+        ? { exitCode: 0, stdout: "not-a-digest\n", stderr: "" }
+        : { exitCode: 127, stdout: "", stderr: "x" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBeNull();
+  });
+});
+
 describe("resolveRegistryDigest (S23: the registry is authoritative, not the local daemon)", () => {
   beforeEach(() => {
     vi.mocked(exec.execCapture).mockReset();
@@ -370,6 +486,49 @@ describe("resolveRegistryDigest (S23: the registry is authoritative, not the loc
   });
 });
 
+describe("S27: image integrity must not depend on the CLOUD", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  it("resolves digests for a generic build with no GCP project", () => {
+    // The digest block was gated on `infra.projectId`, which only a GCP config has. A generic
+    // deploy therefore skipped resolution entirely and shipped MUTABLE TAGS — silently
+    // bypassing the --allow-mutable-tags gate that exists precisely to make that a decision
+    // rather than an accident. The registry probe is provider-specific; the REQUIREMENT is not.
+    const SHA = "sha256:" + "c".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "docker") {
+        const ref = args[args.length - 1]!;
+        return {
+          exitCode: 0,
+          stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${SHA}\n`,
+          stderr: "",
+        };
+      }
+      return { exitCode: 1, stdout: "", stderr: "no gcloud here" };
+    }) as never);
+
+    return expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "registry.example.com/ns/app:b1"]],
+        projectId: "",
+        containerCli: "docker",
+      }),
+    ).resolves.toEqual({ ssr: SHA });
+  });
+
+  it("still fails closed for a generic build when nothing can pin the image", () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "x" });
+    return expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "registry.example.com/ns/app:b1"]],
+        projectId: "",
+      }),
+    ).rejects.toThrow(/--allow-mutable-tags/);
+  });
+});
+
 describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => {
   beforeEach(() => {
     vi.mocked(exec.execCapture).mockReset();
@@ -395,7 +554,11 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (cmd === "gcloud") {
         const ref = args.find((a) => a.includes("/")) ?? "";
-        return { exitCode: 0, stdout: (ref.includes("routing") ? SHA_B : SHA_A) + "\n", stderr: "" };
+        return {
+          exitCode: 0,
+          stdout: (ref.includes("routing") ? SHA_B : SHA_A) + "\n",
+          stderr: "",
+        };
       }
       const ref = args[args.length - 1]!;
       return dockerOk(ref, ref.includes("routing") ? SHA_B : SHA_A);
@@ -420,7 +583,11 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (cmd === "gcloud") return { exitCode: 0, stdout: REGISTRY + "\n", stderr: "" };
       const ref = args[args.length - 1]!;
-      return { exitCode: 0, stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`, stderr: "" };
+      return {
+        exitCode: 0,
+        stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`,
+        stderr: "",
+      };
     }) as never);
 
     const out = await resolveDeployImageDigests({ refs: REFS, projectId: "proj" });
@@ -428,12 +595,83 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     expect(out.routingService).toBe(REGISTRY);
   });
 
+  it("S28: uses the generic registry probe when there is no GCP project", async () => {
+    // An ECR/ACR/Harbor deploy has no projectId, so the AR probe no-ops. Before this it fell
+    // straight to the local daemon — the path podman gets wrong.
+    const SHA = "sha256:" + "9".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
+      cmd === "crane"
+        ? { exitCode: 0, stdout: SHA + "\n", stderr: "" }
+        : { exitCode: 127, stdout: "", stderr: "x" }) as never);
+
+    const out = await resolveDeployImageDigests({
+      refs: [["ssr", "myregistry.example.com/ns/app:b1"]],
+      projectId: "",
+      containerCli: "docker",
+    });
+    expect(out.ssr).toBe(SHA);
+  });
+
+  it("S28: prefers the REGISTRY over a disagreeing local daemon on any registry", async () => {
+    const LOCAL = "sha256:" + "e".repeat(64);
+    const REGISTRY = "sha256:" + "7".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "crane") return { exitCode: 0, stdout: REGISTRY + "\n", stderr: "" };
+      if (cmd === "docker" && args.includes("inspect")) {
+        const ref = args[args.length - 1]!;
+        return {
+          exitCode: 0,
+          stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`,
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "x" };
+    }) as never);
+
+    const out = await resolveDeployImageDigests({
+      refs: [["ssr", "myregistry.example.com/ns/app:b1"]],
+      projectId: "",
+      containerCli: "docker",
+    });
+    expect(out.ssr).toBe(REGISTRY);
+  });
+
+  it("S28: does NOT trust a non-docker local daemon when no registry answered", async () => {
+    // MEASURED with podman 6.0.1: its local RepoDigest matched the registry for one image and
+    // differed for another (e04a0a5b… vs 27fa476b…), because push can rewrite the manifest.
+    // An unreliable digest is worse than none — deploying it yields ImagePullBackOff at
+    // rollout, after cutover has begun. Failing at deploy time is the louder, earlier failure.
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "podman" && args.includes("inspect")) {
+        const ref = args[args.length - 1]!;
+        return {
+          exitCode: 0,
+          stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@sha256:${"f".repeat(64)}\n`,
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "x" };
+    }) as never);
+
+    await expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "myregistry.example.com/ns/app:b1"]],
+        projectId: "",
+        containerCli: "podman",
+      }),
+    ).rejects.toThrow(/crane|skopeo/);
+  });
+
   it("S25: falls back to the local daemon when the registry is unreachable", async () => {
     const LOCAL = "sha256:" + "e".repeat(64);
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (cmd === "gcloud") return { exitCode: 1, stdout: "", stderr: "offline" };
       const ref = args[args.length - 1]!;
-      return { exitCode: 0, stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`, stderr: "" };
+      return {
+        exitCode: 0,
+        stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`,
+        stderr: "",
+      };
     }) as never);
 
     const out = await resolveDeployImageDigests({ refs: REFS, projectId: "proj" });
@@ -461,16 +699,16 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     // opt-out flag (cf. --allow-no-network-policy).
     vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "nope" });
 
-    await expect(
-      resolveDeployImageDigests({ refs: REFS, projectId: "proj" }),
-    ).rejects.toThrow(/--allow-mutable-tags/);
+    await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).rejects.toThrow(
+      /--allow-mutable-tags/,
+    );
   });
 
   it("names the images it could not pin", async () => {
     vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 1, stdout: "", stderr: "nope" });
-    await expect(
-      resolveDeployImageDigests({ refs: REFS, projectId: "proj" }),
-    ).rejects.toThrow(/routing-service:build1/);
+    await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).rejects.toThrow(
+      /routing-service:build1/,
+    );
   });
 
   it("--allow-mutable-tags opts out: warns and omits the unpinned entries", async () => {
@@ -478,6 +716,55 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     await expect(
       resolveDeployImageDigests({ refs: REFS, projectId: "proj", allowMutableTags: true }),
     ).resolves.toEqual({});
+  });
+});
+
+describe("discoverNodeCidrsFromCluster (S27: generic clusters have no gcloud)", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  it("derives node ranges from the Kubernetes API, not a cloud API", () => {
+    // The strict NetworkPolicy needs the kubelet's source range or every pod goes unready
+    // under Calico. discoverClusterNodeCidrs asks gcloud, which a K3s/on-prem cluster does not
+    // have — so strict was simply unavailable there, leaving the dataplane on the broad
+    // posture. kubectl knows the node addresses on every conformant cluster.
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "10.0.1.5\n10.0.1.6\n10.0.2.7\n",
+      stderr: "",
+    } as never);
+
+    return expect(discoverNodeCidrsFromCluster()).resolves.toBe(
+      "10.0.1.5/32,10.0.1.6/32,10.0.2.7/32",
+    );
+  });
+
+  it("de-duplicates repeated node addresses", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "10.0.1.5\n10.0.1.5\n",
+      stderr: "",
+    } as never);
+    await expect(discoverNodeCidrsFromCluster()).resolves.toBe("10.0.1.5/32");
+  });
+
+  it("returns null when the API cannot be reached, so the caller decides", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "connection refused",
+    } as never);
+    await expect(discoverNodeCidrsFromCluster()).resolves.toBeNull();
+  });
+
+  it("rejects malformed addresses rather than corrupting the helm list", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "10.0.1.5\nnot-an-ip\n",
+      stderr: "",
+    } as never);
+    await expect(discoverNodeCidrsFromCluster()).resolves.toBeNull();
   });
 });
 
@@ -656,8 +943,7 @@ describe("resolveImageDigest", () => {
 // every recovery on a deployment created by the normal path.
 // ---------------------------------------------------------------------------
 describe("discoverServingBuildId — digest-pinned images", () => {
-  const jsonpathLine = (name: string, image: string, buildId = "") =>
-    `${name}|${image}|${buildId}`;
+  const jsonpathLine = (name: string, image: string, buildId = "") => `${name}|${image}|${buildId}`;
 
   function mockKubectl(deploymentLines: string[]) {
     vi.mocked(exec.execCapture).mockImplementation((async (_cmd: string, args: string[]) => {

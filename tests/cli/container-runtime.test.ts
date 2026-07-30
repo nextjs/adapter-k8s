@@ -195,7 +195,9 @@ describe("checkContainerRuntime (S24: doctor must not fail a podman-only host)",
 
   it("passes and names the runtime it found", async () => {
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
-      cmd === "podman" ? { exitCode: 0, stdout: "podman version 5.0.0\n", stderr: "" } : missing) as never);
+      cmd === "podman"
+        ? { exitCode: 0, stdout: "podman version 5.0.0\n", stderr: "" }
+        : missing) as never);
     const r = await checkContainerRuntime();
     expect(r.status).toBe("pass");
     expect(r.message).toContain("podman");

@@ -1,80 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Next.js Adapter E2E Deploy Script — INTEGRATION MODE
+# Next.js Adapter E2E Deploy Script — PHASE 2 topology (the full edge stack):
 #
-# Starts the full split architecture locally via Envoy:
-#   Envoy (:8080) → Routing Service ext_proc (:8443) → Pool Server (:3000)
+#   Envoy (:8080) -> Routing Service ext_proc (:8443) -> Pool Server (:3000)
 #
-# This validates the complete request flow including:
-# - ext_proc header mutations (x-output-id, x-upstream-pool, x-matched-pathname)
-# - Middleware execution in the routing service (pre-CDN)
-# - beforeFiles/afterFiles rewrite resolution
-# - Static asset bypass (or not — Envoy sends everything through ext_proc)
-# - Handler invocation in the pool server via dispatch headers
+# This is the path a real deployment takes: the routing service resolves routes and runs
+# middleware at the edge, then forwards trusted dispatch headers (x-output-id,
+# x-mw-evaluated, the internal secret) so the pool skips its own resolution. Phase 1
+# (scripts/e2e-deploy.sh) never exercises any of that.
+#
+# Exercises: ext_proc header mutations, edge middleware execution, beforeFiles/afterFiles
+# rewrite resolution, static-asset handling, and handler invocation via dispatch headers.
+#
+# FIXED PORTS, so run with -c 1. CI gets its parallelism from matrix runners instead;
+# two concurrent test apps here would fight over 8080/8443/3000.
+#
+# Shared setup (pack/install/build/config) is sourced from e2e-setup-common.sh. It used to
+# be a divergent copy that had rotted — see the note there.
+#
+# Contract (from nextjs.org/docs/.../adapterPath#testing-adapters):
+# - cwd is set to the isolated test app by the harness
+# - Exit non-zero on failure
+# - Print deployment URL to stdout (nothing else)
+# - Write diagnostics to stderr or files
 
-ADAPTER_DIR="${ADAPTER_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+# shellcheck source=./e2e-setup-common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e-setup-common.sh"
 
-# --- 1. Install adapter into test fixture ---
+# --- 5. Start pool server (:3000 — the port integration/envoy.yaml routes to) ---
 {
-  echo "[adapter-k8s] Installing adapter from ${ADAPTER_DIR}"
-  TARBALL=$(cd "$ADAPTER_DIR" && npm pack --quiet 2>/dev/null | tail -1)
-  TARBALL_PATH="${ADAPTER_DIR}/${TARBALL}"
-
-  node -e "
-    const pkg = JSON.parse(require('fs').readFileSync('package.json', 'utf8'));
-    pkg.dependencies = pkg.dependencies || {};
-    pkg.dependencies['@next-community/adapter-k8s'] = 'file:${TARBALL_PATH}';
-    require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
-  "
-  npm install --no-frozen-lockfile --ignore-scripts 2>&1 || true
-} >&2
-
-# --- 2. Build with adapter ---
-{
-  export NEXT_ADAPTER_PATH="${ADAPTER_DIR}/dist/index.js"
-  DEPLOY_RANDOM=$(node -e "console.log(require('crypto').randomBytes(8).toString('base64url'))")
-  export NEXT_DEPLOYMENT_ID="k8s-adapter-${DEPLOY_RANDOM}"
-
-  echo "[adapter-k8s] Building test app..."
-  npx next build 2>&1
-
-  BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")
-  {
-    echo "BUILD_ID: ${BUILD_ID}"
-    echo "DEPLOYMENT_ID: ${NEXT_DEPLOYMENT_ID}"
-    echo "NEXT_SUPPORTS_IMMUTABLE_ASSETS: 0"
-  } > .adapter-build.log
-} >&2
-
-# --- 3. Start Pool Server ---
-{
-  export POOL_NAME="default"
-  export NEXT_BUILD_ID="${BUILD_ID}"
-  export NODE_ENV="production"
-
-  # Setup config from adapter output
-  mkdir -p config
-  if [ -d ".k8s-adapter/output" ]; then
-    cp .k8s-adapter/output/routing-manifest.json config/ 2>/dev/null || true
-    cp .k8s-adapter/output/static-assets.json config/ 2>/dev/null || true
-    find .k8s-adapter/output -name "pool-manifest-*.json" -exec cp {} config/ \; 2>/dev/null || true
-  fi
-
-  if ! ls config/pool-manifest-*.json 1>/dev/null 2>&1; then
-    node -e "
-      const fs = require('fs');
-      fs.writeFileSync('config/pool-manifest-default.json', JSON.stringify({
-        buildId: '${BUILD_ID}', poolName: 'default', outputs: {}
-      }, null, 2));
-    "
-  fi
-
   export CONFIG_DIR="${PWD}/config"
+  export POOL_NAME=default NEXT_BUILD_ID="${BUILD_ID}" NODE_ENV=production
   export PORT=3000
-
   echo "[adapter-k8s] Starting pool server on :3000..."
-  node "${ADAPTER_DIR}/dist/pool-server.cjs" >> .adapter-server.log 2>&1 &
+  node "${POOL_SERVER_CJS_LOCAL}" >> .adapter-server.log 2>&1 &
   POOL_PID=$!
   echo "${POOL_PID}" > .adapter-pool.pid
 } >&2
@@ -82,27 +42,42 @@ ADAPTER_DIR="${ADAPTER_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 # --- 4. Start Routing Service ---
 {
   export PORT=8443
+  # Same CONFIG_DIR the pool uses — the routing tier reads the routing manifest from it.
+  export CONFIG_DIR="${PWD}/config"
+  # The routing service refuses to start plaintext by default: GCP ext_proc callouts need
+  # HTTP/2 over TLS, and a plaintext pod would look healthy while every callout failed.
+  # integration/envoy.yaml dials :8443 with no transport_socket (h2c), exactly as `emulate`
+  # does — so opt in here for the same reason emulate.ts does. LOCAL EMULATION ONLY.
+  export ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1
   echo "[adapter-k8s] Starting routing service on :8443..."
-  node "${ADAPTER_DIR}/dist/routing-service.cjs" >> .adapter-routing.log 2>&1 &
+  node "${ROUTING_SERVICE_CJS_LOCAL}" >> .adapter-routing.log 2>&1 &
   ROUTING_PID=$!
   echo "${ROUTING_PID}" > .adapter-routing.pid
 } >&2
 
 # --- 5. Start Envoy ---
 {
-  # Check if Envoy is available
-  if command -v envoy &>/dev/null; then
+  # The config path differs by launcher: a LOCAL binary reads the host path, the container
+  # reads its bind-mount target. Hardcoding /etc/envoy/envoy.yaml for both made the local
+  # branch die with "Invalid path" — that path only exists inside the container.
+  #
+  # `command -v envoy` is not enough either: `envoy` is also an SSH agent manager on some
+  # distros. Real Envoy answers `--version` with "version:", the same check emulate.ts makes.
+  ENVOY_CONFIG_HOST="${ADAPTER_DIR}/integration/envoy.yaml"
+  if envoy --version 2>&1 | grep -q "version:"; then
     ENVOY_CMD="envoy"
+    ENVOY_CONFIG_ARG="${ENVOY_CONFIG_HOST}"
   elif docker image inspect envoyproxy/envoy:v1.32-latest &>/dev/null 2>&1 || docker pull envoyproxy/envoy:v1.32-latest >&2 2>&1; then
-    ENVOY_CMD="docker run --rm --network host -v ${ADAPTER_DIR}/integration/envoy.yaml:/etc/envoy/envoy.yaml:ro envoyproxy/envoy:v1.32-latest"
+    ENVOY_CMD="docker run --rm --network host -v ${ENVOY_CONFIG_HOST}:/etc/envoy/envoy.yaml:ro envoyproxy/envoy:v1.32-latest"
+    ENVOY_CONFIG_ARG="/etc/envoy/envoy.yaml"
   else
     echo "[adapter-k8s] ERROR: Neither envoy nor docker available. Cannot run integration tests."
     kill "$POOL_PID" "$ROUTING_PID" 2>/dev/null
     exit 1
   fi
 
-  echo "[adapter-k8s] Starting Envoy on :8080..."
-  $ENVOY_CMD -c /etc/envoy/envoy.yaml --log-level warn >> .adapter-envoy.log 2>&1 &
+  echo "[adapter-k8s] Starting Envoy on :8080 (${ENVOY_CMD%% *})..."
+  $ENVOY_CMD -c "${ENVOY_CONFIG_ARG}" --log-level warn >> .adapter-envoy.log 2>&1 &
   ENVOY_PID=$!
   echo "${ENVOY_PID}" > .adapter-envoy.pid
 

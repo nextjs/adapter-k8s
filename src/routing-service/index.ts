@@ -94,7 +94,40 @@ export function assertManifestMatchesImage(mountedManifestPath: string): void {
   }
 }
 
+/** Transport for the ext_proc listener. */
+export type RoutingTransport = "tls" | "h2c";
+
+/**
+ * S26. Which transport the ext_proc listener serves.
+ *
+ * GKE's callout arrives from Google's frontend and REQUIRES HTTP/2 over TLS. An in-cluster
+ * Envoy Gateway dials the backend as plain h2c unless a BackendTLSPolicy says otherwise — and
+ * the emitted image bakes TLS_CERT_FILE/TLS_KEY_FILE, so the previous logic (honour the
+ * plaintext opt-in only when BOTH are unset) could never take effect there. MEASURED: the
+ * service self-signed, served h2 TLS, and every callout failed while the :8081 health server
+ * stayed green — a deployment that looks healthy and routes nothing.
+ *
+ * So the transport is stated explicitly rather than inferred. `h2c` is a legitimate PRODUCTION
+ * posture here, not a debug escape hatch, but it is only safe because the emitted NetworkPolicy
+ * admits :8443 solely from the release's own Envoy proxy pods — the ext_proc reply carries
+ * INTERNAL_HEADER_SECRET, so anything that can reach this port can obtain it. The two ship
+ * together deliberately.
+ */
+export function routingTransport(): RoutingTransport {
+  const declared = process.env.ROUTING_TRANSPORT?.trim();
+  if (!declared) return "tls";
+  if (declared === "tls" || declared === "h2c") return declared;
+  throw new Error(
+    `Routing service: ROUTING_TRANSPORT=${JSON.stringify(declared)} is not recognized. ` +
+      `Expected "tls" (GKE / any callout arriving over TLS) or "h2c" (in-cluster Envoy Gateway, ` +
+      `where the NetworkPolicy restricts :8443 to the release's own proxy pods).`,
+  );
+}
+
 export function ensureTlsIdentity(): void {
+  // Checked FIRST: an explicit h2c transport wins over whatever the image baked in, which is
+  // the whole point — the generic Deployment cannot unset an image ENV, only override it.
+  if (routingTransport() === "h2c") return;
   const certFile = process.env.TLS_CERT_FILE;
   const keyFile = process.env.TLS_KEY_FILE;
   if (!certFile || !keyFile) {

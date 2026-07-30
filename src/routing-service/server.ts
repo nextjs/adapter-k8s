@@ -260,7 +260,13 @@ export function createRoutingServer(options: RoutingServerOptions) {
   // client speak to the service trivially).
   const certFile = process.env.TLS_CERT_FILE;
   const keyFile = process.env.TLS_KEY_FILE;
-  const useTls = !!(certFile && keyFile && existsSync(certFile) && existsSync(keyFile));
+  // S26: an explicit h2c transport is authoritative. Relying only on "do the cert files
+  // exist" would flip back to TLS the moment a stale cert was left in the image or an
+  // emptyDir survived a restart — and the mismatch is invisible (health stays green while
+  // every callout fails).
+  const h2cDeclared = process.env.ROUTING_TRANSPORT?.trim() === "h2c";
+  const useTls =
+    !h2cDeclared && !!(certFile && keyFile && existsSync(certFile) && existsSync(keyFile));
   const nodeHandler = connectNodeAdapter({ routes });
   const server: Http2Server = useTls
     ? createSecureServer(

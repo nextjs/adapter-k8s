@@ -14,7 +14,11 @@ import { resolveSharpDepDir, stageSharpRuntimePackages } from "../src/adapter.js
 
 let projectDir: string;
 
-function writePkg(dir: string, pkg: Record<string, unknown>, extraFiles: Record<string, string> = {}) {
+function writePkg(
+  dir: string,
+  pkg: Record<string, unknown>,
+  extraFiles: Record<string, string> = {},
+) {
   mkdirSync(dir, { recursive: true });
   writeFileSync(path.join(dir, "package.json"), JSON.stringify(pkg));
   for (const [rel, content] of Object.entries(extraFiles)) {
@@ -39,16 +43,24 @@ beforeAll(() => {
     },
     { "dist/index.cjs": "module.exports = () => {};" },
   );
-  writePkg(path.join(nm, "detect-libc"), {
-    name: "detect-libc",
-    version: "2.1.0",
-    main: "lib/detect-libc.js",
-  }, { "lib/detect-libc.js": "module.exports = {};" });
-  writePkg(path.join(nm, "@img", "colour"), {
-    name: "@img/colour",
-    version: "1.1.0",
-    main: "index.js",
-  }, { "index.js": "module.exports = {};" });
+  writePkg(
+    path.join(nm, "detect-libc"),
+    {
+      name: "detect-libc",
+      version: "2.1.0",
+      main: "lib/detect-libc.js",
+    },
+    { "lib/detect-libc.js": "module.exports = {};" },
+  );
+  writePkg(
+    path.join(nm, "@img", "colour"),
+    {
+      name: "@img/colour",
+      version: "1.1.0",
+      main: "index.js",
+    },
+    { "index.js": "module.exports = {};" },
+  );
   // @img platform packages: 0.35 shape still exports "./package".
   for (const p of ["sharp-linux-x64", "sharp-libvips-linux-x64"]) {
     writePkg(path.join(nm, "@img", p), {
@@ -85,9 +97,9 @@ describe("sharp staging survives the 0.35 package shape (survey: canary.97 image
   });
 
   it("the pool bundle build marks sharp external (no pack-time JS inlining)", () => {
-    const pkg = JSON.parse(
-      readFileSync(path.join(__dirname, "..", "package.json"), "utf-8"),
-    ) as { scripts: Record<string, string> };
+    const pkg = JSON.parse(readFileSync(path.join(__dirname, "..", "package.json"), "utf-8")) as {
+      scripts: Record<string, string>;
+    };
     expect(pkg.scripts["build:pool-server"]).toContain("--external:sharp");
   });
 });

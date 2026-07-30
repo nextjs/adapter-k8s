@@ -8,6 +8,17 @@ import {
   assertSafePoolName,
 } from "./utils.js";
 
+/**
+ * The app HTTPRoute's resource name. Exported because the generic provider's
+ * EnvoyExtensionPolicy must target this exact name: Envoy Gateway accepts a policy whose
+ * targetRef names a route that does not exist, so a mismatch is SILENT — the Gateway programs,
+ * traffic flows, and the ext_proc callout never fires, meaning middleware never runs. Derive it
+ * from here rather than restating the string.
+ */
+export function httpRouteName(releaseName: string): string {
+  return `${releaseName}-routes`;
+}
+
 export function renderGateway({
   releaseName,
   hosts,
@@ -265,7 +276,7 @@ export function renderHTTPRoute({
   const appRoute = `apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
-  name: ${releaseName}-routes
+  name: ${httpRouteName(releaseName)}
 spec:
   parentRefs:
 ${appParentRef}

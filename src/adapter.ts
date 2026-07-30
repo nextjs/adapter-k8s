@@ -11,6 +11,9 @@ import type {
   BuildCompleteContext,
   PoolDefinition,
 } from "./types.js";
+import { genericConfigOf, gkeConfigOf, providerGatewayHosts } from "./types.js";
+import { resolveProvider } from "./providers/index.js";
+import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 
 // Get current directory in a way that works in ESM and CJS bundle
 const _dirname =
@@ -357,7 +360,9 @@ import { generateCelExpression } from "./cel.js";
 import { generateExtensionChain, determineFailureMode } from "./extension-chain.js";
 
 // Output directory matches §18.3 in the design doc
-const OUTPUT_DIR = ".k8s-adapter/output";
+// Variant-scoped: see outputDirName(). A chart is only valid for the target it was emitted for,
+// because the routing tier's registry is baked in at build time.
+const OUTPUT_DIR = (): string => `.k8s-adapter/${outputDirName()}`;
 
 // Where the adapter's esbuild bundles (pool-server.cjs, routing-service.cjs,
 // cache-handler.cjs) live — next to this module in the published package's dist/.
@@ -442,7 +447,7 @@ async function writeOutputFile(
   projectDir: string,
   relativePath: string,
   content: string,
-  baseDir: string = OUTPUT_DIR,
+  baseDir: string = OUTPUT_DIR(),
   mode?: number,
 ): Promise<void> {
   const fullPath = path.join(projectDir, baseDir, relativePath);
@@ -619,8 +624,8 @@ export async function stageFile(
   const absSource = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(projectDir, sourcePath);
 
   const stageDir = isShared
-    ? path.join(projectDir, OUTPUT_DIR, "shared-context")
-    : path.join(projectDir, OUTPUT_DIR, "pools", poolName, "context");
+    ? path.join(projectDir, OUTPUT_DIR(), "shared-context")
+    : path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context");
 
   // path.join normalizes, so `..` segments are resolved here — assert containment on the
   // RESULT (a `../`-keyed asset throws rather than escaping).
@@ -854,7 +859,7 @@ export async function stageSharpRuntimePackages(
 // actionable error. An all-symbols basename sanitizes to "" — fall back to "nextjs"
 // (the `??` on infra.releaseName used to be dead: .replace() never yields null/undefined).
 function deriveReleaseName(projectDir: string): string {
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath)
     ? (readJsonFile(infraPath, "infrastructure.json") as { releaseName?: string })
     : {};
@@ -915,12 +920,28 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
   async function ensureConfig(projectDir: string) {
     if (!config) {
-      // Try to load from project root
-      const configPaths = [
-        path.join(projectDir, "adapter.config.mjs"),
-        path.join(projectDir, "adapter.config.ts"),
-        path.join(projectDir, "adapter.config.js"),
-      ];
+      // ADAPTER_K8S_CONFIG selects a VARIANT, so one project can carry several targets side by
+      // side — `adapter.config.scaleway.mjs` next to `adapter.config.mjs` — instead of swapping
+      // one file back and forth. Swapping is how a GKE deploy ends up pushing to the wrong
+      // registry: the file that decides the target is mutable global state, and forgetting to
+      // restore it is silent until something deploys somewhere unintended.
+      //
+      // The value is a bare variant NAME (`scaleway`), not a path: it is interpolated into a
+      // filename, so a path would let it escape the project directory.
+      const variant = process.env.ADAPTER_K8S_CONFIG?.trim();
+      if (variant !== undefined && !/^[a-z0-9][-a-z0-9_]*$/i.test(variant)) {
+        throw new Error(
+          `[adapter-k8s] ADAPTER_K8S_CONFIG=${JSON.stringify(variant)} is not a valid variant ` +
+            `name. Use a bare name like "scaleway" (loads adapter.config.scaleway.mjs), not a path.`,
+        );
+      }
+      const suffixes = variant ? [`.${variant}`, ""] : [""];
+      // Try to load from project root, preferring the requested variant.
+      const configPaths = suffixes.flatMap((s) => [
+        path.join(projectDir, `adapter.config${s}.mjs`),
+        path.join(projectDir, `adapter.config${s}.ts`),
+        path.join(projectDir, `adapter.config${s}.js`),
+      ]);
 
       for (const p of configPaths) {
         if (existsSync(p)) {
@@ -1136,7 +1157,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           ((nextConfig.experimental as ExperimentalWithServerActions | undefined)?.serverActions
             ?.allowedOrigins ?? []) as string[],
         );
-        for (const host of cfg.provider?.gke?.gateway?.hosts ?? []) {
+        // Server Actions compare Origin vs Host, and every provider serves the app on its
+        // gateway hosts — so this is provider-independent, not a GKE detail.
+        for (const host of providerGatewayHosts(cfg)) {
           const normalized = normalizeDeploymentHost(host.hostname);
           if (normalized) allowedOrigins.add(normalized);
         }
@@ -1320,7 +1343,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // next `helm upgrade`. Only the generated chart dir is cleared — staged
       // build contexts and injected previous-build templates live elsewhere and
       // are managed by their own steps.
-      const chartDir = path.join(projectDir, OUTPUT_DIR, "chart");
+      const chartDir = path.join(projectDir, OUTPUT_DIR(), "chart");
       if (existsSync(chartDir)) await rm(chartDir, { recursive: true, force: true });
 
       // In a monorepo the tracing root (repoRoot) sits above the app dir (projectDir).
@@ -1338,7 +1361,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       }
 
       // Dump raw build context for debugging
-      const debugDir = path.join(projectDir, OUTPUT_DIR, "debug");
+      const debugDir = path.join(projectDir, OUTPUT_DIR(), "debug");
       await mkdir(debugDir, { recursive: true });
       await writeFile(
         path.join(debugDir, "build-context.json"),
@@ -1425,7 +1448,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // releaseName was derived up top (deriveReleaseName — infrastructure.json with a
       // capped basename fallback); infrastructure.json also carries namespace/registry/
       // project values consumed below.
-      const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+      const infraPath = infrastructurePath(projectDir);
       // N50 (review, Medium): readJsonFile names the file and the remedy — this was a bare
       // JSON.parse whose SyntaxError reached the operator with only a character offset.
       const infra = (
@@ -1455,7 +1478,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
       const failureModeAllow = determineFailureMode(outputs, cfg.routingService?.failureMode);
 
-      const gkeProvider = cfg.provider.gke;
+      const gkeProvider = gkeConfigOf(cfg);
 
       // infrastructure.json is operator/CI-managed state, but a tampered or hand-edited
       // value here flows into helm --set, resource names, and chart YAML — validate at
@@ -1538,7 +1561,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             releaseName,
             namespace,
             projectId: infra.projectId!,
-            timeout: gkeProvider.serviceExtensions?.routeExtension?.timeout
+            timeout: gkeProvider?.serviceExtensions?.routeExtension?.timeout
               ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
               : "5s",
             failureModeAllow,
@@ -1588,7 +1611,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           projectDir,
           `chart/${filePath}`,
           content,
-          OUTPUT_DIR,
+          OUTPUT_DIR(),
           SECRET_CHART_FILES.has(filePath) ? 0o600 : undefined,
         );
       }
@@ -1798,7 +1821,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       } else if (containerStrategy === "shared-image") {
         const sharedStageDir = "shared-context";
-        const absSharedStageDir = path.join(OUTPUT_DIR, sharedStageDir);
+        const absSharedStageDir = path.join(OUTPUT_DIR(), sharedStageDir);
 
         // Wipe the context first — see the N50 note in the traced-assets branch: `cp` MERGES,
         // so without this a file deleted from the source keeps shipping inside the image.
@@ -1888,7 +1911,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         );
       } else {
         for (const [poolName, pool] of pools) {
-          const poolDir = path.join(OUTPUT_DIR, "pools", poolName);
+          const poolDir = path.join(OUTPUT_DIR(), "pools", poolName);
           const poolStageDir = path.join(poolDir, "context");
 
           // N50 (review #32, reproduced): WIPE the build context before staging. Invariant 5
@@ -2045,7 +2068,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       await writeOutputFile(
         projectDir,
         "cdn-invalidation.json",
-        JSON.stringify({ invalidateOnDeploy: gkeProvider.cdn?.invalidateOnDeploy ?? true }),
+        JSON.stringify({ invalidateOnDeploy: gkeProvider?.cdn?.invalidateOnDeploy ?? true }),
       );
 
       // Phase 2 artifacts — write to output (computation moved above Helm chart generation).
@@ -2058,7 +2081,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
       // Routing service Dockerfile + context (skip when staging is disabled)
       if (!skipStaging) {
-        const routingServiceDir = path.join(OUTPUT_DIR, "routing-service");
+        const routingServiceDir = path.join(OUTPUT_DIR(), "routing-service");
 
         await writeOutputFile(
           projectDir,
@@ -2208,6 +2231,17 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         generateBuildMetadata({
           buildId,
           nextVersion,
+          // The CLI cannot otherwise tell a generic build from a GKE one, and it makes
+          // provider-specific decisions (kube context, digest resolution, NetworkPolicy
+          // discovery) on that basis.
+          provider: resolveProvider(cfg).name,
+          // The chart bakes this registry into image references; deploy refuses a chart whose
+          // registry does not match the infrastructure it is deploying with.
+          containerRegistry: imageRegistry,
+          ...(() => {
+            const n = genericConfigOf(cfg)?.nodeCidrs;
+            return n !== undefined ? { nodeCidrs: n } : {};
+          })(),
           poolNames: [...pools.keys()],
           // N50 (review #20): NOT `new Date()`. A wall-clock stamp made every regeneration of
           // the same build produce a different build-metadata.json, which defeats the only

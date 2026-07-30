@@ -239,7 +239,10 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
   ]);
 
   // Attach the AUTH string + CA to a ready endpoint when AUTH mode is on.
-  const withAuth = async (endpoint: CacheEndpoint, hasAuth = wantAuthOnCreate): Promise<CacheEndpoint> => {
+  const withAuth = async (
+    endpoint: CacheEndpoint,
+    hasAuth = wantAuthOnCreate,
+  ): Promise<CacheEndpoint> => {
     if (!hasAuth) return endpoint;
     const [authString, caCert] = await Promise.all([
       fetchAuthString(name, region, projectId),

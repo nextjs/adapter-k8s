@@ -151,11 +151,22 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     throw new Error("provider is required in adapter config");
   }
 
-  if (!config.provider.gke?.gateway?.hosts || config.provider.gke.gateway.hosts.length === 0) {
-    throw new Error("provider.gke.gateway.hosts is required and must contain at least one host");
+  // Every provider needs at least one host: the Gateway's listeners and the HTTPRoute's
+  // hostname matching are both derived from it, so a host-less config renders a Gateway that
+  // matches nothing. The message names the provider actually configured rather than always
+  // saying "gke".
+  const providerKey = "gke" in config.provider ? "gke" : "generic";
+  const gatewayHosts =
+    ("gke" in config.provider
+      ? config.provider.gke?.gateway?.hosts
+      : config.provider.generic?.gateway?.hosts) ?? [];
+  if (gatewayHosts.length === 0) {
+    throw new Error(
+      `provider.${providerKey}.gateway.hosts is required and must contain at least one host`,
+    );
   }
 
-  for (const hostConfig of config.provider.gke.gateway.hosts) {
+  for (const hostConfig of gatewayHosts) {
     if (!hostConfig.hostname) {
       throw new Error("each host in provider.gke.gateway.hosts must have a hostname");
     }
@@ -164,6 +175,39 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // Wildcards ("*.example.com") are supported via Certificate Manager with DNS
     // authorization; init provisions the DNS auth + cert automatically.
     assertSafeHostname(hostConfig.hostname);
+  }
+
+  // A generic provider terminates TLS from a Kubernetes Secret (cert-manager, or one you
+  // create) — there is no Certificate Manager to resolve it implicitly the way GKE has. Asking
+  // for TLS without naming that Secret used to DEGRADE to an HTTP-only listener, which is the
+  // worst outcome available: the deploy succeeds, every resource reports healthy, and the app
+  // serves credentials over plaintext. Someone who wrote `tls: { enabled: true }` has stated
+  // their intent; refuse rather than quietly serve something less safe than they asked for.
+  if ("generic" in config.provider) {
+    // Managed cache provisioning is Memorystore, i.e. GCP-only. `cacheManaged` is derived from
+    // "enabled with no url", so a generic config that just says `cache: { enabled: true }` would
+    // either fail late in the deploy or actually provision a Google resource for a cluster that
+    // has nothing to do with Google. Require the BYO url instead.
+    if (config.cache?.enabled && !config.cache.url) {
+      throw new Error(
+        `cache.url is required when cache.enabled is true on provider.generic. Managed cache ` +
+          `provisioning is Memorystore (GCP-only), so there is nothing to provision here — ` +
+          `point cache.url at a Valkey/Redis you run (redis:// or rediss://), or set ` +
+          `cache.enabled: false to run without a shared cache (ISR/PPR-shell revalidation then ` +
+          `becomes per-replica).`,
+      );
+    }
+    const g = config.provider.generic;
+    const wantsTls = (g?.gateway?.hosts ?? []).some((h) => h.tls?.enabled);
+    if (wantsTls && !g?.gateway?.tlsSecretName) {
+      throw new Error(
+        `provider.generic.gateway.tlsSecretName is required when any host sets ` +
+          `tls.enabled: true. A Gateway listener with no certificateRef never programs, so the ` +
+          `alternative is serving plaintext HTTP while reporting success. Create the TLS Secret ` +
+          `(cert-manager, or \`kubectl create secret tls\`) and name it here, or set ` +
+          `tls.enabled: false to serve HTTP deliberately.`,
+      );
+    }
   }
 
   if (config.cache?.enabled) {
@@ -203,19 +247,23 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
       ...config.routeExtension,
     },
     containerStrategy: config.containerStrategy ?? "traced-assets",
-    provider: {
-      ...config.provider,
-      gke: {
-        ...config.provider.gke,
-        cdn: {
-          enabled: false,
-          bucket: "",
-          cacheMode: "USE_ORIGIN_HEADERS",
-          cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
-          invalidateOnDeploy: true,
-          ...config.provider.gke.cdn,
+    // CDN defaults are a GKE concept (Cloud CDN via GCPHTTPFilter). A generic config carries
+    // no CDN block at all, so it passes through untouched rather than growing an empty one.
+    provider: !("gke" in config.provider)
+      ? config.provider
+      : {
+          ...config.provider,
+          gke: {
+            ...config.provider.gke,
+            cdn: {
+              enabled: false,
+              bucket: "",
+              cacheMode: "USE_ORIGIN_HEADERS",
+              cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
+              invalidateOnDeploy: true,
+              ...config.provider.gke.cdn,
+            },
+          },
         },
-      },
-    },
   };
 }

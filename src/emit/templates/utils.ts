@@ -400,9 +400,13 @@ export function assertProbePathsUnowned(app: {
     if (typeof pathname !== "string") return;
     // Probes are requested WITHOUT the basePath (the kubelet and the health check target the
     // pod directly), so compare both forms.
-    const bare = basePath && pathname.startsWith(basePath) ? pathname.slice(basePath.length) : pathname;
+    const bare =
+      basePath && pathname.startsWith(basePath) ? pathname.slice(basePath.length) : pathname;
     for (const candidate of new Set([pathname, bare || "/"])) {
-      if ((RESERVED_PROBE_PATHS as readonly string[]).includes(candidate) && !owned.has(candidate)) {
+      if (
+        (RESERVED_PROBE_PATHS as readonly string[]).includes(candidate) &&
+        !owned.has(candidate)
+      ) {
         owned.set(candidate, kind);
       }
     }

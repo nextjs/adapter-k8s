@@ -488,11 +488,7 @@ describe("writeState — N22/N23: exec.ts only, and last-writer-wins is closed",
     );
     vi.mocked(execCaptureStdin).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
 
-    await writeState(
-      tmpDir,
-      { buildId: "C", previousBuildId: "B", basedOnGeneration: 5 },
-      "rel",
-    );
+    await writeState(tmpDir, { buildId: "C", previousBuildId: "B", basedOnGeneration: 5 }, "rel");
 
     expect(localState(tmpDir)).toMatchObject({ buildId: "C", generation: 6 });
     expect(vi.mocked(execCaptureStdin)).toHaveBeenCalled();

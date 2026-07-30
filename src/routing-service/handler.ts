@@ -642,9 +642,7 @@ export function createRequestHandler(
         redirect.status,
         // S4: this redirect is a middleware/rule verdict, so it may never carry
         // shared-cache freshness — a cached 3xx is served without the callout running.
-        withMiddlewareCachePolicy(
-          withRscCacheBustingGuard(responseHeaders, unvalidatedRscRequest),
-        ),
+        withMiddlewareCachePolicy(withRscCacheBustingGuard(responseHeaders, unvalidatedRscRequest)),
         undefined,
         setCookies,
       );

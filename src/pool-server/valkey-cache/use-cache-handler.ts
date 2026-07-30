@@ -315,8 +315,8 @@ export class ValkeyCacheHandler implements CacheHandler {
         for (const tag of chunk) {
           args.push(tag, JSON.stringify(computeTagUpdate(undefined, now, durations)));
         }
-      // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
-      // the per-build manifest's lifetime the same way entry keys are bounded.
+        // The trailing argv refreshes the manifest key's own TTL on every write (M11), bounding
+        // the per-build manifest's lifetime the same way entry keys are bounded.
         const clamped = await this.client.eval(
           UPDATE_TAGS_SCRIPT,
           1,

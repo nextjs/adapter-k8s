@@ -80,7 +80,14 @@ describe("renderRoutingServiceDeployment", () => {
 
 describe("renderRoutingServiceService", () => {
   it("renders a Service for the routing service", () => {
-    const yaml = renderRoutingServiceService({ releaseName: "my-app" });
+    const yaml = renderRoutingServiceService({
+      releaseName: "my-app",
+      // The NEG annotation is the GKE PROVIDER's contribution now (providers/gke.ts), not a
+      // hardcoded default — a generic cluster has no NEG controller.
+      annotations: {
+        "cloud.google.com/neg": '{"exposed_ports":{"8443":{"name":"my-app-routing-neg"}}}',
+      },
+    });
     // Standalone NEG so the ext_proc traffic-extension backend service can attach it.
     expect(yaml).toContain("cloud.google.com/neg");
     expect(yaml).toContain("my-app-routing-neg");
@@ -236,5 +243,15 @@ describe("renderRoutingServiceDeployment — review findings", () => {
         requestTimeoutMs: '4000"\n            - name: X' as unknown as number,
       }),
     ).toThrow(/requestTimeoutMs/);
+  });
+});
+
+describe("renderRoutingServiceService — provider annotations", () => {
+  it("emits NO cloud annotations by default", () => {
+    // Generic/AKS/EKS clusters have no NEG controller. An annotation naming a Google resource
+    // there is inert at best and misleading at worst; the GKE provider supplies it explicitly.
+    const yaml = renderRoutingServiceService({ releaseName: "my-app" });
+    expect(yaml).not.toContain("cloud.google.com/neg");
+    expect(yaml).toContain("kind: Service");
   });
 });

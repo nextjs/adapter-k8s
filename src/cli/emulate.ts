@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { outputDirName } from "./infrastructure-validation.js";
 import { execCapture, execOrThrow } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveContainerCli, CONTAINER_CLI_CANDIDATES } from "./container-runtime.js";
@@ -99,7 +100,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     await execOrThrow("npx", ["next", "build"], { cwd: projectDir });
   }
 
-  const outputDir = path.join(projectDir, ".k8s-adapter", "output");
+  const outputDir = path.join(projectDir, ".k8s-adapter", outputDirName());
   if (!existsSync(outputDir)) {
     console.error(`${RED}No build output found at ${outputDir}${RESET}`);
     console.error(`Run ${BOLD}npx next build${RESET} with NEXT_ADAPTER_PATH set first.`);
@@ -379,19 +380,19 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
 
     envoyChild?.stdout?.on("data", (d) => {
       for (const raw of d.toString().split("\n").filter(Boolean)) {
-      // S28: child output carries remote-influenced text (middleware error messages echo
-      // request header values, Envoy warnings echo upstream data) — strip control sequences
-      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
-      const line = sanitizeForTerminal(raw);
+        // S28: child output carries remote-influenced text (middleware error messages echo
+        // request header values, Envoy warnings echo upstream data) — strip control sequences
+        // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+        const line = sanitizeForTerminal(raw);
         console.log(`  ${YELLOW}envoy${RESET}             ${DIM}│${RESET} ${line}`);
       }
     });
     envoyChild?.stderr?.on("data", (d) => {
       for (const raw of d.toString().split("\n").filter(Boolean)) {
-      // S28: child output carries remote-influenced text (middleware error messages echo
-      // request header values, Envoy warnings echo upstream data) — strip control sequences
-      // before it reaches the developer's terminal, as tail.ts already does for pod logs.
-      const line = sanitizeForTerminal(raw);
+        // S28: child output carries remote-influenced text (middleware error messages echo
+        // request header values, Envoy warnings echo upstream data) — strip control sequences
+        // before it reaches the developer's terminal, as tail.ts already does for pod logs.
+        const line = sanitizeForTerminal(raw);
         console.error(`  ${YELLOW}envoy${RESET}             ${DIM}│${RESET} ${line}`);
       }
     });

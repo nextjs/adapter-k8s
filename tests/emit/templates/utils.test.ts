@@ -477,9 +477,8 @@ describe("findEmittedNameCollision (N62: the FULL emitted-name set)", () => {
 describe("S17: release names that are YAML booleans", () => {
   it("renders quoted in every template that stamps the name label", async () => {
     const { renderDeployment } = await import("../../../src/emit/templates/deployment.js");
-    const { renderService, renderActiveService } = await import(
-      "../../../src/emit/templates/service.js"
-    );
+    const { renderService, renderActiveService } =
+      await import("../../../src/emit/templates/service.js");
     const { renderNetworkPolicies } = await import("../../../src/emit/templates/network-policy.js");
     for (const releaseName of ["on", "no", "y"]) {
       const rendered = [
@@ -529,9 +528,9 @@ describe("assertProbePathsUnowned", () => {
   });
 
   it("rejects a static OUTPUT at a probe path", () => {
-    expect(() =>
-      assertProbePathsUnowned({ ...clean, staticPathnames: ["/readyz"] }),
-    ).toThrow(/static output/);
+    expect(() => assertProbePathsUnowned({ ...clean, staticPathnames: ["/readyz"] })).toThrow(
+      /static output/,
+    );
   });
 
   it("compares the basePath-stripped form — probes target the pod, without the basePath", () => {

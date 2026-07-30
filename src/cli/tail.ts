@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
-import { assertSafeInfrastructure } from "./infrastructure-validation.js";
+import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 
 const COLORS = [
   "\x1b[36m", // cyan
@@ -26,7 +26,7 @@ export async function runTail(options: { projectDir: string; releaseName: string
   const { projectDir, releaseName } = options;
 
   // Connect to the right cluster
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
     let infra: { projectId?: string; region?: string };
     try {

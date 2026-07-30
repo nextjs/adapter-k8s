@@ -1,5 +1,6 @@
 // src/cli/deploy.ts
 import path from "node:path";
+import { infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import {
   chmodSync,
   existsSync,
@@ -67,6 +68,24 @@ import {
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveContainerCli, targetPlatform } from "./container-runtime.js";
 import type { GcloudCommand } from "./init.js";
+
+/**
+ * How long to wait for a Deployment rollout.
+ *
+ * 120s was arithmetically impossible against the chart's OWN rollout parameters and only ever
+ * passed by luck. The emitted Deployments use `maxUnavailable: 0` with `minReadySeconds: 30` and a
+ * `preStop: sleep 120` (N63, for load-balancer connection draining), so a 2-replica rollout is
+ * strictly serial: each new pod takes ~10s to become ready, +30s before it counts as available,
+ * and the old pod it replaces spends 120s in preStop before the next surge can start. That is
+ * ~200-320s for two replicas — MEASURED on a 3-node arm64 cluster, where the routing tier
+ * reliably tripped the 120s wait while `kubectl rollout status` reported success moments later.
+ * GKE dodged it only because its routing Deployment spec is often unchanged between builds.
+ *
+ * 600s matches the chart's `progressDeadlineSeconds`: that is Kubernetes' own verdict on a stalled
+ * rollout, so waiting less rejects a rollout the cluster still considers healthy, and waiting
+ * longer outlives the deadline that would mark it Failed.
+ */
+const KUBECTL_ROLLOUT_TIMEOUT = "--timeout=600s";
 
 export interface DeployOptions {
   projectDir: string;
@@ -293,9 +312,19 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   const platformArg = `--platform=${targetPlatform()}`;
   const commands: GcloudCommand[] = [];
 
-  // 0. Configure docker authentication for the registry host
+  // 0. Registry authentication — ONLY for Google registries.
+  //
+  // This used to run `gcloud auth configure-docker` for every registry host unconditionally, so
+  // a Harbor/ECR/ACR deploy with perfectly good credentials already configured died before it
+  // built anything, on a machine that has no reason to have gcloud installed. Registry auth is
+  // the registry's business: for anything non-Google we assume the operator's existing
+  // credential setup (docker login, ECR credential helper, az acr login, a pull secret) — the
+  // same assumption every other tool makes.
   const registryHost = registry.split("/")[0];
-  if (registryHost) {
+  const isGoogleRegistry =
+    !!registryHost &&
+    (registryHost.endsWith("-docker.pkg.dev") || /(^|\.)gcr\.io$/.test(registryHost));
+  if (registryHost && isGoogleRegistry) {
     commands.push({
       description: `Configure Docker authentication for ${registryHost}`,
       command: "gcloud",
@@ -423,6 +452,7 @@ export async function resolveDeployImageDigests(opts: {
 }): Promise<Record<string, string>> {
   const digests: Record<string, string> = {};
   const unresolved: string[] = [];
+  const cliLabel = opts.containerCli ?? "docker";
   for (const [key, ref] of opts.refs) {
     // S25: REGISTRY FIRST. kubelet pulls from the registry, so the registry's digest is the
     // only one that can actually be deployed. The local daemon merely usually agrees —
@@ -430,21 +460,35 @@ export async function resolveDeployImageDigests(opts: {
     // RepoDigest describes the local copy and pointing a Deployment at it yields
     // ImagePullBackOff (observed live: podman said e04a0a5b…, the registry held 27fa476b…,
     // and the rollout failed). The local probe stays as the offline/unreachable fallback.
+    // REGISTRY FIRST, on ANY registry (S25/S28). kubelet pulls from the registry, so only the
+    // registry's digest can actually be deployed; the local daemon merely usually agrees, and
+    // podman measurably does not. Artifact Registry is asked through gcloud (proven, and works
+    // with the credential helper); everything else through crane/skopeo/docker-manifest.
+    const cli = opts.containerCli ?? "docker";
+    // The local daemon is the LAST resort, and only for docker. MEASURED with podman 6.0.1:
+    // its RepoDigest matched the registry for one image and differed for another, because push
+    // can rewrite the manifest. An unreliable digest is worse than none — it deploys and then
+    // ImagePullBackOffs at rollout, after cutover has started, whereas refusing fails at deploy
+    // time with something actionable.
     const digest =
       (await resolveRegistryDigest(ref, opts.projectId)) ??
-      (await resolveImageDigest(ref, opts.containerCli ?? "docker"));
+      (await resolveRegistryDigestAny(ref, cli)) ??
+      (cli === "docker" ? await resolveImageDigest(ref, cli) : null);
     if (digest) digests[key] = digest;
     else unresolved.push(ref);
   }
   if (unresolved.length > 0) {
     if (!opts.allowMutableTags) {
       throw new Error(
-        `Could not resolve an immutable digest for: ${unresolved.join(", ")}. Neither ` +
-          `\`docker inspect\` nor the registry could pin these images, so deploying would run ` +
-          `them by TAG — a retag of that tag would change what runs on the next pod start, on ` +
-          `pods that hold the internal dispatch secret and cache credentials. Refusing to ` +
-          `deploy without image integrity. Check registry access (\`gcloud artifacts docker ` +
-          `images describe <ref>\`), or pass --allow-mutable-tags to deploy anyway.`,
+        `Could not resolve an immutable digest for: ${unresolved.join(", ")}. No registry probe ` +
+          `could pin these images, so deploying would run them by TAG — a retag would change ` +
+          `what runs on the next pod start, on pods that hold the internal dispatch secret and ` +
+          `cache credentials. Refusing to deploy without image integrity.\n` +
+          `Fix by installing a registry client (\`crane\` or \`skopeo\`), or check registry ` +
+          `access (Artifact Registry: \`gcloud artifacts docker images describe <ref>\`).\n` +
+          `Note: the local ${cliLabel} daemon is only trusted as a digest source for docker — ` +
+          `podman rewrites manifests on push, so its local digest can differ from the registry's ` +
+          `and deploying it fails at rollout. Pass --allow-mutable-tags to deploy anyway.`,
       );
     }
     console.warn(
@@ -454,6 +498,101 @@ export async function resolveDeployImageDigests(opts: {
     );
   }
   return digests;
+}
+
+const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
+
+/**
+ * S28: resolve an image's digest from ANY registry — ECR, ACR, Harbor, Docker Hub, or a
+ * self-hosted one.
+ *
+ * `resolveRegistryDigest` below speaks only to Artifact Registry via gcloud, so every non-GCP
+ * registry fell through to the LOCAL daemon. That is the exact path podman gets wrong: its
+ * `RepoDigest` describes the local copy, and podman rewrites the manifest on push, so deploying
+ * that value yields ImagePullBackOff (measured: podman said e04a0a5b…, the registry held
+ * 27fa476b…). Shipping EKS/AKS on the local-daemon fallback would inherit a known-broken path.
+ *
+ * Probe order, first answer wins:
+ *  1. `crane digest` — purpose-built, no daemon needed.
+ *  2. `skopeo inspect` — the podman ecosystem's equivalent.
+ *  3. `docker manifest inspect -v` — needs NO extra tooling, and VERIFIED against Artifact
+ *     Registry to report a digest byte-identical to `gcloud artifacts docker images describe`.
+ *     Docker-only: nerdctl has no such subcommand, and podman's `manifest inspect` operates on
+ *     manifest lists it manages locally rather than querying a remote registry.
+ *
+ * Returns null (never throws) so the caller owns the fail-closed decision.
+ */
+export async function resolveRegistryDigestAny(
+  imageRef: string,
+  containerCli: string,
+): Promise<string | null> {
+  const crane = await execCapture("crane", ["digest", imageRef]).catch(() => null);
+  if (crane?.exitCode === 0) {
+    const d = crane.stdout.trim();
+    if (DIGEST_RE.test(d)) return d;
+  }
+
+  const skopeo = await execCapture("skopeo", [
+    "inspect",
+    "--format",
+    "{{.Digest}}",
+    `docker://${imageRef}`,
+  ]).catch(() => null);
+  if (skopeo?.exitCode === 0) {
+    const d = skopeo.stdout.trim();
+    if (DIGEST_RE.test(d)) return d;
+  }
+
+  if (containerCli === "docker") {
+    const res = await execCapture("docker", ["manifest", "inspect", "-v", imageRef]).catch(
+      () => null,
+    );
+    if (res?.exitCode === 0) {
+      try {
+        const parsed: unknown = JSON.parse(res.stdout);
+        // A SINGLE manifest comes back as one object carrying Descriptor.digest — that is the
+        // digest to deploy, and it is the case verified against Artifact Registry.
+        //
+        // A manifest LIST (multi-arch) comes back as an ARRAY of per-platform entries. Taking
+        // element [0] is WRONG: the order is the registry's, so an ARM-first list would pin the
+        // arm64 child and the pods would die with `exec format error` on x86 nodes. The child's
+        // digest is also not the digest of the index the tag points at. Since the platform we
+        // deploy is fixed (see targetPlatform()), select the matching child explicitly and
+        // refuse rather than guess when it is absent.
+        if (Array.isArray(parsed)) {
+          const want = targetPlatform(); // "linux/amd64" unless overridden
+          const [os, arch, variant] = want.split("/");
+          const match = parsed.find((entry) => {
+            const p = (
+              entry as {
+                Descriptor?: {
+                  platform?: { os?: string; architecture?: string; variant?: string };
+                };
+              }
+            ).Descriptor?.platform;
+            if (!p || p.os !== os || p.architecture !== arch) return false;
+            // The VARIANT matters: `linux/arm/v7` and `linux/arm/v6` are different images, so
+            // ignoring it let registry ORDER decide which ARM build got pinned — the same class
+            // of bug as taking element [0]. An unspecified variant matches only an entry with
+            // none, rather than whichever happens to be first.
+            return (p.variant ?? undefined) === (variant ?? undefined);
+          });
+          const d = (match as { Descriptor?: { digest?: string } } | undefined)?.Descriptor?.digest;
+          if (typeof d === "string" && DIGEST_RE.test(d)) return d;
+          // No child for the platform we deploy: fall through to null so the caller fails
+          // closed rather than pinning an image that cannot run.
+          return null;
+        }
+        const digest = (parsed as { Descriptor?: { digest?: string } } | undefined)?.Descriptor
+          ?.digest;
+        if (typeof digest === "string" && DIGEST_RE.test(digest)) return digest;
+      } catch {
+        // Unparseable output is not a digest; fall through to null.
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -474,6 +613,10 @@ export async function resolveRegistryDigest(
   imageRef: string,
   projectId: string,
 ): Promise<string | null> {
+  // Artifact Registry only. Without a GCP project there is nothing to ask — the caller falls
+  // back to the local daemon, and fails closed if that cannot pin it either. A registry-native
+  // probe for ECR/ACR/generic (crane, skopeo) is Phase 2 of the multi-provider plan.
+  if (!projectId) return null;
   const res = await execCapture("gcloud", [
     "artifacts",
     "docker",
@@ -692,6 +835,52 @@ export async function discoverClusterPodCidr({
 const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d{1,2})*$/;
 
 /**
+ * S27: node ranges from the KUBERNETES API, for clusters with no cloud to ask.
+ *
+ * `discoverClusterNodeCidrs` below asks gcloud for the cluster's subnetwork, which a K3s,
+ * kind or on-prem cluster does not have — so the strict NetworkPolicy posture was simply
+ * unavailable there and the dataplane stayed on the broad `0.0.0.0/0 except pods` denylist.
+ * That matters because the routing tier's ext_proc reply carries the internal dispatch secret.
+ *
+ * Node addresses are exact (`/32`) rather than a subnet: the API reports the addresses the
+ * kubelets actually have, which is tighter than the enclosing range and needs no cloud
+ * metadata. The trade is that adding a node requires a redeploy to admit it — acceptable, and
+ * failing CLOSED (a new node's probes are denied until then) is the right direction for a
+ * control whose job is to bound who can reach the dispatch secret.
+ *
+ * Returns null on any failure so the caller owns the fail-closed decision.
+ */
+export async function discoverNodeCidrsFromCluster(): Promise<string | null> {
+  const res = await execCapture("kubectl", [
+    "get",
+    "nodes",
+    "-o",
+    "jsonpath={range .items[*]}{.status.addresses[?(@.type=='InternalIP')].address}{'\\n'}{end}",
+  ]).catch(() => null);
+  if (!res || res.exitCode !== 0) return null;
+
+  const seen: string[] = [];
+  for (const line of res.stdout.split("\n")) {
+    // A node with MORE THAN ONE InternalIP (dual-stack, multi-NIC) puts them all on one
+    // jsonpath line separated by spaces. Splitting per-address is required: treating the line
+    // as a single value rejected the whole cluster, which silently pushed the deploy onto the
+    // broad posture on exactly the clusters most likely to be dual-stack.
+    for (const raw of line.trim().split(/\s+/)) {
+      const ip = raw.trim();
+      if (!ip) continue;
+      // Validated at the point of consumption: these reach a helm --set brace list.
+      // IPv6 gets /128 — rejecting it outright meant a dual-stack node denied its own kubelet.
+      const isV4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(ip);
+      const isV6 = /^[0-9a-fA-F:]+$/.test(ip) && ip.includes(":");
+      if (!isV4 && !isV6) return null;
+      const cidr = isV4 ? `${ip}/32` : `${ip}/128`;
+      if (!seen.includes(cidr)) seen.push(cidr);
+    }
+  }
+  return seen.length > 0 ? seen.join(",") : null;
+}
+
+/**
  * S22: discover the range(s) the cluster's NODES draw their IPs from, for the strict
  * NetworkPolicy posture's kubelet allowance. Same fail-closed contract as
  * `discoverClusterPodCidr`.
@@ -769,9 +958,7 @@ export async function discoverClusterNodeCidrs({
 
   // Distinguish "could not read it" from "read something unusable" — the operator fixes
   // those two differently (cluster/IAM access vs. an unexpected gcloud output shape).
-  const rangeOf = async (
-    subnetName: string,
-  ): Promise<{ cidr: string } | { error: string }> => {
+  const rangeOf = async (subnetName: string): Promise<{ cidr: string } | { error: string }> => {
     const r = await execCapture("gcloud", [
       "compute",
       "networks",
@@ -846,7 +1033,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     yes,
   } = options;
 
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   if (!existsSync(infraPath)) {
     throw new Error(
       "infrastructure.json not found. Run `npx adapter-k8s init` first, " +
@@ -895,8 +1082,73 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     );
   }
 
-  // 0. Ensure kubectl is pointing at the right cluster
-  const canPinContext = Boolean(infra.projectId && infra.region && releaseName);
+  // 1. Run next build (adapter's onBuildComplete generates artifacts)
+  if (!skipBuild) {
+    console.log("\n  → Running next build...");
+    if (!dryRun) {
+      await execOrThrow("npx", ["next", "build"], { cwd: projectDir });
+    } else {
+      console.log("    [dry-run] npx next build");
+    }
+  }
+
+  // 2. Read build metadata to get buildId and pool names
+  const outputDir = path.join(projectDir, ".k8s-adapter", outputDirName());
+  const metadataPath = path.join(outputDir, "build-metadata.json");
+  if (!existsSync(metadataPath)) {
+    throw new Error(`Build metadata not found at ${metadataPath}. Did next build run?`);
+  }
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf-8"));
+  const buildId: string = metadata.buildId;
+  // H2: the buildId comes from generateBuildId()/git refs and is spliced into helm
+  // --set assignments and image tags — reject helm/shell metacharacters up front.
+  assertSafeBuildId(buildId);
+  const pools: string[] = metadata.pools;
+  // Which provider this build targets. Older metadata predates the field; default to gke,
+  // which is what every build before this change was.
+  const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
+
+  // TARGET FINGERPRINT. `.k8s-adapter/output` is shared across config variants, and the routing
+  // tier's image registry is baked into its Deployment template at BUILD time — so `--skip-build`
+  // will happily deploy another target's chart. MEASURED: a Scaleway deploy reused a GKE chart
+  // from minutes earlier and its routing pods went ImagePullBackOff trying to pull
+  // `us-central1-docker.pkg.dev/...` with a 403, after helm had already applied.
+  //
+  // Refuse before helm instead. This compares what the chart was BUILT for against what we are
+  // deploying WITH; a mismatch always means the output on disk belongs to a different target.
+  const builtRegistry: string | undefined =
+    typeof metadata.containerRegistry === "string" ? metadata.containerRegistry : undefined;
+  if (builtRegistry !== undefined && builtRegistry !== infra.containerRegistry) {
+    throw new Error(
+      `The build output in .k8s-adapter/output was emitted for registry ` +
+        `"${builtRegistry}", but this deploy targets "${infra.containerRegistry}". The chart bakes ` +
+        `image references at build time, so deploying it would pull another target's images ` +
+        `(and fail to authenticate against a registry this cluster cannot reach).\n` +
+        `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the output directory is shared between variants.\n` : ""}` +
+        `Re-run without --skip-build so the chart is emitted for this target.`,
+    );
+  }
+
+  if (!Array.isArray(pools)) {
+    throw new Error(`build-metadata.json is missing a "pools" array. Did next build run?`);
+  }
+  for (const poolName of pools) assertSafePoolName(poolName);
+
+  // 0. Ensure kubectl is pointing at the right cluster.
+  //
+  // WHICH cluster is provider-dependent, so this runs AFTER the build metadata is read — the
+  // provider recorded by THIS build is the only authoritative answer.
+  //
+  // Two earlier cuts were both wrong. Choosing on GCP field presence: a generic deployment may
+  // legitimately push to Artifact Registry and record projectId/region, and this block would then
+  // retarget kubectl at `<release>-cluster` — a different cluster than the one being deployed to.
+  // Then peeking at the PREVIOUS build's metadata: it is stale by construction, so switching a
+  // project between providers pinned the wrong way round in both directions (generic→gke skipped
+  // GKE pinning and helm-upgraded whatever context was current; gke→generic pinned the GKE
+  // cluster). Nothing here touches the cluster before this point, so ordering it after the build
+  // costs nothing.
+  const targetsGke = buildProvider === "gke";
+  const canPinContext = Boolean(targetsGke && infra.projectId && infra.region && releaseName);
   if (!dryRun && canPinContext) {
     const clusterName = `${releaseName}-cluster`;
     console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
@@ -958,7 +1210,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // 0b. Discover the cluster pod CIDR for chart-rendered NetworkPolicies (fail-closed —
+  // S24: resolved in preflight below; the build/push commands and the digest probe all use
+  // it. With --skip-push we never probe, and the registry answers for digests (S23), so
+  // docker stays as a harmless placeholder.
+  let containerCli = "docker";
+
+  // 0c. S24: resolve the container runtime BEFORE anything with side effects. Observed with
+  // nerdctl: resolution used to live down in the push branch, so a host whose runtime cannot
+  // build still provisioned Memorystore and rewrote the docker credential config before
+  // dying on the first `build`. A runtime we cannot build with is a preflight failure.
+  if (!dryRun && !skipPush) {
+    containerCli = await resolveContainerCli();
+    if (containerCli !== "docker") console.log(`\n  Container runtime: ${containerCli}`);
+  }
+
+  console.log(`\n  Build ID: ${buildId}`);
+
+  // 2b. Discover the NetworkPolicy source ranges (fail-closed — see discoverClusterPodCidr).
+  // Deliberately AFTER build metadata is read: WHICH discovery to run is provider-dependent,
+  // and the provider is recorded at build time. Asking gcloud on a K3s cluster cannot work.
+  // (was 0b — the cluster pod CIDR for chart-rendered NetworkPolicies —
   // see discoverClusterPodCidr), and the node range the STRICT posture needs for kubelet
   // (S22 — discoverClusterNodeCidrs). Strict is the default, and the only reason it was not
   // is that `nodeCidrs` had to be supplied by hand; discovering it removes that cost
@@ -978,50 +1249,68 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       projectId: infra.projectId,
       allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
     });
-  }
-
-  // S24: resolved in preflight below; the build/push commands and the digest probe all use
-  // it. With --skip-push we never probe, and the registry answers for digests (S23), so
-  // docker stays as a harmless placeholder.
-  let containerCli = "docker";
-
-  // 0c. S24: resolve the container runtime BEFORE anything with side effects. Observed with
-  // nerdctl: resolution used to live down in the push branch, so a host whose runtime cannot
-  // build still provisioned Memorystore and rewrote the docker credential config before
-  // dying on the first `build`. A runtime we cannot build with is a preflight failure.
-  if (!dryRun && !skipPush) {
-    containerCli = await resolveContainerCli();
-    if (containerCli !== "docker") console.log(`\n  Container runtime: ${containerCli}`);
-  }
-
-  // 1. Run next build (adapter's onBuildComplete generates artifacts)
-  if (!skipBuild) {
-    console.log("\n  → Running next build...");
-    if (!dryRun) {
-      await execOrThrow("npx", ["next", "build"], { cwd: projectDir });
+  } else if (!dryRun && buildProvider !== "gke") {
+    // An explicit range wins: discovery snapshots the node addresses that exist RIGHT NOW, so on
+    // a cluster whose nodes come and go (autoscaling, replacement, rolling upgrade) a node added
+    // after this deploy is not in the allowlist and its kubelet cannot reach the pods it hosts —
+    // they never become ready. That fails safe rather than open, but it is still an outage on
+    // those pods, and no amount of deploy-time discovery can predict a future node.
+    const configured: string[] | undefined = Array.isArray(metadata.nodeCidrs)
+      ? metadata.nodeCidrs.filter((c: unknown): c is string => typeof c === "string")
+      : undefined;
+    if (configured && configured.length > 0) {
+      // Validated here because it reaches a helm --set brace list.
+      const bad = configured.filter((c) => !/^[0-9a-fA-F:.]+\/\d{1,3}$/.test(c));
+      if (bad.length > 0) {
+        throw new Error(
+          `provider.generic.nodeCidrs contains invalid CIDR(s): ${bad.join(", ")}. Expected ` +
+            `entries like "10.0.0.0/16".`,
+        );
+      }
+      nodeCidr = configured.join(",");
+      console.log(`    Node ranges from provider.generic.nodeCidrs: ${nodeCidr}`);
     } else {
-      console.log("    [dry-run] npx next build");
+      // No cloud to ask. The Kubernetes API knows the node addresses on every conformant
+      // cluster, which is what the strict posture needs for kubelet probes.
+      nodeCidr = await discoverNodeCidrsFromCluster();
+      if (nodeCidr) {
+        console.log(
+          `    Node ranges discovered from the cluster: ${nodeCidr}\n` +
+            `    ! These are the nodes that exist NOW. If nodes are added or replaced (autoscaling,\n` +
+            `      node upgrades), their kubelets will not be allowed to probe pods until the next\n` +
+            `      deploy — set provider.generic.nodeCidrs to the node subnet to avoid that.`,
+        );
+      }
     }
+    if (!nodeCidr && !allowNoNetworkPolicy) {
+      throw new Error(
+        `Could not read node addresses from the cluster (kubectl get nodes). The strict ` +
+          `NetworkPolicy posture needs them: kubelet liveness/readiness probes come from the ` +
+          `node IP, and an allowlist without it leaves every pod unready. Refusing to deploy ` +
+          `without network isolation — fix cluster access, or pass --allow-no-network-policy.`,
+      );
+    }
+  } else if (!dryRun && !allowNoNetworkPolicy) {
+    // A GKE build whose infrastructure.json is missing projectId/region reached here with BOTH
+    // discoveries skipped. buildHelmUpgradeArgs then sets `strict=false` (it has no nodeCidrs),
+    // and with no podCidrs either the chart's guard renders NO NetworkPolicies at all — so the
+    // deploy silently shipped an unisolated dataplane, reopening the dispatch-secret
+    // extraction path, without the operator ever passing --allow-no-network-policy. That flag
+    // exists precisely so removing isolation is a decision; make it one.
+    const missing = [infra.projectId ? null : "projectId", infra.region ? null : "region"].filter(
+      (m): m is string => m !== null,
+    );
+    throw new Error(
+      `Cannot determine the NetworkPolicy source ranges: .k8s-adapter/infrastructure.json is ` +
+        `missing ${missing.join(" and ")}. Without ${missing.join(" and ")} neither the pod CIDR ` +
+        `nor the node range can be discovered, and the chart would render NO NetworkPolicies — ` +
+        `leaving the routing tier's ext_proc port reachable, which is what makes the internal ` +
+        `dispatch secret obtainable. Run \`npx adapter-k8s init\` to regenerate ` +
+        `infrastructure.json, or pass --allow-no-network-policy to deploy without isolation ` +
+        `deliberately.`,
+    );
   }
 
-  // 2. Read build metadata to get buildId and pool names
-  const outputDir = path.join(projectDir, ".k8s-adapter", "output");
-  const metadataPath = path.join(outputDir, "build-metadata.json");
-  if (!existsSync(metadataPath)) {
-    throw new Error(`Build metadata not found at ${metadataPath}. Did next build run?`);
-  }
-  const metadata = JSON.parse(readFileSync(metadataPath, "utf-8"));
-  const buildId: string = metadata.buildId;
-  // H2: the buildId comes from generateBuildId()/git refs and is spliced into helm
-  // --set assignments and image tags — reject helm/shell metacharacters up front.
-  assertSafeBuildId(buildId);
-  const pools: string[] = metadata.pools;
-  if (!Array.isArray(pools)) {
-    throw new Error(`build-metadata.json is missing a "pools" array. Did next build run?`);
-  }
-  for (const poolName of pools) assertSafePoolName(poolName);
-
-  console.log(`\n  Build ID: ${buildId}`);
   console.log(`  Pools: ${pools.join(", ")}`);
 
   // Managed cache: provision Memorystore and inject its discovered endpoint into the Helm chart.
@@ -1162,7 +1451,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         console.log(`    [dry-run] ${cmd.command} ${cmd.args.join(" ")}`);
       }
     }
-
   }
 
   // S7/S23: pin every image this deploy will run to an immutable digest, and deploy THAT
@@ -1170,7 +1458,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // were pushed by some earlier step, and "we did not push them" is no reason to run them
   // unpinned — the registry can still answer for them. Fail-closed inside
   // resolveDeployImageDigests; --allow-mutable-tags is the opt-out.
-  if (!dryRun && infra.projectId) {
+  // NOT gated on infra.projectId. That is a GCP field, so gating on it meant a generic deploy
+  // skipped digest resolution entirely and shipped MUTABLE TAGS — silently bypassing the
+  // --allow-mutable-tags gate that exists to make that a decision rather than an accident. The
+  // registry PROBE is provider-specific (and no-ops without a project); the REQUIREMENT is not.
+  if (!dryRun) {
     const registry = infra.containerRegistry;
     const refs: Array<[string, string]> =
       containerStrategy === "shared-image"
@@ -1181,7 +1473,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       imageDigests,
       await resolveDeployImageDigests({
         refs,
-        projectId: infra.projectId,
+        // Empty for a generic build: the AR probe no-ops and the local daemon answers.
+        projectId: infra.projectId ?? "",
         allowMutableTags: allowMutableTags ?? false,
         containerCli,
       }),
@@ -1919,7 +2212,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `deployment/${deployName}`,
         "-n",
         K8S_NAMESPACE,
-        "--timeout=120s",
+        KUBECTL_ROLLOUT_TIMEOUT,
       ]);
       // The pod-health gate below is the real readiness gate, but don't walk into it on
       // an already-failed rollout — the exit code was previously discarded, so a stuck
@@ -1964,7 +2257,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `deployment/${routingDeploy}`,
         "-n",
         K8S_NAMESPACE,
-        "--timeout=120s",
+        KUBECTL_ROLLOUT_TIMEOUT,
       ]);
       if (rsRollout.exitCode !== 0) {
         // The new routing pods can't roll — but the OLD routing pods already picked up the
@@ -2011,6 +2304,94 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         );
       }
       console.log("  → ext_proc traffic extension registration job completed ✓");
+    }
+
+    // The SAME boundary, for providers that register ext_proc in-cluster. There is no Job to
+    // wait on, so before this the generic path verified NOTHING: an EnvoyExtensionPolicy with
+    // Accepted=False, a GatewayClass whose controller is not Envoy, or label drift on the proxy
+    // selector would all leave traffic 500ing (fail-closed) or silently routed without the edge
+    // tier — while the deploy printed success. Middleware not running is the exact class of
+    // failure this gate exists for, so it must cover both registration mechanisms.
+    const policyYaml = path.join(outputDir, "chart", "templates", "envoy-extension-policy.yaml");
+    if (existsSync(policyYaml)) {
+      const policyName = `${releaseName}-routing-extproc`;
+      // POLL, and require the condition to be CURRENT for the object's generation.
+      //
+      // A single immediate read was wrong twice over: a freshly reconciled policy may have no
+      // status yet (false abort), and an UPDATED policy retains the previous
+      // `Accepted=True` until the controller catches up (false pass — the dangerous direction,
+      // since it green-lights a cutover whose edge may not be wired). `observedGeneration`
+      // vs `metadata.generation` is what distinguishes "accepted" from "accepted, previously".
+      //
+      // Ancestors are a map-like list, not an ordered one, so `[0]` is not necessarily this
+      // release's Gateway/route — select by the Envoy Gateway controller instead.
+      let status = "";
+      let detail = "";
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const read = await execCapture("kubectl", [
+          "get",
+          "envoyextensionpolicy",
+          policyName,
+          "-n",
+          K8S_NAMESPACE,
+          "-o",
+          "json",
+        ]);
+        detail = (read.stderr || "").trim();
+        if (read.exitCode === 0) {
+          try {
+            const obj = JSON.parse(read.stdout) as {
+              metadata?: { generation?: number };
+              status?: {
+                ancestors?: Array<{
+                  controllerName?: string;
+                  conditions?: Array<{
+                    type?: string;
+                    status?: string;
+                    observedGeneration?: number;
+                  }>;
+                }>;
+              };
+            };
+            const generation = obj.metadata?.generation;
+            const ancestors = obj.status?.ancestors ?? [];
+            const mine =
+              ancestors.find((a) => a.controllerName?.includes("gateway.envoyproxy.io")) ??
+              ancestors[0];
+            const cond = mine?.conditions?.find((c) => c.type === "Accepted");
+            const current =
+              cond !== undefined &&
+              (generation === undefined ||
+                cond.observedGeneration === undefined ||
+                cond.observedGeneration >= generation);
+            if (cond && current) {
+              status = cond.status ?? "";
+              if (status === "True") break;
+              // A definitive False is final — waiting will not fix a rejected policy.
+              if (status === "False") break;
+            }
+          } catch {
+            // Unparseable status: keep polling rather than treating it as a verdict.
+          }
+        }
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (status !== "True") {
+        const edge = await restoreEdgeToPreviousBuild();
+        throw new Error(
+          [
+            `ext_proc EnvoyExtensionPolicy (${policyName}) is not Accepted (status ` +
+              `${status || "unknown"}); refusing traffic cutover because middleware would not ` +
+              `run at the edge.`,
+            sanitizeForTerminal(detail),
+            `Inspect: kubectl describe envoyextensionpolicy ${policyName} -n ${K8S_NAMESPACE}`,
+            `Common causes: the GatewayClass controller is not Envoy Gateway (an ` +
+              `EnvoyExtensionPolicy only applies to one), or the Gateway it targets does not exist.`,
+            ...edgeStatusLines(edge),
+          ].join("\n"),
+        );
+      }
+      console.log("  → ext_proc EnvoyExtensionPolicy accepted ✓");
     }
 
     // 7a-ter. N64: match the outgoing build's CAPACITY before the gate below can pass.

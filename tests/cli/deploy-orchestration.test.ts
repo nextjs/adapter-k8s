@@ -1401,11 +1401,39 @@ describe("runDeploy — N29: an unpinnable kubectl context is confirmed, not sil
       return happyCluster(events)(cmd, args);
     }) as never);
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true, yes: true });
+    // S29: this scenario has no projectId/region, so neither the pod CIDR nor the node range can
+    // be discovered and the chart would render NO NetworkPolicies. That now requires the
+    // explicit opt-out — `--yes` confirms WHICH CLUSTER to mutate, which is a different
+    // question from whether to ship an unisolated dataplane.
+    await runDeploy({
+      projectDir: PROJECT,
+      releaseName: RELEASE,
+      skipBuild: true,
+      yes: true,
+      allowNoNetworkPolicy: true,
+    });
 
     expect(printedWarnings()).toContain("gke_other-project_us-west1_prod-cluster");
     expect(printedWarnings()).toContain("could NOT be pinned");
     expect(events).toContain("helm");
+  });
+
+  it("S29: --yes alone does NOT authorize deploying without NetworkPolicies", async () => {
+    // Previously this combination silently shipped an unisolated dataplane: CIDR discovery was
+    // skipped, buildHelmUpgradeArgs set strict=false, and with no podCidrs the chart's guard
+    // rendered nothing — leaving the routing tier's ext_proc port reachable, which is what makes
+    // the internal dispatch secret obtainable. Two separate risks need two separate consents.
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args.join(" ") === "config current-context") {
+        return { exitCode: 0, stdout: "gke_other-project_us-west1_prod-cluster\n", stderr: "" };
+      }
+      return happyCluster(events)(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true, yes: true }),
+    ).rejects.toThrow(/--allow-no-network-policy/);
+    expect(events).not.toContain("helm");
   });
 
   it("dry-run just says what a real deploy would target", async () => {

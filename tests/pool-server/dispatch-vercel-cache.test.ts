@@ -290,13 +290,19 @@ describe("x-vercel-cache iteration 5: real-build allowQuery shapes", () => {
     } as any);
     const res1 = mockRes();
     await d.dispatch(mockReq("/m/en/one"), res1, {
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang: "en", id: "one" }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang: "en", id: "one" },
+      resolvedHeaders: undefined,
     } as any);
     const res2 = mockRes();
     await d.dispatch(mockReq("/m/fr/one"), res2, {
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang: "fr", id: "one" }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang: "fr", id: "one" },
+      resolvedHeaders: undefined,
     } as any);
     expect(res2._headers["x-vercel-cache"]).toBe("PRERENDER");
   });
@@ -321,14 +327,20 @@ describe("x-vercel-cache iteration 5: real-build allowQuery shapes", () => {
     } as any);
     const res1 = mockRes();
     await d.dispatch(mockReq("/m/en/one"), res1, {
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang: "en", id: "one" }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang: "en", id: "one" },
+      resolvedHeaders: undefined,
     } as any);
     expect(res1._headers["x-vercel-cache"]).toBe("MISS");
     const res2 = mockRes();
     await d.dispatch(mockReq("/m/en/two"), res2, {
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang: "en", id: "two" }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang: "en", id: "two" },
+      resolvedHeaders: undefined,
     } as any);
     expect(res2._headers["x-vercel-cache"]).toBe("HIT");
   });
@@ -364,8 +376,11 @@ describe("x-vercel-cache iteration 7: platform response store for fully-keyed en
   }
   const matchRes = (lang: string, id: string) =>
     ({
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang, id }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang, id },
+      resolvedHeaders: undefined,
     }) as any;
 
   it("replays the stored bytes for a seen fully-keyed entry (no re-render)", async () => {
@@ -430,8 +445,11 @@ describe("x-vercel-cache iteration 8: response store scoping (canary.97 regressi
   }
   const matchRes = (lang: string, id: string) =>
     ({
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang, id }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang, id },
+      resolvedHeaders: undefined,
     }) as any;
 
   it("never byte-replays for shell-bearing (pprRoutes-sourced) keys", async () => {
@@ -460,7 +478,9 @@ describe("x-vercel-cache iteration 8: response store scoping (canary.97 regressi
       poolName: "ssr",
       buildId: "test123",
       staticAssets: [],
-      pprCapableRoutes: { "/m/[lang]/[id]": { rootParams: [], allowQuery: ["nxtPlang", "nxtPid"] } },
+      pprCapableRoutes: {
+        "/m/[lang]/[id]": { rootParams: [], allowQuery: ["nxtPlang", "nxtPid"] },
+      },
       rscConfig: { header: "rsc", suffix: ".rsc" },
       // Harness posture: the RSC exclusion under test must hold on its own merits.
       emulatePlatformCache: true,
@@ -509,8 +529,11 @@ describe("platform response store is E2E-only (production must never byte-replay
   }
   const matchRes = (lang: string, id: string) =>
     ({
-      kind: "route", pool: "ssr", matchedPathname: "/m/[lang]/[id]",
-      routeMatches: { lang, id }, resolvedHeaders: undefined,
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/m/[lang]/[id]",
+      routeMatches: { lang, id },
+      resolvedHeaders: undefined,
     }) as any;
 
   it("re-renders per request in the production posture (emulatePlatformCache off)", async () => {

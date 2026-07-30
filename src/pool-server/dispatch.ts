@@ -611,19 +611,19 @@ async function writeInnerResponse(
         // bytes and the document re-renders (the matrix's empty-entry sharing contract).
         "HIT"
       : effectivePrefix
-      ? "PRERENDER"
-      : nextCache === "HIT" || nextCache === "STALE"
-        ? "HIT"
-        : (nextCache === "MISS" || headers["x-nextjs-postponed"] !== undefined) &&
-            buildFallbackBacked
-          ? // A BUILD fallback artifact answered this serve. Two measured shapes: Next
-            // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
-            // now), or — fresh-key shell+resume — the response carries only
-            // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
-            // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
-            // the HIT/STALE arm above runs first.
-            "PRERENDER"
-          : "MISS";
+        ? "PRERENDER"
+        : nextCache === "HIT" || nextCache === "STALE"
+          ? "HIT"
+          : (nextCache === "MISS" || headers["x-nextjs-postponed"] !== undefined) &&
+              buildFallbackBacked
+            ? // A BUILD fallback artifact answered this serve. Two measured shapes: Next
+              // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
+              // now), or — fresh-key shell+resume — the response carries only
+              // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
+              // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
+              // the HIT/STALE arm above runs first.
+              "PRERENDER"
+            : "MISS";
   }
   // The combined response is shell bytes followed by resume bytes, so neither
   // component's content length describes the final body.
@@ -2777,8 +2777,7 @@ export function createDispatcher(options: DispatcherOptions) {
             const aq = pprRoutes[candidate]?.allowQuery ?? capableAq;
             if (!aq) continue;
             platformStoreEligible = capableAq !== undefined && platformDocumentRequest;
-            const params =
-              extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
+            const params = extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
             // The build emits nxtP-prefixed param names in allowQuery; extracted route
             // params are bare. Try both spellings (measured on the matrix fixture:
             // ["nxtPlang"] vs params.lang — unnormalized, every key per template collapsed).

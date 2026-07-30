@@ -6,7 +6,11 @@ import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { checkContainerRuntime } from "./container-runtime.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
-import { assertSafeInfrastructure } from "./infrastructure-validation.js";
+import {
+  assertSafeInfrastructure,
+  infrastructurePath,
+  outputDirName,
+} from "./infrastructure-validation.js";
 
 // The release lives in the literal "default" namespace (init binds Workload Identity
 // there; deploy/rollback/state/destroy all pin it). Pin every kubectl read here too —
@@ -188,7 +192,7 @@ export async function runDoctor(options: {
   const results: CheckResult[] = [];
 
   // Ensure kubectl is pointing at the right cluster
-  const infraPathForCtx = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPathForCtx = infrastructurePath(projectDir);
   if (existsSync(infraPathForCtx)) {
     const infraCtx = readJsonFile<{ projectId?: string; region?: string }>(infraPathForCtx);
     // S13: validate before these reach a gcloud/kubectl argv.
@@ -230,7 +234,7 @@ export async function runDoctor(options: {
   results.push(await checkContainerRuntime());
 
   // --- Local config ---
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
     results.push({ name: "infrastructure.json", status: "pass", message: infraPath });
   } else {
@@ -666,7 +670,12 @@ export async function runDoctor(options: {
       if (svcNames.length > 0) svcSource = "cluster";
     }
     if (svcSource !== "cluster") {
-      const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+      const metaPath = path.join(
+        projectDir,
+        ".k8s-adapter",
+        outputDirName(),
+        "build-metadata.json",
+      );
       if (existsSync(metaPath)) {
         try {
           const meta = readJsonFile<{ pools?: unknown }>(metaPath);
@@ -1214,7 +1223,7 @@ export async function runDomainChecks(options: {
   // FAIL — a release unreachable at its own hostname must not report a successful deploy.
 }): Promise<{ failures: number }> {
   const { projectDir, releaseName } = options;
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   if (!existsSync(infraPath)) return { failures: 0 };
 
   const infra = readJsonFile<{ projectId?: string; hosts?: string[]; host?: string }>(infraPath);

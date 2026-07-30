@@ -127,18 +127,19 @@ describe("deploy-mode 404: .next/server/app/_not-found.html disk fallback", () =
     const appDir = path.join(stage, ".next", "server", "app");
     const { mkdirSync } = await import("node:fs");
     mkdirSync(appDir, { recursive: true });
-    writeFileSync(path.join(appDir, "_not-found.html"), "<html><body>disk not found page</body></html>");
+    writeFileSync(
+      path.join(appDir, "_not-found.html"),
+      "<html><body>disk not found page</body></html>",
+    );
     const prevCwd = process.cwd();
     process.chdir(stage);
     try {
       const seen: string[] = [];
       const dispatcher = makeDispatcher(seen, []);
       const res = mockRes();
-      await dispatcher.dispatch(
-        mockReq("/missing-font", { "sec-fetch-dest": "font" }),
-        res,
-        { kind: "not-found" } as any,
-      );
+      await dispatcher.dispatch(mockReq("/missing-font", { "sec-fetch-dest": "font" }), res, {
+        kind: "not-found",
+      } as any);
       expect(res._status).toBe(404);
       expect(String(res._headers["content-type"])).toContain("text/html");
       expect(res._body).toContain("disk not found page");

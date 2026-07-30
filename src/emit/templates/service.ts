@@ -57,9 +57,16 @@ spec:
 export function renderActiveService({
   poolName,
   releaseName,
+  emitHealthCheckPolicy = true,
 }: {
   poolName: string;
   releaseName: string;
+  /**
+   * `networking.gke.io/v1 HealthCheckPolicy` is a GKE CRD. It does NOT exist on k3s, EKS or
+   * AKS, and a chart containing an unknown API group is rejected WHOLE — one stray document
+   * fails the entire install rather than degrading. Providers that are not GKE pass false.
+   */
+  emitHealthCheckPolicy?: boolean;
 }): string {
   assertSafeReleaseName(releaseName);
   assertSafePoolName(poolName);
@@ -90,7 +97,9 @@ spec:
   ports:
     - port: 3000
       targetPort: 3000
----
+${
+  emitHealthCheckPolicy
+    ? `---
 apiVersion: networking.gke.io/v1
 kind: HealthCheckPolicy
 metadata:
@@ -121,7 +130,9 @@ spec:
   targetRef:
     group: ""
     kind: Service
-    name: ${stableName}
+    name: ${stableName}`
+    : ""
+}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

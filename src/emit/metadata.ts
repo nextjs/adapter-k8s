@@ -19,6 +19,9 @@ export function generateBuildMetadata({
   nextVersion,
   poolNames,
   generatedAt,
+  provider,
+  containerRegistry,
+  nodeCidrs,
   containerStrategy,
   hasMiddleware,
   failureModeAllow,
@@ -53,11 +56,30 @@ export function generateBuildMetadata({
    */
   incrementalCacheHandler: boolean;
   cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string } | undefined;
+  /**
+   * Which provider this build targets. The CLI is otherwise unable to tell: it infers "GCP"
+   * from the presence of infrastructure.json fields, so a generic build looked to `deploy`
+   * exactly like a misconfigured GKE one — it skipped image-digest resolution (silently
+   * bypassing the --allow-mutable-tags gate), could not pin a kube context, and tried to
+   * discover NetworkPolicy ranges through gcloud.
+   */
+  provider: string;
+  /**
+   * Registry the emitted chart's image references were built against. The routing tier's image
+   * is baked into its Deployment template at BUILD time, so a chart is only valid for the
+   * registry it was emitted for — see the fingerprint check in deploy.ts.
+   */
+  containerRegistry?: string | undefined;
+  /** provider.generic.nodeCidrs, if set — deploy prefers it over live node discovery. */
+  nodeCidrs?: string[] | undefined;
 }): string {
   return JSON.stringify(
     {
       buildId,
       nextVersion,
+      provider,
+      ...(containerRegistry ? { containerRegistry } : {}),
+      ...(nodeCidrs && nodeCidrs.length > 0 ? { nodeCidrs } : {}),
       pools: poolNames,
       generatedAt,
       containerStrategy,
