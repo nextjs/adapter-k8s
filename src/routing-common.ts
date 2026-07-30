@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import NextRouting from "@next/routing";
 import type { ResolveRoutesParams } from "@next/routing";
+import { isSafePattern } from "redos-detector";
 const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
@@ -182,13 +183,11 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  *     tiny requests then stall both tiers past their health-check deadlines, so a matcher an
  *     app author wrote for convenience becomes a remote availability bug.
  *
- * The guard is a conservative shape check, not a solver. It refuses both nested quantifiers and
- * quantified groups containing alternation. The latter deliberately rejects safe-looking forms
- * such as `(foo|bar)+` too: proving alternatives non-overlapping requires automaton analysis, while
- * accepting `(a|aa)+` gives a remote client an exponential event-loop stall with only a few dozen
- * input bytes. A rejected pattern degrades to exact string comparison — the same fallback an
- * uncompilable pattern already took — rather than throwing, because a matcher that cannot be
- * evaluated must never silently widen coverage.
+ * Cheap shape checks refuse nested quantifiers and quantified groups containing alternation.
+ * A bounded automaton analysis then catches cross-group ambiguity such as `a*a*a*a*a*b`, which
+ * no local group walk can see. A rejected pattern degrades to exact string comparison — the same
+ * fallback an uncompilable pattern already took — rather than throwing, because a matcher that
+ * cannot be evaluated must never silently widen coverage.
  *
  * The degrade is a RUNTIME last resort, not the intended way an author learns about this. The
  * shape is fully known at build time, so `manifest.ts` runs the same predicate
@@ -197,22 +196,27 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  * for a config mistake; `next build` is the right one. Reaching the degrade path therefore means
  * a manifest built before that check existed, or one hand-edited afterwards.
  *
- * This remains intentionally narrower than a general safe-regex theorem; the two known
- * exponential families admitted by the old code are bounded here without adding a native RE2
- * dependency to both dataplane bundles. The build-time half shares this exact predicate.
+ * The analyzer itself is bounded too. A complex or unsupported expression that exceeds the
+ * score or deterministic step budget is unsafe rather than allowed through on an inconclusive
+ * verdict. The build-time half shares this exact predicate.
  */
 const conditionRegexCache = new Map<string, RegExp | null>();
-const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
 
 /**
- * True when an alternation occurs anywhere inside a group that is then repeated.
+ * Identify a repeated group that contains either another quantifier or alternation.
  *
- * This is a tiny syntax walk rather than another regexp so escaped pipes, character classes,
- * non-capturing groups and nested groups are handled consistently. Alternation state propagates
- * to the parent: `((a|aa))+` is the same dangerous family as `(a|aa)+`.
+ * This is a tiny syntax walk rather than another regexp so escaped metacharacters, character
+ * classes, group prefixes and nested groups are handled consistently. State propagates to the
+ * parent: `((a|aa))+` and `((aa?))+` retain the hazards of their inner groups. In particular,
+ * `?` must count as an INNER quantifier — `(aa?)+` is the same exponential language as
+ * `(a|aa)+` — while the `?` that opens `(?:...)`/`(?=...)` is syntax, not repetition.
  */
-function hasQuantifiedAlternation(value: string): boolean {
-  const groups: Array<{ containsAlternation: boolean }> = [];
+function quantifiedGroupHazard(value: string): "nested quantifier" | "alternation" | null {
+  const groups: Array<{
+    openIndex: number;
+    containsAlternation: boolean;
+    containsQuantifier: boolean;
+  }> = [];
   let inCharacterClass = false;
 
   for (let i = 0; i < value.length; i++) {
@@ -230,25 +234,40 @@ function hasQuantifiedAlternation(value: string): boolean {
       continue;
     }
     if (ch === "(") {
-      groups.push({ containsAlternation: false });
+      groups.push({ openIndex: i, containsAlternation: false, containsQuantifier: false });
       continue;
     }
     if (ch === "|" && groups.length > 0) {
       groups[groups.length - 1]!.containsAlternation = true;
       continue;
     }
+    if (
+      groups.length > 0 &&
+      (ch === "+" || ch === "*" || ch === "?" || ch === "{") &&
+      // `?` immediately after this group's opening parenthesis introduces a non-capturing,
+      // lookaround or named group. It does not quantify an atom.
+      !(ch === "?" && groups[groups.length - 1]!.openIndex === i - 1)
+    ) {
+      groups[groups.length - 1]!.containsQuantifier = true;
+      continue;
+    }
     if (ch !== ")" || groups.length === 0) continue;
 
     const group = groups.pop()!;
-    if (group.containsAlternation && groups.length > 0) {
-      groups[groups.length - 1]!.containsAlternation = true;
-    }
     const next = value[i + 1];
-    if (group.containsAlternation && (next === "+" || next === "*" || next === "{")) {
-      return true;
+    const groupIsQuantified = next === "+" || next === "*" || next === "?" || next === "{";
+    const groupIsRepeated = next === "+" || next === "*" || next === "{";
+    if (groupIsRepeated) {
+      if (group.containsQuantifier) return "nested quantifier";
+      if (group.containsAlternation) return "alternation";
+    }
+    if (groups.length > 0) {
+      const parent = groups[groups.length - 1]!;
+      parent.containsAlternation ||= group.containsAlternation;
+      parent.containsQuantifier ||= group.containsQuantifier || groupIsQuantified;
     }
   }
-  return false;
+  return null;
 }
 
 /**
@@ -258,16 +277,51 @@ function hasQuantifiedAlternation(value: string): boolean {
  * "pathological" (the two-resolver-tier drift problem this module exists to prevent).
  */
 export function unsafeConditionPattern(value: string): string | null {
-  if (NESTED_QUANTIFIER_RE.test(value)) {
+  // Bound parser/compiler work too. This is build-authored in normal operation, but a hand-edited
+  // runtime manifest must not turn first-request compilation into a separate CPU spike.
+  if (value.length > 4096) {
+    return "the pattern exceeds the 4096-character analysis and compilation limit";
+  }
+  const hazard = quantifiedGroupHazard(value);
+  if (hazard === "nested quantifier") {
     return (
       "a quantified group containing another quantifier can backtrack exponentially against a " +
       "request-controlled value, blocking the event loop"
     );
   }
-  if (hasQuantifiedAlternation(value)) {
+  if (hazard === "alternation") {
     return (
       "a quantified group containing alternation can backtrack exponentially against a " +
       "request-controlled value, blocking the event loop"
+    );
+  }
+  if (/\\k</.test(value)) {
+    return "named backreferences are not supported by the bounded automaton analysis";
+  }
+  try {
+    // redos-detector 6.x parses lookbehind and numeric backreferences, but not JavaScript named
+    // capture syntax. Names do not change the automaton, so remove only the `?<name>` marker for
+    // analysis. Named backreferences were refused above because replacing those would require a
+    // capture-numbering rewrite rather than this semantics-preserving marker removal.
+    const analyzableValue = value.replace(/\(\?<[$A-Z_a-z][$\w]*>/g, "(");
+    const analysis = isSafePattern(`^${analyzableValue}$`, {
+      // The library scores alternate paths through the expression. A finite, deterministic step
+      // budget is mandatory: an analyzer that can itself run without a bound merely moves the
+      // DoS, while a wall-clock timeout could reject a build-approved pattern only when a pod is
+      // under load and silently narrow middleware coverage.
+      maxScore: 200,
+      maxSteps: 500,
+    });
+    if (!analysis.safe) {
+      return (
+        "bounded automaton analysis found ambiguous matching paths or could not prove the " +
+        "pattern safe within its fixed budget; synchronous evaluation could block the event loop"
+      );
+    }
+  } catch {
+    return (
+      "bounded automaton analysis could not parse or prove this pattern safe for synchronous " +
+      "evaluation against a request-controlled value"
     );
   }
   return null;

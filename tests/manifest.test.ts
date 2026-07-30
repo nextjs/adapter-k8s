@@ -146,6 +146,14 @@ describe("buildRoutingManifest", () => {
       }
     });
 
+    it("rejects ambiguous adjacent repetitions found by bounded automaton analysis", () => {
+      for (const value of ["a*a*a*a*a*b", "a.*a.*a.*a.*a.*b"]) {
+        expect(buildWithCondition({ type: "header", key: "x-value", value }), value).toThrow(
+          /bounded automaton analysis/,
+        );
+      }
+    });
+
     it("allows a presence-only condition (no value is ever compiled)", () => {
       expect(buildWithCondition({ type: "header", key: "x-tier" })).not.toThrow();
     });
@@ -169,9 +177,13 @@ describe("buildRoutingManifest", () => {
         "(x*)*",
         "^(ab+)+$",
         "([0-9]{2,})+",
+        "(aa?)+",
         "(a|aa)+",
         "(aa|a)*",
         "((?:ab|aba)){2,}",
+        "a*a*a*a*a*b",
+        "a.*a.*a.*a.*a.*b",
+        "[a-z]+-[0-9]+",
         "^.*$",
       ];
       for (const value of corpus) {

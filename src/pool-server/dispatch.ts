@@ -2256,11 +2256,12 @@ export function createDispatcher(options: DispatcherOptions) {
             // Buffer before this validator was computed — even for a matching If-None-Match.
             // Hash once through a bounded async stream when the build did not supply an ETag,
             // then decide 304/HEAD before allocating or opening the response body.
-            const etag = String(
-              ownedEtag ?? (await staticAssetEtagForFileAsync(fullPath, staticStat)),
-            );
+            const etag =
+              ownedEtag === null || ownedEtag === undefined
+                ? await staticAssetEtagForFileAsync(fullPath, staticStat)
+                : String(ownedEtag);
             if (manifestEtagKey && manifestEtagKey !== "etag") delete headers[manifestEtagKey];
-            headers.etag = etag;
+            if (etag !== null) headers.etag = etag;
             if (staticAsset.prerender) {
               // Next's generated entrypoint emits origin-cache directives (s-maxage/SWR) because
               // it normally owns ISR. In this adapter Valkey is the mutable ISR/PPR cache; Cloud
@@ -2282,7 +2283,7 @@ export function createDispatcher(options: DispatcherOptions) {
               headers,
               cdnCacheTag(String(headers["cache-control"] ?? staticAsset.cacheControl), buildId),
             );
-            if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
+            if (etag !== null && ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
               res.writeHead(304, headers);
               res.end();
               return;

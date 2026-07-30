@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  __etagHashStatsForTests,
   __resetEtagCacheForTests,
   ifNoneMatchMatches,
   staticAssetEtag,
@@ -49,5 +50,24 @@ describe("staticAssetEtagForFileAsync", () => {
     await expect(staticAssetEtagForFileAsync(filePath, stat)).resolves.toBe(
       staticAssetEtag(content),
     );
+  });
+
+  it("bounds concurrent distinct cold hashes and sheds excess validator work", async () => {
+    tempDir = mkdtempSync(path.join(os.tmpdir(), "stream-etag-fanout-"));
+    const { maxActive, maxPending } = __etagHashStatsForTests();
+    const calls = Array.from({ length: maxPending + 1 }, (_, index) => {
+      const filePath = path.join(tempDir!, `asset-${index}.bin`);
+      writeFileSync(filePath, String(index));
+      return staticAssetEtagForFileAsync(filePath, statSync(filePath));
+    });
+    const during = __etagHashStatsForTests();
+    expect(during.active).toBe(maxActive);
+    expect(during.pending).toBe(maxPending);
+    expect(during.queued).toBe(maxPending - maxActive);
+
+    const results = await Promise.all(calls);
+    expect(results.filter((etag) => etag === null)).toHaveLength(1);
+    expect(results.filter((etag) => etag !== null)).toHaveLength(maxPending);
+    expect(__etagHashStatsForTests()).toMatchObject({ active: 0, queued: 0, pending: 0 });
   });
 });

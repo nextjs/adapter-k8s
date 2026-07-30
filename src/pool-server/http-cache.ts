@@ -36,20 +36,37 @@ export function ifNoneMatchMatches(value: string | undefined, etag: string): boo
  * computed once per file per process.
  *
  * Bounded so a large public/ directory cannot itself become the leak: entries are small
- * (a path plus a base64 digest) and the map is cleared wholesale when it exceeds the cap,
- * which costs one recompute per file rather than tracking LRU order.
+ * (a path plus a base64 digest) and insertion order is maintained as an LRU.
  */
 const MAX_MEMOIZED_ETAGS = 4096;
 const etagCache = new Map<string, string>();
 const pendingEtagCache = new Map<string, Promise<string>>();
+const MAX_CONCURRENT_ETAG_HASHES = 4;
+const MAX_PENDING_ETAG_HASHES = 64;
+let activeEtagHashes = 0;
+const etagHashQueue: Array<() => void> = [];
 
 function etagCacheKey(filePath: string, stat: { size: number; mtimeMs: number }): string {
   return `${filePath}:${stat.size}:${stat.mtimeMs}`;
 }
 
 function rememberEtag(key: string, etag: string): void {
-  if (etagCache.size >= MAX_MEMOIZED_ETAGS) etagCache.clear();
+  etagCache.delete(key);
+  while (etagCache.size >= MAX_MEMOIZED_ETAGS) {
+    const oldest = etagCache.keys().next().value;
+    if (oldest === undefined) break;
+    etagCache.delete(oldest);
+  }
   etagCache.set(key, etag);
+}
+
+function cachedEtag(key: string): string | undefined {
+  const cached = etagCache.get(key);
+  if (cached === undefined) return undefined;
+  // Map iteration order is the LRU order. Touch on every hit.
+  etagCache.delete(key);
+  etagCache.set(key, cached);
+  return cached;
 }
 
 export function staticAssetEtagForFile(
@@ -58,35 +75,68 @@ export function staticAssetEtagForFile(
   readContent: () => Buffer,
 ): string {
   const key = etagCacheKey(filePath, stat);
-  const cached = etagCache.get(key);
+  const cached = cachedEtag(key);
   if (cached !== undefined) return cached;
   const etag = staticAssetEtag(readContent());
   rememberEtag(key, etag);
   return etag;
 }
 
+function pumpEtagHashQueue(): void {
+  while (activeEtagHashes < MAX_CONCURRENT_ETAG_HASHES && etagHashQueue.length > 0) {
+    etagHashQueue.shift()!();
+  }
+}
+
+function hashFileWithAdmission(filePath: string): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const start = (): void => {
+      activeEtagHashes++;
+      const hash = createHash("sha1");
+      let settled = false;
+      const settle = (error: Error | null, etag?: string): void => {
+        if (settled) return;
+        settled = true;
+        activeEtagHashes--;
+        pumpEtagHashQueue();
+        if (error) reject(error);
+        else resolve(etag!);
+      };
+      try {
+        const stream = createReadStream(filePath);
+        stream.on("data", (chunk: Buffer) => hash.update(chunk));
+        stream.once("error", (error) => settle(error));
+        stream.once("end", () => settle(null, `"${hash.digest("base64url")}"`));
+      } catch (error) {
+        settle(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
+
+    if (activeEtagHashes < MAX_CONCURRENT_ETAG_HASHES) start();
+    else etagHashQueue.push(start);
+  });
+}
+
 /**
  * The manifest dispatch path needs the same strong, per-file ETag without first allocating the
  * whole asset or synchronously hashing it on the event loop. Hash one bounded stream, share that
- * work across concurrent first requests, then reuse the digest for the process lifetime.
+ * work across concurrent first requests, then reuse the digest for the process lifetime. Distinct
+ * cold assets are bounded too: at most four descriptors/hash streams run and at most 64 unique
+ * hashes may be active or queued. Beyond that, return null so dispatch can safely serve without
+ * a validator instead of turning an asset fan-out into descriptor/memory exhaustion.
  */
 export async function staticAssetEtagForFileAsync(
   filePath: string,
   stat: { size: number; mtimeMs: number },
-): Promise<string> {
+): Promise<string | null> {
   const key = etagCacheKey(filePath, stat);
-  const cached = etagCache.get(key);
+  const cached = cachedEtag(key);
   if (cached !== undefined) return cached;
   const pending = pendingEtagCache.get(key);
   if (pending) return pending;
+  if (pendingEtagCache.size >= MAX_PENDING_ETAG_HASHES) return null;
 
-  const computation = new Promise<string>((resolve, reject) => {
-    const hash = createHash("sha1");
-    const stream = createReadStream(filePath);
-    stream.on("data", (chunk: Buffer) => hash.update(chunk));
-    stream.once("error", reject);
-    stream.once("end", () => resolve(`"${hash.digest("base64url")}"`));
-  });
+  const computation = hashFileWithAdmission(filePath);
   pendingEtagCache.set(key, computation);
   try {
     const etag = await computation;
@@ -99,6 +149,24 @@ export async function staticAssetEtagForFileAsync(
 
 /** Test seam — the cache is process-global, so a test that asserts recompute must reset it. */
 export function __resetEtagCacheForTests(): void {
+  if (activeEtagHashes !== 0 || etagHashQueue.length !== 0 || pendingEtagCache.size !== 0) {
+    throw new Error("cannot reset ETag caches while hashes are active or queued");
+  }
   etagCache.clear();
-  pendingEtagCache.clear();
+}
+
+export function __etagHashStatsForTests(): {
+  active: number;
+  queued: number;
+  pending: number;
+  maxActive: number;
+  maxPending: number;
+} {
+  return {
+    active: activeEtagHashes,
+    queued: etagHashQueue.length,
+    pending: pendingEtagCache.size,
+    maxActive: MAX_CONCURRENT_ETAG_HASHES,
+    maxPending: MAX_PENDING_ETAG_HASHES,
+  };
 }
