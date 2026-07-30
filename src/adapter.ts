@@ -803,6 +803,84 @@ async function stagePackageTree(
   }
 }
 
+// Stage `next`'s OWN declared runtime dependencies beside `next` in the traced context.
+//
+// Next resolves several packages at RUNTIME rather than bundling them, through mechanisms no
+// tracer can follow: the pool's `appReq("next/dist/server/web/sandbox")`, and turbopack's
+// externalRequire inside next-server's compiled runtimes. Two CrashLoops on GKE from the same
+// gap, found by the cluster topology with upstream's middleware-responses fixture:
+//
+//   Cannot find module '@swc/helpers/_/_interop_require_default'
+//     <- next/dist/shared/lib/constants.js <- next/dist/server/web/sandbox/context.js
+//   Cannot find module 'styled-jsx'
+//     <- next/dist/compiled/next-server/pages-turbo.runtime.prod.js  (route /_error)
+//
+// The traced image shipped 8 top-level packages. Naming victims one CrashLoop at a time does
+// not converge, so mirror the declaration instead: whatever the app's installed `next` lists
+// as a dependency is what Next expects to resolve at runtime. Reading it from the installed
+// package (not a hardcoded list) is what stops this rotting as Next's deps move between
+// releases. Cost is a few MB against a several-hundred-MB image.
+//
+// Resolves app-first: these must match the app's own next install, not the adapter's.
+export async function stageNextRuntimeDependencies(
+  projectDir: string,
+  poolName: string,
+  isShared: boolean = false,
+  resolveDep?: (dep: string, projectDir: string) => string | undefined,
+): Promise<{ staged: string[]; unresolved: string[] }> {
+  // App-ONLY, deliberately: resolveDepDir's adapter fallback would stage the ADAPTER's next
+  // (and its deps) into an app that has none — a version pairing guaranteed not to match the
+  // build output. An app without a resolvable next is not buildable anyway.
+  const fromDir = (dep: string, dir: string): string | undefined => {
+    try {
+      return path.dirname(
+        createRequire(path.join(dir, "package.json")).resolve(`${dep}/package.json`),
+      );
+    } catch {
+      return undefined;
+    }
+  };
+  const nextDir = (resolveDep ?? fromDir)("next", projectDir);
+  const staged: string[] = [];
+  const unresolved: string[] = [];
+  if (!nextDir || !existsSync(nextDir)) return { staged, unresolved };
+
+  let deps: string[];
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(nextDir, "package.json"), "utf-8")) as {
+      dependencies?: Record<string, string>;
+    };
+    deps = Object.keys(pkg.dependencies ?? {});
+  } catch {
+    // Unreadable next/package.json — the build would already be failing elsewhere.
+    return { staged, unresolved };
+  }
+
+  // Resolve each dep from next's OWN location first (pnpm nests them there), then the app
+  // root (npm/yarn hoist them). That is the same order next itself would resolve them in.
+  const resolveRuntimeDep =
+    resolveDep ?? ((dep: string, dir: string) => fromDir(dep, nextDir) ?? fromDir(dep, dir));
+
+  for (const dep of deps) {
+    const dir = resolveRuntimeDep(dep, projectDir);
+    if (!dir || !existsSync(dir)) {
+      // Warn rather than throw. A pnpm/monorepo layout can hide one, and refusing to build
+      // over a package the app may never load would be worse than the CrashLoop it prevents.
+      // When it does matter, the pool now fails at startup naming the real missing module.
+      console.warn(
+        `[adapter-k8s] Could not resolve "${dep}" (a declared dependency of next) from ` +
+          `${projectDir}. Next resolves some of these at runtime, so the "${poolName}" pool ` +
+          `container may fail to start with a module-not-found error.`,
+      );
+      unresolved.push(dep);
+      continue;
+    }
+    await stagePackageTree(projectDir, dep, dir, poolName, isShared);
+    staged.push(dep);
+  }
+  return { staged, unresolved };
+}
+
 // Stage sharp's linux-x64 native packages into the pool's traced-assets context.
 // npm installs platform-specific optional packages for the BUILD host only, so a
 // darwin/arm64 host won't have the linux-x64 pair at all — in that case fall back to
@@ -1804,6 +1882,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             isShared,
           );
         }
+
+        // next's declared runtime dependencies (see stageNextRuntimeDependencies) — the ones
+        // Next resolves rather than bundles. Without them pools CrashLoop on edge middleware
+        // and on the Pages Router server runtime.
+        await stageNextRuntimeDependencies(projectDir, poolName, isShared);
 
         // sharp's native linux-x64 packages (see stageSharpRuntimePackages) — pool-server.cjs
         // inlines sharp's JS but requires the platform binding at RUNTIME.

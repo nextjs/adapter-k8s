@@ -56,8 +56,107 @@ function validateScaling(
 // cutover cannot tolerate (see the collision guard in adapter.ts).
 const MIN_SURVIVING_BUILD_ID_CHARS = 8;
 
+// Names the pod template already emits, or that the runtime derives identity from. Letting
+// user config shadow one is never what the author meant: NEXT_BUILD_ID in particular is what
+// the pool reports as its build and what namespaces its Valkey entries (`k8s:<buildId>:`), so
+// overriding it would silently cross-wire two builds' caches.
+const RESERVED_ENV_NAMES = new Set([
+  "NODE_ENV",
+  "NEXT_BUILD_ID",
+  "POOL_NAME",
+  "RELEASE_NAME",
+  "INTERNAL_HEADER_SECRET",
+  "VALKEY_URL",
+  "VALKEY_AUTH",
+  "VALKEY_CA_CERT",
+  "PORT",
+  "CONFIG_DIR",
+]);
+
+// POSIX-ish, and the subset Kubernetes accepts for an env var name. Deliberately excludes
+// lowercase: a lowercase name is almost always a typo for the uppercase one, and admitting
+// both invites a pair that differs only by case.
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * Validate one `env` map. `where` names the location for the error message — an error that
+ * says only "invalid env" sends the reader hunting through pools.
+ */
+function validateEnvMap(env: unknown, where: string): void {
+  if (env === undefined) return;
+  if (typeof env !== "object" || env === null || Array.isArray(env)) {
+    throw new Error(`${where} env must be an object mapping variable names to values`);
+  }
+  for (const [name, value] of Object.entries(env as Record<string, unknown>)) {
+    if (!ENV_NAME_RE.test(name)) {
+      throw new Error(
+        `${where} env has an invalid environment variable name ${JSON.stringify(name)}. ` +
+          `Names must match ${ENV_NAME_RE.source} (uppercase letters, digits and underscores, ` +
+          `not starting with a digit).`,
+      );
+    }
+    if (name.startsWith("NEXT_PUBLIC_")) {
+      throw new Error(
+        `${where} env sets ${name}, but NEXT_PUBLIC_* variables are inlined into client ` +
+          `bundles at BUILD time — setting one as container environment produces a value the ` +
+          `browser never sees, and nothing would report the mistake. Put it in .env.production ` +
+          `or the build environment instead.`,
+      );
+    }
+    if (RESERVED_ENV_NAMES.has(name)) {
+      throw new Error(
+        `${where} env sets ${name}, which is reserved: the adapter emits it into every pool ` +
+          `container and the runtime derives behaviour from it. Choose a different name.`,
+      );
+    }
+    if (typeof value === "string") continue;
+    if (typeof value !== "object" || value === null) {
+      throw new Error(
+        `${where} env value for ${name} must be a string, or a ` +
+          `{ secret, key } / { configMap, key } reference. Numbers and booleans are rejected ` +
+          `because Kubernetes requires env values to be strings.`,
+      );
+    }
+    const ref = value as { secret?: unknown; configMap?: unknown; key?: unknown };
+    const hasSecret = typeof ref.secret === "string" && ref.secret.length > 0;
+    const hasConfigMap = typeof ref.configMap === "string" && ref.configMap.length > 0;
+    if (hasSecret === hasConfigMap) {
+      throw new Error(
+        `${where} env value for ${name} must reference exactly one of "secret" or "configMap".`,
+      );
+    }
+    if (typeof ref.key !== "string" || ref.key.length === 0) {
+      throw new Error(
+        `${where} env value for ${name} references a ${hasSecret ? "secret" : "configMap"} ` +
+          `but has no "key" — Kubernetes needs the key WITHIN that object to read.`,
+      );
+    }
+  }
+}
+
+function validateEnvFrom(envFrom: unknown, where: string): void {
+  if (envFrom === undefined) return;
+  if (!Array.isArray(envFrom)) {
+    throw new Error(`${where} envFrom must be an array of { secret } / { configMap } sources`);
+  }
+  for (const source of envFrom as Array<Record<string, unknown>>) {
+    const hasSecret = typeof source?.secret === "string" && source.secret.length > 0;
+    const hasConfigMap = typeof source?.configMap === "string" && source.configMap.length > 0;
+    if (hasSecret === hasConfigMap) {
+      throw new Error(
+        `${where} envFrom entries must reference exactly one of "secret" or "configMap".`,
+      );
+    }
+    if (source.prefix !== undefined && typeof source.prefix !== "string") {
+      throw new Error(`${where} envFrom prefix must be a string`);
+    }
+  }
+}
+
 export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
+  validateEnvMap(config.env, "adapter config");
+  validateEnvFrom(config.envFrom, "adapter config");
   if (!config.pools) {
     throw new Error("pools is required in adapter config");
   }
@@ -83,6 +182,8 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // label value and DNS-1123 name component). assertSafePoolName is the same validator
     // the templates now call at each consumption point.
     assertSafePoolName(name);
+    validateEnvMap(pool.env, `pool "${name}"`);
+    validateEnvFrom(pool.envFrom, `pool "${name}"`);
     // "routing-service" is the reserved routing-tier name: the chart renders the
     // routing tier's Service as `${releaseName}-routing-service`, which is exactly
     // the ACTIVE Service name a pool called "routing-service" would get — two

@@ -1843,6 +1843,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   let edgeSandboxRun:
     | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
     | null = null;
+  let edgeSandboxLoadError: Error | undefined;
   const distDir = path.join(process.cwd(), ".next");
   try {
     const { createRequire: cr } = await import("node:module");
@@ -1867,8 +1868,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         clientAssetToken: "",
       });
     console.log("Edge sandbox initialized");
-  } catch {
-    // Edge sandbox not available
+  } catch (err) {
+    // Do NOT swallow this. For a node-runtime app an unavailable sandbox is genuinely
+    // harmless, but for an edge-middleware app it is fatal — and the downstream symptom
+    // ("middleware has no callable export") blames the app's own middleware, which is fine.
+    // Live on GKE the actual cause was a missing @swc/helpers in the traced image, and
+    // finding that took a probe pod because this handler discarded it.
+    edgeSandboxLoadError = err instanceof Error ? err : new Error(String(err));
   }
 
   // The edge sandbox loads an entry's WASM/asset bindings by their `filePath`, but the middleware
@@ -1989,7 +1995,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       console.log(`Edge middleware sandbox ready (name=${mwName}, files=${mwFiles.length})`);
     } else if (isEdge) {
       console.warn(
-        "Edge middleware found but sandbox not available, falling back to Node.js loading",
+        "Edge middleware found but sandbox not available, falling back to Node.js loading" +
+          (edgeSandboxLoadError ? ` (${edgeSandboxLoadError.message})` : ""),
       );
       middlewareModule = await resolveMiddlewareModule(mwPath);
       console.log("Middleware module loaded (Node.js fallback)");
@@ -1999,6 +2006,19 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     }
 
     if (!edgeMiddlewareRunner && !hasCallableMiddlewareExport(middlewareModule)) {
+      // An EDGE entry reaching here means the sandbox never loaded: the module is a webpack
+      // edge wrapper, which Node cannot call, so "no callable export" is a true statement
+      // about a file that was never meant to be loaded this way. Lead with the real cause —
+      // it is nearly always a dependency missing from the container image, not the app.
+      if (isEdge) {
+        throw new Error(
+          `Edge middleware at ${mwPath} could not be run: the Next.js edge sandbox failed to ` +
+            `load, and the Node.js fallback found no callable export (an edge bundle is not ` +
+            `callable from Node). This usually means the container image is missing a runtime ` +
+            `dependency of next/dist/server/web/sandbox. Underlying error: ` +
+            `${edgeSandboxLoadError?.message ?? "sandbox unavailable, no error recorded"}`,
+        );
+      }
       throw new Error(
         `Configured middleware at ${mwPath} has no callable export. Refusing to start the pool.`,
       );

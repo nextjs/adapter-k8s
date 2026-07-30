@@ -13,11 +13,34 @@ export type BuildCompleteContext = Parameters<NonNullable<NextAdapter["onBuildCo
 
 // --- Adapter Config ---
 
+/**
+ * One runtime environment variable for the app containers.
+ *
+ * A literal string is rendered inline in the pod template. The reference forms render
+ * `secretKeyRef`/`configMapKeyRef` against an object you manage, which is the preferred
+ * shape for two reasons: `adapter.config.mjs` is committed, so a literal is the wrong home
+ * for a credential; and the chart is emitted during `next build`, so changing a LITERAL
+ * requires a rebuild while changing a referenced Secret only needs a pod restart.
+ */
+export type EnvValue =
+  | string
+  | { secret: string; key: string; optional?: boolean }
+  | { configMap: string; key: string; optional?: boolean };
+
+/** Bulk import of every key in a Secret or ConfigMap, rendered as `envFrom`. */
+export type EnvFromSource =
+  | { secret: string; prefix?: string; optional?: boolean }
+  | { configMap: string; prefix?: string; optional?: boolean };
+
 export interface PoolConfig {
   routes: string[]; // OutputType name ('appPages', 'appRoutes', 'pages', 'pagesApi') or glob pattern
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
   timeout?: number;
+  /** Merged OVER the top-level `env`, so a pool can override a shared default. */
+  env?: Record<string, EnvValue>;
+  /** Appended AFTER the top-level `envFrom`; later sources win, per Kubernetes. */
+  envFrom?: EnvFromSource[];
 }
 
 export interface HostConfig {
@@ -51,6 +74,20 @@ export interface GKEProviderConfig {
 
 export interface K8sAdapterConfig {
   pools: Record<string, PoolConfig>;
+  /**
+   * Runtime environment for every app container. `.env` files are deliberately never staged
+   * into an image (they can hold secrets and would be baked into pushed layers), so this is
+   * the supported way to give a deployed app its environment.
+   *
+   * Precedence at runtime matches Next: the pool server calls `loadEnvConfig`, which does NOT
+   * overwrite an already-set variable, so anything set here wins over a `.env` file.
+   *
+   * NOT for `NEXT_PUBLIC_*`. Those are inlined into client bundles at BUILD time; setting one
+   * here produces a variable the browser never sees. Validation rejects them for that reason.
+   */
+  env?: Record<string, EnvValue>;
+  /** Bulk `envFrom` sources for every app container. Individual `env` entries win over these. */
+  envFrom?: EnvFromSource[];
   cache?: {
     enabled: boolean;
     provider?: "valkey" | "redis";

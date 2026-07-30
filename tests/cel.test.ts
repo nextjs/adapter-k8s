@@ -361,6 +361,17 @@ describe("generateCelExpression", () => {
       warn.mockRestore();
     }
   });
+
+  it("budgets against GCP's REAL 512-character limit", () => {
+    // Measured on GKE 2026-07-29 deploying upstream's app-dir/app-static fixture:
+    //   ERROR: (gcloud.service-extensions.lb-traffic-extensions.import) INVALID_ARGUMENT:
+    //   INVALID_CEL_EXPRESSION: expression exceeded max length 512
+    // The budget was 1024 — double the real ceiling — so an expression between 512 and 1024
+    // characters passed the build with NO warning and then failed the deploy at cutover,
+    // which is precisely the "hear it from `next build`, not from gcloud" outcome this
+    // constant exists to produce.
+    expect(CEL_EXPRESSION_WARN_LENGTH).toBe(512);
+  });
 });
 
 describe("generateCelExpression with basePath", () => {

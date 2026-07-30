@@ -78,7 +78,10 @@ export default createK8sAdapter({
         type: "gateway-api",
         className: "gke-l7-global-external-managed",
         hosts: [
-          { hostname: "app.example.com", tls: { enabled: true, managedCert: true } },
+          {
+            hostname: "app.example.com",
+            tls: { enabled: true, managedCert: true },
+          },
         ],
       },
     },
@@ -100,20 +103,20 @@ Idempotently provisions the GKE cluster, static IP, Artifact Registry repo, GCS 
 npx adapter-k8s deploy
 ```
 
-This builds and pushes per-pool images plus the routing service, provisions the managed cache if configured, runs `helm upgrade`, verifies the new pods are serving, and cuts traffic over blue/green. New deployments resolve every image to its immutable `@sha256:` registry digest and deploy that; the routing tier's *rollback* path currently reconstructs its image reference from the build tag (digest-pinned rollback is on the [roadmap](#roadmap)).
+This builds and pushes per-pool images plus the routing service, provisions the managed cache if configured, runs `helm upgrade`, verifies the new pods are serving, and cuts traffic over blue/green. New deployments resolve every image to its immutable `@sha256:` registry digest and deploy that; the routing tier's _rollback_ path currently reconstructs its image reference from the build tag (digest-pinned rollback is on the [roadmap](#roadmap)).
 
 ## CLI Commands
 
-| Command    | What it does                                                                                                    |
-| ---------- | --------------------------------------------------------------------------------------------------------------- |
-| `init`     | Provision cloud infrastructure and scaffold config. `--project-id`, `--region`, `--host`, `--dry-run`            |
-| `deploy`   | Build, push, and deploy with blue/green cutover. `--skip-build`, `--skip-push`, `--dry-run`                      |
+| Command    | What it does                                                                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `init`     | Provision cloud infrastructure and scaffold config. `--project-id`, `--region`, `--host`, `--dry-run`                                    |
+| `deploy`   | Build, push, and deploy with blue/green cutover. `--skip-build`, `--skip-push`, `--dry-run`                                              |
 | `rollback` | Return to the previous build—pools scale back up, the routing tier reverts, traffic cuts over. Symmetric: running it again rolls forward |
-| `doctor`   | Health-check the whole stack: prerequisites, cloud resources, Kubernetes state, LB backend health, DNS + TLS     |
-| `emulate`  | Run the full request path locally: Envoy → routing service → pool server                                         |
-| `describe` | Live architecture diagram of your deployment with pod counts and revision tags                                   |
-| `tail`     | Stream color-coded logs from all workloads                                                                       |
-| `destroy`  | Tear down release-scoped resources; shared infrastructure (cluster, registry, certs) is kept and reported        |
+| `doctor`   | Health-check the whole stack: prerequisites, cloud resources, Kubernetes state, LB backend health, DNS + TLS                             |
+| `emulate`  | Run the full request path locally: Envoy → routing service → pool server                                                                 |
+| `describe` | Live architecture diagram of your deployment with pod counts and revision tags                                                           |
+| `tail`     | Stream color-coded logs from all workloads                                                                                               |
+| `destroy`  | Tear down release-scoped resources; shared infrastructure (cluster, registry, certs) is kept and reported                                |
 
 Run any command with `--help` for the full flag set.
 
@@ -121,10 +124,10 @@ Run any command with `--help` for the full flag set.
 
 Exactly one `provider` key selects the target. It decides how the routing tier attaches to the data plane—the one genuinely platform-specific part of the architecture.
 
-| provider  | ingress                                 | ext_proc registration   | CDN       | managed cache   |
-| --------- | --------------------------------------- | ----------------------- | --------- | --------------- |
-| `gke`     | GXLB (`gke-l7-global-external-managed`) | traffic extension       | Cloud CDN | Memorystore     |
-| `generic` | Envoy Gateway (`eg`)                    | `EnvoyExtensionPolicy`  | BYO       | BYO `cache.url` |
+| provider  | ingress                                 | ext_proc registration  | CDN       | managed cache   |
+| --------- | --------------------------------------- | ---------------------- | --------- | --------------- |
+| `gke`     | GXLB (`gke-l7-global-external-managed`) | traffic extension      | Cloud CDN | Memorystore     |
+| `generic` | Envoy Gateway (`eg`)                    | `EnvoyExtensionPolicy` | BYO       | BYO `cache.url` |
 
 `aks` and `eks` are planned and will use the `generic` shape.
 
@@ -197,6 +200,46 @@ containerStrategy: 'shared-image',   // one image for all pools—simpler CI/CD
 
 `deploy` probes for `docker`, `podman`, then `nerdctl` (force one with `ADAPTER_K8S_CONTAINER_CLI`). Builds are pinned to `--platform=linux/amd64` by default so Apple Silicon hosts don't ship arm64 images to x86 nodes; set `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` for ARM node pools.
 
+### Environment variables
+
+`.env` files are never staged into an image — they routinely hold secrets, and an image layer
+is a poor place for one. Runtime environment is supplied to the containers instead:
+
+```js
+export default createK8sAdapter({
+  env: {
+    API_URL: "https://api.example.com", // literal
+    API_KEY: { secret: "app-secrets", key: "api-key" }, // -> secretKeyRef
+    FLAGS: { configMap: "app-config", key: "flags" }, // -> configMapKeyRef
+  },
+  envFrom: [
+    { secret: "app-secrets" },
+    { configMap: "app-config", prefix: "CFG_" },
+  ],
+
+  pools: {
+    // Merged OVER the top-level map, so a pool can override a shared default.
+    worker: { routes: ["pagesApi"], env: { TIER: "worker" } },
+  },
+});
+```
+
+You manage the referenced Secret/ConfigMap; the adapter only points at them. That is the
+preferred shape for two reasons: `adapter.config.mjs` is committed, so a literal is the wrong
+home for a credential — and the chart is emitted during `next build`, so changing a _literal_
+needs a rebuild while changing a referenced Secret only needs a pod restart.
+
+Precedence matches Next: the pool server calls `loadEnvConfig`, which does not overwrite an
+already-set variable, so anything set here wins over a `.env` file the app loads itself.
+
+**Not for `NEXT_PUBLIC_*`.** Those are inlined into client bundles at _build_ time; setting one
+as container environment produces a value the browser never sees. The build fails rather than
+let that pass silently — put them in `.env.production` or the build environment.
+
+Names the adapter emits itself (`NODE_ENV`, `NEXT_BUILD_ID`, `POOL_NAME`, `RELEASE_NAME`,
+`INTERNAL_HEADER_SECRET`, `VALKEY_*`, `PORT`, `CONFIG_DIR`) are reserved and rejected —
+shadowing `NEXT_BUILD_ID` in particular would cross-wire two builds' cache namespaces.
+
 ### Cloud CDN (GKE)
 
 ```js
@@ -250,7 +293,7 @@ routingService: {
 
 ## Architecture
 
-> **Middleware runs behind the CDN, not in front of it.** No CDN runs your compute before its cache, so cache *hits* are served without invoking middleware; the routing service runs on cache *misses* on the way to origin. To keep this correct, middleware-covered routes are sent `Cache-Control: no-cache` so they are never cached ahead of the middleware that gates them. This constraint shapes the whole architecture and applies to both providers.
+> **Middleware runs behind the CDN, not in front of it.** No CDN runs your compute before its cache, so cache _hits_ are served without invoking middleware; the routing service runs on cache _misses_ on the way to origin. To keep this correct, middleware-covered routes are sent `Cache-Control: no-cache` so they are never cached ahead of the middleware that gates them. This constraint shapes the whole architecture and applies to both providers.
 
 ```
                  GCP Global External Application Load Balancer
@@ -311,7 +354,7 @@ instead. That is why the generic provider's CNI must actually enforce policy—s
 
 ### Blue/green deploys
 
-Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness *and* is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target; `rollback` scales it up, reverts the routing tier to that build's image and manifest, and patches the selector back.
+Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target; `rollback` scales it up, reverts the routing tier to that build's image and manifest, and patches the selector back.
 
 ## CI/CD
 

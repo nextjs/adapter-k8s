@@ -215,11 +215,19 @@ export function generateHelmChart({
   });
 
   for (const poolName of pools.keys()) {
+    // Per-pool env merges OVER the shared map, and per-pool envFrom is appended AFTER the
+    // shared sources — both match Kubernetes' own "last one wins" semantics, so a pool
+    // override behaves the way someone reading the rendered pod spec would predict.
+    const poolConfig = config.pools?.[poolName];
+    const mergedEnv = { ...(config.env ?? {}), ...(poolConfig?.env ?? {}) };
+    const mergedEnvFrom = [...(config.envFrom ?? []), ...(poolConfig?.envFrom ?? [])];
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({
       poolName,
       buildId,
       releaseName,
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
+      ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
+      ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,

@@ -263,7 +263,9 @@ echo "[adapter-k8s] NODE_OPTIONS=${NODE_OPTIONS}" >&2
 export ADAPTER_K8S_BUILD_CPUS="${BUILD_CPUS}"
 # Skip Docker context staging — pool server reads from .next/ directly.
 # This saves thousands of inodes in /tmp which is critical for large e2e runs.
-export ADAPTER_K8S_SKIP_STAGING=1
+# The cluster topology (e2e-cluster-deploy.sh) needs the staged context to build an
+# image, so it presets this to 0; default stays 1 for the two local topologies.
+export ADAPTER_K8S_SKIP_STAGING="${ADAPTER_K8S_SKIP_STAGING:-1}"
 echo "[adapter-k8s] Build profile: cpus=${BUILD_CPUS}" >&2
 
 # Equivalent to passing --experimental-next-config-strip-types to
@@ -279,8 +281,23 @@ export __NEXT_NODE_NATIVE_TS_LOADER_ENABLED=true
 # config.deploymentId (client bundles append ?dpl= to asset requests and
 # runtime code reads process.env.NEXT_DEPLOYMENT_ID). Tests compare against
 # the DEPLOYMENT_ID marker we report, so build, server, and marker must agree.
-DEPLOYMENT_ID="k8s-$(node -e "console.log(require('crypto').randomBytes(6).toString('hex'))")"
-export NEXT_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
+#
+# ...EXCEPT on a real cluster. Setting deploymentId makes Next return a LITERAL CONSTANT
+# from getBuildId (packages/next/src/build/index.ts: `return 'build-TfctsWXpff2fKS'`), so
+# every app in every suite builds under the same id. The adapter derives blue/green resource
+# names, the CDN cutover cache-tag, and the `k8s:<buildId>:` Valkey namespace from it — so
+# suites would overwrite each other's Deployments and SHARE cache entries. `adapter-k8s
+# deploy` correctly refuses that cutover, which would block every suite after the first.
+# Nothing is lost by omitting it here: skew protection is already carried by the per-build
+# build id, and `?dpl=` asset versioning is moot because the adapter enables immutable
+# (content-addressed) assets. The marker is then reported as the build id, below.
+if [ "${ADAPTER_K8S_SET_DEPLOYMENT_ID:-1}" = "1" ]; then
+  DEPLOYMENT_ID="k8s-$(node -e "console.log(require('crypto').randomBytes(6).toString('hex'))")"
+  export NEXT_DEPLOYMENT_ID="${DEPLOYMENT_ID}"
+else
+  DEPLOYMENT_ID=""
+  unset NEXT_DEPLOYMENT_ID
+fi
 
 # --- 3. Build ---
 # Fixtures can define a package.json build script with pre-build setup steps
@@ -309,6 +326,9 @@ else
 fi
 
 BUILD_ID="$(cat .next/BUILD_ID 2>/dev/null || echo unknown)"
+# With deploymentId omitted (see above), the per-build build id IS the deployment identity —
+# it is what the RSC payload carries and what the client compares on for skew.
+[ -n "$DEPLOYMENT_ID" ] || DEPLOYMENT_ID="$BUILD_ID"
 # Report immutable-asset support from the ACTUAL build output, so the harness's asset-URL/?dpl
 # expectations match what shipped. Next does NOT persist experimental.supportsImmutableAssets into
 # required-server-files.json, so reading the config there always yields undefined→0 even when the

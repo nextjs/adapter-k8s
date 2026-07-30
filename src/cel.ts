@@ -162,12 +162,13 @@ function celPathEquals(wirePath: string): string {
 
 // GCP validates the route-extension matchCondition.celExpression only at DEPLOY
 // time — an oversized expression fails the extension update mid-deploy with no
-// build-time signal. The Service Extensions CEL matcher language reference
-// (https://cloud.google.com/service-extensions/docs/cel-matcher-language-reference)
-// documents tight limits on match-condition expressions; 1,024 characters is the
-// conservative budget we warn at so the operator hears about it from `next build`,
-// not from a failed `gcloud service-extensions` call during cutover.
-export const CEL_EXPRESSION_WARN_LENGTH = 1024;
+// build-time signal. The limit is a HARD 512 characters, measured on GKE 2026-07-29:
+//   INVALID_CEL_EXPRESSION: expression exceeded max length 512
+// This constant was 1024 — double the real ceiling — so an expression in the 512..1024
+// band built clean and then failed at cutover, which is the exact outcome the warning
+// exists to prevent. See also the Service Extensions CEL matcher language reference:
+// https://cloud.google.com/service-extensions/docs/cel-matcher-language-reference
+export const CEL_EXPRESSION_WARN_LENGTH = 512;
 
 function warnIfOversized(expr: string): string {
   if (expr.length > CEL_EXPRESSION_WARN_LENGTH) {
