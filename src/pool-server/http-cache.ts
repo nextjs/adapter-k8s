@@ -1,4 +1,11 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+
+/**
+ * Above this size static bodies are streamed instead of buffered. Below it the buffered path
+ * stays one syscall and avoids stream setup for the small files that dominate a build.
+ */
+export const STATIC_STREAM_THRESHOLD_BYTES = 512 * 1024;
 
 export function staticAssetEtag(content: Buffer): string {
   // Strong content identity lets mutable static artifacts such as generated service workers use
@@ -34,22 +41,64 @@ export function ifNoneMatchMatches(value: string | undefined, etag: string): boo
  */
 const MAX_MEMOIZED_ETAGS = 4096;
 const etagCache = new Map<string, string>();
+const pendingEtagCache = new Map<string, Promise<string>>();
+
+function etagCacheKey(filePath: string, stat: { size: number; mtimeMs: number }): string {
+  return `${filePath}:${stat.size}:${stat.mtimeMs}`;
+}
+
+function rememberEtag(key: string, etag: string): void {
+  if (etagCache.size >= MAX_MEMOIZED_ETAGS) etagCache.clear();
+  etagCache.set(key, etag);
+}
 
 export function staticAssetEtagForFile(
   filePath: string,
   stat: { size: number; mtimeMs: number },
   readContent: () => Buffer,
 ): string {
-  const key = `${filePath}:${stat.size}:${stat.mtimeMs}`;
+  const key = etagCacheKey(filePath, stat);
   const cached = etagCache.get(key);
   if (cached !== undefined) return cached;
   const etag = staticAssetEtag(readContent());
-  if (etagCache.size >= MAX_MEMOIZED_ETAGS) etagCache.clear();
-  etagCache.set(key, etag);
+  rememberEtag(key, etag);
   return etag;
+}
+
+/**
+ * The manifest dispatch path needs the same strong, per-file ETag without first allocating the
+ * whole asset or synchronously hashing it on the event loop. Hash one bounded stream, share that
+ * work across concurrent first requests, then reuse the digest for the process lifetime.
+ */
+export async function staticAssetEtagForFileAsync(
+  filePath: string,
+  stat: { size: number; mtimeMs: number },
+): Promise<string> {
+  const key = etagCacheKey(filePath, stat);
+  const cached = etagCache.get(key);
+  if (cached !== undefined) return cached;
+  const pending = pendingEtagCache.get(key);
+  if (pending) return pending;
+
+  const computation = new Promise<string>((resolve, reject) => {
+    const hash = createHash("sha1");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk: Buffer) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", () => resolve(`"${hash.digest("base64url")}"`));
+  });
+  pendingEtagCache.set(key, computation);
+  try {
+    const etag = await computation;
+    rememberEtag(key, etag);
+    return etag;
+  } finally {
+    if (pendingEtagCache.get(key) === computation) pendingEtagCache.delete(key);
+  }
 }
 
 /** Test seam — the cache is process-global, so a test that asserts recompute must reset it. */
 export function __resetEtagCacheForTests(): void {
   etagCache.clear();
+  pendingEtagCache.clear();
 }

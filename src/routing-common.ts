@@ -182,11 +182,13 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  *     tiny requests then stall both tiers past their health-check deadlines, so a matcher an
  *     app author wrote for convenience becomes a remote availability bug.
  *
- * The guard is a shape check, not a solver: nested quantifiers (a quantified group that itself
- * contains a quantifier) are the class that produces exponential backtracking, and no
- * legitimate has/missing value needs one. A rejected pattern degrades to exact string
- * comparison — the same fallback an uncompilable pattern already took — rather than throwing,
- * because a matcher that cannot be evaluated must never silently widen coverage.
+ * The guard is a conservative shape check, not a solver. It refuses both nested quantifiers and
+ * quantified groups containing alternation. The latter deliberately rejects safe-looking forms
+ * such as `(foo|bar)+` too: proving alternatives non-overlapping requires automaton analysis, while
+ * accepting `(a|aa)+` gives a remote client an exponential event-loop stall with only a few dozen
+ * input bytes. A rejected pattern degrades to exact string comparison — the same fallback an
+ * uncompilable pattern already took — rather than throwing, because a matcher that cannot be
+ * evaluated must never silently widen coverage.
  *
  * The degrade is a RUNTIME last resort, not the intended way an author learns about this. The
  * shape is fully known at build time, so `manifest.ts` runs the same predicate
@@ -195,17 +197,59 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  * for a config mistake; `next build` is the right one. Reaching the degrade path therefore means
  * a manifest built before that check existed, or one hand-edited afterwards.
  *
- * KNOWN LIMIT, stated rather than implied: this does not catch alternation-overlap patterns
- * such as `(a|aa)+`, which backtrack for the same reason without matching the shape above.
- * Catching those needs real automaton analysis (or an RE2-style engine). What is bounded here
- * is the common, accidental form; an app that deliberately writes a pathological matcher can
- * still hurt itself. The build-time half inherits exactly this limit — it shares the predicate,
- * so it is not a second, broader net. See
- * docs/superpowers/specs/2026-07-26-smaller-open-items.md §2 for why broadening the shape check
- * was rejected on its own and what a real bound (a deadline, or a non-backtracking engine) needs.
+ * This remains intentionally narrower than a general safe-regex theorem; the two known
+ * exponential families admitted by the old code are bounded here without adding a native RE2
+ * dependency to both dataplane bundles. The build-time half shares this exact predicate.
  */
 const conditionRegexCache = new Map<string, RegExp | null>();
 const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
+
+/**
+ * True when an alternation occurs anywhere inside a group that is then repeated.
+ *
+ * This is a tiny syntax walk rather than another regexp so escaped pipes, character classes,
+ * non-capturing groups and nested groups are handled consistently. Alternation state propagates
+ * to the parent: `((a|aa))+` is the same dangerous family as `(a|aa)+`.
+ */
+function hasQuantifiedAlternation(value: string): boolean {
+  const groups: Array<{ containsAlternation: boolean }> = [];
+  let inCharacterClass = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]!;
+    if (ch === "\\") {
+      i++; // the following code point is literal, including `|`, `[` or `)`
+      continue;
+    }
+    if (inCharacterClass) {
+      if (ch === "]") inCharacterClass = false;
+      continue;
+    }
+    if (ch === "[") {
+      inCharacterClass = true;
+      continue;
+    }
+    if (ch === "(") {
+      groups.push({ containsAlternation: false });
+      continue;
+    }
+    if (ch === "|" && groups.length > 0) {
+      groups[groups.length - 1]!.containsAlternation = true;
+      continue;
+    }
+    if (ch !== ")" || groups.length === 0) continue;
+
+    const group = groups.pop()!;
+    if (group.containsAlternation && groups.length > 0) {
+      groups[groups.length - 1]!.containsAlternation = true;
+    }
+    const next = value[i + 1];
+    if (group.containsAlternation && (next === "+" || next === "*" || next === "{")) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Why this has/missing pattern must not be evaluated as a regexp, or `null` if it is fine.
@@ -214,10 +258,19 @@ const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
  * "pathological" (the two-resolver-tier drift problem this module exists to prevent).
  */
 export function unsafeConditionPattern(value: string): string | null {
-  return NESTED_QUANTIFIER_RE.test(value)
-    ? "a quantified group containing another quantifier can backtrack exponentially against a " +
-        "request-controlled value, blocking the event loop"
-    : null;
+  if (NESTED_QUANTIFIER_RE.test(value)) {
+    return (
+      "a quantified group containing another quantifier can backtrack exponentially against a " +
+      "request-controlled value, blocking the event loop"
+    );
+  }
+  if (hasQuantifiedAlternation(value)) {
+    return (
+      "a quantified group containing alternation can backtrack exponentially against a " +
+      "request-controlled value, blocking the event loop"
+    );
+  }
+  return null;
 }
 
 export function conditionRegex(value: string): RegExp | null {
@@ -1740,11 +1793,93 @@ export function rscCacheBustingUnvalidated(args: {
   }
 }
 
+export interface CacheControlDirective {
+  name: string;
+  value: string | null;
+}
+
+const CACHE_CONTROL_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Parse Cache-Control as a comma-delimited directive list, keeping commas inside quoted strings.
+ *
+ * Security decisions must compare exact directive names: word-boundary searches make extension
+ * names such as `x-no-store` and `x-s-maxage` indistinguishable from the standard directives.
+ * Malformed members are ignored rather than partially interpreted. That is fail-closed for both
+ * consumers below: malformed vetoes cannot weaken a forced cache policy, while malformed
+ * freshness extensions cannot invent a cache window.
+ */
+export function parseCacheControlDirectives(cacheControl: string): CacheControlDirective[] {
+  const members: string[] = [];
+  let memberStart = 0;
+  let quoted = false;
+  let escaped = false;
+
+  for (let i = 0; i < cacheControl.length; i++) {
+    const ch = cacheControl[i]!;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === ",") {
+      members.push(cacheControl.slice(memberStart, i));
+      memberStart = i + 1;
+    }
+  }
+  members.push(cacheControl.slice(memberStart));
+
+  const directives: CacheControlDirective[] = [];
+  for (const rawMember of members) {
+    const member = rawMember.trim();
+    if (!member) continue;
+    const equals = member.indexOf("=");
+    const rawName = (equals === -1 ? member : member.slice(0, equals)).trim();
+    if (!CACHE_CONTROL_TOKEN_RE.test(rawName)) continue;
+    if (equals === -1) {
+      directives.push({ name: rawName.toLowerCase(), value: null });
+      continue;
+    }
+
+    const rawValue = member.slice(equals + 1).trim();
+    let value: string;
+    if (rawValue.startsWith('"')) {
+      let end = -1;
+      let quotedEscape = false;
+      for (let i = 1; i < rawValue.length; i++) {
+        const ch = rawValue[i]!;
+        if (quotedEscape) quotedEscape = false;
+        else if (ch === "\\") quotedEscape = true;
+        else if (ch === '"') {
+          end = i;
+          break;
+        }
+      }
+      if (end === -1 || rawValue.slice(end + 1).trim() !== "") continue;
+      value = rawValue.slice(1, end).replace(/\\([\t !-~\u0080-\u00ff])/g, "$1");
+    } else {
+      if (!CACHE_CONTROL_TOKEN_RE.test(rawValue)) continue;
+      value = rawValue;
+    }
+    directives.push({ name: rawName.toLowerCase(), value });
+  }
+  return directives;
+}
+
+export function hasUnqualifiedCacheControlDirective(cacheControl: string, name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  return parseCacheControlDirectives(cacheControl).some(
+    (directive) => directive.name === normalizedName && directive.value === null,
+  );
+}
+
 /**
  * True when this Cache-Control gives a SHARED cache a window in which it may serve hits without
- * revalidating — with neither `no-cache` nor `private` to veto storage. The single derivation for
- * both the middleware invariant (pool-server/cache-policy.ts) and the RSC-validation invariant
- * (routing-service/handler.ts).
+ * revalidating — with neither unqualified `no-store`, `no-cache` nor `private` to veto storage.
+ * The single derivation for both the middleware invariant (pool-server/cache-policy.ts) and the
+ * RSC-validation invariant (routing-service/handler.ts).
  *
  * Three independent grants, any one of which opens the window:
  *  - a positive `s-maxage` (else `max-age`) — the plain freshness lifetime;
@@ -1759,24 +1894,32 @@ export function rscCacheBustingUnvalidated(args: {
  * the middleware invariant wants.
  */
 export function grantsSharedCacheFreshness(cacheControl: string): boolean {
-  // S24. Only the UNQUALIFIED forms veto storage. RFC 9111 §5.2.2.4/§5.2.2.7 also allow the
-  // argumented response forms — `no-cache="set-cookie"` means only that field must be
-  // revalidated, and the rest of the response may be served fresh for the stated lifetime. A
-  // bare `\bno-cache\b` test matched those too, so `no-cache="set-cookie", s-maxage=600` was
-  // classified as granting no shared freshness and honored verbatim on a middleware-covered
-  // route — a shared cache that implements the qualified semantics then serves unrevalidated
-  // hits for 600s, and because ext_proc is post-cache those hits never reach middleware. The
-  // lookahead requires the directive to END there (`,`, whitespace, or end of string), so an
-  // `=` immediately after it falls through to the freshness checks below.
-  if (/(?:^|[,\s])no-cache(?=$|[,\s])/i.test(cacheControl)) return false;
-  if (/(?:^|[,\s])private(?=$|[,\s])/i.test(cacheControl)) return false;
-  const sMaxAge = /\bs-maxage=(\d+)/i.exec(cacheControl);
-  const maxAge = /\bmax-age=(\d+)/i.exec(cacheControl);
-  const shared = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : 0;
-  if (shared > 0) return true;
-  // `\b` would match the `max-age` inside `stale-while-revalidate`'s neighbours, so anchor on a
-  // non-token character (or string start) instead — and require the `stale-` prefix explicitly.
-  const staleWhileRevalidate = /(?:^|[^a-z-])stale-while-revalidate=(\d+)/i.exec(cacheControl);
-  const staleIfError = /(?:^|[^a-z-])stale-if-error=(\d+)/i.exec(cacheControl);
-  return Number(staleWhileRevalidate?.[1] ?? 0) > 0 || Number(staleIfError?.[1] ?? 0) > 0;
+  const directives = parseCacheControlDirectives(cacheControl);
+  const hasUnqualified = (name: string): boolean =>
+    directives.some((directive) => directive.name === name && directive.value === null);
+  // S24. Only the UNQUALIFIED no-cache/private forms veto the whole response. RFC 9111 also
+  // permits field-name arguments, whose remaining response can still be served fresh.
+  if (hasUnqualified("no-store") || hasUnqualified("no-cache") || hasUnqualified("private")) {
+    return false;
+  }
+
+  const values = (name: string): string[] =>
+    directives
+      .filter(
+        (directive): directive is CacheControlDirective & { value: string } =>
+          directive.name === name && directive.value !== null,
+      )
+      .map((directive) => directive.value);
+  const grantsPositiveSeconds = (name: string): boolean =>
+    values(name).some((value) => /^\d+$/.test(value) && Number(value) > 0);
+
+  // s-maxage overrides max-age for shared caches. Duplicate directives make the field invalid;
+  // treating any positive duplicate as a grant is the safe interpretation for this guard.
+  const sMaxAge = values("s-maxage");
+  if (sMaxAge.length > 0) {
+    if (sMaxAge.some((value) => /^\d+$/.test(value) && Number(value) > 0)) return true;
+  } else if (grantsPositiveSeconds("max-age")) {
+    return true;
+  }
+  return grantsPositiveSeconds("stale-while-revalidate") || grantsPositiveSeconds("stale-if-error");
 }

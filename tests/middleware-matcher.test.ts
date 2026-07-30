@@ -374,6 +374,18 @@ describe("conditionRegex (S11)", () => {
     warn.mockRestore();
   });
 
+  it("REFUSES quantified alternation, including the short overlapping family", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(conditionRegex("(a|aa)+")).toBeNull();
+    expect(conditionRegex("(aa|a)*")).toBeNull();
+    expect(conditionRegex("((?:ab|aba)){2,}")).toBeNull();
+    // Alternation that is not itself repeated stays compatible with next start.
+    expect(conditionRegex("^(beta|canary)$")).toBeInstanceOf(RegExp);
+    expect(conditionRegex("[|]+")).toBeInstanceOf(RegExp);
+    expect(conditionRegex(String.raw`\|+`)).toBeInstanceOf(RegExp);
+    warn.mockRestore();
+  });
+
   it("a refused pattern degrades to exact comparison, never to 'matches everything'", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const m = M("/gated", { has: [{ type: "header", key: "x-v", value: "(a+)+" }] });
@@ -386,6 +398,15 @@ describe("conditionRegex (S11)", () => {
   it("stays fast on the input that used to block the event loop", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const m = M("/gated", { has: [{ type: "header", key: "x-v", value: "(a+)+" }] });
+    const started = performance.now();
+    matchesMiddleware([m], url("/gated"), h({ "x-v": "a".repeat(40) + "!" }));
+    expect(performance.now() - started).toBeLessThan(250);
+    warn.mockRestore();
+  });
+
+  it("stays fast on an overlapping-alternation adversarial input", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const m = M("/gated", { has: [{ type: "header", key: "x-v", value: "(a|aa)+" }] });
     const started = performance.now();
     matchesMiddleware([m], url("/gated"), h({ "x-v": "a".repeat(40) + "!" }));
     expect(performance.now() - started).toBeLessThan(250);

@@ -1,5 +1,20 @@
-import { describe, expect, it } from "vitest";
-import { ifNoneMatchMatches, staticAssetEtag } from "../../src/pool-server/http-cache.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  __resetEtagCacheForTests,
+  ifNoneMatchMatches,
+  staticAssetEtag,
+  staticAssetEtagForFileAsync,
+} from "../../src/pool-server/http-cache.js";
+
+let tempDir: string | undefined;
+afterEach(() => {
+  __resetEtagCacheForTests();
+  if (tempDir) rmSync(tempDir, { recursive: true, force: true });
+  tempDir = undefined;
+});
 
 describe("static asset HTTP validators", () => {
   it("uses stable content identity rather than replica-local file metadata", () => {
@@ -17,5 +32,22 @@ describe("static asset HTTP validators", () => {
     expect(ifNoneMatchMatches(`"other", W/${etag}`, etag)).toBe(true);
     expect(ifNoneMatchMatches("*", etag)).toBe(true);
     expect(ifNoneMatchMatches('"other"', etag)).toBe(false);
+  });
+});
+
+describe("staticAssetEtagForFileAsync", () => {
+  it("computes the same strong validator through a bounded file stream", async () => {
+    tempDir = mkdtempSync(path.join(os.tmpdir(), "stream-etag-"));
+    const filePath = path.join(tempDir, "asset.bin");
+    const content = Buffer.alloc(1024 * 1024 + 1, 0x5a);
+    writeFileSync(filePath, content);
+    const stat = statSync(filePath);
+    await expect(staticAssetEtagForFileAsync(filePath, stat)).resolves.toBe(
+      staticAssetEtag(content),
+    );
+    // A second call is served from the stable per-file cache.
+    await expect(staticAssetEtagForFileAsync(filePath, stat)).resolves.toBe(
+      staticAssetEtag(content),
+    );
   });
 });

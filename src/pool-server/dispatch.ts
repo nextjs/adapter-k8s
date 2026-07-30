@@ -1,6 +1,6 @@
 // src/pool-server/dispatch.ts
 import { createServer, request as httpRequest } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
@@ -21,7 +21,11 @@ import {
   type RscConfig,
 } from "../routing-common.js";
 import { cdnCacheTag } from "../cdn-tags.js";
-import { ifNoneMatchMatches, staticAssetEtag } from "./http-cache.js";
+import {
+  ifNoneMatchMatches,
+  STATIC_STREAM_THRESHOLD_BYTES,
+  staticAssetEtagForFileAsync,
+} from "./http-cache.js";
 // The pool-server bundle is esbuild-bundled, so cross-importing the emit-side sanitizer
 // is fine — and REQUIRED: this module previously carried a local copy that stripped
 // trailing hyphens BEFORE truncating to 63 chars, so a >63-char name with a hyphen at
@@ -2193,7 +2197,7 @@ export function createDispatcher(options: DispatcherOptions) {
               }
               servedFallbackShells.add(requestPathname);
             }
-            const content = readFileSync(fullPath);
+            const staticStat = statSync(fullPath);
             const assetHeaders = staticAsset.headers;
             const headers: Record<string, string | string[]> = Object.assign(
               {
@@ -2245,10 +2249,15 @@ export function createDispatcher(options: DispatcherOptions) {
             const manifestEtagKey = Object.keys(headers).find(
               (name) => name.toLowerCase() === "etag",
             );
-            const etag = String(
+            const ownedEtag =
               resolution.resolvedHeaders?.get("etag") ??
-                (manifestEtagKey ? headers[manifestEtagKey] : undefined) ??
-                staticAssetEtag(content),
+              (manifestEtagKey ? headers[manifestEtagKey] : undefined);
+            // S41 (AVAILABILITY). Manifest-backed assets used to be synchronously read into a
+            // Buffer before this validator was computed — even for a matching If-None-Match.
+            // Hash once through a bounded async stream when the build did not supply an ETag,
+            // then decide 304/HEAD before allocating or opening the response body.
+            const etag = String(
+              ownedEtag ?? (await staticAssetEtagForFileAsync(fullPath, staticStat)),
             );
             if (manifestEtagKey && manifestEtagKey !== "etag") delete headers[manifestEtagKey];
             headers.etag = etag;
@@ -2282,14 +2291,22 @@ export function createDispatcher(options: DispatcherOptions) {
             // Content-Length NOR Transfer-Encoding, so HEAD reported no size where `next start`
             // sends the real one (measured). Third instance of the bug sendImageResponse already
             // documents. Stamped after the manifest headers so it always describes these bytes.
-            headers["content-length"] = String(content.length);
+            headers["content-length"] = String(staticStat.size);
             // A stored (build) entry answered this key — that is HIT by the platform contract
             // above (and what `next start` reports for a prerendered page: its filesystem
             // cache reads the build output). Only for the seed path: plain static files and
             // fallback shells keep their existing header surface.
             if (serveConcretePrerenderSeed) headers["x-vercel-cache"] = "HIT";
             res.writeHead(staticAsset.status ?? 200, headers);
-            res.end(req.method === "HEAD" ? undefined : content);
+            if (req.method === "HEAD") {
+              res.end();
+              return;
+            }
+            if (staticStat.size > STATIC_STREAM_THRESHOLD_BYTES) {
+              pipeline(createReadStream(fullPath), res, () => undefined);
+              return;
+            }
+            res.end(readFileSync(fullPath));
             return;
           }
         }

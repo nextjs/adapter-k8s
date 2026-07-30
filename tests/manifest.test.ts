@@ -138,6 +138,14 @@ describe("buildRoutingManifest", () => {
       );
     });
 
+    it("rejects quantified alternation before `(a|aa)+` reaches a request value", () => {
+      for (const value of ["(a|aa)+", "(aa|a)*", "((?:ab|aba)){2,}"]) {
+        expect(buildWithCondition({ type: "query", key: "value", value }), value).toThrow(
+          /quantified group containing alternation/,
+        );
+      }
+    });
+
     it("allows a presence-only condition (no value is ever compiled)", () => {
       expect(buildWithCondition({ type: "header", key: "x-tier" })).not.toThrow();
     });
@@ -161,6 +169,9 @@ describe("buildRoutingManifest", () => {
         "(x*)*",
         "^(ab+)+$",
         "([0-9]{2,})+",
+        "(a|aa)+",
+        "(aa|a)*",
+        "((?:ab|aba)){2,}",
         "^.*$",
       ];
       for (const value of corpus) {
