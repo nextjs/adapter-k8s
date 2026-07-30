@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Build — the adapter generates .k8s-adapter/output/
+      # 1. Build—the adapter generates .k8s-adapter/output/
       - run: NEXT_ADAPTER_PATH=@next-community/adapter-k8s npx next build
 
       # 2. Build + push images (any of docker/podman/nerdctl)
@@ -37,7 +37,7 @@ The Helm chart is self-contained: it includes the traffic-extension registration
 
 ## Deploy by digest, resolved from the registry
 
-Deploy images by immutable `@sha256:` digest, not by tag — the pods hold the internal dispatch secret, and a mutable tag lets a retag change what runs on the next restart (see [SECURITY.md](../SECURITY.md#image-provenance)).
+Deploy images by immutable `@sha256:` digest, not by tag—the pods hold the internal dispatch secret, and a mutable tag lets a retag change what runs on the next restart (see [SECURITY.md](../SECURITY.md#image-provenance)).
 
 Resolve the digest **from the registry**, never from the local daemon:
 
@@ -59,15 +59,15 @@ kubectl patch service <release>-<pool> --type=json \
   -p '[{"op":"replace","path":"/spec/selector/app.kubernetes.io~1version","value":"<sanitized-build-id>"}]'
 ```
 
-Before patching, verify each new pod answers `/readyz` **directly on the pod** (e.g. `kubectl exec`/port-forward), not via load-balancer backend health — `/readyz` is the pod's own verdict and answers 503 until instrumentation registration has succeeded and at least one route module has imported.
+Before patching, verify each new pod answers `/readyz` **directly on the pod** (e.g. `kubectl exec`/port-forward), not via load-balancer backend health—`/readyz` is the pod's own verdict and answers 503 until instrumentation registration has succeeded and at least one route module has imported.
 
 The selector flip is atomic, but the load balancer reprograms the standalone NEG asynchronously; expect a few seconds where the LB catches up to the new endpoints.
 
-To roll back, patch the selector to the previous build's label and scale that Deployment back up (it is kept at 0 replicas). Note that a full rollback also reverts the routing tier to the target build's image and manifest snapshot — the routing pod refuses to start on a manifest that doesn't match its image, so a mismatched pair fails loudly rather than serving another build's route classification. If a routing rollout is stuck after a manual rollback, that mismatch is the usual cause.
+To roll back, patch the selector to the previous build's label and scale that Deployment back up (it is kept at 0 replicas). Note that a full rollback also reverts the routing tier to the target build's image and manifest snapshot—the routing pod refuses to start on a manifest that doesn't match its image, so a mismatched pair fails loudly rather than serving another build's route classification. If a routing rollout is stuck after a manual rollback, that mismatch is the usual cause.
 
 ## CI service account (GKE)
 
-If your pipeline impersonates a service account, use `<release>-cli` — it holds the Artifact Registry writer and bucket permissions. Do **not** use `<release>-deploy`: `init` revokes push permissions from it on every run, so a pipeline authenticated as it breaks the next time someone runs `init`. See [SECURITY.md](../SECURITY.md#cloud-iam-two-identities-split-by-pod-assumability).
+If your pipeline impersonates a service account, use `<release>-cli`—it holds the Artifact Registry writer and bucket permissions. Do **not** use `<release>-deploy`: `init` revokes push permissions from it on every run, so a pipeline authenticated as it breaks the next time someone runs `init`. See [SECURITY.md](../SECURITY.md#cloud-iam-two-identities-split-by-pod-assumability).
 
 ## Container runtimes
 
@@ -77,11 +77,11 @@ All three supported runtimes accept the same verb set (`build`, `push`, `inspect
 | --------- | -------- |
 | `docker`  | a reachable daemon |
 | `podman`  | a reachable daemon |
-| `nerdctl` | containerd **and** buildkit reachable from your user — containerd alone cannot build |
+| `nerdctl` | containerd **and** buildkit reachable from your user—containerd alone cannot build |
 
-**Platform pinning.** Always pass `--platform=linux/amd64` (or your node architecture) explicitly. A host-native build on an ARM runner or Apple Silicon produces arm64 images that fail with `exec format error` on x86 nodes — at rollout, not at build time. For ARM node pools (e.g. GCP T2A), build `linux/arm64` instead.
+**Platform pinning.** Always pass `--platform=linux/amd64` (or your node architecture) explicitly. A host-native build on an ARM runner or Apple Silicon produces arm64 images that fail with `exec format error` on x86 nodes—at rollout, not at build time. For ARM node pools (e.g. GCP T2A), build `linux/arm64` instead.
 
-**nerdctl notes.** buildkit is a separate daemon from containerd, and a `buildkitd` running as root is not reachable by rootless `nerdctl` — its socket lives at `/run/buildkit/buildkitd.sock` while nerdctl looks under `$XDG_RUNTIME_DIR`. If `nerdctl build` fails:
+**nerdctl notes.** buildkit is a separate daemon from containerd, and a `buildkitd` running as root is not reachable by rootless `nerdctl`—its socket lives at `/run/buildkit/buildkitd.sock` while nerdctl looks under `$XDG_RUNTIME_DIR`. If `nerdctl build` fails:
 
 ```bash
 containerd-rootless-setuptool.sh install-buildkit-containerd
