@@ -66,7 +66,7 @@ describe.skipIf(!helmAvailable())("real helm: opaque chart data is inert (S5)", 
     // escaping is removed from the renderer.
     const body =
       "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: probe\ndata:\n" +
-      "  routing-manifest.json: |\n    {\n      \"value\": \"{{ mul 7 6 }}\"\n    }\n";
+      '  routing-manifest.json: |\n    {\n      "value": "{{ mul 7 6 }}"\n    }\n';
     const { ok, out } = helmRender(body);
     expect(ok).toBe(true);
     expect(out).toContain('"42"'); // evaluated — the primitive is real

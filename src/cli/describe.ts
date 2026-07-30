@@ -5,7 +5,11 @@ import boxen from "boxen";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
-import { assertSafeInfrastructure } from "./infrastructure-validation.js";
+import {
+  assertSafeInfrastructure,
+  infrastructurePath,
+  outputDirName,
+} from "./infrastructure-validation.js";
 
 // Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
 // WHICH file is corrupt.
@@ -22,7 +26,7 @@ export async function runDescribe(options: {
   releaseName: string;
 }): Promise<void> {
   const { projectDir, releaseName } = options;
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath)
     ? (readJsonFile(infraPath) as {
         projectId?: string;
@@ -76,10 +80,12 @@ export async function runDescribe(options: {
   // nonempty string — a namespace actor who can edit the ConfigMap could otherwise inject
   // CSI/OSC bytes into this deliberately ANSI-formatted report and forge convincing status.
   const buildId = sanitizeForTerminal(state?.buildId ?? "none");
-  const previousBuildId = state?.previousBuildId ? sanitizeForTerminal(state.previousBuildId) : null;
+  const previousBuildId = state?.previousBuildId
+    ? sanitizeForTerminal(state.previousBuildId)
+    : null;
 
   // Read generated CEL expression from build output
-  const celPath = path.join(projectDir, ".k8s-adapter", "output", "cel-expression.txt");
+  const celPath = path.join(projectDir, ".k8s-adapter", outputDirName(), "cel-expression.txt");
   const celExpression = existsSync(celPath) ? readFileSync(celPath, "utf-8").trim() : null;
 
   let gatewayIp = "pending";

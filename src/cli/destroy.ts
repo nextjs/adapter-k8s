@@ -7,7 +7,7 @@ import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } fr
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
 import { K8S_NAMESPACE } from "../emit/templates/utils.js";
-import { assertSafeInfrastructure } from "./infrastructure-validation.js";
+import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -160,7 +160,7 @@ function promptConfirmation(question: string): Promise<string> {
 export async function runDestroy(options: DestroyOptions): Promise<void> {
   const { projectDir, releaseName, dryRun, yes } = options;
 
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);

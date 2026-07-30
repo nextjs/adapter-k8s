@@ -294,7 +294,10 @@ export function buildRoutingManifest({
   // unresolved ROOT params that stopped it. See the types.ts doc comment — the pool needs both
   // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
   // flavour (the only flavour that must run NON-minimal).
-  const pprCapableRoutes: Record<string, { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }> = {};
+  const pprCapableRoutes: Record<
+    string,
+    { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }
+  > = {};
   // Survey Tier 2 #7 (plans/lessons-from-sibling-adapters.md): PARTIALLY_STATIC prerenders whose
   // fallback carries a postponedState but NO filePath — the shell-less `.rsc` postponed-state
   // siblings (build-complete.js:986-991, the dynamic-RSC prefetch responses for PPR routes).

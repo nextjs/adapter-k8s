@@ -1843,12 +1843,68 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   let edgeSandboxRun:
     | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
     | null = null;
+  let edgeSandboxLoadError: Error | undefined;
   const distDir = path.join(process.cwd(), ".next");
   try {
     const { createRequire: cr } = await import("node:module");
     const appReq = cr(path.join(process.cwd(), "package.json"));
     const sandbox = appReq("next/dist/server/web/sandbox") as {
       run: (params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>;
+    };
+    // Node-side IncrementalCache for edge invocations on a cold replica (see the wiring note
+    // below). Mirrors NextNodeServer.getIncrementalCache: the app's own IncrementalCache class,
+    // the REGISTERED cacheHandler (required-server-files config, resolved against distDir), and
+    // a minimal prerender-manifest surface. Lazy + memoized; any failure returns undefined,
+    // which is exactly the previous behavior (edge runs with an isolated cache).
+    let fallbackIncrementalCache: unknown;
+    let fallbackIncrementalCacheFailed = false;
+    const getFallbackIncrementalCache = (): unknown => {
+      if (fallbackIncrementalCache !== undefined || fallbackIncrementalCacheFailed) {
+        return fallbackIncrementalCache;
+      }
+      try {
+        const rsf = JSON.parse(
+          readFileSync(path.join(distDir, "required-server-files.json"), "utf-8"),
+        );
+        const cacheHandlerRel: string | undefined = rsf?.config?.cacheHandler;
+        if (!cacheHandlerRel) {
+          fallbackIncrementalCacheFailed = true;
+          return undefined;
+        }
+        const { IncrementalCache } = appReq("next/dist/server/lib/incremental-cache") as {
+          IncrementalCache: new (options: Record<string, unknown>) => unknown;
+        };
+        const CurCacheHandler = appReq(
+          path.isAbsolute(cacheHandlerRel)
+            ? cacheHandlerRel
+            : path.resolve(distDir, cacheHandlerRel),
+        );
+        fallbackIncrementalCache = new IncrementalCache({
+          fs: appReq("next/dist/server/lib/node-fs-methods").nodeFs,
+          dev: false,
+          flushToDisk: false,
+          fetchCache: true,
+          minimalMode: false,
+          serverDistDir: path.join(distDir, "server"),
+          requestHeaders: {},
+          getPrerenderManifest: () => ({
+            version: -1,
+            routes: {},
+            dynamicRoutes: {},
+            notFoundRoutes: [],
+            preview: { previewModeId: "", previewModeSigningKey: "", previewModeEncryptionKey: "" },
+          }),
+          CurCacheHandler: CurCacheHandler?.default ?? CurCacheHandler,
+        });
+      } catch (error) {
+        fallbackIncrementalCacheFailed = true;
+        console.warn(
+          "[pool-server] could not build the fallback IncrementalCache for edge invocations; " +
+            "edge revalidateTag on a cold replica will not reach the shared cache:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      return fallbackIncrementalCache;
     };
     edgeSandboxRun = (params) =>
       sandbox.run({
@@ -1863,12 +1919,26 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // invalidate the Node-rendered page cache.
         incrementalCache:
           params.incrementalCache ??
-          (globalThis as typeof globalThis & { __incrementalCache?: unknown }).__incrementalCache,
+          (globalThis as typeof globalThis & { __incrementalCache?: unknown }).__incrementalCache ??
+          // COLD-REPLICA FIX (2026-07-30): `__incrementalCache` is published by NODE
+          // entrypoints on their first invocation, so on a pod where no node route has run
+          // yet an edge function got NO incremental cache here — and inside the sandbox the
+          // bundled cache handler detects EdgeRuntime and goes INERT (cache-handler-entry.ts),
+          // so an edge route handler's `revalidateTag` wrote into a void and the invalidation
+          // was lost cluster-wide. Measured on GKE: upstream app-static's "revalidate tag
+          // correctly with edge route handler" timed out forever. Build a real Node-side
+          // IncrementalCache backed by the registered handler, once, lazily.
+          getFallbackIncrementalCache(),
         clientAssetToken: "",
       });
     console.log("Edge sandbox initialized");
-  } catch {
-    // Edge sandbox not available
+  } catch (err) {
+    // Do NOT swallow this. For a node-runtime app an unavailable sandbox is genuinely
+    // harmless, but for an edge-middleware app it is fatal — and the downstream symptom
+    // ("middleware has no callable export") blames the app's own middleware, which is fine.
+    // Live on GKE the actual cause was a missing @swc/helpers in the traced image, and
+    // finding that took a probe pod because this handler discarded it.
+    edgeSandboxLoadError = err instanceof Error ? err : new Error(String(err));
   }
 
   // The edge sandbox loads an entry's WASM/asset bindings by their `filePath`, but the middleware
@@ -1989,7 +2059,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       console.log(`Edge middleware sandbox ready (name=${mwName}, files=${mwFiles.length})`);
     } else if (isEdge) {
       console.warn(
-        "Edge middleware found but sandbox not available, falling back to Node.js loading",
+        "Edge middleware found but sandbox not available, falling back to Node.js loading" +
+          (edgeSandboxLoadError ? ` (${edgeSandboxLoadError.message})` : ""),
       );
       middlewareModule = await resolveMiddlewareModule(mwPath);
       console.log("Middleware module loaded (Node.js fallback)");
@@ -1999,6 +2070,19 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     }
 
     if (!edgeMiddlewareRunner && !hasCallableMiddlewareExport(middlewareModule)) {
+      // An EDGE entry reaching here means the sandbox never loaded: the module is a webpack
+      // edge wrapper, which Node cannot call, so "no callable export" is a true statement
+      // about a file that was never meant to be loaded this way. Lead with the real cause —
+      // it is nearly always a dependency missing from the container image, not the app.
+      if (isEdge) {
+        throw new Error(
+          `Edge middleware at ${mwPath} could not be run: the Next.js edge sandbox failed to ` +
+            `load, and the Node.js fallback found no callable export (an edge bundle is not ` +
+            `callable from Node). This usually means the container image is missing a runtime ` +
+            `dependency of next/dist/server/web/sandbox. Underlying error: ` +
+            `${edgeSandboxLoadError?.message ?? "sandbox unavailable, no error recorded"}`,
+        );
+      }
       throw new Error(
         `Configured middleware at ${mwPath} has no callable export. Refusing to start the pool.`,
       );

@@ -159,12 +159,40 @@ export const STRICT_INGRESS_CIDRS: readonly string[] = [
   ...HEALTH_CHECK_PROBE_CIDRS.filter((c) => !(GFE_PROXY_CIDRS as readonly string[]).includes(c)),
 ];
 
+/**
+ * The ONE helm expression permitted as a selector label value.
+ *
+ * A provider sometimes needs the release's own namespace in a selector — Envoy Gateway labels
+ * its proxies with `owning-gateway-namespace`, and only helm knows where the release installs.
+ * Every other value is charset-checked, so this is an explicit single-item allowlist rather than
+ * a hole: permitting arbitrary `{{ … }}` would let a config-supplied value inject template
+ * directives into the rendered chart.
+ */
+export const RELEASE_NAMESPACE_EXPR = "{{ .Release.Namespace }}";
+
 export function renderNetworkPolicies({
   releaseName,
   poolNames,
+  ingressSources,
 }: {
   releaseName: string;
   poolNames: string[];
+  /**
+   * The STRICT posture's admitted sources, from the provider.
+   *
+   * GKE can only name Google's published GFE/health-check CIDRs — a network control cannot
+   * tell your load balancer's traffic from anything else sourced from those ranges, which the
+   * README states plainly. A provider whose gateway runs IN the cluster supplies a podSelector
+   * instead: real workload identity, scoped to that release's own proxies.
+   *
+   * This matters more than it looks: the ext_proc reply carries INTERNAL_HEADER_SECRET, so
+   * whatever can reach :8443 can obtain the credential that makes a pool trust dispatch
+   * headers. Defaults to GKE's CIDRs so existing callers are unchanged.
+   */
+  ingressSources?: {
+    cidrs: readonly string[];
+    podSelectors: ReadonlyArray<{ namespace?: string; labels: Record<string, string> }>;
+  };
 }): string {
   assertSafeReleaseName(releaseName);
   // N61. Pool names reach LABEL VALUES and label SELECTORS below; they are quoted at every
@@ -183,10 +211,51 @@ export function renderNetworkPolicies({
 
   // Literal, doc-grounded constants (N19) — not helm values, so no deploy-time knob can
   // widen them; they change only with a code review of this file.
-  const googleLbFrom = STRICT_INGRESS_CIDRS.map(
-    (cidr) => `        - ipBlock:
+  const sources = ingressSources ?? { cidrs: STRICT_INGRESS_CIDRS, podSelectors: [] };
+  // Charset-check anything reaching a selector: these become label keys/values and a
+  // namespace name in rendered YAML.
+  for (const sel of sources.podSelectors) {
+    if (sel.namespace !== undefined && !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(sel.namespace)) {
+      throw new Error(`Invalid gateway namespace ${JSON.stringify(sel.namespace)}.`);
+    }
+    for (const [k, v] of Object.entries(sel.labels)) {
+      // The release-namespace expression is the single permitted helm value (see
+      // RELEASE_NAMESPACE_EXPR); everything else must be a plain label value. Anything looser
+      // would let a config-supplied string inject template directives into the chart.
+      const valueOk =
+        v === RELEASE_NAMESPACE_EXPR || /^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$/.test(v);
+      if (!/^[A-Za-z0-9]([-A-Za-z0-9_./]*[A-Za-z0-9])?$/.test(k) || !valueOk) {
+        throw new Error(
+          `Invalid ingress selector label ${JSON.stringify(k)}: ${JSON.stringify(v)}.`,
+        );
+      }
+    }
+  }
+
+  const cidrFrom = sources.cidrs
+    .map(
+      (cidr) => `        - ipBlock:
             cidr: ${cidr}`,
-  ).join("\n");
+    )
+    .join("\n");
+  const podSelectorFrom = sources.podSelectors
+    .map((sel) => {
+      const labels = Object.entries(sel.labels)
+        .map(([k, v]) => `                ${k}: "${v}"`)
+        .join("\n");
+      const ns =
+        sel.namespace !== undefined
+          ? `\n          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: "${sel.namespace}"`
+          : "";
+      return `        - podSelector:
+            matchLabels:
+${labels}${ns}`;
+    })
+    .join("\n");
+  // Both lists render; an empty one contributes nothing.
+  const googleLbFrom = [cidrFrom, podSelectorFrom].filter(Boolean).join("\n");
 
   // Operator-supplied node/subnet range(s): kubelet probe traffic (N19). Required
   // whenever strict is on — the guard below refuses to render without it.

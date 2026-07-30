@@ -1,5 +1,6 @@
 // src/cli/index.ts
 import path from "node:path";
+import { infrastructurePath } from "./infrastructure-validation.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { existsSync, readFileSync } from "node:fs";
 import { runInit } from "./init.js";
@@ -187,7 +188,7 @@ async function main(): Promise<void> {
       .slice(0, 40)
       .replace(/-+$/, "") || "app";
   let persistedReleaseName: string | undefined;
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
     try {
       const infra = JSON.parse(readFileSync(infraPath, "utf-8"));

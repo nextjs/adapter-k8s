@@ -664,10 +664,14 @@ export async function runInit(options: InitOptions): Promise<void> {
           ...extRoleArgs,
         ]);
         if (updated.exitCode !== 0) {
-          throw new Error(`Updating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(updated.stderr)}`);
+          throw new Error(
+            `Updating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(updated.stderr)}`,
+          );
         }
       } else {
-        throw new Error(`Creating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(created.stderr)}`);
+        throw new Error(
+          `Creating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(created.stderr)}`,
+        );
       }
     }
   }

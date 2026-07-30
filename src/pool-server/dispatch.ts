@@ -611,19 +611,19 @@ async function writeInnerResponse(
         // bytes and the document re-renders (the matrix's empty-entry sharing contract).
         "HIT"
       : effectivePrefix
-      ? "PRERENDER"
-      : nextCache === "HIT" || nextCache === "STALE"
-        ? "HIT"
-        : (nextCache === "MISS" || headers["x-nextjs-postponed"] !== undefined) &&
-            buildFallbackBacked
-          ? // A BUILD fallback artifact answered this serve. Two measured shapes: Next
-            // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
-            // now), or — fresh-key shell+resume — the response carries only
-            // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
-            // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
-            // the HIT/STALE arm above runs first.
-            "PRERENDER"
-          : "MISS";
+        ? "PRERENDER"
+        : nextCache === "HIT" || nextCache === "STALE"
+          ? "HIT"
+          : (nextCache === "MISS" || headers["x-nextjs-postponed"] !== undefined) &&
+              buildFallbackBacked
+            ? // A BUILD fallback artifact answered this serve. Two measured shapes: Next
+              // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
+              // now), or — fresh-key shell+resume — the response carries only
+              // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
+              // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
+              // the HIT/STALE arm above runs first.
+              "PRERENDER"
+            : "MISS";
   }
   // The combined response is shell bytes followed by resume bytes, so neither
   // component's content length describes the final body.
@@ -1708,13 +1708,32 @@ export function createDispatcher(options: DispatcherOptions) {
   // cache, so those requests must run NON-minimal and let Next's own filesystem incremental
   // cache own them and report x-nextjs-cache MISS/STALE/HIT like `next start`. Precomputed
   // once; only the membership test runs per request.
-  const emulatedSsgTemplates = emulatePlatformCache
-    ? new Set(
-        staticAssets
-          .filter((asset) => asset.prerender && !asset.ppr)
-          .flatMap((asset) => templateOutputCandidates(asset.pathname, outputIds)),
-      )
-    : new Set<string>();
+  //
+  // PRODUCTION FIX (attempt 2, 2026-07-30): the three incrementalCacheShared additions here
+  // and below, plus seed-serving static pages (serveConcretePrerenderSeed) with an
+  // x-vercel-cache verdict. The bug: these rungs were harness-only, so with Valkey configured
+  // every plain SSG/static app page ran MINIMAL — the entrypoint re-rendered per request and
+  // emitted no x-nextjs-cache (Next gates it on !isMinimalMode), while the adapter's
+  // `max-age=0, must-revalidate` kept Cloud CDN out. MEASURED on GKE, same pod/build:
+  // VALKEY_URL set -> 3 requests, 3 renders, MISS; unset -> 1 render, HIT x3.
+  //
+  // Attempt 1 (reverted) flipped ONLY these rungs. Measured against upstream app-static on
+  // GKE: fixed force-static(lazy), broke dynamicParams:false + navigate-to-static-path,
+  // untouched the five header/revalidate failures — because with Valkey EMPTY at deploy
+  // (a custom cacheHandler never reads build artifacts off disk, unlike the harness's
+  // filesystem cache) every first request was still a rendered MISS. Attempt 2 adds the
+  // missing platform half: build seeds are served for static pages while fresh and not
+  // tag-stale, so the first request answers from the artifact like `next start`.
+  // incrementalCacheShared is FALSE in the upstream harness (no adapter config -> no
+  // registered handler), so none of this moves the pool-only baseline.
+  const emulatedSsgTemplates =
+    emulatePlatformCache || incrementalCacheShared
+      ? new Set(
+          staticAssets
+            .filter((asset) => asset.prerender && !asset.ppr)
+            .flatMap((asset) => templateOutputCandidates(asset.pathname, outputIds)),
+        )
+      : new Set<string>();
   // NEXT_ENABLE_ADAPTER-only bookkeeping (unreachable in production — the add site is
   // gated on emulatePlatformCache): one shell-served marker per concrete URL. Cap it so
   // a long-lived harness pod crawling many URLs can't grow it without bound. Eviction
@@ -2059,7 +2078,12 @@ export function createDispatcher(options: DispatcherOptions) {
           // revalidatePath/updateTag transitions and reports the real x-nextjs-cache status. The
           // gate is unreachable in production, where Valkey owns the same lifecycle.
           !(emulatePlatformCache && hasHandler) &&
-          handlerPathname !== mp &&
+          // Static pages (handlerPathname === mp) serve their seed too. This used to be
+          // restricted to concrete instances under a dynamic template, with the static-page
+          // half waved at as "Valkey owns the same lifecycle" — it does not: minimal-mode
+          // entrypoints never consult the incremental cache for the response, so a static
+          // page's first request (and, before the incrementalCacheShared rungs above, EVERY
+          // request) rendered instead of serving the artifact `next start` would have served.
           resolution.pool === poolName;
         // Pages Router fallback:true emits a build-time HTML shell under the dynamic route
         // template. A first document request for a path outside getStaticPaths must receive that
@@ -2259,6 +2283,11 @@ export function createDispatcher(options: DispatcherOptions) {
             // sends the real one (measured). Third instance of the bug sendImageResponse already
             // documents. Stamped after the manifest headers so it always describes these bytes.
             headers["content-length"] = String(content.length);
+            // A stored (build) entry answered this key — that is HIT by the platform contract
+            // above (and what `next start` reports for a prerendered page: its filesystem
+            // cache reads the build output). Only for the seed path: plain static files and
+            // fallback shells keep their existing header surface.
+            if (serveConcretePrerenderSeed) headers["x-vercel-cache"] = "HIT";
             res.writeHead(staticAsset.status ?? 200, headers);
             res.end(req.method === "HEAD" ? undefined : content);
             return;
@@ -2777,8 +2806,7 @@ export function createDispatcher(options: DispatcherOptions) {
             const aq = pprRoutes[candidate]?.allowQuery ?? capableAq;
             if (!aq) continue;
             platformStoreEligible = capableAq !== undefined && platformDocumentRequest;
-            const params =
-              extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
+            const params = extractRouteParams(candidate, resolution.routeMatches ?? null) ?? {};
             // The build emits nxtP-prefixed param names in allowQuery; extracted route
             // params are bare. Try both spellings (measured on the matrix fixture:
             // ["nxtPlang"] vs params.lang — unnormalized, every key per template collapsed).
@@ -2981,7 +3009,7 @@ export function createDispatcher(options: DispatcherOptions) {
                   // The truncation bug it was meant to fix is therefore still open; see
                   // docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md.
                   (!!handlerPprInfo || handlerPprRootParams)) ||
-                (emulatePlatformCache &&
+                ((emulatePlatformCache || incrementalCacheShared) &&
                   !!dispatchStaticAsset?.prerender &&
                   !dispatchStaticAsset.ppr) ||
                 // N13: a concrete path served through an SSG/ISR app template has no build
@@ -2997,7 +3025,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 // exactly like a plain SSG instance here. Without this rung, fallback-shells'
                 // `without-suspense`/`without-io` routes were flipped non-minimal by THIS clause
                 // even after the N16 gate above was narrowed.
-                (emulatePlatformCache &&
+                ((emulatePlatformCache || incrementalCacheShared) &&
                   !handlerPprInfo &&
                   !handlerPprCapable &&
                   handlerOutputInfo?.type === "APP_PAGE" &&

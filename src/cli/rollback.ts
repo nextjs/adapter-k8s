@@ -26,7 +26,11 @@ import {
   internalSecretName,
   legacyInternalSecretName,
 } from "../emit/templates/internal-secret.js";
-import { assertSafeInfrastructure } from "./infrastructure-validation.js";
+import {
+  assertSafeInfrastructure,
+  infrastructurePath,
+  outputDirName,
+} from "./infrastructure-validation.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -85,9 +89,7 @@ type RoutingServingRead =
  * it from the image reference broke once images became digest-pinned (see the NEXT_BUILD_ID note
  * inside).
  */
-export async function readRoutingServingConfig(
-  releaseName: string,
-): Promise<RoutingServingRead> {
+export async function readRoutingServingConfig(releaseName: string): Promise<RoutingServingRead> {
   const deployName = routingServiceDeploymentName(releaseName);
   const res = await execCapture("kubectl", [
     "get",
@@ -126,9 +128,9 @@ export async function readRoutingServingConfig(
     | undefined;
   const containers: unknown[] = Array.isArray(podSpec?.containers) ? podSpec.containers : [];
   const volumes: unknown[] = Array.isArray(podSpec?.volumes) ? podSpec.volumes : [];
-  const routingContainer = (
-    containers as { name?: string; image?: string; env?: unknown }[]
-  ).find((c) => c?.name === "routing-service");
+  const routingContainer = (containers as { name?: string; image?: string; env?: unknown }[]).find(
+    (c) => c?.name === "routing-service",
+  );
   const image = routingContainer?.image;
   const cmName = (volumes as { name?: string; configMap?: { name?: string } }[]).find(
     (v) => v?.name === ROUTING_MANIFEST_VOLUME_NAME,
@@ -795,7 +797,7 @@ export async function runRollback(options: {
 }): Promise<void> {
   const { projectDir, releaseName, dryRun } = options;
 
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
@@ -843,7 +845,7 @@ export async function runRollback(options: {
   // readable without touching the cluster, so the dry-run plan can be printed before any
   // cluster interaction.
   let poolNames: string[] = [];
-  const metaPath = path.join(projectDir, ".k8s-adapter", "output", "build-metadata.json");
+  const metaPath = path.join(projectDir, ".k8s-adapter", outputDirName(), "build-metadata.json");
   if (existsSync(metaPath)) {
     try {
       const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
@@ -921,7 +923,7 @@ export async function runRollback(options: {
   // pool's previous and current Deployment by exact name, and verify every previous pool
   // exists BEFORE touching traffic.
   const scalingByPool = new Map<string, { min: number; max: number; targetCPU: number }>();
-  const valuesPath = path.join(projectDir, ".k8s-adapter", "output", "chart", "values.yaml");
+  const valuesPath = path.join(projectDir, ".k8s-adapter", outputDirName(), "chart", "values.yaml");
   if (existsSync(valuesPath)) {
     try {
       const raw = readFileSync(valuesPath, "utf-8");
@@ -1345,7 +1347,7 @@ export async function runRollback(options: {
   // 4c. Traffic now points at the previous build and state is committed. Invalidate the CDN
   // entries tagged for the build we rolled AWAY from (currentBuildId) so its stale content
   // stops serving. Best-effort and non-fatal — a failure just lets the TTL self-heal.
-  const rbOutputDir = path.join(projectDir, ".k8s-adapter", "output");
+  const rbOutputDir = path.join(projectDir, ".k8s-adapter", outputDirName());
   if (existsSync(path.join(rbOutputDir, "chart", "templates", "cdn-http-filter.yaml"))) {
     try {
       if (infra?.projectId) {

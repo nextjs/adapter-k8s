@@ -8,7 +8,9 @@ import {
   assertSafeQuantity,
   assertSafeReleaseName,
   assertSafeReplicaCount,
+  escapeHelmActions,
 } from "./utils.js";
+import type { EnvValue, EnvFromSource } from "../../types.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
 import { renderValkeyEnv } from "./valkey-secret.js";
 
@@ -79,6 +81,8 @@ export function renderDeployment({
   replicas,
   readinessPath = POOL_READINESS_PATH,
   internalSecretRef,
+  env,
+  envFrom,
 }: {
   poolName: string;
   buildId: string;
@@ -134,6 +138,9 @@ export function renderDeployment({
    * wants.
    */
   internalSecretRef?: string;
+  /** User-supplied runtime environment, already merged (top-level config + this pool). */
+  env?: Record<string, EnvValue>;
+  envFrom?: EnvFromSource[];
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -162,6 +169,48 @@ export function renderDeployment({
   // Emitting it unconditionally keeps the pod template identical whether or not the cache is on,
   // so toggling `cache.enabled` between deploys never rolls the retained previous deployment.
   const valkeyEnv = "\n" + renderValkeyEnv(releaseName, "            ");
+
+  // User-supplied runtime environment. Rendered AFTER the adapter's own entries: Kubernetes
+  // takes the last occurrence of a duplicated name, so this ordering makes "user config can
+  // never shadow a built-in" a property of the output rather than of validation alone
+  // (validateConfig rejects the collision too — belt and braces, cheap).
+  //
+  // Every interpolated string is JSON.stringify'd (env values must be YAML strings, and a
+  // bare `1.20` or `yes` would parse as a float/bool and be rejected at apply time) and then
+  // escapeHelmActions'd, because chart templates are Go-template-evaluated before the YAML is
+  // parsed — see the S5 note in utils.ts.
+  const yamlStr = (value: string): string => escapeHelmActions(JSON.stringify(value));
+  const envEntries = Object.entries(env ?? {}).map(([name, value]) => {
+    if (typeof value === "string") {
+      return `            - name: ${name}\n              value: ${yamlStr(value)}`;
+    }
+    const isSecret = "secret" in value;
+    const refKind = isSecret ? "secretKeyRef" : "configMapKeyRef";
+    const refName = isSecret ? value.secret : value.configMap;
+    const optional = value.optional === true ? `\n                  optional: true` : "";
+    return (
+      `            - name: ${name}\n` +
+      `              valueFrom:\n` +
+      `                ${refKind}:\n` +
+      `                  name: ${yamlStr(refName)}\n` +
+      `                  key: ${yamlStr(value.key)}${optional}`
+    );
+  });
+  const userEnv = envEntries.length > 0 ? "\n" + envEntries.join("\n") : "";
+
+  const envFromEntries = (envFrom ?? []).map((source) => {
+    const isSecret = "secret" in source;
+    const refKind = isSecret ? "secretRef" : "configMapRef";
+    const refName = isSecret ? source.secret : source.configMap;
+    const prefix = source.prefix ? `\n              prefix: ${yamlStr(source.prefix)}` : "";
+    const optional = source.optional === true ? `\n                optional: true` : "";
+    return (
+      `            - ${refKind}:\n` +
+      `                name: ${yamlStr(refName)}${optional}${prefix}`
+    );
+  });
+  const userEnvFrom =
+    envFromEntries.length > 0 ? `\n          envFrom:\n${envFromEntries.join("\n")}` : "";
 
   // N60. Literal quantities are validated here too: a `.Values`-sourced quantity is
   // already checked in values-yaml.ts, but a literal from deploy's per-build snapshot
@@ -323,7 +372,7 @@ ${podLabels}
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-${internalSecretEnv}${valkeyEnv}
+${internalSecretEnv}${valkeyEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             # readOnlyRootFilesystem makes / read-only; Next still needs a writable
             # scratch dir, so /tmp is an emptyDir. NOT in-memory: a bare \`emptyDir: {}\`

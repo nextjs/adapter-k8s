@@ -1667,9 +1667,7 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
             spec: {
               template: {
                 spec: {
-                  containers: [
-                    { name: "routing-service", image: "gcr.io/p/routing-service:cur" },
-                  ],
+                  containers: [{ name: "routing-service", image: "gcr.io/p/routing-service:cur" }],
                   volumes: [
                     { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
                   ],

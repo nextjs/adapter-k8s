@@ -111,15 +111,35 @@ export NEXT_TEST_MODE=deploy
 # (e.g. middleware-rewrites via `skipDeployment: isAdapterTest && isTurbopackTest`), and the harness
 # gates its immutable-assets reporting on it. Without it we wrongly run+fail upstream-disabled tests.
 export NEXT_ENABLE_ADAPTER=1
-export NEXT_E2E_TEST_TIMEOUT=240000
+# Covers deploy + test, since createNext() runs inside the suite's beforeAll hook. 240s is
+# right for a local pool start; a real-cluster deploy (image push + rollout + LB program)
+# blows through it, and the failure looks like "14 tests failed" rather than "the deploy
+# was still running". Overridable so the cluster topology can raise it.
+export NEXT_E2E_TEST_TIMEOUT="${NEXT_E2E_TEST_TIMEOUT:-240000}"
 export NEXT_EXTERNAL_TESTS_FILTERS="$NEXT_TEST_FILTERS"
 export ADAPTER_DIR="$ADAPTER_DIR"
 export IS_TURBOPACK_TEST=1
 export NEXT_TEST_JOB=1
 export NEXT_TELEMETRY_DISABLED=1
-export NEXT_TEST_DEPLOY_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-deploy.sh"
-export NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-logs.sh"
-export NEXT_TEST_CLEANUP_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-cleanup.sh"
+# Topology selection. These were assigned unconditionally, which silently defeated the
+# only mechanism callers had to pick a different one: `npm run test:integration` sets
+# NEXT_TEST_DEPLOY_SCRIPT_PATH=scripts/e2e-integration-deploy.sh and this line overwrote
+# it, so the "Phase 2 through Envoy" suite was in fact running the Phase 1 pool topology.
+# Defaulting instead of assigning keeps Phase 1 the default for a bare `test:e2e`.
+export NEXT_TEST_DEPLOY_SCRIPT_PATH="${NEXT_TEST_DEPLOY_SCRIPT_PATH:-${ADAPTER_DIR}/scripts/e2e-deploy.sh}"
+export NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH="${NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH:-${ADAPTER_DIR}/scripts/e2e-logs.sh}"
+export NEXT_TEST_CLEANUP_SCRIPT_PATH="${NEXT_TEST_CLEANUP_SCRIPT_PATH:-${ADAPTER_DIR}/scripts/e2e-cleanup.sh}"
+# Relative paths are how package.json spells these; the harness runs them from the
+# Next.js checkout, where a relative path resolves to the wrong tree (or nothing).
+for _var in NEXT_TEST_DEPLOY_SCRIPT_PATH NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH NEXT_TEST_CLEANUP_SCRIPT_PATH; do
+  _val="${!_var}"
+  case "$_val" in
+    /*) ;;
+    *) export "$_var=${ADAPTER_DIR}/${_val}" ;;
+  esac
+  [ -f "${!_var}" ] || { echo "ERROR: ${_var} does not exist: ${!_var}" >&2; exit 1; }
+done
+echo "Topology:  ${NEXT_TEST_DEPLOY_SCRIPT_PATH}"
 
 if [ -n "$TEST_PATTERN" ]; then
   node run-tests.js --test-pattern "$TEST_PATTERN" --retries "$TEST_RETRIES" -c "$CONCURRENCY" --debug

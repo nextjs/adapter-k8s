@@ -11,6 +11,9 @@ import type {
   BuildCompleteContext,
   PoolDefinition,
 } from "./types.js";
+import { genericConfigOf, gkeConfigOf, providerGatewayHosts } from "./types.js";
+import { resolveProvider } from "./providers/index.js";
+import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 
 // Get current directory in a way that works in ESM and CJS bundle
 const _dirname =
@@ -357,7 +360,9 @@ import { generateCelExpression } from "./cel.js";
 import { generateExtensionChain, determineFailureMode } from "./extension-chain.js";
 
 // Output directory matches §18.3 in the design doc
-const OUTPUT_DIR = ".k8s-adapter/output";
+// Variant-scoped: see outputDirName(). A chart is only valid for the target it was emitted for,
+// because the routing tier's registry is baked in at build time.
+const OUTPUT_DIR = (): string => `.k8s-adapter/${outputDirName()}`;
 
 // Where the adapter's esbuild bundles (pool-server.cjs, routing-service.cjs,
 // cache-handler.cjs) live — next to this module in the published package's dist/.
@@ -442,7 +447,7 @@ async function writeOutputFile(
   projectDir: string,
   relativePath: string,
   content: string,
-  baseDir: string = OUTPUT_DIR,
+  baseDir: string = OUTPUT_DIR(),
   mode?: number,
 ): Promise<void> {
   const fullPath = path.join(projectDir, baseDir, relativePath);
@@ -619,8 +624,8 @@ export async function stageFile(
   const absSource = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(projectDir, sourcePath);
 
   const stageDir = isShared
-    ? path.join(projectDir, OUTPUT_DIR, "shared-context")
-    : path.join(projectDir, OUTPUT_DIR, "pools", poolName, "context");
+    ? path.join(projectDir, OUTPUT_DIR(), "shared-context")
+    : path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context");
 
   // path.join normalizes, so `..` segments are resolved here — assert containment on the
   // RESULT (a `../`-keyed asset throws rather than escaping).
@@ -798,6 +803,84 @@ async function stagePackageTree(
   }
 }
 
+// Stage `next`'s OWN declared runtime dependencies beside `next` in the traced context.
+//
+// Next resolves several packages at RUNTIME rather than bundling them, through mechanisms no
+// tracer can follow: the pool's `appReq("next/dist/server/web/sandbox")`, and turbopack's
+// externalRequire inside next-server's compiled runtimes. Two CrashLoops on GKE from the same
+// gap, found by the cluster topology with upstream's middleware-responses fixture:
+//
+//   Cannot find module '@swc/helpers/_/_interop_require_default'
+//     <- next/dist/shared/lib/constants.js <- next/dist/server/web/sandbox/context.js
+//   Cannot find module 'styled-jsx'
+//     <- next/dist/compiled/next-server/pages-turbo.runtime.prod.js  (route /_error)
+//
+// The traced image shipped 8 top-level packages. Naming victims one CrashLoop at a time does
+// not converge, so mirror the declaration instead: whatever the app's installed `next` lists
+// as a dependency is what Next expects to resolve at runtime. Reading it from the installed
+// package (not a hardcoded list) is what stops this rotting as Next's deps move between
+// releases. Cost is a few MB against a several-hundred-MB image.
+//
+// Resolves app-first: these must match the app's own next install, not the adapter's.
+export async function stageNextRuntimeDependencies(
+  projectDir: string,
+  poolName: string,
+  isShared: boolean = false,
+  resolveDep?: (dep: string, projectDir: string) => string | undefined,
+): Promise<{ staged: string[]; unresolved: string[] }> {
+  // App-ONLY, deliberately: resolveDepDir's adapter fallback would stage the ADAPTER's next
+  // (and its deps) into an app that has none — a version pairing guaranteed not to match the
+  // build output. An app without a resolvable next is not buildable anyway.
+  const fromDir = (dep: string, dir: string): string | undefined => {
+    try {
+      return path.dirname(
+        createRequire(path.join(dir, "package.json")).resolve(`${dep}/package.json`),
+      );
+    } catch {
+      return undefined;
+    }
+  };
+  const nextDir = (resolveDep ?? fromDir)("next", projectDir);
+  const staged: string[] = [];
+  const unresolved: string[] = [];
+  if (!nextDir || !existsSync(nextDir)) return { staged, unresolved };
+
+  let deps: string[];
+  try {
+    const pkg = JSON.parse(readFileSync(path.join(nextDir, "package.json"), "utf-8")) as {
+      dependencies?: Record<string, string>;
+    };
+    deps = Object.keys(pkg.dependencies ?? {});
+  } catch {
+    // Unreadable next/package.json — the build would already be failing elsewhere.
+    return { staged, unresolved };
+  }
+
+  // Resolve each dep from next's OWN location first (pnpm nests them there), then the app
+  // root (npm/yarn hoist them). That is the same order next itself would resolve them in.
+  const resolveRuntimeDep =
+    resolveDep ?? ((dep: string, dir: string) => fromDir(dep, nextDir) ?? fromDir(dep, dir));
+
+  for (const dep of deps) {
+    const dir = resolveRuntimeDep(dep, projectDir);
+    if (!dir || !existsSync(dir)) {
+      // Warn rather than throw. A pnpm/monorepo layout can hide one, and refusing to build
+      // over a package the app may never load would be worse than the CrashLoop it prevents.
+      // When it does matter, the pool now fails at startup naming the real missing module.
+      console.warn(
+        `[adapter-k8s] Could not resolve "${dep}" (a declared dependency of next) from ` +
+          `${projectDir}. Next resolves some of these at runtime, so the "${poolName}" pool ` +
+          `container may fail to start with a module-not-found error.`,
+      );
+      unresolved.push(dep);
+      continue;
+    }
+    await stagePackageTree(projectDir, dep, dir, poolName, isShared);
+    staged.push(dep);
+  }
+  return { staged, unresolved };
+}
+
 // Stage sharp's linux-x64 native packages into the pool's traced-assets context.
 // npm installs platform-specific optional packages for the BUILD host only, so a
 // darwin/arm64 host won't have the linux-x64 pair at all — in that case fall back to
@@ -854,7 +937,7 @@ export async function stageSharpRuntimePackages(
 // actionable error. An all-symbols basename sanitizes to "" — fall back to "nextjs"
 // (the `??` on infra.releaseName used to be dead: .replace() never yields null/undefined).
 function deriveReleaseName(projectDir: string): string {
-  const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+  const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath)
     ? (readJsonFile(infraPath, "infrastructure.json") as { releaseName?: string })
     : {};
@@ -915,12 +998,28 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
   async function ensureConfig(projectDir: string) {
     if (!config) {
-      // Try to load from project root
-      const configPaths = [
-        path.join(projectDir, "adapter.config.mjs"),
-        path.join(projectDir, "adapter.config.ts"),
-        path.join(projectDir, "adapter.config.js"),
-      ];
+      // ADAPTER_K8S_CONFIG selects a VARIANT, so one project can carry several targets side by
+      // side — `adapter.config.scaleway.mjs` next to `adapter.config.mjs` — instead of swapping
+      // one file back and forth. Swapping is how a GKE deploy ends up pushing to the wrong
+      // registry: the file that decides the target is mutable global state, and forgetting to
+      // restore it is silent until something deploys somewhere unintended.
+      //
+      // The value is a bare variant NAME (`scaleway`), not a path: it is interpolated into a
+      // filename, so a path would let it escape the project directory.
+      const variant = process.env.ADAPTER_K8S_CONFIG?.trim();
+      if (variant !== undefined && !/^[a-z0-9][-a-z0-9_]*$/i.test(variant)) {
+        throw new Error(
+          `[adapter-k8s] ADAPTER_K8S_CONFIG=${JSON.stringify(variant)} is not a valid variant ` +
+            `name. Use a bare name like "scaleway" (loads adapter.config.scaleway.mjs), not a path.`,
+        );
+      }
+      const suffixes = variant ? [`.${variant}`, ""] : [""];
+      // Try to load from project root, preferring the requested variant.
+      const configPaths = suffixes.flatMap((s) => [
+        path.join(projectDir, `adapter.config${s}.mjs`),
+        path.join(projectDir, `adapter.config${s}.ts`),
+        path.join(projectDir, `adapter.config${s}.js`),
+      ]);
 
       for (const p of configPaths) {
         if (existsSync(p)) {
@@ -1136,7 +1235,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           ((nextConfig.experimental as ExperimentalWithServerActions | undefined)?.serverActions
             ?.allowedOrigins ?? []) as string[],
         );
-        for (const host of cfg.provider?.gke?.gateway?.hosts ?? []) {
+        // Server Actions compare Origin vs Host, and every provider serves the app on its
+        // gateway hosts — so this is provider-independent, not a GKE detail.
+        for (const host of providerGatewayHosts(cfg)) {
           const normalized = normalizeDeploymentHost(host.hostname);
           if (normalized) allowedOrigins.add(normalized);
         }
@@ -1195,6 +1296,20 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           const dest = path.join(destDir, "cache-handler.cjs");
           await copyFile(src, dest);
           modified.cacheHandler = dest;
+          // Next keeps a per-process in-memory LRU IN FRONT of any custom cacheHandler
+          // (cacheMaxMemorySize, 50MB default). With replicas that layer is incoherent by
+          // construction: its tag manifest is process-local, so a `revalidateTag` performed
+          // on any OTHER pod — or in an EDGE sandbox even on the SAME pod, which has its own
+          // module graph — never invalidates it, and the entry serves as fresh for its whole
+          // revalidate window. MEASURED on GKE (2026-07-30): upstream app-static's
+          // "revalidate tag correctly with edge route handler" pinned a tagged fetch entry
+          // for 360s; the value was in NO Valkey key (39 scanned) — pure memory-layer serve —
+          // and the harness's keep-alive connection pinned every iteration to the same pod.
+          // The upstream suite only passes the node variant because keep-alive pins it to the
+          // pod that healed itself. Zero disables the layer so the shared handler — whose tag
+          // logic reads the SHARED manifest — is authoritative on every read. In-VPC Valkey
+          // RTT is ~1ms; correctness across replicas is the entire point of the shared cache.
+          modified.cacheMaxMemorySize = 0;
           // The handler's bundled Redis client uses only `node:net`/`node:tls` (loaded lazily),
           // which Next externalizes automatically — so there's no third-party package to mark
           // external or stage into the pool container.
@@ -1320,7 +1435,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // next `helm upgrade`. Only the generated chart dir is cleared — staged
       // build contexts and injected previous-build templates live elsewhere and
       // are managed by their own steps.
-      const chartDir = path.join(projectDir, OUTPUT_DIR, "chart");
+      const chartDir = path.join(projectDir, OUTPUT_DIR(), "chart");
       if (existsSync(chartDir)) await rm(chartDir, { recursive: true, force: true });
 
       // In a monorepo the tracing root (repoRoot) sits above the app dir (projectDir).
@@ -1338,7 +1453,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       }
 
       // Dump raw build context for debugging
-      const debugDir = path.join(projectDir, OUTPUT_DIR, "debug");
+      const debugDir = path.join(projectDir, OUTPUT_DIR(), "debug");
       await mkdir(debugDir, { recursive: true });
       await writeFile(
         path.join(debugDir, "build-context.json"),
@@ -1425,7 +1540,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // releaseName was derived up top (deriveReleaseName — infrastructure.json with a
       // capped basename fallback); infrastructure.json also carries namespace/registry/
       // project values consumed below.
-      const infraPath = path.join(projectDir, ".k8s-adapter", "infrastructure.json");
+      const infraPath = infrastructurePath(projectDir);
       // N50 (review, Medium): readJsonFile names the file and the remedy — this was a bare
       // JSON.parse whose SyntaxError reached the operator with only a character offset.
       const infra = (
@@ -1450,12 +1565,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // expression was `!(request.path.startsWith('/_next/static/'))`, zero per-file
         // exclusions. `collectPublicPathnames` is the same enumeration the static-asset
         // manifest and the pool's pathname set already use, and it is already imported here.
-        publicPathnames: collectPublicPathnames(projectDir),
       });
 
       const failureModeAllow = determineFailureMode(outputs, cfg.routingService?.failureMode);
 
-      const gkeProvider = cfg.provider.gke;
+      const gkeProvider = gkeConfigOf(cfg);
 
       // infrastructure.json is operator/CI-managed state, but a tampered or hand-edited
       // value here flows into helm --set, resource names, and chart YAML — validate at
@@ -1538,7 +1652,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             releaseName,
             namespace,
             projectId: infra.projectId!,
-            timeout: gkeProvider.serviceExtensions?.routeExtension?.timeout
+            timeout: gkeProvider?.serviceExtensions?.routeExtension?.timeout
               ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
               : "5s",
             failureModeAllow,
@@ -1588,7 +1702,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           projectDir,
           `chart/${filePath}`,
           content,
-          OUTPUT_DIR,
+          OUTPUT_DIR(),
           SECRET_CHART_FILES.has(filePath) ? 0o600 : undefined,
         );
       }
@@ -1782,6 +1896,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           );
         }
 
+        // next's declared runtime dependencies (see stageNextRuntimeDependencies) — the ones
+        // Next resolves rather than bundles. Without them pools CrashLoop on edge middleware
+        // and on the Pages Router server runtime.
+        await stageNextRuntimeDependencies(projectDir, poolName, isShared);
+
         // sharp's native linux-x64 packages (see stageSharpRuntimePackages) — pool-server.cjs
         // inlines sharp's JS but requires the platform binding at RUNTIME.
         return stageSharpRuntimePackages(projectDir, poolName, resolveSharpDepDir, isShared);
@@ -1798,7 +1917,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       } else if (containerStrategy === "shared-image") {
         const sharedStageDir = "shared-context";
-        const absSharedStageDir = path.join(OUTPUT_DIR, sharedStageDir);
+        const absSharedStageDir = path.join(OUTPUT_DIR(), sharedStageDir);
 
         // Wipe the context first — see the N50 note in the traced-assets branch: `cp` MERGES,
         // so without this a file deleted from the source keeps shipping inside the image.
@@ -1888,7 +2007,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         );
       } else {
         for (const [poolName, pool] of pools) {
-          const poolDir = path.join(OUTPUT_DIR, "pools", poolName);
+          const poolDir = path.join(OUTPUT_DIR(), "pools", poolName);
           const poolStageDir = path.join(poolDir, "context");
 
           // N50 (review #32, reproduced): WIPE the build context before staging. Invariant 5
@@ -2045,7 +2164,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       await writeOutputFile(
         projectDir,
         "cdn-invalidation.json",
-        JSON.stringify({ invalidateOnDeploy: gkeProvider.cdn?.invalidateOnDeploy ?? true }),
+        JSON.stringify({ invalidateOnDeploy: gkeProvider?.cdn?.invalidateOnDeploy ?? true }),
       );
 
       // Phase 2 artifacts — write to output (computation moved above Helm chart generation).
@@ -2058,7 +2177,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
       // Routing service Dockerfile + context (skip when staging is disabled)
       if (!skipStaging) {
-        const routingServiceDir = path.join(OUTPUT_DIR, "routing-service");
+        const routingServiceDir = path.join(OUTPUT_DIR(), "routing-service");
 
         await writeOutputFile(
           projectDir,
@@ -2208,6 +2327,17 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         generateBuildMetadata({
           buildId,
           nextVersion,
+          // The CLI cannot otherwise tell a generic build from a GKE one, and it makes
+          // provider-specific decisions (kube context, digest resolution, NetworkPolicy
+          // discovery) on that basis.
+          provider: resolveProvider(cfg).name,
+          // The chart bakes this registry into image references; deploy refuses a chart whose
+          // registry does not match the infrastructure it is deploying with.
+          containerRegistry: imageRegistry,
+          ...(() => {
+            const n = genericConfigOf(cfg)?.nodeCidrs;
+            return n !== undefined ? { nodeCidrs: n } : {};
+          })(),
           poolNames: [...pools.keys()],
           // N50 (review #20): NOT `new Date()`. A wall-clock stamp made every regeneration of
           // the same build produce a different build-metadata.json, which defeats the only

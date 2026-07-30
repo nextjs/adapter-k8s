@@ -1945,7 +1945,56 @@ describe("createDispatcher", () => {
       });
     });
 
-    it("routes a prerender through the handler when one exists (ISR/draft/revalidate semantics)", async () => {
+    it("serves a FRESH prerender seed without invoking the handler, and reports HIT", async () => {
+      // Changed with the static-page seed-serve fix (2026-07-30): this used to assert the
+      // handler always runs for a prerender-with-handler. That design assumed "Valkey owns
+      // the same lifecycle", but minimal-mode entrypoints never consult the incremental cache
+      // for the response — so in production the handler re-rendered on EVERY request and
+      // nothing ever cached. `next start` serves the build artifact (via its filesystem
+      // cache, reported as HIT) until the revalidate window expires; the seed serve is that
+      // behavior. The expiry half is the next test.
+      writeFileSync(path.join(tmpDir, "fresh.html"), "<html>build seed</html>");
+
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const handler = vi.fn();
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(handler),
+          has: vi.fn().mockReturnValue(true),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        // builtAt now: the 60s revalidate window is open.
+        builtAt: new Date().toISOString(),
+        staticAssets: [
+          {
+            pathname: "/isr-page",
+            filePath: "fresh.html",
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            revalidate: 60,
+          },
+        ],
+        localHandlerInvoker,
+      });
+
+      const req = mockReq("/isr-page");
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/isr-page",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+      expect(res._body).toContain("build seed");
+      expect(res._headers["x-vercel-cache"]).toBe("HIT");
+    });
+
+    it("routes an EXPIRED prerender through the handler (ISR/draft/revalidate semantics)", async () => {
       writeFileSync(path.join(tmpDir, "stale.html"), "<html>stale build file</html>");
 
       const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
@@ -1958,6 +2007,9 @@ describe("createDispatcher", () => {
         } as any,
         poolName: "ssr",
         buildId: "test123",
+        // Built 10 minutes ago: the 60s revalidate window has long expired, so the seed is
+        // stale and the handler must regenerate rather than the stale file being re-served.
+        builtAt: new Date(Date.now() - 600_000).toISOString(),
         staticAssets: [
           {
             pathname: "/isr-page",

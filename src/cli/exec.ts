@@ -188,10 +188,7 @@ export function exec(command: string, args: string[], options?: ExecOptions): Pr
     // S28: forward line-by-line through the sanitizer. Partial lines are held until their
     // newline arrives so a control sequence cannot be split across two chunks and slip
     // through; whatever is left at EOF is flushed.
-    const forward = (
-      src: NodeJS.ReadableStream | null,
-      dest: NodeJS.WriteStream,
-    ): (() => void) => {
+    const forward = (src: NodeJS.ReadableStream | null, dest: NodeJS.WriteStream): (() => void) => {
       let pending = "";
       src?.setEncoding("utf8");
       src?.on("data", (chunk: string) => {

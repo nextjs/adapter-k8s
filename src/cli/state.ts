@@ -1,10 +1,14 @@
 // src/cli/state.ts
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { stateFileName } from "./infrastructure-validation.js";
 import { execCapture, execCaptureStdin } from "./exec.js";
 
 const STATE_DIR = ".k8s-adapter";
-const STATE_FILE = "state.json";
+// Variant-scoped: see stateFileName(). Sharing one state file across deploy targets lets a
+// higher generation from one cluster supply another cluster's activeBuildId — repointing that
+// cluster's Services at a build that only ever existed on the other one.
+const STATE_FILE = (): string => stateFileName();
 const CONFIGMAP_NAME_SUFFIX = "-adapter-state";
 // init binds Workload Identity to [<namespace>/${releaseName}-deploy-sa] with the literal
 // namespace "default" — the release (and therefore this ConfigMap) lives there. Pin it:
@@ -134,7 +138,7 @@ export class LocalStateReadError extends StateUnavailableError {}
 export class StateDisagreementError extends StateUnavailableError {}
 
 function stateFilePath(projectDir: string): string {
-  return path.join(projectDir, STATE_DIR, STATE_FILE);
+  return path.join(projectDir, STATE_DIR, STATE_FILE());
 }
 
 function isAdapterState(value: unknown): value is AdapterState {
@@ -223,7 +227,7 @@ export function chooseNewerState(local: AdapterState, cluster: AdapterState): Ad
       `Refusing to guess: deploying against the wrong one patches the active Service ` +
       `selector onto a build that may be scaled to zero. Confirm which build is serving ` +
       `(\`npx adapter-k8s doctor\`), then delete the stale copy — ` +
-      `\`rm ${path.join(STATE_DIR, STATE_FILE)}\` to accept the cluster's, or re-run the ` +
+      `\`rm ${path.join(STATE_DIR, STATE_FILE())}\` to accept the cluster's, or re-run the ` +
       `deploy after \`kubectl delete configmap <release>${CONFIGMAP_NAME_SUFFIX} -n ${STATE_NAMESPACE}\` ` +
       `to accept the local one.`,
   );
@@ -365,8 +369,8 @@ export async function writeState(
   // caught cluster-side by the resourceVersion precondition below (N23).
   const dir = path.join(projectDir, STATE_DIR);
   mkdirSync(dir, { recursive: true });
-  const target = path.join(dir, STATE_FILE);
-  const tmp = path.join(dir, `${STATE_FILE}.tmp`);
+  const target = path.join(dir, STATE_FILE());
+  const tmp = path.join(dir, `${STATE_FILE()}.tmp`);
   writeFileSync(tmp, JSON.stringify(stamped, null, 2));
   renameSync(tmp, target);
 

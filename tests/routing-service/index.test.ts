@@ -2,15 +2,55 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-  assertManifestMatchesImage,
-  ensureTlsIdentity,
-} from "../../src/routing-service/index.js";
+import { assertManifestMatchesImage, ensureTlsIdentity } from "../../src/routing-service/index.js";
 
 // ensureTlsIdentity: a routing service that can't mint its TLS identity must CRASH
 // (throw) rather than start plaintext — an h2c server passes the health probes while
 // every ext_proc callout (h2+TLS only) silently fails. The only override is the
 // explicit ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT=1 opt-in (local emulation).
+describe("ensureTlsIdentity — ROUTING_TRANSPORT (S26)", () => {
+  const saved = { ...process.env };
+  afterEach(() => {
+    process.env = { ...saved };
+  });
+
+  it("serves h2c when the transport is explicitly h2c, even with TLS paths baked in", () => {
+    // The emitted image bakes TLS_CERT_FILE/TLS_KEY_FILE, and the plaintext opt-in only
+    // applied when BOTH were unset — so on an in-cluster gateway the service self-signed and
+    // served h2 TLS while Envoy dialled h2c. MEASURED: every callout 500s while :8081 health
+    // stays green, so the deployment looks fine and no request is ever routed.
+    const dir = mkdtempSync(path.join(os.tmpdir(), "h2c-"));
+    const cert = path.join(dir, "tls-cert.pem");
+    const key = path.join(dir, "tls-key.pem");
+    process.env.TLS_CERT_FILE = cert;
+    process.env.TLS_KEY_FILE = key;
+    process.env.ROUTING_TRANSPORT = "h2c";
+
+    expect(() => ensureTlsIdentity()).not.toThrow();
+    // The real assertion: it returned WITHOUT minting a certificate. Merely not throwing
+    // would also be true if it had self-signed and served TLS — which is the bug.
+    expect(existsSync(cert)).toBe(false);
+    expect(existsSync(key)).toBe(false);
+  });
+
+  it("rejects an unrecognized transport rather than guessing", () => {
+    process.env.ROUTING_TRANSPORT = "sslv3";
+    delete process.env.TLS_CERT_FILE;
+    delete process.env.TLS_KEY_FILE;
+    expect(() => ensureTlsIdentity()).toThrow(/ROUTING_TRANSPORT/);
+  });
+
+  it("still refuses an accidental plaintext start when no transport is declared", () => {
+    // The original guard must survive: unset TLS paths with no explicit opt-in is a
+    // misconfiguration, not a request for plaintext.
+    delete process.env.TLS_CERT_FILE;
+    delete process.env.TLS_KEY_FILE;
+    delete process.env.ROUTING_TRANSPORT;
+    delete process.env.ADAPTER_K8S_ROUTING_INSECURE_PLAINTEXT;
+    expect(() => ensureTlsIdentity()).toThrow(/TLS_CERT_FILE/);
+  });
+});
+
 describe("ensureTlsIdentity", () => {
   let tmpDir: string;
   const ENV_KEYS = [

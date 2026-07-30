@@ -13,24 +13,6 @@ export interface CelGenerationInput {
    * middleware-match probe must test the basePath-prefixed pathname too.
    */
   basePath?: string;
-  /**
-   * Pathnames of the app's `public/` files (`collectPublicPathnames(projectDir)`).
-   *
-   * N40: the per-file exclusion loop below iterated `outputs.staticFiles`, which for a real
-   * build holds ONLY build outputs and `/_next/static/*` — Next never enumerates `public/` as
-   * an adapter output (that is exactly why `collectPublicPathnames` exists, and why the
-   * static-asset manifest and the pool's pathname set both call it). MEASURED on
-   * `fixtures/main`, whose matcher explicitly excludes `cdn-probe.txt` and
-   * `header-priority.txt`: the emitted expression was
-   * `!(request.path.startsWith('/_next/static/'))` — zero per-file exclusions. So the
-   * documented percent-encoding machinery never ran on a public file and
-   * `warnIfOversized`'s advice ("reduce the number of public files not covered by
-   * middleware") was unactionable.
-   *
-   * Optional: absent ⇒ the loop sees only `outputs.staticFiles`, i.e. exactly the previous
-   * behavior, so a caller that has no projectDir is unaffected.
-   */
-  publicPathnames?: string[];
 }
 
 /**
@@ -132,149 +114,56 @@ export function extractStaticPrefix(sourceRegex: string): string | null {
   return match?.[1] ?? null;
 }
 
-/**
- * An exact-path CEL term that is correct whether or not `request.path` carries the query string.
- *
- * N40. GCP's CEL matcher language reference
- * (https://cloud.google.com/service-extensions/docs/cel-matcher-language-reference) documents
- * `request.path` as "The requested HTTP URL path" and lists `request.query` separately — and it
- * does NOT document `request.url_path` at all (the documented `request.*` set is headers, method,
- * host, path, query, scheme, backend_service_name, backend_service_project_number). Envoy, which
- * these attributes come from, documents `request.path` as "The path portion of the URL" and
- * `request.url_path` as "The path portion of the URL **without the query string**"
- * (https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/advanced/attributes) — i.e.
- * upstream `request.path` DOES include the query, and the attribute that strips it is the one
- * GCP does not expose. Using `request.url_path` would risk the match condition being rejected
- * when the extension is updated — a mid-deploy failure, which is the exact class
- * `CEL_EXPRESSION_WARN_LENGTH` exists to avoid.
- *
- * So: stay inside the documented attribute set and accept BOTH readings. Under the path-only
- * reading the second term can never fire (a path cannot contain a raw `?`); under the
- * path-plus-query reading it catches `/file.txt?x=1`, which a bare `==` silently missed. Both
- * directions were already fail-safe (a missed exclusion costs one ext_proc callout; a missed
- * inclusion falls through to the pool's local resolver), so this is a hit-rate fix, not a
- * correctness one — and it is pinned by a test rather than left to the next reader to rediscover.
- */
-function celPathEquals(wirePath: string): string {
-  const literal = escapeCelString(wirePath);
-  return `(request.path == '${literal}' || request.path.startsWith('${literal}?'))`;
-}
-
 // GCP validates the route-extension matchCondition.celExpression only at DEPLOY
 // time — an oversized expression fails the extension update mid-deploy with no
-// build-time signal. The Service Extensions CEL matcher language reference
-// (https://cloud.google.com/service-extensions/docs/cel-matcher-language-reference)
-// documents tight limits on match-condition expressions; 1,024 characters is the
-// conservative budget we warn at so the operator hears about it from `next build`,
-// not from a failed `gcloud service-extensions` call during cutover.
-export const CEL_EXPRESSION_WARN_LENGTH = 1024;
-
-function warnIfOversized(expr: string): string {
-  if (expr.length > CEL_EXPRESSION_WARN_LENGTH) {
-    console.warn(
-      `[adapter-k8s] Generated CEL match condition is ${expr.length} characters, over the ` +
-        `${CEL_EXPRESSION_WARN_LENGTH}-character budget for GCP Service Extensions match ` +
-        `conditions — the route-extension update may be rejected at deploy time. Reduce the ` +
-        `number of public/ files NOT covered by the middleware matcher (each one emits an ` +
-        `exclusion; widening the matcher to cover them removes it) or consolidate dynamic ` +
-        `route prefixes.`,
-    );
-  }
-  return expr;
-}
+// build-time signal. The limit is a HARD 512 characters, measured on GKE 2026-07-29:
+//   INVALID_CEL_EXPRESSION: expression exceeded max length 512
+// This constant was 1024 — double the real ceiling — so an expression in the 512..1024
+// band built clean and then failed at cutover, which is the exact outcome the warning
+// exists to prevent. See also the Service Extensions CEL matcher language reference:
+// https://cloud.google.com/service-extensions/docs/cel-matcher-language-reference
+export const CEL_EXPRESSION_WARN_LENGTH = 512;
 
 export function generateCelExpression(input: CelGenerationInput): string {
-  const { outputs, dynamicRoutes, basePath = "", publicPathnames = [] } = input;
-  const exclusions: string[] = [];
+  const { outputs, dynamicRoutes } = input;
 
-  exclusions.push(`request.path.startsWith('${escapeCelString(`${basePath}/_next/static/`)}')`);
-
-  const middlewareMatchers = (outputs.middleware as any)?.config?.matchers ?? [];
-  // N40: `outputs.staticFiles` carries build outputs (and `/_next/static/*`), never `public/`
-  // files — those are staged separately and enumerated by `collectPublicPathnames`. Union both
-  // so the loop below actually sees the files its comment and the oversize warning describe.
-  const publicFiles = [
-    ...new Set([
-      ...outputs.staticFiles
-        .filter((f) => !f.pathname.startsWith("/_next/"))
-        .map((f) => f.pathname),
-      ...publicPathnames.filter((p) => !p.startsWith("/_next/")),
-    ]),
-  ].sort();
-
-  for (const publicPath of publicFiles) {
-    // The wire path (and the compiled middleware matcher) carries the basePath,
-    // so the middleware-coverage probe must too.
-    const wirePath = `${basePath}${publicPath}`;
-    // Runtime matchesMiddleware (routing-common.ts) tests BOTH the raw (encoded)
-    // pathname and its decoded form — this build-time probe must be at least as
-    // generous, or a middleware-covered file gets an exact-match exclusion and
-    // bypasses ext_proc (and middleware) entirely at the edge.
-    const probePaths = new Set([wirePath, percentEncodePath(wirePath)]);
-    try {
-      probePaths.add(decodeURIComponent(wirePath));
-    } catch {
-      // not percent-encoded — raw + encoded forms suffice
-    }
-    const matchedByMiddleware = middlewareMatchers.some((m: { sourceRegex: string }) => {
-      let re: RegExp;
-      try {
-        re = new RegExp(m.sourceRegex);
-      } catch {
-        // FAIL SAFE: a matcher source that doesn't compile at build time (regex
-        // engine skew, hand-written matcher) MIGHT cover this file. Treat it as
-        // covered so the file stays behind ext_proc — the cost is one callout per
-        // request; the alternative (an exact-match exclusion) is a middleware
-        // bypass at the edge. Mirrors the runtime fail-safe in routing-common.ts.
-        return true;
-      }
-      return [...probePaths].some((p) => re.test(p));
-    });
-    if (!matchedByMiddleware) {
-      exclusions.push(celPathEquals(wirePath));
-    }
-  }
-
-  if (!outputs.middleware) {
-    const inclusions: string[] = [];
-    for (const route of dynamicRoutes) {
-      const staticPrefix = extractStaticPrefix(route.sourceRegex);
-      if (staticPrefix) {
-        // A locale-prefixed route matches /en/blog/…, /fr/blog/… — never the bare
-        // /blog/…. Expand one inclusion per enumerable locale so the CEL fires for
-        // the paths that actually arrive; non-enumerable groups keep the bare
-        // prefix (fail-safe: misses fall through to the pool's local resolver).
-        const locales = leadingLocaleAlternatives(route.sourceRegex);
-        if (locales) {
-          for (const locale of locales) {
-            inclusions.push(
-              `request.path.startsWith('${escapeCelString(`${basePath}/${locale}${staticPrefix}`)}')`,
-            );
-          }
-        } else {
-          inclusions.push(
-            `request.path.startsWith('${escapeCelString(`${basePath}${staticPrefix}`)}')`,
-          );
-        }
-      }
-    }
-    for (const prerender of outputs.prerenders) {
-      const fallback = prerender.fallback as Record<string, unknown> | undefined;
-      if (fallback?.initialRevalidate) {
-        inclusions.push(celPathEquals(`${basePath}${prerender.pathname}`));
-      }
-    }
-    if (inclusions.length === 0) return "false";
-    inclusions.push(`request.path.startsWith('${escapeCelString(`${basePath}/_next/image`)}')`);
-    return warnIfOversized(inclusions.join(" || "));
-  }
-
+  // Two constants. That is the whole function, deliberately.
+  //
+  // This match condition used to carry two optimizations, and both traded correctness for
+  // speed:
+  //
+  //  - ENUMERATING the paths that need ext_proc (no-middleware apps). Under-matching silently
+  //    drops PPR at the edge, and it blew GCP's hard 512-character limit at ~20 routes:
+  //    app-static failed to deploy at all with INVALID_CEL_EXPRESSION (GKE, 2026-07-29).
+  //  - EXCLUDING paths believed not to need it. Excluding a path a middleware matcher covers
+  //    is a middleware bypass at the edge — which is why the public-file loop needed a
+  //    per-file matcher probe over raw/encoded/decoded forms. The `/_next/static/` exclusion
+  //    never had that probe at all: an app with `matcher: '/:path*'` had static requests
+  //    excluded regardless of its middleware covering them.
+  //
+  // Neither optimization was ever measured, and both are worth little in practice: ext_proc
+  // sits behind Cloud CDN, so a cacheable path pays at most one callout per cache lifetime.
+  // Work, then correct, then fast — with no data saying these are wins, they are not worth
+  // their failure modes. Nothing to enumerate means nothing to under-match; nothing to exclude
+  // means nothing to mis-exclude; a constant cannot exceed a length limit.
+  //
+  // Restoring an exclusion later is easy and should be driven by a measurement, not a hunch.
+  //
   // The extension is invoked for all methods that match. Body-capable requests (non-GET/HEAD)
   // with middleware are short-circuited at runtime by the handler's backstop (handler.ts): it
   // clears the internal dispatch headers and adds no secret, so the pool re-resolves with the
   // real body. Method is NOT gated in CEL because the extension must still run on POSTs to
   // strip client-spoofed dispatch headers — a CEL method gate would skip the callout entirely
   // and let a spoofed x-output-id reach the pool. See plans/tripwire-body-middleware-plan.md.
-  if (exclusions.length === 0) return "true";
-  return warnIfOversized(`!(${exclusions.join(" || ")})`);
+
+  // Nothing the routing service could act on: no middleware to run, no prerendered output to
+  // classify, no dynamic routes. Skip the callout rather than pay for a no-op. Safe in both
+  // directions — the pool re-resolves locally either way, and it always strips client-spoofed
+  // dispatch headers. Conservative on purpose: ANY prerender keeps the extension, because PPR
+  // routes are not separately identifiable here and losing PPR at the edge is the failure this
+  // match condition exists to prevent.
+  if (!outputs.middleware && outputs.prerenders.length === 0 && dynamicRoutes.length === 0) {
+    return "false";
+  }
+  return "true";
 }

@@ -56,8 +56,107 @@ function validateScaling(
 // cutover cannot tolerate (see the collision guard in adapter.ts).
 const MIN_SURVIVING_BUILD_ID_CHARS = 8;
 
+// Names the pod template already emits, or that the runtime derives identity from. Letting
+// user config shadow one is never what the author meant: NEXT_BUILD_ID in particular is what
+// the pool reports as its build and what namespaces its Valkey entries (`k8s:<buildId>:`), so
+// overriding it would silently cross-wire two builds' caches.
+const RESERVED_ENV_NAMES = new Set([
+  "NODE_ENV",
+  "NEXT_BUILD_ID",
+  "POOL_NAME",
+  "RELEASE_NAME",
+  "INTERNAL_HEADER_SECRET",
+  "VALKEY_URL",
+  "VALKEY_AUTH",
+  "VALKEY_CA_CERT",
+  "PORT",
+  "CONFIG_DIR",
+]);
+
+// POSIX-ish, and the subset Kubernetes accepts for an env var name. Deliberately excludes
+// lowercase: a lowercase name is almost always a typo for the uppercase one, and admitting
+// both invites a pair that differs only by case.
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+/**
+ * Validate one `env` map. `where` names the location for the error message — an error that
+ * says only "invalid env" sends the reader hunting through pools.
+ */
+function validateEnvMap(env: unknown, where: string): void {
+  if (env === undefined) return;
+  if (typeof env !== "object" || env === null || Array.isArray(env)) {
+    throw new Error(`${where} env must be an object mapping variable names to values`);
+  }
+  for (const [name, value] of Object.entries(env as Record<string, unknown>)) {
+    if (!ENV_NAME_RE.test(name)) {
+      throw new Error(
+        `${where} env has an invalid environment variable name ${JSON.stringify(name)}. ` +
+          `Names must match ${ENV_NAME_RE.source} (uppercase letters, digits and underscores, ` +
+          `not starting with a digit).`,
+      );
+    }
+    if (name.startsWith("NEXT_PUBLIC_")) {
+      throw new Error(
+        `${where} env sets ${name}, but NEXT_PUBLIC_* variables are inlined into client ` +
+          `bundles at BUILD time — setting one as container environment produces a value the ` +
+          `browser never sees, and nothing would report the mistake. Put it in .env.production ` +
+          `or the build environment instead.`,
+      );
+    }
+    if (RESERVED_ENV_NAMES.has(name)) {
+      throw new Error(
+        `${where} env sets ${name}, which is reserved: the adapter emits it into every pool ` +
+          `container and the runtime derives behaviour from it. Choose a different name.`,
+      );
+    }
+    if (typeof value === "string") continue;
+    if (typeof value !== "object" || value === null) {
+      throw new Error(
+        `${where} env value for ${name} must be a string, or a ` +
+          `{ secret, key } / { configMap, key } reference. Numbers and booleans are rejected ` +
+          `because Kubernetes requires env values to be strings.`,
+      );
+    }
+    const ref = value as { secret?: unknown; configMap?: unknown; key?: unknown };
+    const hasSecret = typeof ref.secret === "string" && ref.secret.length > 0;
+    const hasConfigMap = typeof ref.configMap === "string" && ref.configMap.length > 0;
+    if (hasSecret === hasConfigMap) {
+      throw new Error(
+        `${where} env value for ${name} must reference exactly one of "secret" or "configMap".`,
+      );
+    }
+    if (typeof ref.key !== "string" || ref.key.length === 0) {
+      throw new Error(
+        `${where} env value for ${name} references a ${hasSecret ? "secret" : "configMap"} ` +
+          `but has no "key" — Kubernetes needs the key WITHIN that object to read.`,
+      );
+    }
+  }
+}
+
+function validateEnvFrom(envFrom: unknown, where: string): void {
+  if (envFrom === undefined) return;
+  if (!Array.isArray(envFrom)) {
+    throw new Error(`${where} envFrom must be an array of { secret } / { configMap } sources`);
+  }
+  for (const source of envFrom as Array<Record<string, unknown>>) {
+    const hasSecret = typeof source?.secret === "string" && source.secret.length > 0;
+    const hasConfigMap = typeof source?.configMap === "string" && source.configMap.length > 0;
+    if (hasSecret === hasConfigMap) {
+      throw new Error(
+        `${where} envFrom entries must reference exactly one of "secret" or "configMap".`,
+      );
+    }
+    if (source.prefix !== undefined && typeof source.prefix !== "string") {
+      throw new Error(`${where} envFrom prefix must be a string`);
+    }
+  }
+}
+
 export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
+  validateEnvMap(config.env, "adapter config");
+  validateEnvFrom(config.envFrom, "adapter config");
   if (!config.pools) {
     throw new Error("pools is required in adapter config");
   }
@@ -83,6 +182,8 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // label value and DNS-1123 name component). assertSafePoolName is the same validator
     // the templates now call at each consumption point.
     assertSafePoolName(name);
+    validateEnvMap(pool.env, `pool "${name}"`);
+    validateEnvFrom(pool.envFrom, `pool "${name}"`);
     // "routing-service" is the reserved routing-tier name: the chart renders the
     // routing tier's Service as `${releaseName}-routing-service`, which is exactly
     // the ACTIVE Service name a pool called "routing-service" would get — two
@@ -151,11 +252,22 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     throw new Error("provider is required in adapter config");
   }
 
-  if (!config.provider.gke?.gateway?.hosts || config.provider.gke.gateway.hosts.length === 0) {
-    throw new Error("provider.gke.gateway.hosts is required and must contain at least one host");
+  // Every provider needs at least one host: the Gateway's listeners and the HTTPRoute's
+  // hostname matching are both derived from it, so a host-less config renders a Gateway that
+  // matches nothing. The message names the provider actually configured rather than always
+  // saying "gke".
+  const providerKey = "gke" in config.provider ? "gke" : "generic";
+  const gatewayHosts =
+    ("gke" in config.provider
+      ? config.provider.gke?.gateway?.hosts
+      : config.provider.generic?.gateway?.hosts) ?? [];
+  if (gatewayHosts.length === 0) {
+    throw new Error(
+      `provider.${providerKey}.gateway.hosts is required and must contain at least one host`,
+    );
   }
 
-  for (const hostConfig of config.provider.gke.gateway.hosts) {
+  for (const hostConfig of gatewayHosts) {
     if (!hostConfig.hostname) {
       throw new Error("each host in provider.gke.gateway.hosts must have a hostname");
     }
@@ -164,6 +276,39 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // Wildcards ("*.example.com") are supported via Certificate Manager with DNS
     // authorization; init provisions the DNS auth + cert automatically.
     assertSafeHostname(hostConfig.hostname);
+  }
+
+  // A generic provider terminates TLS from a Kubernetes Secret (cert-manager, or one you
+  // create) — there is no Certificate Manager to resolve it implicitly the way GKE has. Asking
+  // for TLS without naming that Secret used to DEGRADE to an HTTP-only listener, which is the
+  // worst outcome available: the deploy succeeds, every resource reports healthy, and the app
+  // serves credentials over plaintext. Someone who wrote `tls: { enabled: true }` has stated
+  // their intent; refuse rather than quietly serve something less safe than they asked for.
+  if ("generic" in config.provider) {
+    // Managed cache provisioning is Memorystore, i.e. GCP-only. `cacheManaged` is derived from
+    // "enabled with no url", so a generic config that just says `cache: { enabled: true }` would
+    // either fail late in the deploy or actually provision a Google resource for a cluster that
+    // has nothing to do with Google. Require the BYO url instead.
+    if (config.cache?.enabled && !config.cache.url) {
+      throw new Error(
+        `cache.url is required when cache.enabled is true on provider.generic. Managed cache ` +
+          `provisioning is Memorystore (GCP-only), so there is nothing to provision here — ` +
+          `point cache.url at a Valkey/Redis you run (redis:// or rediss://), or set ` +
+          `cache.enabled: false to run without a shared cache (ISR/PPR-shell revalidation then ` +
+          `becomes per-replica).`,
+      );
+    }
+    const g = config.provider.generic;
+    const wantsTls = (g?.gateway?.hosts ?? []).some((h) => h.tls?.enabled);
+    if (wantsTls && !g?.gateway?.tlsSecretName) {
+      throw new Error(
+        `provider.generic.gateway.tlsSecretName is required when any host sets ` +
+          `tls.enabled: true. A Gateway listener with no certificateRef never programs, so the ` +
+          `alternative is serving plaintext HTTP while reporting success. Create the TLS Secret ` +
+          `(cert-manager, or \`kubectl create secret tls\`) and name it here, or set ` +
+          `tls.enabled: false to serve HTTP deliberately.`,
+      );
+    }
   }
 
   if (config.cache?.enabled) {
@@ -203,19 +348,23 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
       ...config.routeExtension,
     },
     containerStrategy: config.containerStrategy ?? "traced-assets",
-    provider: {
-      ...config.provider,
-      gke: {
-        ...config.provider.gke,
-        cdn: {
-          enabled: false,
-          bucket: "",
-          cacheMode: "USE_ORIGIN_HEADERS",
-          cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
-          invalidateOnDeploy: true,
-          ...config.provider.gke.cdn,
+    // CDN defaults are a GKE concept (Cloud CDN via GCPHTTPFilter). A generic config carries
+    // no CDN block at all, so it passes through untouched rather than growing an empty one.
+    provider: !("gke" in config.provider)
+      ? config.provider
+      : {
+          ...config.provider,
+          gke: {
+            ...config.provider.gke,
+            cdn: {
+              enabled: false,
+              bucket: "",
+              cacheMode: "USE_ORIGIN_HEADERS",
+              cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
+              invalidateOnDeploy: true,
+              ...config.provider.gke.cdn,
+            },
+          },
         },
-      },
-    },
   };
 }

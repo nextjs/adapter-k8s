@@ -671,8 +671,6 @@ describe("S25: secret-bearing templates are all mode-gated", () => {
   });
 
   it("ignores non-template chart files", () => {
-    expect(() =>
-      assertSecretChartFilesComplete({ "values.yaml": "kind: Secret\n" }),
-    ).not.toThrow();
+    expect(() => assertSecretChartFilesComplete({ "values.yaml": "kind: Secret\n" })).not.toThrow();
   });
 });

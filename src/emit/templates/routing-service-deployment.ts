@@ -55,11 +55,20 @@ export function renderRoutingServiceDeployment({
   failOpen,
   requestTimeoutMs,
   imageDigest,
+  transport = "tls",
 }: {
   releaseName: string;
   buildId: string;
   imageRegistry: string;
   resources?: RoutingServiceResources;
+  /**
+   * S26. ext_proc listener transport. GKE's callout arrives from Google's frontend over TLS;
+   * an in-cluster Envoy Gateway dials plain h2c unless a BackendTLSPolicy says otherwise.
+   * Stated explicitly because the image BAKES TLS_CERT_FILE/TLS_KEY_FILE, so a Deployment can
+   * override those values but never unset them — and a mismatch is invisible: the health
+   * server stays green on :8081 while every callout fails.
+   */
+  transport?: "tls" | "h2c";
   /** GCP callout-failure policy mirrored to the server: false = fail-closed (500). */
   failOpen?: boolean;
   requestTimeoutMs?: number;
@@ -201,6 +210,8 @@ spec:
               value: "8443"
             - name: HEALTH_PORT
               value: "8081"
+            - name: ROUTING_TRANSPORT
+              value: "${transport}"
             - name: ROUTING_FAIL_OPEN
               value: "${failOpen === false ? "false" : "true"}"
             - name: ROUTING_REQUEST_TIMEOUT_MS

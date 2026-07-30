@@ -16,6 +16,7 @@
 // module eval), so importing them statically is fine in any runtime.
 import { ValkeyIncrementalCacheHandler } from "./incremental-cache-handler.js";
 import { createValkeyClient } from "./client.js";
+import { createBuildSeedLookup } from "./build-seed-index.js";
 
 // `require` is available because this module is bundled to CJS. Next's file-system cache is required
 // lazily (inside the constructor) so this module evaluates without it in edge/build runtimes.
@@ -39,7 +40,13 @@ function getValkeyHandler(): ValkeyIncrementalCacheHandler | undefined {
       caCert: process.env.VALKEY_CA_CERT,
     });
     try {
-      sharedHandler = new ValkeyIncrementalCacheHandler({ client, buildId });
+      sharedHandler = new ValkeyIncrementalCacheHandler({
+        client,
+        buildId,
+        // Warm-start parity with `next start` (see build-seed-index.ts): a Valkey miss
+        // consults the on-disk build prerender before reporting a miss to Next.
+        seedLookup: createBuildSeedLookup(),
+      });
     } catch (error) {
       // N82: the constructor asserts the build id's charset (a `:` would let one build's keys
       // alias another's). This runs inside Next's `cacheHandler` construction, i.e. during a

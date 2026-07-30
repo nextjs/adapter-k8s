@@ -9,19 +9,16 @@ import { renderDeployment } from "./templates/deployment.js";
 import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import { renderRoutingManifestConfigMap } from "./templates/routing-manifest-configmap.js";
-import { renderGateway, renderHTTPRoute } from "./templates/gateway.js";
-import { renderCdnFilter } from "./templates/gcp-http-filter.js";
 import { sanitizeK8sName } from "./templates/utils.js";
 import { renderRoutingServiceDeployment } from "./templates/routing-service-deployment.js";
 import { renderRoutingServiceService } from "./templates/routing-service-service.js";
 import { renderRoutingServiceHPA } from "./templates/routing-service-hpa.js";
-import { renderRouteExtUpdateJob } from "./templates/route-ext-update-job.js";
 import {
   renderRouteExtConfigMap,
   routeExtDocumentDigest,
 } from "./templates/route-ext-configmap.js";
-import { renderDeployServiceAccount } from "./templates/deploy-service-account.js";
 import { renderNetworkPolicies } from "./templates/network-policy.js";
+import { resolveProvider } from "../providers/index.js";
 
 /**
  * Chart files that carry secret material. The write site (adapter.ts) MUST create these
@@ -125,6 +122,7 @@ export function generateHelmChart({
   imageDigests?: Record<string, string>;
 }): Record<string, string> {
   const files: Record<string, string> = {};
+  const provider = resolveProvider(config);
   const secret = internalSecret;
   // N87: per-BUILD Secret name (and therefore one Secret per live build, annotated
   // `helm.sh/resource-policy: keep`). The FILENAME stays `templates/internal-secret.yaml`
@@ -185,34 +183,18 @@ export function generateHelmChart({
     routingManifestJson,
   });
 
-  const gke = config.provider.gke;
-  if (gke.gateway?.hosts?.length) {
-    files["templates/gateway.yaml"] = renderGateway({
+  // The ingress tier (Gateway + route + any CDN attachment) is the first seam to move behind
+  // the provider interface — see plans/multi-provider-aks-eks-generic.md. Emitting nothing when
+  // no gateway is configured stays the provider's decision, not this caller's.
+  Object.assign(
+    files,
+    provider.emitIngressTemplates({
       releaseName,
-      hosts: gke.gateway.hosts,
-    });
-
-    // Cloud CDN rides the HTTPRoute (GCPHTTPFilter via ExtensionRef), so it only exists
-    // when a gateway does. validateConfig guarantees hosts for adapter-built configs;
-    // the double condition covers direct generateHelmChart callers.
-    let cdnFilterName: string | undefined;
-    if (gke.cdn?.enabled) {
-      cdnFilterName = sanitizeK8sName(`${releaseName}-cdn`);
-      files["templates/cdn-http-filter.yaml"] = renderCdnFilter({
-        releaseName,
-        cacheMode: gke.cdn.cacheMode,
-        cacheKeyHeaders: gke.cdn.cacheKeyHeaders,
-      });
-    }
-
-    files["templates/http-route.yaml"] = renderHTTPRoute({
-      releaseName,
-      hosts: gke.gateway.hosts,
       pools,
       routingManifest,
-      cdnFilterName,
-    });
-  }
+      config,
+    }),
+  );
 
   // NetworkPolicies for both workload tiers. Always emitted — the template is wrapped
   // in a helm `if` on global.networkPolicy.podCidrs, so it renders nothing until the
@@ -220,14 +202,32 @@ export function generateHelmChart({
   files["templates/network-policy.yaml"] = renderNetworkPolicies({
     releaseName,
     poolNames: [...pools.keys()],
+    // The STRICT posture's admitted sources come from the provider: Google CIDRs on GKE, the
+    // release's own Envoy proxy pods on an in-cluster gateway. Reachability to the routing
+    // tier's :8443 IS the internal dispatch secret, so this is the control that makes the
+    // in-cluster h2c hop safe.
+    ingressSources: provider.strictIngressSources({
+      releaseName,
+      pools,
+      routingManifest,
+      config,
+    }),
   });
 
   for (const poolName of pools.keys()) {
+    // Per-pool env merges OVER the shared map, and per-pool envFrom is appended AFTER the
+    // shared sources — both match Kubernetes' own "last one wins" semantics, so a pool
+    // override behaves the way someone reading the rendered pod spec would predict.
+    const poolConfig = config.pools?.[poolName];
+    const mergedEnv = { ...(config.env ?? {}), ...(poolConfig?.env ?? {}) };
+    const mergedEnvFrom = [...(config.envFrom ?? []), ...(poolConfig?.envFrom ?? [])];
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({
       poolName,
       buildId,
       releaseName,
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
+      ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
+      ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,
@@ -238,6 +238,7 @@ export function generateHelmChart({
     files[`templates/${poolName}-active-service.yaml`] = renderActiveService({
       poolName,
       releaseName,
+      emitHealthCheckPolicy: provider.emitsHealthCheckPolicyCrd,
     });
     files[`templates/${poolName}-hpa.yaml`] = renderHPA({
       poolName,
@@ -246,43 +247,37 @@ export function generateHelmChart({
     });
   }
 
-  // Phase 2: Routing service templates (only when extension chain is provided)
-  if (extensionChainJson) {
-    // N50 (review, Medium): the update Job + its ServiceAccount used to be emitted under a
-    // bare `if (projectId && region)` with NO else — so without those values the chart
-    // installed the ext_proc routing service and its ConfigMap but nothing ever registered
-    // the GXLB traffic extension. The edge kept the PREVIOUS build's chain (or none at
-    // all, silently bypassing the middleware tier) while `deploy` reported success. The
-    // chain JSON itself is also unusable without a projectId — its `service` field renders
-    // `projects//global/backendServices/...`. Refuse to emit a chain that cannot be
-    // registered; the caller (adapter.ts) only requests one once init has written both.
-    const missing = [
-      infrastructure?.projectId ? null : "projectId",
-      infrastructure?.region ? null : "region",
-    ].filter((m): m is string => m !== null);
-    if (missing.length > 0) {
-      throw new Error(
-        `[adapter-k8s] Cannot render the GXLB traffic extension: .k8s-adapter/` +
-          `infrastructure.json is missing ${missing.join(" and ")}. Without ${missing.join(
-            " and ",
-          )} the chart would install the ext_proc routing service but never register the ` +
-          `route extension — the edge would keep the previous build's chain (or bypass the ` +
-          `middleware tier entirely) while the deploy reported success. Run ` +
-          `\`npx adapter-k8s init\` to regenerate infrastructure.json.`,
-      );
-    }
+  // Phase 2: the ext_proc routing tier.
+  //
+  // WHAT GATES IT is provider-dependent. On GKE the tier is useless without a registered GXLB
+  // traffic extension, so `extensionChainJson` is both the trigger and the proof that init has
+  // run. An `envoy-gateway` provider has no chain and no GCP infrastructure at all — its
+  // registration is an in-cluster EnvoyExtensionPolicy — so gating on the chain there emitted a
+  // chart with NO routing tier: the app served, nothing looked broken, and every request
+  // silently fell back to pool-local middleware. The edge tier this adapter exists for was
+  // simply absent.
+  const wantsRoutingTier =
+    provider.extProcStrategy === "envoy-gateway" ? true : Boolean(extensionChainJson);
+  if (wantsRoutingTier) {
     const rs = config.routingService;
     files["templates/routing-service-deployment.yaml"] = renderRoutingServiceDeployment({
       releaseName,
       buildId,
       imageRegistry,
       ...(rs?.resources ? { resources: rs.resources } : {}),
+      transport: provider.routingTransport,
       ...(routingFailOpen !== undefined ? { failOpen: routingFailOpen } : {}),
       ...(rs?.requestTimeoutMs !== undefined ? { requestTimeoutMs: rs.requestTimeoutMs } : {}),
       ...(imageDigests?.routingService ? { imageDigest: imageDigests.routingService } : {}),
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,
+      annotations: provider.routingServiceAnnotations({
+        releaseName,
+        pools,
+        routingManifest,
+        config,
+      }),
     });
     files["templates/routing-service-hpa.yaml"] = renderRoutingServiceHPA({
       releaseName,
@@ -290,24 +285,26 @@ export function generateHelmChart({
       ...(rs?.scaling?.max !== undefined ? { maxReplicas: rs.scaling.max } : {}),
       ...(rs?.scaling?.targetCPU !== undefined ? { targetCPU: rs.scaling.targetCPU } : {}),
     });
-    files["templates/route-ext-config.yaml"] = renderRouteExtConfigMap({
-      releaseName,
-      extensionChainJson,
-    });
-
-    // Guaranteed present by the guard above.
-    files["templates/route-ext-update-job.yaml"] = renderRouteExtUpdateJob({
-      releaseName,
-      projectId: infrastructure!.projectId!,
-      region: infrastructure!.region!,
-      buildId,
-      // S9: pin the Job to the exact document the ConfigMap above rendered.
-      documentDigest: routeExtDocumentDigest(),
-    });
-    files["templates/deploy-service-account.yaml"] = renderDeployServiceAccount({
-      releaseName,
-      projectId: infrastructure!.projectId!,
-    });
+    // Second seam: HOW the ext_proc callout attaches to the data plane. GKE emits a
+    // privileged gcloud registration Job; envoy-gateway providers emit an
+    // EnvoyExtensionPolicy and need no cloud IAM at all.
+    Object.assign(
+      files,
+      provider.emitExtProcTemplates({
+        releaseName,
+        pools,
+        routingManifest,
+        config,
+        buildId,
+        infrastructure,
+        extensionChainJson,
+        routeExtDocumentDigest,
+        routingFailOpen,
+        ...(config.routingService?.requestTimeoutMs !== undefined
+          ? { requestTimeoutMs: config.routingService.requestTimeoutMs }
+          : {}),
+      }),
+    );
   }
 
   // S25: a secret-bearing template that is not in SECRET_CHART_FILES would be written 0644.

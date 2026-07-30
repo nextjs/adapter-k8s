@@ -44,7 +44,10 @@ interface StagedDir {
   configDir: string;
 }
 
-function writeStagedDir(withMiddleware: boolean): StagedDir {
+function writeStagedDir(
+  withMiddleware: boolean,
+  middlewareRuntime: "nodejs" | "edge" = "nodejs",
+): StagedDir {
   const dir = mkdtempSync(path.join(REPO_ROOT, ".smoke-stage-"));
   const configDir = path.join(dir, "config");
   mkdirSync(path.join(dir, "public"), { recursive: true });
@@ -157,7 +160,7 @@ function writeStagedDir(withMiddleware: boolean): StagedDir {
       middleware: withMiddleware
         ? // Absolute: the pool resolves middleware filePath against process.cwd(),
           // and this test's cwd is the FIRST staged dir when the guard test runs.
-          { filePath: path.join(dir, "mw.mjs"), runtime: "nodejs" }
+          { filePath: path.join(dir, "mw.mjs"), runtime: middlewareRuntime }
         : null,
       poolAssignments: {
         "/hello": "main",
@@ -423,6 +426,35 @@ describe("pool-server startup smoke test", () => {
     } finally {
       process.env.CONFIG_DIR = previousConfigDir;
       rmSync(stagedB.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("names the edge sandbox load failure when EDGE middleware cannot be loaded", async () => {
+    // Live on GKE, an edge-middleware app CrashLooped with only "has no callable export".
+    // The real cause was the sandbox require failing on a missing @swc/helpers in the traced
+    // image, swallowed by a bare `catch {}` — so the message pointed at the app's middleware
+    // (which was fine) instead of the image's dependency closure. Cost ~30 minutes to trace
+    // through a pod probe. The staged dir has no resolvable `next`, so the sandbox require
+    // fails here for the same structural reason.
+    const stagedC = writeStagedDir(true, "edge");
+    const previousConfigDir = process.env.CONFIG_DIR;
+    process.env.CONFIG_DIR = stagedC.configDir;
+    try {
+      const err = await startPoolServer().then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(err).toBeDefined();
+      // Points at the sandbox and at the image, not at the app's middleware file.
+      expect(err!.message).toMatch(/edge sandbox failed to load/i);
+      expect(err!.message).toMatch(/container image is missing a runtime dependency/i);
+      // Whatever the sandbox require threw is carried through. This staged dir resolves the
+      // repo's own `next`, so there is no module error to report here — the assertion is that
+      // the slot exists and is filled, which is what the bare `catch {}` destroyed.
+      expect(err!.message).toMatch(/Underlying error: .+/);
+    } finally {
+      process.env.CONFIG_DIR = previousConfigDir;
+      rmSync(stagedC.dir, { recursive: true, force: true });
     }
   });
 });

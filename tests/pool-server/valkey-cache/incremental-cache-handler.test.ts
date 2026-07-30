@@ -556,3 +556,89 @@ describe("variant fanout via shared implicit path tags (survey Tier 3 #18)", () 
     expect(await later.get("/route.rsc")).toBeNull();
   });
 });
+
+describe("build-seed fallback: an empty Valkey behaves like next start's warm filesystem cache", () => {
+  // The production invariant this exists for, measured on GKE 2026-07-30: /blog/[author] with
+  // `dynamicParams: false` 500'd with "invariant: cache entry required but not generated" the
+  // moment its seed's revalidate window lapsed — Next consulted the (empty) Valkey store,
+  // found nothing, and is FORBIDDEN from rendering dynamically by dynamicParams:false.
+  // `next start` never hits this because its filesystem cache IS the build output. The seed
+  // fallback restores that property: a Valkey miss consults the on-disk build prerender.
+  const seed = {
+    lastModified: 500,
+    tags: ["_N_T_/blog/tim"],
+    value: {
+      kind: "APP_PAGE",
+      html: "<html>built at build time</html>",
+      rscData: Buffer.from("rsc-bytes"),
+      headers: { vary: "rsc" },
+      status: 200,
+    },
+  };
+
+  it("returns the build seed on a Valkey miss", async () => {
+    const client = new FakeValkeyClient();
+    const seedLookup = vi.fn().mockResolvedValue(seed);
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "seed1",
+      now: () => 1000,
+      seedLookup,
+    });
+    const got = await h.get("/blog/tim");
+    expect(seedLookup).toHaveBeenCalledWith("/blog/tim");
+    expect(got?.lastModified).toBe(500);
+    expect((got?.value as { html?: string })?.html).toContain("built at build time");
+  });
+
+  it("prefers a stored Valkey entry over the seed", async () => {
+    const client = new FakeValkeyClient();
+    const h0 = new ValkeyIncrementalCacheHandler({ client, buildId: "seed2", now: () => 1000 });
+    await h0.set("/blog/tim", appPageEntry("<html>regenerated</html>") as never, {});
+    const seedLookup = vi.fn().mockResolvedValue(seed);
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "seed2",
+      now: () => 1000,
+      seedLookup,
+    });
+    const got = await h.get("/blog/tim");
+    expect((got?.value as { html?: string })?.html).toContain("regenerated");
+    expect(seedLookup).not.toHaveBeenCalled();
+  });
+
+  it("misses (never crashes) when there is no seed either", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "seed3",
+      now: () => 1000,
+      seedLookup: vi.fn().mockResolvedValue(null),
+    });
+    expect(await h.get("/no-seed")).toBeNull();
+  });
+
+  it("drops a seed whose tag was HARD-invalidated (updateTag semantics)", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "seed4",
+      now: () => 5000,
+      seedLookup: vi.fn().mockResolvedValue(seed),
+    });
+    // Hard-expire the seed's tag AFTER the seed's lastModified (expire: 0 = updateTag).
+    await h.revalidateTag("_N_T_/blog/tim", { expire: 0 });
+    expect(await h.get("/blog/tim")).toBeNull();
+  });
+
+  it("keeps working when the seed lookup itself throws", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "seed5",
+      now: () => 1000,
+      seedLookup: vi.fn().mockRejectedValue(new Error("corrupt manifest")),
+    });
+    expect(await h.get("/blog/tim")).toBeNull();
+  });
+});

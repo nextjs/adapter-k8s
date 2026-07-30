@@ -1432,9 +1432,10 @@ describe("N18: ext_proc immediate responses and the `_rsc` cache-busting param",
         return { middlewareResponded: true } as any;
       });
       vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
-      const response = await createRequestHandler(makeManifest(), middlewareModule)(
-        makeHeaders("/gated"),
-      );
+      const response = await createRequestHandler(
+        makeManifest(),
+        middlewareModule,
+      )(makeHeaders("/gated"));
       expect(headerValue(response, "cache-control")).toBe(cc);
     }
   });

@@ -13,11 +13,34 @@ export type BuildCompleteContext = Parameters<NonNullable<NextAdapter["onBuildCo
 
 // --- Adapter Config ---
 
+/**
+ * One runtime environment variable for the app containers.
+ *
+ * A literal string is rendered inline in the pod template. The reference forms render
+ * `secretKeyRef`/`configMapKeyRef` against an object you manage, which is the preferred
+ * shape for two reasons: `adapter.config.mjs` is committed, so a literal is the wrong home
+ * for a credential; and the chart is emitted during `next build`, so changing a LITERAL
+ * requires a rebuild while changing a referenced Secret only needs a pod restart.
+ */
+export type EnvValue =
+  | string
+  | { secret: string; key: string; optional?: boolean }
+  | { configMap: string; key: string; optional?: boolean };
+
+/** Bulk import of every key in a Secret or ConfigMap, rendered as `envFrom`. */
+export type EnvFromSource =
+  | { secret: string; prefix?: string; optional?: boolean }
+  | { configMap: string; prefix?: string; optional?: boolean };
+
 export interface PoolConfig {
   routes: string[]; // OutputType name ('appPages', 'appRoutes', 'pages', 'pagesApi') or glob pattern
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
   timeout?: number;
+  /** Merged OVER the top-level `env`, so a pool can override a shared default. */
+  env?: Record<string, EnvValue>;
+  /** Appended AFTER the top-level `envFrom`; later sources win, per Kubernetes. */
+  envFrom?: EnvFromSource[];
 }
 
 export interface HostConfig {
@@ -51,6 +74,20 @@ export interface GKEProviderConfig {
 
 export interface K8sAdapterConfig {
   pools: Record<string, PoolConfig>;
+  /**
+   * Runtime environment for every app container. `.env` files are deliberately never staged
+   * into an image (they can hold secrets and would be baked into pushed layers), so this is
+   * the supported way to give a deployed app its environment.
+   *
+   * Precedence at runtime matches Next: the pool server calls `loadEnvConfig`, which does NOT
+   * overwrite an already-set variable, so anything set here wins over a `.env` file.
+   *
+   * NOT for `NEXT_PUBLIC_*`. Those are inlined into client bundles at BUILD time; setting one
+   * here produces a variable the browser never sees. Validation rejects them for that reason.
+   */
+  env?: Record<string, EnvValue>;
+  /** Bulk `envFrom` sources for every app container. Individual `env` entries win over these. */
+  envFrom?: EnvFromSource[];
   cache?: {
     enabled: boolean;
     provider?: "valkey" | "redis";
@@ -106,7 +143,80 @@ export interface K8sAdapterConfig {
      */
     failureMode?: "auto" | "open" | "closed";
   };
-  provider: { gke: GKEProviderConfig };
+  provider: { gke: GKEProviderConfig } | { generic: GenericProviderConfig };
+}
+
+/**
+ * Any conformant Kubernetes cluster — K3s, kind, on-prem, or a managed cluster whose cloud
+ * integrations you would rather not use. The ext_proc callout is hosted by an in-cluster Envoy
+ * (Envoy Gateway) rather than a cloud load balancer, which is what makes this portable: no
+ * cloud IAM, no managed CDN, no provider CRDs.
+ */
+export interface GenericProviderConfig {
+  gateway?: {
+    /**
+     * GatewayClass to attach to. Defaults to `eg` (Envoy Gateway). It must be a class whose
+     * controller is Envoy-based — the routing tier is an ext_proc server, and
+     * `EnvoyExtensionPolicy` is an Envoy Gateway API. A non-Envoy class will program the
+     * Gateway and then silently never call the routing service.
+     */
+    className?: string;
+    hosts: HostConfig[];
+    /**
+     * Secret holding the TLS cert/key for the HTTPS listener (cert-manager, or one you
+     * create). Without it only an HTTP listener is emitted — see renderGenericGateway for why
+     * a certificate-less HTTPS listener is worse than none.
+     */
+    tlsSecretName?: string;
+  };
+  /**
+   * Namespace where the Gateway controller runs its PROXY pods — the source the emitted
+   * NetworkPolicy admits to the routing tier's ext_proc port. Defaults to Envoy Gateway's
+   * `envoy-gateway-system`. Note this is the proxies' namespace, not the app's.
+   */
+  gatewayNamespace?: string;
+  /**
+   * Ingress ranges the kubelet probes arrive from, for the strict NetworkPolicy posture.
+   *
+   * WHEN TO SET THIS: leave it unset on a fixed-size cluster and deploy discovers the node
+   * addresses itself. Set it if nodes come and go — autoscaling, replacement, or a rolling node
+   * upgrade — because discovery snapshots the addresses that exist AT DEPLOY TIME. A node added
+   * afterwards is not in the allowlist, so its kubelet cannot reach the pods it hosts and they
+   * never become ready. That fails safe rather than open, but it is still an outage on the pods
+   * scheduled there.
+   *
+   * Give the range your nodes draw addresses from (e.g. `["10.0.0.0/16"]`) — usually the node
+   * subnet. Wider than per-node addresses by definition, so anything else in that range can also
+   * reach the dataplane ports; scope it as tightly as your node addressing allows.
+   */
+  nodeCidrs?: string[];
+}
+
+/**
+ * The GKE block when this config targets GKE, else undefined.
+ *
+ * `provider` is a one-key union, so every pre-existing site that reached for `.gke`
+ * unconditionally is now a place that must decide what a non-GKE config means. Most of them
+ * are GKE-only features (Cloud CDN, certmap, traffic extensions) and correctly no-op; making
+ * that explicit at each site is the point of the union.
+ */
+export function gkeConfigOf(config: K8sAdapterConfig): GKEProviderConfig | undefined {
+  return "gke" in config.provider ? config.provider.gke : undefined;
+}
+
+/**
+ * Gateway hosts for whichever provider is configured. The hosts are where the app is served,
+ * so anything deriving public URLs (Server Action allowed origins, DNS/TLS checks) wants this
+ * rather than a provider-specific path.
+ */
+export function providerGatewayHosts(config: K8sAdapterConfig): HostConfig[] {
+  if ("gke" in config.provider) return config.provider.gke?.gateway?.hosts ?? [];
+  return config.provider.generic?.gateway?.hosts ?? [];
+}
+
+/** The generic block when this config targets a plain Kubernetes cluster, else undefined. */
+export function genericConfigOf(config: K8sAdapterConfig): GenericProviderConfig | undefined {
+  return "generic" in config.provider ? config.provider.generic : undefined;
 }
 
 // --- Internal Types ---
@@ -219,7 +329,10 @@ export interface RoutingManifest {
    * Kept on the manifest because it is a correct, cheap build-time observation that option B needs;
    * do not re-wire it into the gate without re-running the two suites above.
    */
-  pprCapableRoutes?: Record<string, { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }>;
+  pprCapableRoutes?: Record<
+    string,
+    { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }
+  >;
   nextVersion: string;
 }
 

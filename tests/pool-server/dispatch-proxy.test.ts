@@ -899,5 +899,4 @@ describe("edge route handler stream failure", () => {
 
     expect(outcome).not.toBe("hung");
   });
-
 });

@@ -50,5 +50,12 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico|cdn-probe.txt|header-priority.txt).*)"],
+  // `isr-template` is excluded deliberately. Everything else here is middleware-matched, which
+  // forces `no-cache` on page routes; the exclusion keeps the one plain-SSG template in this
+  // app on the ordinary cacheable path so the live guard can observe its cache status. That
+  // template is the only route here that reaches the `emulatedSsgTemplates` rung — see the
+  // KNOWN PRODUCTION BUG note in pool-server/dispatch.ts.
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|cdn-probe.txt|header-priority.txt|isr-template).*)",
+  ],
 };

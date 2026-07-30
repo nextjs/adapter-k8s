@@ -1,16 +1,35 @@
 import { createK8sAdapter } from "@next-community/adapter-k8s";
 
-// Edge runtime segment config is incompatible with cacheComponents in Next 16. Keep this fixture
-// separate from e2e/ so the adapter's PPR and Edge invocation contracts are both build-tested.
+// Deploys to the existing `test-app` infra (cluster/gateway/IP/DNS/cert already
+// provisioned). CDN is enabled here to validate the GCPHTTPFilter path on real
+// infrastructure — the running rev-24 deployment predates that feature.
 export default createK8sAdapter({
-  pools: { default: { routes: ["appPages", "appRoutes"] } },
+  pools: {
+    default: {
+      routes: ["appPages", "appRoutes", "pages", "pagesApi"],
+      scaling: { min: 2, max: 10, targetCPU: 70 },
+    },
+  },
+
+  cache: {
+    enabled: true,
+    provider: "valkey",
+    memorystore: { region: "us-central1", sizeGb: 1 },
+  },
   containerStrategy: "traced-assets",
+
   provider: {
     gke: {
+      cdn: {
+        enabled: true,
+        bucket: "praxis-road-491306-c0-nextjs-static",
+      },
       gateway: {
         type: "gateway-api",
         className: "gke-l7-global-external-managed",
-        hosts: [{ hostname: "edge-e2e.invalid", tls: { enabled: false } }],
+        hosts: [
+          { hostname: "adapter-gke.jamesdaniels.net", tls: { enabled: true, managedCert: true } },
+        ],
       },
     },
   },

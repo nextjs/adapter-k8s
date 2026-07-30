@@ -8,14 +8,7 @@
 // THE REPO ROOT so createRequire(<staged>/package.json) can resolve the repo's
 // `next` (pool-server requires several next/dist modules at boot).
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import {
-  existsSync,
-  mkdtempSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  rmSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";

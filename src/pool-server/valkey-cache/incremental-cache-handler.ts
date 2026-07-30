@@ -284,10 +284,28 @@ function parseStoredEntry(raw: string): StoredEntry | undefined {
   return e as unknown as StoredEntry;
 }
 
+/** A build-time prerender usable as a cache entry when Valkey has no stored value. */
+export interface SeedEntry {
+  lastModified: number;
+  tags: string[];
+  value: Record<string, unknown>;
+}
+
 export interface ValkeyIncrementalCacheOptions {
   client: ValkeyClient;
   buildId: string;
   now?: () => number;
+  /**
+   * Build-seed fallback (see build-seed-index.ts). `next start`'s filesystem cache STARTS
+   * FULL — the build outputs are its initial content — while a custom handler starts empty.
+   * Next assumes the full model: `dynamicParams: false` refuses to render dynamically and
+   * throws "invariant: cache entry required but not generated" on a miss (500'd live on GKE,
+   * 2026-07-30), and first requests to any prerendered page re-render instead of serving the
+   * artifact. On a Valkey MISS this consults the on-disk build prerender, restoring the
+   * warm-start model; stored entries always win, and `set` still writes to Valkey so
+   * regeneration owns the key from then on.
+   */
+  seedLookup?: (cacheKey: string) => Promise<SeedEntry | null>;
 }
 
 // ---- binary (de)serialization: Buffers ↔ base64, the segmentData Map ↔ an object ----
@@ -371,6 +389,7 @@ export class ValkeyIncrementalCacheHandler {
   private readonly now: () => number;
   private readonly prefix: string;
   private readonly tagsKey: string;
+  private readonly seedLookup: ((cacheKey: string) => Promise<SeedEntry | null>) | undefined;
 
   constructor(options: ValkeyIncrementalCacheOptions) {
     this.client = options.client;
@@ -381,6 +400,7 @@ export class ValkeyIncrementalCacheHandler {
     // Same build-namespaced tag keyspace as the V2 handler, so `revalidateTag` is shared.
     this.prefix = `k8s:${options.buildId}:`;
     this.tagsKey = `${this.prefix}tags`;
+    this.seedLookup = options.seedLookup;
   }
 
   private entryKey(cacheKey: string): string {
@@ -391,12 +411,63 @@ export class ValkeyIncrementalCacheHandler {
     return `${this.prefix}inc-revalidate-lock:${cacheKey}`;
   }
 
+  /**
+   * Valkey had nothing for this key: consult the build seed. Tag semantics mirror the stored
+   * path — a HARD-invalidated tag (updateTag / expireTag, or revalidateTag's expire:0 form)
+   * kills the seed exactly as it deletes a stored entry, and a soft-stale tag serves the seed
+   * while signalling stale so Next revalidates behind the request. Age-based ISR staleness
+   * needs nothing here: Next compares `lastModified` (the build artifact's mtime) against the
+   * route's revalidate window itself, which is precisely `next start` serving a stale
+   * filesystem entry and regenerating in the background.
+   */
+  private async seedFallback(cacheKey: string, ctx: GetCtx): Promise<CacheHandlerValue | null> {
+    if (!this.seedLookup) return null;
+    try {
+      const seed = await this.seedLookup(cacheKey);
+      if (!seed) return null;
+      const softTags = ctx.softTags ?? ctx.tags ?? [];
+      const tags = [...seed.tags, ...softTags];
+      const manifest = await this.tagStates(tags);
+      const now = this.now();
+      if (areTagsExpired(tags, seed.lastModified, manifest, now)) return null;
+      const staleByTag = areTagsStale(tags, seed.lastModified, manifest);
+      let signalStale = staleByTag;
+      if (staleByTag) {
+        try {
+          const acquired = await this.client.set(
+            this.revalidateLockKey(cacheKey),
+            "1",
+            "NX",
+            "EX",
+            REVALIDATE_LOCK_TTL_SECONDS,
+          );
+          signalStale = acquired !== null;
+        } catch {
+          signalStale = true;
+        }
+      }
+      return {
+        lastModified: signalStale
+          ? staleByTagLastModified({ lastModified: seed.lastModified } as StoredEntry, now)
+          : seed.lastModified,
+        value: seed.value as CacheHandlerValue["value"],
+      };
+    } catch (error) {
+      logErrorRateLimited(
+        "cache-seed",
+        "[valkey-cache] build-seed fallback failed; treating it as a miss",
+        error,
+      );
+      return null;
+    }
+  }
+
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
     try {
       const raw = await this.client.get(this.entryKey(cacheKey));
-      if (!raw) return null;
+      if (!raw) return this.seedFallback(cacheKey, ctx);
       const entry = parseStoredEntry(raw);
-      if (!entry) return null; // corrupt entry → miss, Next regenerates (L5)
+      if (!entry) return this.seedFallback(cacheKey, ctx); // corrupt entry → seed, else miss (L5)
       const now = this.now();
 
       // Own the staleness check against the SHARED manifest (the tags-manifest.external check Next

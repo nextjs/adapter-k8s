@@ -135,6 +135,33 @@ describe("cache handler bundle is required when cache.enabled (N50)", () => {
   });
 });
 
+describe("the per-process memory cache is disabled when the shared cache is registered", () => {
+  // Next fronts any custom cacheHandler with a per-process in-memory LRU whose tag manifest
+  // is process-local. Across replicas that layer is incoherent by construction: a
+  // revalidateTag on another pod (or in an edge sandbox on the SAME pod) never invalidates
+  // it, so a tagged fetch entry pins for its whole revalidate window. Measured on GKE via
+  // upstream app-static's "revalidate tag correctly with edge route handler" (2026-07-30).
+  it("sets cacheMaxMemorySize: 0 alongside the cacheHandler", async () => {
+    const saved = process.env.ADAPTER_K8S_BUNDLE_DIR;
+    process.env.ADAPTER_K8S_BUNDLE_DIR = path.join(__dirname, "..", "dist");
+    try {
+      const adapter = createK8sAdapter({ ...validConfig, cache: { enabled: true } });
+      const modified = await adapter.modifyConfig!({} as any, {} as any);
+      expect((modified as { cacheHandler?: string }).cacheHandler).toBeTruthy();
+      expect((modified as { cacheMaxMemorySize?: number }).cacheMaxMemorySize).toBe(0);
+    } finally {
+      if (saved === undefined) delete process.env.ADAPTER_K8S_BUNDLE_DIR;
+      else process.env.ADAPTER_K8S_BUNDLE_DIR = saved;
+    }
+  });
+
+  it("leaves cacheMaxMemorySize alone when the cache is disabled", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    const modified = await adapter.modifyConfig!({} as any, {} as any);
+    expect((modified as { cacheMaxMemorySize?: number }).cacheMaxMemorySize).toBeUndefined();
+  });
+});
+
 describe("buildId validation at build time (H2)", () => {
   // The finalized buildId flows into helm --set values, K8s names/labels, image tags and
   // chart YAML — an unsafe one (e.g. a git branch from a custom generateBuildId) must
@@ -229,7 +256,7 @@ describe("onBuildComplete build-time guards", () => {
     );
   };
 
-  it("completes a minimal build (skip-staging) and threads basePath into the CEL", async () => {
+  it("completes a minimal build (skip-staging) and emits a valid CEL for a basePath app", async () => {
     const adapter = createK8sAdapter(validConfig);
     await adapter.modifyConfig!({} as any, {} as any);
     const withMiddleware = ctx("b12345", { basePath: "/docs" });
@@ -248,7 +275,11 @@ describe("onBuildComplete build-time guards", () => {
       path.join(projectDir, ".k8s-adapter/output/cel-expression.txt"),
       "utf-8",
     );
-    expect(cel).toContain("/docs/_next/static/");
+    // The CEL is now a constant: basePath no longer appears because nothing is excluded.
+    // Threading basePath through the build is still exercised elsewhere (the emitted routes,
+    // manifest and probe-path guard all consume it); what this asserts is that a basePath app
+    // still produces a valid match condition.
+    expect(cel).toBe("true");
   });
 
   it("fails the build when the build id sanitizes to the previous build's K8s name", async () => {
