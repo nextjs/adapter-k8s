@@ -2284,7 +2284,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     outputIds: Object.keys(poolManifest.outputs),
     strictDynamicRoutes,
     prerenderedPaths,
-    buildIdForData: buildId,
+    // Next's OWN build id (manifest) — clients build /_next/data URLs from the id Next
+    // inlined, which under deploymentId mode is NOT the adapter's effective NEXT_BUILD_ID.
+    buildIdForData: routingManifest.buildId ?? buildId,
     internalSecret,
     basePath: routingManifest.basePath ?? "",
     i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
@@ -2625,7 +2627,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // pathname: GSSP and ISR pages have function outputs keyed by their data
     // URL, and those must go through dispatch so the handler (and its
     // incremental cache) produces the payload.
-    const dataPrefix = `${basePath}/_next/data/${buildId}/`;
+    // Next's own build id (see buildIdForData above) — clients inline it into data URLs.
+    const dataPrefix = `${basePath}/_next/data/${routingManifest.buildId ?? buildId}/`;
     let pagesDataRoutingUrl: URL | undefined;
     if (!middlewareMayCover && url.pathname.startsWith(dataPrefix)) {
       const dataPath = url.pathname.slice(dataPrefix.length);

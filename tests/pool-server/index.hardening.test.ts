@@ -262,6 +262,7 @@ async function getFreePort(): Promise<number> {
 }
 
 const ENV_KEYS = [
+  "__NEXT_PRIVATE_ORIGIN",
   "POOL_NAME",
   "NEXT_BUILD_ID",
   "PORT",
@@ -280,6 +281,9 @@ async function boot(options: StageOptions = {}) {
     sigint: process.listeners("SIGINT") as Function[],
   };
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+  // A previously-imported module (next's own start-server machinery) may have set this in
+  // the shared test process — the assertion below must prove the POOL sets it.
+  delete process.env.__NEXT_PRIVATE_ORIGIN;
   const staged = writeStagedDir(options);
   const port = await getFreePort();
   process.env.POOL_NAME = "main";
@@ -487,6 +491,14 @@ describe("pool-server request-boundary hardening", () => {
       expect(body.status).toBe("ok");
       expect(body.reason).toContain("route module loaded");
       expect(res.headers.get("cache-control")).toBe("no-store");
+    });
+
+    it("publishes the loopback origin for self-forwarded requests (Server Action forwarding)", async () => {
+      // next start sets __NEXT_PRIVATE_ORIGIN to its own URL (start-server.js) and action
+      // forwarding fetches `${origin}${workerPathname}` — without it the pool fell back to
+      // the request's PUBLIC origin and hairpinned action POSTs through the whole edge
+      // (full-run v4: app-action forwarding, both runtimes, "<null>" results).
+      expect(process.env.__NEXT_PRIVATE_ORIGIN).toBe(`http://127.0.0.1:${pool.port}`);
     });
 
     it("answers a probe with a query string too (the old check was exact-match on req.url)", async () => {

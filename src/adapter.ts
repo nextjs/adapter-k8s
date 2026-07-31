@@ -4,7 +4,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import type {
   NextAdapter,
   K8sAdapterConfig,
@@ -403,6 +403,33 @@ export function readAdapterBundle(name: string): string {
 // dead build-id generator, ~1 nanoid in 64 started with `-`. Assert the tag charset at the
 // same place the build id is validated, so the failure is a build-time message rather than a
 // docker error at push time.
+// Next pins the BUILD ID to this literal whenever `config.deploymentId` is set (getBuildId,
+// next/src/build/index.ts) — "skew protection is enabled and the deployment id will be used
+// instead". Every one of the adapter's identities (blue/green resource names, image tags,
+// CDN cutover cache-tag, `k8s:<buildId>:` Valkey namespace) derives from the build id, so
+// consecutive builds would collide wholesale. Substitute the deploymentId itself: skew
+// protection's own contract is that it is unique per deploy.
+const NEXT_PINNED_BUILD_ID = "build-TfctsWXpff2fKS";
+export function effectiveBuildId(buildId: string, deploymentId: string | undefined): string {
+  if (buildId !== NEXT_PINNED_BUILD_ID) return buildId;
+  if (!deploymentId) {
+    throw new Error(
+      `[adapter-k8s] Next pinned the build id to its deploymentId constant but no ` +
+        `deploymentId is visible to the adapter. Set next.config \`deploymentId\` (or ` +
+        `NEXT_DEPLOYMENT_ID) to a value that is unique per deploy.`,
+    );
+  }
+  // Verbatim when already safe for every sink (docker tag ∩ BUILD_ID_RE, bounded length).
+  if (/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(deploymentId) && deploymentId.length <= 63) {
+    return deploymentId;
+  }
+  // Otherwise sanitize deterministically and disambiguate with a content hash — two
+  // deploymentIds that sanitize identically must still produce distinct build ids.
+  const sanitized = deploymentId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+/, "");
+  const hash = createHash("sha256").update(deploymentId).digest("hex").slice(0, 8);
+  return `dpl-${sanitized.slice(0, 40)}-${hash}`.replace(/-+/g, "-");
+}
+
 export function assertDockerTagSafeBuildId(buildId: string): void {
   if (!/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(buildId)) {
     throw new Error(
@@ -822,6 +849,79 @@ async function stagePackageTree(
   }
 }
 
+// Turbopack's externals (`.next/node_modules/<name>-<hash>`) are COPIES of resolved
+// packages, but at runtime they still require their OWN dependencies by bare specifier,
+// resolved from /app/node_modules — which staging never shipped. An instrumentation hook's
+// require-in-the-middle could not find `debug`, register() rejected, and the pool sat
+// NOT READY forever (full-run v4, cache-components-allow-otel-spans; same class as
+// @swc/helpers and scheduler, one layer deeper). Read each external's declared
+// dependencies and stage their trees app-first.
+export async function stageExternalsDependencies(
+  projectDir: string,
+  externalsDir: string,
+  poolName: string,
+  isShared: boolean = false,
+  stageDirOverride?: string,
+): Promise<{ staged: string[]; unresolved: string[] }> {
+  const staged: string[] = [];
+  const unresolved: string[] = [];
+  if (!existsSync(externalsDir)) return { staged, unresolved };
+
+  const fromApp = (dep: string): string | undefined => {
+    try {
+      return path.dirname(
+        createRequire(path.join(projectDir, "package.json")).resolve(`${dep}/package.json`),
+      );
+    } catch {
+      return undefined;
+    }
+  };
+
+  const packageDirs: string[] = [];
+  for (const entry of await readdir(externalsDir)) {
+    const abs = path.join(externalsDir, entry);
+    if (!statSync(abs).isDirectory()) continue;
+    if (entry.startsWith("@")) {
+      for (const sub of await readdir(abs)) {
+        const subAbs = path.join(abs, sub);
+        if (statSync(subAbs).isDirectory()) packageDirs.push(subAbs);
+      }
+    } else {
+      packageDirs.push(abs);
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const dir of packageDirs) {
+    let deps: string[];
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
+        dependencies?: Record<string, string>;
+      };
+      deps = Object.keys(pkg.dependencies ?? {});
+    } catch {
+      continue;
+    }
+    for (const dep of deps) {
+      if (seen.has(dep)) continue;
+      seen.add(dep);
+      const depDir = fromApp(dep);
+      if (!depDir || !existsSync(depDir)) {
+        console.warn(
+          `[adapter-k8s] Could not resolve "${dep}" (a dependency of the Turbopack external ` +
+            `at ${path.basename(dir)}) from ${projectDir}. The "${poolName}" container may ` +
+            `fail at runtime with a module-not-found error.`,
+        );
+        unresolved.push(dep);
+        continue;
+      }
+      await stagePackageTree(projectDir, dep, depDir, poolName, isShared, stageDirOverride);
+      staged.push(dep);
+    }
+  }
+  return { staged, unresolved };
+}
+
 // Stage `next`'s OWN declared runtime dependencies beside `next` in the traced context.
 //
 // Next resolves several packages at RUNTIME rather than bundling them, through mechanisms no
@@ -1145,19 +1245,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // so `adapter-k8s deploy` refuses it there (see the build-id collision guard in
       // src/cli/deploy.ts, which aborts on identical composed names).
       if ((nextConfig as { deploymentId?: string }).deploymentId) {
-        console.warn(
-          "[adapter-k8s] next.config `deploymentId` is set — you almost certainly do not need " +
-            "it here, and it breaks blue/green. Next pins the build id to a CONSTANT when " +
-            "deploymentId is set (getBuildId in next/src/build/index.ts), and this adapter " +
-            "derives every blue/green resource name, the build-id label, the CDN cutover " +
-            "cache-tag, AND the Valkey cache namespace (`k8s:<buildId>:`) from the build id — " +
-            "so consecutive deploys would collide and even share cache entries. " +
-            "`adapter-k8s deploy` refuses the cutover. You lose nothing by removing it: skew " +
-            "protection is ALREADY active via the per-build build id (the RSC payload carries " +
-            "it and the client hard-reloads on mismatch — see fetch-server-response.ts; " +
-            "deploymentId only substitutes a different token for that same check), and " +
-            "`?dpl=` asset versioning is moot because this adapter enables immutable " +
-            "(content-addressed) assets, which suppress it.",
+        console.log(
+          "[adapter-k8s] next.config `deploymentId` detected. Next pins its BUILD_ID to a " +
+            "constant in this mode, so the adapter derives its blue/green identity (resource " +
+            "names, image tags, cache-tags, the Valkey namespace) from the deploymentId " +
+            "instead — which therefore MUST be unique per deploy, exactly as skew " +
+            "protection already requires.",
         );
       }
 
@@ -1345,7 +1438,19 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     },
 
     async onBuildComplete(ctx: BuildCompleteContext) {
-      const { routing, outputs, projectDir, config: nextConfig, buildId, nextVersion } = ctx;
+      const {
+        routing,
+        outputs,
+        projectDir,
+        config: nextConfig,
+        buildId: ctxBuildId,
+        nextVersion,
+      } = ctx;
+      const deploymentId = (nextConfig as { deploymentId?: string }).deploymentId;
+      // Substitute Next's pinned deploymentId-mode constant with a unique id — see
+      // effectiveBuildId. Everything below (resource names, image tags, Valkey namespace,
+      // NEXT_BUILD_ID env) flows from this one variable.
+      const buildId = effectiveBuildId(ctxBuildId, deploymentId);
       const repoRoot = (ctx as { repoRoot?: string }).repoRoot ?? projectDir;
       // N50 (review #33): `.next` was hardcoded at every staging site, and each site was
       // guarded by `existsSync`, so a custom `distDir` staged NOTHING (no Turbopack chunks,
@@ -1530,7 +1635,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         routing,
         outputs,
         pools,
-        buildId,
+        // NEXT'S OWN build id, not the adapter's effective one: the manifest's buildId is
+        // what normalizes `/_next/data/<id>/…` URLs (@next/routing + pool dispatch), and
+        // clients build those URLs from the id Next INLINED — under deploymentId mode that
+        // is the pinned constant, while `buildId` above is the substituted unique id used
+        // for resource names. Mixing them 404s every pages data route.
+        buildId: ctxBuildId,
         basePath: nextConfig.basePath ?? "",
         i18n: nextConfig.i18n ?? null,
         trailingSlash: nextConfig.trailingSlash ?? false,
@@ -1712,6 +1822,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // must produce the same chart, and must not rotate the secret out from under the
         // pods that are currently serving.
         internalSecret: await deriveInternalSecret(projectDir, releaseName, buildId),
+        ...(deploymentId !== undefined ? { deploymentId } : {}),
         // N72: no `imageDigests` here, deliberately. `next build` runs BEFORE `docker
         // build`/`docker push`, so no digest exists at this point; passing an empty/invented
         // map would only look like the pinning is in place. Until the deploy step resolves
@@ -2094,6 +2205,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           if (existsSync(nextNodeModules)) {
             const dest = path.join(projectDir, poolStageDir, distDirRel, "node_modules");
             await resolveAndCopyExternals(nextNodeModules, dest);
+            // …and each external's OWN dependency tree from the app's node_modules — the
+            // copies still resolve bare specifiers at runtime (see stageExternalsDependencies).
+            await stageExternalsDependencies(projectDir, nextNodeModules, poolName);
           }
 
           // Stage next/setup-node-env (required for AsyncLocalStorage initialization).
@@ -2342,6 +2456,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           );
           if (existsSync(nextNodeModules)) {
             await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
+            // Same externals-dependency rule as the pool contexts (node middleware may pull
+            // in instrumentation-adjacent externals through its bundle).
+            await stageExternalsDependencies(projectDir, nextNodeModules, "routing-service", false, path.join(projectDir, routingServiceContextDir));
           }
           if (existsSync(chunksDir)) {
             // Replace the whole chunk set (not merge) so a stale prior build's chunks can't linger
