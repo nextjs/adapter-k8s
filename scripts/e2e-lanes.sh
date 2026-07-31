@@ -31,6 +31,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_DIR="${ADAPTER_DIR}/.k8s-adapter/lane-runs/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$RUN_DIR"
+# Fixed start marker for the end-of-run aggregation. The dir's own mtime is useless as a
+# cutoff — every lane log written into it advances it, so the first full run's aggregate
+# silently counted only the last ~40 minutes of results.
+touch "${RUN_DIR}/.run-start"
 
 # DEDICATED TMPDIR on the real disk — never tmpfs. The harness creates one full Next app
 # (node_modules included, ~150k inodes) per in-flight suite under os.tmpdir(); two lanes on
@@ -43,6 +47,23 @@ export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
 # Stale files only cost disk; a failed wipe must never cost the run.
 rm -rf "$TMPDIR" 2>/dev/null || true
 mkdir -p "$TMPDIR"
+
+# Build + pack the adapter ONCE for every lane. Each lane's e2e-local.sh honors
+# ADAPTER_K8S_PREBUILT_TARBALL and skips its own build — without this, six concurrent
+# `npm run build`s each ran `buf generate`, and the Buf Schema Registry rate-limited the
+# run to death ("resource_exhausted: too many requests"; full-run v2, lane 5, group 5).
+if [ -z "${ADAPTER_K8S_PREBUILT_TARBALL:-}" ]; then
+  echo "→ Building + packing adapter once for all lanes..."
+  (cd "$ADAPTER_DIR" && npm run build >/dev/null)
+  PACK_DIR="${RUN_DIR}/adapter-pack"
+  mkdir -p "$PACK_DIR"
+  PACK_JSON="$(cd "$ADAPTER_DIR" && npm pack --json --ignore-scripts --pack-destination "$PACK_DIR")"
+  ADAPTER_K8S_PREBUILT_TARBALL="$PACK_DIR/$(
+    node -e "console.log(JSON.parse(process.argv[1])[0].filename)" "$PACK_JSON"
+  )"
+  export ADAPTER_K8S_PREBUILT_TARBALL
+  echo "→ Adapter tarball: ${ADAPTER_K8S_PREBUILT_TARBALL}"
+fi
 
 echo "=== Phase 2 lane run ==="
 echo "lanes:   ${LANES}"
@@ -107,7 +128,7 @@ echo "=== Lane run complete (failed=${FAILED}) ==="
 python3 - "$RUN_DIR" <<'EOF'
 import glob, json, os, sys
 run_dir = sys.argv[1]
-start = os.path.getmtime(run_dir)
+start = os.path.getmtime(os.path.join(run_dir, ".run-start"))
 root = os.path.abspath(os.path.join(run_dir, "../../../..", ".adapter-k8s-e2e/next.js"))
 tot = p = f = suites = 0
 failed = []

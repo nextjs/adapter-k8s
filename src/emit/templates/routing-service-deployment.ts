@@ -6,7 +6,9 @@ import {
   assertSafeReleaseName,
   UNCONFIGURED_IMAGE_REGISTRY,
   routingManifestSnapshotName as routingManifestSnapshotNameFor,
+  renderUserEnvBlocks,
 } from "./utils.js";
+import type { EnvValue, EnvFromSource } from "../../types.js";
 import {
   assertSafeImageDigest,
   PRESTOP_DRAIN_SECONDS,
@@ -57,6 +59,8 @@ export function renderRoutingServiceDeployment({
   requestTimeoutMs,
   imageDigest,
   transport = "tls",
+  env,
+  envFrom,
 }: {
   releaseName: string;
   buildId: string;
@@ -75,6 +79,9 @@ export function renderRoutingServiceDeployment({
   requestTimeoutMs?: number;
   /** N72. Immutable digest for the routing image; see renderDeployment's `imageDigest`. */
   imageDigest?: string;
+  /** User-supplied runtime environment (top-level config; NODE middleware reads it here). */
+  env?: Record<string, EnvValue>;
+  envFrom?: EnvFromSource[];
 }): string {
   // Sanitize at the point of consumption (AGENTS.md) — this template splices all three
   // into resource names, a quoted image reference, and `value: "…"` env scalars.
@@ -124,6 +131,9 @@ export function renderRoutingServiceDeployment({
   // it back alongside NEXT_BUILD_ID, or the reverted edge would present the rolled-away-from
   // build's secret to the rolled-back pools.
   const internalSecretEnv = renderInternalSecretEnv(releaseName, buildId, "            ");
+  // Same env blocks as the pool template (see renderUserEnvBlocks): NODE-runtime middleware
+  // executes in THIS container and reads process.env at request time.
+  const { userEnv, userEnvFrom } = renderUserEnvBlocks(env, envFrom);
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -227,7 +237,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-${internalSecretEnv}
+${internalSecretEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             - name: routing-manifest
               mountPath: /config

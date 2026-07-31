@@ -71,7 +71,10 @@ import {
   type ReadinessState,
 } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
-import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
+import {
+  registerValkeyCacheHandler,
+  seedSandboxCacheHandlerRegistry,
+} from "./valkey-cache/register.js";
 import {
   createPprRouteMatcher,
   explicitCacheControlWins,
@@ -1906,8 +1909,34 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
       return fallbackIncrementalCache;
     };
-    edgeSandboxRun = (params) =>
-      sandbox.run({
+    const sandboxContext = appReq("next/dist/server/web/sandbox/context") as {
+      getModuleContext: (options: {
+        moduleName: string;
+        onWarning: (w: unknown) => void;
+        onError: (e: unknown) => void;
+        useCache: boolean;
+        edgeFunctionEntry: unknown;
+        distDir: string;
+      }) => Promise<{ runtime: { context: { globalThis: Record<symbol, unknown> } } }>;
+    };
+    edgeSandboxRun = async (params) => {
+      // Seed the sandbox realm's `use cache` handler registry BEFORE the entry modules
+      // evaluate in it. getModuleContext is cached by moduleName and does NOT evaluate the
+      // entry files (sandbox.run does, afterwards), so this hands the fresh realm the
+      // node-side Valkey handlers in time: without it, edge-runtime after() revalidatePath
+      // found zero handlers in the sandbox and the write vanished — an edge-middleware app
+      // registers no classic cacheHandler, so there is no incrementalCache fallback either
+      // (measured live: next-after-app-deploy, all edge + middleware cases).
+      const { runtime } = await sandboxContext.getModuleContext({
+        moduleName: params.name,
+        onWarning: () => {},
+        onError: () => {},
+        useCache: true,
+        edgeFunctionEntry: params.edgeFunctionEntry,
+        distDir,
+      });
+      seedSandboxCacheHandlerRegistry(runtime.context.globalThis);
+      return sandbox.run({
         ...params,
         useCache: true,
         distDir,
@@ -1931,6 +1960,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           getFallbackIncrementalCache(),
         clientAssetToken: "",
       });
+    };
     console.log("Edge sandbox initialized");
   } catch (err) {
     // Do NOT swallow this. For a node-runtime app an unavailable sandbox is genuinely
@@ -3432,8 +3462,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // process-global `_ENTRIES`, and loading one at boot would change which entry the
   // handler-loader's single-entry fallback resolves. The load is cached, so the first real
   // request reuses it.
-  const verifiableOutputs = Object.values(poolManifest.outputs).filter(
-    (output) => output.runtime !== "edge",
+  // Entries, not values: the handler-loader keys strictly on the MANIFEST KEY, and under a
+  // basePath the key ("/base/ssr") differs from Next's output id ("/ssr"). Probing by `.id`
+  // meant NO basePath build could ever load its probe ("Unknown output ID"), /readyz sat 503,
+  // and the blue/green gate timed out every basePath rollout — the full run's entire
+  // ~20-suite basePath cluster was this one lookup.
+  const verifiableOutputs = Object.entries(poolManifest.outputs).filter(
+    ([, output]) => output.runtime !== "edge",
   );
   if (instrumentationStatus === "failed") {
     console.error(
@@ -3447,14 +3482,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     readinessReason = "no node route modules to verify (manifests loaded)";
     console.log(`[pool-server] READY: ${readinessReason}`);
   } else {
-    const probe = verifiableOutputs[0]!;
+    const [probeKey] = verifiableOutputs[0]!;
     try {
-      await handlerLoader.load(probe.id);
+      await handlerLoader.load(probeKey);
       routeModulesVerified = true;
-      readinessReason = `route module loaded (${probe.id})`;
+      readinessReason = `route module loaded (${probeKey})`;
       console.log(`[pool-server] READY: ${readinessReason}`);
     } catch (err) {
-      readinessReason = `route module ${probe.id} failed to load`;
+      readinessReason = `route module ${probeKey} failed to load`;
       console.error(
         `[pool-server] NOT READY: ${readinessReason} — /readyz will report 503. ` +
           `Every request for this pool's routes would 500:`,

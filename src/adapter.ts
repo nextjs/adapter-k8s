@@ -635,12 +635,15 @@ export async function stageFile(
   destRelativePath: string,
   poolName: string,
   isShared: boolean = false,
+  stageDirOverride?: string,
 ): Promise<void> {
   const absSource = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(projectDir, sourcePath);
 
-  const stageDir = isShared
-    ? path.join(projectDir, OUTPUT_DIR(), "shared-context")
-    : path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context");
+  const stageDir =
+    stageDirOverride ??
+    (isShared
+      ? path.join(projectDir, OUTPUT_DIR(), "shared-context")
+      : path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context"));
 
   // path.join normalizes, so `..` segments are resolved here — assert containment on the
   // RESULT (a `../`-keyed asset throws rather than escaping).
@@ -777,12 +780,13 @@ async function stagePackageTree(
   rootDir: string,
   poolName: string,
   isShared: boolean,
+  stageDirOverride?: string,
 ): Promise<void> {
   const queue: Array<[string, string]> = [[rootName, rootDir]];
   const seen = new Set<string>([rootName]);
   while (queue.length > 0) {
     const [name, dir] = queue.shift()!;
-    await stageFile(projectDir, dir, `node_modules/${name}`, poolName, isShared);
+    await stageFile(projectDir, dir, `node_modules/${name}`, poolName, isShared, stageDirOverride);
     let deps: string[] = [];
     try {
       const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
@@ -842,6 +846,7 @@ export async function stageNextRuntimeDependencies(
   poolName: string,
   isShared: boolean = false,
   resolveDep?: (dep: string, projectDir: string) => string | undefined,
+  options?: { stageDir?: string },
 ): Promise<{ staged: string[]; unresolved: string[] }> {
   // App-ONLY, deliberately: resolveDepDir's adapter fallback would stage the ADAPTER's next
   // (and its deps) into an app that has none — a version pairing guaranteed not to match the
@@ -876,7 +881,12 @@ export async function stageNextRuntimeDependencies(
   const resolveRuntimeDep =
     resolveDep ?? ((dep: string, dir: string) => fromDir(dep, nextDir) ?? fromDir(dep, dir));
 
-  for (const dep of deps) {
+  // react and react-dom ride along with next's own list: they are next's PEER deps, resolved
+  // from the APP at runtime by pages-router externals — and staging react-dom without its
+  // dependency tree shipped an image whose /_error could not load react-dom/client ("Cannot
+  // find module 'scheduler'", pool never Ready; Phase-2 pilot, app-tree). stagePackageTree
+  // below walks each package's dependencies, which is what pulls scheduler in.
+  for (const dep of [...deps, "react", "react-dom"]) {
     const dir = resolveRuntimeDep(dep, projectDir);
     if (!dir || !existsSync(dir)) {
       // Warn rather than throw. A pnpm/monorepo layout can hide one, and refusing to build
@@ -890,7 +900,7 @@ export async function stageNextRuntimeDependencies(
       unresolved.push(dep);
       continue;
     }
-    await stagePackageTree(projectDir, dep, dir, poolName, isShared);
+    await stagePackageTree(projectDir, dep, dir, poolName, isShared, options?.stageDir);
     staged.push(dep);
   }
   return { staged, unresolved };
@@ -2302,6 +2312,16 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               }
             }
           }
+          // next's declared runtime dependencies, same rule as the pool contexts: the routing
+          // container executes middleware.js, whose externalized `next` resolves @swc/helpers
+          // (and friends) at RUNTIME — invisibly to tracing. Without them a NODE-runtime
+          // middleware CrashLooped the routing service on startup ("Cannot find module
+          // '@swc/helpers/_/_interop_require_default'"), which timed out EVERY deploy of such
+          // an app at the rollout gate — the full run's node-middleware cluster (~10 suites).
+          await stageNextRuntimeDependencies(projectDir, "routing-service", false, undefined, {
+            stageDir: path.join(projectDir, routingServiceContextDir),
+          });
+
           // Stage <distDir>/server/chunks/ for Turbopack runtime chunk loading
           const chunksDir = path.join(distDir, "server", "chunks");
           const chunksDest = path.join(

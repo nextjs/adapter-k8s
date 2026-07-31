@@ -69,6 +69,23 @@ function genericChart(over: Record<string, unknown> = {}): Record<string, string
 // (which per-host listener NAMES broke, see below) is untouched.
 import { renderGenericGateway } from "../../src/emit/templates/generic-gateway.js";
 
+// Escaped-slash parity (Phase-2 pilot, 2026-07-30). Envoy Gateway's default is Envoy's
+// UnescapeAndRedirect: a request for /a%2Fb is 307-redirected to /a/b BEFORE the app sees it
+// — measured on k3d (`location: /probe/path`), and it is why upstream's
+// next-after-app-deploy (8/8) and segment-cache/encoded-slash-params failed: both encode a
+// slash INSIDE a route param, which `next start` preserves. The chart must pin
+// escapedSlashesAction: KeepUnchanged so the generic edge matches next start.
+describe("generic client traffic policy: escaped-slash parity", () => {
+  it("emits a ClientTrafficPolicy pinning KeepUnchanged, targeting the release gateway", () => {
+    const files = genericChart();
+    const ctp = files["templates/client-traffic-policy.yaml"];
+    expect(ctp).toBeTruthy();
+    expect(ctp).toContain("kind: ClientTrafficPolicy");
+    expect(ctp).toContain("escapedSlashesAction: KeepUnchanged");
+    expect(ctp).toContain("name: my-app-gateway");
+  });
+});
+
 describe("generic gateway listeners under merged gateways", () => {
   it("stamps the hostname on the listener for a single-host release", () => {
     const yaml = renderGenericGateway({

@@ -48,6 +48,13 @@ type StageOptions = {
   appOwnsHealthz?: boolean;
   /** Boot with a dispatch secret so trusted and UNTRUSTED Phase-2 requests can be told apart. */
   internalSecret?: string;
+  /**
+   * The production basePath manifest shape: keys (and pathnames) carry the basePath prefix
+   * while each entry's `id` is Next's UNPREFIXED output id. Every basePath deploy shipped
+   * this shape, and the readiness probe loaded by `.id` → "Unknown output ID" → /readyz 503
+   * forever (measured: the full-run basePath cluster, ~20 suites, all rollout timeouts).
+   */
+  basePathKeys?: boolean;
 };
 
 function writeStagedDir(options: StageOptions = {}): Staged {
@@ -171,8 +178,16 @@ function writeStagedDir(options: StageOptions = {}): Staged {
     );
   }
 
+  // The production basePath shape prefixes the manifest KEY and `pathname` but keeps Next's
+  // unprefixed output id — see StageOptions.basePathKeys.
+  const keyPrefix = options.basePathKeys ? "/base" : "";
   const outputs: Record<string, unknown> = {
-    "/ssr": { id: "/ssr", filePath: "handlers/ssr.mjs", pathname: "/ssr", type: "APP_PAGE" },
+    [`${keyPrefix}/ssr`]: {
+      id: "/ssr",
+      filePath: "handlers/ssr.mjs",
+      pathname: `${keyPrefix}/ssr`,
+      type: "APP_PAGE",
+    },
     "/slow": { id: "/slow", filePath: "handlers/slow.mjs", pathname: "/slow", type: "PAGES_API" },
     "/big-image": {
       id: "/big-image",
@@ -515,6 +530,28 @@ describe("pool-server request-boundary hardening", () => {
 });
 
 // ---- N32: the failure this endpoint exists for ----
+describe("N32: /readyz goes ready on a basePath build (manifest keys prefixed, Next ids not)", () => {
+  let pool: Awaited<ReturnType<typeof boot>>;
+
+  beforeAll(async () => {
+    pool = await boot({ basePathKeys: true });
+  }, 60_000);
+  afterAll(async () => {
+    await pool.stop();
+  });
+
+  it("verifies a route module by its manifest KEY, not Next's unprefixed output id", async () => {
+    // Every basePath deploy shipped keys like "/base/ssr" with id "/ssr". Probing by `.id`
+    // could never load anything ("Unknown output ID"), so /readyz sat 503 and the blue/green
+    // gate timed every basePath rollout out — the full run's ~20-suite basePath cluster.
+    const res = await fetch(`http://localhost:${pool.port}/readyz`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { status: string; reason: string };
+    expect(body.status).toBe("ok");
+    expect(body.reason).toContain("route module loaded");
+  });
+});
+
 describe("N32: /readyz withholds traffic from a build whose route module cannot load", () => {
   let pool: Awaited<ReturnType<typeof boot>>;
 

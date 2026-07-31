@@ -9,6 +9,7 @@ import {
   assertSafeReleaseName,
   assertSafeReplicaCount,
   escapeHelmActions,
+  renderUserEnvBlocks,
 } from "./utils.js";
 import type { EnvValue, EnvFromSource } from "../../types.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
@@ -179,38 +180,7 @@ export function renderDeployment({
   // bare `1.20` or `yes` would parse as a float/bool and be rejected at apply time) and then
   // escapeHelmActions'd, because chart templates are Go-template-evaluated before the YAML is
   // parsed — see the S5 note in utils.ts.
-  const yamlStr = (value: string): string => escapeHelmActions(JSON.stringify(value));
-  const envEntries = Object.entries(env ?? {}).map(([name, value]) => {
-    if (typeof value === "string") {
-      return `            - name: ${name}\n              value: ${yamlStr(value)}`;
-    }
-    const isSecret = "secret" in value;
-    const refKind = isSecret ? "secretKeyRef" : "configMapKeyRef";
-    const refName = isSecret ? value.secret : value.configMap;
-    const optional = value.optional === true ? `\n                  optional: true` : "";
-    return (
-      `            - name: ${name}\n` +
-      `              valueFrom:\n` +
-      `                ${refKind}:\n` +
-      `                  name: ${yamlStr(refName)}\n` +
-      `                  key: ${yamlStr(value.key)}${optional}`
-    );
-  });
-  const userEnv = envEntries.length > 0 ? "\n" + envEntries.join("\n") : "";
-
-  const envFromEntries = (envFrom ?? []).map((source) => {
-    const isSecret = "secret" in source;
-    const refKind = isSecret ? "secretRef" : "configMapRef";
-    const refName = isSecret ? source.secret : source.configMap;
-    const prefix = source.prefix ? `\n              prefix: ${yamlStr(source.prefix)}` : "";
-    const optional = source.optional === true ? `\n                optional: true` : "";
-    return (
-      `            - ${refKind}:\n` +
-      `                name: ${yamlStr(refName)}${optional}${prefix}`
-    );
-  });
-  const userEnvFrom =
-    envFromEntries.length > 0 ? `\n          envFrom:\n${envFromEntries.join("\n")}` : "";
+  const { userEnv, userEnvFrom } = renderUserEnvBlocks(env, envFrom);
 
   // N60. Literal quantities are validated here too: a `.Values`-sourced quantity is
   // already checked in values-yaml.ts, but a literal from deploy's per-build snapshot

@@ -3,6 +3,7 @@
 // for why this exists at all (cluster run, 2026-07-29, middleware-general).
 import { describe, it, expect } from "vitest";
 import { renderDeployment } from "../../src/emit/templates/deployment.js";
+import { renderRoutingServiceDeployment } from "../../src/emit/templates/routing-service-deployment.js";
 
 const render = (
   over: Parameters<typeof renderDeployment>[0] extends infer T ? Partial<T> : never,
@@ -85,5 +86,42 @@ describe("renderDeployment env", () => {
     // collision. Order here is what makes that guarantee real rather than incidental.
     const yaml = render({ env: { USER_VALUE: "x" } });
     expect(yaml.indexOf("name: NEXT_BUILD_ID")).toBeLessThan(yaml.indexOf("name: USER_VALUE"));
+  });
+});
+
+describe("renderRoutingServiceDeployment env", () => {
+  // Full-run cluster (middleware-general node-runtime, 66/68 after the staging fix): a
+  // NODE-runtime middleware executes in the ROUTING container and reads process.env at
+  // request time — but only pool deployments rendered user env, so the suite's declared
+  // variable was undefined in middleware. Same rendering rules as pools: after built-ins
+  // (K8s last-wins), JSON-quoted, Helm-action-escaped.
+  const renderRouting = (over: Record<string, unknown>) =>
+    renderRoutingServiceDeployment({
+      releaseName: "test-app",
+      buildId: "bms6abc",
+      imageRegistry: "registry.example.com/app",
+      ...over,
+    } as Parameters<typeof renderRoutingServiceDeployment>[0]);
+
+  it("renders user env after the adapter's own entries", () => {
+    const yaml = renderRouting({ env: { MIDDLEWARE_VAR: "asdf2" } });
+    expect(yaml).toContain('- name: MIDDLEWARE_VAR\n              value: "asdf2"');
+    expect(yaml.indexOf("name: NEXT_BUILD_ID")).toBeLessThan(yaml.indexOf("name: MIDDLEWARE_VAR"));
+  });
+
+  it("renders secret refs and envFrom like the pool template", () => {
+    const yaml = renderRouting({
+      env: { TOKEN: { secret: "app-secrets", key: "token", optional: true } },
+      envFrom: [{ configMap: "shared-config", prefix: "APP_" }],
+    });
+    expect(yaml).toContain("secretKeyRef:");
+    expect(yaml).toContain('name: "app-secrets"');
+    expect(yaml).toContain("envFrom:");
+    expect(yaml).toContain('prefix: "APP_"');
+  });
+
+  it("renders nothing extra without env", () => {
+    const yaml = renderRouting({});
+    expect(yaml).not.toContain("envFrom:");
   });
 });

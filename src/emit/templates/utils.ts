@@ -573,3 +573,58 @@ export function assertSafePoolName(poolName: string): void {
     );
   }
 }
+
+import type { EnvValue, EnvFromSource } from "../../types.js";
+
+/**
+ * User-supplied runtime environment, rendered for a container spec whose fields sit at
+ * 10-space indent (both the pool and routing-service Deployments). Rendered AFTER the
+ * adapter's own entries — Kubernetes takes the last occurrence of a duplicated name, so the
+ * ordering makes "user config can never shadow a built-in" a property of the output.
+ *
+ * Every interpolated string is JSON.stringify'd (env values must be YAML strings; a bare
+ * `1.20` or `yes` would parse as a float/bool and be rejected at apply time) and then
+ * escapeHelmActions'd — chart templates are Go-template-evaluated before the YAML is parsed
+ * (S5). Extracted from the pool Deployment when the routing tier needed the same blocks: a
+ * NODE-runtime middleware reads process.env in the ROUTING container, and only pools
+ * rendered user env (full run, middleware-general "allows to access env variables").
+ */
+export function renderUserEnvBlocks(
+  env: Record<string, EnvValue> | undefined,
+  envFrom: EnvFromSource[] | undefined,
+): { userEnv: string; userEnvFrom: string } {
+  const yamlStr = (value: string): string => escapeHelmActions(JSON.stringify(value));
+  const envEntries = Object.entries(env ?? {}).map(([name, value]) => {
+    if (typeof value === "string") {
+      return `            - name: ${name}\n              value: ${yamlStr(value)}`;
+    }
+    const isSecret = "secret" in value;
+    const refKind = isSecret ? "secretKeyRef" : "configMapKeyRef";
+    const refName = isSecret ? value.secret : value.configMap;
+    const optional = value.optional === true ? `\n                  optional: true` : "";
+    return (
+      `            - name: ${name}\n` +
+      `              valueFrom:\n` +
+      `                ${refKind}:\n` +
+      `                  name: ${yamlStr(refName)}\n` +
+      `                  key: ${yamlStr(value.key)}${optional}`
+    );
+  });
+  const userEnv = envEntries.length > 0 ? "\n" + envEntries.join("\n") : "";
+
+  const envFromEntries = (envFrom ?? []).map((source) => {
+    const isSecret = "secret" in source;
+    const refKind = isSecret ? "secretRef" : "configMapRef";
+    const refName = isSecret ? source.secret : source.configMap;
+    const prefix = source.prefix ? `\n              prefix: ${yamlStr(source.prefix)}` : "";
+    const optional = source.optional === true ? `\n                optional: true` : "";
+    return (
+      `            - ${refKind}:\n` +
+      `                name: ${yamlStr(refName)}${optional}${prefix}`
+    );
+  });
+  const userEnvFrom =
+    envFromEntries.length > 0 ? `\n          envFrom:\n${envFromEntries.join("\n")}` : "";
+
+  return { userEnv, userEnvFrom };
+}

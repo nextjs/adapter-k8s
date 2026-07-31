@@ -52,31 +52,62 @@ echo "Retries:  ${TEST_RETRIES}"
 echo "Concurrency: ${CONCURRENCY}"
 echo ""
 
-# --- 1. Clone/fetch Next.js ---
-if [ -d "$NEXTJS_DIR/.git" ]; then
-  echo "Fetching Next.js ref ${NEXTJS_REF}..."
+# --- 1-3. Prepare the shared Next.js checkout (clone/fetch, build, playwright) ---
+# The checkout is SHARED MUTABLE STATE across concurrent lanes. The lane driver staggers
+# lane 1, but then releases the remaining lanes simultaneously — and five concurrent preps
+# race git (`shallow.lock`: mass-failed 16 of 24 groups in the first full 6-lane run) and
+# pnpm's virtual store. Double-checked stamp + flock: the stamp records the prepped commit
+# for THIS ref, so post-prep lanes skip without touching the lock at all, and racers
+# serialize then re-check before doing any work.
+PREP_STAMP="${WORKSPACE}/.prep-done-${NEXTJS_REF}"
+prep_needed() {
+  [ -f "$PREP_STAMP" ] || return 0
+  [ -d "$NEXTJS_DIR/.git" ] || return 0
+  local head
+  head=$(git -C "$NEXTJS_DIR" rev-parse HEAD 2>/dev/null) || return 0
+  [ "$head" = "$(cat "$PREP_STAMP")" ] || return 0
+  return 1
+}
+run_prep() {
+  if [ -d "$NEXTJS_DIR/.git" ]; then
+    echo "Fetching Next.js ref ${NEXTJS_REF}..."
+    cd "$NEXTJS_DIR"
+    git fetch origin "$NEXTJS_REF" --depth=25
+    git checkout FETCH_HEAD
+  else
+    echo "Cloning Next.js..."
+    mkdir -p "$WORKSPACE"
+    git clone --depth=25 --branch "$NEXTJS_REF" https://github.com/vercel/next.js.git "$NEXTJS_DIR"
+  fi
+
+  echo "Building Next.js..."
   cd "$NEXTJS_DIR"
-  git fetch origin "$NEXTJS_REF" --depth=25
-  git checkout FETCH_HEAD
-else
-  echo "Cloning Next.js..."
+  if ! command -v pnpm >/dev/null 2>&1; then
+    corepack enable
+  fi
+  pnpm install
+  pnpm build
+  pnpm install
+
+  echo "Installing Playwright..."
+  pnpm playwright install chromium
+
+  git -C "$NEXTJS_DIR" rev-parse HEAD > "$PREP_STAMP"
+}
+if prep_needed; then
   mkdir -p "$WORKSPACE"
-  git clone --depth=25 --branch "$NEXTJS_REF" https://github.com/vercel/next.js.git "$NEXTJS_DIR"
+  exec 9>"${WORKSPACE}/.prep.lock"
+  flock 9
+  if prep_needed; then
+    run_prep
+  else
+    echo "Next.js checkout already prepared (another lane finished it while we waited)"
+  fi
+  exec 9>&-
+else
+  echo "Next.js checkout already prepared for ${NEXTJS_REF} — skipping fetch/build"
 fi
-
-# --- 2. Build Next.js ---
-echo "Building Next.js..."
 cd "$NEXTJS_DIR"
-if ! command -v pnpm >/dev/null 2>&1; then
-  corepack enable
-fi
-pnpm install
-pnpm build
-pnpm install
-
-# --- 3. Install Playwright ---
-echo "Installing Playwright..."
-pnpm playwright install chromium
 
 # --- 4. Build + pack the adapter ONCE for the whole run ---
 # Every deploy then installs this exact tarball (the ADAPTER_K8S_PREBUILT_TARBALL fast

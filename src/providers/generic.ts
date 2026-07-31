@@ -12,6 +12,7 @@
 // the full dispatch vocabulary reached the backend (`x-mw-evaluated: ran`), and scaling the
 // routing service to zero returned 500 rather than bypassing middleware.
 import { renderGenericGateway } from "../emit/templates/generic-gateway.js";
+import { renderClientTrafficPolicy } from "../emit/templates/client-traffic-policy.js";
 import { renderEnvoyExtensionPolicy } from "../emit/templates/envoy-extension-policy.js";
 import { renderHTTPRoute, httpRouteName } from "../emit/templates/gateway.js";
 import { RELEASE_NAMESPACE_EXPR } from "../emit/templates/network-policy.js";
@@ -30,6 +31,9 @@ export const genericProvider: ProviderAdapter = {
     const generic = genericConfigOf(config);
     const hosts = generic?.gateway?.hosts ?? [];
     if (!hosts.length) return files;
+
+    // Escaped-slash parity with `next start` — see the template's doc comment.
+    files["templates/client-traffic-policy.yaml"] = renderClientTrafficPolicy({ releaseName });
 
     files["templates/gateway.yaml"] = renderGenericGateway({
       releaseName,

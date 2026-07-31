@@ -281,6 +281,11 @@ export function generateHelmChart({
       ...(routingFailOpen !== undefined ? { failOpen: routingFailOpen } : {}),
       ...(rs?.requestTimeoutMs !== undefined ? { requestTimeoutMs: rs.requestTimeoutMs } : {}),
       ...(imageDigests?.routingService ? { imageDigest: imageDigests.routingService } : {}),
+      // TOP-LEVEL env only (no pool merge — middleware belongs to no pool): NODE-runtime
+      // middleware executes in this container and reads process.env at request time
+      // (full run, middleware-general "allows to access env variables").
+      ...(Object.keys(config.env ?? {}).length > 0 ? { env: config.env } : {}),
+      ...((config.envFrom ?? []).length > 0 ? { envFrom: config.envFrom } : {}),
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,

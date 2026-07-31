@@ -88,8 +88,12 @@ kubectl wait --for=condition=Ready node --all --timeout=120s >/dev/null
 # --- 3. Envoy Gateway ---
 if ! kubectl get deploy -n envoy-gateway-system envoy-gateway >/dev/null 2>&1; then
   echo "→ Installing Envoy Gateway ${ENVOY_GATEWAY_VERSION}"
+  # enableEnvoyPatchPolicy: the chart's ClientTrafficPolicy (escaped-slash pass-through) is
+  # REJECTED under merged gateways ("applied to multiple http listeners on the same port"),
+  # so the lanes need the class-level EnvoyPatchPolicy applied below instead.
   helm install eg oci://docker.io/envoyproxy/gateway-helm \
     --version "${ENVOY_GATEWAY_VERSION#v}" \
+    --set config.envoyGateway.extensionApis.enableEnvoyPatchPolicy=true \
     -n envoy-gateway-system --create-namespace --wait
 else
   echo "→ Envoy Gateway present"
@@ -121,6 +125,70 @@ spec:
     name: merged-lanes
     namespace: envoy-gateway-system
 EOF
+
+# Escaped-slash pass-through for the merged data plane. Envoy Gateway's default
+# UnescapeAndRedirect 307s "/a%2Fb" → "/a/b" before the app ever sees it; next start
+# preserves %2F in params, so that default fails every encoded-slash e2e. Standalone
+# generic deployments get this via the chart's ClientTrafficPolicy, but EG rejects a CTP
+# whose gateway shares a merged port with others — the class-level escape hatch is an
+# EnvoyPatchPolicy on the xDS listener. The merged listener is NAMED AFTER ONE member
+# gateway (e.g. "default/e2e-lane1-gateway/http"), and which one is not ours to pick, so
+# emit one policy per candidate release name: exactly one matches the live listener and
+# applies; the rest fail resource-lookup in their own isolated policy status, harmlessly.
+for name in e2e-local e2e-lane1 e2e-lane2 e2e-lane3 e2e-lane4 e2e-lane5 e2e-lane6; do
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: keep-escaped-slashes-${name}
+  namespace: default
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: GatewayClass
+    name: eg
+  type: JSONPatch
+  jsonPatches:
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/${name}-gateway/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/path_with_escaped_slashes_action
+        value: KEEP_UNCHANGED
+EOF
+done
+
+# In-cluster loopback for the lane hostnames. Upstream fixtures self-fetch their own public
+# origin from inside the app (e.g. next-after-app-deploy's middleware POSTs to
+# `http://laneN.localhost:8788/...`), and on a real deployment that public hostname resolves
+# from the pods too. Here it is host-machine-only, so: a Service exposing the merged proxy on
+# the SAME port the external URL carries (8788 → proxy 10080), plus a CoreDNS rewrite mapping
+# the lane names onto it (k3s imports coredns-custom `*.override` inside the server block).
+# Gateway API hostname matching ignores the Host header's port, so routes match unchanged.
+kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: lanes-loopback
+  namespace: envoy-gateway-system
+spec:
+  selector:
+    gateway.envoyproxy.io/owning-gatewayclass: eg
+  ports:
+    - name: http-loopback
+      port: 8788
+      targetPort: 10080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  lanes-loopback.override: |
+    rewrite name regex ^(e2e-local|lane[1-9][0-9]*)\.localhost\.$ lanes-loopback.envoy-gateway-system.svc.cluster.local answer auto
+EOF
+kubectl -n kube-system rollout restart deployment coredns >/dev/null 2>&1 || true
 
 # --- 4. Valkey ---
 if ! kubectl get deploy e2e-valkey >/dev/null 2>&1; then
