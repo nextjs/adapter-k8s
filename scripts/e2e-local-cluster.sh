@@ -39,6 +39,14 @@ if [ -n "${E2E_LANE:-}" ]; then
 fi
 
 export KUBECONFIG="${E2E_K3D_KUBECONFIG:-$HOME/.kube/k3d-adapter-e2e.yaml}"
+
+# Disk-backed TMPDIR for the harness temp apps (~150k inodes each) — the lane DRIVER
+# already exports this, but a manually-launched suite (or several in parallel) used the
+# default tmpfs /tmp and exhausted its 1M inodes (measured twice; the second time was four
+# concurrent verification repros). No wipe here: concurrent manual runs share the dir, and
+# the driver still wipes it at full-run start.
+export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
+mkdir -p "$TMPDIR"
 if [ ! -f "$KUBECONFIG" ]; then
   echo "ERROR: ${KUBECONFIG} not found — run scripts/e2e-k3d-bootstrap.sh first." >&2
   exit 1
