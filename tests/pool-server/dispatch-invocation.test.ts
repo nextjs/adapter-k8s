@@ -337,29 +337,47 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     return { calls, invoker };
   }
 
-  it("invokes PPR handlers non-minimal when incrementalCacheShared owns the shell", async () => {
-    const { calls, invoker } = invokerCapture();
-    const dispatcher = createDispatcher({
-      handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
-      poolName: "ssr",
-      buildId: "test123",
-      staticAssets: [],
-      pprRoutes,
-      incrementalCacheShared: true,
-      localHandlerInvoker: invoker as any,
-    });
-    await dispatcher.dispatch(
-      mockReq("/ppr-page"),
-      mockRes(),
-      routeResolution({ matchedPathname: "/ppr-page" }),
-    );
-    expect(calls).toHaveLength(1);
-    // Non-minimal: Next itself performs the shell lookup + resume join through the
-    // shared incremental cache; minimal mode returned a bare postponed shell that
-    // nothing resumed (live PPR documents were served with unfilled dynamic holes).
-    expect(calls[0].minimalMode).toBe(false);
-    // The entry owns the shell — the build-time token/prefix must NOT be injected.
-    expect(calls[0].responsePrefix).toBeUndefined();
+  it("injects the build shell for PPR under incrementalCacheShared too (k3d sub-shell family)", async () => {
+    // The previous pin here expected NON-minimal with no injection, on the premise that a
+    // registered classic cacheHandler means "Next itself performs the shell lookup + resume
+    // join through the shared incremental cache". Measured false on the k3d cluster
+    // (sub-shell-generation 6/7 failing: "(runtime)" layouts where "(buildtime)" is
+    // expected): the generated adapter entrypoints are per-request render modules — the
+    // route-shell orchestration lives in NextServer, which the pool replaces. The shell
+    // dance is the PLATFORM's job in both cache modes; cross-replica coherence comes from
+    // checkShellStale (live tag check against the shared Valkey manifest), exactly as on
+    // the proven no-classic-handler path.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-shell-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {
+          "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile },
+        },
+        incrementalCacheShared: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      // Same shape as the no-classic-handler path: minimal render resumes onto the
+      // injected token, and the document response is [shell][resume].
+      expect(calls[0].minimalMode).toBe(true);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBe("token");
+      expect(calls[0].responsePrefix?.filePath).toBe(shellFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // N16: a PPR-capable route whose build emitted NO fallback shell (`fallback: null`) is absent
@@ -522,9 +540,15 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
         [false, false, true, true], // early-span: STILL minimal — the rung was measured out (above)
         [false, true, false, false], // unresolved root params (the live shell-less reason)
         [false, true, true, false], // …and wouldPostpone does not subtract from it
-        [true, false, false, false], // shell-bearing, via handlerPprInfo
-        [true, false, true, false],
-        [true, true, false, false],
+        // Shell-bearing rows are MINIMAL now under incrementalCacheShared: the platform
+        // injects the build shell + postponed token and prepends the shell (same path as
+        // the no-classic-handler case) — Next's entrypoints have no route-shell
+        // orchestration of their own (measured: k3d sub-shell-generation, "(runtime)"
+        // layouts everywhere). rootParams=true rows keep non-minimal: unresolved root
+        // params force a live shell-less render regardless of the recorded shell.
+        [true, false, false, true], // shell-bearing → minimal + inject
+        [true, false, true, true],
+        [true, true, false, false], // root params still win
         [true, true, true, false],
       ];
 
@@ -540,7 +564,8 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
               ? {
                   "/x/[id]": {
                     postponedState: "token",
-                    // incrementalCacheShared owns the shell, so nothing is read from disk here.
+                    // The injection path stats this; absence degrades to no prefix, which is
+                    // fine here — the truth table only pins minimalMode.
                     fallbackFilePath: ".next/server/app/x/[id].html",
                   },
                 }

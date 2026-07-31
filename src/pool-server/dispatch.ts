@@ -1634,7 +1634,6 @@ export function createDispatcher(options: DispatcherOptions) {
   // pod start (the previous behavior). A garbage timestamp parses to NaN → same fallback.
   const builtAtMs = builtAt ? Date.parse(builtAt) : Number.NaN;
   const deployedAt = Number.isFinite(builtAtMs) ? builtAtMs : Date.now();
-  const entrypointOwnsPprCache = incrementalCacheShared || entrypointOwnsPprShell;
   // N16: every shell-less PPR template (used only to recognize the route as PPR), and the
   // root-param subset that must actually run NON-minimal. Splitting these was the fix for
   // app-dir/fallback-shells: treating ALL shell-less PPR templates as non-minimal made Next
@@ -2856,7 +2855,7 @@ export function createDispatcher(options: DispatcherOptions) {
               }
             | undefined;
           let pprInvocationHeaders: Record<string, string> | undefined;
-          if (pprInfo?.postponedState && !entrypointOwnsPprCache) {
+          if (pprInfo?.postponedState && !entrypointOwnsPprShell && !handlerPprRootParams) {
             // Do NOT inject the resume token for Server Action requests. Next's app-page handler
             // only splits the postponed state out of the action body (via the
             // `x-next-resume-state-length` framing) when no `postponed` meta is already set —
@@ -2990,7 +2989,15 @@ export function createDispatcher(options: DispatcherOptions) {
               // upstream, and running it non-minimal made Next resume a fallback shell upstream
               // deliberately skips (app-dir/fallback-shells).
               (
-                ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
+                // mode, where the entrypoint's own filesystem cache holds the build shells
+                // and Next resumes internally. Under a SHARED cache the entrypoints are
+                // per-request render modules with no route-shell orchestration (measured:
+                // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
+                // take the same minimal+inject path as the no-classic-handler case below.
+                // Shell-LESS root-param templates still need non-minimal in both modes (N16).
+                ((entrypointOwnsPprShell ||
+                  (incrementalCacheShared && (!handlerPprInfo || handlerPprRootParams))) &&
                   // N16c. `pprCapableRoutes[route].wouldPostpone` is DELIBERATELY NOT a rung
                   // here, and is not even read into a local. The manifest computes it
                   // (manifest.ts) and it is real — the build does put a postponed state on a
