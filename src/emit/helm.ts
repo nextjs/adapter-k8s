@@ -78,6 +78,7 @@ export function generateHelmChart({
   infrastructure,
   internalSecret,
   imageDigests,
+  deploymentId,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -90,6 +91,8 @@ export function generateHelmChart({
   /** Mirrors the GCP callout failOpen to the server (ROUTING_FAIL_OPEN) for a consistent policy. */
   routingFailOpen?: boolean;
   infrastructure?: { projectId?: string; region?: string };
+  /** next.config `deploymentId`, rendered as NEXT_DEPLOYMENT_ID into pool + routing pods. */
+  deploymentId?: string;
   /**
    * Shared secret authenticating internal dispatch headers between the routing service and the
    * pools. Both deployments read it from the rendered Secret, so they always agree.
@@ -240,6 +243,7 @@ export function generateHelmChart({
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
       ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
       ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,
@@ -286,6 +290,7 @@ export function generateHelmChart({
       // (full run, middleware-general "allows to access env variables").
       ...(Object.keys(config.env ?? {}).length > 0 ? { env: config.env } : {}),
       ...((config.envFrom ?? []).length > 0 ? { envFrom: config.envFrom } : {}),
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,

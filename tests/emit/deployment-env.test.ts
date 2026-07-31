@@ -125,3 +125,28 @@ describe("renderRoutingServiceDeployment env", () => {
     expect(yaml).not.toContain("envFrom:");
   });
 });
+
+describe("NEXT_DEPLOYMENT_ID rendering", () => {
+  // Full-run v4 deployment-id family (next-image-legacy ?dpl=, worker NEXT_DEPLOYMENT_ID,
+  // both deployment-skew suites): Next's runtime reads process.env.NEXT_DEPLOYMENT_ID and
+  // config load REFUSES a mismatch, so both containers must carry the exact build value.
+  it("pool pods carry the build's deploymentId before user env", () => {
+    const yaml = render({ deploymentId: "k8s-3f9a12bc45de", env: { A: "b" } });
+    expect(yaml).toContain('- name: NEXT_DEPLOYMENT_ID\n              value: "k8s-3f9a12bc45de"');
+    expect(yaml.indexOf("NEXT_DEPLOYMENT_ID")).toBeLessThan(yaml.indexOf("- name: A"));
+  });
+
+  it("routing pods carry it too (node middleware runs there)", () => {
+    const yaml = renderRoutingServiceDeployment({
+      releaseName: "test-app",
+      buildId: "bms6abc",
+      imageRegistry: "registry.example.com/app",
+      deploymentId: "k8s-3f9a12bc45de",
+    } as Parameters<typeof renderRoutingServiceDeployment>[0]);
+    expect(yaml).toContain('- name: NEXT_DEPLOYMENT_ID\n              value: "k8s-3f9a12bc45de"');
+  });
+
+  it("renders nothing when no deploymentId is set", () => {
+    expect(render({})).not.toContain("NEXT_DEPLOYMENT_ID");
+  });
+});

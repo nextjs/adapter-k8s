@@ -84,6 +84,7 @@ export function renderDeployment({
   internalSecretRef,
   env,
   envFrom,
+  deploymentId,
 }: {
   poolName: string;
   buildId: string;
@@ -142,6 +143,12 @@ export function renderDeployment({
   /** User-supplied runtime environment, already merged (top-level config + this pool). */
   env?: Record<string, EnvValue>;
   envFrom?: EnvFromSource[];
+  /**
+   * next.config `deploymentId` — Next's runtime reads process.env.NEXT_DEPLOYMENT_ID for
+   * `?dpl=` asset/image URLs and skew headers, and config load REFUSES a mismatch, so the
+   * pod must carry the exact build-time value.
+   */
+  deploymentId?: string;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -170,6 +177,11 @@ export function renderDeployment({
   // Emitting it unconditionally keeps the pod template identical whether or not the cache is on,
   // so toggling `cache.enabled` between deploys never rolls the retained previous deployment.
   const valkeyEnv = "\n" + renderValkeyEnv(releaseName, "            ");
+  // Built-in, so it renders BEFORE user env (user config can never shadow it). Quoted via
+  // JSON + Helm-action escaping like every other user-shaped scalar in this template.
+  const deploymentIdEnv = deploymentId
+    ? `\n            - name: NEXT_DEPLOYMENT_ID\n              value: ${escapeHelmActions(JSON.stringify(deploymentId))}`
+    : "";
 
   // User-supplied runtime environment. Rendered AFTER the adapter's own entries: Kubernetes
   // takes the last occurrence of a duplicated name, so this ordering makes "user config can
@@ -342,7 +354,7 @@ ${podLabels}
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-${internalSecretEnv}${valkeyEnv}${userEnv}${userEnvFrom}
+${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             # readOnlyRootFilesystem makes / read-only; Next still needs a writable
             # scratch dir, so /tmp is an emptyDir. NOT in-memory: a bare \`emptyDir: {}\`

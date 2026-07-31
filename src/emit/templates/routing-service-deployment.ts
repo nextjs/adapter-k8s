@@ -7,6 +7,7 @@ import {
   UNCONFIGURED_IMAGE_REGISTRY,
   routingManifestSnapshotName as routingManifestSnapshotNameFor,
   renderUserEnvBlocks,
+  escapeHelmActions,
 } from "./utils.js";
 import type { EnvValue, EnvFromSource } from "../../types.js";
 import {
@@ -61,6 +62,7 @@ export function renderRoutingServiceDeployment({
   transport = "tls",
   env,
   envFrom,
+  deploymentId,
 }: {
   releaseName: string;
   buildId: string;
@@ -82,6 +84,8 @@ export function renderRoutingServiceDeployment({
   /** User-supplied runtime environment (top-level config; NODE middleware reads it here). */
   env?: Record<string, EnvValue>;
   envFrom?: EnvFromSource[];
+  /** next.config `deploymentId` — see renderDeployment; node middleware runs here. */
+  deploymentId?: string;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md) — this template splices all three
   // into resource names, a quoted image reference, and `value: "…"` env scalars.
@@ -134,6 +138,9 @@ export function renderRoutingServiceDeployment({
   // Same env blocks as the pool template (see renderUserEnvBlocks): NODE-runtime middleware
   // executes in THIS container and reads process.env at request time.
   const { userEnv, userEnvFrom } = renderUserEnvBlocks(env, envFrom);
+  const deploymentIdEnv = deploymentId
+    ? `\n            - name: NEXT_DEPLOYMENT_ID\n              value: ${escapeHelmActions(JSON.stringify(deploymentId))}`
+    : "";
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -237,7 +244,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-${internalSecretEnv}${userEnv}${userEnvFrom}
+${internalSecretEnv}${deploymentIdEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             - name: routing-manifest
               mountPath: /config

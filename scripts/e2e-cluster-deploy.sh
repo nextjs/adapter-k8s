@@ -114,9 +114,12 @@ chmod 600 "${APP_DIR}/.k8s-adapter/internal-secret.key" 2>/dev/null || true
 # build an image from. Must be set before sourcing common, which defaults it to 1.
 export ADAPTER_K8S_SKIP_STAGING=0
 
-# No deploymentId on a real cluster — it pins Next's build id to a literal constant, which
-# collapses blue/green across every suite. See the long note in e2e-setup-common.sh.
-export ADAPTER_K8S_SET_DEPLOYMENT_ID=0
+# deploymentId is ON for cluster runs again: Next still pins its BUILD_ID to a literal
+# constant in deploymentId mode, but the adapter now substitutes the (unique-per-deploy)
+# deploymentId as its effective build id (effectiveBuildId, src/adapter.ts), so blue/green
+# names, image tags, and the Valkey namespace stay unique. Suites that assert `?dpl=` asset
+# URLs, worker NEXT_DEPLOYMENT_ID, and skew headers need the id end-to-end — and the
+# deployment-skew fixtures refuse to BUILD without one.
 
 # --- 2. Shared setup: pack adapter, install, build ---
 # shellcheck source=./e2e-setup-common.sh
