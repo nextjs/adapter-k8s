@@ -1,5 +1,6 @@
 import {
   grantsSharedCacheFreshness,
+  hasUnqualifiedCacheControlDirective,
   rscParentCandidates,
   stripBasePath,
   trailingSlashVariants,
@@ -156,8 +157,10 @@ export function explicitCacheControlWins({
   if (!resolvedCacheControl) return false;
   // The app's own `no-store` is at least as strong as the forced default — honor it
   // verbatim instead of downgrading it to `no-cache`.
-  if (/\bno-store\b/i.test(resolvedCacheControl)) return true;
-  if (responseCacheControls.some((cc) => /\bno-store\b/i.test(cc))) return false;
+  if (hasUnqualifiedCacheControlDirective(resolvedCacheControl, "no-store")) return true;
+  if (responseCacheControls.some((cc) => hasUnqualifiedCacheControlDirective(cc, "no-store"))) {
+    return false;
+  }
   if (grantsSharedCacheFreshness(resolvedCacheControl)) return false;
   return true;
 }

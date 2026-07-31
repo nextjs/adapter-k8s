@@ -34,15 +34,11 @@ import {
   mergeResolvedHeadersIntoHeadersArg,
 } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
-import { ifNoneMatchMatches, staticAssetEtagForFile } from "./http-cache.js";
-
-/**
- * S14. Above this size a static/public body is STREAMED instead of buffered. Below it the
- * buffered path stays — it is one syscall and avoids stream setup for the small files that
- * dominate a build's asset count. The threshold is what keeps N concurrent requests for one
- * large asset from holding N copies of it resident on a 512 MiB pod.
- */
-const STREAM_THRESHOLD_BYTES = 512 * 1024;
+import {
+  ifNoneMatchMatches,
+  STATIC_STREAM_THRESHOLD_BYTES,
+  staticAssetEtagForFile,
+} from "./http-cache.js";
 import { decodePublicPathname } from "./public-files.js";
 import {
   DEFAULT_IMAGE_FORMATS,
@@ -532,7 +528,7 @@ function servePublicFileFromDisk(
     res.end();
     return true;
   }
-  if (publicStat.size > STREAM_THRESHOLD_BYTES) {
+  if (publicStat.size > STATIC_STREAM_THRESHOLD_BYTES) {
     pipeline(createReadStream(publicFile), res, () => undefined);
     return true;
   }
@@ -861,11 +857,8 @@ let joinedImageOptimizations = 0;
 interface ImageAdmission {
   /**
    * Replace this admission's worst-case reservation with the number of source bytes actually
-   * held. Called as soon as the source is in hand; it can move the charge UP as well as down —
-   * the disk-read path is not bounded by MAX_IMAGE_BYTES (a build-emitted public file is not
-   * attacker-supplied, and upstream does not cap a local read either), so the honest charge for
-   * one of those may exceed the reservation. Going over budget only blocks further admissions;
-   * it never retroactively refuses work already in flight.
+   * held. Called as soon as the source is in hand. Every external, self-fetch and local-file path
+   * is now capped before or while it reads, so this can only reduce the worst-case reservation.
    */
   settleSourceBytes(bytes: number): void;
   release(): void;
@@ -1137,13 +1130,31 @@ function isPrivateIPv4(ip: string): boolean {
   if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return true;
   const a = parts[0] ?? 0;
   const b = parts[1] ?? 0;
+  const c = parts[2] ?? 0;
+  const d = parts[3] ?? 0;
+
+  // SECURITY: this is a GLOBAL-address allow policy, despite the historical function name.
+  // Keep it aligned with the IANA IPv4 Special-Purpose Address Registry (checked 2026-07-30),
+  // not just the familiar RFC1918 ranges. The image fetcher uses this one predicate for URL
+  // literals, DNS preflight, redirect hops and the socket-pinned lookup; an omission therefore
+  // becomes an SSRF route in all four places. More-specific globally reachable assignments
+  // inside 192.0.0.0/24 are the only exceptions to that parent block.
   if (a === 0) return true; // 0.0.0.0/8 "this host"
   if (a === 10) return true; // 10/8 private
   if (a === 127) return true; // loopback
   if (a === 169 && b === 254) return true; // link-local incl. 169.254.169.254 metadata
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
-  if (a === 192 && b === 168) return true; // 192.168/16
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT 100.64/10
+  if (a === 192 && b === 0 && c === 0) {
+    if (d === 9 || d === 10) return false; // PCP/TURN anycast: globally reachable
+    return true; // IETF protocol assignments, otherwise non-global
+  }
+  if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return true; // deprecated 6to4 relay anycast
+  if (a === 192 && b === 168) return true; // 192.168/16
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking 198.18/15
+  if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3
   if (a >= 224) return true; // multicast / reserved
   return false;
 }
@@ -1228,23 +1239,42 @@ function isPrivateIPv6(ip: string): boolean {
   if (g[0] === 0x0064 && g[1] === 0xff9b && isZeroRange(g, 2, 6)) {
     return isPrivateIPv4(ipv4FromGroups(g));
   }
+  // The local-use NAT64 prefix is explicitly not globally reachable.
+  if (g[0] === 0x0064 && g[1] === 0xff9b && g[2] === 0x0001) return true;
   // 6to4 2002::/16 embeds an IPv4 address in the next 32 bits.
   if (g[0] === 0x2002) {
     return isPrivateIPv4(`${g[1]! >> 8}.${g[1]! & 0xff}.${g[2]! >> 8}.${g[2]! & 0xff}`);
   }
-  // Link-local fe80::/10 (the whole range, not just the fe80 prefix).
-  if ((g[0]! & 0xffc0) === 0xfe80) return true;
-  // Unique-local fc00::/7.
-  if ((g[0]! & 0xfe00) === 0xfc00) return true;
-  // Multicast ff00::/8.
-  if ((g[0]! & 0xff00) === 0xff00) return true;
+
+  // SECURITY: default-deny IPv6 space outside the currently allocated global-unicast 2000::/3
+  // block. This covers unspecified/reserved, discard-only, unique-local, site/link-local and
+  // multicast space without betting the SSRF boundary on a familiar-prefix shortlist.
+  if ((g[0]! & 0xe000) !== 0x2000) return true;
+
+  // IANA's 2001::/23 protocol-assignment parent is non-global unless a more-specific registry
+  // entry says otherwise. Keep those public anycast/protocol exceptions explicit so a new
+  // special-purpose assignment fails closed until this table is reviewed.
+  if (g[0] === 0x2001 && (g[1]! & 0xfe00) === 0) {
+    const exactAnycast =
+      g[1] === 0x0001 &&
+      isZeroRange(g, 2, 7) &&
+      (g[7] === 0x0001 || g[7] === 0x0002 || g[7] === 0x0003);
+    const globallyReachableProtocolAssignment =
+      g[1] === 0x0003 ||
+      (g[1] === 0x0004 && g[2] === 0x0112) ||
+      (g[1]! & 0xfff0) === 0x0020 ||
+      (g[1]! & 0xfff0) === 0x0030;
+    if (!exactAnycast && !globallyReachableProtocolAssignment) return true;
+  }
+
+  if (g[0] === 0x2001 && g[1] === 0x0db8) return true; // documentation
+  if (g[0] === 0x3fff && (g[1]! & 0xf000) === 0) return true; // documentation 3fff::/20
   return false;
 }
 
 /**
- * Exported for tests: this is a security control (the SSRF address filter) and had NO test
- * coverage at all — nothing in tests/ referenced 169.254 or exercised these predicates, which
- * is exactly why the IPv6 gaps in S23 went unnoticed.
+ * Exported for tests. The historical name is retained to avoid churn, but `true` means
+ * non-global/special-purpose, not only RFC1918 private space.
  */
 export function isPrivateAddress(ip: string): boolean {
   const kind = isIP(ip);
@@ -2575,7 +2605,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           res.end();
           return;
         }
-        if (staticStat.size > STREAM_THRESHOLD_BYTES) {
+        if (staticStat.size > STATIC_STREAM_THRESHOLD_BYTES) {
           pipeline(createReadStream(filePath), res, () => undefined);
           return;
         }
@@ -2808,19 +2838,42 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               new URL(`${url.origin}${basePath}${decodedImagePath}`),
             );
 
+          let localImageFile: string | null = null;
+          let localImageSize = 0;
+          if (!sourceCoveredByMiddleware && existsSync(publicFile)) {
+            const publicStat = statSync(publicFile);
+            if (!publicStat.isDirectory()) {
+              localImageFile = publicFile;
+              localImageSize = publicStat.size;
+            }
+          }
           if (
-            !sourceCoveredByMiddleware &&
-            existsSync(publicFile) &&
-            !statSync(publicFile).isDirectory()
-          ) {
-            imageBuffer = readFileSync(publicFile);
-          } else if (
+            !localImageFile &&
             !sourceCoveredByMiddleware &&
             staticFile &&
-            existsSync(staticFile) &&
-            !statSync(staticFile).isDirectory()
+            existsSync(staticFile)
           ) {
-            imageBuffer = readFileSync(staticFile);
+            const staticStat = statSync(staticFile);
+            if (!staticStat.isDirectory()) {
+              localImageFile = staticFile;
+              localImageSize = staticStat.size;
+            }
+          }
+
+          if (localImageFile) {
+            // S42 (AVAILABILITY). Admission reserves MAX_IMAGE_BYTES before source I/O, but the
+            // old local fast paths allocated the whole file and only trued-up accounting after
+            // the fact. A build-authored oversized public or .next/static image therefore
+            // bypassed both the per-image cap and the process-wide reservation. Stat first and
+            // refuse it before readFileSync can allocate or block on those bytes.
+            if (localImageSize > MAX_IMAGE_BYTES) {
+              return {
+                kind: "error",
+                status: 413,
+                body: '"url" parameter is valid but internal response is invalid',
+              };
+            }
+            imageBuffer = readFileSync(localImageFile);
           } else {
             // Fetch from ourselves (same-origin relative image, e.g. served by a route).
             // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and the

@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import NextRouting from "@next/routing";
 import type { ResolveRoutesParams } from "@next/routing";
+import { isSafePattern } from "redos-detector";
 const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
@@ -182,11 +183,11 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  *     tiny requests then stall both tiers past their health-check deadlines, so a matcher an
  *     app author wrote for convenience becomes a remote availability bug.
  *
- * The guard is a shape check, not a solver: nested quantifiers (a quantified group that itself
- * contains a quantifier) are the class that produces exponential backtracking, and no
- * legitimate has/missing value needs one. A rejected pattern degrades to exact string
- * comparison — the same fallback an uncompilable pattern already took — rather than throwing,
- * because a matcher that cannot be evaluated must never silently widen coverage.
+ * Cheap shape checks refuse nested quantifiers and quantified groups containing alternation.
+ * A bounded automaton analysis then catches cross-group ambiguity such as `a*a*a*a*a*b`, which
+ * no local group walk can see. A rejected pattern degrades to exact string comparison — the same
+ * fallback an uncompilable pattern already took — rather than throwing, because a matcher that
+ * cannot be evaluated must never silently widen coverage.
  *
  * The degrade is a RUNTIME last resort, not the intended way an author learns about this. The
  * shape is fully known at build time, so `manifest.ts` runs the same predicate
@@ -195,17 +196,79 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
  * for a config mistake; `next build` is the right one. Reaching the degrade path therefore means
  * a manifest built before that check existed, or one hand-edited afterwards.
  *
- * KNOWN LIMIT, stated rather than implied: this does not catch alternation-overlap patterns
- * such as `(a|aa)+`, which backtrack for the same reason without matching the shape above.
- * Catching those needs real automaton analysis (or an RE2-style engine). What is bounded here
- * is the common, accidental form; an app that deliberately writes a pathological matcher can
- * still hurt itself. The build-time half inherits exactly this limit — it shares the predicate,
- * so it is not a second, broader net. See
- * docs/superpowers/specs/2026-07-26-smaller-open-items.md §2 for why broadening the shape check
- * was rejected on its own and what a real bound (a deadline, or a non-backtracking engine) needs.
+ * The analyzer itself is bounded too. A complex or unsupported expression that exceeds the
+ * score or deterministic step budget is unsafe rather than allowed through on an inconclusive
+ * verdict. The build-time half shares this exact predicate.
  */
 const conditionRegexCache = new Map<string, RegExp | null>();
-const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
+
+/**
+ * Identify a repeated group that contains either another quantifier or alternation.
+ *
+ * This is a tiny syntax walk rather than another regexp so escaped metacharacters, character
+ * classes, group prefixes and nested groups are handled consistently. State propagates to the
+ * parent: `((a|aa))+` and `((aa?))+` retain the hazards of their inner groups. In particular,
+ * `?` must count as an INNER quantifier — `(aa?)+` is the same exponential language as
+ * `(a|aa)+` — while the `?` that opens `(?:...)`/`(?=...)` is syntax, not repetition.
+ */
+function quantifiedGroupHazard(value: string): "nested quantifier" | "alternation" | null {
+  const groups: Array<{
+    openIndex: number;
+    containsAlternation: boolean;
+    containsQuantifier: boolean;
+  }> = [];
+  let inCharacterClass = false;
+
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]!;
+    if (ch === "\\") {
+      i++; // the following code point is literal, including `|`, `[` or `)`
+      continue;
+    }
+    if (inCharacterClass) {
+      if (ch === "]") inCharacterClass = false;
+      continue;
+    }
+    if (ch === "[") {
+      inCharacterClass = true;
+      continue;
+    }
+    if (ch === "(") {
+      groups.push({ openIndex: i, containsAlternation: false, containsQuantifier: false });
+      continue;
+    }
+    if (ch === "|" && groups.length > 0) {
+      groups[groups.length - 1]!.containsAlternation = true;
+      continue;
+    }
+    if (
+      groups.length > 0 &&
+      (ch === "+" || ch === "*" || ch === "?" || ch === "{") &&
+      // `?` immediately after this group's opening parenthesis introduces a non-capturing,
+      // lookaround or named group. It does not quantify an atom.
+      !(ch === "?" && groups[groups.length - 1]!.openIndex === i - 1)
+    ) {
+      groups[groups.length - 1]!.containsQuantifier = true;
+      continue;
+    }
+    if (ch !== ")" || groups.length === 0) continue;
+
+    const group = groups.pop()!;
+    const next = value[i + 1];
+    const groupIsQuantified = next === "+" || next === "*" || next === "?" || next === "{";
+    const groupIsRepeated = next === "+" || next === "*" || next === "{";
+    if (groupIsRepeated) {
+      if (group.containsQuantifier) return "nested quantifier";
+      if (group.containsAlternation) return "alternation";
+    }
+    if (groups.length > 0) {
+      const parent = groups[groups.length - 1]!;
+      parent.containsAlternation ||= group.containsAlternation;
+      parent.containsQuantifier ||= group.containsQuantifier || groupIsQuantified;
+    }
+  }
+  return null;
+}
 
 /**
  * Why this has/missing pattern must not be evaluated as a regexp, or `null` if it is fine.
@@ -214,10 +277,54 @@ const NESTED_QUANTIFIER_RE = /\([^)]*[+*}][^)]*\)\s*[+*{]/;
  * "pathological" (the two-resolver-tier drift problem this module exists to prevent).
  */
 export function unsafeConditionPattern(value: string): string | null {
-  return NESTED_QUANTIFIER_RE.test(value)
-    ? "a quantified group containing another quantifier can backtrack exponentially against a " +
-        "request-controlled value, blocking the event loop"
-    : null;
+  // Bound parser/compiler work too. This is build-authored in normal operation, but a hand-edited
+  // runtime manifest must not turn first-request compilation into a separate CPU spike.
+  if (value.length > 4096) {
+    return "the pattern exceeds the 4096-character analysis and compilation limit";
+  }
+  const hazard = quantifiedGroupHazard(value);
+  if (hazard === "nested quantifier") {
+    return (
+      "a quantified group containing another quantifier can backtrack exponentially against a " +
+      "request-controlled value, blocking the event loop"
+    );
+  }
+  if (hazard === "alternation") {
+    return (
+      "a quantified group containing alternation can backtrack exponentially against a " +
+      "request-controlled value, blocking the event loop"
+    );
+  }
+  if (/\\k</.test(value)) {
+    return "named backreferences are not supported by the bounded automaton analysis";
+  }
+  try {
+    // redos-detector 6.x parses lookbehind and numeric backreferences, but not JavaScript named
+    // capture syntax. Names do not change the automaton, so remove only the `?<name>` marker for
+    // analysis. Named backreferences were refused above because replacing those would require a
+    // capture-numbering rewrite rather than this semantics-preserving marker removal.
+    const analyzableValue = value.replace(/\(\?<[$A-Z_a-z][$\w]*>/g, "(");
+    const analysis = isSafePattern(`^${analyzableValue}$`, {
+      // The library scores alternate paths through the expression. A finite, deterministic step
+      // budget is mandatory: an analyzer that can itself run without a bound merely moves the
+      // DoS, while a wall-clock timeout could reject a build-approved pattern only when a pod is
+      // under load and silently narrow middleware coverage.
+      maxScore: 200,
+      maxSteps: 500,
+    });
+    if (!analysis.safe) {
+      return (
+        "bounded automaton analysis found ambiguous matching paths or could not prove the " +
+        "pattern safe within its fixed budget; synchronous evaluation could block the event loop"
+      );
+    }
+  } catch {
+    return (
+      "bounded automaton analysis could not parse or prove this pattern safe for synchronous " +
+      "evaluation against a request-controlled value"
+    );
+  }
+  return null;
 }
 
 export function conditionRegex(value: string): RegExp | null {
@@ -1740,11 +1847,93 @@ export function rscCacheBustingUnvalidated(args: {
   }
 }
 
+export interface CacheControlDirective {
+  name: string;
+  value: string | null;
+}
+
+const CACHE_CONTROL_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * Parse Cache-Control as a comma-delimited directive list, keeping commas inside quoted strings.
+ *
+ * Security decisions must compare exact directive names: word-boundary searches make extension
+ * names such as `x-no-store` and `x-s-maxage` indistinguishable from the standard directives.
+ * Malformed members are ignored rather than partially interpreted. That is fail-closed for both
+ * consumers below: malformed vetoes cannot weaken a forced cache policy, while malformed
+ * freshness extensions cannot invent a cache window.
+ */
+export function parseCacheControlDirectives(cacheControl: string): CacheControlDirective[] {
+  const members: string[] = [];
+  let memberStart = 0;
+  let quoted = false;
+  let escaped = false;
+
+  for (let i = 0; i < cacheControl.length; i++) {
+    const ch = cacheControl[i]!;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === ",") {
+      members.push(cacheControl.slice(memberStart, i));
+      memberStart = i + 1;
+    }
+  }
+  members.push(cacheControl.slice(memberStart));
+
+  const directives: CacheControlDirective[] = [];
+  for (const rawMember of members) {
+    const member = rawMember.trim();
+    if (!member) continue;
+    const equals = member.indexOf("=");
+    const rawName = (equals === -1 ? member : member.slice(0, equals)).trim();
+    if (!CACHE_CONTROL_TOKEN_RE.test(rawName)) continue;
+    if (equals === -1) {
+      directives.push({ name: rawName.toLowerCase(), value: null });
+      continue;
+    }
+
+    const rawValue = member.slice(equals + 1).trim();
+    let value: string;
+    if (rawValue.startsWith('"')) {
+      let end = -1;
+      let quotedEscape = false;
+      for (let i = 1; i < rawValue.length; i++) {
+        const ch = rawValue[i]!;
+        if (quotedEscape) quotedEscape = false;
+        else if (ch === "\\") quotedEscape = true;
+        else if (ch === '"') {
+          end = i;
+          break;
+        }
+      }
+      if (end === -1 || rawValue.slice(end + 1).trim() !== "") continue;
+      value = rawValue.slice(1, end).replace(/\\([\t !-~\u0080-\u00ff])/g, "$1");
+    } else {
+      if (!CACHE_CONTROL_TOKEN_RE.test(rawValue)) continue;
+      value = rawValue;
+    }
+    directives.push({ name: rawName.toLowerCase(), value });
+  }
+  return directives;
+}
+
+export function hasUnqualifiedCacheControlDirective(cacheControl: string, name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  return parseCacheControlDirectives(cacheControl).some(
+    (directive) => directive.name === normalizedName && directive.value === null,
+  );
+}
+
 /**
  * True when this Cache-Control gives a SHARED cache a window in which it may serve hits without
- * revalidating — with neither `no-cache` nor `private` to veto storage. The single derivation for
- * both the middleware invariant (pool-server/cache-policy.ts) and the RSC-validation invariant
- * (routing-service/handler.ts).
+ * revalidating — with neither unqualified `no-store`, `no-cache` nor `private` to veto storage.
+ * The single derivation for both the middleware invariant (pool-server/cache-policy.ts) and the
+ * RSC-validation invariant (routing-service/handler.ts).
  *
  * Three independent grants, any one of which opens the window:
  *  - a positive `s-maxage` (else `max-age`) — the plain freshness lifetime;
@@ -1759,24 +1948,32 @@ export function rscCacheBustingUnvalidated(args: {
  * the middleware invariant wants.
  */
 export function grantsSharedCacheFreshness(cacheControl: string): boolean {
-  // S24. Only the UNQUALIFIED forms veto storage. RFC 9111 §5.2.2.4/§5.2.2.7 also allow the
-  // argumented response forms — `no-cache="set-cookie"` means only that field must be
-  // revalidated, and the rest of the response may be served fresh for the stated lifetime. A
-  // bare `\bno-cache\b` test matched those too, so `no-cache="set-cookie", s-maxage=600` was
-  // classified as granting no shared freshness and honored verbatim on a middleware-covered
-  // route — a shared cache that implements the qualified semantics then serves unrevalidated
-  // hits for 600s, and because ext_proc is post-cache those hits never reach middleware. The
-  // lookahead requires the directive to END there (`,`, whitespace, or end of string), so an
-  // `=` immediately after it falls through to the freshness checks below.
-  if (/(?:^|[,\s])no-cache(?=$|[,\s])/i.test(cacheControl)) return false;
-  if (/(?:^|[,\s])private(?=$|[,\s])/i.test(cacheControl)) return false;
-  const sMaxAge = /\bs-maxage=(\d+)/i.exec(cacheControl);
-  const maxAge = /\bmax-age=(\d+)/i.exec(cacheControl);
-  const shared = sMaxAge ? Number(sMaxAge[1]) : maxAge ? Number(maxAge[1]) : 0;
-  if (shared > 0) return true;
-  // `\b` would match the `max-age` inside `stale-while-revalidate`'s neighbours, so anchor on a
-  // non-token character (or string start) instead — and require the `stale-` prefix explicitly.
-  const staleWhileRevalidate = /(?:^|[^a-z-])stale-while-revalidate=(\d+)/i.exec(cacheControl);
-  const staleIfError = /(?:^|[^a-z-])stale-if-error=(\d+)/i.exec(cacheControl);
-  return Number(staleWhileRevalidate?.[1] ?? 0) > 0 || Number(staleIfError?.[1] ?? 0) > 0;
+  const directives = parseCacheControlDirectives(cacheControl);
+  const hasUnqualified = (name: string): boolean =>
+    directives.some((directive) => directive.name === name && directive.value === null);
+  // S24. Only the UNQUALIFIED no-cache/private forms veto the whole response. RFC 9111 also
+  // permits field-name arguments, whose remaining response can still be served fresh.
+  if (hasUnqualified("no-store") || hasUnqualified("no-cache") || hasUnqualified("private")) {
+    return false;
+  }
+
+  const values = (name: string): string[] =>
+    directives
+      .filter(
+        (directive): directive is CacheControlDirective & { value: string } =>
+          directive.name === name && directive.value !== null,
+      )
+      .map((directive) => directive.value);
+  const grantsPositiveSeconds = (name: string): boolean =>
+    values(name).some((value) => /^\d+$/.test(value) && Number(value) > 0);
+
+  // s-maxage overrides max-age for shared caches. Duplicate directives make the field invalid;
+  // treating any positive duplicate as a grant is the safe interpretation for this guard.
+  const sMaxAge = values("s-maxage");
+  if (sMaxAge.length > 0) {
+    if (sMaxAge.some((value) => /^\d+$/.test(value) && Number(value) > 0)) return true;
+  } else if (grantsPositiveSeconds("max-age")) {
+    return true;
+  }
+  return grantsPositiveSeconds("stale-while-revalidate") || grantsPositiveSeconds("stale-if-error");
 }
