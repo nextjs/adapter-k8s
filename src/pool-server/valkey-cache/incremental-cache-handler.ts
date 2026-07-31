@@ -197,6 +197,9 @@ interface GetCtx {
   kind?: string;
   softTags?: string[];
   tags?: string[];
+  /** Threaded to the seed lookup — the fs-mirror layer needs the fs-cache read semantics. */
+  isFallback?: boolean;
+  isRoutePPREnabled?: boolean;
 }
 interface SetCtx {
   tags?: string[];
@@ -305,7 +308,10 @@ export interface ValkeyIncrementalCacheOptions {
    * warm-start model; stored entries always win, and `set` still writes to Valkey so
    * regeneration owns the key from then on.
    */
-  seedLookup?: (cacheKey: string) => Promise<SeedEntry | null>;
+  seedLookup?: (
+    cacheKey: string,
+    ctx?: { kind?: string; isFallback?: boolean; isRoutePPREnabled?: boolean },
+  ) => Promise<SeedEntry | null>;
 }
 
 // ---- binary (de)serialization: Buffers ↔ base64, the segmentData Map ↔ an object ----
@@ -389,7 +395,7 @@ export class ValkeyIncrementalCacheHandler {
   private readonly now: () => number;
   private readonly prefix: string;
   private readonly tagsKey: string;
-  private readonly seedLookup: ((cacheKey: string) => Promise<SeedEntry | null>) | undefined;
+  private readonly seedLookup: ValkeyIncrementalCacheOptions["seedLookup"];
 
   constructor(options: ValkeyIncrementalCacheOptions) {
     this.client = options.client;
@@ -423,7 +429,11 @@ export class ValkeyIncrementalCacheHandler {
   private async seedFallback(cacheKey: string, ctx: GetCtx): Promise<CacheHandlerValue | null> {
     if (!this.seedLookup) return null;
     try {
-      const seed = await this.seedLookup(cacheKey);
+      const seed = await this.seedLookup(cacheKey, {
+        ...(ctx.kind !== undefined ? { kind: ctx.kind } : {}),
+        ...(ctx.isFallback !== undefined ? { isFallback: ctx.isFallback } : {}),
+        ...(ctx.isRoutePPREnabled !== undefined ? { isRoutePPREnabled: ctx.isRoutePPREnabled } : {}),
+      });
       if (!seed) return null;
       const softTags = ctx.softTags ?? ctx.tags ?? [];
       const tags = [...seed.tags, ...softTags];

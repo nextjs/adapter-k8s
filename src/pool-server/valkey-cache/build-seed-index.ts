@@ -9,9 +9,13 @@
 //     which is wrong even when it does not crash.
 //
 // The index is built once per process from the SAME static-assets manifest the pool server
-// serves from (CONFIG_DIR/static-assets.json, present in the pool image), so the set of
-// seedable keys is exactly the set of build prerenders. PPR artifacts are excluded — their
-// shells carry postponed state and are owned by the dispatch-level shell/resume machinery.
+// serves from (CONFIG_DIR/static-assets.json, present in the pool image). PPR artifacts are
+// excluded from THAT source (an html-only seed is half-usable) — they are covered by the
+// filesystem-mirror layer below, which reads `.next/server/app/<key>` exactly the way
+// next start's FileSystemCache does (html + .meta postponed state + .segments), so
+// route-keyed fallback-shell lookups behave like a warm fs cache. Without it, every PPR
+// shell lookup missed under the production config and the route rendered fully dynamically
+// (k3d full run: the sub-shell-generation family, "(runtime)" where "(buildtime)").
 //
 // This module is bundled into cache-handler.cjs, which must evaluate cleanly in EVERY runtime
 // including edge — so node builtins are required lazily inside functions, never at module eval
@@ -97,10 +101,80 @@ export function buildSeedSources(assets: StaticAssetRecord[]): Map<string, SeedS
  * manifest is read once on first use; any failure (missing manifest, unreadable file) is a
  * miss, never a crash — the caller already treats seed errors as misses and logs them.
  */
+export interface SeedLookupCtx {
+  kind?: string;
+  isFallback?: boolean;
+  isRoutePPREnabled?: boolean;
+}
+
+/**
+ * Filesystem-mirror seed: read `.next/server/app/<key>` the way FileSystemCache.get does
+ * (file-system-cache.js:138-181 in the installed next) — html, `.meta` (postponed / headers /
+ * status / segmentPaths), rscData only when there is NO postponed state, segment files from
+ * `<key>.segments/`. Returns null (miss) when the html is absent or the entry would be
+ * half-usable.
+ */
+function fsMirrorSeed(appRoot: string, cacheKey: string): SeedEntry | null {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const base = path.join(appRoot, ".next", "server", "app", ...cacheKey.split("/").filter(Boolean));
+  const htmlAbs = cacheKey === "/" ? path.join(appRoot, ".next", "server", "app", "index.html") : `${base}.html`;
+  if (!fs.existsSync(htmlAbs)) return null;
+  const stat = fs.statSync(htmlAbs);
+  const html = fs.readFileSync(htmlAbs, "utf8");
+  let meta:
+    | {
+        status?: number;
+        headers?: Record<string, string>;
+        postponed?: string;
+        segmentPaths?: string[];
+      }
+    | undefined;
+  try {
+    meta = JSON.parse(fs.readFileSync(htmlAbs.replace(/\.html$/, ".meta"), "utf8"));
+  } catch {
+    // fs-cache tolerates a missing meta the same way.
+  }
+  let rscData: unknown;
+  if (meta?.postponed == null) {
+    const rscAbs = htmlAbs.replace(/\.html$/, ".rsc");
+    if (!fs.existsSync(rscAbs)) return null; // half-usable without flight data — decline
+    rscData = fs.readFileSync(rscAbs);
+  }
+  let segmentData: Map<string, unknown> | undefined;
+  if (meta?.segmentPaths) {
+    segmentData = new Map();
+    const segmentsDir = htmlAbs.replace(/\.html$/, ".segments");
+    for (const segmentPath of meta.segmentPaths) {
+      try {
+        segmentData.set(
+          segmentPath,
+          fs.readFileSync(path.join(segmentsDir, `${segmentPath === "/" ? "" : segmentPath}.rsc`)),
+        );
+      } catch {
+        // Same as fs-cache: a missing segment file is treated as dynamic (no prefetch).
+      }
+    }
+  }
+  return {
+    lastModified: Math.round(stat.mtimeMs),
+    tags: seedTags(meta?.headers),
+    value: {
+      kind: "APP_PAGE",
+      html,
+      ...(rscData !== undefined ? { rscData } : {}),
+      ...(meta?.postponed !== undefined ? { postponed: meta.postponed } : {}),
+      headers: seedHeaders(meta?.headers),
+      status: meta?.status ?? 200,
+      ...(segmentData !== undefined ? { segmentData } : {}),
+    },
+  };
+}
+
 export function createBuildSeedLookup(options?: {
   configDir?: string;
   appRoot?: string;
-}): (cacheKey: string) => Promise<SeedEntry | null> {
+}): (cacheKey: string, ctx?: SeedLookupCtx) => Promise<SeedEntry | null> {
   let sources: Map<string, SeedSource> | null | undefined;
 
   const load = (): Map<string, SeedSource> | null => {
@@ -121,11 +195,21 @@ export function createBuildSeedLookup(options?: {
     return sources;
   };
 
-  return async (cacheKey: string): Promise<SeedEntry | null> => {
+  return async (cacheKey: string, ctx?: SeedLookupCtx): Promise<SeedEntry | null> => {
     const map = load();
-    if (!map) return null;
-    const source = map.get(cacheKey);
-    if (!source) return null;
+    const source = map?.get(cacheKey);
+    if (!source) {
+      // Keys the manifest doesn't carry — route-keyed PPR fallback shells, concrete PPR
+      // prerenders, segment-bearing entries — fall through to the filesystem mirror. Scoped
+      // to APP_PAGE (or unstated kind): PAGES/FETCH keys have different shapes.
+      if (ctx?.kind !== undefined && ctx.kind !== "APP_PAGE") return null;
+      try {
+        const appRoot = options?.appRoot ?? process.cwd();
+        return fsMirrorSeed(appRoot, cacheKey);
+      } catch {
+        return null;
+      }
+    }
     const fs = require("node:fs");
     const path = require("node:path");
     const appRoot = options?.appRoot ?? process.cwd();

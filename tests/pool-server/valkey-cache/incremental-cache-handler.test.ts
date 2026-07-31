@@ -586,7 +586,7 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
       seedLookup,
     });
     const got = await h.get("/blog/tim");
-    expect(seedLookup).toHaveBeenCalledWith("/blog/tim");
+    expect(seedLookup).toHaveBeenCalledWith("/blog/tim", expect.any(Object));
     expect(got?.lastModified).toBe(500);
     expect((got?.value as { html?: string })?.html).toContain("built at build time");
   });
