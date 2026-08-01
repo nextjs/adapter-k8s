@@ -2744,6 +2744,14 @@ export function createDispatcher(options: DispatcherOptions) {
           const handlerPprInfo = [
             resolution.matchedPathname,
             handlerPathname,
+            // Root alias, same as the handler-loader candidates: the router resolves the
+            // root page as "/index" while pprRoutes keys the prerender "/" — without this
+            // the rdc fixture's root PPR shell was never injected (live values instead of
+            // the build shell, measured on k3d).
+            ...(resolution.matchedPathname === "/index" || handlerPathname === "/index"
+              ? ["/"]
+              : []),
+            ...(resolution.matchedPathname === "/" ? ["/index"] : []),
             ...rscParentCandidates(resolution.matchedPathname, rscConfig),
             ...rscParentCandidates(handlerPathname, rscConfig),
           ]
@@ -2855,6 +2863,13 @@ export function createDispatcher(options: DispatcherOptions) {
               }
             | undefined;
           let pprInvocationHeaders: Record<string, string> | undefined;
+          // Whether the shell actually got injected — the minimal-mode gate keys on this:
+          // a usable shell means minimal+inject+prefix; ANY reason the shell is unusable
+          // (tag-stale, revalidate window expired, file missing, Server Action, root-alias
+          // miss) degrades to the NON-minimal path where Next renders the complete document
+          // dynamically. A withheld shell + minimal is a truncated document; measured as
+          // vary-params-base-dynamic 15/15 failing when the first injection cut ignored this.
+          let pprShellInjected = false;
           if (pprInfo?.postponedState && !entrypointOwnsPprShell && !handlerPprRootParams) {
             // Do NOT inject the resume token for Server Action requests. Next's app-page handler
             // only splits the postponed state out of the action body (via the
@@ -2872,13 +2887,22 @@ export function createDispatcher(options: DispatcherOptions) {
               checkShellStale && pprTags && pprTags.length > 0
                 ? await checkShellStale(pprTags)
                 : false;
+            // Time-based revalidate window, same anchor as the concrete-seed path: a shell
+            // with `revalidate: <seconds>` stops being injected once the window since BUILD
+            // elapses (Next then regenerates per request until a fresher entry exists).
+            // `revalidate: false`/absent means tag-lifetime only.
+            const shellRevalidate = (pprInfo as { revalidate?: number | false }).revalidate;
+            const shellWithinWindow =
+              typeof shellRevalidate !== "number" ||
+              (shellRevalidate > 0 && Date.now() - deployedAt < shellRevalidate * 1000);
             const shellPath = path.resolve(process.cwd(), pprInfo.fallbackFilePath);
             const shellAvailable = existsSync(shellPath);
-            if (!isServerAction && !shellStale && shellAvailable) {
+            if (!isServerAction && !shellStale && shellWithinWindow && shellAvailable) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
               meta.postponed = pprInfo.postponedState;
               (req as any)[NEXT_REQUEST_META] = meta;
               pprInvocationHeaders = pprInfo.chainHeaders;
+              pprShellInjected = true;
 
               // Direct handler invocation with requestMeta.postponed returns only the resumed
               // dynamic stream. For document requests, prepend the build-time fallback shell so
@@ -2997,7 +3021,11 @@ export function createDispatcher(options: DispatcherOptions) {
                 // take the same minimal+inject path as the no-classic-handler case below.
                 // Shell-LESS root-param templates still need non-minimal in both modes (N16).
                 ((entrypointOwnsPprShell ||
-                  (incrementalCacheShared && (!handlerPprInfo || handlerPprRootParams))) &&
+                  // Under a shared cache, a shell-bearing route is minimal exactly when its
+                  // shell was actually injected above; every unusable-shell reason (stale,
+                  // window-expired, missing file, Server Action) falls through to Next's
+                  // non-minimal complete render. Shell-less routes keep their own rungs.
+                  (incrementalCacheShared && (!handlerPprInfo || !pprShellInjected))) &&
                   // N16c. `pprCapableRoutes[route].wouldPostpone` is DELIBERATELY NOT a rung
                   // here, and is not even read into a local. The manifest computes it
                   // (manifest.ts) and it is real — the build does put a postponed state on a

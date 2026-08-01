@@ -28,10 +28,14 @@ import type { ResolveResult } from "../../src/pool-server/resolve.js";
 
 type NodeHandler = (req: IncomingMessage, res: ServerResponse, ctx: any) => unknown;
 
-function mockReq(url: string, headers: Record<string, string> = {}): IncomingMessage {
+function mockReq(
+  url: string,
+  headers: Record<string, string> = {},
+  method: string = "GET",
+): IncomingMessage {
   return {
     url,
-    method: "GET",
+    method,
     headers: { host: "app.example.com", ...headers },
     pipe: vi.fn(),
   } as unknown as IncomingMessage;
@@ -380,6 +384,99 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     }
   });
 
+  it("keeps Server Actions on shell-bearing PPR routes NON-minimal under incrementalCacheShared", async () => {
+    // resume-data-cache "should use RDC for server action re-renders": the injection path
+    // deliberately never touches actions (the x-next-resume-state-length body framing is
+    // Next's own), so a minimal action invocation would re-render without the Resume Data
+    // Cache and produce fresh values. Actions keep the non-minimal path where Next performs
+    // the action + inline resume itself.
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprRoutes,
+      incrementalCacheShared: true,
+      localHandlerInvoker: invoker as any,
+    });
+    const req = mockReq("/ppr-page", { "next-action": "abc123" }, "POST");
+    await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(false);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBeUndefined();
+  });
+
+  it("falls back to NON-minimal when the shell is tag-stale (vary-params tag flows)", async () => {
+    // A withheld shell + minimal render is a truncated document (bare postponed shell that
+    // nothing resumes). When checkShellStale reports the baked tags revalidated, the route
+    // must take the non-minimal path: Next renders the complete document dynamically —
+    // exactly the pre-injection behavior these suites were green under.
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprRoutes: {
+        "/ppr-page": {
+          postponedState: "token",
+          fallbackFilePath: ".next/server/app/ppr-page.html",
+          tags: ["t1"],
+        },
+      },
+      incrementalCacheShared: true,
+      checkShellStale: async () => true,
+      localHandlerInvoker: invoker as any,
+    });
+    const req = mockReq("/ppr-page");
+    await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(false);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBeUndefined();
+    expect(calls[0].responsePrefix).toBeUndefined();
+  });
+
+  it("falls back to NON-minimal when the shell's time-based revalidate window expired", async () => {
+    // pprRoutes[].revalidate was latent — a shell with `revalidate: 1` (vary-params) must
+    // stop being injected after its window, like the concrete-seed path already does.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-shell-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {
+          "/ppr-page": {
+            postponedState: "token",
+            fallbackFilePath: shellFile,
+            revalidate: 1,
+          },
+        },
+        incrementalCacheShared: true,
+        builtAt: new Date(Date.now() - 60_000).toISOString(),
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   // N16: a PPR-capable route whose build emitted NO fallback shell (`fallback: null`) is absent
   // from pprRoutes, so the old `!!handlerPprInfo` gate left it in minimal mode — the entrypoint
   // then answered with a truncated postponed shell (measured 1705 B + `x-nextjs-postponed: 1`,
@@ -540,15 +637,15 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
         [false, false, true, true], // early-span: STILL minimal — the rung was measured out (above)
         [false, true, false, false], // unresolved root params (the live shell-less reason)
         [false, true, true, false], // …and wouldPostpone does not subtract from it
-        // Shell-bearing rows are MINIMAL now under incrementalCacheShared: the platform
-        // injects the build shell + postponed token and prepends the shell (same path as
-        // the no-classic-handler case) — Next's entrypoints have no route-shell
-        // orchestration of their own (measured: k3d sub-shell-generation, "(runtime)"
-        // layouts everywhere). rootParams=true rows keep non-minimal: unresolved root
-        // params force a live shell-less render regardless of the recorded shell.
-        [true, false, false, true], // shell-bearing → minimal + inject
-        [true, false, true, true],
-        [true, true, false, false], // root params still win
+        // Shell-bearing rows: minimal EXACTLY when the shell is usable and injected. In
+        // this table the fallbackFilePath does not exist on disk, so injection declines and
+        // the route takes the non-minimal complete-render path — the degradation rule that
+        // keeps a withheld shell from producing a truncated minimal document (measured:
+        // vary-params-base-dynamic 15/15 when the first cut ignored it). The usable-shell
+        // minimal+inject case is pinned by the dedicated injection tests above.
+        [true, false, false, false], // shell unusable (missing file) → non-minimal
+        [true, false, true, false],
+        [true, true, false, false], // root params always win
         [true, true, true, false],
       ];
 
@@ -564,8 +661,8 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
               ? {
                   "/x/[id]": {
                     postponedState: "token",
-                    // The injection path stats this; absence degrades to no prefix, which is
-                    // fine here — the truth table only pins minimalMode.
+                    // Deliberately ABSENT on disk: these rows pin the unusable-shell
+                    // degradation (non-minimal complete render).
                     fallbackFilePath: ".next/server/app/x/[id].html",
                   },
                 }
