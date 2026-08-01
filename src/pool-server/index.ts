@@ -75,6 +75,9 @@ import {
   registerValkeyCacheHandler,
   seedSandboxCacheHandlerRegistry,
 } from "./valkey-cache/register.js";
+import { createValkeyClient } from "./valkey-cache/client.js";
+import { ValkeyIncrementalCacheHandler } from "./valkey-cache/incremental-cache-handler.js";
+import { createBuildSeedLookup } from "./valkey-cache/build-seed-index.js";
 import {
   createPprRouteMatcher,
   explicitCacheControlWins,
@@ -1716,6 +1719,51 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // BEFORE the HTTP server is created, so a hook that patches `node:http` or installs a
   // tracer provider sees a clean process. That is a strictly stronger ordering guarantee
   // than `next start`, which binds the port first and queues arriving requests.
+  // Pool-side classic incremental-cache handle for the PPR materialization layer. Distinct
+  // from the app-registered handler instance (different module graph) but the same keyspace,
+  // tag manifest, and seed semantics — Valkey is the shared truth. Constructed lazily-safe:
+  // any failure leaves the dispatcher without a platformCache, which is exactly the old
+  // behavior.
+  let platformCacheHandler: ValkeyIncrementalCacheHandler | undefined;
+  let previewModeId: string | undefined;
+  if (valkeyUrl) {
+    try {
+      platformCacheHandler = new ValkeyIncrementalCacheHandler({
+        client: createValkeyClient({
+          url: valkeyUrl,
+          ...(process.env.VALKEY_AUTH ? { password: process.env.VALKEY_AUTH } : {}),
+          ...(process.env.VALKEY_CA_CERT ? { caCert: process.env.VALKEY_CA_CERT } : {}),
+        }),
+        buildId,
+        seedLookup: createBuildSeedLookup(),
+      });
+    } catch (error) {
+      console.warn(
+        "[pool-server] platform cache handle unavailable — PPR materialization disabled:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    // The canonical regeneration is OPT-IN for now: with it enabled, the on-demand
+    // revalidation render of a cache-components fixture hard-errored ("uncached or runtime
+    // data during prerendering") instead of postponing, and the concurrent foreground
+    // requests 500'd the same way (measured live, resume-data-cache). Until that render
+    // mode is cracked (likely the canonical POST resume protocol rather than a plain
+    // minimal GET), the platform cache runs read-only — which is exactly the pre-existing
+    // behavior plus materialized-entry serving.
+    if (process.env.ADAPTER_K8S_EXPERIMENTAL_PPR_REGEN === "1") {
+      try {
+        const pm = JSON.parse(
+          readFileSync(path.join(process.cwd(), ".next", "prerender-manifest.json"), "utf-8"),
+        ) as { preview?: { previewModeId?: string } };
+        if (typeof pm.preview?.previewModeId === "string" && pm.preview.previewModeId.length > 0) {
+          previewModeId = pm.preview.previewModeId;
+        }
+      } catch {
+        // No manifest → no regeneration identity; reads still work.
+      }
+    }
+  }
+
   const instrumentationStatus = await registerInstrumentationHook();
 
   const port = parseInt(process.env.PORT ?? "3000", 10);
@@ -2312,6 +2360,29 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       ? {
           checkShellStale: (tags: string[]) =>
             valkeyHandler!.getExpiration(tags).then((e) => e > 0),
+        }
+      : {}),
+    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's own view of the
+    // shared incremental cache. Reads go through the classic Valkey handler (get() owns tag
+    // staleness and falls back to the build seed via the SAME fs-mirror the registered
+    // in-app handler uses), writes persist entries captured from the canonical
+    // `x-prerender-revalidate` regeneration. previewModeId comes from the build's
+    // prerender-manifest preview identity — absent one, regeneration never fires.
+    ...(platformCacheHandler
+      ? {
+          platformCache: {
+            read: (key: string, ctx?: { kind?: string }) =>
+              platformCacheHandler!.get(key, ctx ?? {}),
+            write: (
+              key: string,
+              value: Record<string, unknown>,
+              ctx: {
+                tags?: string[];
+                cacheControl?: { revalidate?: number | false; expire?: number };
+              },
+            ) => platformCacheHandler!.set(key, value, ctx),
+            ...(previewModeId !== undefined ? { previewModeId } : {}),
+          },
         }
       : {}),
   });

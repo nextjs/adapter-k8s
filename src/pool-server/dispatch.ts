@@ -756,6 +756,7 @@ async function invokeLocalHandlerOverHttp({
   mergeInvocationQueryIntoUrl = false,
   responsePrefix,
   invocationHeaders,
+  captureCacheEntry,
   discardResponse,
   minimalMode = false,
   normalizePrerenderCacheControl = false,
@@ -791,12 +792,20 @@ async function invokeLocalHandlerOverHttp({
   mergeInvocationQueryIntoUrl?: boolean;
   /** Build-time PPR shell prepended to the handler's resumed render stream. */
   responsePrefix?: {
-    filePath: string;
+    filePath?: string;
+    /** In-memory shell bytes (a materialized platform-cache entry) — wins over filePath. */
+    content?: Buffer;
     headers?: Record<string, string | string[]>;
     status?: number;
   };
   /** Headers prescribed by the build output's internal invocation chain (for example next-resume). */
   invocationHeaders?: Record<string, string>;
+  /**
+   * Materialization capture: when set, onCacheEntryV2 hands the WHOLE completed entry here
+   * (still returning false — the adapter writes no HTTP response from it). Used by the
+   * canonical background regeneration to persist the entry into the platform cache.
+   */
+  captureCacheEntry?: (entry: unknown) => void;
   /** Drain the entrypoint response without forwarding it. Used only by the explicitly E2E-gated
    * platform-cache simulation to let a segment prefetch schedule a background shell fill. */
   discardResponse?: boolean;
@@ -953,16 +962,21 @@ async function invokeLocalHandlerOverHttp({
               // Option D: for eligible shell-less PPR routes the same callback also OBSERVES the
               // entry's postponed state (capture only — still returns false, and the callback is
               // present either way so Next's presence-keyed branches cannot vary by eligibility).
-              onCacheEntryV2: captureActive
-                ? async (entry: unknown) => {
-                    const postponed = (entry as { value?: { postponed?: unknown } } | undefined)
-                      ?.value?.postponed;
-                    if (typeof postponed === "string" && postponed.length > 0) {
-                      capturedPostponed = postponed;
+              onCacheEntryV2:
+                captureActive || captureCacheEntry
+                  ? async (entry: unknown) => {
+                      if (captureCacheEntry) captureCacheEntry(entry);
+                      if (captureActive) {
+                        const postponed = (
+                          entry as { value?: { postponed?: unknown } } | undefined
+                        )?.value?.postponed;
+                        if (typeof postponed === "string" && postponed.length > 0) {
+                          capturedPostponed = postponed;
+                        }
+                      }
+                      return false;
                     }
-                    return false;
-                  }
-                : async () => false,
+                  : async () => false,
               ...(render404 ? { render404 } : {}),
               ...(revalidate ? { revalidate } : {}),
             },
@@ -1154,7 +1168,7 @@ async function invokeLocalHandlerOverHttp({
             forceStatus,
             responsePrefix
               ? {
-                  body: readFileSync(responsePrefix.filePath),
+                  body: responsePrefix.content ?? readFileSync(responsePrefix.filePath!),
                   ...(responsePrefix.headers ? { headers: responsePrefix.headers } : {}),
                   ...(responsePrefix.status ? { status: responsePrefix.status } : {}),
                 }
@@ -1555,6 +1569,24 @@ export interface DispatcherOptions {
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
    * `revalidateTag` still forces a fresh shell render. Absent when there's no shared cache. */
   checkShellStale?: (tags: string[]) => Promise<boolean>;
+  /**
+   * The platform's own view of the shared incremental cache (Valkey classic handler): the
+   * serve ladder READS materialized/seed entries through it (get() owns staleness), and the
+   * canonical background regeneration WRITES captured entries back. previewModeId authorizes
+   * the `x-prerender-revalidate` regeneration request (prerender-manifest preview identity).
+   */
+  platformCache?: {
+    read: (
+      key: string,
+      ctx?: { kind?: string },
+    ) => Promise<{ lastModified?: number | undefined; value: unknown } | null>;
+    write: (
+      key: string,
+      value: Record<string, unknown>,
+      ctx: { tags?: string[]; cacheControl?: { revalidate?: number | false; expire?: number } },
+    ) => Promise<void>;
+    previewModeId?: string;
+  };
   rscConfig?: RscConfig | undefined;
   /** All output ids in this pool's manifest — used to map concrete prerender
    * paths back to their dynamic-route template handler (outputs of dynamic
@@ -1620,6 +1652,7 @@ export function createDispatcher(options: DispatcherOptions) {
     entrypointOwnsPprShell = false,
     emulatePlatformCache = false,
     checkShellStale,
+    platformCache,
     revalidate,
     basePath = "",
     i18nLocales = [],
@@ -1634,6 +1667,13 @@ export function createDispatcher(options: DispatcherOptions) {
   // pod start (the previous behavior). A garbage timestamp parses to NaN → same fallback.
   const builtAtMs = builtAt ? Date.parse(builtAt) : Number.NaN;
   const deployedAt = Number.isFinite(builtAtMs) ? builtAtMs : Date.now();
+  // In-flight canonical regenerations, one per platform-cache key (bounded backstop — a
+  // stampede of distinct stale keys must not fan out unbounded background renders).
+  const MAX_PENDING_REGENS = 64;
+  const pendingRegens = new Set<string>();
+  // The Vary header every RSC-flavored platform response carries (mirrors the entrypoints).
+  const RSC_VARY_HEADER =
+    "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch";
   // N16: every shell-less PPR template (used only to recognize the route as PPR), and the
   // root-param subset that must actually run NON-minimal. Splitting these was the fix for
   // app-dir/fallback-shells: treating ALL shell-less PPR templates as non-minimal made Next
@@ -2857,7 +2897,8 @@ export function createDispatcher(options: DispatcherOptions) {
           const pprInfo = manifestPprInfo;
           let pprResponsePrefix:
             | {
-                filePath: string;
+                filePath?: string;
+                content?: Buffer;
                 headers?: Record<string, string | string[]>;
                 status?: number;
               }
@@ -2897,16 +2938,97 @@ export function createDispatcher(options: DispatcherOptions) {
               (shellRevalidate > 0 && Date.now() - deployedAt < shellRevalidate * 1000);
             const shellPath = path.resolve(process.cwd(), pprInfo.fallbackFilePath);
             const shellAvailable = existsSync(shellPath);
-            if (!isServerAction && !shellStale && shellWithinWindow && shellAvailable) {
+            const shellUsable = !isServerAction && !shellStale && shellWithinWindow;
+
+            // MATERIALIZATION READ: the platform cache (Valkey classic handler; get() owns
+            // tag staleness and falls back to the build seed) is the authority when wired.
+            // A materialized entry — written by the canonical regeneration below after a
+            // revalidation — supersedes the on-disk build shell: its html/postponed/
+            // segmentData reflect the CURRENT content, which is how `next start` keeps
+            // segment prefetches consistent with regenerated documents.
+            const platformKey =
+              resolution.matchedPathname === "/" ? "/index" : resolution.matchedPathname;
+            let platformEntry: { lastModified?: number | undefined; value: unknown } | null =
+              null;
+            const isPprReadMethod = req.method === "GET" || req.method === "HEAD";
+            if (platformCache && !isServerAction && isPprReadMethod && shellUsable) {
+              platformEntry = await platformCache
+                .read(platformKey, { kind: "APP_PAGE" })
+                .catch(() => null);
+            }
+            const segmentPrefetchPath =
+              typeof req.headers["next-router-segment-prefetch"] === "string"
+                ? req.headers["next-router-segment-prefetch"]
+                : undefined;
+            const entryValue = platformEntry?.value as
+              | {
+                  kind?: string;
+                  html?: unknown;
+                  postponed?: unknown;
+                  headers?: Record<string, string>;
+                  status?: number;
+                  segmentData?: Map<string, unknown>;
+                }
+              | undefined;
+
+            // Segment prefetch served straight from the entry's segmentData (build seed or
+            // materialized) — never resumed, mirroring the fs-cache read `next start` does.
+            if (
+              entryValue?.kind === "APP_PAGE" &&
+              segmentPrefetchPath !== undefined &&
+              entryValue.segmentData instanceof Map &&
+              entryValue.segmentData.has(segmentPrefetchPath)
+            ) {
+              const seg = entryValue.segmentData.get(segmentPrefetchPath) as Buffer | string;
+              res.writeHead(200, {
+                "content-type": "text/x-component",
+                "cache-control": "no-store",
+                vary: RSC_VARY_HEADER,
+              });
+              res.end(Buffer.isBuffer(seg) ? seg : Buffer.from(String(seg)));
+              return;
+            }
+
+            const entryPostponed =
+              typeof entryValue?.postponed === "string" && entryValue.postponed.length > 0
+                ? entryValue.postponed
+                : undefined;
+            const entryHtml =
+              entryValue?.html !== undefined && entryValue.html !== null
+                ? Buffer.isBuffer(entryValue.html)
+                  ? entryValue.html
+                  : Buffer.from(String(entryValue.html))
+                : undefined;
+
+            // A COMPLETE materialized entry (no postponed state) is a finished document —
+            // serve it outright, no resume.
+            if (
+              entryValue?.kind === "APP_PAGE" &&
+              entryHtml !== undefined &&
+              entryPostponed === undefined &&
+              req.method === "GET" &&
+              req.headers[rscConfig?.header ?? "rsc"] !== "1"
+            ) {
+              res.writeHead(entryValue.status ?? 200, {
+                "content-type": "text/html; charset=utf-8",
+                ...(entryValue.headers ?? {}),
+              });
+              res.end(entryHtml);
+              return;
+            }
+
+            if (shellUsable && (entryPostponed !== undefined || shellAvailable)) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
-              meta.postponed = pprInfo.postponedState;
+              // The materialized entry's token wins over the build token — it carries the
+              // regenerated Resume Data Cache.
+              meta.postponed = entryPostponed ?? pprInfo.postponedState;
               (req as any)[NEXT_REQUEST_META] = meta;
               pprInvocationHeaders = pprInfo.chainHeaders;
               pprShellInjected = true;
 
               // Direct handler invocation with requestMeta.postponed returns only the resumed
-              // dynamic stream. For document requests, prepend the build-time fallback shell so
-              // the client receives the single `[shell][resume]` response required by the PPR
+              // dynamic stream. For document requests, prepend the fallback shell so the
+              // client receives the single `[shell][resume]` response required by the PPR
               // protocol. RSC requests consume only the resumed flight stream and must not get
               // HTML prepended.
               // N43: the BUILD-PINNED RSC header name, as every neighbouring check uses. With
@@ -2918,11 +3040,83 @@ export function createDispatcher(options: DispatcherOptions) {
                 req.headers["next-router-prefetch"] !== "1";
               if (isDocumentRequest) {
                 pprResponsePrefix = {
-                  filePath: shellPath,
+                  ...(entryPostponed !== undefined && entryHtml !== undefined
+                    ? { content: entryHtml }
+                    : { filePath: shellPath }),
                   ...(pprInfo.initialHeaders ? { headers: pprInfo.initialHeaders } : {}),
                   ...(pprInfo.initialStatus ? { status: pprInfo.initialStatus } : {}),
                 };
               }
+            } else if (
+              platformCache?.previewModeId !== undefined &&
+              !isServerAction &&
+              isPprReadMethod &&
+              !pendingRegens.has(platformKey) &&
+              pendingRegens.size < MAX_PENDING_REGENS
+            ) {
+              // CANONICAL REGENERATION: the shell is unusable (tag-stale / window-expired) or
+              // the platform read found nothing — the foreground request degrades to the
+              // non-minimal live render, and ONE background revalidation request per key
+              // regenerates the entry the way `next start`'s response cache would: minimal
+              // GET with `x-prerender-revalidate: <previewModeId>` (Next runs a blocking
+              // static regeneration and hands the completed entry to onCacheEntryV2), then
+              // the captured entry is written back through the platform cache.
+              pendingRegens.add(platformKey);
+              let capturedEntry:
+                | { value?: Record<string, unknown>; cacheControl?: Record<string, unknown> }
+                | undefined;
+              const regenHeaders = { ...req.headers };
+              delete regenHeaders[rscConfig?.header ?? "rsc"];
+              delete regenHeaders["next-router-prefetch"];
+              delete regenHeaders["next-router-segment-prefetch"];
+              const regenReq = {
+                method: "GET",
+                url: req.url,
+                headers: regenHeaders,
+              } as IncomingMessage;
+              void handlerLoader
+                .load(handlerPathname)
+                .then((regenHandler) =>
+                  localHandlerInvoker({
+                    handler: regenHandler,
+                    req: regenReq,
+                    res,
+                    matchedPathname: handlerPathname,
+                    routeMatches: resolution.routeMatches,
+                    bufferedBody: undefined,
+                    discardResponse: true,
+                    minimalMode: true,
+                    invocationHeaders: {
+                      "x-prerender-revalidate": platformCache.previewModeId!,
+                    },
+                    captureCacheEntry: (entry) => {
+                      capturedEntry = entry as typeof capturedEntry;
+                    },
+                    render404: render404FromEntrypoint,
+                    renderError: renderErrorFromEntrypoint,
+                    handlerTimeoutMs,
+                  }),
+                )
+                .then(async () => {
+                  if (capturedEntry?.value) {
+                    await platformCache.write(platformKey, capturedEntry.value, {
+                      ...(capturedEntry.cacheControl
+                        ? {
+                            cacheControl: capturedEntry.cacheControl as {
+                              revalidate?: number | false;
+                              expire?: number;
+                            },
+                          }
+                        : {}),
+                    });
+                  }
+                })
+                .catch((error) => {
+                  console.error("[pool-server] PPR platform regeneration failed:", error);
+                })
+                .finally(() => {
+                  pendingRegens.delete(platformKey);
+                });
             }
           }
 
