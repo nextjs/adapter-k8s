@@ -472,12 +472,25 @@ export class ValkeyIncrementalCacheHandler {
     }
   }
 
+  /** get() without the seed fallback: STORED entries only (a post-deploy write or null). */
+  async getStored(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
+    return this.getImpl(cacheKey, ctx, true);
+  }
+
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
+    return this.getImpl(cacheKey, ctx, false);
+  }
+
+  private async getImpl(
+    cacheKey: string,
+    ctx: GetCtx,
+    skipSeed: boolean,
+  ): Promise<CacheHandlerValue | null> {
     try {
       const raw = await this.client.get(this.entryKey(cacheKey));
-      if (!raw) return this.seedFallback(cacheKey, ctx);
+      if (!raw) return skipSeed ? null : this.seedFallback(cacheKey, ctx);
       const entry = parseStoredEntry(raw);
-      if (!entry) return this.seedFallback(cacheKey, ctx); // corrupt entry → seed, else miss (L5)
+      if (!entry) return skipSeed ? null : this.seedFallback(cacheKey, ctx); // corrupt entry → seed, else miss (L5)
       const now = this.now();
 
       // Own the staleness check against the SHARED manifest (the tags-manifest.external check Next

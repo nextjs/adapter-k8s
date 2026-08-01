@@ -1431,7 +1431,8 @@ async function serveNotFound(
   // manifest entry, then the build artifact on disk — the build's INJECTED /_not-found has
   // no source file, so its adapter output carries no fallback.filePath and no asset entry
   // is emitted, but `.next/server/app/_not-found.html` is always staged with the app.
-  if (isNonHtmlSecFetchDest(req)) {
+  const nonHtmlSubresource = isNonHtmlSecFetchDest(req);
+  if (nonHtmlSubresource) {
     const prerenderedNotFound = staticAssets.find(
       (a) =>
         (a.pathname === (basePath ? `${basePath}/_not-found` : "/_not-found") ||
@@ -1453,6 +1454,14 @@ async function serveNotFound(
       }
     }
   }
+  // The platform prerender candidates missed (canary cache-components builds emit no
+  // _not-found.html artifact at all) — the handler is the fallback, and it must render the
+  // HTML DOCUMENT: base-server's isNonHtmlSecFetchDest branch would answer text/plain,
+  // breaking the deploy contract (not-found-non-document expects text/html deployed). The
+  // subresource decision was the platform's and it was already made above.
+  if (nonHtmlSubresource) {
+    delete req.headers["sec-fetch-dest"];
+  }
   const notFoundPaths = [
     ...(basePath ? [`${basePath}/_not-found`, `${basePath}/404`] : []),
     "/_not-found",
@@ -1471,6 +1480,10 @@ async function serveNotFound(
         bufferedBody,
         // A Pages Router `/404` entrypoint renders like a normal page, so force the status here.
         forceStatus: 404,
+        // …and tell the RENDER it is a 404: Next emits the default not-found metadata
+        // (robots noindex) only when the render itself knows the status
+        // (metadata-navigation "root not-found with default metadata").
+        invokeStatus: 404,
       });
       return;
     } catch (error) {
@@ -1585,6 +1598,11 @@ export interface DispatcherOptions {
       value: Record<string, unknown>,
       ctx: { tags?: string[]; cacheControl?: { revalidate?: number | false; expire?: number } },
     ) => Promise<void>;
+    /** Like read() but STORED entries only (no seed fallback) — a revalidation's output. */
+    readStored?: (
+      key: string,
+      ctx?: { kind?: string },
+    ) => Promise<{ lastModified?: number | undefined; value: unknown } | null>;
     previewModeId?: string;
   };
   rscConfig?: RscConfig | undefined;
@@ -2209,6 +2227,38 @@ export function createDispatcher(options: DispatcherOptions) {
             .catch((error) => {
               console.error("[pool-server] background PPR shell fill failed:", error);
             });
+        }
+
+        // A STORED platform-cache entry (written by an on-demand revalidation after deploy)
+        // supersedes the build seed for document serves — the seed is the cold-start answer
+        // only. Measured: revalidate-reason's res.revalidate() rendered 'on-demand' and
+        // persisted the fresh page, but the seed rung kept serving the build artifact.
+        if (
+          staticAsset?.prerender &&
+          !staticAsset.ppr &&
+          (serveConcretePrerenderSeed || serveHandlerlessPrerender) &&
+          platformCache?.readStored &&
+          isReadMethod &&
+          !isPagesDataRequest &&
+          !isRSC
+        ) {
+          const storedKey = mp === "/" ? "/index" : mp;
+          const stored = await platformCache.readStored(storedKey, { kind: "APP_PAGE" }).catch(() => null);
+          const sv = stored?.value as
+            | { kind?: string; html?: unknown; headers?: Record<string, string>; status?: number }
+            | undefined;
+          if (
+            (sv?.kind === "PAGES" || sv?.kind === "APP_PAGE") &&
+            sv.html !== undefined &&
+            sv.html !== null
+          ) {
+            res.writeHead(sv.status ?? 200, {
+              "content-type": "text/html; charset=utf-8",
+              ...(sv.headers ?? {}),
+            });
+            res.end(Buffer.isBuffer(sv.html) ? sv.html : Buffer.from(String(sv.html)));
+            return;
+          }
         }
 
         if (
@@ -3048,69 +3098,28 @@ export function createDispatcher(options: DispatcherOptions) {
                 };
               }
             } else if (
-              platformCache?.previewModeId !== undefined &&
+              revalidate &&
+              process.env.__NEXT_PREVIEW_MODE_ID &&
               !isServerAction &&
               isPprReadMethod &&
               !pendingRegens.has(platformKey) &&
               pendingRegens.size < MAX_PENDING_REGENS
             ) {
-              // CANONICAL REGENERATION: the shell is unusable (tag-stale / window-expired) or
-              // the platform read found nothing — the foreground request degrades to the
-              // non-minimal live render, and ONE background revalidation request per key
-              // regenerates the entry the way `next start`'s response cache would: minimal
-              // GET with `x-prerender-revalidate: <previewModeId>` (Next runs a blocking
-              // static regeneration and hands the completed entry to onCacheEntryV2), then
-              // the captured entry is written back through the platform cache.
+              // CANONICAL REGENERATION, via the pool's own res.revalidate() re-entry
+              // (N33 boundary): the mocked-request loopback carries
+              // x-prerender-revalidate, dispatch verifies it and runs the render
+              // NON-minimal as an on-demand revalidation — Next itself writes the fresh
+              // entry through the registered cache handler, exactly like `next start`'s
+              // response-cache regeneration. The foreground request degrades to the
+              // non-minimal live render meanwhile; one regen per key in flight.
               pendingRegens.add(platformKey);
-              let capturedEntry:
-                | { value?: Record<string, unknown>; cacheControl?: Record<string, unknown> }
-                | undefined;
-              const regenHeaders = { ...req.headers };
-              delete regenHeaders[rscConfig?.header ?? "rsc"];
-              delete regenHeaders["next-router-prefetch"];
-              delete regenHeaders["next-router-segment-prefetch"];
-              const regenReq = {
-                method: "GET",
-                url: req.url,
-                headers: regenHeaders,
-              } as IncomingMessage;
-              void handlerLoader
-                .load(handlerPathname)
-                .then((regenHandler) =>
-                  localHandlerInvoker({
-                    handler: regenHandler,
-                    req: regenReq,
-                    res,
-                    matchedPathname: handlerPathname,
-                    routeMatches: resolution.routeMatches,
-                    bufferedBody: undefined,
-                    discardResponse: true,
-                    minimalMode: true,
-                    invocationHeaders: {
-                      "x-prerender-revalidate": platformCache.previewModeId!,
-                    },
-                    captureCacheEntry: (entry) => {
-                      capturedEntry = entry as typeof capturedEntry;
-                    },
-                    render404: render404FromEntrypoint,
-                    renderError: renderErrorFromEntrypoint,
-                    handlerTimeoutMs,
-                  }),
-                )
-                .then(async () => {
-                  if (capturedEntry?.value) {
-                    await platformCache.write(platformKey, capturedEntry.value, {
-                      ...(capturedEntry.cacheControl
-                        ? {
-                            cacheControl: capturedEntry.cacheControl as {
-                              revalidate?: number | false;
-                              expire?: number;
-                            },
-                          }
-                        : {}),
-                    });
-                  }
-                })
+              void revalidate({
+                urlPath: req.url ?? resolution.matchedPathname,
+                headers: {
+                  "x-prerender-revalidate": process.env.__NEXT_PREVIEW_MODE_ID,
+                },
+                opts: {},
+              })
                 .catch((error) => {
                   console.error("[pool-server] PPR platform regeneration failed:", error);
                 })
@@ -3214,6 +3223,12 @@ export function createDispatcher(options: DispatcherOptions) {
                 // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
                 // take the same minimal+inject path as the no-classic-handler case below.
                 // Shell-LESS root-param templates still need non-minimal in both modes (N16).
+                // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
+                // next start serves these through the full server, so getStaticProps sees
+                // revalidateReason 'on-demand' and the fresh entry persists through the
+                // registered cache handler. The minimal rungs exist for platform-cache
+                // emulation, which must never intercept an authenticated revalidation.
+                isVerifiedPreviewRequest(req) ||
                 ((entrypointOwnsPprShell ||
                   // Under a shared cache, a shell-bearing route is minimal exactly when its
                   // shell was actually injected above; every unusable-shell reason (stale,

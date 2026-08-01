@@ -190,60 +190,104 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(res._status).toBe(200);
   });
 
-  it("on a STALE shell falls to the live render AND schedules ONE canonical regeneration", async () => {
-    const calls: any[] = [];
-    const written: any[] = [];
-    let resolveWrite: () => void;
-    const wrote = new Promise<void>((r) => (resolveWrite = r));
+  it("serves a STORED (revalidated) entry in preference to the build seed for a non-PPR prerender", async () => {
+    // revalidate-reason: res.revalidate() renders with reason 'on-demand' and persists the
+    // fresh entry through the registered handler — but the concrete-seed rung kept serving
+    // the BUILD artifact (whose build render had no reason at all). A stored entry written
+    // after deploy supersedes the seed; the seed remains the cold-start answer only.
+    const invoker = vi.fn();
     const dispatcher = createDispatcher(
       baseOptions({
-        localHandlerInvoker: (async (a: any) => {
-          calls.push(a);
-          if (a.captureCacheEntry) {
-            a.captureCacheEntry({
-              value: { kind: "APP_PAGE", html: "<html>fresh</html>", postponed: "p2" },
-              cacheControl: { revalidate: 60 },
-            });
-          }
-        }) as any,
-        // The shell's baked tag has been revalidated — the injection path must not use it.
-        checkShellStale: async () => true,
-        pprRoutes: {
-          "/ppr-page": {
-            postponedState: "build-token",
-            fallbackFilePath: shellFile,
-            tags: ["t1"],
+        pprRoutes: {},
+        staticAssets: [
+          {
+            pathname: "/isr-page",
+            filePath: shellFile,
+            prerender: true,
+            cacheControl: "public, max-age=0, must-revalidate",
+            revalidate: 60,
           },
-        },
+        ],
+        localHandlerInvoker: invoker as any,
+        handlerLoader: handlerLoaderFor("/isr-page"),
         platformCache: {
           read: async () => null,
-          write: async (key: string, value: any, ctx: any) => {
-            written.push({ key, value, ctx });
-            resolveWrite();
-          },
-          previewModeId: "preview-123",
+          readStored: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "PAGES",
+              html: "<html>revalidated content</html>",
+              pageData: {},
+              headers: {},
+              status: 200,
+            },
+          }),
+          write: async () => {},
         },
       }),
     );
-    await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
-    await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
-    await wrote;
+    const res = mockRes();
+    await dispatcher.dispatch(mockReq("/isr-page"), res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/isr-page",
+      routeMatches: null,
+    } as any);
+    expect(invoker).not.toHaveBeenCalled();
+    expect(res._body).toContain("revalidated content");
+    expect(res._status).toBe(200);
+  });
 
-    // Both foreground invocations are the non-minimal live render (unusable shell path).
-    const foreground = calls.filter((c) => !c.discardResponse);
-    expect(foreground).toHaveLength(2);
-    for (const c of foreground) expect(c.minimalMode).toBe(false);
+  it("on a STALE shell falls to the live render AND schedules ONE regeneration via revalidate()", async () => {
+    // The regeneration rides the pool's own res.revalidate() re-entry (N33 boundary):
+    // a mocked-request loopback carrying x-prerender-revalidate, which dispatch verifies
+    // and runs NON-minimal as an on-demand revalidation — Next itself persists the fresh
+    // entry through the registered cache handler, like next start's response cache.
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-xyz";
+    try {
+      const calls: any[] = [];
+      const revalidations: any[] = [];
+      let resolveRegen: () => void;
+      const regenerated = new Promise<void>((r) => (resolveRegen = r));
+      let releaseRegen: () => void;
+      const holdRegen = new Promise<void>((r) => (releaseRegen = r));
+      const dispatcher = createDispatcher(
+        baseOptions({
+          localHandlerInvoker: (async (a: any) => {
+            calls.push(a);
+          }) as any,
+          checkShellStale: async () => true,
+          pprRoutes: {
+            "/ppr-page": {
+              postponedState: "build-token",
+              fallbackFilePath: shellFile,
+              tags: ["t1"],
+            },
+          },
+          revalidate: (cfg: any) => {
+            revalidations.push(cfg);
+            resolveRegen();
+            // Stay in-flight until released — the dedupe is per-key WHILE pending.
+            return holdRegen;
+          },
+          platformCache: { read: async () => null, write: async () => {} },
+        }),
+      );
+      await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
+      await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
+      await regenerated;
 
-    // Exactly one background regeneration: minimal, discard, canonical revalidate header.
-    const regen = calls.filter((c) => c.discardResponse);
-    expect(regen).toHaveLength(1);
-    expect(regen[0].minimalMode).toBe(true);
-    expect(regen[0].invocationHeaders?.["x-prerender-revalidate"]).toBe("preview-123");
+      // Both foreground invocations are the non-minimal live render (unusable shell path).
+      expect(calls).toHaveLength(2);
+      for (const c of calls) expect(c.minimalMode).toBe(false);
 
-    // The captured entry landed in the platform cache.
-    expect(written).toHaveLength(1);
-    expect(written[0].key).toBe("/ppr-page");
-    expect(written[0].value.postponed).toBe("p2");
-    expect(written[0].ctx.cacheControl).toEqual({ revalidate: 60 });
+      // Exactly one regeneration, deduped in flight, canonical header shape.
+      expect(revalidations).toHaveLength(1);
+      expect(revalidations[0].urlPath).toBe("/ppr-page");
+      expect(revalidations[0].headers["x-prerender-revalidate"]).toBe("pmid-xyz");
+      releaseRegen!();
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
   });
 });

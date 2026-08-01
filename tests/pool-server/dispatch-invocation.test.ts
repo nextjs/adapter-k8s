@@ -408,6 +408,54 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     expect(meta?.postponed).toBeUndefined();
   });
 
+  it("runs a VERIFIED on-demand revalidation request NON-minimal (revalidate-reason)", async () => {
+    // res.revalidate() sends x-prerender-revalidate: <previewModeId>. next start serves that
+    // request non-minimal, so getStaticProps sees revalidateReason 'on-demand' AND the fresh
+    // entry is written through the registered cache handler. Our minimal default suppressed
+    // both — the revalidation rendered with reason 'build' and persisted nothing.
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-123";
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/isr-page", vi.fn(), "PAGES"),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {},
+        incrementalCacheShared: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/isr-page", { "x-prerender-revalidate": "pmid-123" });
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/isr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
+  });
+
+  it("keeps an UNVERIFIED revalidate header minimal (spoof guard)", async () => {
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-123";
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/isr-page", vi.fn(), "PAGES"),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {},
+        incrementalCacheShared: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/isr-page", { "x-prerender-revalidate": "wrong-token" });
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/isr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(true);
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
+  });
+
   it("falls back to NON-minimal when the shell is tag-stale (vary-params tag flows)", async () => {
     // A withheld shell + minimal render is a truncated document (bare postponed shell that
     // nothing resumes). When checkShellStale reports the baked tags revalidated, the route

@@ -116,6 +116,42 @@ describe("deploy-mode 404: prerendered /_not-found preferred over handler invoca
     expect(seen).toEqual(["handler-invoked"]);
     expect(res._status).toBe(404);
   });
+
+  it("strips sec-fetch-dest before the handler fallback so the render is the HTML document", async () => {
+    // Canary cache-components builds emit NO _not-found.html artifact, so the disk/asset
+    // candidates miss and the handler runs — and base-server's isNonHtmlSecFetchDest branch
+    // then answers text/plain, breaking the deploy contract (not-found-non-document expects
+    // text/html on deployed platforms). The platform decision was already made when the
+    // prerender candidates were consulted; the handler must render the document.
+    const seenHeaders: Array<string | undefined> = [];
+    const notFoundHandler: NodeHandler = (req2, res2) => {
+      seenHeaders.push((req2 as any).headers["sec-fetch-dest"]);
+      res2.writeHead(404, { "content-type": "text/html; charset=utf-8" });
+      res2.end("<html>doc 404</html>");
+    };
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(notFoundHandler),
+        has: vi.fn((p: string) => p === "/_not-found"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE", filePath: "x.js" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "b1",
+      staticAssets: [],
+      localHandlerInvoker: (async (a: any) => {
+        await a.handler(a.req, { writeHead: () => {}, end: () => {} });
+      }) as any,
+    } as any);
+    await dispatcher.dispatch(
+      mockReq("/missing.png", {
+        "sec-fetch-dest": "image",
+        accept: "image/avif,image/webp",
+      }),
+      mockRes(),
+      { kind: "not-found" } as any,
+    );
+    expect(seenHeaders).toEqual([undefined]);
+  });
 });
 
 describe("deploy-mode 404: .next/server/app/_not-found.html disk fallback", () => {

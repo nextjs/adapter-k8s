@@ -2299,6 +2299,21 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       throw new Error(`Invalid revalidate response ${mocked.res.statusCode} for ${urlPath}`);
     }
   };
+  // Register the same fn on the router-server-methods global (the slot every sibling
+  // adapter leaves unfilled — sibling survey 2026-08-01): route modules resolve
+  // routerServerContext[relativeProjectDir] from this symbol when no requestMeta channel is
+  // present, and the edge sandbox mirrors the symbol into its context (sandbox.js), so edge
+  // API routes get the in-process res.revalidate() path too.
+  {
+    const routerGlobal = globalThis as typeof globalThis & Record<symbol, unknown>;
+    const RouterServerContextSymbol = Symbol.for("@next/router-server-methods");
+    const existing =
+      (routerGlobal[RouterServerContextSymbol] as Record<string, unknown> | undefined) ?? {};
+    routerGlobal[RouterServerContextSymbol] = {
+      ...existing,
+      ".": { ...(existing["."] as object | undefined), revalidate },
+    };
+  }
   // Next's local deploy-test harness (NEXT_ENABLE_ADAPTER=1) has neither Cloud CDN nor Valkey, so
   // it stands in Next's built-in filesystem cache for the platform cache and expects `next start`
   // response headers. This is E2E-only and MUST NOT be true in a real deployment — the second guard
@@ -2373,6 +2388,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           platformCache: {
             read: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.get(key, ctx ?? {}),
+            readStored: (key: string, ctx?: { kind?: string }) =>
+              platformCacheHandler!.getStored(key, ctx ?? {}),
             write: (
               key: string,
               value: Record<string, unknown>,
