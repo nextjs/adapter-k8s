@@ -238,6 +238,50 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(res._status).toBe(200);
   });
 
+  it("serves a STORED regenerated entry when the build seed is tag-stale (post-revalidation SWR)", async () => {
+    // After a revalidation regenerates the entry, a stale-seed request must serve the
+    // STORED entry (its html + fresh postponed token) rather than falling to a live render
+    // forever — getStored applies the handler's own tag staleness, so a stale stored entry
+    // still degrades to the live path.
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        checkShellStale: async () => true,
+        pprRoutes: {
+          "/ppr-page": {
+            postponedState: "build-token",
+            fallbackFilePath: shellFile,
+            tags: ["t1"],
+          },
+        },
+        platformCache: {
+          read: async () => null,
+          readStored: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>regenerated shell</html>",
+              postponed: "regen-token",
+              headers: {},
+              status: 200,
+            },
+          }),
+          write: async () => {},
+        },
+      }),
+    );
+    const req = mockReq("/ppr-page");
+    await dispatcher.dispatch(req, mockRes(), route);
+    expect(calls).toHaveLength(1);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBe("regen-token");
+    expect(calls[0].minimalMode).toBe(true);
+    expect(calls[0].responsePrefix?.content?.toString()).toContain("regenerated shell");
+  });
+
   it("on a STALE shell falls to the live render AND schedules ONE regeneration via revalidate()", async () => {
     // The regeneration rides the pool's own res.revalidate() re-entry (N33 boundary):
     // a mocked-request loopback carrying x-prerender-revalidate, which dispatch verifies

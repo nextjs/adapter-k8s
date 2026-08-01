@@ -2242,7 +2242,8 @@ export function createDispatcher(options: DispatcherOptions) {
           !isPagesDataRequest &&
           !isRSC
         ) {
-          const storedKey = mp === "/" ? "/index" : mp;
+          const storedConcrete = new URL(req.url ?? "/", "http://localhost").pathname;
+          const storedKey = storedConcrete === "/" ? "/index" : storedConcrete;
           const stored = await platformCache.readStored(storedKey, { kind: "APP_PAGE" }).catch(() => null);
           const sv = stored?.value as
             | { kind?: string; html?: unknown; headers?: Record<string, string>; status?: number }
@@ -2996,15 +2997,27 @@ export function createDispatcher(options: DispatcherOptions) {
             // revalidation — supersedes the on-disk build shell: its html/postponed/
             // segmentData reflect the CURRENT content, which is how `next start` keeps
             // segment prefetches consistent with regenerated documents.
-            const platformKey =
-              resolution.matchedPathname === "/" ? "/index" : resolution.matchedPathname;
+            // Concrete request path — matches the write key above (per-param entries).
+            const concreteReadPath = new URL(req.url ?? "/", "http://localhost").pathname;
+            const platformKey = concreteReadPath === "/" ? "/index" : concreteReadPath;
             let platformEntry: { lastModified?: number | undefined; value: unknown } | null =
               null;
             const isPprReadMethod = req.method === "GET" || req.method === "HEAD";
-            if (platformCache && !isServerAction && isPprReadMethod && shellUsable) {
-              platformEntry = await platformCache
-                .read(platformKey, { kind: "APP_PAGE" })
-                .catch(() => null);
+            if (platformCache && !isServerAction && isPprReadMethod) {
+              // STORED entries first, regardless of SEED staleness: a revalidation's output
+              // supersedes the build seed, and getStored applies the handler's own tag
+              // check, so a stale stored entry returns null and degrades to the live path
+              // (post-revalidation SWR).
+              if (platformCache.readStored) {
+                platformEntry = await platformCache
+                  .readStored(platformKey, { kind: "APP_PAGE" })
+                  .catch(() => null);
+              }
+              if (!platformEntry && shellUsable) {
+                platformEntry = await platformCache
+                  .read(platformKey, { kind: "APP_PAGE" })
+                  .catch(() => null);
+              }
             }
             const segmentPrefetchPath =
               typeof req.headers["next-router-segment-prefetch"] === "string"
@@ -3067,7 +3080,10 @@ export function createDispatcher(options: DispatcherOptions) {
               return;
             }
 
-            if (shellUsable && (entryPostponed !== undefined || shellAvailable)) {
+            // A STORED entry's postponed token injects even when the SEED is stale — the
+            // stored entry passed the handler's own tag check. The disk-shell path keeps
+            // the shellUsable gate.
+            if (entryPostponed !== undefined || (shellUsable && shellAvailable)) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
               // The materialized entry's token wins over the build token — it carries the
               // regenerated Resume Data Cache.
