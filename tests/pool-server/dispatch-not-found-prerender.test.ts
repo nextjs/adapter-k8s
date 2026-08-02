@@ -117,6 +117,39 @@ describe("deploy-mode 404: prerendered /_not-found preferred over handler invoca
     expect(res._status).toBe(404);
   });
 
+  it("does NOT strip sec-fetch-dest without a prerendered not-found (dynamic apps keep text/plain)", async () => {
+    // not-found-non-document-DYNAMIC: a non-cache-components app has no prerendered
+    // /_not-found, and its deployed contract is next start's — text/plain for subresource
+    // requests. Only the cache-components flavour (where the build DOES prerender
+    // /_not-found and a platform serves it without invoking Next) expects text/html, and
+    // that case is answered by the prerender candidates above, not by the handler.
+    const seenHeaders: Array<string | undefined> = [];
+    const nfHandler: NodeHandler = (req2, res2) => {
+      seenHeaders.push((req2 as any).headers["sec-fetch-dest"]);
+      res2.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      res2.end("Not Found");
+    };
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn().mockResolvedValue(nfHandler),
+        has: vi.fn((p: string) => p === "/_not-found"),
+        get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE", filePath: "x.js" }),
+      } as any,
+      poolName: "ssr",
+      buildId: "b1",
+      staticAssets: [],
+      localHandlerInvoker: (async (a: any) => {
+        await a.handler(a.req, { writeHead: () => {}, end: () => {} });
+      }) as any,
+    } as any);
+    await dispatcher.dispatch(
+      mockReq("/missing.png", { "sec-fetch-dest": "image" }),
+      mockRes(),
+      { kind: "not-found" } as any,
+    );
+    expect(seenHeaders).toEqual(["image"]);
+  });
+
   it("strips sec-fetch-dest before the handler fallback so the render is the HTML document", async () => {
     // Canary cache-components builds emit NO _not-found.html artifact, so the disk/asset
     // candidates miss and the handler runs — and base-server's isNonHtmlSecFetchDest branch
@@ -138,6 +171,9 @@ describe("deploy-mode 404: prerendered /_not-found preferred over handler invoca
       poolName: "ssr",
       buildId: "b1",
       staticAssets: [],
+      // A cache-components build: /_not-found IS prerendered (the manifest records it),
+      // so the deployed contract is the HTML document even for subresource requests.
+      notFoundIsPrerendered: true,
       localHandlerInvoker: (async (a: any) => {
         await a.handler(a.req, { writeHead: () => {}, end: () => {} });
       }) as any,

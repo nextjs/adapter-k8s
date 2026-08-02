@@ -1419,6 +1419,7 @@ async function serveNotFound(
   res: ServerResponse,
   bufferedBody: Buffer | undefined,
   basePath = "",
+  notFoundIsPrerendered = false,
 ): Promise<void> {
   // Deploy contract (upstream not-found-non-document, canary.97): for non-HTML subresource
   // requests (sec-fetch-dest: image/font/manifest/…) the deployed routing layer serves the
@@ -1459,7 +1460,7 @@ async function serveNotFound(
   // HTML DOCUMENT: base-server's isNonHtmlSecFetchDest branch would answer text/plain,
   // breaking the deploy contract (not-found-non-document expects text/html deployed). The
   // subresource decision was the platform's and it was already made above.
-  if (nonHtmlSubresource) {
+  if (nonHtmlSubresource && notFoundIsPrerendered) {
     delete req.headers["sec-fetch-dest"];
   }
   const notFoundPaths = [
@@ -1583,6 +1584,14 @@ export interface DispatcherOptions {
    * `revalidateTag` still forces a fresh shell render. Absent when there's no shared cache. */
   checkShellStale?: (tags: string[]) => Promise<boolean>;
   /**
+   * True when the BUILD prerendered `/_not-found` (a cache-components build). Upstream's
+   * deployed contract then serves that prerender for non-HTML subresource requests
+   * ("without invoking Next.js" — not-found-non-document), so if the artifact cannot be
+   * found the handler must still render the HTML DOCUMENT. A dynamic app prerenders no
+   * not-found and keeps `next start`'s text/plain answer (not-found-non-document-dynamic).
+   */
+  notFoundIsPrerendered?: boolean;
+  /**
    * The platform's own view of the shared incremental cache (Valkey classic handler): the
    * serve ladder READS materialized/seed entries through it (get() owns staleness), and the
    * canonical background regeneration WRITES captured entries back. previewModeId authorizes
@@ -1670,6 +1679,7 @@ export function createDispatcher(options: DispatcherOptions) {
     entrypointOwnsPprShell = false,
     emulatePlatformCache = false,
     checkShellStale,
+    notFoundIsPrerendered = false,
     platformCache,
     revalidate,
     basePath = "",
@@ -2549,6 +2559,7 @@ export function createDispatcher(options: DispatcherOptions) {
             res,
             bufferedBody,
             basePath,
+              notFoundIsPrerendered,
           );
           return;
         }
@@ -2607,6 +2618,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 res,
                 undefined,
                 basePath,
+              notFoundIsPrerendered,
               );
               return;
             }
@@ -2676,6 +2688,7 @@ export function createDispatcher(options: DispatcherOptions) {
               res,
               bufferedBody,
               basePath,
+              notFoundIsPrerendered,
             );
             return;
           }

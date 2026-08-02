@@ -1098,6 +1098,27 @@ function sendImageResponse(
 // edge middleware; when registered, that handler owns the PPR shell so dispatch must NOT inject the
 // build-time postponed token. Reading the resolved config (rather than VALKEY_URL) tracks exactly
 // that build decision — a cache + edge-middleware app has VALKEY_URL but no registered handler.
+// True when the BUILD prerendered `/_not-found` — read from the prerender manifest, which
+// is the exact discriminator between the two upstream suites (both ship an EMPTY
+// next.config, so no config flag separates them):
+//   • not-found-non-document:         manifest.routes["/_not-found"] present (static
+//     prerender) → the deployed contract serves that prerender even for non-HTML
+//     subresource requests, so a handler fallback must still render the HTML document.
+//   • not-found-non-document-dynamic: absent (the app's not-found is dynamic) → keep
+//     `next start`'s text/plain answer for subresources.
+function notFoundIsPrerenderedBuild(cwd: string): boolean {
+  try {
+    const manifestPath = path.join(cwd, ".next", "prerender-manifest.json");
+    if (!existsSync(manifestPath)) return false;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+      routes?: Record<string, unknown>;
+    };
+    return manifest?.routes?.["/_not-found"] !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 function hasRegisteredCacheHandler(cwd: string): boolean {
   try {
     const rsfPath = path.join(cwd, ".next", "required-server-files.json");
@@ -2371,6 +2392,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     emulatePlatformCache: emulateNextServer,
     // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
     // revalidateTag invalidate a PPR shell by checking its baked tags against the shared manifest.
+    // Cache-components builds prerender /_not-found; the deployed contract then serves that
+    // prerender for subresource requests (not-found-non-document), while a dynamic app keeps
+    // next start's text/plain (not-found-non-document-dynamic).
+    notFoundIsPrerendered: notFoundIsPrerenderedBuild(process.cwd()),
     ...(valkeyHandler
       ? {
           checkShellStale: (tags: string[]) =>
