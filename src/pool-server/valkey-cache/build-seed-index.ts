@@ -136,12 +136,15 @@ function fsMirrorSeed(appRoot: string, cacheKey: string, ctx?: SeedLookupCtx): S
     // fs-cache tolerates a missing meta the same way.
   }
   let rscData: unknown;
-  // FileSystemCache.get's gate is `!isFallback && (!isRoutePPREnabled || postponed == null)`;
-  // a postponed entry only exists on a PPR-enabled route, so in every realizable state that
-  // reduces to `!isFallback && postponed == null`. Use the reduced form: callers that pass
-  // only `{kind}` (dispatch's platformCache reads) must not have `!isRoutePPREnabled` force
-  // an .rsc requirement onto postponed shells.
-  if (!ctx?.isFallback && meta?.postponed == null) {
+  // DELIBERATE DIVERGENCE from FileSystemCache.get (whose gate reduces to
+  // `!isFallback && postponed == null`): an isFallback read with no postponed state and no
+  // .rsc file DECLINES here instead of returning the bare fallback HTML. Measured A/B on
+  // cache-components-prerender-matrix (2026-08-02, lane A/B): honoring fallback reads for
+  // these entries hands Next's runtime the build's GENERIC fallback shell and param
+  // regions render empty — 3/60 -> 21/60 failing ("Expected: id-<uuid> Received: ''").
+  // Declining makes Next render the document fresh, which is the correct (and green)
+  // behavior for the partialFallback contract this adapter does not implement.
+  if (meta?.postponed == null) {
     const rscAbs = htmlAbs.replace(/\.html$/, ".rsc");
     if (!fs.existsSync(rscAbs)) return null; // half-usable without flight data — decline
     rscData = fs.readFileSync(rscAbs);

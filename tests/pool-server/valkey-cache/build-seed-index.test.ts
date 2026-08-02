@@ -180,10 +180,12 @@ describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation
     expect(segs.has("/missing")).toBe(false);
   });
 
-  it("serves a fallback read without rscData even when no .rsc exists (fs-cache gate)", async () => {
-    // FileSystemCache.get reads rscData only when `!isFallback && (!isRoutePPREnabled ||
-    // postponed == null)`. A fallback read must not require (or load) the .rsc file —
-    // requiring it turned valid fallback HTML seeds into misses.
+  it("DECLINES a fallback read with no postponed state and no .rsc (measured divergence)", async () => {
+    // FileSystemCache.get would return the bare fallback HTML here (`!isFallback` gate).
+    // We deliberately diverge: serving these entries hands Next's runtime the build's
+    // GENERIC fallback shell and param regions render empty — measured A/B on
+    // cache-components-prerender-matrix, 3/60 -> 21/60 failing when the fs-cache gate was
+    // mirrored faithfully (2026-08-02). Declining makes Next render the document fresh.
     writeManifest([]);
     stage(".next/server/app/[slug].html", "<html>fallback</html>");
     stage(".next/server/app/[slug].meta", JSON.stringify({ status: 200, headers: {} }));
@@ -195,9 +197,7 @@ describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation
       isRoutePPREnabled: true,
     });
 
-    expect(entry).not.toBeNull();
-    expect(String(entry!.value.html)).toContain("fallback");
-    expect(entry!.value.rscData).toBeUndefined();
+    expect(entry).toBeNull();
   });
 
   it("reads rscData for a non-postponed app page found only on disk", async () => {
