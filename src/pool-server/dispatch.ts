@@ -1592,6 +1592,15 @@ export interface DispatcherOptions {
    */
   notFoundIsPrerendered?: boolean;
   /**
+   * `next.config.partialPrefetching` — the app opts into the partialFallback serving
+   * contract (on-demand shell specialization, entry sharing across never-prerenderable
+   * params). The adapter implements NONE of it, and minimal+inject actively harms these
+   * builds by freezing one generic shell where Next's own non-minimal path specializes per
+   * param set (cache-components-prerender-matrix: 3/60 -> 13/60 when injection landed at
+   * baseline v6). Until partialFallback is implemented, leave those routes to Next.
+   */
+  partialPrefetching?: boolean;
+  /**
    * The platform's own view of the shared incremental cache (Valkey classic handler): the
    * serve ladder READS materialized/seed entries through it (get() owns staleness), and the
    * canonical background regeneration WRITES captured entries back. previewModeId authorizes
@@ -1680,6 +1689,7 @@ export function createDispatcher(options: DispatcherOptions) {
     emulatePlatformCache = false,
     checkShellStale,
     notFoundIsPrerendered = false,
+    partialPrefetching = false,
     platformCache,
     revalidate,
     basePath = "",
@@ -2975,7 +2985,13 @@ export function createDispatcher(options: DispatcherOptions) {
           // dynamically. A withheld shell + minimal is a truncated document; measured as
           // vary-params-base-dynamic 15/15 failing when the first injection cut ignored this.
           let pprShellInjected = false;
-          if (pprInfo?.postponedState && !entrypointOwnsPprShell && !handlerPprRootParams) {
+          if (
+            pprInfo?.postponedState &&
+            !entrypointOwnsPprShell &&
+            !handlerPprRootParams &&
+            // partialFallback builds keep Next's own serving path — see the option doc.
+            !partialPrefetching
+          ) {
             // Do NOT inject the resume token for Server Action requests. Next's app-page handler
             // only splits the postponed state out of the action body (via the
             // `x-next-resume-state-length` framing) when no `postponed` meta is already set —

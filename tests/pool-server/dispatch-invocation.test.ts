@@ -456,6 +456,60 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     }
   });
 
+  it("stays NON-minimal for a partialPrefetching build (partialFallback contract is Next's)", async () => {
+    // cache-components-prerender-matrix declares `partialPrefetching: true` and its
+    // expectations are, per its own config comment, "the partialFallback serving contract"
+    // — on-demand shell specialization and entry sharing across never-prerenderable
+    // params. The adapter implements none of that, and minimal+inject made it WORSE
+    // (3/60 -> 13/60 at baseline v6) by freezing a generic shell where Next's own
+    // non-minimal path was already specializing per param set. Leave these builds to Next.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-pp-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      // Control: WITHOUT the flag this usable shell is injected (minimal).
+      const control = invokerCapture();
+      const controlDispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: { "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile } },
+        incrementalCacheShared: true,
+        localHandlerInvoker: control.invoker as any,
+      });
+      await controlDispatcher.dispatch(
+        mockReq("/ppr-page"),
+        mockRes(),
+        routeResolution({ matchedPathname: "/ppr-page" }),
+      );
+      expect(control.calls[0].minimalMode).toBe(true);
+
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: { "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile } },
+        incrementalCacheShared: true,
+        partialPrefetching: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("falls back to NON-minimal when the shell is tag-stale (vary-params tag flows)", async () => {
     // A withheld shell + minimal render is a truncated document (bare postponed shell that
     // nothing resumes). When checkShellStale reports the baked tags revalidated, the route

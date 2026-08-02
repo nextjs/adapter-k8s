@@ -1106,6 +1106,21 @@ function sendImageResponse(
 //     subresource requests, so a handler fallback must still render the HTML document.
 //   • not-found-non-document-dynamic: absent (the app's not-found is dynamic) → keep
 //     `next start`'s text/plain answer for subresources.
+// `next.config.partialPrefetching` from the resolved build config — see the dispatcher
+// option of the same name.
+function partialPrefetchingEnabled(cwd: string): boolean {
+  try {
+    const rsfPath = path.join(cwd, ".next", "required-server-files.json");
+    if (!existsSync(rsfPath)) return false;
+    const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
+      config?: { partialPrefetching?: boolean };
+    };
+    return rsf?.config?.partialPrefetching === true;
+  } catch {
+    return false;
+  }
+}
+
 function notFoundIsPrerenderedBuild(cwd: string): boolean {
   try {
     const manifestPath = path.join(cwd, ".next", "prerender-manifest.json");
@@ -2396,6 +2411,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // prerender for subresource requests (not-found-non-document), while a dynamic app keeps
     // next start's text/plain (not-found-non-document-dynamic).
     notFoundIsPrerendered: notFoundIsPrerenderedBuild(process.cwd()),
+    partialPrefetching: partialPrefetchingEnabled(process.cwd()),
     ...(valkeyHandler
       ? {
           checkShellStale: (tags: string[]) =>
