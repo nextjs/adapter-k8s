@@ -282,6 +282,55 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(calls[0].responsePrefix?.content?.toString()).toContain("regenerated shell");
   });
 
+  it("reads the CONCRETE key first, then falls back to the ROUTE-TEMPLATE key", async () => {
+    // Route-keyed fallback shells live under the TEMPLATE (`/[lang]/[slug]`) in the
+    // fs-mirror seed, while materialized entries are per-URL. Reading only the concrete
+    // path missed every template shell and fell back to the generic disk shell — measured
+    // as cache-components-prerender-matrix regressing 3/60 -> 13/60 (wrong layout region
+    // values). Try concrete first (a materialized entry wins), then the template.
+    const seen: string[] = [];
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {
+          "/[lang]/[slug]": { postponedState: "build-token", fallbackFilePath: shellFile },
+        },
+        handlerLoader: handlerLoaderFor("/[lang]/[slug]"),
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        platformCache: {
+          read: async (key: string) => {
+            seen.push(key);
+            if (key !== "/[lang]/[slug]") return null;
+            return {
+              lastModified: Date.now(),
+              value: {
+                kind: "APP_PAGE",
+                html: "<html>template shell</html>",
+                postponed: "template-token",
+                headers: {},
+                status: 200,
+              },
+            };
+          },
+          readStored: async () => null,
+          write: async () => {},
+        },
+      }),
+    );
+    const req = mockReq("/es/2");
+    await dispatcher.dispatch(req, mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/[lang]/[slug]",
+      routeMatches: null,
+    } as any);
+    expect(seen).toEqual(["/es/2", "/[lang]/[slug]"]);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBe("template-token");
+  });
+
   it("on a STALE shell falls to the live render AND schedules ONE regeneration via revalidate()", async () => {
     // The regeneration rides the pool's own res.revalidate() re-entry (N33 boundary):
     // a mocked-request loopback carrying x-prerender-revalidate, which dispatch verifies

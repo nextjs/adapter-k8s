@@ -3010,9 +3010,17 @@ export function createDispatcher(options: DispatcherOptions) {
             // revalidation — supersedes the on-disk build shell: its html/postponed/
             // segmentData reflect the CURRENT content, which is how `next start` keeps
             // segment prefetches consistent with regenerated documents.
-            // Concrete request path — matches the write key above (per-param entries).
+            // Read ladder: the CONCRETE request path first (a materialized per-URL entry
+            // wins), then the ROUTE TEMPLATE — route-keyed fallback shells live under the
+            // template in the fs-mirror seed, and reading only the concrete path missed
+            // every one of them (cache-components-prerender-matrix 3/60 -> 13/60, wrong
+            // layout-region values from the generic disk shell).
             const concreteReadPath = new URL(req.url ?? "/", "http://localhost").pathname;
             const platformKey = concreteReadPath === "/" ? "/index" : concreteReadPath;
+            const templateKey =
+              resolution.matchedPathname === "/" ? "/index" : resolution.matchedPathname;
+            const platformKeys =
+              templateKey === platformKey ? [platformKey] : [platformKey, templateKey];
             let platformEntry: { lastModified?: number | undefined; value: unknown } | null =
               null;
             const isPprReadMethod = req.method === "GET" || req.method === "HEAD";
@@ -3022,14 +3030,20 @@ export function createDispatcher(options: DispatcherOptions) {
               // check, so a stale stored entry returns null and degrades to the live path
               // (post-revalidation SWR).
               if (platformCache.readStored) {
-                platformEntry = await platformCache
-                  .readStored(platformKey, { kind: "APP_PAGE" })
-                  .catch(() => null);
+                for (const key of platformKeys) {
+                  platformEntry = await platformCache
+                    .readStored(key, { kind: "APP_PAGE" })
+                    .catch(() => null);
+                  if (platformEntry) break;
+                }
               }
               if (!platformEntry && shellUsable) {
-                platformEntry = await platformCache
-                  .read(platformKey, { kind: "APP_PAGE" })
-                  .catch(() => null);
+                for (const key of platformKeys) {
+                  platformEntry = await platformCache
+                    .read(key, { kind: "APP_PAGE" })
+                    .catch(() => null);
+                  if (platformEntry) break;
+                }
               }
             }
             const segmentPrefetchPath =
