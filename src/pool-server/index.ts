@@ -1761,7 +1761,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // any failure leaves the dispatcher without a platformCache, which is exactly the old
   // behavior.
   let platformCacheHandler: ValkeyIncrementalCacheHandler | undefined;
-  let previewModeId: string | undefined;
   if (valkeyUrl) {
     try {
       platformCacheHandler = new ValkeyIncrementalCacheHandler({
@@ -1778,25 +1777,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         "[pool-server] platform cache handle unavailable — PPR materialization disabled:",
         error instanceof Error ? error.message : String(error),
       );
-    }
-    // The canonical regeneration is OPT-IN for now: with it enabled, the on-demand
-    // revalidation render of a cache-components fixture hard-errored ("uncached or runtime
-    // data during prerendering") instead of postponing, and the concurrent foreground
-    // requests 500'd the same way (measured live, resume-data-cache). Until that render
-    // mode is cracked (likely the canonical POST resume protocol rather than a plain
-    // minimal GET), the platform cache runs read-only — which is exactly the pre-existing
-    // behavior plus materialized-entry serving.
-    if (process.env.ADAPTER_K8S_EXPERIMENTAL_PPR_REGEN === "1") {
-      try {
-        const pm = JSON.parse(
-          readFileSync(path.join(process.cwd(), ".next", "prerender-manifest.json"), "utf-8"),
-        ) as { preview?: { previewModeId?: string } };
-        if (typeof pm.preview?.previewModeId === "string" && pm.preview.previewModeId.length > 0) {
-          previewModeId = pm.preview.previewModeId;
-        }
-      } catch {
-        // No manifest → no regeneration identity; reads still work.
-      }
     }
   }
 
@@ -2418,12 +2398,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             valkeyHandler!.getExpiration(tags).then((e) => e > 0),
         }
       : {}),
-    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's own view of the
-    // shared incremental cache. Reads go through the classic Valkey handler (get() owns tag
-    // staleness and falls back to the build seed via the SAME fs-mirror the registered
-    // in-app handler uses), writes persist entries captured from the canonical
-    // `x-prerender-revalidate` regeneration. previewModeId comes from the build's
-    // prerender-manifest preview identity — absent one, regeneration never fires.
+    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's own READ-ONLY view of
+    // the shared incremental cache. Reads go through the classic Valkey handler (get() owns
+    // tag staleness and falls back to the build seed via the SAME fs-mirror the registered
+    // in-app handler uses). Nothing writes through this interface — regeneration re-enters
+    // Next via the registered `revalidate()` and Next's own handler persists the entry.
+    // Regeneration fires whenever the build has a preview identity (__NEXT_PREVIEW_MODE_ID,
+    // loaded unconditionally from the prerender manifest at startup) — it is always-on, not
+    // flag-gated.
     ...(platformCacheHandler
       ? {
           platformCache: {
@@ -2431,15 +2413,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               platformCacheHandler!.get(key, ctx ?? {}),
             readStored: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.getStored(key, ctx ?? {}),
-            write: (
-              key: string,
-              value: Record<string, unknown>,
-              ctx: {
-                tags?: string[];
-                cacheControl?: { revalidate?: number | false; expire?: number };
-              },
-            ) => platformCacheHandler!.set(key, value, ctx),
-            ...(previewModeId !== undefined ? { previewModeId } : {}),
+            readSeed: (key: string, ctx?: { kind?: string }) =>
+              platformCacheHandler!.getSeed(key, ctx ?? {}),
           },
         }
       : {}),

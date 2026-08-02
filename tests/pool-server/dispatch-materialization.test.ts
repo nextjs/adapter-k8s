@@ -154,6 +154,76 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(res._status).toBe(200);
   });
 
+  it("strips internal cache headers when serving a COMPLETE entry directly", async () => {
+    // The normal loopback path deletes x-next-cache-tags before the public response
+    // (it exposes route/tag structure; `next start` never forwards it). The stored-entry
+    // direct serve bypasses that path, so it must sanitize on its own.
+    const dispatcher = createDispatcher(
+      baseOptions({
+        localHandlerInvoker: vi.fn() as any,
+        platformCache: {
+          read: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>complete page</html>",
+              headers: { "x-next-cache-tags": "_N_T_/layout,_N_T_/ppr-page", "x-custom": "1" },
+              status: 200,
+            },
+          }),
+          write: async () => {},
+        },
+      }),
+    );
+    const res = mockRes();
+    await dispatcher.dispatch(mockReq("/ppr-page"), res, route);
+    expect(res._body).toContain("complete page");
+    expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+    expect(res._headers["x-custom"]).toBe("1");
+  });
+
+  it("uses the STORED entry's headers and status for the injected shell prefix, not the build's", async () => {
+    // A materialized entry carries the regeneration's headers/status; the build-time
+    // initialHeaders/initialStatus belong to the disk shell only.
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {
+          "/ppr-page": {
+            postponedState: "build-token",
+            fallbackFilePath: shellFile,
+            initialHeaders: { "x-build-era": "old" },
+            initialStatus: 200,
+          },
+        },
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        platformCache: {
+          read: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>regenerated shell</html>",
+              postponed: "fresh-token",
+              headers: { "x-entry-era": "new", "x-next-cache-tags": "_N_T_/x" },
+              status: 203,
+            },
+          }),
+          write: async () => {},
+        },
+      }),
+    );
+    await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
+    expect(calls).toHaveLength(1);
+    const prefix = calls[0].responsePrefix;
+    expect(prefix?.content?.toString()).toContain("regenerated shell");
+    expect(prefix?.headers?.["x-entry-era"]).toBe("new");
+    expect(prefix?.headers?.["x-build-era"]).toBeUndefined();
+    expect(prefix?.headers?.["x-next-cache-tags"]).toBeUndefined();
+    expect(prefix?.status).toBe(203);
+  });
+
   it("serves a segment prefetch from the entry's segmentData", async () => {
     const invoker = vi.fn();
     const dispatcher = createDispatcher(
@@ -190,6 +260,137 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(res._status).toBe(200);
   });
 
+  it("derives the concrete read key from the REWRITE destination, not the public URL", async () => {
+    // Next keys cache writes by the resolved invocation pathname (requestMeta.resolvedPathname
+    // = the rewrite destination). Reading by the public URL means `/alias -> /posts/1` writes
+    // under /posts/1 but reads under /alias: permanent misses + duplicate regenerations.
+    const keys: string[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {
+          "/posts/[id]": { postponedState: "build-token", fallbackFilePath: shellFile },
+        },
+        handlerLoader: handlerLoaderFor("/posts/[id]"),
+        localHandlerInvoker: (async () => {}) as any,
+        platformCache: {
+          read: async (key: string) => {
+            keys.push(`read:${key}`);
+            return null;
+          },
+          readStored: async (key: string) => {
+            keys.push(`stored:${key}`);
+            if (key !== "/posts/1") return null;
+            return {
+              lastModified: Date.now(),
+              value: {
+                kind: "APP_PAGE",
+                html: "<html>materialized post 1</html>",
+                headers: {},
+                status: 200,
+              },
+            };
+          },
+        },
+      }),
+    );
+    const res = mockRes();
+    await dispatcher.dispatch(mockReq("/alias"), res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/posts/[id]",
+      invokePath: "/posts/1",
+      routeMatches: { id: "1" },
+    } as any);
+    expect(keys).toContain("stored:/posts/1");
+    expect(res._body).toContain("materialized post 1");
+  });
+
+  it("never serves a STORED entry from the TEMPLATE key (sibling-sharing guard)", async () => {
+    // Stored entries are written under concrete request paths; the template key exists only
+    // for route-keyed fallback SHELLS in the build seed. A stored entry under the template
+    // (however it got there) served to every sibling path is exactly the cross-request
+    // poisoning the concrete-key fix eliminated (/es/2 receiving /es/1's layout).
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {
+          "/posts/[id]": { postponedState: "build-token", fallbackFilePath: shellFile },
+        },
+        handlerLoader: handlerLoaderFor("/posts/[id]"),
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        platformCache: {
+          read: async () => null,
+          readStored: async (key: string) =>
+            key === "/posts/[id]"
+              ? {
+                  lastModified: Date.now(),
+                  value: {
+                    kind: "APP_PAGE",
+                    html: "<html>poisoned sibling</html>",
+                    postponed: "poisoned-token",
+                    headers: {},
+                    status: 200,
+                  },
+                }
+              : null,
+        },
+      }),
+    );
+    const req = mockReq("/posts/2");
+    const res = mockRes();
+    await dispatcher.dispatch(req, res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/posts/[id]",
+      invokePath: "/posts/2",
+      routeMatches: { id: "2" },
+    } as any);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).not.toBe("poisoned-token");
+    expect(res._body ?? "").not.toContain("poisoned sibling");
+  });
+
+  it("reads the TEMPLATE key seed-only (readSeed) for route-keyed fallback shells", async () => {
+    // The template rung exists for fs-mirror fallback shells. It must go through the
+    // seed-only read — read() is stored-first and would reintroduce template-stored serving.
+    const keys: string[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {
+          "/posts/[id]": { postponedState: "build-token", fallbackFilePath: shellFile },
+        },
+        handlerLoader: handlerLoaderFor("/posts/[id]"),
+        localHandlerInvoker: (async () => {}) as any,
+        platformCache: {
+          read: async (key: string) => {
+            keys.push(`read:${key}`);
+            return null;
+          },
+          readStored: async (key: string) => {
+            keys.push(`stored:${key}`);
+            return null;
+          },
+          readSeed: async (key: string) => {
+            keys.push(`seed:${key}`);
+            return null;
+          },
+        },
+      }),
+    );
+    await dispatcher.dispatch(mockReq("/posts/2"), mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/posts/[id]",
+      invokePath: "/posts/2",
+      routeMatches: { id: "2" },
+    } as any);
+    expect(keys).toContain("seed:/posts/[id]");
+    expect(keys).not.toContain("stored:/posts/[id]");
+    expect(keys).not.toContain("read:/posts/[id]");
+  });
+
   it("serves a STORED (revalidated) entry in preference to the build seed for a non-PPR prerender", async () => {
     // revalidate-reason: res.revalidate() renders with reason 'on-demand' and persists the
     // fresh entry through the registered handler — but the concrete-seed rung kept serving
@@ -218,7 +419,7 @@ describe("PPR serve ladder reads the platform cache", () => {
               kind: "PAGES",
               html: "<html>revalidated content</html>",
               pageData: {},
-              headers: {},
+              headers: { "x-next-cache-tags": "_N_T_/isr-page" },
               status: 200,
             },
           }),
@@ -236,6 +437,8 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(invoker).not.toHaveBeenCalled();
     expect(res._body).toContain("revalidated content");
     expect(res._status).toBe(200);
+    // The direct serve bypasses the loopback pipe's stripping — it must sanitize itself.
+    expect(res._headers["x-next-cache-tags"]).toBeUndefined();
   });
 
   it("serves a STORED regenerated entry when the build seed is tag-stale (post-revalidation SWR)", async () => {
@@ -287,7 +490,9 @@ describe("PPR serve ladder reads the platform cache", () => {
     // fs-mirror seed, while materialized entries are per-URL. Reading only the concrete
     // path missed every template shell and fell back to the generic disk shell — measured
     // as cache-components-prerender-matrix regressing 3/60 -> 13/60 (wrong layout region
-    // values). Try concrete first (a materialized entry wins), then the template.
+    // values). Try concrete first (a materialized entry wins), then the template — which
+    // is SEED-only (readSeed): a stored entry under the template would be one sibling's
+    // page served to the whole route.
     const seen: string[] = [];
     const calls: any[] = [];
     const dispatcher = createDispatcher(
@@ -302,6 +507,11 @@ describe("PPR serve ladder reads the platform cache", () => {
         platformCache: {
           read: async (key: string) => {
             seen.push(key);
+            return null;
+          },
+          readStored: async () => null,
+          readSeed: async (key: string) => {
+            seen.push(key);
             if (key !== "/[lang]/[slug]") return null;
             return {
               lastModified: Date.now(),
@@ -314,8 +524,6 @@ describe("PPR serve ladder reads the platform cache", () => {
               },
             };
           },
-          readStored: async () => null,
-          write: async () => {},
         },
       }),
     );
@@ -329,6 +537,47 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(seen).toEqual(["/es/2", "/[lang]/[slug]"]);
     const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
     expect(meta?.postponed).toBe("template-token");
+  });
+
+  it("serves a STALE stored entry AND schedules regeneration (SWR, never stale-forever)", async () => {
+    // getStored surfaces soft staleness (tag or age, single-flight lock-gated) as isStale.
+    // Ignoring it made SWR into stale-forever: the regen branch is the no-entry arm, so an
+    // existing entry suppressed regeneration for its whole retention.
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-xyz";
+    try {
+      const revalidations: any[] = [];
+      const dispatcher = createDispatcher(
+        baseOptions({
+          localHandlerInvoker: vi.fn() as any,
+          revalidate: (cfg: any) => {
+            revalidations.push(cfg);
+            return Promise.resolve();
+          },
+          platformCache: {
+            read: async () => null,
+            readStored: async () => ({
+              lastModified: Date.now() - 120_000,
+              isStale: true,
+              value: {
+                kind: "APP_PAGE",
+                html: "<html>stale but served</html>",
+                headers: {},
+                status: 200,
+              },
+            }),
+          },
+        }),
+      );
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq("/ppr-page"), res, route);
+      // The stale entry still answers the foreground request (serve-stale)...
+      expect(res._body).toContain("stale but served");
+      // ...while ONE canonical regeneration is scheduled behind it.
+      expect(revalidations).toHaveLength(1);
+      expect(revalidations[0].headers["x-prerender-revalidate"]).toBe("pmid-xyz");
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
   });
 
   it("on a STALE shell falls to the live render AND schedules ONE regeneration via revalidate()", async () => {

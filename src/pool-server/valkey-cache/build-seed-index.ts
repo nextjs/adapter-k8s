@@ -114,7 +114,7 @@ export interface SeedLookupCtx {
  * `<key>.segments/`. Returns null (miss) when the html is absent or the entry would be
  * half-usable.
  */
-function fsMirrorSeed(appRoot: string, cacheKey: string): SeedEntry | null {
+function fsMirrorSeed(appRoot: string, cacheKey: string, ctx?: SeedLookupCtx): SeedEntry | null {
   const fs = require("node:fs");
   const path = require("node:path");
   const base = path.join(appRoot, ".next", "server", "app", ...cacheKey.split("/").filter(Boolean));
@@ -136,7 +136,12 @@ function fsMirrorSeed(appRoot: string, cacheKey: string): SeedEntry | null {
     // fs-cache tolerates a missing meta the same way.
   }
   let rscData: unknown;
-  if (meta?.postponed == null) {
+  // FileSystemCache.get's gate is `!isFallback && (!isRoutePPREnabled || postponed == null)`;
+  // a postponed entry only exists on a PPR-enabled route, so in every realizable state that
+  // reduces to `!isFallback && postponed == null`. Use the reduced form: callers that pass
+  // only `{kind}` (dispatch's platformCache reads) must not have `!isRoutePPREnabled` force
+  // an .rsc requirement onto postponed shells.
+  if (!ctx?.isFallback && meta?.postponed == null) {
     const rscAbs = htmlAbs.replace(/\.html$/, ".rsc");
     if (!fs.existsSync(rscAbs)) return null; // half-usable without flight data — decline
     rscData = fs.readFileSync(rscAbs);
@@ -147,9 +152,11 @@ function fsMirrorSeed(appRoot: string, cacheKey: string): SeedEntry | null {
     const segmentsDir = htmlAbs.replace(/\.html$/, ".segments");
     for (const segmentPath of meta.segmentPaths) {
       try {
+        // `<key>.segments` + segmentPath + RSC_SEGMENT_SUFFIX (".segment.rsc"), exactly as
+        // FileSystemCache.get concatenates them — segmentPath always starts with "/".
         segmentData.set(
           segmentPath,
-          fs.readFileSync(path.join(segmentsDir, `${segmentPath === "/" ? "" : segmentPath}.rsc`)),
+          fs.readFileSync(path.join(segmentsDir, `${segmentPath}.segment.rsc`)),
         );
       } catch {
         // Same as fs-cache: a missing segment file is treated as dynamic (no prefetch).
@@ -205,7 +212,7 @@ export function createBuildSeedLookup(options?: {
       if (ctx?.kind !== undefined && ctx.kind !== "APP_PAGE") return null;
       try {
         const appRoot = options?.appRoot ?? process.cwd();
-        return fsMirrorSeed(appRoot, cacheKey);
+        return fsMirrorSeed(appRoot, cacheKey, ctx);
       } catch {
         return null;
       }

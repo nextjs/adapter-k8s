@@ -483,6 +483,63 @@ describe("N6: non-finite lifetimes are refused (never reach Valkey)", () => {
 // Survey Tier 3 #16: `set(key, null)` is a REAL cached value (Next stores null for
 // not-found responses). It must round-trip as a hit carrying `value: null` — collapsing it
 // into a miss makes Next re-render the known-empty result on every request, forever.
+describe("getStored staleness signal (SWR must not become stale-forever)", () => {
+  // Dispatch consumes getStored DIRECTLY — no Next incremental-cache layer above it to
+  // compute age staleness from lastModified. getStored therefore surfaces `isStale`
+  // itself (tag- OR age-stale, single-flight lock-gated); dispatch serves the stale
+  // entry and schedules one canonical regeneration behind it.
+  it("marks an AGE-stale stored entry isStale", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx1", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 120_000; // past the 60s revalidate window, inside expire
+    const got = await h.getStored("/p", {});
+    expect(got).not.toBeNull();
+    expect((got as { isStale?: boolean }).isStale).toBe(true);
+  });
+
+  it("does not mark a fresh stored entry", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx2", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 1_000;
+    const got = await h.getStored("/p", {});
+    expect(got).not.toBeNull();
+    expect((got as { isStale?: boolean }).isStale).toBeFalsy();
+  });
+
+  it("age staleness is single-flight: only the lock winner is told stale", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx3", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 120_000;
+    const first = await h.getStored("/p", {});
+    const second = await h.getStored("/p", {});
+    expect((first as { isStale?: boolean }).isStale).toBe(true);
+    expect((second as { isStale?: boolean }).isStale).toBeFalsy();
+  });
+
+  it("does not surface isStale (or take the regen lock for age) on the app-path get()", async () => {
+    // Next's own incremental-cache layer sits above get() and computes age staleness from
+    // lastModified — the handler adding its own signal there would double-signal and take
+    // locks the app path never needed. Age staleness is a getStored-only contract.
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx4", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 120_000;
+    const got = await h.get("/p", {});
+    expect(got).not.toBeNull();
+    expect((got as { isStale?: boolean }).isStale).toBeUndefined();
+    // The lock was not consumed — a getStored after the app-path get still wins it.
+    const stored = await h.getStored("/p", {});
+    expect((stored as { isStale?: boolean }).isStale).toBe(true);
+  });
+});
+
 describe("negative caching (survey Tier 3 #16)", () => {
   it("round-trips set(key, null) as a cache HIT with value null, distinct from a miss", async () => {
     const client = new FakeValkeyClient();

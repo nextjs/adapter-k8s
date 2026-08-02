@@ -510,6 +510,40 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     }
   });
 
+  it("stays NON-minimal for a partialPrefetching build even WITHOUT a shared cache", async () => {
+    // The no-Valkey posture: injection is gated off for partialPrefetching builds, and
+    // without incrementalCacheShared no other rung forced non-minimal — a minimal render
+    // with no injected shell is a truncated document (bare postponed shell, dynamic holes
+    // never streamed). partialPrefetching must force non-minimal on its own.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-pp-nv-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: { "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile } },
+        incrementalCacheShared: false,
+        partialPrefetching: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("falls back to NON-minimal when the shell is tag-stale (vary-params tag flows)", async () => {
     // A withheld shell + minimal render is a truncated document (bare postponed shell that
     // nothing resumes). When checkShellStale reports the baked tags revalidated, the route

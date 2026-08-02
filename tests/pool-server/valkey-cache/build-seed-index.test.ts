@@ -147,14 +147,26 @@ describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation
   });
 
   it("collects segmentData from the .segments directory like the fs cache", async () => {
+    // Filenames mirror a REAL build artifact (`<key>.segments/_tree.segment.rsc`,
+    // nested `<key>.segments/<path>/__PAGE__.segment.rsc` — RSC_SEGMENT_SUFFIX is
+    // `.segment.rsc`, NOT `.rsc`). An earlier version of this test staged `.rsc` names
+    // copied from the implementation's wrong assumption and masked the bug: every real
+    // segment file was silently missed.
     writeManifest([]);
     stage(".next/server/app/[lang]/[slug].html", "<html>shell</html>");
     stage(
       ".next/server/app/[lang]/[slug].meta",
-      JSON.stringify({ status: 200, postponed: "P", segmentPaths: ["/", "/$c$slug$"] }),
+      JSON.stringify({
+        status: 200,
+        postponed: "P",
+        segmentPaths: ["/_tree", "/[lang]/[slug]/__PAGE__"],
+      }),
     );
-    stage(".next/server/app/[lang]/[slug].segments/.rsc", "root-segment");
-    stage(".next/server/app/[lang]/[slug].segments/$c$slug$.rsc", "slug-segment");
+    stage(".next/server/app/[lang]/[slug].segments/_tree.segment.rsc", "tree-segment");
+    stage(
+      ".next/server/app/[lang]/[slug].segments/[lang]/[slug]/__PAGE__.segment.rsc",
+      "page-segment",
+    );
     const lookup = createBuildSeedLookup({ appRoot });
 
     const entry = await lookup("/[lang]/[slug]", { kind: "APP_PAGE", isRoutePPREnabled: true });
@@ -162,8 +174,30 @@ describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation
     expect(entry).not.toBeNull();
     const segs = entry!.value.segmentData as Map<string, Buffer>;
     expect(segs).toBeInstanceOf(Map);
-    expect(String(segs.get("/"))).toBe("root-segment");
-    expect(String(segs.get("/$c$slug$"))).toBe("slug-segment");
+    expect(String(segs.get("/_tree"))).toBe("tree-segment");
+    expect(String(segs.get("/[lang]/[slug]/__PAGE__"))).toBe("page-segment");
+    // A segmentPath whose file is absent is skipped (dynamic, no prefetch) — not an error.
+    expect(segs.has("/missing")).toBe(false);
+  });
+
+  it("serves a fallback read without rscData even when no .rsc exists (fs-cache gate)", async () => {
+    // FileSystemCache.get reads rscData only when `!isFallback && (!isRoutePPREnabled ||
+    // postponed == null)`. A fallback read must not require (or load) the .rsc file —
+    // requiring it turned valid fallback HTML seeds into misses.
+    writeManifest([]);
+    stage(".next/server/app/[slug].html", "<html>fallback</html>");
+    stage(".next/server/app/[slug].meta", JSON.stringify({ status: 200, headers: {} }));
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("/[slug]", {
+      kind: "APP_PAGE",
+      isFallback: true,
+      isRoutePPREnabled: true,
+    });
+
+    expect(entry).not.toBeNull();
+    expect(String(entry!.value.html)).toContain("fallback");
+    expect(entry!.value.rscData).toBeUndefined();
   });
 
   it("reads rscData for a non-postponed app page found only on disk", async () => {
