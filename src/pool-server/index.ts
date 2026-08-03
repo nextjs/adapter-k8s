@@ -1845,6 +1845,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // reproduce that check on its own.
   const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
   const strictDynamicRoutes: { pageRegex: RegExp }[] = [];
+  const runtimeStaticTemplates = new Set<string>();
   const prerenderedPaths = new Set<string>();
   if (existsSync(prerenderManifestPath)) {
     try {
@@ -1868,13 +1869,24 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           prerenderedPaths.add(p.slice(seg.length + 1) || "/");
         }
       }
-      for (const [, route] of Object.entries<Record<string, unknown>>(
+      for (const [template, route] of Object.entries<Record<string, unknown>>(
         prerenderManifest.dynamicRoutes ?? {},
       )) {
         if (route.fallback === false && typeof route.routeRegex === "string") {
           strictDynamicRoutes.push({
             pageRegex: new RegExp(route.routeRegex),
           });
+        }
+        // `fallback: null` on an APP route (dataRoute *.rsc): Next may statically GENERATE
+        // never-prerendered concrete paths at runtime — under a shared cache these render
+        // non-minimal so Next's own response-cache write materializes them (dispatch's
+        // runtimeStaticTemplates rung; sub-shell-generation-middleware parity).
+        if (
+          route.fallback === null &&
+          typeof route.dataRoute === "string" &&
+          route.dataRoute.endsWith(".rsc")
+        ) {
+          runtimeStaticTemplates.add(template);
         }
       }
     } catch {
@@ -2362,6 +2374,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     rscConfig: poolRscConfig,
     outputIds: Object.keys(poolManifest.outputs),
     strictDynamicRoutes,
+    runtimeStaticTemplates,
     prerenderedPaths,
     // Next's OWN build id (manifest) — clients build /_next/data URLs from the id Next
     // inlined, which under deploymentId mode is NOT the adapter's effective NEXT_BUILD_ID.

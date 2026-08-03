@@ -1642,6 +1642,11 @@ export interface DispatcherOptions {
   /** Dynamic routes with fallback:false / dynamicParams:false — a matching path
    * not in prerenderedPaths must 404 (mirrors `next start`). */
   strictDynamicRoutes?: { pageRegex: RegExp }[];
+  /** App route TEMPLATES whose prerender-manifest entry has `fallback: null` — Next may
+   * statically GENERATE never-prerendered concrete paths at runtime. Under a shared cache
+   * these render non-minimal so Next's own response-cache write materializes them
+   * (`next start` parity; a minimal render never writes). */
+  runtimeStaticTemplates?: Set<string>;
   prerenderedPaths?: Set<string>;
   buildIdForData?: string;
   /** Build timestamp (ISO) from the routing manifest — anchors the ISR seed-freshness
@@ -1692,6 +1697,7 @@ export function createDispatcher(options: DispatcherOptions) {
     rscConfig,
     outputIds = [],
     strictDynamicRoutes = [],
+    runtimeStaticTemplates = new Set<string>(),
     prerenderedPaths = new Set<string>(),
     buildIdForData = "",
     internalSecret,
@@ -3397,7 +3403,23 @@ export function createDispatcher(options: DispatcherOptions) {
                   !handlerPprInfo &&
                   !handlerPprCapable &&
                   handlerOutputInfo?.type === "APP_PAGE" &&
-                  emulatedSsgTemplates.has(handlerPathname))
+                  emulatedSsgTemplates.has(handlerPathname)) ||
+                // Runtime-static generation (sub-shell-generation-middleware): a template
+                // whose prerender-manifest entry says `fallback: null` is generatable at
+                // runtime — `next start` renders a never-prerendered concrete path
+                // NON-minimally and MATERIALIZES it (first request writes, second is HIT).
+                // A minimal render never writes through the cache handler, so these
+                // requests were MISS forever (measured: zero Valkey writes on the lane-4
+                // probe). Deliberately narrow: shared cache, an APP_PAGE handler, no
+                // concrete build asset (the asset rung above owns that case), and not
+                // PPR-capable (PPR templates keep their own rungs).
+                (incrementalCacheShared &&
+                  !dispatchStaticAsset &&
+                  !handlerPprInfo &&
+                  !handlerPprCapable &&
+                  handlerOutputInfo?.type === "APP_PAGE" &&
+                  (runtimeStaticTemplates.has(resolution.matchedPathname) ||
+                    runtimeStaticTemplates.has(handlerPathname)))
               )
             ),
             normalizePrerenderCacheControl:

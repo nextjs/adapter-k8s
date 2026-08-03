@@ -510,6 +510,53 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     }
   });
 
+  it("runs NON-minimal for a runtime-static-capable template with no build asset (shared cache)", async () => {
+    // sub-shell-generation-middleware: middleware rewrites /not-broken -> /rewrite/not-broken,
+    // whose template /rewrite/[slug] has prerender-manifest fallback: null — Next's
+    // declaration that non-prerendered paths are generatable at runtime. next start renders
+    // it non-minimally and MATERIALIZES it (postponed=False on disk) so the next request is
+    // HIT; a minimal render never writes through the cache handler, so the pool served
+    // MISS forever (zero Valkey writes measured on the lane-4 probe).
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/rewrite/[slug]", vi.fn(), "APP_PAGE"),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      incrementalCacheShared: true,
+      runtimeStaticTemplates: new Set(["/rewrite/[slug]"]),
+      localHandlerInvoker: invoker as any,
+    });
+    await dispatcher.dispatch(
+      mockReq("/rewrite/not-broken"),
+      mockRes(),
+      routeResolution({ matchedPathname: "/rewrite/[slug]", routeMatches: { slug: "not-broken" } }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(false);
+  });
+
+  it("stays MINIMAL for the same shape when the template is not runtime-static-capable", async () => {
+    // Control: without the prerender-manifest signal nothing changes — the otel/fallback-shells
+    // lesson is that broad non-minimal flips regress cache-verdict semantics elsewhere.
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/rewrite/[slug]", vi.fn(), "APP_PAGE"),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      incrementalCacheShared: true,
+      localHandlerInvoker: invoker as any,
+    });
+    await dispatcher.dispatch(
+      mockReq("/rewrite/not-broken"),
+      mockRes(),
+      routeResolution({ matchedPathname: "/rewrite/[slug]", routeMatches: { slug: "not-broken" } }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(true);
+  });
+
   it("stays NON-minimal for a partialPrefetching build even WITHOUT a shared cache", async () => {
     // The no-Valkey posture: injection is gated off for partialPrefetching builds, and
     // without incrementalCacheShared no other rung forced non-minimal — a minimal render
