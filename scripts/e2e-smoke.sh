@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# SMOKE SET: the ~35-minute regression gate. Runs the suites that historically move when
+# dispatch/valkey-cache/routing change — every currently-red suite plus the families that
+# have regressed at least once (matrix v6 3→13, segment-cache v12, interception, rewrites,
+# not-found, i18n). Use this to close a fix batch; the FULL lane run (e2e-lanes.sh) is the
+# nightly drift detector, not the per-batch gate. Compare results BY PER-SUITE COUNTS.
+#
+# Usage:
+#   ./scripts/e2e-smoke.sh [lanes] [nextjs-ref]
+#
+# Honors ADAPTER_K8S_PREBUILT_TARBALL (packs once itself when unset, like e2e-lanes.sh).
+
+LANES="${1:-6}"
+NEXTJS_REF="${2:-v16.3.0-canary.97}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_DIR="${ADAPTER_DIR}/.k8s-adapter/lane-runs/$(date +%Y%m%dT%H%M%S)-smoke"
+mkdir -p "$RUN_DIR"
+touch "${RUN_DIR}/.run-start"
+
+export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
+mkdir -p "$TMPDIR"
+
+if [ -z "${ADAPTER_K8S_PREBUILT_TARBALL:-}" ]; then
+  echo "→ Building + packing adapter once for all lanes..."
+  (cd "$ADAPTER_DIR" && npm run build >/dev/null)
+  PACK_DIR="${RUN_DIR}/adapter-pack"
+  mkdir -p "$PACK_DIR"
+  PACK_JSON="$(cd "$ADAPTER_DIR" && npm pack --json --ignore-scripts --pack-destination "$PACK_DIR")"
+  ADAPTER_K8S_PREBUILT_TARBALL="$PACK_DIR/$(
+    node -e "console.log(JSON.parse(process.argv[1])[0].filename)" "$PACK_JSON"
+  )"
+  export ADAPTER_K8S_PREBUILT_TARBALL
+  echo "→ Adapter tarball: ${ADAPTER_K8S_PREBUILT_TARBALL}"
+fi
+
+# One entry per suite (jest test-pattern fragments, matched against the test file path).
+# Keep RED suites and SENSITIVE-green suites together — the point is catching both fixes
+# and regressions in one run. Ordered roughly slowest-first so round-robin balances lanes.
+SMOKE_SUITES=(
+  # slow / multi-test heavyweights first
+  "e2e/app-dir/actions/app-action.test"
+  "e2e/app-dir/actions/app-action-node-middleware"
+  "e2e/app-dir/cache-components-prerender-matrix/"
+  "e2e/prerender.test"
+  "e2e/middleware-general/"
+  "e2e/getserversideprops/"
+  # PPR / materialization family
+  "e2e/app-dir/fallback-shells/"
+  "e2e/app-dir/sub-shell-generation/"
+  "e2e/app-dir/sub-shell-generation-middleware/"
+  "e2e/app-dir/resume-data-cache/"
+  "e2e/app-dir/partial-fallback-shell-upgrade/"
+  "e2e/fallback-route-params/"
+  "e2e/app-dir/revalidate-reason"
+  "e2e/app-dir/cache-components-allow-otel-spans/"
+  # segment-cache family (v12 regression surface)
+  "e2e/app-dir/segment-cache/cached-navigations/"
+  "e2e/app-dir/segment-cache/prefetch-app-shell-cached-gsp/"
+  "e2e/app-dir/segment-cache/prefetch-inlining/"
+  "e2e/app-dir/segment-cache/vary-params-base-dynamic/"
+  # interception + rewrites (routing surface)
+  "e2e/app-dir/interception-dynamic-segment-middleware/"
+  "e2e/app-dir/interception-middleware-rewrite/"
+  "e2e/basepath/redirect-and-rewrite"
+  "e2e/rewrites-manual-href-as/"
+  # not-found / status contracts
+  "e2e/app-dir/not-found-non-document/"
+  "e2e/app-dir/not-found-non-document-dynamic/"
+  "e2e/app-dir/metadata-navigation/"
+  # cache-tag / misc red tail
+  "e2e/app-dir/non-ascii-cache-tags/"
+  "e2e/app-dir/no-duplicate-headers-middleware/"
+  "e2e/app-dir/catch-error/"
+  "e2e/app-dir/action-forward-loop/"
+  "e2e/app-dir/concurrent-navigations/mismatching-prefetch"
+  "e2e/i18n-support-same-page-hash-change/"
+)
+
+echo "=== Smoke run: ${#SMOKE_SUITES[@]} suite patterns across ${LANES} lanes ==="
+echo "ref:  ${NEXTJS_REF}"
+echo "logs: ${RUN_DIR}/"
+
+# Round-robin the suite list into per-lane alternation patterns.
+declare -a LANE_PATTERNS
+for i in "${!SMOKE_SUITES[@]}"; do
+  idx=$((i % LANES))
+  LANE_PATTERNS[idx]="${LANE_PATTERNS[idx]:+${LANE_PATTERNS[idx]}|}${SMOKE_SUITES[i]}"
+done
+
+pids=()
+for ((lane = 0; lane < LANES; lane++)); do
+  [ -z "${LANE_PATTERNS[lane]:-}" ] && continue
+  log="${RUN_DIR}/smoke-lane$((lane + 1)).log"
+  echo "[lane $((lane + 1))] $(tr '|' ' ' <<<"${LANE_PATTERNS[lane]}" | wc -w) suites → ${log}"
+  E2E_LANE="$((lane + 1))" bash "${SCRIPT_DIR}/e2e-local-cluster.sh" \
+    "${LANE_PATTERNS[lane]}" "$NEXTJS_REF" > "$log" 2>&1 &
+  pids+=($!)
+done
+
+FAILED=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || FAILED=1
+done
+
+# Aggregate exactly like e2e-lanes.sh: per-suite results.json newer than .run-start.
+python3 - "$RUN_DIR" "$HOME/Code/nextjs/.adapter-k8s-e2e/next.js" <<'EOF'
+import glob, json, os, sys
+run_dir, root = sys.argv[1], sys.argv[2]
+start = os.path.getmtime(os.path.join(run_dir, ".run-start"))
+suites = tot = p = f = retried = 0
+failed = []
+for fn in glob.glob(os.path.join(root, "test/**/*.results.json"), recursive=True):
+    if os.path.getmtime(fn) < start:
+        continue
+    try:
+        d = json.load(open(fn))
+    except Exception:
+        continue
+    suites += 1
+    tot += d.get("numTotalTests", 0)
+    p += d.get("numPassedTests", 0)
+    nf = d.get("numFailedTests", 0)
+    f += nf
+    for tr in d.get("testResults", []):
+        for a in tr.get("assertionResults", []):
+            if a.get("status") == "passed" and a.get("invocations", 1) > 1:
+                retried += 1
+    if nf:
+        failed.append(f'{fn[len(root) + 6:-len(".results.json")]} ({nf}/{d.get("numTotalTests")})')
+print(f"suites={suites} tests={tot} passed={p} failed={f} passed_on_retry={retried}")
+for x in sorted(failed):
+    print("  FAIL:", x)
+EOF
+exit "$FAILED"

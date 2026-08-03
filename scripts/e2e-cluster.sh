@@ -86,10 +86,13 @@ export NEXT_TEST_CONCURRENCY=1
 # test. The pool topology's 240s would expire during the image push.
 export NEXT_E2E_TEST_TIMEOUT="${NEXT_E2E_TEST_TIMEOUT:-1800000}"
 
-# No retries by default. A retry here means another full build/push/rollout, and the
-# question this topology exists to answer — "is the failure real?" — is exactly the one
-# a retry obscures.
-export NEXT_TEST_RETRIES="${NEXT_TEST_RETRIES:-0}"
+# Retries match upstream CI (num_retries: 2) — same policy as e2e-local.sh, adopted once
+# the failure count dropped well under 100: at that scale the race-shaped singletons
+# (~8-9 per full run at 0 retries) cost more triage than they carry signal, and
+# `passed-on-retry` counts in the results record what retries absorbed. Set
+# NEXT_TEST_RETRIES=0 when hunting a specific flake (a retry obscures "is it real?"),
+# which was the default while the count was in the hundreds.
+export NEXT_TEST_RETRIES="${NEXT_TEST_RETRIES:-2}"
 
 chmod +x "${ADAPTER_DIR}/scripts/e2e-cluster-deploy.sh" "${ADAPTER_DIR}/scripts/e2e-cluster-cleanup.sh"
 
