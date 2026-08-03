@@ -51,12 +51,15 @@ function resolveDepDir(
   return undefined;
 }
 
-// Whether the app defines EDGE middleware. A node-based incremental `cacheHandler` (the
-// adapter's bundled zero-dep RESP2 client over node:net/node:tls) gets bundled by Turbopack
-// INTO the edge middleware runtime, where it can't evaluate — so the adapter skips
-// registering that handler when edge middleware is present. (The V2 `use cache` handler,
-// registered via the global symbol at runtime, is unaffected either way and always shares
-// `use cache` entries cross-replica.)
+// Whether the app defines EDGE middleware. HISTORY: Turbopack bundles
+// `next.config.cacheHandler` into the edge middleware compilation, and a statically
+// resolvable `node:net`/`node:tls` specifier (or a literal `process.cwd()`) there fails the
+// BUILD — so registration used to be skipped for edge-middleware apps, silently costing
+// them all cross-replica ISR/PPR materialization (Phase-0 measured:
+// sub-shell-generation-middleware wrote zero Valkey entries, MISS forever). As of
+// 2026-08-02 the bundled handler is edge-COMPILE-safe (process.getBuiltinModule + hidden
+// cwd; see resp-client.ts/build-seed-index.ts) and registration no longer consults this.
+// The detector remains exported for tests and diagnostics.
 //
 // N50 (review #34): this used to be a pure FILENAME test — any `middleware.ts` counted as
 // edge. Next 16 decides by the file's declared runtime, not its name:
@@ -1389,7 +1392,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // absent — so it is inert during `next build` and local runs, and only backs the incremental
       // cache (PPR shells + ISR pages) with Valkey at runtime in the pool, where VALKEY_URL +
       // NEXT_BUILD_ID are injected. Sharing this store is what makes those revalidate cross-replica.
-      if (cfg.cache?.enabled && !hasEdgeMiddleware(process.cwd())) {
+      // No edge-middleware skip anymore: the bundled handler is now edge-COMPILE-safe (every
+      // node builtin loads via process.getBuiltinModule — no static specifier for Turbopack
+      // to refuse in the Edge Runtime compilation; see resp-client.ts / stream-codec.ts).
+      // The skip silently cost edge-middleware apps ALL cross-replica ISR/PPR materialization
+      // (Phase-0 measured: sub-shell-generation-middleware wrote ZERO Valkey entries and
+      // served MISS forever).
+      if (cfg.cache?.enabled) {
         // Respect an application-provided cacheHandler rather than silently overwriting it — the two
         // are mutually exclusive (a custom handler owns the incremental cache, so the adapter's
         // shared store can't also own it). Warn and keep theirs; the V2 `use cache` handler still

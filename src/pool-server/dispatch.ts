@@ -3292,6 +3292,25 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // Iteration 7: first serve of a fully-keyed platform entry — record it so later
           // serves of the same key replay the stored bytes (see the early-serve above).
+          if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+            // Rung-input dump for the runtime-static diagnosis (probe deployments only).
+            console.log(
+              `[cache-trace] ${JSON.stringify({
+                op: "gate-inputs",
+                url: req.url,
+                matched: resolution.matchedPathname,
+                handlerPathname,
+                type: handlerOutputInfo?.type,
+                staticAsset: dispatchStaticAsset?.pathname ?? null,
+                pprInfo: !!handlerPprInfo,
+                pprCapable: handlerPprCapable,
+                shared: incrementalCacheShared,
+                runtimeStaticHit:
+                  runtimeStaticTemplates.has(resolution.matchedPathname) ||
+                  runtimeStaticTemplates.has(handlerPathname),
+              })}`,
+            );
+          }
           const storeCapture =
             platformFullyKeyed && !platformCacheSeen && platformKey && platformStoreEligible
               ? captureResponseForStore(res, PLATFORM_STORE_MAX_BODY)

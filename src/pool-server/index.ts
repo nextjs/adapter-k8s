@@ -1893,6 +1893,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // Non-fatal — draft mode just won't work
     }
   }
+  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+    console.log(
+      `[cache-trace] ${JSON.stringify({ op: "startup", runtimeStaticTemplates: [...runtimeStaticTemplates] })}`,
+    );
+  }
 
   // Load the middleware manifest — contains edge function names, files, and assets.
   // This is used by the edge sandbox to find the right _ENTRIES key.

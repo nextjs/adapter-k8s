@@ -101,6 +101,26 @@ export function buildSeedSources(assets: StaticAssetRecord[]): Map<string, SeedS
  * manifest is read once on first use; any failure (missing manifest, unreadable file) is a
  * miss, never a crash — the caller already treats seed errors as misses and logs them.
  */
+// Edge-compile-safe builtin loading — same contract as resp-client.ts: Turbopack refuses
+// static `require("node:*")` specifiers in the Edge Runtime compilation, and this module is
+// bundled into next.config.cacheHandler which the edge middleware graph pulls in. The seed
+// lookup only ever RUNS in the Node pool; in the edge bundle this is dead code that parses.
+function builtin<T>(id: string): T {
+  const getBuiltin = (
+    globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }
+  ).process?.getBuiltinModule;
+  if (!getBuiltin) {
+    throw new Error(`[valkey-cache] process.getBuiltinModule unavailable loading ${id}`);
+  }
+  return getBuiltin(id) as T;
+}
+
+/** Edge-parse-safe cwd — Turbopack flags a literal `process.cwd()` as a Node API even in
+ * dead code; property access through globalThis is invisible to that detector. */
+function cwd(): string {
+  return (globalThis as { process?: { cwd?: () => string } }).process!.cwd!();
+}
+
 export interface SeedLookupCtx {
   kind?: string;
   isFallback?: boolean;
@@ -115,8 +135,8 @@ export interface SeedLookupCtx {
  * half-usable.
  */
 function fsMirrorSeed(appRoot: string, cacheKey: string, ctx?: SeedLookupCtx): SeedEntry | null {
-  const fs = require("node:fs");
-  const path = require("node:path");
+  const fs = builtin<typeof import("node:fs")>("node:fs");
+  const path = builtin<typeof import("node:path")>("node:path");
   const base = path.join(appRoot, ".next", "server", "app", ...cacheKey.split("/").filter(Boolean));
   const htmlAbs = cacheKey === "/" ? path.join(appRoot, ".next", "server", "app", "index.html") : `${base}.html`;
   if (!fs.existsSync(htmlAbs)) return null;
@@ -190,9 +210,9 @@ export function createBuildSeedLookup(options?: {
   const load = (): Map<string, SeedSource> | null => {
     if (sources !== undefined) return sources;
     try {
-      const fs = require("node:fs");
-      const path = require("node:path");
-      const appRoot = options?.appRoot ?? process.cwd();
+      const fs = builtin<typeof import("node:fs")>("node:fs");
+      const path = builtin<typeof import("node:path")>("node:path");
+      const appRoot = options?.appRoot ?? cwd();
       const configDir = options?.configDir ?? process.env.CONFIG_DIR ?? "config";
       const manifestPath = path.resolve(appRoot, configDir, "static-assets.json");
       const assets = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as StaticAssetRecord[];
@@ -214,15 +234,15 @@ export function createBuildSeedLookup(options?: {
       // to APP_PAGE (or unstated kind): PAGES/FETCH keys have different shapes.
       if (ctx?.kind !== undefined && ctx.kind !== "APP_PAGE") return null;
       try {
-        const appRoot = options?.appRoot ?? process.cwd();
+        const appRoot = options?.appRoot ?? cwd();
         return fsMirrorSeed(appRoot, cacheKey, ctx);
       } catch {
         return null;
       }
     }
-    const fs = require("node:fs");
-    const path = require("node:path");
-    const appRoot = options?.appRoot ?? process.cwd();
+    const fs = builtin<typeof import("node:fs")>("node:fs");
+    const path = builtin<typeof import("node:path")>("node:path");
+    const appRoot = options?.appRoot ?? cwd();
     const htmlAbs = path.resolve(appRoot, source.htmlPath);
     const stat = fs.statSync(htmlAbs);
     const html = fs.readFileSync(htmlAbs, "utf8");
