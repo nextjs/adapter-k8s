@@ -3275,8 +3275,14 @@ export function createDispatcher(options: DispatcherOptions) {
                   // N9: align the locale prefix with the chosen template first — see
                   // localeAlignedRouteParamPathname. Handing `/en-US` to `/[[...slug]]`
                   // made the locale itself the first catch-all param.
+                  // Strip a concrete RSC/segment variant suffix before deriving params:
+                  // @next/routing >= 16.3.0-preview.10 no longer supplies routeMatches for
+                  // a statically-matched `.rsc` variant (shouldUseDynamicMatch gate), and
+                  // parsing "/prerendered.rsc" against /[slug] put the transport suffix IN
+                  // THE PARAM ("Slug: prerendered.rsc", baseline v12).
                   routeParamPathname: localeAlignedRouteParamPathname(
-                    resolution.matchedPathname,
+                    rscParentCandidates(resolution.matchedPathname, rscConfig).at(-1) ??
+                      resolution.matchedPathname,
                     handlerPathname,
                     i18nLocales,
                   ),
