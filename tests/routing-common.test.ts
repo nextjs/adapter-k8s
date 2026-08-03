@@ -818,6 +818,14 @@ describe("grantsSharedCacheFreshness", () => {
   it("still vetoes on no-cache/private even with stale-while-revalidate", () => {
     expect(grantsSharedCacheFreshness("no-cache, stale-while-revalidate=600")).toBe(false);
     expect(grantsSharedCacheFreshness("private, stale-while-revalidate=600")).toBe(false);
+    expect(grantsSharedCacheFreshness("no-store, s-maxage=600")).toBe(false);
+  });
+
+  it("matches exact directive names and respects quoted commas", () => {
+    expect(grantsSharedCacheFreshness("x-s-maxage=600")).toBe(false);
+    expect(grantsSharedCacheFreshness("x-no-store, s-maxage=600")).toBe(true);
+    expect(grantsSharedCacheFreshness('x-policy="no-store, private", s-maxage=600')).toBe(true);
+    expect(grantsSharedCacheFreshness("almost-private, max-age=600")).toBe(true);
   });
 
   it("treats a zero stale-while-revalidate as no window", () => {

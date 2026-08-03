@@ -189,3 +189,55 @@ describe("grantsSharedCacheFreshness: qualified directives (S24)", () => {
     ).toBe(false);
   });
 });
+
+// S41 (SECURITY/CACHE): directive names are tokens, not word-boundary substrings. Treating the
+// `no-store` inside `x-no-store` as the real directive let an accompanying s-maxage override the
+// middleware no-cache guard, creating a CDN hit path that never reaches ext_proc.
+describe("explicitCacheControlWins: exact directive parsing (S41)", () => {
+  const wins = (resolvedCacheControl: string): boolean =>
+    explicitCacheControlWins({
+      forced: "no-cache",
+      resolvedCacheControl,
+      responseCacheControls: [],
+    });
+
+  it("refuses extension names and quoted values that only contain veto directive text", () => {
+    for (const cacheControl of [
+      "x-no-store, s-maxage=600",
+      'x-policy="no-store", s-maxage=600',
+      'x-policy="no-cache, private", s-maxage=600',
+      "almost-private, max-age=600",
+    ]) {
+      expect(wins(cacheControl), cacheControl).toBe(false);
+    }
+  });
+
+  it("still honors exact unqualified vetoes and zero-freshness policies", () => {
+    for (const cacheControl of [
+      "no-store",
+      "no-store, s-maxage=600",
+      "no-cache",
+      "private",
+      "public, max-age=0, must-revalidate",
+    ]) {
+      expect(wins(cacheControl), cacheControl).toBe(true);
+    }
+  });
+
+  it("does not mistake no-store text in the entrypoint response for a real veto", () => {
+    expect(
+      explicitCacheControlWins({
+        forced: "no-cache",
+        resolvedCacheControl: "public, max-age=0",
+        responseCacheControls: ["x-no-store"],
+      }),
+    ).toBe(true);
+    expect(
+      explicitCacheControlWins({
+        forced: "no-cache",
+        resolvedCacheControl: "public, max-age=0",
+        responseCacheControls: ["no-store"],
+      }),
+    ).toBe(false);
+  });
+});

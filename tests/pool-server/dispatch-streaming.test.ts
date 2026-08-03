@@ -6,8 +6,12 @@
 // style of tests/pool-server/server.test.ts.
 import { describe, it, expect, afterEach } from "vitest";
 import { createServer, get as httpGet, type IncomingMessage, type Server } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { createDispatcher } from "../../src/pool-server/dispatch.js";
+import { STATIC_STREAM_THRESHOLD_BYTES } from "../../src/pool-server/http-cache.js";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
 
 type NodeHandler = (req: IncomingMessage, res: import("node:http").ServerResponse) => void;
@@ -87,6 +91,49 @@ let openServers: Server[] = [];
 afterEach(async () => {
   await Promise.all(openServers.map((s) => new Promise<void>((r) => s.close(() => r()))));
   openServers = [];
+});
+
+// S41 (AVAILABILITY): manifest-backed assets bypassed the size-aware static serving path and
+// synchronously buffered the complete body before even checking If-None-Match.
+describe("manifest-backed static asset bounds", () => {
+  it("streams a large body and answers a conditional request without a body", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "manifest-static-stream-"));
+    const filePath = path.join(dir, "large.bin");
+    const body = Buffer.alloc(STATIC_STREAM_THRESHOLD_BYTES + 1, 0x61);
+    writeFileSync(filePath, body);
+    try {
+      const front = await startFront(
+        {
+          handlerLoader: handlerLoaderFor("/unused", () => undefined),
+          poolName: "main",
+          buildId: "b1",
+          staticAssets: [
+            {
+              pathname: "/large.bin",
+              filePath,
+              cacheControl: "public, max-age=0, must-revalidate",
+            },
+          ],
+        },
+        routeResolution("/large.bin"),
+      );
+      openServers.push(front.server);
+
+      const first = await timedGet(front.port, "/large.bin");
+      expect(first.status).toBe(200);
+      expect(first.headers["content-length"]).toBe(String(body.length));
+      expect(first.body.length).toBe(body.length);
+      expect(first.headers.etag).toMatch(/^".+"$/);
+
+      const conditional = await timedGet(front.port, "/large.bin", {
+        "if-none-match": String(first.headers.etag),
+      });
+      expect(conditional.status).toBe(304);
+      expect(conditional.body).toBe("");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // N36: writeInnerResponse awaited `iterator.next()` — the handler's FIRST BODY CHUNK — before

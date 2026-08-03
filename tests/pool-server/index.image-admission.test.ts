@@ -81,6 +81,7 @@ const BIG_PNG: Buffer = await realSharp(noise, { raw: { width: 40, height: 40, c
   .png({ compressionLevel: 0 })
   .toBuffer();
 const BIG = BIG_PNG.length;
+const IMAGE_BYTE_LIMIT = BIG + 100;
 // A real 1×1 PNG — the same bytes index.image.test.ts uses.
 const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -99,7 +100,7 @@ const HTML_AS_PNG = "<html><body>not an image</body></html>";
 //     (2·BIG + BIG + 100 > budget) — while the slot count still has a free slot. With TINY
 //     sources the trued-up charges are negligible and the slot count is what binds instead.
 process.env.ADAPTER_K8S_MAX_CONCURRENT_IMAGE_OPTIMIZATIONS = "3";
-process.env.ADAPTER_K8S_MAX_IMAGE_BYTES = String(BIG + 100);
+process.env.ADAPTER_K8S_MAX_IMAGE_BYTES = String(IMAGE_BYTE_LIMIT);
 process.env.ADAPTER_K8S_MAX_INFLIGHT_IMAGE_BYTES = String(2 * BIG + 100);
 // Long enough that a queued request in the other tests is never shed by accident, short enough
 // that the shed test is a second rather than five.
@@ -127,6 +128,15 @@ function writeStagedDir(): { dir: string; configDir: string; markers: string } {
   writeFileSync(path.join(dir, "public", "big.png"), BIG_PNG);
   writeFileSync(path.join(dir, "public", "tiny.png"), TINY_PNG);
   writeFileSync(path.join(dir, "public", "html-as.png"), HTML_AS_PNG);
+  writeFileSync(
+    path.join(dir, "public", "oversized-public.png"),
+    Buffer.alloc(IMAGE_BYTE_LIMIT + 1),
+  );
+  mkdirSync(path.join(dir, ".next", "static"), { recursive: true });
+  writeFileSync(
+    path.join(dir, ".next", "static", "oversized-static.png"),
+    Buffer.alloc(IMAGE_BYTE_LIMIT + 1),
+  );
 
   // Both AVIF and WebP configured, so `Accept` alone decides the negotiated output and the two
   // variants must not share a single-flight entry.
@@ -443,6 +453,22 @@ describe("image optimizer — S32 admission and single-flight", () => {
   });
 
   // --- (a) admission before I/O -------------------------------------------------
+
+  it("rejects oversized public and .next/static sources before decoding", async () => {
+    sharpCalls = 0;
+    for (const source of ["/oversized-public.png", "/_next/static/oversized-static.png"]) {
+      const res = await get(port, `/_next/image?url=${encodeURIComponent(source)}&w=64&q=75`, {
+        accept: "image/webp",
+      });
+      expect(res.status, source).toBe(413);
+      expect(res.body.toString(), source).toBe(
+        '"url" parameter is valid but internal response is invalid',
+      );
+    }
+    // Without the pre-read stat gate both full Buffers reached sharp.
+    expect(sharpCalls).toBe(0);
+    expect(imageOptimizerAdmissionStats().reservedBytes).toBe(0);
+  });
 
   it("admits at most MAX_CONCURRENT_IMAGE_OPTIMIZATIONS sources at once", async () => {
     // Four distinct keys, tiny sources so the byte budget cannot be what binds. The queued

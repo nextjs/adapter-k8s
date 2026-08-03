@@ -367,10 +367,32 @@ describe("conditionRegex (S11)", () => {
     expect(conditionRegex("(a+)+")).toBeNull();
     expect(conditionRegex("([a-z]+)*")).toBeNull();
     expect(conditionRegex("(a*)*")).toBeNull();
+    expect(conditionRegex("(aa?)+")).toBeNull();
     expect(warn).toHaveBeenCalled();
     const before = warn.mock.calls.length;
     conditionRegex("(a+)+"); // cached negative verdict — no second warning
     expect(warn.mock.calls.length).toBe(before);
+    warn.mockRestore();
+  });
+
+  it("REFUSES quantified alternation, including the short overlapping family", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(conditionRegex("(a|aa)+")).toBeNull();
+    expect(conditionRegex("(aa|a)*")).toBeNull();
+    expect(conditionRegex("((?:ab|aba)){2,}")).toBeNull();
+    // Alternation that is not itself repeated stays compatible with next start.
+    expect(conditionRegex("^(beta|canary)$")).toBeInstanceOf(RegExp);
+    expect(conditionRegex("[|]+")).toBeInstanceOf(RegExp);
+    expect(conditionRegex(String.raw`\|+`)).toBeInstanceOf(RegExp);
+    warn.mockRestore();
+  });
+
+  it("REFUSES ambiguous adjacent repetitions that have no repeated group", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(conditionRegex("a*a*a*a*a*b")).toBeNull();
+    expect(conditionRegex("a.*a.*a.*a.*a.*b")).toBeNull();
+    // Multiple repetitions remain valid when their character languages cannot overlap.
+    expect(conditionRegex("[a-z]+-[0-9]+")).toBeInstanceOf(RegExp);
     warn.mockRestore();
   });
 
@@ -389,6 +411,17 @@ describe("conditionRegex (S11)", () => {
     const started = performance.now();
     matchesMiddleware([m], url("/gated"), h({ "x-v": "a".repeat(40) + "!" }));
     expect(performance.now() - started).toBeLessThan(250);
+    warn.mockRestore();
+  });
+
+  it("stays fast on an overlapping-alternation adversarial input", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    for (const value of ["(a|aa)+", "(aa?)+", "a*a*a*a*a*b", "a.*a.*a.*a.*a.*b"]) {
+      const m = M("/gated", { has: [{ type: "header", key: "x-v", value }] });
+      const started = performance.now();
+      matchesMiddleware([m], url("/gated"), h({ "x-v": "a".repeat(40) + "!" }));
+      expect(performance.now() - started, value).toBeLessThan(250);
+    }
     warn.mockRestore();
   });
 

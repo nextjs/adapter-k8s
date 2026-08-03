@@ -50,8 +50,9 @@ function assertSafeMatcherConditions(m: MiddlewareMatcherBuild): void {
           `request-controlled string, so this would be a remote availability bug; the pool and the ` +
           `routing service both refuse to compile it and would fall back to EXACT string ` +
           `comparison, silently narrowing which requests run middleware. Rewrite the pattern ` +
-          `without a quantifier inside a quantified group (for matching purposes \`(a+)+\` is ` +
-          `\`a+\`).`,
+          `without nested quantifiers or repeated alternation (for matching purposes \`(a+)+\` ` +
+          `is \`a+\`; replace repeated alternatives with a character class or another linear ` +
+          `expression).`,
       );
     }
   }
