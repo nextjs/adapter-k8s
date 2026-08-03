@@ -189,6 +189,13 @@ export function assertSafeBuildId(buildId: string): void {
 // Minimal structural mirror of Next's classic CacheHandler contract (avoids a compile-time
 // dependency on Next internals). `value` is an `IncrementalCacheValue`; we serialize its binary
 // members (Buffers, the segmentData Map) to base64 for JSON storage.
+/** Trace-only size probe: bytes for Buffer/string values, 0 for anything else. */
+function byteLen(v: unknown): number {
+  if (Buffer.isBuffer(v)) return v.length;
+  if (typeof v === "string") return Buffer.byteLength(v);
+  return 0;
+}
+
 interface CacheHandlerValue {
   lastModified?: number;
   value: unknown | null;
@@ -476,9 +483,25 @@ export class ValkeyIncrementalCacheHandler {
     }
   }
 
+  /**
+   * PPR-materialization diagnosis channel (ADAPTER_K8S_CACHE_TRACE=1): one JSON line per
+   * cache operation, so a deployed pool's write pattern can be diffed against `next
+   * start`'s filesystem materialization. Off by default and costs one env check.
+   */
+  private trace(op: string, key: string, detail: Record<string, unknown>): void {
+    if (process.env.ADAPTER_K8S_CACHE_TRACE !== "1") return;
+    console.log(`[cache-trace] ${JSON.stringify({ op, key, ...detail })}`);
+  }
+
   /** get() without the seed fallback: STORED entries only (a post-deploy write or null). */
   async getStored(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    return this.getImpl(cacheKey, ctx, true);
+    const r = await this.getImpl(cacheKey, ctx, true);
+    this.trace("getStored", cacheKey, {
+      kind: ctx.kind,
+      hit: r !== null,
+      ...(r?.isStale !== undefined ? { isStale: r.isStale } : {}),
+    });
+    return r;
   }
 
   /** The complement of getStored(): SEED entries only (build artifacts), never a stored
@@ -489,7 +512,9 @@ export class ValkeyIncrementalCacheHandler {
   }
 
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    return this.getImpl(cacheKey, ctx, false);
+    const r = await this.getImpl(cacheKey, ctx, false);
+    this.trace("get", cacheKey, { kind: ctx.kind, hit: r !== null });
+    return r;
   }
 
   private async getImpl(
@@ -636,6 +661,17 @@ export class ValkeyIncrementalCacheHandler {
         );
         return;
       }
+      this.trace("set", cacheKey, {
+        kind: (data as { kind?: string } | null)?.kind,
+        htmlBytes: byteLen((data as { html?: unknown } | null)?.html),
+        postponedBytes: byteLen((data as { postponed?: unknown } | null)?.postponed),
+        rscDataBytes: byteLen((data as { rscData?: unknown } | null)?.rscData),
+        segmentCount:
+          (data as { segmentData?: Map<unknown, unknown> } | null)?.segmentData?.size ?? 0,
+        tags,
+        revalidate,
+        ttlSeconds: entry.ttlSeconds,
+      });
       await this.client.set(this.entryKey(cacheKey), serialized, "EX", entry.ttlSeconds);
       // A completed re-render releases the single-flight revalidation lock early (see `get`);
       // best-effort — the lock's own TTL is the backstop.

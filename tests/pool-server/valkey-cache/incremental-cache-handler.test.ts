@@ -483,6 +483,59 @@ describe("N6: non-finite lifetimes are refused (never reach Valkey)", () => {
 // Survey Tier 3 #16: `set(key, null)` is a REAL cached value (Next stores null for
 // not-found responses). It must round-trip as a hit carrying `value: null` — collapsing it
 // into a miss makes Next re-render the known-empty result on every request, forever.
+describe("cache trace (ADAPTER_K8S_CACHE_TRACE=1 — PPR materialization diagnosis)", () => {
+  // One JSON line per set()/get() so a deployed pool's writes can be diffed against
+  // `next start`'s filesystem materialization (which keys, which kinds, postponed/rscData
+  // presence). Off by default; costs nothing when unset.
+  it("logs a structured line for set() and get() when enabled", async () => {
+    process.env.ADAPTER_K8S_CACHE_TRACE = "1";
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.join(" "));
+    });
+    try {
+      const client = new FakeValkeyClient();
+      const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tr1", now: () => 1000 });
+      await h.set("/traced", appPageEntry("T"), {
+        tags: ["t1"],
+        cacheControl: { revalidate: 60, expire: 600 },
+      });
+      await h.get("/traced", { kind: "APP_PAGE" });
+      const traceLines = lines.filter((l) => l.includes("[cache-trace]"));
+      expect(traceLines.length).toBe(2);
+      const setLine = JSON.parse(traceLines[0]!.slice(traceLines[0]!.indexOf("{")));
+      expect(setLine.op).toBe("set");
+      expect(setLine.key).toBe("/traced");
+      expect(setLine.kind).toBe("APP_PAGE");
+      expect(setLine).toHaveProperty("postponedBytes");
+      expect(setLine).toHaveProperty("htmlBytes");
+      expect(setLine.tags).toEqual(["t1"]);
+      const getLine = JSON.parse(traceLines[1]!.slice(traceLines[1]!.indexOf("{")));
+      expect(getLine.op).toBe("get");
+      expect(getLine.hit).toBe(true);
+    } finally {
+      spy.mockRestore();
+      delete process.env.ADAPTER_K8S_CACHE_TRACE;
+    }
+  });
+
+  it("logs nothing when disabled", async () => {
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.join(" "));
+    });
+    try {
+      const client = new FakeValkeyClient();
+      const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tr2", now: () => 1000 });
+      await h.set("/quiet", appPageEntry("Q"), {});
+      await h.get("/quiet", {});
+      expect(lines.filter((l) => l.includes("[cache-trace]"))).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 describe("getStored staleness signal (SWR must not become stale-forever)", () => {
   // Dispatch consumes getStored DIRECTLY — no Next incremental-cache layer above it to
   // compute age staleness from lastModified. getStored therefore surfaces `isStale`
