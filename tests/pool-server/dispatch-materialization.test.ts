@@ -261,6 +261,39 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(calls[0].minimalMode).toBe(false);
   });
 
+  it("strips the rsc-variant suffix from the INVOCATION PATH for a dynamic RSC request", async () => {
+    // The rsc-negotiation rewrite resolves a dynamic RSC request to the `.rsc` OUTPUT id
+    // (matched "/index.rsc"), and the invoker turns invocationPath into
+    // requestMeta.resolvedPathname. The entrypoint's RDC branch then does
+    // incrementalCache.get(resolvedPathname) and prerenderManifest.routes[resolvedPathname]
+    // (app-page-runtime.ts:1373) — both keyed by the PAGE path ("/"), so handing it
+    // "/index.rsc" misses everything and the render loses the RDC (measured: rdc stayed
+    // 3/5 under the exclusion alone).
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        handlerLoader: handlerLoaderFor("/ppr-page"),
+        pprRoutes,
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        rscConfig: { header: "rsc", suffix: ".rsc" },
+        platformCache: { read: async () => null, readStored: async () => null },
+      }),
+    );
+    const req = mockReq("/ppr-page", { rsc: "1" });
+    await dispatcher.dispatch(req, mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/ppr-page.rsc",
+      invokePath: "/ppr-page.rsc",
+      routeMatches: null,
+    } as any);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].invocationPath).toBe("/ppr-page");
+    expect(calls[0].minimalMode).toBe(false);
+  });
+
   it("keeps minimal+inject for a full-page PREFETCH RSC request", async () => {
     // Prefetch flights are the static shell — injection is exactly right for them.
     const calls: any[] = [];
