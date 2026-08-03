@@ -41,6 +41,14 @@ touch "${RUN_DIR}/.run-start"
 # the default 1M-inode /tmp tmpfs exhausted it mid-pilot (measured: 16 clean deploys, then
 # ENOSPC mass-failed every suite after). The dir is exclusively ours, so wipe it at run
 # start rather than trusting per-suite cleanup to never leak.
+
+# DISK GUARD (2026-08-03): ~1,100 suite deploys accumulate ~1.8TB of docker build cache and
+# ~14k images; at 96% host disk the k3d node hit DiskPressure, kubelet EVICTED the Envoy
+# gateway, and an entire smoke run all-failed with ERR_EMPTY_RESPONSE (236/236 — pure
+# infra). Cap the cache and drop this run's superseded e2e images up front.
+docker builder prune -f --keep-storage 100gb >/dev/null 2>&1 || true
+docker image prune -f >/dev/null 2>&1 || true
+
 export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
 # Best-effort wipe: a previous run's straggler can still be writing here, and rm -rf races
 # concurrent writes into ENOTEMPTY — which under `set -e` killed the whole run at launch.

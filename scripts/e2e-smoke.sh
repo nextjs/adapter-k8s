@@ -21,6 +21,14 @@ RUN_DIR="${ADAPTER_DIR}/.k8s-adapter/lane-runs/$(date +%Y%m%dT%H%M%S)-smoke"
 mkdir -p "$RUN_DIR"
 touch "${RUN_DIR}/.run-start"
 
+
+# DISK GUARD (2026-08-03): ~1,100 suite deploys accumulate ~1.8TB of docker build cache and
+# ~14k images; at 96% host disk the k3d node hit DiskPressure, kubelet EVICTED the Envoy
+# gateway, and an entire smoke run all-failed with ERR_EMPTY_RESPONSE (236/236 — pure
+# infra). Cap the cache and drop this run's superseded e2e images up front.
+docker builder prune -f --keep-storage 100gb >/dev/null 2>&1 || true
+docker image prune -f >/dev/null 2>&1 || true
+
 export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
 mkdir -p "$TMPDIR"
 
