@@ -109,6 +109,42 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("RSC cache-busting query param (_rsc)", () => {
+  it("strips _rsc from the invocation URL for RSC requests, keeping other params", async () => {
+    // base-server deletes NEXT_RSC_UNION_QUERY ('_rsc') from the render query
+    // (base-server.ts:2719-2722) — the param exists only to partition browser/CDN caches.
+    // Our loopback kept it, so the generated entrypoint saw an unexpected query param,
+    // ssgCacheKey went null, and the stale-entry BACKGROUND REVALIDATION gate disarmed:
+    // resume-data-cache's post-revalidateTag flow served stale forever under the suite's
+    // cache-busted fetches while the identical param-less curl sequence passed.
+    let innerUrl: string | undefined;
+    const handler: NodeHandler = (req, res) => {
+      innerUrl = req.url;
+      res.writeHead(200, { "content-type": "text/x-component" });
+      res.end("flight");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(
+      mockReq("/api/echo?_rsc=abc123&keep=1", { rsc: "1" }),
+      mockRes(),
+      routeResolution(),
+    );
+    expect(innerUrl).toBe("/api/echo?keep=1");
+  });
+
+  it("leaves non-RSC requests untouched", async () => {
+    let innerUrl: string | undefined;
+    const handler: NodeHandler = (req, res) => {
+      innerUrl = req.url;
+      res.writeHead(200, {});
+      res.end("ok");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(mockReq("/api/echo?_rsc=abc123"), mockRes(), routeResolution());
+    expect(innerUrl).toBe("/api/echo?_rsc=abc123");
+  });
+});
+
 describe("requestMeta.initURL public scheme", () => {
   it("derives the initURL scheme from a validated x-forwarded-proto", async () => {
     let initURL: string | undefined;

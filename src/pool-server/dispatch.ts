@@ -1980,6 +1980,25 @@ export function createDispatcher(options: DispatcherOptions) {
       // listener Node crashes the process. Guard the outer client response up front.
       guardStreamErrors(res);
 
+      // base-server deletes the RSC cache-busting param NEXT_RSC_UNION_QUERY ('_rsc') from
+      // the render query (base-server.ts:2719-2722) — it exists only to partition
+      // browser/CDN caches. The generated entrypoint parses req.url directly under our
+      // loopback, so the param must come off HERE: left on, the entrypoint saw an
+      // unexpected query param, ssgCacheKey went null, and the stale-entry background
+      // revalidation never armed (resume-data-cache: stale-forever under the suite's
+      // cache-busted fetches while the identical param-less sequence passed).
+      if (
+        req.url !== undefined &&
+        req.headers[options.rscConfig?.header ?? "rsc"] === "1" &&
+        req.url.includes("_rsc=")
+      ) {
+        const u = new URL(req.url, "http://localhost");
+        if (u.searchParams.has("_rsc")) {
+          u.searchParams.delete("_rsc");
+          req.url = `${u.pathname}${u.search}`;
+        }
+      }
+
       // Pages Router uses this response header to interpret middleware data-request
       // preflights and retain the matched route template. Next's router-server sets
       // it for both static and dynamic data routes.
