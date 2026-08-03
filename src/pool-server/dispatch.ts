@@ -3365,7 +3365,27 @@ export function createDispatcher(options: DispatcherOptions) {
             matchedPathname: handlerPathname,
             routeMatches: resolution.routeMatches,
             bufferedBody,
-            ...(resolution.invokePath ? { invocationPath: resolution.invokePath } : {}),
+            ...(resolution.invokePath
+              ? {
+                  // A dynamic RSC request resolves to the `.rsc` OUTPUT id, but the
+                  // invocation path becomes requestMeta.resolvedPathname, and the
+                  // entrypoint's RDC branch keys BOTH incrementalCache.get and
+                  // prerenderManifest.routes by the PAGE path (app-page-runtime.ts:1373)
+                  // — "/index.rsc" misses everything and the render loses the RDC. Strip
+                  // the variant suffix for exactly these requests; every other flow keeps
+                  // the output id (matrix cache-key semantics depend on it).
+                  invocationPath: (() => {
+                    const dynRsc =
+                      req.headers[rscConfig?.header ?? "rsc"] === "1" &&
+                      req.headers["next-router-prefetch"] !== "1" &&
+                      typeof req.headers["next-router-segment-prefetch"] !== "string";
+                    if (!dynRsc) return resolution.invokePath;
+                    const u = new URL(resolution.invokePath, "http://localhost");
+                    const base = rscParentCandidates(u.pathname, rscConfig)[0];
+                    return base ? `${base}${u.search}` : resolution.invokePath;
+                  })(),
+                }
+              : {}),
             // Next compiles an i18n index rewrite to a locale-prefixed concrete prerender, then
             // maps that artifact back to a locale-prefixed dynamic Pages handler. `invokePath`
             // deliberately strips an auto-added default locale, so it cannot recover the
