@@ -6,17 +6,20 @@ The README's status claim—framework compatibility strongly validated, hardenin
 
 ## The layers
 
-### 1. Unit suite—2,168 tests
+### 1. Unit suite—2,292 tests
 
 Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted templates. Several template tests render through **real `helm`**, because the question being asked is what helm does with the file, not what the file contains.
 
 **Cannot see:** anything about a live cluster, load balancer, or CDN. Template tests prove the chart renders and carries the intended values; they cannot prove GKE programs it.
 
-### 2. Upstream Next.js e2e suite—3,439 passing / 2 failing
+### 2. Upstream Next.js e2e suite—two topologies
 
-The upstream suite runs against the pool server. This is the strongest evidence that handler
-invocation via `import()` is faithful to `next start` semantics across the framework's surface
-area—1,082 suites, run in the adapter deploy mode upstream uses for conformance.
+The upstream conformance suite (1,082 suites, run in the adapter deploy mode upstream uses)
+runs against this adapter in two configurations.
+
+**Pool topology** — the harness starts the pool server only. This is the strongest evidence
+that handler invocation via `import()` is faithful to `next start` semantics across the
+framework's surface area:
 
 ```text
 Next.js:        v16.3.0-canary.97 (367e5215)
@@ -26,29 +29,45 @@ result:         3,439 passed / 2 failed / 1,082 suites
 reproduce:      NEXT_TEST_CONCURRENCY=4 bash scripts/e2e-local.sh "" v16.3.0-canary.97
 ```
 
-**The two failures**, named rather than waved at as "known flakes":
+The two pool-topology failures are client-side navigation timing races
+(`i18n-support-same-page-hash-change`, `rewrites-manual-href-as`) whose assertions read DOM
+state after a client transition with no request reaching the pool; both reproduce at similar
+rates against vanilla `next start`.
 
-| Suite | Test | Symptom |
+**Full cluster topology** — the same suite through the production request path: Envoy
+Gateway → ext_proc routing service → pool, with a shared Valkey incremental cache, deployed
+to a local k3d cluster per suite. This is the configuration the pool-only harness
+structurally cannot see, and it now runs the entire suite:
+
+```text
+Next.js:        v16.3.0-canary.97 (367e5215)
+adapter-k8s:    2e00b98
+run date:       2026-08-03
+result:         4,434 passed / 31 failed / 1,082 suites
+reproduce:      bash scripts/e2e-lanes.sh 6 24   — ~3-4.5h, 6 concurrent lanes
+```
+
+**The 31 failures, characterized rather than waved at:**
+
+| Group | Count | Status |
 | --- | --- | --- |
-| `i18n-support-same-page-hash-change` | should update props on locale change with same hash | expected `"en"`, received `"fr"` |
-| `rewrites-manual-href-as` | should allow manual href/as on index page | `toBeTruthy()` received `false` |
+| Server-action suites (`app-action`, `app-action-node-middleware`, `action-forward-loop`) | 10 | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
+| Timing races (`cached-navigations` 5, `prerender` 2, `vary-params-base-dynamic`, `i18n-support-same-page-hash-change`, `rewrites-manual-href-as`) | 10 | Client-navigation waits that reproduce intermittently; rates vary with host load |
+| PPR runtime materialization (`resume-data-cache` 3, `partial-fallback-shell-upgrade` 1) | 4 | The remaining frontier: runtime-generated shell/resume-data consistency across requests. Active work; the underlying mechanisms are mapped |
+| `cache-components-prerender-matrix` | 3 | The `partialFallback` on-demand shell-specialization contract, which this adapter deliberately does not yet implement |
+| Singletons (`metadata-navigation`, `no-duplicate-headers-middleware`, `non-ascii-cache-tags`, `cache-components-allow-otel-spans`) | 4 | One test each; `no-duplicate-headers-middleware` is a documented, deliberate divergence |
 
-Both are client-side navigation timing races that reproduce intermittently and are unaffected by
-adapter code paths—the assertions read DOM state after a client transition, with no request
-reaching the pool server. Neither has been root-caused upstream, so treat them as *unexplained
-but consistently isolated to these two suites* rather than as proven-external. If either ever
-fails differently, that is a signal worth chasing.
-
-**Cannot see:** the edge. The harness starts the **pool only**—no Envoy, no ext_proc—so it
-validates local route resolution (the fail-safe tier that runs when dispatch headers are absent),
-not the routing service that classifies requests in production. It also says nothing about
-behaviour under load: it is a functional suite run at concurrency 4.
+**Cannot see:** the real load balancer, CEL match-condition evaluation as GCP performs it,
+Cloud CDN interaction, or behaviour under load—both topologies are functional suites, not
+load tests.
 
 ### 3. `adapter-k8s emulate`—the ext_proc path locally
 
 Envoy → routing service → pool server, wired the way GKE wires it, on one machine. Verified by hand against the e2e fixture: all routes serve, `x-mw-executed` confirms middleware ran at the edge, RSC negotiation returns a flight payload, and the internal dispatch headers do not leak to the client.
 
-There is also a **full upstream suite against this topology** (`test-e2e-integration.yml`, which starts Envoy + routing service + pool and points the harness at Envoy rather than the pool). It does **not currently complete**: its deploy script had drifted behind the pool-only one and, after repair, the stack does not survive between deploy and test. So the honest position is that `emulate` is the only ext_proc coverage that presently works, and it is manual.
+`emulate` remains the quick local way to inspect this path by hand; the full upstream suite
+now runs against the same topology on a real cluster (layer 2, cluster topology), which
+supersedes the process-level integration workflow this section previously described.
 
 **Cannot see:** the real load balancer, CEL match-condition evaluation as GCP performs it, Cloud CDN interaction, or NetworkPolicy enforcement.
 
@@ -80,7 +99,15 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 
 Stated plainly, because a reviewer will find them anyway:
 
-- **The ext_proc path has no *working* automated coverage.** `emulate` covers it but is run by hand; the upstream-suite-through-Envoy workflow exists and does not currently pass (see layer 3). The live suites exercise the real edge, but against real infrastructure rather than in CI on every commit.
+- **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
+  suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
+  when a maintainer launches it—hours, not minutes—so individual commits are gated by the
+  unit suite and a ~35-minute smoke subset (`scripts/e2e-smoke.sh`), with full runs between
+  batches.
+- **31 upstream tests fail in the full topology** (0.7% of the suite; see the table in
+  layer 2). About half are intermittent timing races; the substantive remainder are the PPR
+  runtime-materialization frontier, the unimplemented `partialFallback` contract, and the
+  server-action harness conditions.
 - **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to—the claim here is correctness, not capacity.
 - **The generic provider is younger** than the GKE one and has correspondingly less real-world exposure, though it passes the same unit suite and its live verification covered the full request path.
 
@@ -88,5 +115,6 @@ Stated plainly, because a reviewer will find them anyway:
 
 - Unit suite: `npm test`
 - Upstream Next.js e2e (pool topology): `NEXT_TEST_CONCURRENCY=4 bash scripts/e2e-local.sh "" v16.3.0-canary.97`—expect ~17 minutes
+- Upstream Next.js e2e (full cluster topology): `bash scripts/e2e-k3d-bootstrap.sh` once, then `bash scripts/e2e-lanes.sh 6 24`—expect 3–4.5 hours; `bash scripts/e2e-smoke.sh` runs the ~32-suite sensitive subset in ~35 minutes
 - ext_proc path locally: `npx adapter-k8s emulate` in `fixtures/main`
 - Live suite: `E2E_BASE_URL=https://<host> npm run test:e2e:live` against a deployed release
