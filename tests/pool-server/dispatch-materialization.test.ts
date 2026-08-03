@@ -391,6 +391,89 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(keys).not.toContain("read:/posts/[id]");
   });
 
+  it("serves the Pages fallback SKELETON (not a blocking render) in production", async () => {
+    // fallback-route-params: `getStaticPaths { paths: [], fallback: true }`. next start
+    // serves the build skeleton (query {} in __NEXT_DATA__, router.isFallback) and lets the
+    // client's data fetch materialize the page. Our production path blocking-rendered with
+    // resolved params instead — the skeleton assertions got `{slug:"first"}`.
+    const invoker = vi.fn();
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {},
+        staticAssets: [
+          {
+            pathname: "/[slug]",
+            filePath: shellFile,
+            prerender: true,
+            cacheControl: "public, max-age=0, must-revalidate",
+          },
+        ],
+        handlerLoader: handlerLoaderFor("/[slug]"),
+        localHandlerInvoker: invoker as any,
+        platformCache: {
+          read: async () => null,
+          readStored: async () => null,
+        },
+      }),
+    );
+    const res = mockRes();
+    await dispatcher.dispatch(mockReq("/first"), res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/[slug]",
+      routeMatches: { slug: "first" },
+    } as any);
+    expect(invoker).not.toHaveBeenCalled();
+    expect(res._body).toContain("build shell");
+  });
+
+  it("serves the MATERIALIZED page over the Pages fallback skeleton once it exists", async () => {
+    // After the data fetch materializes the concrete entry, documents must serve it —
+    // otherwise the skeleton would be served forever.
+    const invoker = vi.fn();
+    const dispatcher = createDispatcher(
+      baseOptions({
+        pprRoutes: {},
+        staticAssets: [
+          {
+            pathname: "/[slug]",
+            filePath: shellFile,
+            prerender: true,
+            cacheControl: "public, max-age=0, must-revalidate",
+          },
+        ],
+        handlerLoader: handlerLoaderFor("/[slug]"),
+        localHandlerInvoker: invoker as any,
+        platformCache: {
+          read: async () => null,
+          readStored: async (key: string) =>
+            key === "/first"
+              ? {
+                  lastModified: Date.now(),
+                  value: {
+                    kind: "PAGES",
+                    html: "<html>materialized first</html>",
+                    pageData: {},
+                    headers: { "x-next-cache-tags": "strip-me" },
+                    status: 200,
+                  },
+                }
+              : null,
+        },
+      }),
+    );
+    const res = mockRes();
+    await dispatcher.dispatch(mockReq("/first"), res, {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/[slug]",
+      routeMatches: { slug: "first" },
+    } as any);
+    expect(invoker).not.toHaveBeenCalled();
+    expect(res._body).toContain("materialized first");
+    expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+  });
+
   it("serves a STORED (revalidated) entry in preference to the build seed for a non-PPR prerender", async () => {
     // revalidate-reason: res.revalidate() renders with reason 'on-demand' and persists the
     // fresh entry through the registered handler — but the concrete-seed rung kept serving

@@ -2186,7 +2186,15 @@ export function createDispatcher(options: DispatcherOptions) {
         // instead, so serving this emitted artifact is the adapter's documented fallback role.
         // Keep PPR out of this branch: PPR shells use postponed state and the resume protocol below.
         const servePagesDynamicFallbackShell =
-          emulatePlatformCache &&
+          // Emulate mode models "one platform-cache miss per URL" with a process-local
+          // marker; PRODUCTION serves the skeleton whenever the shared platform cache is
+          // wired — a materialized entry supersedes it in the serve block below
+          // (fallback-route-params: a blocking render put resolved params in the
+          // skeleton's __NEXT_DATA__.query where `next start` serves the build skeleton
+          // with query {} and lets the client's data fetch materialize the page).
+          (emulatePlatformCache
+            ? !servedFallbackShells.has(requestPathname)
+            : !!platformCache?.readStored) &&
           isReadMethod &&
           !isPagesDataRequest &&
           !isPreviewRequest &&
@@ -2195,7 +2203,6 @@ export function createDispatcher(options: DispatcherOptions) {
           !staticAsset.ppr &&
           /\[[^/]+\]/.test(staticAsset.pathname) &&
           handlerPathname === mp &&
-          !servedFallbackShells.has(requestPathname) &&
           resolution.pool === poolName;
         // Segment-prefetch outputs are independent build-time cache entries, not executable
         // handlers. `handlerPathname` deliberately maps them back to the parent page so dynamic
@@ -2314,16 +2321,45 @@ export function createDispatcher(options: DispatcherOptions) {
         ) {
           const fullPath = path.resolve(process.cwd(), staticAsset.filePath);
           if (existsSync(fullPath)) {
-            if (servePagesDynamicFallbackShell) {
+            if (servePagesDynamicFallbackShell && emulatePlatformCache) {
               // NEXT_ENABLE_ADAPTER's deploy harness has no Valkey. Model one platform cache miss
               // per concrete URL; after the data request materializes the page, later documents
-              // invoke Next's filesystem-cache stand-in. The explicit index.ts gate makes this
-              // process-local marker unreachable in production.
+              // invoke Next's filesystem-cache stand-in.
               if (servedFallbackShells.size >= MAX_SERVED_FALLBACK_SHELLS) {
                 const oldest = servedFallbackShells.values().next().value;
                 if (oldest !== undefined) servedFallbackShells.delete(oldest);
               }
               servedFallbackShells.add(requestPathname);
+            }
+            if (servePagesDynamicFallbackShell && !emulatePlatformCache) {
+              // Production: the client's /_next/data fetch materializes the page through the
+              // non-minimal data render (measured: `inc:/second` written by exactly that);
+              // once it exists the STORED page supersedes the skeleton — without this rung
+              // documents would serve the skeleton forever.
+              const fallbackConcrete = new URL(
+                resolution.invokePath ?? req.url ?? "/",
+                "http://localhost",
+              ).pathname;
+              const fallbackKey = fallbackConcrete === "/" ? "/index" : fallbackConcrete;
+              const stored = await platformCache!.readStored!(fallbackKey, {
+                kind: "PAGES",
+              }).catch(() => null);
+              const sv = stored?.value as
+                | {
+                    kind?: string;
+                    html?: unknown;
+                    headers?: Record<string, string>;
+                    status?: number;
+                  }
+                | undefined;
+              if ((sv?.kind === "PAGES" || sv?.kind === "APP_PAGE") && sv.html != null) {
+                res.writeHead(sv.status ?? 200, {
+                  "content-type": "text/html; charset=utf-8",
+                  ...sanitizeStoredEntryHeaders(sv.headers),
+                });
+                res.end(Buffer.isBuffer(sv.html) ? sv.html : Buffer.from(String(sv.html)));
+                return;
+              }
             }
             const content = readFileSync(fullPath);
             const assetHeaders = staticAsset.headers;
