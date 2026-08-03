@@ -224,6 +224,74 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(prefix?.status).toBe(203);
   });
 
+  it("runs a DYNAMIC RSC request non-minimal WITHOUT injecting the postponed token", async () => {
+    // A dynamic RSC request (rsc: 1, not a prefetch) resolved with minimal+inject returns
+    // only the RESUME TAIL — but the values the client needs live in the STATIC part
+    // (resume-data-cache: seed-era dynamic RSC lacked the shell's number, measured on a
+    // virgin keyspace). next start runs these NON-minimal: the entrypoint itself does
+    // incrementalCache.get(resolvedPathname) and threads entry.postponed's RDC into the
+    // full dynamic render (app-page-runtime.ts:1352-1391) — self-contained given the
+    // shared handler, no injection wanted.
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        platformCache: {
+          read: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>seed shell</html>",
+              postponed: "seed-token",
+              headers: {},
+              status: 200,
+            },
+          }),
+          readStored: async () => null,
+        },
+      }),
+    );
+    const req = mockReq("/ppr-page", { rsc: "1" });
+    await dispatcher.dispatch(req, mockRes(), route);
+    expect(calls).toHaveLength(1);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBeUndefined();
+    expect(calls[0].minimalMode).toBe(false);
+  });
+
+  it("keeps minimal+inject for a full-page PREFETCH RSC request", async () => {
+    // Prefetch flights are the static shell — injection is exactly right for them.
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        localHandlerInvoker: (async (a: any) => {
+          calls.push(a);
+        }) as any,
+        platformCache: {
+          read: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>seed shell</html>",
+              postponed: "seed-token",
+              headers: {},
+              status: 200,
+            },
+          }),
+          readStored: async () => null,
+        },
+      }),
+    );
+    const req = mockReq("/ppr-page", { rsc: "1", "next-router-prefetch": "1" });
+    await dispatcher.dispatch(req, mockRes(), route);
+    expect(calls).toHaveLength(1);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBe("seed-token");
+    expect(calls[0].minimalMode).toBe(true);
+  });
+
   it("serves a segment prefetch from the entry's segmentData", async () => {
     const invoker = vi.fn();
     const dispatcher = createDispatcher(

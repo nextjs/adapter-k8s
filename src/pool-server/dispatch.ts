@@ -3233,10 +3233,23 @@ export function createDispatcher(options: DispatcherOptions) {
               return;
             }
 
+            // A DYNAMIC RSC request (rsc: 1, not a prefetch, not a segment prefetch) must
+            // NOT take minimal+inject: a resume produces only the dynamic TAIL, but the
+            // values the client asserts on live in the STATIC part (resume-data-cache:
+            // seed-era dynamic RSC lacked the shell's number on a virgin keyspace). It runs
+            // NON-minimal instead — the entrypoint itself does incrementalCache.get on the
+            // resolved pathname and threads the entry's postponed RDC into the full dynamic
+            // render (app-page-runtime.ts:1352-1391), self-contained over the shared
+            // handler, and schedules its own background revalidation when the entry is
+            // tag-stale.
+            const isDynamicRsc =
+              req.headers[rscConfig?.header ?? "rsc"] === "1" &&
+              req.headers["next-router-prefetch"] !== "1" &&
+              segmentPrefetchPath === undefined;
             // A STORED entry's postponed token injects even when the SEED is stale — the
             // stored entry passed the handler's own tag check. The disk-shell path keeps
             // the shellUsable gate.
-            if (entryPostponed !== undefined || (shellUsable && shellAvailable)) {
+            if (!isDynamicRsc && (entryPostponed !== undefined || (shellUsable && shellAvailable))) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
               // The materialized entry's token wins over the build token — it carries the
               // regenerated Resume Data Cache.
