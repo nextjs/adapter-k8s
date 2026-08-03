@@ -3062,6 +3062,8 @@ export function createDispatcher(options: DispatcherOptions) {
           // dynamically. A withheld shell + minimal is a truncated document; measured as
           // vary-params-base-dynamic 15/15 failing when the first injection cut ignored this.
           let pprShellInjected = false;
+          /** Trace-only (ADAPTER_K8S_CACHE_TRACE): why the PPR block did or didn't inject. */
+          let pprTraceDetail: Record<string, unknown> | undefined;
           if (
             pprInfo?.postponedState &&
             !entrypointOwnsPprShell &&
@@ -3096,6 +3098,12 @@ export function createDispatcher(options: DispatcherOptions) {
             const shellPath = path.resolve(process.cwd(), pprInfo.fallbackFilePath);
             const shellAvailable = existsSync(shellPath);
             const shellUsable = !isServerAction && !shellStale && shellWithinWindow;
+            pprTraceDetail = {
+              shellStale,
+              shellWithinWindow,
+              shellAvailable,
+              isServerAction,
+            };
 
             // MATERIALIZATION READ: the platform cache (Valkey classic handler; get() owns
             // tag staleness and falls back to the build seed) is the authority when wired.
@@ -3329,6 +3337,8 @@ export function createDispatcher(options: DispatcherOptions) {
             console.log(
               `[cache-trace] ${JSON.stringify({
                 op: "gate-inputs",
+                injected: pprShellInjected,
+                ...pprTraceDetail,
                 url: req.url,
                 matched: resolution.matchedPathname,
                 handlerPathname,

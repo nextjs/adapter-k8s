@@ -659,6 +659,24 @@ function isReservedContextDest(relDest: string): boolean {
   return relDest === "config" || relDest.startsWith("config/");
 }
 
+/**
+ * Sibling files a prerendered document needs at RUNTIME that the static-assets manifest
+ * does not carry: the `.meta` next to a `server/{app,pages}` html prerender (postponed
+ * state + segmentPaths — what the fs-mirror seed reads). The staging loop copies exactly
+ * the manifest's filePaths, so pool images shipped `.html` + `.segments` with ZERO `.meta`
+ * files and every PPR fs-mirror seed silently missed in containers (measured:
+ * resume-data-cache pods) while local runs — cwd = the real build dir — worked.
+ */
+export function prerenderSiblingFiles(asset: {
+  filePath: string;
+  prerender?: boolean;
+}): string[] {
+  if (!asset.prerender) return [];
+  if (!/(^|[/\\])server[/\\](app|pages)[/\\]/.test(asset.filePath)) return [];
+  if (!asset.filePath.endsWith(".html")) return [];
+  return [`${asset.filePath.slice(0, -".html".length)}.meta`];
+}
+
 export async function stageFile(
   projectDir: string,
   sourcePath: string,
@@ -2185,6 +2203,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           for (const asset of staticManifest) {
             const absPath = path.resolve(projectDir, asset.filePath);
             await stageFile(projectDir, absPath, asset.filePath, poolName);
+            // Runtime sibling files the manifest doesn't carry (`.meta` — see
+            // prerenderSiblingFiles). stageFile skips missing sources, so a prerender
+            // without one costs nothing.
+            for (const sibling of prerenderSiblingFiles(asset)) {
+              await stageFile(projectDir, path.resolve(projectDir, sibling), sibling, poolName);
+            }
           }
 
           if (outputs.middleware?.filePath) {
