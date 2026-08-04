@@ -4,6 +4,7 @@ import {
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   requestTargetPathname,
+  UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../routing-common.js";
 import { guardStreamErrors, timingSafeStringEqual } from "./dispatch.js";
 
@@ -61,6 +62,14 @@ export function applyRequestTrustBoundary(
     ? typeof presentedSecret === "string" && timingSafeStringEqual(presentedSecret, internalSecret)
     : trustInternalHeaders;
   delete req.headers[INTERNAL_SECRET_HEADER];
+
+  // These are private Next.js control headers, not trusted adapter dispatch headers. Never
+  // preserve a network-supplied value, even when this request carries a valid dispatch secret:
+  // the upstream routing tier may otherwise turn public resume controls into trusted postponed
+  // state. Legitimate resume controls are synthesized later on private local invocations.
+  for (const h of UNTRUSTED_NEXT_REQUEST_HEADERS) {
+    delete req.headers[h];
+  }
 
   // Strip internal routing headers from untrusted sources. A client must not be able to
   // spoof the dispatch protocol (e.g. x-output-id → dispatch straight to a handler, skipping

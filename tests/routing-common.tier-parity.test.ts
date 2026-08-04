@@ -35,6 +35,7 @@ import {
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   parseRequestUrl,
+  UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../src/routing-common.js";
 
 const ORIGIN = "http://app.example.com";
@@ -725,7 +726,11 @@ describe("Phase 1 / Phase 2 middleware response parity (N40 / findings #16, #35,
     // … and must clear the WHOLE vocabulary (plus the secret) so the pool re-resolves untrusted.
     expect(r.phase2.dispatch("x-mw-evaluated")).toBeUndefined();
     expect(new Set(r.phase2.removeHeaders)).toEqual(
-      new Set([...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]),
+      new Set([
+        ...INTERNAL_DISPATCH_HEADERS,
+        ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+        INTERNAL_SECRET_HEADER,
+      ]),
     );
   });
 
