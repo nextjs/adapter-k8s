@@ -58,6 +58,17 @@ export const INTERNAL_DISPATCH_HEADERS = [
   "x-mw-request-headers",
 ] as const;
 
+// Next.js treats these as private request-control headers. `next-resume: 1` tells the App Router
+// to deserialize the request body as trusted postponed state; `x-next-resume-state-length` frames
+// postponed state prepended to a Server Action body. They are NOT part of the adapter's
+// secret-gated dispatch protocol: no network hop is allowed to preserve client-supplied values.
+// The pool creates either header only after this boundary, so stripping them at both public
+// ingress tiers does not interfere with legitimate resume handling.
+export const UNTRUSTED_NEXT_REQUEST_HEADERS = [
+  "next-resume",
+  "x-next-resume-state-length",
+] as const;
+
 // Recognized `x-mw-evaluated` verdicts that authorize the pool to skip its own middleware.
 // `ran` = matched + executed; `skip-nomatch` = middleware exists but matcher didn't match;
 // `none` = the app has no middleware. Anything else (incl. `error` / absent) ⇒ do NOT skip.

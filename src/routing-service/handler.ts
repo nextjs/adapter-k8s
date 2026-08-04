@@ -29,6 +29,7 @@ import {
   serializeHeaderMap,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
+  UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../routing-common.js";
 
 type LoadedModule = Record<string, unknown>;
@@ -205,6 +206,7 @@ export function createRequestHandler(
           (h) =>
             !h.key.startsWith(":") &&
             !(INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.key.toLowerCase()) &&
+            !(UNTRUSTED_NEXT_REQUEST_HEADERS as readonly string[]).includes(h.key.toLowerCase()) &&
             h.key.toLowerCase() !== INTERNAL_SECRET_HEADER,
         )
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
@@ -263,7 +265,7 @@ export function createRequestHandler(
     if (middlewareModule && method !== "GET" && method !== "HEAD") {
       return buildHeaderMutationResponse(
         [],
-        [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER],
+        [...INTERNAL_DISPATCH_HEADERS, ...UNTRUSTED_NEXT_REQUEST_HEADERS, INTERNAL_SECRET_HEADER],
       );
     }
 
@@ -691,7 +693,7 @@ export function createRequestHandler(
       // cost the body backstop pays, and it is the fail-safe direction.)
       return buildHeaderMutationResponse(
         [],
-        [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER],
+        [...INTERNAL_DISPATCH_HEADERS, ...UNTRUSTED_NEXT_REQUEST_HEADERS, INTERNAL_SECRET_HEADER],
       );
     }
 
@@ -717,7 +719,11 @@ export function createRequestHandler(
     // Every internal dispatch header the extension does NOT set this response must be actively
     // removed, so a client can't smuggle one past the extension (setHeaders only overwrites the
     // keys it lists). We start by clearing all of them, then un-clear each key we set below.
-    const clear = new Set<string>([...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]);
+    const clear = new Set<string>([
+      ...INTERNAL_DISPATCH_HEADERS,
+      ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+      INTERNAL_SECRET_HEADER,
+    ]);
     const setDispatch = (key: string, value: string) => {
       mutations.push({ key, value });
       clear.delete(key);
@@ -890,7 +896,7 @@ export function createRequestHandler(
       );
       return buildHeaderMutationResponse(
         [],
-        [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER],
+        [...INTERNAL_DISPATCH_HEADERS, ...UNTRUSTED_NEXT_REQUEST_HEADERS, INTERNAL_SECRET_HEADER],
       );
     }
 
