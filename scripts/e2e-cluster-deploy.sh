@@ -114,9 +114,12 @@ chmod 600 "${APP_DIR}/.k8s-adapter/internal-secret.key" 2>/dev/null || true
 # build an image from. Must be set before sourcing common, which defaults it to 1.
 export ADAPTER_K8S_SKIP_STAGING=0
 
-# No deploymentId on a real cluster — it pins Next's build id to a literal constant, which
-# collapses blue/green across every suite. See the long note in e2e-setup-common.sh.
-export ADAPTER_K8S_SET_DEPLOYMENT_ID=0
+# deploymentId is ON for cluster runs again: Next still pins its BUILD_ID to a literal
+# constant in deploymentId mode, but the adapter now substitutes the (unique-per-deploy)
+# deploymentId as its effective build id (effectiveBuildId, src/adapter.ts), so blue/green
+# names, image tags, and the Valkey namespace stay unique. Suites that assert `?dpl=` asset
+# URLs, worker NEXT_DEPLOYMENT_ID, and skew headers need the id end-to-end — and the
+# deployment-skew fixtures refuse to BUILD without one.
 
 # --- 2. Shared setup: pack adapter, install, build ---
 # shellcheck source=./e2e-setup-common.sh
@@ -173,6 +176,28 @@ process.stdout.write(j.hosts[0]);
 # over plain HTTP (http://<host>.localhost:<port>). The wrapper that knows the topology
 # exports the base URL; the hostname-derived HTTPS form stays the default for cloud runs.
 URL="${ADAPTER_K8S_E2E_BASE_URL:-https://${HOST}}"
+
+# LOCAL topology only: before trusting any HTTP probe, require the release's HTTPRoute to be
+# Accepted by the gateway controller. The curl gate deliberately tolerates 404 (an app may
+# 404 at /), which made it blind to the one local failure mode that matters: a route whose
+# listener never attached (measured: merged-gateway listener conflicts 404'd every request
+# and the gate waved it through; 40+ suites then failed on empty bodies).
+if [ -n "${ADAPTER_K8S_E2E_BASE_URL:-}" ]; then
+  RELEASE_NAME_JSON="$(node -e "
+    process.stdout.write(require('${APP_DIR}/.k8s-adapter/infrastructure.json').releaseName);
+  ")"
+  ROUTE_OK=0
+  for _i in $(seq 1 30); do
+    ACCEPTED="$(kubectl get httproute "${RELEASE_NAME_JSON}-routes"       -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}' 2>/dev/null || true)"
+    [ "$ACCEPTED" = "True" ] && { ROUTE_OK=1; break; }
+    sleep 2
+  done
+  if [ "$ROUTE_OK" -ne 1 ]; then
+    MSG="$(kubectl get httproute "${RELEASE_NAME_JSON}-routes"       -o jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].message}' 2>/dev/null || true)"
+    echo "[adapter-k8s] HTTPRoute ${RELEASE_NAME_JSON}-routes is NOT Accepted: ${MSG:-no status}" >&2
+    exit 1
+  fi
+fi
 # Require a RUN of consecutive good responses, not one. `deploy` returns once the new
 # rollout is complete, but the previous build's pods are still draining and the routing
 # service is still rolling — measured on this cluster, requests in that window return 503

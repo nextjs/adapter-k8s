@@ -280,6 +280,49 @@ describe("pool build context staging", () => {
     ).toBe(true);
   });
 
+  it("never lets a traced asset clobber the reserved config/ manifests (stale-emulate trap)", async () => {
+    // Live on GKE 2026-07-30: EIGHT consecutive fixture deploys failed at the routing
+    // manifest-match guard. The staged context's config/routing-manifest.json carried a build
+    // id from TWO DAYS earlier — `adapter-k8s emulate` had left its scratch copies in
+    // projectDir/config/, Next's file tracing swept them into the NODE middleware's asset set
+    // (155 assets; the middleware shares code that reads CONFIG_DIR), and the asset-staging
+    // loop then bulk-copied them OVER the fresh manifests the same build had just written.
+    // The guard refused every genuinely-stale image, exactly as designed. `config/` inside a
+    // build context is the adapter's reserved namespace: traced assets must never land there.
+    seedProject();
+    const staleManifest = writeFile(
+      "config/routing-manifest.json",
+      JSON.stringify({ buildId: "STALE-EMULATE-SCRATCH" }),
+    );
+    const stalePool = writeFile(
+      "config/pool-manifest-default.json",
+      JSON.stringify({ buildId: "STALE-EMULATE-SCRATCH" }),
+    );
+    const mwFile = writeFile(".next/server/middleware.js", "// mw");
+    await build({
+      middleware: {
+        id: "middleware",
+        filePath: mwFile,
+        pathname: "/_middleware",
+        type: 8,
+        runtime: "nodejs",
+        assets: {
+          "config/routing-manifest.json": staleManifest,
+          "config/pool-manifest-default.json": stalePool,
+        },
+        config: { matchers: [] },
+      },
+    });
+
+    const routingCtx = (rel: string) =>
+      path.join(projectDir, ".k8s-adapter/output/routing-service/context", rel);
+    const staged = readFileSync(routingCtx("config/routing-manifest.json"), "utf8");
+    expect(staged).not.toContain("STALE-EMULATE-SCRATCH");
+    // The pool context's config/ is reserved for the same reason.
+    const poolStaged = readFileSync(poolContext("config/pool-manifest-ssr.json"), "utf8");
+    expect(poolStaged).not.toContain("STALE-EMULATE-SCRATCH");
+  });
+
   // N50 (review #33): `.next` was hardcoded at every staging site and each site was guarded
   // by existsSync, so a custom distDir staged no chunks and no `<dist>/node_modules`
   // externals — the pool could not load a single handler, silently.

@@ -378,3 +378,52 @@ describe("hostname validation at the consumption point", () => {
     ).toThrow(/Invalid pool name/);
   });
 });
+
+describe("renderHTTPRoute path-prefix encoding", () => {
+  // Full-run v4 (interception-dynamic-single-segment 9/9, non-ascii-cache-tags 6/6,
+  // prerender-encoding 1/1 — 16 tests): Gateway API restricts Exact/PathPrefix values to
+  // ^(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9a-fA-F]{2})+$, and helm's server-side apply
+  // rejected the whole HTTPRoute for any app with a non-ASCII or space-containing first
+  // segment — the deploy failed wholesale. On the wire clients percent-encode exactly those
+  // bytes, so emitting the ENCODED form is also the form that actually matches requests.
+  const GATEWAY_PATH_RE = /^(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9a-fA-F]{2})+$/;
+
+  const pathValues = (yaml: string): string[] =>
+    [...yaml.matchAll(/path: \{ type: \w+, value: "([^"]*)" \}/g)].map((m) => m[1]!);
+
+  it("percent-encodes a non-ASCII prefix so the apiserver accepts it and the wire form matches", () => {
+    const pools = makePools(1);
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      routingManifest: makeManifest({ "/产品/page": "pool0" }),
+    });
+    for (const v of pathValues(yaml)) expect(v).toMatch(GATEWAY_PATH_RE);
+    expect(yaml).toContain(`value: "/%E4%BA%A7%E5%93%81"`);
+  });
+
+  it("percent-encodes a space-containing prefix", () => {
+    const pools = makePools(1);
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      routingManifest: makeManifest({ "/hello world/page": "pool0" }),
+    });
+    for (const v of pathValues(yaml)) expect(v).toMatch(GATEWAY_PATH_RE);
+    expect(yaml).toContain(`value: "/hello%20world"`);
+  });
+
+  it("leaves already-legal prefixes exactly as-is (no double encoding, no drift)", () => {
+    const pools = makePools(1);
+    const yaml = renderHTTPRoute({
+      releaseName: "nextjs",
+      hosts,
+      pools,
+      routingManifest: makeManifest({ "/products(v2)/page": "pool0", "/a.b~c/page": "pool0" }),
+    });
+    expect(yaml).toContain(`value: "/products(v2)"`);
+    expect(yaml).toContain(`value: "/a.b~c"`);
+  });
+});

@@ -798,6 +798,18 @@ export function prepareRequest(
     trailingSlash?: boolean | undefined;
   },
 ): PrepareResult {
+  // Strip client-sent x-middleware-* control headers FIRST — this is the shared entry for
+  // both tiers, and Phase-2 middleware runs at the routing tier on these very headers. A
+  // spoofed `x-middleware-set-cookie` request header round-tripped through
+  // NextResponse.next()'s x-middleware-override-headers and materialized as a cookie the
+  // client never set (app-middleware-proxy). The pool's server.ts does the same strip for
+  // Phase 1; doing it here too is idempotent. The public prefetch hint is protocol, kept.
+  for (const name of [...headers.keys()]) {
+    if (name.startsWith("x-middleware-") && name !== "x-middleware-prefetch") {
+      headers.delete(name);
+    }
+  }
+
   // Malformed percent-encoding in the path → 400, matching upstream.
   try {
     decodeURIComponent(requestUrl.pathname);

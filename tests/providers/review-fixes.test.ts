@@ -35,6 +35,36 @@ describe("review fix 1: the proxy selector needs BOTH halves of the gateway iden
     expect(sel.labels["gateway.envoyproxy.io/owning-gateway-namespace"]).toBeTruthy();
   });
 
+  it("ALSO admits the class-owned MERGED proxy (EnvoyProxy mergeGateways)", () => {
+    // Under `mergeGateways` — how Phase-2 lanes share one data plane — proxy pods are owned by
+    // the GatewayCLASS, not any Gateway: their labels are `owning-gatewayclass: <class>` and
+    // NEITHER owning-gateway-name nor -namespace exists. The per-gateway peer therefore never
+    // matches, and on a netpol-enforcing CNI (k3s enforces even on flannel) every proxy→pool
+    // and proxy→ext_proc connection is REFUSED: measured on k3d, pods Ready while Envoy got
+    // connection-refused, gate timed out at 503 for 180s, fail-closed 500s after.
+    // TENANCY TRADE, stated: the merged proxy is shared by every release on the class, so
+    // admitting it admits the shared data plane to this release's ext_proc port. That is
+    // inherent to choosing merged gateways — per-release proxy identity does not exist there.
+    const cfg = genericCfg();
+    const sels = resolveProvider(cfg).strictIngressSources({
+      releaseName: "my-app",
+      pools,
+      routingManifest,
+      config: cfg,
+    }).podSelectors;
+    const merged = sels.find(
+      (s) => s.labels["gateway.envoyproxy.io/owning-gatewayclass"] !== undefined,
+    );
+    expect(merged).toBeDefined();
+    expect(merged!.labels["gateway.envoyproxy.io/owning-gatewayclass"]).toBe("eg");
+    expect(merged!.labels["app.kubernetes.io/name"]).toBe("envoy");
+    // The per-gateway peer must REMAIN — single-gateway (non-merged) deployments still rely
+    // on it, and peers are OR'd.
+    expect(
+      sels.some((s) => s.labels["gateway.envoyproxy.io/owning-gateway-name"] === "my-app-gateway"),
+    ).toBe(true);
+  });
+
   it("renders the namespace label through helm, since only helm knows the release namespace", () => {
     const cfg = genericCfg();
     const np = renderNetworkPolicies({

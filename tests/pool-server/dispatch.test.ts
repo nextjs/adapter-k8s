@@ -575,7 +575,10 @@ describe("createDispatcher", () => {
 
     expect(handlerLoader.load).toHaveBeenCalledWith("/docs/404");
     expect(localHandlerInvoker).toHaveBeenCalledWith(
-      expect.objectContaining({ matchedPathname: "/docs/404", forceStatus: 404 }),
+      // invokeStatus tells the RENDER it is a 404 (Next then emits the default not-found
+      // metadata — robots noindex; metadata-navigation "root not-found with default
+      // metadata"); forceStatus alone only rewrites the status after the fact.
+      expect.objectContaining({ matchedPathname: "/docs/404", forceStatus: 404, invokeStatus: 404 }),
     );
   });
 
@@ -2941,6 +2944,43 @@ describe("createDispatcher", () => {
 
       expect(localHandlerInvoker).toHaveBeenCalledOnce();
       expect(localHandlerInvoker.mock.calls[0][0].matchedPathname).toBe("/page");
+    });
+
+    it("strips the .rsc suffix before deriving route params for a concrete prerender variant", async () => {
+      // @next/routing >= 16.3.0-preview.10: when a concrete `.rsc` pathname matches
+      // statically, the rsc-variant dynamic route is skipped (shouldUseDynamicMatch gate),
+      // so the resolution arrives with routeMatches: null. Params must then derive from the
+      // SUFFIX-STRIPPED concrete path — "/prerendered.rsc" parsed against /[slug] as-is put
+      // "prerendered.rsc" IN THE PARAM (prefetch-app-shell-cached-gsp: "Slug:
+      // prerendered.rsc", deterministic in baseline v12).
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const has = vi.fn((p: string) => p === "/[slug]");
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has,
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        outputIds: ["/[slug]", "/[slug].rsc"],
+        localHandlerInvoker,
+        rscConfig: { header: "rsc", suffix: ".rsc" },
+      });
+
+      const req = mockReq("/prerendered.rsc", { rsc: "1" });
+      const res = mockRes();
+      await dispatcher.dispatch(req, res as unknown as ServerResponse, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/prerendered.rsc",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+      expect(localHandlerInvoker.mock.calls[0][0].routeParamPathname).toBe("/prerendered");
     });
 
     it("forwards middleware redirect response headers (NextResponse.redirect with headers)", async () => {

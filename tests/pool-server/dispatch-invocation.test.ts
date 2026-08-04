@@ -28,10 +28,14 @@ import type { ResolveResult } from "../../src/pool-server/resolve.js";
 
 type NodeHandler = (req: IncomingMessage, res: ServerResponse, ctx: any) => unknown;
 
-function mockReq(url: string, headers: Record<string, string> = {}): IncomingMessage {
+function mockReq(
+  url: string,
+  headers: Record<string, string> = {},
+  method: string = "GET",
+): IncomingMessage {
   return {
     url,
-    method: "GET",
+    method,
     headers: { host: "app.example.com", ...headers },
     pipe: vi.fn(),
   } as unknown as IncomingMessage;
@@ -103,6 +107,42 @@ function makeDispatcher(handler: NodeHandler, options: Record<string, unknown> =
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("RSC cache-busting query param (_rsc)", () => {
+  it("strips _rsc from the invocation URL for RSC requests, keeping other params", async () => {
+    // base-server deletes NEXT_RSC_UNION_QUERY ('_rsc') from the render query
+    // (base-server.ts:2719-2722) — the param exists only to partition browser/CDN caches.
+    // Our loopback kept it, so the generated entrypoint saw an unexpected query param,
+    // ssgCacheKey went null, and the stale-entry BACKGROUND REVALIDATION gate disarmed:
+    // resume-data-cache's post-revalidateTag flow served stale forever under the suite's
+    // cache-busted fetches while the identical param-less curl sequence passed.
+    let innerUrl: string | undefined;
+    const handler: NodeHandler = (req, res) => {
+      innerUrl = req.url;
+      res.writeHead(200, { "content-type": "text/x-component" });
+      res.end("flight");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(
+      mockReq("/api/echo?_rsc=abc123&keep=1", { rsc: "1" }),
+      mockRes(),
+      routeResolution(),
+    );
+    expect(innerUrl).toBe("/api/echo?keep=1");
+  });
+
+  it("leaves non-RSC requests untouched", async () => {
+    let innerUrl: string | undefined;
+    const handler: NodeHandler = (req, res) => {
+      innerUrl = req.url;
+      res.writeHead(200, {});
+      res.end("ok");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(mockReq("/api/echo?_rsc=abc123"), mockRes(), routeResolution());
+    expect(innerUrl).toBe("/api/echo?_rsc=abc123");
+  });
 });
 
 describe("requestMeta.initURL public scheme", () => {
@@ -337,7 +377,55 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     return { calls, invoker };
   }
 
-  it("invokes PPR handlers non-minimal when incrementalCacheShared owns the shell", async () => {
+  it("injects the build shell for PPR under incrementalCacheShared too (k3d sub-shell family)", async () => {
+    // The previous pin here expected NON-minimal with no injection, on the premise that a
+    // registered classic cacheHandler means "Next itself performs the shell lookup + resume
+    // join through the shared incremental cache". Measured false on the k3d cluster
+    // (sub-shell-generation 6/7 failing: "(runtime)" layouts where "(buildtime)" is
+    // expected): the generated adapter entrypoints are per-request render modules — the
+    // route-shell orchestration lives in NextServer, which the pool replaces. The shell
+    // dance is the PLATFORM's job in both cache modes; cross-replica coherence comes from
+    // checkShellStale (live tag check against the shared Valkey manifest), exactly as on
+    // the proven no-classic-handler path.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-shell-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {
+          "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile },
+        },
+        incrementalCacheShared: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      // Same shape as the no-classic-handler path: minimal render resumes onto the
+      // injected token, and the document response is [shell][resume].
+      expect(calls[0].minimalMode).toBe(true);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBe("token");
+      expect(calls[0].responsePrefix?.filePath).toBe(shellFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps Server Actions on shell-bearing PPR routes NON-minimal under incrementalCacheShared", async () => {
+    // resume-data-cache "should use RDC for server action re-renders": the injection path
+    // deliberately never touches actions (the x-next-resume-state-length body framing is
+    // Next's own), so a minimal action invocation would re-render without the Resume Data
+    // Cache and produce fresh values. Actions keep the non-minimal path where Next performs
+    // the action + inline resume itself.
     const { calls, invoker } = invokerCapture();
     const dispatcher = createDispatcher({
       handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
@@ -348,18 +436,264 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
       incrementalCacheShared: true,
       localHandlerInvoker: invoker as any,
     });
+    const req = mockReq("/ppr-page", { "next-action": "abc123" }, "POST");
+    await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(false);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBeUndefined();
+  });
+
+  it("runs a VERIFIED on-demand revalidation request NON-minimal (revalidate-reason)", async () => {
+    // res.revalidate() sends x-prerender-revalidate: <previewModeId>. next start serves that
+    // request non-minimal, so getStaticProps sees revalidateReason 'on-demand' AND the fresh
+    // entry is written through the registered cache handler. Our minimal default suppressed
+    // both — the revalidation rendered with reason 'build' and persisted nothing.
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-123";
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/isr-page", vi.fn(), "PAGES"),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {},
+        incrementalCacheShared: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/isr-page", { "x-prerender-revalidate": "pmid-123" });
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/isr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
+  });
+
+  it("keeps an UNVERIFIED revalidate header minimal (spoof guard)", async () => {
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-123";
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/isr-page", vi.fn(), "PAGES"),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {},
+        incrementalCacheShared: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/isr-page", { "x-prerender-revalidate": "wrong-token" });
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/isr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(true);
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
+  });
+
+  it("stays NON-minimal for a partialPrefetching build (partialFallback contract is Next's)", async () => {
+    // cache-components-prerender-matrix declares `partialPrefetching: true` and its
+    // expectations are, per its own config comment, "the partialFallback serving contract"
+    // — on-demand shell specialization and entry sharing across never-prerenderable
+    // params. The adapter implements none of that, and minimal+inject made it WORSE
+    // (3/60 -> 13/60 at baseline v6) by freezing a generic shell where Next's own
+    // non-minimal path was already specializing per param set. Leave these builds to Next.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-pp-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      // Control: WITHOUT the flag this usable shell is injected (minimal).
+      const control = invokerCapture();
+      const controlDispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: { "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile } },
+        incrementalCacheShared: true,
+        localHandlerInvoker: control.invoker as any,
+      });
+      await controlDispatcher.dispatch(
+        mockReq("/ppr-page"),
+        mockRes(),
+        routeResolution({ matchedPathname: "/ppr-page" }),
+      );
+      expect(control.calls[0].minimalMode).toBe(true);
+
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: { "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile } },
+        incrementalCacheShared: true,
+        partialPrefetching: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("runs NON-minimal for a runtime-static-capable template with no build asset (shared cache)", async () => {
+    // sub-shell-generation-middleware: middleware rewrites /not-broken -> /rewrite/not-broken,
+    // whose template /rewrite/[slug] has prerender-manifest fallback: null — Next's
+    // declaration that non-prerendered paths are generatable at runtime. next start renders
+    // it non-minimally and MATERIALIZES it (postponed=False on disk) so the next request is
+    // HIT; a minimal render never writes through the cache handler, so the pool served
+    // MISS forever (zero Valkey writes measured on the lane-4 probe).
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/rewrite/[slug]", vi.fn(), "APP_PAGE"),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      incrementalCacheShared: true,
+      runtimeStaticTemplates: new Set(["/rewrite/[slug]"]),
+      localHandlerInvoker: invoker as any,
+    });
     await dispatcher.dispatch(
-      mockReq("/ppr-page"),
+      mockReq("/rewrite/not-broken"),
       mockRes(),
-      routeResolution({ matchedPathname: "/ppr-page" }),
+      routeResolution({ matchedPathname: "/rewrite/[slug]", routeMatches: { slug: "not-broken" } }),
     );
     expect(calls).toHaveLength(1);
-    // Non-minimal: Next itself performs the shell lookup + resume join through the
-    // shared incremental cache; minimal mode returned a bare postponed shell that
-    // nothing resumed (live PPR documents were served with unfilled dynamic holes).
     expect(calls[0].minimalMode).toBe(false);
-    // The entry owns the shell — the build-time token/prefix must NOT be injected.
+  });
+
+  it("stays MINIMAL for the same shape when the template is not runtime-static-capable", async () => {
+    // Control: without the prerender-manifest signal nothing changes — the otel/fallback-shells
+    // lesson is that broad non-minimal flips regress cache-verdict semantics elsewhere.
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/rewrite/[slug]", vi.fn(), "APP_PAGE"),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      incrementalCacheShared: true,
+      localHandlerInvoker: invoker as any,
+    });
+    await dispatcher.dispatch(
+      mockReq("/rewrite/not-broken"),
+      mockRes(),
+      routeResolution({ matchedPathname: "/rewrite/[slug]", routeMatches: { slug: "not-broken" } }),
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(true);
+  });
+
+  it("stays NON-minimal for a partialPrefetching build even WITHOUT a shared cache", async () => {
+    // The no-Valkey posture: injection is gated off for partialPrefetching builds, and
+    // without incrementalCacheShared no other rung forced non-minimal — a minimal render
+    // with no injected shell is a truncated document (bare postponed shell, dynamic holes
+    // never streamed). partialPrefetching must force non-minimal on its own.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-pp-nv-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: { "/ppr-page": { postponedState: "token", fallbackFilePath: shellFile } },
+        incrementalCacheShared: false,
+        partialPrefetching: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to NON-minimal when the shell is tag-stale (vary-params tag flows)", async () => {
+    // A withheld shell + minimal render is a truncated document (bare postponed shell that
+    // nothing resumes). When checkShellStale reports the baked tags revalidated, the route
+    // must take the non-minimal path: Next renders the complete document dynamically —
+    // exactly the pre-injection behavior these suites were green under.
+    const { calls, invoker } = invokerCapture();
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprRoutes: {
+        "/ppr-page": {
+          postponedState: "token",
+          fallbackFilePath: ".next/server/app/ppr-page.html",
+          tags: ["t1"],
+        },
+      },
+      incrementalCacheShared: true,
+      checkShellStale: async () => true,
+      localHandlerInvoker: invoker as any,
+    });
+    const req = mockReq("/ppr-page");
+    await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(false);
+    const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+    expect(meta?.postponed).toBeUndefined();
     expect(calls[0].responsePrefix).toBeUndefined();
+  });
+
+  it("falls back to NON-minimal when the shell's time-based revalidate window expired", async () => {
+    // pprRoutes[].revalidate was latent — a shell with `revalidate: 1` (vary-params) must
+    // stop being injected after its window, like the concrete-seed path already does.
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-shell-"));
+    const shellFile = path.join(dir, "ppr-page.html");
+    writeFileSync(shellFile, "<html>shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [],
+        pprRoutes: {
+          "/ppr-page": {
+            postponedState: "token",
+            fallbackFilePath: shellFile,
+            revalidate: 1,
+          },
+        },
+        incrementalCacheShared: true,
+        builtAt: new Date(Date.now() - 60_000).toISOString(),
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/ppr-page");
+      await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
+      expect(calls).toHaveLength(1);
+      expect(calls[0].minimalMode).toBe(false);
+      const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(meta?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // N16: a PPR-capable route whose build emitted NO fallback shell (`fallback: null`) is absent
@@ -522,9 +856,15 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
         [false, false, true, true], // early-span: STILL minimal — the rung was measured out (above)
         [false, true, false, false], // unresolved root params (the live shell-less reason)
         [false, true, true, false], // …and wouldPostpone does not subtract from it
-        [true, false, false, false], // shell-bearing, via handlerPprInfo
+        // Shell-bearing rows: minimal EXACTLY when the shell is usable and injected. In
+        // this table the fallbackFilePath does not exist on disk, so injection declines and
+        // the route takes the non-minimal complete-render path — the degradation rule that
+        // keeps a withheld shell from producing a truncated minimal document (measured:
+        // vary-params-base-dynamic 15/15 when the first cut ignored it). The usable-shell
+        // minimal+inject case is pinned by the dedicated injection tests above.
+        [true, false, false, false], // shell unusable (missing file) → non-minimal
         [true, false, true, false],
-        [true, true, false, false],
+        [true, true, false, false], // root params always win
         [true, true, true, false],
       ];
 
@@ -540,7 +880,8 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
               ? {
                   "/x/[id]": {
                     postponedState: "token",
-                    // incrementalCacheShared owns the shell, so nothing is read from disk here.
+                    // Deliberately ABSENT on disk: these rows pin the unusable-shell
+                    // degradation (non-minimal complete render).
                     fallbackFilePath: ".next/server/app/x/[id].html",
                   },
                 }

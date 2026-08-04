@@ -1112,3 +1112,41 @@ describe("allowQuery on PPR manifest entries (matrix key registry)", () => {
     expect((manifest.pprRoutes["/m/[lang]/[id]"] as any)?.allowQuery).toEqual(["lang"]);
   });
 });
+
+describe("buildRoutingManifest public files", () => {
+  // Full-run v4 (custom-routes-catchall, i18n-ignore-rewrite-source-locale): a next.config
+  // rewrite whose destination is a PUBLIC file 404'd — the manifest's `pathnames` came only
+  // from build outputs, so @next/routing had no filesystem route for `/another.txt` and the
+  // rewrite fell through (`next start` serves public files as filesystem routes between
+  // beforeFiles and afterFiles). Public pathnames must join the manifest.
+  it("includes public/ file pathnames so rewrites can target them", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const nodePath = await import("node:path");
+    const projectDir = mkdtempSync(nodePath.join(os.tmpdir(), "manifest-public-"));
+    try {
+      mkdirSync(nodePath.join(projectDir, "public", "static"), { recursive: true });
+      writeFileSync(nodePath.join(projectDir, "public", "another.txt"), "some text");
+      writeFileSync(nodePath.join(projectDir, "public", "static", "data.txt"), "some data...");
+      const outputs = mockOutputs({ appPages: [mockAppPage({ pathname: "/hello" })] });
+      const pools = new Map<string, PoolDefinition>([
+        ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
+      ]);
+      const manifest = buildRoutingManifest({
+        routing: mockRouting(),
+        outputs,
+        pools,
+        buildId: "b",
+        basePath: "",
+        i18n: null,
+        trailingSlash: false,
+        nextVersion: "16.2.0",
+        projectDir,
+      } as any);
+      expect(manifest.pathnames).toContain("/another.txt");
+      expect(manifest.pathnames).toContain("/static/data.txt");
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+});

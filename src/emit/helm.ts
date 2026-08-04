@@ -8,7 +8,10 @@ import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
 import { renderService, renderActiveService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
-import { renderRoutingManifestConfigMap } from "./templates/routing-manifest-configmap.js";
+import {
+  renderRoutingManifestConfigMap,
+  renderRoutingManifestSnapshotConfigMap,
+} from "./templates/routing-manifest-configmap.js";
 import { sanitizeK8sName } from "./templates/utils.js";
 import { renderRoutingServiceDeployment } from "./templates/routing-service-deployment.js";
 import { renderRoutingServiceService } from "./templates/routing-service-service.js";
@@ -75,6 +78,7 @@ export function generateHelmChart({
   infrastructure,
   internalSecret,
   imageDigests,
+  deploymentId,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -87,6 +91,8 @@ export function generateHelmChart({
   /** Mirrors the GCP callout failOpen to the server (ROUTING_FAIL_OPEN) for a consistent policy. */
   routingFailOpen?: boolean;
   infrastructure?: { projectId?: string; region?: string };
+  /** next.config `deploymentId`, rendered as NEXT_DEPLOYMENT_ID into pool + routing pods. */
+  deploymentId?: string;
   /**
    * Shared secret authenticating internal dispatch headers between the routing service and the
    * pools. Both deployments read it from the rendered Secret, so they always agree.
@@ -182,6 +188,15 @@ export function generateHelmChart({
     releaseName,
     routingManifestJson,
   });
+  // PER-BUILD manifest CM — the one the routing Deployment actually mounts (2026-07-30).
+  // The stable CM above is kept for compatibility: pre-change retained renders and the
+  // revert path still reference it, and it costs one small object per release.
+  files["templates/routing-manifest-snapshot-configmap.yaml"] =
+    renderRoutingManifestSnapshotConfigMap({
+      releaseName,
+      buildId,
+      routingManifestJson,
+    });
 
   // The ingress tier (Gateway + route + any CDN attachment) is the first seam to move behind
   // the provider interface — see plans/multi-provider-aks-eks-generic.md. Emitting nothing when
@@ -228,6 +243,7 @@ export function generateHelmChart({
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
       ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
       ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,
@@ -269,6 +285,12 @@ export function generateHelmChart({
       ...(routingFailOpen !== undefined ? { failOpen: routingFailOpen } : {}),
       ...(rs?.requestTimeoutMs !== undefined ? { requestTimeoutMs: rs.requestTimeoutMs } : {}),
       ...(imageDigests?.routingService ? { imageDigest: imageDigests.routingService } : {}),
+      // TOP-LEVEL env only (no pool merge — middleware belongs to no pool): NODE-runtime
+      // middleware executes in this container and reads process.env at request time
+      // (full run, middleware-general "allows to access env variables").
+      ...(Object.keys(config.env ?? {}).length > 0 ? { env: config.env } : {}),
+      ...((config.envFrom ?? []).length > 0 ? { envFrom: config.envFrom } : {}),
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,

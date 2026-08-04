@@ -601,12 +601,31 @@ class RespClient implements ValkeyClient {
     const password = this.password ?? userinfoPassword;
     if (password && !useTls) warnPlaintextAuthOnce();
 
-    // Lazy dynamic import keeps `node:net`/`node:tls` out of module eval (edge-eval-safe).
-    // With a configured CA (Memorystore in-transit encryption), pin verification to it — its
-    // CA is not publicly rooted, so the default trust store would reject the handshake.
-    const net = await import("node:net");
+    // EDGE-COMPILE-SAFE builtin loading (2026-08-02, measured on canary.97): Turbopack
+    // statically resolves `import("node:net")` / `require("node:net")` specifiers even in
+    // never-executed branches and REFUSES them in the Edge Runtime compilation — and
+    // next.config.cacheHandler is pulled into the edge middleware graph, so a resolvable
+    // specifier here made every edge-middleware app UNBUILDABLE with the shared cache
+    // (the historical hasEdgeMiddleware registration skip, now removed).
+    // `process.getBuiltinModule` (Node >= 20.16/22.3, within `engines`) has no static
+    // specifier: the edge bundle carries this as dead code and parses; Node loads the real
+    // builtins. With a configured CA (Memorystore in-transit encryption), pin verification
+    // to it — its CA is not publicly rooted, so the default trust store would reject the
+    // handshake.
+    const getBuiltin = (
+      globalThis as {
+        process?: { getBuiltinModule?: (id: string) => unknown };
+      }
+    ).process?.getBuiltinModule;
+    if (!getBuiltin) {
+      throw new Error(
+        "[valkey-cache] process.getBuiltinModule is unavailable — Node >= 20.16 is required " +
+          "to open a Valkey connection (edge runtimes never connect; this code is inert there).",
+      );
+    }
+    const net = getBuiltin("node:net") as typeof import("node:net");
     const socket: Socket | TLSSocket = useTls
-      ? (await import("node:tls")).connect({
+      ? (getBuiltin("node:tls") as typeof import("node:tls")).connect({
           host,
           port,
           // L18: SNI is a DNS-name extension, so it is omitted for IP-literal hosts —

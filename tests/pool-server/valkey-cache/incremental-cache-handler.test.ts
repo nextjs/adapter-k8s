@@ -483,6 +483,123 @@ describe("N6: non-finite lifetimes are refused (never reach Valkey)", () => {
 // Survey Tier 3 #16: `set(key, null)` is a REAL cached value (Next stores null for
 // not-found responses). It must round-trip as a hit carrying `value: null` — collapsing it
 // into a miss makes Next re-render the known-empty result on every request, forever.
+describe("cache trace (ADAPTER_K8S_CACHE_TRACE=1 — PPR materialization diagnosis)", () => {
+  // One JSON line per set()/get() so a deployed pool's writes can be diffed against
+  // `next start`'s filesystem materialization (which keys, which kinds, postponed/rscData
+  // presence). Off by default; costs nothing when unset.
+  it("logs a structured line for set() and get() when enabled", async () => {
+    process.env.ADAPTER_K8S_CACHE_TRACE = "1";
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.join(" "));
+    });
+    try {
+      const client = new FakeValkeyClient();
+      const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tr1", now: () => 1000 });
+      await h.set("/traced", appPageEntry("T"), {
+        tags: ["t1"],
+        cacheControl: { revalidate: 60, expire: 600 },
+      });
+      await h.get("/traced", { kind: "APP_PAGE" });
+      const traceLines = lines.filter((l) => l.includes("[cache-trace]"));
+      expect(traceLines.length).toBe(2);
+      const setLine = JSON.parse(traceLines[0]!.slice(traceLines[0]!.indexOf("{")));
+      expect(setLine.op).toBe("set");
+      expect(setLine.key).toBe("/traced");
+      expect(setLine.kind).toBe("APP_PAGE");
+      expect(setLine).toHaveProperty("postponedBytes");
+      expect(setLine).toHaveProperty("htmlBytes");
+      expect(setLine.tags).toEqual(["t1"]);
+      const getLine = JSON.parse(traceLines[1]!.slice(traceLines[1]!.indexOf("{")));
+      expect(getLine.op).toBe("get");
+      expect(getLine.hit).toBe(true);
+    } finally {
+      spy.mockRestore();
+      delete process.env.ADAPTER_K8S_CACHE_TRACE;
+    }
+  });
+
+  it("logs nothing when disabled", async () => {
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+      lines.push(a.join(" "));
+    });
+    try {
+      const client = new FakeValkeyClient();
+      const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tr2", now: () => 1000 });
+      await h.set("/quiet", appPageEntry("Q"), {});
+      await h.get("/quiet", {});
+      expect(lines.filter((l) => l.includes("[cache-trace]"))).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("getStored staleness signal (SWR must not become stale-forever)", () => {
+  // Dispatch consumes getStored DIRECTLY — no Next incremental-cache layer above it to
+  // compute age staleness from lastModified. getStored therefore surfaces `isStale`
+  // itself (tag- OR age-stale, single-flight lock-gated); dispatch serves the stale
+  // entry and schedules one canonical regeneration behind it.
+  it("marks an AGE-stale stored entry isStale", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx1", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 120_000; // past the 60s revalidate window, inside expire
+    const got = await h.getStored("/p", {});
+    expect(got).not.toBeNull();
+    expect((got as { isStale?: boolean }).isStale).toBe(true);
+  });
+
+  it("does not mark a fresh stored entry", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx2", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 1_000;
+    const got = await h.getStored("/p", {});
+    expect(got).not.toBeNull();
+    expect((got as { isStale?: boolean }).isStale).toBeFalsy();
+  });
+
+  it("staleness is a NON-CONSUMING peek: every getStored reader is told stale", async () => {
+    // The single-flight NX revalidate lock nearly killed resume-data-cache: dispatch's
+    // ladder read consumed it (its own regen path 500s for cache-components AND holds the
+    // lock to TTL on failure), so the ENTRYPOINT — the only actor whose revalidation works
+    // — was told FRESH and never regenerated (stale >12s on cold pods, traced). getStored
+    // now reports staleness without touching the lock; the app-path get() keeps lock
+    // semantics for Next's own SWR signalling.
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx3", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 120_000;
+    const first = await h.getStored("/p", {});
+    const second = await h.getStored("/p", {});
+    expect((first as { isStale?: boolean }).isStale).toBe(true);
+    expect((second as { isStale?: boolean }).isStale).toBe(true);
+    // And the lock was NOT consumed: the app path's tag-stale signalling still wins it.
+  });
+
+  it("does not surface isStale (or take the regen lock for age) on the app-path get()", async () => {
+    // Next's own incremental-cache layer sits above get() and computes age staleness from
+    // lastModified — the handler adding its own signal there would double-signal and take
+    // locks the app path never needed. Age staleness is a getStored-only contract.
+    const client = new FakeValkeyClient();
+    const clock = { t: 1_000_000 };
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx4", now: () => clock.t });
+    await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
+    clock.t += 120_000;
+    const got = await h.get("/p", {});
+    expect(got).not.toBeNull();
+    expect((got as { isStale?: boolean }).isStale).toBeUndefined();
+    // The lock was not consumed — a getStored after the app-path get still wins it.
+    const stored = await h.getStored("/p", {});
+    expect((stored as { isStale?: boolean }).isStale).toBe(true);
+  });
+});
+
 describe("negative caching (survey Tier 3 #16)", () => {
   it("round-trips set(key, null) as a cache HIT with value null, distinct from a miss", async () => {
     const client = new FakeValkeyClient();
@@ -586,7 +703,7 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
       seedLookup,
     });
     const got = await h.get("/blog/tim");
-    expect(seedLookup).toHaveBeenCalledWith("/blog/tim");
+    expect(seedLookup).toHaveBeenCalledWith("/blog/tim", expect.any(Object));
     expect(got?.lastModified).toBe(500);
     expect((got?.value as { html?: string })?.html).toContain("built at build time");
   });

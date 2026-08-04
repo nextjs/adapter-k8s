@@ -72,6 +72,26 @@ afterEach(() => {
 });
 
 describe("staging next's runtime dependency closure", () => {
+  it("stages into an explicit context dir when given one (the routing-service image)", async () => {
+    // Full-run cluster (node-middleware, ~10 suites): a NODE-runtime middleware runs in the
+    // ROUTING container, and its externalized `next` requires @swc/helpers at startup —
+    // "Cannot find module '@swc/helpers/_/_interop_require_default'", routing pods
+    // CrashLoop, every deploy of such an app times out at the rollout gate. The routing
+    // context is not a pool context, so the staging needs an explicit destination.
+    seedApp();
+    const routingContext = path.join(projectDir, ".k8s-adapter", "routing-service", "context");
+
+    const result = await stageNextRuntimeDependencies(projectDir, "routing-service", false, undefined, {
+      stageDir: routingContext,
+    });
+
+    expect(result.staged).toContain("@swc/helpers");
+    expect(
+      existsSync(path.join(routingContext, "node_modules/@swc/helpers/_/_interop_require_default.js")),
+    ).toBe(true);
+    expect(existsSync(path.join(routingContext, "node_modules/styled-jsx/package.json"))).toBe(true);
+  });
+
   it("stages @swc/helpers so the edge sandbox can load in the container", async () => {
     seedApp();
 
@@ -90,6 +110,32 @@ describe("staging next's runtime dependency closure", () => {
 
     expect(result.staged).toContain("styled-jsx");
     expect(staged("node_modules/styled-jsx/package.json")).toBe(true);
+  });
+
+  it("walks REACT-DOM's dependency tree too (scheduler) — pages-router externals need it", async () => {
+    // Phase-2 pilot, app-tree (Pages router): the pool image carried react-dom but NOT its
+    // dependency `scheduler`, so the /_error route module failed to load react-dom/client and
+    // the pod never became Ready ("Cannot find module 'scheduler'"). Same class as
+    // @swc/helpers and styled-jsx: a package staged without its runtime dependency closure.
+    // react/react-dom are next's peer deps, resolved from the APP at runtime by pages-router
+    // externals — staging them means staging their trees.
+    seedApp();
+    const nm = path.join(projectDir, "node_modules");
+    writePkg(
+      path.join(nm, "react-dom"),
+      { name: "react-dom", version: "19.2.0", dependencies: { scheduler: "^0.27.0" } },
+      { "client.js": "module.exports = {};" },
+    );
+    writePkg(path.join(nm, "scheduler"), { name: "scheduler", version: "0.27.0" }, {
+      "index.js": "module.exports = {};",
+    });
+    writePkg(path.join(nm, "react"), { name: "react", version: "19.2.0" });
+
+    await stageNextRuntimeDependencies(projectDir, "ssr");
+
+    expect(staged("node_modules/react-dom/package.json")).toBe(true);
+    expect(staged("node_modules/scheduler/package.json")).toBe(true);
+    expect(staged("node_modules/react/package.json")).toBe(true);
   });
 
   it("takes the dependency list from the APP's next, not a hardcoded list", async () => {
@@ -115,7 +161,9 @@ describe("staging next's runtime dependency closure", () => {
     );
 
     expect(result.staged).not.toContain("styled-jsx");
-    expect(result.unresolved).toEqual(["styled-jsx"]);
+    // react/react-dom join the walk (see the scheduler test) and are equally unresolvable in
+    // this fixture — the pinned behavior is "styled-jsx is reported, nothing throws".
+    expect(result.unresolved).toContain("styled-jsx");
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("styled-jsx"));
   });
 

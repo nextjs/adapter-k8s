@@ -27,6 +27,7 @@ import {
   stageSharpRuntimePackages,
   SHARP_RUNTIME_PACKAGES,
   resolveSharpDepDir,
+  prerenderSiblingFiles,
 } from "../src/adapter.js";
 
 let tmpDir: string;
@@ -184,6 +185,36 @@ describe("stageFile", () => {
     await stageFile(tmpDir, src, "handler.js", "ssr");
     const staged = path.join(tmpDir, ".k8s-adapter/output/pools/ssr/context/handler.js");
     expect(readFileSync(staged, "utf-8")).toBe("v1"); // second call was a no-op
+  });
+});
+
+describe("prerenderSiblingFiles", () => {
+  // The fs-mirror seed (build-seed-index.ts) reads `<key>.meta` next to a prerendered
+  // document — postponed state and segmentPaths live there. The staging loop copies
+  // exactly the static-assets manifest's filePaths, and `.meta` is never a manifest
+  // asset, so pool images shipped `.html` + `.segments` with ZERO `.meta` files and
+  // every PPR fs-mirror seed silently missed in containers (measured: resume-data-cache
+  // pods, `ls /app/.next/server/app/*.meta` → none) while local runs worked.
+  it("returns the .meta sibling for an app-dir html prerender", () => {
+    expect(
+      prerenderSiblingFiles({ filePath: ".next/server/app/index.html", prerender: true }),
+    ).toEqual([".next/server/app/index.meta"]);
+    expect(
+      prerenderSiblingFiles({
+        filePath: ".next/server/pages/blog/post.html",
+        prerender: true,
+      }),
+    ).toEqual([".next/server/pages/blog/post.meta"]);
+  });
+
+  it("returns nothing for non-prerenders, non-html assets, and public files", () => {
+    expect(
+      prerenderSiblingFiles({ filePath: ".next/server/app/index.html", prerender: false }),
+    ).toEqual([]);
+    expect(
+      prerenderSiblingFiles({ filePath: ".next/server/app/index.rsc", prerender: true }),
+    ).toEqual([]);
+    expect(prerenderSiblingFiles({ filePath: "public/logo.svg", prerender: true })).toEqual([]);
   });
 });
 

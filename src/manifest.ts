@@ -9,6 +9,7 @@ import type {
 } from "./types.js";
 import { unsafeConditionPattern, type RouteHasCondition } from "./routing-common.js";
 import { assertSafePathname } from "./emit/templates/utils.js";
+import { collectPublicPathnames } from "./pool-server/public-files.js";
 
 // Build-time middleware matcher shape (outputs.middleware.config.matchers).
 interface MiddlewareMatcherBuild {
@@ -421,7 +422,13 @@ export function buildRoutingManifest({
 
   // Every emitted pathname ends up spliced into quoted YAML in the HTTPRoute
   // prefix rules (gateway.ts) — reject `"`/`\`/control characters at the source.
-  const pathnames = collectOutputPathnames(outputs);
+  // Public files join the set: `next start` serves them as FILESYSTEM routes (between
+  // beforeFiles and afterFiles), so a rewrite destination like `/another.txt` must resolve —
+  // without them @next/routing fell through and every rewrite-to-public-file 404'd
+  // (full-run v4: custom-routes-catchall, i18n-ignore-rewrite-source-locale).
+  const pathnames = [
+    ...new Set([...collectOutputPathnames(outputs), ...collectPublicPathnames(projectDir)]),
+  ].sort();
   for (const pathname of pathnames) {
     assertSafePathname(pathname);
   }

@@ -189,14 +189,28 @@ export function assertSafeBuildId(buildId: string): void {
 // Minimal structural mirror of Next's classic CacheHandler contract (avoids a compile-time
 // dependency on Next internals). `value` is an `IncrementalCacheValue`; we serialize its binary
 // members (Buffers, the segmentData Map) to base64 for JSON storage.
+/** Trace-only size probe: bytes for Buffer/string values, 0 for anything else. */
+function byteLen(v: unknown): number {
+  if (Buffer.isBuffer(v)) return v.length;
+  if (typeof v === "string") return Buffer.byteLength(v);
+  return 0;
+}
+
 interface CacheHandlerValue {
   lastModified?: number;
   value: unknown | null;
+  /** getStored()-only: the entry is soft-stale (tag- or age-, single-flight lock-gated) —
+   * serve it AND regenerate behind it. Never set on the app-path get(): Next's own
+   * incremental-cache layer computes age staleness from lastModified there. */
+  isStale?: boolean;
 }
 interface GetCtx {
   kind?: string;
   softTags?: string[];
   tags?: string[];
+  /** Threaded to the seed lookup — the fs-mirror layer needs the fs-cache read semantics. */
+  isFallback?: boolean;
+  isRoutePPREnabled?: boolean;
 }
 interface SetCtx {
   tags?: string[];
@@ -305,7 +319,10 @@ export interface ValkeyIncrementalCacheOptions {
    * warm-start model; stored entries always win, and `set` still writes to Valkey so
    * regeneration owns the key from then on.
    */
-  seedLookup?: (cacheKey: string) => Promise<SeedEntry | null>;
+  seedLookup?: (
+    cacheKey: string,
+    ctx?: { kind?: string; isFallback?: boolean; isRoutePPREnabled?: boolean },
+  ) => Promise<SeedEntry | null>;
 }
 
 // ---- binary (de)serialization: Buffers ↔ base64, the segmentData Map ↔ an object ----
@@ -389,7 +406,7 @@ export class ValkeyIncrementalCacheHandler {
   private readonly now: () => number;
   private readonly prefix: string;
   private readonly tagsKey: string;
-  private readonly seedLookup: ((cacheKey: string) => Promise<SeedEntry | null>) | undefined;
+  private readonly seedLookup: ValkeyIncrementalCacheOptions["seedLookup"];
 
   constructor(options: ValkeyIncrementalCacheOptions) {
     this.client = options.client;
@@ -423,7 +440,11 @@ export class ValkeyIncrementalCacheHandler {
   private async seedFallback(cacheKey: string, ctx: GetCtx): Promise<CacheHandlerValue | null> {
     if (!this.seedLookup) return null;
     try {
-      const seed = await this.seedLookup(cacheKey);
+      const seed = await this.seedLookup(cacheKey, {
+        ...(ctx.kind !== undefined ? { kind: ctx.kind } : {}),
+        ...(ctx.isFallback !== undefined ? { isFallback: ctx.isFallback } : {}),
+        ...(ctx.isRoutePPREnabled !== undefined ? { isRoutePPREnabled: ctx.isRoutePPREnabled } : {}),
+      });
       if (!seed) return null;
       const softTags = ctx.softTags ?? ctx.tags ?? [];
       const tags = [...seed.tags, ...softTags];
@@ -462,12 +483,50 @@ export class ValkeyIncrementalCacheHandler {
     }
   }
 
+  /**
+   * PPR-materialization diagnosis channel (ADAPTER_K8S_CACHE_TRACE=1): one JSON line per
+   * cache operation, so a deployed pool's write pattern can be diffed against `next
+   * start`'s filesystem materialization. Off by default and costs one env check.
+   */
+  private trace(op: string, key: string, detail: Record<string, unknown>): void {
+    if (process.env.ADAPTER_K8S_CACHE_TRACE !== "1") return;
+    console.log(`[cache-trace] ${JSON.stringify({ op, key, ...detail })}`);
+  }
+
+  /** get() without the seed fallback: STORED entries only (a post-deploy write or null). */
+  async getStored(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
+    const r = await this.getImpl(cacheKey, ctx, true);
+    this.trace("getStored", cacheKey, {
+      kind: ctx.kind,
+      hit: r !== null,
+      ...(r?.isStale !== undefined ? { isStale: r.isStale } : {}),
+    });
+    return r;
+  }
+
+  /** The complement of getStored(): SEED entries only (build artifacts), never a stored
+   * write. The dispatch template-shell rung reads through this — a stored entry answering
+   * a TEMPLATE key would share one sibling's materialized page across the whole route. */
+  async getSeed(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
+    return this.seedFallback(cacheKey, ctx);
+  }
+
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
+    const r = await this.getImpl(cacheKey, ctx, false);
+    this.trace("get", cacheKey, { kind: ctx.kind, hit: r !== null });
+    return r;
+  }
+
+  private async getImpl(
+    cacheKey: string,
+    ctx: GetCtx,
+    skipSeed: boolean,
+  ): Promise<CacheHandlerValue | null> {
     try {
       const raw = await this.client.get(this.entryKey(cacheKey));
-      if (!raw) return this.seedFallback(cacheKey, ctx);
+      if (!raw) return skipSeed ? null : this.seedFallback(cacheKey, ctx);
       const entry = parseStoredEntry(raw);
-      if (!entry) return this.seedFallback(cacheKey, ctx); // corrupt entry → seed, else miss (L5)
+      if (!entry) return skipSeed ? null : this.seedFallback(cacheKey, ctx); // corrupt entry → seed, else miss (L5)
       const now = this.now();
 
       // Own the staleness check against the SHARED manifest (the tags-manifest.external check Next
@@ -493,6 +552,26 @@ export class ValkeyIncrementalCacheHandler {
       // winner). A lock-acquire FAILURE fails open to the stale signal — at worst the old
       // stampede, never a lost revalidation.
       const staleByTag = areTagsStale(tags, entry.lastModified, manifest);
+      if (skipSeed) {
+        // getStored (dispatch's direct consumption): staleness is a NON-CONSUMING PEEK.
+        // The single-flight NX revalidate lock must NOT be spent here — dispatch cannot
+        // regenerate cache-components routes (the on-demand render mode hard-errors and a
+        // failed re-entry held the lock to TTL), so a consumed lock starved the
+        // ENTRYPOINT's own working revalidation: it read "fresh" and never regenerated
+        // (resume-data-cache stale >12s on cold pods, traced 2026-08-03). Age staleness is
+        // computed here because no Next incremental-cache layer sits above this caller.
+        const staleByAge =
+          typeof entry.revalidateSeconds === "number" &&
+          now >= entry.lastModified + entry.revalidateSeconds * 1000;
+        return {
+          lastModified: entry.lastModified,
+          value: decodeValue(entry.value),
+          ...(staleByTag || staleByAge ? { isStale: true } : {}),
+        };
+      }
+      // App-path get(): the lock-gated stale signal is Next's own SWR contract — exactly
+      // ONE replica is told stale (adjusted lastModified) and revalidates; its set()
+      // releases the lock early, and the TTL bounds a crashed winner.
       let signalStale = staleByTag;
       if (staleByTag) {
         try {
@@ -590,6 +669,17 @@ export class ValkeyIncrementalCacheHandler {
         );
         return;
       }
+      this.trace("set", cacheKey, {
+        kind: (data as { kind?: string } | null)?.kind,
+        htmlBytes: byteLen((data as { html?: unknown } | null)?.html),
+        postponedBytes: byteLen((data as { postponed?: unknown } | null)?.postponed),
+        rscDataBytes: byteLen((data as { rscData?: unknown } | null)?.rscData),
+        segmentCount:
+          (data as { segmentData?: Map<unknown, unknown> } | null)?.segmentData?.size ?? 0,
+        tags,
+        revalidate,
+        ttlSeconds: entry.ttlSeconds,
+      });
       await this.client.set(this.entryKey(cacheKey), serialized, "EX", entry.ttlSeconds);
       // A completed re-render releases the single-flight revalidation lock early (see `get`);
       // best-effort — the lock's own TTL is the backstop.

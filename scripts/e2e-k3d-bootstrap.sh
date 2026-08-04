@@ -14,10 +14,12 @@ set -euo pipefail
 #   valkey:    single in-cluster pod + Service; shared across lanes safely because the
 #              adapter namespaces every key by build id (k8s:<buildId>:)
 #
-# KNOWN LIMIT, on purpose: k3d's default CNI (flannel) ACCEPTS NetworkPolicies but does not
-# ENFORCE them, so the strict ingress allowlist is decorative here. Fine for framework
-# conformance — enforcement is proven live on Cilium (Scaleway) — but Phase 2 results must
-# never be cited as evidence for the security posture.
+# CORRECTION (2026-07-30, measured): k3s ENFORCES NetworkPolicy even under flannel — it
+# ships a built-in kube-router-based netpol controller. Pilot 3 proved it the hard way:
+# the merged Envoy proxy (owned by the GatewayClass, so unmatched by the per-gateway
+# allowlist peer) was REFUSED by every pool and ext_proc port while the pods sat Ready.
+# So Phase 2 exercises the strict allowlist for real; the earlier "decorative netpol"
+# caveat here was wrong, in the good direction.
 
 CLUSTER_NAME="${E2E_K3D_CLUSTER:-adapter-e2e}"
 REGISTRY_NAME="${E2E_K3D_REGISTRY:-adapter-e2e-registry}"
@@ -49,16 +51,33 @@ if ! k3d cluster list 2>/dev/null | grep -q "^${CLUSTER_NAME}"; then
   # --k3s-arg disables Traefik (Envoy Gateway is the ingress under test — two ingresses
   # fight over ports and confuse the topology). The port mapping exposes the Envoy Gateway
   # service via the k3d loadbalancer once the Gateway's Service is of type LoadBalancer.
+  # registries.yaml: containerd inside the node must resolve `localhost:${REGISTRY_PORT}`
+  # (the SAME name the host pushes to and the chart bakes into image references) to the
+  # registry container. `--registry-use` alone only wires the registry's cluster-network
+  # name — measured: every pull of localhost:5511/... died with "dial tcp [::1]:5511:
+  # connect: connection refused" against the node's own loopback.
+  REG_CONF="$(mktemp)"
+  cat > "$REG_CONF" <<EOF
+mirrors:
+  "localhost:${REGISTRY_PORT}":
+    endpoint:
+      # :5000, not :${REGISTRY_PORT} — the registry container LISTENS on 5000 in-network;
+      # ${REGISTRY_PORT} is only the host-side mapping (127.0.0.1:${REGISTRY_PORT}->5000).
+      # Measured: the ${REGISTRY_PORT} endpoint refused every in-cluster pull.
+      - http://k3d-${REGISTRY_NAME}:5000
+EOF
   # --kubeconfig-*=false: cluster create must NOT merge into or switch the global
   # kubeconfig — that is the cross-wire vector the dedicated KUBECONFIG above exists to
   # close, and create's default behavior would reopen it on every fresh bootstrap.
   k3d cluster create "${CLUSTER_NAME}" \
     --registry-use "k3d-${REGISTRY_NAME}:${REGISTRY_PORT}" \
+    --registry-config "$REG_CONF" \
     --port "${HTTP_PORT}:80@loadbalancer" \
     --k3s-arg "--disable=traefik@server:0" \
     --kubeconfig-update-default=false \
     --kubeconfig-switch-context=false \
     --wait
+  rm -f "$REG_CONF"
 else
   echo "→ Cluster ${CLUSTER_NAME} exists"
 fi
@@ -69,21 +88,107 @@ kubectl wait --for=condition=Ready node --all --timeout=120s >/dev/null
 # --- 3. Envoy Gateway ---
 if ! kubectl get deploy -n envoy-gateway-system envoy-gateway >/dev/null 2>&1; then
   echo "→ Installing Envoy Gateway ${ENVOY_GATEWAY_VERSION}"
+  # enableEnvoyPatchPolicy: the chart's ClientTrafficPolicy (escaped-slash pass-through) is
+  # REJECTED under merged gateways ("applied to multiple http listeners on the same port"),
+  # so the lanes need the class-level EnvoyPatchPolicy applied below instead.
   helm install eg oci://docker.io/envoyproxy/gateway-helm \
     --version "${ENVOY_GATEWAY_VERSION#v}" \
+    --set config.envoyGateway.extensionApis.enableEnvoyPatchPolicy=true \
     -n envoy-gateway-system --create-namespace --wait
 else
   echo "→ Envoy Gateway present"
 fi
 # GatewayClass "eg" — the className the generic provider config expects.
+# mergeGateways: every lane's release creates its OWN Gateway object, but only ONE proxy
+# data plane (and one LoadBalancer service) exists, so k3d's single 8788:80 port mapping
+# serves every lane by Host routing. Without merging, each Gateway spawns its own proxy
+# and its own LB service, and klipper-lb can bind :80 exactly once per node — lane 2's
+# Gateway would sit Pending forever.
 kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: merged-lanes
+  namespace: envoy-gateway-system
+spec:
+  mergeGateways: true
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata:
   name: eg
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: merged-lanes
+    namespace: envoy-gateway-system
 EOF
+
+# Escaped-slash pass-through for the merged data plane. Envoy Gateway's default
+# UnescapeAndRedirect 307s "/a%2Fb" → "/a/b" before the app ever sees it; next start
+# preserves %2F in params, so that default fails every encoded-slash e2e. Standalone
+# generic deployments get this via the chart's ClientTrafficPolicy, but EG rejects a CTP
+# whose gateway shares a merged port with others — the class-level escape hatch is an
+# EnvoyPatchPolicy on the xDS listener. The merged listener is NAMED AFTER ONE member
+# gateway (e.g. "default/e2e-lane1-gateway/http"), and which one is not ours to pick, so
+# emit one policy per candidate release name: exactly one matches the live listener and
+# applies; the rest fail resource-lookup in their own isolated policy status, harmlessly.
+for name in e2e-local e2e-lane1 e2e-lane2 e2e-lane3 e2e-lane4 e2e-lane5 e2e-lane6; do
+  kubectl apply -f - >/dev/null <<EOF
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyPatchPolicy
+metadata:
+  name: keep-escaped-slashes-${name}
+  namespace: default
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: GatewayClass
+    name: eg
+  type: JSONPatch
+  jsonPatches:
+    - type: type.googleapis.com/envoy.config.listener.v3.Listener
+      name: default/${name}-gateway/http
+      operation:
+        op: add
+        path: /default_filter_chain/filters/0/typed_config/path_with_escaped_slashes_action
+        value: KEEP_UNCHANGED
+EOF
+done
+
+# In-cluster loopback for the lane hostnames. Upstream fixtures self-fetch their own public
+# origin from inside the app (e.g. next-after-app-deploy's middleware POSTs to
+# `http://laneN.localhost:8788/...`), and on a real deployment that public hostname resolves
+# from the pods too. Here it is host-machine-only, so: a Service exposing the merged proxy on
+# the SAME port the external URL carries (8788 → proxy 10080), plus a CoreDNS rewrite mapping
+# the lane names onto it (k3s imports coredns-custom `*.override` inside the server block).
+# Gateway API hostname matching ignores the Host header's port, so routes match unchanged.
+kubectl apply -f - >/dev/null <<'EOF'
+apiVersion: v1
+kind: Service
+metadata:
+  name: lanes-loopback
+  namespace: envoy-gateway-system
+spec:
+  selector:
+    gateway.envoyproxy.io/owning-gatewayclass: eg
+  ports:
+    - name: http-loopback
+      port: 8788
+      targetPort: 10080
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  lanes-loopback.override: |
+    rewrite name regex ^(e2e-local|lane[1-9][0-9]*)\.localhost\.$ lanes-loopback.envoy-gateway-system.svc.cluster.local answer auto
+EOF
+kubectl -n kube-system rollout restart deployment coredns >/dev/null 2>&1 || true
 
 # --- 4. Valkey ---
 if ! kubectl get deploy e2e-valkey >/dev/null 2>&1; then

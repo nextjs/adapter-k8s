@@ -303,6 +303,20 @@ function deleteHeaderCaseInsensitive(
   }
 }
 
+/**
+ * Headers persisted on a platform-cache entry include Next's internal cache-transport
+ * headers (`x-next-cache-tags` — route/tag structure `next start` strips before the public
+ * response). The stored-entry DIRECT serves bypass the loopback pipe that normally strips
+ * them, so every direct `writeHead` from a cache entry must go through this.
+ */
+function sanitizeStoredEntryHeaders(
+  headers: Record<string, string> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = { ...(headers ?? {}) };
+  deleteHeaderCaseInsensitive(out, "x-next-cache-tags");
+  return out;
+}
+
 // Restate honest framing headers on a forwarded request: drop any client-supplied
 // content-length/transfer-encoding, then set content-length from the ACTUAL buffered
 // body when there is one. Forwarding the client's declared length without the bytes
@@ -795,7 +809,9 @@ async function invokeLocalHandlerOverHttp({
   mergeInvocationQueryIntoUrl?: boolean;
   /** Build-time PPR shell prepended to the handler's resumed render stream. */
   responsePrefix?: {
-    filePath: string;
+    filePath?: string;
+    /** In-memory shell bytes (a materialized platform-cache entry) — wins over filePath. */
+    content?: Buffer;
     headers?: Record<string, string | string[]>;
     status?: number;
   };
@@ -1158,7 +1174,7 @@ async function invokeLocalHandlerOverHttp({
             forceStatus,
             responsePrefix
               ? {
-                  body: readFileSync(responsePrefix.filePath),
+                  body: responsePrefix.content ?? readFileSync(responsePrefix.filePath!),
                   ...(responsePrefix.headers ? { headers: responsePrefix.headers } : {}),
                   ...(responsePrefix.status ? { status: responsePrefix.status } : {}),
                 }
@@ -1409,6 +1425,7 @@ async function serveNotFound(
   res: ServerResponse,
   bufferedBody: Buffer | undefined,
   basePath = "",
+  notFoundIsPrerendered = false,
 ): Promise<void> {
   // Deploy contract (upstream not-found-non-document, canary.97): for non-HTML subresource
   // requests (sec-fetch-dest: image/font/manifest/…) the deployed routing layer serves the
@@ -1421,7 +1438,8 @@ async function serveNotFound(
   // manifest entry, then the build artifact on disk — the build's INJECTED /_not-found has
   // no source file, so its adapter output carries no fallback.filePath and no asset entry
   // is emitted, but `.next/server/app/_not-found.html` is always staged with the app.
-  if (isNonHtmlSecFetchDest(req)) {
+  const nonHtmlSubresource = isNonHtmlSecFetchDest(req);
+  if (nonHtmlSubresource) {
     const prerenderedNotFound = staticAssets.find(
       (a) =>
         (a.pathname === (basePath ? `${basePath}/_not-found` : "/_not-found") ||
@@ -1443,6 +1461,14 @@ async function serveNotFound(
       }
     }
   }
+  // The platform prerender candidates missed (canary cache-components builds emit no
+  // _not-found.html artifact at all) — the handler is the fallback, and it must render the
+  // HTML DOCUMENT: base-server's isNonHtmlSecFetchDest branch would answer text/plain,
+  // breaking the deploy contract (not-found-non-document expects text/html deployed). The
+  // subresource decision was the platform's and it was already made above.
+  if (nonHtmlSubresource && notFoundIsPrerendered) {
+    delete req.headers["sec-fetch-dest"];
+  }
   const notFoundPaths = [
     ...(basePath ? [`${basePath}/_not-found`, `${basePath}/404`] : []),
     "/_not-found",
@@ -1461,6 +1487,10 @@ async function serveNotFound(
         bufferedBody,
         // A Pages Router `/404` entrypoint renders like a normal page, so force the status here.
         forceStatus: 404,
+        // …and tell the RENDER it is a 404: Next emits the default not-found metadata
+        // (robots noindex) only when the render itself knows the status
+        // (metadata-navigation "root not-found with default metadata").
+        invokeStatus: 404,
       });
       return;
     } catch (error) {
@@ -1559,6 +1589,55 @@ export interface DispatcherOptions {
    * registered (e.g. an edge-middleware app): it withholds the stale build-time postponed token so
    * `revalidateTag` still forces a fresh shell render. Absent when there's no shared cache. */
   checkShellStale?: (tags: string[]) => Promise<boolean>;
+  /**
+   * True when the BUILD prerendered `/_not-found` (a cache-components build). Upstream's
+   * deployed contract then serves that prerender for non-HTML subresource requests
+   * ("without invoking Next.js" — not-found-non-document), so if the artifact cannot be
+   * found the handler must still render the HTML DOCUMENT. A dynamic app prerenders no
+   * not-found and keeps `next start`'s text/plain answer (not-found-non-document-dynamic).
+   */
+  notFoundIsPrerendered?: boolean;
+  /**
+   * `next.config.partialPrefetching` — the app opts into the partialFallback serving
+   * contract (on-demand shell specialization, entry sharing across never-prerenderable
+   * params). The adapter implements NONE of it, and minimal+inject actively harms these
+   * builds by freezing one generic shell where Next's own non-minimal path specializes per
+   * param set (cache-components-prerender-matrix: 3/60 -> 13/60 when injection landed at
+   * baseline v6). Until partialFallback is implemented, leave those routes to Next.
+   */
+  partialPrefetching?: boolean;
+  /**
+   * The platform's own view of the shared incremental cache (Valkey classic handler): the
+   * serve ladder READS materialized/seed entries through it (get() owns tag staleness).
+   * READ-ONLY by design: regeneration goes through the registered `revalidate()` re-entry,
+   * whose render persists entries via Next's own cache handler — a direct entry-capture
+   * write half was tried and REVERTED (an entry captured from a minimal render is not
+   * equivalent to next start's response-cache write; see the materialization dead-end
+   * record). Regeneration authorization uses `process.env.__NEXT_PREVIEW_MODE_ID`.
+   */
+  platformCache?: {
+    read: (
+      key: string,
+      ctx?: { kind?: string },
+    ) => Promise<{ lastModified?: number | undefined; value: unknown } | null>;
+    /** Like read() but STORED entries only (no seed fallback) — a revalidation's output.
+     * `isStale` = soft-stale (tag or age, single-flight lock-gated): serve it AND schedule
+     * a regeneration behind it (SWR), never suppress the regen because an entry exists. */
+    readStored?: (
+      key: string,
+      ctx?: { kind?: string },
+    ) => Promise<{
+      lastModified?: number | undefined;
+      value: unknown;
+      isStale?: boolean;
+    } | null>;
+    /** SEED-only read (build artifacts, no stored entries) — the template-shell rung, where
+     * a stored entry must never answer (it would share one sibling's page across the route). */
+    readSeed?: (
+      key: string,
+      ctx?: { kind?: string },
+    ) => Promise<{ lastModified?: number | undefined; value: unknown } | null>;
+  };
   rscConfig?: RscConfig | undefined;
   /** All output ids in this pool's manifest — used to map concrete prerender
    * paths back to their dynamic-route template handler (outputs of dynamic
@@ -1567,6 +1646,11 @@ export interface DispatcherOptions {
   /** Dynamic routes with fallback:false / dynamicParams:false — a matching path
    * not in prerenderedPaths must 404 (mirrors `next start`). */
   strictDynamicRoutes?: { pageRegex: RegExp }[];
+  /** App route TEMPLATES whose prerender-manifest entry has `fallback: null` — Next may
+   * statically GENERATE never-prerendered concrete paths at runtime. Under a shared cache
+   * these render non-minimal so Next's own response-cache write materializes them
+   * (`next start` parity; a minimal render never writes). */
+  runtimeStaticTemplates?: Set<string>;
   prerenderedPaths?: Set<string>;
   buildIdForData?: string;
   /** Build timestamp (ISO) from the routing manifest — anchors the ISR seed-freshness
@@ -1617,6 +1701,7 @@ export function createDispatcher(options: DispatcherOptions) {
     rscConfig,
     outputIds = [],
     strictDynamicRoutes = [],
+    runtimeStaticTemplates = new Set<string>(),
     prerenderedPaths = new Set<string>(),
     buildIdForData = "",
     internalSecret,
@@ -1624,6 +1709,9 @@ export function createDispatcher(options: DispatcherOptions) {
     entrypointOwnsPprShell = false,
     emulatePlatformCache = false,
     checkShellStale,
+    notFoundIsPrerendered = false,
+    partialPrefetching = false,
+    platformCache,
     revalidate,
     basePath = "",
     i18nLocales = [],
@@ -1638,7 +1726,13 @@ export function createDispatcher(options: DispatcherOptions) {
   // pod start (the previous behavior). A garbage timestamp parses to NaN → same fallback.
   const builtAtMs = builtAt ? Date.parse(builtAt) : Number.NaN;
   const deployedAt = Number.isFinite(builtAtMs) ? builtAtMs : Date.now();
-  const entrypointOwnsPprCache = incrementalCacheShared || entrypointOwnsPprShell;
+  // In-flight canonical regenerations, one per platform-cache key (bounded backstop — a
+  // stampede of distinct stale keys must not fan out unbounded background renders).
+  const MAX_PENDING_REGENS = 64;
+  const pendingRegens = new Set<string>();
+  // The Vary header every RSC-flavored platform response carries (mirrors the entrypoints).
+  const RSC_VARY_HEADER =
+    "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch";
   // N16: every shell-less PPR template (used only to recognize the route as PPR), and the
   // root-param subset that must actually run NON-minimal. Splitting these was the fix for
   // app-dir/fallback-shells: treating ALL shell-less PPR templates as non-minimal made Next
@@ -1886,6 +1980,25 @@ export function createDispatcher(options: DispatcherOptions) {
       // listener Node crashes the process. Guard the outer client response up front.
       guardStreamErrors(res);
 
+      // base-server deletes the RSC cache-busting param NEXT_RSC_UNION_QUERY ('_rsc') from
+      // the render query (base-server.ts:2719-2722) — it exists only to partition
+      // browser/CDN caches. The generated entrypoint parses req.url directly under our
+      // loopback, so the param must come off HERE: left on, the entrypoint saw an
+      // unexpected query param, ssgCacheKey went null, and the stale-entry background
+      // revalidation never armed (resume-data-cache: stale-forever under the suite's
+      // cache-busted fetches while the identical param-less sequence passed).
+      if (
+        req.url !== undefined &&
+        req.headers[options.rscConfig?.header ?? "rsc"] === "1" &&
+        req.url.includes("_rsc=")
+      ) {
+        const u = new URL(req.url, "http://localhost");
+        if (u.searchParams.has("_rsc")) {
+          u.searchParams.delete("_rsc");
+          req.url = `${u.pathname}${u.search}`;
+        }
+      }
+
       // Pages Router uses this response header to interpret middleware data-request
       // preflights and retain the matched route template. Next's router-server sets
       // it for both static and dynamic data routes.
@@ -2096,7 +2209,15 @@ export function createDispatcher(options: DispatcherOptions) {
         // instead, so serving this emitted artifact is the adapter's documented fallback role.
         // Keep PPR out of this branch: PPR shells use postponed state and the resume protocol below.
         const servePagesDynamicFallbackShell =
-          emulatePlatformCache &&
+          // Emulate mode models "one platform-cache miss per URL" with a process-local
+          // marker; PRODUCTION serves the skeleton whenever the shared platform cache is
+          // wired — a materialized entry supersedes it in the serve block below
+          // (fallback-route-params: a blocking render put resolved params in the
+          // skeleton's __NEXT_DATA__.query where `next start` serves the build skeleton
+          // with query {} and lets the client's data fetch materialize the page).
+          (emulatePlatformCache
+            ? !servedFallbackShells.has(requestPathname)
+            : !!platformCache?.readStored) &&
           isReadMethod &&
           !isPagesDataRequest &&
           !isPreviewRequest &&
@@ -2105,7 +2226,6 @@ export function createDispatcher(options: DispatcherOptions) {
           !staticAsset.ppr &&
           /\[[^/]+\]/.test(staticAsset.pathname) &&
           handlerPathname === mp &&
-          !servedFallbackShells.has(requestPathname) &&
           resolution.pool === poolName;
         // Segment-prefetch outputs are independent build-time cache entries, not executable
         // handlers. `handlerPathname` deliberately maps them back to the parent page so dynamic
@@ -2176,6 +2296,44 @@ export function createDispatcher(options: DispatcherOptions) {
             });
         }
 
+        // A STORED platform-cache entry (written by an on-demand revalidation after deploy)
+        // supersedes the build seed for document serves — the seed is the cold-start answer
+        // only. Measured: revalidate-reason's res.revalidate() rendered 'on-demand' and
+        // persisted the fresh page, but the seed rung kept serving the build artifact.
+        if (
+          staticAsset?.prerender &&
+          !staticAsset.ppr &&
+          (serveConcretePrerenderSeed || serveHandlerlessPrerender) &&
+          platformCache?.readStored &&
+          isReadMethod &&
+          !isPagesDataRequest &&
+          !isRSC
+        ) {
+          // Same key contract as the PPR ladder: Next writes under the resolved invocation
+          // pathname (rewrite destination), so read under it too — never the public URL.
+          const storedConcrete = new URL(
+            resolution.invokePath ?? req.url ?? "/",
+            "http://localhost",
+          ).pathname;
+          const storedKey = storedConcrete === "/" ? "/index" : storedConcrete;
+          const stored = await platformCache.readStored(storedKey, { kind: "APP_PAGE" }).catch(() => null);
+          const sv = stored?.value as
+            | { kind?: string; html?: unknown; headers?: Record<string, string>; status?: number }
+            | undefined;
+          if (
+            (sv?.kind === "PAGES" || sv?.kind === "APP_PAGE") &&
+            sv.html !== undefined &&
+            sv.html !== null
+          ) {
+            res.writeHead(sv.status ?? 200, {
+              "content-type": "text/html; charset=utf-8",
+              ...sanitizeStoredEntryHeaders(sv.headers),
+            });
+            res.end(Buffer.isBuffer(sv.html) ? sv.html : Buffer.from(String(sv.html)));
+            return;
+          }
+        }
+
         if (
           staticAsset &&
           (serveStaticFile ||
@@ -2186,16 +2344,45 @@ export function createDispatcher(options: DispatcherOptions) {
         ) {
           const fullPath = path.resolve(process.cwd(), staticAsset.filePath);
           if (existsSync(fullPath)) {
-            if (servePagesDynamicFallbackShell) {
+            if (servePagesDynamicFallbackShell && emulatePlatformCache) {
               // NEXT_ENABLE_ADAPTER's deploy harness has no Valkey. Model one platform cache miss
               // per concrete URL; after the data request materializes the page, later documents
-              // invoke Next's filesystem-cache stand-in. The explicit index.ts gate makes this
-              // process-local marker unreachable in production.
+              // invoke Next's filesystem-cache stand-in.
               if (servedFallbackShells.size >= MAX_SERVED_FALLBACK_SHELLS) {
                 const oldest = servedFallbackShells.values().next().value;
                 if (oldest !== undefined) servedFallbackShells.delete(oldest);
               }
               servedFallbackShells.add(requestPathname);
+            }
+            if (servePagesDynamicFallbackShell && !emulatePlatformCache) {
+              // Production: the client's /_next/data fetch materializes the page through the
+              // non-minimal data render (measured: `inc:/second` written by exactly that);
+              // once it exists the STORED page supersedes the skeleton — without this rung
+              // documents would serve the skeleton forever.
+              const fallbackConcrete = new URL(
+                resolution.invokePath ?? req.url ?? "/",
+                "http://localhost",
+              ).pathname;
+              const fallbackKey = fallbackConcrete === "/" ? "/index" : fallbackConcrete;
+              const stored = await platformCache!.readStored!(fallbackKey, {
+                kind: "PAGES",
+              }).catch(() => null);
+              const sv = stored?.value as
+                | {
+                    kind?: string;
+                    html?: unknown;
+                    headers?: Record<string, string>;
+                    status?: number;
+                  }
+                | undefined;
+              if ((sv?.kind === "PAGES" || sv?.kind === "APP_PAGE") && sv.html != null) {
+                res.writeHead(sv.status ?? 200, {
+                  "content-type": "text/html; charset=utf-8",
+                  ...sanitizeStoredEntryHeaders(sv.headers),
+                });
+                res.end(Buffer.isBuffer(sv.html) ? sv.html : Buffer.from(String(sv.html)));
+                return;
+              }
             }
             const staticStat = statSync(fullPath);
             const assetHeaders = staticAsset.headers;
@@ -2307,7 +2494,8 @@ export function createDispatcher(options: DispatcherOptions) {
               pipeline(createReadStream(fullPath), res, () => undefined);
               return;
             }
-            res.end(readFileSync(fullPath));
+            const content = readFileSync(fullPath);
+            res.end(content);
             return;
           }
         }
@@ -2477,6 +2665,7 @@ export function createDispatcher(options: DispatcherOptions) {
             res,
             bufferedBody,
             basePath,
+              notFoundIsPrerendered,
           );
           return;
         }
@@ -2535,6 +2724,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 res,
                 undefined,
                 basePath,
+              notFoundIsPrerendered,
               );
               return;
             }
@@ -2604,6 +2794,7 @@ export function createDispatcher(options: DispatcherOptions) {
               res,
               bufferedBody,
               basePath,
+              notFoundIsPrerendered,
             );
             return;
           }
@@ -2763,6 +2954,14 @@ export function createDispatcher(options: DispatcherOptions) {
           const handlerPprInfo = [
             resolution.matchedPathname,
             handlerPathname,
+            // Root alias, same as the handler-loader candidates: the router resolves the
+            // root page as "/index" while pprRoutes keys the prerender "/" — without this
+            // the rdc fixture's root PPR shell was never injected (live values instead of
+            // the build shell, measured on k3d).
+            ...(resolution.matchedPathname === "/index" || handlerPathname === "/index"
+              ? ["/"]
+              : []),
+            ...(resolution.matchedPathname === "/" ? ["/index"] : []),
             ...rscParentCandidates(resolution.matchedPathname, rscConfig),
             ...rscParentCandidates(handlerPathname, rscConfig),
           ]
@@ -2868,13 +3067,29 @@ export function createDispatcher(options: DispatcherOptions) {
           const pprInfo = manifestPprInfo;
           let pprResponsePrefix:
             | {
-                filePath: string;
+                filePath?: string;
+                content?: Buffer;
                 headers?: Record<string, string | string[]>;
                 status?: number;
               }
             | undefined;
           let pprInvocationHeaders: Record<string, string> | undefined;
-          if (pprInfo?.postponedState && !entrypointOwnsPprCache) {
+          // Whether the shell actually got injected — the minimal-mode gate keys on this:
+          // a usable shell means minimal+inject+prefix; ANY reason the shell is unusable
+          // (tag-stale, revalidate window expired, file missing, Server Action, root-alias
+          // miss) degrades to the NON-minimal path where Next renders the complete document
+          // dynamically. A withheld shell + minimal is a truncated document; measured as
+          // vary-params-base-dynamic 15/15 failing when the first injection cut ignored this.
+          let pprShellInjected = false;
+          /** Trace-only (ADAPTER_K8S_CACHE_TRACE): why the PPR block did or didn't inject. */
+          let pprTraceDetail: Record<string, unknown> | undefined;
+          if (
+            pprInfo?.postponedState &&
+            !entrypointOwnsPprShell &&
+            !handlerPprRootParams &&
+            // partialFallback builds keep Next's own serving path — see the option doc.
+            !partialPrefetching
+          ) {
             // Do NOT inject the resume token for Server Action requests. Next's app-page handler
             // only splits the postponed state out of the action body (via the
             // `x-next-resume-state-length` framing) when no `postponed` meta is already set —
@@ -2891,17 +3106,211 @@ export function createDispatcher(options: DispatcherOptions) {
               checkShellStale && pprTags && pprTags.length > 0
                 ? await checkShellStale(pprTags)
                 : false;
+            // Time-based revalidate window, same anchor as the concrete-seed path: a shell
+            // with `revalidate: <seconds>` stops being injected once the window since BUILD
+            // elapses (Next then regenerates per request until a fresher entry exists).
+            // `revalidate: false`/absent means tag-lifetime only.
+            const shellRevalidate = (pprInfo as { revalidate?: number | false }).revalidate;
+            const shellWithinWindow =
+              typeof shellRevalidate !== "number" ||
+              (shellRevalidate > 0 && Date.now() - deployedAt < shellRevalidate * 1000);
             const shellPath = path.resolve(process.cwd(), pprInfo.fallbackFilePath);
             const shellAvailable = existsSync(shellPath);
-            if (!isServerAction && !shellStale && shellAvailable) {
+            const shellUsable = !isServerAction && !shellStale && shellWithinWindow;
+            pprTraceDetail = {
+              shellStale,
+              shellWithinWindow,
+              shellAvailable,
+              isServerAction,
+            };
+
+            // MATERIALIZATION READ: the platform cache (Valkey classic handler; get() owns
+            // tag staleness and falls back to the build seed) is the authority when wired.
+            // A materialized entry — written by the canonical regeneration below after a
+            // revalidation — supersedes the on-disk build shell: its html/postponed/
+            // segmentData reflect the CURRENT content, which is how `next start` keeps
+            // segment prefetches consistent with regenerated documents.
+            // Read ladder: the CONCRETE request path first (a materialized per-URL entry
+            // wins), then the ROUTE TEMPLATE — route-keyed fallback shells live under the
+            // template in the fs-mirror seed, and reading only the concrete path missed
+            // every one of them (cache-components-prerender-matrix 3/60 -> 13/60, wrong
+            // layout-region values from the generic disk shell).
+            // Concrete key = what Next WRITES under: the resolved invocation pathname (the
+            // rewrite destination when a rewrite fired — requestMeta.resolvedPathname uses
+            // the same derivation), never the public URL. `/alias -> /posts/1` writes
+            // /posts/1; reading /alias would miss forever and double-schedule regens.
+            const concreteReadPath = new URL(
+              resolution.invokePath ?? req.url ?? "/",
+              "http://localhost",
+            ).pathname;
+            const platformKey = concreteReadPath === "/" ? "/index" : concreteReadPath;
+            const templateKey =
+              resolution.matchedPathname === "/" ? "/index" : resolution.matchedPathname;
+            let platformEntry: {
+              lastModified?: number | undefined;
+              value: unknown;
+              isStale?: boolean;
+            } | null = null;
+            const isPprReadMethod = req.method === "GET" || req.method === "HEAD";
+            if (platformCache && !isServerAction && isPprReadMethod) {
+              // STORED entries first, CONCRETE key only, regardless of SEED staleness: a
+              // revalidation's output supersedes the build seed. Stored entries are written
+              // under concrete request paths — a stored entry under the TEMPLATE key must
+              // never serve (cross-sibling poisoning: /es/2 receiving /es/1's layout).
+              if (platformCache.readStored) {
+                platformEntry = await platformCache
+                  .readStored(platformKey, { kind: "APP_PAGE" })
+                  .catch(() => null);
+              }
+              if (!platformEntry && shellUsable) {
+                // Seed rungs: the concrete prerender first (read() is stored-first, but the
+                // concrete stored rung just missed, so it degrades to the seed), then the
+                // ROUTE TEMPLATE — route-keyed fallback shells live under the template in
+                // the fs-mirror seed. The template rung is SEED-ONLY (readSeed); read()'s
+                // stored-first order would reintroduce template-stored serving.
+                platformEntry = await platformCache
+                  .read(platformKey, { kind: "APP_PAGE" })
+                  .catch(() => null);
+                if (!platformEntry && templateKey !== platformKey) {
+                  platformEntry = platformCache.readSeed
+                    ? await platformCache
+                        .readSeed(templateKey, { kind: "APP_PAGE" })
+                        .catch(() => null)
+                    : null;
+                }
+              }
+            }
+            // CANONICAL REGENERATION scheduling, shared by every arm that needs one — the
+            // stale-entry SWR serve below and the no-entry/unusable-shell live render. It
+            // rides the pool's own res.revalidate() re-entry (N33 boundary): a
+            // mocked-request loopback carrying x-prerender-revalidate, which dispatch
+            // verifies and runs NON-minimal as an on-demand revalidation — Next itself
+            // writes the fresh entry through the registered cache handler, exactly like
+            // `next start`'s response-cache regeneration. One regen per key in flight.
+            const scheduleRegen = (): void => {
+              if (
+                !revalidate ||
+                !process.env.__NEXT_PREVIEW_MODE_ID ||
+                isServerAction ||
+                !isPprReadMethod ||
+                pendingRegens.has(platformKey) ||
+                pendingRegens.size >= MAX_PENDING_REGENS
+              ) {
+                return;
+              }
+              pendingRegens.add(platformKey);
+              void revalidate({
+                urlPath: req.url ?? resolution.matchedPathname,
+                headers: {
+                  "x-prerender-revalidate": process.env.__NEXT_PREVIEW_MODE_ID,
+                },
+                opts: {},
+              })
+                .catch((error) => {
+                  console.error("[pool-server] PPR platform regeneration failed:", error);
+                })
+                .finally(() => {
+                  pendingRegens.delete(platformKey);
+                });
+            };
+            // A soft-stale STORED entry still answers the foreground request (every serve
+            // shape below), and dispatch DELIBERATELY does not regenerate it: the
+            // x-prerender-revalidate re-entry hard-errors for cache-components routes and
+            // its failed render held the single-flight lock to TTL, starving the
+            // entrypoint's own WORKING revalidation (forceStaticRender). The next
+            // non-minimal dynamic-RSC/action request's entrypoint read wins the lock and
+            // regenerates properly (measured end-to-end, 2026-08-03). The no-entry arm
+            // below keeps its regen: that is the plain-ISR path (revalidate-reason), whose
+            // render mode works.
+            const segmentPrefetchPath =
+              typeof req.headers["next-router-segment-prefetch"] === "string"
+                ? req.headers["next-router-segment-prefetch"]
+                : undefined;
+            const entryValue = platformEntry?.value as
+              | {
+                  kind?: string;
+                  html?: unknown;
+                  postponed?: unknown;
+                  headers?: Record<string, string>;
+                  status?: number;
+                  segmentData?: Map<string, unknown>;
+                }
+              | undefined;
+
+            // Segment prefetch served straight from the entry's segmentData (build seed or
+            // materialized) — never resumed, mirroring the fs-cache read `next start` does.
+            if (
+              entryValue?.kind === "APP_PAGE" &&
+              segmentPrefetchPath !== undefined &&
+              entryValue.segmentData instanceof Map &&
+              entryValue.segmentData.has(segmentPrefetchPath)
+            ) {
+              const seg = entryValue.segmentData.get(segmentPrefetchPath) as Buffer | string;
+              res.writeHead(200, {
+                "content-type": "text/x-component",
+                "cache-control": "no-store",
+                vary: RSC_VARY_HEADER,
+              });
+              res.end(Buffer.isBuffer(seg) ? seg : Buffer.from(String(seg)));
+              return;
+            }
+
+            const entryPostponed =
+              typeof entryValue?.postponed === "string" && entryValue.postponed.length > 0
+                ? entryValue.postponed
+                : undefined;
+            const entryHtml =
+              entryValue?.html !== undefined && entryValue.html !== null
+                ? Buffer.isBuffer(entryValue.html)
+                  ? entryValue.html
+                  : Buffer.from(String(entryValue.html))
+                : undefined;
+
+            // A COMPLETE materialized entry (no postponed state) is a finished document —
+            // serve it outright, no resume.
+            if (
+              entryValue?.kind === "APP_PAGE" &&
+              entryHtml !== undefined &&
+              entryPostponed === undefined &&
+              req.method === "GET" &&
+              req.headers[rscConfig?.header ?? "rsc"] !== "1"
+            ) {
+              res.writeHead(entryValue.status ?? 200, {
+                "content-type": "text/html; charset=utf-8",
+                ...sanitizeStoredEntryHeaders(entryValue.headers),
+              });
+              res.end(entryHtml);
+              return;
+            }
+
+            // A DYNAMIC RSC request (rsc: 1, not a prefetch, not a segment prefetch) must
+            // NOT take minimal+inject: a resume produces only the dynamic TAIL, but the
+            // values the client asserts on live in the STATIC part (resume-data-cache:
+            // seed-era dynamic RSC lacked the shell's number on a virgin keyspace). It runs
+            // NON-minimal instead — the entrypoint itself does incrementalCache.get on the
+            // resolved pathname and threads the entry's postponed RDC into the full dynamic
+            // render (app-page-runtime.ts:1352-1391), self-contained over the shared
+            // handler, and schedules its own background revalidation when the entry is
+            // tag-stale.
+            const isDynamicRsc =
+              req.headers[rscConfig?.header ?? "rsc"] === "1" &&
+              req.headers["next-router-prefetch"] !== "1" &&
+              segmentPrefetchPath === undefined;
+            // A STORED entry's postponed token injects even when the SEED is stale — the
+            // stored entry passed the handler's own tag check. The disk-shell path keeps
+            // the shellUsable gate.
+            if (!isDynamicRsc && (entryPostponed !== undefined || (shellUsable && shellAvailable))) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
-              meta.postponed = pprInfo.postponedState;
+              // The materialized entry's token wins over the build token — it carries the
+              // regenerated Resume Data Cache.
+              meta.postponed = entryPostponed ?? pprInfo.postponedState;
               (req as any)[NEXT_REQUEST_META] = meta;
               pprInvocationHeaders = pprInfo.chainHeaders;
+              pprShellInjected = true;
 
               // Direct handler invocation with requestMeta.postponed returns only the resumed
-              // dynamic stream. For document requests, prepend the build-time fallback shell so
-              // the client receives the single `[shell][resume]` response required by the PPR
+              // dynamic stream. For document requests, prepend the fallback shell so the
+              // client receives the single `[shell][resume]` response required by the PPR
               // protocol. RSC requests consume only the resumed flight stream and must not get
               // HTML prepended.
               // N43: the BUILD-PINNED RSC header name, as every neighbouring check uses. With
@@ -2912,12 +3321,27 @@ export function createDispatcher(options: DispatcherOptions) {
                 req.headers[rscConfig?.header ?? "rsc"] !== "1" &&
                 req.headers["next-router-prefetch"] !== "1";
               if (isDocumentRequest) {
+                // An entry-backed prefix carries the REGENERATION's headers/status
+                // (sanitized); the build-time initialHeaders/initialStatus belong to the
+                // disk shell only.
+                const entryBacked = entryPostponed !== undefined && entryHtml !== undefined;
                 pprResponsePrefix = {
-                  filePath: shellPath,
-                  ...(pprInfo.initialHeaders ? { headers: pprInfo.initialHeaders } : {}),
-                  ...(pprInfo.initialStatus ? { status: pprInfo.initialStatus } : {}),
+                  ...(entryBacked ? { content: entryHtml } : { filePath: shellPath }),
+                  ...(entryBacked
+                    ? {
+                        headers: sanitizeStoredEntryHeaders(entryValue?.headers),
+                        ...(entryValue?.status ? { status: entryValue.status } : {}),
+                      }
+                    : {
+                        ...(pprInfo.initialHeaders ? { headers: pprInfo.initialHeaders } : {}),
+                        ...(pprInfo.initialStatus ? { status: pprInfo.initialStatus } : {}),
+                      }),
                 };
               }
+            } else {
+              // No entry and no usable shell: the foreground request degrades to the
+              // non-minimal live render while a canonical regeneration fills the store.
+              scheduleRegen();
             }
           }
 
@@ -2931,6 +3355,27 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // Iteration 7: first serve of a fully-keyed platform entry — record it so later
           // serves of the same key replay the stored bytes (see the early-serve above).
+          if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+            // Rung-input dump for the runtime-static diagnosis (probe deployments only).
+            console.log(
+              `[cache-trace] ${JSON.stringify({
+                op: "gate-inputs",
+                injected: pprShellInjected,
+                ...pprTraceDetail,
+                url: req.url,
+                matched: resolution.matchedPathname,
+                handlerPathname,
+                type: handlerOutputInfo?.type,
+                staticAsset: dispatchStaticAsset?.pathname ?? null,
+                pprInfo: !!handlerPprInfo,
+                pprCapable: handlerPprCapable,
+                shared: incrementalCacheShared,
+                runtimeStaticHit:
+                  runtimeStaticTemplates.has(resolution.matchedPathname) ||
+                  runtimeStaticTemplates.has(handlerPathname),
+              })}`,
+            );
+          }
           const storeCapture =
             platformFullyKeyed && !platformCacheSeen && platformKey && platformStoreEligible
               ? captureResponseForStore(res, PLATFORM_STORE_MAX_BODY)
@@ -2943,7 +3388,27 @@ export function createDispatcher(options: DispatcherOptions) {
             matchedPathname: handlerPathname,
             routeMatches: resolution.routeMatches,
             bufferedBody,
-            ...(resolution.invokePath ? { invocationPath: resolution.invokePath } : {}),
+            ...(resolution.invokePath
+              ? {
+                  // A dynamic RSC request resolves to the `.rsc` OUTPUT id, but the
+                  // invocation path becomes requestMeta.resolvedPathname, and the
+                  // entrypoint's RDC branch keys BOTH incrementalCache.get and
+                  // prerenderManifest.routes by the PAGE path (app-page-runtime.ts:1373)
+                  // — "/index.rsc" misses everything and the render loses the RDC. Strip
+                  // the variant suffix for exactly these requests; every other flow keeps
+                  // the output id (matrix cache-key semantics depend on it).
+                  invocationPath: (() => {
+                    const dynRsc =
+                      req.headers[rscConfig?.header ?? "rsc"] === "1" &&
+                      req.headers["next-router-prefetch"] !== "1" &&
+                      typeof req.headers["next-router-segment-prefetch"] !== "string";
+                    if (!dynRsc) return resolution.invokePath;
+                    const u = new URL(resolution.invokePath, "http://localhost");
+                    const base = rscParentCandidates(u.pathname, rscConfig)[0];
+                    return base ? `${base}${u.search}` : resolution.invokePath;
+                  })(),
+                }
+              : {}),
             // Next compiles an i18n index rewrite to a locale-prefixed concrete prerender, then
             // maps that artifact back to a locale-prefixed dynamic Pages handler. `invokePath`
             // deliberately strips an auto-added default locale, so it cannot recover the
@@ -2956,8 +3421,14 @@ export function createDispatcher(options: DispatcherOptions) {
                   // N9: align the locale prefix with the chosen template first — see
                   // localeAlignedRouteParamPathname. Handing `/en-US` to `/[[...slug]]`
                   // made the locale itself the first catch-all param.
+                  // Strip a concrete RSC/segment variant suffix before deriving params:
+                  // @next/routing >= 16.3.0-preview.10 no longer supplies routeMatches for
+                  // a statically-matched `.rsc` variant (shouldUseDynamicMatch gate), and
+                  // parsing "/prerendered.rsc" against /[slug] put the transport suffix IN
+                  // THE PARAM ("Slug: prerendered.rsc", baseline v12).
                   routeParamPathname: localeAlignedRouteParamPathname(
-                    resolution.matchedPathname,
+                    rscParentCandidates(resolution.matchedPathname, rscConfig).at(-1) ??
+                      resolution.matchedPathname,
                     handlerPathname,
                     i18nLocales,
                   ),
@@ -3008,7 +3479,32 @@ export function createDispatcher(options: DispatcherOptions) {
               // upstream, and running it non-minimal made Next resume a fallback shell upstream
               // deliberately skips (app-dir/fallback-shells).
               (
-                ((entrypointOwnsPprShell || incrementalCacheShared) &&
+                // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
+                // mode, where the entrypoint's own filesystem cache holds the build shells
+                // and Next resumes internally. Under a SHARED cache the entrypoints are
+                // per-request render modules with no route-shell orchestration (measured:
+                // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
+                // take the same minimal+inject path as the no-classic-handler case below.
+                // Shell-LESS root-param templates still need non-minimal in both modes (N16).
+                // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
+                // next start serves these through the full server, so getStaticProps sees
+                // revalidateReason 'on-demand' and the fresh entry persists through the
+                // registered cache handler. The minimal rungs exist for platform-cache
+                // emulation, which must never intercept an authenticated revalidation.
+                isVerifiedPreviewRequest(req) ||
+                ((entrypointOwnsPprShell ||
+                  // partialPrefetching builds get NO injection (the partialFallback serving
+                  // contract is Next's, see the injection gate) — so they must never run
+                  // minimal either: minimal + no injected shell is a truncated document
+                  // (bare postponed shell, dynamic holes never streamed). With a shared
+                  // cache the rung below already forces non-minimal; this makes the
+                  // no-Valkey posture safe too (per-pod cache incoherence over truncation).
+                  partialPrefetching ||
+                  // Under a shared cache, a shell-bearing route is minimal exactly when its
+                  // shell was actually injected above; every unusable-shell reason (stale,
+                  // window-expired, missing file, Server Action) falls through to Next's
+                  // non-minimal complete render. Shell-less routes keep their own rungs.
+                  (incrementalCacheShared && (!handlerPprInfo || !pprShellInjected))) &&
                   // N16c. `pprCapableRoutes[route].wouldPostpone` is DELIBERATELY NOT a rung
                   // here, and is not even read into a local. The manifest computes it
                   // (manifest.ts) and it is real — the build does put a postponed state on a
@@ -3047,7 +3543,23 @@ export function createDispatcher(options: DispatcherOptions) {
                   !handlerPprInfo &&
                   !handlerPprCapable &&
                   handlerOutputInfo?.type === "APP_PAGE" &&
-                  emulatedSsgTemplates.has(handlerPathname))
+                  emulatedSsgTemplates.has(handlerPathname)) ||
+                // Runtime-static generation (sub-shell-generation-middleware): a template
+                // whose prerender-manifest entry says `fallback: null` is generatable at
+                // runtime — `next start` renders a never-prerendered concrete path
+                // NON-minimally and MATERIALIZES it (first request writes, second is HIT).
+                // A minimal render never writes through the cache handler, so these
+                // requests were MISS forever (measured: zero Valkey writes on the lane-4
+                // probe). Deliberately narrow: shared cache, an APP_PAGE handler, no
+                // concrete build asset (the asset rung above owns that case), and not
+                // PPR-capable (PPR templates keep their own rungs).
+                (incrementalCacheShared &&
+                  !dispatchStaticAsset &&
+                  !handlerPprInfo &&
+                  !handlerPprCapable &&
+                  handlerOutputInfo?.type === "APP_PAGE" &&
+                  (runtimeStaticTemplates.has(resolution.matchedPathname) ||
+                    runtimeStaticTemplates.has(handlerPathname)))
               )
             ),
             normalizePrerenderCacheControl:

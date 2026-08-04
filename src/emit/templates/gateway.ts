@@ -15,6 +15,28 @@ import {
  * traffic flows, and the ext_proc callout never fires, meaning middleware never runs. Derive it
  * from here rather than restating the string.
  */
+// Gateway API restricts HTTPRoute Exact/PathPrefix values to
+// ^(?:[-A-Za-z0-9/._~!$&'()*+,;=:@]|%[0-9a-fA-F]{2})+$ — helm's server-side apply rejects
+// the WHOLE route (deploy fails wholesale) for any app whose first path segment carries a
+// byte outside that set (full-run v4: non-ASCII slugs, spaces from prerender-encoding — 16
+// tests across 3 suites). Percent-encode exactly the disallowed bytes: that is also the
+// form clients put on the wire, so the emitted match is the one that actually fires.
+// A literal "%" is itself disallowed and becomes %25 — pathnames here are the DECODED form.
+const GATEWAY_PATH_SAFE = /[-A-Za-z0-9/._~!$&'()*+,;=:@]/;
+export function encodeGatewayPath(path: string): string {
+  let out = "";
+  for (const ch of path) {
+    if (ch.length === 1 && GATEWAY_PATH_SAFE.test(ch)) {
+      out += ch;
+    } else {
+      for (const byte of Buffer.from(ch, "utf8")) {
+        out += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+      }
+    }
+  }
+  return out;
+}
+
 export function httpRouteName(releaseName: string): string {
   return `${releaseName}-routes`;
 }
@@ -244,7 +266,7 @@ export function renderHTTPRoute({
   const pathRulesYaml = pathPrefixRules.map((rule) => {
     const backendName = sanitizeK8sName(`${releaseName}-${rule.poolName}`);
     return `    - matches:
-        - path: { type: ${rule.matchType}, value: "${rule.path}" }
+        - path: { type: ${rule.matchType}, value: "${encodeGatewayPath(rule.path)}" }
       backendRefs:
         - name: ${backendName}
           port: 3000${filtersYaml}`;
@@ -253,7 +275,7 @@ export function renderHTTPRoute({
   const catchAllRuleYaml = (() => {
     const backendName = sanitizeK8sName(`${releaseName}-${catchAllRule.poolName}`);
     return `    - matches:
-        - path: { type: ${catchAllRule.matchType}, value: "${catchAllRule.path}" }
+        - path: { type: ${catchAllRule.matchType}, value: "${encodeGatewayPath(catchAllRule.path)}" }
       backendRefs:
         - name: ${backendName}
           port: 3000${filtersYaml}`;

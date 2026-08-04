@@ -58,6 +58,57 @@ function genericChart(over: Record<string, unknown> = {}): Record<string, string
   });
 }
 
+// Merged-gateway lane support (Phase 2, 2026-07-30): with EnvoyProxy `mergeGateways`, every
+// Gateway's listeners land in ONE data plane, and Gateway API requires the
+// (port, protocol, hostname) tuple to be unique across them. A hostname-LESS listener (this
+// template's default) therefore conflicts with every other release's — measured on k3d: the
+// oldest Gateway kept the slot, every lane's HTTPRoute reported "no ready listeners", and
+// Envoy 404'd all lane traffic while the stability gate (which tolerates 404) waved it
+// through. A single-host release stamps its hostname on the listener — distinct across
+// lanes, and the listener KEEPS the name `http`, so `sectionName: http` route attachment
+// (which per-host listener NAMES broke, see below) is untouched.
+import { renderGenericGateway } from "../../src/emit/templates/generic-gateway.js";
+
+// Escaped-slash parity (Phase-2 pilot, 2026-07-30). Envoy Gateway's default is Envoy's
+// UnescapeAndRedirect: a request for /a%2Fb is 307-redirected to /a/b BEFORE the app sees it
+// — measured on k3d (`location: /probe/path`), and it is why upstream's
+// next-after-app-deploy (8/8) and segment-cache/encoded-slash-params failed: both encode a
+// slash INSIDE a route param, which `next start` preserves. The chart must pin
+// escapedSlashesAction: KeepUnchanged so the generic edge matches next start.
+describe("generic client traffic policy: escaped-slash parity", () => {
+  it("emits a ClientTrafficPolicy pinning KeepUnchanged, targeting the release gateway", () => {
+    const files = genericChart();
+    const ctp = files["templates/client-traffic-policy.yaml"];
+    expect(ctp).toBeTruthy();
+    expect(ctp).toContain("kind: ClientTrafficPolicy");
+    expect(ctp).toContain("escapedSlashesAction: KeepUnchanged");
+    expect(ctp).toContain("name: my-app-gateway");
+  });
+});
+
+describe("generic gateway listeners under merged gateways", () => {
+  it("stamps the hostname on the listener for a single-host release", () => {
+    const yaml = renderGenericGateway({
+      releaseName: "e2e-lane1",
+      className: "eg",
+      hosts: [{ hostname: "lane1.localhost", tls: { enabled: false } }],
+    } as never);
+    expect(yaml).toMatch(/- name: http\n\s+hostname: "lane1\.localhost"/);
+  });
+
+  it("keeps the hostname-less listener for multi-host releases (sectionName contract)", () => {
+    const yaml = renderGenericGateway({
+      releaseName: "multi",
+      className: "eg",
+      hosts: [
+        { hostname: "a.example.com", tls: { enabled: false } },
+        { hostname: "b.example.com", tls: { enabled: false } },
+      ],
+    } as never);
+    expect(yaml).not.toContain("hostname:");
+  });
+});
+
 describe("generic provider — complete chart", () => {
   it("emits the ext_proc routing tier even with no GCP infrastructure", () => {
     // The routing tier IS the adapter's middleware story. Emitting a chart without it means

@@ -50,9 +50,13 @@ describe("generic provider", () => {
     expect(provider().extProcStrategy).toBe("envoy-gateway");
   });
 
-  it("emits a Gateway and an HTTPRoute", () => {
+  it("emits a ClientTrafficPolicy, a Gateway and an HTTPRoute", () => {
     const files = provider().emitIngressTemplates(ctx(cfg({ gateway: { hosts: HOSTS } })));
-    expect(Object.keys(files)).toEqual(["templates/gateway.yaml", "templates/http-route.yaml"]);
+    expect(Object.keys(files)).toEqual([
+      "templates/client-traffic-policy.yaml",
+      "templates/gateway.yaml",
+      "templates/http-route.yaml",
+    ]);
   });
 
   it("emits NO Cloud CDN filter — that is a GKE concept", () => {

@@ -114,3 +114,130 @@ describe("createBuildSeedLookup", () => {
     expect(await lookup("/anything")).toBeNull();
   });
 });
+
+describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation family)", () => {
+  // `next start`'s FileSystemCache serves ROUTE-KEYED fallback shells straight from
+  // `.next/server/app/<key>.html` + `.meta` (postponed state, headers, segmentPaths). With a
+  // custom handler those keys always missed and PPR routes rendered fully dynamically under
+  // the production config — the k3d full-run PPR cluster (sub-shell-generation 6/7 failing:
+  // "Root Layout: (runtime)" where "(buildtime)" is expected). Mirror the fs-cache read for
+  // keys the static-assets manifest doesn't carry.
+  it("serves a route-keyed PPR fallback shell with its postponed state and NO rscData", async () => {
+    writeManifest([]);
+    stage(".next/server/app/[lang]/[slug].html", "<html>shell</html>");
+    stage(
+      ".next/server/app/[lang]/[slug].meta",
+      JSON.stringify({
+        status: 200,
+        postponed: "POSTPONED_STATE_TOKEN",
+        headers: { "x-next-cache-tags": "_N_T_/layout,_N_T_/[lang]/[slug]/page" },
+      }),
+    );
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("/[lang]/[slug]", { kind: "APP_PAGE", isRoutePPREnabled: true });
+
+    expect(entry).not.toBeNull();
+    expect(entry!.value.kind).toBe("APP_PAGE");
+    expect(String(entry!.value.html)).toContain("shell");
+    expect(entry!.value.postponed).toBe("POSTPONED_STATE_TOKEN");
+    // fs-cache reads rscData only when there is no postponed state (file-system-cache.js:167).
+    expect(entry!.value.rscData).toBeUndefined();
+    expect(entry!.tags).toContain("_N_T_/layout");
+  });
+
+  it("collects segmentData from the .segments directory like the fs cache", async () => {
+    // Filenames mirror a REAL build artifact (`<key>.segments/_tree.segment.rsc`,
+    // nested `<key>.segments/<path>/__PAGE__.segment.rsc` — RSC_SEGMENT_SUFFIX is
+    // `.segment.rsc`, NOT `.rsc`). An earlier version of this test staged `.rsc` names
+    // copied from the implementation's wrong assumption and masked the bug: every real
+    // segment file was silently missed.
+    writeManifest([]);
+    stage(".next/server/app/[lang]/[slug].html", "<html>shell</html>");
+    stage(
+      ".next/server/app/[lang]/[slug].meta",
+      JSON.stringify({
+        status: 200,
+        postponed: "P",
+        segmentPaths: ["/_tree", "/[lang]/[slug]/__PAGE__"],
+      }),
+    );
+    stage(".next/server/app/[lang]/[slug].segments/_tree.segment.rsc", "tree-segment");
+    stage(
+      ".next/server/app/[lang]/[slug].segments/[lang]/[slug]/__PAGE__.segment.rsc",
+      "page-segment",
+    );
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("/[lang]/[slug]", { kind: "APP_PAGE", isRoutePPREnabled: true });
+
+    expect(entry).not.toBeNull();
+    const segs = entry!.value.segmentData as Map<string, Buffer>;
+    expect(segs).toBeInstanceOf(Map);
+    expect(String(segs.get("/_tree"))).toBe("tree-segment");
+    expect(String(segs.get("/[lang]/[slug]/__PAGE__"))).toBe("page-segment");
+    // A segmentPath whose file is absent is skipped (dynamic, no prefetch) — not an error.
+    expect(segs.has("/missing")).toBe(false);
+  });
+
+  it("DECLINES a fallback read with no postponed state and no .rsc (measured divergence)", async () => {
+    // FileSystemCache.get would return the bare fallback HTML here (`!isFallback` gate).
+    // We deliberately diverge: serving these entries hands Next's runtime the build's
+    // GENERIC fallback shell and param regions render empty — measured A/B on
+    // cache-components-prerender-matrix, 3/60 -> 21/60 failing when the fs-cache gate was
+    // mirrored faithfully (2026-08-02). Declining makes Next render the document fresh.
+    writeManifest([]);
+    stage(".next/server/app/[slug].html", "<html>fallback</html>");
+    stage(".next/server/app/[slug].meta", JSON.stringify({ status: 200, headers: {} }));
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("/[slug]", {
+      kind: "APP_PAGE",
+      isFallback: true,
+      isRoutePPREnabled: true,
+    });
+
+    expect(entry).toBeNull();
+  });
+
+  it("reads rscData for a non-postponed app page found only on disk", async () => {
+    writeManifest([]);
+    stage(".next/server/app/plain.html", "<html>plain</html>");
+    stage(".next/server/app/plain.meta", JSON.stringify({ status: 200, headers: {} }));
+    stage(".next/server/app/plain.rsc", "flight-bytes");
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("/plain", { kind: "APP_PAGE" });
+
+    expect(entry).not.toBeNull();
+    expect(String(entry!.value.rscData)).toBe("flight-bytes");
+  });
+
+  it("declines a non-postponed page whose .rsc is missing (half-usable) and unknown keys", async () => {
+    writeManifest([]);
+    stage(".next/server/app/broken.html", "<html>x</html>");
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    expect(await lookup("/broken", { kind: "APP_PAGE" })).toBeNull();
+    expect(await lookup("/nope", { kind: "APP_PAGE" })).toBeNull();
+  });
+
+  it("manifest-based seeds still take precedence for keys they cover", async () => {
+    writeManifest([
+      asset({
+        pathname: "/covered",
+        filePath: ".next/server/app/covered.html",
+        headers: { "x-next-cache-tags": "manifest-tag" },
+      }),
+      asset({ pathname: "/covered.rsc", filePath: ".next/server/app/covered.rsc" }),
+    ]);
+    stage(".next/server/app/covered.html", "<html>covered</html>");
+    stage(".next/server/app/covered.rsc", "rsc");
+    stage(".next/server/app/covered.meta", JSON.stringify({ headers: { "x-next-cache-tags": "disk-tag" } }));
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("/covered", { kind: "APP_PAGE" });
+    expect(entry!.tags).toContain("manifest-tag");
+    expect(entry!.tags).not.toContain("disk-tag");
+  });
+});

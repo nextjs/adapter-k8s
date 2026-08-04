@@ -4,7 +4,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import type {
   NextAdapter,
   K8sAdapterConfig,
@@ -51,12 +51,15 @@ function resolveDepDir(
   return undefined;
 }
 
-// Whether the app defines EDGE middleware. A node-based incremental `cacheHandler` (the
-// adapter's bundled zero-dep RESP2 client over node:net/node:tls) gets bundled by Turbopack
-// INTO the edge middleware runtime, where it can't evaluate — so the adapter skips
-// registering that handler when edge middleware is present. (The V2 `use cache` handler,
-// registered via the global symbol at runtime, is unaffected either way and always shares
-// `use cache` entries cross-replica.)
+// Whether the app defines EDGE middleware. HISTORY: Turbopack bundles
+// `next.config.cacheHandler` into the edge middleware compilation, and a statically
+// resolvable `node:net`/`node:tls` specifier (or a literal `process.cwd()`) there fails the
+// BUILD — so registration used to be skipped for edge-middleware apps, silently costing
+// them all cross-replica ISR/PPR materialization (Phase-0 measured:
+// sub-shell-generation-middleware wrote zero Valkey entries, MISS forever). As of
+// 2026-08-02 the bundled handler is edge-COMPILE-safe (process.getBuiltinModule + hidden
+// cwd; see resp-client.ts/build-seed-index.ts) and registration no longer consults this.
+// The detector remains exported for tests and diagnostics.
 //
 // N50 (review #34): this used to be a pure FILENAME test — any `middleware.ts` counted as
 // edge. Next 16 decides by the file's declared runtime, not its name:
@@ -403,6 +406,33 @@ export function readAdapterBundle(name: string): string {
 // dead build-id generator, ~1 nanoid in 64 started with `-`. Assert the tag charset at the
 // same place the build id is validated, so the failure is a build-time message rather than a
 // docker error at push time.
+// Next pins the BUILD ID to this literal whenever `config.deploymentId` is set (getBuildId,
+// next/src/build/index.ts) — "skew protection is enabled and the deployment id will be used
+// instead". Every one of the adapter's identities (blue/green resource names, image tags,
+// CDN cutover cache-tag, `k8s:<buildId>:` Valkey namespace) derives from the build id, so
+// consecutive builds would collide wholesale. Substitute the deploymentId itself: skew
+// protection's own contract is that it is unique per deploy.
+const NEXT_PINNED_BUILD_ID = "build-TfctsWXpff2fKS";
+export function effectiveBuildId(buildId: string, deploymentId: string | undefined): string {
+  if (buildId !== NEXT_PINNED_BUILD_ID) return buildId;
+  if (!deploymentId) {
+    throw new Error(
+      `[adapter-k8s] Next pinned the build id to its deploymentId constant but no ` +
+        `deploymentId is visible to the adapter. Set next.config \`deploymentId\` (or ` +
+        `NEXT_DEPLOYMENT_ID) to a value that is unique per deploy.`,
+    );
+  }
+  // Verbatim when already safe for every sink (docker tag ∩ BUILD_ID_RE, bounded length).
+  if (/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(deploymentId) && deploymentId.length <= 63) {
+    return deploymentId;
+  }
+  // Otherwise sanitize deterministically and disambiguate with a content hash — two
+  // deploymentIds that sanitize identically must still produce distinct build ids.
+  const sanitized = deploymentId.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^[.-]+/, "");
+  const hash = createHash("sha256").update(deploymentId).digest("hex").slice(0, 8);
+  return `dpl-${sanitized.slice(0, 40)}-${hash}`.replace(/-+/g, "-");
+}
+
 export function assertDockerTagSafeBuildId(buildId: string): void {
   if (!/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(buildId)) {
     throw new Error(
@@ -614,18 +644,54 @@ export function assertStagedWithin(stageDir: string, absDest: string, destRelati
   }
 }
 
+
+/**
+ * `config/` inside a build context is the ADAPTER'S reserved namespace — the fresh
+ * routing/pool/static manifests are written there by this build, and the routing image's
+ * manifest-match guard treats that copy as the build's identity. A TRACED asset must never
+ * land there: `adapter-k8s emulate` leaves scratch copies of those very files in
+ * projectDir/config/, Next's tracer sweeps them into the NODE middleware's asset set, and
+ * the asset loops would clobber the fresh manifests with days-old ones. Measured on GKE
+ * 2026-07-30: eight consecutive deploys refused by the guard, staged manifest two days
+ * older than its build.
+ */
+function isReservedContextDest(relDest: string): boolean {
+  return relDest === "config" || relDest.startsWith("config/");
+}
+
+/**
+ * Sibling files a prerendered document needs at RUNTIME that the static-assets manifest
+ * does not carry: the `.meta` next to a `server/{app,pages}` html prerender (postponed
+ * state + segmentPaths — what the fs-mirror seed reads). The staging loop copies exactly
+ * the manifest's filePaths, so pool images shipped `.html` + `.segments` with ZERO `.meta`
+ * files and every PPR fs-mirror seed silently missed in containers (measured:
+ * resume-data-cache pods) while local runs — cwd = the real build dir — worked.
+ */
+export function prerenderSiblingFiles(asset: {
+  filePath: string;
+  prerender?: boolean;
+}): string[] {
+  if (!asset.prerender) return [];
+  if (!/(^|[/\\])server[/\\](app|pages)[/\\]/.test(asset.filePath)) return [];
+  if (!asset.filePath.endsWith(".html")) return [];
+  return [`${asset.filePath.slice(0, -".html".length)}.meta`];
+}
+
 export async function stageFile(
   projectDir: string,
   sourcePath: string,
   destRelativePath: string,
   poolName: string,
   isShared: boolean = false,
+  stageDirOverride?: string,
 ): Promise<void> {
   const absSource = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(projectDir, sourcePath);
 
-  const stageDir = isShared
-    ? path.join(projectDir, OUTPUT_DIR(), "shared-context")
-    : path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context");
+  const stageDir =
+    stageDirOverride ??
+    (isShared
+      ? path.join(projectDir, OUTPUT_DIR(), "shared-context")
+      : path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context"));
 
   // path.join normalizes, so `..` segments are resolved here — assert containment on the
   // RESULT (a `../`-keyed asset throws rather than escaping).
@@ -762,12 +828,13 @@ async function stagePackageTree(
   rootDir: string,
   poolName: string,
   isShared: boolean,
+  stageDirOverride?: string,
 ): Promise<void> {
   const queue: Array<[string, string]> = [[rootName, rootDir]];
   const seen = new Set<string>([rootName]);
   while (queue.length > 0) {
     const [name, dir] = queue.shift()!;
-    await stageFile(projectDir, dir, `node_modules/${name}`, poolName, isShared);
+    await stageFile(projectDir, dir, `node_modules/${name}`, poolName, isShared, stageDirOverride);
     let deps: string[] = [];
     try {
       const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
@@ -803,6 +870,79 @@ async function stagePackageTree(
   }
 }
 
+// Turbopack's externals (`.next/node_modules/<name>-<hash>`) are COPIES of resolved
+// packages, but at runtime they still require their OWN dependencies by bare specifier,
+// resolved from /app/node_modules — which staging never shipped. An instrumentation hook's
+// require-in-the-middle could not find `debug`, register() rejected, and the pool sat
+// NOT READY forever (full-run v4, cache-components-allow-otel-spans; same class as
+// @swc/helpers and scheduler, one layer deeper). Read each external's declared
+// dependencies and stage their trees app-first.
+export async function stageExternalsDependencies(
+  projectDir: string,
+  externalsDir: string,
+  poolName: string,
+  isShared: boolean = false,
+  stageDirOverride?: string,
+): Promise<{ staged: string[]; unresolved: string[] }> {
+  const staged: string[] = [];
+  const unresolved: string[] = [];
+  if (!existsSync(externalsDir)) return { staged, unresolved };
+
+  const fromApp = (dep: string): string | undefined => {
+    try {
+      return path.dirname(
+        createRequire(path.join(projectDir, "package.json")).resolve(`${dep}/package.json`),
+      );
+    } catch {
+      return undefined;
+    }
+  };
+
+  const packageDirs: string[] = [];
+  for (const entry of await readdir(externalsDir)) {
+    const abs = path.join(externalsDir, entry);
+    if (!statSync(abs).isDirectory()) continue;
+    if (entry.startsWith("@")) {
+      for (const sub of await readdir(abs)) {
+        const subAbs = path.join(abs, sub);
+        if (statSync(subAbs).isDirectory()) packageDirs.push(subAbs);
+      }
+    } else {
+      packageDirs.push(abs);
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const dir of packageDirs) {
+    let deps: string[];
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
+        dependencies?: Record<string, string>;
+      };
+      deps = Object.keys(pkg.dependencies ?? {});
+    } catch {
+      continue;
+    }
+    for (const dep of deps) {
+      if (seen.has(dep)) continue;
+      seen.add(dep);
+      const depDir = fromApp(dep);
+      if (!depDir || !existsSync(depDir)) {
+        console.warn(
+          `[adapter-k8s] Could not resolve "${dep}" (a dependency of the Turbopack external ` +
+            `at ${path.basename(dir)}) from ${projectDir}. The "${poolName}" container may ` +
+            `fail at runtime with a module-not-found error.`,
+        );
+        unresolved.push(dep);
+        continue;
+      }
+      await stagePackageTree(projectDir, dep, depDir, poolName, isShared, stageDirOverride);
+      staged.push(dep);
+    }
+  }
+  return { staged, unresolved };
+}
+
 // Stage `next`'s OWN declared runtime dependencies beside `next` in the traced context.
 //
 // Next resolves several packages at RUNTIME rather than bundling them, through mechanisms no
@@ -827,6 +967,7 @@ export async function stageNextRuntimeDependencies(
   poolName: string,
   isShared: boolean = false,
   resolveDep?: (dep: string, projectDir: string) => string | undefined,
+  options?: { stageDir?: string },
 ): Promise<{ staged: string[]; unresolved: string[] }> {
   // App-ONLY, deliberately: resolveDepDir's adapter fallback would stage the ADAPTER's next
   // (and its deps) into an app that has none — a version pairing guaranteed not to match the
@@ -861,7 +1002,12 @@ export async function stageNextRuntimeDependencies(
   const resolveRuntimeDep =
     resolveDep ?? ((dep: string, dir: string) => fromDir(dep, nextDir) ?? fromDir(dep, dir));
 
-  for (const dep of deps) {
+  // react and react-dom ride along with next's own list: they are next's PEER deps, resolved
+  // from the APP at runtime by pages-router externals — and staging react-dom without its
+  // dependency tree shipped an image whose /_error could not load react-dom/client ("Cannot
+  // find module 'scheduler'", pool never Ready; Phase-2 pilot, app-tree). stagePackageTree
+  // below walks each package's dependencies, which is what pulls scheduler in.
+  for (const dep of [...deps, "react", "react-dom"]) {
     const dir = resolveRuntimeDep(dep, projectDir);
     if (!dir || !existsSync(dir)) {
       // Warn rather than throw. A pnpm/monorepo layout can hide one, and refusing to build
@@ -875,7 +1021,7 @@ export async function stageNextRuntimeDependencies(
       unresolved.push(dep);
       continue;
     }
-    await stagePackageTree(projectDir, dep, dir, poolName, isShared);
+    await stagePackageTree(projectDir, dep, dir, poolName, isShared, options?.stageDir);
     staged.push(dep);
   }
   return { staged, unresolved };
@@ -1120,19 +1266,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // so `adapter-k8s deploy` refuses it there (see the build-id collision guard in
       // src/cli/deploy.ts, which aborts on identical composed names).
       if ((nextConfig as { deploymentId?: string }).deploymentId) {
-        console.warn(
-          "[adapter-k8s] next.config `deploymentId` is set — you almost certainly do not need " +
-            "it here, and it breaks blue/green. Next pins the build id to a CONSTANT when " +
-            "deploymentId is set (getBuildId in next/src/build/index.ts), and this adapter " +
-            "derives every blue/green resource name, the build-id label, the CDN cutover " +
-            "cache-tag, AND the Valkey cache namespace (`k8s:<buildId>:`) from the build id — " +
-            "so consecutive deploys would collide and even share cache entries. " +
-            "`adapter-k8s deploy` refuses the cutover. You lose nothing by removing it: skew " +
-            "protection is ALREADY active via the per-build build id (the RSC payload carries " +
-            "it and the client hard-reloads on mismatch — see fetch-server-response.ts; " +
-            "deploymentId only substitutes a different token for that same check), and " +
-            "`?dpl=` asset versioning is moot because this adapter enables immutable " +
-            "(content-addressed) assets, which suppress it.",
+        console.log(
+          "[adapter-k8s] next.config `deploymentId` detected. Next pins its BUILD_ID to a " +
+            "constant in this mode, so the adapter derives its blue/green identity (resource " +
+            "names, image tags, cache-tags, the Valkey namespace) from the deploymentId " +
+            "instead — which therefore MUST be unique per deploy, exactly as skew " +
+            "protection already requires.",
         );
       }
 
@@ -1271,7 +1410,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // absent — so it is inert during `next build` and local runs, and only backs the incremental
       // cache (PPR shells + ISR pages) with Valkey at runtime in the pool, where VALKEY_URL +
       // NEXT_BUILD_ID are injected. Sharing this store is what makes those revalidate cross-replica.
-      if (cfg.cache?.enabled && !hasEdgeMiddleware(process.cwd())) {
+      // No edge-middleware skip anymore: the bundled handler is now edge-COMPILE-safe (every
+      // node builtin loads via process.getBuiltinModule — no static specifier for Turbopack
+      // to refuse in the Edge Runtime compilation; see resp-client.ts / stream-codec.ts).
+      // The skip silently cost edge-middleware apps ALL cross-replica ISR/PPR materialization
+      // (Phase-0 measured: sub-shell-generation-middleware wrote ZERO Valkey entries and
+      // served MISS forever).
+      if (cfg.cache?.enabled) {
         // Respect an application-provided cacheHandler rather than silently overwriting it — the two
         // are mutually exclusive (a custom handler owns the incremental cache, so the adapter's
         // shared store can't also own it). Warn and keep theirs; the V2 `use cache` handler still
@@ -1320,7 +1465,19 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     },
 
     async onBuildComplete(ctx: BuildCompleteContext) {
-      const { routing, outputs, projectDir, config: nextConfig, buildId, nextVersion } = ctx;
+      const {
+        routing,
+        outputs,
+        projectDir,
+        config: nextConfig,
+        buildId: ctxBuildId,
+        nextVersion,
+      } = ctx;
+      const deploymentId = (nextConfig as { deploymentId?: string }).deploymentId;
+      // Substitute Next's pinned deploymentId-mode constant with a unique id — see
+      // effectiveBuildId. Everything below (resource names, image tags, Valkey namespace,
+      // NEXT_BUILD_ID env) flows from this one variable.
+      const buildId = effectiveBuildId(ctxBuildId, deploymentId);
       const repoRoot = (ctx as { repoRoot?: string }).repoRoot ?? projectDir;
       // N50 (review #33): `.next` was hardcoded at every staging site, and each site was
       // guarded by `existsSync`, so a custom `distDir` staged NOTHING (no Turbopack chunks,
@@ -1505,7 +1662,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         routing,
         outputs,
         pools,
-        buildId,
+        // NEXT'S OWN build id, not the adapter's effective one: the manifest's buildId is
+        // what normalizes `/_next/data/<id>/…` URLs (@next/routing + pool dispatch), and
+        // clients build those URLs from the id Next INLINED — under deploymentId mode that
+        // is the pinned constant, while `buildId` above is the substituted unique id used
+        // for resource names. Mixing them 404s every pages data route.
+        buildId: ctxBuildId,
         basePath: nextConfig.basePath ?? "",
         i18n: nextConfig.i18n ?? null,
         trailingSlash: nextConfig.trailingSlash ?? false,
@@ -1687,6 +1849,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // must produce the same chart, and must not rotate the secret out from under the
         // pods that are currently serving.
         internalSecret: await deriveInternalSecret(projectDir, releaseName, buildId),
+        ...(deploymentId !== undefined ? { deploymentId } : {}),
         // N72: no `imageDigests` here, deliberately. `next build` runs BEFORE `docker
         // build`/`docker push`, so no digest exists at this point; passing an empty/invented
         // map would only look like the pinning is in place. Until the deploy step resolves
@@ -1830,13 +1993,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           if (!group || typeof group !== "object") continue;
           for (const [relAsset, absAsset] of Object.entries(group as Record<string, unknown>)) {
             if (typeof absAsset !== "string") continue;
-            await stageFile(
-              projectDir,
-              absAsset,
-              assetDestPath(projectDir, relAsset, absAsset),
-              poolName,
-              isShared,
-            );
+            const relDest = assetDestPath(projectDir, relAsset, absAsset);
+            if (isReservedContextDest(relDest)) continue; // see isReservedContextDest
+            await stageFile(projectDir, absAsset, relDest, poolName, isShared);
           }
         }
       };
@@ -2044,6 +2203,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           for (const asset of staticManifest) {
             const absPath = path.resolve(projectDir, asset.filePath);
             await stageFile(projectDir, absPath, asset.filePath, poolName);
+            // Runtime sibling files the manifest doesn't carry (`.meta` — see
+            // prerenderSiblingFiles). stageFile skips missing sources, so a prerender
+            // without one costs nothing.
+            for (const sibling of prerenderSiblingFiles(asset)) {
+              await stageFile(projectDir, path.resolve(projectDir, sibling), sibling, poolName);
+            }
           }
 
           if (outputs.middleware?.filePath) {
@@ -2073,6 +2238,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           if (existsSync(nextNodeModules)) {
             const dest = path.join(projectDir, poolStageDir, distDirRel, "node_modules");
             await resolveAndCopyExternals(nextNodeModules, dest);
+            // …and each external's OWN dependency tree from the app's node_modules — the
+            // copies still resolve bare specifiers at runtime (see stageExternalsDependencies).
+            await stageExternalsDependencies(projectDir, nextNodeModules, poolName);
           }
 
           // Stage next/setup-node-env (required for AsyncLocalStorage initialization).
@@ -2275,6 +2443,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           for (const [relAsset, absAsset] of Object.entries(mwAssets)) {
             if (typeof absAsset === "string" && existsSync(absAsset)) {
               const relDest = assetDestPath(projectDir, relAsset, absAsset);
+              if (isReservedContextDest(relDest)) continue; // see isReservedContextDest
               const contextRoot = path.join(projectDir, routingServiceContextDir);
               const dest = path.join(contextRoot, relDest);
               // Same containment rule as stageFile (N50, review #9): this branch does its own
@@ -2290,6 +2459,16 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               }
             }
           }
+          // next's declared runtime dependencies, same rule as the pool contexts: the routing
+          // container executes middleware.js, whose externalized `next` resolves @swc/helpers
+          // (and friends) at RUNTIME — invisibly to tracing. Without them a NODE-runtime
+          // middleware CrashLooped the routing service on startup ("Cannot find module
+          // '@swc/helpers/_/_interop_require_default'"), which timed out EVERY deploy of such
+          // an app at the rollout gate — the full run's node-middleware cluster (~10 suites).
+          await stageNextRuntimeDependencies(projectDir, "routing-service", false, undefined, {
+            stageDir: path.join(projectDir, routingServiceContextDir),
+          });
+
           // Stage <distDir>/server/chunks/ for Turbopack runtime chunk loading
           const chunksDir = path.join(distDir, "server", "chunks");
           const chunksDest = path.join(
@@ -2310,6 +2489,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           );
           if (existsSync(nextNodeModules)) {
             await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
+            // Same externals-dependency rule as the pool contexts (node middleware may pull
+            // in instrumentation-adjacent externals through its bundle).
+            await stageExternalsDependencies(projectDir, nextNodeModules, "routing-service", false, path.join(projectDir, routingServiceContextDir));
           }
           if (existsSync(chunksDir)) {
             // Replace the whole chunk set (not merge) so a stale prior build's chunks can't linger

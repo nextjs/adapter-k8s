@@ -12,6 +12,7 @@
 // the full dispatch vocabulary reached the backend (`x-mw-evaluated: ran`), and scaling the
 // routing service to zero returned 500 rather than bypassing middleware.
 import { renderGenericGateway } from "../emit/templates/generic-gateway.js";
+import { renderClientTrafficPolicy } from "../emit/templates/client-traffic-policy.js";
 import { renderEnvoyExtensionPolicy } from "../emit/templates/envoy-extension-policy.js";
 import { renderHTTPRoute, httpRouteName } from "../emit/templates/gateway.js";
 import { RELEASE_NAMESPACE_EXPR } from "../emit/templates/network-policy.js";
@@ -30,6 +31,9 @@ export const genericProvider: ProviderAdapter = {
     const generic = genericConfigOf(config);
     const hosts = generic?.gateway?.hosts ?? [];
     if (!hosts.length) return files;
+
+    // Escaped-slash parity with `next start` — see the template's doc comment.
+    files["templates/client-traffic-policy.yaml"] = renderClientTrafficPolicy({ releaseName });
 
     files["templates/gateway.yaml"] = renderGenericGateway({
       releaseName,
@@ -135,6 +139,25 @@ export const genericProvider: ProviderAdapter = {
             // that port IS the internal dispatch secret. The value is resolved by helm because
             // only helm knows which namespace the release installs into.
             "gateway.envoyproxy.io/owning-gateway-namespace": RELEASE_NAMESPACE_EXPR,
+          },
+        },
+        {
+          // MERGED proxies (EnvoyProxy `mergeGateways` — how Phase-2 lanes share one data
+          // plane) are owned by the GatewayCLASS: their pods carry ONLY
+          // `owning-gatewayclass: <class>`, never the per-gateway pair above, so without this
+          // peer a netpol-enforcing CNI refuses every proxy→pool and proxy→ext_proc
+          // connection (measured on k3d: pods Ready, Envoy connection-refused, fail-closed
+          // 500s). TENANCY TRADE, stated plainly: the merged proxy serves every release on
+          // the class, so admitting it admits the SHARED data plane to this release's
+          // ext_proc port — reachability-as-secret narrows to "the class's data plane".
+          // That is inherent to choosing merged gateways; per-release proxy identity does
+          // not exist there. Non-merged deployments are unaffected: peers are OR'd and their
+          // proxies match the stricter peer above.
+          namespace: generic?.gatewayNamespace ?? "envoy-gateway-system",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gatewayclass":
+              generic?.gateway?.className ?? "eg",
           },
         },
       ],

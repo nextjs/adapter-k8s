@@ -22,12 +22,31 @@ ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_PATTERN="${1:-}"
 NEXTJS_REF="${2:-v16.3.0-canary.97}"
-if [ -z "$TEST_PATTERN" ]; then
-  echo "ERROR: a test pattern is required (see the header of this script)." >&2
+TEST_GROUP="${3:-}"
+if [ -z "$TEST_PATTERN" ] && [ -z "$TEST_GROUP" ]; then
+  echo "ERROR: a test pattern (arg 1) or group (arg 3) is required." >&2
   exit 1
 fi
 
+# LANE mode: E2E_LANE=N gives this run its own release, hostname, and state dir, so N lanes
+# deploy concurrently to one cluster with zero shared mutable state (the cutover lock is
+# per-state-dir). All lanes share the merged Envoy data plane (Host routing) and Valkey
+# (build-id-namespaced keys).
+if [ -n "${E2E_LANE:-}" ]; then
+  E2E_K3D_RELEASE="e2e-lane${E2E_LANE}"
+  E2E_K3D_HOSTNAME="lane${E2E_LANE}.localhost"
+  ADAPTER_K8S_E2E_CLUSTER_STATE="${ADAPTER_DIR}/.k8s-adapter/e2e-lane${E2E_LANE}"
+fi
+
 export KUBECONFIG="${E2E_K3D_KUBECONFIG:-$HOME/.kube/k3d-adapter-e2e.yaml}"
+
+# Disk-backed TMPDIR for the harness temp apps (~150k inodes each) — the lane DRIVER
+# already exports this, but a manually-launched suite (or several in parallel) used the
+# default tmpfs /tmp and exhausted its 1M inodes (measured twice; the second time was four
+# concurrent verification repros). No wipe here: concurrent manual runs share the dir, and
+# the driver still wipes it at full-run start.
+export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
+mkdir -p "$TMPDIR"
 if [ ! -f "$KUBECONFIG" ]; then
   echo "ERROR: ${KUBECONFIG} not found — run scripts/e2e-k3d-bootstrap.sh first." >&2
   exit 1
@@ -85,4 +104,4 @@ fi
 export ADAPTER_K8S_E2E_BASE_URL="http://${HOSTNAME_LOCAL}:${HTTP_PORT}"
 export ADAPTER_K8S_E2E_CLUSTER_STATE="$STATE_DIR"
 
-exec bash "${SCRIPT_DIR}/e2e-cluster.sh" "$TEST_PATTERN" "$NEXTJS_REF"
+exec bash "${SCRIPT_DIR}/e2e-cluster.sh" "$TEST_PATTERN" "$NEXTJS_REF" "$TEST_GROUP"

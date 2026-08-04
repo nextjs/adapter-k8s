@@ -9,6 +9,7 @@ import {
   assertSafeReleaseName,
   assertSafeReplicaCount,
   escapeHelmActions,
+  renderUserEnvBlocks,
 } from "./utils.js";
 import type { EnvValue, EnvFromSource } from "../../types.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
@@ -83,6 +84,7 @@ export function renderDeployment({
   internalSecretRef,
   env,
   envFrom,
+  deploymentId,
 }: {
   poolName: string;
   buildId: string;
@@ -141,6 +143,12 @@ export function renderDeployment({
   /** User-supplied runtime environment, already merged (top-level config + this pool). */
   env?: Record<string, EnvValue>;
   envFrom?: EnvFromSource[];
+  /**
+   * next.config `deploymentId` — Next's runtime reads process.env.NEXT_DEPLOYMENT_ID for
+   * `?dpl=` asset/image URLs and skew headers, and config load REFUSES a mismatch, so the
+   * pod must carry the exact build-time value.
+   */
+  deploymentId?: string;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -169,6 +177,11 @@ export function renderDeployment({
   // Emitting it unconditionally keeps the pod template identical whether or not the cache is on,
   // so toggling `cache.enabled` between deploys never rolls the retained previous deployment.
   const valkeyEnv = "\n" + renderValkeyEnv(releaseName, "            ");
+  // Built-in, so it renders BEFORE user env (user config can never shadow it). Quoted via
+  // JSON + Helm-action escaping like every other user-shaped scalar in this template.
+  const deploymentIdEnv = deploymentId
+    ? `\n            - name: NEXT_DEPLOYMENT_ID\n              value: ${escapeHelmActions(JSON.stringify(deploymentId))}`
+    : "";
 
   // User-supplied runtime environment. Rendered AFTER the adapter's own entries: Kubernetes
   // takes the last occurrence of a duplicated name, so this ordering makes "user config can
@@ -179,38 +192,7 @@ export function renderDeployment({
   // bare `1.20` or `yes` would parse as a float/bool and be rejected at apply time) and then
   // escapeHelmActions'd, because chart templates are Go-template-evaluated before the YAML is
   // parsed — see the S5 note in utils.ts.
-  const yamlStr = (value: string): string => escapeHelmActions(JSON.stringify(value));
-  const envEntries = Object.entries(env ?? {}).map(([name, value]) => {
-    if (typeof value === "string") {
-      return `            - name: ${name}\n              value: ${yamlStr(value)}`;
-    }
-    const isSecret = "secret" in value;
-    const refKind = isSecret ? "secretKeyRef" : "configMapKeyRef";
-    const refName = isSecret ? value.secret : value.configMap;
-    const optional = value.optional === true ? `\n                  optional: true` : "";
-    return (
-      `            - name: ${name}\n` +
-      `              valueFrom:\n` +
-      `                ${refKind}:\n` +
-      `                  name: ${yamlStr(refName)}\n` +
-      `                  key: ${yamlStr(value.key)}${optional}`
-    );
-  });
-  const userEnv = envEntries.length > 0 ? "\n" + envEntries.join("\n") : "";
-
-  const envFromEntries = (envFrom ?? []).map((source) => {
-    const isSecret = "secret" in source;
-    const refKind = isSecret ? "secretRef" : "configMapRef";
-    const refName = isSecret ? source.secret : source.configMap;
-    const prefix = source.prefix ? `\n              prefix: ${yamlStr(source.prefix)}` : "";
-    const optional = source.optional === true ? `\n                optional: true` : "";
-    return (
-      `            - ${refKind}:\n` +
-      `                name: ${yamlStr(refName)}${optional}${prefix}`
-    );
-  });
-  const userEnvFrom =
-    envFromEntries.length > 0 ? `\n          envFrom:\n${envFromEntries.join("\n")}` : "";
+  const { userEnv, userEnvFrom } = renderUserEnvBlocks(env, envFrom);
 
   // N60. Literal quantities are validated here too: a `.Values`-sourced quantity is
   // already checked in values-yaml.ts, but a literal from deploy's per-build snapshot
@@ -372,7 +354,7 @@ ${podLabels}
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-${internalSecretEnv}${valkeyEnv}${userEnv}${userEnvFrom}
+${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             # readOnlyRootFilesystem makes / read-only; Next still needs a writable
             # scratch dir, so /tmp is an emptyDir. NOT in-memory: a bare \`emptyDir: {}\`

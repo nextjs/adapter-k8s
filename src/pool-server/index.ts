@@ -67,7 +67,13 @@ import {
   type ReadinessState,
 } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
-import { registerValkeyCacheHandler } from "./valkey-cache/register.js";
+import {
+  registerValkeyCacheHandler,
+  seedSandboxCacheHandlerRegistry,
+} from "./valkey-cache/register.js";
+import { createValkeyClient } from "./valkey-cache/client.js";
+import { ValkeyIncrementalCacheHandler } from "./valkey-cache/incremental-cache-handler.js";
+import { createBuildSeedLookup } from "./valkey-cache/build-seed-index.js";
 import {
   createPprRouteMatcher,
   explicitCacheControlWins,
@@ -1085,6 +1091,42 @@ function sendImageResponse(
 // edge middleware; when registered, that handler owns the PPR shell so dispatch must NOT inject the
 // build-time postponed token. Reading the resolved config (rather than VALKEY_URL) tracks exactly
 // that build decision — a cache + edge-middleware app has VALKEY_URL but no registered handler.
+// True when the BUILD prerendered `/_not-found` — read from the prerender manifest, which
+// is the exact discriminator between the two upstream suites (both ship an EMPTY
+// next.config, so no config flag separates them):
+//   • not-found-non-document:         manifest.routes["/_not-found"] present (static
+//     prerender) → the deployed contract serves that prerender even for non-HTML
+//     subresource requests, so a handler fallback must still render the HTML document.
+//   • not-found-non-document-dynamic: absent (the app's not-found is dynamic) → keep
+//     `next start`'s text/plain answer for subresources.
+// `next.config.partialPrefetching` from the resolved build config — see the dispatcher
+// option of the same name.
+function partialPrefetchingEnabled(cwd: string): boolean {
+  try {
+    const rsfPath = path.join(cwd, ".next", "required-server-files.json");
+    if (!existsSync(rsfPath)) return false;
+    const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
+      config?: { partialPrefetching?: boolean };
+    };
+    return rsf?.config?.partialPrefetching === true;
+  } catch {
+    return false;
+  }
+}
+
+function notFoundIsPrerenderedBuild(cwd: string): boolean {
+  try {
+    const manifestPath = path.join(cwd, ".next", "prerender-manifest.json");
+    if (!existsSync(manifestPath)) return false;
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
+      routes?: Record<string, unknown>;
+    };
+    return manifest?.routes?.["/_not-found"] !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 function hasRegisteredCacheHandler(cwd: string): boolean {
   try {
     const rsfPath = path.join(cwd, ".next", "required-server-files.json");
@@ -1743,6 +1785,31 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // BEFORE the HTTP server is created, so a hook that patches `node:http` or installs a
   // tracer provider sees a clean process. That is a strictly stronger ordering guarantee
   // than `next start`, which binds the port first and queues arriving requests.
+  // Pool-side classic incremental-cache handle for the PPR materialization layer. Distinct
+  // from the app-registered handler instance (different module graph) but the same keyspace,
+  // tag manifest, and seed semantics — Valkey is the shared truth. Constructed lazily-safe:
+  // any failure leaves the dispatcher without a platformCache, which is exactly the old
+  // behavior.
+  let platformCacheHandler: ValkeyIncrementalCacheHandler | undefined;
+  if (valkeyUrl) {
+    try {
+      platformCacheHandler = new ValkeyIncrementalCacheHandler({
+        client: createValkeyClient({
+          url: valkeyUrl,
+          ...(process.env.VALKEY_AUTH ? { password: process.env.VALKEY_AUTH } : {}),
+          ...(process.env.VALKEY_CA_CERT ? { caCert: process.env.VALKEY_CA_CERT } : {}),
+        }),
+        buildId,
+        seedLookup: createBuildSeedLookup(),
+      });
+    } catch (error) {
+      console.warn(
+        "[pool-server] platform cache handle unavailable — PPR materialization disabled:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   const instrumentationStatus = await registerInstrumentationHook();
 
   const port = parseInt(process.env.PORT ?? "3000", 10);
@@ -1808,6 +1875,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // reproduce that check on its own.
   const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
   const strictDynamicRoutes: { pageRegex: RegExp }[] = [];
+  const runtimeStaticTemplates = new Set<string>();
   const prerenderedPaths = new Set<string>();
   if (existsSync(prerenderManifestPath)) {
     try {
@@ -1831,7 +1899,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           prerenderedPaths.add(p.slice(seg.length + 1) || "/");
         }
       }
-      for (const [, route] of Object.entries<Record<string, unknown>>(
+      for (const [template, route] of Object.entries<Record<string, unknown>>(
         prerenderManifest.dynamicRoutes ?? {},
       )) {
         if (route.fallback === false && typeof route.routeRegex === "string") {
@@ -1839,10 +1907,26 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             pageRegex: new RegExp(route.routeRegex),
           });
         }
+        // `fallback: null` on an APP route (dataRoute *.rsc): Next may statically GENERATE
+        // never-prerendered concrete paths at runtime — under a shared cache these render
+        // non-minimal so Next's own response-cache write materializes them (dispatch's
+        // runtimeStaticTemplates rung; sub-shell-generation-middleware parity).
+        if (
+          route.fallback === null &&
+          typeof route.dataRoute === "string" &&
+          route.dataRoute.endsWith(".rsc")
+        ) {
+          runtimeStaticTemplates.add(template);
+        }
       }
     } catch {
       // Non-fatal — draft mode just won't work
     }
+  }
+  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+    console.log(
+      `[cache-trace] ${JSON.stringify({ op: "startup", runtimeStaticTemplates: [...runtimeStaticTemplates] })}`,
+    );
   }
 
   // Load the middleware manifest — contains edge function names, files, and assets.
@@ -1936,8 +2020,34 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
       return fallbackIncrementalCache;
     };
-    edgeSandboxRun = (params) =>
-      sandbox.run({
+    const sandboxContext = appReq("next/dist/server/web/sandbox/context") as {
+      getModuleContext: (options: {
+        moduleName: string;
+        onWarning: (w: unknown) => void;
+        onError: (e: unknown) => void;
+        useCache: boolean;
+        edgeFunctionEntry: unknown;
+        distDir: string;
+      }) => Promise<{ runtime: { context: { globalThis: Record<symbol, unknown> } } }>;
+    };
+    edgeSandboxRun = async (params) => {
+      // Seed the sandbox realm's `use cache` handler registry BEFORE the entry modules
+      // evaluate in it. getModuleContext is cached by moduleName and does NOT evaluate the
+      // entry files (sandbox.run does, afterwards), so this hands the fresh realm the
+      // node-side Valkey handlers in time: without it, edge-runtime after() revalidatePath
+      // found zero handlers in the sandbox and the write vanished — an edge-middleware app
+      // registers no classic cacheHandler, so there is no incrementalCache fallback either
+      // (measured live: next-after-app-deploy, all edge + middleware cases).
+      const { runtime } = await sandboxContext.getModuleContext({
+        moduleName: params.name,
+        onWarning: () => {},
+        onError: () => {},
+        useCache: true,
+        edgeFunctionEntry: params.edgeFunctionEntry,
+        distDir,
+      });
+      seedSandboxCacheHandlerRegistry(runtime.context.globalThis);
+      return sandbox.run({
         ...params,
         useCache: true,
         distDir,
@@ -1961,6 +2071,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           getFallbackIncrementalCache(),
         clientAssetToken: "",
       });
+    };
     console.log("Edge sandbox initialized");
   } catch (err) {
     // Do NOT swallow this. For a node-runtime app an unavailable sandbox is genuinely
@@ -2251,6 +2362,21 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       throw new Error(`Invalid revalidate response ${mocked.res.statusCode} for ${urlPath}`);
     }
   };
+  // Register the same fn on the router-server-methods global (the slot every sibling
+  // adapter leaves unfilled — sibling survey 2026-08-01): route modules resolve
+  // routerServerContext[relativeProjectDir] from this symbol when no requestMeta channel is
+  // present, and the edge sandbox mirrors the symbol into its context (sandbox.js), so edge
+  // API routes get the in-process res.revalidate() path too.
+  {
+    const routerGlobal = globalThis as typeof globalThis & Record<symbol, unknown>;
+    const RouterServerContextSymbol = Symbol.for("@next/router-server-methods");
+    const existing =
+      (routerGlobal[RouterServerContextSymbol] as Record<string, unknown> | undefined) ?? {};
+    routerGlobal[RouterServerContextSymbol] = {
+      ...existing,
+      ".": { ...(existing["."] as object | undefined), revalidate },
+    };
+  }
   // Next's local deploy-test harness (NEXT_ENABLE_ADAPTER=1) has neither Cloud CDN nor Valkey, so
   // it stands in Next's built-in filesystem cache for the platform cache and expects `next start`
   // response headers. This is E2E-only and MUST NOT be true in a real deployment — the second guard
@@ -2283,8 +2409,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     rscConfig: poolRscConfig,
     outputIds: Object.keys(poolManifest.outputs),
     strictDynamicRoutes,
+    runtimeStaticTemplates,
     prerenderedPaths,
-    buildIdForData: buildId,
+    // Next's OWN build id (manifest) — clients build /_next/data URLs from the id Next
+    // inlined, which under deploymentId mode is NOT the adapter's effective NEXT_BUILD_ID.
+    buildIdForData: routingManifest.buildId ?? buildId,
     internalSecret,
     basePath: routingManifest.basePath ?? "",
     i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
@@ -2306,10 +2435,35 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     emulatePlatformCache: emulateNextServer,
     // Only used when no classic incremental handler is registered (e.g. edge-middleware apps): lets
     // revalidateTag invalidate a PPR shell by checking its baked tags against the shared manifest.
+    // Cache-components builds prerender /_not-found; the deployed contract then serves that
+    // prerender for subresource requests (not-found-non-document), while a dynamic app keeps
+    // next start's text/plain (not-found-non-document-dynamic).
+    notFoundIsPrerendered: notFoundIsPrerenderedBuild(process.cwd()),
+    partialPrefetching: partialPrefetchingEnabled(process.cwd()),
     ...(valkeyHandler
       ? {
           checkShellStale: (tags: string[]) =>
             valkeyHandler!.getExpiration(tags).then((e) => e > 0),
+        }
+      : {}),
+    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's own READ-ONLY view of
+    // the shared incremental cache. Reads go through the classic Valkey handler (get() owns
+    // tag staleness and falls back to the build seed via the SAME fs-mirror the registered
+    // in-app handler uses). Nothing writes through this interface — regeneration re-enters
+    // Next via the registered `revalidate()` and Next's own handler persists the entry.
+    // Regeneration fires whenever the build has a preview identity (__NEXT_PREVIEW_MODE_ID,
+    // loaded unconditionally from the prerender manifest at startup) — it is always-on, not
+    // flag-gated.
+    ...(platformCacheHandler
+      ? {
+          platformCache: {
+            read: (key: string, ctx?: { kind?: string }) =>
+              platformCacheHandler!.get(key, ctx ?? {}),
+            readStored: (key: string, ctx?: { kind?: string }) =>
+              platformCacheHandler!.getStored(key, ctx ?? {}),
+            readSeed: (key: string, ctx?: { kind?: string }) =>
+              platformCacheHandler!.getSeed(key, ctx ?? {}),
+          },
         }
       : {}),
   });
@@ -2625,7 +2779,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // pathname: GSSP and ISR pages have function outputs keyed by their data
     // URL, and those must go through dispatch so the handler (and its
     // incremental cache) produces the payload.
-    const dataPrefix = `${basePath}/_next/data/${buildId}/`;
+    // Next's own build id (see buildIdForData above) — clients inline it into data URLs.
+    const dataPrefix = `${basePath}/_next/data/${routingManifest.buildId ?? buildId}/`;
     let pagesDataRoutingUrl: URL | undefined;
     if (!middlewareMayCover && url.pathname.startsWith(dataPrefix)) {
       const dataPath = url.pathname.slice(dataPrefix.length);
@@ -3485,8 +3640,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // process-global `_ENTRIES`, and loading one at boot would change which entry the
   // handler-loader's single-entry fallback resolves. The load is cached, so the first real
   // request reuses it.
-  const verifiableOutputs = Object.values(poolManifest.outputs).filter(
-    (output) => output.runtime !== "edge",
+  // Entries, not values: the handler-loader keys strictly on the MANIFEST KEY, and under a
+  // basePath the key ("/base/ssr") differs from Next's output id ("/ssr"). Probing by `.id`
+  // meant NO basePath build could ever load its probe ("Unknown output ID"), /readyz sat 503,
+  // and the blue/green gate timed out every basePath rollout — the full run's entire
+  // ~20-suite basePath cluster was this one lookup.
+  const verifiableOutputs = Object.entries(poolManifest.outputs).filter(
+    ([, output]) => output.runtime !== "edge",
   );
   if (instrumentationStatus === "failed") {
     console.error(
@@ -3500,14 +3660,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     readinessReason = "no node route modules to verify (manifests loaded)";
     console.log(`[pool-server] READY: ${readinessReason}`);
   } else {
-    const probe = verifiableOutputs[0]!;
+    const [probeKey] = verifiableOutputs[0]!;
     try {
-      await handlerLoader.load(probe.id);
+      await handlerLoader.load(probeKey);
       routeModulesVerified = true;
-      readinessReason = `route module loaded (${probe.id})`;
+      readinessReason = `route module loaded (${probeKey})`;
       console.log(`[pool-server] READY: ${readinessReason}`);
     } catch (err) {
-      readinessReason = `route module ${probe.id} failed to load`;
+      readinessReason = `route module ${probeKey} failed to load`;
       console.error(
         `[pool-server] NOT READY: ${readinessReason} — /readyz will report 503. ` +
           `Every request for this pool's routes would 500:`,

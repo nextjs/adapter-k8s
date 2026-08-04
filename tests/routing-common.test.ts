@@ -457,6 +457,25 @@ describe("templateOutputCandidates", () => {
 describe("prepareRequest / normalizeResolvedRedirect (shared orchestration)", () => {
   const manifest = { i18n: I18N, basePath: "", trailingSlash: false };
 
+  it("strips client-sent x-middleware-* control headers before middleware can see them", () => {
+    // app-middleware-proxy "should ignore x-middleware-set-cookie as a request header"
+    // (full-run v4): the POOL sanitizes these, but Phase-2 middleware runs at the ROUTING
+    // tier on the client's raw headers — NextResponse.next() then round-trips the spoofed
+    // header through x-middleware-override-headers and the handler observed a cookie the
+    // client never legitimately set. The public Pages Router prefetch hint stays.
+    const headers = new Headers({
+      "x-middleware-set-cookie": "spoofed=1",
+      "x-middleware-override-headers": "x",
+      "x-middleware-prefetch": "1",
+      "x-ordinary": "keep",
+    });
+    prepareRequest(url("/"), headers, manifest);
+    expect(headers.get("x-middleware-set-cookie")).toBeNull();
+    expect(headers.get("x-middleware-override-headers")).toBeNull();
+    expect(headers.get("x-middleware-prefetch")).toBe("1");
+    expect(headers.get("x-ordinary")).toBe("keep");
+  });
+
   it("400s malformed encoding and 308s duplicate slashes", () => {
     expect(prepareRequest(url("/%zz"), new Headers(), manifest)).toEqual({
       kind: "error",
