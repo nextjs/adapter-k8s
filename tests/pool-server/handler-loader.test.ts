@@ -182,6 +182,50 @@ describe("createHandlerLoader", () => {
     expect(loadModule).toHaveBeenCalledTimes(1);
   });
 
+  it("un-latches ResponseCache: per-request minimalMode, one instance per mode", async () => {
+    // route-module.ts:1101 lazily constructs `new ResponseCache(minimalMode)` ONCE per
+    // route-module instance — latching the FIRST request's mode for the process lifetime
+    // (our loader caches the module). response-cache/index.ts:493 skips the incremental
+    // write under latched-minimal, so a cold pod whose first hit was a MINIMAL document
+    // render never persisted a background revalidation again: resume-data-cache served
+    // stale >12s on fresh pods while byte-identical sequences passed on warmed ones
+    // (codex-traced, 2026-08-04). The loader now wraps getResponseCache to pick a
+    // per-MODE instance from the live request's meta.
+    const ctorCalls: boolean[] = [];
+    class FakeResponseCache {
+      constructor(minimal: boolean) {
+        ctorCalls.push(minimal);
+      }
+    }
+    const routeModule = {
+      getResponseCache: () => {
+        throw new Error("original latch should have been replaced");
+      },
+    };
+    const loadModule = vi.fn().mockResolvedValue({ handler: () => {}, routeModule });
+    const manifest = {
+      buildId: "test123",
+      poolName: "ssr",
+      outputs: {
+        "/": { id: "/app/page", filePath: "x.js", pathname: "/", type: "APP_PAGE" },
+      },
+    } as any;
+    const loader = createHandlerLoader(manifest, loadModule, {
+      responseCacheCtor: FakeResponseCache as any,
+    });
+    await loader.load("/");
+
+    const META = Symbol.for("NextInternalRequestMeta");
+    const reqMin = { [META]: { minimalMode: true } };
+    const reqNonMin = { [META]: { minimalMode: false } };
+    const a = routeModule.getResponseCache(reqMin as any);
+    const b = routeModule.getResponseCache(reqNonMin as any);
+    const a2 = routeModule.getResponseCache(reqMin as any);
+    expect(a).not.toBe(b);
+    expect(a2).toBe(a); // batcher dedupe preserved within a mode
+    expect(ctorCalls).toEqual([true, false]);
+  });
+
   it("throws for unknown output ID", async () => {
     const manifest = { buildId: "test123", poolName: "ssr", outputs: {} } as any;
     const loader = createHandlerLoader(manifest, vi.fn());

@@ -1,5 +1,6 @@
 // src/pool-server/handler-loader.ts
 import { pathToFileURL } from "node:url";
+import { createRequire } from "node:module";
 import path from "node:path";
 import type { PoolManifest } from "../types.js";
 
@@ -108,10 +109,70 @@ export function resolveRouteHandlerExport(
   );
 }
 
+/**
+ * Un-latch the route module's ResponseCache mode (the rdc stale-forever root cause):
+ * `RouteModule.getResponseCache` lazily constructs `new ResponseCache(minimalMode)` ONCE
+ * per instance (route-module.ts:1101), latching the FIRST request's mode for the process
+ * lifetime — and this loader caches the module for the process lifetime. ResponseCache
+ * skips the incremental-cache write under minimal mode (response-cache/index.ts:493), so a
+ * pod whose first hit on a route was a MINIMAL document render never persisted a
+ * background revalidation again: measured as resume-data-cache serving stale >12s on cold
+ * pods while byte-identical request sequences passed on warmed ones. Replace the accessor
+ * with one that keys a ResponseCache instance per MODE off the live request's meta —
+ * minimal requests keep skip-write semantics (the platform owns those entries), and the
+ * Batcher dedupe survives within each mode.
+ */
+function unlatchResponseCache(
+  module: LoadedModule,
+  ResponseCacheCtor: new (minimalMode: boolean) => unknown,
+): void {
+  const rm = (
+    module as {
+      routeModule?: { getResponseCache?: (req: unknown) => unknown };
+    }
+  ).routeModule;
+  if (!rm || typeof rm.getResponseCache !== "function") return;
+  const META = Symbol.for("NextInternalRequestMeta");
+  const perMode = new Map<boolean, unknown>();
+  rm.getResponseCache = (req: unknown): unknown => {
+    const minimal = !!(
+      req as { [key: symbol]: { minimalMode?: boolean } | undefined } | undefined
+    )?.[META]?.minimalMode;
+    let rc = perMode.get(minimal);
+    if (!rc) {
+      rc = new ResponseCacheCtor(minimal);
+      perMode.set(minimal, rc);
+    }
+    return rc;
+  };
+}
+
+/** Resolve Next's ResponseCache class through the APP's own next (the module graph the
+ * entrypoints run in). Lazy and fail-open: an unresolvable class leaves the upstream
+ * latch behavior untouched rather than breaking handler loading. */
+function defaultResponseCacheCtor(): (new (minimalMode: boolean) => unknown) | undefined {
+  try {
+    const req = createRequire(path.resolve(process.cwd(), "package.json"));
+    const mod = req("next/dist/server/response-cache") as {
+      default?: new (minimalMode: boolean) => unknown;
+    };
+    return typeof mod.default === "function" ? mod.default : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function createHandlerLoader(
   manifest: PoolManifest,
   loadModule: LoadModuleFn = (p) => import(pathToFileURL(path.resolve(process.cwd(), p)).href),
+  options?: { responseCacheCtor?: new (minimalMode: boolean) => unknown },
 ) {
+  let resolvedCtor: (new (minimalMode: boolean) => unknown) | undefined | null = null;
+  const responseCacheCtor = (): (new (minimalMode: boolean) => unknown) | undefined => {
+    if (options?.responseCacheCtor) return options.responseCacheCtor;
+    if (resolvedCtor === null) resolvedCtor = defaultResponseCacheCtor();
+    return resolvedCtor;
+  };
   const cache = new Map<string, Promise<ArtifactRouteHandler>>();
 
   return {
@@ -140,6 +201,8 @@ export function createHandlerLoader(
             resolved = await (defaultExport as Promise<LoadedModule>);
           }
           try {
+            const ctor = responseCacheCtor();
+            if (ctor) unlatchResponseCache(resolved, ctor);
             // The route's own pathname keys the _ENTRIES fallback — the registry is
             // process-global, so a pool with several edge routes must select by key.
             return resolveRouteHandlerExport(resolved, output.pathname);
