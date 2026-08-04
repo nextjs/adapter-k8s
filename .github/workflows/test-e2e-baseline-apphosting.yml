@@ -9,7 +9,7 @@ on:
         type: string
       nextVersion:
         description: "npm version for next"
-        default: "16.2.1"
+        default: "16.3.0"
         type: string
       reactVersion:
         description: "npm version for react/react-dom"

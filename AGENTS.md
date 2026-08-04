@@ -2,7 +2,7 @@
 
 ## What this is
 
-`@next-community/adapter-k8s` — a Next.js adapter (Next 16.2+ `adapterPath` API) that deploys
+`@next-community/adapter-k8s` — a Next.js adapter (Next 16.3+ `adapterPath` API) that deploys
 Next.js apps to GKE. At build time it analyzes the route structure and generates pool servers, an
 ext_proc routing service, a Helm chart, and Dockerfiles. A CLI (`adapter-k8s`) provisions GCP
 infrastructure and runs zero-downtime blue/green deploys.

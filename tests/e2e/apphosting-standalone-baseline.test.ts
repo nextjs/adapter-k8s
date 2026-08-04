@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 const runBaseline = process.env.RUN_APPHOSTING_BASELINE_E2E === "1";
 const describeIf = runBaseline ? describe : describe.skip;
 
-const nextVersion = process.env.APPHOSTING_BASELINE_NEXT_VERSION ?? "16.2.1";
+const nextVersion = process.env.APPHOSTING_BASELINE_NEXT_VERSION ?? "16.3.0";
 const reactVersion = process.env.APPHOSTING_BASELINE_REACT_VERSION ?? "19.2.4";
 const adapterVersion = process.env.APPHOSTING_BASELINE_ADAPTER_VERSION ?? "latest";
 

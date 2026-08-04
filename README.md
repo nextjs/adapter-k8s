@@ -1,6 +1,6 @@
 # @next-community/adapter-k8s
 
-Deploy full-fidelity Next.js—middleware, Partial Prerendering, cache components, ISR—to Kubernetes with a single command. The adapter plugs into Next.js 16.2+'s `adapterPath` API and generates everything from your build output—Helm charts, Dockerfiles, routing manifests—so your infrastructure evolves with your routes, not with hand-maintained YAML.
+Deploy full-fidelity Next.js—middleware, Partial Prerendering, cache components, ISR—to Kubernetes with a single command. The adapter plugs into Next.js 16.3+'s `adapterPath` API and generates everything from your build output—Helm charts, Dockerfiles, routing manifests—so your infrastructure evolves with your routes, not with hand-maintained YAML.
 
 ```bash
 npx adapter-k8s deploy
@@ -32,7 +32,7 @@ Middleware, PPR, cache components, and ISR are verified through the upstream Nex
 ## Requirements
 
 - Node.js >= 20.9.0
-- Next.js >= 16.2.0
+- Next.js >= 16.3.0
 - A Kubernetes cluster:
   - **GKE** (Autopilot or Standard) for `provider.gke`, plus `gcloud` in PATH
   - **any conformant cluster** for `provider.generic`, with [Envoy Gateway](https://gateway.envoyproxy.io/) installed and a CNI that enforces NetworkPolicy
