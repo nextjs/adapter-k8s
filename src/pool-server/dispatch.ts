@@ -1839,6 +1839,28 @@ export function createDispatcher(options: DispatcherOptions) {
   const MAX_SERVED_FALLBACK_SHELLS = 10_000;
   const servedFallbackShells = new Set<string>();
 
+  // #42 production shell-fill dedupe: one background upgrade attempt per URL per window.
+  // Segment prefetches arrive per client navigation, so without this every prefetch of a
+  // fallback-served URL would fan out a full document render. Bounded like the marker set
+  // above; eviction only means one extra (idempotent) upgrade attempt for that URL.
+  const SHELL_FILL_COOLDOWN_MS = 60_000;
+  const MAX_SHELL_FILL_URLS = 10_000;
+  const shellFillLastAttempt = new Map<string, number>();
+  const shellFillCooldownAllows = (url: string): boolean => {
+    const now = Date.now();
+    const last = shellFillLastAttempt.get(url);
+    if (last !== undefined && now - last < SHELL_FILL_COOLDOWN_MS) return false;
+    if (shellFillLastAttempt.size >= MAX_SHELL_FILL_URLS) {
+      const oldest = shellFillLastAttempt.keys().next().value;
+      if (oldest !== undefined) shellFillLastAttempt.delete(oldest);
+    }
+    // Delete-then-set so a refreshed URL moves to the back of the insertion order — the
+    // capped eviction above stays an approximate-LRU instead of evicting hot URLs.
+    shellFillLastAttempt.delete(url);
+    shellFillLastAttempt.set(url, now);
+    return true;
+  };
+
   // Pages entrypoints call requestMeta.render404 when getStaticProps/getServerSideProps returns
   // notFound. In a custom adapter there is no Next router-server above the entrypoint, so provide
   // that missing layer explicitly and render into the SAME response. This also preserves request
@@ -2254,8 +2276,21 @@ export function createDispatcher(options: DispatcherOptions) {
           return;
         }
 
+        // #42 (partial-fallback-shell-upgrade): production fires the SAME fill as the E2E
+        // stand-in whenever the shared classic handler is registered — the detached
+        // non-minimal document render drives Next's own fallback-upgrade scheduling
+        // (app-page-runtime.ts:1276-1330, gated !isMinimalMode), whose writes land in
+        // Valkey via the registered handler. Without this, segment prefetches are served
+        // entirely from the build seed and NOTHING ever triggers the upgrade (the one
+        // upstream trigger lives in the entrypoint, which seed serving never invokes).
+        // Deduped per URL by a cooldown: prefetch traffic is per-navigation hot-path and
+        // must not fan out one document render per prefetch — one attempt per URL per
+        // window is enough (the upgrade is idempotent; Next's own gates make a no-op of
+        // routes with nothing left to specialize).
+        const productionOwnsShellFill = incrementalCacheShared && !!platformCache;
         if (
-          entrypointOwnsPprShell &&
+          (entrypointOwnsPprShell ||
+            (productionOwnsShellFill && shellFillCooldownAllows(req.url ?? "/"))) &&
           serveRscPrerenderVariant &&
           typeof req.headers["next-router-segment-prefetch"] === "string"
         ) {
@@ -2263,8 +2298,8 @@ export function createDispatcher(options: DispatcherOptions) {
           // seeded segment immediately, then fills the more-specific route shell in its durable
           // middle cache. Reproduce only that missing orchestration here: keep the fast seeded
           // response, and run a document render whose output is discarded while Next writes the
-          // upgraded shell to its filesystem cache. This branch is unreachable in production;
-          // production cache ownership is the separately registered Valkey incremental handler.
+          // upgraded shell — to its filesystem cache under the E2E stand-in, to Valkey through
+          // the registered classic handler in production.
           const backgroundHeaders = { ...req.headers };
           delete backgroundHeaders.rsc;
           delete backgroundHeaders["next-router-prefetch"];
@@ -2331,6 +2366,49 @@ export function createDispatcher(options: DispatcherOptions) {
             });
             res.end(Buffer.isBuffer(sv.html) ? sv.html : Buffer.from(String(sv.html)));
             return;
+          }
+        }
+
+        // A STORED materialized entry supersedes the seeded SEGMENT files too (rdc run 12,
+        // 2026-08-04): the fast path below serves segment prefetches straight from the
+        // BUILD file, so once the stored-supersedes-seed rung existed only for documents
+        // (below), a regenerated page kept serving build-era segment bytes to every
+        // prefetch forever. The materialized entry's segmentData is the CURRENT content —
+        // exactly how `next start`'s fs-cache read keeps segment prefetches consistent
+        // with regenerated documents. Missing/absent stored entry (or a stored entry
+        // without this segment) falls through to the seeded file unchanged.
+        if (
+          serveRscPrerenderVariant &&
+          staticAsset &&
+          incrementalCacheShared &&
+          platformCache?.readStored &&
+          typeof req.headers["next-router-segment-prefetch"] === "string"
+        ) {
+          const segDirSuffix = rscConfig?.prefetchSegmentDirSuffix ?? ".segments";
+          const segIdx = staticAsset.pathname.indexOf(`${segDirSuffix}/`);
+          if (segIdx > 0) {
+            const pageKey = staticAsset.pathname.slice(0, segIdx) || "/index";
+            const storedSeg = await platformCache
+              .readStored(pageKey, { kind: "APP_PAGE" })
+              .catch(() => null);
+            const sv = storedSeg?.value as
+              | { kind?: string; segmentData?: Map<string, unknown> }
+              | undefined;
+            const segPath = req.headers["next-router-segment-prefetch"];
+            if (
+              sv?.kind === "APP_PAGE" &&
+              sv.segmentData instanceof Map &&
+              sv.segmentData.has(segPath)
+            ) {
+              const seg = sv.segmentData.get(segPath) as Buffer | string;
+              res.writeHead(200, {
+                "content-type": "text/x-component",
+                "cache-control": "no-store",
+                vary: RSC_VARY_HEADER,
+              });
+              res.end(Buffer.isBuffer(seg) ? seg : Buffer.from(String(seg)));
+              return;
+            }
           }
         }
 
@@ -3338,9 +3416,20 @@ export function createDispatcher(options: DispatcherOptions) {
                       }),
                 };
               }
-            } else {
+            } else if (!isDynamicRsc) {
               // No entry and no usable shell: the foreground request degrades to the
               // non-minimal live render while a canonical regeneration fills the store.
+              //
+              // NEVER from a dynamic RSC request (traced live 2026-08-04, rdc): the
+              // x-prerender-revalidate re-entry cannot succeed for cache-components routes
+              // — patch-fetch skips every fetch-cache read under
+              // workStore.isOnDemandRevalidate (patch-fetch.ts:1019), so the render
+              // live-fetches under the prerender's abort signal and dies with "uncached or
+              // runtime data" — and its doomed read WINS the single-flight revalidate lock,
+              // so the entrypoint's own read milliseconds later is told FRESH and its
+              // WORKING background revalidation (forceStaticRender,
+              // isOnDemandRevalidate=false) never schedules. Dynamic RSC runs non-minimal
+              // and the ENTRYPOINT owns regeneration (app-page-runtime.ts:1395-1435).
               scheduleRegen();
             }
           }

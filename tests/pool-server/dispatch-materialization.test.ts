@@ -763,6 +763,47 @@ describe("PPR serve ladder reads the platform cache", () => {
     }
   });
 
+  it("a DYNAMIC RSC request on a stale shell never self-regenerates (rdc stale-forever)", async () => {
+    // Traced live 2026-08-04 (rdc consistency tests): the suite's post-revalidateTag flow
+    // is ALL dynamic-RSC, and each request's scheduleRegen() fired an x-prerender-revalidate
+    // render that (a) CANNOT succeed for cache-components routes — patch-fetch skips every
+    // fetch-cache read under workStore.isOnDemandRevalidate (patch-fetch.ts:1019), so the
+    // render live-fetches under the prerender's abort signal and dies with "uncached or
+    // runtime data" — and (b) WINS the single-flight revalidate lock first, so the
+    // entrypoint's read milliseconds later is told FRESH and its WORKING background
+    // revalidation (forceStaticRender, isOnDemandRevalidate=false) never schedules:
+    // measured zero "Error revalidating the page in the background" lines while the regen
+    // failed 6 times. Dynamic RSC runs non-minimal and the ENTRYPOINT owns regeneration.
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-xyz";
+    try {
+      const revalidations: any[] = [];
+      const dispatcher = createDispatcher(
+        baseOptions({
+          localHandlerInvoker: vi.fn() as any,
+          checkShellStale: async () => true,
+          pprRoutes: {
+            "/ppr-page": {
+              postponedState: "build-token",
+              fallbackFilePath: shellFile,
+              tags: ["t1"],
+            },
+          },
+          revalidate: (cfg: any) => {
+            revalidations.push(cfg);
+            return Promise.resolve();
+          },
+          platformCache: { read: async () => null, write: async () => {} },
+        }),
+      );
+      await dispatcher.dispatch(mockReq("/ppr-page", { rsc: "1" }), mockRes(), route);
+      // Let any wrongly-scheduled regen fire before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(revalidations).toHaveLength(0);
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
+  });
+
   it("on a STALE shell falls to the live render AND schedules ONE regeneration via revalidate()", async () => {
     // The regeneration rides the pool's own res.revalidate() re-entry (N33 boundary):
     // a mocked-request loopback carrying x-prerender-revalidate, which dispatch verifies

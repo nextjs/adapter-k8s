@@ -25,6 +25,7 @@ import {
 } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
+import { restoreFetchCacheSeed } from "./fetch-cache-seed.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import {
@@ -1816,6 +1817,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   const releaseName = process.env.RELEASE_NAME ?? "nextjs";
   const configDir = process.env.CONFIG_DIR ?? "/config";
 
+  // The writable emptyDir at /app/.next/cache shadows anything the image ships there, so
+  // the build's fetch-cache rides at .k8s-adapter/fetch-cache-seed and is restored into
+  // the runtime location before anything can read it (see fetch-cache-seed.ts).
+  restoreFetchCacheSeed(process.cwd());
+
   // Load pool manifest (mounted as ConfigMap or baked into container)
   const poolManifestPath = path.join(configDir, `pool-manifest-${poolName}.json`);
   if (!existsSync(poolManifestPath)) {
@@ -2457,8 +2463,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     ...(platformCacheHandler
       ? {
           platformCache: {
+            // getPeek, NOT get: dispatch reads entries to SERVE them and never
+            // revalidates from these paths — get()'s single-flight lock consumption
+            // starved the entrypoint's own revalidation (told FRESH, never regenerated;
+            // rdc stale-forever, traced 2026-08-04). Only Next's own reads through the
+            // registered cacheHandler may spend the lock.
             read: (key: string, ctx?: { kind?: string }) =>
-              platformCacheHandler!.get(key, ctx ?? {}),
+              platformCacheHandler!.getPeek(key, ctx ?? {}),
             readStored: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.getStored(key, ctx ?? {}),
             readSeed: (key: string, ctx?: { kind?: string }) =>

@@ -87,6 +87,7 @@ function seedProject(distDirName = ".next") {
   const chunk = writeFile(`${distDirName}/server/chunks/[root-of-the-server]__abc.js`, "chunk");
   writeFile(`${distDirName}/server/chunks/stale-from-previous-build.js`, "stale");
   writeFile(`${distDirName}/cache/fetch-cache/entry`, "build cache");
+  writeFile(`${distDirName}/cache/webpack/build-junk`, "junk");
   writeFile("public/logo.png", "png-bytes");
   // node_modules/next must be resolvable from the app for the pool image (setup-node-env).
   writeFile("node_modules/next/package.json", JSON.stringify({ name: "next", version: "16.2.10" }));
@@ -221,6 +222,28 @@ describe("pool build context staging", () => {
 
     const staged = JSON.parse(readFileSync(poolContext("node_modules/next/package.json"), "utf-8"));
     expect(staged.version).toBe("0.0.0-app-local");
+  });
+
+  // The build's fetch-cache is `next start`'s warm-start content: FileSystemCache reads
+  // `.next/cache/fetch-cache/<key>` for FETCH-kind entries, and the seed layer mirrors that
+  // (build-seed-index.ts fetchCacheSeed). Without the files in the image, a
+  // post-revalidateTag FETCH read is a MISS and upstream patch-fetch re-fetches WITH the
+  // prerender's abort signal attached (a stale HIT re-fetches signal-DETACHED,
+  // patch-fetch.ts:1073-1104) — under load the abort wins and the cache-components
+  // background revalidation dies with "uncached or runtime data during prerendering"
+  // (rdc stale-forever, traced 2026-08-04). Only fetch-cache: the sibling build caches
+  // (webpack/turbopack) are the bloat the old blanket exclusion was right about. Staged at
+  // .k8s-adapter/fetch-cache-seed, NOT the runtime location — the pod mounts a writable
+  // emptyDir over /app/.next/cache that shadows image content (measured: the image had the
+  // files, the pod showed an empty dir); the pool server restores the seed at boot.
+  it("stages the build's fetch-cache seed but not the other build caches", async () => {
+    seedProject();
+    await build();
+
+    expect(readFileSync(poolContext(".k8s-adapter/fetch-cache-seed/entry"), "utf-8")).toBe(
+      "build cache",
+    );
+    expect(existsSync(poolContext(".next/cache"))).toBe(false);
   });
 
   // N50 (review #32, reproduced): the pool context dirs were never wiped and `stageFile`
@@ -405,7 +428,7 @@ describe("pool build context staging", () => {
 describe("shared-image strategy (#30)", () => {
   const sharedConfig: K8sAdapterConfig = { ...validConfig, containerStrategy: "shared-image" };
 
-  it("stages public/, @next/routing and a commonjs-pinned package.json; excludes dist cache", async () => {
+  it("stages public/, @next/routing and a commonjs-pinned package.json; excludes build caches except fetch-cache", async () => {
     seedProject();
     await build({}, sharedConfig);
 
@@ -415,8 +438,12 @@ describe("shared-image strategy (#30)", () => {
     const pkg = JSON.parse(readFileSync(sharedContext("package.json"), "utf-8"));
     expect(pkg.type).toBe("commonjs");
     expect(pkg.name).toBe("app"); // the rest of the app's manifest is preserved
-    // Build output present, build cache absent.
+    // Build output present; the fetch-cache seed staged (next start warm-start parity —
+    // see the traced-assets fetch-cache test), build caches absent from the dist copy.
     expect(existsSync(sharedContext(".next/server/app/page.js"))).toBe(true);
+    expect(readFileSync(sharedContext(".k8s-adapter/fetch-cache-seed/entry"), "utf-8")).toBe(
+      "build cache",
+    );
     expect(existsSync(sharedContext(".next/cache"))).toBe(false);
     // static-assets.json references public/logo.png — which is now actually there.
     const staticManifest = JSON.parse(

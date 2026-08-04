@@ -6,7 +6,7 @@ The README's status claim—framework compatibility strongly validated, hardenin
 
 ## The layers
 
-### 1. Unit suite—2,292 tests
+### 1. Unit suite—2,356 tests
 
 Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted templates. Several template tests render through **real `helm`**, because the question being asked is what helm does with the file, not what the file contains.
 
@@ -41,19 +41,18 @@ structurally cannot see, and it now runs the entire suite:
 
 ```text
 Next.js:        v16.3.0-canary.97 (367e5215)
-adapter-k8s:    2e00b98
-run date:       2026-08-03
-result:         4,434 passed / 31 failed / 1,082 suites
+run date:       2026-08-04
+result:         ~4,438 passed / 27 failed / 1,082 suites
 reproduce:      bash scripts/e2e-lanes.sh 6 24   — ~3-4.5h, 6 concurrent lanes
 ```
 
-**The 31 failures, characterized rather than waved at:**
+**The 27 failures, characterized rather than waved at:**
 
 | Group | Count | Status |
 | --- | --- | --- |
-| Server-action suites (`app-action`, `app-action-node-middleware`, `action-forward-loop`) | 10 | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
-| Timing races (`cached-navigations` 5, `prerender` 2, `vary-params-base-dynamic`, `i18n-support-same-page-hash-change`, `rewrites-manual-href-as`) | 10 | Client-navigation waits that reproduce intermittently; rates vary with host load |
-| PPR runtime materialization (`resume-data-cache` 3, `partial-fallback-shell-upgrade` 1) | 4 | The remaining frontier: runtime-generated shell/resume-data consistency across requests. Active work; the underlying mechanisms are mapped |
+| Server-action suites (`app-action` 5, `app-action-node-middleware` 5, `action-forward-loop` 1) | 11 | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
+| Timing races (`cached-navigations` 2, `prerender` 2, `vary-params-base-dynamic`, `catch-error`, `catch-error-react-compiler`, `client-params`) | 8 | Client-navigation waits that reproduce intermittently; rates and membership vary with host load |
+| PPR resume-data consistency (`resume-data-cache`) | 1 | After a tag revalidation, a regenerated page can retain the previous fetch-cache value in its resume data; under investigation |
 | `cache-components-prerender-matrix` | 3 | The `partialFallback` on-demand shell-specialization contract, which this adapter deliberately does not yet implement |
 | Singletons (`metadata-navigation`, `no-duplicate-headers-middleware`, `non-ascii-cache-tags`, `cache-components-allow-otel-spans`) | 4 | One test each; `no-duplicate-headers-middleware` is a documented, deliberate divergence |
 
@@ -65,9 +64,9 @@ load tests.
 
 Envoy → routing service → pool server, wired the way GKE wires it, on one machine. Verified by hand against the e2e fixture: all routes serve, `x-mw-executed` confirms middleware ran at the edge, RSC negotiation returns a flight payload, and the internal dispatch headers do not leak to the client.
 
-`emulate` remains the quick local way to inspect this path by hand; the full upstream suite
-now runs against the same topology on a real cluster (layer 2, cluster topology), which
-supersedes the process-level integration workflow this section previously described.
+`emulate` is the quick local way to inspect this path by hand; for automated coverage of
+the same topology, the full upstream suite runs against a real cluster (layer 2, cluster
+topology).
 
 **Cannot see:** the real load balancer, CEL match-condition evaluation as GCP performs it, Cloud CDN interaction, or NetworkPolicy enforcement.
 
@@ -104,10 +103,10 @@ Stated plainly, because a reviewer will find them anyway:
   when a maintainer launches it—hours, not minutes—so individual commits are gated by the
   unit suite and a ~35-minute smoke subset (`scripts/e2e-smoke.sh`), with full runs between
   batches.
-- **31 upstream tests fail in the full topology** (0.7% of the suite; see the table in
-  layer 2). About half are intermittent timing races; the substantive remainder are the PPR
-  runtime-materialization frontier, the unimplemented `partialFallback` contract, and the
-  server-action harness conditions.
+- **27 upstream tests fail in the full topology** (0.6% of the suite; see the table in
+  layer 2). About a third are intermittent timing races; the substantive remainder are the
+  server-action harness conditions, the unimplemented `partialFallback` contract, and one
+  remaining PPR resume-data consistency case.
 - **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to—the claim here is correctness, not capacity.
 - **The generic provider is younger** than the GKE one and has correspondingly less real-world exposure, though it passes the same unit suite and its live verification covered the full request path.
 

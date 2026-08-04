@@ -16,7 +16,113 @@ import {
   resolveDeployImageDigests,
   discoverServingBuildId,
   resolveImageDigest,
+  refreshFetchCacheStaging,
 } from "../../src/cli/deploy.js";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+// The build's fetch-cache is written ASYNCHRONOUSLY by the static-export workers, and
+// upstream orders nothing between those writes and handleBuildComplete — measured: my
+// repro build staged it fine (write landed 750ms before the staging read) while two
+// consecutive harness builds shipped images WITHOUT it (the write lost the race with
+// onBuildComplete's existsSync). Deploy runs minutes later, when the artifact is
+// certainly on disk, so it re-stages the fetch-cache into every image context before
+// `docker build`. See build-seed-index.ts fetchCacheSeed for why the files matter.
+describe("refreshFetchCacheStaging", () => {
+  let projectDir: string;
+  beforeEach(() => {
+    projectDir = mkdtempSync(path.join(os.tmpdir(), "deploy-fetch-cache-"));
+  });
+  const write = (rel: string, content = "x") => {
+    const abs = path.join(projectDir, rel);
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, content);
+  };
+
+  it("copies the build fetch-cache into every pool context (traced-assets)", () => {
+    write(".next/cache/fetch-cache/abc123", "entry-bytes");
+    write(".k8s-adapter/output/pools/ssr/context/pool-server.cjs");
+    write(".k8s-adapter/output/pools/api/context/pool-server.cjs");
+
+    refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+      distDir: ".next",
+      pools: ["ssr", "api"],
+      containerStrategy: "traced-assets",
+    });
+
+    for (const pool of ["ssr", "api"]) {
+      expect(
+        readFileSync(
+          path.join(
+            projectDir,
+            `.k8s-adapter/output/pools/${pool}/context/.k8s-adapter/fetch-cache-seed/abc123`,
+          ),
+          "utf-8",
+        ),
+      ).toBe("entry-bytes");
+    }
+  });
+
+  it("copies into the shared context (shared-image) and replaces a stale copy", () => {
+    write(".next/cache/fetch-cache/fresh", "fresh");
+    write(".k8s-adapter/output/shared-context/pool-server.cjs");
+    write(".k8s-adapter/output/shared-context/.k8s-adapter/fetch-cache-seed/stale", "stale");
+
+    refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+      distDir: ".next",
+      pools: ["default"],
+      containerStrategy: "shared-image",
+    });
+
+    const base = path.join(
+      projectDir,
+      ".k8s-adapter/output/shared-context/.k8s-adapter/fetch-cache-seed",
+    );
+    expect(readFileSync(path.join(base, "fresh"), "utf-8")).toBe("fresh");
+    // A build's staged copy is REPLACED wholesale — entries deleted from the build's
+    // fetch-cache must not keep shipping (same rule as the context wipe, #32).
+    expect(existsSync(path.join(base, "stale"))).toBe(false);
+  });
+
+  it("no-ops when the build produced no fetch-cache, and skips absent contexts", () => {
+    write(".k8s-adapter/output/pools/ssr/context/pool-server.cjs");
+    refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+      distDir: ".next",
+      pools: ["ssr", "ghost"],
+      containerStrategy: "traced-assets",
+    });
+    expect(
+      existsSync(
+        path.join(projectDir, ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed"),
+      ),
+    ).toBe(false);
+  });
+
+  it("refuses a distDir that escapes the project (metadata is build-controlled)", () => {
+    write(".next/cache/fetch-cache/abc", "x");
+    write(".k8s-adapter/output/pools/ssr/context/pool-server.cjs");
+    const victim = path.join(path.dirname(projectDir), `victim-${path.basename(projectDir)}`);
+    mkdirSync(path.join(victim, "cache/fetch-cache"), { recursive: true });
+    writeFileSync(path.join(victim, "cache/fetch-cache/leak"), "outside");
+    try {
+      expect(() =>
+        refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+          distDir: `../${path.basename(victim)}`,
+          pools: ["ssr"],
+          containerStrategy: "traced-assets",
+        }),
+      ).toThrow(/distDir/);
+      expect(
+        existsSync(
+          path.join(projectDir, ".k8s-adapter/output/pools/ssr/context"),
+        ),
+      ).toBe(true);
+    } finally {
+      rmSync(victim, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("buildDockerCommands", () => {
   it("generates docker build and push commands per pool with auth", () => {

@@ -1597,6 +1597,284 @@ describe("createDispatcher", () => {
       );
     });
 
+    // #42 (partial-fallback-shell-upgrade "segment prefetch triggers background shell
+    // upgrade"): in production, segment prefetches are served straight from the build seed
+    // and NEVER invoke the entrypoint — so the entrypoint's own fallback-upgrade scheduling
+    // (app-page-runtime.ts:1276-1330, gated !isMinimalMode) has no trigger, and the more
+    // specific shell is never materialized. The E2E-gated fill above shows the intended
+    // shape; production fires the same detached non-minimal document render whenever the
+    // SHARED classic handler is registered (its writes land in Valkey via Next's own
+    // machinery), deduped per URL by a cooldown so prefetch bursts don't fan out renders.
+    it("schedules a production shell fill (shared platform cache) after a seeded segment prefetch, once per URL", async () => {
+      mkdirSync(path.join(tmpDir, "index.segments"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
+        "seeded-segment-rsc",
+      );
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index.segments/__PAGE__.segment.rsc",
+            filePath: "index.segments/__PAGE__.segment.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        incrementalCacheShared: true,
+        platformCache: {
+          read: vi.fn().mockResolvedValue(null),
+          readStored: vi.fn().mockResolvedValue(null),
+        } as any,
+        rscConfig: {
+          header: "rsc",
+          suffix: ".rsc",
+          prefetchSegmentHeader: "next-router-segment-prefetch",
+          prefetchSegmentDirSuffix: ".segments",
+          prefetchSegmentSuffix: ".segment.rsc",
+        },
+      });
+
+      const doPrefetch = () =>
+        dispatcher.dispatch(
+          mockReq("/?_rsc=abc", {
+            rsc: "1",
+            "next-router-prefetch": "1",
+            "next-router-segment-prefetch": "/__PAGE__",
+          }),
+          mockRes(),
+          {
+            kind: "route",
+            pool: "ssr",
+            matchedPathname: "/index.segments/__PAGE__.segment.rsc",
+            routeMatches: null,
+            resolvedHeaders: undefined,
+          },
+        );
+
+      await doPrefetch();
+      await vi.waitFor(() => expect(localHandlerInvoker).toHaveBeenCalledOnce());
+      expect(localHandlerInvoker).toHaveBeenCalledWith(
+        expect.objectContaining({
+          discardResponse: true,
+          req: expect.objectContaining({
+            method: "GET",
+            headers: expect.not.objectContaining({
+              rsc: expect.anything(),
+              "next-router-prefetch": expect.anything(),
+              "next-router-segment-prefetch": expect.anything(),
+            }),
+          }),
+        }),
+      );
+
+      // Cooldown: a second prefetch of the same URL inside the window schedules NOTHING —
+      // production prefetch traffic must not fan out one document render per prefetch.
+      await doPrefetch();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(localHandlerInvoker).toHaveBeenCalledOnce();
+    });
+
+    it("does NOT schedule a production shell fill without the shared classic handler", async () => {
+      // Without the registered Valkey classic handler the background render's writes land
+      // in the pod's ephemeral filesystem cache — useless cross-replica, so don't render.
+      mkdirSync(path.join(tmpDir, "index.segments"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
+        "seeded-segment-rsc",
+      );
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index.segments/__PAGE__.segment.rsc",
+            filePath: "index.segments/__PAGE__.segment.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        rscConfig: {
+          header: "rsc",
+          suffix: ".rsc",
+          prefetchSegmentHeader: "next-router-segment-prefetch",
+          prefetchSegmentDirSuffix: ".segments",
+          prefetchSegmentSuffix: ".segment.rsc",
+        },
+      });
+
+      await dispatcher.dispatch(
+        mockReq("/?_rsc=abc", {
+          rsc: "1",
+          "next-router-prefetch": "1",
+          "next-router-segment-prefetch": "/__PAGE__",
+        }),
+        mockRes(),
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/index.segments/__PAGE__.segment.rsc",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(localHandlerInvoker).not.toHaveBeenCalled();
+    });
+
+    it("a STORED materialized entry's segmentData supersedes the seeded segment file", async () => {
+      // rdc run 12 (2026-08-04): after the background revalidation finally landed, the
+      // suite still failed at the PREFETCH step — segment prefetches are served by this
+      // static-asset fast path straight from the BUILD file, so a regenerated page kept
+      // serving its build-era segment bytes forever. The stored-supersedes-seed rung
+      // (documents, #2299) applies here too: a materialized entry's segmentData is the
+      // CURRENT content, exactly how next start keeps segment prefetches consistent.
+      mkdirSync(path.join(tmpDir, "index.segments"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
+        "build-era-segment",
+      );
+      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index.segments/__PAGE__.segment.rsc",
+            filePath: "index.segments/__PAGE__.segment.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker,
+        incrementalCacheShared: true,
+        platformCache: {
+          read: vi.fn().mockResolvedValue(null),
+          readStored: vi.fn().mockResolvedValue({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>materialized</html>",
+              postponed: "token",
+              headers: {},
+              status: 200,
+              segmentData: new Map([["/__PAGE__", Buffer.from("materialized-segment")]]),
+            },
+          }),
+        } as any,
+        rscConfig: {
+          header: "rsc",
+          suffix: ".rsc",
+          prefetchSegmentHeader: "next-router-segment-prefetch",
+          prefetchSegmentDirSuffix: ".segments",
+          prefetchSegmentSuffix: ".segment.rsc",
+        },
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(
+        mockReq("/?_rsc=abc", {
+          rsc: "1",
+          "next-router-prefetch": "1",
+          "next-router-segment-prefetch": "/__PAGE__",
+        }),
+        res,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/index.segments/__PAGE__.segment.rsc",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(res._status).toBe(200);
+      expect(res._body).toBe("materialized-segment");
+    });
+
+    it("a STORED entry WITHOUT the requested segment falls back to the seeded file", async () => {
+      mkdirSync(path.join(tmpDir, "index.segments"), { recursive: true });
+      writeFileSync(
+        path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
+        "build-era-segment",
+      );
+      const dispatcher = createDispatcher({
+        handlerLoader: {
+          load: vi.fn().mockResolvedValue(vi.fn()),
+          has: vi.fn((pathname: string) => pathname === "/"),
+          get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+        } as any,
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/index.segments/__PAGE__.segment.rsc",
+            filePath: "index.segments/__PAGE__.segment.rsc",
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "content-type": "text/x-component" },
+            prerender: true,
+          },
+        ],
+        localHandlerInvoker: vi.fn().mockResolvedValue(undefined),
+        incrementalCacheShared: true,
+        platformCache: {
+          read: vi.fn().mockResolvedValue(null),
+          readStored: vi.fn().mockResolvedValue(null),
+        } as any,
+        rscConfig: {
+          header: "rsc",
+          suffix: ".rsc",
+          prefetchSegmentHeader: "next-router-segment-prefetch",
+          prefetchSegmentDirSuffix: ".segments",
+          prefetchSegmentSuffix: ".segment.rsc",
+        },
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(
+        mockReq("/?_rsc=abc", {
+          rsc: "1",
+          "next-router-prefetch": "1",
+          "next-router-segment-prefetch": "/__PAGE__",
+        }),
+        res,
+        {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/index.segments/__PAGE__.segment.rsc",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+      );
+
+      expect(res._status).toBe(200);
+      expect(res._body).toBe("build-era-segment");
+    });
+
     it("serves a seeded concrete RSC entry when execution maps to a dynamic parent handler", async () => {
       mkdirSync(path.join(tmpDir, "blog"), { recursive: true });
       writeFileSync(path.join(tmpDir, "blog", "first.rsc"), "seeded-concrete-rsc");
