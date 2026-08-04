@@ -3,9 +3,11 @@ import path from "node:path";
 import { infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   readdirSync,
   readFileSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -301,6 +303,67 @@ export interface DockerCommandOptions {
    * push — is accepted identically by podman and nerdctl.
    */
   containerCli?: string;
+}
+
+/**
+ * Re-stage the build's fetch-cache (`<distDir>/cache/fetch-cache`) into every image build
+ * context, right before `docker build`.
+ *
+ * WHY HERE and not (only) in onBuildComplete: the fetch-cache entries are written
+ * ASYNCHRONOUSLY by the static-export workers, and upstream orders nothing between those
+ * writes and handleBuildComplete — the workers are only torn down in `next build`'s
+ * `finally`, AFTER the adapter hook. Measured 2026-08-04: a local repro build staged the
+ * dir fine (the write landed ~750ms before the staging read) while two consecutive harness
+ * builds of the same fixture shipped images WITHOUT it — the write lost the race with
+ * onBuildComplete's existsSync. Deploy runs minutes after the build, when the artifact is
+ * deterministically on disk. The staged copy is REPLACED wholesale so entries deleted from
+ * the build's fetch-cache stop shipping (the #32 context-wipe rule).
+ *
+ * The files matter because `next start`'s filesystem cache starts WITH them: without them a
+ * post-revalidateTag FETCH read is a miss, patch-fetch re-fetches under the prerender's
+ * abort signal, and the cache-components background revalidation dies under load
+ * (rdc stale-forever — see build-seed-index.ts fetchCacheSeed).
+ */
+export function refreshFetchCacheStaging(
+  projectDir: string,
+  outputDir: string,
+  metadata: { distDir?: unknown; pools: string[]; containerStrategy: string },
+): void {
+  // Validate at the point of consumption: distDir comes from build-metadata.json, which is
+  // build-controlled. The same escape S20 rejects at build time is rejected here — the dest
+  // is built as `<context>/<distDir>` and a `../` form would land the recursive rm/cp
+  // OUTSIDE the build context. Older metadata predates the field; default to .next.
+  const distDirRel = typeof metadata.distDir === "string" ? metadata.distDir : ".next";
+  if (path.isAbsolute(distDirRel) || distDirRel.split(path.sep).includes("..")) {
+    throw new Error(
+      `Invalid distDir ${JSON.stringify(distDirRel)} in build-metadata.json: it must be a ` +
+        `project-relative path inside the project (S20). Re-run the build.`,
+    );
+  }
+  const src = path.join(projectDir, distDirRel, "cache", "fetch-cache");
+  // Observable either way (M1 spirit): the silent-return variant of this function cost a
+  // debugging round — an image shipped without the files and nothing said which of the two
+  // silent paths (no source vs no re-stage) was taken.
+  if (!existsSync(src)) {
+    console.log(`    (no build fetch-cache at ${src} — nothing to re-stage)`);
+    return;
+  }
+  const contexts =
+    metadata.containerStrategy === "shared-image"
+      ? [path.join(outputDir, "shared-context")]
+      : metadata.pools.map((pool) => path.join(outputDir, "pools", pool, "context"));
+  for (const context of contexts) {
+    // A context can legitimately be absent (ADAPTER_K8S_SKIP_STAGING builds have no
+    // contexts, and those deploys never reach the docker step anyway).
+    if (!existsSync(context)) continue;
+    // NOT the runtime location: the pod mounts a writable emptyDir over /app/.next/cache
+    // that shadows image content there; the pool server restores this seed at boot
+    // (pool-server/fetch-cache-seed.ts).
+    const dest = path.join(context, ".k8s-adapter", "fetch-cache-seed");
+    rmSync(dest, { recursive: true, force: true });
+    cpSync(src, dest, { recursive: true, dereference: true });
+    console.log(`    Re-staged build fetch-cache into ${path.relative(projectDir, context)}`);
+  }
 }
 
 export function buildDockerCommands(options: DockerCommandOptions): GcloudCommand[] {
@@ -1434,6 +1497,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // paths (the registry can pin an image this run did not push).
   const imageDigests: Record<string, string> = {};
   if (!skipPush) {
+    // The build's fetch-cache is re-staged HERE because its writes race onBuildComplete's
+    // staging inside `next build` (see refreshFetchCacheStaging) — by deploy time the
+    // artifact is deterministically on disk.
+    if (!dryRun) {
+      refreshFetchCacheStaging(projectDir, outputDir, {
+        distDir: metadata.distDir,
+        pools,
+        containerStrategy,
+      });
+    }
     const dockerCommands = buildDockerCommands({
       pools,
       buildId,

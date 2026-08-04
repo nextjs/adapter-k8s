@@ -126,12 +126,70 @@ function unlatchResponseCache(
   module: LoadedModule,
   ResponseCacheCtor: new (minimalMode: boolean) => unknown,
 ): void {
-  const rm = (
-    module as {
-      routeModule?: { getResponseCache?: (req: unknown) => unknown };
+  type RouteModuleish = {
+    getResponseCache?: (req: unknown) => unknown;
+    handleResponse?: (arg: Record<string, unknown>) => unknown;
+  };
+  const candidates = module as {
+    routeModule?: RouteModuleish;
+    default?: { routeModule?: RouteModuleish };
+  };
+  // The template exports `routeModule` at top level; some bundlings put the real exports
+  // on `default`. Attachment MUST be loud under the trace env: a silent no-op here
+  // disables the entire un-latch (and every wrapper below), which reads as "the
+  // revalidation never runs" from the outside — that ambiguity cost a diagnosis round.
+  const rm = candidates.routeModule ?? candidates.default?.routeModule;
+  if (!rm || typeof rm.getResponseCache !== "function") {
+    if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+      console.log(
+        `[cache-trace] ${JSON.stringify({
+          op: "unlatch-skipped",
+          hasRouteModule: !!rm,
+          keys: Object.keys(module as object).slice(0, 12),
+        })}`,
+      );
     }
-  ).routeModule;
-  if (!rm || typeof rm.getResponseCache !== "function") return;
+    return;
+  }
+  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+    console.log(`[cache-trace] {"op":"unlatch-attached"}`);
+  }
+  // Trace-channel visibility into the response pipeline (ADAPTER_K8S_CACHE_TRACE): whether
+  // handleResponse runs, whether it actually invokes the response GENERATOR (the code that
+  // hosts the entrypoint's RDC branch and its stale-revalidation scheduling), and what the
+  // generator returns. Thirteen stale-signalled reads with zero revalidate() calls
+  // (rdc, 2026-08-04) could not be localized without seeing this boundary.
+  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1" && typeof rm.handleResponse === "function") {
+    const origHandle = rm.handleResponse.bind(rm);
+    rm.handleResponse = (arg: Record<string, unknown>) => {
+      const cacheKey = arg?.cacheKey;
+      console.log(`[cache-trace] ${JSON.stringify({ op: "rm-handleResponse", cacheKey })}`);
+      const gen = arg?.responseGenerator;
+      if (typeof gen === "function") {
+        arg = {
+          ...arg,
+          responseGenerator: async (...genArgs: unknown[]) => {
+            console.log(`[cache-trace] ${JSON.stringify({ op: "rm-generator", cacheKey })}`);
+            const out = (await (gen as (...a: unknown[]) => Promise<unknown>)(...genArgs)) as {
+              cacheControl?: unknown;
+              value?: { kind?: string; postponed?: unknown };
+            } | null;
+            console.log(
+              `[cache-trace] ${JSON.stringify({
+                op: "rm-generator-done",
+                cacheKey,
+                nullEntry: out === null,
+                hasCacheControl: !!out?.cacheControl,
+                hasPostponed: !!out?.value?.postponed,
+              })}`,
+            );
+            return out;
+          },
+        };
+      }
+      return origHandle(arg);
+    };
+  }
   const META = Symbol.for("NextInternalRequestMeta");
   const perMode = new Map<boolean, unknown>();
   rm.getResponseCache = (req: unknown): unknown => {
@@ -141,6 +199,46 @@ function unlatchResponseCache(
     let rc = perMode.get(minimal);
     if (!rc) {
       rc = new ResponseCacheCtor(minimal);
+      // Trace-channel visibility into Next's revalidation writes (ADAPTER_K8S_CACHE_TRACE):
+      // ResponseCache.handleRevalidate has two SILENT no-write paths — a null generator
+      // result and a missing cacheControl — and telling "the revalidation never ran" from
+      // "it ran and silently declined to persist" cost a full diagnosis round (rdc,
+      // 2026-08-04). Wrap revalidate() at the same seam that un-latches the mode.
+      if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
+        const inst = rc as { revalidate?: (...args: unknown[]) => Promise<unknown> };
+        const orig = inst.revalidate?.bind(inst);
+        if (orig) {
+          inst.revalidate = async (...args: unknown[]) => {
+            const key = args[0];
+            console.log(`[cache-trace] ${JSON.stringify({ op: "rc-revalidate", key, minimal })}`);
+            try {
+              const out = (await orig(...args)) as {
+                cacheControl?: unknown;
+                value?: { kind?: string };
+              } | null;
+              console.log(
+                `[cache-trace] ${JSON.stringify({
+                  op: "rc-revalidate-done",
+                  key,
+                  nullEntry: out === null,
+                  hasCacheControl: !!out?.cacheControl,
+                  kind: out?.value?.kind,
+                })}`,
+              );
+              return out;
+            } catch (error) {
+              console.log(
+                `[cache-trace] ${JSON.stringify({
+                  op: "rc-revalidate-error",
+                  key,
+                  message: (error as Error)?.message?.slice(0, 200),
+                })}`,
+              );
+              throw error;
+            }
+          };
+        }
+      }
       perMode.set(minimal, rc);
     }
     return rc;

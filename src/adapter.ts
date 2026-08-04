@@ -2082,15 +2082,31 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // so without this a file deleted from the source keeps shipping inside the image.
         await rm(path.join(projectDir, absSharedStageDir), { recursive: true, force: true });
 
-        // Stage everything for shared image. `<distDir>/cache` is deliberately excluded: it
-        // is the build's own file-system cache (fetch cache, ISR entries) and baking it into
-        // the image bloats layers and ships build-time cache state into every replica.
+        // Stage everything for shared image. `<distDir>/cache` is excluded from the dist
+        // copy: the build caches (webpack/turbopack, images) are pure layer bloat. The
+        // `cache/fetch-cache` subtree is NOT bloat — it is `next start`'s warm-start
+        // content and the FETCH seed layer reads it (build-seed-index.ts fetchCacheSeed);
+        // without it a post-revalidateTag FETCH read is a MISS, patch-fetch re-fetches
+        // under the prerender's abort signal, and the cache-components background
+        // revalidation dies under load (rdc stale-forever, traced 2026-08-04). It is
+        // staged separately below at `.k8s-adapter/fetch-cache-seed` because the pod
+        // mounts a writable emptyDir over `/app/.next/cache` that would shadow it at its
+        // runtime location; the pool server restores it at boot
+        // (pool-server/fetch-cache-seed.ts).
         const distCacheDir = path.join(distDir, "cache");
         await cp(distDir, path.join(projectDir, absSharedStageDir, distDirRel), {
           recursive: true,
           dereference: true,
           filter: (src) => src !== distCacheDir && !src.startsWith(distCacheDir + path.sep),
         });
+        const sharedFetchCacheDir = path.join(distCacheDir, "fetch-cache");
+        if (existsSync(sharedFetchCacheDir)) {
+          await cp(
+            sharedFetchCacheDir,
+            path.join(projectDir, absSharedStageDir, ".k8s-adapter", "fetch-cache-seed"),
+            { recursive: true, dereference: true },
+          );
+        }
         await cp(
           path.join(projectDir, "node_modules"),
           path.join(projectDir, absSharedStageDir, "node_modules"),
@@ -2209,6 +2225,26 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             for (const sibling of prerenderSiblingFiles(asset)) {
               await stageFile(projectDir, path.resolve(projectDir, sibling), sibling, poolName);
             }
+          }
+
+          // The build's fetch-cache (`<distDir>/cache/fetch-cache`) — `next start`'s
+          // filesystem cache STARTS with these entries and the FETCH seed layer mirrors
+          // them (build-seed-index.ts fetchCacheSeed): without the files in the image, a
+          // post-revalidateTag FETCH read is a MISS, upstream patch-fetch re-fetches under
+          // the prerender's abort signal, and the cache-components background revalidation
+          // dies under load (rdc stale-forever, traced 2026-08-04). Only fetch-cache — the
+          // sibling `cache/` dirs (webpack/turbopack, images) are real bloat. Staged OUT of
+          // its runtime location because the pod mounts a writable emptyDir over
+          // `/app/.next/cache` that shadows image content; the pool server restores it at
+          // boot (pool-server/fetch-cache-seed.ts).
+          const fetchCacheDir = path.join(distDir, "cache", "fetch-cache");
+          if (existsSync(fetchCacheDir)) {
+            await stageFile(
+              projectDir,
+              fetchCacheDir,
+              path.join(".k8s-adapter", "fetch-cache-seed"),
+              poolName,
+            );
           }
 
           if (outputs.middleware?.filePath) {
@@ -2521,6 +2557,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             return n !== undefined ? { nodeCidrs: n } : {};
           })(),
           poolNames: [...pools.keys()],
+          // S20-validated project-relative dist dir — deploy re-stages the fetch-cache from
+          // it before docker build (refreshFetchCacheStaging).
+          distDir: distDirRel,
           // N50 (review #20): NOT `new Date()`. A wall-clock stamp made every regeneration of
           // the same build produce a different build-metadata.json, which defeats the only
           // audit for invariant 5 (diff a regenerated artifact against what was applied).

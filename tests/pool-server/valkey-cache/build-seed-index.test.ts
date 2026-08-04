@@ -222,6 +222,58 @@ describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation
     expect(await lookup("/nope", { kind: "APP_PAGE" })).toBeNull();
   });
 
+  it("fetch-cache seeds mirror next start's warm-start FETCH reads (rdc revalidation parity)", async () => {
+    // next start's FileSystemCache reads `.next/cache/fetch-cache/<key>` for kind FETCH
+    // (file-system-cache.ts:146-188) — the BUILD's fetch entries are its warm-start content.
+    // Without this mirror, a post-revalidateTag FETCH read is a MISS, and upstream
+    // patch-fetch then re-fetches WITH the prerender's abort signal attached (a stale HIT
+    // re-fetches signal-DETACHED — patch-fetch.ts:1073-1104, `signal: isStale ? undefined :
+    // signal`), so under load the cache-components background revalidation dies with
+    // "uncached or runtime data during prerendering" and a profiled revalidateTag serves
+    // stale forever (both rdc consistency tests, traced 2026-08-04).
+    writeManifest([]);
+    const fetchValue = {
+      kind: "FETCH",
+      data: { headers: {}, body: "YmFrZWQ=", status: 200, url: "https://api.example/random" },
+      revalidate: 31536000,
+      tags: ["test"],
+    };
+    stage(".next/cache/fetch-cache/0123abcdef", JSON.stringify(fetchValue));
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    const entry = await lookup("0123abcdef", { kind: "FETCH" });
+
+    expect(entry).not.toBeNull();
+    expect(entry!.value.kind).toBe("FETCH");
+    expect((entry!.value as { data?: { body?: string } }).data?.body).toBe("YmFrZWQ=");
+    expect(entry!.tags).toEqual(["test"]);
+    expect(entry!.lastModified).toBeGreaterThan(0);
+  });
+
+  it("FETCH: declines unsafe keys — the key becomes a filename under .next/cache", async () => {
+    writeManifest([]);
+    stage("secret-outside-cache", JSON.stringify({ kind: "FETCH", data: {} }));
+    const lookup = createBuildSeedLookup({ appRoot });
+    expect(await lookup("../../secret-outside-cache", { kind: "FETCH" })).toBeNull();
+    expect(await lookup("a/b", { kind: "FETCH" })).toBeNull();
+  });
+
+  it("FETCH: misses on absent, malformed, or non-FETCH entries; never falls through to the page mirror", async () => {
+    writeManifest([]);
+    stage(".next/cache/fetch-cache/badjson", "{not json");
+    stage(".next/cache/fetch-cache/wrongkind", JSON.stringify({ kind: "APP_PAGE" }));
+    // A page artifact that would satisfy the fs-mirror must NOT answer a FETCH read.
+    stage(".next/server/app/collide.html", "<html>page</html>");
+    stage(".next/server/app/collide.rsc", "rsc");
+    stage(".next/server/app/collide.meta", JSON.stringify({ status: 200, headers: {} }));
+    const lookup = createBuildSeedLookup({ appRoot });
+
+    expect(await lookup("absent", { kind: "FETCH" })).toBeNull();
+    expect(await lookup("badjson", { kind: "FETCH" })).toBeNull();
+    expect(await lookup("wrongkind", { kind: "FETCH" })).toBeNull();
+    expect(await lookup("/collide", { kind: "FETCH" })).toBeNull();
+  });
+
   it("manifest-based seeds still take precedence for keys they cover", async () => {
     writeManifest([
       asset({

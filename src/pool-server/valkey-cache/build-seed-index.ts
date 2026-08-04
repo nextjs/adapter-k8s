@@ -128,6 +128,49 @@ export interface SeedLookupCtx {
 }
 
 /**
+ * Next's fetch-cache keys are hex digests (`incremental-cache/index.ts` generateCacheKey);
+ * validate at the point of consumption — the key becomes a filename under `.next/cache`, so
+ * separators and dots are refused outright rather than path-normalized.
+ */
+const SAFE_FETCH_CACHE_KEY = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Fetch-cache mirror seed: read `<appRoot>/.next/cache/fetch-cache/<key>` the way
+ * FileSystemCache.get does for kind FETCH (file-system-cache.ts:146-188 — one JSON file,
+ * the CachedFetchValue stored verbatim, lastModified from the file mtime). The BUILD's
+ * fetch entries are `next start`'s warm-start content, and their absence is not a mere
+ * cold-start cost: after a PROFILED `revalidateTag`, upstream patch-fetch foreground-
+ * refetches a STALE fetch entry with the prerender's abort signal DETACHED
+ * (patch-fetch.ts:1073-1104, `signal: isStale ? undefined : signal`), while a MISS
+ * re-fetches signal-ATTACHED — under load the cache-components background revalidation
+ * loses that race and dies with "uncached or runtime data during prerendering", so the
+ * page serves stale forever (both rdc consistency tests, traced live 2026-08-04).
+ */
+function fetchCacheSeed(appRoot: string, cacheKey: string): SeedEntry | null {
+  if (!SAFE_FETCH_CACHE_KEY.test(cacheKey)) return null;
+  const fs = builtin<typeof import("node:fs")>("node:fs");
+  const path = builtin<typeof import("node:path")>("node:path");
+  const abs = path.join(appRoot, ".next", "cache", "fetch-cache", cacheKey);
+  if (!fs.existsSync(abs)) return null;
+  const stat = fs.statSync(abs);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(abs, "utf8"));
+  } catch {
+    return null; // corrupt artifact → miss, exactly like a corrupt stored entry (L5)
+  }
+  if (!parsed || typeof parsed !== "object" || (parsed as { kind?: unknown }).kind !== "FETCH") {
+    return null;
+  }
+  const tags = (parsed as { tags?: unknown }).tags;
+  return {
+    lastModified: Math.round(stat.mtimeMs),
+    tags: Array.isArray(tags) ? tags.filter((t): t is string => typeof t === "string") : [],
+    value: parsed as Record<string, unknown>,
+  };
+}
+
+/**
  * Filesystem-mirror seed: read `.next/server/app/<key>` the way FileSystemCache.get does
  * (file-system-cache.js:138-181 in the installed next) — html, `.meta` (postponed / headers /
  * status / segmentPaths), rscData only when there is NO postponed state, segment files from
@@ -226,6 +269,15 @@ export function createBuildSeedLookup(options?: {
   };
 
   return async (cacheKey: string, ctx?: SeedLookupCtx): Promise<SeedEntry | null> => {
+    // FETCH keys never appear in the static-assets manifest and must never fall through to
+    // the page fs-mirror — they are answered from the staged build fetch-cache or not at all.
+    if (ctx?.kind === "FETCH") {
+      try {
+        return fetchCacheSeed(options?.appRoot ?? cwd(), cacheKey);
+      } catch {
+        return null;
+      }
+    }
     const map = load();
     const source = map?.get(cacheKey);
     if (!source) {

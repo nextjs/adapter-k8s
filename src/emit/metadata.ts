@@ -29,10 +29,18 @@ export function generateBuildMetadata({
   cacheManaged,
   incrementalCacheHandler,
   cacheMemorystore,
+  distDir,
 }: {
   buildId: string;
   nextVersion: string;
   poolNames: string[];
+  /**
+   * Project-relative dist dir (the S20-validated `distDirRel`, usually ".next"). The deploy
+   * step needs it to re-stage `<distDir>/cache/fetch-cache` into the image contexts before
+   * `docker build` — the build's own staging races the async fetch-cache writes (see
+   * refreshFetchCacheStaging in cli/deploy.ts).
+   */
+  distDir: string;
   /**
    * Build timestamp. Must be STABLE for a given build (adapter.ts passes the routing
    * manifest's `builtAt`, which is anchored to SOURCE_DATE_EPOCH / the BUILD_ID mtime) —
@@ -82,6 +90,7 @@ export function generateBuildMetadata({
       ...(nodeCidrs && nodeCidrs.length > 0 ? { nodeCidrs } : {}),
       pools: poolNames,
       generatedAt,
+      distDir,
       containerStrategy,
       hasMiddleware,
       failureModeAllow,
