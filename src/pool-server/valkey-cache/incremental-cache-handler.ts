@@ -552,16 +552,28 @@ export class ValkeyIncrementalCacheHandler {
       // winner). A lock-acquire FAILURE fails open to the stale signal — at worst the old
       // stampede, never a lost revalidation.
       const staleByTag = areTagsStale(tags, entry.lastModified, manifest);
-      // Age staleness (the entry outlived its own `revalidate` window) is computed here ONLY
-      // for the skipSeed/getStored path: dispatch consumes that entry directly, with no Next
-      // incremental-cache layer above it to do the lastModified-vs-revalidate math. The
-      // app-path get() must not double-signal or spend the regen lock on it.
-      const staleByAge =
-        skipSeed &&
-        typeof entry.revalidateSeconds === "number" &&
-        now >= entry.lastModified + entry.revalidateSeconds * 1000;
-      let signalStale = staleByTag || staleByAge;
-      if (signalStale) {
+      if (skipSeed) {
+        // getStored (dispatch's direct consumption): staleness is a NON-CONSUMING PEEK.
+        // The single-flight NX revalidate lock must NOT be spent here — dispatch cannot
+        // regenerate cache-components routes (the on-demand render mode hard-errors and a
+        // failed re-entry held the lock to TTL), so a consumed lock starved the
+        // ENTRYPOINT's own working revalidation: it read "fresh" and never regenerated
+        // (resume-data-cache stale >12s on cold pods, traced 2026-08-03). Age staleness is
+        // computed here because no Next incremental-cache layer sits above this caller.
+        const staleByAge =
+          typeof entry.revalidateSeconds === "number" &&
+          now >= entry.lastModified + entry.revalidateSeconds * 1000;
+        return {
+          lastModified: entry.lastModified,
+          value: decodeValue(entry.value),
+          ...(staleByTag || staleByAge ? { isStale: true } : {}),
+        };
+      }
+      // App-path get(): the lock-gated stale signal is Next's own SWR contract — exactly
+      // ONE replica is told stale (adjusted lastModified) and revalidates; its set()
+      // releases the lock early, and the TTL bounds a crashed winner.
+      let signalStale = staleByTag;
+      if (staleByTag) {
         try {
           const acquired = await this.client.set(
             this.revalidateLockKey(cacheKey),
@@ -576,12 +588,8 @@ export class ValkeyIncrementalCacheHandler {
         }
       }
       return {
-        // Only TAG staleness adjusts lastModified (N80's serve-stale signal to Next's math);
-        // age staleness leaves it untouched — the real mtime IS the age signal upstream.
-        lastModified:
-          signalStale && staleByTag ? staleByTagLastModified(entry, now) : entry.lastModified,
+        lastModified: signalStale ? staleByTagLastModified(entry, now) : entry.lastModified,
         value: decodeValue(entry.value),
-        ...(skipSeed && signalStale ? { isStale: true } : {}),
       };
     } catch (error) {
       // N81: fail open to a miss (Next regenerates) — but SAY SO. This catch was bare, so a

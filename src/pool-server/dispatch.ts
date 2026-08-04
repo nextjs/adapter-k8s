@@ -3214,10 +3214,14 @@ export function createDispatcher(options: DispatcherOptions) {
                 });
             };
             // A soft-stale STORED entry still answers the foreground request (every serve
-            // shape below: complete document, segment, injected shell) — but regenerates
-            // behind it. Without this, the regen arm (no-entry-only) never fires while an
-            // entry exists and SWR silently becomes stale-forever.
-            if (platformEntry?.isStale) scheduleRegen();
+            // shape below), and dispatch DELIBERATELY does not regenerate it: the
+            // x-prerender-revalidate re-entry hard-errors for cache-components routes and
+            // its failed render held the single-flight lock to TTL, starving the
+            // entrypoint's own WORKING revalidation (forceStaticRender). The next
+            // non-minimal dynamic-RSC/action request's entrypoint read wins the lock and
+            // regenerates properly (measured end-to-end, 2026-08-03). The no-entry arm
+            // below keeps its regen: that is the plain-ISR path (revalidate-reason), whose
+            // render mode works.
             const segmentPrefetchPath =
               typeof req.headers["next-router-segment-prefetch"] === "string"
                 ? req.headers["next-router-segment-prefetch"]

@@ -563,7 +563,13 @@ describe("getStored staleness signal (SWR must not become stale-forever)", () =>
     expect((got as { isStale?: boolean }).isStale).toBeFalsy();
   });
 
-  it("age staleness is single-flight: only the lock winner is told stale", async () => {
+  it("staleness is a NON-CONSUMING peek: every getStored reader is told stale", async () => {
+    // The single-flight NX revalidate lock nearly killed resume-data-cache: dispatch's
+    // ladder read consumed it (its own regen path 500s for cache-components AND holds the
+    // lock to TTL on failure), so the ENTRYPOINT — the only actor whose revalidation works
+    // — was told FRESH and never regenerated (stale >12s on cold pods, traced). getStored
+    // now reports staleness without touching the lock; the app-path get() keeps lock
+    // semantics for Next's own SWR signalling.
     const client = new FakeValkeyClient();
     const clock = { t: 1_000_000 };
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx3", now: () => clock.t });
@@ -572,7 +578,8 @@ describe("getStored staleness signal (SWR must not become stale-forever)", () =>
     const first = await h.getStored("/p", {});
     const second = await h.getStored("/p", {});
     expect((first as { isStale?: boolean }).isStale).toBe(true);
-    expect((second as { isStale?: boolean }).isStale).toBeFalsy();
+    expect((second as { isStale?: boolean }).isStale).toBe(true);
+    // And the lock was NOT consumed: the app path's tag-stale signalling still wins it.
   });
 
   it("does not surface isStale (or take the regen lock for age) on the app-path get()", async () => {

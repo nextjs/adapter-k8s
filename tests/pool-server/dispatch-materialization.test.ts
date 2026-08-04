@@ -723,10 +723,12 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(meta?.postponed).toBe("template-token");
   });
 
-  it("serves a STALE stored entry AND schedules regeneration (SWR, never stale-forever)", async () => {
-    // getStored surfaces soft staleness (tag or age, single-flight lock-gated) as isStale.
-    // Ignoring it made SWR into stale-forever: the regen branch is the no-entry arm, so an
-    // existing entry suppressed regeneration for its whole retention.
+  it("serves a STALE stored entry WITHOUT self-regenerating (entrypoint owns PPR regen)", async () => {
+    // The x-prerender-revalidate re-entry hard-errors for cache-components routes
+    // ("uncached or runtime data during prerendering") and its failed render holds the
+    // single-flight lock to TTL — starving the entrypoint's own WORKING revalidation
+    // (forceStaticRender). Dispatch serves the stale entry and leaves regeneration to the
+    // next non-minimal dynamic-RSC/action request's entrypoint read.
     process.env.__NEXT_PREVIEW_MODE_ID = "pmid-xyz";
     try {
       const revalidations: any[] = [];
@@ -754,11 +756,8 @@ describe("PPR serve ladder reads the platform cache", () => {
       );
       const res = mockRes();
       await dispatcher.dispatch(mockReq("/ppr-page"), res, route);
-      // The stale entry still answers the foreground request (serve-stale)...
       expect(res._body).toContain("stale but served");
-      // ...while ONE canonical regeneration is scheduled behind it.
-      expect(revalidations).toHaveLength(1);
-      expect(revalidations[0].headers["x-prerender-revalidate"]).toBe("pmid-xyz");
+      expect(revalidations).toHaveLength(0);
     } finally {
       delete process.env.__NEXT_PREVIEW_MODE_ID;
     }
