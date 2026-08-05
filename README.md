@@ -212,10 +212,7 @@ export default createK8sAdapter({
     API_KEY: { secret: "app-secrets", key: "api-key" }, // -> secretKeyRef
     FLAGS: { configMap: "app-config", key: "flags" }, // -> configMapKeyRef
   },
-  envFrom: [
-    { secret: "app-secrets" },
-    { configMap: "app-config", prefix: "CFG_" },
-  ],
+  envFrom: [{ secret: "app-secrets" }, { configMap: "app-config", prefix: "CFG_" }],
 
   pools: {
     // Merged OVER the top-level map, so a pool can override a shared default.

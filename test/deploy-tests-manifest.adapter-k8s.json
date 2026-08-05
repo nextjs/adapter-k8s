@@ -22,16 +22,12 @@
         "Deploy and build both succeed here — only the assertion diverges — so this is a",
         "case-level exclusion rather than a file exclusion."
       ],
-      "failed": [
-        "expire-time should do a blocking revalidation when the cache entry has expired"
-      ]
+      "failed": ["expire-time should do a blocking revalidation when the cache entry has expired"]
     }
   },
   "rules": {
     "include": [],
-    "exclude": [
-      "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
-    ]
+    "exclude": ["test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"]
   },
   "_excludeReasons": {
     "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts": [

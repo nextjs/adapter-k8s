@@ -71,8 +71,10 @@ export function renderGenericGateway({
   // listener (a listener carries at most one hostname) and therefore cannot share a merged
   // data plane — acceptable: lanes are single-host by construction.
   const singleHostname =
-    hosts.length === 1 ? `
-      hostname: "${hosts[0]!.hostname}"` : "";
+    hosts.length === 1
+      ? `
+      hostname: "${hosts[0]!.hostname}"`
+      : "";
   let listeners = `    - name: http${singleHostname}
       protocol: HTTP
       port: 80

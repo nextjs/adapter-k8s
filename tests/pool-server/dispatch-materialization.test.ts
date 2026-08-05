@@ -94,7 +94,12 @@ function baseOptions(over: Record<string, unknown> = {}) {
   } as any;
 }
 
-const route = { kind: "route", pool: "ssr", matchedPathname: "/ppr-page", routeMatches: null } as any;
+const route = {
+  kind: "route",
+  pool: "ssr",
+  matchedPathname: "/ppr-page",
+  routeMatches: null,
+} as any;
 
 describe("PPR serve ladder reads the platform cache", () => {
   it("serves a materialized POSTPONED entry's html and injects ITS postponed token", async () => {

@@ -156,8 +156,7 @@ export const genericProvider: ProviderAdapter = {
           namespace: generic?.gatewayNamespace ?? "envoy-gateway-system",
           labels: {
             "app.kubernetes.io/name": "envoy",
-            "gateway.envoyproxy.io/owning-gatewayclass":
-              generic?.gateway?.className ?? "eg",
+            "gateway.envoyproxy.io/owning-gatewayclass": generic?.gateway?.className ?? "eg",
           },
         },
       ],

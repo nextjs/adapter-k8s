@@ -2357,7 +2357,9 @@ export function createDispatcher(options: DispatcherOptions) {
             "http://localhost",
           ).pathname;
           const storedKey = storedConcrete === "/" ? "/index" : storedConcrete;
-          const stored = await platformCache.readStored(storedKey, { kind: "APP_PAGE" }).catch(() => null);
+          const stored = await platformCache
+            .readStored(storedKey, { kind: "APP_PAGE" })
+            .catch(() => null);
           const sv = stored?.value as
             | { kind?: string; html?: unknown; headers?: Record<string, string>; status?: number }
             | undefined;
@@ -2749,7 +2751,7 @@ export function createDispatcher(options: DispatcherOptions) {
             res,
             bufferedBody,
             basePath,
-              notFoundIsPrerendered,
+            notFoundIsPrerendered,
           );
           return;
         }
@@ -2808,7 +2810,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 res,
                 undefined,
                 basePath,
-              notFoundIsPrerendered,
+                notFoundIsPrerendered,
               );
               return;
             }
@@ -3383,7 +3385,10 @@ export function createDispatcher(options: DispatcherOptions) {
             // A STORED entry's postponed token injects even when the SEED is stale — the
             // stored entry passed the handler's own tag check. The disk-shell path keeps
             // the shellUsable gate.
-            if (!isDynamicRsc && (entryPostponed !== undefined || (shellUsable && shellAvailable))) {
+            if (
+              !isDynamicRsc &&
+              (entryPostponed !== undefined || (shellUsable && shellAvailable))
+            ) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
               // The materialized entry's token wins over the build token — it carries the
               // regenerated Resume Data Cache.
@@ -3573,19 +3578,19 @@ export function createDispatcher(options: DispatcherOptions) {
               // (no Suspense boundary above the params access) is rendered dynamically by
               // upstream, and running it non-minimal made Next resume a fallback shell upstream
               // deliberately skips (app-dir/fallback-shells).
+              // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
+              // mode, where the entrypoint's own filesystem cache holds the build shells
+              // and Next resumes internally. Under a SHARED cache the entrypoints are
+              // per-request render modules with no route-shell orchestration (measured:
+              // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
+              // take the same minimal+inject path as the no-classic-handler case below.
+              // Shell-LESS root-param templates still need non-minimal in both modes (N16).
+              // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
+              // next start serves these through the full server, so getStaticProps sees
+              // revalidateReason 'on-demand' and the fresh entry persists through the
+              // registered cache handler. The minimal rungs exist for platform-cache
+              // emulation, which must never intercept an authenticated revalidation.
               (
-                // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
-                // mode, where the entrypoint's own filesystem cache holds the build shells
-                // and Next resumes internally. Under a SHARED cache the entrypoints are
-                // per-request render modules with no route-shell orchestration (measured:
-                // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
-                // take the same minimal+inject path as the no-classic-handler case below.
-                // Shell-LESS root-param templates still need non-minimal in both modes (N16).
-                // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
-                // next start serves these through the full server, so getStaticProps sees
-                // revalidateReason 'on-demand' and the fresh entry persists through the
-                // registered cache handler. The minimal rungs exist for platform-cache
-                // emulation, which must never intercept an authenticated revalidation.
                 isVerifiedPreviewRequest(req) ||
                 ((entrypointOwnsPprShell ||
                   // partialPrefetching builds get NO injection (the partialFallback serving

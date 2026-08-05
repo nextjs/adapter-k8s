@@ -56,8 +56,7 @@ describe("per-build routing manifest ConfigMap", () => {
       buildId: "bms7bbb",
       imageRegistry: "r/x",
     });
-    const name = (y: string) =>
-      y.match(/configMap:\s*\n(?:\s*#[^\n]*\n)*\s*name: (\S+)/)?.[1];
+    const name = (y: string) => y.match(/configMap:\s*\n(?:\s*#[^\n]*\n)*\s*name: (\S+)/)?.[1];
     expect(name(a)).toBeTruthy();
     expect(name(a)).not.toBe(name(b));
   });

@@ -71,7 +71,11 @@ async function canBuild(candidate: ContainerCli): Promise<boolean> {
         "",
       ];
   for (const host of hosts) {
-    const res = await execCapture("buildctl", ["debug", "workers"], (host ? { env: { BUILDKIT_HOST: host } } : {})).catch(() => null);
+    const res = await execCapture(
+      "buildctl",
+      ["debug", "workers"],
+      host ? { env: { BUILDKIT_HOST: host } } : {},
+    ).catch(() => null);
     if (res && res.exitCode === 0) return true;
   }
   return false;

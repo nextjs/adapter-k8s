@@ -578,7 +578,11 @@ describe("createDispatcher", () => {
       // invokeStatus tells the RENDER it is a 404 (Next then emits the default not-found
       // metadata — robots noindex; metadata-navigation "root not-found with default
       // metadata"); forceStatus alone only rewrites the status after the fact.
-      expect.objectContaining({ matchedPathname: "/docs/404", forceStatus: 404, invokeStatus: 404 }),
+      expect.objectContaining({
+        matchedPathname: "/docs/404",
+        forceStatus: 404,
+        invokeStatus: 404,
+      }),
     );
   });
 

@@ -94,7 +94,10 @@ describe("refreshFetchCacheStaging", () => {
     });
     expect(
       existsSync(
-        path.join(projectDir, ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed"),
+        path.join(
+          projectDir,
+          ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed",
+        ),
       ),
     ).toBe(false);
   });
@@ -113,11 +116,7 @@ describe("refreshFetchCacheStaging", () => {
           containerStrategy: "traced-assets",
         }),
       ).toThrow(/distDir/);
-      expect(
-        existsSync(
-          path.join(projectDir, ".k8s-adapter/output/pools/ssr/context"),
-        ),
-      ).toBe(true);
+      expect(existsSync(path.join(projectDir, ".k8s-adapter/output/pools/ssr/context"))).toBe(true);
     } finally {
       rmSync(victim, { recursive: true, force: true });
     }

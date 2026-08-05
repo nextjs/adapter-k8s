@@ -2,7 +2,6 @@
   "name": "adapter-k8s-interception-e2e-app",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "npm@11.6.2",
   "scripts": {
     "build": "next build",
     "start": "next start"
@@ -18,5 +17,6 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "typescript": "^6"
-  }
+  },
+  "packageManager": "npm@11.6.2"
 }

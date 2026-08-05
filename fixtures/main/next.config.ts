@@ -34,9 +34,7 @@ const nextConfig: NextConfig = {
         // Service workers are mutable build artifacts: the browser must check for an update, but
         // an ETag should turn an unchanged check into a body-less 304. This local fixture locks the
         // same cache contract as Next's generated `_next/static/service-worker/*` output.
-        headers: [
-          { key: "Cache-Control", value: "public, max-age=0, must-revalidate" },
-        ],
+        headers: [{ key: "Cache-Control", value: "public, max-age=0, must-revalidate" }],
       },
     ];
   },

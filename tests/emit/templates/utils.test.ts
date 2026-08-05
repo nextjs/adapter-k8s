@@ -38,7 +38,7 @@ describe("sanitizeK8sName", () => {
   it("strips trailing hyphens introduced by the 63-char boundary", () => {
     const result = sanitizeK8sName("valid-name-" + "x".repeat(60) + "-suffix");
     expect(result.length).toBeLessThanOrEqual(63);
-    expect(result.endsWith('-')).toBe(false);
+    expect(result.endsWith("-")).toBe(false);
   });
 
   it("handles all-special-character input", () => {

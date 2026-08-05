@@ -142,11 +142,9 @@ describe("deploy-mode 404: prerendered /_not-found preferred over handler invoca
         await a.handler(a.req, { writeHead: () => {}, end: () => {} });
       }) as any,
     } as any);
-    await dispatcher.dispatch(
-      mockReq("/missing.png", { "sec-fetch-dest": "image" }),
-      mockRes(),
-      { kind: "not-found" } as any,
-    );
+    await dispatcher.dispatch(mockReq("/missing.png", { "sec-fetch-dest": "image" }), mockRes(), {
+      kind: "not-found",
+    } as any);
     expect(seenHeaders).toEqual(["image"]);
   });
 

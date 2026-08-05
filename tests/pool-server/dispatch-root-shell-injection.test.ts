@@ -16,9 +16,17 @@ function mockReq(url: string): any {
 }
 function mockRes(): any {
   return {
-    headersSent: false, writableEnded: false,
-    setHeader: vi.fn(), getHeaderNames: () => [], removeHeader: vi.fn(),
-    writeHead: vi.fn(), write: vi.fn(), end: vi.fn(), on: vi.fn(), once: vi.fn(), emit: vi.fn(),
+    headersSent: false,
+    writableEnded: false,
+    setHeader: vi.fn(),
+    getHeaderNames: () => [],
+    removeHeader: vi.fn(),
+    writeHead: vi.fn(),
+    write: vi.fn(),
+    end: vi.fn(),
+    on: vi.fn(),
+    once: vi.fn(),
+    emit: vi.fn(),
   };
 }
 const handlerLoader = {
@@ -34,16 +42,19 @@ for (const mp of ["/", "/index"]) {
       handlerLoader,
       poolName: "ssr",
       buildId: "b1",
-      staticAssets: [
-        { pathname: "/", filePath: shellFile, prerender: true, ppr: true },
-      ] as any,
+      staticAssets: [{ pathname: "/", filePath: shellFile, prerender: true, ppr: true }] as any,
       pprRoutes: { "/": { postponedState: "tok", fallbackFilePath: shellFile } } as any,
       incrementalCacheShared: true,
-      localHandlerInvoker: (async (a: any) => { calls.push(a); }) as any,
+      localHandlerInvoker: (async (a: any) => {
+        calls.push(a);
+      }) as any,
     } as any);
     const req = mockReq("/");
     await dispatcher.dispatch(req, mockRes(), {
-      kind: "route", matchedPathname: mp, pool: "ssr", routeMatches: null,
+      kind: "route",
+      matchedPathname: mp,
+      pool: "ssr",
+      routeMatches: null,
     } as any);
     expect(calls).toHaveLength(1);
     const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];

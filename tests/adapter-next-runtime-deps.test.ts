@@ -81,15 +81,25 @@ describe("staging next's runtime dependency closure", () => {
     seedApp();
     const routingContext = path.join(projectDir, ".k8s-adapter", "routing-service", "context");
 
-    const result = await stageNextRuntimeDependencies(projectDir, "routing-service", false, undefined, {
-      stageDir: routingContext,
-    });
+    const result = await stageNextRuntimeDependencies(
+      projectDir,
+      "routing-service",
+      false,
+      undefined,
+      {
+        stageDir: routingContext,
+      },
+    );
 
     expect(result.staged).toContain("@swc/helpers");
     expect(
-      existsSync(path.join(routingContext, "node_modules/@swc/helpers/_/_interop_require_default.js")),
+      existsSync(
+        path.join(routingContext, "node_modules/@swc/helpers/_/_interop_require_default.js"),
+      ),
     ).toBe(true);
-    expect(existsSync(path.join(routingContext, "node_modules/styled-jsx/package.json"))).toBe(true);
+    expect(existsSync(path.join(routingContext, "node_modules/styled-jsx/package.json"))).toBe(
+      true,
+    );
   });
 
   it("stages @swc/helpers so the edge sandbox can load in the container", async () => {
@@ -126,9 +136,13 @@ describe("staging next's runtime dependency closure", () => {
       { name: "react-dom", version: "19.2.0", dependencies: { scheduler: "^0.27.0" } },
       { "client.js": "module.exports = {};" },
     );
-    writePkg(path.join(nm, "scheduler"), { name: "scheduler", version: "0.27.0" }, {
-      "index.js": "module.exports = {};",
-    });
+    writePkg(
+      path.join(nm, "scheduler"),
+      { name: "scheduler", version: "0.27.0" },
+      {
+        "index.js": "module.exports = {};",
+      },
+    );
     writePkg(path.join(nm, "react"), { name: "react", version: "19.2.0" });
 
     await stageNextRuntimeDependencies(projectDir, "ssr");

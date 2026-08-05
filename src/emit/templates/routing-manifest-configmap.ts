@@ -1,5 +1,8 @@
 // src/emit/templates/routing-manifest-configmap.ts
-import { sanitizeK8sName, routingManifestSnapshotName as routingManifestSnapshotNameLocal } from "./utils.js";
+import {
+  sanitizeK8sName,
+  routingManifestSnapshotName as routingManifestSnapshotNameLocal,
+} from "./utils.js";
 import { renderConfigMap } from "./configmap.js";
 
 /**

@@ -8,7 +8,7 @@ Please report suspected vulnerabilities privately via GitHub's [private vulnerab
 
 ## Threat model in one paragraph
 
-The sensitive asset is the **internal dispatch secret**. The routing service resolves each request (runs middleware, classifies the route) and communicates its verdict to the pool servers via headers authenticated with this secret. Anything that holds the secret can hand a pool a forged, pre-trusted verdict—including "middleware already ran"—and have middleware skipped for arbitrary requests. The design therefore reduces to two questions: *who can reach the routing service*, and *who can obtain the secret at rest*. Everything below serves one of those two.
+The sensitive asset is the **internal dispatch secret**. The routing service resolves each request (runs middleware, classifies the route) and communicates its verdict to the pool servers via headers authenticated with this secret. Anything that holds the secret can hand a pool a forged, pre-trusted verdict—including "middleware already ran"—and have middleware skipped for arbitrary requests. The design therefore reduces to two questions: _who can reach the routing service_, and _who can obtain the secret at rest_. Everything below serves one of those two.
 
 ## Workload hardening
 
@@ -29,12 +29,12 @@ The ext_proc listener authenticates only the server (TLS with no client-certific
 
 The chart emits default-deny ingress NetworkPolicies with a positive allowlist:
 
-| source | reaches | why |
-| --- | --- | --- |
-| `35.191.0.0/16`, `130.211.0.0/22`, `2600:2d00:1:1::/64` | pools `:3000`, routing `:8443` | GFE proxy ranges for a global external Application Load Balancer with zonal `GCE_VM_IP_PORT` NEG backends—the topology this chart emits. The ext_proc callout arrives from the same ranges. |
-| `35.191.0.0/16`, `2600:2d00:1:b029::/64` | same | Health-check probers for GFE-based load balancers (the Gateway's pool checks and the routing tier's TCP check on `:8443`). |
-| node CIDRs (auto-discovered) | pools `:3000`, routing `:8081` | kubelet liveness/readiness probes originate from the **node** IP, which no Google range covers. The template fails at render time if the range is unknown, rather than leaving every pod unready at rollout. |
-| sibling pool pods (label selector) | pools `:3000` | cross-pool proxying. The routing service cannot originate pool traffic. |
+| source                                                  | reaches                        | why                                                                                                                                                                                                          |
+| ------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `35.191.0.0/16`, `130.211.0.0/22`, `2600:2d00:1:1::/64` | pools `:3000`, routing `:8443` | GFE proxy ranges for a global external Application Load Balancer with zonal `GCE_VM_IP_PORT` NEG backends—the topology this chart emits. The ext_proc callout arrives from the same ranges.                  |
+| `35.191.0.0/16`, `2600:2d00:1:b029::/64`                | same                           | Health-check probers for GFE-based load balancers (the Gateway's pool checks and the routing tier's TCP check on `:8443`).                                                                                   |
+| node CIDRs (auto-discovered)                            | pools `:3000`, routing `:8081` | kubelet liveness/readiness probes originate from the **node** IP, which no Google range covers. The template fails at render time if the range is unknown, rather than leaving every pod unready at rollout. |
+| sibling pool pods (label selector)                      | pools `:3000`                  | cross-pool proxying. The routing service cannot originate pool traffic.                                                                                                                                      |
 
 Both CIDR sets are discovered at deploy time (cluster subnetwork plus any node-pool subnets on Standard clusters); nothing needs setting by hand. To pin them, or to fall back to a pod-CIDR denylist:
 
@@ -42,8 +42,8 @@ Both CIDR sets are discovered at deploy time (cluster subnetwork plus any node-p
 # .k8s-adapter/helm/values.override.yaml
 global:
   networkPolicy:
-    strict: true                  # default; false = 0.0.0.0/0-except-pod-CIDR denylist
-    nodeCidrs: ["10.128.0.0/20"]  # normally discovered
+    strict: true # default; false = 0.0.0.0/0-except-pod-CIDR denylist
+    nodeCidrs: ["10.128.0.0/20"] # normally discovered
 ```
 
 The denylist exists for compatibility but is **not** a boundary for the dispatch secret: its edge is the pod CIDR, and VMs on the VPC, `hostNetwork` pods using node IPs, and pods in peered clusters all sit outside it while still being routable to `:8443`. The allowlist is the default because it is what actually closes that.
@@ -53,7 +53,7 @@ What you accept in exchange:
 1. Google publishes these ranges but guarantees nothing—new probers can appear without notification, and a future range addition would surface as unhealthy backends, not a warning.
 2. IPv6 ranges are included unconditionally (inert on single-stack clusters).
 3. The discovered node range is usually the whole cluster subnet, so any VM sharing that subnet keeps its reach—give the cluster its own subnet if that matters.
-4. The allowlist trusts the Google LB ranges wholesale; a network-level control cannot distinguish *your* load balancer's traffic from anything else sourced from those ranges.
+4. The allowlist trusts the Google LB ranges wholesale; a network-level control cannot distinguish _your_ load balancer's traffic from anything else sourced from those ranges.
 
 Neither posture governs **egress** (`policyTypes: [Ingress]`), so pool → Valkey/GCS/Artifact Registry/DNS traffic is unaffected. Standard clusters are created with `--enable-network-policy`; Autopilot always enforces it. `deploy` discovers the pod and node ranges and **aborts** if it can't—`--allow-no-network-policy` deploys without isolation, which disables everything in this section.
 
@@ -85,7 +85,7 @@ One asymmetry worth knowing: a **rolled-back** routing tier is pinned by tag rat
 
 ## Cache security
 
-Memorystore's own defaults are AUTH off and transit encryption off, and the chart's NetworkPolicies govern ingress to *pods* only—so a plaintext instance is readable **and writable** by any workload with VPC reachability. Writable matters: overwriting cached HTML/RSC is content injection into the site.
+Memorystore's own defaults are AUTH off and transit encryption off, and the chart's NetworkPolicies govern ingress to _pods_ only—so a plaintext instance is readable **and writable** by any workload with VPC reachability. Writable matters: overwriting cached HTML/RSC is content injection into the site.
 
 The adapter therefore creates instances **with AUTH + TLS** (`SERVER_AUTHENTICATION`); pods connect over `rediss://` with the AUTH string and server CA injected from the connection Secret. Because AUTH is creation-only on Memorystore, there are three config states:
 

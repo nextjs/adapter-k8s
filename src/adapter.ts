@@ -644,7 +644,6 @@ export function assertStagedWithin(stageDir: string, absDest: string, destRelati
   }
 }
 
-
 /**
  * `config/` inside a build context is the ADAPTER'S reserved namespace — the fresh
  * routing/pool/static manifests are written there by this build, and the routing image's
@@ -667,10 +666,7 @@ function isReservedContextDest(relDest: string): boolean {
  * files and every PPR fs-mirror seed silently missed in containers (measured:
  * resume-data-cache pods) while local runs — cwd = the real build dir — worked.
  */
-export function prerenderSiblingFiles(asset: {
-  filePath: string;
-  prerender?: boolean;
-}): string[] {
+export function prerenderSiblingFiles(asset: { filePath: string; prerender?: boolean }): string[] {
   if (!asset.prerender) return [];
   if (!/(^|[/\\])server[/\\](app|pages)[/\\]/.test(asset.filePath)) return [];
   if (!asset.filePath.endsWith(".html")) return [];
@@ -2527,7 +2523,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             await resolveAndCopyExternals(nextNodeModules, nextNodeModulesDest);
             // Same externals-dependency rule as the pool contexts (node middleware may pull
             // in instrumentation-adjacent externals through its bundle).
-            await stageExternalsDependencies(projectDir, nextNodeModules, "routing-service", false, path.join(projectDir, routingServiceContextDir));
+            await stageExternalsDependencies(
+              projectDir,
+              nextNodeModules,
+              "routing-service",
+              false,
+              path.join(projectDir, routingServiceContextDir),
+            );
           }
           if (existsSync(chunksDir)) {
             // Replace the whole chunk set (not merge) so a stale prior build's chunks can't linger
