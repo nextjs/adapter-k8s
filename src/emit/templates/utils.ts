@@ -1,16 +1,15 @@
 // src/emit/templates/utils.ts
 import { createHash } from "node:crypto";
 
-/**
- * The ONLY namespace this adapter deploys to. init binds Workload Identity to
- * `default/<release>-deploy-sa`, and every kubectl/helm call in the CLI pins this
- * literal instead of trusting the operator's current context. Build time
- * (adapter.ts) and deploy time (deploy.ts) both REJECT an infrastructure.json
- * `namespace` other than this: honoring it only in the ext_proc extension-chain
- * authority (extension-chain.ts) while workloads land in "default" skewed the
- * GXLB callout target and failed every edge callout.
- */
+/** Default release namespace when infrastructure.json does not declare one. */
 export const K8S_NAMESPACE = "default";
+
+/** Resolve and validate the release namespace at each cluster/YAML consumption boundary. */
+export function resolveK8sNamespace(namespace?: unknown): string {
+  const resolved = namespace ?? K8S_NAMESPACE;
+  assertSafeNamespace(resolved);
+  return resolved;
+}
 
 export function sanitizeK8sName(name: string, suffix = ""): string {
   // Lowercase, replace non-alphanumeric with hyphens
@@ -233,7 +232,7 @@ const IMAGE_REGISTRY_RE =
 // Next.js build ids (default or from `generateBuildId()` — commonly a git ref in CI).
 // Excludes helm `--set` metacharacters (`,` `\`) and YAML/template breakouts (`"` `'` `{`).
 const BUILD_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const NAMESPACE_RE = /^[a-z0-9-]{1,63}$/;
+const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // GCS bucket naming rules (https://cloud.google.com/storage/docs/buckets#naming).
 const BUCKET_RE = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;
 
@@ -301,11 +300,12 @@ export function assertSafeBuildId(buildId: string): void {
   }
 }
 
-export function assertSafeNamespace(namespace: string): void {
-  if (!NAMESPACE_RE.test(namespace)) {
+export function assertSafeNamespace(namespace: unknown): asserts namespace is string {
+  if (typeof namespace !== "string" || !NAMESPACE_RE.test(namespace)) {
     throw new Error(
-      `Invalid namespace "${namespace}": must match ${NAMESPACE_RE} ` +
-        `(lowercase letters, digits, and hyphens only, max 63 chars).`,
+      `Invalid namespace ${JSON.stringify(namespace)}: must be a DNS-1123 label ` +
+        `(lowercase letters, digits, and hyphens only, max 63 chars, and must start ` +
+        `and end with a letter or digit).`,
     );
   }
 }

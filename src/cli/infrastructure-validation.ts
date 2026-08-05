@@ -12,7 +12,7 @@ import {
 export interface InfrastructureArgvFields {
   projectId?: string | undefined;
   region?: string | undefined;
-  namespace?: string | undefined;
+  namespace?: unknown;
   containerRegistry?: string | undefined;
   gcsBucket?: string | undefined;
   cacheRegion?: string | undefined;
@@ -40,7 +40,7 @@ export function assertSafeInfrastructure(infra: InfrastructureArgvFields | null 
   if (!infra) return;
   if (infra.projectId) assertSafeProjectId(infra.projectId);
   if (infra.region) assertSafeRegion(infra.region);
-  if (infra.namespace) assertSafeNamespace(infra.namespace);
+  if (infra.namespace !== undefined) assertSafeNamespace(infra.namespace);
   if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
   // A region-shaped value; same charset as `region` (lowercase alnum + hyphen).
   if (infra.cacheRegion) assertSafeRegion(infra.cacheRegion);
@@ -74,16 +74,9 @@ export function assertSafeInfrastructure(infra: InfrastructureArgvFields | null 
  * existing single-target project is unaffected.
  */
 export function infrastructurePath(projectDir: string): string {
+  const scoped = infrastructureWritePath(projectDir);
   const variant = process.env.ADAPTER_K8S_CONFIG?.trim();
-  const base = path.join(projectDir, ".k8s-adapter");
-  if (!variant) return path.join(base, "infrastructure.json");
-  if (!/^[a-z0-9][-a-z0-9_]*$/i.test(variant)) {
-    throw new Error(
-      `ADAPTER_K8S_CONFIG=${JSON.stringify(variant)} is not a valid variant name. Use a bare ` +
-        `name like "scaleway"; it is interpolated into a filename, so a path is refused.`,
-    );
-  }
-  const scoped = path.join(base, `infrastructure.${variant}.json`);
+  if (!variant) return scoped;
   // NO FALLBACK. Falling back was a cross-wiring hazard: the adapter loads
   // adapter.config.<variant>.mjs while this returned the DEFAULT infrastructure.json, so a
   // half-present variant built config A against infrastructure B — a deploy aimed at one
@@ -98,6 +91,23 @@ export function infrastructurePath(projectDir: string): string {
     );
   }
   return scoped;
+}
+
+/**
+ * Path where init writes infrastructure state. Unlike infrastructurePath(), this permits a
+ * selected variant not to exist yet because creating it is init's job.
+ */
+export function infrastructureWritePath(projectDir: string): string {
+  const variant = process.env.ADAPTER_K8S_CONFIG?.trim();
+  const base = path.join(projectDir, ".k8s-adapter");
+  if (!variant) return path.join(base, "infrastructure.json");
+  if (!/^[a-z0-9][-a-z0-9_]*$/i.test(variant)) {
+    throw new Error(
+      `ADAPTER_K8S_CONFIG=${JSON.stringify(variant)} is not a valid variant name. Use a bare ` +
+        `name like "scaleway"; it is interpolated into a filename, so a path is refused.`,
+    );
+  }
+  return path.join(base, `infrastructure.${variant}.json`);
 }
 
 /**

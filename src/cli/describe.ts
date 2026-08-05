@@ -4,7 +4,7 @@ import path from "node:path";
 import boxen from "boxen";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
-import { sanitizeK8sName } from "../emit/templates/utils.js";
+import { resolveK8sNamespace, sanitizeK8sName } from "../emit/templates/utils.js";
 import {
   assertSafeInfrastructure,
   infrastructurePath,
@@ -32,10 +32,12 @@ export async function runDescribe(options: {
         projectId?: string;
         region?: string;
         hosts?: string[];
+        namespace?: string;
       } | null)
     : null;
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
+  const namespace = resolveK8sNamespace(infra?.namespace);
 
   // Ensure kubectl is pointing at the right cluster BEFORE reading state — readState
   // prefers the cluster ConfigMap, and with kubectl still pinned to a stale context it
@@ -66,7 +68,7 @@ export async function runDescribe(options: {
   const { readState, StateUnavailableError } = await import("./state.js");
   // N20: state reads now throw when state is indeterminate. describe is diagnostic — report
   // and continue rather than crashing the one command an operator runs to inspect a release.
-  const state = await readState(projectDir, releaseName).catch((err: unknown) => {
+  const state = await readState(projectDir, releaseName, { namespace }).catch((err: unknown) => {
     if (!(err instanceof StateUnavailableError)) throw err;
     console.warn(
       `  ! Deploy state could not be determined: ${(err as Error).message.split("\n")[0]}`,
@@ -119,10 +121,8 @@ export async function runDescribe(options: {
   const deploymentsResult = await execCapture("kubectl", [
     "get",
     "deployments",
-    // The release lives in the literal "default" namespace (same pin as deploy/
-    // rollback/state) — a kubeconfig namespace override would otherwise show nothing.
     "-n",
-    "default",
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName}`,
     "-o",

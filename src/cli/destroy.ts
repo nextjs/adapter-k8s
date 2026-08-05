@@ -5,7 +5,7 @@ import { execCapture } from "./exec.js";
 import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
-import { K8S_NAMESPACE } from "../emit/templates/utils.js";
+import { resolveK8sNamespace } from "../emit/templates/utils.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 
 export interface DestroyOptions {
@@ -163,6 +163,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
+  const namespace = resolveK8sNamespace(infra?.namespace);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
 
@@ -295,13 +296,12 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
-  // 1. Helm uninstall. The release lives in the "default" namespace — the same one init
-  // binds Workload Identity to — so pin it instead of trusting the context's namespace.
+  // Pin every cluster-side deletion to the release namespace instead of trusting the context.
   if (dryRun) {
-    console.log(`  [dry-run] helm uninstall ${releaseName} --namespace default`);
+    console.log(`  [dry-run] helm uninstall ${releaseName} --namespace ${namespace}`);
   } else {
     console.log("  → Running helm uninstall...");
-    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", "default"]);
+    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", namespace]);
     if (res.exitCode !== 0) {
       if (isAlreadyGoneError(res.stderr)) {
         console.log("    (release not found or already uninstalled)");
@@ -323,7 +323,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     "delete",
     "configmap",
     "-n",
-    "default",
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s`,
     "--ignore-not-found",
@@ -336,7 +336,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       console.warn(
         `    WARNING: could not delete adapter state ConfigMaps: ` +
           `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
-          `(kubectl delete configmap -n default -l app.kubernetes.io/name=${releaseName},` +
+          `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
       );
     }
@@ -354,7 +354,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     "delete",
     "secret",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
     "--ignore-not-found",
@@ -367,7 +367,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       console.warn(
         `    WARNING: could not delete the internal-dispatch Secrets: ` +
           `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them ` +
-          `manually (kubectl delete secret -n ${K8S_NAMESPACE} -l ` +
+          `manually (kubectl delete secret -n ${namespace} -l ` +
           `app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}); they are retained by ` +
           `resource-policy and helm uninstall will not remove them.`,

@@ -219,6 +219,20 @@ describe("runDestroy — confirmation gate (L12)", () => {
     expect(out).toContain(`[dry-run] gcloud iam roles delete ${deployExtRoleId("my-app")}`);
   });
 
+  it("targets the configured namespace for release-scoped Kubernetes resources", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ ...INFRA, namespace: "apps" }),
+    );
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", dryRun: true });
+
+    const out = printedOutput();
+    expect(out).toContain("helm uninstall my-app --namespace apps");
+    expect(out).toContain("kubectl delete configmap -n apps");
+    expect(out).toContain("kubectl delete secret -n apps");
+  });
+
   it("deletes BOTH service accounts for real (not only the deploy one)", async () => {
     await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
     const deleted = vi

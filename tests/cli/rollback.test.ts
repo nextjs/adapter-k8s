@@ -124,6 +124,7 @@ describe("runRollback — CDN invalidation", () => {
       // N69: rollback passes the generation it READ as writeState's floor.
       { buildId: "buildm", previousBuildId: "buildn", cdnTags, basedOnGeneration: null },
       RELEASE,
+      "default",
     );
   });
 
@@ -140,6 +141,7 @@ describe("runRollback — CDN invalidation", () => {
       PROJECT,
       { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
       RELEASE,
+      "default",
     );
   });
 
@@ -163,7 +165,10 @@ describe("runRollback — CDN invalidation", () => {
     expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
     expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
     // State came from the LOCAL file only.
-    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, { localOnly: true });
+    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, {
+      localOnly: true,
+      namespace: "default",
+    });
     // No mutations of any kind.
     expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
@@ -284,6 +289,7 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
       PROJECT,
       { buildId: PREV, previousBuildId: CURR, basedOnGeneration: null },
       LONG_RELEASE,
+      "default",
     );
   });
 });
@@ -319,7 +325,9 @@ describe("runRollback — state read ordering", () => {
     expect(vi.mocked(execCapture).mock.calls[0]![1]).toContain("get-credentials");
     expect(stateOrder).toBeGreaterThan(credOrder);
     // Non-dry-run reads may hit the cluster ConfigMap (no localOnly flag).
-    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, undefined);
+    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, {
+      namespace: "default",
+    });
   });
 });
 
@@ -476,6 +484,7 @@ describe("runRollback — routing service revert", () => {
       PROJECT,
       { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
       RELEASE,
+      "default",
     );
   });
 

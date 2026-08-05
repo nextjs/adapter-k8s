@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "
 import path from "node:path";
 import { stateFileName } from "./infrastructure-validation.js";
 import { execCapture, execCaptureStdin } from "./exec.js";
+import { resolveK8sNamespace } from "../emit/templates/utils.js";
 
 const STATE_DIR = ".k8s-adapter";
 // Variant-scoped: see stateFileName(). Sharing one state file across deploy targets lets a
@@ -10,11 +11,6 @@ const STATE_DIR = ".k8s-adapter";
 // cluster's Services at a build that only ever existed on the other one.
 const STATE_FILE = (): string => stateFileName();
 const CONFIGMAP_NAME_SUFFIX = "-adapter-state";
-// init binds Workload Identity to [<namespace>/${releaseName}-deploy-sa] with the literal
-// namespace "default" — the release (and therefore this ConfigMap) lives there. Pin it:
-// reading/writing via whatever namespace the operator's context happens to have can
-// silently target the wrong namespace.
-const STATE_NAMESPACE = "default";
 // N22: every shell-out goes through exec.ts (AGENTS.md) — this file used to call
 // `spawn("kubectl", …)` directly, which meant no `stdin.on("error")` handler (the
 // ERR_STREAM_DESTROYED crash exec.ts:231-236 documents, hit immediately AFTER cutover,
@@ -228,7 +224,7 @@ export function chooseNewerState(local: AdapterState, cluster: AdapterState): Ad
       `selector onto a build that may be scaled to zero. Confirm which build is serving ` +
       `(\`npx adapter-k8s doctor\`), then delete the stale copy — ` +
       `\`rm ${path.join(STATE_DIR, STATE_FILE())}\` to accept the cluster's, or re-run the ` +
-      `deploy after \`kubectl delete configmap <release>${CONFIGMAP_NAME_SUFFIX} -n ${STATE_NAMESPACE}\` ` +
+      `deploy after \`kubectl delete configmap <release>${CONFIGMAP_NAME_SUFFIX} -n <namespace>\` ` +
       `to accept the local one.`,
   );
 }
@@ -241,12 +237,15 @@ export function chooseNewerState(local: AdapterState, cluster: AdapterState): Ad
 export async function readState(
   projectDir: string,
   releaseName?: string,
-  opts?: { localOnly?: boolean },
+  opts?: { localOnly?: boolean; namespace?: string },
 ): Promise<AdapterState | null> {
   const local = readLocalState(projectDir);
   if (!releaseName || opts?.localOnly) return local;
 
-  const { state: cluster } = await readClusterState(releaseName);
+  const { state: cluster } = await readClusterState(
+    releaseName,
+    resolveK8sNamespace(opts?.namespace),
+  );
   if (!cluster) return local;
   if (!local) return cluster;
   return chooseNewerState(local, cluster);
@@ -288,7 +287,9 @@ export async function writeState(
   projectDir: string,
   state: StateWrite,
   releaseName?: string,
+  configuredNamespace?: string,
 ): Promise<void> {
+  const namespace = resolveK8sNamespace(configuredNamespace);
   const { basedOnGeneration, ...body } = state;
   const localExisting = readLocalStateQuiet(projectDir);
 
@@ -304,7 +305,7 @@ export async function writeState(
   let clusterReadError: ClusterStateWriteError | null = null;
   if (releaseName) {
     try {
-      const existing = await readClusterStateForWrite(releaseName);
+      const existing = await readClusterStateForWrite(releaseName, namespace);
       clusterGeneration = existing.generation;
       resourceVersion = existing.resourceVersion;
     } catch (err) {
@@ -378,7 +379,7 @@ export async function writeState(
 
   // Write to cluster ConfigMap (throws ClusterStateWriteError on failure)
   if (releaseName) {
-    await writeClusterState(releaseName, stamped, resourceVersion);
+    await writeClusterState(releaseName, stamped, resourceVersion, namespace);
   }
 }
 
@@ -386,12 +387,12 @@ function configMapName(releaseName: string): string {
   return `${releaseName}${CONFIGMAP_NAME_SUFFIX}`;
 }
 
-const STATE_GET_ARGS = (cmName: string): string[] => [
+const STATE_GET_ARGS = (cmName: string, namespace: string): string[] => [
   "get",
   "configmap",
   cmName,
   "-n",
-  STATE_NAMESPACE,
+  namespace,
   // N20: THE machine-readable absence signal. With --ignore-not-found a genuinely absent
   // ConfigMap is exit 0 + empty stdout, so any non-zero exit is a real failure
   // (connectivity, RBAC, expired credentials) and must never read as "no state yet".
@@ -460,19 +461,19 @@ function parseStateConfigMap(
   return { state, resourceVersion };
 }
 
-async function readClusterState(releaseName: string): Promise<ClusterStateRead> {
+async function readClusterState(releaseName: string, namespace: string): Promise<ClusterStateRead> {
   const cmName = configMapName(releaseName);
-  const result = await execCapture("kubectl", STATE_GET_ARGS(cmName), {
+  const result = await execCapture("kubectl", STATE_GET_ARGS(cmName, namespace), {
     timeoutMs: KUBECTL_TIMEOUT_MS,
   }).catch((err: unknown) => {
     throw new ClusterStateReadError(
-      `Could not read the deploy-state ConfigMap ${cmName} in namespace ${STATE_NAMESPACE}: ` +
+      `Could not read the deploy-state ConfigMap ${cmName} in namespace ${namespace}: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
   });
   if (result.exitCode !== 0) {
     throw new ClusterStateReadError(
-      `Could not read the deploy-state ConfigMap ${cmName} in namespace ${STATE_NAMESPACE} ` +
+      `Could not read the deploy-state ConfigMap ${cmName} in namespace ${namespace} ` +
         `(kubectl exited ${result.exitCode}${result.timedOut ? ", timed out" : ""}). ` +
         `--ignore-not-found makes a genuinely absent ConfigMap exit 0, so this is a ` +
         `connectivity/RBAC failure, NOT "no deploys yet".` +
@@ -488,9 +489,10 @@ async function readClusterState(releaseName: string): Promise<ClusterStateRead> 
 // while an unreadable cluster IS (see writeState).
 async function readClusterStateForWrite(
   releaseName: string,
+  namespace: string,
 ): Promise<{ generation: number; resourceVersion: string | null }> {
   const cmName = configMapName(releaseName);
-  const result = await execCapture("kubectl", STATE_GET_ARGS(cmName), {
+  const result = await execCapture("kubectl", STATE_GET_ARGS(cmName, namespace), {
     timeoutMs: KUBECTL_TIMEOUT_MS,
   }).catch((err: unknown) => {
     throw new ClusterStateWriteError(
@@ -513,10 +515,17 @@ async function readClusterStateForWrite(
   };
 }
 
-async function currentResourceVersion(releaseName: string): Promise<string | null> {
-  const result = await execCapture("kubectl", STATE_GET_ARGS(configMapName(releaseName)), {
-    timeoutMs: KUBECTL_TIMEOUT_MS,
-  });
+async function currentResourceVersion(
+  releaseName: string,
+  namespace: string,
+): Promise<string | null> {
+  const result = await execCapture(
+    "kubectl",
+    STATE_GET_ARGS(configMapName(releaseName), namespace),
+    {
+      timeoutMs: KUBECTL_TIMEOUT_MS,
+    },
+  );
   if (result.exitCode !== 0) return null;
   return parseStateConfigMap(configMapName(releaseName), result.stdout).resourceVersion;
 }
@@ -525,6 +534,7 @@ async function writeClusterState(
   releaseName: string,
   state: AdapterState,
   resourceVersion: string | null,
+  namespace: string,
 ): Promise<void> {
   const cmName = configMapName(releaseName);
   // JSON, not hand-built YAML: the old writer embedded the state in a single-quoted YAML
@@ -551,8 +561,8 @@ async function writeClusterState(
   // replace (update, precondition) when it exists; create (fails AlreadyExists if a
   // racing writer got there first) when it does not.
   const args = resourceVersion
-    ? ["replace", "-n", STATE_NAMESPACE, "-f", "-"]
-    : ["create", "-n", STATE_NAMESPACE, "-f", "-"];
+    ? ["replace", "-n", namespace, "-f", "-"]
+    : ["create", "-n", namespace, "-f", "-"];
 
   // N22: via execCaptureStdin — the stdin 'error' handler, timeout, and Windows shim
   // handling all live in exec.ts. The payload never goes on argv (size + secrets rule).
@@ -570,7 +580,7 @@ async function writeClusterState(
   // N23: classify the failure on the machine-readable signal — did the object move? —
   // never on stderr text. A moved (or newly created) resourceVersion means a concurrent
   // deploy/rollback committed state while we were writing.
-  const observed = await currentResourceVersion(releaseName).catch(() => null);
+  const observed = await currentResourceVersion(releaseName, namespace).catch(() => null);
   const concurrent = observed !== null && observed !== resourceVersion;
   const detail = result.stderr.trim() || `kubectl ${args[0]} exited ${result.exitCode}`;
   throw new ClusterStateWriteError(

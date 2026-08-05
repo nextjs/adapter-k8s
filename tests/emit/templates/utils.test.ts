@@ -16,6 +16,8 @@ import {
   assertSafePoolName,
   assertSafeYamlScalar,
   assertSafeImageReference,
+  assertSafeNamespace,
+  resolveK8sNamespace,
   K8S_NAMESPACE,
 } from "../../../src/emit/templates/utils.js";
 // The snapshot name must be importable from its historical home too — deploy.ts and
@@ -88,6 +90,21 @@ describe("sanitizeK8sName", () => {
     // Short names are untouched apart from the suffix.
     expect(sanitizeK8sName("nextjs-ssr", "-hcp")).toBe("nextjs-ssr-hcp");
   });
+});
+
+describe("Kubernetes namespace validation", () => {
+  it("accepts DNS-1123 labels and defaults only absent values", () => {
+    expect(resolveK8sNamespace()).toBe(K8S_NAMESPACE);
+    expect(resolveK8sNamespace("apps-3")).toBe("apps-3");
+    expect(() => assertSafeNamespace("a".repeat(63))).not.toThrow();
+  });
+
+  it.each(["-prod", "prod-", "---", "Prod", "", "a".repeat(64), 123, null])(
+    "rejects an invalid namespace value: %j",
+    (namespace) => {
+      expect(() => assertSafeNamespace(namespace)).toThrow(/Invalid namespace/);
+    },
+  );
 });
 
 describe("routingManifestSnapshotName", () => {

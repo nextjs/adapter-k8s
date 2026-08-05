@@ -30,6 +30,7 @@ describe("state", () => {
   let tmpDir: string;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-test-"));
   });
 
@@ -60,6 +61,23 @@ describe("state", () => {
     // N21: every write stamps a monotonic generation + updatedAt on top of the payload.
     expect(read).toMatchObject(state);
     expect(read!.generation).toBe(1);
+  });
+
+  it("pins cluster state reads and writes to the configured namespace", async () => {
+    vi.clearAllMocks();
+    vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.mocked(execCaptureStdin).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await readState(tmpDir, "rel", { namespace: "apps" });
+    expect(vi.mocked(execCapture).mock.calls[0]![1]).toContain("apps");
+
+    await writeState(
+      tmpDir,
+      { buildId: "b1", previousBuildId: null, basedOnGeneration: null },
+      "rel",
+      "apps",
+    );
+    expect(vi.mocked(execCaptureStdin).mock.calls[0]![1]).toContain("apps");
   });
 
   it("overwrites existing state", async () => {

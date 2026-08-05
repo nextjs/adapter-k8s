@@ -412,12 +412,14 @@ describe("N73: route-ext Job verifies the mounted route-extension.yaml", () => {
 
   it("pins the expected service and authority to the values it was RENDERED with", () => {
     const yaml = job();
-    // Both are fully determined by release name + project + the single supported namespace
-    // (K8S_NAMESPACE), so they can be re-derived rather than trusted from /config.
+    // Both are fully determined by release name + project + the Helm release namespace,
+    // so they can be re-derived rather than trusted from /config.
     expect(yaml).toContain(
       'EXPECT_SERVICE="projects/my-project/global/backendServices/my-app-routing-service"',
     );
-    expect(yaml).toContain('EXPECT_AUTHORITY="my-app-routing-service.default.svc.cluster.local"');
+    expect(yaml).toContain(
+      'EXPECT_AUTHORITY="my-app-routing-service.{{ .Release.Namespace }}.svc.cluster.local"',
+    );
   });
 
   it("aborts before the privileged import when either value mismatches", () => {

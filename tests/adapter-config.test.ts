@@ -380,17 +380,26 @@ describe("onBuildComplete build-time guards", () => {
     await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
   });
 
-  it("rejects a non-default namespace from infrastructure.json (fail-fast, actionable)", async () => {
-    // The namespace feeds ONLY the ext_proc extension-chain authority; every
-    // kubectl/helm call pins the literal "default" (init binds Workload Identity
-    // there). Honoring "prod" here shipped workloads to default while the GXLB
-    // callout targeted prod — every edge callout failed. The build must refuse.
+  it("records a custom namespace in the build handoff", async () => {
     writeInfra({ namespace: "prod" });
     const adapter = createK8sAdapter(validConfig);
     await adapter.modifyConfig!({} as any, {} as any);
-    await expect(adapter.onBuildComplete!(ctx("b12345"))).rejects.toThrow(
-      /Unsupported namespace "prod".*deploys only to the "default" namespace.*Remove "namespace"/s,
-    );
+    await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
+    expect(
+      JSON.parse(
+        readFileSync(path.join(projectDir, ".k8s-adapter/output/build-metadata.json"), "utf-8"),
+      ).namespace,
+    ).toBe("prod");
+  });
+
+  it("qualifies the GKE extension-chain authority with the custom namespace", async () => {
+    writeInfra({ namespace: "prod", projectId: "my-project-1", region: "us-central1" });
+    const adapter = createK8sAdapter(validConfig);
+    await adapter.modifyConfig!({} as any, {} as any);
+    await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
+    expect(
+      readFileSync(path.join(projectDir, ".k8s-adapter/output/extension-chains.json"), "utf-8"),
+    ).toContain("-routing-service.prod.svc.cluster.local");
   });
 
   it('accepts an explicit namespace of "default" (and none at all)', async () => {

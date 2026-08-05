@@ -10,7 +10,7 @@ import {
 } from "../../src/cli/init.js";
 import * as exec from "../../src/cli/exec.js";
 import * as scaffold from "../../src/cli/scaffold.js";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -62,6 +62,30 @@ describe("buildInitGcloudCommands", () => {
 
     const saCmd = commands.find((c) => c.description.includes("service account"));
     expect(saCmd).toBeDefined();
+  });
+
+  it("binds Workload Identity to the configured namespace", () => {
+    const commands = buildInitGcloudCommands({
+      projectId: "my-project",
+      region: "us-central1",
+      bucket: "my-project-nextjs-static",
+      releaseName: "my-app",
+      namespace: "apps",
+    });
+    const binding = commands.find((c) => c.args.includes("roles/iam.workloadIdentityUser"));
+    expect(binding?.args).toContain("serviceAccount:my-project.svc.id.goog[apps/my-app-deploy-sa]");
+  });
+
+  it("rejects an unsafe namespace before building command arguments", () => {
+    expect(() =>
+      buildInitGcloudCommands({
+        projectId: "my-project",
+        region: "us-central1",
+        bucket: "my-project-nextjs-static",
+        releaseName: "my-app",
+        namespace: 'bad";inject',
+      }),
+    ).toThrow(/Invalid namespace/);
   });
 
   it("includes routing service backend provisioning commands", () => {
@@ -269,8 +293,59 @@ describe("runInit", () => {
 
   function mockScaffold(): void {
     vi.spyOn(scaffold, "generateAdapterConfig").mockReturnValue("config");
-    vi.spyOn(scaffold, "generateInfrastructureJson").mockReturnValue("infra");
+    vi.spyOn(scaffold, "generateInfrastructureJson").mockImplementation((config) =>
+      JSON.stringify(config),
+    );
   }
+
+  it("writes the selected config variant instead of the default infrastructure file", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    process.env.ADAPTER_K8S_CONFIG = "staging";
+
+    try {
+      await runInit({ ...VALID, namespace: "apps", projectDir: tmpDir, iamRetryDelayMs: 0 });
+    } finally {
+      delete process.env.ADAPTER_K8S_CONFIG;
+    }
+
+    const variantPath = path.join(tmpDir, ".k8s-adapter", "infrastructure.staging.json");
+    expect(existsSync(variantPath)).toBe(true);
+    expect(existsSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"))).toBe(false);
+    expect(JSON.parse(readFileSync(variantPath, "utf-8")).namespace).toBe("apps");
+  });
+
+  it("prints a namespace-pinned Gateway lookup after init", async () => {
+    const execCapture = vi.spyOn(exec, "execCapture");
+    mockScaffold();
+    execCapture.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await runInit({
+      ...VALID,
+      namespace: "apps",
+      projectDir: tmpDir,
+      iamRetryDelayMs: 0,
+    });
+
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("kubectl get gateway my-app-gateway -n apps"),
+    );
+  });
+
+  it("refuses to move an existing release to another namespace", async () => {
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ namespace: "default" }),
+    );
+    const execCapture = vi.spyOn(exec, "execCapture");
+
+    await expect(
+      runInit({ ...VALID, namespace: "apps", projectDir: tmpDir, iamRetryDelayMs: 0 }),
+    ).rejects.toThrow(/Cannot change the namespace.*default.*apps/s);
+    expect(execCapture).not.toHaveBeenCalled();
+  });
 
   it("retries on IAM binding failure and handles already exists", async () => {
     const execCapture = vi.spyOn(exec, "execCapture");

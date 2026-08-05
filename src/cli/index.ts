@@ -1,6 +1,6 @@
 // src/cli/index.ts
 import path from "node:path";
-import { infrastructurePath } from "./infrastructure-validation.js";
+import { infrastructurePath, infrastructureWritePath } from "./infrastructure-validation.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { existsSync, readFileSync } from "node:fs";
 import { runInit } from "./init.js";
@@ -40,6 +40,7 @@ const VALUE_FLAGS = new Set([
   "bucket",
   "registry",
   "release-name",
+  "namespace",
   "port",
 ]);
 
@@ -143,6 +144,7 @@ Options:
   --bucket <name>          GCS bucket name for static assets (init)
   --registry <url>         Container registry URL (init)
   --release-name <name>    Helm release name (default: current directory name)
+  --namespace <name>       Kubernetes namespace (init; default: persisted value or default)
   --standard               Provision a GKE Standard cluster instead of Autopilot (init)
   --skip-build             Skip next build (deploy, emulate)
   --skip-push              Skip docker build + push (deploy)
@@ -188,12 +190,17 @@ async function main(): Promise<void> {
       .slice(0, 40)
       .replace(/-+$/, "") || "app";
   let persistedReleaseName: string | undefined;
-  const infraPath = infrastructurePath(projectDir);
+  let persistedNamespace: string | undefined;
+  const infraPath =
+    command === "init" ? infrastructureWritePath(projectDir) : infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
     try {
       const infra = JSON.parse(readFileSync(infraPath, "utf-8"));
       if (typeof infra.releaseName === "string" && infra.releaseName) {
         persistedReleaseName = infra.releaseName;
+      }
+      if (typeof infra.namespace === "string" && infra.namespace) {
+        persistedNamespace = infra.namespace;
       }
     } catch (err) {
       // Malformed infrastructure.json — fall back to the directory default, but name
@@ -229,6 +236,7 @@ async function main(): Promise<void> {
       const registry =
         (flags["registry"] as string) ??
         (projectId && region ? `${region}-docker.pkg.dev/${projectId}/nextjs` : undefined);
+      const initNamespace = (flags["namespace"] as string | undefined) ?? persistedNamespace;
 
       if (!projectId || hosts.length === 0) {
         console.error("Error: --project-id and --host are required for init");
@@ -248,6 +256,7 @@ async function main(): Promise<void> {
         bucket: bucket!,
         registry: registry!,
         releaseName,
+        ...(initNamespace ? { namespace: initNamespace } : {}),
         projectDir,
         dryRun,
         // --standard opts out of the Autopilot default (Standard clusters get

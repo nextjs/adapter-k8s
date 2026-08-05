@@ -5,17 +5,12 @@ import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { checkContainerRuntime } from "./container-runtime.js";
-import { sanitizeK8sName } from "../emit/templates/utils.js";
+import { resolveK8sNamespace, sanitizeK8sName } from "../emit/templates/utils.js";
 import {
   assertSafeInfrastructure,
   infrastructurePath,
   outputDirName,
 } from "./infrastructure-validation.js";
-
-// The release lives in the literal "default" namespace (init binds Workload Identity
-// there; deploy/rollback/state/destroy all pin it). Pin every kubectl read here too —
-// a kubeconfig namespace override otherwise makes every check report "not found".
-const K8S_NAMESPACE = "default";
 
 // Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
 // WHICH file is corrupt.
@@ -190,13 +185,17 @@ export async function runDoctor(options: {
 }): Promise<void> {
   const { projectDir, releaseName } = options;
   const results: CheckResult[] = [];
+  let namespace = resolveK8sNamespace();
 
   // Ensure kubectl is pointing at the right cluster
   const infraPathForCtx = infrastructurePath(projectDir);
   if (existsSync(infraPathForCtx)) {
-    const infraCtx = readJsonFile<{ projectId?: string; region?: string }>(infraPathForCtx);
+    const infraCtx = readJsonFile<{ projectId?: string; region?: string; namespace?: string }>(
+      infraPathForCtx,
+    );
     // S13: validate before these reach a gcloud/kubectl argv.
     assertSafeInfrastructure(infraCtx);
+    namespace = resolveK8sNamespace(infraCtx.namespace);
     if (infraCtx.projectId && infraCtx.region) {
       const clusterName = `${releaseName}-cluster`;
       const credResult = await execCapture("gcloud", [
@@ -270,7 +269,7 @@ export async function runDoctor(options: {
   let state: Awaited<ReturnType<typeof readState>> = null;
   let stateError: string | null = null;
   try {
-    state = await readState(projectDir, releaseName);
+    state = await readState(projectDir, releaseName, { namespace });
   } catch (err) {
     if (!(err instanceof StateUnavailableError)) throw err;
     stateError = err.message;
@@ -417,7 +416,7 @@ export async function runDoctor(options: {
       "gateway",
       `${releaseName}-gateway`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-o",
       "jsonpath={.status.conditions[?(@.type=='Accepted')].status}",
     ]);
@@ -432,7 +431,7 @@ export async function runDoctor(options: {
           "gateway",
           `${releaseName}-gateway`,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "-o",
           "jsonpath={.status.conditions[?(@.type=='Accepted')].message}",
         ]);
@@ -442,7 +441,7 @@ export async function runDoctor(options: {
           // L14: condition messages are cluster-sourced — strip terminal control chars.
           message:
             sanitizeForTerminal(reasonResult.stdout.trim()) || `Status: ${accepted || "Unknown"}`,
-          fix: `kubectl describe gateway ${releaseName}-gateway`,
+          fix: `kubectl describe gateway ${releaseName}-gateway -n ${namespace}`,
         });
       }
     } else {
@@ -460,7 +459,7 @@ export async function runDoctor(options: {
       "gateway",
       `${releaseName}-gateway`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-o",
       "jsonpath={.status.addresses[0].value}",
     ]);
@@ -499,7 +498,7 @@ export async function runDoctor(options: {
       "httproute",
       `${releaseName}-routes`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-o",
       "jsonpath={.status.parents[0].conditions[?(@.type=='Accepted')].status}",
     ]);
@@ -512,7 +511,7 @@ export async function runDoctor(options: {
               name: "HTTPRoute",
               status: "fail",
               message: `Status: ${accepted || "Unknown"}`,
-              fix: `kubectl describe httproute ${releaseName}-routes`,
+              fix: `kubectl describe httproute ${releaseName}-routes -n ${namespace}`,
             },
       );
     } else {
@@ -524,7 +523,7 @@ export async function runDoctor(options: {
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -594,7 +593,7 @@ export async function runDoctor(options: {
             name: `${label}${roleTag}`,
             status: "fail",
             message: `${ready}/${total} ready`,
-            fix: `kubectl describe deployment/${name}`,
+            fix: `kubectl describe deployment/${name} -n ${namespace}`,
           });
         } else if (ready < total) {
           results.push({
@@ -607,7 +606,7 @@ export async function runDoctor(options: {
             name: `${label}${roleTag}`,
             status: "fail",
             message: `${ready}/${total} ready`,
-            fix: `kubectl describe deployment/${name}`,
+            fix: `kubectl describe deployment/${name} -n ${namespace}`,
           });
         }
       }
@@ -651,7 +650,7 @@ export async function runDoctor(options: {
       "get",
       "svc",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -704,7 +703,7 @@ export async function runDoctor(options: {
         "get",
         "endpointslice",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         `kubernetes.io/service-name=${svc}`,
         "-o",
@@ -728,7 +727,7 @@ export async function runDoctor(options: {
           name: `Active Service endpoints: ${svc}`,
           status: "fail",
           message: "0 ready endpoints — selector matches no ready pods (origin will 503)",
-          fix: `kubectl get svc ${svc} -o jsonpath='{.spec.selector}' — verify app.kubernetes.io/version matches a running pod's label`,
+          fix: `kubectl get svc ${svc} -n ${namespace} -o jsonpath='{.spec.selector}' — verify app.kubernetes.io/version matches a running pod's label`,
         });
       }
       // readyEndpoints === -1 (kubectl error) is left unreported — cluster-connectivity
@@ -779,7 +778,7 @@ export async function runDoctor(options: {
       "get",
       "pods",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -796,7 +795,7 @@ export async function runDoctor(options: {
           "logs",
           pod,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--tail=50",
         ]);
         if (logsResult.exitCode !== 0) continue;
@@ -812,14 +811,14 @@ export async function runDoctor(options: {
           name: "Pod logs",
           status: "fail",
           message: `Fatal error in ${fatalHit.pod}: ${firstFatal}`,
-          fix: `kubectl logs ${fatalHit.pod} --tail=50`,
+          fix: `kubectl logs ${fatalHit.pod} -n ${namespace} --tail=50`,
         });
       } else if (errorPods.length > 0) {
         results.push({
           name: "Pod logs",
           status: "warn",
           message: `error-level lines in ${errorPods.length}/${podsToCheck.length} pod(s) — likely transient app errors`,
-          fix: `kubectl logs ${errorPods[0]} --tail=50`,
+          fix: `kubectl logs ${errorPods[0]} -n ${namespace} --tail=50`,
         });
       } else if (podsToCheck.length > 0) {
         results.push({
@@ -940,7 +939,7 @@ export async function runDoctor(options: {
         "get",
         "svcneg",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-o",
         "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=='Initialized')].status}{\"\\n\"}{end}",
       ]);

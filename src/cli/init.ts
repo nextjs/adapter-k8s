@@ -5,12 +5,14 @@ import { execCapture } from "./exec.js";
 import { generateAdapterConfig, generateInfrastructureJson } from "./scaffold.js";
 import { gkeVersionAtLeast, MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import { infrastructureWritePath } from "./infrastructure-validation.js";
 import {
   assertSafeBucketName,
   assertSafeHostname,
   assertSafeImageRegistry,
   assertSafeProjectId,
   assertSafeRegion,
+  resolveK8sNamespace,
 } from "../emit/templates/utils.js";
 
 export interface InitOptions {
@@ -20,6 +22,7 @@ export interface InitOptions {
   bucket: string;
   registry: string;
   releaseName: string;
+  namespace?: string;
   projectDir: string;
   dryRun?: boolean;
   /** Backoff between IAM-binding retries (ms). Defaults to 5000; tests override to run fast. */
@@ -94,10 +97,12 @@ export function buildInitGcloudCommands(options: {
   region: string;
   bucket: string;
   releaseName: string;
+  namespace?: string;
   hosts?: string[];
   autopilot?: boolean;
 }): GcloudCommand[] {
   const { projectId, region, bucket, releaseName, hosts = [], autopilot = true } = options;
+  const namespace = resolveK8sNamespace(options.namespace);
   const commands: GcloudCommand[] = [];
   // S6: the impersonable Job identity and the CLI-only one. See the doc comments above —
   // every grant below is deliberate about WHICH of the two it lands on.
@@ -390,7 +395,7 @@ export function buildInitGcloudCommands(options: {
       "--role",
       "roles/iam.workloadIdentityUser",
       "--member",
-      `serviceAccount:${projectId}.svc.id.goog[default/${releaseName}-deploy-sa]`,
+      `serviceAccount:${projectId}.svc.id.goog[${namespace}/${releaseName}-deploy-sa]`,
       "--condition=None",
       "--project",
       projectId,
@@ -609,11 +614,34 @@ export async function runInit(options: InitOptions): Promise<void> {
     bucket,
     registry,
     releaseName,
+    namespace: configuredNamespace,
     projectDir,
     dryRun,
     iamRetryDelayMs = 5000,
     autopilot = true,
   } = options;
+  const namespace = resolveK8sNamespace(configuredNamespace);
+
+  const infraPath = infrastructureWritePath(projectDir);
+  if (existsSync(infraPath)) {
+    let existing: { namespace?: unknown };
+    try {
+      existing = JSON.parse(readFileSync(infraPath, "utf-8"));
+    } catch (err) {
+      throw new Error(
+        `Failed to parse ${infraPath}: ${err instanceof Error ? err.message : String(err)}. ` +
+          `Fix the file before re-running init.`,
+      );
+    }
+    const existingNamespace = resolveK8sNamespace(existing.namespace);
+    if (existingNamespace !== namespace) {
+      throw new Error(
+        `Cannot change the namespace of an existing release from "${existingNamespace}" to ` +
+          `"${namespace}". The old namespace still contains release state and Workload ` +
+          `Identity bindings. Destroy that release first, or use a new release/config variant.`,
+      );
+    }
+  }
 
   // Validate every operator-supplied value BEFORE it reaches a gcloud arg array or the
   // scaffolded adapter.config.mjs — a `'` in a host/bucket name would otherwise be raw
@@ -682,6 +710,7 @@ export async function runInit(options: InitOptions): Promise<void> {
     region,
     bucket,
     releaseName,
+    namespace,
     hosts,
     autopilot,
   });
@@ -914,9 +943,8 @@ export async function runInit(options: InitOptions): Promise<void> {
   }
 
   // 4. Write infrastructure.json
-  const infraDir = path.join(projectDir, ".k8s-adapter");
-  const infraPath = path.join(infraDir, "infrastructure.json");
-  console.log("  → Writing .k8s-adapter/infrastructure.json");
+  const infraDir = path.dirname(infraPath);
+  console.log(`  → Writing ${path.relative(projectDir, infraPath)}`);
   if (!dryRun) {
     mkdirSync(infraDir, { recursive: true });
     writeFileSync(
@@ -930,6 +958,7 @@ export async function runInit(options: InitOptions): Promise<void> {
         gatewayName: `${releaseName}-gateway`,
         routeExtensionName: `${releaseName}-route-ext`,
         releaseName,
+        namespace,
       }),
     );
   }
@@ -992,7 +1021,7 @@ export async function runInit(options: InitOptions): Promise<void> {
   console.log(`  3. Configure your DNS A records for your hosts:`);
   console.log("     - Wait 5-10 minutes for the GCP Load Balancer to initialize.");
   console.log(
-    `     - Run \`kubectl get gateway ${releaseName}-gateway\` to find your external IP address.`,
+    `     - Run \`kubectl get gateway ${releaseName}-gateway -n ${namespace}\` to find your external IP address.`,
   );
   for (const h of hosts) {
     console.log(`     - Create a DNS A record for ${h} pointing to that IP.`);

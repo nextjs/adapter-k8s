@@ -4,7 +4,6 @@ import {
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeBuildId,
-  K8S_NAMESPACE,
 } from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
@@ -178,10 +177,10 @@ spec:
               # A rewritten \`service\`/\`authority\` would point this LB's callout at a
               # DIFFERENT backend — i.e. insert a middleware tier that sees and rewrites
               # every request. Both values are fully determined by the release name,
-              # project, and the single supported namespace, so verify them against the
+              # project, and the Helm release namespace, so verify them against the
               # values this Job was RENDERED with instead of trusting the mount. (The
               # residual IAM exposure — the binding is project-wide, so any principal who
-              # can create a pod in "${K8S_NAMESPACE}" can set
+              # can create a pod in this release namespace can set
               # serviceAccountName: ${releaseName}-deploy-sa and inherit it — needs a
               # resource condition on the binding in cli/init.ts; that is tracked
               # separately.)
@@ -216,7 +215,7 @@ spec:
                 echo "route-extension.yaml matches the rendered chart (sha256) ✓"
               fi
               EXPECT_SERVICE="projects/${projectId}/global/backendServices/${releaseName}-routing-service"
-              EXPECT_AUTHORITY="${releaseName}-routing-service.${K8S_NAMESPACE}.svc.cluster.local"
+              EXPECT_AUTHORITY="${releaseName}-routing-service.{{ .Release.Namespace }}.svc.cluster.local"
               GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
               GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
               if [ "$GOT_SERVICE" != "$EXPECT_SERVICE" ]; then

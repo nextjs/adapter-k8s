@@ -254,6 +254,19 @@ describe("buildHelmUpgradeArgs", () => {
     expect(args.join(" ")).toContain("activeBuildId=abc123");
   });
 
+  it("pins Helm to the configured namespace", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "abc123",
+      registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+      previousBuildId: null,
+      namespace: "apps",
+    });
+
+    expect(args.join(" ")).toContain("--namespace apps --create-namespace");
+  });
+
   it("sanitizes the serving build selector used during the upgrade", () => {
     const args = buildHelmUpgradeArgs({
       releaseName: "my-app",

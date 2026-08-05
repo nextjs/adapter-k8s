@@ -1740,23 +1740,6 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           `[adapter-k8s] Unsafe namespace in .k8s-adapter/infrastructure.json: ${(err as Error).message}`,
         );
       }
-      // The namespace feeds ONLY the ext_proc extension-chain authority
-      // (`<release>-routing-service.<namespace>.svc.cluster.local`, extension-chain.ts)
-      // — every kubectl/helm call in the CLI pins the literal K8S_NAMESPACE, and init
-      // binds Workload Identity to default/<release>-deploy-sa. A non-default value
-      // here would land workloads in "default" while the GXLB callout targets the
-      // other namespace: every edge callout fails, and diagnostics chase the "wrong"
-      // resources. Fail fast at build time instead of emitting a skewed chain.
-      if (namespace !== K8S_NAMESPACE) {
-        throw new Error(
-          `[adapter-k8s] Unsupported namespace "${namespace}" in ` +
-            `.k8s-adapter/infrastructure.json: this adapter version deploys only to the ` +
-            `"${K8S_NAMESPACE}" namespace (init binds Workload Identity to ` +
-            `${K8S_NAMESPACE}/<release>-deploy-sa and every kubectl/helm call pins it). ` +
-            `Remove "namespace" from infrastructure.json.`,
-        );
-      }
-
       const configuredRegistry = infra.containerRegistry ?? process.env.IMAGE_REGISTRY;
       if (configuredRegistry !== undefined) {
         try {
@@ -2551,6 +2534,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // provider-specific decisions (kube context, digest resolution, NetworkPolicy
           // discovery) on that basis.
           provider: resolveProvider(cfg).name,
+          namespace,
           // The chart bakes this registry into image references; deploy refuses a chart whose
           // registry does not match the infrastructure it is deploying with.
           containerRegistry: imageRegistry,

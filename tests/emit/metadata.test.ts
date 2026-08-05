@@ -5,6 +5,8 @@ import { generateBuildMetadata } from "../../src/emit/metadata.js";
 const base = {
   buildId: "b12345",
   nextVersion: "16.2.0",
+  provider: "generic",
+  namespace: "apps",
   poolNames: ["ssr"],
   generatedAt: "2026-01-01T00:00:00.000Z",
   containerStrategy: "traced-assets" as const,
@@ -20,6 +22,8 @@ describe("generateBuildMetadata", () => {
     expect(JSON.parse(generateBuildMetadata(base))).toEqual({
       buildId: "b12345",
       nextVersion: "16.2.0",
+      provider: "generic",
+      namespace: "apps",
       pools: ["ssr"],
       generatedAt: "2026-01-01T00:00:00.000Z",
       containerStrategy: "traced-assets",

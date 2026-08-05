@@ -458,6 +458,7 @@ describe("runDeploy — orchestration", () => {
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
     // CDN invalidated for the OUTGOING build. Prior state (legacy) recorded no tag for
     // it, so no recordedTag is passed — cdn-invalidate falls back to the full purge (M13).
@@ -681,6 +682,7 @@ describe("runDeploy — guards and teardown", () => {
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
     // A loud warning named the missing deployment...
     expect(
@@ -792,21 +794,66 @@ describe("runDeploy — guards and teardown", () => {
     expect(events).not.toContain("helm");
   });
 
-  it("rejects a non-default namespace in infrastructure.json before touching anything", async () => {
-    // The chart/extension chain were built for the ext_proc authority in
-    // infra.namespace, but every kubectl/helm call pins "default" — deploying would
-    // skew the GXLB callout target away from the workloads. Fail fast instead.
-    setupFs({ infra: { ...BASE_INFRA, namespace: "prod" } });
+  it("uses a custom namespace for Helm, cluster state, and routing retention", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, namespace: "prod" },
+    });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
+    expect(helmCall?.[1].join(" ")).toContain("--namespace prod --create-namespace");
+    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, { namespace: "prod" });
+    expect(vi.mocked(retainLiveRoutingManifest)).toHaveBeenCalledWith(RELEASE, "prod");
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      expect.objectContaining({ buildId: "buildn", previousBuildId: "buildm" }),
+      RELEASE,
+      "prod",
+    );
+  });
+
+  it("refuses build output emitted for a different namespace", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: false,
+        namespace: "staging",
+      },
+    });
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(
-      /Unsupported namespace "prod".*deploys only to the "default" namespace.*Remove "namespace"/s,
-    );
+    ).rejects.toThrow(/emitted for namespace "staging".*targets "prod"/s);
     expect(events).not.toContain("helm");
-    expect(events).not.toContain("get-credentials");
-    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("treats legacy build output with no namespace as default", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false },
+    });
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/emitted for namespace "default".*targets "prod"/s);
+    expect(events).not.toContain("helm");
+  });
+
+  it("rejects malformed namespace metadata instead of bypassing the fingerprint", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, namespace: 123 },
+    });
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Invalid namespace/);
+    expect(events).not.toContain("helm");
   });
 
   it('accepts an explicit namespace of "default" in infrastructure.json', async () => {
@@ -831,6 +878,7 @@ describe("runDeploy — guards and teardown", () => {
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
   });
 
@@ -866,6 +914,7 @@ describe("runDeploy — guards and teardown", () => {
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
   });
 
@@ -1189,8 +1238,10 @@ describe("runDeploy — N25: every post-helm abort puts the ext_proc edge back",
 
     expect(vi.mocked(revertRoutingServiceToBuild)).toHaveBeenCalledWith({
       releaseName: RELEASE,
+      namespace: "default",
       targetBuildId: "buildm",
       registry: REGISTRY,
+      targetImageDigest: undefined,
     });
     expect(printedErrors()).toContain("reverted to build buildm");
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
@@ -1484,6 +1535,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
       PROJECT,
       expect.objectContaining({ unretainedManifestBuilds: ["buildm"] }),
       RELEASE,
+      "default",
     );
     expect(printedWarnings()).toContain("revert the routing IMAGE only");
   });
@@ -1512,6 +1564,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
   });
 });

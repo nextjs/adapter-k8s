@@ -20,6 +20,7 @@ export function generateBuildMetadata({
   poolNames,
   generatedAt,
   provider,
+  namespace,
   containerRegistry,
   nodeCidrs,
   containerStrategy,
@@ -72,6 +73,8 @@ export function generateBuildMetadata({
    * discover NetworkPolicy ranges through gcloud.
    */
   provider: string;
+  /** Namespace qualified into the ext_proc authority at build time. */
+  namespace: string;
   /**
    * Registry the emitted chart's image references were built against. The routing tier's image
    * is baked into its Deployment template at BUILD time, so a chart is only valid for the
@@ -86,6 +89,7 @@ export function generateBuildMetadata({
       buildId,
       nextVersion,
       provider,
+      namespace,
       ...(containerRegistry ? { containerRegistry } : {}),
       ...(nodeCidrs && nodeCidrs.length > 0 ? { nodeCidrs } : {}),
       pools: poolNames,

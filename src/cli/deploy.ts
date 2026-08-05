@@ -57,15 +57,11 @@ import {
   findBuildIdNameCollision,
   findEmittedNameCollision,
   assertSafeImageRegistry,
-  assertSafeNamespace,
   assertSafeProbePath,
   assertSafeProjectId,
   assertSafeRegion,
   poolResourceNames,
-  // init binds Workload Identity to [default/<release>-deploy-sa]; the release lives
-  // in the literal "default" namespace. Pin it on every kubectl/helm call instead of
-  // trusting whatever namespace the operator's context happens to have.
-  K8S_NAMESPACE,
+  resolveK8sNamespace,
 } from "../emit/templates/utils.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveContainerCli, targetPlatform } from "./container-runtime.js";
@@ -172,17 +168,21 @@ function promptConfirmation(question: string): Promise<string> {
  * Throws (never returns a guess) when the cluster cannot be read, when pools disagree, or
  * when the selected build has no Deployment.
  */
-export async function discoverServingBuildId(releaseName: string): Promise<string> {
+export async function discoverServingBuildId(
+  releaseName: string,
+  configuredNamespace?: string,
+): Promise<string> {
+  const namespace = resolveK8sNamespace(configuredNamespace);
   const REPAIR =
     `Repair deploy state before deploying: run \`npx adapter-k8s doctor\`, then either ` +
     `restore .k8s-adapter/state.json or fix access to the ${releaseName}-adapter-state ` +
-    `ConfigMap in namespace ${K8S_NAMESPACE}.`;
+    `ConfigMap in namespace ${namespace}.`;
 
   const svcResult = await execCapture("kubectl", [
     "get",
     "svc",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName}`,
     "-o",
@@ -210,7 +210,7 @@ export async function discoverServingBuildId(releaseName: string): Promise<strin
   if (labels.size === 0) {
     throw new Error(
       `Deploy state could not be determined and no active pool Service in namespace ` +
-        `${K8S_NAMESPACE} carries an app.kubernetes.io/version selector, so the live build ` +
+        `${namespace} carries an app.kubernetes.io/version selector, so the live build ` +
         `is unknown. Refusing to deploy as if this were a first deploy. ${REPAIR}`,
     );
   }
@@ -227,7 +227,7 @@ export async function discoverServingBuildId(releaseName: string): Promise<strin
     "get",
     "deployments",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${label},` +
       `app.kubernetes.io/component!=routing-service`,
@@ -737,6 +737,7 @@ export function buildHelmUpgradeArgs(options: {
   buildId: string;
   registry: string;
   previousBuildId: string | null;
+  namespace?: string;
   overridesFile?: string;
   podCidrs?: string | null;
   /** S22: node/subnet range(s) for the strict posture's kubelet allowance. */
@@ -756,12 +757,14 @@ export function buildHelmUpgradeArgs(options: {
     buildId,
     registry,
     previousBuildId,
+    namespace: configuredNamespace,
     overridesFile,
     podCidrs,
     nodeCidrs,
     imageDigests,
     poolHealthCheckPath,
   } = options;
+  const namespace = resolveK8sNamespace(configuredNamespace);
   // H2: these values land in `helm --set` assignments — reject helm metacharacters
   // (","  "\"  quotes) before they can split one assignment into several. The buildId
   // comes from generateBuildId()/git refs and the registry from infrastructure.json.
@@ -781,7 +784,7 @@ export function buildHelmUpgradeArgs(options: {
     // The release lives in the namespace init binds Workload Identity to — pin it rather
     // than installing into whatever namespace the operator's context happens to have.
     "--namespace",
-    "default",
+    namespace,
     "--create-namespace",
     "--set",
     `global.image.tag=${buildId}`,
@@ -1118,22 +1121,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // assignments / docker tags (containerRegistry) — validate before any use.
   if (infra.projectId) assertSafeProjectId(infra.projectId);
   if (infra.region) assertSafeRegion(infra.region);
-  if (infra.namespace) assertSafeNamespace(infra.namespace);
-  // Same fail-fast as build time (adapter.ts): every kubectl/helm call below pins
-  // K8S_NAMESPACE, but the build-time extension chain derives the ext_proc authority
-  // from infra.namespace — honoring any other value would put the workloads in
-  // "default" while the GXLB callout targets the other namespace, failing every edge
-  // callout. Reject instead of deploying skewed. (Deploy-time too, not just build
-  // time: --skip-build deploys ship a chart built elsewhere, possibly before this
-  // guard existed.)
-  if (infra.namespace !== undefined && infra.namespace !== K8S_NAMESPACE) {
-    throw new Error(
-      `Unsupported namespace "${infra.namespace}" in .k8s-adapter/infrastructure.json: ` +
-        `this adapter version deploys only to the "${K8S_NAMESPACE}" namespace (init binds ` +
-        `Workload Identity to ${K8S_NAMESPACE}/<release>-deploy-sa and every kubectl/helm ` +
-        `call pins it). Remove "namespace" from infrastructure.json.`,
-    );
-  }
+  const namespace = resolveK8sNamespace(infra.namespace);
   if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
   // Without a registry, docker tags and the helm --set image registry can't be formed —
   // fail with a pointer to the fix instead of a raw TypeError deep in the deploy.
@@ -1189,6 +1177,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `(and fail to authenticate against a registry this cluster cannot reach).\n` +
         `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the output directory is shared between variants.\n` : ""}` +
         `Re-run without --skip-build so the chart is emitted for this target.`,
+    );
+  }
+  // Build metadata predating namespace support has no field and therefore targets the
+  // historical default namespace.
+  const builtNamespace = resolveK8sNamespace(metadata.namespace);
+  if (builtNamespace !== namespace) {
+    throw new Error(
+      `The build output in .k8s-adapter/output was emitted for namespace ` +
+        `"${builtNamespace}", but this deploy targets "${namespace}". The ext_proc authority ` +
+        `is namespace-qualified at build time, so deploying this chart would make routing ` +
+        `callouts target the wrong Service. Re-run without --skip-build so the chart is ` +
+        `emitted for this target.`,
     );
   }
 
@@ -1455,7 +1455,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "secret",
         `${releaseName}-valkey`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
       ]);
       if (secretDelete.stdout.trim())
@@ -1632,7 +1632,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     state = await readState(projectDir).catch(() => null);
   } else {
     try {
-      state = await readState(projectDir, releaseName);
+      state = await readState(projectDir, releaseName, { namespace });
     } catch (err) {
       if (!(err instanceof StateUnavailableError)) throw err;
       stateUnavailable = err.message;
@@ -1649,7 +1649,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     console.warn(
       `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
     );
-    previousBuildId = await discoverServingBuildId(releaseName);
+    previousBuildId = await discoverServingBuildId(releaseName, namespace);
     console.warn(
       `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
         `Service selector. Proceeding with it as the previous build — its recorded CDN tag ` +
@@ -1729,6 +1729,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     buildId,
     registry: infra.containerRegistry,
     previousBuildId,
+    namespace,
     overridesFile,
     podCidrs: podCidr,
     nodeCidrs: nodeCidr,
@@ -1832,7 +1833,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "deployment",
           poolPrevName,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--ignore-not-found",
           "-o",
           // N66: one probe, one round trip — every field the retained manifest must
@@ -1897,7 +1898,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "service",
             activeServiceName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--ignore-not-found",
             "-o",
             "name",
@@ -2055,7 +2056,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // revert the edge IMAGE — silently, with the degradation recorded nowhere.
   let unretainedManifestBuild: string | null = null;
   if (!dryRun) {
-    const retention = await retainLiveRoutingManifest(releaseName);
+    const retention = await retainLiveRoutingManifest(releaseName, namespace);
     if (retention.status === "failed") {
       if (!allowUnretainedManifest) {
         throw new Error(
@@ -2095,7 +2096,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const keepAnnotation = "helm.sh/resource-policy=keep";
     if (dryRun) {
       console.log(
-        `    [dry-run] kubectl annotate secret ${legacySecret} -n ${K8S_NAMESPACE} ` +
+        `    [dry-run] kubectl annotate secret ${legacySecret} -n ${namespace} ` +
           `${keepAnnotation} --overwrite (if it exists)`,
       );
     } else {
@@ -2104,7 +2105,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "secret",
         legacySecret,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
         "-o",
         "name",
@@ -2126,7 +2127,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "secret",
           legacySecret,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           keepAnnotation,
           "--overwrite",
         ]);
@@ -2181,6 +2182,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     try {
       await revertRoutingServiceToBuild({
         releaseName,
+        namespace,
         targetBuildId: previousBuildId,
         registry: infra.containerRegistry,
         targetImageDigest: state?.routingImageDigests?.[previousBuildId],
@@ -2214,7 +2216,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       `  The edge (ext_proc) is running build ${buildId}'s middleware and routing manifest ` +
         `while the pools serve ${previousBuildId}. Mismatched routes fall back to pool-local ` +
         `re-resolution (invariant 1), but edge middleware is the NEW build's until repaired:`,
-      `    kubectl -n ${K8S_NAMESPACE} set image deployment/` +
+      `    kubectl -n ${namespace} set image deployment/` +
         `${routingServiceDeploymentName(releaseName)} routing-service=` +
         `${infra.containerRegistry}/routing-service:${previousBuildId}`,
     ];
@@ -2228,7 +2230,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "httproute",
       `${releaseName}-routes`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-o",
       "jsonpath={.spec.rules[*].filters[*].extensionRef.kind}",
     ]);
@@ -2237,7 +2239,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     } else {
       console.warn(
         "  ! Could not confirm the Cloud CDN filter on the HTTPRoute (non-fatal). " +
-          `Inspect with: kubectl get httproute ${releaseName}-routes -o yaml`,
+          `Inspect with: kubectl get httproute ${releaseName}-routes -n ${namespace} -o yaml`,
       );
     }
   }
@@ -2263,7 +2265,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
       "-o",
@@ -2284,7 +2286,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "status",
         `deployment/${deployName}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         KUBECTL_ROLLOUT_TIMEOUT,
       ]);
       // The pod-health gate below is the real readiness gate, but don't walk into it on
@@ -2300,7 +2302,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `NOT switched — the previous build's pools are still serving.`,
             // L14: kubectl rollout output carries controller/admission messages.
             `${sanitizeForTerminal((rollout.stderr || rollout.stdout).trim())}`,
-            `Inspect: kubectl logs deployment/${deployName} -n ${K8S_NAMESPACE} --tail=40`,
+            `Inspect: kubectl logs deployment/${deployName} -n ${namespace} --tail=40`,
             ...edgeStatusLines(edge),
           ].join("\n"),
         );
@@ -2317,7 +2319,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "deployment",
       routingDeploy,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--ignore-not-found",
       "-o",
       "name",
@@ -2329,7 +2331,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "status",
         `deployment/${routingDeploy}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         KUBECTL_ROLLOUT_TIMEOUT,
       ]);
       if (rsRollout.exitCode !== 0) {
@@ -2342,7 +2344,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             `Routing service (${routingDeploy}) did not become healthy. Traffic was NOT ` +
               `switched — the previous build's pools are still serving.`,
             `${(rsRollout.stderr || rsRollout.stdout).trim()}`,
-            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${K8S_NAMESPACE} --tail=40`,
+            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${namespace} --tail=40`,
             ...edgeStatusLines(edge),
           ].join("\n"),
         );
@@ -2360,7 +2362,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "--for=condition=complete",
         `job/${currentRouteExtJob}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--timeout=600s",
       ]);
       if (wait.exitCode !== 0) {
@@ -2371,7 +2373,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `traffic cutover because middleware may not be wired.`,
             // L14: kubectl wait output carries controller/admission messages.
             `${sanitizeForTerminal((wait.stderr || wait.stdout).trim())}`,
-            `Inspect: kubectl logs job/${currentRouteExtJob} -n ${K8S_NAMESPACE}`,
+            `Inspect: kubectl logs job/${currentRouteExtJob} -n ${namespace}`,
             ...edgeStatusLines(edge),
           ].join("\n"),
         );
@@ -2406,7 +2408,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "envoyextensionpolicy",
           policyName,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "-o",
           "json",
         ]);
@@ -2457,7 +2459,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `${status || "unknown"}); refusing traffic cutover because middleware would not ` +
               `run at the edge.`,
             sanitizeForTerminal(detail),
-            `Inspect: kubectl describe envoyextensionpolicy ${policyName} -n ${K8S_NAMESPACE}`,
+            `Inspect: kubectl describe envoyextensionpolicy ${policyName} -n ${namespace}`,
             `Common causes: the GatewayClass controller is not Envoy Gateway (an ` +
               `EnvoyExtensionPolicy only applies to one), or the Gateway it targets does not exist.`,
             ...edgeStatusLines(edge),
@@ -2503,7 +2505,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "hpa",
           name,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--type=merge",
           // Same field-manager rationale as the Service/Deployment patches: helm owns the
           // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
@@ -2519,7 +2521,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `(${restore.stderr.trim() || `exit ${restore.exitCode}`}) — it is STILL widened ` +
               `for the pre-cutover warm-up, so this pool may autoscale above its configured ` +
               `ceiling until the next \`helm upgrade\` re-renders it. Fix it with: kubectl -n ` +
-              `${K8S_NAMESPACE} patch hpa ${name} --type=merge -p ` +
+              `${namespace} patch hpa ${name} --type=merge -p ` +
               `'{"spec":{"maxReplicas":${max}}}'`,
           );
         }
@@ -2559,7 +2561,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "hpa",
         newHpaName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
         "-o",
         "jsonpath={.metadata.name}|{.spec.minReplicas}|{.spec.maxReplicas}",
@@ -2589,7 +2591,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "hpa",
             newHpaName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--type=merge",
             "--field-manager=helm",
             "-p",
@@ -2622,7 +2624,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "deployment",
         newDeployName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
         "-o",
         "jsonpath={.metadata.name}|{.spec.replicas}",
@@ -2648,7 +2650,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "scale",
         `deployment/${newDeployName}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         `--replicas=${expected}`,
       ]);
       if (scaleUp.exitCode !== 0) {
@@ -2688,7 +2690,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "pods",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         // The routing service shares the version label; exclude it by its component label
         // (exact — a name substring match would also drop pool pods named similarly).
@@ -2758,7 +2760,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "pods",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
         "-o",
@@ -2780,7 +2782,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "exec",
             podName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--",
             "node",
             "-e",
@@ -2804,7 +2806,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "logs",
             podName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--tail=20",
           ]);
           if (logsResult.exitCode === 0) {
@@ -2856,7 +2858,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "service",
         activeServiceName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--type=json",
         // Impersonate helm as the field manager so the next helm upgrade (server-side
         // apply, manager "helm") does not conflict on the selector field we flip here.
@@ -2898,7 +2900,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "service",
             serviceName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--type=json",
             "--field-manager=helm",
             "-p",
@@ -3000,6 +3002,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           basedOnGeneration: state?.generation ?? null,
         },
         releaseName,
+        namespace,
       );
     } catch (err) {
       // N67: the warm-up widening is scoped to the warm-up on this path too — traffic HAS
@@ -3075,14 +3078,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "hpa",
           poolPrevHpa,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--ignore-not-found",
         ]);
         const scaleDown = await execCapture("kubectl", [
           "scale",
           `deployment/${poolPrevName}`,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--replicas=0",
         ]);
         if (hpaDelete.exitCode !== 0 || scaleDown.exitCode !== 0) {
@@ -3119,7 +3122,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -3150,10 +3153,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         }
         // Delete everything else
         console.log(`  → Deleting old build: ${name}`);
-        await execCapture("kubectl", ["delete", "deployment", name, "-n", K8S_NAMESPACE]);
-        await execCapture("kubectl", ["delete", "service", name, "-n", K8S_NAMESPACE]).catch(
-          () => {},
-        );
+        await execCapture("kubectl", ["delete", "deployment", name, "-n", namespace]);
+        await execCapture("kubectl", ["delete", "service", name, "-n", namespace]).catch(() => {});
         // This build's raw release/pool/buildId parts are unknowable here (`name` is a
         // cluster-listed deployment of a build state no longer tracks), so the HCP name
         // can't go through poolResourceNames. Re-sanitizing the deployment name with the
@@ -3167,7 +3168,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "healthcheckpolicy",
           sanitizeK8sName(name, "-hcp"),
           "-n",
-          K8S_NAMESPACE,
+          namespace,
         ]).catch(() => {});
       }
     }
@@ -3180,7 +3181,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "jobs",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
       "-o",
@@ -3189,7 +3190,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (oldJobs.exitCode === 0) {
       for (const jobName of oldJobs.stdout.trim().split("\n")) {
         if (!jobName || jobName === currentRouteExtJob) continue;
-        await execCapture("kubectl", ["delete", "job", jobName, "-n", K8S_NAMESPACE]);
+        await execCapture("kubectl", ["delete", "job", jobName, "-n", namespace]);
       }
     }
 
@@ -3209,7 +3210,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "configmaps",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s,` +
           `app.kubernetes.io/component=routing-manifest-snapshot`,
@@ -3220,7 +3221,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         for (const cmName of snapshots.stdout.trim().split("\n")) {
           if (!cmName || keepSnapshots.has(cmName)) continue;
           console.log(`  → Deleting old routing-manifest snapshot: ${cmName}`);
-          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", K8S_NAMESPACE]);
+          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
         }
       }
     }
@@ -3245,7 +3246,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -3297,7 +3298,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "secrets",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         `app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
@@ -3308,7 +3309,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         for (const secretName of internalSecrets.stdout.trim().split("\n")) {
           if (!secretName || referencedSecrets.has(secretName)) continue;
           console.log(`  → Deleting unreferenced internal dispatch Secret: ${secretName}`);
-          await execCapture("kubectl", ["delete", "secret", secretName, "-n", K8S_NAMESPACE]);
+          await execCapture("kubectl", ["delete", "secret", secretName, "-n", namespace]);
         }
       }
     }
