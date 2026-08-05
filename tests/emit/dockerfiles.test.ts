@@ -67,7 +67,11 @@ describe("generateDockerfile", () => {
       buildId: "abc123",
       installSharpVersion: "0.34.5",
     });
-    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    expect(result).toContain(
+      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund sharp@0.34.5",
+    );
+    expect(result).toContain("cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/");
+    expect(result).not.toContain("RUN npm install --no-save");
     expect(result.indexOf("COPY --chown=node:node . .")).toBeLessThan(
       result.indexOf("RUN npm install"),
     );
@@ -121,7 +125,11 @@ describe("generatePoolDockerfile", () => {
       buildId: "abc123",
       installSharpVersion: "0.34.5",
     });
-    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    expect(result).toContain(
+      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund sharp@0.34.5",
+    );
+    expect(result).toContain("cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/");
+    expect(result).not.toContain("RUN npm install --no-save");
     // Must run after the context is copied (needs /app) and before dropping to the
     // non-root user (npm writes node_modules as root at build time).
     expect(result.indexOf("COPY --chown=node:node context/ .")).toBeLessThan(

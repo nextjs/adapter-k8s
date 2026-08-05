@@ -65,11 +65,15 @@ function assertSafeSharpVersion(version: string): void {
 }
 
 // The in-image sharp install, shared by both emitted app Dockerfiles.
+// Keep it outside /app: npm would otherwise prune traced packages that are deliberately
+// absent from the minimal staged package.json before the container ever starts.
 function sharpInstallStep(installSharpVersion: string): string {
   assertSafeSharpVersion(installSharpVersion);
   return `# Build host had no linux-x64 sharp binding to stage — install it in-image so
 # /_next/image works (pool-server.cjs requires @img/sharp-linux-x64 at runtime).
-RUN npm install --no-save --no-audit --no-fund sharp@${installSharpVersion} \\
+RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund sharp@${installSharpVersion} \\
+ && cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/ \\
+ && rm -rf /tmp/adapter-k8s-sharp \\
  && npm cache clean --force
 `;
 }
