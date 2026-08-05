@@ -9,7 +9,11 @@ import {
   type ProcessingResponse as ProtoProcessingResponse,
 } from "../../src/routing-service/protos/envoy/service/ext_proc/v3/external_processor_pb.js";
 import { mockRouting } from "../helpers/mock-outputs.js";
-import { INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER } from "../../src/routing-common.js";
+import {
+  INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_SECRET_HEADER,
+  UNTRUSTED_NEXT_REQUEST_HEADERS,
+} from "../../src/routing-common.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
 
@@ -175,7 +179,11 @@ describe("createRequestHandler", () => {
     // Every internal dispatch header AND the secret must be removed, or a client could
     // smuggle a spoofed x-output-id past the extension on this path.
     expect(new Set(mutation.removeHeaders)).toEqual(
-      new Set([...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]),
+      new Set([
+        ...INTERNAL_DISPATCH_HEADERS,
+        ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+        INTERNAL_SECRET_HEADER,
+      ]),
     );
   });
 
@@ -493,6 +501,28 @@ describe("createRequestHandler ingress hygiene", () => {
     }
     // …while legitimate client headers pass through untouched.
     expect(seenHeaders.get("host")).toBe("app.example.com");
+  });
+
+  it("strips client-supplied Next resume headers before routing and forwarding", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    const response = await handler([
+      ...makeHeaders("/about"),
+      { key: "next-resume", value: "1" },
+      { key: "x-next-resume-state-length", value: "32" },
+    ]);
+
+    const seenHeaders = vi.mocked(resolveRoutes).mock.calls[0]![0].headers as Headers;
+    expect(seenHeaders.get("next-resume")).toBeNull();
+    expect(seenHeaders.get("x-next-resume-state-length")).toBeNull();
+
+    const removeHeaders = response.requestHeaders!.response!.headerMutation!.removeHeaders ?? [];
+    expect(removeHeaders).toContain("next-resume");
+    expect(removeHeaders).toContain("x-next-resume-state-length");
   });
 
   it("never leaks the :path query string into the dispatch fallback pathname", async () => {
@@ -1716,7 +1746,11 @@ describe("N40b: pool header-budget guard", () => {
     // the request as untrusted and re-resolves it locally (running middleware itself).
     const mutation = response.requestHeaders!.response!.headerMutation!;
     expect(mutation.setHeaders ?? []).toHaveLength(0);
-    for (const name of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) {
+    for (const name of [
+      ...INTERNAL_DISPATCH_HEADERS,
+      ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+      INTERNAL_SECRET_HEADER,
+    ]) {
       expect(mutation.removeHeaders).toContain(name);
     }
     // Nothing is silently lost: without `x-mw-evaluated` the pool cannot skip its own
