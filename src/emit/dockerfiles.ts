@@ -75,7 +75,7 @@ RUN npm install --no-save --no-audit --no-fund sharp@${installSharpVersion} \\
 }
 
 export function generateDockerfile({
-  containerStrategy,
+  containerStrategy: _containerStrategy,
   nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
   buildId,
   installSharpVersion,

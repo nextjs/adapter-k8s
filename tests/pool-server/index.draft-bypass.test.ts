@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
-import net, { type AddressInfo } from "node:net";
+import { type AddressInfo } from "node:net";
 import { createServer } from "node:http";
 
 const REPO_ROOT = process.cwd();

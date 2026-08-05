@@ -1,5 +1,4 @@
 // src/cli/destroy.ts
-import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import readline from "node:readline";
 import { execCapture } from "./exec.js";

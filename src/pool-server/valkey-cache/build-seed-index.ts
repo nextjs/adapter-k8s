@@ -22,8 +22,6 @@
 // (same rule as the Valkey client; see cache-handler-entry.ts).
 import type { SeedEntry } from "./incremental-cache-handler.js";
 
-declare const require: (id: string) => any;
-
 interface StaticAssetRecord {
   pathname: string;
   filePath: string;
@@ -177,7 +175,7 @@ function fetchCacheSeed(appRoot: string, cacheKey: string): SeedEntry | null {
  * `<key>.segments/`. Returns null (miss) when the html is absent or the entry would be
  * half-usable.
  */
-function fsMirrorSeed(appRoot: string, cacheKey: string, ctx?: SeedLookupCtx): SeedEntry | null {
+function fsMirrorSeed(appRoot: string, cacheKey: string, _ctx?: SeedLookupCtx): SeedEntry | null {
   const fs = builtin<typeof import("node:fs")>("node:fs");
   const path = builtin<typeof import("node:path")>("node:path");
   const base = path.join(appRoot, ".next", "server", "app", ...cacheKey.split("/").filter(Boolean));

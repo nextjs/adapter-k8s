@@ -21,7 +21,6 @@ import {
   templateOutputCandidates,
   trailingSlashVariants,
   type MiddlewareMatcher,
-  type RscConfig,
 } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
@@ -2750,7 +2749,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           "content-type": getContentType(staticPathname),
           "cache-control": cacheControl,
           etag,
-          ...(headers ?? {}),
+          ...headers,
         };
         if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
           res.writeHead(304, responseHeaders);

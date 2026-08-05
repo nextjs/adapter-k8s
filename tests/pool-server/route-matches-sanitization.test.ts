@@ -37,7 +37,7 @@ describe("extractRouteParams sentinel filtering (the Phase-2 compensation)", () 
     // removed is therefore also removed here, which is why an UNSANITIZED Phase-2 header
     // cannot produce params Phase 1 would not have produced.
     const phase1Drops = (value: string) => /^\$nxtP[^/]*$/.test(value);
-    const consumerDrops = (value: string) => /^\$nxtP/.test(value);
+    const consumerDrops = (value: string) => value.startsWith('$nxtP');
     for (const value of [
       "$nxtPid",
       "$nxtPslug",

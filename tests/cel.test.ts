@@ -1,17 +1,11 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   generateCelExpression,
   extractStaticPrefix,
   escapeCelString,
   CEL_EXPRESSION_WARN_LENGTH,
 } from "../src/cel.js";
-import {
-  mockOutputs,
-  mockStaticFile,
-  mockPrerender,
-  mockAppPage,
-  mockAppRoute,
-} from "./helpers/mock-outputs.js";
+import { mockOutputs, mockStaticFile } from "./helpers/mock-outputs.js";
 
 describe("extractStaticPrefix", () => {
   it("extracts prefix from dynamic route regex", () => {
@@ -136,18 +130,6 @@ describe("generateCelExpression", () => {
 });
 
 describe("generateCelExpression with basePath", () => {
-  const mwOutputs = (staticFiles: { pathname: string }[]) =>
-    mockOutputs({
-      staticFiles: staticFiles.map((f) => mockStaticFile(f)),
-      middleware: {
-        id: "middleware",
-        filePath: "/dist/server/middleware.js",
-        pathname: "/middleware",
-        type: 8 as any,
-        config: { matchers: [] },
-      } as any,
-    });
-
   it("probes middleware coverage with the basePath-prefixed pathname", () => {
     // Next bakes the basePath into matcher sourceRegexes, so the coverage probe
     // must test the wire path — a basePath-less probe would wrongly exclude
@@ -166,4 +148,3 @@ describe("generateCelExpression with basePath", () => {
     expect(cel).not.toContain("api-docs");
   });
 });
-

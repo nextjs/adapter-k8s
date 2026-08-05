@@ -53,8 +53,9 @@
     "build": "npm run build:clean && npm run build:types && npm run build:adapter && npm run build:pool-server && npm run build:cache-handler && npm run build:protos && npm run build:routing-service && npm run build:cli",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
-    "lint": "oxlint",
-    "lint:fix": "oxlint --fix"
+    "lint": "oxlint --deny-warnings",
+    "lint:fix": "oxlint --fix",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.12.1",
@@ -72,7 +73,7 @@
     "esbuild": "^0.27.4",
     "ioredis": "^5.11.1",
     "oxfmt": "^0.42.0",
-    "oxlint": "^1.57.0",
+    "oxlint": "1.73.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.1"
   },

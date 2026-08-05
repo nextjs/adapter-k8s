@@ -312,7 +312,7 @@ function deleteHeaderCaseInsensitive(
 function sanitizeStoredEntryHeaders(
   headers: Record<string, string> | undefined,
 ): Record<string, string> {
-  const out: Record<string, string> = { ...(headers ?? {}) };
+  const out: Record<string, string> = { ...headers };
   deleteHeaderCaseInsensitive(out, "x-next-cache-tags");
   return out;
 }
@@ -536,7 +536,7 @@ function captureResponseForStore(res: ServerResponse, maxBytes: number) {
       | undefined {
       if (over) return undefined;
       const merged: Record<string, string | string[]> = {
-        ...((res.getHeaders?.() as Record<string, string | string[]>) ?? {}),
+        ...(res.getHeaders?.() as Record<string, string | string[]> | undefined),
         ...headHeaders,
       };
       // The stored copy replays under its own verdict; drop the first serve's.
@@ -881,6 +881,9 @@ async function invokeLocalHandlerOverHttp({
       // has already been streamed to the client; this only keeps the invocation/server lifecycle
       // alive until Next's cache writes, revalidations, and after() work have completed.
       while (pendingWaitUntil.size > 0) {
+        // Snapshot the Set: callbacks may delete themselves and enqueue more work while this
+        // batch settles; the outer loop deliberately picks up the next fixed-point batch.
+        // oxlint-disable-next-line unicorn/no-useless-spread
         await Promise.all([...pendingWaitUntil]);
       }
     };
@@ -1240,6 +1243,9 @@ export function extractRouteParams(
     const name = match[1] ?? match[2];
     if (!name) continue;
     const value = routeMatches?.[name] ?? routeMatches?.[`nxtP${name}`];
+    // RegExp.test intentionally preserves the legacy coercion behaviour for a malformed
+    // secret-gated route-matches value; startsWith would throw before the existing shape path.
+    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
     if (value === undefined || /^\$nxtP/.test(value)) continue;
     if (match[1]) {
       const segments = value.split("/");

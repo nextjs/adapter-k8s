@@ -1,7 +1,6 @@
 // src/cli/tail.ts
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";

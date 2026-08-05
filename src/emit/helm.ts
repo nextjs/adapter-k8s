@@ -12,14 +12,10 @@ import {
   renderRoutingManifestConfigMap,
   renderRoutingManifestSnapshotConfigMap,
 } from "./templates/routing-manifest-configmap.js";
-import { sanitizeK8sName } from "./templates/utils.js";
 import { renderRoutingServiceDeployment } from "./templates/routing-service-deployment.js";
 import { renderRoutingServiceService } from "./templates/routing-service-service.js";
 import { renderRoutingServiceHPA } from "./templates/routing-service-hpa.js";
-import {
-  renderRouteExtConfigMap,
-  routeExtDocumentDigest,
-} from "./templates/route-ext-configmap.js";
+import { routeExtDocumentDigest } from "./templates/route-ext-configmap.js";
 import { renderNetworkPolicies } from "./templates/network-policy.js";
 import { resolveProvider } from "../providers/index.js";
 
@@ -234,7 +230,7 @@ export function generateHelmChart({
     // shared sources — both match Kubernetes' own "last one wins" semantics, so a pool
     // override behaves the way someone reading the rendered pod spec would predict.
     const poolConfig = config.pools?.[poolName];
-    const mergedEnv = { ...(config.env ?? {}), ...(poolConfig?.env ?? {}) };
+    const mergedEnv = { ...config.env, ...poolConfig?.env };
     const mergedEnvFrom = [...(config.envFrom ?? []), ...(poolConfig?.envFrom ?? [])];
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({
       poolName,

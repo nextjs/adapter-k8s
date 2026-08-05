@@ -804,6 +804,8 @@ export function prepareRequest(
   // NextResponse.next()'s x-middleware-override-headers and materialized as a cookie the
   // client never set (app-middleware-proxy). The pool's server.ts does the same strip for
   // Phase 1; doing it here too is idempotent. The public prefetch hint is protocol, kept.
+  // Snapshot before deleting so iteration never depends on Map mutation semantics.
+  // oxlint-disable-next-line unicorn/no-useless-spread
   for (const name of [...headers.keys()]) {
     if (name.startsWith("x-middleware-") && name !== "x-middleware-prefetch") {
       headers.delete(name);
@@ -1241,6 +1243,7 @@ export function filterInternalQuery(
   for (const [k, v] of Object.entries(query)) {
     if (k.startsWith("nxtP") || k === "_rsc") continue;
     const values = Array.isArray(v) ? v : [v];
+    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
     if (values.some((value) => /^\$nxtP/.test(value))) continue;
     out[k] = v;
   }
@@ -1273,7 +1276,11 @@ export function sanitizeRouteMatches(
   matches: Record<string, string> | null | undefined,
 ): Record<string, string> | null {
   if (!matches) return null;
-  const unresolvedValues = new Set(Object.values(matches).filter((value) => /^\$nxtP/.test(value)));
+  const unresolvedValues = new Set(
+    // RegExp.test retains the previous coercion behaviour at this trust boundary.
+    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
+    Object.values(matches).filter((value) => /^\$nxtP/.test(value)),
+  );
   if (unresolvedValues.size === 0) return matches;
   const sanitized = Object.fromEntries(
     Object.entries(matches).filter(([, value]) => !unresolvedValues.has(value)),

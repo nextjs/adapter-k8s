@@ -1244,7 +1244,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
   const adapter: NextAdapter = {
     name: "k8s",
 
-    async modifyConfig(nextConfig, ctx) {
+    async modifyConfig(nextConfig, _ctx) {
       // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
       // Use process.cwd() which is the project root during build.
       const cfg = await ensureConfig(process.cwd());
@@ -1341,7 +1341,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // asset split regresses client bootstrap (asset URLs move under /_next/static/immutable/).
         const disabled = process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS === "1";
         modified.experimental = {
-          ...((modified.experimental as Record<string, unknown>) ?? {}),
+          ...(modified.experimental as Record<string, unknown> | undefined),
           supportsImmutableAssets: disabled ? false : (userImmutable ?? true),
         };
       }
@@ -1351,7 +1351,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const buildCpus = parseInt(process.env.ADAPTER_K8S_BUILD_CPUS ?? "", 10);
       if (buildCpus > 0) {
         modified.experimental = {
-          ...((modified.experimental as Record<string, unknown>) ?? {}),
+          ...(modified.experimental as Record<string, unknown> | undefined),
           cpus: buildCpus,
           memoryBasedWorkersCount: false,
           parallelServerCompiles: false,
@@ -1392,7 +1392,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // 3,342/0 without it (2026-07-28). Absent a measured need, a build-wide define stays
         // out; if it is ever reconsidered, land it alone and re-run the full suite.
         modified.experimental = {
-          ...((modified.experimental as Record<string, unknown>) ?? {}),
+          ...(modified.experimental as Record<string, unknown> | undefined),
           ...(allowedOrigins.size > 0
             ? {
                 serverActions: {
@@ -1400,7 +1400,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
                   allowedOrigins: [...allowedOrigins],
                 },
               }
-            : {}),
+            : undefined),
         };
       }
 

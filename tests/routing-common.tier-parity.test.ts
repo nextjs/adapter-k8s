@@ -1078,7 +1078,7 @@ describe("Phase 1 / Phase 2 client rewrite-signal parity", () => {
    * `isRSCRequest` / `isRSCRequestHeader` guards at both upstream emission sites). */
   const rscTiers = (args: Parameters<typeof bothTiers>[0]) => {
     const rscHeader = args.manifest.routeGraph.rsc?.header ?? "rsc";
-    return bothTiers({ ...args, headers: { [rscHeader]: "1", ...(args.headers ?? {}) } });
+    return bothTiers({ ...args, headers: { [rscHeader]: "1", ...args.headers } });
   };
 
   it("emits the rewrite signal for a next.config rewrite on BOTH tiers (repeated query keys)", async () => {
