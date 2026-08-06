@@ -95,6 +95,18 @@ describe("renderOriginService (portable entrypoint)", () => {
       /Invalid pool name/,
     );
   });
+
+  it("attaches the GKE health check to the origin backend when requested", () => {
+    const yaml = renderOriginService({
+      poolName: "default",
+      releaseName: "my-app",
+      emitHealthCheckPolicy: true,
+    });
+    expect(yaml).toContain("kind: HealthCheckPolicy");
+    expect(yaml).toContain("name: my-app-origin-hcp");
+    expect(yaml).toContain("name: my-app-origin");
+    expect(yaml).toContain("requestPath: {{ .Values.poolHealthCheckPath }}");
+  });
 });
 
 describe("renderActiveService (stable)", () => {

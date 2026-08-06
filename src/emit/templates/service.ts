@@ -58,12 +58,15 @@ spec:
 export function renderOriginService({
   releaseName,
   poolName,
+  emitHealthCheckPolicy = false,
 }: {
   releaseName: string;
   poolName: string;
+  emitHealthCheckPolicy?: boolean;
 }): string {
   assertSafeReleaseName(releaseName);
   assertSafePoolName(poolName);
+  const healthCheckName = stablePoolResourceNames(releaseName, "origin").hcp;
   return `apiVersion: v1
 kind: Service
 metadata:
@@ -80,6 +83,34 @@ spec:
   ports:
     - port: 3000
       targetPort: 3000
+${
+  emitHealthCheckPolicy
+    ? `---
+apiVersion: networking.gke.io/v1
+kind: HealthCheckPolicy
+metadata:
+  name: ${healthCheckName}
+  labels:
+    ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: origin
+spec:
+  default:
+    checkIntervalSec: 15
+    timeoutSec: 5
+    healthyThreshold: 1
+    unhealthyThreshold: 2
+    config:
+      type: HTTP
+      httpHealthCheck:
+        port: 3000
+        requestPath: {{ .Values.poolHealthCheckPath }}
+  targetRef:
+    group: ""
+    kind: Service
+    name: ${sanitizeK8sName(`${releaseName}-origin`)}`
+    : ""
+}
 `;
 }
 

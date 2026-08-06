@@ -13,6 +13,8 @@ import type {
 } from "./types.js";
 import { genericConfigOf, gkeConfigOf, providerGatewayHosts } from "./types.js";
 import { resolveProvider } from "./providers/index.js";
+import { compileTarget, targetForConfig } from "./target/index.js";
+import { fingerprintCompositionPlan } from "./composition-plan/index.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 import { targetPlatform, type TargetPlatform } from "./target-platform.js";
 import { assertStagedNativeArtifactsTargetPlatform } from "./native-artifacts.js";
@@ -1778,6 +1780,23 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       }
 
+      const compiledTarget = cfg.target
+        ? compileTarget(targetForConfig(cfg), {
+            releaseName,
+            namespace,
+            buildId,
+            imageRegistry,
+            pools: [...pools.keys()],
+            defaultPool: [...pools.keys()][0]!,
+            failurePolicy: failureModeAllow ? "open" : "closed",
+            cache: cfg.cache?.enabled ? "external" : "none",
+            infrastructure: {
+              ...(infra.projectId ? { projectId: infra.projectId } : {}),
+              ...(infra.region ? { region: infra.region } : {}),
+            },
+          })
+        : undefined;
+
       // The GXLB traffic extension can only be described (and registered) once init has
       // written projectId + region: the chain's `service` field is
       // `projects/<projectId>/global/backendServices/<release>-routing-service`, and the
@@ -1787,7 +1806,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // so the chart installed the ext_proc tier and NOTHING ever attached it to the load
       // balancer (the edge kept the previous build's chain) with a green deploy. Emit the
       // chain only when it can actually be registered, and say so loudly when it cannot.
-      const canRegisterExtension = !!(infra.projectId && infra.region);
+      const needsGkeRegistration = compiledTarget
+        ? compiledTarget.routingTier.registration === "gke-traffic-extension"
+        : Boolean(gkeProvider);
+      const canRegisterExtension = needsGkeRegistration && !!(infra.projectId && infra.region);
       const extensionChain = canRegisterExtension
         ? generateExtensionChain({
             celExpression,
@@ -1796,11 +1818,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             projectId: infra.projectId!,
             timeout: gkeProvider?.serviceExtensions?.routeExtension?.timeout
               ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
-              : "5s",
+              : `${Math.max(1, Math.ceil((cfg.routingService?.requestTimeoutMs ?? 4000) / 1000))}s`,
             failureModeAllow,
           })
         : undefined;
-      if (!canRegisterExtension) {
+      if (needsGkeRegistration && !canRegisterExtension) {
         console.warn(
           `[adapter-k8s] .k8s-adapter/infrastructure.json has no ${
             infra.projectId ? "region" : infra.region ? "projectId" : "projectId/region"
@@ -1831,6 +1853,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // pods that are currently serving.
         internalSecret: await deriveInternalSecret(projectDir, releaseName, buildId),
         ...(deploymentId !== undefined ? { deploymentId } : {}),
+        ...(compiledTarget ? { compiledTarget } : {}),
         // N72: no `imageDigests` here, deliberately. `next build` runs BEFORE `docker
         // build`/`docker push`, so no digest exists at this point; passing an empty/invented
         // map would only look like the pinning is in place. Until the deploy step resolves
@@ -1838,6 +1861,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // Deployments reference the mutable build-id tag with `imagePullPolicy: Always`,
         // which is the mitigation for a retag.
       });
+
+      if (compiledTarget) {
+        await writeOutputFile(
+          projectDir,
+          "composition-plan.json",
+          JSON.stringify(compiledTarget.plan, null, 2),
+        );
+      }
 
       for (const [filePath, content] of Object.entries(helmFiles)) {
         // Secret-bearing templates land on disk mode 0600 — they hold the internal
@@ -2559,7 +2590,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // The CLI cannot otherwise tell a generic build from a GKE one, and it makes
           // provider-specific decisions (kube context, digest resolution, NetworkPolicy
           // discovery) on that basis.
-          provider: resolveProvider(cfg).name,
+          provider: compiledTarget
+            ? compiledTarget.plan.target.identity.kind === "gke-resource"
+              ? "gke"
+              : "generic"
+            : resolveProvider(cfg).name,
           namespace,
           // The chart bakes this registry into image references; deploy refuses a chart whose
           // registry does not match the infrastructure it is deploying with.
@@ -2569,6 +2604,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             return n !== undefined ? { nodeCidrs: n } : {};
           })(),
           poolNames: [...pools.keys()],
+          defaultPool: [...pools.keys()][0]!,
+          ...(compiledTarget
+            ? {
+                compositionPlan: {
+                  digest: fingerprintCompositionPlan(compiledTarget.plan),
+                  targetFingerprint: compiledTarget.plan.target.fingerprint,
+                },
+              }
+            : {}),
           // S20-validated project-relative dist dir — deploy re-stages the fetch-cache from
           // it before docker build (refreshFetchCacheStaging).
           distDir: distDirRel,
@@ -2582,7 +2626,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           hasMiddleware: !!outputs.middleware,
           failureModeAllow,
           cacheEnabled: cfg.cache?.enabled ?? false,
-          cacheManaged: !!cfg.cache?.enabled && !cfg.cache.url,
+          cacheManaged: !cfg.target && !!cfg.cache?.enabled && !cfg.cache.url,
           // Deliberately NOT folded into cacheEnabled: the review suggested reporting
           // cacheEnabled:false when this handler is skipped, but deploy.ts:383/:442 use
           // cacheEnabled/cacheManaged to PROVISION and TEAR DOWN the managed Memorystore, and

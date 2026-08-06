@@ -268,6 +268,12 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     throw new Error("target exposure must contain at least one host");
   }
 
+  if (config.target && config.cache?.enabled && !config.cache.url) {
+    throw new Error(
+      "target compositions require cache.url when cache.enabled is true; managed cache provisioning must be declared explicitly by a future target resource",
+    );
+  }
+
   for (const hostConfig of gatewayHosts) {
     if (!hostConfig.hostname) {
       throw new Error("each host in provider.gke.gateway.hosts must have a hostname");

@@ -138,6 +138,8 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
       assertSafeProjectId(projectId);
       assertSafeRegion(region);
       const clusterName = options.clusterName ?? `${context.releaseName}-cluster`;
+      const registryHost = context.imageRegistry.split("/")[0]!;
+      const usesArtifactRegistry = registryHost.endsWith(".pkg.dev");
       return {
         identity: {
           kind: "gke-resource",
@@ -153,14 +155,16 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
         },
         registry: {
           repository: context.imageRegistry,
-          authentication: options.registry?.authentication ?? {
-            kind: "gcloud-docker-helper",
-            registryHost: context.imageRegistry.split("/")[0]!,
-          },
-          digestLookup: options.registry?.digestLookup ?? {
-            kind: "gcp-artifact-registry",
-            projectId,
-          },
+          authentication:
+            options.registry?.authentication ??
+            (usesArtifactRegistry
+              ? { kind: "gcloud-docker-helper", registryHost }
+              : { kind: "ambient-credentials" }),
+          digestLookup:
+            options.registry?.digestLookup ??
+            (usesArtifactRegistry
+              ? { kind: "gcp-artifact-registry", projectId }
+              : { kind: "oci-distribution" }),
         },
         network: {
           podCidrs: {
@@ -246,6 +250,11 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
     throw new Error(`Invalid GatewayClass name ${JSON.stringify(options.className)}`);
   }
   const wantsTls = hosts.some((host) => host.tls.enabled);
+  if (wantsTls && hosts.some((host) => !host.tls.enabled)) {
+    throw new Error(
+      "gatewayApiExposure cannot mix TLS and plaintext hosts in one exposure; compose separate releases or use matching TLS settings",
+    );
+  }
   if (wantsTls && !options.tlsSecretName && !options.controllerManagedTls) {
     throw new Error(
       "gatewayApiExposure requires tlsSecretName or controllerManagedTls when TLS is enabled",
@@ -259,7 +268,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
       const routeName = sanitizeK8sName(`${context.releaseName}-routes`);
       const annotations = {
         ...options.annotations,
-        ...(options.controllerManagedCertificate
+        ...(wantsTls && options.controllerManagedCertificate
           ? {
               [options.controllerManagedCertificate.annotation]:
                 `${context.releaseName}${options.controllerManagedCertificate.nameSuffix}`,
@@ -274,11 +283,13 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         })),
       ];
       const labels = { "app.kubernetes.io/name": context.releaseName };
+      const listenerHostname = hosts.length === 1 ? { hostname: hosts[0]!.hostname } : {};
       const listeners: KubernetesJsonValue[] = [
         {
           name: "http",
           protocol: "HTTP",
           port: 80,
+          ...listenerHostname,
           allowedRoutes: { namespaces: { from: "Same" } },
         },
       ];
@@ -287,6 +298,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
           name: "https",
           protocol: "HTTPS",
           port: 443,
+          ...listenerHostname,
           ...(!options.controllerManagedTls
             ? {
                 tls: {
@@ -338,6 +350,32 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         },
         { labels },
       );
+      const redirectRoute = wantsTls
+        ? object(
+            "gateway.networking.k8s.io/v1",
+            "HTTPRoute",
+            "httproutes",
+            sanitizeK8sName(`${context.releaseName}-http-redirect`),
+            context.namespace,
+            {
+              spec: {
+                parentRefs: [{ name: gatewayName, sectionName: "http" }],
+                hostnames: hosts.map((host) => host.hostname),
+                rules: [
+                  {
+                    filters: [
+                      {
+                        type: "RequestRedirect",
+                        requestRedirect: { scheme: "https", statusCode: 301 },
+                      },
+                    ],
+                  },
+                ],
+              },
+            },
+            { labels },
+          )
+        : undefined;
       const gatewayReady: RoutingReadiness = {
         kind: "kubernetes-condition",
         object: {
@@ -370,8 +408,26 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         },
         timeoutSeconds: 600,
       };
+      const redirectReady: RoutingReadiness | undefined = redirectRoute
+        ? {
+            kind: "kubernetes-condition",
+            object: {
+              apiVersion: "gateway.networking.k8s.io/v1",
+              resource: "httproutes",
+              name: redirectRoute.metadata.name,
+              namespace: context.namespace,
+            },
+            conditionsAt: { kind: "parents" },
+            condition: {
+              type: "Accepted",
+              status: "True",
+              observedGeneration: "must-equal-metadata-generation",
+            },
+            timeoutSeconds: 600,
+          }
+        : undefined;
       return {
-        objects: [gateway, route],
+        objects: [gateway, route, ...(redirectRoute ? [redirectRoute] : [])],
         requirements: [
           { apiVersion: "gateway.networking.k8s.io/v1", resource: "gateways", optional: false },
           {
@@ -380,7 +436,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             optional: false,
           },
         ],
-        readiness: [gatewayReady, routeReady],
+        readiness: [gatewayReady, routeReady, ...(redirectReady ? [redirectReady] : [])],
         ingressSources: copyIngressSources(options.ingressSources),
         capabilities: [{ kind: "gateway-api", className: options.className }],
       };
@@ -617,6 +673,13 @@ export function gkeNativeRouting(
         },
         backend: backend(context),
         readiness,
+        requirements: [
+          {
+            apiVersion: "networking.gke.io/v1",
+            resource: "healthcheckpolicies",
+            optional: false,
+          },
+        ],
         requiresExposure: {
           kind: "gateway-api",
           className: options.gatewayClassName ?? "gke-l7-global-external-managed",

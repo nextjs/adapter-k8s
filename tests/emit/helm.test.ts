@@ -8,6 +8,12 @@ import {
 import { sanitizeK8sName } from "../../src/emit/templates/utils.js";
 import { internalSecretName } from "../../src/emit/templates/internal-secret.js";
 import type { PoolDefinition, K8sAdapterConfig, RoutingManifest } from "../../src/types.js";
+import {
+  compileTarget,
+  defineTarget,
+  gatewayApiExposure,
+  kubernetesCluster,
+} from "../../src/target/index.js";
 
 const mockManifest: RoutingManifest = {
   routeGraph: { rsc: {} } as any,
@@ -113,6 +119,44 @@ describe("chart version is always valid SemVer (N50)", () => {
 });
 
 describe("generateHelmChart", () => {
+  it("renders a composed target behind the stable portable origin", () => {
+    const target = defineTarget({
+      cluster: kubernetesCluster(),
+      exposure: gatewayApiExposure({
+        className: "eg",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "ghcr.io/example/site",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "ghcr.io/example/site",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      compiledTarget,
+    });
+
+    expect(result["templates/origin-service.yaml"]).toContain("name: site-origin");
+    expect(result["templates/origin-service.yaml"]).toContain('app.kubernetes.io/component: "ssr"');
+    expect(Object.keys(result)).toContain("templates/composition-plan.yaml");
+    expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(true);
+    expect(Object.values(result).some((body) => body.includes('"kind": "HTTPRoute"'))).toBe(true);
+    expect(result["templates/routing-service-deployment.yaml"]).toBeUndefined();
+  });
+
   it("translates flat pool resource settings into Kubernetes requests and limits", () => {
     const pools = new Map<string, PoolDefinition>([
       [

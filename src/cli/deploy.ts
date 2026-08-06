@@ -1429,6 +1429,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // --set assignments and image tags — reject helm/shell metacharacters up front.
   assertSafeBuildId(buildId);
   const pools: string[] = metadata.pools;
+  const defaultPool: string | undefined =
+    typeof metadata.defaultPool === "string" ? metadata.defaultPool : pools?.[0];
+  const hasPortableOrigin = existsSync(
+    path.join(outputDir, "chart", "templates", "origin-service.yaml"),
+  );
   // Which provider this build targets. Older metadata predates the field; default to gke,
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
@@ -1489,6 +1494,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     throw new Error(`build-metadata.json is missing a "pools" array. Did next build run?`);
   }
   for (const poolName of pools) assertSafePoolName(poolName);
+  if (!defaultPool || !pools.includes(defaultPool)) {
+    throw new Error(
+      `build-metadata.json defaultPool must name one of its pools; got ${JSON.stringify(defaultPool)}`,
+    );
+  }
 
   // 0. Ensure kubectl is pointing at the right cluster.
   //
@@ -3224,8 +3234,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // A topology-changing rollback may have redirected a stable Service to a fallback pool.
     // Read every selector before changing any of them so cutover restores both component and
     // version, and a partial failure can put the exact live selectors back.
-    for (const pool of pools) {
-      const activeServiceName = sanitizeK8sName(`${releaseName}-${pool}`);
+    const serviceDestinations = [
+      ...pools.map((pool) => ({ servicePool: pool, targetPool: pool })),
+      ...(hasPortableOrigin ? [{ servicePool: "origin", targetPool: defaultPool }] : []),
+    ];
+    for (const { servicePool } of serviceDestinations) {
+      const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
       const read = await execCapture("kubectl", [
         "get",
         "service",
@@ -3250,7 +3264,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         Object.values(selector).some((value) => typeof value !== "string")
       ) {
         patchFailures.push({
-          pool,
+          pool: servicePool,
           service: activeServiceName,
           stderr:
             read.stderr.trim() ||
@@ -3262,8 +3276,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
 
     if (patchFailures.length === 0) {
-      for (const pool of pools) {
-        const activeServiceName = sanitizeK8sName(`${releaseName}-${pool}`);
+      for (const { servicePool, targetPool } of serviceDestinations) {
+        const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
         const originalSelector = originalServiceSelectors.get(activeServiceName)!;
         const patchResult = await execCapture("kubectl", [
           "patch",
@@ -3286,7 +3300,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               path: "/spec/selector",
               value: {
                 ...originalSelector,
-                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/component": targetPool,
                 "app.kubernetes.io/version": safeBuildId,
               },
             },
@@ -3294,7 +3308,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         ]);
         if (patchResult.exitCode !== 0) {
           patchFailures.push({
-            pool,
+            pool: servicePool,
             service: activeServiceName,
             stderr: patchResult.stderr.trim(),
           });
@@ -3337,7 +3351,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       await restoreWarmedHpas();
       console.error(`\n  DEPLOY FAILED: traffic was NOT switched to the new build.`);
       console.error(
-        `  ${patchFailures.length} of ${pools.length} pool Service selector patch(es) failed:`,
+        `  ${patchFailures.length} of ${serviceDestinations.length} Service selector patch(es) failed:`,
       );
       for (const f of patchFailures) {
         console.error(
@@ -3422,6 +3436,19 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             ...(previousBuildId ? { [previousBuildId]: [...previousPools] } : {}),
             [buildId]: [...pools],
           },
+          ...(hasPortableOrigin || state?.defaultPools
+            ? {
+                defaultPools: {
+                  ...(previousBuildId
+                    ? {
+                        [previousBuildId]:
+                          state?.defaultPools?.[previousBuildId] ?? previousPools[0]!,
+                      }
+                    : {}),
+                  [buildId]: defaultPool,
+                },
+              }
+            : {}),
           targetPlatforms,
           // The build this deploy just installed serves /readyz, so the NEXT deploy can flip
           // the load balancer's HealthCheckPolicy to readiness without stranding it.
