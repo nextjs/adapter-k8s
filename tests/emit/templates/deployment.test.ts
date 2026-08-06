@@ -38,6 +38,7 @@ describe("renderDeployment", () => {
     expect(yaml).toContain("NEXT_BUILD_ID");
     expect(yaml).toContain('value: "old123"');
     expect(yaml).toContain("RELEASE_NAME");
+    expect(yaml).toContain('adapter-k8s.dev/release: "my-app"');
     // S7: the tag is now the `{{ else }}` arm of the values-digest conditional — the render
     // still pins this retained build to its own tag, helm just picks tag-vs-digest.
     expect(yaml).toContain(':old123{{ end }}"');

@@ -271,9 +271,9 @@ function happyCluster(
     // transferring it to `keep`, then deleting it only after cutover is durable.
     outgoingHpaPresent?: boolean;
     outgoingHpaProbeFails?: boolean;
-    outgoingHpaAnnotateFails?: boolean;
+    outgoingHpaMetadataPatchFails?: boolean;
     outgoingHpaDeleteFails?: boolean;
-    outgoingDeploymentAnnotateFails?: boolean;
+    outgoingDeploymentMetadataPatchFails?: boolean;
     // N87: internal dispatch Secret lifecycle. The legacy stable-named Secret (migrated past
     // helm upgrade), and the per-build ones the post-cutover sweep prunes.
     legacySecretPresent?: boolean;
@@ -420,12 +420,15 @@ function happyCluster(
         }),
       );
     }
-    if (args[0] === "annotate" && args[1] === "deployment") {
+    if (args[0] === "patch" && args[1] === "deployment") {
+      const body = JSON.parse(args[args.length - 1]!) as {
+        metadata?: { annotations?: Record<string, string>; labels?: Record<string, string> };
+      };
       events.push(
-        `annotate-deployment:${args[2]}:${args.find((a) => a.includes("resource-policy"))}`,
+        `preserve-deployment:${args[2]}:${body.metadata?.labels?.["adapter-k8s.dev/release"]}`,
       );
-      if (overrides.outgoingDeploymentAnnotateFails) {
-        return { exitCode: 1, stdout: "", stderr: "deployment annotation denied" };
+      if (overrides.outgoingDeploymentMetadataPatchFails) {
+        return { exitCode: 1, stdout: "", stderr: "deployment metadata patch denied" };
       }
       return ok();
     }
@@ -516,12 +519,20 @@ function happyCluster(
           ? ok("")
           : ok(`horizontalpodautoscaler.autoscaling/${hpaName}\n`);
       }
-      if (args[0] === "annotate") {
-        events.push(`annotate-hpa:${hpaName}:${args.find((a) => a.includes("resource-policy"))}`);
-        if (overrides.outgoingHpaAnnotateFails) {
-          return { exitCode: 1, stdout: "", stderr: "hpa annotation denied" };
+      if (args[0] === "patch") {
+        const body = JSON.parse(args[args.length - 1]!) as {
+          metadata?: { annotations?: Record<string, string>; labels?: Record<string, string> };
+          spec?: { maxReplicas?: number; minReplicas?: number };
+        };
+        if (body.metadata?.annotations?.["helm.sh/resource-policy"] === "keep") {
+          events.push(
+            `preserve-hpa:${hpaName}:${body.metadata.labels?.["adapter-k8s.dev/release"]}`,
+          );
+          if (overrides.outgoingHpaMetadataPatchFails) {
+            return { exitCode: 1, stdout: "", stderr: "hpa metadata patch denied" };
+          }
+          return ok();
         }
-        return ok();
       }
       if (args.includes("delete")) {
         events.push(`delete-hpa:${hpaName}`);
@@ -758,15 +769,43 @@ describe("runDeploy — orchestration", () => {
     expect(retainedNames).toContain("ssr-prev-service.yaml");
     expect(retainedNames).not.toContain("ssr-prev-hpa.yaml");
 
-    const keepDeployment = events.indexOf(
-      "annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep",
-    );
+    const keepDeployment = events.indexOf("preserve-deployment:rel-ssr-buildm:rel");
     expect(keepDeployment).toBeGreaterThanOrEqual(0);
     expect(keepDeployment).toBeLessThan(events.indexOf("helm"));
+    const deploymentTransfer = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([, args]) =>
+          args[0] === "patch" && args[1] === "deployment" && args[2] === "rel-ssr-buildm",
+      );
+    const deploymentMetadata = JSON.parse(
+      deploymentTransfer![1][deploymentTransfer![1].length - 1]!,
+    ).metadata;
+    expect(deploymentMetadata).toMatchObject({
+      annotations: { "helm.sh/resource-policy": "keep" },
+      labels: { "adapter-k8s.dev/release": "rel" },
+    });
+    expect(deploymentMetadata.labels).not.toHaveProperty("app.kubernetes.io/managed-by");
 
-    const keepHpa = events.indexOf("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
+    const keepHpa = events.indexOf("preserve-hpa:rel-ssr-buildm-hpa:rel");
     expect(keepHpa).toBeGreaterThanOrEqual(0);
     expect(keepHpa).toBeLessThan(events.indexOf("helm"));
+    const hpaTransfer = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([, args]) => args[0] === "patch" && args[1] === "hpa" && args[2] === "rel-ssr-buildm-hpa",
+      );
+    const hpaMetadata = JSON.parse(hpaTransfer![1][hpaTransfer![1].length - 1]!).metadata;
+    expect(hpaMetadata).toMatchObject({
+      annotations: { "helm.sh/resource-policy": "keep" },
+      labels: {
+        "adapter-k8s.dev/release": "rel",
+        "app.kubernetes.io/name": "rel",
+        "app.kubernetes.io/component": "ssr",
+        "app.kubernetes.io/version": "buildm",
+      },
+    });
+    expect(hpaMetadata.labels).not.toHaveProperty("app.kubernetes.io/managed-by");
 
     const stateCommit = events.indexOf("writeState");
     const deleteHpa = events.indexOf("delete-hpa:rel-ssr-buildm-hpa");
@@ -839,7 +878,7 @@ describe("runDeploy — orchestration", () => {
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
     // The outgoing autoscaler was transferred out of Helm before the upgrade and is never
     // deleted on this abort, so the build that still carries traffic keeps autoscaling.
-    const keepHpa = events.indexOf("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
+    const keepHpa = events.indexOf("preserve-hpa:rel-ssr-buildm-hpa:rel");
     expect(keepHpa).toBeGreaterThanOrEqual(0);
     expect(keepHpa).toBeLessThan(events.indexOf("helm"));
     expect(events).not.toContain("delete-hpa:rel-ssr-buildm-hpa");
@@ -869,12 +908,12 @@ describe("runDeploy — orchestration", () => {
 
   it("aborts before Helm when the outgoing HPA cannot be transferred to keep", async () => {
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { outgoingHpaAnnotateFails: true }) as never,
+      happyCluster(events, { outgoingHpaMetadataPatchFails: true }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/transfer the outgoing HPA.*serving build must keep autoscaling/s);
+    ).rejects.toThrow(/preserve the outgoing HPA.*serving build must keep autoscaling/s);
 
     expect(events).not.toContain("helm");
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
@@ -908,8 +947,8 @@ describe("runDeploy — orchestration", () => {
     expect(vi.mocked(invalidateCdnBuildTag)).not.toHaveBeenCalled();
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
     // Both outgoing autoscalers remain active after the partial selector flip is reverted.
-    expect(events).toContain("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
-    expect(events).toContain("annotate-hpa:rel-api-buildm-hpa:helm.sh/resource-policy=keep");
+    expect(events).toContain("preserve-hpa:rel-ssr-buildm-hpa:rel");
+    expect(events).toContain("preserve-hpa:rel-api-buildm-hpa:rel");
     expect(events.some((e) => e.startsWith("delete-hpa:"))).toBe(false);
   });
 
@@ -1502,7 +1541,7 @@ describe("runDeploy — N20: unreadable deploy state must never read as a first 
     expect(helmArgLine()).toContain("previousBuildId=buildm");
     expect(helmArgLine()).toContain("activeBuildId=buildm");
     // ...and the serving build's live Deployment was kept before Helm could prune it.
-    const keep = events.indexOf("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    const keep = events.indexOf("preserve-deployment:rel-ssr-buildm:rel");
     expect(keep).toBeGreaterThanOrEqual(0);
     expect(keep).toBeLessThan(events.indexOf("helm"));
     expect(printedWarnings()).toContain('Recovered the currently-serving build "buildm"');
@@ -1819,7 +1858,7 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
     expect(retainedFiles.some((p) => p.endsWith("ssr-prev-deployment.yaml"))).toBe(false);
     expect(retainedFiles.some((p) => p.endsWith("ssr-prev-service.yaml"))).toBe(true);
     expect(retainedFiles.some((p) => p.includes("api-prev-"))).toBe(false);
-    expect(events).toContain("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    expect(events).toContain("preserve-deployment:rel-ssr-buildm:rel");
   });
 
   it("does not guess from a stable Service when the recorded Deployment is missing", async () => {
@@ -2234,7 +2273,7 @@ describe("runDeploy — N66: the outgoing Deployment pod template is never re-re
         .mocked(writeFileSync)
         .mock.calls.some(([p]) => String(p).endsWith("ssr-prev-deployment.yaml")),
     ).toBe(false);
-    expect(events).toContain("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    expect(events).toContain("preserve-deployment:rel-ssr-buildm:rel");
     expect(events).not.toContain("rollout:deployment/rel-ssr-buildm");
   });
 
@@ -2243,7 +2282,7 @@ describe("runDeploy — N66: the outgoing Deployment pod template is never re-re
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const keep = events.indexOf("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    const keep = events.indexOf("preserve-deployment:rel-ssr-buildm:rel");
     expect(keep).toBeGreaterThanOrEqual(0);
     expect(keep).toBeLessThan(events.indexOf("helm"));
 
@@ -2255,10 +2294,18 @@ describe("runDeploy — N66: the outgoing Deployment pod template is never re-re
           args.includes("rel-ssr-buildm") &&
           ["apply", "patch", "replace", "set"].includes(args[0] ?? ""),
       );
-    expect(mutations).toEqual([]);
+    expect(mutations).toHaveLength(1);
+    const patch = JSON.parse(mutations[0]![1][mutations[0]![1].length - 1]!);
+    expect(patch).toEqual({
+      metadata: {
+        annotations: { "helm.sh/resource-policy": "keep" },
+        labels: { "adapter-k8s.dev/release": "rel" },
+      },
+    });
+    expect(patch).not.toHaveProperty("spec");
   });
 
-  it("passes the configured namespace to both the read and keep annotation", async () => {
+  it("passes the configured namespace to both the read and keep metadata patch", async () => {
     setupFs({
       infra: { ...BASE_INFRA, namespace: "tenant-apps" },
       metadata: {
@@ -2285,13 +2332,13 @@ describe("runDeploy — N66: the outgoing Deployment pod template is never re-re
 
   it("aborts before Helm when keep cannot be applied", async () => {
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { outgoingDeploymentAnnotateFails: true }) as never,
+      happyCluster(events, { outgoingDeploymentMetadataPatchFails: true }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
     ).rejects.toThrow(
-      /Could not transfer the outgoing Deployment.*Refusing to run `helm upgrade`/s,
+      /Could not preserve the outgoing Deployment.*Refusing to run `helm upgrade`/s,
     );
     expect(events).not.toContain("helm");
   });
@@ -2338,8 +2385,8 @@ describe("runDeploy — N70: build-scoped pool topology", () => {
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    expect(events).toContain("annotate-deployment:rel-legacy-buildm:helm.sh/resource-policy=keep");
-    expect(events).toContain("annotate-hpa:rel-legacy-buildm-hpa:helm.sh/resource-policy=keep");
+    expect(events).toContain("preserve-deployment:rel-legacy-buildm:rel");
+    expect(events).toContain("preserve-hpa:rel-legacy-buildm-hpa:rel");
     expect(events).toContain("retain-stable:service:rel-legacy");
     expect(events).toContain("scale:deployment/rel-legacy-buildm");
     expect(events).toContain("patch:rel-api");

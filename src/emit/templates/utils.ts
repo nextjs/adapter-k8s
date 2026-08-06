@@ -4,6 +4,9 @@ import { createHash } from "node:crypto";
 /** Default release namespace when infrastructure.json does not declare one. */
 export const K8S_NAMESPACE = "default";
 
+/** Exact adapter ownership boundary for release-scoped Kubernetes resources. */
+export const ADAPTER_RELEASE_LABEL = "adapter-k8s.dev/release";
+
 /** Resolve and validate the release namespace at each cluster/YAML consumption boundary. */
 export function resolveK8sNamespace(namespace?: unknown): string {
   const resolved = namespace ?? K8S_NAMESPACE;

@@ -6,7 +6,15 @@ import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } fr
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
 import { ROUTING_MANIFEST_SNAPSHOT_COMPONENT } from "../emit/templates/routing-manifest-configmap.js";
-import { resolveK8sNamespace } from "../emit/templates/utils.js";
+import {
+  ADAPTER_RELEASE_LABEL,
+  assertSafePoolName,
+  assertSafeReleaseName,
+  poolResourceNames,
+  resolveK8sNamespace,
+  sanitizeK8sName,
+  stablePoolResourceNames,
+} from "../emit/templates/utils.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 
 export interface DestroyOptions {
@@ -56,6 +64,227 @@ export function isAlreadyGoneError(stderr: string): boolean {
     s.includes("does not exist") ||
     s.includes("was not found") ||
     s.includes("release: not found")
+  );
+}
+
+function parseKubernetesList(stdout: string, description: string): unknown[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (err) {
+    throw new Error(
+      `${description} returned invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const items = (parsed as { items?: unknown })?.items;
+  if (!Array.isArray(items)) {
+    throw new Error(`${description} did not contain an items array`);
+  }
+  return items;
+}
+
+interface PoolDeploymentIdentity {
+  name: string;
+}
+
+/**
+ * Prove the exact versioned pool Deployments whose autoscalers this release may own.
+ *
+ * The API-server selector is intentionally broad enough to find pre-ownership-label releases.
+ * The runtime env, component/version labels and exact adapter-derived name must all agree before
+ * a Deployment becomes an HPA ownership root; never infer ownership from a name prefix or generic
+ * Helm labels.
+ */
+function parsePoolDeploymentIdentities(
+  stdout: string,
+  releaseName: string,
+): PoolDeploymentIdentity[] {
+  const result: PoolDeploymentIdentity[] = [];
+  const names = new Set<string>();
+  for (const item of parseKubernetesList(stdout, "Versioned pool Deployment listing") as {
+    metadata?: { name?: unknown; labels?: Record<string, unknown> };
+    spec?: {
+      template?: {
+        spec?: {
+          containers?: { name?: unknown; env?: { name?: unknown; value?: unknown }[] }[];
+        };
+      };
+    };
+  }[]) {
+    const name = item?.metadata?.name;
+    const labels = item?.metadata?.labels;
+    const component = labels?.["app.kubernetes.io/component"];
+    const version = labels?.["app.kubernetes.io/version"];
+    const poolContainer = item?.spec?.template?.spec?.containers?.find(
+      (container) => container?.name === "pool-server",
+    );
+    const env = new Map(
+      (poolContainer?.env ?? [])
+        .filter(
+          (entry): entry is { name: string; value: string } =>
+            typeof entry?.name === "string" && typeof entry.value === "string",
+        )
+        .map((entry) => [entry.name, entry.value]),
+    );
+    const rawBuildId = env.get("NEXT_BUILD_ID");
+    const rawPool = env.get("POOL_NAME");
+    const rawRelease = env.get("RELEASE_NAME");
+
+    // This list is intentionally broad enough to find pre-label resources. A foreign Helm
+    // Deployment can share the generic app/version labels, so unprovable objects are skipped,
+    // not promoted into deletion authority. The runtime identity and exact adapter-derived name
+    // are what make a legacy Deployment an HPA ownership root.
+    if (
+      typeof name !== "string" ||
+      labels?.["app.kubernetes.io/name"] !== releaseName ||
+      typeof component !== "string" ||
+      component === "routing-service" ||
+      typeof version !== "string" ||
+      rawRelease !== releaseName ||
+      rawPool !== component ||
+      typeof rawBuildId !== "string"
+    ) {
+      continue;
+    }
+    try {
+      assertSafePoolName(component);
+      const expected = poolResourceNames(releaseName, component, rawBuildId);
+      if (name !== expected.deployment || version !== sanitizeK8sName(rawBuildId)) continue;
+    } catch {
+      continue;
+    }
+    if (names.has(name)) {
+      throw new Error(`Versioned pool Deployment listing repeated Deployment "${name}"`);
+    }
+    names.add(name);
+    result.push({ name });
+  }
+  return result;
+}
+
+/** Select only adapter-named HPAs that target one of the exact owned Deployment identities. */
+function parseOwnedHpaNames(stdout: string, deployments: PoolDeploymentIdentity[]): string[] {
+  const targets = new Set(deployments.map(({ name }) => name));
+  const names = new Set<string>();
+  for (const item of parseKubernetesList(stdout, "HPA listing") as {
+    metadata?: { name?: unknown };
+    spec?: {
+      scaleTargetRef?: { apiVersion?: unknown; kind?: unknown; name?: unknown };
+    };
+  }[]) {
+    const target = item?.spec?.scaleTargetRef;
+    if (typeof target?.name !== "string" || !targets.has(target.name)) continue;
+
+    const name = item?.metadata?.name;
+    const expected = sanitizeK8sName(target.name, "-hpa");
+    if (
+      target.apiVersion !== "apps/v1" ||
+      target.kind !== "Deployment" ||
+      typeof name !== "string" ||
+      name !== expected
+    ) {
+      // A foreign autoscaler can target an adapter Deployment. Its target does not make it
+      // adapter-owned; only the exact name emitted by hpa.ts is eligible for deletion.
+      continue;
+    }
+    names.add(name);
+  }
+  return [...names];
+}
+
+type StablePoolResourceKind = "service" | "poddisruptionbudget" | "healthcheckpolicy";
+
+/** Validate topology-retained stable pool objects before deleting any exact name. */
+function parseStablePoolResourceNames(
+  stdout: string,
+  kind: StablePoolResourceKind,
+  releaseName: string,
+  namespace: string,
+): string[] {
+  const names = new Set<string>();
+  for (const item of parseKubernetesList(stdout, `Retained ${kind} listing`) as {
+    metadata?: {
+      name?: unknown;
+      labels?: Record<string, unknown>;
+      annotations?: Record<string, unknown>;
+    };
+    spec?: {
+      selector?: Record<string, unknown>;
+      targetRef?: { group?: unknown; kind?: unknown; name?: unknown };
+    };
+  }[]) {
+    const name = item?.metadata?.name;
+    const labels = item?.metadata?.labels;
+    const annotations = item?.metadata?.annotations;
+    const component = labels?.["app.kubernetes.io/component"];
+    if (
+      typeof name !== "string" ||
+      labels?.["app.kubernetes.io/name"] !== releaseName ||
+      labels?.[ADAPTER_RELEASE_LABEL] !== releaseName ||
+      annotations?.["meta.helm.sh/release-name"] !== releaseName ||
+      annotations?.["meta.helm.sh/release-namespace"] !== namespace ||
+      typeof component !== "string"
+    ) {
+      throw new Error(
+        `Retained ${kind} listing contained an object without the exact pool identity`,
+      );
+    }
+    if (component === "routing-service") continue;
+    assertSafePoolName(component);
+    const resourceNames = stablePoolResourceNames(releaseName, component);
+    const expected =
+      kind === "service"
+        ? resourceNames.service
+        : kind === "poddisruptionbudget"
+          ? resourceNames.pdb
+          : resourceNames.hcp;
+    if (name !== expected) {
+      throw new Error(
+        `Retained ${kind} "${name}" claims pool "${component}", but its adapter-derived ` +
+          `name is "${expected}"`,
+      );
+    }
+    const selector = item?.spec?.selector;
+    if (
+      kind === "service" &&
+      (selector?.["app.kubernetes.io/name"] !== releaseName ||
+        selector?.["app.kubernetes.io/component"] !== component)
+    ) {
+      throw new Error(`Retained service "${name}" does not select its exact pool identity`);
+    }
+    if (kind === "poddisruptionbudget") {
+      const matchLabels = selector?.matchLabels as Record<string, unknown> | undefined;
+      if (
+        matchLabels?.["app.kubernetes.io/name"] !== releaseName ||
+        matchLabels?.["app.kubernetes.io/component"] !== component
+      ) {
+        throw new Error(
+          `Retained poddisruptionbudget "${name}" does not select its exact pool identity`,
+        );
+      }
+    }
+    if (
+      kind === "healthcheckpolicy" &&
+      (item?.spec?.targetRef?.group !== "" ||
+        item.spec.targetRef.kind !== "Service" ||
+        item.spec.targetRef.name !== resourceNames.service)
+    ) {
+      throw new Error(
+        `Retained healthcheckpolicy "${name}" does not target its exact stable Service`,
+      );
+    }
+    names.add(name);
+  }
+  return [...names];
+}
+
+function isOptionalHealthCheckPolicyApiMissing(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  if (NOT_GONE_MARKERS.some((marker) => s.includes(marker))) return false;
+  return (
+    s.includes('the server doesn\'t have a resource type "healthcheckpolicy"') ||
+    s.includes('no matches for kind "healthcheckpolicy"') ||
+    s.includes("could not find the requested resource")
   );
 }
 
@@ -160,6 +389,7 @@ function promptConfirmation(question: string): Promise<string> {
 export async function runDestroy(options: DestroyOptions): Promise<void> {
   const { projectDir, releaseName, dryRun, yes } = options;
 
+  assertSafeReleaseName(releaseName);
   const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before any of these reach a gcloud/kubectl argv.
@@ -297,6 +527,76 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
+  // Snapshot exact versioned Deployment identities BEFORE Helm removes the current release.
+  // Legacy/rollback-created HPAs have no labels at all, so after their target Deployment is gone
+  // there is no safe way to distinguish them from another operator's autoscaler. The target
+  // relation is the migration seam: only the adapter-derived HPA name pointing at one of these
+  // exact, strongly-labeled Deployments is eligible for the post-uninstall exact-name sweep.
+  const legacyRolloutDiscoverySelector = `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version`;
+  const retainedRolloutSelector =
+    `${ADAPTER_RELEASE_LABEL}=${releaseName},` +
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version`;
+  const poolDeploymentListArgs = [
+    "get",
+    "deployments",
+    "-n",
+    namespace,
+    "-l",
+    legacyRolloutDiscoverySelector,
+    "-o",
+    "json",
+  ];
+  const hpaListArgs = ["get", "hpa", "-n", namespace, "-o", "json"];
+  let exactOwnedHpas: string[] = [];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${poolDeploymentListArgs.join(" ")}`);
+    console.log(`  [dry-run] kubectl ${hpaListArgs.join(" ")}`);
+    console.log(
+      "  [dry-run] would delete only adapter-named HPAs whose scaleTargetRef matches an " +
+        "exact selected Deployment",
+    );
+  } else {
+    const deploymentList = await execCapture("kubectl", poolDeploymentListArgs);
+    if (deploymentList.exitCode !== 0) {
+      throw new Error(
+        `Could not discover versioned pool Deployment identities before Helm uninstall: ` +
+          `${sanitizeForTerminal(deploymentList.stderr.trim()) || `exit ${deploymentList.exitCode}`}. ` +
+          `No resources were deleted; refusing to orphan legacy unlabeled HPAs.`,
+      );
+    }
+
+    let deployments: PoolDeploymentIdentity[];
+    try {
+      deployments = parsePoolDeploymentIdentities(deploymentList.stdout, releaseName);
+    } catch (err) {
+      throw new Error(
+        `Could not validate versioned pool Deployment identities before Helm uninstall: ` +
+          `${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}. ` +
+          `No resources were deleted; refusing to orphan legacy unlabeled HPAs.`,
+      );
+    }
+
+    if (deployments.length > 0) {
+      const hpaList = await execCapture("kubectl", hpaListArgs);
+      if (hpaList.exitCode !== 0) {
+        throw new Error(
+          `Could not discover retained HPAs before Helm uninstall: ` +
+            `${sanitizeForTerminal(hpaList.stderr.trim()) || `exit ${hpaList.exitCode}`}. ` +
+            `No resources were deleted.`,
+        );
+      }
+      try {
+        exactOwnedHpas = parseOwnedHpaNames(hpaList.stdout, deployments);
+      } catch (err) {
+        throw new Error(
+          `Could not validate retained HPAs before Helm uninstall: ` +
+            `${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}. ` +
+            `No resources were deleted.`,
+        );
+      }
+    }
+  }
+
   // Pin every cluster-side deletion to the release namespace instead of trusting the context.
   if (dryRun) {
     console.log(`  [dry-run] helm uninstall ${releaseName} --namespace ${namespace}`);
@@ -311,6 +611,138 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
           `    WARNING: helm uninstall failed: ${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}`,
         );
         failures.push(`helm release "${releaseName}"`);
+      }
+    }
+  }
+
+  // Deploy transfers the outgoing pool Deployments and HPAs out of Helm's release manifest
+  // with `helm.sh/resource-policy: keep`. That is required for an abort-safe blue/green rollout,
+  // but it also means `helm uninstall` intentionally leaves those objects behind. A failed deploy
+  // can leave the incoming build behind as well. Sweep every versioned pool object after uninstall
+  // instead of relying on deploy state, which may describe only the last successful cutover.
+  //
+  // The deletion selector is deliberately stricter than generic Kubernetes conventions:
+  // namespace + the adapter's exact release ownership label + matching app/version identity. A
+  // foreign Helm resource can legitimately share app.kubernetes.io/name and managed-by values;
+  // neither is deletion authority. The version requirement excludes the stable routing tier.
+  for (const hpaName of exactOwnedHpas) {
+    const exactDelete = await execCapture("kubectl", [
+      "delete",
+      "hpa",
+      hpaName,
+      "-n",
+      namespace,
+      "--ignore-not-found",
+    ]);
+    if (exactDelete.exitCode !== 0 && !isAlreadyGoneError(exactDelete.stderr)) {
+      console.warn(
+        `    WARNING: could not delete retained HPA ${hpaName}: ` +
+          `${sanitizeForTerminal(exactDelete.stderr.trim()) || `exit ${exactDelete.exitCode}`}.`,
+      );
+      failures.push(`retained HPA "${hpaName}"`);
+    }
+  }
+  for (const { kind, description } of [
+    { kind: "deployment", description: "retained pool Deployments" },
+    { kind: "hpa", description: "retained pool HPAs" },
+  ]) {
+    const deleteArgs = [
+      "delete",
+      kind,
+      "-n",
+      namespace,
+      "-l",
+      retainedRolloutSelector,
+      "--ignore-not-found",
+    ];
+    if (dryRun) {
+      console.log(`  [dry-run] kubectl ${deleteArgs.join(" ")}`);
+      continue;
+    }
+
+    const res = await execCapture("kubectl", deleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete ${description}: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}.`,
+      );
+      failures.push(description);
+    }
+  }
+
+  // A topology-changing deploy can retain a removed pool's stable Service, PDB and (on GKE)
+  // HealthCheckPolicy for rollback. The topology transfer stamps these adapter-owned objects
+  // without a version label, so they need a separate sweep from build-scoped resources. List by
+  // exact dedicated release identity, then validate every component and helper-equivalent derived
+  // name before deleting it by exact name. The routing tier uses component=routing-service and is
+  // intentionally excluded even if a future migration gives it the same ownership label.
+  const retainedStableSelector = `${ADAPTER_RELEASE_LABEL}=${releaseName},app.kubernetes.io/name=${releaseName}`;
+  for (const { kind, description, apiOptional } of [
+    { kind: "service", description: "retained stable pool Services", apiOptional: false },
+    {
+      kind: "poddisruptionbudget",
+      description: "retained stable pool PodDisruptionBudgets",
+      apiOptional: false,
+    },
+    {
+      kind: "healthcheckpolicy",
+      description: "retained stable pool HealthCheckPolicies",
+      apiOptional: true,
+    },
+  ] as const) {
+    const listArgs = ["get", kind, "-n", namespace, "-l", retainedStableSelector, "-o", "json"];
+    if (dryRun) {
+      console.log(`  [dry-run] kubectl ${listArgs.join(" ")}`);
+      console.log(
+        `  [dry-run] would delete exact validated ${kind} names from that adapter-owned list`,
+      );
+      continue;
+    }
+
+    const listed = await execCapture("kubectl", listArgs);
+    if (
+      listed.exitCode !== 0 &&
+      apiOptional &&
+      isOptionalHealthCheckPolicyApiMissing(listed.stderr)
+    ) {
+      continue;
+    }
+    if (listed.exitCode !== 0) {
+      console.warn(
+        `    WARNING: could not discover ${description}: ` +
+          `${sanitizeForTerminal(listed.stderr.trim()) || `exit ${listed.exitCode}`}.`,
+      );
+      failures.push(description);
+      continue;
+    }
+
+    let names: string[];
+    try {
+      names = parseStablePoolResourceNames(listed.stdout, kind, releaseName, namespace);
+    } catch (err) {
+      console.warn(
+        `    WARNING: could not validate ${description}: ` +
+          `${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}.`,
+      );
+      failures.push(description);
+      continue;
+    }
+
+    for (const name of names) {
+      const deleted = await execCapture("kubectl", [
+        "delete",
+        kind,
+        name,
+        "-n",
+        namespace,
+        "--ignore-not-found",
+      ]);
+      if (deleted.exitCode !== 0 && !isAlreadyGoneError(deleted.stderr)) {
+        console.warn(
+          `    WARNING: could not delete ${kind} ${name}: ` +
+            `${sanitizeForTerminal(deleted.stderr.trim()) || `exit ${deleted.exitCode}`}.`,
+        );
+        failures.push(`${description}: "${name}"`);
       }
     }
   }
@@ -527,9 +959,11 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // releases and expensive/slow to recreate, so nuking them from a per-release `destroy` is
   // unsafe. Surface them with exact commands instead of silently leaving them AND deleting
   // the state needed to find them (the previous behavior).
-  console.log("\n✓ Removed: Helm release, GCS bucket, both service accounts, and the");
-  console.log("  release-scoped ext_proc resources (traffic extension, routing backend,");
-  console.log("  health check, static IP, custom IAM role).\n");
+  console.log("\n✓ Removed: Helm release, retained pool rollout/rollback resources, GCS bucket,");
+  console.log("  both service accounts, and the release-scoped ext_proc resources");
+  console.log(
+    "  (traffic extension, routing backend, health check, static IP, custom IAM role).\n",
+  );
   if (projectId) {
     console.log("  Left in place (shared / expensive — remove manually if truly unused):");
     console.log(

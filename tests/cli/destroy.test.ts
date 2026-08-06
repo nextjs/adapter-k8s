@@ -13,6 +13,11 @@ import os from "node:os";
 
 vi.mock("../../src/cli/exec.js");
 
+function successfulDestroyCommand(args: string[]) {
+  const jsonOutput = args.includes("-o") && args[args.indexOf("-o") + 1] === "json";
+  return { exitCode: 0, stdout: jsonOutput ? '{"items":[]}' : "", stderr: "" };
+}
+
 // L12: control what the interactive prompt "types" per test. `queue` answers multiple
 // prompts in order (release-name gate, then the unpinned-context confirmation); when
 // the queue is empty every prompt gets `value`.
@@ -90,7 +95,9 @@ describe("runDestroy — confirmation gate (L12)", () => {
     mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
     writeFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), JSON.stringify(INFRA));
     vi.clearAllMocks();
-    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) =>
+      successfulDestroyCommand(args),
+    );
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -164,7 +171,7 @@ describe("runDestroy — confirmation gate (L12)", () => {
       if (args.includes("config") && args.includes("get-value")) {
         return { exitCode: 0, stdout: "other-project\n", stderr: "" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     });
 
     await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
@@ -180,7 +187,7 @@ describe("runDestroy — confirmation gate (L12)", () => {
       if (args.includes("config") && args.includes("get-value")) {
         return { exitCode: 1, stdout: "", stderr: "gcloud broken" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     });
 
     await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
@@ -261,7 +268,7 @@ describe("runDestroy — confirmation gate (L12)", () => {
       ) {
         return { exitCode: 1, stdout: "", stderr: "NOT_FOUND: Unknown service account" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     });
 
     await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
@@ -290,7 +297,9 @@ describe("runDestroy — kubectl context pinning", () => {
     mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
     writeFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), JSON.stringify(INFRA));
     vi.clearAllMocks();
-    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) =>
+      successfulDestroyCommand(args),
+    );
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -319,7 +328,7 @@ describe("runDestroy — kubectl context pinning", () => {
       if (args.includes("get-credentials")) {
         return { exitCode: 1, stdout: "", stderr: "cluster not found" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     });
 
     await expect(
@@ -362,7 +371,9 @@ describe("runDestroy — adapter state ConfigMap cleanup", () => {
     mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
     writeFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), JSON.stringify(INFRA));
     vi.clearAllMocks();
-    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) =>
+      successfulDestroyCommand(args),
+    );
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -393,10 +404,10 @@ describe("runDestroy — adapter state ConfigMap cleanup", () => {
 
   it("tolerates a ConfigMap-delete failure (warns, destroy still succeeds)", async () => {
     vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
-      if (cmd === "kubectl" && args.includes("delete")) {
+      if (cmd === "kubectl" && args.includes("delete") && args.includes("configmap")) {
         return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     });
 
     await expect(
@@ -439,7 +450,7 @@ describe("runDestroy — unpinnable kubectl context (C1)", () => {
       if (args.includes("current-context")) {
         return { exitCode: 0, stdout: "gke_other-project_us-west1_some-cluster\n", stderr: "" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     });
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -549,7 +560,9 @@ describe("destroy: retained internal-dispatch Secrets", () => {
       JSON.stringify({ projectId: "deploy-project", region: "us-central1" }),
     );
     vi.clearAllMocks();
-    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) =>
+      successfulDestroyCommand(args),
+    );
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -599,7 +612,7 @@ describe("destroy: retained internal-dispatch Secrets", () => {
       if (args[0] === "delete" && args[1] === "secret") {
         return { exitCode: 1, stdout: "", stderr: "forbidden" };
       }
-      return { exitCode: 0, stdout: "", stderr: "" };
+      return successfulDestroyCommand(args);
     }) as never);
 
     await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
@@ -607,5 +620,534 @@ describe("destroy: retained internal-dispatch Secrets", () => {
       expect.stringMatching(/could not delete the internal-dispatch Secrets/),
     );
     warn.mockRestore();
+  });
+});
+
+describe("destroy: retained rollout resources", () => {
+  let tmpDir: string;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-destroy-rollout-"));
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ projectId: "deploy-project", region: "us-central1", namespace: "apps" }),
+    );
+    vi.clearAllMocks();
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) =>
+      successfulDestroyCommand(args),
+    );
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function rolloutDelete(kind: "deployment" | "hpa"): string[] | undefined {
+    return vi
+      .mocked(exec.execCapture)
+      .mock.calls.find(
+        ([cmd, args]) => cmd === "kubectl" && args[0] === "delete" && args[1] === kind,
+      )?.[1];
+  }
+
+  it("dry-run includes the rollout-resource sweeps without executing them", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", dryRun: true });
+
+    expect(vi.mocked(exec.execCapture)).not.toHaveBeenCalled();
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("[dry-run] kubectl delete deployment -n apps -l");
+    expect(output).toContain("[dry-run] kubectl delete hpa -n apps -l");
+  });
+
+  it("deletes retained Deployments and HPAs by dedicated release ownership and namespace", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const expectedSelector =
+      "adapter-k8s.dev/release=my-app," +
+      "app.kubernetes.io/name=my-app," +
+      "app.kubernetes.io/version";
+    for (const kind of ["deployment", "hpa"] as const) {
+      const deletion = rolloutDelete(kind);
+      expect(deletion).toEqual([
+        "delete",
+        kind,
+        "-n",
+        "apps",
+        "-l",
+        expectedSelector,
+        "--ignore-not-found",
+      ]);
+    }
+
+    const calls = vi.mocked(exec.execCapture).mock.calls;
+    const helmIndex = calls.findIndex(([cmd, args]) => cmd === "helm" && args[0] === "uninstall");
+    expect(calls.findIndex(([, args]) => args === rolloutDelete("deployment"))).toBeGreaterThan(
+      helmIndex,
+    );
+  });
+
+  it("treats retained rollout resources that are already gone as success", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "delete" && ["deployment", "hpa"].includes(args[1]!)) {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: `Error from server (NotFound): ${args[1]}s not found`,
+        };
+      }
+      return successfulDestroyCommand(args);
+    });
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).resolves.toBeUndefined();
+    expect(rolloutDelete("deployment")).toBeDefined();
+    expect(rolloutDelete("hpa")).toBeDefined();
+  });
+
+  it("reports a real rollout-resource deletion error as an incomplete destroy", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "delete" && args[1] === "deployment") {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
+      return successfulDestroyCommand(args);
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow("process.exit(1)");
+    expect(errorSpy.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+      "retained pool Deployments",
+    );
+  });
+
+  it("deletes a legacy unlabeled HPA only through its exact owned Deployment target", async () => {
+    const deploymentName = "my-app-web-build-a";
+    const hpaName = "my-app-web-build-a-hpa";
+    const foreignDeployment = "my-app-foreign-build-a";
+    const foreignHpa = "my-app-foreign-build-a-hpa";
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "deployments") {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: deploymentName,
+                  labels: {
+                    "app.kubernetes.io/name": "my-app",
+                    "app.kubernetes.io/component": "web",
+                    "app.kubernetes.io/version": "build-a",
+                    "app.kubernetes.io/managed-by": "Helm",
+                  },
+                },
+                spec: {
+                  template: {
+                    spec: {
+                      containers: [
+                        {
+                          name: "pool-server",
+                          env: [
+                            { name: "NEXT_BUILD_ID", value: "build-a" },
+                            { name: "POOL_NAME", value: "web" },
+                            { name: "RELEASE_NAME", value: "my-app" },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              {
+                metadata: {
+                  name: foreignDeployment,
+                  labels: {
+                    // Same generic app/Helm/version identity is legal for another chart and
+                    // must never become deletion authority.
+                    "app.kubernetes.io/name": "my-app",
+                    "app.kubernetes.io/component": "foreign",
+                    "app.kubernetes.io/version": "build-a",
+                    "app.kubernetes.io/managed-by": "Helm",
+                  },
+                },
+                spec: {
+                  template: {
+                    spec: {
+                      containers: [{ name: "foreign-server", env: [] }],
+                    },
+                  },
+                },
+              },
+            ],
+          }),
+        };
+      }
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "hpa") {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            items: [
+              {
+                metadata: { name: hpaName },
+                spec: {
+                  scaleTargetRef: {
+                    apiVersion: "apps/v1",
+                    kind: "Deployment",
+                    name: deploymentName,
+                  },
+                },
+              },
+              {
+                metadata: { name: "foreign-autoscaler" },
+                spec: {
+                  scaleTargetRef: {
+                    apiVersion: "apps/v1",
+                    kind: "Deployment",
+                    name: deploymentName,
+                  },
+                },
+              },
+              {
+                metadata: { name: "my-app-looking-hpa" },
+                spec: {
+                  scaleTargetRef: {
+                    apiVersion: "apps/v1",
+                    kind: "Deployment",
+                    name: "someone-elses-deployment",
+                  },
+                },
+              },
+              {
+                metadata: { name: foreignHpa },
+                spec: {
+                  scaleTargetRef: {
+                    apiVersion: "apps/v1",
+                    kind: "Deployment",
+                    name: foreignDeployment,
+                  },
+                },
+              },
+            ],
+          }),
+        };
+      }
+      return successfulDestroyCommand(args);
+    });
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const exactHpaDeletes = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(
+        ([cmd, args]) =>
+          cmd === "kubectl" && args[0] === "delete" && args[1] === "hpa" && !args.includes("-l"),
+      )
+      .map(([, args]) => args[2]);
+    expect(exactHpaDeletes).toEqual([hpaName]);
+    expect(exactHpaDeletes).not.toContain("foreign-autoscaler");
+    expect(exactHpaDeletes).not.toContain("my-app-looking-hpa");
+    expect(exactHpaDeletes).not.toContain(foreignHpa);
+  });
+
+  it("fails honestly when legacy HPA ownership cannot be discovered through RBAC", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "deployments") {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
+      return successfulDestroyCommand(args);
+    });
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow(
+      /Could not discover versioned pool Deployment identities.*No resources were deleted/s,
+    );
+    expect(
+      vi
+        .mocked(exec.execCapture)
+        .mock.calls.some(
+          ([cmd, args]) => cmd === "helm" || (cmd === "kubectl" && args[0] === "delete"),
+        ),
+    ).toBe(false);
+  });
+
+  it("fails honestly when the HPA ownership listing is invalid JSON", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "deployments") {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: "my-app-web-build-a",
+                  labels: {
+                    "app.kubernetes.io/name": "my-app",
+                    "app.kubernetes.io/component": "web",
+                    "app.kubernetes.io/version": "build-a",
+                  },
+                },
+                spec: {
+                  template: {
+                    spec: {
+                      containers: [
+                        {
+                          name: "pool-server",
+                          env: [
+                            { name: "NEXT_BUILD_ID", value: "build-a" },
+                            { name: "POOL_NAME", value: "web" },
+                            { name: "RELEASE_NAME", value: "my-app" },
+                          ],
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          }),
+        };
+      }
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "hpa") {
+        return { exitCode: 0, stdout: "not-json", stderr: "" };
+      }
+      return successfulDestroyCommand(args);
+    });
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow(/Could not validate retained HPAs.*No resources were deleted/s);
+    expect(
+      vi
+        .mocked(exec.execCapture)
+        .mock.calls.some(
+          ([cmd, args]) => cmd === "helm" || (cmd === "kubectl" && args[0] === "delete"),
+        ),
+    ).toBe(false);
+  });
+
+  it("deletes exact topology-retained stable pool resources but excludes routing", async () => {
+    const item = (
+      kind: "service" | "poddisruptionbudget" | "healthcheckpolicy",
+      name: string,
+      component: string,
+    ) => ({
+      metadata: {
+        name,
+        labels: {
+          "adapter-k8s.dev/release": "my-app",
+          "app.kubernetes.io/name": "my-app",
+          "app.kubernetes.io/component": component,
+          // Destroy does not rely on this generic label: old Helm and the chart's own value
+          // can both survive depending on Helm version/ownership mode.
+          "app.kubernetes.io/managed-by": component === "legacy" ? "Helm" : "adapter-k8s-active",
+        },
+        annotations: {
+          "meta.helm.sh/release-name": "my-app",
+          "meta.helm.sh/release-namespace": "apps",
+        },
+      },
+      spec:
+        kind === "service"
+          ? {
+              selector: {
+                "app.kubernetes.io/name": "my-app",
+                "app.kubernetes.io/component": component,
+                "app.kubernetes.io/version": "build-a",
+              },
+            }
+          : kind === "poddisruptionbudget"
+            ? {
+                selector: {
+                  matchLabels: {
+                    "app.kubernetes.io/name": "my-app",
+                    "app.kubernetes.io/component": component,
+                  },
+                },
+              }
+            : {
+                targetRef: {
+                  group: "",
+                  kind: "Service",
+                  name:
+                    component === "routing-service" ? "my-app-routing-service" : "my-app-legacy",
+                },
+              },
+    });
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args.includes("-l")) {
+        if (args[1] === "service") {
+          return {
+            exitCode: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              items: [
+                item("service", "my-app-legacy", "legacy"),
+                item("service", "my-app-routing-service", "routing-service"),
+              ],
+            }),
+          };
+        }
+        if (args[1] === "poddisruptionbudget") {
+          return {
+            exitCode: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              items: [
+                item("poddisruptionbudget", "my-app-legacy-pdb", "legacy"),
+                item("poddisruptionbudget", "my-app-routing-service-pdb", "routing-service"),
+              ],
+            }),
+          };
+        }
+        if (args[1] === "healthcheckpolicy") {
+          return {
+            exitCode: 0,
+            stderr: "",
+            stdout: JSON.stringify({
+              items: [
+                item("healthcheckpolicy", "my-app-legacy-hcp", "legacy"),
+                item("healthcheckpolicy", "my-app-routing-service-hcp", "routing-service"),
+              ],
+            }),
+          };
+        }
+      }
+      return successfulDestroyCommand(args);
+    });
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const exactDeletes = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(
+        ([cmd, args]) =>
+          cmd === "kubectl" &&
+          args[0] === "delete" &&
+          ["service", "poddisruptionbudget", "healthcheckpolicy"].includes(args[1]!),
+      )
+      .map(([, args]) => `${args[1]}/${args[2]}`);
+    expect(exactDeletes).toEqual([
+      "service/my-app-legacy",
+      "poddisruptionbudget/my-app-legacy-pdb",
+      "healthcheckpolicy/my-app-legacy-hcp",
+    ]);
+    expect(exactDeletes.some((name) => name.includes("routing"))).toBe(false);
+    const stableListSelectors = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(
+        ([cmd, args]) =>
+          cmd === "kubectl" &&
+          args[0] === "get" &&
+          ["service", "poddisruptionbudget", "healthcheckpolicy"].includes(args[1]!),
+      )
+      .map(([, args]) => args[args.indexOf("-l") + 1]);
+    expect(stableListSelectors).toEqual(
+      Array(3).fill("adapter-k8s.dev/release=my-app,app.kubernetes.io/name=my-app"),
+    );
+    expect(stableListSelectors.some((selector) => selector?.includes("managed-by"))).toBe(false);
+  });
+
+  it("does not delete a retained stable resource whose name disagrees with its component", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "service") {
+        return {
+          exitCode: 0,
+          stderr: "",
+          stdout: JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: "my-app-not-legacy",
+                  labels: {
+                    "adapter-k8s.dev/release": "my-app",
+                    "app.kubernetes.io/name": "my-app",
+                    "app.kubernetes.io/component": "legacy",
+                  },
+                  annotations: {
+                    "meta.helm.sh/release-name": "my-app",
+                    "meta.helm.sh/release-namespace": "apps",
+                  },
+                },
+                spec: {
+                  selector: {
+                    "app.kubernetes.io/name": "my-app",
+                    "app.kubernetes.io/component": "legacy",
+                  },
+                },
+              },
+            ],
+          }),
+        };
+      }
+      return successfulDestroyCommand(args);
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow("process.exit(1)");
+    expect(
+      vi
+        .mocked(exec.execCapture)
+        .mock.calls.some(
+          ([cmd, args]) =>
+            cmd === "kubectl" && args[0] === "delete" && args[2] === "my-app-not-legacy",
+        ),
+    ).toBe(false);
+  });
+
+  it("treats an absent HealthCheckPolicy API as a generic-cluster no-op", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "healthcheckpolicy") {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: 'error: the server doesn\'t have a resource type "healthcheckpolicy"',
+        };
+      }
+      return successfulDestroyCommand(args);
+    });
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not mistake HealthCheckPolicy RBAC denial for an absent optional API", async () => {
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "get" && args[1] === "healthcheckpolicy") {
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: 'forbidden: could not find the requested resource "healthcheckpolicies"',
+        };
+      }
+      return successfulDestroyCommand(args);
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow("process.exit(1)");
+    expect(errorSpy.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+      "retained stable pool HealthCheckPolicies",
+    );
   });
 });

@@ -56,6 +56,7 @@ import {
 // omitted the `b-` prefix drained the Service to zero endpoints and 503'd the site.
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 import {
+  ADAPTER_RELEASE_LABEL,
   assertSafeBuildId,
   assertSafePoolName as assertSafePoolNameCharset,
   findBuildTopologyNameCollision,
@@ -2089,18 +2090,24 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           previousReplicasByPool.set(poolName, n);
 
           const keptDeployment = await execCapture("kubectl", [
-            "annotate",
+            "patch",
             "deployment",
             poolPrevName,
             "-n",
             namespace,
-            "helm.sh/resource-policy=keep",
-            "--overwrite",
+            "--type=merge",
+            "-p",
+            JSON.stringify({
+              metadata: {
+                annotations: { "helm.sh/resource-policy": "keep" },
+                labels: { [ADAPTER_RELEASE_LABEL]: releaseName },
+              },
+            }),
           ]);
           if (keptDeployment.exitCode !== 0) {
             throw new Error(
-              `Could not transfer the outgoing Deployment ${poolPrevName} out of Helm ` +
-                `ownership (${keptDeployment.stderr.trim() || `kubectl exited ${keptDeployment.exitCode}`}). ` +
+              `Could not preserve the outgoing Deployment ${poolPrevName} across the Helm ` +
+                `upgrade (${keptDeployment.stderr.trim() || `kubectl exited ${keptDeployment.exitCode}`}). ` +
                 `Refusing to run \`helm upgrade\`: re-rendering it would change the serving ` +
                 `pod template and omitting it without keep would delete it. Fix kubectl access ` +
                 `and re-run.`,
@@ -2127,8 +2134,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         }
       } else {
         console.log(
-          `    [dry-run] kubectl annotate deployment ${poolPrevName} -n ${namespace} ` +
-            `helm.sh/resource-policy=keep --overwrite (if it exists)`,
+          `    [dry-run] kubectl patch deployment ${poolPrevName} -n ${namespace} ` +
+            `--type=merge (set helm.sh/resource-policy=keep and ${ADAPTER_RELEASE_LABEL}, ` +
+            `if it exists)`,
         );
         if (!incomingPoolSet.has(poolName)) {
           console.log(
@@ -2153,15 +2161,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // carries traffic, but remove it from Helm's next release manifest. Rendering it here
       // would overwrite a rollback-created HPA's incident-sized min/max with the incoming
       // build's config; merely omitting it would let Helm prune it before the new build is ready.
-      // The live keep annotation makes the ownership transfer explicit. On every abort before
+      // The live keep annotation makes the retention transfer explicit. On every abort before
       // the durable state commit the HPA remains present and active; step 7f deletes it only
       // after traffic and state have moved to the new build.
       const outgoingHpa = poolResourceNames(releaseName, poolName, previousBuildId).hpa;
       const keepAnnotation = "helm.sh/resource-policy=keep";
       if (dryRun) {
         console.log(
-          `    [dry-run] kubectl annotate hpa ${outgoingHpa} -n ${namespace} ` +
-            `${keepAnnotation} --overwrite (if it exists)`,
+          `    [dry-run] kubectl patch hpa ${outgoingHpa} -n ${namespace} --type=merge ` +
+            `(set ${keepAnnotation} and release/build ownership labels, if it exists)`,
         );
       } else {
         const foundHpa = await execCapture("kubectl", [
@@ -2184,18 +2192,35 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           );
         }
         if (foundHpa.stdout.trim()) {
+          // Older charts did not stamp pool HPAs with the release/build labels destroy needs
+          // for a namespace-safe sweep, and rollback can create one imperatively. Transfer the
+          // keep annotation and complete adapter identity in one merge patch, without changing
+          // Helm's managed-by label or release annotations: a retry must still pass Helm's
+          // ownership validation. If admission rejects the patch, neither half is left behind
+          // and Helm is never allowed to prune the serving build's autoscaler.
           const keptHpa = await execCapture("kubectl", [
-            "annotate",
+            "patch",
             "hpa",
             outgoingHpa,
             "-n",
             namespace,
-            keepAnnotation,
-            "--overwrite",
+            "--type=merge",
+            "-p",
+            JSON.stringify({
+              metadata: {
+                annotations: { "helm.sh/resource-policy": "keep" },
+                labels: {
+                  [ADAPTER_RELEASE_LABEL]: releaseName,
+                  "app.kubernetes.io/name": releaseName,
+                  "app.kubernetes.io/component": poolName,
+                  "app.kubernetes.io/version": sanitizeK8sName(previousBuildId),
+                },
+              },
+            }),
           ]);
           if (keptHpa.exitCode !== 0) {
             throw new Error(
-              `Could not transfer the outgoing HPA ${outgoingHpa} out of Helm ownership ` +
+              `Could not preserve the outgoing HPA ${outgoingHpa} across the Helm upgrade ` +
                 `(${keptHpa.stderr.trim() || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
                 `to run \`helm upgrade\`: the serving build must keep autoscaling until ` +
                 `cutover. Fix kubectl access and re-run.`,
@@ -3298,7 +3323,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // Best-effort: success is already durable (7d) — a failure here warns instead of
     // failing the whole deploy (the previous build just keeps burning replicas until the
     // next deploy or a manual scale-down). The outgoing HPA was transferred out of Helm
-    // ownership before the upgrade so it could remain active while this build served. Delete it
+    // release-manifest lifecycle before the upgrade so it could remain active while this build
+    // served. Delete it
     // now and wait for that deletion to finish BEFORE setting replicas=0; if deletion fails,
     // leave the Deployment alone rather than asking a still-live HPA to fight the scale command.
     if (previousBuildId && previousBuildId !== buildId) {
