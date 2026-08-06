@@ -72,6 +72,34 @@ describe("Kubernetes target composition", () => {
     expect(compiled.plan.operations.routing).toMatchObject({
       dataplane: { kind: "portable-http-origin", targetPool: "api" },
     });
+    expect(compiled.plan.target.fingerprint).not.toBe(
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+        }),
+        context({ defaultPool: "default" }),
+      ).plan.target.fingerprint,
+    );
+  });
+
+  it("changes target identity when exposure or routing composition changes", () => {
+    const manual = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({ hosts }),
+      }),
+      context(),
+    );
+    const gateway = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: gatewayApiExposure({ className: "eg", hosts }),
+        routing: envoyNativeRouting({ escapedSlashes: "external" }),
+      }),
+      context(),
+    );
+    expect(gateway.plan.target.fingerprint).not.toBe(manual.plan.target.fingerprint);
   });
 
   it("emits typed Gateway API objects targeting the origin Service", () => {
