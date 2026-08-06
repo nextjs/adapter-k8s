@@ -2339,34 +2339,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  console.log("\n  → Running helm upgrade...");
-  // N25: from here on, the ext_proc edge runs the NEW build — helm overwrites the stable
-  // `<release>-routing-manifest` ConfigMap the routing Deployment mounts BY NAME, and
-  // kubelet volume sync propagates it even to routing pods that never rolled. Every abort
-  // below must therefore put the edge back on the previous build (rollback has the
-  // symmetric roll-forward; deploy had none) and say what state the edge is in.
-  let helmApplied = false;
-  if (!dryRun) {
-    await execOrThrow("helm", helmArgs);
-    helmApplied = true;
-  } else {
-    const helm4Args = buildHelmUpgradeArgs({ ...helmArgsBase, helmUpgradeMode: "server-side" });
-    console.log(`    [dry-run] helm ${helmArgs.join(" ")}  # Helm 3.2–3.x, client-side upgrade`);
-    console.log(`    [dry-run] helm ${helm4Args.join(" ")}  # Helm 4+, server-side upgrade`);
-  }
-
   /**
-   * N25: re-point the routing tier (image + retained manifest snapshot) at the previous
-   * build after a post-`helm upgrade` abort, so the edge and the pools agree on which
-   * build is live. Returns what actually happened so the abort message can be accurate
-   * instead of asserting "no cutover performed" while the edge serves the new build.
+   * Re-point the routing tier (image + retained manifest snapshot) at the previous build after
+   * Helm was invoked. A non-zero Helm exit is not proof that nothing changed: client-side Helm
+   * can fail after applying earlier resources, and server-side apply can return an error after
+   * admission or transport uncertainty. Recovery therefore starts when mutation is attempted,
+   * not only after the command reports success.
    */
+  let helmMutationAttempted = false;
   const restoreEdgeToPreviousBuild = async (): Promise<{
     attempted: boolean;
     restored: boolean;
     error: string;
   }> => {
-    if (!helmApplied || !previousBuildId || previousBuildId === buildId) {
+    if (!helmMutationAttempted || !previousBuildId || previousBuildId === buildId) {
       return { attempted: false, restored: false, error: "" };
     }
     try {
@@ -2376,6 +2362,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         targetBuildId: previousBuildId,
         registry: infra.containerRegistry,
         targetImageDigest: state?.routingImageDigests?.[previousBuildId],
+        // The outgoing manifest was snapshotted before Helm. Do not retain the uncertain
+        // image/manifest pair left by a failed or aborted deploy under either build's name.
+        retainCurrentManifest: false,
       });
       return { attempted: true, restored: true, error: "" };
     } catch (err) {
@@ -2411,6 +2400,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `${infra.containerRegistry}/routing-service:${previousBuildId}`,
     ];
   };
+
+  console.log("\n  → Running helm upgrade...");
+  // From this point the edge MAY run the new build. Helm overwrites the stable routing-manifest
+  // ConfigMap, and a non-zero exit can still mean that write reached the API server. Every later
+  // abort, including the Helm call itself, must put the edge back and report the actual result.
+  if (!dryRun) {
+    helmMutationAttempted = true;
+    try {
+      await execOrThrow("helm", helmArgs);
+    } catch (err) {
+      const edge = await restoreEdgeToPreviousBuild();
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        [
+          `Helm upgrade failed and may have partially applied the new release: ${detail}`,
+          ...edgeStatusLines(edge),
+        ].join("\n"),
+      );
+    }
+  } else {
+    const helm4Args = buildHelmUpgradeArgs({ ...helmArgsBase, helmUpgradeMode: "server-side" });
+    console.log(`    [dry-run] helm ${helmArgs.join(" ")}  # Helm 3.2–3.x, client-side upgrade`);
+    console.log(`    [dry-run] helm ${helm4Args.join(" ")}  # Helm 4+, server-side upgrade`);
+  }
 
   // 6b. Best-effort CDN verification: confirm the applied HTTPRoute carries the CDN filter.
   // The chart is the source of truth; this is confirmation only, never fatal.

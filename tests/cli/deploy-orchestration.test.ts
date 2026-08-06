@@ -1627,9 +1627,37 @@ describe("runDeploy — N25: every post-helm abort puts the ext_proc edge back",
       targetBuildId: "buildm",
       registry: REGISTRY,
       targetImageDigest: undefined,
+      retainCurrentManifest: false,
     });
     expect(printedErrors()).toContain("reverted to build buildm");
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("reverts the edge when Helm exits after a partial apply", async () => {
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+    vi.mocked(execOrThrow).mockImplementation((async (cmd: string) => {
+      if (cmd === "helm") {
+        events.push("helm");
+        throw new Error("upgrade failed: connection reset by peer");
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(
+      /Helm upgrade failed and may have partially applied.*edge and pools are consistent/s,
+    );
+
+    expect(events).toContain("revert-edge");
+    expect(revertRoutingServiceToBuild).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetBuildId: "buildm",
+        retainCurrentManifest: false,
+      }),
+    );
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(writeState).not.toHaveBeenCalled();
   });
 
   it("names the edge's ACTUAL state (and the recovery command) when the revert also fails", async () => {

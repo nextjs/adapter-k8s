@@ -413,6 +413,12 @@ export async function revertRoutingServiceToBuild(opts: {
   targetBuildId: string;
   registry: string | undefined;
   /**
+   * Preserve the edge being replaced as another rollback target. Deploy recovery disables this:
+   * a failed Helm command may have updated the stable manifest without updating the image, so
+   * naming that uncertain pair after either build could overwrite a valid snapshot.
+   */
+  retainCurrentManifest?: boolean;
+  /**
    * The target build's recorded routing-image digest (`AdapterState.routingImageDigests`), when
    * one exists. Without it the reference can only be a TAG, which leaves a rolled-back edge one
    * step less immutable than a freshly deployed one.
@@ -457,7 +463,9 @@ export async function revertRoutingServiceToBuild(opts: {
 
   // Retain the manifest we are about to roll AWAY from, so the symmetric roll-forward
   // can restore it (its stable-ConfigMap content is otherwise lost on the next deploy).
-  await retainLiveRoutingManifest(releaseName, namespace);
+  if (opts.retainCurrentManifest !== false) {
+    await retainLiveRoutingManifest(releaseName, namespace);
+  }
 
   const targetSnapshot = routingManifestSnapshotName(releaseName, targetBuildId);
   const snap = await execCapture("kubectl", [
