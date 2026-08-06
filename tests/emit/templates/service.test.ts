@@ -110,8 +110,8 @@ describe("renderActiveService (stable)", () => {
   });
 
   it("N65: the PDB lives here (rendered once per pool), never in the per-build templates", () => {
-    // deploy.ts re-renders renderDeployment/renderService/renderHPA for the RETAINED
-    // previous build. A PDB in one of those would either duplicate a resource name or
+    // deploy.ts re-renders renderDeployment/renderService for the RETAINED previous build.
+    // A PDB in one of those would either duplicate a resource name or
     // need per-build cleanup; renderActiveService is emitted exactly once per pool.
     const versioned = renderService({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });
     expect(versioned).not.toContain("PodDisruptionBudget");

@@ -155,6 +155,13 @@ function happyCluster(
     newBuildHpa?: { min?: number; max: number } | null;
     newBuildHpaReadFails?: boolean;
     newBuildHpaPatchFails?: boolean;
+    // The outgoing HPA may have been created imperatively by rollback rather than by the
+    // current Helm revision. Deploy protects either shape by probing the live object by name,
+    // transferring it to `keep`, then deleting it only after cutover is durable.
+    outgoingHpaPresent?: boolean;
+    outgoingHpaProbeFails?: boolean;
+    outgoingHpaAnnotateFails?: boolean;
+    outgoingHpaDeleteFails?: boolean;
     // N87: internal dispatch Secret lifecycle. The legacy stable-named Secret (migrated past
     // helm upgrade), and the per-build ones the post-cutover sweep prunes.
     legacySecretPresent?: boolean;
@@ -325,10 +332,35 @@ function happyCluster(
       });
       return ok(`${rows.join("\n")}\n`);
     }
-    // N67: the new build's HPA — read (min|max), widened for the warm-up, restored after.
-    // MUST come before the generic `patch` branch below, which assumes a Service.
+    // The outgoing HPA is deliberately omitted from the new Helm manifest, but must stay live
+    // while its build serves. Its by-name read/keep/delete lifecycle is separate from N67's
+    // new-build HPA read/patch lifecycle below.
     if (args.includes("hpa")) {
       const hpaName = args[args.indexOf("hpa") + 1]!;
+      if (args[0] === "get" && args.includes("-o") && args[args.indexOf("-o") + 1] === "name") {
+        if (overrides.outgoingHpaProbeFails) {
+          return { exitCode: 1, stdout: "", stderr: "horizontalpodautoscalers is forbidden" };
+        }
+        return overrides.outgoingHpaPresent === false
+          ? ok("")
+          : ok(`horizontalpodautoscaler.autoscaling/${hpaName}\n`);
+      }
+      if (args[0] === "annotate") {
+        events.push(`annotate-hpa:${hpaName}:${args.find((a) => a.includes("resource-policy"))}`);
+        if (overrides.outgoingHpaAnnotateFails) {
+          return { exitCode: 1, stdout: "", stderr: "hpa annotation denied" };
+        }
+        return ok();
+      }
+      if (args.includes("delete")) {
+        events.push(`delete-hpa:${hpaName}`);
+        if (overrides.outgoingHpaDeleteFails) {
+          return { exitCode: 1, stdout: "", stderr: "hpa deletion denied" };
+        }
+        return ok("");
+      }
+      // N67: the new build's HPA — read (min|max), widened for the warm-up, restored after.
+      // MUST come before the generic `patch` branch below, which assumes a Service.
       if (args.includes("patch")) {
         const body = JSON.parse(args[args.length - 1]!) as {
           spec: { maxReplicas?: number; minReplicas?: number };
@@ -339,7 +371,6 @@ function happyCluster(
         }
         return ok();
       }
-      if (args.includes("delete")) return ok(""); // 7f parks the previous build
       if (overrides.newBuildHpaReadFails) {
         return { exitCode: 1, stdout: "", stderr: "connection refused" };
       }
@@ -501,6 +532,57 @@ describe("runDeploy — orchestration", () => {
     });
   });
 
+  it("keeps a rollback-created HPA active through warm-up, then deletes it before parking", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { replicas: 5 },
+        readyPerPool: { ssr: 5 },
+        // The object exists only in the cluster, as after rollback's `kubectl autoscale`.
+        // It is intentionally absent from the retained files asserted below.
+        outgoingHpaPresent: true,
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const retainedWrites = vi
+      .mocked(writeFileSync)
+      .mock.calls.filter(([p]) => String(p).includes("-prev-"));
+    const retainedNames = retainedWrites.map(([p]) => path.basename(String(p)));
+    expect(retainedNames).toContain("ssr-prev-deployment.yaml");
+    expect(retainedNames).toContain("ssr-prev-service.yaml");
+    expect(retainedNames).not.toContain("ssr-prev-hpa.yaml");
+
+    const retainedDeployment = retainedWrites.find(([p]) =>
+      String(p).endsWith("ssr-prev-deployment.yaml"),
+    );
+    expect(String(retainedDeployment?.[1])).toContain("replicas: 5");
+
+    const keepHpa = events.indexOf("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
+    expect(keepHpa).toBeGreaterThanOrEqual(0);
+    expect(keepHpa).toBeLessThan(events.indexOf("helm"));
+
+    const stateCommit = events.indexOf("writeState");
+    const deleteHpa = events.indexOf("delete-hpa:rel-ssr-buildm-hpa");
+    const scaleDown = events.indexOf("scale:deployment/rel-ssr-buildm");
+    expect(stateCommit).toBeGreaterThanOrEqual(0);
+    expect(deleteHpa).toBeGreaterThan(stateCommit);
+    expect(scaleDown).toBeGreaterThan(deleteHpa);
+  });
+
+  it("leaves the rollback Deployment running when its outgoing HPA cannot be deleted", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { outgoingHpaDeleteFails: true }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events).toContain("writeState");
+    expect(events).toContain("delete-hpa:rel-ssr-buildm-hpa");
+    expect(events).not.toContain("scale:deployment/rel-ssr-buildm");
+    expect(printedWarnings()).toContain("could immediately undo a scale to zero");
+  });
+
   it("new build never healthy: no selector patch, no state commit, non-zero exit, previous keeps serving", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, { podsNeverReady: true }) as never,
@@ -516,6 +598,12 @@ describe("runDeploy — orchestration", () => {
     expect(events).not.toContain("writeState");
     expect(events).not.toContain("cdn-invalidate");
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+    // The outgoing autoscaler was transferred out of Helm before the upgrade and is never
+    // deleted on this abort, so the build that still carries traffic keeps autoscaling.
+    const keepHpa = events.indexOf("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
+    expect(keepHpa).toBeGreaterThanOrEqual(0);
+    expect(keepHpa).toBeLessThan(events.indexOf("helm"));
+    expect(events).not.toContain("delete-hpa:rel-ssr-buildm-hpa");
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     const printed = vi
       .mocked(console.error)
@@ -525,6 +613,32 @@ describe("runDeploy — orchestration", () => {
     // N25: the claim is now scoped to the POOLS — the ext_proc edge went to the new build
     // at `helm upgrade` and is reported separately (see the N25 suite below).
     expect(printed).toContain("previous build's pools are still serving");
+  });
+
+  it("aborts before Helm when the outgoing HPA cannot be read", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { outgoingHpaProbeFails: true }) as never,
+    );
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing HPA.*Refusing to run `helm upgrade`/s);
+
+    expect(events).not.toContain("helm");
+    expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+  });
+
+  it("aborts before Helm when the outgoing HPA cannot be transferred to keep", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { outgoingHpaAnnotateFails: true }) as never,
+    );
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/transfer the outgoing HPA.*serving build must keep autoscaling/s);
+
+    expect(events).not.toContain("helm");
+    expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
   });
 
   it("selector patch failure: reverts the successful patches, no state commit, non-zero exit", async () => {
@@ -549,6 +663,10 @@ describe("runDeploy — orchestration", () => {
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     expect(vi.mocked(invalidateCdnBuildTag)).not.toHaveBeenCalled();
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+    // Both outgoing autoscalers remain active after the partial selector flip is reverted.
+    expect(events).toContain("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
+    expect(events).toContain("annotate-hpa:rel-api-buildm-hpa:helm.sh/resource-policy=keep");
+    expect(events.some((e) => e.startsWith("delete-hpa:"))).toBe(false);
   });
 
   it("dry-run: prints the plan and mutates nothing", async () => {
@@ -808,6 +926,13 @@ describe("runDeploy — guards and teardown", () => {
     expect(helmCall?.[1].join(" ")).toContain("--namespace prod --create-namespace");
     expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, { namespace: "prod" });
     expect(vi.mocked(retainLiveRoutingManifest)).toHaveBeenCalledWith(RELEASE, "prod");
+    const outgoingHpaCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args.includes("hpa") && args.includes("rel-ssr-buildm-hpa"));
+    expect(outgoingHpaCalls).not.toHaveLength(0);
+    for (const [, args] of outgoingHpaCalls) {
+      expect(args).toEqual(expect.arrayContaining(["-n", "prod"]));
+    }
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
       expect.objectContaining({ buildId: "buildn", previousBuildId: "buildm" }),
