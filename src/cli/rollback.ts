@@ -1274,81 +1274,14 @@ export async function runRollback(options: {
   }
 
   // N70: Helm is not rolled back, so HTTPRoute still carries the former-current topology.
-  // When pool sets differ, every stable Service that route may reference must be redirected to
-  // a real target-build pool before current-only Deployments are parked. Capture the exact live
-  // selectors first so a partial patch failure can restore them byte-for-byte; guessing
-  // `component=<service suffix>` is wrong after one topology-changing rollback/roll-forward.
+  // Every Service selector that will be changed must be captured before the edge is reverted.
+  // This is required even when pool topology is unchanged: the portable origin's component is
+  // the build's default pool, not the Service suffix "origin", so a guessed partial-failure
+  // restore would drain it to zero endpoints.
   const targetPoolSet = new Set(poolNames);
   const currentOnlyPools = currentPoolNames.filter((pool) => !targetPoolSet.has(pool));
   const topologyChanged =
     currentOnlyPools.length > 0 || poolNames.some((pool) => !currentPoolNames.includes(pool));
-  const originalSelectors = new Map<string, Record<string, string>>();
-  if (topologyChanged) {
-    for (const pool of new Set([...poolNames, ...currentOnlyPools])) {
-      const serviceName = sanitizeK8sName(`${releaseName}-${pool}`);
-      const read = await execCapture("kubectl", [
-        "get",
-        "service",
-        serviceName,
-        "-n",
-        namespace,
-        "-o",
-        "json",
-      ]);
-      let selector: unknown;
-      if (read.exitCode === 0) {
-        try {
-          selector = JSON.parse(read.stdout)?.spec?.selector;
-        } catch {
-          selector = undefined;
-        }
-      }
-      if (
-        !selector ||
-        typeof selector !== "object" ||
-        Array.isArray(selector) ||
-        Object.values(selector).some((value) => typeof value !== "string")
-      ) {
-        throw new Error(
-          `Could not read the exact selector for topology-changing rollback Service ` +
-            `${serviceName} (kubectl exited ${read.exitCode}${read.stderr.trim() ? `: ${read.stderr.trim()}` : ""}). ` +
-            `Traffic was NOT switched; refusing to patch selectors without a reversible ` +
-            `snapshot.`,
-        );
-      }
-      originalSelectors.set(serviceName, selector as Record<string, string>);
-    }
-  }
-
-  // 3b. Revert the routing tier (image + manifest) to the previous build BEFORE flipping
-  // pool traffic — the same order deploy applies (edge first, selectors second), so the
-  // middleware/manifest never trails the pools by more than one step.
-  assertSafeBuildId(previousBuildId);
-  if (infra?.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
-  await revertRoutingServiceToBuild({
-    releaseName,
-    namespace,
-    targetBuildId: previousBuildId,
-    registry: infra?.containerRegistry,
-    targetImageDigest: state.routingImageDigests?.[previousBuildId],
-    targetPlatform: state.targetPlatforms?.[previousBuildId],
-  });
-
-  // 4. Switch traffic: patch active Service selectors to the previous build.
-  // The selector value MUST use the same sanitizer that stamped the pod label
-  // (sanitizeK8sName prepends `b-` when the build id starts with a non-letter). A
-  // divergent value (the old inline sanitizer omitted the `b-` prefix) matches no pods,
-  // draining the active Service to zero endpoints and 503'ing the site on rollback.
-  // (safePreviousBuild is computed once in step 3 above and reused here.)
-
-  // Switch each target Service (`<release>-<pool>`) by NAME, then redirect Services that only
-  // exist in the still-installed HTTPRoute topology to a real target pool. (The template's
-  // `managed-by: adapter-k8s-active` label is overwritten by Helm to `managed-by: Helm`,
-  // so a label selector would match nothing, patch ZERO Services, skip the failure guard,
-  // and strand the site when the current build is scaled down.)
-  const patchFailures: { service: string; stderr: string }[] = [];
-  const patchedServices: { service: string; pool: string }[] = [];
-  console.log(`  → Switching traffic to previous build...`);
   const fallbackTargetPool = poolNames[0]!;
   let hasPortableOrigin = Boolean(state.defaultPools);
   if (!dryRun) {
@@ -1383,6 +1316,75 @@ export async function runRollback(options: {
         ]
       : []),
   ];
+  const originalSelectors = new Map<string, Record<string, string>>();
+  for (const { servicePool } of serviceDestinations) {
+    // Same-topology pool Services can be reconstructed from their own pool suffix and the
+    // current build. The origin cannot: its component is whichever pool that build declared
+    // as default, so it always needs an exact snapshot.
+    if (!topologyChanged && servicePool !== "origin") continue;
+    const serviceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
+    if (originalSelectors.has(serviceName)) continue;
+    const read = await execCapture("kubectl", [
+      "get",
+      "service",
+      serviceName,
+      "-n",
+      namespace,
+      "-o",
+      "json",
+    ]);
+    let selector: unknown;
+    if (read.exitCode === 0) {
+      try {
+        selector = JSON.parse(read.stdout)?.spec?.selector;
+      } catch {
+        selector = undefined;
+      }
+    }
+    if (
+      !selector ||
+      typeof selector !== "object" ||
+      Array.isArray(selector) ||
+      Object.values(selector).some((value) => typeof value !== "string")
+    ) {
+      throw new Error(
+        `Could not read the exact selector for rollback Service ` +
+          `${serviceName} (kubectl exited ${read.exitCode}${read.stderr.trim() ? `: ${read.stderr.trim()}` : ""}). ` +
+          `Traffic was NOT switched; refusing to patch selectors without a reversible snapshot.`,
+      );
+    }
+    originalSelectors.set(serviceName, selector as Record<string, string>);
+  }
+
+  // 3b. Revert the routing tier (image + manifest) to the previous build BEFORE flipping
+  // pool traffic — the same order deploy applies (edge first, selectors second), so the
+  // middleware/manifest never trails the pools by more than one step.
+  assertSafeBuildId(previousBuildId);
+  if (infra?.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
+  await revertRoutingServiceToBuild({
+    releaseName,
+    namespace,
+    targetBuildId: previousBuildId,
+    registry: infra?.containerRegistry,
+    targetImageDigest: state.routingImageDigests?.[previousBuildId],
+    targetPlatform: state.targetPlatforms?.[previousBuildId],
+  });
+
+  // 4. Switch traffic: patch active Service selectors to the previous build.
+  // The selector value MUST use the same sanitizer that stamped the pod label
+  // (sanitizeK8sName prepends `b-` when the build id starts with a non-letter). A
+  // divergent value (the old inline sanitizer omitted the `b-` prefix) matches no pods,
+  // draining the active Service to zero endpoints and 503'ing the site on rollback.
+  // (safePreviousBuild is computed once in step 3 above and reused here.)
+
+  // Switch each target Service (`<release>-<pool>`) by NAME, then redirect Services that only
+  // exist in the still-installed HTTPRoute topology to a real target pool. (The template's
+  // `managed-by: adapter-k8s-active` label is overwritten by Helm to `managed-by: Helm`,
+  // so a label selector would match nothing, patch ZERO Services, skip the failure guard,
+  // and strand the site when the current build is scaled down.)
+  const patchFailures: { service: string; stderr: string }[] = [];
+  const patchedServices: { service: string; pool: string }[] = [];
+  console.log(`  → Switching traffic to previous build...`);
   for (const { servicePool, targetPool } of serviceDestinations) {
     const svcName = sanitizeK8sName(`${releaseName}-${servicePool}`);
     const patchResult = await execCapture("kubectl", [

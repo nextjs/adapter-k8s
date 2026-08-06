@@ -881,7 +881,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
 
   // Two pools; the ssr Service patch to the previous build succeeds, the api one
   // fails. The routing tier exists and serves buildn from the stable ConfigMap.
-  function partialFailCapture(opts: { edgeForwardFails?: boolean } = {}) {
+  function partialFailCapture(opts: { edgeForwardFails?: boolean; portableOrigin?: boolean } = {}) {
     return vi.fn(async (_cmd: string, args: string[]) => {
       const j = args.join(" ");
       const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
@@ -917,6 +917,23 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
       }
       if (j.includes("get configmap rel-routing-manifest") && args.includes("json")) {
         return ok(JSON.stringify({ data: { "routing-manifest.json": "{}" } }));
+      }
+      if (j.includes("get service rel-origin") && args.includes("--ignore-not-found")) {
+        return ok(opts.portableOrigin ? "service/rel-origin\n" : "");
+      }
+      if (j.includes("get service rel-origin") && args.includes("json")) {
+        return ok(
+          JSON.stringify({
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": "rel",
+                "app.kubernetes.io/component": "api",
+                "app.kubernetes.io/version": "buildn",
+                "example.com/operator-selector": "preserve-me",
+              },
+            },
+          }),
+        );
       }
       if (args.includes("patch") && args.includes("service")) {
         const svc = args[args.indexOf("service") + 1]!;
@@ -1046,6 +1063,49 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
       "The routing edge (image + manifest) was restored to the current build.",
     );
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("restores the portable origin's exact selector after a partial rollback", async () => {
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: { buildn: ["ssr", "api"], buildm: ["ssr", "api"] },
+      defaultPools: { buildn: "api", buildm: "ssr" },
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      partialFailCapture({ portableOrigin: true }) as never,
+    );
+
+    await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    const originPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) => args[0] === "patch" && args[1] === "service" && args[2] === "rel-origin",
+      )
+      .map(([, args]) => JSON.parse(args.at(-1)!) as Array<Record<string, unknown>>);
+    expect(originPatches).toHaveLength(2);
+    expect(originPatches[0]).toContainEqual(
+      expect.objectContaining({
+        path: "/spec/selector/app.kubernetes.io~1component",
+        value: "ssr",
+      }),
+    );
+    expect(originPatches[1]).toEqual([
+      {
+        op: "replace",
+        path: "/spec/selector",
+        value: {
+          "app.kubernetes.io/name": "rel",
+          "app.kubernetes.io/component": "api",
+          "app.kubernetes.io/version": "buildn",
+          "example.com/operator-selector": "preserve-me",
+        },
+      },
+    ]);
   });
 });
 
