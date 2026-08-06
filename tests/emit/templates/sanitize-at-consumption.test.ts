@@ -80,6 +80,15 @@ describe("hpa.ts", () => {
       /Invalid buildId/,
     );
   });
+
+  it("labels each autoscaler with its adapter ownership, release, pool, build, and manager", () => {
+    const yaml = renderHPA({ poolName: "ssr", buildId: "123-build", releaseName: "my-app" });
+    expect(yaml).toContain('adapter-k8s.dev/release: "my-app"');
+    expect(yaml).toContain('app.kubernetes.io/name: "my-app"');
+    expect(yaml).toContain('app.kubernetes.io/component: "ssr"');
+    expect(yaml).toContain('app.kubernetes.io/version: "b-123-build"');
+    expect(yaml).toContain("app.kubernetes.io/managed-by: Helm");
+  });
 });
 
 describe("routing-service-service.ts", () => {

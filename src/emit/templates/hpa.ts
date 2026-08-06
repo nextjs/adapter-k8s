@@ -1,5 +1,6 @@
 // src/emit/templates/hpa.ts
 import {
+  ADAPTER_RELEASE_LABEL,
   sanitizeK8sName,
   assertSafeBuildId,
   assertSafePoolName,
@@ -28,10 +29,17 @@ export function renderHPA({
   // limit (a 63-char deployment name would otherwise yield a 67-char HPA name
   // the API server rejects). scaleTargetRef still uses the exact Deployment name.
   const hpaName = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`, "-hpa");
+  const safeBuildId = sanitizeK8sName(buildId);
   return `apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: ${hpaName}
+  labels:
+    ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: "${poolName}"
+    app.kubernetes.io/version: "${safeBuildId}"
+    app.kubernetes.io/managed-by: Helm
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

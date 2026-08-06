@@ -1,5 +1,6 @@
 // src/emit/templates/deployment.ts
 import {
+  ADAPTER_RELEASE_LABEL,
   sanitizeK8sName,
   assertSafeBuildId,
   assertSafeImageReference,
@@ -241,6 +242,7 @@ kind: Deployment
 metadata:
   name: ${name}
   labels:
+    ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"
     # N61: QUOTED. A pool named "on"/"no"/"y"/"off"/"true"/"123" renders a YAML boolean or
     # int here; \`helm template\` accepts it (exit 0) and the apiserver then rejects the
