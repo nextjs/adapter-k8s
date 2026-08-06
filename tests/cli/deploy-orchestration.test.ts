@@ -247,6 +247,8 @@ function happyCluster(
     poolServiceMissing?: boolean; // N31: the pool is NEW in this build
     poolServiceProbeFails?: boolean;
     patchFailsFor?: string; // service name whose selector patch fails
+    activeSelectorByPool?: Record<string, Record<string, string>>;
+    activeSelectorReadFailsFor?: string;
     podsNeverReady?: boolean;
     // N20: active-Service discovery (used only when deploy state is unavailable).
     activeServices?: string; // jsonpath rows: name|component|versionSelector
@@ -476,6 +478,25 @@ function happyCluster(
         );
       }
       return ok(`service/${svcName}\n`);
+    }
+    if (args[0] === "get" && args[1] === "service" && args.includes("json")) {
+      const svcName = args[2]!;
+      if (svcName === overrides.activeSelectorReadFailsFor) {
+        return { exitCode: 1, stdout: "", stderr: "services is forbidden" };
+      }
+      const pool = svcName.slice(`${RELEASE}-`.length);
+      return ok(
+        JSON.stringify({
+          metadata: { name: svcName },
+          spec: {
+            selector: overrides.activeSelectorByPool?.[pool] ?? {
+              "app.kubernetes.io/name": RELEASE,
+              "app.kubernetes.io/component": pool,
+              "app.kubernetes.io/version": "buildm",
+            },
+          },
+        }),
+      );
     }
     if (args.includes("configmaps")) {
       // Snapshot-pruning listing: previous build's snapshot + a stale one.
@@ -961,22 +982,44 @@ describe("runDeploy — orchestration", () => {
       poolTopologies: { buildm: ["ssr", "api"], buildm0: ["ssr", "api"] },
     } as never);
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { patchFailsFor: "rel-api" }) as never,
+      happyCluster(events, {
+        patchFailsFor: "rel-api",
+        activeSelectorByPool: {
+          ssr: {
+            "app.kubernetes.io/name": "rel",
+            "app.kubernetes.io/component": "legacy-fallback",
+            "app.kubernetes.io/version": "buildm",
+            "example.com/custom": "kept",
+          },
+        },
+      }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
     ).rejects.toThrow(/process\.exit:1/);
 
-    // rel-ssr was patched to buildn, then reverted back to buildm after rel-api failed.
+    // rel-ssr was patched to its canonical pool/build, then restored byte-for-byte after the
+    // rel-api patch failed.
     const patchCalls = vi
       .mocked(execCapture)
       .mock.calls.filter(
         ([, a]) => a.includes("patch") && a.includes("service") && a.includes("rel-ssr"),
       );
     expect(patchCalls).toHaveLength(2);
-    expect(patchCalls[0]![1].join(" ")).toContain('"value":"buildn"');
-    expect(patchCalls[1]![1].join(" ")).toContain('"value":"buildm"');
+    const forward = JSON.parse(patchCalls[0]![1].at(-1)!)[0].value;
+    expect(forward).toMatchObject({
+      "app.kubernetes.io/component": "ssr",
+      "app.kubernetes.io/version": "buildn",
+      "example.com/custom": "kept",
+    });
+    const restored = JSON.parse(patchCalls[1]![1].at(-1)!)[0].value;
+    expect(restored).toEqual({
+      "app.kubernetes.io/name": "rel",
+      "app.kubernetes.io/component": "legacy-fallback",
+      "app.kubernetes.io/version": "buildm",
+      "example.com/custom": "kept",
+    });
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     expect(vi.mocked(invalidateCdnBuildTag)).not.toHaveBeenCalled();
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
@@ -984,6 +1027,40 @@ describe("runDeploy — orchestration", () => {
     expect(events).toContain("preserve-hpa:rel-ssr-buildm-hpa:rel");
     expect(events).toContain("preserve-hpa:rel-api-buildm-hpa:rel");
     expect(events.some((e) => e.startsWith("delete-hpa:"))).toBe(false);
+  });
+
+  it("restores a re-added pool's component selector after topology rollback redirection", async () => {
+    setupFs({ metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr", "api"] },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        activeSelectorByPool: {
+          api: {
+            "app.kubernetes.io/name": "rel",
+            "app.kubernetes.io/component": "ssr",
+            "app.kubernetes.io/version": "buildm",
+          },
+        },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const apiPatch = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([, args]) => args[0] === "patch" && args[1] === "service" && args[2] === "rel-api",
+      );
+    const selector = JSON.parse(apiPatch![1].at(-1)!)[0].value;
+    expect(selector).toEqual({
+      "app.kubernetes.io/name": "rel",
+      "app.kubernetes.io/component": "api",
+      "app.kubernetes.io/version": "buildn",
+    });
   });
 
   it("dry-run: prints the plan and mutates nothing", async () => {
