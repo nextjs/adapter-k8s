@@ -2684,30 +2684,38 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // (success AND abort). After cutover, real load under the chart's own bounds decides the
     // count again.
     const warmedHpas: { name: string; min: number; max: number }[] = [];
-    let warmedHpasRestored = false;
+    const restoredWarmedHpas = new Set<string>();
     const restoreWarmedHpas = async (): Promise<void> => {
-      if (warmedHpasRestored) return;
-      warmedHpasRestored = true; // idempotent: every exit path calls this
       for (const { name, min, max } of warmedHpas) {
-        const restore = await execCapture("kubectl", [
-          "patch",
-          "hpa",
-          name,
-          "-n",
-          namespace,
-          "--type=merge",
-          // Same field-manager rationale as the Service/Deployment patches: helm owns the
-          // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify({ spec: { minReplicas: min, maxReplicas: max } }),
-        ]);
-        if (restore.exitCode === 0) {
-          console.log(`  → Restored ${name} to the chart's minReplicas=${min}, maxReplicas=${max}`);
-        } else {
+        if (restoredWarmedHpas.has(name)) continue;
+        let lastFailure = "";
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const restore = await execCapture("kubectl", [
+            "patch",
+            "hpa",
+            name,
+            "-n",
+            namespace,
+            "--type=merge",
+            // Same field-manager rationale as the Service/Deployment patches: helm owns the
+            // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
+            "--field-manager=helm",
+            "-p",
+            JSON.stringify({ spec: { minReplicas: min, maxReplicas: max } }),
+          ]);
+          if (restore.exitCode === 0) {
+            restoredWarmedHpas.add(name);
+            console.log(
+              `  → Restored ${name} to the chart's minReplicas=${min}, maxReplicas=${max}`,
+            );
+            break;
+          }
+          lastFailure = restore.stderr.trim() || `exit ${restore.exitCode}`;
+        }
+        if (!restoredWarmedHpas.has(name)) {
           console.warn(
             `  ! Could not restore ${name} to the chart's minReplicas=${min}, ` +
-              `maxReplicas=${max} (${restore.stderr.trim() || `exit ${restore.exitCode}`}) — ` +
+              `maxReplicas=${max} after 3 attempts (${lastFailure}) — ` +
               `it still has the temporary pre-cutover bounds, so this pool may retain warm-up ` +
               `capacity until the next \`helm upgrade\` re-renders it. Fix it with: kubectl -n ` +
               `${namespace} patch hpa ${name} --type=merge -p ` +
@@ -2747,12 +2755,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
 
     const shortfalls: string[] = [];
-    for (const [poolName, outgoing] of previousReplicasByPool) {
+    for (const poolName of pools) {
+      const outgoing = previousReplicasByPool.get(poolName);
       const { hpa: newHpaName } = poolResourceNames(releaseName, poolName, buildId);
 
-      // N67: machine-readable HPA probe — `--ignore-not-found` makes a genuinely absent
-      // HPA (autoscaling disabled for the pool) exit 0 with empty stdout, so a non-zero
-      // exit is a real read failure and the name field tells the two apart.
+      // The chart always renders one HPA per pool. A missing HPA after Helm means the release
+      // was only partially applied; accepting it would cut traffic to an unautoscaled pool.
+      // Probe every pool, including first-deploy and newly added pools, before scaling any of
+      // them. `--ignore-not-found` keeps absence machine-readable without hiding read errors.
       const hpaRead = await execCapture("kubectl", [
         "get",
         "hpa",
@@ -2773,55 +2783,55 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       }
 
       const [hpaFound, hpaMinField, hpaMaxField] = hpaRead.stdout.trim().split("|");
-      if (hpaFound) {
-        const hpaMin = Number(hpaMinField);
-        const hpaMax = Number(hpaMaxField);
-        if (
-          !Number.isInteger(hpaMin) ||
-          hpaMin < 1 ||
-          !Number.isInteger(hpaMax) ||
-          hpaMax < hpaMin
-        ) {
-          await abortWarmupSetup(
-            `Could not parse the new build's HPA ${newHpaName} bounds ` +
-              `(minReplicas=${JSON.stringify(hpaMinField ?? "")}, ` +
-              `maxReplicas=${JSON.stringify(hpaMaxField ?? "")}). Refusing to warm pool ` +
-              `"${poolName}" because its original bounds cannot be restored safely. ` +
-              `Nothing was cut over.`,
-          );
-        }
+      if (!hpaFound) {
+        await abortWarmupSetup(
+          `The new build's expected HPA ${newHpaName} was not found after Helm applied the ` +
+            `release. Refusing to cut over pool "${poolName}" to a partially applied build. ` +
+            `Nothing was cut over.`,
+        );
+      }
+      const hpaMin = Number(hpaMinField);
+      const hpaMax = Number(hpaMaxField);
+      if (!Number.isInteger(hpaMin) || hpaMin < 1 || !Number.isInteger(hpaMax) || hpaMax < hpaMin) {
+        await abortWarmupSetup(
+          `Could not parse the new build's HPA ${newHpaName} bounds ` +
+            `(minReplicas=${JSON.stringify(hpaMinField ?? "")}, ` +
+            `maxReplicas=${JSON.stringify(hpaMaxField ?? "")}). Refusing to warm pool ` +
+            `"${poolName}" because its original bounds cannot be restored safely. ` +
+            `Nothing was cut over.`,
+        );
+      }
 
-        if (hpaMin < outgoing) {
-          const warmMin = outgoing;
-          const warmMax = Math.max(hpaMax, warmMin);
-          console.log(
-            `  → Warming ${newHpaName} at minReplicas=${warmMin}, ` +
-              `maxReplicas=${warmMax} so the idle new pool keeps the outgoing build's ` +
-              `${outgoing} replicas (restored to minReplicas=${hpaMin}, ` +
-              `maxReplicas=${hpaMax} after cutover)`,
+      if (outgoing !== undefined && hpaMin < outgoing) {
+        const warmMin = outgoing;
+        const warmMax = Math.max(hpaMax, warmMin);
+        console.log(
+          `  → Warming ${newHpaName} at minReplicas=${warmMin}, ` +
+            `maxReplicas=${warmMax} so the idle new pool keeps the outgoing build's ` +
+            `${outgoing} replicas (restored to minReplicas=${hpaMin}, ` +
+            `maxReplicas=${hpaMax} after cutover)`,
+        );
+        const warm = await execCapture("kubectl", [
+          "patch",
+          "hpa",
+          newHpaName,
+          "-n",
+          namespace,
+          "--type=merge",
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify({ spec: { minReplicas: warmMin, maxReplicas: warmMax } }),
+        ]);
+        if (warm.exitCode !== 0) {
+          await abortWarmupSetup(
+            `Could not set temporary warm-up bounds on ${newHpaName} ` +
+              `(minReplicas=${warmMin}, maxReplicas=${warmMax}; ` +
+              `${warm.stderr.trim() || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
+              `scale or cut over pool "${poolName}" because its HPA could immediately ` +
+              `remove the required capacity. Nothing was cut over.`,
           );
-          const warm = await execCapture("kubectl", [
-            "patch",
-            "hpa",
-            newHpaName,
-            "-n",
-            namespace,
-            "--type=merge",
-            "--field-manager=helm",
-            "-p",
-            JSON.stringify({ spec: { minReplicas: warmMin, maxReplicas: warmMax } }),
-          ]);
-          if (warm.exitCode !== 0) {
-            await abortWarmupSetup(
-              `Could not set temporary warm-up bounds on ${newHpaName} ` +
-                `(minReplicas=${warmMin}, maxReplicas=${warmMax}; ` +
-                `${warm.stderr.trim() || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
-                `scale or cut over pool "${poolName}" because its HPA could immediately ` +
-                `remove the required capacity. Nothing was cut over.`,
-            );
-          }
-          warmedHpas.push({ name: newHpaName, min: hpaMin, max: hpaMax });
         }
+        warmedHpas.push({ name: newHpaName, min: hpaMin, max: hpaMax });
       }
     }
 
