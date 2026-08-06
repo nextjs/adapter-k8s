@@ -413,13 +413,13 @@ function happyCluster(
         }
         return ok("");
       }
-      // N67: the new build's HPA — read (min|max), widened for the warm-up, restored after.
+      // N67: the new build's HPA — read (min|max), raised for the warm-up, restored after.
       // MUST come before the generic `patch` branch below, which assumes a Service.
       if (args.includes("patch")) {
         const body = JSON.parse(args[args.length - 1]!) as {
           spec: { maxReplicas?: number; minReplicas?: number };
         };
-        events.push(`hpa-max:${hpaName}:${body.spec.maxReplicas}`);
+        events.push(`hpa-bounds:${hpaName}:${body.spec.minReplicas}:${body.spec.maxReplicas}`);
         if (overrides.newBuildHpaPatchFails) {
           return { exitCode: 1, stdout: "", stderr: "hpa patch denied by webhook" };
         }
@@ -2324,25 +2324,26 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     vi.restoreAllMocks();
   });
 
-  it("widens maxReplicas above the chart ceiling, warms up, then restores the ceiling after cutover", async () => {
-    // The outgoing build runs 6; the new chart caps the pool at 3. helm already installed
-    // that HPA, so the N64 scale-up to 6 was reconciled straight back down to 3 and the
-    // capacity gate waited for a count that could never be reached — every such deploy
-    // hung for the full health budget and aborted BEFORE cutover.
+  it("raises the HPA floor before warm-up even when its ceiling already covers capacity", async () => {
+    // This is the live failure shape: maxReplicas allowed the outgoing count, but the idle
+    // new pool's desired count was still minReplicas. The autoscaler undid kubectl scale
+    // before the capacity gate could pass.
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
         newBuildReplicas: 1,
-        newBuildHpa: { min: 1, max: 3 },
+        newBuildHpa: { min: 1, max: 10 },
         readyPerPool: { ssr: 6 },
       }) as never,
     );
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    // Widened to the warm-up target BEFORE the scale-up, and the scale-up asked for 6.
-    expect(events).toContain(`hpa-max:${NEW_HPA}:6`);
-    expect(events.indexOf(`hpa-max:${NEW_HPA}:6`)).toBeLessThan(
+    // The floor was raised while the already-sufficient ceiling stayed exact, BEFORE scale.
+    const warmBounds = `hpa-bounds:${NEW_HPA}:6:10`;
+    const chartBounds = `hpa-bounds:${NEW_HPA}:1:10`;
+    expect(events).toContain(warmBounds);
+    expect(events.indexOf(warmBounds)).toBeLessThan(
       events.indexOf("scaleup:deployment/rel-ssr-buildn"),
     );
     const scaleUp = vi
@@ -2352,29 +2353,48 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     // Cutover happened (the gate was satisfiable) and state was committed.
     expect(events).toContain("patch:rel-ssr");
     expect(events).toContain("writeState");
-    // ...and the chart's ceiling is back, AFTER the cutover was committed.
-    expect(events).toContain(`hpa-max:${NEW_HPA}:3`);
-    expect(events.indexOf("writeState")).toBeLessThan(events.indexOf(`hpa-max:${NEW_HPA}:3`));
-    // The LAST thing done to that HPA is the restore — no widened HPA is left behind.
-    const hpaEvents = events.filter((e) => e.startsWith("hpa-max:"));
-    expect(hpaEvents).toEqual([`hpa-max:${NEW_HPA}:6`, `hpa-max:${NEW_HPA}:3`]);
+    // ...and BOTH exact chart bounds are back after the cutover was committed.
+    expect(events).toContain(chartBounds);
+    expect(events.indexOf("writeState")).toBeLessThan(events.indexOf(chartBounds));
+    const hpaEvents = events.filter((e) => e.startsWith("hpa-bounds:"));
+    expect(hpaEvents).toEqual([warmBounds, chartBounds]);
     // The restore patch impersonates helm, which owns the chart-rendered HPA.
     const restore = vi
       .mocked(execCapture)
       .mock.calls.filter(([, a]) => a.includes("patch") && a.includes("hpa"))
       .at(-1)!;
     expect(restore[1]).toContain("--field-manager=helm");
-    expect(JSON.parse(restore[1].at(-1)!)).toEqual({ spec: { maxReplicas: 3 } });
+    expect(JSON.parse(restore[1].at(-1)!)).toEqual({
+      spec: { minReplicas: 1, maxReplicas: 10 },
+    });
   });
 
-  it("restores the chart ceiling when the deploy ABORTS mid-warm-up", async () => {
-    // A deploy that aborts before cutover must not leave a widened autoscaler behind:
-    // the abandoned build would keep the right to autoscale past its configured ceiling.
+  it("raises maxReplicas with the floor when the chart ceiling is below capacity", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
         newBuildReplicas: 1,
-        newBuildHpa: { min: 1, max: 3 },
+        newBuildHpa: { min: 2, max: 3 },
+        readyPerPool: { ssr: 6 },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:2:3`,
+    ]);
+  });
+
+  it("restores both exact chart bounds when the deploy aborts mid-warm-up", async () => {
+    // A deploy that aborts before cutover must not leave a raised floor on its abandoned
+    // build. Non-default original bounds prove the restore does not guess chart defaults.
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { replicas: 6 },
+        newBuildReplicas: 1,
+        newBuildHpa: { min: 2, max: 9 },
         readyPerPool: { ssr: 3 }, // never reaches 6 → the gate expires
       }) as never,
     );
@@ -2387,12 +2407,12 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
 
     expect(events.some((e) => e.startsWith("patch:rel-ssr"))).toBe(false);
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
-    const hpaEvents = events.filter((e) => e.startsWith("hpa-max:"));
-    expect(hpaEvents).toEqual([`hpa-max:${NEW_HPA}:6`, `hpa-max:${NEW_HPA}:3`]);
+    const hpaEvents = events.filter((e) => e.startsWith("hpa-bounds:"));
+    expect(hpaEvents).toEqual([`hpa-bounds:${NEW_HPA}:6:9`, `hpa-bounds:${NEW_HPA}:2:9`]);
     expect(printedErrors()).toContain("ssr: 3/6 ready");
   });
 
-  it("restores the chart ceiling when the selector cutover fails", async () => {
+  it("restores both chart bounds when the selector cutover fails", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2408,13 +2428,13 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     ).rejects.toThrow(/process\.exit:1/);
 
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
-    expect(events.filter((e) => e.startsWith("hpa-max:"))).toEqual([
-      `hpa-max:${NEW_HPA}:6`,
-      `hpa-max:${NEW_HPA}:3`,
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
     ]);
   });
 
-  it("restores the chart ceiling when the post-cutover state commit fails", async () => {
+  it("restores both chart bounds when the post-cutover state commit fails", async () => {
     // The third exit path: traffic HAS switched but state could not be persisted. The
     // process still leaves here, so the HPA must be chart-intended before it does.
     vi.mocked(execCapture).mockImplementation(
@@ -2431,16 +2451,16 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
     ).rejects.toThrow(/process\.exit:1/);
 
-    expect(events.filter((e) => e.startsWith("hpa-max:"))).toEqual([
-      `hpa-max:${NEW_HPA}:6`,
-      `hpa-max:${NEW_HPA}:3`,
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
     ]);
     expect(printedErrors()).toContain("persisting deploy state failed");
   });
 
-  it("warns with a repair command when the ceiling cannot be restored", async () => {
-    // Never silent: an HPA left widened outlives the deploy, so name it and the fix.
-    let widenSeen = false;
+  it("warns with an exact repair command when the chart bounds cannot be restored", async () => {
+    // Never silent: a raised HPA floor outlives the deploy, so name it and both exact bounds.
+    let warmSeen = false;
     const cluster = happyCluster(events, {
       prevLive: { replicas: 6 },
       newBuildReplicas: 1,
@@ -2449,8 +2469,8 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     });
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (args.includes("patch") && args.includes("hpa")) {
-        if (widenSeen) return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
-        widenSeen = true;
+        if (warmSeen) return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
+        warmSeen = true;
       }
       return cluster(cmd, args);
     }) as never);
@@ -2458,16 +2478,19 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
     const warned = printedWarnings();
-    expect(warned).toContain(`Could not restore ${NEW_HPA} to the chart's maxReplicas=3`);
+    expect(warned).toContain(
+      `Could not restore ${NEW_HPA} to the chart's minReplicas=1, maxReplicas=3`,
+    );
     expect(warned).toContain(`patch hpa ${NEW_HPA}`);
+    expect(warned).toContain('"minReplicas":1,"maxReplicas":3');
   });
 
-  it("leaves the HPA alone when its ceiling already covers the outgoing capacity", async () => {
+  it("leaves the HPA alone when its floor already covers the outgoing capacity", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 3 },
         newBuildReplicas: 1,
-        newBuildHpa: { min: 1, max: 10 },
+        newBuildHpa: { min: 3, max: 10 },
         readyPerPool: { ssr: 3 },
       }) as never,
     );
@@ -2475,35 +2498,32 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
     expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
-    expect(events.some((e) => e.startsWith("hpa-max:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
   });
 
-  it("cuts over at the ceiling it could not raise instead of waiting for an unreachable count", async () => {
-    // An un-widenable HPA (RBAC, webhook) must not turn into a hung deploy: the ceiling
-    // IS the most capacity this pool can have under this chart, so the gate asks for it.
+  it("aborts before scale or cutover when the temporary HPA bounds are rejected", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
         newBuildReplicas: 1,
         newBuildHpa: { min: 1, max: 3 },
         newBuildHpaPatchFails: true,
-        readyPerPool: { ssr: 3 },
+        readyPerPool: { ssr: 6 },
       }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not set temporary warm-up bounds.*Nothing was cut over/s);
 
-    expect(events).toContain("patch:rel-ssr");
-    const scaleUp = vi
-      .mocked(execCapture)
-      .mock.calls.find(([, a]) => a.includes("scale") && a.includes("deployment/rel-ssr-buildn"))!;
-    expect(scaleUp[1]).toContain("--replicas=3");
-    expect(printedWarnings()).toContain("caps pool");
-    // Nothing to restore — the widen never took effect.
-    expect(events.filter((e) => e.startsWith("hpa-max:"))).toEqual([`hpa-max:${NEW_HPA}:6`]);
+    expect(events).toContain(`hpa-bounds:${NEW_HPA}:6:6`);
+    expect(events).toContain("revert-edge");
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("patch:rel-ssr"))).toBe(false);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 
-  it("warns but still scales up when the HPA cannot be read", async () => {
+  it("aborts before scale or cutover when the HPA cannot be read", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2513,13 +2533,124 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not read the new build's HPA.*Nothing was cut over/s);
 
-    expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
-    expect(printedWarnings()).toContain(`Could not read the new build's HPA ${NEW_HPA}`);
+    expect(events).toContain("revert-edge");
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("patch:rel-ssr"))).toBe(false);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 
-  it("needs no widening when the pool has no HPA at all", async () => {
+  it("restores earlier pools and scales none when a later HPA read fails", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr", "heavy"], cacheEnabled: false },
+    });
+    const heavyHpa = poolResourceNames(RELEASE, "heavy", "buildn").hpa;
+    const cluster = happyCluster(events, {
+      prevLive: { replicas: 6 },
+      newBuildReplicas: 1,
+      newBuildHpa: { min: 1, max: 3 },
+    });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "hpa" && args[2] === heavyHpa) {
+        return { exitCode: 1, stdout: "", stderr: "horizontalpodautoscalers is forbidden" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(new RegExp(`Could not read the new build's HPA ${heavyHpa}`));
+
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
+    ]);
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("restores earlier pools and scales none when a later HPA patch fails", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr", "heavy"], cacheEnabled: false },
+    });
+    const heavyHpa = poolResourceNames(RELEASE, "heavy", "buildn").hpa;
+    const cluster = happyCluster(events, {
+      prevLive: { replicas: 6 },
+      newBuildReplicas: 1,
+      newBuildHpa: { min: 1, max: 3 },
+    });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "patch" && args[1] === "hpa" && args[2] === heavyHpa) {
+        return { exitCode: 1, stdout: "", stderr: "hpa patch denied by webhook" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(new RegExp(`Could not set temporary warm-up bounds on ${heavyHpa}`));
+
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
+    ]);
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("aborts safely when an existing HPA returns malformed bounds", async () => {
+    const cluster = happyCluster(events, { prevLive: { replicas: 6 } });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "hpa" && args[2] === NEW_HPA) {
+        return { exitCode: 0, stdout: `${NEW_HPA}|unknown|3`, stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not parse.*minReplicas="unknown".*Nothing was cut over/s);
+
+    expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+  });
+
+  it("uses the configured namespace for every warm-up HPA read and patch", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: false,
+        namespace: "prod",
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { replicas: 6 },
+        newBuildHpa: { min: 1, max: 3 },
+        readyPerPool: { ssr: 6 },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const warmupCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args.includes("hpa") && args.includes(NEW_HPA));
+    expect(warmupCalls).toHaveLength(3); // read, temporary bounds, exact restore
+    for (const [, args] of warmupCalls) {
+      expect(args).toEqual(expect.arrayContaining(["-n", "prod"]));
+    }
+  });
+
+  it("needs no temporary bounds when the pool has no HPA at all", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2532,7 +2663,7 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
     expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
-    expect(events.some((e) => e.startsWith("hpa-max:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
   });
 });
 
