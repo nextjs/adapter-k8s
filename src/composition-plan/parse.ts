@@ -1093,10 +1093,58 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
         .map((entry) => entry.metadata.namespace)
         .filter((entry): entry is string => entry !== undefined),
     ],
+    [
+      "$.operations.resources.readiness",
+      plan.operations.resources.readiness.flatMap((entry) =>
+        entry.kind === "kubernetes-service-endpoints"
+          ? [entry.service.namespace]
+          : entry.kind === "gcp-traffic-extension"
+            ? []
+            : entry.object.namespace
+              ? [entry.object.namespace]
+              : [],
+      ),
+    ],
+    [
+      "$.operations.routing.dataplane.readiness",
+      plan.operations.routing.dataplane.readiness.flatMap((entry) =>
+        entry.kind === "kubernetes-service-endpoints"
+          ? [entry.service.namespace]
+          : entry.kind === "gcp-traffic-extension"
+            ? []
+            : entry.object.namespace
+              ? [entry.object.namespace]
+              : [],
+      ),
+    ],
+    [
+      "$.operations.diagnostics",
+      plan.operations.diagnostics.flatMap((entry) => {
+        if (entry.kind === "kubernetes-condition") {
+          return entry.check.object.namespace ? [entry.check.object.namespace] : [];
+        }
+        if (entry.kind === "kubernetes-gateway-address") {
+          return entry.gateway.namespace ? [entry.gateway.namespace] : [];
+        }
+        return [];
+      }),
+    ],
   ] as const) {
     const mismatched = candidate.filter((entry) => entry !== namespace);
     if (mismatched.length > 0)
       fail(path, `all release-scoped objects must use namespace ${namespace}`);
+  }
+
+  const routingService =
+    plan.operations.routing.dataplane.kind === "portable-http-origin" ||
+    plan.operations.routing.dataplane.kind === "adapter-owned-envoy-proxy"
+      ? plan.operations.routing.dataplane.service
+      : null;
+  if (routingService && routingService.namespace !== namespace) {
+    fail(
+      "$.operations.routing.dataplane.service.namespace",
+      `all release-scoped objects must use namespace ${namespace}`,
+    );
   }
 
   for (const source of plan.operations.logs) {

@@ -94,6 +94,11 @@ export interface AdapterState {
   poolTopologies?: Record<string, string[]>;
   /** Default pool selected by the portable origin Service for each retained build. */
   defaultPools?: Record<string, string>;
+  /** Independent trust anchors for retained build-scoped composition plans. */
+  compositionPlans?: Record<
+    string,
+    { digest: `sha256:${string}`; targetFingerprint: `sha256:${string}` }
+  >;
   /**
    * The container platform each retained build was produced for, keyed by build id.
    *

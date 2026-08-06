@@ -1,12 +1,28 @@
 // tests/cli/destroy.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  buildExternalCleanupCommand,
   buildReleaseScopedGcpResources,
   isAlreadyGoneError,
+  removePlannedKubernetesObject,
   runDestroy,
 } from "../../src/cli/destroy.js";
 import { deployExtRoleId } from "../../src/cli/init.js";
 import * as exec from "../../src/cli/exec.js";
+import {
+  compileTarget,
+  defineResourceComponent,
+  defineTarget,
+  kubernetesCluster,
+  manualExposure,
+} from "../../src/target/index.js";
+import {
+  canonicalCompositionPlanJson,
+  fingerprintCompositionPlan,
+  type CompositionPlan,
+  type RetainedExternalResource,
+} from "../../src/composition-plan/index.js";
+import { compositionPlanConfigMapName } from "../../src/emit/templates/composition-plan-configmap.js";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -76,6 +92,350 @@ describe("buildReleaseScopedGcpResources", () => {
       "--project=my-project",
       "--quiet",
     ]);
+  });
+});
+
+describe("composition-plan cleanup", () => {
+  it("translates typed external operations without inferred names", () => {
+    expect(
+      buildExternalCleanupCommand({
+        kind: "gcp-global-address",
+        projectId: "project-123",
+        name: "shared-edge-address",
+      }),
+    ).toEqual({
+      desc: 'global address "shared-edge-address"',
+      command: "gcloud",
+      args: [
+        "compute",
+        "addresses",
+        "delete",
+        "shared-edge-address",
+        "--global",
+        "--project=project-123",
+        "--quiet",
+      ],
+    });
+  });
+
+  it("verifies the release ownership label before exact Kubernetes deletion", async () => {
+    const owned = {
+      ref: {
+        apiVersion: "networking.k8s.io/v1",
+        resource: "ingresses",
+        name: "custom-entry",
+        namespace: "apps",
+      },
+      lifecycle: "helm" as const,
+      ownership: {
+        releaseLabel: { key: "adapter-k8s.dev/release" as const, value: "my-app" },
+        helmRelease: { name: "my-app", namespace: "apps" },
+      },
+    };
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          metadata: { labels: { "adapter-k8s.dev/release": "my-app" } },
+        }),
+        stderr: "",
+      })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" });
+    await expect(removePlannedKubernetesObject(owned, false)).resolves.toBeNull();
+    expect(vi.mocked(exec.execCapture).mock.calls[1]).toEqual([
+      "kubectl",
+      ["delete", "ingresses", "custom-entry", "-n", "apps", "--ignore-not-found"],
+    ]);
+
+    vi.mocked(exec.execCapture).mockReset();
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        metadata: { labels: { "adapter-k8s.dev/release": "another-app" } },
+      }),
+      stderr: "",
+    });
+    await expect(removePlannedKubernetesObject(owned, false)).resolves.toMatch(
+      /ownership label.*does not match/i,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("runDestroy — composition-plan trust boundary", () => {
+  let tmpDir: string;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  const targetFingerprint = (plan: CompositionPlan) => plan.target.fingerprint;
+
+  function plan(options: {
+    buildId: string;
+    objectName?: string;
+    externalAddress?: string;
+    retained?: RetainedExternalResource[];
+  }): CompositionPlan {
+    const lifecycle = defineResourceComponent({
+      name: `lifecycle-${options.buildId}`,
+      build(context) {
+        return {
+          ...(options.objectName
+            ? {
+                objects: [
+                  {
+                    apiVersion: "v1",
+                    kind: "ConfigMap",
+                    resource: "configmaps",
+                    metadata: { name: options.objectName, namespace: context.namespace },
+                    body: { data: { source: "composition-plan" } },
+                  },
+                ],
+              }
+            : {}),
+          ...(options.externalAddress
+            ? {
+                externalCleanup: [
+                  {
+                    kind: "gcp-global-address" as const,
+                    projectId: "project-123",
+                    name: options.externalAddress,
+                  },
+                ],
+              }
+            : {}),
+          retained: options.retained ?? [],
+        };
+      },
+    });
+    return compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({
+          hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+        }),
+        resources: [lifecycle],
+      }),
+      {
+        releaseName: "my-app",
+        namespace: "default",
+        buildId: options.buildId,
+        imageRegistry: "ghcr.io/example/my-app",
+        pools: ["default"],
+        defaultPool: "default",
+        failurePolicy: "closed",
+        cache: "none",
+      },
+    ).plan;
+  }
+
+  function planConfigMap(value: CompositionPlan): string {
+    return JSON.stringify({
+      metadata: {
+        annotations: {
+          "adapter-k8s.dev/composition-digest": fingerprintCompositionPlan(value),
+        },
+      },
+      data: { "plan.json": canonicalCompositionPlanJson(value) },
+    });
+  }
+
+  function authorizeExternalCleanupLocally(value: CompositionPlan): void {
+    const outputDir = path.join(tmpDir, ".k8s-adapter", "output");
+    const digest = fingerprintCompositionPlan(value);
+    mkdirSync(outputDir, { recursive: true });
+    writeFileSync(
+      path.join(outputDir, "composition-plan.json"),
+      canonicalCompositionPlanJson(value),
+    );
+    writeFileSync(
+      path.join(outputDir, "build-metadata.json"),
+      JSON.stringify({
+        buildId: value.metadata.buildId,
+        compositionPlan: { digest, targetFingerprint: value.target.fingerprint },
+      }),
+    );
+  }
+
+  async function destroyFromClusterPlans(plans: CompositionPlan[]): Promise<void> {
+    const [current, previous] = plans;
+    const state = {
+      buildId: current!.metadata.buildId,
+      previousBuildId: previous?.metadata.buildId ?? null,
+      compositionPlans: Object.fromEntries(
+        plans.map((value) => [
+          value.metadata.buildId,
+          {
+            digest: fingerprintCompositionPlan(value),
+            targetFingerprint: targetFingerprint(value),
+          },
+        ]),
+      ),
+    };
+    const plansByName = new Map(
+      plans.map((value) => [compositionPlanConfigMapName("my-app", value.metadata.buildId), value]),
+    );
+    vi.mocked(exec.execCapture).mockImplementation(async (command, args) => {
+      if (command === "gcloud") return { exitCode: 0, stdout: "", stderr: "" };
+      if (command === "kubectl" && args.join(" ") === "config current-context") {
+        return { exitCode: 0, stdout: "home\n", stderr: "" };
+      }
+      if (command === "kubectl" && args.at(-1) === "/version") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ gitVersion: "v1.35.0" }),
+          stderr: "",
+        };
+      }
+      const discovery = new Map<string, Array<{ name: string; kind: string }>>([
+        ["/api/v1", [{ name: "services", kind: "Service" }]],
+        ["/apis/apps/v1", [{ name: "deployments", kind: "Deployment" }]],
+        [
+          "/apis/autoscaling/v2",
+          [{ name: "horizontalpodautoscalers", kind: "HorizontalPodAutoscaler" }],
+        ],
+        ["/apis/policy/v1", [{ name: "poddisruptionbudgets", kind: "PodDisruptionBudget" }]],
+        ["/apis/networking.k8s.io/v1", [{ name: "networkpolicies", kind: "NetworkPolicy" }]],
+        ["/apis/discovery.k8s.io/v1", [{ name: "endpointslices", kind: "EndpointSlice" }]],
+      ]);
+      if (command === "kubectl" && discovery.has(args.at(-1)!)) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ resources: discovery.get(args.at(-1)!) }),
+          stderr: "",
+        };
+      }
+      if (command === "kubectl" && args.includes("my-app-adapter-state")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ data: { "state.json": JSON.stringify(state) } }),
+          stderr: "",
+        };
+      }
+      if (command === "kubectl" && args[0] === "get" && args[1] === "configmap") {
+        const value = plansByName.get(args[2]!);
+        if (value) return { exitCode: 0, stdout: planConfigMap(value), stderr: "" };
+      }
+      if (
+        command === "kubectl" &&
+        args[0] === "get" &&
+        args[1] === "configmaps" &&
+        plans.some((value) =>
+          value.operations.cleanup.kubernetes.contributedObjects.some(
+            (owned) => owned.ref.name === args[2],
+          ),
+        )
+      ) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            metadata: { labels: { "adapter-k8s.dev/release": "my-app" } },
+          }),
+          stderr: "",
+        };
+      }
+      return successfulDestroyCommand(args);
+    });
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+  }
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-plan-trust-"));
+    mkdirSync(path.join(tmpDir, ".k8s-adapter"), { recursive: true });
+    vi.clearAllMocks();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("never executes cluster-only external operations but preserves owned Kubernetes cleanup", async () => {
+    await destroyFromClusterPlans([
+      plan({ buildId: "build-2", objectName: "custom-config", externalAddress: "planted-ip" }),
+    ]);
+
+    expect(vi.mocked(exec.execCapture).mock.calls.some(([command]) => command === "gcloud")).toBe(
+      false,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledWith("kubectl", [
+      "delete",
+      "configmaps",
+      "custom-config",
+      "-n",
+      "default",
+      "--ignore-not-found",
+    ]);
+    const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(warnings).toContain("External cleanup was NOT executed");
+    expect(warnings).toContain(
+      'global address "planted-ip": gcloud compute addresses delete planted-ip --global --project=project-123 --quiet',
+    );
+  });
+
+  it("executes an external operation corroborated by the local build plan", async () => {
+    const value = plan({ buildId: "build-2", externalAddress: "release-ip" });
+    authorizeExternalCleanupLocally(value);
+
+    await destroyFromClusterPlans([value]);
+
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledWith("gcloud", [
+      "compute",
+      "addresses",
+      "delete",
+      "release-ip",
+      "--global",
+      "--project=project-123",
+      "--quiet",
+    ]);
+    expect(warnSpy.mock.calls.flat().join("\n")).not.toContain("External cleanup was NOT executed");
+  });
+
+  it("prints the exact union of retained resources from current and previous plans", async () => {
+    const sharedCluster: RetainedExternalResource = {
+      kind: "gke-cluster",
+      projectId: "project-123",
+      clusterName: "shared-cluster",
+      location: { kind: "region", name: "europe-west2" },
+    };
+    await destroyFromClusterPlans([
+      plan({
+        buildId: "build-2",
+        retained: [
+          sharedCluster,
+          {
+            kind: "gcp-artifact-registry",
+            projectId: "project-123",
+            region: "europe-west2",
+            repository: "nextjs",
+          },
+        ],
+      }),
+      plan({
+        buildId: "build-1",
+        retained: [
+          sharedCluster,
+          {
+            kind: "gcp-certificate-manager",
+            projectId: "project-123",
+            releasePrefix: "my-app",
+          },
+        ],
+      }),
+    ]);
+
+    const output = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    const clusterLine =
+      '    • GKE cluster "shared-cluster": gcloud container clusters delete shared-cluster --region europe-west2 --project project-123';
+    expect(output.split(clusterLine)).toHaveLength(2);
+    expect(output).toContain(
+      '    • Artifact Registry "nextjs": gcloud artifacts repositories delete nextjs --location europe-west2 --project project-123',
+    );
+    expect(output).toContain(
+      '    • Certificate Manager resources prefixed "my-app": gcloud certificate-manager maps list --project project-123 --filter=name:my-app',
+    );
   });
 });
 

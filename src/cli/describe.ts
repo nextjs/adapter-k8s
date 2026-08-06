@@ -10,6 +10,13 @@ import {
   infrastructurePath,
   outputDirName,
 } from "./infrastructure-validation.js";
+import {
+  describeCompositionPlan,
+  loadDeployedCompositionPlan,
+  loadProjectCompositionPlan,
+  preflightCompositionPlan,
+} from "./composition-plan.js";
+import type { CompositionPlan } from "../composition-plan/index.js";
 
 // Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
 // WHICH file is corrupt.
@@ -37,13 +44,25 @@ export async function runDescribe(options: {
     : null;
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
-  const namespace = resolveK8sNamespace(infra?.namespace);
+  const localComposition = loadProjectCompositionPlan(projectDir);
+  const namespace =
+    localComposition?.plan.metadata.namespace ?? resolveK8sNamespace(infra?.namespace);
 
   // Ensure kubectl is pointing at the right cluster BEFORE reading state — readState
   // prefers the cluster ConfigMap, and with kubectl still pinned to a stale context it
   // would read (or miss) state on the WRONG cluster (the bug class AGENTS.md invariant 6
   // covers; rollback was fixed for it, describe had the same ordering flaw).
-  if (infra?.projectId && infra?.region) {
+  if (localComposition) {
+    try {
+      await preflightCompositionPlan(localComposition.plan, { explicitlyConfirmed: true });
+    } catch (error) {
+      console.error(
+        `Failed to access composition target: ` +
+          `${sanitizeForTerminal(error instanceof Error ? error.message : String(error))}`,
+      );
+      process.exit(1);
+    }
+  } else if (infra?.projectId && infra?.region) {
     const credResult = await execCapture("gcloud", [
       "container",
       "clusters",
@@ -85,6 +104,40 @@ export async function runDescribe(options: {
   const previousBuildId = state?.previousBuildId
     ? sanitizeForTerminal(state.previousBuildId)
     : null;
+  // Style
+  const d = "\x1b[2m";
+  const b = "\x1b[1m";
+  const g = "\x1b[32m";
+  const y = "\x1b[33m";
+  const r = "\x1b[31m";
+  const c = "\x1b[36m";
+  const x = "\x1b[0m";
+  let compositionSummary = "";
+  let compositionPlan: CompositionPlan | null = null;
+  if (state?.buildId) {
+    try {
+      const snapshot = await loadDeployedCompositionPlan({
+        releaseName,
+        namespace,
+        buildId: state.buildId,
+        ...(state.compositionPlans?.[state.buildId]
+          ? { expected: state.compositionPlans[state.buildId] }
+          : {}),
+      });
+      if (snapshot) {
+        compositionPlan = snapshot.plan;
+        const description = describeCompositionPlan(snapshot.plan);
+        compositionSummary =
+          `\n${d}Plan:    ${snapshot.digest}  ${description.resources.length} resources, ` +
+          `${description.logs.length} log sources, ` +
+          `${description.cleanup.kubernetes.length + description.cleanup.external.length} cleanup operations${x}`;
+      }
+    } catch (error) {
+      compositionSummary =
+        `\n${r}Plan:    invalid deployed snapshot — ` +
+        `${sanitizeForTerminal(error instanceof Error ? error.message : String(error))}${x}`;
+    }
+  }
 
   // Read generated CEL expression from build output
   const celPath = path.join(projectDir, ".k8s-adapter", outputDirName(), "cel-expression.txt");
@@ -93,7 +146,8 @@ export async function runDescribe(options: {
   let gatewayIp = "pending";
   let certStatus = "unknown";
 
-  if (infra?.projectId) {
+  const compositionUsesGcp = compositionPlan?.target.identity.kind === "gke-resource";
+  if (infra?.projectId && (!localComposition || compositionUsesGcp)) {
     const ipResult = await execCapture("gcloud", [
       "compute",
       "addresses",
@@ -176,15 +230,6 @@ export async function runDescribe(options: {
     }
   }
 
-  // Style
-  const d = "\x1b[2m";
-  const b = "\x1b[1m";
-  const g = "\x1b[32m";
-  const y = "\x1b[33m";
-  const r = "\x1b[31m";
-  const c = "\x1b[36m";
-  const x = "\x1b[0m";
-
   function icon(dep: DeployInfo): string {
     const { status, role } = dep;
     // Scaled to 0 is expected for previous/old — not an error
@@ -212,7 +257,7 @@ export async function runDescribe(options: {
   console.log(`
 ${b}${c}${releaseName}${x} ${d}— @next-community/adapter-k8s${x}
 ${d}Project: ${projectId}  Region: ${region}${x}
-${d}Build:   ${buildId}${previousBuildId ? `  Previous: ${previousBuildId}` : ""}${x}
+${d}Build:   ${buildId}${previousBuildId ? `  Previous: ${previousBuildId}` : ""}${x}${compositionSummary}
 
 ${b}Request Flow${x}
 
@@ -238,23 +283,32 @@ ${b}Request Flow${x}
     `${c}${celDisplay}${x}`,
   ].join("\n");
 
-  const albContent = [
-    `${b}GCP Application Load Balancer${x}`,
-    `${d}IP: ${gatewayIp}   TLS: ${certStatus}${x}`,
-    ``,
-    boxen(celSection, {
-      padding: { left: 1, right: 1, top: 0, bottom: 0 },
-      borderStyle: "single",
-      dimBorder: true,
-    }),
-    ``,
-    `    ${d}matched${x}              ${d}skipped${x}`,
-    `       ${d}│${x}                     ${d}│${x}`,
-    `       ${d}▼${x}                     ${d}▼${x}`,
-    `  ${c}ext_proc${x} ${d}(gRPC)${x} ──▶ ${c}URL Map / HTTPRoute${x}`,
-    `                      ${d}x-upstream-pool → pool backend${x}`,
-    `                      ${d}path fallback → default pool${x}`,
-  ].join("\n");
+  const routing = compositionPlan?.operations.routing;
+  const albContent =
+    routing?.protocol === "pool-local-v1"
+      ? [
+          `${b}Kubernetes Exposure${x}`,
+          `${d}Portable HTTP origin; no Envoy or cloud routing service required${x}`,
+          ``,
+          `${c}${routing.dataplane.service.namespace}/${routing.dataplane.service.name}:${routing.dataplane.service.port}${x}`,
+          `${d}default pool: ${routing.dataplane.targetPool}${x}`,
+        ].join("\n")
+      : [
+          `${b}${compositionUsesGcp ? "GCP Application Load Balancer" : "Kubernetes Gateway"}${x}`,
+          ...(compositionUsesGcp ? [`${d}IP: ${gatewayIp}   TLS: ${certStatus}${x}`, ``] : []),
+          boxen(celSection, {
+            padding: { left: 1, right: 1, top: 0, bottom: 0 },
+            borderStyle: "single",
+            dimBorder: true,
+          }),
+          ``,
+          `    ${d}matched${x}              ${d}skipped${x}`,
+          `       ${d}│${x}                     ${d}│${x}`,
+          `       ${d}▼${x}                     ${d}▼${x}`,
+          `  ${c}ext_proc${x} ${d}(gRPC)${x} ──▶ ${c}HTTPRoute${x}`,
+          `                      ${d}x-upstream-pool → pool backend${x}`,
+          `                      ${d}path fallback → default pool${x}`,
+        ].join("\n");
 
   console.log(boxen(albContent, { padding: 1, borderStyle: "round" }));
 
@@ -279,7 +333,7 @@ ${b}Request Flow${x}
   ].join("\n");
 
   const gkeContent = [
-    `${b}GKE Cluster${x}`,
+    `${b}${compositionUsesGcp || !compositionPlan ? "GKE Cluster" : "Kubernetes Cluster"}${x}`,
     ``,
     boxen(routingSection, {
       padding: { left: 1, right: 1, top: 0, bottom: 0 },

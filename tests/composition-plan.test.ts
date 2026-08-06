@@ -140,6 +140,39 @@ describe("composition plan schema", () => {
     futureRequirements.kubernetes.minimumVersion = "1.36.0";
     expect(() => parseCompositionPlan(future)).not.toThrow();
   });
+
+  it("rejects cross-namespace readiness and dataplane references", () => {
+    const readiness = basePlan();
+    const operations = readiness.operations as Record<string, unknown>;
+    const resources = operations.resources as Record<string, unknown>;
+    resources.readiness = [
+      {
+        kind: "kubernetes-service-endpoints",
+        service: { name: "foreign", namespace: "other", port: 3000 },
+        minimumReady: 1,
+      },
+    ];
+    expect(() => parseCompositionPlan(readiness)).toThrow(
+      /resources\.readiness.*namespace test-app/i,
+    );
+
+    const dataplane = basePlan();
+    const routing = (dataplane.operations as Record<string, unknown>).routing as Record<
+      string,
+      unknown
+    >;
+    routing.protocol = "pool-local-v1";
+    routing.failurePolicy = "closed";
+    routing.dataplane = {
+      kind: "portable-http-origin",
+      service: { name: "origin", namespace: "other", port: 3000 },
+      targetPool: "default",
+      readiness: [],
+    };
+    expect(() => parseCompositionPlan(dataplane)).toThrow(
+      /dataplane\.service\.namespace.*namespace test-app/i,
+    );
+  });
 });
 
 describe("composition plan fingerprints", () => {

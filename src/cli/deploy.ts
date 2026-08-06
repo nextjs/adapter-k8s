@@ -1,5 +1,6 @@
 // src/cli/deploy.ts
 import path from "node:path";
+import { isIP } from "node:net";
 import { infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import {
   chmodSync,
@@ -81,6 +82,15 @@ import {
   type TargetPlatform,
 } from "../target-platform.js";
 import type { GcloudCommand } from "./init.js";
+import type { RegistryAuthentication, RegistryDigestLookup } from "../composition-plan/index.js";
+import {
+  assertCompositionPlanInvocation,
+  compositionPlanNeedsExplicitConfirmation,
+  currentKubeContext,
+  loadLocalCompositionPlan,
+  preflightCompositionPlan,
+  waitForCompositionPlanReadiness,
+} from "./composition-plan.js";
 
 /**
  * How long to wait for a Deployment rollout.
@@ -306,6 +316,10 @@ export interface DockerCommandOptions {
   containerCli?: string;
   /** Platform recorded by the build artifact; never re-infer it from the deploy host. */
   targetPlatform?: TargetPlatform;
+  /** Exact authentication operation declared by a composed target. Omitted for legacy builds. */
+  registryAuthentication?: RegistryAuthentication;
+  /** Portable routing has no routing-service workload or image. */
+  includeRoutingService?: boolean;
 }
 
 /**
@@ -389,11 +403,22 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   // the registry's business: for anything non-Google we assume the operator's existing
   // credential setup (docker login, ECR credential helper, az acr login, a pull secret) — the
   // same assumption every other tool makes.
-  const registryHost = registry.split("/")[0];
-  const isGoogleRegistry =
-    !!registryHost &&
-    (registryHost.endsWith("-docker.pkg.dev") || /(^|\.)gcr\.io$/.test(registryHost));
-  if (registryHost && isGoogleRegistry) {
+  const registryHost = registry.split("/")[0]!;
+  const authentication = options.registryAuthentication;
+  const shouldConfigureGcloud = authentication
+    ? authentication.kind === "gcloud-docker-helper"
+    : registryHost.endsWith("-docker.pkg.dev") || /(^|\.)gcr\.io$/.test(registryHost);
+  if (
+    authentication?.kind === "gcloud-docker-helper" &&
+    authentication.registryHost !== registryHost
+  ) {
+    throw new Error(
+      `Composition plan registry authentication names host ` +
+        `${JSON.stringify(authentication.registryHost)}, but the image repository uses ` +
+        `${JSON.stringify(registryHost)}. Rebuild the target plan.`,
+    );
+  }
+  if (shouldConfigureGcloud) {
     commands.push({
       description: `Configure Docker authentication for ${registryHost}`,
       command: "gcloud",
@@ -429,26 +454,27 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
     }
   }
 
-  // Always build routing service image
-  const routingTag = `${registry}/routing-service:${buildId}`;
-  commands.push({
-    description: "Build routing service image",
-    command: cli,
-    args: [
-      "build",
-      platformArg,
-      "-f",
-      `${outputDir}/routing-service/Dockerfile`,
-      "-t",
-      routingTag,
-      `${outputDir}/routing-service`,
-    ],
-  });
-  commands.push({
-    description: "Push routing service image",
-    command: cli,
-    args: ["push", routingTag],
-  });
+  if (options.includeRoutingService !== false) {
+    const routingTag = `${registry}/routing-service:${buildId}`;
+    commands.push({
+      description: "Build routing service image",
+      command: cli,
+      args: [
+        "build",
+        platformArg,
+        "-f",
+        `${outputDir}/routing-service/Dockerfile`,
+        "-t",
+        routingTag,
+        `${outputDir}/routing-service`,
+      ],
+    });
+    commands.push({
+      description: "Push routing service image",
+      command: cli,
+      args: ["push", routingTag],
+    });
+  }
 
   return commands;
 }
@@ -519,6 +545,7 @@ export async function resolveDeployImageDigests(opts: {
   allowMutableTags?: boolean;
   containerCli?: string;
   targetPlatform?: TargetPlatform;
+  digestLookup?: RegistryDigestLookup;
 }): Promise<Record<string, string>> {
   const digests: Record<string, string> = {};
   const unresolved: string[] = [];
@@ -544,8 +571,16 @@ export async function resolveDeployImageDigests(opts: {
     // can rewrite the manifest. An unreliable digest is worse than none — it deploys and then
     // ImagePullBackOffs at rollout, after cutover has started, whereas refusing fails at deploy
     // time with something actionable.
+    const artifactRegistryProject =
+      opts.digestLookup?.kind === "gcp-artifact-registry"
+        ? opts.digestLookup.projectId
+        : opts.digestLookup?.kind === "oci-distribution"
+          ? null
+          : opts.projectId;
     const digest =
-      (await resolveRegistryDigest(ref, opts.projectId, platform, cli)) ??
+      (artifactRegistryProject !== null
+        ? await resolveRegistryDigest(ref, artifactRegistryProject, platform, cli)
+        : null) ??
       (await resolveRegistryDigestAny(ref, cli, platform)) ??
       (cli === "docker" ? await resolveImageDigest(ref, cli, platform) : null);
     if (digest) digests[key] = digest;
@@ -1228,6 +1263,44 @@ export async function discoverNodeCidrsFromCluster(): Promise<string | null> {
   return seen.length > 0 ? seen.join(",") : null;
 }
 
+/** Discover the pod CIDRs declared by the Kubernetes Nodes, without assuming a cloud provider. */
+export async function discoverPodCidrsFromCluster(): Promise<string | null> {
+  const result = await execCapture("kubectl", ["get", "nodes", "-o", "json"]).catch(() => null);
+  if (!result || result.exitCode !== 0) return null;
+  let object: { items?: Array<{ spec?: { podCIDR?: unknown; podCIDRs?: unknown } }> };
+  try {
+    object = JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+  const cidrs: string[] = [];
+  for (const node of object.items ?? []) {
+    const candidates = Array.isArray(node.spec?.podCIDRs)
+      ? node.spec.podCIDRs
+      : node.spec?.podCIDR !== undefined
+        ? [node.spec.podCIDR]
+        : [];
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") return null;
+      const [address, prefix, extra] = candidate.split("/");
+      const family = address ? isIP(address) : 0;
+      const bits = Number(prefix);
+      if (
+        extra !== undefined ||
+        family === 0 ||
+        !Number.isInteger(bits) ||
+        bits < 0 ||
+        (family === 4 && bits > 32) ||
+        (family === 6 && bits > 128)
+      ) {
+        return null;
+      }
+      if (!cidrs.includes(candidate)) cidrs.push(candidate);
+    }
+  }
+  return cidrs.length > 0 ? cidrs.join(",") : null;
+}
+
 /**
  * S22: discover the range(s) the cluster's NODES draw their IPs from, for the strict
  * NetworkPolicy posture's kubelet allowance. Same fail-closed contract as
@@ -1442,6 +1515,21 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // H2: the buildId comes from generateBuildId()/git refs and is spliced into helm
   // --set assignments and image tags — reject helm/shell metacharacters up front.
   assertSafeBuildId(buildId);
+  const compositionSnapshot = loadLocalCompositionPlan(outputDir, metadata);
+  if (compositionSnapshot) {
+    assertCompositionPlanInvocation(compositionSnapshot.plan, {
+      releaseName,
+      namespace,
+      buildId,
+    });
+    if (compositionSnapshot.plan.target.registry.repository !== infra.containerRegistry) {
+      throw new Error(
+        `Composition plan registry ${JSON.stringify(compositionSnapshot.plan.target.registry.repository)} ` +
+          `does not match infrastructure registry ${JSON.stringify(infra.containerRegistry)}. ` +
+          `Rebuild for the selected target.`,
+      );
+    }
+  }
   const pools: string[] = metadata.pools;
   const defaultPool: string | undefined =
     typeof metadata.defaultPool === "string" ? metadata.defaultPool : pools?.[0];
@@ -1527,53 +1615,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // GKE pinning and helm-upgraded whatever context was current; gke→generic pinned the GKE
   // cluster). Nothing here touches the cluster before this point, so ordering it after the build
   // costs nothing.
-  const targetsGke = buildProvider === "gke";
-  const canPinContext = Boolean(targetsGke && infra.projectId && infra.region && releaseName);
-  if (!dryRun && canPinContext) {
-    const clusterName = `${releaseName}-cluster`;
-    console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
-    await execOrThrow("gcloud", [
-      "container",
-      "clusters",
-      "get-credentials",
-      clusterName,
-      "--region",
-      infra.region!,
-      "--project",
-      infra.projectId!,
-      "--quiet",
-    ]);
-  } else if (!canPinContext) {
-    // N29: context pinning is IMPOSSIBLE (no projectId/region in infrastructure.json), so
-    // EVERYTHING below — helm upgrade, the Service selector patches, the state ConfigMap
-    // write — would run against whatever kubectl context happens to be current. This
-    // silently-skipped get-credentials is the same hole destroy's C1 guard closed; deploy
-    // had no equivalent (invariant 6). Surface the context and require confirmation.
+  if (compositionSnapshot) {
     if (dryRun) {
       console.log(
-        `  [dry-run] infrastructure.json is missing projectId/region — kubectl context ` +
-          `pinning is impossible. A real deploy would target whatever kubectl context is ` +
-          `current (and ask you to confirm it).`,
+        `  [dry-run] verified composition plan ${compositionSnapshot.digest}; a real deploy ` +
+          `would verify cluster identity, Kubernetes ` +
+          `${compositionSnapshot.plan.requirements.kubernetes.minimumVersion}+, and every ` +
+          `required API before mutating the release.`,
       );
     } else {
-      const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
-      // L14: the context name is kubeconfig-sourced — strip terminal control chars.
-      const currentContext =
-        ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
-      console.warn(
-        `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
-          `NOT be pinned to this release's cluster.\n` +
-          `      The ENTIRE deploy (helm upgrade, Service selector cutover, deploy-state ` +
-          `ConfigMap) will run against your CURRENT kubectl context:\n` +
-          `      ${currentContext || "(no current context / kubectl unavailable)"}\n`,
-      );
-      if (!yes) {
+      let explicitlyConfirmed = yes === true;
+      if (
+        compositionPlanNeedsExplicitConfirmation(compositionSnapshot.plan) &&
+        !explicitlyConfirmed
+      ) {
+        const context = await currentKubeContext();
+        console.warn(
+          `\n  !!! WARNING: the composition plan cannot prove that the current kubectl ` +
+            `context is the intended cluster:\n      ${context ?? "(no current context / kubectl unavailable)"}\n`,
+        );
         if (!process.stdin.isTTY) {
           throw new Error(
-            "Refusing to deploy against an unpinned kubectl context non-interactively. " +
-              "Restore projectId/region in .k8s-adapter/infrastructure.json (re-run " +
-              "`npx adapter-k8s init`) so the context can be pinned, or re-run with --yes " +
-              "only if the context above is the intended cluster.",
+            "Refusing to deploy an explicitly-unverified composition plan non-interactively. " +
+              "Use a verifiable cluster identity, or re-run with --yes only after confirming " +
+              "the context above.",
           );
         }
         const answer = await promptConfirmation(
@@ -1581,11 +1646,92 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         );
         if (answer.trim() !== "yes") {
           throw new Error(
-            "Deploy aborted: the current kubectl context was not confirmed as the intended " +
-              "cluster. Nothing was changed.",
+            "Deploy aborted: the composition plan's cluster identity was not explicitly " +
+              "confirmed. Nothing was changed.",
           );
         }
+        explicitlyConfirmed = true;
         console.log("");
+      }
+      const preflight = await preflightCompositionPlan(compositionSnapshot.plan, {
+        explicitlyConfirmed,
+      });
+      console.log(
+        `\n  → Composition plan verified: ${preflight.clusterIdentity}; Kubernetes ` +
+          `${preflight.serverVersion}`,
+      );
+      if (preflight.missingOptional.length > 0) {
+        console.warn(
+          `  ! Optional Kubernetes APIs unavailable: ${preflight.missingOptional
+            .map((entry) => `${entry.apiVersion}/${entry.resource}`)
+            .join(", ")}`,
+        );
+      }
+    }
+  } else {
+    // Compatibility path for artifacts emitted before composition plans. New targets carry an
+    // exact access/identity operation above; legacy metadata still uses the historical provider
+    // marker until it is rebuilt.
+    const targetsGke = buildProvider === "gke";
+    const canPinContext = Boolean(targetsGke && infra.projectId && infra.region && releaseName);
+    if (!dryRun && canPinContext) {
+      const clusterName = `${releaseName}-cluster`;
+      console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
+      await execOrThrow("gcloud", [
+        "container",
+        "clusters",
+        "get-credentials",
+        clusterName,
+        "--region",
+        infra.region!,
+        "--project",
+        infra.projectId!,
+        "--quiet",
+      ]);
+    } else if (!canPinContext) {
+      // N29: context pinning is IMPOSSIBLE (no projectId/region in infrastructure.json), so
+      // EVERYTHING below — helm upgrade, the Service selector patches, the state ConfigMap
+      // write — would run against whatever kubectl context happens to be current. This
+      // silently-skipped get-credentials is the same hole destroy's C1 guard closed; deploy
+      // had no equivalent (invariant 6). Surface the context and require confirmation.
+      if (dryRun) {
+        console.log(
+          `  [dry-run] infrastructure.json is missing projectId/region — kubectl context ` +
+            `pinning is impossible. A real deploy would target whatever kubectl context is ` +
+            `current (and ask you to confirm it).`,
+        );
+      } else {
+        const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+        // L14: the context name is kubeconfig-sourced — strip terminal control chars.
+        const currentContext =
+          ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+        console.warn(
+          `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
+            `NOT be pinned to this release's cluster.\n` +
+            `      The ENTIRE deploy (helm upgrade, Service selector cutover, deploy-state ` +
+            `ConfigMap) will run against your CURRENT kubectl context:\n` +
+            `      ${currentContext || "(no current context / kubectl unavailable)"}\n`,
+        );
+        if (!yes) {
+          if (!process.stdin.isTTY) {
+            throw new Error(
+              "Refusing to deploy against an unpinned kubectl context non-interactively. " +
+                "Restore projectId/region in .k8s-adapter/infrastructure.json (re-run " +
+                "`npx adapter-k8s init`) so the context can be pinned, or re-run with --yes " +
+                "only if the context above is the intended cluster.",
+            );
+          }
+          const answer = await promptConfirmation(
+            `  Type "yes" to confirm this kubectl context is the intended cluster: `,
+          );
+          if (answer.trim() !== "yes") {
+            throw new Error(
+              "Deploy aborted: the current kubectl context was not confirmed as the intended " +
+                "cluster. Nothing was changed.",
+            );
+          }
+          console.log("");
+        }
       }
     }
   }
@@ -1616,7 +1762,68 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // entirely, so the secure posture is what an ordinary deploy gets.
   let podCidr: string | null = null;
   let nodeCidr: string | null = null;
-  if (!dryRun && infra.projectId && infra.region && releaseName) {
+  if (!dryRun && compositionSnapshot) {
+    const network = compositionSnapshot.plan.operations.network;
+    const resolvePlanSource = async (
+      source: typeof network.podCidrs,
+      purpose: "pod" | "node",
+    ): Promise<string | null> => {
+      switch (source.kind) {
+        case "not-required":
+          return null;
+        case "static":
+          return source.cidrs.join(",");
+        case "kubernetes-node-pod-cidrs":
+          return discoverPodCidrsFromCluster();
+        case "kubernetes-node-addresses":
+          return discoverNodeCidrsFromCluster();
+        case "gke-pod-range":
+          if (source.location.kind !== "region") {
+            throw new Error(
+              `Composition-plan ${purpose} CIDR discovery uses a zonal GKE location, but ` +
+                `the current GKE discovery operation requires a region. Rebuild with a ` +
+                `regional target or configure static CIDRs.`,
+            );
+          }
+          return discoverClusterPodCidr({
+            clusterName: source.clusterName,
+            region: source.location.name,
+            projectId: source.projectId,
+            allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
+          });
+        case "gke-node-subnet":
+          if (source.location.kind !== "region") {
+            throw new Error(
+              `Composition-plan ${purpose} CIDR discovery uses a zonal GKE location, but ` +
+                `the current GKE discovery operation requires a region. Rebuild with a ` +
+                `regional target or configure static CIDRs.`,
+            );
+          }
+          return discoverClusterNodeCidrs({
+            clusterName: source.clusterName,
+            region: source.location.name,
+            projectId: source.projectId,
+            allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
+          });
+      }
+    };
+    podCidr = await resolvePlanSource(network.podCidrs, "pod");
+    nodeCidr = await resolvePlanSource(network.nodeCidrs, "node");
+    for (const [purpose, source, resolved] of [
+      ["pod", network.podCidrs, podCidr],
+      ["node", network.nodeCidrs, nodeCidr],
+    ] as const) {
+      if (source.kind !== "not-required" && !resolved && !allowNoNetworkPolicy) {
+        throw new Error(
+          `Composition-plan ${purpose} CIDR source ${source.kind} returned no ranges. The ` +
+            `plan's missingSourcePolicy is fail, so refusing to deploy without network ` +
+            `isolation. Fix cluster access, configure static CIDRs, or explicitly pass ` +
+            `--allow-no-network-policy.`,
+        );
+      }
+    }
+  } else if (!dryRun && infra.projectId && infra.region && releaseName) {
+    // Legacy artifacts predate typed network sources and use the historical GKE convention.
     podCidr = await discoverClusterPodCidr({
       clusterName: `${releaseName}-cluster`,
       region: infra.region,
@@ -1756,7 +1963,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // its old mode, so a previously world-readable secret file would stay that way.
     chmodSync(secretPath, 0o600);
     console.log(`    Cache Secret ${releaseName}-valkey staged for Helm → ${url}`);
-  } else if (!cacheManaged && !dryRun) {
+  } else if (!compositionSnapshot && !cacheManaged && !dryRun) {
     // The current build is NOT using the managed cache (disabled entirely, or BYO via
     // cache.url). If a managed Memorystore was previously provisioned for this release
     // (infra.cacheRegion persisted at provision time), tear it down — otherwise the
@@ -1832,6 +2039,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       containerStrategy,
       containerCli,
       targetPlatform: builtTargetPlatform,
+      ...(compositionSnapshot
+        ? {
+            registryAuthentication: compositionSnapshot.plan.target.registry.authentication,
+            includeRoutingService:
+              compositionSnapshot.plan.operations.routing.protocol !== "pool-local-v1",
+          }
+        : {}),
     });
 
     for (const cmd of dockerCommands) {
@@ -1859,7 +2073,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       containerStrategy === "shared-image"
         ? pools.map((p) => [p, `${registry}/nextjs-app:${buildId}`])
         : pools.map((p) => [p, `${registry}/nextjs-app-${p}:${buildId}`]);
-    refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
+    if (
+      !compositionSnapshot ||
+      compositionSnapshot.plan.operations.routing.protocol !== "pool-local-v1"
+    ) {
+      refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
+    }
     Object.assign(
       imageDigests,
       await resolveDeployImageDigests({
@@ -1869,15 +2088,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         allowMutableTags: allowMutableTags ?? false,
         containerCli,
         targetPlatform: builtTargetPlatform,
+        ...(compositionSnapshot
+          ? { digestLookup: compositionSnapshot.plan.target.registry.digestLookup }
+          : {}),
       }),
     );
     const pinned = Object.keys(imageDigests).length;
     if (pinned > 0) console.log(`    Pinned ${pinned} image(s) to immutable digests`);
   }
 
-  // 5. Pre-flight: ensure static IP exists (Gateway needs it)
-  if (!dryRun && infra.projectId) {
-    const ipName = `${releaseName}-ip`;
+  // 5. Pre-flight: ensure the exact address named by a GCP traffic-extension plan exists.
+  // Legacy artifacts retain their historical infrastructure-derived convention.
+  const plannedTrafficExtension = compositionSnapshot
+    ? compositionSnapshot.plan.operations.routing.dataplane.readiness.find(
+        (entry) => entry.kind === "gcp-traffic-extension",
+      )
+    : undefined;
+  const addressProject =
+    plannedTrafficExtension?.projectId ?? (!compositionSnapshot ? infra.projectId : undefined);
+  const addressName = plannedTrafficExtension?.addressName ?? `${releaseName}-ip`;
+  if (!dryRun && addressProject) {
+    const ipName = addressName;
     const ipCheck = await execCapture("gcloud", [
       "compute",
       "addresses",
@@ -1885,7 +2116,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       ipName,
       "--global",
       "--project",
-      infra.projectId,
+      addressProject,
       "--format=value(address)",
     ]);
     if (ipCheck.exitCode !== 0) {
@@ -1897,7 +2128,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         ipName,
         "--global",
         "--project",
-        infra.projectId,
+        addressProject,
         "--quiet",
       ]);
     }
@@ -2835,6 +3066,23 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       console.log("  → ext_proc EnvoyExtensionPolicy accepted ✓");
     }
 
+    if (compositionSnapshot) {
+      console.log("  → Verifying composition-plan readiness...");
+      try {
+        await waitForCompositionPlanReadiness(compositionSnapshot.plan);
+      } catch (error) {
+        const edge = await restoreEdgeToPreviousBuild();
+        throw new Error(
+          [
+            `Composition-plan readiness failed; refusing traffic cutover: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+            ...edgeStatusLines(edge),
+          ].join("\n"),
+        );
+      }
+      console.log("  → Composition-plan resources are ready ✓");
+    }
+
     // 7a-ter. N64: match the outgoing build's CAPACITY before the gate below can pass.
     // The chart renders a new build at its HPA floor (`replicas.min`), while the build
     // being replaced may be sitting far above that after autoscaling under load. Cutting
@@ -3443,6 +3691,19 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         ...(state?.unretainedManifestBuilds ?? []).filter((b) => b === previousBuildId),
         ...(unretainedManifestBuild ? [unretainedManifestBuild] : []),
       ].filter((b, i, all) => all.indexOf(b) === i);
+      const compositionPlans: NonNullable<AdapterState["compositionPlans"]> = {};
+      const previousCompositionPlan = previousBuildId
+        ? state?.compositionPlans?.[previousBuildId]
+        : undefined;
+      if (previousBuildId && previousCompositionPlan) {
+        compositionPlans[previousBuildId] = previousCompositionPlan;
+      }
+      if (compositionSnapshot) {
+        compositionPlans[buildId] = {
+          digest: compositionSnapshot.digest,
+          targetFingerprint: compositionSnapshot.plan.target.fingerprint,
+        };
+      }
       await writeState(
         projectDir,
         {
@@ -3468,6 +3729,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               }
             : {}),
           targetPlatforms,
+          ...(Object.keys(compositionPlans).length > 0 ? { compositionPlans } : {}),
           // The build this deploy just installed serves /readyz, so the NEXT deploy can flip
           // the load balancer's HealthCheckPolicy to readiness without stranding it.
           readinessPathSupported: true,
@@ -3512,7 +3774,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // are dropped — but after the state commit (7d) so a failure here can't leave
     // cluster state pointing at the outgoing build.
     const cdnFilterPath = path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml");
-    if (existsSync(cdnFilterPath) && infra.projectId) {
+    if (!compositionSnapshot && existsSync(cdnFilterPath) && infra.projectId) {
       try {
         await invalidateCdnBuildTag({
           projectId: infra.projectId,
