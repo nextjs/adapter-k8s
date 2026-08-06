@@ -89,18 +89,36 @@ function setupFs({
   infra = BASE_INFRA,
   metadata = { buildId: "buildn", pools: ["ssr"], cacheEnabled: false },
   cdn = true,
+  outputName = "output",
+  infrastructureName = "infrastructure.json",
 }: {
   infra?: InfraFixture;
   metadata?: Record<string, unknown>;
   cdn?: boolean;
+  outputName?: string;
+  infrastructureName?: string;
 } = {}) {
   fixturePools = Array.isArray(metadata.pools) ? (metadata.pools as string[]) : ["ssr"];
+  const fixtureInfraPath = path.join(PROJECT, ".k8s-adapter", infrastructureName);
+  const fixtureOutput = path.join(PROJECT, ".k8s-adapter", outputName);
+  const fixtureMetaPath = path.join(fixtureOutput, "build-metadata.json");
+  const fixtureCdnFilter = path.join(fixtureOutput, "chart", "templates", "cdn-http-filter.yaml");
+  const fixtureRouteExtJobYaml = path.join(
+    fixtureOutput,
+    "chart",
+    "templates",
+    "route-ext-update-job.yaml",
+  );
   vi.mocked(existsSync).mockImplementation(
-    (p) => p === infraPath || p === metaPath || (cdn && p === cdnFilter) || p === routeExtJobYaml,
+    (p) =>
+      p === fixtureInfraPath ||
+      p === fixtureMetaPath ||
+      (cdn && p === fixtureCdnFilter) ||
+      p === fixtureRouteExtJobYaml,
   );
   vi.mocked(readFileSync).mockImplementation((p) => {
-    if (p === infraPath) return JSON.stringify(infra);
-    if (p === metaPath) return JSON.stringify(metadata);
+    if (p === fixtureInfraPath) return JSON.stringify(infra);
+    if (p === fixtureMetaPath) return JSON.stringify(metadata);
     return "";
   });
 }
@@ -499,6 +517,31 @@ describe("runDeploy — orchestration", () => {
       projectDir: PROJECT,
       releaseName: RELEASE,
     });
+  });
+
+  it("builds every container from the selected variant output", async () => {
+    process.env.ADAPTER_K8S_CONFIG = "staging";
+    try {
+      setupFs({
+        outputName: "output.staging",
+        infrastructureName: "infrastructure.staging.json",
+      });
+      vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+      await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+      const dockerBuilds = vi
+        .mocked(execOrThrow)
+        .mock.calls.filter(([cmd, args]) => cmd === "docker" && args.includes("build"))
+        .map(([, args]) => args.join(" "));
+      expect(dockerBuilds).toHaveLength(2);
+      expect(dockerBuilds).toEqual([
+        expect.stringContaining(".k8s-adapter/output.staging/pools/ssr"),
+        expect.stringContaining(".k8s-adapter/output.staging/routing-service"),
+      ]);
+    } finally {
+      delete process.env.ADAPTER_K8S_CONFIG;
+    }
   });
 
   it("new build never healthy: no selector patch, no state commit, non-zero exit, previous keeps serving", async () => {

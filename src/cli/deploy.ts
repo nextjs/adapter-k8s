@@ -1144,7 +1144,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 2. Read build metadata to get buildId and pool names
-  const outputDir = path.join(projectDir, ".k8s-adapter", outputDirName());
+  const outputDirRelative = path.join(".k8s-adapter", outputDirName());
+  const outputDir = path.join(projectDir, outputDirRelative);
   const metadataPath = path.join(outputDir, "build-metadata.json");
   if (!existsSync(metadataPath)) {
     throw new Error(`Build metadata not found at ${metadataPath}. Did next build run?`);
@@ -1159,10 +1160,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
 
-  // TARGET FINGERPRINT. `.k8s-adapter/output` is shared across config variants, and the routing
-  // tier's image registry is baked into its Deployment template at BUILD time — so `--skip-build`
-  // will happily deploy another target's chart. MEASURED: a Scaleway deploy reused a GKE chart
-  // from minutes earlier and its routing pods went ImagePullBackOff trying to pull
+  // TARGET FINGERPRINT. The routing tier's image registry is baked into its Deployment template
+  // at BUILD time, so copied or pre-variant output can still belong to another target. MEASURED:
+  // a Scaleway deploy reused a GKE chart and its routing pods went ImagePullBackOff trying to pull
   // `us-central1-docker.pkg.dev/...` with a 403, after helm had already applied.
   //
   // Refuse before helm instead. This compares what the chart was BUILT for against what we are
@@ -1171,11 +1171,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     typeof metadata.containerRegistry === "string" ? metadata.containerRegistry : undefined;
   if (builtRegistry !== undefined && builtRegistry !== infra.containerRegistry) {
     throw new Error(
-      `The build output in .k8s-adapter/output was emitted for registry ` +
+      `The build output in ${outputDirRelative} was emitted for registry ` +
         `"${builtRegistry}", but this deploy targets "${infra.containerRegistry}". The chart bakes ` +
         `image references at build time, so deploying it would pull another target's images ` +
         `(and fail to authenticate against a registry this cluster cannot reach).\n` +
-        `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the output directory is shared between variants.\n` : ""}` +
+        `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the selected variant output does not match its infrastructure.\n` : ""}` +
         `Re-run without --skip-build so the chart is emitted for this target.`,
     );
   }
@@ -1184,7 +1184,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   const builtNamespace = resolveK8sNamespace(metadata.namespace);
   if (builtNamespace !== namespace) {
     throw new Error(
-      `The build output in .k8s-adapter/output was emitted for namespace ` +
+      `The build output in ${outputDirRelative} was emitted for namespace ` +
         `"${builtNamespace}", but this deploy targets "${namespace}". The ext_proc authority ` +
         `is namespace-qualified at build time, so deploying this chart would make routing ` +
         `callouts target the wrong Service. Re-run without --skip-build so the chart is ` +
@@ -1511,7 +1511,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       pools,
       buildId,
       registry: infra.containerRegistry,
-      outputDir: ".k8s-adapter/output",
+      outputDir: outputDirRelative,
       containerStrategy,
       containerCli,
     });
