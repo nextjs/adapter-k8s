@@ -50,6 +50,112 @@ describe("classifyIntoPools", () => {
     expect(pools.get("api")!.outputs[0]!.pathname).toBe("/api/hello");
   });
 
+  it("treats Next.js dynamic route segments literally inside route selectors", () => {
+    const outputs = mockOutputs({
+      appPages: [
+        mockAppPage({ pathname: "/blog/[slug]" }),
+        mockAppPage({ pathname: "/blog/s" }),
+        mockAppPage({ pathname: "/[locale]/lab/[view]" }),
+        mockAppPage({ pathname: "/l/lab/report" }),
+        mockAppPage({ pathname: "/docs/[...slug]" }),
+        mockAppPage({ pathname: "/docs/." }),
+        mockAppPage({ pathname: "/shop/[[...slug]]" }),
+      ],
+    });
+    const config: K8sAdapterConfig = {
+      pools: {
+        dynamic: {
+          routes: ["/blog/[slug]", "/[locale]/lab/**", "/docs/[...slug]", "/shop/[[...slug]]"],
+        },
+        static: { routes: ["appPages"] },
+      },
+      provider: { gke: {} },
+    };
+
+    const pools = classifyIntoPools(outputs, config);
+    expect(pools.get("dynamic")!.outputs.map((output) => output.pathname)).toEqual([
+      "/blog/[slug]",
+      "/[locale]/lab/[view]",
+      "/docs/[...slug]",
+      "/shop/[[...slug]]",
+    ]);
+    expect(pools.get("static")!.outputs.map((output) => output.pathname)).toEqual([
+      "/blog/s",
+      "/l/lab/report",
+      "/docs/.",
+    ]);
+  });
+
+  it("treats interception-prefixed dynamic segments literally without claiming static decoys", () => {
+    const outputs = mockOutputs({
+      appPages: [
+        // Real App Router output shape from fixtures/interception.
+        mockAppPage({ pathname: "/[locale]/(.)[username]/p/[id]" }),
+        mockAppPage({ pathname: "/[locale]/(.)u/p/[id]" }),
+        mockAppPage({ pathname: "/feed/(..)[...slug]" }),
+        mockAppPage({ pathname: "/feed/(..)s" }),
+        mockAppPage({ pathname: "/root/(...)[[...slug]]" }),
+        mockAppPage({ pathname: "/root/(...)s" }),
+        mockAppPage({ pathname: "/nested/(..)(..)[slug]" }),
+        mockAppPage({ pathname: "/nested/(..)(..)s" }),
+      ],
+    });
+    const config: K8sAdapterConfig = {
+      pools: {
+        intercepted: {
+          routes: [
+            "/[locale]/(.)[username]/p/[id]",
+            "/feed/(..)[...slug]",
+            "/root/(...)[[...slug]]",
+            "/nested/(..)(..)[slug]",
+          ],
+        },
+        static: { routes: ["appPages"] },
+      },
+      provider: { gke: {} },
+    };
+
+    const pools = classifyIntoPools(outputs, config);
+    expect(pools.get("intercepted")!.outputs.map((output) => output.pathname)).toEqual([
+      "/[locale]/(.)[username]/p/[id]",
+      "/feed/(..)[...slug]",
+      "/root/(...)[[...slug]]",
+      "/nested/(..)(..)[slug]",
+    ]);
+    expect(pools.get("static")!.outputs.map((output) => output.pathname)).toEqual([
+      "/[locale]/(.)u/p/[id]",
+      "/feed/(..)s",
+      "/root/(...)s",
+      "/nested/(..)(..)s",
+    ]);
+  });
+
+  it("keeps minimatch syntax for ordinary static route globs", () => {
+    const outputs = mockOutputs({
+      appPages: [
+        mockAppPage({ pathname: "/reports/2025/weekly" }),
+        mockAppPage({ pathname: "/reports/2026/monthly" }),
+        mockAppPage({ pathname: "/api/v1/users" }),
+        mockAppPage({ pathname: "/api/v3/users" }),
+      ],
+    });
+    const config: K8sAdapterConfig = {
+      pools: {
+        selected: { routes: ["/reports/{2025,2026}/**", "/api/v[12]/**"] },
+        rest: { routes: ["appPages"] },
+      },
+      provider: { gke: {} },
+    };
+
+    const pools = classifyIntoPools(outputs, config);
+    expect(pools.get("selected")!.outputs.map((output) => output.pathname)).toEqual([
+      "/reports/2025/weekly",
+      "/reports/2026/monthly",
+      "/api/v1/users",
+    ]);
+    expect(pools.get("rest")!.outputs.map((output) => output.pathname)).toEqual(["/api/v3/users"]);
+  });
+
   it("uses first-match-wins — earlier pool takes precedence", () => {
     const outputs = mockOutputs({
       appPages: [mockAppPage({ pathname: "/dashboard" })],

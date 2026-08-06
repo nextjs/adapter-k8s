@@ -1,5 +1,5 @@
 // src/classify.ts
-import { minimatch } from "minimatch";
+import { escape, minimatch } from "minimatch";
 import type { AdapterOutput, AdapterOutputs, K8sAdapterConfig, PoolDefinition } from "./types.js";
 
 type FunctionOutput =
@@ -17,6 +17,24 @@ const OUTPUT_TYPE_KEYS: Record<
   pages: "pages",
   pagesApi: "pagesApi",
 };
+
+// Pool selectors are globs over the route template pathnames emitted by Next, not over
+// concrete request URLs. A full segment such as `[slug]` therefore names that literal route
+// template. Passing it straight to minimatch instead treats the brackets as a character class:
+// `/blog/[slug]` misses the dynamic output and can claim an unrelated `/blog/s` route instead.
+// Interception markers are glued to the segment they target (`(.)[user]`,
+// `(..)(..)[...slug]`) and remain present in Next's output pathname. Treat that whole form as
+// literal too; otherwise the dynamic tail is still a minimatch character class and can claim a
+// static interception output such as `(.)u`. Ordinary glob syntax such as `v[12]`, `*`, `**`,
+// braces, and extglobs keeps its minimatch meaning outside these Next-specific segment forms.
+const NEXT_DYNAMIC_SEGMENT = /^(?:\(\.{1,3}\))*(?:\[(?:\.\.\.)?[^/[\]]+\]|\[\[\.\.\.[^/[\]]+\]\])$/;
+
+function normalizeRouteSelector(selector: string): string {
+  return selector
+    .split("/")
+    .map((segment) => (NEXT_DYNAMIC_SEGMENT.test(segment) ? escape(segment) : segment))
+    .join("/");
+}
 
 export function classifyIntoPools(
   outputs: AdapterOutputs,
@@ -36,12 +54,13 @@ export function classifyIntoPools(
       if (typeKey) {
         candidates = outputs[typeKey] as FunctionOutput[];
       } else {
+        const selector = normalizeRouteSelector(routeSpec);
         candidates = [
           ...outputs.appPages,
           ...outputs.appRoutes,
           ...outputs.pages,
           ...outputs.pagesApi,
-        ].filter((o) => minimatch(o.pathname, routeSpec));
+        ].filter((o) => minimatch(o.pathname, selector));
       }
 
       if (candidates.length > 0) specsWithCandidates.add(routeSpec);
