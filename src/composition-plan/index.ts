@@ -1,30 +1,18 @@
-// src/index.ts
-import { createK8sAdapter } from "./adapter.js";
-export { createK8sAdapter };
 export {
-  COMPOSITION_PLAN_API_VERSION,
-  COMPOSITION_PLAN_KIND,
-  MINIMUM_KUBERNETES_VERSION,
   assertKubernetesMinimumVersion,
   assertKubernetesServerVersion,
+  parseCompositionPlan,
+} from "./parse.js";
+export {
   canonicalCompositionPlanJson,
   fingerprintCompositionPlan,
   parseAndFingerprintCompositionPlan,
   parseAndVerifyCompositionPlan,
-  parseCompositionPlan,
-} from "./composition-plan/index.js";
-
-// Default instance for zero-config use via adapterPath: '@next-community/adapter-k8s'
-// It will attempt to load adapter.config.ts from the project root.
-const defaultAdapter = createK8sAdapter();
-export default defaultAdapter;
-
-export type {
-  K8sAdapterConfig,
-  PoolConfig,
-  GKEProviderConfig,
-  RoutingManifest,
-  PoolManifest,
+} from "./fingerprint.js";
+export {
+  COMPOSITION_PLAN_API_VERSION,
+  COMPOSITION_PLAN_KIND,
+  MINIMUM_KUBERNETES_VERSION,
 } from "./types.js";
 export type {
   CacheProvisioning,
@@ -51,4 +39,4 @@ export type {
   RetainedExternalResource,
   RoutingPlan,
   RoutingReadiness,
-} from "./composition-plan/index.js";
+} from "./types.js";
