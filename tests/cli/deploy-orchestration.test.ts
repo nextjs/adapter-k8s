@@ -259,10 +259,10 @@ function happyCluster(
     newBuildReplicasProbeFails?: boolean;
     podReplicas?: number;
     readyPerPool?: Record<string, number>;
-    // N67: the chart-rendered HPA the new build's Deployment is bound to. `null` = the
-    // pool has no HPA at all (autoscaling disabled). Default min 1 / max 3 mirrors
-    // renderValuesYaml, and covers DEFAULT_PREV_LIVE.replicas so the common case needs
-    // no widening at all.
+    // N67: the chart-rendered HPA the new build's Deployment is bound to. `null` simulates
+    // a partial Helm apply where that required object is missing. Default min 1 / max 3
+    // mirrors renderValuesYaml and covers DEFAULT_PREV_LIVE.replicas, so the common case
+    // needs no widening at all.
     newBuildHpa?: { min?: number; max: number } | null;
     newBuildHpaReadFails?: boolean;
     newBuildHpaPatchFails?: boolean;
@@ -2763,7 +2763,7 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       readyPerPool: { ssr: 6 },
     });
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      if (args.includes("patch") && args.includes("hpa")) {
+      if (args[0] === "patch" && args[1] === "hpa" && (args.at(-1) ?? "").includes('"spec"')) {
         if (warmSeen) return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
         warmSeen = true;
       }
@@ -2778,6 +2778,41 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     );
     expect(warned).toContain(`patch hpa ${NEW_HPA}`);
     expect(warned).toContain('"minReplicas":1,"maxReplicas":3');
+    const hpaPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) =>
+          args[0] === "patch" && args[1] === "hpa" && (args.at(-1) ?? "").includes('"spec"'),
+      );
+    expect(hpaPatches).toHaveLength(4); // temporary bounds + three restore attempts
+  });
+
+  it("retries a transient chart-bounds restore failure", async () => {
+    let hpaPatches = 0;
+    const cluster = happyCluster(events, {
+      prevLive: { replicas: 6 },
+      newBuildReplicas: 1,
+      newBuildHpa: { min: 1, max: 3 },
+      readyPerPool: { ssr: 6 },
+    });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "patch" && args[1] === "hpa" && (args.at(-1) ?? "").includes('"spec"')) {
+        hpaPatches++;
+        if (hpaPatches === 2) {
+          return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
+        }
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(hpaPatches).toBe(3); // temporary bounds + failed restore + successful retry
+    expect(events.filter((event) => event.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
+    ]);
+    expect(printedWarnings()).not.toContain(`Could not restore ${NEW_HPA}`);
   });
 
   it("leaves the HPA alone when its floor already covers the outgoing capacity", async () => {
@@ -2955,7 +2990,7 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     }
   });
 
-  it("needs no temporary bounds when the pool has no HPA at all", async () => {
+  it("aborts when Helm did not create the pool's expected HPA", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2965,10 +3000,49 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/expected HPA.*was not found.*partially applied build/s);
 
-    expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
+    expect(events).toContain("revert-edge");
+    expect(events.some((event) => event.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((event) => event.startsWith("patch:rel-ssr"))).toBe(false);
+    expect(writeState).not.toHaveBeenCalled();
     expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
+  });
+
+  it("requires the expected HPA for a newly added pool too", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false },
+    });
+    const apiHpa = poolResourceNames(RELEASE, "api", "buildn").hpa;
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args[2] === "rel-api-buildm" &&
+        args.includes("--ignore-not-found") &&
+        args.includes("json")
+      ) {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "service" && args[2] === "rel-api") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "hpa" && args[2] === apiHpa) {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(new RegExp(`expected HPA ${apiHpa} was not found`));
+
+    expect(events.some((event) => event.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(writeState).not.toHaveBeenCalled();
   });
 });
 
