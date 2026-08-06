@@ -4,6 +4,7 @@ import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
+import { splitCookiesString } from "next/dist/server/web/utils.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
@@ -63,14 +64,9 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
     if (lower === "x-next-cache-tags") continue;
     headers[key] = value;
   }
-  const setCookies =
-    webHeaders.getSetCookie?.() ??
-    (webHeaders.has("set-cookie")
-      ? webHeaders
-          .get("set-cookie")!
-          .split(/,(?=[^;]*=)/)
-          .map((c) => c.trim())
-      : []);
+  const setCookies = webHeaders
+    .getSetCookie()
+    .flatMap((maybeCompoundCookie) => splitCookiesString(maybeCompoundCookie));
   if (setCookies.length > 0) headers["set-cookie"] = setCookies;
   return headers;
 }
@@ -435,6 +431,10 @@ export function mergeResolvedHeadersIntoHeadersArg(
 ): unknown {
   if (headersArg === undefined || headersArg === null) return headersArg;
 
+  const resolvedSetCookies = resolvedHeaders
+    .getSetCookie()
+    .flatMap((maybeCompoundCookie) => splitCookiesString(maybeCompoundCookie));
+
   if (Array.isArray(headersArg)) {
     const pairs: [string, unknown][] = [];
     if (headersArg.length > 0 && !Array.isArray(headersArg[0])) {
@@ -448,17 +448,13 @@ export function mergeResolvedHeadersIntoHeadersArg(
       }
     }
     for (const [key, value] of resolvedHeaders.entries()) {
-      if (key.toLowerCase() === "set-cookie") {
-        for (const c of value.split(/,(?=[^;]*=)/)) {
-          pairs.push(["set-cookie", c.trim()]);
-        }
-      } else {
-        for (let i = pairs.length - 1; i >= 0; i--) {
-          if (pairs[i]![0].toLowerCase() === key.toLowerCase()) pairs.splice(i, 1);
-        }
-        pairs.push([key, value]);
+      if (key.toLowerCase() === "set-cookie") continue;
+      for (let i = pairs.length - 1; i >= 0; i--) {
+        if (pairs[i]![0].toLowerCase() === key.toLowerCase()) pairs.splice(i, 1);
       }
+      pairs.push([key, value]);
     }
+    for (const cookie of resolvedSetCookies) pairs.push(["set-cookie", cookie]);
     // Tuple form back to Node — it accepts tuples regardless of the input shape.
     return pairs;
   }
@@ -466,29 +462,26 @@ export function mergeResolvedHeadersIntoHeadersArg(
   if (typeof headersArg === "object") {
     const handlerHeaders = headersArg as Record<string, string | string[]>;
     for (const [key, value] of resolvedHeaders.entries()) {
-      if (key.toLowerCase() === "set-cookie") {
-        const existingKey = Object.keys(handlerHeaders).find(
-          (name) => name.toLowerCase() === "set-cookie",
-        );
-        const existing = existingKey ? handlerHeaders[existingKey] : undefined;
-        const arr: string[] = [];
-        if (existing) {
-          if (Array.isArray(existing)) arr.push(...existing);
-          else arr.push(existing);
+      if (key.toLowerCase() === "set-cookie") continue;
+      for (const existingKey of Object.keys(handlerHeaders)) {
+        if (existingKey.toLowerCase() === key.toLowerCase()) {
+          delete handlerHeaders[existingKey];
         }
-        for (const c of value.split(/,(?=[^;]*=)/)) {
-          arr.push(c.trim());
-        }
-        if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
-        handlerHeaders["set-cookie"] = arr;
-      } else {
-        for (const existingKey of Object.keys(handlerHeaders)) {
-          if (existingKey.toLowerCase() === key.toLowerCase()) {
-            delete handlerHeaders[existingKey];
-          }
-        }
-        handlerHeaders[key] = value;
       }
+      handlerHeaders[key] = value;
+    }
+    if (resolvedSetCookies.length > 0) {
+      const existingKey = Object.keys(handlerHeaders).find(
+        (name) => name.toLowerCase() === "set-cookie",
+      );
+      const existing = existingKey ? handlerHeaders[existingKey] : undefined;
+      const cookies = Array.isArray(existing)
+        ? [...existing, ...resolvedSetCookies]
+        : existing
+          ? [existing, ...resolvedSetCookies]
+          : resolvedSetCookies;
+      if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
+      handlerHeaders["set-cookie"] = cookies;
     }
     return handlerHeaders;
   }
@@ -507,7 +500,7 @@ export function applyMiddlewareRequestHeaders(
   for (const [key, value] of middlewareRequestHeaders.entries()) {
     if (key === "x-middleware-set-cookie") {
       const cookies: string[] = [];
-      for (const setCookie of value.split(/,(?=[^;]*=)/)) {
+      for (const setCookie of splitCookiesString(value)) {
         const nameValue = setCookie.trim().split(";")[0];
         if (nameValue) cookies.push(nameValue);
       }
