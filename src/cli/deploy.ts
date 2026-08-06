@@ -2646,21 +2646,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // reconciles the manual scale below straight back down within one control loop, and the
     // gate at 7b then waits for a count that can NEVER be reached: the deploy burned the
     // whole health budget and aborted BEFORE cutover, i.e. the capacity gate blocked every
-    // such deploy. So raise the ceiling for the warm-up, remember the chart-rendered value,
-    // and put it back on EVERY exit path (success AND abort) — an aborted deploy must not
-    // leave a widened autoscaler behind on the build it abandoned.
-    //
-    // Only `maxReplicas` is touched. `minReplicas` cannot undo the scale-up inside this
-    // window: HPA scale-DOWN is gated by `behavior.scaleDown.stabilizationWindowSeconds`
-    // (300s by default) while the gate below is bounded at 120s, so widening the floor too
-    // would be a second mutation to restore for no reachability gain — and after cutover
-    // real load, under the chart's own bounds, is exactly what should decide the count.
-    const widenedHpas: { name: string; max: number }[] = [];
-    let widenedHpasRestored = false;
-    const restoreWidenedHpas = async (): Promise<void> => {
-      if (widenedHpasRestored) return;
-      widenedHpasRestored = true; // idempotent: every exit path calls this
-      for (const { name, max } of widenedHpas) {
+    // such deploy. Raising only maxReplicas is not enough: an idle new build has no load,
+    // so the HPA's desired count remains its configured minReplicas and it can reconcile a
+    // manual `kubectl scale` straight back to that floor. Do not assume a scale-down
+    // stabilization window protects the warm-up — that behavior is configurable and is not
+    // part of the generated HPA. Temporarily lift BOTH bounds around the capacity gate,
+    // remember their exact chart-rendered values, and put both back on EVERY exit path
+    // (success AND abort). After cutover, real load under the chart's own bounds decides the
+    // count again.
+    const warmedHpas: { name: string; min: number; max: number }[] = [];
+    let warmedHpasRestored = false;
+    const restoreWarmedHpas = async (): Promise<void> => {
+      if (warmedHpasRestored) return;
+      warmedHpasRestored = true; // idempotent: every exit path calls this
+      for (const { name, min, max } of warmedHpas) {
         const restore = await execCapture("kubectl", [
           "patch",
           "hpa",
@@ -2672,27 +2671,34 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
           "--field-manager=helm",
           "-p",
-          JSON.stringify({ spec: { maxReplicas: max } }),
+          JSON.stringify({ spec: { minReplicas: min, maxReplicas: max } }),
         ]);
         if (restore.exitCode === 0) {
-          console.log(`  → Restored ${name} to the chart's maxReplicas=${max}`);
+          console.log(`  → Restored ${name} to the chart's minReplicas=${min}, maxReplicas=${max}`);
         } else {
           console.warn(
-            `  ! Could not restore ${name} to the chart's maxReplicas=${max} ` +
-              `(${restore.stderr.trim() || `exit ${restore.exitCode}`}) — it is STILL widened ` +
-              `for the pre-cutover warm-up, so this pool may autoscale above its configured ` +
-              `ceiling until the next \`helm upgrade\` re-renders it. Fix it with: kubectl -n ` +
+            `  ! Could not restore ${name} to the chart's minReplicas=${min}, ` +
+              `maxReplicas=${max} (${restore.stderr.trim() || `exit ${restore.exitCode}`}) — ` +
+              `it still has the temporary pre-cutover bounds, so this pool may retain warm-up ` +
+              `capacity until the next \`helm upgrade\` re-renders it. Fix it with: kubectl -n ` +
               `${namespace} patch hpa ${name} --type=merge -p ` +
-              `'{"spec":{"maxReplicas":${max}}}'`,
+              `'{"spec":{"minReplicas":${min},"maxReplicas":${max}}}'`,
           );
         }
       }
     };
 
-    // N67: the per-pool count the gate at 7b requires. Starts at the outgoing build's live
-    // count and is only ever LOWERED — to a ceiling we could not raise, because asking for
-    // more than the autoscaler permits is unreachable by construction.
-    //
+    // A partial warm-up setup cannot safely continue. If the HPA cannot be read, its
+    // original bounds cannot be restored; if the temporary patch is rejected, it may
+    // immediately lower the idle Deployment again. Restore every pool already prepared and
+    // put ext_proc back on the serving build before failing, without waiting out the health
+    // budget for a capacity target that is not stable.
+    const abortWarmupSetup = async (message: string): Promise<never> => {
+      const edge = await restoreEdgeToPreviousBuild();
+      await restoreWarmedHpas();
+      throw new Error([message, ...edgeStatusLines(edge)].join("\n"));
+    };
+
     // S18: seeded from EVERY configured pool at a floor of one, not only from pools with a
     // live predecessor. previousReplicasByPool has no entry for a pool that is new in this
     // build, nor for any pool on a first deploy, so those pools used to contribute no
@@ -2708,11 +2714,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
     const shortfalls: string[] = [];
     for (const [poolName, outgoing] of previousReplicasByPool) {
-      const { deployment: newDeployName, hpa: newHpaName } = poolResourceNames(
-        releaseName,
-        poolName,
-        buildId,
-      );
+      const { hpa: newHpaName } = poolResourceNames(releaseName, poolName, buildId);
 
       // N67: machine-readable HPA probe — `--ignore-not-found` makes a genuinely absent
       // HPA (autoscaling disabled for the pool) exit 0 with empty stdout, so a non-zero
@@ -2728,26 +2730,43 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "jsonpath={.metadata.name}|{.spec.minReplicas}|{.spec.maxReplicas}",
       ]);
       if (hpaRead.exitCode !== 0) {
-        console.warn(
-          `  ! Could not read the new build's HPA ${newHpaName} (kubectl exited ` +
-            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${hpaRead.stderr.trim()}` : ""}) — ` +
-            `if its maxReplicas is below ${outgoing} it will undo the scale-up below and the ` +
-            `capacity gate cannot be satisfied.`,
+        await abortWarmupSetup(
+          `Could not read the new build's HPA ${newHpaName} (kubectl exited ` +
+            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${hpaRead.stderr.trim()}` : ""}). ` +
+            `Refusing to warm pool "${poolName}" because its original bounds cannot be ` +
+            `preserved or its capacity kept stable. Nothing was cut over.`,
         );
-      } else {
-        const [hpaFound, hpaMinField, hpaMaxField] = hpaRead.stdout.trim().split("|");
-        const hpaMin = parseInt(hpaMinField ?? "", 10);
-        const hpaMax = parseInt(hpaMaxField ?? "", 10);
-        if (hpaFound && Number.isFinite(hpaMax) && hpaMax < outgoing) {
-          // maxReplicas must stay >= minReplicas (the API server rejects otherwise); an
-          // unset minReplicas defaults to 1, which is also what the chart renders.
-          const widened = Math.max(outgoing, Number.isFinite(hpaMin) ? hpaMin : 1);
-          console.log(
-            `  → Widening ${newHpaName} maxReplicas ${hpaMax} → ${widened} so the warm-up to ` +
-              `the outgoing build's ${outgoing} replicas is not autoscaled back down ` +
-              `(restored to ${hpaMax} after cutover)`,
+      }
+
+      const [hpaFound, hpaMinField, hpaMaxField] = hpaRead.stdout.trim().split("|");
+      if (hpaFound) {
+        const hpaMin = Number(hpaMinField);
+        const hpaMax = Number(hpaMaxField);
+        if (
+          !Number.isInteger(hpaMin) ||
+          hpaMin < 1 ||
+          !Number.isInteger(hpaMax) ||
+          hpaMax < hpaMin
+        ) {
+          await abortWarmupSetup(
+            `Could not parse the new build's HPA ${newHpaName} bounds ` +
+              `(minReplicas=${JSON.stringify(hpaMinField ?? "")}, ` +
+              `maxReplicas=${JSON.stringify(hpaMaxField ?? "")}). Refusing to warm pool ` +
+              `"${poolName}" because its original bounds cannot be restored safely. ` +
+              `Nothing was cut over.`,
           );
-          const widen = await execCapture("kubectl", [
+        }
+
+        if (hpaMin < outgoing) {
+          const warmMin = outgoing;
+          const warmMax = Math.max(hpaMax, warmMin);
+          console.log(
+            `  → Warming ${newHpaName} at minReplicas=${warmMin}, ` +
+              `maxReplicas=${warmMax} so the idle new pool keeps the outgoing build's ` +
+              `${outgoing} replicas (restored to minReplicas=${hpaMin}, ` +
+              `maxReplicas=${hpaMax} after cutover)`,
+          );
+          const warm = await execCapture("kubectl", [
             "patch",
             "hpa",
             newHpaName,
@@ -2756,29 +2775,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "--type=merge",
             "--field-manager=helm",
             "-p",
-            JSON.stringify({ spec: { maxReplicas: widened } }),
+            JSON.stringify({ spec: { minReplicas: warmMin, maxReplicas: warmMax } }),
           ]);
-          if (widen.exitCode === 0) {
-            widenedHpas.push({ name: newHpaName, max: hpaMax });
-          } else {
-            // The ceiling stands, so asking the gate for more than it allows would hang the
-            // deploy until the health budget expired and then abort — a deploy-blocking
-            // failure for a pool that simply cannot exceed its configured maximum. Lower
-            // the target to what the autoscaler permits and say so.
-            capacityTargets.set(poolName, hpaMax);
-            console.warn(
-              `  ! Could not widen ${newHpaName} to maxReplicas=${widened} ` +
-                `(${widen.stderr.trim() || `exit ${widen.exitCode}`}). That HPA caps pool ` +
-                `"${poolName}" at ${hpaMax} replicas, below the outgoing build's ${outgoing} — ` +
-                `cutting over at ${hpaMax} (the configured ceiling, the most this pool can ` +
-                `ever run under this chart) instead of waiting for a count the autoscaler ` +
-                `forbids. Raise pools.${poolName}.replicas.max in adapter config if the ` +
-                `outgoing capacity is what this pool actually needs.`,
+          if (warm.exitCode !== 0) {
+            await abortWarmupSetup(
+              `Could not set temporary warm-up bounds on ${newHpaName} ` +
+                `(minReplicas=${warmMin}, maxReplicas=${warmMax}; ` +
+                `${warm.stderr.trim() || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
+                `scale or cut over pool "${poolName}" because its HPA could immediately ` +
+                `remove the required capacity. Nothing was cut over.`,
             );
           }
+          warmedHpas.push({ name: newHpaName, min: hpaMin, max: hpaMax });
         }
       }
+    }
 
+    // Prepare every autoscaler before scaling any Deployment. A read or admission failure
+    // on a later pool then restores the earlier HPA patches without leaving part of the new
+    // build manually scaled above its chart state.
+    for (const [poolName, outgoing] of previousReplicasByPool) {
+      const { deployment: newDeployName } = poolResourceNames(releaseName, poolName, buildId);
       const expected = capacityTargets.get(poolName) ?? outgoing;
       const cur = await execCapture("kubectl", [
         "get",
@@ -2873,9 +2890,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           if (component) readyByPool.set(component, (readyByPool.get(component) ?? 0) + 1);
         }
       }
-      // Per-pool capacity check against the build being replaced (N67: against the
-      // possibly-lowered target, so an autoscaler ceiling we could not raise aborts the
-      // deploy here only when the pods really are short of that ceiling).
+      // Per-pool capacity check against the build being replaced.
       const missing: string[] = [];
       for (const [poolName, expected] of capacityTargets) {
         const ready = readyByPool.get(poolName) ?? 0;
@@ -2897,9 +2912,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // `helm upgrade` (stable manifest ConfigMap + in-place routing Deployment), so
       // "no cutover performed" was only ever true of the POOLS.
       const edge = await restoreEdgeToPreviousBuild();
-      // N67: and the warm-up widening goes back before we leave — this build is being
-      // abandoned, so it must not keep the right to autoscale past its chart ceiling.
-      await restoreWidenedHpas();
+      // N67: and both temporary warm-up bounds go back before we leave — this build is
+      // being abandoned, so it must not keep the raised replica floor.
+      await restoreWarmedHpas();
       console.error(`\n  DEPLOY FAILED: New build did not become healthy within 2 minutes.`);
       console.error(
         `  The previous build's pools are still serving traffic. No pool cutover was performed.`,
@@ -3079,8 +3094,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       }
       // N25: the pools stay on the previous build, so the edge must too.
       const edge = await restoreEdgeToPreviousBuild();
-      // N67: restore the chart's autoscaling ceiling on the build we are abandoning.
-      await restoreWidenedHpas();
+      // N67: restore the chart's autoscaling bounds on the build we are abandoning.
+      await restoreWarmedHpas();
       console.error(`\n  DEPLOY FAILED: traffic was NOT switched to the new build.`);
       console.error(
         `  ${patchFailures.length} of ${pools.length} pool Service selector patch(es) failed:`,
@@ -3167,10 +3182,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         namespace,
       );
     } catch (err) {
-      // N67: the warm-up widening is scoped to the warm-up on this path too — traffic HAS
+      // N67: the temporary warm-up bounds are scoped to the warm-up on this path too — traffic HAS
       // switched, so the chart's own bounds are the right ones to autoscale under, and a
-      // deploy that exits here must not leave a widened autoscaler for the operator to find.
-      await restoreWidenedHpas();
+      // deploy that exits here must not leave a raised replica floor for the operator to find.
+      await restoreWarmedHpas();
       console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
       // L14: the error wraps cluster-sourced write/read failures.
       console.error(`  ${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}`);
@@ -3189,7 +3204,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // never be able to lose a confirmed cutover) and BEFORE the best-effort steps below, so
     // the HPA is chart-intended on every path out of this function. Scaling DOWN from here
     // is the autoscaler's decision under real load, bounded by the operator's config.
-    await restoreWidenedHpas();
+    await restoreWarmedHpas();
 
     // 7e. State is durable. Now invalidate the PREVIOUS build's Cloud CDN entries
     // (best-effort, non-fatal; TTL self-heals) so its stale content stops serving.
