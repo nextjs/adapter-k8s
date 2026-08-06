@@ -1358,15 +1358,24 @@ export async function runRollback(options: {
   // already points at the previous build but either version remains safe to select during
   // recovery.
   try {
+    // A rollback swaps the two build pointers; it does not create a new build. Preserve every
+    // other durable state field by default so per-build provenance remains available in BOTH
+    // directions. Keeping an allowlist here already lost routingImageDigests and
+    // unretainedManifestBuilds in production, which made the next rollback downgrade the edge
+    // from an immutable digest to a mutable tag and hid the retained-manifest warning.
+    //
+    // generation/updatedAt belong to writeState, and readinessPathSupported is the one
+    // deliberate exception: it describes the build that is NOW serving, so rolling back to an
+    // older build must conservatively clear it (see below).
+    const { generation, updatedAt, readinessPathSupported, ...durableState } = state;
+    void updatedAt;
+    void readinessPathSupported;
     await writeState(
       projectDir,
       {
+        ...durableState,
         buildId: previousBuildId,
         previousBuildId: currentBuildId,
-        // M13: carry the recorded per-build CDN tags verbatim — a rollback keeps both
-        // builds in play, and each build's tag is only ever the one recorded at ITS
-        // deploy (re-deriving under newer code is exactly the M13 failure).
-        ...(state.cdnTags ? { cdnTags: state.cdnTags } : {}),
         // `readinessPathSupported` is deliberately NOT carried forward. It means "the build
         // now serving answers /readyz", and after a rollback the serving build is an OLDER
         // one that may predate it — so dropping it is the conservative answer, and the next
@@ -1382,7 +1391,7 @@ export async function runRollback(options: {
         // so a post-cutover cluster outage stamped local generation 1 while the stale
         // cluster record sat at N — and readState prefers the higher generation, so the
         // next operation re-drained the build this rollback had just switched TO.
-        basedOnGeneration: state.generation ?? null,
+        basedOnGeneration: generation ?? null,
       },
       releaseName,
       namespace,
