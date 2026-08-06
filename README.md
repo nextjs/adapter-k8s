@@ -36,7 +36,8 @@ Middleware, PPR, cache components, and ISR are verified through the upstream Nex
 - A Kubernetes cluster:
   - **GKE** (Autopilot or Standard) for `provider.gke`, plus `gcloud` in PATH
   - **any conformant cluster** for `provider.generic`, with [Envoy Gateway](https://gateway.envoyproxy.io/) installed and a CNI that enforces NetworkPolicy
-- `kubectl` and `helm` in PATH, plus a container runtime—`docker`, `podman`, or `nerdctl`
+- `kubectl` and Helm >= 3.2 in PATH, plus a container runtime—`docker`, `podman`, or `nerdctl`.
+  Helm 3 uses its client-side upgrade path; Helm 4 uses server-side apply.
 
 Emitted container images run **Node 24** (the generated routing manifest requires it; the build fails on older bases rather than 500ing at runtime).
 
@@ -352,6 +353,13 @@ instead. That is why the generic provider's CNI must actually enforce policy—s
 ### Blue/green deploys
 
 Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target; `rollback` scales it up, reverts the routing tier to that build's image and manifest, and patches the selector back.
+
+Use `npx adapter-k8s rollback`, not `helm rollback`. Helm revisions are reconciliation snapshots
+captured before the adapter's verified Service-selector cutover, not application release
+checkpoints. A raw Helm rollback does not restore adapter state, routing state, pool capacity, or
+CDN state, and can restore a pre-cutover stable Service selector. On Helm 4 it can also conflict
+with HPA-owned Deployment replicas; `--force-conflicts` bypasses that conflict but does not make
+the rollback safe.
 
 ## CI/CD
 

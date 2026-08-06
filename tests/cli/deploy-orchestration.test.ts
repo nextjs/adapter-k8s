@@ -66,6 +66,16 @@ const routeExtJobYaml = path.join(
   "route-ext-update-job.yaml",
 );
 
+const HELM_4_UPGRADE_HELP = `
+      --create-namespace   if --install is set, create the release namespace
+      --force-conflicts    if set server-side apply will force changes against conflicts
+      --server-side string    must be "true", "false" or "auto"
+`;
+
+const HELM_3_UPGRADE_HELP = `
+      --create-namespace   if --install is set, create the release namespace
+`;
+
 interface InfraFixture {
   projectId?: string;
   region?: string;
@@ -194,6 +204,9 @@ function happyCluster(
   return vi.fn(async (_cmd: string, args: string[]) => {
     const j = args.join(" ");
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+    if (_cmd === "helm" && args[0] === "upgrade" && args.includes("--help")) {
+      return ok(HELM_4_UPGRADE_HELP);
+    }
     // N87 (before the generic `secret` branch below, which answers the cache-Secret delete).
     if (args[0] === "get" && args[1] === "secret" && args.includes("--ignore-not-found")) {
       if (overrides.legacySecretProbeFails) {
@@ -522,6 +535,9 @@ describe("runDeploy — orchestration", () => {
     // Helm pinned to the namespace init binds Workload Identity to.
     const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
     expect(helmCall?.[1].join(" ")).toContain("--namespace default --create-namespace");
+    expect(helmCall?.[1]).not.toContain("--take-ownership");
+    expect(helmCall?.[1]).toContain("--server-side=true");
+    expect(helmCall?.[1]).toContain("--force-conflicts");
     // Docker push happened for the pool and the routing service.
     const dockerCalls = vi
       .mocked(execOrThrow)
@@ -624,6 +640,39 @@ describe("runDeploy — orchestration", () => {
     expect(events).toContain("delete-hpa:rel-ssr-buildm-hpa");
     expect(events).not.toContain("scale:deployment/rel-ssr-buildm");
     expect(printedWarnings()).toContain("could immediately undo a scale to zero");
+  });
+
+  it("uses Helm 3's client-side upgrade without passing Helm 4-only flags", async () => {
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "helm" && args[0] === "upgrade" && args.includes("--help")) {
+        return { exitCode: 0, stdout: HELM_3_UPGRADE_HELP, stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
+    expect(helmCall?.[1]).not.toContain("--take-ownership");
+    expect(helmCall?.[1]).not.toContain("--server-side=true");
+    expect(helmCall?.[1]).not.toContain("--force-conflicts");
+  });
+
+  it("rejects Helm older than 3.2 before any deployment mutation", async () => {
+    vi.mocked(execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "Usage: helm upgrade [RELEASE] [CHART]",
+      stderr: "",
+    } as never);
+
+    await expect(runDeploy({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /does not support --create-namespace/,
+    );
+
+    expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 
   it("new build never healthy: no selector patch, no state commit, non-zero exit, previous keeps serving", async () => {
@@ -731,6 +780,14 @@ describe("runDeploy — orchestration", () => {
       .join("\n");
     expect(printed).toContain("[dry-run] helm upgrade");
     expect(printed).toContain("--namespace default --create-namespace");
+    const helmPlans = printed.split("\n").filter((line) => line.includes("[dry-run] helm upgrade"));
+    expect(helmPlans).toHaveLength(2);
+    expect(helmPlans[0]).toContain("Helm 3.2–3.x, client-side upgrade");
+    expect(helmPlans[0]).not.toContain("--server-side=true");
+    expect(helmPlans[0]).not.toContain("--force-conflicts");
+    expect(helmPlans[1]).toContain("Helm 4+, server-side upgrade");
+    expect(helmPlans[1]).toContain("--server-side=true");
+    expect(helmPlans[1]).toContain("--force-conflicts");
   });
 });
 
@@ -1168,6 +1225,40 @@ describe("runDeploy — guards and teardown", () => {
     expect(infraWrites.length).toBeGreaterThan(0);
     expect(infraWrites[infraWrites.length - 1]).not.toContain("cacheRegion");
     expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+  });
+
+  it("aborts before Helm rather than adopting a foreign-owned non-cache Secret", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
+    });
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "get" &&
+        args[1] === "secret" &&
+        args[2] === "rel-valkey" &&
+        args.some((arg) => arg.includes("resourceVersion"))
+      ) {
+        return {
+          exitCode: 0,
+          stdout:
+            "rel-valkey|Opaque|foreign-app|database-credentials|Helm|foreign-release|default|123",
+          stderr: "",
+        };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/foreign or incomplete ownership metadata/);
+
+    expect(events).not.toContain("helm");
+    const valkeyPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "patch" && args[2] === "rel-valkey");
+    expect(valkeyPatches).toHaveLength(0);
   });
 
   it("cache disabled: removes the Secret AND the managed instance (regression)", async () => {
