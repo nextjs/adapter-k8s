@@ -2839,8 +2839,13 @@ export function createDispatcher(options: DispatcherOptions) {
             req.headers = nextHeaders;
           }
 
-          // If this output belongs to another pool, proxy the request
-          if (resolution.pool !== poolName && !handlerLoader.has(handlerPathname)) {
+          // Pool ownership is authoritative. A broad local dynamic template can match the
+          // same concrete pathname as an exact route assigned elsewhere (for example an App
+          // `/[locale]` beside a Pages `/legacy`). Serving merely because this image has that
+          // template runs the wrong router and can feed a Pages cache entry to an App handler.
+          // Shared static files have already returned through the fast path above; every
+          // remaining foreign execution must go to its assigned pool.
+          if (resolution.pool !== poolName) {
             return proxyToPool(
               req,
               res,

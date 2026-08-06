@@ -394,6 +394,49 @@ describe("cross-pool proxy hardening", () => {
     }
   }
 
+  it("does not let a local dynamic template steal a route assigned to another pool", async (ctx) => {
+    pinPoolDns();
+    let targetRequests = 0;
+    await startTargetPool((_req, res) => {
+      targetRequests += 1;
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("from-legacy-pool");
+    }, ctx);
+
+    const localHandler = vi.fn();
+    const handlerLoader = {
+      load: vi.fn().mockResolvedValue(localHandler),
+      has: vi.fn((pathname: string) => pathname === "/[locale]"),
+      get: vi.fn().mockReturnValue({ runtime: "nodejs", type: "APP_PAGE" }),
+    } as any;
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "legacy",
+          matchedPathname: "/legacy",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+        {
+          releaseName: "rel",
+          handlerLoader,
+          outputIds: ["/[locale]"],
+          localHandlerInvoker: vi.fn(async ({ res }) => {
+            res.writeHead(500, { "content-type": "text/plain" });
+            res.end("wrong-local-template");
+          }),
+        },
+      ),
+    );
+
+    const response = await fetch(`http://127.0.0.1:${front.port}/legacy`);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("from-legacy-pool");
+    expect(targetRequests).toBe(1);
+    expect(localHandler).not.toHaveBeenCalled();
+  });
+
   it("applies resolvedHeaders exactly once — front wrapper only, never re-forwarded", async (ctx) => {
     const lookedUp = pinPoolDns();
     let seenResolvedHeaders: string | undefined;
