@@ -755,11 +755,7 @@ export const SHARP_RUNTIME_PACKAGES = [
 // bundle no longer inlines sharp's JS, so the version that matters is the one the APP's
 // next install brought — resolving adapter-first staged a different generation's
 // binaries than the app's sharp JS expects and 503'd every /_next/image.
-export function resolveSharpDepDir(dep: string, projectDir: string): string | undefined {
-  const fromFiles = [
-    path.join(projectDir, "package.json"), // app root (authoritative version)
-    path.join(_dirname, "index.js"), // adapter package (dist/) fallback
-  ];
+function resolvePackageDirFromFiles(dep: string, fromFiles: string[]): string | undefined {
   for (const fromFile of fromFiles) {
     const req = createRequire(fromFile);
     for (const subpath of [`${dep}/package`, `${dep}/package.json`]) {
@@ -792,6 +788,16 @@ export function resolveSharpDepDir(dep: string, projectDir: string): string | un
       // not resolvable from this root at all
     }
   }
+  return undefined;
+}
+
+export function resolveSharpDepDir(dep: string, projectDir: string): string | undefined {
+  const fromFiles = [
+    path.join(projectDir, "package.json"), // app root (authoritative version)
+    path.join(_dirname, "index.js"), // adapter package (dist/) fallback
+  ];
+  const resolved = resolvePackageDirFromFiles(dep, fromFiles);
+  if (resolved) return resolved;
   if (dep !== "sharp") {
     // Check the sibling of EVERY resolvable sharp copy — one root's copy may simply not
     // have this platform package installed while another root's does.
@@ -844,16 +850,7 @@ async function stagePackageTree(
       if (seen.has(dep)) continue;
       seen.add(dep);
       // Resolve the dep relative to its dependent first (nested installs), then the app.
-      const req = createRequire(path.join(dir, "package.json"));
-      let depDir: string | undefined;
-      for (const subpath of [`${dep}/package.json`, `${dep}/package`]) {
-        try {
-          depDir = path.dirname(req.resolve(subpath));
-          break;
-        } catch {
-          // next shape
-        }
-      }
+      let depDir = resolvePackageDirFromFiles(dep, [path.join(dir, "package.json")]);
       depDir ??= resolveSharpDepDir(dep, projectDir);
       if (depDir) queue.push([dep, depDir]);
       else {
@@ -885,13 +882,7 @@ export async function stageExternalsDependencies(
   if (!existsSync(externalsDir)) return { staged, unresolved };
 
   const fromApp = (dep: string): string | undefined => {
-    try {
-      return path.dirname(
-        createRequire(path.join(projectDir, "package.json")).resolve(`${dep}/package.json`),
-      );
-    } catch {
-      return undefined;
-    }
+    return resolvePackageDirFromFiles(dep, [path.join(projectDir, "package.json")]);
   };
 
   const packageDirs: string[] = [];
@@ -969,13 +960,7 @@ export async function stageNextRuntimeDependencies(
   // (and its deps) into an app that has none — a version pairing guaranteed not to match the
   // build output. An app without a resolvable next is not buildable anyway.
   const fromDir = (dep: string, dir: string): string | undefined => {
-    try {
-      return path.dirname(
-        createRequire(path.join(dir, "package.json")).resolve(`${dep}/package.json`),
-      );
-    } catch {
-      return undefined;
-    }
+    return resolvePackageDirFromFiles(dep, [path.join(dir, "package.json")]);
   };
   const nextDir = (resolveDep ?? fromDir)("next", projectDir);
   const staged: string[] = [];

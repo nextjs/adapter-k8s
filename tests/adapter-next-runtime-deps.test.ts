@@ -163,6 +163,21 @@ describe("staging next's runtime dependency closure", () => {
     expect(staged("node_modules/@swc/helpers/package.json")).toBe(false);
   });
 
+  it("stages a Next dependency whose exports hide package.json", async () => {
+    seedApp({ "locked-runtime": "1.0.0" });
+    writePkg(
+      path.join(projectDir, "node_modules", "locked-runtime"),
+      { name: "locked-runtime", exports: { ".": "./dist/index.js" } },
+      { "dist/index.js": "module.exports = {};" },
+    );
+
+    const result = await stageNextRuntimeDependencies(projectDir, "ssr");
+
+    expect(result.staged).toContain("locked-runtime");
+    expect(result.unresolved).not.toContain("locked-runtime");
+    expect(staged("node_modules/locked-runtime/package.json")).toBe(true);
+  });
+
   it("warns and continues when a declared dependency is unresolvable", async () => {
     // A pnpm/monorepo layout can hide one. Refusing to build the image over a package the app
     // may never load would be worse than the CrashLoop it prevents.
