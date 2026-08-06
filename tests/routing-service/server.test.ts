@@ -177,6 +177,7 @@ describe("plainResponseToProto (Fix E converter)", () => {
               },
             ],
           },
+          clearRouteCache: true,
           status: "CONTINUE",
         },
       },
@@ -186,6 +187,7 @@ describe("plainResponseToProto (Fix E converter)", () => {
     if (decoded.response.case !== "requestHeaders") throw new Error("wrong case");
     const common = decoded.response.value.response!;
     expect(common.status).toBe(CommonResponse_ResponseStatus.CONTINUE);
+    expect(common.clearRouteCache).toBe(true);
     const h = common.headerMutation!.setHeaders[0]!;
     expect(h.header!.key).toBe("x-upstream-pool");
     expect(dec.decode(h.header!.rawValue)).toBe("ssr");
