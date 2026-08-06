@@ -311,6 +311,21 @@ describe("buildHelmUpgradeArgs", () => {
 
     expect(args.join(" ")).toContain("activeBuildId=b-123old");
   });
+
+  it("keeps the origin on the outgoing default pool until cutover", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "new-build",
+      registry: "ghcr.io/example/app",
+      previousBuildId: "old-build",
+      defaultPool: "api",
+      previousDefaultPool: "ssr",
+    });
+
+    expect(args.join(" ")).toContain("activeDefaultPool=ssr");
+    expect(args.join(" ")).not.toContain("activeDefaultPool=api");
+  });
 });
 
 describe("detectHelmUpgradeMode", () => {

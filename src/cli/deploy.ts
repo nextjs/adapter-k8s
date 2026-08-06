@@ -42,6 +42,10 @@ import {
   routingManifestSnapshotName,
   routingServiceDeploymentName,
 } from "../emit/templates/routing-manifest-configmap.js";
+import {
+  COMPOSITION_PLAN_COMPONENT,
+  compositionPlanConfigMapName,
+} from "../emit/templates/composition-plan-configmap.js";
 // N87: internal dispatch Secrets are per BUILD and annotated `helm.sh/resource-policy: keep`,
 // so deploy owns both halves of their lifecycle — migrating the legacy stable-named one past
 // `helm upgrade`, and pruning the ones nothing references any more.
@@ -1006,6 +1010,8 @@ export function buildHelmUpgradeArgs(options: {
   buildId: string;
   registry: string;
   previousBuildId: string | null;
+  defaultPool?: string;
+  previousDefaultPool?: string;
   namespace?: string;
   overridesFile?: string;
   podCidrs?: string | null;
@@ -1028,6 +1034,8 @@ export function buildHelmUpgradeArgs(options: {
     buildId,
     registry,
     previousBuildId,
+    defaultPool,
+    previousDefaultPool,
     namespace: configuredNamespace,
     overridesFile,
     podCidrs,
@@ -1043,6 +1051,8 @@ export function buildHelmUpgradeArgs(options: {
   assertSafeBuildId(buildId);
   assertSafeImageRegistry(registry);
   if (previousBuildId) assertSafeBuildId(previousBuildId);
+  if (defaultPool !== undefined) assertSafePoolName(defaultPool);
+  if (previousDefaultPool !== undefined) assertSafePoolName(previousDefaultPool);
   const args = [
     "upgrade",
     "--install",
@@ -1063,6 +1073,10 @@ export function buildHelmUpgradeArgs(options: {
     "--set",
     `activeBuildId=${sanitizeK8sName(previousBuildId ?? buildId)}`,
   ];
+
+  if (defaultPool !== undefined) {
+    args.push("--set", `activeDefaultPool=${previousDefaultPool ?? defaultPool}`);
+  }
 
   if (poolHealthCheckPath !== undefined) {
     // Validated at the consumption point like every other --set value; it also lands in a bare
@@ -2069,6 +2083,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     podCidrs: podCidr,
     nodeCidrs: nodeCidr,
     imageDigests,
+    defaultPool,
+    previousDefaultPool: previousBuildId
+      ? (state?.defaultPools?.[previousBuildId] ?? previousPools[0] ?? defaultPool)
+      : defaultPool,
     // First-upgrade probe migration. `helm upgrade` rewrites the stable HealthCheckPolicy
     // BEFORE the cutover, while the ACTIVE pods are still the OUTGOING build's — and a build
     // produced by an adapter from before /readyz existed answers only /healthz. Flipping the
@@ -3734,6 +3752,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           if (!cmName || keepSnapshots.has(cmName)) continue;
           console.log(`  → Deleting old routing-manifest snapshot: ${cmName}`);
           await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
+        }
+      }
+
+      if (hasPortableOrigin) {
+        const keepPlans = new Set([
+          compositionPlanConfigMapName(releaseName, buildId),
+          compositionPlanConfigMapName(releaseName, previousBuildId),
+        ]);
+        const plans = await execCapture("kubectl", [
+          "get",
+          "configmaps",
+          "-n",
+          namespace,
+          "-l",
+          `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
+          "-o",
+          'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ]);
+        if (plans.exitCode === 0) {
+          for (const cmName of plans.stdout.trim().split("\n")) {
+            if (!cmName || keepPlans.has(cmName)) continue;
+            console.log(`  → Deleting old composition plan: ${cmName}`);
+            await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
+          }
         }
       }
     }

@@ -6,6 +6,7 @@ import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } fr
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
 import { ROUTING_MANIFEST_SNAPSHOT_COMPONENT } from "../emit/templates/routing-manifest-configmap.js";
+import { COMPOSITION_PLAN_COMPONENT } from "../emit/templates/composition-plan-configmap.js";
 import {
   ADAPTER_RELEASE_LABEL,
   assertSafePoolName,
@@ -797,6 +798,27 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
           `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
           `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}).`,
+      );
+    }
+  }
+
+  const compositionDeleteArgs = [
+    "delete",
+    "configmap",
+    "-n",
+    namespace,
+    "-l",
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
+    "--ignore-not-found",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${compositionDeleteArgs.join(" ")}`);
+  } else {
+    const res = await execCapture("kubectl", compositionDeleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete retained composition-plan ConfigMaps: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}.`,
       );
     }
   }
