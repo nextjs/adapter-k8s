@@ -804,7 +804,7 @@ async function writeWebResponseToNode(
   if (!res.writableEnded) res.end();
 }
 
-async function invokeLocalHandlerOverHttp({
+export async function invokeLocalHandlerOverHttp({
   handler,
   req,
   res,
@@ -1261,10 +1261,10 @@ async function invokeLocalHandlerOverHttp({
               );
               activeClientRes?.destroy(error);
               clientReq.destroy(error);
-              if (!res.headersSent) {
+              if (!discardResponse && !res.headersSent) {
                 res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
                 res.end("Gateway Timeout");
-              } else if (!res.writableEnded) {
+              } else if (!discardResponse && !res.writableEnded) {
                 res.destroy(error);
               }
               server.close(() => resolve());
@@ -2100,13 +2100,16 @@ export function createDispatcher(options: DispatcherOptions) {
         resolution.kind === "route"
           ? routeExecutionTimeouts[resolution.matchedPathname]
           : undefined;
-      const executionDeadlineAt =
-        resolution.kind === "route"
-          ? (resolution.executionDeadlineAt ??
-            (configuredExecutionTimeoutMs !== undefined
-              ? Date.now() + configuredExecutionTimeoutMs
-              : undefined))
+      const localExecutionDeadlineAt =
+        configuredExecutionTimeoutMs !== undefined
+          ? Date.now() + configuredExecutionTimeoutMs
           : undefined;
+      const propagatedExecutionDeadlineAt =
+        resolution.kind === "route" ? resolution.executionDeadlineAt : undefined;
+      const executionDeadlineAt =
+        localExecutionDeadlineAt !== undefined && propagatedExecutionDeadlineAt !== undefined
+          ? Math.min(localExecutionDeadlineAt, propagatedExecutionDeadlineAt)
+          : (localExecutionDeadlineAt ?? propagatedExecutionDeadlineAt);
       const remainingExecutionMs =
         executionDeadlineAt !== undefined
           ? Math.max(1, executionDeadlineAt - Date.now())
