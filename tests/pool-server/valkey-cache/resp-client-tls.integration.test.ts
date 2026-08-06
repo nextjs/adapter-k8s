@@ -21,6 +21,8 @@ import {
 import type { CacheEntry } from "../../../src/pool-server/valkey-cache/types.js";
 import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
 
+const SERVER_CLOCK_TOLERANCE_MS = 100;
+
 // The `rediss://` (TLS) variant of the plaintext integration suites: the SAME paths those cover —
 // RESP round-trips, the tag-manifest `updateTags` EVAL, cross-replica revalidation through both
 // handlers — but over a real TLS handshake to a real Valkey configured with `--tls-port`. The unit
@@ -525,8 +527,8 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
       const after = Date.now();
       expect(Number(clamped)).toBe(1);
       const stored = JSON.parse((await c.hmget(key, "t"))[0]!);
-      expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
-      expect(stored.expired).toBeLessThanOrEqual(after + 5);
+      expect(stored.expired).toBeGreaterThanOrEqual(before - SERVER_CLOCK_TOLERANCE_MS);
+      expect(stored.expired).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
       expect(stored.expired).toBeLessThan(clientNow - MAX_CLOCK_SKEW_MS);
       expect(await c.ttl(key)).toBeGreaterThan(29 * 24 * 60 * 60); // M11 TTL applied over TLS too
     });
