@@ -1,4 +1,5 @@
 export {
+  defineClusterComponent,
   defineExposureComponent,
   defineResourceComponent,
   defineRoutingComponent,

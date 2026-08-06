@@ -6,7 +6,7 @@ Deploy full-fidelity Next.js—middleware, Partial Prerendering, cache component
 npx adapter-k8s deploy
 ```
 
-Two providers ship today: **GKE** (Google's load balancer + Cloud CDN) and **generic** (any conformant cluster behind in-cluster [Envoy Gateway](https://gateway.envoyproxy.io/)). See [Providers](#providers).
+The target API composes cluster access, exposure, routing, and additional Kubernetes resources independently. Built-in components cover portable Kubernetes, Gateway API, Ingress, manual exposure, Envoy Gateway, and GKE; custom components use the same typed plan consumed by every lifecycle command. See [Kubernetes targets](#kubernetes-targets).
 
 ## What it does
 
@@ -33,9 +33,8 @@ Middleware, PPR, cache components, and ISR are verified through the upstream Nex
 
 - Node.js >= 20.9.0
 - Next.js >= 16.3.0
-- A Kubernetes cluster:
-  - **GKE** (Autopilot or Standard) for `provider.gke`, plus `gcloud` in PATH
-  - **any conformant cluster** for `provider.generic`, with [Envoy Gateway](https://gateway.envoyproxy.io/) installed and a CNI that enforces NetworkPolicy
+- Kubernetes >= 1.33 with the APIs required by the selected target components
+- [Envoy Gateway](https://gateway.envoyproxy.io/) only when using `envoyNativeRouting`; `gcloud` only for GKE components
 - `kubectl` and Helm >= 3.2 in PATH, plus a container runtime—`docker`, `podman`, or `nerdctl`.
   Helm 3 uses its client-side upgrade path; Helm 4 uses server-side apply.
 
@@ -64,7 +63,12 @@ NEXT_ADAPTER_PATH=@next-community/adapter-k8s
 Or create `adapter.config.mjs` (scaffolded by `init`):
 
 ```js
-import { createK8sAdapter } from "@next-community/adapter-k8s";
+import {
+  createK8sAdapter,
+  defineTarget,
+  gatewayApiExposure,
+  kubernetesCluster,
+} from "@next-community/adapter-k8s";
 
 export default createK8sAdapter({
   pools: {
@@ -73,20 +77,14 @@ export default createK8sAdapter({
       scaling: { min: 2, max: 10, targetCPU: 70 },
     },
   },
-  provider: {
-    gke: {
-      gateway: {
-        type: "gateway-api",
-        className: "gke-l7-global-external-managed",
-        hosts: [
-          {
-            hostname: "app.example.com",
-            tls: { enabled: true, managedCert: true },
-          },
-        ],
-      },
-    },
-  },
+  target: defineTarget({
+    cluster: kubernetesCluster(),
+    exposure: gatewayApiExposure({
+      className: "example",
+      hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+      tlsSecretName: "app-tls",
+    }),
+  }),
 });
 ```
 
@@ -96,7 +94,7 @@ export default createK8sAdapter({
 npx adapter-k8s init --project-id my-project --host app.example.com
 ```
 
-Idempotently provisions the GKE cluster, static IP, Artifact Registry repo, GCS bucket, IAM service accounts, and managed TLS certificate. Add the DNS records printed at the end.
+For the legacy GKE preset, this idempotently provisions the cluster, static IP, Artifact Registry repo, GCS bucket, IAM service accounts, and managed TLS certificate. Other targets use an existing cluster and registry declared by their cluster component.
 
 ### 4. Deploy
 
@@ -104,7 +102,7 @@ Idempotently provisions the GKE cluster, static IP, Artifact Registry repo, GCS 
 npx adapter-k8s deploy
 ```
 
-This builds and pushes per-pool images plus the routing service, provisions the managed cache if configured, runs `helm upgrade`, verifies the new pods are serving, and cuts traffic over blue/green. New deployments resolve every image to its immutable `@sha256:` registry digest and deploy that; the routing tier's _rollback_ path currently reconstructs its image reference from the build tag (digest-pinned rollback is on the [roadmap](#roadmap)).
+This builds and pushes per-pool images plus the routing service when selected, runs the plan's preflight checks and `helm upgrade`, verifies the new pods and target resources are serving, and cuts traffic over blue/green. New deployments resolve every image to its immutable `@sha256:` registry digest and deploy that; the routing tier's _rollback_ path currently reconstructs its image reference from the build tag (digest-pinned rollback is on the [roadmap](#roadmap)).
 
 ## CLI Commands
 
@@ -121,16 +119,87 @@ This builds and pushes per-pool images plus the routing service, provisions the 
 
 Run any command with `--help` for the full flag set.
 
-## Providers
+## Kubernetes targets
 
-Exactly one `provider` key selects the target. It decides how the routing tier attaches to the data plane—the one genuinely platform-specific part of the architecture.
+`defineTarget` composes four independent layers:
 
-| provider  | ingress                                 | ext_proc registration  | CDN       | managed cache   |
-| --------- | --------------------------------------- | ---------------------- | --------- | --------------- |
-| `gke`     | GXLB (`gke-l7-global-external-managed`) | traffic extension      | Cloud CDN | Memorystore     |
-| `generic` | Envoy Gateway (`eg`)                    | `EnvoyExtensionPolicy` | BYO       | BYO `cache.url` |
+| layer     | built-ins                                                   | extension hook            |
+| --------- | ----------------------------------------------------------- | ------------------------- |
+| cluster   | `kubernetesCluster`, `gkeCluster`                           | `defineClusterComponent`  |
+| exposure  | `gatewayApiExposure`, `ingressExposure`, `manualExposure`   | `defineExposureComponent` |
+| routing   | `portableRouting`, `envoyNativeRouting`, `gkeNativeRouting` | `defineRoutingComponent`  |
+| resources | none required                                               | `defineResourceComponent` |
 
-`aks` and `eks` are planned and will use the `generic` shape.
+The compiler turns those components into one versioned composition plan. Deploy, rollback, doctor, describe, and destroy consume that same plan, including cluster identity, API requirements, readiness, diagnostics, and exact cleanup ownership.
+
+### Portable Gateway API or Ingress
+
+Gateway API and Ingress are exposure choices, not providers. With the default portable routing, Next.js routing executes in the application origin and no Envoy CRD is emitted:
+
+```js
+target: defineTarget({
+  cluster: kubernetesCluster({
+    access: { kind: "kubeconfig-context", context: "production" },
+    identity: {
+      kind: "kubernetes-namespace-uid",
+      namespace: "kube-system",
+      uid: "EXPECTED-CLUSTER-UID",
+    },
+  }),
+  exposure: ingressExposure({
+    className: "nginx",
+    hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+    tlsSecretName: "app-tls",
+  }),
+}),
+```
+
+Use `gatewayApiExposure` instead for any conformant GatewayClass. Add `envoyNativeRouting()` only when the selected class is managed by Envoy Gateway and ext_proc routing is desired.
+
+### Custom cluster components
+
+Cluster components declare operations rather than a provider name. This example uses ordinary kubeconfig, OCI registry APIs, and Kubernetes-discovered network ranges:
+
+```js
+const clusterUid = process.env.CLUSTER_UID;
+if (!clusterUid) throw new Error("CLUSTER_UID is required");
+
+const cluster = defineClusterComponent({
+  name: "on-prem",
+  build(ctx) {
+    return {
+      identity: {
+        kind: "kubernetes-namespace-uid",
+        namespace: "kube-system",
+        uid: clusterUid,
+      },
+      access: { kind: "kubeconfig-context", context: "on-prem" },
+      registry: {
+        repository: ctx.imageRegistry,
+        authentication: { kind: "ambient-credentials" },
+        digestLookup: { kind: "oci-distribution" },
+      },
+      network: {
+        podCidrs: { kind: "kubernetes-node-pod-cidrs" },
+        nodeCidrs: {
+          kind: "kubernetes-node-addresses",
+          addressTypes: ["InternalIP"],
+        },
+        missingSourcePolicy: "fail",
+      },
+      managedCache: "none",
+    };
+  },
+});
+```
+
+Custom exposure and resource components emit typed Kubernetes objects. They must declare their API requirements and readiness conditions; the adapter checks them before mutation and records their exact object identities for rollback and cleanup. Raw YAML and inferred cloud names are deliberately outside this boundary.
+
+Set `managedCache: "none"` for custom clusters and configure an operator-managed Valkey/Redis endpoint through `cache.url`. Managed cache provisioning is currently supplied only by the GKE preset.
+
+### Legacy provider configuration
+
+`provider.gke` and `provider.generic` remain accepted for compatibility and are translated into built-in target components. New integrations should use `target: defineTarget(...)`; adding another provider enum is not required.
 
 ### `provider.generic`
 
@@ -334,8 +403,8 @@ routingService: {
 2. On a miss, the routing service runs `@next/routing`—middleware, rewrites, redirects—and sets `x-upstream-pool`. Static assets and middleware-free `public/` files skip the callout entirely.
 3. The HTTPRoute routes to the matching pool, whose server invokes the handler directly.
 
-On `provider.generic` the shape is the same, with the callout hosted in-cluster instead of by the
-load balancer—the routing service itself is byte-identical:
+With `envoyNativeRouting` the shape is the same, with the callout hosted in-cluster instead of by
+the load balancer—the routing service itself is byte-identical:
 
 ```
    Internet --> [your CDN, optional] --> Envoy Gateway (in-cluster)
@@ -351,8 +420,8 @@ load balancer—the routing service itself is byte-identical:
 ```
 
 The difference that matters is trust: GXLB authenticates the callout by arriving from Google's
-frontend over TLS, whereas an in-cluster gateway dials plain h2c and is bounded by NetworkPolicy
-instead. That is why the generic provider's CNI must actually enforce policy—see
+frontend over TLS, whereas an in-cluster Envoy gateway dials plain h2c and is bounded by NetworkPolicy
+instead. That is why this target's CNI must actually enforce policy—see
 [SECURITY.md](./SECURITY.md).
 
 ### Blue/green deploys
@@ -406,7 +475,7 @@ Defaults, in brief—the full model is in [SECURITY.md](./SECURITY.md):
 
 ## Roadmap
 
-Skew protection (versioned routing for zero-mismatch deploys), mTLS caller authentication on the routing callout, digest-pinned rollback for the routing tier, `aks`/`eks` providers, and the hardening work above—connection pooling, routing-service tuning, published benchmarks.
+Skew protection (versioned routing for zero-mismatch deploys), mTLS caller authentication on the routing callout, digest-pinned rollback for the routing tier, additional exposure/routing presets, and the hardening work above—connection pooling, routing-service tuning, published benchmarks.
 
 ## License
 

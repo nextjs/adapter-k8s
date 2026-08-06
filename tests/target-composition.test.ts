@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   compileTarget,
+  defineClusterComponent,
   defineExposureComponent,
   defineResourceComponent,
   defineTarget,
@@ -417,6 +418,71 @@ describe("Kubernetes target composition", () => {
 });
 
 describe("open build-time hooks", () => {
+  it("accepts a custom cluster without a provider key", () => {
+    const cluster = defineClusterComponent({
+      name: "home-cluster",
+      build(ctx) {
+        return {
+          identity: {
+            kind: "kubernetes-namespace-uid",
+            namespace: "kube-system",
+            uid: "cluster-uid",
+          },
+          access: { kind: "kubeconfig-context", context: "home" },
+          registry: {
+            repository: ctx.imageRegistry,
+            authentication: { kind: "ambient-credentials" },
+            digestLookup: { kind: "oci-distribution" },
+          },
+          network: {
+            podCidrs: { kind: "kubernetes-node-pod-cidrs" },
+            nodeCidrs: {
+              kind: "kubernetes-node-addresses",
+              addressTypes: ["InternalIP"],
+            },
+            missingSourcePolicy: "fail",
+          },
+          managedCache: "none",
+        };
+      },
+    });
+    const compiled = compileTarget(
+      defineTarget({ cluster, exposure: ingressExposure({ className: "traefik", hosts }) }),
+      context(),
+    );
+
+    expect(compiled.plan.target).toMatchObject({
+      identity: { kind: "kubernetes-namespace-uid", uid: "cluster-uid" },
+      access: { kind: "kubeconfig-context", context: "home" },
+      registry: {
+        repository: "ghcr.io/davidilie/test-app",
+        authentication: { kind: "ambient-credentials" },
+        digestLookup: { kind: "oci-distribution" },
+      },
+    });
+    expect(compiled.plan.operations.network).toEqual({
+      podCidrs: { kind: "kubernetes-node-pod-cidrs" },
+      nodeCidrs: { kind: "kubernetes-node-addresses", addressTypes: ["InternalIP"] },
+      missingSourcePolicy: "fail",
+    });
+    expect(JSON.stringify(compiled.plan)).not.toContain("gcp-");
+    expect(compiled.plan.target.fingerprint).not.toBe(
+      compileTarget(
+        defineTarget({ cluster, exposure: ingressExposure({ className: "traefik", hosts }) }),
+        context({ imageRegistry: "registry.example.com/team/test-app" }),
+      ).plan.target.fingerprint,
+    );
+  });
+
+  it("validates custom cluster component names", () => {
+    expect(() =>
+      defineClusterComponent({
+        name: "Home Cluster",
+        build: () => kubernetesCluster().build(context()),
+      }),
+    ).toThrow(/invalid target component name/i);
+  });
+
   it("accepts typed objects, API requirements, and readiness", () => {
     const resource = defineResourceComponent({
       name: "metrics",

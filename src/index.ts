@@ -3,6 +3,7 @@ import { createK8sAdapter } from "./adapter.js";
 export { createK8sAdapter };
 export {
   compileTarget,
+  defineClusterComponent,
   defineExposureComponent,
   defineResourceComponent,
   defineRoutingComponent,

@@ -15,6 +15,7 @@ import {
   sanitizeK8sName,
 } from "../emit/templates/utils.js";
 import type {
+  ClusterBuildResult,
   ClusterComponent,
   DefineTargetOptions,
   ExposureBuildContext,
@@ -137,8 +138,7 @@ function object(
 }
 
 export function kubernetesCluster(options: KubernetesClusterOptions = {}): ClusterComponent {
-  return {
-    componentType: "cluster",
+  return defineClusterComponent({
     name: "kubernetes",
     build(context) {
       return {
@@ -159,12 +159,11 @@ export function kubernetesCluster(options: KubernetesClusterOptions = {}): Clust
         managedCache: "none",
       };
     },
-  };
+  });
 }
 
 export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
-  return {
-    componentType: "cluster",
+  return defineClusterComponent({
     name: "gke",
     build(context) {
       const projectId = options.projectId ?? context.infrastructure?.projectId;
@@ -253,6 +252,17 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
         ],
       };
     },
+  });
+}
+
+export function defineClusterComponent(options: {
+  name: string;
+  build(context: TargetBuildContext): ClusterBuildResult;
+}): ClusterComponent {
+  return {
+    componentType: "cluster",
+    name: safeComponentName(options.name),
+    build: options.build,
   };
 }
 
