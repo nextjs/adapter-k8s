@@ -177,6 +177,7 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
       const clusterName = options.clusterName ?? `${context.releaseName}-cluster`;
       const registryHost = context.imageRegistry.split("/")[0]!;
       const usesArtifactRegistry = registryHost.endsWith(".pkg.dev");
+      const registryRepository = context.imageRegistry.split("/").at(-1)!;
       return {
         identity: {
           kind: "gke-resource",
@@ -219,6 +220,37 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
           missingSourcePolicy: "fail",
         },
         managedCache: "gcp-memorystore",
+        retained: [
+          {
+            kind: "gke-cluster",
+            projectId,
+            clusterName,
+            location: { kind: "region", name: region },
+          },
+          ...(usesArtifactRegistry
+            ? [
+                {
+                  kind: "gcp-artifact-registry" as const,
+                  projectId,
+                  region,
+                  repository: registryRepository,
+                },
+              ]
+            : []),
+        ],
+        diagnostics: [
+          { kind: "gcp-auth", projectId },
+          ...(usesArtifactRegistry
+            ? [
+                {
+                  kind: "gcp-artifact-registry" as const,
+                  projectId,
+                  region,
+                  repository: registryRepository,
+                },
+              ]
+            : []),
+        ],
       };
     },
   };
@@ -779,12 +811,14 @@ export function gkeNativeRouting(
       const projectId = options.projectId ?? context.infrastructure?.projectId;
       if (!projectId) throw new Error("gkeNativeRouting requires a projectId");
       assertSafeProjectId(projectId);
+      const extensionName = options.extensionName ?? `${context.releaseName}-traffic-ext`;
+      const addressName = options.addressName ?? `${context.releaseName}-ip`;
       const readiness: RoutingReadiness[] = [
         {
           kind: "gcp-traffic-extension",
           projectId,
-          extensionName: options.extensionName ?? `${context.releaseName}-traffic-ext`,
-          addressName: options.addressName ?? `${context.releaseName}-ip`,
+          extensionName,
+          addressName,
           requireEveryForwardingRule: true,
         },
       ];
@@ -810,6 +844,49 @@ export function gkeNativeRouting(
           },
           registration: "gke-traffic-extension",
         },
+        externalCleanup: [
+          {
+            kind: "gcp-traffic-extension",
+            projectId,
+            name: extensionName,
+            location: "global",
+          },
+          {
+            kind: "gcp-backend-service",
+            projectId,
+            name: `${context.releaseName}-routing-service`,
+            scope: "global",
+          },
+          {
+            kind: "gcp-health-check",
+            projectId,
+            name: `${context.releaseName}-routing-hc`,
+            scope: "global",
+          },
+          { kind: "gcp-global-address", projectId, name: addressName },
+        ],
+        diagnostics: [
+          { kind: "gcp-global-address", projectId, name: addressName },
+          {
+            kind: "gcp-traffic-extension",
+            projectId,
+            extensionName,
+            addressName,
+          },
+          {
+            kind: "gcp-backend-service-shape",
+            projectId,
+            name: `${context.releaseName}-routing-service`,
+            loadBalancingScheme: "EXTERNAL_MANAGED",
+            requireBackend: true,
+          },
+          {
+            kind: "gcp-health-check-shape",
+            projectId,
+            name: `${context.releaseName}-routing-hc`,
+            expectedType: "TCP",
+          },
+        ],
       };
     },
   };

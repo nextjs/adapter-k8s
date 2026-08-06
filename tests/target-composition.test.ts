@@ -57,7 +57,11 @@ describe("Kubernetes target composition", () => {
     expect(compiled.routingTier.enabled).toBe(false);
     expect(compiled.defaultPool).toBe("default");
     expect(compiled.plan.operations.resources.objects).toEqual([]);
+    expect(compiled.plan.operations.cleanup.external).toEqual([]);
+    expect(compiled.plan.operations.cleanup.retained).toEqual([]);
+    expect(compiled.plan.operations.diagnostics).toEqual([]);
     expect(JSON.stringify(compiled.plan)).not.toContain("envoy");
+    expect(JSON.stringify(compiled.plan)).not.toContain("gcp-");
   });
 
   it("records an explicit portable origin pool independently of declaration order", () => {
@@ -100,6 +104,15 @@ describe("Kubernetes target composition", () => {
       context(),
     );
     expect(gateway.plan.target.fingerprint).not.toBe(manual.plan.target.fingerprint);
+    expect(
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+        }),
+        context({ buildId: "another-build" }),
+      ).plan.target.fingerprint,
+    ).toBe(manual.plan.target.fingerprint);
   });
 
   it("emits typed Gateway API objects targeting the origin Service", () => {
@@ -344,6 +357,62 @@ describe("Kubernetes target composition", () => {
     expect(JSON.stringify(compiled.plan)).not.toContain("PLACEHOLDER");
     expect(JSON.stringify(compiled.plan)).toContain("test-app-certmap");
     expect(JSON.stringify(compiled.plan)).toContain("test-app-ip");
+    expect(compiled.plan.operations.cleanup.external).toEqual([
+      {
+        kind: "gcp-traffic-extension",
+        projectId: "sample-project",
+        name: "test-app-traffic-ext",
+        location: "global",
+      },
+      {
+        kind: "gcp-backend-service",
+        projectId: "sample-project",
+        name: "test-app-routing-service",
+        scope: "global",
+      },
+      {
+        kind: "gcp-health-check",
+        projectId: "sample-project",
+        name: "test-app-routing-hc",
+        scope: "global",
+      },
+      { kind: "gcp-global-address", projectId: "sample-project", name: "test-app-ip" },
+    ]);
+    expect(compiled.plan.operations.cleanup.retained).toEqual([
+      {
+        kind: "gke-cluster",
+        projectId: "sample-project",
+        clusterName: "test-app-cluster",
+        location: { kind: "region", name: "us-central1" },
+      },
+    ]);
+    expect(compiled.plan.operations.diagnostics).toEqual([
+      { kind: "gcp-auth", projectId: "sample-project" },
+      {
+        kind: "gcp-global-address",
+        projectId: "sample-project",
+        name: "test-app-ip",
+      },
+      {
+        kind: "gcp-traffic-extension",
+        projectId: "sample-project",
+        extensionName: "test-app-traffic-ext",
+        addressName: "test-app-ip",
+      },
+      {
+        kind: "gcp-backend-service-shape",
+        projectId: "sample-project",
+        name: "test-app-routing-service",
+        loadBalancingScheme: "EXTERNAL_MANAGED",
+        requireBackend: true,
+      },
+      {
+        kind: "gcp-health-check-shape",
+        projectId: "sample-project",
+        name: "test-app-routing-hc",
+        expectedType: "TCP",
+      },
+    ]);
   });
 });
 
@@ -384,6 +453,48 @@ describe("open build-time hooks", () => {
       kind: "ServiceMonitor",
       metadata: { labels: { "adapter-k8s.dev/release": "test-app" } },
     });
+  });
+
+  it("accepts typed cleanup and diagnostics from custom components", () => {
+    const resource = defineResourceComponent({
+      name: "external-lifecycle",
+      build() {
+        return {
+          externalCleanup: [
+            {
+              kind: "gcp-global-address",
+              projectId: "sample-project",
+              name: "custom-address",
+            },
+          ],
+          retained: [
+            {
+              kind: "gcp-certificate-manager",
+              projectId: "sample-project",
+              releasePrefix: "test-app",
+            },
+          ],
+          diagnostics: [
+            {
+              kind: "gcp-global-address",
+              projectId: "sample-project",
+              name: "custom-address",
+            },
+          ],
+        };
+      },
+    });
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({ hosts }),
+        resources: [resource],
+      }),
+      context(),
+    );
+    expect(compiled.plan.operations.cleanup.external).toHaveLength(1);
+    expect(compiled.plan.operations.cleanup.retained).toHaveLength(1);
+    expect(compiled.plan.operations.diagnostics).toHaveLength(1);
   });
 
   it("rejects ownership-label overrides", () => {

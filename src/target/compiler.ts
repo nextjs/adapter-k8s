@@ -22,7 +22,15 @@ function contributionOf(
     throw new Error(`Target component "${componentName}" returned a non-object contribution`);
   }
   const unknown = Object.keys(contribution).filter(
-    (key) => !["objects", "requirements", "readiness"].includes(key),
+    (key) =>
+      ![
+        "objects",
+        "requirements",
+        "readiness",
+        "externalCleanup",
+        "retained",
+        "diagnostics",
+      ].includes(key),
   );
   if (unknown.length > 0) {
     throw new Error(
@@ -33,6 +41,9 @@ function contributionOf(
     objects: [...(contribution.objects ?? [])],
     requirements: [...(contribution.requirements ?? [])],
     readiness: [...(contribution.readiness ?? [])],
+    externalCleanup: [...(contribution.externalCleanup ?? [])],
+    retained: [...(contribution.retained ?? [])],
+    diagnostics: [...(contribution.diagnostics ?? [])],
   };
 }
 
@@ -78,7 +89,17 @@ export function compileTarget(
     throw new Error(`Target component "${target.exposure.name}" returned a non-object result`);
   }
   const unknownClusterFields = Object.keys(cluster).filter(
-    (key) => !["identity", "access", "registry", "network", "managedCache"].includes(key),
+    (key) =>
+      ![
+        "identity",
+        "access",
+        "registry",
+        "network",
+        "managedCache",
+        "externalCleanup",
+        "retained",
+        "diagnostics",
+      ].includes(key),
   );
   if (unknownClusterFields.length > 0) {
     throw new Error(
@@ -87,7 +108,16 @@ export function compileTarget(
   }
   const unknownExposureFields = Object.keys(exposure).filter(
     (key) =>
-      !["objects", "requirements", "readiness", "ingressSources", "capabilities"].includes(key),
+      ![
+        "objects",
+        "requirements",
+        "readiness",
+        "externalCleanup",
+        "retained",
+        "diagnostics",
+        "ingressSources",
+        "capabilities",
+      ].includes(key),
   );
   if (unknownExposureFields.length > 0) {
     throw new Error(
@@ -105,7 +135,17 @@ export function compileTarget(
     throw new Error(`Target component "${target.routing.name}" returned a non-object result`);
   }
   const unknownRoutingFields = Object.keys(routing).filter(
-    (key) => !["plan", "routingTier", "objects", "requirements", "readiness"].includes(key),
+    (key) =>
+      ![
+        "plan",
+        "routingTier",
+        "objects",
+        "requirements",
+        "readiness",
+        "externalCleanup",
+        "retained",
+        "diagnostics",
+      ].includes(key),
   );
   if (unknownRoutingFields.length > 0) {
     throw new Error(
@@ -119,6 +159,9 @@ export function compileTarget(
         objects: exposure.objects ?? [],
         requirements: exposure.requirements ?? [],
         readiness: exposure.readiness ?? [],
+        externalCleanup: exposure.externalCleanup ?? [],
+        retained: exposure.retained ?? [],
+        diagnostics: exposure.diagnostics ?? [],
       },
       target.exposure.name,
     ),
@@ -127,6 +170,9 @@ export function compileTarget(
         objects: routing.objects ?? [],
         requirements: routing.requirements ?? [],
         readiness: routing.readiness ?? [],
+        externalCleanup: routing.externalCleanup ?? [],
+        retained: routing.retained ?? [],
+        diagnostics: routing.diagnostics ?? [],
       },
       target.routing.name,
     ),
@@ -162,6 +208,18 @@ export function compileTarget(
     identities.add(identity);
   }
   const readiness: RoutingReadiness[] = contributions.flatMap((entry) => entry.readiness);
+  const externalCleanup = [
+    ...(cluster.externalCleanup ?? []),
+    ...contributions.flatMap((entry) => entry.externalCleanup),
+  ];
+  const retained = [
+    ...(cluster.retained ?? []),
+    ...contributions.flatMap((entry) => entry.retained),
+  ];
+  const diagnostics = [
+    ...(cluster.diagnostics ?? []),
+    ...contributions.flatMap((entry) => entry.diagnostics),
+  ];
   const requirements = mergeRequirements([
     { apiVersion: "v1", resource: "services", optional: false },
     { apiVersion: "apps/v1", resource: "deployments", optional: false },
@@ -193,6 +251,9 @@ export function compileTarget(
     routingTier: routing.routingTier,
     cache,
     cdn: { kind: "none" },
+    externalCleanup,
+    retained,
+    diagnostics,
   });
   const plan = parseCompositionPlan({
     apiVersion: "adapter-k8s.nextjs.org/v1alpha1",
@@ -243,10 +304,10 @@ export function compileTarget(
             },
           })),
         },
-        external: [],
-        retained: [],
+        external: externalCleanup,
+        retained,
       },
-      diagnostics: [],
+      diagnostics,
       logs: [
         {
           kind: "kubernetes-pods",

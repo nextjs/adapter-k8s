@@ -3,6 +3,8 @@ import type {
   ClusterAccess,
   ClusterIdentity,
   CompositionPlan,
+  DiagnosticSource,
+  ExternalCleanupOperation,
   KubernetesApiRequirement,
   KubernetesManifest,
   KubernetesObjectRef,
@@ -11,6 +13,7 @@ import type {
   RegistryAuthentication,
   RegistryDigestLookup,
   RegistryPlan,
+  RetainedExternalResource,
   RoutingPlan,
   RoutingReadiness,
 } from "../composition-plan/types.js";
@@ -30,7 +33,13 @@ export interface TargetBuildContext {
   };
 }
 
-export interface KubernetesContribution {
+export interface OperationalContribution {
+  externalCleanup?: ExternalCleanupOperation[];
+  retained?: RetainedExternalResource[];
+  diagnostics?: DiagnosticSource[];
+}
+
+export interface KubernetesContribution extends OperationalContribution {
   objects?: KubernetesManifest[];
   requirements?: KubernetesApiRequirement[];
   readiness?: RoutingReadiness[];
@@ -53,7 +62,7 @@ export type ExposureCapability =
 
 export type ExposureRequirement = Extract<ExposureCapability, { kind: "gateway-api" }>;
 
-export interface ClusterBuildResult {
+export interface ClusterBuildResult extends OperationalContribution {
   identity: ClusterIdentity;
   access: ClusterAccess;
   registry: RegistryPlan;
