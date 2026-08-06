@@ -694,6 +694,42 @@ describe("cross-pool proxy hardening", () => {
     expect(forwardedDeadline).toBe(String(deadlineAt));
   });
 
+  it("clamps a propagated deadline to the target route maxDuration", async (ctx) => {
+    pinPoolDns();
+    let forwardedDeadline = Number.POSITIVE_INFINITY;
+    await startTargetPool((req, res) => {
+      forwardedDeadline = Number(req.headers["x-adapter-k8s-execution-deadline"]);
+      setTimeout(() => {
+        res.writeHead(200);
+        res.end("late");
+      }, 250);
+    }, ctx);
+
+    const farFuture = Date.now() + 60_000;
+    const started = Date.now();
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api",
+          matchedPathname: "/api/clamped",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+          executionDeadlineAt: farFuture,
+        },
+        {
+          handlerTimeoutMs: 2_000,
+          routeExecutionTimeouts: { "/api/clamped": 100 },
+        },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/api/clamped`);
+    expect(res.status).toBe(504);
+    expect(forwardedDeadline).toBeLessThanOrEqual(started + 250);
+    expect(forwardedDeadline).toBeLessThan(farFuture);
+  });
+
   it("drops a forged content-length on GET before proxying", async (ctx) => {
     pinPoolDns();
     let upstreamContentLength: string | undefined;

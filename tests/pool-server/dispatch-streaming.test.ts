@@ -4,13 +4,13 @@
 // entrypoint response. These need the REAL loopback invoker (invokeLocalHandlerOverHttp is
 // module-private), so every case drives createDispatcher over an actual HTTP server, in the
 // style of tests/pool-server/server.test.ts.
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { createServer, get as httpGet, type IncomingMessage, type Server } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
-import { createDispatcher } from "../../src/pool-server/dispatch.js";
+import { createDispatcher, invokeLocalHandlerOverHttp } from "../../src/pool-server/dispatch.js";
 import { STATIC_STREAM_THRESHOLD_BYTES } from "../../src/pool-server/http-cache.js";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
 
@@ -223,6 +223,37 @@ describe("streamed responses commit headers before the first body byte", () => {
 // request RECEIPT rather than handler runtime. A wedged handler therefore held a listening
 // socket, an ephemeral port, its pendingWaitUntil set and the client socket indefinitely.
 describe("handler invocation deadline", () => {
+  it("never mutates the outer response when a detached fill exceeds maxDuration", async () => {
+    const outerRes = {
+      headersSent: false,
+      writableEnded: false,
+      writeHead: vi.fn(),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    } as unknown as import("node:http").ServerResponse;
+    const outerReq = {
+      method: "GET",
+      url: "/fill",
+      headers: { host: "localhost" },
+    } as IncomingMessage;
+
+    await invokeLocalHandlerOverHttp({
+      handler: () => undefined,
+      req: outerReq,
+      res: outerRes,
+      matchedPathname: "/fill",
+      routeMatches: null,
+      bufferedBody: undefined,
+      discardResponse: true,
+      handlerTimeoutMs: 1_000,
+      executionTimeoutMs: 50,
+    });
+
+    expect(outerRes.writeHead).not.toHaveBeenCalled();
+    expect(outerRes.end).not.toHaveBeenCalled();
+    expect(outerRes.destroy).not.toHaveBeenCalled();
+  });
+
   it("504s a handler that never answers, instead of pinning the request forever", async () => {
     const front = await startFront(
       {
