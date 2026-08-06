@@ -69,8 +69,14 @@ export function compileTarget(
   }
   validateTargetContext(context);
   const cluster = target.cluster.build(context);
-  const routing = target.routing.build(context);
-  const exposure = target.exposure.build({ ...context, backend: routing.backend });
+  if (!cluster || typeof cluster !== "object" || Array.isArray(cluster)) {
+    throw new Error(`Target component "${target.cluster.name}" returned a non-object result`);
+  }
+  const routingBackend = target.routing.backend(context);
+  const exposure = target.exposure.build({ ...context, backend: routingBackend });
+  if (!exposure || typeof exposure !== "object" || Array.isArray(exposure)) {
+    throw new Error(`Target component "${target.exposure.name}" returned a non-object result`);
+  }
   const unknownClusterFields = Object.keys(cluster).filter(
     (key) => !["identity", "access", "registry", "network", "managedCache"].includes(key),
   );
@@ -88,34 +94,22 @@ export function compileTarget(
       `Target component "${target.exposure.name}" returned unknown field${unknownExposureFields.length === 1 ? "" : "s"}: ${unknownExposureFields.join(", ")}`,
     );
   }
+  if (!Array.isArray(exposure.capabilities)) {
+    throw new Error(`Target component "${target.exposure.name}" must return capabilities`);
+  }
+  const routing = target.routing.build({
+    ...context,
+    exposureCapabilities: exposure.capabilities,
+  });
+  if (!routing || typeof routing !== "object" || Array.isArray(routing)) {
+    throw new Error(`Target component "${target.routing.name}" returned a non-object result`);
+  }
   const unknownRoutingFields = Object.keys(routing).filter(
-    (key) =>
-      ![
-        "plan",
-        "backend",
-        "requiresExposure",
-        "routingTier",
-        "objects",
-        "requirements",
-        "readiness",
-      ].includes(key),
+    (key) => !["plan", "routingTier", "objects", "requirements", "readiness"].includes(key),
   );
   if (unknownRoutingFields.length > 0) {
     throw new Error(
       `Target component "${target.routing.name}" returned unknown field${unknownRoutingFields.length === 1 ? "" : "s"}: ${unknownRoutingFields.join(", ")}`,
-    );
-  }
-  if (
-    routing.requiresExposure &&
-    !exposure.capabilities.some(
-      (capability) =>
-        capability.kind === "gateway-api" &&
-        capability.className === routing.requiresExposure!.className,
-    )
-  ) {
-    throw new Error(
-      `Routing component "${target.routing.name}" requires Gateway API class ` +
-        `"${routing.requiresExposure.className}", but "${target.exposure.name}" does not provide it`,
     );
   }
 

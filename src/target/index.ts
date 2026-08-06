@@ -1,6 +1,7 @@
 export {
   defineExposureComponent,
   defineResourceComponent,
+  defineRoutingComponent,
   defineTarget,
   envoyNativeRouting,
   gatewayApiExposure,
@@ -31,6 +32,7 @@ export type {
   KubernetesTargetDefinition,
   ResourceComponent,
   RoutingBuildResult,
+  RoutingBuildContext,
   RoutingComponent,
   TargetBuildContext,
 } from "./types.js";

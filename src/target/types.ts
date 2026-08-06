@@ -5,6 +5,7 @@ import type {
   CompositionPlan,
   KubernetesApiRequirement,
   KubernetesManifest,
+  KubernetesObjectRef,
   KubernetesServiceRef,
   NetworkPlan,
   RegistryAuthentication,
@@ -42,7 +43,12 @@ export interface IngressSourceSet {
 
 export type ExposureCapability =
   | { kind: "manual" }
-  | { kind: "gateway-api"; className: string }
+  | {
+      kind: "gateway-api";
+      className: string;
+      gateway: KubernetesObjectRef;
+      applicationRoutes: KubernetesObjectRef[];
+    }
   | { kind: "ingress"; className: string };
 
 export type ExposureRequirement = Extract<ExposureCapability, { kind: "gateway-api" }>;
@@ -85,8 +91,6 @@ export interface ResourceComponent {
 
 export interface RoutingBuildResult extends KubernetesContribution {
   plan: RoutingPlan;
-  backend: KubernetesServiceRef;
-  requiresExposure?: ExposureRequirement;
   routingTier: {
     enabled: boolean;
     transport?: "tls" | "h2c";
@@ -95,10 +99,15 @@ export interface RoutingBuildResult extends KubernetesContribution {
   };
 }
 
+export interface RoutingBuildContext extends TargetBuildContext {
+  exposureCapabilities: readonly ExposureCapability[];
+}
+
 export interface RoutingComponent {
   readonly componentType: "routing";
   readonly name: string;
-  build(context: TargetBuildContext): RoutingBuildResult;
+  backend(context: TargetBuildContext): KubernetesServiceRef;
+  build(context: RoutingBuildContext): RoutingBuildResult;
 }
 
 export interface KubernetesTargetDefinition {
