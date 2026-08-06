@@ -240,6 +240,12 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // N60: pod-spec / HPA-spec injection sinks.
     validateResources(pool.resources, `pool "${name}"`);
     validateScaling(pool.scaling, `pool "${name}"`);
+    if (
+      pool.timeout !== undefined &&
+      (!Number.isInteger(pool.timeout) || pool.timeout < 1 || pool.timeout > 86_400)
+    ) {
+      throw new Error(`pool "${name}" timeout must be an integer from 1 to 86400 seconds`);
+    }
   }
 
   // N60: the routing tier's quantities are interpolated UNQUOTED

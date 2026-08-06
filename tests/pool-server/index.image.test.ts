@@ -114,7 +114,12 @@ const JP2_BODY = Buffer.from(
 
 function writeStagedDir(
   images: Record<string, unknown> | null,
-  options: { middlewareMatcher?: string; middlewareSource?: string; publicFiles?: string[] } = {},
+  options: {
+    middlewareMatcher?: string;
+    middlewareSource?: string;
+    publicFiles?: string[];
+    basePath?: string;
+  } = {},
 ): {
   dir: string;
   configDir: string;
@@ -181,7 +186,7 @@ function writeStagedDir(
       pathnames: [],
       i18n: null,
       buildId: "imgbuild1",
-      basePath: "",
+      basePath: options.basePath ?? "",
       middleware: options.middlewareMatcher
         ? {
             filePath: path.join(dir, "mw.mjs"),
@@ -238,6 +243,7 @@ interface BootedServer {
 function makeBooter() {
   let savedEnv: Record<string, string | undefined>;
   let listenersBefore: Record<string, Function[]>;
+  let savedCwd = REPO_ROOT;
   let staged: { dir: string; configDir: string } | undefined;
   let server: Awaited<ReturnType<typeof startPoolServer>> | undefined;
 
@@ -250,12 +256,14 @@ function makeBooter() {
         middlewareMatcher?: string;
         middlewareSource?: string;
         publicFiles?: string[];
+        basePath?: string;
       } = {},
     ): Promise<BootedServer> {
       listenersBefore = Object.fromEntries(
         events.map((e) => [e, process.listeners(e as "SIGTERM") as Function[]]),
       );
       savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+      savedCwd = process.cwd();
       staged = writeStagedDir(images, options);
       const port = await getFreePort();
       process.env.POOL_NAME = "main";
@@ -269,7 +277,7 @@ function makeBooter() {
     async cleanup(): Promise<void> {
       if (server) await server.close().catch(() => undefined);
       server = undefined;
-      process.chdir(REPO_ROOT);
+      process.chdir(savedCwd ?? REPO_ROOT);
       if (staged) rmSync(staged.dir, { recursive: true, force: true });
       staged = undefined;
       for (const key of envKeys) {
@@ -1044,6 +1052,55 @@ describe("image optimizer — middleware coverage must still win over the cachea
     await res.arrayBuffer();
   });
 
+  it("runs terminal middleware before the optimizer", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response("blocked by image middleware", {
+    status: 451,
+    headers: { "x-image-middleware": "ran" },
+  });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(451);
+      expect(res.headers.get("x-image-middleware")).toBe("ran");
+      expect(await res.text()).toBe("blocked by image middleware");
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("carries middleware request and response header mutations into the optimizer", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response(null, {
+    headers: {
+      "x-middleware-next": "1",
+      "x-middleware-override-headers": "accept",
+      "x-middleware-request-accept": "image/png",
+      "x-image-middleware": "continued",
+    },
+  });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        headers: { accept: "image/webp" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(res.headers.get("x-image-middleware")).toBe("continued");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
   it("still answers If-None-Match with a 304 whose Cache-Control is the forced no-cache", async () => {
     const first = await rawGet(port, "/_next/image?url=/mislabeled.jpg&w=640&q=75", {
       accept: "image/webp",
@@ -1073,6 +1130,25 @@ describe("image optimizer — middleware coverage must still win over the cachea
       await scoped.cleanup();
     }
   }, 60_000);
+});
+
+describe("image optimizer — basePath", () => {
+  const booter = makeBooter();
+
+  afterAll(async () => {
+    await booter.cleanup();
+  });
+
+  it("serves the basePath-prefixed platform route", async () => {
+    const { port } = await booter.boot(null, { basePath: "/docs" });
+    const res = await fetch(
+      `http://127.0.0.1:${port}/docs/_next/image?url=/docs/mislabeled.jpg&w=640&q=75`,
+      { headers: { accept: "image/png" } },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    await res.arrayBuffer();
+  });
 });
 
 // ---------------------------------------------------------------------------

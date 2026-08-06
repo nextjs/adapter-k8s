@@ -39,6 +39,47 @@ describe("collectOutputPathnames", () => {
 });
 
 describe("buildRoutingManifest", () => {
+  it("records route maxDuration and pool response-head deadlines", () => {
+    const page = mockAppPage({
+      pathname: "/reports/[id]",
+      config: { maxDuration: 7 } as never,
+    });
+    const concrete = mockPrerender({
+      pathname: "/reports/one",
+      parentOutputId: page.id,
+      sourcePage: page.pathname,
+    });
+    const outputs = mockOutputs({ appPages: [page], prerenders: [concrete] });
+    const pools = new Map<string, PoolDefinition>([
+      [
+        "ssr",
+        {
+          name: "ssr",
+          outputs: [page],
+          config: { routes: ["appPages"], timeout: 15 },
+        },
+      ],
+    ]);
+
+    const manifest = buildRoutingManifest({
+      routing: mockRouting(),
+      outputs,
+      pools,
+      buildId: "b",
+      basePath: "",
+      i18n: null,
+      trailingSlash: false,
+      nextVersion: "16.3.0",
+      projectDir: "/app",
+    });
+
+    expect(manifest.poolTimeouts).toEqual({ ssr: 15_000 });
+    expect(manifest.routeTimeouts).toEqual({
+      "/reports/[id]": 7_000,
+      "/reports/one": 7_000,
+    });
+  });
+
   // REGRESSION: middleware config.matcher must be carried into the routing
   // manifest (build-time sourceRegex -> regexp) so the ext_proc edge can gate
   // middleware. Without it the routing service runs middleware on every path.

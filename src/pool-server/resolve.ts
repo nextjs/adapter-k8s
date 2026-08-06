@@ -46,12 +46,18 @@ export type ResolveResult =
       invokePath?: string | undefined;
       /** Resolved user query for the documented handler context. */
       invocationQuery?: Record<string, string | string[]> | undefined;
+      /** Trusted absolute Unix deadline for response headers, propagated across pool hops. */
+      deadlineAt?: number | undefined;
     }
   | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
   | { kind: "error"; status: number }
   | { kind: "middleware-response"; response: Response }
   | { kind: "external-rewrite"; url: URL }
-  | { kind: "not-found"; resolvedHeaders?: Headers | undefined };
+  | {
+      kind: "not-found";
+      resolvedHeaders?: Headers | undefined;
+      middlewareRequestHeaders?: Headers | undefined;
+    };
 
 export function createLocalResolver(
   manifest: RoutingManifest,
@@ -508,7 +514,11 @@ export function createLocalResolver(
       if (!pool) {
         // Preserve headers set by middleware (NextResponse.next() with headers)
         // and route rules — they must still reach the 404 response.
-        return { kind: "not-found", resolvedHeaders: resolution.resolvedHeaders ?? undefined };
+        return {
+          kind: "not-found",
+          resolvedHeaders: resolution.resolvedHeaders ?? undefined,
+          middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
+        };
       }
 
       // Output-key resolution (normalize → prefer a concrete output over a dynamic

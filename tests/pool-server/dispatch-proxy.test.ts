@@ -181,7 +181,7 @@ describe("external-rewrite proxy hardening", () => {
     expect(seen.contentLength).toBe(String(payload.length));
   });
 
-  it("502s promptly when the upstream wedges (bounded proxy timeout)", async () => {
+  it("504s promptly when the upstream exceeds the response-head deadline", async () => {
     const upstream = await track(
       startServer(() => {
         // Accept the request and never respond.
@@ -201,8 +201,8 @@ describe("external-rewrite proxy hardening", () => {
     const res = await fetch(`http://127.0.0.1:${front.port}/api`);
     const elapsed = Date.now() - started;
 
-    expect(res.status).toBe(502);
-    expect(await res.text()).toBe("Bad Gateway");
+    expect(res.status).toBe(504);
+    expect(await res.text()).toBe("Gateway Timeout");
     expect(elapsed).toBeLessThan(5000);
   });
 
@@ -557,7 +557,7 @@ describe("cross-pool proxy hardening", () => {
     expect(poolHostname!.endsWith("-")).toBe(false);
   });
 
-  it("502s promptly when the target pool wedges", async (ctx) => {
+  it("504s promptly when the target pool exceeds the response-head deadline", async (ctx) => {
     pinPoolDns();
     await startTargetPool(() => {
       // Never respond.
@@ -572,14 +572,102 @@ describe("cross-pool proxy hardening", () => {
           routeMatches: null,
           resolvedHeaders: undefined,
         },
-        { proxyTimeoutMs: 100 },
+        { handlerTimeoutMs: 100 },
       ),
     );
 
     const started = Date.now();
     const res = await fetch(`http://127.0.0.1:${front.port}/api/thing`);
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(504);
+    expect(await res.text()).toBe("Gateway Timeout");
     expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it("prefers the route deadline over its pool and default deadlines", async (ctx) => {
+    pinPoolDns();
+    await startTargetPool((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("late");
+      }, 250);
+    }, ctx);
+
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api",
+          matchedPathname: "/api/route-budget",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+        {
+          handlerTimeoutMs: 2_000,
+          poolTimeouts: { api: 1_000 },
+          routeTimeouts: { "/api/route-budget": 100 },
+        },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/api/route-budget`);
+    expect(res.status).toBe(504);
+  });
+
+  it("uses the pool deadline when the route has no maxDuration", async (ctx) => {
+    pinPoolDns();
+    await startTargetPool((_req, res) => {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("late");
+      }, 250);
+    }, ctx);
+
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api",
+          matchedPathname: "/api/pool-budget",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+        { handlerTimeoutMs: 2_000, poolTimeouts: { api: 100 } },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/api/pool-budget`);
+    expect(res.status).toBe(504);
+  });
+
+  it("preserves an existing trusted deadline instead of minting a new budget", async (ctx) => {
+    pinPoolDns();
+    let forwardedDeadline: string | undefined;
+    await startTargetPool((req, res) => {
+      forwardedDeadline = req.headers["x-adapter-k8s-deadline"] as string | undefined;
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("late");
+      }, 250);
+    }, ctx);
+
+    const deadlineAt = Date.now() + 100;
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api",
+          matchedPathname: "/api/shared-budget",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+          deadlineAt,
+        },
+        { handlerTimeoutMs: 2_000 },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/api/shared-budget`);
+    expect(res.status).toBe(504);
+    expect(forwardedDeadline).toBe(String(deadlineAt));
   });
 
   it("drops a forged content-length on GET before proxying", async (ctx) => {
@@ -627,10 +715,10 @@ describe("cross-pool proxy hardening", () => {
     expect(upstreamContentLength).toBeUndefined();
   });
 
-  it("does not kill a streaming response that stalls longer than the proxy timeout", async (ctx) => {
+  it("does not kill a streaming response that stalls after its headers", async (ctx) => {
     pinPoolDns();
     // Headers + first chunk arrive promptly, then the stream goes quiet for LONGER
-    // than the (short, injected) proxy timeout before finishing. The timeout is an
+    // than the (short, injected) response-head timeout before finishing. The timeout is an
     // IDLE timeout that used to stay armed mid-stream and destroyed the response —
     // a parity break: the same route served same-pool has no such cap.
     await startTargetPool((_req, res) => {
@@ -650,7 +738,7 @@ describe("cross-pool proxy hardening", () => {
           routeMatches: null,
           resolvedHeaders: undefined,
         },
-        { proxyTimeoutMs: 150 },
+        { handlerTimeoutMs: 150 },
       ),
     );
 
@@ -676,13 +764,13 @@ describe("cross-pool proxy hardening", () => {
           routeMatches: null,
           resolvedHeaders: undefined,
         },
-        { proxyTimeoutMs: 100 },
+        { handlerTimeoutMs: 100 },
       ),
     );
 
     const started = Date.now();
     const res = await fetch(`http://127.0.0.1:${front.port}/api/never`);
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(504);
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
