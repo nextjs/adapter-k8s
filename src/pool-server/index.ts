@@ -10,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.js";
 import {
   getRscConfig,
-  INTERNAL_DEADLINE_HEADER,
+  INTERNAL_EXECUTION_DEADLINE_HEADER,
   manifestNextConfig,
   middlewareMayCoverPath,
   INTERNAL_DISPATCH_HEADERS,
@@ -2438,8 +2438,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // into the routing manifest; read defensively — older manifests (and any build
     // without it) fall back to pod-start anchoring inside the dispatcher.
     builtAt: (routingManifest as { builtAt?: string }).builtAt,
-    routeTimeouts: routingManifest.routeTimeouts,
-    poolTimeouts: routingManifest.poolTimeouts,
+    routeExecutionTimeouts: routingManifest.routeExecutionTimeouts,
+    poolResponseHeadTimeouts: routingManifest.poolResponseHeadTimeouts,
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
@@ -3580,7 +3580,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // from an extension bug must not 500 the request — the invoker recovers the
       // query from the invocation path itself.
       const extInvokePath = req.headers["x-invoke-path"] as string | undefined;
-      const extDeadlineRaw = req.headers[INTERNAL_DEADLINE_HEADER] as string | undefined;
+      const extDeadlineRaw = req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER] as string | undefined;
       const extDeadlineParsed = extDeadlineRaw === undefined ? Number.NaN : Number(extDeadlineRaw);
       const extDeadlineAt =
         Number.isSafeInteger(extDeadlineParsed) && extDeadlineParsed > 0
@@ -3619,7 +3619,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         ...(extMwRequestHeaders ? { middlewareRequestHeaders: extMwRequestHeaders } : {}),
         ...(extInvokePath ? { invokePath: extInvokePath } : {}),
         ...(extInvocationQuery ? { invocationQuery: extInvocationQuery } : {}),
-        ...(extDeadlineAt ? { deadlineAt: extDeadlineAt } : {}),
+        ...(extDeadlineAt ? { executionDeadlineAt: extDeadlineAt } : {}),
       });
       return;
     }

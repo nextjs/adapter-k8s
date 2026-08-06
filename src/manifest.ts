@@ -257,20 +257,20 @@ export function buildRoutingManifest({
   // Also track output id → pool so prerenders can inherit their parent's pool.
   const poolAssignments: Record<string, string> = {};
   const poolByOutputId: Record<string, string> = {};
-  const routeTimeoutByOutputId: Record<string, number> = {};
-  const routeTimeouts: Record<string, number> = {};
-  const poolTimeouts: Record<string, number> = {};
+  const routeExecutionTimeoutByOutputId: Record<string, number> = {};
+  const routeExecutionTimeouts: Record<string, number> = {};
+  const poolResponseHeadTimeouts: Record<string, number> = {};
   for (const [poolName, pool] of pools) {
     if (pool.config.timeout !== undefined) {
-      poolTimeouts[poolName] = pool.config.timeout * 1000;
+      poolResponseHeadTimeouts[poolName] = pool.config.timeout * 1000;
     }
     for (const output of pool.outputs) {
       poolAssignments[output.pathname] = poolName;
       poolByOutputId[output.id] = poolName;
       const maxDuration = (output.config as { maxDuration?: unknown } | undefined)?.maxDuration;
       if (typeof maxDuration === "number" && Number.isFinite(maxDuration) && maxDuration > 0) {
-        routeTimeouts[output.pathname] = Math.round(maxDuration * 1000);
-        routeTimeoutByOutputId[output.id] = routeTimeouts[output.pathname]!;
+        routeExecutionTimeouts[output.pathname] = Math.round(maxDuration * 1000);
+        routeExecutionTimeoutByOutputId[output.id] = routeExecutionTimeouts[output.pathname]!;
       }
     }
   }
@@ -285,8 +285,10 @@ export function buildRoutingManifest({
     const parentPool = parentOutputId ? poolByOutputId[parentOutputId] : undefined;
     if (parentPool) {
       poolAssignments[prerender.pathname] = parentPool;
-      const parentTimeout = parentOutputId ? routeTimeoutByOutputId[parentOutputId] : undefined;
-      if (parentTimeout !== undefined) routeTimeouts[prerender.pathname] = parentTimeout;
+      const parentTimeout = parentOutputId
+        ? routeExecutionTimeoutByOutputId[parentOutputId]
+        : undefined;
+      if (parentTimeout !== undefined) routeExecutionTimeouts[prerender.pathname] = parentTimeout;
     }
   }
 
@@ -494,8 +496,8 @@ export function buildRoutingManifest({
         }
       : null,
     poolAssignments,
-    ...(Object.keys(routeTimeouts).length > 0 ? { routeTimeouts } : {}),
-    ...(Object.keys(poolTimeouts).length > 0 ? { poolTimeouts } : {}),
+    ...(Object.keys(routeExecutionTimeouts).length > 0 ? { routeExecutionTimeouts } : {}),
+    ...(Object.keys(poolResponseHeadTimeouts).length > 0 ? { poolResponseHeadTimeouts } : {}),
     pprRoutes,
     // Sorted for byte-identical chart regeneration, like pprCapableRoutes below.
     pprStatePrerenders: Object.fromEntries(

@@ -63,10 +63,9 @@ export function applyRequestTrustBoundary(
     : trustInternalHeaders;
   delete req.headers[INTERNAL_SECRET_HEADER];
 
-  // These are private Next.js control headers, not trusted adapter dispatch headers. Never
-  // preserve a network-supplied value, even when this request carries a valid dispatch secret:
-  // the upstream routing tier may otherwise turn public resume controls into trusted postponed
-  // state. Legitimate resume controls are synthesized later on private local invocations.
+  // These are Next's private request controls, not trusted adapter dispatch headers. Keep the
+  // list aligned with Next 16's server-ipc INTERNAL_HEADERS; legitimate values are synthesized
+  // only after this boundary on private invocations.
   for (const h of UNTRUSTED_NEXT_REQUEST_HEADERS) {
     delete req.headers[h];
   }

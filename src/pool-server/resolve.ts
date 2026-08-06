@@ -46,8 +46,8 @@ export type ResolveResult =
       invokePath?: string | undefined;
       /** Resolved user query for the documented handler context. */
       invocationQuery?: Record<string, string | string[]> | undefined;
-      /** Trusted absolute Unix deadline for response headers, propagated across pool hops. */
-      deadlineAt?: number | undefined;
+      /** Trusted absolute Unix execution deadline propagated across pool hops. */
+      executionDeadlineAt?: number | undefined;
     }
   | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
   | { kind: "error"; status: number }
@@ -116,7 +116,8 @@ export function createLocalResolver(
       // the build-scoped /_next/data protocol; accepting it on an arbitrary
       // document URL makes middleware redirects lose Location.
       const routingHeaders = new Headers(headers);
-      if (!prep.isDataRequest) routingHeaders.delete("x-nextjs-data");
+      if (prep.isDataRequest) routingHeaders.set("x-nextjs-data", "1");
+      else routingHeaders.delete("x-nextjs-data");
 
       // A declared middleware policy without an executable implementation is a server error,
       // never an implicit `next()`. This resolver is the security fallback when ext_proc is

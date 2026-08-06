@@ -9,7 +9,7 @@ import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
 import {
-  INTERNAL_DEADLINE_HEADER,
+  INTERNAL_EXECUTION_DEADLINE_HEADER,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   localeAlignedRouteParamPathname,
@@ -200,6 +200,13 @@ class ClientAbortError extends Error {
   constructor() {
     super("client disconnected before the proxied response completed");
     this.name = "ClientAbortError";
+  }
+}
+
+class DeadlineExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeadlineExceededError";
   }
 }
 
@@ -827,6 +834,7 @@ async function invokeLocalHandlerOverHttp({
   revalidate,
   i18nLocales,
   handlerTimeoutMs = HANDLER_TIMEOUT_MS,
+  executionTimeoutMs,
   capturePostponedState = false,
   buildFallbackBacked = false,
   platformCacheSeen,
@@ -883,6 +891,8 @@ async function invokeLocalHandlerOverHttp({
   i18nLocales?: string[];
   /** N37: bound on time-to-response-head for this invocation. See HANDLER_TIMEOUT_MS. */
   handlerTimeoutMs?: number;
+  /** Next output maxDuration. Unlike the head timeout, this remains active while streaming. */
+  executionTimeoutMs?: number;
   /**
    * Rev-4 "Option D" (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md):
    * shell-less PPR-capable route running MINIMAL. Swap the inert onCacheEntryV2 stub for a
@@ -1133,6 +1143,8 @@ async function invokeLocalHandlerOverHttp({
       // (which closes the ephemeral server and releases the port through the error path below)
       // and the client gets a 504 if nothing has been written yet.
       let invocationTimedOut = false;
+      let executionTimedOut = false;
+      let activeClientRes: IncomingMessage | undefined;
       const invocationDeadline = setTimeout(() => {
         invocationTimedOut = true;
         console.error(
@@ -1152,13 +1164,19 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
+          activeClientRes = clientRes;
           clearTimeout(invocationDeadline);
           const closeThenSettle = (onError: (error: unknown) => void): void => {
             // App Router wires after() through res.on("close"). Close the loopback response first
             // so that callback can register its waitUntil promise, then drain the complete batch.
             // Draining before server.close races the close callback and silently loses after().
             server.close(() => {
-              void settleWaitUntil().then(resolve).catch(onError);
+              void settleWaitUntil()
+                .then(resolve)
+                .catch(onError)
+                .finally(() => {
+                  if (executionDeadline) clearTimeout(executionDeadline);
+                });
             });
           };
           if (discardResponse) {
@@ -1232,10 +1250,34 @@ async function invokeLocalHandlerOverHttp({
           )
             .then(() => closeThenSettle(reject))
             .catch((error) => {
-              server.close(() => reject(error));
+              server.close(() => (executionTimedOut ? resolve() : reject(error)));
             });
         },
       );
+
+      const executionDeadline =
+        executionTimeoutMs !== undefined
+          ? setTimeout(() => {
+              executionTimedOut = true;
+              console.error(
+                `[pool-server] handler for ${matchedPathname} exceeded maxDuration after ` +
+                  `${executionTimeoutMs}ms — aborting the invocation`,
+              );
+              const error = new DeadlineExceededError(
+                `handler execution timed out after ${executionTimeoutMs}ms`,
+              );
+              activeClientRes?.destroy(error);
+              clientReq.destroy(error);
+              if (!res.headersSent) {
+                res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+                res.end("Gateway Timeout");
+              } else if (!res.writableEnded) {
+                res.destroy(error);
+              }
+              server.close(() => resolve());
+            }, executionTimeoutMs)
+          : undefined;
+      executionDeadline?.unref?.();
 
       clientReq.once("error", (error) => {
         clearTimeout(invocationDeadline);
@@ -1243,7 +1285,7 @@ async function invokeLocalHandlerOverHttp({
         // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
         // invocations share the outer `res` with a response already sent to the client, so they
         // must never write; they just release the socket and the port.
-        if (invocationTimedOut) {
+        if (invocationTimedOut || executionTimedOut) {
           if (!discardResponse && !res.headersSent) {
             res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
             res.end("Gateway Timeout");
@@ -1253,6 +1295,7 @@ async function invokeLocalHandlerOverHttp({
           server.close(() => resolve());
           return;
         }
+        if (executionDeadline) clearTimeout(executionDeadline);
         server.close(() => reject(error));
       });
 
@@ -1711,9 +1754,9 @@ export interface DispatcherOptions {
   /** N37: bound on time-to-response-head for a LOCAL handler invocation. Defaults to
    * HANDLER_TIMEOUT_MS (ADAPTER_K8S_HANDLER_TIMEOUT_MS); injectable for the same reason. */
   handlerTimeoutMs?: number | undefined;
-  /** Build-derived route and pool budgets. Route maxDuration wins over the pool fallback. */
-  routeTimeouts?: Record<string, number> | undefined;
-  poolTimeouts?: Record<string, number> | undefined;
+  /** Build-derived route execution and pool response-head budgets. */
+  routeExecutionTimeouts?: Record<string, number> | undefined;
+  poolResponseHeadTimeouts?: Record<string, number> | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
@@ -1770,8 +1813,8 @@ export function createDispatcher(options: DispatcherOptions) {
     builtAt,
     proxyTimeoutMs = PROXY_TIMEOUT_MS,
     handlerTimeoutMs = HANDLER_TIMEOUT_MS,
-    routeTimeouts = {},
-    poolTimeouts = {},
+    routeExecutionTimeouts = {},
+    poolResponseHeadTimeouts = {},
   } = options;
 
   // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
@@ -2058,16 +2101,26 @@ export function createDispatcher(options: DispatcherOptions) {
 
       const configuredRequestHeadTimeoutMs =
         resolution.kind === "route"
-          ? (routeTimeouts[resolution.matchedPathname] ??
-            poolTimeouts[resolution.pool] ??
-            handlerTimeoutMs)
+          ? (poolResponseHeadTimeouts[resolution.pool] ?? handlerTimeoutMs)
           : handlerTimeoutMs;
+      const configuredExecutionTimeoutMs =
+        resolution.kind === "route"
+          ? routeExecutionTimeouts[resolution.matchedPathname]
+          : undefined;
+      const executionDeadlineAt =
+        resolution.kind === "route"
+          ? (resolution.executionDeadlineAt ??
+            (configuredExecutionTimeoutMs !== undefined
+              ? Date.now() + configuredExecutionTimeoutMs
+              : undefined))
+          : undefined;
+      const remainingExecutionMs =
+        executionDeadlineAt !== undefined
+          ? Math.max(1, executionDeadlineAt - Date.now())
+          : undefined;
       const requestHeadTimeoutMs =
-        resolution.kind === "route" && resolution.deadlineAt !== undefined
-          ? Math.max(
-              1,
-              Math.min(configuredRequestHeadTimeoutMs, resolution.deadlineAt - Date.now()),
-            )
+        remainingExecutionMs !== undefined
+          ? Math.min(configuredRequestHeadTimeoutMs, remainingExecutionMs)
           : configuredRequestHeadTimeoutMs;
 
       // base-server deletes the RSC cache-busting param NEXT_RSC_UNION_QUERY ('_rsc') from
@@ -2377,6 +2430,9 @@ export function createDispatcher(options: DispatcherOptions) {
                 render404: render404FromEntrypoint,
                 renderError: renderErrorFromEntrypoint,
                 handlerTimeoutMs: requestHeadTimeoutMs,
+                ...(remainingExecutionMs !== undefined
+                  ? { executionTimeoutMs: remainingExecutionMs }
+                  : {}),
                 ...(revalidate ? { revalidate } : {}),
               }),
             )
@@ -2715,9 +2771,9 @@ export function createDispatcher(options: DispatcherOptions) {
                 path: target.pathname + target.search,
                 method: req.method,
                 headers: forwardHeaders,
-                timeout: proxyTimeoutMs,
               },
               (proxyRes) => {
+                clearTimeout(responseHeadDeadline);
                 res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
                 // pipeline handles errors on either end (e.g. client disconnect) and
                 // cleans up both streams, unlike a bare .pipe().
@@ -2725,10 +2781,13 @@ export function createDispatcher(options: DispatcherOptions) {
               },
             );
 
-            proxyReq.on("timeout", () => {
+            const responseHeadDeadline = setTimeout(() => {
               deadlineExceeded = true;
-              proxyReq.destroy(new Error(`external rewrite to ${target.origin} timed out`));
-            });
+              proxyReq.destroy(
+                new DeadlineExceededError(`external rewrite to ${target.origin} timed out`),
+              );
+            }, proxyTimeoutMs);
+            responseHeadDeadline.unref?.();
 
             // S19 (AVAILABILITY). `timeout` above is an IDLE timeout — an upstream that emits
             // one byte just inside each interval holds a client socket, an upstream socket and
@@ -2751,6 +2810,7 @@ export function createDispatcher(options: DispatcherOptions) {
             proxyReq.on("close", () => clearTimeout(absoluteDeadline));
 
             proxyReq.on("error", (err) => {
+              clearTimeout(responseHeadDeadline);
               // A client abort is our own deliberate teardown, not an upstream failure —
               // log it at info level and skip the 502 (the client is gone anyway).
               if (err instanceof ClientAbortError) {
@@ -2889,6 +2949,7 @@ export function createDispatcher(options: DispatcherOptions) {
               buildId,
               internalSecret,
               requestHeadTimeoutMs,
+              executionDeadlineAt,
             );
           }
 
@@ -2995,26 +3056,66 @@ export function createDispatcher(options: DispatcherOptions) {
                 console.error(`Edge background work failed for ${handlerPathname}:`, error);
               });
             };
+            let executionTimer: ReturnType<typeof setTimeout> | undefined;
+            const executionExceeded =
+              remainingExecutionMs !== undefined
+                ? new Promise<never>((_resolve, reject) => {
+                    executionTimer = setTimeout(
+                      () =>
+                        reject(
+                          new DeadlineExceededError(
+                            `edge route ${handlerPathname} exceeded maxDuration`,
+                          ),
+                        ),
+                      remainingExecutionMs,
+                    );
+                    executionTimer.unref?.();
+                  })
+                : undefined;
+            const withinExecution = <T>(promise: Promise<T>): Promise<T> =>
+              executionExceeded ? Promise.race([promise, executionExceeded]) : promise;
             try {
-              const result = await edgeRouteRunner({
-                name: handlerPathname,
-                paths: [filePath],
-                request: {
-                  url: fullUrl.toString(),
-                  method: req.method,
-                  headers: headerObj,
-                  body:
-                    req.method !== "GET" && req.method !== "HEAD"
-                      ? (
-                          req as IncomingMessage & { [NEXT_REQUEST_META]?: { actionBody?: Buffer } }
-                        )[NEXT_REQUEST_META]?.actionBody
-                      : undefined,
-                  page: {
+              let headTimer: ReturnType<typeof setTimeout> | undefined;
+              const responseHeadExceeded = new Promise<never>((_resolve, reject) => {
+                headTimer = setTimeout(
+                  () =>
+                    reject(
+                      new DeadlineExceededError(
+                        `edge route ${handlerPathname} exceeded its response-head deadline`,
+                      ),
+                    ),
+                  requestHeadTimeoutMs,
+                );
+                headTimer.unref?.();
+              });
+              const result = await withinExecution(
+                Promise.race([
+                  edgeRouteRunner({
                     name: handlerPathname,
-                    ...(Object.keys(edgeRouteParams).length > 0 && { params: edgeRouteParams }),
-                  },
-                  waitUntil,
-                },
+                    paths: [filePath],
+                    request: {
+                      url: fullUrl.toString(),
+                      method: req.method,
+                      headers: headerObj,
+                      body:
+                        req.method !== "GET" && req.method !== "HEAD"
+                          ? (
+                              req as IncomingMessage & {
+                                [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+                              }
+                            )[NEXT_REQUEST_META]?.actionBody
+                          : undefined,
+                      page: {
+                        name: handlerPathname,
+                        ...(Object.keys(edgeRouteParams).length > 0 && { params: edgeRouteParams }),
+                      },
+                      waitUntil,
+                    },
+                  }),
+                  responseHeadExceeded,
+                ]),
+              ).finally(() => {
+                if (headTimer) clearTimeout(headTimer);
               });
               const edgeRes = result.response;
               res.writeHead(edgeRes.status, webHeadersToNodeHeaders(edgeRes.headers));
@@ -3022,7 +3123,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 const reader = edgeRes.body.getReader();
                 try {
                   while (true) {
-                    const { done, value } = await reader.read();
+                    const { done, value } = await withinExecution(reader.read());
                     if (done) break;
                     if (value && !(await writeChunkSafely(res, Buffer.from(value)))) break;
                   }
@@ -3034,10 +3135,23 @@ export function createDispatcher(options: DispatcherOptions) {
               // The body is already complete, but the platform invocation must remain alive until
               // Edge after()/cache work settles. This mirrors the Node entrypoint lifecycle above
               // and prevents a pod/request teardown from dropping revalidation side effects.
-              await result.waitUntil?.catch((error) => {
-                console.error(`Edge background work failed for ${handlerPathname}:`, error);
-              });
+              if (result.waitUntil) {
+                await withinExecution(result.waitUntil).catch((error) => {
+                  if (error instanceof DeadlineExceededError) throw error;
+                  console.error(`Edge background work failed for ${handlerPathname}:`, error);
+                });
+              }
             } catch (err) {
+              if (err instanceof DeadlineExceededError) {
+                console.error(`[pool-server] ${err.message}`);
+                if (!res.headersSent) {
+                  res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+                  res.end("Gateway Timeout");
+                } else if (!res.writableEnded) {
+                  res.destroy(err);
+                }
+                return;
+              }
               console.error(`Edge route handler failed for ${handlerPathname}:`, err);
               if (!res.headersSent) {
                 res.writeHead(500, { "content-type": "text/plain" });
@@ -3050,6 +3164,8 @@ export function createDispatcher(options: DispatcherOptions) {
                 if (typeof res.destroy === "function") res.destroy();
                 else res.end();
               }
+            } finally {
+              if (executionTimer) clearTimeout(executionTimer);
             }
             return;
           }
@@ -3699,6 +3815,9 @@ export function createDispatcher(options: DispatcherOptions) {
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
             handlerTimeoutMs: requestHeadTimeoutMs,
+            ...(remainingExecutionMs !== undefined
+              ? { executionTimeoutMs: remainingExecutionMs }
+              : {}),
             // Option D (spec rev 4): shell-less PPR template with no root params — if this
             // MINIMAL render postpones live, the invoker captures the state and performs the
             // canonical POST resume itself. Excluded: shell-bearing routes (their injection
@@ -3737,7 +3856,7 @@ const ASSERTED_BY_THIS_HOP: Record<string, true> = {
   "x-mw-evaluated": true,
   "x-invoke-path": true,
   "x-invoke-query": true,
-  [INTERNAL_DEADLINE_HEADER]: true,
+  [INTERNAL_EXECUTION_DEADLINE_HEADER]: true,
   [INTERNAL_SECRET_HEADER]: true,
 };
 
@@ -3749,6 +3868,7 @@ function proxyToPool(
   buildId: string,
   internalSecret?: string,
   proxyTimeoutMs: number = PROXY_TIMEOUT_MS,
+  executionDeadlineAt?: number,
 ): Promise<void> {
   return new Promise((resolve) => {
     let deadlineExceeded = false;
@@ -3776,7 +3896,9 @@ function proxyToPool(
       ...(resolution.invocationQuery
         ? { "x-invoke-query": JSON.stringify(resolution.invocationQuery) }
         : {}),
-      [INTERNAL_DEADLINE_HEADER]: String(resolution.deadlineAt ?? Date.now() + proxyTimeoutMs),
+      ...(executionDeadlineAt !== undefined
+        ? { [INTERNAL_EXECUTION_DEADLINE_HEADER]: String(executionDeadlineAt) }
+        : {}),
       // This pool already ran the middleware stage in its Phase-1 resolve before deciding
       // to proxy; assert it so the target pool trusts the skip instead of re-running
       // middleware (which would double-apply cookies/redirects). Without this, the target's
@@ -3814,17 +3936,9 @@ function proxyToPool(
         path: req.url,
         method: req.method,
         headers: forwardHeaders,
-        timeout: proxyTimeoutMs,
       },
       (proxyRes) => {
-        // The timeout option is an IDLE timeout that stays armed while the response
-        // streams — a cross-pool SSE/streaming response quiet for >proxyTimeoutMs (or
-        // stalled on client backpressure) was destroyed mid-stream, while the same
-        // route served same-pool has no such cap (parity break). Disarm it once
-        // response headers arrive; the cap still bounds connect/headers, and
-        // client-abort propagation plus the server-wide requestTimeout still bound
-        // the streaming phase.
-        proxyReq.setTimeout(0);
+        clearTimeout(responseHeadDeadline);
         res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
         // pipeline handles errors on either end (e.g. client disconnect) and cleans up
         // both streams, unlike a bare .pipe().
@@ -3832,12 +3946,20 @@ function proxyToPool(
       },
     );
 
-    proxyReq.on("timeout", () => {
+    // A socket idle timeout is not a deadline: DNS/connect and informational traffic can reset
+    // it. This wall-clock timer starts before dialing and is cleared only by final headers.
+    const responseHeadDeadline = setTimeout(() => {
       deadlineExceeded = true;
-      proxyReq.destroy(new Error(`cross-pool proxy to pool "${resolution.pool}" timed out`));
-    });
+      proxyReq.destroy(
+        new DeadlineExceededError(
+          `cross-pool proxy to pool "${resolution.pool}" exceeded its response-head deadline`,
+        ),
+      );
+    }, proxyTimeoutMs);
+    responseHeadDeadline.unref?.();
 
     proxyReq.on("error", (err) => {
+      clearTimeout(responseHeadDeadline);
       // A client abort is our own deliberate teardown, not a pool failure — log it at
       // info level and skip the 502 (the client is gone anyway).
       if (err instanceof ClientAbortError) {

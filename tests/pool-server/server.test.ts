@@ -211,14 +211,12 @@ describe("internal header security", () => {
       expect(authHeader).toBe("Bearer token123");
     });
 
-    it("always strips client-supplied Next resume headers on a trusted dispatch hop", async () => {
+    it("always strips client-supplied Next internal headers on a trusted dispatch hop", async () => {
       let outputId: string | undefined;
-      let nextResume: string | undefined;
-      let resumeStateLength: string | undefined;
+      let seen: Record<string, string | string[] | undefined> = {};
       const onRequest = vi.fn((req: IncomingMessage, res: ServerResponse) => {
         outputId = req.headers["x-output-id"] as string | undefined;
-        nextResume = req.headers["next-resume"] as string | undefined;
-        resumeStateLength = req.headers["x-next-resume-state-length"] as string | undefined;
+        seen = { ...req.headers };
         res.writeHead(200);
         res.end("ok");
       });
@@ -237,13 +235,25 @@ describe("internal header security", () => {
           "x-output-id": "/page",
           "next-resume": "1",
           "x-next-resume-state-length": "32",
+          "x-now-route-matches": "spoofed",
+          "x-matched-path": "/private",
+          "x-nextjs-data": "1",
+          "x-middleware-next": "1",
         },
         body: "attacker-controlled-postponed-state",
       });
 
       expect(outputId).toBe("/page");
-      expect(nextResume).toBeUndefined();
-      expect(resumeStateLength).toBeUndefined();
+      for (const header of [
+        "next-resume",
+        "x-next-resume-state-length",
+        "x-now-route-matches",
+        "x-matched-path",
+        "x-nextjs-data",
+        "x-middleware-next",
+      ]) {
+        expect(seen[header]).toBeUndefined();
+      }
     });
 
     it("preserves the public Pages Router middleware prefetch hint", async () => {
