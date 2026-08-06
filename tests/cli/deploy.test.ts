@@ -15,6 +15,8 @@ import {
   resolveRegistryDigestAny,
   resolveDeployImageDigests,
   discoverServingBuildId,
+  detectHelmUpgradeMode,
+  ensureValkeySecretHelmOwnership,
   resolveImageDigest,
   refreshFetchCacheStaging,
 } from "../../src/cli/deploy.js";
@@ -238,7 +240,24 @@ describe("buildHelmUpgradeArgs", () => {
     expect(args).toContain(".k8s-adapter/output/chart");
     expect(args.join(" ")).toContain("global.image.tag=abc123");
     expect(args.join(" ")).toContain("activeBuildId=abc123");
-    expect(args).toContain("--take-ownership");
+    expect(args).not.toContain("--take-ownership");
+    expect(args).toContain("--server-side=true");
+    expect(args).toContain("--force-conflicts");
+  });
+
+  it("omits Helm 4-only flags and any release-wide ownership bypass in client-side mode", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "abc123",
+      registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+      previousBuildId: null,
+      helmUpgradeMode: "client-side",
+    });
+
+    expect(args).not.toContain("--take-ownership");
+    expect(args).not.toContain("--server-side=true");
+    expect(args).not.toContain("--force-conflicts");
   });
 
   it("includes previousBuildId when set", () => {
@@ -277,6 +296,246 @@ describe("buildHelmUpgradeArgs", () => {
     });
 
     expect(args.join(" ")).toContain("activeBuildId=b-123old");
+  });
+});
+
+describe("detectHelmUpgradeMode", () => {
+  const CREATE_NAMESPACE =
+    "      --create-namespace    if --install is set, create the release namespace";
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it("selects Helm 4 server-side apply from actual Cobra option rows", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout:
+        `${CREATE_NAMESPACE}\n` +
+        `      --force-conflicts    force server-side apply conflicts\n` +
+        `      --server-side string    must be true, false, or auto\n`,
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).resolves.toBe("server-side");
+  });
+
+  it("selects Helm 3 client-side upgrade and ignores flag names mentioned only in prose", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout:
+        `${CREATE_NAMESPACE}\n` +
+        `This downstream build does not support --server-side or --force-conflicts.\n`,
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).resolves.toBe("client-side");
+  });
+
+  it.each([
+    ["server-side only", "      --server-side string    must be true, false, or auto"],
+    ["force-conflicts only", "      --force-conflicts    force server-side apply conflicts"],
+  ])("uses client-side mode when a downstream build exposes %s", async (_name, row) => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: `${CREATE_NAMESPACE}\n${row}\n`,
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).resolves.toBe("client-side");
+  });
+
+  it("rejects Helm older than the --create-namespace capability floor", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "Usage: helm upgrade [RELEASE] [CHART]",
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).rejects.toThrow(/Helm 3\.2 or newer/);
+  });
+
+  it("reports a non-zero capability probe without leaking terminal controls", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 2,
+      stdout: "",
+      stderr: "\u001b[31munknown command\u001b[0m",
+    });
+
+    let message = "";
+    try {
+      await detectHelmUpgradeMode();
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("helm upgrade --help exited 2:");
+    expect(message).toContain("unknown command");
+    expect(message).not.toContain("\u001b");
+  });
+
+  it("reports a failed capability probe invocation", async () => {
+    vi.mocked(exec.execCapture).mockRejectedValue(new Error("spawn helm ENOENT"));
+
+    await expect(detectHelmUpgradeMode()).rejects.toThrow(/spawn helm ENOENT.*Helm 3\.2/s);
+  });
+});
+
+describe("ensureValkeySecretHelmOwnership", () => {
+  const response = (
+    fields: [string, string, string, string, string, string, string, string],
+  ): { exitCode: number; stdout: string; stderr: string } => ({
+    exitCode: 0,
+    stdout: fields.join("|"),
+    stderr: "",
+  });
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it("atomically adopts only the exact unowned legacy adapter Valkey Secret", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(
+        response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", "123"]),
+      )
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "secret/rel-valkey patched", stderr: "" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).resolves.toBe("adopted");
+
+    const calls = vi.mocked(exec.execCapture).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual([
+      "kubectl",
+      expect.arrayContaining(["get", "secret", "rel-valkey", "--ignore-not-found"]),
+    ]);
+    const patchArgs = calls[1]![1];
+    expect(patchArgs).toEqual(
+      expect.arrayContaining(["patch", "secret", "rel-valkey", "--type=merge", "-p"]),
+    );
+    const body = JSON.parse(patchArgs[patchArgs.indexOf("-p") + 1]!) as {
+      metadata: {
+        resourceVersion: string;
+        labels: Record<string, string>;
+        annotations: Record<string, string>;
+      };
+    };
+    expect(body.metadata).toEqual({
+      resourceVersion: "123",
+      labels: { "app.kubernetes.io/managed-by": "Helm" },
+      annotations: {
+        "meta.helm.sh/release-name": "rel",
+        "meta.helm.sh/release-namespace": "default",
+      },
+    });
+  });
+
+  it("accepts an exact Secret already owned by this release without patching it", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "valkey-secret", "Helm", "rel", "default", "123"]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).resolves.toBe("owned");
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("adopts the legacy Secret into the configured namespace", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(
+        response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", "123"]),
+      )
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "secret/rel-valkey patched", stderr: "" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel", "prod")).resolves.toBe("adopted");
+
+    for (const [, args] of vi.mocked(exec.execCapture).mock.calls) {
+      expect(args).toEqual(expect.arrayContaining(["-n", "prod"]));
+    }
+    const patchArgs = vi.mocked(exec.execCapture).mock.calls[1]![1];
+    const body = JSON.parse(patchArgs[patchArgs.indexOf("-p") + 1]!) as {
+      metadata: { annotations: Record<string, string> };
+    };
+    expect(body.metadata.annotations["meta.helm.sh/release-namespace"]).toBe("prod");
+  });
+
+  it("does nothing when the exact Secret is absent", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).resolves.toBe("absent");
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("cannot adopt a foreign-owned non-cache resource with the colliding name", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response([
+        "rel-valkey",
+        "Opaque",
+        "foreign-app",
+        "database-credentials",
+        "Helm",
+        "foreign-release",
+        "default",
+        "123",
+      ]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /foreign or incomplete ownership metadata/,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("cannot adopt an unowned non-cache resource with the colliding name", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "database-credentials", "", "", "", "123"]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /is not the adapter's legacy Valkey Secret/,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("aborts on partial ownership instead of overwriting it", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "valkey-secret", "Helm", "", "", "123"]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /foreign or incomplete ownership metadata/,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("refuses an adoption patch without a resourceVersion precondition", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", ""]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /no resourceVersion.*optimistic-concurrency/s,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("aborts when the Secret identity cannot be read", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "secrets is forbidden",
+    });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /Could not inspect cache Secret.*secrets is forbidden/s,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("aborts when the validated Secret cannot be patched", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(
+        response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", "123"]),
+      )
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "forbidden" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /Could not attach Helm ownership.*forbidden/s,
+    );
   });
 });
 
