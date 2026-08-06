@@ -7,7 +7,15 @@
 // Additionally sharp@0.35 gained an exports map WITHOUT a "./package" subpath, which the
 // old `${dep}/package` resolution choked on.
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  realpathSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { resolveSharpDepDir, stageSharpRuntimePackages } from "../src/adapter.js";
@@ -78,7 +86,7 @@ afterAll(() => {
 describe("sharp staging survives the 0.35 package shape (survey: canary.97 image cluster)", () => {
   it("resolveSharpDepDir resolves a sharp whose exports map has no ./package subpath", () => {
     const dir = resolveSharpDepDir("sharp", projectDir);
-    expect(dir).toBe(path.join(projectDir, "node_modules", "sharp"));
+    expect(dir).toBe(realpathSync(path.join(projectDir, "node_modules", "sharp")));
   });
 
   it("stages the app's sharp JS package AND its runtime dep tree alongside the @img binaries", async () => {

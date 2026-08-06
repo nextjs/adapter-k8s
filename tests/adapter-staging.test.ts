@@ -13,6 +13,7 @@ import {
   readFileSync,
   existsSync,
   lstatSync,
+  realpathSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -587,7 +588,7 @@ describe("resolveSharpDepDir", () => {
         exports: { "./sharp.node": "./sharp.node", "./package": "./package.json" },
       }),
     );
-    expect(resolveSharpDepDir("@img/sharp-testonly-linux-x64", tmpDir)).toBe(dir);
+    expect(resolveSharpDepDir("@img/sharp-testonly-linux-x64", tmpDir)).toBe(realpathSync(dir));
   });
 
   it("falls back to the sibling of a resolvable sharp copy when exports block resolution entirely", () => {
@@ -609,7 +610,7 @@ describe("resolveSharpDepDir", () => {
         exports: { "./sharp.node": "./sharp.node" },
       }),
     );
-    expect(resolveSharpDepDir("@img/sharp-testonly-sibling", tmpDir)).toBe(dir);
+    expect(resolveSharpDepDir("@img/sharp-testonly-sibling", tmpDir)).toBe(realpathSync(dir));
   });
 
   it("returns undefined for an unresolvable package", () => {
