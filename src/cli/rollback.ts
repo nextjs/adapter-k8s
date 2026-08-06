@@ -30,6 +30,7 @@ import {
   infrastructurePath,
   outputDirName,
 } from "./infrastructure-validation.js";
+import { targetArchitecture, type TargetPlatform } from "../target-platform.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -60,6 +61,8 @@ interface RoutingServingConfig {
    * Deployment carries no such env (an adapter version predating the injection).
    */
   internalSecretRef: string | null;
+  /** Exact value of the routing pod's Kubernetes architecture selector, if present. */
+  nodeArchitecture: string | null;
 }
 
 /**
@@ -127,7 +130,7 @@ export async function readRoutingServingConfig(
     };
   }
   const podSpec = (parsed as { spec?: { template?: { spec?: unknown } } })?.spec?.template?.spec as
-    | { containers?: unknown; volumes?: unknown }
+    | { containers?: unknown; volumes?: unknown; nodeSelector?: unknown }
     | undefined;
   const containers: unknown[] = Array.isArray(podSpec?.containers) ? podSpec.containers : [];
   const volumes: unknown[] = Array.isArray(podSpec?.volumes) ? podSpec.volumes : [];
@@ -158,6 +161,10 @@ export async function readRoutingServingConfig(
   const internalSecretRef =
     envEntries.find((e) => e?.name === "INTERNAL_HEADER_SECRET")?.valueFrom?.secretKeyRef?.name ??
     null;
+  const nodeArchitecture =
+    podSpec?.nodeSelector && typeof podSpec.nodeSelector === "object"
+      ? ((podSpec.nodeSelector as Record<string, unknown>)["kubernetes.io/arch"] ?? null)
+      : null;
   // A TAG-pinned image names its own build, and the image is what actually runs — so when the
   // reference carries a tag, that tag wins. The env is the source only for a DIGEST-pinned
   // image, where the reference cannot name a build at all.
@@ -200,6 +207,7 @@ export async function readRoutingServingConfig(
       image: typeof image === "string" ? image : "",
       manifestConfigMap: cmName,
       internalSecretRef,
+      nodeArchitecture: typeof nodeArchitecture === "string" ? nodeArchitecture : null,
     },
   };
 }
@@ -424,8 +432,10 @@ export async function revertRoutingServiceToBuild(opts: {
    * step less immutable than a freshly deployed one.
    */
   targetImageDigest?: string | undefined;
+  /** The target build's recorded platform. Unknown legacy builds leave the selector alone. */
+  targetPlatform?: TargetPlatform | undefined;
 }): Promise<void> {
-  const { releaseName, targetBuildId, registry, targetImageDigest } = opts;
+  const { releaseName, targetBuildId, registry, targetImageDigest, targetPlatform } = opts;
   const namespace = resolveK8sNamespace(opts.namespace);
   const deployName = routingServiceDeploymentName(releaseName);
   // N68: same distinction as retention — a read failure here used to return silently, i.e.
@@ -459,6 +469,7 @@ export async function revertRoutingServiceToBuild(opts: {
     image: exists.config.image || null,
     manifestConfigMap: exists.config.manifestConfigMap || null,
     internalSecretRef: exists.config.internalSecretRef,
+    nodeArchitecture: exists.config.nodeArchitecture,
   };
 
   // Retain the manifest we are about to roll AWAY from, so the symmetric roll-forward
@@ -498,6 +509,14 @@ export async function revertRoutingServiceToBuild(opts: {
       `  ! No recorded routing-image digest for build ${targetBuildId} — reverting the edge by ` +
         `TAG. A retag of that tag would change what the edge runs on its next restart; the ` +
         `next deploy records a digest so a later rollback can pin it.`,
+    );
+  }
+  if (!targetPlatform) {
+    console.warn(
+      `  ! No recorded target platform for build ${targetBuildId}. This build predates ` +
+        `platform-aware deploy state, so the routing Deployment's kubernetes.io/arch ` +
+        `selector will NOT be changed. Verify that the live selector can run this image; ` +
+        `new builds record platform provenance, but this legacy build ID remains unknown.`,
     );
   }
   // N87: the internal dispatch secret is per BUILD, so the edge's secretKeyRef must move with
@@ -546,6 +565,13 @@ export async function revertRoutingServiceToBuild(opts: {
     spec: {
       template: {
         spec: {
+          ...(targetPlatform
+            ? {
+                nodeSelector: {
+                  "kubernetes.io/arch": targetArchitecture(targetPlatform),
+                },
+              }
+            : {}),
           containers: [
             {
               name: "routing-service",
@@ -635,7 +661,12 @@ export async function revertRoutingServiceToBuild(opts: {
   ]);
   if (rollout.exitCode !== 0) {
     const detail = rollout.stderr.trim() || rollout.stdout.trim() || `exit ${rollout.exitCode}`;
-    const restored = await restoreRoutingSpec(deployName, priorSpec, namespace);
+    const restored = await restoreRoutingSpec(
+      deployName,
+      priorSpec,
+      namespace,
+      targetPlatform !== undefined,
+    );
     throw new Error(
       `The routing service did not roll out to build ${targetBuildId} within ` +
         `${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s: ${detail}\n` +
@@ -666,6 +697,8 @@ interface RoutingSpecSnapshot {
   manifestConfigMap: string | null;
   /** N87: the per-build internal dispatch Secret the container resolved from. */
   internalSecretRef: string | null;
+  /** Exact prior selector value; null means the key was absent and must be removed. */
+  nodeArchitecture: string | null;
 }
 
 /**
@@ -677,12 +710,24 @@ async function restoreRoutingSpec(
   deployName: string,
   prior: RoutingSpecSnapshot,
   namespace: string,
+  restoreNodeArchitecture: boolean,
 ): Promise<boolean> {
   if (!prior.image) return false;
   const patch = {
     spec: {
       template: {
         spec: {
+          // Restore only fields this invocation changed. A legacy target with unknown platform
+          // deliberately leaves the selector alone in the forward patch, so touching it here
+          // would break patch/restore symmetry and trust parser fidelity unnecessarily.
+          ...(restoreNodeArchitecture
+            ? {
+                // Strategic merge treats null as deletion and preserves unrelated selectors.
+                nodeSelector: {
+                  "kubernetes.io/arch": prior.nodeArchitecture,
+                },
+              }
+            : {}),
           containers: [
             {
               name: "routing-service",
@@ -1285,6 +1330,7 @@ export async function runRollback(options: {
     targetBuildId: previousBuildId,
     registry: infra?.containerRegistry,
     targetImageDigest: state.routingImageDigests?.[previousBuildId],
+    targetPlatform: state.targetPlatforms?.[previousBuildId],
   });
 
   // 4. Switch traffic: patch active Service selectors to the previous build.
@@ -1393,6 +1439,7 @@ export async function runRollback(options: {
         targetBuildId: currentBuildId,
         registry: infra?.containerRegistry,
         targetImageDigest: state.routingImageDigests?.[currentBuildId],
+        targetPlatform: state.targetPlatforms?.[currentBuildId],
       });
       edgeRestored = true;
     } catch (err) {
@@ -1464,6 +1511,17 @@ export async function runRollback(options: {
           [previousBuildId]: [...poolNames],
           [currentBuildId]: [...currentPoolNames],
         },
+        // The pointer swap keeps these same two build artifacts in play. Prune any stale
+        // provenance while preserving the exact platform recorded for both directions.
+        ...(state.targetPlatforms
+          ? {
+              targetPlatforms: Object.fromEntries(
+                Object.entries(state.targetPlatforms).filter(([build]) =>
+                  [currentBuildId, previousBuildId].includes(build),
+                ),
+              ),
+            }
+          : {}),
         // `readinessPathSupported` is deliberately NOT carried forward. It means "the build
         // now serving answers /readyz", and after a rollback the serving build is an OLDER
         // one that may predate it — so dropping it is the conservative answer, and the next

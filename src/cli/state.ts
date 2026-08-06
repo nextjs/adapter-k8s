@@ -4,6 +4,7 @@ import path from "node:path";
 import { stateFileName } from "./infrastructure-validation.js";
 import { execCapture, execCaptureStdin } from "./exec.js";
 import { resolveK8sNamespace } from "../emit/templates/utils.js";
+import type { TargetPlatform } from "../target-platform.js";
 
 const STATE_DIR = ".k8s-adapter";
 // Variant-scoped: see stateFileName(). Sharing one state file across deploy targets lets a
@@ -91,6 +92,16 @@ export interface AdapterState {
    * objects cannot prove the topology. Pruned to the current and previous builds.
    */
   poolTopologies?: Record<string, string[]>;
+  /**
+   * The container platform each retained build was produced for, keyed by build id.
+   *
+   * The routing Deployment is updated in place, including its architecture selector. A
+   * rollback therefore needs the target build's recorded platform to move the image and
+   * `kubernetes.io/arch` selector together. Absent for builds deployed before platform
+   * recording existed; callers must leave the live selector unchanged rather than guess.
+   * Pruned to the current and previous builds, like `routingImageDigests`.
+   */
+  targetPlatforms?: Record<string, TargetPlatform>;
 }
 
 // Thrown when the local file was written but the cluster ConfigMap mirror failed.

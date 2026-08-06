@@ -199,7 +199,7 @@ containerStrategy: 'shared-image',   // one image for all pools—simpler CI/CD
 
 ### Container runtimes
 
-`deploy` probes for `docker`, `podman`, then `nerdctl` (force one with `ADAPTER_K8S_CONTAINER_CLI`). Builds are pinned to `--platform=linux/amd64` by default so Apple Silicon hosts don't ship arm64 images to x86 nodes; set `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` for ARM node pools.
+`deploy` probes for `docker`, `podman`, then `nerdctl` (force one with `ADAPTER_K8S_CONTAINER_CLI`). Each build publishes one platform, `linux/amd64` by default; set `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` while running `next build`/`adapter-k8s deploy` for ARM nodes. The platform is recorded in the build artifact, used for native Sharp packages and Docker builds, and enforced with a pod node selector. Changing it after a skipped build is rejected—rebuild instead. Sharp is the only native dependency the adapter retargets itself; staged foreign ELF, Mach-O, PE, Prisma engines, and `.node` addons fail the build. Prisma `linux-musl` engines are also rejected because the emitted runtime is Debian/glibc, even when their CPU architecture matches. Apps with other native dependencies must install and build them on a matching Linux runner/container. This does not publish a multi-architecture image index.
 
 ### Environment variables
 

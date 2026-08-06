@@ -59,6 +59,7 @@ describe("renderRoutingServiceDeployment", () => {
     expect(yaml).toContain("allowPrivilegeEscalation: false");
     expect(yaml).toContain("readOnlyRootFilesystem: true");
     expect(yaml).toContain('drop: ["ALL"]');
+    expect(yaml).toContain('kubernetes.io/arch: "amd64"');
     // A writable /tmp (emptyDir) backs the read-only root filesystem — the runtime TLS
     // cert generation writes under /tmp/tls.
     expect(yaml).toMatch(/volumeMounts:[\s\S]*?name: tmp\n\s+mountPath: \/tmp/);

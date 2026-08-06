@@ -11,6 +11,11 @@ import {
   UNCONFIGURED_IMAGE_REGISTRY,
 } from "./utils.js";
 import { POOL_READINESS_PATH } from "./deployment.js";
+import {
+  DEFAULT_TARGET_PLATFORM,
+  targetArchitecture,
+  type TargetPlatform,
+} from "../../target-platform.js";
 
 /**
  * Pool defaults. Exported so the tests (and deploy's per-build snapshot) can pin the
@@ -29,12 +34,14 @@ export function renderValuesYaml({
   pools,
   buildId,
   nextVersion,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
   config,
   imageRegistry,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
   nextVersion: string;
+  targetPlatform?: TargetPlatform;
   config: K8sAdapterConfig;
   imageRegistry: string;
 }): string {
@@ -52,6 +59,10 @@ export function renderValuesYaml({
 
   const values = {
     global: {
+      // The adapter publishes one platform per build, not a multi-arch index. Constrain every
+      // adapter-built workload to nodes that can execute that image; otherwise a mixed-arch
+      // cluster can schedule it onto the wrong node and fail only at image start.
+      targetArchitecture: targetArchitecture(targetPlatform),
       image: {
         registry: imageRegistry,
         repository: "nextjs-app",

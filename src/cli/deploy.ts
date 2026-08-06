@@ -71,6 +71,11 @@ import {
 } from "../emit/templates/utils.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveContainerCli, targetPlatform } from "./container-runtime.js";
+import {
+  DEFAULT_TARGET_PLATFORM,
+  parseTargetPlatform,
+  type TargetPlatform,
+} from "../target-platform.js";
 import type { GcloudCommand } from "./init.js";
 
 /**
@@ -295,6 +300,8 @@ export interface DockerCommandOptions {
    * push — is accepted identically by podman and nerdctl.
    */
   containerCli?: string;
+  /** Platform recorded by the build artifact; never re-infer it from the deploy host. */
+  targetPlatform?: TargetPlatform;
 }
 
 /**
@@ -364,7 +371,10 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   // S24: pin the build architecture. Without it a host-native build on Apple Silicon
   // produces arm64 images that fail with `exec format error` on GKE's x86 nodes — and only
   // at rollout, not at build time. Never passed to `push`, which has no such flag.
-  const platformArg = `--platform=${targetPlatform()}`;
+  const platformArg = `--platform=${parseTargetPlatform(
+    options.targetPlatform ?? targetPlatform(),
+    "Docker target platform",
+  )}`;
   const commands: GcloudCommand[] = [];
 
   // 0. Registry authentication — ONLY for Google registries.
@@ -504,10 +514,15 @@ export async function resolveDeployImageDigests(opts: {
   projectId: string;
   allowMutableTags?: boolean;
   containerCli?: string;
+  targetPlatform?: TargetPlatform;
 }): Promise<Record<string, string>> {
   const digests: Record<string, string> = {};
   const unresolved: string[] = [];
   const cliLabel = opts.containerCli ?? "docker";
+  const platform = parseTargetPlatform(
+    opts.targetPlatform ?? targetPlatform(),
+    "image digest target platform",
+  );
   for (const [key, ref] of opts.refs) {
     // S25: REGISTRY FIRST. kubelet pulls from the registry, so the registry's digest is the
     // only one that can actually be deployed. The local daemon merely usually agrees —
@@ -526,9 +541,9 @@ export async function resolveDeployImageDigests(opts: {
     // ImagePullBackOffs at rollout, after cutover has started, whereas refusing fails at deploy
     // time with something actionable.
     const digest =
-      (await resolveRegistryDigest(ref, opts.projectId)) ??
-      (await resolveRegistryDigestAny(ref, cli)) ??
-      (cli === "docker" ? await resolveImageDigest(ref, cli) : null);
+      (await resolveRegistryDigest(ref, opts.projectId, platform, cli)) ??
+      (await resolveRegistryDigestAny(ref, cli, platform)) ??
+      (cli === "docker" ? await resolveImageDigest(ref, cli, platform) : null);
     if (digest) digests[key] = digest;
     else unresolved.push(ref);
   }
@@ -539,8 +554,9 @@ export async function resolveDeployImageDigests(opts: {
           `could pin these images, so deploying would run them by TAG — a retag would change ` +
           `what runs on the next pod start, on pods that hold the internal dispatch secret and ` +
           `cache credentials. Refusing to deploy without image integrity.\n` +
-          `Fix by installing a registry client (\`crane\` or \`skopeo\`), or check registry ` +
-          `access (Artifact Registry: \`gcloud artifacts docker images describe <ref>\`).\n` +
+          `Fix registry access for a platform-aware client (\`crane\`, \`skopeo\`, or ` +
+          `\`docker manifest inspect\`). An Artifact Registry summary digest alone is not ` +
+          `enough because it may name an index with no ${platform} child.\n` +
           `Note: the local ${cliLabel} daemon is only trusted as a digest source for docker — ` +
           `podman rewrites manifests on push, so its local digest can differ from the registry's ` +
           `and deploying it fails at rollout. Pass --allow-mutable-tags to deploy anyway.`,
@@ -567,9 +583,9 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
  * that value yields ImagePullBackOff (measured: podman said e04a0a5b…, the registry held
  * 27fa476b…). Shipping EKS/AKS on the local-daemon fallback would inherit a known-broken path.
  *
- * Probe order, first answer wins:
- *  1. `crane digest` — purpose-built, no daemon needed.
- *  2. `skopeo inspect` — the podman ecosystem's equivalent.
+ * Probe order, first platform-validated answer wins:
+ *  1. `crane manifest/config/digest` — inspect the index or single-image config before digest.
+ *  2. `skopeo inspect --override-*` — require its selected image to report the target platform.
  *  3. `docker manifest inspect -v` — needs NO extra tooling, and VERIFIED against Artifact
  *     Registry to report a digest byte-identical to `gcloud artifacts docker images describe`.
  *     Docker-only: nerdctl has no such subcommand, and podman's `manifest inspect` operates on
@@ -580,22 +596,81 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 export async function resolveRegistryDigestAny(
   imageRef: string,
   containerCli: string,
+  platform: TargetPlatform = targetPlatform(),
 ): Promise<string | null> {
-  const crane = await execCapture("crane", ["digest", imageRef]).catch(() => null);
-  if (crane?.exitCode === 0) {
-    const d = crane.stdout.trim();
-    if (DIGEST_RE.test(d)) return d;
+  const safePlatform = parseTargetPlatform(platform, "registry digest target platform");
+  const [targetOs, targetArch, targetVariant] = safePlatform.split("/");
+  const matches = (candidate: {
+    os?: string | undefined;
+    architecture?: string | undefined;
+    variant?: string | undefined;
+  }) =>
+    candidate.os === targetOs &&
+    candidate.architecture === targetArch &&
+    (candidate.variant ?? undefined) === (targetVariant ?? undefined);
+
+  const craneManifest = await execCapture("crane", ["manifest", imageRef]).catch(() => null);
+  if (craneManifest?.exitCode === 0) {
+    try {
+      const manifest = JSON.parse(craneManifest.stdout) as {
+        manifests?: Array<{
+          digest?: string;
+          platform?: { os?: string; architecture?: string; variant?: string };
+        }>;
+      };
+      if (Array.isArray(manifest.manifests)) {
+        const child = manifest.manifests.find((entry) => entry.platform && matches(entry.platform));
+        return child?.digest && DIGEST_RE.test(child.digest) ? child.digest : null;
+      }
+
+      // A single-image manifest has no platform field. Its config is the authoritative OS/arch.
+      const config = await execCapture("crane", ["config", imageRef]).catch(() => null);
+      if (config?.exitCode !== 0) return null;
+      const imageConfig = JSON.parse(config.stdout) as {
+        os?: string;
+        architecture?: string;
+        variant?: string;
+      };
+      if (!matches(imageConfig)) return null;
+      const digest = await execCapture("crane", ["digest", imageRef]).catch(() => null);
+      const value = digest?.stdout.trim() ?? "";
+      return digest?.exitCode === 0 && DIGEST_RE.test(value) ? value : null;
+    } catch {
+      // Malformed output is not proof of a platform; try the next independent probe.
+    }
   }
 
-  const skopeo = await execCapture("skopeo", [
+  const skopeoArgs = [
     "inspect",
-    "--format",
-    "{{.Digest}}",
+    "--override-os",
+    targetOs!,
+    "--override-arch",
+    targetArch!,
+    ...(targetVariant ? ["--override-variant", targetVariant] : []),
     `docker://${imageRef}`,
-  ]).catch(() => null);
+  ];
+  const skopeo = await execCapture("skopeo", skopeoArgs).catch(() => null);
   if (skopeo?.exitCode === 0) {
-    const d = skopeo.stdout.trim();
-    if (DIGEST_RE.test(d)) return d;
+    try {
+      const inspected = JSON.parse(skopeo.stdout) as {
+        Digest?: string;
+        Os?: string;
+        Architecture?: string;
+        Variant?: string;
+      };
+      if (
+        !matches({
+          os: inspected.Os,
+          architecture: inspected.Architecture,
+          variant: inspected.Variant,
+        })
+      ) {
+        return null;
+      }
+      return inspected.Digest && DIGEST_RE.test(inspected.Digest) ? inspected.Digest : null;
+    } catch {
+      // Try docker's registry view when skopeo did not return usable JSON.
+    }
   }
 
   if (containerCli === "docker") {
@@ -615,8 +690,6 @@ export async function resolveRegistryDigestAny(
         // deploy is fixed (see targetPlatform()), select the matching child explicitly and
         // refuse rather than guess when it is absent.
         if (Array.isArray(parsed)) {
-          const want = targetPlatform(); // "linux/amd64" unless overridden
-          const [os, arch, variant] = want.split("/");
           const match = parsed.find((entry) => {
             const p = (
               entry as {
@@ -625,12 +698,7 @@ export async function resolveRegistryDigestAny(
                 };
               }
             ).Descriptor?.platform;
-            if (!p || p.os !== os || p.architecture !== arch) return false;
-            // The VARIANT matters: `linux/arm/v7` and `linux/arm/v6` are different images, so
-            // ignoring it let registry ORDER decide which ARM build got pinned — the same class
-            // of bug as taking element [0]. An unspecified variant matches only an entry with
-            // none, rather than whichever happens to be first.
-            return (p.variant ?? undefined) === (variant ?? undefined);
+            return !!p && matches(p);
           });
           const d = (match as { Descriptor?: { digest?: string } } | undefined)?.Descriptor?.digest;
           if (typeof d === "string" && DIGEST_RE.test(d)) return d;
@@ -638,9 +706,22 @@ export async function resolveRegistryDigestAny(
           // closed rather than pinning an image that cannot run.
           return null;
         }
-        const digest = (parsed as { Descriptor?: { digest?: string } } | undefined)?.Descriptor
-          ?.digest;
-        if (typeof digest === "string" && DIGEST_RE.test(digest)) return digest;
+        const descriptor = (
+          parsed as {
+            Descriptor?: {
+              digest?: string;
+              platform?: { os?: string; architecture?: string; variant?: string };
+            };
+          }
+        )?.Descriptor;
+        if (
+          descriptor?.platform &&
+          matches(descriptor.platform) &&
+          typeof descriptor.digest === "string" &&
+          DIGEST_RE.test(descriptor.digest)
+        ) {
+          return descriptor.digest;
+        }
       } catch {
         // Unparseable output is not a digest; fall through to null.
       }
@@ -667,10 +748,12 @@ export async function resolveRegistryDigestAny(
 export async function resolveRegistryDigest(
   imageRef: string,
   projectId: string,
+  platform: TargetPlatform = targetPlatform(),
+  containerCli: string = "docker",
 ): Promise<string | null> {
-  // Artifact Registry only. Without a GCP project there is nothing to ask — the caller falls
-  // back to the local daemon, and fails closed if that cannot pin it either. A registry-native
-  // probe for ECR/ACR/generic (crane, skopeo) is Phase 2 of the multi-provider plan.
+  // Artifact Registry only. Without a GCP project there is nothing to ask. The summary is a
+  // useful authoritative existence/digest check, but it is never sufficient by itself because
+  // an index digest does not prove that the requested platform is present.
   if (!projectId) return null;
   const res = await execCapture("gcloud", [
     "artifacts",
@@ -685,34 +768,39 @@ export async function resolveRegistryDigest(
   const digest = res.stdout.trim();
   // Validated at the point of consumption: this string reaches a helm --set and then the pod
   // spec's image reference.
-  return /^sha256:[a-f0-9]{64}$/.test(digest) ? digest : null;
+  if (!DIGEST_RE.test(digest)) return null;
+  // Artifact Registry's summary digest can name an OCI INDEX and says nothing about which
+  // children it contains. Never return it directly: a requested arm64 deploy previously
+  // accepted an amd64-only index here before any platform-aware probe ran.
+  return resolveRegistryDigestAny(imageRef, containerCli, platform);
 }
 
 export async function resolveImageDigest(
   imageRef: string,
   containerCli: string = "docker",
+  platform: TargetPlatform = targetPlatform(),
 ): Promise<string | null> {
   // ALL RepoDigests, not just index 0: they belong to the image ID, and one local image tagged
   // and pushed to more than one repository carries an entry per repository. Taking the first and
   // pairing its digest with THIS repository could reference a manifest that does not exist
   // there, leaving the new pods in ImagePullBackOff. Select the entry whose repository matches.
   // podman and nerdctl both implement `inspect --format` with the same Go template fields.
+  const safePlatform = parseTargetPlatform(platform, "local image target platform");
   const res = await execCapture(containerCli, [
     "inspect",
     "--format",
-    "{{range .RepoDigests}}{{println .}}{{end}}",
+    "{{.Os}}/{{.Architecture}}\n{{range .RepoDigests}}{{println .}}{{end}}",
     imageRef,
   ]);
   if (res.exitCode !== 0) return null;
+  const [reportedPlatform, ...digestLines] = res.stdout.split("\n");
+  if (reportedPlatform?.trim() !== safePlatform) return null;
   // The repository is the reference without its tag — `registry/host/repo:tag` → `…/repo`.
   // (A digest never appears here: this is the tag we just pushed.)
   const colon = imageRef.lastIndexOf(":");
   const slash = imageRef.lastIndexOf("/");
   const repository = colon > slash ? imageRef.slice(0, colon) : imageRef;
-  const entries = res.stdout
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const entries = digestLines.map((l) => l.trim()).filter(Boolean);
   for (const entry of entries) {
     const at = entry.lastIndexOf("@");
     if (at === -1) continue;
@@ -1344,6 +1432,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Which provider this build targets. Older metadata predates the field; default to gke,
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
+  // Native dependencies are staged during `next build`, so deploy must consume the artifact's
+  // platform instead of re-reading a possibly different environment. Older artifacts did not
+  // record it and always staged the amd64 Sharp pair, so they are amd64 artifacts regardless
+  // of a deploy-time override.
+  const builtTargetPlatform =
+    metadata.targetPlatform === undefined
+      ? DEFAULT_TARGET_PLATFORM
+      : parseTargetPlatform(metadata.targetPlatform, "build-metadata.json targetPlatform");
+  const requestedTargetPlatform = process.env.ADAPTER_K8S_TARGET_PLATFORM?.trim();
+  if (
+    requestedTargetPlatform &&
+    parseTargetPlatform(requestedTargetPlatform) !== builtTargetPlatform
+  ) {
+    throw new Error(
+      `The build output in .k8s-adapter/output targets "${builtTargetPlatform}", but this ` +
+        `deploy requested "${requestedTargetPlatform}" through ADAPTER_K8S_TARGET_PLATFORM. ` +
+        `Sharp's native packages and the chart's node selector are fixed at build time. Re-run ` +
+        `without --skip-build so every artifact targets the same platform.`,
+    );
+  }
 
   // TARGET FINGERPRINT. The routing tier's image registry is baked into its Deployment template
   // at BUILD time, so copied or pre-variant output can still belong to another target. MEASURED:
@@ -1699,6 +1807,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       outputDir: outputDirRelative,
       containerStrategy,
       containerCli,
+      targetPlatform: builtTargetPlatform,
     });
 
     for (const cmd of dockerCommands) {
@@ -1735,6 +1844,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         projectId: infra.projectId ?? "",
         allowMutableTags: allowMutableTags ?? false,
         containerCli,
+        targetPlatform: builtTargetPlatform,
       }),
     );
     const pinned = Object.keys(imageDigests).length;
@@ -2031,7 +2141,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const healthCheckPolicyCrd = buildProvider === "gke";
     for (const poolName of previousPools) {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
-
       if (!dryRun) {
         // Read the complete object rather than selecting pod-template fields. The JSON is never
         // rendered back into YAML: it only supplies the live capacity target. That is the key
@@ -2387,6 +2496,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         targetBuildId: previousBuildId,
         registry: infra.containerRegistry,
         targetImageDigest: state?.routingImageDigests?.[previousBuildId],
+        targetPlatform: state?.targetPlatforms?.[previousBuildId],
         // The outgoing manifest was snapshotted before Helm. Do not retain the uncertain
         // image/manifest pair left by a failed or aborted deploy under either build's name.
         retainCurrentManifest: false,
@@ -3237,6 +3347,17 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (imageDigests.routingService) {
         routingImageDigests[buildId] = imageDigests.routingService;
       }
+      // The stable routing Deployment is updated in place, so rollback must move its
+      // architecture selector with the target image. Record this build's exact platform and
+      // carry only the outgoing rollback target when its provenance is known.
+      const targetPlatforms: Record<string, TargetPlatform> = {};
+      const recordedPrevPlatform = previousBuildId
+        ? state?.targetPlatforms?.[previousBuildId]
+        : undefined;
+      if (previousBuildId && recordedPrevPlatform) {
+        targetPlatforms[previousBuildId] = recordedPrevPlatform;
+      }
+      targetPlatforms[buildId] = builtTargetPlatform;
       // N30: carry (and prune to the builds in play) the record of which builds have NO
       // retained routing manifest, so doctor can qualify "rollback ready" honestly.
       const unretainedManifestBuilds = [
@@ -3254,6 +3375,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             ...(previousBuildId ? { [previousBuildId]: [...previousPools] } : {}),
             [buildId]: [...pools],
           },
+          targetPlatforms,
           // The build this deploy just installed serves /readyz, so the NEXT deploy can flip
           // the load balancer's HealthCheckPolicy to readiness without stranding it.
           readinessPathSupported: true,
