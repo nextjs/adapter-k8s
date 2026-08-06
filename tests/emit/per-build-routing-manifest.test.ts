@@ -31,6 +31,9 @@ describe("per-build routing manifest ConfigMap", () => {
       routingManifestJson: MANIFEST,
     });
     expect(yaml).toContain(`name: ${routingManifestSnapshotName("test-app", "bms7test1")}`);
+    expect(yaml).toContain('app.kubernetes.io/name: "test-app"');
+    expect(yaml).toContain('app.kubernetes.io/component: "routing-manifest-snapshot"');
+    expect(yaml).toContain('helm.sh/resource-policy: "keep"');
     expect(yaml).toContain("routing-manifest.json");
   });
 

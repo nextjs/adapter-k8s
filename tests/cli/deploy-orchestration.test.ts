@@ -756,7 +756,8 @@ describe("runDeploy — guards and teardown", () => {
       .mock.calls.find(([, a]) => a.includes("configmaps"))![1]
       .join(" ");
     expect(listing).toContain("app.kubernetes.io/component=routing-manifest-snapshot");
-    expect(listing).toContain("app.kubernetes.io/managed-by=adapter-k8s");
+    expect(listing).toContain(`app.kubernetes.io/name=${RELEASE}`);
+    expect(listing).not.toContain("app.kubernetes.io/managed-by=adapter-k8s");
   });
 
   it("fails fast when a pool rollout status fails (exit code is not discarded)", async () => {

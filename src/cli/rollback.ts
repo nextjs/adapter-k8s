@@ -12,6 +12,7 @@ import {
   resolveK8sNamespace,
 } from "../emit/templates/utils.js";
 import {
+  ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
   ROUTING_MANIFEST_VOLUME_NAME,
   routingManifestSnapshotName,
   routingServiceDeploymentName,
@@ -243,8 +244,45 @@ export async function retainLiveRoutingManifest(
   }
   const serving = read.config;
   const snapshotName = routingManifestSnapshotName(releaseName, serving.imageTag);
-  // Already serving from this build's snapshot (post-rollback state) — nothing to copy.
-  if (serving.manifestConfigMap === snapshotName) return { status: "retained", snapshotName };
+  // A current chart renders the serving build's snapshot as a Helm-owned object. Merely
+  // observing that it already has the right name is not retention: Helm deletes resources
+  // that disappear from the next chart. Stamp the keep policy and classification labels
+  // before upgrade so the outgoing routing ReplicaSet and rollback target keep mounting it.
+  // This also migrates snapshots emitted before the chart carried the policy itself.
+  if (serving.manifestConfigMap === snapshotName) {
+    const annotated = await execCapture("kubectl", [
+      "annotate",
+      "configmap",
+      snapshotName,
+      "-n",
+      namespace,
+      "helm.sh/resource-policy=keep",
+      "--overwrite",
+    ]);
+    if (annotated.exitCode !== 0) {
+      return {
+        status: "failed",
+        reason: `could not retain the live snapshot ${snapshotName}: ${annotated.stderr.trim() || `kubectl annotate exited ${annotated.exitCode}`}`,
+      };
+    }
+    const labeled = await execCapture("kubectl", [
+      "label",
+      "configmap",
+      snapshotName,
+      "-n",
+      namespace,
+      `app.kubernetes.io/name=${releaseName}`,
+      `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
+      "--overwrite",
+    ]);
+    if (labeled.exitCode !== 0) {
+      return {
+        status: "failed",
+        reason: `could not classify the live snapshot ${snapshotName}: ${labeled.stderr.trim() || `kubectl label exited ${labeled.exitCode}`}`,
+      };
+    }
+    return { status: "retained", snapshotName };
+  }
   // Overwrite protection: if a ConfigMap already exists under this snapshot name but is
   // stamped with a DIFFERENT build id, the two builds' snapshot names collide after
   // sanitization — overwriting would destroy that build's only retained manifest.
@@ -318,10 +356,11 @@ export async function retainLiveRoutingManifest(
         "app.kubernetes.io/name": releaseName,
         // kubectl-created (not helm-owned) — destroy deletes by this label pair.
         "app.kubernetes.io/managed-by": "adapter-k8s",
-        "app.kubernetes.io/component": "routing-manifest-snapshot",
+        "app.kubernetes.io/component": ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
       },
       // An ANNOTATION, not a label: build ids may exceed the 63-char label-value limit.
       annotations: {
+        "helm.sh/resource-policy": "keep",
         [SNAPSHOT_BUILD_ID_ANNOTATION]: serving.imageTag,
       },
     },

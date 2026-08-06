@@ -739,7 +739,7 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
     // permanently destroys the rollback target's manifest once helm overwrites the stable
     // ConfigMap.
     vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
-    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+    await expect(retainLiveRoutingManifest("rel", "prod")).resolves.toEqual({
       status: "no-routing-tier",
     });
     expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
@@ -825,10 +825,48 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
       retainCapture({ existingSnapshotAnnotation: undefined }) as never,
     );
 
-    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+    await expect(retainLiveRoutingManifest("rel", "prod")).resolves.toEqual({
       status: "retained",
       snapshotName: SNAP_N,
     });
+  });
+
+  it("retains a chart-owned live snapshot before the next Helm upgrade", async () => {
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+      if (j.includes("get deployment rel-routing-service") && args.includes("json")) {
+        return ok(
+          JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    { name: "routing-service", image: `${REGISTRY}/routing-service:buildn` },
+                  ],
+                  volumes: [{ name: "routing-manifest", configMap: { name: SNAP_N } }],
+                },
+              },
+            },
+          }),
+        );
+      }
+      return ok();
+    }) as never);
+
+    await expect(retainLiveRoutingManifest("rel", "prod")).resolves.toEqual({
+      status: "retained",
+      snapshotName: SNAP_N,
+    });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls).toContain(
+      `annotate configmap ${SNAP_N} -n prod helm.sh/resource-policy=keep --overwrite`,
+    );
+    expect(calls).toContain(
+      `label configmap ${SNAP_N} -n prod app.kubernetes.io/name=rel app.kubernetes.io/component=routing-manifest-snapshot --overwrite`,
+    );
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
   });
 
   it("N30: reports a failed apply as failed, with a reason", async () => {
@@ -904,6 +942,7 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
     });
     const applied = JSON.parse(vi.mocked(execCaptureStdin).mock.calls[0]![2] as string);
     expect(applied.metadata.annotations[SNAPSHOT_BUILD_ID_ANNOTATION]).toBe("buildn");
+    expect(applied.metadata.annotations["helm.sh/resource-policy"]).toBe("keep");
     expect(applied.metadata.labels["app.kubernetes.io/managed-by"]).toBe("adapter-k8s");
   });
 });
