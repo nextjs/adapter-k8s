@@ -231,6 +231,23 @@ describe("validateConfig", () => {
     expect(() => validateConfig(config)).toThrow(/reserved for the portable entrypoint/);
   });
 
+  it("requires defaultPool to name a configured pool", () => {
+    const config: K8sAdapterConfig = {
+      pools: { web: { routes: ["appPages"] } },
+      defaultPool: "missing",
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: false } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).toThrow(/defaultPool.*configured pool/);
+  });
+
   it("enforces the combined release+pool budget when the release name is known", () => {
     // sanitizeK8sName truncates `${release}-${pool}-${buildId}` to 63 (59 for the
     // -hpa/-hcp variants): at least 8 build-id chars must survive, i.e.

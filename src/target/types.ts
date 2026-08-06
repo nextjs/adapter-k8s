@@ -127,6 +127,7 @@ export interface DefineTargetOptions {
 
 export interface CompiledKubernetesTarget {
   plan: CompositionPlan;
+  defaultPool: string;
   hosts: HostConfig[];
   ingressSources: IngressSourceSet;
   routingTier: RoutingBuildResult["routingTier"];

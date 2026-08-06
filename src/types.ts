@@ -83,6 +83,8 @@ export interface GKEProviderConfig {
 
 export interface K8sAdapterConfig {
   pools: Record<string, PoolConfig>;
+  /** Pool that hosts the stable portable origin. Defaults to the first declared pool. */
+  defaultPool?: string;
   /**
    * Runtime environment for every app container. `.env` files are deliberately never staged
    * into an image (they can hold secrets and would be baked into pushed layers), so this is

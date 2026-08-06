@@ -140,7 +140,8 @@ export function generateHelmChart({
   if (!provider && !compiledTarget) {
     throw new Error("generateHelmChart requires compiledTarget when config.target is used");
   }
-  const defaultPool = pools.keys().next().value as string | undefined;
+  const defaultPool =
+    compiledTarget?.defaultPool ?? (pools.keys().next().value as string | undefined);
   if (!defaultPool) throw new Error("generateHelmChart requires at least one pool");
   const emitsHealthCheckPolicy = compiledTarget
     ? compiledTarget.routingTier.registration === "gke-traffic-extension"
@@ -197,6 +198,7 @@ export function generateHelmChart({
     targetPlatform,
     config,
     imageRegistry,
+    defaultPool,
   });
 
   // Routing and Config

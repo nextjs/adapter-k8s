@@ -158,6 +158,7 @@ export type RoutingPlan =
       dataplane: {
         kind: "portable-http-origin";
         service: KubernetesServiceRef;
+        targetPool: string;
         readiness: RoutingReadiness[];
       };
     }

@@ -3,6 +3,7 @@ import {
   assertSafeBuildId,
   assertSafeImageRegistry,
   assertSafeNamespace,
+  assertSafePoolName,
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeReleaseName,
@@ -517,13 +518,18 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
     if (kind !== "portable-http-origin") {
       fail(`${path}.dataplane.kind`, 'pool-local-v1 requires "portable-http-origin"');
     }
-    exactKeys(dataplane, ["kind", "service", "readiness"], `${path}.dataplane`);
+    exactKeys(dataplane, ["kind", "service", "targetPool", "readiness"], `${path}.dataplane`);
     return {
       protocol,
       failurePolicy: literal(parsed.failurePolicy, "closed", `${path}.failurePolicy`),
       dataplane: {
         kind,
         service: parseKubernetesServiceRef(dataplane.service, `${path}.dataplane.service`),
+        targetPool: validated(
+          dataplane.targetPool,
+          `${path}.dataplane.targetPool`,
+          assertSafePoolName,
+        ),
         readiness: readiness(dataplane.readiness),
       },
     };

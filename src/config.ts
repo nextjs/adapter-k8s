@@ -256,6 +256,15 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     }
   }
 
+  if (config.defaultPool !== undefined) {
+    assertSafePoolName(config.defaultPool);
+    if (!(config.defaultPool in config.pools)) {
+      throw new Error(
+        `defaultPool ${JSON.stringify(config.defaultPool)} does not name a configured pool`,
+      );
+    }
+  }
+
   // N60: the routing tier's quantities are interpolated UNQUOTED
   // (routing-service-deployment.ts) and its scaling numbers as bare scalars
   // (routing-service-hpa.ts) — the least-escaped sinks in the chart.

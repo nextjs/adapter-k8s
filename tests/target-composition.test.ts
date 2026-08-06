@@ -44,6 +44,7 @@ describe("Kubernetes target composition", () => {
       dataplane: {
         kind: "portable-http-origin",
         service: { name: "test-app-origin", namespace: "apps", port: 3000 },
+        targetPool: "default",
         readiness: [
           {
             kind: "kubernetes-service-endpoints",
@@ -54,8 +55,23 @@ describe("Kubernetes target composition", () => {
       },
     });
     expect(compiled.routingTier.enabled).toBe(false);
+    expect(compiled.defaultPool).toBe("default");
     expect(compiled.plan.operations.resources.objects).toEqual([]);
     expect(JSON.stringify(compiled.plan)).not.toContain("envoy");
+  });
+
+  it("records an explicit portable origin pool independently of declaration order", () => {
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({ hosts }),
+      }),
+      context({ defaultPool: "api" }),
+    );
+    expect(compiled.defaultPool).toBe("api");
+    expect(compiled.plan.operations.routing).toMatchObject({
+      dataplane: { kind: "portable-http-origin", targetPool: "api" },
+    });
   });
 
   it("emits typed Gateway API objects targeting the origin Service", () => {
