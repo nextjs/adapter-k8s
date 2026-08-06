@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.js";
 import {
   getRscConfig,
+  INTERNAL_DEADLINE_HEADER,
   manifestNextConfig,
   middlewareMayCoverPath,
   INTERNAL_DISPATCH_HEADERS,
@@ -28,8 +29,10 @@ import { restoreFetchCacheSeed } from "./fetch-cache-seed.js";
 import { cdnCacheTag } from "../cdn-tags.js";
 import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import {
+  applyMiddlewareRequestHeaders,
   createDispatcher,
   getContentType,
+  installResolvedResponseHeaders,
   isVerifiedPreviewRequest,
   mergeResolvedHeadersIntoHeadersArg,
 } from "./dispatch.js";
@@ -374,6 +377,15 @@ function createBufferedStream(body: Buffer | null): ReadableStream<Uint8Array> {
       controller.close();
     },
   });
+}
+
+function requestHeaders(req: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (typeof value === "string") headers.set(key, value);
+    else if (Array.isArray(value)) value.forEach((entry) => headers.append(key, entry));
+  }
+  return headers;
 }
 
 // Reconstruct a Headers from the routing extension's serialized x-resolved-headers (JSON of
@@ -2426,6 +2438,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // into the routing manifest; read defensively — older manifests (and any build
     // without it) fall back to pod-start anchoring inside the dispatcher.
     builtAt: (routingManifest as { builtAt?: string }).builtAt,
+    routeTimeouts: routingManifest.routeTimeouts,
+    poolTimeouts: routingManifest.poolTimeouts,
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
@@ -2872,12 +2886,38 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
     }
 
+    const imagePlatformPath = stripBasePath(url.pathname, basePath);
+    const isImageRequest =
+      imagePlatformPath === "/_next/image" || imagePlatformPath === "/_next/image/";
+
+    // The optimizer is a platform route, but Next middleware still runs before it. Resolve the
+    // public URL first whenever middleware may cover it. A terminal middleware verdict is
+    // dispatched normally; next() carries request/response header mutations into the optimizer.
+    // Non-read methods fall through to the ordinary resolver so middleware can consume the body.
+    if (isImageRequest && middlewareMayCover && isReadMethod(req.method)) {
+      const resolution = await resolver.resolve(
+        url,
+        requestHeaders(req),
+        req.method ?? "GET",
+        createBufferedStream(null),
+      );
+      if (resolution.kind !== "not-found") {
+        await dispatcher.dispatch(req, res, resolution);
+        return;
+      }
+      applyMiddlewareRequestHeaders(req, resolution.middlewareRequestHeaders);
+      installResolvedResponseHeaders(res, resolution.resolvedHeaders);
+      if (appCacheControl === null) {
+        appCacheControl = resolution.resolvedHeaders?.get("cache-control") ?? null;
+      }
+    }
+
     // Basic image optimization: /_next/image?url=...&w=...&q=...
     // Fetches the source image and serves it (with optimization if Sharp is available).
     // Both forms: a custom images.loaderFile commonly emits `/_next/image/?url=…` (the
     // upstream loader-config fixture does), and `trailingSlash: true` apps mirror it. The
     // exact match silently bypassed the optimizer for the slash form (canary.97 catch-up ②).
-    if (url.pathname === "/_next/image" || url.pathname === "/_next/image/") {
+    if (isImageRequest && (!middlewareMayCover || isReadMethod(req.method))) {
       // The `url` gate FIRST, then `w`/`q` — upstream's order, and observable: with
       // `?url=/_next/image&w=16` `next start` answers "cannot be recursive" while the
       // adapter used to answer `"w" parameter (width) of 16 is not allowed`. See
@@ -2953,17 +2993,24 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // until afterwards, so `/..%2f..%2fpackage.json` reaches here intact and must be
           // refused. Pinned by test in tests/pool-server/index.image.test.ts.
           const decodedImagePath = urlParam.pathname;
+          const filesystemImagePath = stripBasePath(decodedImagePath, basePath);
+          const publicImagePath =
+            basePath &&
+            decodedImagePath !== basePath &&
+            !decodedImagePath.startsWith(`${basePath}/`)
+              ? `${basePath}${decodedImagePath}`
+              : decodedImagePath;
           const publicRoot = path.join(process.cwd(), "public");
           const staticRoot = path.join(process.cwd(), ".next", "static");
-          const publicFile = resolveWithinRoot(publicRoot, decodedImagePath);
-          const staticFile = decodedImagePath.startsWith("/_next/static/")
-            ? resolveWithinRoot(staticRoot, decodedImagePath.slice("/_next/static/".length))
+          const publicFile = resolveWithinRoot(publicRoot, filesystemImagePath);
+          const staticFile = filesystemImagePath.startsWith("/_next/static/")
+            ? resolveWithinRoot(staticRoot, filesystemImagePath.slice("/_next/static/".length))
             : null;
 
           // A null result means the path escaped its root — reject traversal.
           if (
             publicFile === null ||
-            (decodedImagePath.startsWith("/_next/static/") && staticFile === null)
+            (filesystemImagePath.startsWith("/_next/static/") && staticFile === null)
           ) {
             // No exact upstream counterpart: upstream NORMALIZES `..` away in
             // `new URL(url, "http://n")` and then simply misses the file, answering
@@ -2977,8 +3024,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // `immutable/media` variant), evaluated on the DECODED path so an encoded
           // prefix can't claim immutability for a public/ file.
           isStaticSource =
-            decodedImagePath.startsWith("/_next/static/media/") ||
-            decodedImagePath.startsWith("/_next/static/immutable/media/");
+            filesystemImagePath.startsWith("/_next/static/media/") ||
+            filesystemImagePath.startsWith("/_next/static/immutable/media/");
 
           // S3 (SECURITY + PARITY). Does middleware cover the SOURCE pathname? If so the disk
           // read below would serve bytes middleware was supposed to gate: the sibling fast
@@ -2998,10 +3045,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // for every request, not just the ones whose has/missing match (see S2).
           const sourceCoveredByMiddleware =
             !!(middlewareModule || edgeMiddlewareRunner) &&
-            middlewareMayCoverPath(
-              middlewareMatchers,
-              new URL(`${url.origin}${basePath}${decodedImagePath}`),
-            );
+            middlewareMayCoverPath(middlewareMatchers, new URL(`${url.origin}${publicImagePath}`));
 
           let localImageFile: string | null = null;
           let localImageSize = 0;
@@ -3044,7 +3088,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and the
             // SHARED MAX_IMAGE_BYTES cap (N35) so an oversized body can't exhaust memory —
             // the same number the external path enforces, which it previously did not.
-            const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
+            const selfUrl = `http://127.0.0.1:${port}${publicImagePath}`;
             const imgRes = await fetch(selfUrl, {
               signal: AbortSignal.timeout(5000),
               // The EXTERNAL path re-validates every redirect hop against the SSRF
@@ -3103,7 +3147,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             selfFetchContentType = imgRes.headers.get("content-type");
             upstreamCacheControl = imgRes.headers.get("cache-control");
           }
-          contentType = selfFetchContentType ?? getContentType(decodedImagePath);
+          contentType = selfFetchContentType ?? getContentType(filesystemImagePath);
         } else {
           // External image: only fetch allowlisted http(s) hosts, and only after
           // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
@@ -3418,11 +3462,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // middleware headers. servePublicFileFromDisk remains as the last resort for files
     // the manifest missed (both phases, below).
 
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === "string") headers.set(key, value);
-      else if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
-    }
+    const headers = requestHeaders(req);
 
     let bodyBuffer: Buffer | null;
     try {
@@ -3540,6 +3580,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // from an extension bug must not 500 the request — the invoker recovers the
       // query from the invocation path itself.
       const extInvokePath = req.headers["x-invoke-path"] as string | undefined;
+      const extDeadlineRaw = req.headers[INTERNAL_DEADLINE_HEADER] as string | undefined;
+      const extDeadlineParsed = extDeadlineRaw === undefined ? Number.NaN : Number(extDeadlineRaw);
+      const extDeadlineAt =
+        Number.isSafeInteger(extDeadlineParsed) && extDeadlineParsed > 0
+          ? extDeadlineParsed
+          : undefined;
       let extInvocationQuery: Record<string, string | string[]> | undefined;
       const extInvokeQueryRaw = req.headers["x-invoke-query"] as string | undefined;
       if (extInvokeQueryRaw) {
@@ -3573,6 +3619,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         ...(extMwRequestHeaders ? { middlewareRequestHeaders: extMwRequestHeaders } : {}),
         ...(extInvokePath ? { invokePath: extInvokePath } : {}),
         ...(extInvocationQuery ? { invocationQuery: extInvocationQuery } : {}),
+        ...(extDeadlineAt ? { deadlineAt: extDeadlineAt } : {}),
       });
       return;
     }

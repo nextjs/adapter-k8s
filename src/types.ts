@@ -43,6 +43,7 @@ export interface PoolConfig {
   routes: string[];
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
+  /** Fallback time-to-response-headers budget, in seconds, when a route has no maxDuration. */
   timeout?: number;
   /** Merged OVER the top-level `env`, so a pool can override a shared default. */
   env?: Record<string, EnvValue>;
@@ -261,6 +262,9 @@ export interface RoutingManifest {
     matchers?: MiddlewareMatcher[];
   } | null;
   poolAssignments: Record<string, string>;
+  /** Time-to-response-head budgets in milliseconds, keyed by output pathname and pool. */
+  routeTimeouts?: Record<string, number>;
+  poolTimeouts?: Record<string, number>;
   pprRoutes: Record<
     string,
     {

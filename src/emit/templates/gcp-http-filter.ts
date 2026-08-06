@@ -60,6 +60,8 @@ export const NEVER_KEYED_DISPATCH_HEADERS: readonly string[] = [
   "x-mw-evaluated",
   "x-invoke-path",
   "x-invoke-query",
+  // REQUEST-SCOPED and stamped only after cache lookup; keying it would guarantee misses.
+  "x-adapter-k8s-deadline",
 ];
 
 /**

@@ -44,6 +44,9 @@ export const INTERNAL_DISPATCH_HEADERS = [
   // entirely (the handler would see only the client's original search params).
   "x-invoke-path",
   "x-invoke-query",
+  // Absolute time-to-response-head deadline propagated by a trusted cross-pool hop. Keeping one
+  // build-derived deadline prevents the target pool from minting a fresh maxDuration budget.
+  "x-adapter-k8s-deadline",
   // N40 (SECURITY). The middleware's FINAL request-header set — what
   // `NextResponse.next({ request: { headers } })` produces. `responseToMiddlewareResult`
   // resolves `x-middleware-override-headers` / `x-middleware-request-*` /
@@ -126,6 +129,7 @@ export function fitsPoolHeaderBudget(bytes: number): boolean {
 // Header carrying the shared secret that authenticates the dispatch headers above.
 // Present only on responses from the trusted routing extension / cross-pool proxy.
 export const INTERNAL_SECRET_HEADER = "x-internal-secret";
+export const INTERNAL_DEADLINE_HEADER = "x-adapter-k8s-deadline";
 
 // A compiled middleware matcher entry from middleware-manifest.json.
 export interface MiddlewareMatcher {

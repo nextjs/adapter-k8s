@@ -35,6 +35,25 @@ describe("validateConfig", () => {
     expect(() => validateConfig(config)).toThrow(/pool "ssr" must have at least one route/);
   });
 
+  it.each([0, -1, 1.5, 86_401, Number.NaN])(
+    "rejects invalid pool response-head timeout %s",
+    (timeout) => {
+      const config = {
+        pools: { ssr: { routes: ["appPages"], timeout } },
+        provider: {
+          gke: {
+            gateway: {
+              type: "gateway-api",
+              className: "gke",
+              hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+            },
+          },
+        },
+      } as K8sAdapterConfig;
+      expect(() => validateConfig(config)).toThrow(/timeout must be an integer from 1 to 86400/);
+    },
+  );
+
   it("throws error if hosts is missing or empty", () => {
     const config = {
       pools: { ssr: { routes: ["appPages"] } },
