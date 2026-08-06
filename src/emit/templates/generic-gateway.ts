@@ -84,7 +84,7 @@ export function renderGenericGateway({
 
   if (emitHttps) {
     listeners += `
-    - name: https
+    - name: https${singleHostname}
       protocol: HTTPS
       port: 443
       tls:
