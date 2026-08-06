@@ -32,6 +32,8 @@ export interface HeaderMutation {
 export interface CommonResponse {
   headerMutation?: HeaderMutation;
   status?: "CONTINUE" | "CONTINUE_AND_REPLACE";
+  /** Re-run route selection after mutating a header used by the data plane's route table. */
+  clearRouteCache?: boolean;
 }
 
 export interface ImmediateResponse {

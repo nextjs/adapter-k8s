@@ -106,6 +106,7 @@ export function plainResponseToProto(plain: PlainProcessingResponse): Processing
             setHeaders: toProtoSetHeaders(common?.headerMutation?.setHeaders ?? []),
             removeHeaders: common?.headerMutation?.removeHeaders ?? [],
           },
+          clearRouteCache: common?.clearRouteCache ?? false,
         },
       },
     },
