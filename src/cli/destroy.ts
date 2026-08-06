@@ -5,6 +5,7 @@ import { execCapture } from "./exec.js";
 import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
+import { ROUTING_MANIFEST_SNAPSHOT_COMPONENT } from "../emit/templates/routing-manifest-configmap.js";
 import { resolveK8sNamespace } from "../emit/templates/utils.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 
@@ -338,6 +339,32 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
           `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
           `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
+      );
+    }
+  }
+
+  // Helm-owned per-build routing snapshots carry resource-policy: keep so an outgoing
+  // ReplicaSet and rollback target never lose the ConfigMap they mount. Helm uninstall
+  // deliberately leaves them behind; remove the release-scoped snapshots explicitly.
+  const snapshotDeleteArgs = [
+    "delete",
+    "configmap",
+    "-n",
+    namespace,
+    "-l",
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
+    "--ignore-not-found",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${snapshotDeleteArgs.join(" ")}`);
+  } else {
+    const res = await execCapture("kubectl", snapshotDeleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete retained routing-manifest ConfigMaps: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
+          `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}).`,
       );
     }
   }

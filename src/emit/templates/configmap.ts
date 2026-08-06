@@ -5,15 +5,35 @@ import { assertSafeReleaseName, escapeHelmActions, sanitizeK8sName } from "./uti
 // key is emitted as a BARE YAML scalar before the `|` block indicator, so anything outside
 // that charset is also a YAML-injection sink.
 const CONFIGMAP_KEY_RE = /^[-._a-zA-Z0-9]+$/;
+const METADATA_KEY_RE =
+  /^(?:[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?\/)?[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
+
+function renderMetadataMap(
+  field: "labels" | "annotations",
+  values: Record<string, string> | undefined,
+): string {
+  if (!values || Object.keys(values).length === 0) return "";
+  const entries = Object.entries(values).map(([key, value]) => {
+    if (!METADATA_KEY_RE.test(key)) {
+      throw new Error(`Invalid ConfigMap metadata key "${key}" in ${field}`);
+    }
+    return `    ${key}: ${escapeHelmActions(JSON.stringify(value))}`;
+  });
+  return `  ${field}:\n${entries.join("\n")}\n`;
+}
 
 export function renderConfigMap({
   name,
   releaseName,
   data,
+  labels,
+  annotations,
 }: {
   name: string;
   releaseName: string;
   data: Record<string, string>;
+  labels?: Record<string, string>;
+  annotations?: Record<string, string>;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md) — nothing here was checked.
   assertSafeReleaseName(releaseName);
@@ -40,7 +60,7 @@ export function renderConfigMap({
 kind: ConfigMap
 metadata:
   name: ${safeName}
-data:
+${renderMetadataMap("labels", labels)}${renderMetadataMap("annotations", annotations)}data:
 ${dataEntries}
 `;
 }

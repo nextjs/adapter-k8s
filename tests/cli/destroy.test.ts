@@ -574,6 +574,25 @@ describe("destroy: retained internal-dispatch Secrets", () => {
     expect(del).toContain("--ignore-not-found");
   });
 
+  it("sweeps retained routing snapshots left behind by Helm", async () => {
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const del = vi
+      .mocked(exec.execCapture)
+      .mock.calls.map(([, args]) => args)
+      .find(
+        (args) =>
+          args[0] === "delete" &&
+          args[1] === "configmap" &&
+          args.some((arg) => arg.includes("routing-manifest-snapshot")),
+      );
+    expect(del).toBeDefined();
+    expect(del!.join(" ")).toContain(
+      "app.kubernetes.io/name=my-app,app.kubernetes.io/component=routing-manifest-snapshot",
+    );
+    expect(del).toContain("--ignore-not-found");
+  });
+
   it("warns rather than failing the destroy when the sweep cannot run", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.mocked(exec.execCapture).mockImplementation((async (_c: string, args: string[]) => {
