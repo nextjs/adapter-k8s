@@ -154,6 +154,9 @@ describe("generateHelmChart", () => {
       'app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"',
     );
     expect(Object.keys(result)).toContain("templates/composition-plan.yaml");
+    expect(
+      JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{"))),
+    ).toMatchObject({ activeDefaultPool: "ssr" });
     expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(true);
     expect(Object.values(result).some((body) => body.includes('"kind": "HTTPRoute"'))).toBe(true);
     expect(result["templates/routing-service-deployment.yaml"]).toBeUndefined();

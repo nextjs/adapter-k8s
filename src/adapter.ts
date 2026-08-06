@@ -1780,6 +1780,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       }
 
+      const configuredDefaultPool = cfg.defaultPool ?? [...pools.keys()][0]!;
       const compiledTarget = cfg.target
         ? compileTarget(targetForConfig(cfg), {
             releaseName,
@@ -1787,7 +1788,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             buildId,
             imageRegistry,
             pools: [...pools.keys()],
-            defaultPool: [...pools.keys()][0]!,
+            defaultPool: configuredDefaultPool,
             failurePolicy: failureModeAllow ? "open" : "closed",
             cache: cfg.cache?.enabled ? "external" : "none",
             infrastructure: {
@@ -2604,7 +2605,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             return n !== undefined ? { nodeCidrs: n } : {};
           })(),
           poolNames: [...pools.keys()],
-          defaultPool: [...pools.keys()][0]!,
+          defaultPool: configuredDefaultPool,
           ...(compiledTarget
             ? {
                 compositionPlan: {

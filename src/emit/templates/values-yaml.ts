@@ -37,6 +37,7 @@ export function renderValuesYaml({
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   config,
   imageRegistry,
+  defaultPool = pools.keys().next().value,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -44,6 +45,7 @@ export function renderValuesYaml({
   targetPlatform?: TargetPlatform;
   config: K8sAdapterConfig;
   imageRegistry: string;
+  defaultPool?: string;
 }): string {
   // Output as JSON (valid YAML) with a comment header.
   const gke = config.provider && "gke" in config.provider ? config.provider.gke : undefined;
@@ -152,7 +154,7 @@ export function renderValuesYaml({
       containerStrategy: config.containerStrategy ?? "traced-assets",
     },
     activeBuildId: sanitizeK8sName(buildId),
-    activeDefaultPool: pools.keys().next().value,
+    activeDefaultPool: defaultPool,
     // The path the LOAD BALANCER's HealthCheckPolicy probes on pool backends. Defaults to
     // readiness; `deploy` overrides it to the liveness path for one cycle when the outgoing
     // build may predate /readyz (see AdapterState.readinessPathSupported).

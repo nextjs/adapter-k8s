@@ -244,6 +244,7 @@ export function compileTarget(
   });
   return {
     plan,
+    defaultPool: context.defaultPool,
     hosts: target.exposure.hosts.map((host) => ({
       hostname: host.hostname,
       tls: { ...host.tls },

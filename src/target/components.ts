@@ -579,7 +579,12 @@ export function portableRouting(): RoutingComponent {
         plan: {
           protocol: "pool-local-v1",
           failurePolicy: "closed",
-          dataplane: { kind: "portable-http-origin", service, readiness },
+          dataplane: {
+            kind: "portable-http-origin",
+            service,
+            targetPool: context.defaultPool,
+            readiness,
+          },
         },
         readiness,
         routingTier: {
