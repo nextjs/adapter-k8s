@@ -4,6 +4,7 @@ import {
   assertSafeBuildId,
   assertSafePoolName,
   assertSafeReleaseName,
+  stablePoolResourceNames,
 } from "./utils.js";
 
 // Versioned Service — points to a specific build's pods
@@ -71,20 +72,25 @@ export function renderActiveService({
   assertSafeReleaseName(releaseName);
   assertSafePoolName(poolName);
 
-  const stableName = sanitizeK8sName(`${releaseName}-${poolName}`);
-  // Same "-hcp" suffix reservation as the versioned Service above.
-  const stableHcpName = sanitizeK8sName(`${releaseName}-${poolName}`, "-hcp");
+  const {
+    service: stableName,
+    hcp: stableHcpName,
+    pdb: stablePdbName,
+  } = stablePoolResourceNames(releaseName, poolName);
   // N65. The per-pool PodDisruptionBudget lives here, with the other STABLE per-pool
   // objects: this template is rendered exactly once per pool (helm.ts), whereas the
   // versioned Deployment/Service templates are rendered a second time by deploy.ts for
   // the retained previous build — a PDB in one of those would either duplicate a name or
   // need per-build cleanup. Selecting on name+component (no `version`) is also what makes
   // it correct THROUGH a cutover, when both builds' pods exist.
-  const stablePdbName = sanitizeK8sName(`${releaseName}-${poolName}`, "-pdb");
   return `apiVersion: v1
 kind: Service
 metadata:
   name: ${stableName}
+  # Explicit empty policy lets Helm clear a previous rollback-retention keep annotation when a
+  # removed pool re-enters the current topology. Omission is not enough under three-way/SSA merge.
+  annotations:
+    helm.sh/resource-policy: ""
   labels:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: "${poolName}"
@@ -104,6 +110,11 @@ apiVersion: networking.gke.io/v1
 kind: HealthCheckPolicy
 metadata:
   name: ${stableHcpName}
+  annotations:
+    helm.sh/resource-policy: ""
+  labels:
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: "${poolName}"
 spec:
   default:
     checkIntervalSec: 15
@@ -138,6 +149,8 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: ${stablePdbName}
+  annotations:
+    helm.sh/resource-policy: ""
   labels:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: "${poolName}"

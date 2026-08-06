@@ -77,12 +77,18 @@ describe("renderActiveService (stable)", () => {
     const yaml = renderActiveService({ poolName: "ssr", releaseName: "my-app" });
     expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
     expect(yaml).toContain("app.kubernetes.io/managed-by: adapter-k8s-active");
+    for (const document of yaml.split("---")) {
+      expect(document).toContain('helm.sh/resource-policy: ""');
+    }
   });
 
   it("carries the stable HealthCheckPolicy, probing READINESS not liveness (N32)", () => {
     const yaml = renderActiveService({ poolName: "ssr", releaseName: "my-app" });
     expect(yaml).toContain("kind: HealthCheckPolicy");
     expect(yaml).toContain("name: my-app-ssr-hcp");
+    const hcpDoc = yaml.split("---").find((d) => d.includes("HealthCheckPolicy"))!;
+    expect(hcpDoc).toContain('app.kubernetes.io/name: "my-app"');
+    expect(hcpDoc).toContain('app.kubernetes.io/component: "ssr"');
     // N32: this policy is the load balancer's OWN verdict — the last /healthz gate in the
     // cutover path. /healthz is a hardcoded 200 emitted before any routing/handler/manifest
     // work, so it cannot fail; /readyz 503s until the pod can actually serve.

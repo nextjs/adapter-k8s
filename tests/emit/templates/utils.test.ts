@@ -8,6 +8,7 @@ import {
   routingManifestSnapshotName,
   composedBuildResourceNames,
   findBuildIdNameCollision,
+  findBuildTopologyNameCollision,
   findEmittedNameCollision,
   poolResourceNames,
   assertSafeQuantity,
@@ -283,6 +284,35 @@ describe("findBuildIdNameCollision (composed blue/green resource names)", () => 
     expect(names).toContain(routingManifestSnapshotName("my-app", "build-1"));
     // Per pool: base + -hpa + -hcp, plus the snapshot name.
     expect(names).toHaveLength(4);
+  });
+});
+
+describe("findBuildTopologyNameCollision", () => {
+  it("does not invent previous-build resources for a newly-added pool", () => {
+    const release = "a".repeat(30);
+    const newPool = "p".repeat(20);
+    // Projecting both ids over newPool collides because the long prefix truncates the ids.
+    expect(
+      findBuildIdNameCollision(release, [newPool], "sharedprefix-one", "sharedprefix-two"),
+    ).not.toBeNull();
+    // The previous build never had newPool, so those colliding objects do not exist.
+    expect(
+      findBuildTopologyNameCollision(
+        release,
+        { buildId: "sharedprefix-one", pools: [newPool] },
+        { buildId: "sharedprefix-two", pools: ["legacy"] },
+      ),
+    ).toBeNull();
+  });
+
+  it("detects collisions between different pools that really coexist", () => {
+    expect(
+      findBuildTopologyNameCollision(
+        "nextjs",
+        { buildId: "v2", pools: ["api"] },
+        { buildId: "old", pools: ["api-v2"] },
+      ),
+    ).toEqual({ kind: "Deployment/Service", name: "nextjs-api-v2" });
   });
 });
 

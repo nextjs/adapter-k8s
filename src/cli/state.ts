@@ -81,6 +81,16 @@ export interface AdapterState {
    * the tag remains the only option. Pruned to the two builds still in play, like `cdnTags`.
    */
   routingImageDigests?: Record<string, string>;
+  /**
+   * Exact pool topology emitted for each retained build (`buildId` -> ordered pool names).
+   *
+   * Pool sets can change between builds. Deploy and rollback must therefore never derive the
+   * outgoing/target topology from the incoming build's `build-metadata.json`: doing so prunes a
+   * removed pool before cutover and cannot restore it later. Absent means a state written by an
+   * older adapter; callers migrate it from build-scoped Deployments and fail closed when those
+   * objects cannot prove the topology. Pruned to the current and previous builds.
+   */
+  poolTopologies?: Record<string, string[]>;
 }
 
 // Thrown when the local file was written but the cluster ConfigMap mirror failed.

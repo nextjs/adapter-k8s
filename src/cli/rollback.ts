@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture, execCaptureStdin, execOrThrow } from "./exec.js";
 import { readState, writeState } from "./state.js";
+import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import {
   assertSafeBuildId,
@@ -891,20 +892,33 @@ export async function runRollback(options: {
 
   const { buildId: currentBuildId, previousBuildId } = state;
 
-  // Pool names come from local build metadata (the same source deploy's cutover uses) —
-  // readable without touching the cluster, so the dry-run plan can be printed before any
-  // cluster interaction.
-  let poolNames: string[] = [];
-  const metaPath = path.join(projectDir, ".k8s-adapter", outputDirName(), "build-metadata.json");
-  if (existsSync(metaPath)) {
-    try {
-      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-      if (Array.isArray(meta.pools)) {
-        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
-      }
-    } catch {
-      // fall through to the empty guard
-    }
+  // N70: rollback has TWO independent topologies. Local build-metadata describes whichever
+  // build happened to run last in this checkout, not necessarily the rollback target (and a
+  // renamed pool makes the two sets differ by definition). Current states record both exact
+  // build-scoped sets. Legacy states are migrated from immutable versioned Deployments; dry-run
+  // cannot perform that cluster read and fails closed rather than fabricating a plan.
+  let poolNames = recordedBuildPools(state, previousBuildId);
+  let currentPoolNames = recordedBuildPools(state, currentBuildId);
+  if (dryRun && (!poolNames || !currentPoolNames)) {
+    throw new Error(
+      `Deploy state predates per-build pool topology for ${!poolNames ? `rollback target "${previousBuildId}"` : `current build "${currentBuildId}"`}. ` +
+        `Dry-run cannot recover it without cluster access; run rollback without --dry-run to ` +
+        `migrate the state, or restore poolTopologies in .k8s-adapter/state.json.`,
+    );
+  }
+  if (!poolNames) {
+    poolNames = await discoverBuildPools(releaseName, previousBuildId, namespace);
+    console.warn(
+      `  ! Recovered legacy pool topology for rollback target "${previousBuildId}" from ` +
+        `its versioned Deployments: ${poolNames.join(", ")}.`,
+    );
+  }
+  if (!currentPoolNames) {
+    currentPoolNames = await discoverBuildPools(releaseName, currentBuildId, namespace);
+    console.warn(
+      `  ! Recovered legacy pool topology for current build "${currentBuildId}" from its ` +
+        `versioned Deployments: ${currentPoolNames.join(", ")}.`,
+    );
   }
 
   // L13: dry-run must not mutate anything — and get-credentials mutates the operator's
@@ -938,13 +952,6 @@ export async function runRollback(options: {
       `  [dry-run] Would swap state: buildId=${previousBuildId}, previousBuildId=${currentBuildId}`,
     );
     return;
-  }
-
-  if (poolNames.length === 0) {
-    throw new Error(
-      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
-        "cannot safely roll back. Aborting before touching traffic.",
-    );
   }
 
   console.log(`\nRolling back: ${currentBuildId} → ${previousBuildId}\n`);
@@ -1010,10 +1017,12 @@ export async function runRollback(options: {
   const missingPrev: string[] = [];
   for (const pool of poolNames) {
     const prev = poolResourceNames(releaseName, pool, previousBuildId);
-    const curr = poolResourceNames(releaseName, pool, currentBuildId);
     if (discovered.has(prev.deployment)) {
       previousDeploys.push({ pool, name: prev.deployment, hpa: prev.hpa });
     } else missingPrev.push(pool);
+  }
+  for (const pool of currentPoolNames) {
+    const curr = poolResourceNames(releaseName, pool, currentBuildId);
     if (discovered.has(curr.deployment)) {
       currentDeploys.push({ pool, name: curr.deployment, hpa: curr.hpa });
     }
@@ -1210,6 +1219,53 @@ export async function runRollback(options: {
     );
   }
 
+  // N70: Helm is not rolled back, so HTTPRoute still carries the former-current topology.
+  // When pool sets differ, every stable Service that route may reference must be redirected to
+  // a real target-build pool before current-only Deployments are parked. Capture the exact live
+  // selectors first so a partial patch failure can restore them byte-for-byte; guessing
+  // `component=<service suffix>` is wrong after one topology-changing rollback/roll-forward.
+  const targetPoolSet = new Set(poolNames);
+  const currentOnlyPools = currentPoolNames.filter((pool) => !targetPoolSet.has(pool));
+  const topologyChanged =
+    currentOnlyPools.length > 0 || poolNames.some((pool) => !currentPoolNames.includes(pool));
+  const originalSelectors = new Map<string, Record<string, string>>();
+  if (topologyChanged) {
+    for (const pool of new Set([...poolNames, ...currentOnlyPools])) {
+      const serviceName = sanitizeK8sName(`${releaseName}-${pool}`);
+      const read = await execCapture("kubectl", [
+        "get",
+        "service",
+        serviceName,
+        "-n",
+        namespace,
+        "-o",
+        "json",
+      ]);
+      let selector: unknown;
+      if (read.exitCode === 0) {
+        try {
+          selector = JSON.parse(read.stdout)?.spec?.selector;
+        } catch {
+          selector = undefined;
+        }
+      }
+      if (
+        !selector ||
+        typeof selector !== "object" ||
+        Array.isArray(selector) ||
+        Object.values(selector).some((value) => typeof value !== "string")
+      ) {
+        throw new Error(
+          `Could not read the exact selector for topology-changing rollback Service ` +
+            `${serviceName} (kubectl exited ${read.exitCode}${read.stderr.trim() ? `: ${read.stderr.trim()}` : ""}). ` +
+            `Traffic was NOT switched; refusing to patch selectors without a reversible ` +
+            `snapshot.`,
+        );
+      }
+      originalSelectors.set(serviceName, selector as Record<string, string>);
+    }
+  }
+
   // 3b. Revert the routing tier (image + manifest) to the previous build BEFORE flipping
   // pool traffic — the same order deploy applies (edge first, selectors second), so the
   // middleware/manifest never trails the pools by more than one step.
@@ -1230,16 +1286,21 @@ export async function runRollback(options: {
   // draining the active Service to zero endpoints and 503'ing the site on rollback.
   // (safePreviousBuild is computed once in step 3 above and reused here.)
 
-  // Switch each active Service (`<release>-<pool>`) by NAME, exactly as deploy's cutover
-  // does — reusing the pool list resolved above. (The active-service template's
+  // Switch each target Service (`<release>-<pool>`) by NAME, then redirect Services that only
+  // exist in the still-installed HTTPRoute topology to a real target pool. (The template's
   // `managed-by: adapter-k8s-active` label is overwritten by Helm to `managed-by: Helm`,
   // so a label selector would match nothing, patch ZERO Services, skip the failure guard,
   // and strand the site when the current build is scaled down.)
   const patchFailures: { service: string; stderr: string }[] = [];
-  const patchedServices: string[] = [];
+  const patchedServices: { service: string; pool: string }[] = [];
   console.log(`  → Switching traffic to previous build...`);
-  for (const pool of poolNames) {
-    const svcName = sanitizeK8sName(`${releaseName}-${pool}`);
+  const fallbackTargetPool = poolNames[0]!;
+  const serviceDestinations = [
+    ...poolNames.map((pool) => ({ servicePool: pool, targetPool: pool })),
+    ...currentOnlyPools.map((pool) => ({ servicePool: pool, targetPool: fallbackTargetPool })),
+  ];
+  for (const { servicePool, targetPool } of serviceDestinations) {
+    const svcName = sanitizeK8sName(`${releaseName}-${servicePool}`);
     const patchResult = await execCapture("kubectl", [
       "patch",
       "service",
@@ -1254,6 +1315,11 @@ export async function runRollback(options: {
       JSON.stringify([
         {
           op: "replace",
+          path: "/spec/selector/app.kubernetes.io~1component",
+          value: targetPool,
+        },
+        {
+          op: "replace",
           path: "/spec/selector/app.kubernetes.io~1version",
           value: safePreviousBuild,
         },
@@ -1262,7 +1328,7 @@ export async function runRollback(options: {
     if (patchResult.exitCode !== 0) {
       patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
     } else {
-      patchedServices.push(svcName);
+      patchedServices.push({ service: svcName, pool: servicePool });
     }
   }
 
@@ -1272,7 +1338,8 @@ export async function runRollback(options: {
   if (patchFailures.length > 0) {
     const safeCurrentBuild = sanitizeK8sName(currentBuildId);
     const revertFailures: string[] = [];
-    for (const serviceName of patchedServices) {
+    for (const { service: serviceName, pool } of patchedServices) {
+      const original = originalSelectors.get(serviceName);
       const revertResult = await execCapture("kubectl", [
         "patch",
         "service",
@@ -1282,13 +1349,22 @@ export async function runRollback(options: {
         "--type=json",
         "--field-manager=helm",
         "-p",
-        JSON.stringify([
-          {
-            op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1version",
-            value: safeCurrentBuild,
-          },
-        ]),
+        JSON.stringify(
+          original
+            ? [{ op: "replace", path: "/spec/selector", value: original }]
+            : [
+                {
+                  op: "replace",
+                  path: "/spec/selector/app.kubernetes.io~1component",
+                  value: pool,
+                },
+                {
+                  op: "replace",
+                  path: "/spec/selector/app.kubernetes.io~1version",
+                  value: safeCurrentBuild,
+                },
+              ],
+        ),
       ]);
       if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
     }
@@ -1376,6 +1452,10 @@ export async function runRollback(options: {
         ...durableState,
         buildId: previousBuildId,
         previousBuildId: currentBuildId,
+        poolTopologies: {
+          [previousBuildId]: [...poolNames],
+          [currentBuildId]: [...currentPoolNames],
+        },
         // `readinessPathSupported` is deliberately NOT carried forward. It means "the build
         // now serving answers /readyz", and after a rollback the serving build is an OLDER
         // one that may predate it — so dropping it is the conservative answer, and the next

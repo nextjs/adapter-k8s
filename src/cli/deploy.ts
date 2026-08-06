@@ -14,6 +14,12 @@ import {
 import readline from "node:readline";
 import { execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState, StateUnavailableError, type AdapterState } from "./state.js";
+import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
+import {
+  cleanupRetainedStablePoolResources,
+  hasHealthCheckPolicyCrd,
+  retainRemovedPoolResources,
+} from "./stable-pool-resources.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import { cdnTagForBuildId } from "../cdn-tags.js";
 import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "./rollback.js";
@@ -52,7 +58,7 @@ import { sanitizeK8sName } from "../emit/templates/utils.js";
 import {
   assertSafeBuildId,
   assertSafePoolName as assertSafePoolNameCharset,
-  findBuildIdNameCollision,
+  findBuildTopologyNameCollision,
   findEmittedNameCollision,
   assertSafeImageRegistry,
   assertSafeProbePath,
@@ -1865,10 +1871,40 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `a \`generateBuildId\` that changes per build.`,
     );
   }
+
+  // N70: the outgoing build owns its own pool topology. The incoming build metadata cannot
+  // describe pools that were removed or renamed: iterating `pools` here used to omit those
+  // outgoing Deployments/HPAs from retention, so Helm deleted the rollback target before the
+  // new build was healthy. Current states record the exact topology per build. Legacy states
+  // are migrated from immutable, versioned Deployments; dry-run cannot do that without cluster
+  // access and therefore fails closed instead of printing an incomplete plan.
+  let previousPools: string[] = [];
   if (previousBuildId && previousBuildId !== buildId) {
-    // Same helper as the build-time guard in adapter.ts so both sides agree on the
-    // full composed-name set (pool Deployment/Service, -hpa/-hcp variants, snapshot).
-    const collision = findBuildIdNameCollision(releaseName, pools, buildId, previousBuildId);
+    previousPools = state ? (recordedBuildPools(state, previousBuildId) ?? []) : [];
+    if (previousPools.length === 0) {
+      if (dryRun) {
+        throw new Error(
+          `Deploy state predates per-build pool topology for build "${previousBuildId}". ` +
+            `Dry-run cannot recover it without cluster access; run a real deploy to migrate ` +
+            `the state, or restore poolTopologies in .k8s-adapter/state.json.`,
+        );
+      }
+      previousPools = await discoverBuildPools(releaseName, previousBuildId, namespace);
+      console.warn(
+        `  ! Recovered legacy pool topology for build "${previousBuildId}" from its ` +
+          `versioned Deployments: ${previousPools.join(", ")}. The successful deploy will ` +
+          `record it in adapter state.`,
+      );
+    }
+  }
+  if (previousBuildId && previousBuildId !== buildId) {
+    // Compare the exact resource pairs that coexist during this rollout. Projecting both
+    // build ids over the incoming pool list invents previous-build resources after a rename.
+    const collision = findBuildTopologyNameCollision(
+      releaseName,
+      { buildId, pools },
+      { buildId: previousBuildId, pools: previousPools },
+    );
     if (collision) {
       throw new Error(
         `Build id "${buildId}" collides with the currently-serving build "${previousBuildId}" ` +
@@ -1988,7 +2024,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // fully canonical. The HPA follows the same keep transfer as the Deployment so it remains active
   // throughout warm-up and every pre-cutover abort.
   if (previousBuildId && previousBuildId !== buildId) {
-    for (const poolName of pools) {
+    const incomingPoolSet = new Set(pools);
+    // Provider capability, not a cluster-wide CRD permission probe: generic operators need no
+    // CRD-list RBAC and legitimately have no GKE HealthCheckPolicy object.
+    const healthCheckPolicyCrd = buildProvider === "gke";
+    for (const poolName of previousPools) {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
 
       if (!dryRun) {
@@ -2015,45 +2055,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           );
         }
         if (!r.stdout.trim()) {
-          // N31: no Deployment for this pool in the previous build. Two very different
-          // causes — tell them apart by whether the pool's STABLE active Service exists
-          // (helm creates it with the pool; it outlives individual builds):
-          //   * Service exists  → the pool existed before and its previous Deployment was
-          //     deleted (manually / partial cluster recovery). Do NOT recreate it from the
-          //     incoming build's template: that is different code/config under an old identity.
-          //   * Service absent  → the pool is NEW in this build, so there is nothing to
-          //     retain.
-          const activeServiceName = sanitizeK8sName(`${releaseName}-${poolName}`);
-          const svc = await execCapture("kubectl", [
-            "get",
-            "service",
-            activeServiceName,
-            "-n",
-            namespace,
-            "--ignore-not-found",
-            "-o",
-            "name",
-          ]);
-          if (svc.exitCode !== 0) {
-            throw new Error(
-              `Could not determine whether pool "${poolName}" existed in the previous build ` +
-                `${previousBuildId}: neither its Deployment (${poolPrevName}) nor its active ` +
-                `Service (${activeServiceName}) could be read (kubectl exited ` +
-                `${svc.exitCode}: ${svc.stderr.trim()}). Refusing to guess. Fix kubectl access ` +
-                `and re-run the deploy.`,
-            );
-          }
-          if (!svc.stdout.trim()) {
-            console.log(
-              `  → Pool "${poolName}" is new in this build (no active Service ` +
-                `${activeServiceName}) — nothing to retain for build ${previousBuildId}.`,
-            );
-            continue;
-          }
-          console.warn(
-            `  ! Previous deployment ${poolPrevName} (build ${previousBuildId}) not found — ` +
-              `it appears to have been deleted. Nothing is serving from it; it will not be ` +
-              `recreated from the incoming build's pod template.`,
+          throw new Error(
+            `The recorded pool topology says build "${previousBuildId}" contains pool ` +
+              `"${poolName}", but its versioned Deployment ${poolPrevName} is missing. ` +
+              `Refusing to run \`helm upgrade\`: fabricating it from the incoming build would ` +
+              `run different code under the rollback build's identity.`,
           );
         } else {
           let live: { metadata?: { name?: unknown }; spec?: { replicas?: unknown } };
@@ -2102,11 +2108,34 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           }
           console.log(`  → Preserved outgoing Deployment (${poolPrevName}) without re-rendering`);
         }
+
+        // A pool removed or renamed by the incoming build disappears from the generated chart.
+        // Transfer the complete stable resource group (Service, PDB, and the optional GKE HCP)
+        // out of Helm's deletion set. Service is required for rollback DNS/backend identity;
+        // PDB/HCP are optional only because older adapters/generic providers may not emit them.
+        if (!incomingPoolSet.has(poolName)) {
+          const retained = await retainRemovedPoolResources({
+            releaseName,
+            pool: poolName,
+            namespace,
+            healthCheckPolicyCrd,
+          });
+          console.log(
+            `  → Preserved rollback resources for removed pool "${poolName}": ` +
+              retained.join(", "),
+          );
+        }
       } else {
         console.log(
           `    [dry-run] kubectl annotate deployment ${poolPrevName} -n ${namespace} ` +
             `helm.sh/resource-policy=keep --overwrite (if it exists)`,
         );
+        if (!incomingPoolSet.has(poolName)) {
+          console.log(
+            `    [dry-run] would retain the stable Service/PDB and provider HCP for removed ` +
+              `pool "${poolName}" with exact identity checks`,
+          );
+        }
       }
 
       // L13: dry-run must not write into the chart — report the planned Service write instead.
@@ -2709,7 +2738,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // DO have a predecessor the real count below overwrites it immediately.
     const capacityTargets = new Map<string, number>(pools.map((poolName) => [poolName, 1]));
     for (const [poolName, replicas] of previousReplicasByPool) {
-      capacityTargets.set(poolName, replicas);
+      // A removed/renamed pool has no incoming Deployment to warm. It remains in
+      // previousReplicasByPool because deploy must preserve and later park it, but adding it
+      // here creates an impossible health target and makes every topology-changing deploy time
+      // out before cutover. Only common pools inherit outgoing capacity; newly-added pools keep
+      // the one-ready-pod floor above.
+      if (capacityTargets.has(poolName)) capacityTargets.set(poolName, replicas);
     }
 
     const shortfalls: string[] = [];
@@ -3168,6 +3202,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           previousBuildId,
           cdnTags,
           ...(Object.keys(routingImageDigests).length > 0 ? { routingImageDigests } : {}),
+          poolTopologies: {
+            ...(previousBuildId ? { [previousBuildId]: [...previousPools] } : {}),
+            [buildId]: [...pools],
+          },
           // The build this deploy just installed serves /readyz, so the NEXT deploy can flip
           // the load balancer's HealthCheckPolicy to readiness without stranding it.
           readinessPathSupported: true,
@@ -3242,7 +3280,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // leave the Deployment alone rather than asking a still-live HPA to fight the scale command.
     if (previousBuildId && previousBuildId !== buildId) {
       let scaleDownFailed = false;
-      for (const poolName of pools) {
+      for (const poolName of previousPools) {
         // The HPA name must come from the SAME suffix-reserving helper the template
         // uses (hpa.ts truncates the base at 59, then appends "-hpa") — concatenating
         // "-hpa" onto the 63-truncated deployment name diverges past that boundary
@@ -3304,7 +3342,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       pools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${buildId}`)),
     );
     const previousDeployNames = previousBuildId
-      ? new Set(pools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
+      ? new Set(previousPools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
       : undefined;
 
     const allDeploys = await execCapture("kubectl", [
@@ -3360,6 +3398,46 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           namespace,
         ]).catch(() => {});
       }
+    }
+
+    // Stable resources transferred out of Helm's deletion set deliberately survive without
+    // rewriting their managed-by label while their pool belongs to either build in play. Once a
+    // later successful cutover removes that pool from BOTH topologies, delete the exact
+    // adapter-retained Service/PDB/HCP group. This is post-state
+    // commit and best-effort: cleanup failure leaks bounded objects but cannot invalidate the
+    // serving cutover. The helper validates ownership, labels, names, and selectors before any
+    // deletion and keeps the Service as a retry anchor when a companion delete fails.
+    try {
+      let healthCheckPolicyCrd = false;
+      try {
+        healthCheckPolicyCrd = await hasHealthCheckPolicyCrd();
+      } catch (err) {
+        // Post-commit cleanup can still safely classify Service/PDB without cluster-wide CRD
+        // permission. Preserve a truthful warning that HCP cleanup was skipped.
+        console.warn(
+          `  ! Could not classify retained HealthCheckPolicy objects: ` +
+            `${err instanceof Error ? err.message : String(err)}. Service/PDB cleanup will ` +
+            `continue; any retained HCP was left in place.`,
+        );
+      }
+      const stableCleanup = await cleanupRetainedStablePoolResources({
+        releaseName,
+        namespace,
+        keepPools: new Set([...pools, ...previousPools]),
+        healthCheckPolicyCrd,
+      });
+      for (const deleted of stableCleanup.deleted) {
+        console.log(`  → Deleted obsolete retained stable resource: ${deleted}`);
+      }
+      for (const failure of stableCleanup.failures) {
+        console.warn(`  ! Retained stable-resource cleanup incomplete: ${failure}`);
+      }
+    } catch (err) {
+      console.warn(
+        `  ! Retained stable-resource cleanup could not run: ` +
+          `${err instanceof Error ? err.message : String(err)}. The deploy is committed; ` +
+          `the retained objects were left in place for a later retry.`,
+      );
     }
 
     // Clean up OLD route-ext Jobs (K8s Jobs are immutable; each deploy creates a fresh
