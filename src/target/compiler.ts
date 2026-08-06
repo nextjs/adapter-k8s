@@ -170,11 +170,29 @@ export function compileTarget(
     { apiVersion: "networking.k8s.io/v1", resource: "networkpolicies", optional: false },
     ...contributions.flatMap((entry) => entry.requirements),
   ]);
+  const cache =
+    context.cache === "external"
+      ? ({ kind: "external", lifecycle: "operator-managed" } as const)
+      : ({ kind: "none" } as const);
+  // This is the compatibility identity for lifecycle commands, not merely a cluster locator.
+  // A rollback cannot safely keep the current Helm release while claiming to restore a build
+  // whose exposure, routing policies, contributed objects or default origin pool differ.
   const fingerprint = targetFingerprint({
-    identity: cluster.identity,
-    access: cluster.access,
-    registry: cluster.registry,
-    network: cluster.network,
+    cluster: {
+      identity: cluster.identity,
+      access: cluster.access,
+      registry: cluster.registry,
+      network: cluster.network,
+    },
+    defaultPool: context.defaultPool,
+    ingressSources: exposure.ingressSources,
+    objects,
+    requirements,
+    readiness,
+    routing: routing.plan,
+    routingTier: routing.routingTier,
+    cache,
+    cdn: { kind: "none" },
   });
   const plan = parseCompositionPlan({
     apiVersion: "adapter-k8s.nextjs.org/v1alpha1",
@@ -199,10 +217,7 @@ export function compileTarget(
     operations: {
       resources: { objects, readiness },
       network: cluster.network,
-      cache:
-        context.cache === "external"
-          ? { kind: "external", lifecycle: "operator-managed" }
-          : { kind: "none" },
+      cache,
       cdn: { kind: "none" },
       routing: routing.plan,
       cleanup: {
