@@ -150,7 +150,9 @@ describe("generateHelmChart", () => {
     });
 
     expect(result["templates/origin-service.yaml"]).toContain("name: site-origin");
-    expect(result["templates/origin-service.yaml"]).toContain('app.kubernetes.io/component: "ssr"');
+    expect(result["templates/origin-service.yaml"]).toContain(
+      'app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"',
+    );
     expect(Object.keys(result)).toContain("templates/composition-plan.yaml");
     expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(true);
     expect(Object.values(result).some((body) => body.includes('"kind": "HTTPRoute"'))).toBe(true);

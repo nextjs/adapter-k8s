@@ -80,7 +80,7 @@ describe("renderOriginService (portable entrypoint)", () => {
   it("selects the active default-pool pods through one stable Service", () => {
     const yaml = renderOriginService({ poolName: "default", releaseName: "my-app" });
     expect(yaml).toContain("name: my-app-origin");
-    expect(yaml).toContain('app.kubernetes.io/component: "default"');
+    expect(yaml).toContain('app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"');
     expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
     expect(yaml).toContain("port: 3000");
     expect(yaml).not.toContain("kind: Deployment");

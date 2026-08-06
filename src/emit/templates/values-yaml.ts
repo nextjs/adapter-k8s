@@ -152,6 +152,7 @@ export function renderValuesYaml({
       containerStrategy: config.containerStrategy ?? "traced-assets",
     },
     activeBuildId: sanitizeK8sName(buildId),
+    activeDefaultPool: pools.keys().next().value,
     // The path the LOAD BALANCER's HealthCheckPolicy probes on pool backends. Defaults to
     // readiness; `deploy` overrides it to the liveness path for one cycle when the outgoing
     // build may predate /readyz (see AdapterState.readinessPathSupported).

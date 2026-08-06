@@ -53,6 +53,10 @@ export function routingManifestSnapshotName(releaseName: string, buildId: string
   return sanitizeK8sName(`${releaseName}-rm-${buildId}`, `-${digest}`);
 }
 
+export function compositionPlanResourceName(releaseName: string, buildId: string): string {
+  return sanitizeK8sName(`${releaseName}-composition-${buildId}`);
+}
+
 /**
  * The per-pool, per-build sanitized resource names EXACTLY as the templates render
  * them: the versioned Deployment (deployment.ts) and its same-named Service
@@ -197,7 +201,10 @@ export function findEmittedNameCollision(
   // truncation-proof, but the guard should not silently assume that).
   buckets.push([
     "ConfigMap",
-    buildIds.map((buildId) => routingManifestSnapshotName(releaseName, buildId)),
+    buildIds.flatMap((buildId) => [
+      routingManifestSnapshotName(releaseName, buildId),
+      compositionPlanResourceName(releaseName, buildId),
+    ]),
   ]);
 
   for (const [kind, names] of buckets) {
@@ -253,6 +260,8 @@ export function findBuildTopologyNameCollision(
       [
         routingManifestSnapshotName(releaseName, current.buildId),
         routingManifestSnapshotName(releaseName, previous.buildId),
+        compositionPlanResourceName(releaseName, current.buildId),
+        compositionPlanResourceName(releaseName, previous.buildId),
       ],
     ],
   ];

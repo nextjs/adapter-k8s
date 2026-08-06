@@ -78,7 +78,7 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: "${poolName}"
+    app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"
     app.kubernetes.io/version: "{{ .Values.activeBuildId }}"
   ports:
     - port: 3000

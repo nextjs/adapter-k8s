@@ -7,12 +7,15 @@ import {
   ADAPTER_RELEASE_LABEL,
   assertSafeBuildId,
   assertSafeReleaseName,
+  compositionPlanResourceName,
   escapeHelmActions,
   sanitizeK8sName,
 } from "./utils.js";
 
+export const COMPOSITION_PLAN_COMPONENT = "composition-plan";
+
 export function compositionPlanConfigMapName(releaseName: string, buildId: string): string {
-  return sanitizeK8sName(`${releaseName}-composition-${buildId}`);
+  return compositionPlanResourceName(releaseName, buildId);
 }
 
 export function renderCompositionPlanConfigMap(plan: CompositionPlan): string {
@@ -34,7 +37,7 @@ metadata:
   labels:
     ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: composition-plan
+    app.kubernetes.io/component: ${COMPOSITION_PLAN_COMPONENT}
     app.kubernetes.io/version: "${sanitizeK8sName(buildId)}"
 immutable: true
 data:
