@@ -127,7 +127,7 @@ export async function findForeignNativeArtifacts(
   };
 
   await walk(contextRoot);
-  return problems;
+  return problems.sort((left, right) => left.file.localeCompare(right.file));
 }
 
 export async function assertStagedNativeArtifactsTargetPlatform(
