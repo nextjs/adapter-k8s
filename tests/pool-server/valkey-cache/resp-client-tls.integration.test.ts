@@ -371,12 +371,13 @@ describe("readClientHelloSni (guards the L18 wire assertion from going vacuous)"
     const port = await new Promise<number>((r) => {
       server.listen(0, "127.0.0.1", () => r((server.address() as net.AddressInfo).port));
     });
-    const socket = tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false, ...options });
-    socket.on("error", () => undefined);
+    let socket: tls.TLSSocket | undefined;
     try {
+      socket = tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false, ...options });
+      socket.on("error", () => undefined);
       return await seen;
     } finally {
-      socket.destroy();
+      socket?.destroy();
       await new Promise<void>((r) => server.close(() => r()));
     }
   }
@@ -385,8 +386,17 @@ describe("readClientHelloSni (guards the L18 wire assertion from going vacuous)"
     expect(await sniOf({ servername: "valkey.example.internal" })).toBe("valkey.example.internal");
   });
 
-  it("reports an IP servername (Node sends it; this is what L18 must avoid)", async () => {
-    expect(await sniOf({ servername: "10.1.2.3" })).toBe("10.1.2.3");
+  it("reports an IP servername when the Node runtime permits sending one", async () => {
+    try {
+      expect(await sniOf({ servername: "10.1.2.3" })).toBe("10.1.2.3");
+    } catch (error) {
+      // Node 26 upgraded DEP0123 from a warning to a TypeError. That is a stronger runtime
+      // guarantee than L18 needs; Node 20/22/24 still exercise the ClientHello parser above.
+      expect(error).toBeInstanceOf(TypeError);
+      expect(String(error)).toContain(
+        "Setting the TLS ServerName to an IP address is not permitted",
+      );
+    }
   });
 
   it("reports null when no servername is set (the L18 shape)", async () => {
