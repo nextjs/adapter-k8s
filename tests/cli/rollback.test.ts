@@ -65,7 +65,7 @@ function capture(patchFails: boolean) {
   });
 }
 
-describe("runRollback — CDN invalidation", () => {
+describe("runRollback — state and CDN invalidation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(readState).mockResolvedValue({
@@ -143,6 +143,133 @@ describe("runRollback — CDN invalidation", () => {
       RELEASE,
       "default",
     );
+  });
+
+  it("preserves per-build provenance across two-way rollbacks while clearing readiness", async () => {
+    const digestN = `sha256:${"a".repeat(64)}`;
+    const digestM = `sha256:${"b".repeat(64)}`;
+    const cdnTags = { buildn: `build-${"ef".repeat(32)}`, buildm: `build-${"0a".repeat(32)}` };
+    const routingImageDigests = { buildn: digestN, buildm: digestM };
+    const unretainedManifestBuilds = ["buildm"];
+    let state = {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      generation: 7,
+      readinessPathSupported: true,
+      cdnTags,
+      routingImageDigests,
+      unretainedManifestBuilds,
+    };
+    vi.mocked(readState).mockImplementation(async () => state as never);
+    vi.mocked(writeState).mockImplementation(async (_projectDir, next) => {
+      const { basedOnGeneration: _basedOnGeneration, ...body } = next;
+      state = { ...body, generation: state.generation + 1 } as typeof state;
+    });
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    } as never);
+    vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath)
+        return JSON.stringify({
+          projectId: "proj-12345",
+          region: "us-central1",
+          containerRegistry: "gcr.io/p",
+        });
+      if (p === metaPath) return '{"pools":["ssr"]}';
+      return "";
+    });
+
+    vi.mocked(execCapture).mockImplementation(async (_cmd, args) => {
+      const joined = args.join(" ");
+      if (args.includes("deployments")) {
+        return {
+          exitCode: 0,
+          stdout: "rel-ssr-buildm|2\nrel-ssr-buildn|2",
+          stderr: "",
+        };
+      }
+      if (joined.includes("get deployment rel-routing-service") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: `gcr.io/p/routing-service:${state.buildId}`,
+                      env: [{ name: "NEXT_BUILD_ID", value: state.buildId }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (joined.includes("get deployment rel-routing-service")) {
+        return { exitCode: 0, stdout: "deployment.apps/rel-routing-service\n", stderr: "" };
+      }
+      if (joined.includes("get configmap rel-rm-")) {
+        return { exitCode: 0, stdout: "configmap/snapshot\n", stderr: "" };
+      }
+      if (joined.includes("get configmap rel-routing-manifest") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ data: { "routing-manifest.json": "{}" } }),
+          stderr: "",
+        };
+      }
+      if (args.includes("pods")) {
+        return {
+          exitCode: 0,
+          stdout: `rel-ssr-${state.previousBuildId}-abc\n`,
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const writes = vi.mocked(writeState).mock.calls.map((call) => call[1]);
+    expect(writes).toEqual([
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        cdnTags,
+        routingImageDigests,
+        unretainedManifestBuilds,
+        basedOnGeneration: 7,
+      },
+      {
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        cdnTags,
+        routingImageDigests,
+        unretainedManifestBuilds,
+        basedOnGeneration: 8,
+      },
+    ]);
+
+    const edgePatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args.includes("patch") && args.includes("deployment"))
+      .map(([, args]) => args[args.length - 1] as string);
+    expect(edgePatches).toHaveLength(2);
+    expect(edgePatches[0]).toContain(`routing-service@${digestM}`);
+    expect(edgePatches[0]).not.toContain("routing-service:buildm");
+    expect(edgePatches[1]).toContain(`routing-service@${digestN}`);
+    expect(edgePatches[1]).not.toContain("routing-service:buildn");
   });
 
   it("does NOT invalidate anything when the selector switch fails", async () => {
