@@ -102,6 +102,16 @@ describe("state", () => {
     expect(await readState(tmpDir)).toMatchObject(state);
   });
 
+  it("round-trips recorded per-build target platforms", async () => {
+    const state: AdapterState = {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
+    };
+    await writeState(tmpDir, { ...state, basedOnGeneration: null });
+    expect(await readState(tmpDir)).toMatchObject(state);
+  });
+
   it("M13: reads legacy state without cdnTags (pre-recording deploys)", async () => {
     const stateDir = path.join(tmpDir, ".k8s-adapter");
     mkdirSync(stateDir, { recursive: true });

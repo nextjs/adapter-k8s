@@ -14,6 +14,8 @@ import type {
 import { genericConfigOf, gkeConfigOf, providerGatewayHosts } from "./types.js";
 import { resolveProvider } from "./providers/index.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
+import { targetPlatform, type TargetPlatform } from "./target-platform.js";
+import { assertStagedNativeArtifactsTargetPlatform } from "./native-artifacts.js";
 
 // Get current directory in a way that works in ESM and CJS bundle
 const _dirname =
@@ -733,19 +735,26 @@ export async function stageFile(
   }
 }
 
-// Sharp's native runtime packages for the emitted pool container platform: the pool
-// base image is node:*-slim (linux glibc) and GKE's default node pools are amd64, so
-// the container needs the linux-x64 pair. esbuild inlines sharp's JS into
-// pool-server.cjs, but the binding stays a RUNTIME require
-// (`@img/sharp-linux-x64/sharp.node`, which in turn dlopens libvips from
-// `@img/sharp-libvips-linux-x64`). Build XchOtaGFu6GdFrcdujVc0 shipped without either
+// Sharp's native runtime packages for the emitted pool container platform. The base image is
+// Linux/glibc, while its architecture is selected per build. pool-server.cjs externalizes
+// sharp, so the staged JS package loads the matching @img binding and libvips packages at
+// runtime. Build XchOtaGFu6GdFrcdujVc0 shipped without the amd64 pair
 // — every containerized /_next/image failed the sharp load (503 "sharp is
 // unavailable") while local runs resolved the binding by walking up to the repo's own
 // node_modules, which masked the gap.
-export const SHARP_RUNTIME_PACKAGES = [
-  "@img/sharp-linux-x64",
-  "@img/sharp-libvips-linux-x64",
-] as const;
+const SHARP_RUNTIME_PACKAGES_BY_PLATFORM: Record<TargetPlatform, readonly [string, string]> = {
+  "linux/amd64": ["@img/sharp-linux-x64", "@img/sharp-libvips-linux-x64"],
+  "linux/arm64": ["@img/sharp-linux-arm64", "@img/sharp-libvips-linux-arm64"],
+};
+
+/** Backward-compatible default pair for callers/tests targeting the default amd64 platform. */
+export const SHARP_RUNTIME_PACKAGES = SHARP_RUNTIME_PACKAGES_BY_PLATFORM["linux/amd64"];
+
+export function sharpRuntimePackagesForPlatform(
+  platform: TargetPlatform,
+): readonly [string, string] {
+  return SHARP_RUNTIME_PACKAGES_BY_PLATFORM[platform];
+}
 
 // Resolver for sharp and its platform packages. Three resolution shapes must all work
 // (they have all shipped): legacy sharp@0.34 has NO exports map (`package.json` resolves),
@@ -1008,9 +1017,9 @@ export async function stageNextRuntimeDependencies(
   return { staged, unresolved };
 }
 
-// Stage sharp's linux-x64 native packages into the pool's traced-assets context.
+// Stage sharp's target-platform native packages into the pool's traced-assets context.
 // npm installs platform-specific optional packages for the BUILD host only, so a
-// darwin/arm64 host won't have the linux-x64 pair at all — in that case fall back to
+// build host often won't have the requested pair at all — in that case fall back to
 // reporting the app's resolved sharp version so the caller can emit an npm-install
 // step into the pool Dockerfile (running inside the image resolves the correct
 // platform packages natively). `staged: false` with no version means sharp is not
@@ -1020,8 +1029,10 @@ export async function stageSharpRuntimePackages(
   poolName: string,
   resolveDep: (dep: string, projectDir: string) => string | undefined = resolveSharpDepDir,
   isShared: boolean = false,
+  platform: TargetPlatform = targetPlatform(),
 ): Promise<{ staged: boolean; sharpVersion?: string }> {
-  const resolved = SHARP_RUNTIME_PACKAGES.map((pkg) => ({ pkg, dir: resolveDep(pkg, projectDir) }));
+  const runtimePackages = sharpRuntimePackagesForPlatform(platform);
+  const resolved = runtimePackages.map((pkg) => ({ pkg, dir: resolveDep(pkg, projectDir) }));
   const sharpJsDir = resolveDep("sharp", projectDir);
   if (
     resolved.every(({ dir }) => dir !== undefined && existsSync(dir)) &&
@@ -1050,8 +1061,8 @@ export async function stageSharpRuntimePackages(
     }
   }
   console.warn(
-    `[adapter-k8s] Could not resolve sharp's linux-x64 runtime packages ` +
-      `(${SHARP_RUNTIME_PACKAGES.join(", ")}) or a local sharp install — ` +
+    `[adapter-k8s] Could not resolve sharp's ${platform} runtime packages ` +
+      `(${runtimePackages.join(", ")}) or a local sharp install — ` +
       `/_next/image optimization will be UNAVAILABLE (503) in the "${poolName}" pool container.`,
   );
   return { staged: false };
@@ -1459,6 +1470,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // effectiveBuildId. Everything below (resource names, image tags, Valkey namespace,
       // NEXT_BUILD_ID env) flows from this one variable.
       const buildId = effectiveBuildId(ctxBuildId, deploymentId);
+      // Resolve once for the whole artifact. Sharp staging, Docker builds, digest selection,
+      // and pod scheduling must all describe the same platform; reading the env independently
+      // at deploy time allowed an arm64 image to carry amd64 native bindings.
+      const imageTargetPlatform = targetPlatform();
       const repoRoot = (ctx as { repoRoot?: string }).repoRoot ?? projectDir;
       // N50 (review #33): `.next` was hardcoded at every staging site, and each site was
       // guarded by `existsSync`, so a custom `distDir` staged NOTHING (no Turbopack chunks,
@@ -1599,6 +1614,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           {
             buildId,
             nextVersion,
+            targetPlatform: imageTargetPlatform,
             basePath: nextConfig.basePath,
             i18n: nextConfig.i18n,
             routing,
@@ -1799,6 +1815,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         pools,
         buildId,
         nextVersion,
+        targetPlatform: imageTargetPlatform,
         config: cfg,
         imageRegistry,
         routingManifest,
@@ -2024,9 +2041,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // and on the Pages Router server runtime.
         await stageNextRuntimeDependencies(projectDir, poolName, isShared);
 
-        // sharp's native linux-x64 packages (see stageSharpRuntimePackages) — pool-server.cjs
-        // inlines sharp's JS but requires the platform binding at RUNTIME.
-        return stageSharpRuntimePackages(projectDir, poolName, resolveSharpDepDir, isShared);
+        // sharp's native target-platform packages (see stageSharpRuntimePackages) — the
+        // externalized JS package requires its matching platform binding at runtime.
+        return stageSharpRuntimePackages(
+          projectDir,
+          poolName,
+          resolveSharpDepDir,
+          isShared,
+          imageTargetPlatform,
+        );
       };
 
       if (skipStaging) {
@@ -2138,6 +2161,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           generateDockerfile({
             containerStrategy: "shared-image",
             buildId,
+            targetPlatform: imageTargetPlatform,
             ...(!sharpStaging.staged && sharpStaging.sharpVersion
               ? { installSharpVersion: sharpStaging.sharpVersion }
               : {}),
@@ -2305,8 +2329,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             generatePoolDockerfile({
               poolName,
               buildId,
-              // Build host lacked linux-x64 sharp packages — install in-image instead,
-              // pinned to the app's sharp so the native ABI matches the inlined JS.
+              targetPlatform: imageTargetPlatform,
+              // Build host lacked the target's sharp packages — install in-image instead,
+              // pinned to the app's sharp so the native ABI matches its staged JS.
               ...(!sharpStaging.staged && sharpStaging.sharpVersion
                 ? { installSharpVersion: sharpStaging.sharpVersion }
                 : {}),
@@ -2509,12 +2534,28 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       } // end if (!skipStaging)
 
+      if (!skipStaging) {
+        const runtimeContexts =
+          containerStrategy === "shared-image"
+            ? [path.join(projectDir, OUTPUT_DIR(), "shared-context")]
+            : [...pools.keys()].map((poolName) =>
+                path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context"),
+              );
+        const routingContext = path.join(projectDir, OUTPUT_DIR(), "routing-service", "context");
+        if (existsSync(routingContext)) runtimeContexts.push(routingContext);
+        // next build traces bytes produced for the BUILD host. Docker's --platform flag does
+        // not rewrite a Prisma engine or arbitrary .node addon already copied into the context,
+        // so reject detectable foreign binaries before an image can reach the cluster.
+        await assertStagedNativeArtifactsTargetPlatform(runtimeContexts, imageTargetPlatform);
+      }
+
       await writeOutputFile(
         projectDir,
         "build-metadata.json",
         generateBuildMetadata({
           buildId,
           nextVersion,
+          targetPlatform: imageTargetPlatform,
           // The CLI cannot otherwise tell a generic build from a GKE one, and it makes
           // provider-specific decisions (kube context, digest resolution, NetworkPolicy
           // discovery) on that basis.

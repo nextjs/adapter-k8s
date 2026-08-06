@@ -79,7 +79,7 @@ All three supported runtimes accept the same verb set (`build`, `push`, `inspect
 | `podman`  | a reachable daemon |
 | `nerdctl` | containerd **and** buildkit reachable from your user—containerd alone cannot build |
 
-**Platform pinning.** Always pass `--platform=linux/amd64` (or your node architecture) explicitly. A host-native build on an ARM runner or Apple Silicon produces arm64 images that fail with `exec format error` on x86 nodes—at rollout, not at build time. For ARM node pools (e.g. GCP T2A), build `linux/arm64` instead.
+**Platform pinning.** Always pass `--platform=linux/amd64` or `--platform=linux/arm64` explicitly in a manual image pipeline. With the adapter CLI, set `ADAPTER_K8S_TARGET_PLATFORM` before `next build`; the emitted artifact records it and deploy rejects a different override. Each build publishes one platform, not a multi-architecture index, and its pods are scheduled only on matching nodes. Docker cannot convert native files already produced by `next build`: Sharp is retargeted explicitly, while detectable foreign Prisma engines, ELF/Mach-O/PE binaries, and `.node` addons abort artifact generation. Run dependency installation and `next build` on a matching Linux runner/container when the app has other native dependencies.
 
 **nerdctl notes.** buildkit is a separate daemon from containerd, and a `buildkitd` running as root is not reachable by rootless `nerdctl`—its socket lives at `/run/buildkit/buildkitd.sock` while nerdctl looks under `$XDG_RUNTIME_DIR`. If `nerdctl build` fails:
 

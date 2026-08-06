@@ -373,7 +373,7 @@ function happyCluster(
     // daemon knows the digest; the registry fallback is never reached on the happy path.
     if (args.includes("inspect") && j.includes("RepoDigests")) {
       const ref = args[args.length - 1]!;
-      return ok(`${ref.slice(0, ref.lastIndexOf(":"))}@sha256:${"a".repeat(64)}\n`);
+      return ok(`linux/amd64\n${ref.slice(0, ref.lastIndexOf(":"))}@sha256:${"a".repeat(64)}\n`);
     }
     if (j.includes("clusterIpv4Cidr")) return ok("10.4.0.0/14\n");
     // S22: strict-posture node-range discovery — cluster subnetwork, then its primary
@@ -635,8 +635,41 @@ describe("runDeploy — orchestration", () => {
   });
 
   afterEach(() => {
+    delete process.env.ADAPTER_K8S_TARGET_PLATFORM;
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("rejects a deploy-time platform override that differs from the built artifact", async () => {
+    setupFs({
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: false,
+        targetPlatform: "linux/arm64",
+      },
+    });
+    process.env.ADAPTER_K8S_TARGET_PLATFORM = "linux/amd64";
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/targets "linux\/arm64".*requested "linux\/amd64"/s);
+    // The lifecycle stack probes Helm capabilities before reading skipped-build metadata; this
+    // is read-only and still occurs before every build/push/credential/cluster mutation.
+    expect(execCapture).toHaveBeenCalledOnce();
+    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"]);
+  });
+
+  it("treats pre-platform metadata as amd64 instead of relabeling its x64 Sharp staging", async () => {
+    process.env.ADAPTER_K8S_TARGET_PLATFORM = "linux/arm64";
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/targets "linux\/amd64".*requested "linux\/arm64"/s);
+    expect(execCapture).toHaveBeenCalledOnce();
+    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"]);
   });
 
   it("happy path: build → push → helm → rollout → health → selector patch → state commit → CDN invalidate → previous scaled down, in that order", async () => {
@@ -673,6 +706,7 @@ describe("runDeploy — orchestration", () => {
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        targetPlatforms: { buildn: "linux/amd64" },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
@@ -1261,6 +1295,7 @@ describe("runDeploy — guards and teardown", () => {
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        targetPlatforms: { buildn: "linux/amd64" },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
@@ -1280,6 +1315,7 @@ describe("runDeploy — guards and teardown", () => {
       previousBuildId: "buildm0",
       cdnTags: { buildm: recordedPrev },
       poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      targetPlatforms: { buildm: "linux/arm64", buildm0: "linux/amd64" },
     } as never);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
@@ -1300,6 +1336,8 @@ describe("runDeploy — guards and teardown", () => {
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        // The outgoing rollback target is carried; the older, out-of-play build is pruned.
+        targetPlatforms: { buildm: "linux/arm64", buildn: "linux/amd64" },
         basedOnGeneration: null,
       },
       RELEASE,
@@ -2018,6 +2056,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        targetPlatforms: { buildn: "linux/amd64" },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },

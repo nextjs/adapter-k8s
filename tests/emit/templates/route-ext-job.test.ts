@@ -47,6 +47,10 @@ describe("renderRouteExtUpdateJob", () => {
     // Attaches the standalone routing NEG to the ext_proc backend service
     expect(yaml).toContain("my-app-routing-neg");
     expect(yaml).toContain("add-backend");
+    expect(yaml).toContain(
+      "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:6fd292185f0efc136eff2f6d20287870e5b66619818d5108c31ad55311722028",
+    );
+    expect(yaml).toContain('kubernetes.io/arch: "{{ .Values.global.targetArchitecture }}"');
   });
 
   it("renders the exact job name from routeExtJobName (deploy cleanup matches this)", () => {
@@ -92,7 +96,7 @@ describe("renderRouteExtUpdateJob", () => {
       region: "us-central1",
       buildId: "abc123",
     });
-    expect(yaml).toMatch(/cloud-sdk:slim@sha256:[0-9a-f]{64}/);
+    expect(yaml).toMatch(/google-cloud-cli@sha256:[0-9a-f]{64}/);
   });
 
   it("ships the hardened job/pod posture (ttl, non-root, read-only FS, gcloud config home)", () => {

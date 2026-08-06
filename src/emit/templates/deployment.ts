@@ -15,6 +15,7 @@ import {
 import type { EnvValue, EnvFromSource } from "../../types.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
 import { renderValkeyEnv } from "./valkey-secret.js";
+import type { TargetArchitecture } from "../../target-platform.js";
 
 /**
  * N63. Pod-termination timings for a NEG-backed pod, from Google's own guidance —
@@ -86,6 +87,7 @@ export function renderDeployment({
   env,
   envFrom,
   deploymentId,
+  nodeArchitecture = "amd64",
 }: {
   poolName: string;
   buildId: string;
@@ -129,6 +131,8 @@ export function renderDeployment({
    * pod must carry the exact build-time value.
    */
   deploymentId?: string;
+  /** Literal architecture for this newly emitted build. */
+  nodeArchitecture?: TargetArchitecture;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -236,6 +240,11 @@ export function renderDeployment({
   const podLabels = `        app.kubernetes.io/name: "${releaseName}"
         app.kubernetes.io/component: "${poolName}"
         app.kubernetes.io/version: "${safeBuildId}"`;
+  const nodeSelector =
+    `      # The adapter emits a single-platform image for this build. Pin scheduling to\n` +
+    `      # the matching node architecture in mixed-architecture clusters.\n` +
+    `      nodeSelector:\n` +
+    `        kubernetes.io/arch: "${nodeArchitecture}"\n`;
 
   return `apiVersion: apps/v1
 kind: Deployment
@@ -277,7 +286,7 @@ ${podLabels}
     spec:
       # The pool server never calls the Kubernetes API — don't mount a SA token.
       automountServiceAccountToken: false
-      securityContext:
+${nodeSelector}      securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000

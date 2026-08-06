@@ -68,8 +68,9 @@ describe("generateDockerfile", () => {
       installSharpVersion: "0.34.5",
     });
     expect(result).toContain(
-      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund sharp@0.34.5",
+      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund",
     );
+    expect(result).toContain("--os=linux --cpu=x64 --libc=glibc sharp@0.34.5");
     expect(result).toContain("cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/");
     expect(result).not.toContain("RUN npm install --no-save");
     expect(result.indexOf("COPY --chown=node:node . .")).toBeLessThan(
@@ -126,8 +127,9 @@ describe("generatePoolDockerfile", () => {
       installSharpVersion: "0.34.5",
     });
     expect(result).toContain(
-      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund sharp@0.34.5",
+      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund",
     );
+    expect(result).toContain("--os=linux --cpu=x64 --libc=glibc sharp@0.34.5");
     expect(result).toContain("cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/");
     expect(result).not.toContain("RUN npm install --no-save");
     // Must run after the context is copied (needs /app) and before dropping to the
@@ -136,6 +138,18 @@ describe("generatePoolDockerfile", () => {
       result.indexOf("RUN npm install"),
     );
     expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("USER node"));
+  });
+
+  it("installs the arm64 binding when the arm64 pair could not be staged", () => {
+    const result = generatePoolDockerfile({
+      poolName: "ssr",
+      buildId: "abc123",
+      targetPlatform: "linux/arm64",
+      installSharpVersion: "0.35.3",
+    });
+    expect(result).toContain("Build host had no linux/arm64 sharp binding");
+    expect(result).toContain("--os=linux --cpu=arm64 --libc=glibc sharp@0.35.3");
+    expect(result).not.toContain("--cpu=x64");
   });
 
   it("emits no npm install by default (packages staged into the context instead)", () => {

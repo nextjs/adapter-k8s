@@ -661,7 +661,10 @@ describe("runRollback — state read ordering", () => {
 describe("runRollback — routing service revert", () => {
   const REGISTRY = "us-central1-docker.pkg.dev/proj/nextjs";
 
-  function routingCapture(opts: { targetSnapshotExists: boolean }) {
+  function routingCapture(opts: {
+    targetSnapshotExists: boolean;
+    liveArchitecture?: "amd64" | "arm64";
+  }) {
     return vi.fn(async (_cmd: string, args: string[]) => {
       const j = args.join(" ");
       if (args.includes("deployments"))
@@ -673,6 +676,9 @@ describe("runRollback — routing service revert", () => {
             spec: {
               template: {
                 spec: {
+                  nodeSelector: {
+                    "kubernetes.io/arch": opts.liveArchitecture ?? "arm64",
+                  },
                   containers: [
                     {
                       name: "routing-service",
@@ -717,6 +723,7 @@ describe("runRollback — routing service revert", () => {
       buildId: "buildn",
       previousBuildId: "buildm",
       poolTopologies: POOL_TOPOLOGIES,
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -763,6 +770,7 @@ describe("runRollback — routing service revert", () => {
     const patchBody = deployPatch![1][deployPatch![1].length - 1]!;
     expect(patchBody).toContain(`"image":"${REGISTRY}/routing-service:buildm"`);
     expect(patchBody).toContain(`"configMap":{"name":"${SNAP_M}"}`);
+    expect(patchBody).toContain('"kubernetes.io/arch":"amd64"');
 
     // 3. ...and its rollout was awaited. Through execCapture, not execOrThrow: the exit code
     // is needed, because a failed rollout must RESTORE the edge rather than throw with the
@@ -814,6 +822,38 @@ describe("runRollback — routing service revert", () => {
         buildId: "buildm",
         previousBuildId: "buildn",
         poolTopologies: POOL_TOPOLOGIES,
+        targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
+        basedOnGeneration: null,
+      },
+      RELEASE,
+      "default",
+    );
+  });
+
+  it("moves an amd64 routing edge to arm64 and preserves both platform records", async () => {
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
+      targetPlatforms: { buildn: "linux/amd64", buildm: "linux/arm64" },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      routingCapture({ targetSnapshotExists: true, liveArchitecture: "amd64" }) as never,
+    );
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const deployPatch = vi
+      .mocked(execCapture)
+      .mock.calls.find(([, args]) => args.includes("patch") && args.includes("deployment"))!;
+    expect(deployPatch[1].at(-1)).toContain('"kubernetes.io/arch":"arm64"');
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: POOL_TOPOLOGIES,
+        targetPlatforms: { buildn: "linux/amd64", buildm: "linux/arm64" },
         basedOnGeneration: null,
       },
       RELEASE,
@@ -853,6 +893,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
             spec: {
               template: {
                 spec: {
+                  nodeSelector: { "kubernetes.io/arch": "arm64" },
                   containers: [
                     { name: "routing-service", image: `${REGISTRY}/routing-service:buildn` },
                   ],
@@ -905,6 +946,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
       buildId: "buildn",
       previousBuildId: "buildm",
       poolTopologies: { buildn: ["ssr", "api"], buildm: ["ssr", "api"] },
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -968,6 +1010,11 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
         a[a.length - 1]!.includes("routing-service:buildn"),
     );
     expect(edgeForwardIdx).toBeGreaterThan(svcRestoreIdx);
+    const edgePatches = calls
+      .filter(([, a]) => a.includes("patch") && a.includes("deployment"))
+      .map(([, a]) => a.at(-1)!);
+    expect(edgePatches[0]).toContain('"kubernetes.io/arch":"amd64"');
+    expect(edgePatches.at(-1)).toContain('"kubernetes.io/arch":"arm64"');
 
     const out = errorOutput();
     expect(out).toContain("ROLLBACK FAILED");
@@ -2004,7 +2051,11 @@ describe("revertRoutingServiceToBuild — the dispatch secret moves with the ima
 describe("revertRoutingServiceToBuild — failed rollout restores the edge", () => {
   const PRIOR_IMAGE = `gcr.io/p/routing-service@sha256:${"a".repeat(64)}`;
 
-  function mockCluster(opts: { rolloutFails: boolean; restoreFails?: boolean }) {
+  function mockCluster(opts: {
+    rolloutFails: boolean;
+    restoreFails?: boolean;
+    priorNodeArchitecture?: "arm64" | null;
+  }) {
     let patches = 0;
     vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
       const j = args.join(" ");
@@ -2015,6 +2066,14 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
             spec: {
               template: {
                 spec: {
+                  ...(opts.priorNodeArchitecture === null
+                    ? {}
+                    : {
+                        nodeSelector: {
+                          "kubernetes.io/arch": opts.priorNodeArchitecture ?? "arm64",
+                          "topology.kubernetes.io/zone": "zone-a",
+                        },
+                      }),
                   containers: [
                     {
                       name: "routing-service",
@@ -2057,6 +2116,7 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
         releaseName: "rel",
         targetBuildId: "target",
         registry: "gcr.io/p",
+        targetPlatform: "linux/amd64",
       }),
     ).rejects.toThrow(/did not roll out.*restored to what it was serving before/s);
 
@@ -2069,6 +2129,53 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
     const body = restore[1][restore[1].length - 1]!;
     expect(body).toContain(PRIOR_IMAGE);
     expect(body).toContain("prior-build");
+    const patchBodies = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .map(([, a]) => a.at(-1)!)
+      .slice(-2);
+    expect(patchBodies[0]).toContain('"kubernetes.io/arch":"amd64"');
+    expect(patchBodies.at(-1)).toContain('"kubernetes.io/arch":"arm64"');
+    // Only the architecture key is patched; strategic merge preserves unrelated selectors.
+    expect(patchBodies.at(-1)).not.toContain("topology.kubernetes.io/zone");
+  });
+
+  it("removes the architecture key when a failed revert started without one", async () => {
+    mockCluster({ rolloutFails: true, priorNodeArchitecture: null });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target",
+        registry: "gcr.io/p",
+        targetPlatform: "linux/arm64",
+      }),
+    ).rejects.toThrow(/did not roll out/);
+
+    const restoreBody = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .at(-1)![1]
+      .at(-1)!;
+    expect(restoreBody).toContain('"kubernetes.io/arch":null');
+  });
+
+  it("does not touch the selector while restoring a failed legacy-platform revert", async () => {
+    mockCluster({ rolloutFails: true });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "legacy-target",
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/did not roll out/);
+
+    const patchBodies = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .map(([, a]) => a.at(-1)!)
+      .slice(-2);
+    expect(patchBodies).toHaveLength(2);
+    expect(patchBodies.every((body) => !body.includes("nodeSelector"))).toBe(true);
   });
 
   it("says so explicitly when the restore ALSO fails — that is a different situation", async () => {
@@ -2078,6 +2185,7 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
         releaseName: "rel",
         targetBuildId: "target",
         registry: "gcr.io/p",
+        targetPlatform: "linux/amd64",
       }),
     ).rejects.toThrow(/could NOT be restored.*DIFFERENT builds/s);
   });
@@ -2088,6 +2196,7 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
       releaseName: "rel",
       targetBuildId: "target",
       registry: "gcr.io/p",
+      targetPlatform: "linux/amd64",
     });
     expect(patchCount()).toBe(1);
   });
@@ -2144,9 +2253,11 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
       targetBuildId: "target",
       registry: "gcr.io/p",
       targetImageDigest: DIGEST,
+      targetPlatform: "linux/arm64",
     });
     expect(patchBody()).toContain(`routing-service@${DIGEST}`);
     expect(patchBody()).not.toContain("routing-service:target");
+    expect(patchBody()).toContain('"kubernetes.io/arch":"arm64"');
   });
 
   it("falls back to the tag for a build with no recorded digest, and warns", async () => {
@@ -2158,7 +2269,9 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
       registry: "gcr.io/p",
     });
     expect(patchBody()).toContain("routing-service:legacy");
+    expect(patchBody()).not.toContain("nodeSelector");
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reverting the edge by\s+TAG/i));
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/No recorded target platform/i));
     warn.mockRestore();
   });
 });

@@ -14,9 +14,12 @@
 //     config.ts `applyDefaults`, so the two would drift the moment either changed.
 // Both are fixed the same way: the fields are REQUIRED. Callers supply defaults once, in
 // applyDefaults (config.ts), and this file only serializes what it is given.
+import { parseTargetPlatform, type TargetPlatform } from "../target-platform.js";
+
 export function generateBuildMetadata({
   buildId,
   nextVersion,
+  targetPlatform,
   poolNames,
   generatedAt,
   provider,
@@ -34,6 +37,8 @@ export function generateBuildMetadata({
 }: {
   buildId: string;
   nextVersion: string;
+  /** OCI platform used for native staging, image builds, digest selection, and scheduling. */
+  targetPlatform: TargetPlatform;
   poolNames: string[];
   /**
    * Project-relative dist dir (the S20-validated `distDirRel`, usually ".next"). The deploy
@@ -84,10 +89,12 @@ export function generateBuildMetadata({
   /** provider.generic.nodeCidrs, if set — deploy prefers it over live node discovery. */
   nodeCidrs?: string[] | undefined;
 }): string {
+  const safeTargetPlatform = parseTargetPlatform(targetPlatform, "build metadata targetPlatform");
   return JSON.stringify(
     {
       buildId,
       nextVersion,
+      targetPlatform: safeTargetPlatform,
       provider,
       namespace,
       ...(containerRegistry ? { containerRegistry } : {}),

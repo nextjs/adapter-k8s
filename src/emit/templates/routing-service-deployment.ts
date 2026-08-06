@@ -16,6 +16,7 @@ import {
   TERMINATION_GRACE_SECONDS,
 } from "./deployment.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
+import type { TargetArchitecture } from "../../target-platform.js";
 
 export interface RoutingServiceResources {
   cpu?: string;
@@ -63,6 +64,7 @@ export function renderRoutingServiceDeployment({
   env,
   envFrom,
   deploymentId,
+  nodeArchitecture = "amd64",
 }: {
   releaseName: string;
   buildId: string;
@@ -86,6 +88,7 @@ export function renderRoutingServiceDeployment({
   envFrom?: EnvFromSource[];
   /** next.config `deploymentId` — see renderDeployment; node middleware runs here. */
   deploymentId?: string;
+  nodeArchitecture?: TargetArchitecture;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md) — this template splices all three
   // into resource names, a quoted image reference, and `value: "…"` env scalars.
@@ -174,6 +177,8 @@ spec:
     spec:
       # The routing service never calls the Kubernetes API — don't mount a SA token.
       automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: "${nodeArchitecture}"
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

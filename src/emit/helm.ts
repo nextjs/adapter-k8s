@@ -18,6 +18,11 @@ import { renderRoutingServiceHPA } from "./templates/routing-service-hpa.js";
 import { routeExtDocumentDigest } from "./templates/route-ext-configmap.js";
 import { renderNetworkPolicies } from "./templates/network-policy.js";
 import { resolveProvider } from "../providers/index.js";
+import {
+  DEFAULT_TARGET_PLATFORM,
+  targetArchitecture,
+  type TargetPlatform,
+} from "../target-platform.js";
 
 /**
  * Chart files that carry secret material. The write site (adapter.ts) MUST create these
@@ -65,6 +70,7 @@ export function generateHelmChart({
   pools,
   buildId,
   nextVersion,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
   config,
   imageRegistry,
   routingManifest,
@@ -79,6 +85,7 @@ export function generateHelmChart({
   pools: Map<string, PoolDefinition>;
   buildId: string;
   nextVersion: string;
+  targetPlatform?: TargetPlatform;
   config: K8sAdapterConfig;
   imageRegistry: string;
   routingManifest: RoutingManifest;
@@ -172,6 +179,7 @@ export function generateHelmChart({
     pools,
     buildId,
     nextVersion,
+    targetPlatform,
     config,
     imageRegistry,
   });
@@ -234,6 +242,7 @@ export function generateHelmChart({
       poolName,
       buildId,
       releaseName,
+      nodeArchitecture: targetArchitecture(targetPlatform),
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
       ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
       ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),
@@ -274,6 +283,7 @@ export function generateHelmChart({
       releaseName,
       buildId,
       imageRegistry,
+      nodeArchitecture: targetArchitecture(targetPlatform),
       ...(rs?.resources ? { resources: rs.resources } : {}),
       transport: provider.routingTransport,
       ...(routingFailOpen !== undefined ? { failOpen: routingFailOpen } : {}),
