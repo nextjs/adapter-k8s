@@ -90,21 +90,23 @@ describe("generic gateway listeners under merged gateways", () => {
   it("stamps the hostname on the listener for a single-host release", () => {
     const yaml = renderGenericGateway({
       releaseName: "e2e-lane1",
-      className: "eg",
-      hosts: [{ hostname: "lane1.localhost", tls: { enabled: false } }],
-    } as never);
+      gatewayClassName: "eg",
+      hosts: [{ hostname: "lane1.localhost", tls: { enabled: true } }],
+      tlsSecretName: "lane1-tls",
+    });
     expect(yaml).toMatch(/- name: http\n\s+hostname: "lane1\.localhost"/);
+    expect(yaml).toMatch(/- name: https\n\s+hostname: "lane1\.localhost"/);
   });
 
   it("keeps the hostname-less listener for multi-host releases (sectionName contract)", () => {
     const yaml = renderGenericGateway({
       releaseName: "multi",
-      className: "eg",
+      gatewayClassName: "eg",
       hosts: [
         { hostname: "a.example.com", tls: { enabled: false } },
         { hostname: "b.example.com", tls: { enabled: false } },
       ],
-    } as never);
+    });
     expect(yaml).not.toContain("hostname:");
   });
 });
