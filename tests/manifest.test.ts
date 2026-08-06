@@ -73,8 +73,8 @@ describe("buildRoutingManifest", () => {
       projectDir: "/app",
     });
 
-    expect(manifest.poolTimeouts).toEqual({ ssr: 15_000 });
-    expect(manifest.routeTimeouts).toEqual({
+    expect(manifest.poolResponseHeadTimeouts).toEqual({ ssr: 15_000 });
+    expect(manifest.routeExecutionTimeouts).toEqual({
       "/reports/[id]": 7_000,
       "/reports/one": 7_000,
     });

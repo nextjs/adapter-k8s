@@ -583,6 +583,30 @@ describe("cross-pool proxy hardening", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  it("does not let informational responses extend the response-head deadline", async (ctx) => {
+    pinPoolDns();
+    await startTargetPool((_req, res) => {
+      const timer = setInterval(() => res.writeContinue(), 20);
+      res.on("close", () => clearInterval(timer));
+    }, ctx);
+
+    const front = await track(
+      startFront(
+        {
+          kind: "route",
+          pool: "api",
+          matchedPathname: "/api/informational",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        },
+        { handlerTimeoutMs: 100 },
+      ),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/api/informational`);
+    expect(res.status).toBe(504);
+  });
+
   it("prefers the route deadline over its pool and default deadlines", async (ctx) => {
     pinPoolDns();
     await startTargetPool((_req, res) => {
@@ -603,8 +627,8 @@ describe("cross-pool proxy hardening", () => {
         },
         {
           handlerTimeoutMs: 2_000,
-          poolTimeouts: { api: 1_000 },
-          routeTimeouts: { "/api/route-budget": 100 },
+          poolResponseHeadTimeouts: { api: 1_000 },
+          routeExecutionTimeouts: { "/api/route-budget": 100 },
         },
       ),
     );
@@ -631,7 +655,7 @@ describe("cross-pool proxy hardening", () => {
           routeMatches: null,
           resolvedHeaders: undefined,
         },
-        { handlerTimeoutMs: 2_000, poolTimeouts: { api: 100 } },
+        { handlerTimeoutMs: 2_000, poolResponseHeadTimeouts: { api: 100 } },
       ),
     );
 
@@ -643,7 +667,7 @@ describe("cross-pool proxy hardening", () => {
     pinPoolDns();
     let forwardedDeadline: string | undefined;
     await startTargetPool((req, res) => {
-      forwardedDeadline = req.headers["x-adapter-k8s-deadline"] as string | undefined;
+      forwardedDeadline = req.headers["x-adapter-k8s-execution-deadline"] as string | undefined;
       setTimeout(() => {
         res.writeHead(200, { "content-type": "text/plain" });
         res.end("late");
@@ -659,7 +683,7 @@ describe("cross-pool proxy hardening", () => {
           matchedPathname: "/api/shared-budget",
           routeMatches: null,
           resolvedHeaders: undefined,
-          deadlineAt,
+          executionDeadlineAt: deadlineAt,
         },
         { handlerTimeoutMs: 2_000 },
       ),
@@ -973,6 +997,85 @@ describe("loopback handler invocation hardening", () => {
 });
 
 describe("edge route handler stream failure", () => {
+  it("504s an edge runner that never returns response headers", async () => {
+    const edgeRouteRunner = vi.fn(() => new Promise<never>(() => undefined));
+    const front = await track(
+      startServer((req, res) => {
+        const dispatcher = createDispatcher({
+          handlerLoader: {
+            load: vi.fn(),
+            has: vi.fn().mockReturnValue(true),
+            get: vi
+              .fn()
+              .mockReturnValue({ runtime: "edge", type: "APP_ROUTE", filePath: "edge.js" }),
+          } as any,
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          handlerTimeoutMs: 100,
+          edgeRouteRunner,
+        });
+        void dispatcher.dispatch(req, res, {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/edge-never",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        });
+      }),
+    );
+
+    const res = await fetch(`http://127.0.0.1:${front.port}/edge-never`);
+    expect(res.status).toBe(504);
+    expect(await res.text()).toBe("Gateway Timeout");
+  });
+
+  it("keeps maxDuration active after an edge response starts streaming", async () => {
+    const edgeRouteRunner = vi.fn(async () => ({
+      waitUntil: Promise.resolve(),
+      response: new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("first"));
+            setTimeout(() => controller.close(), 500);
+          },
+        }),
+      ),
+    }));
+    const front = await track(
+      startServer((req, res) => {
+        const dispatcher = createDispatcher({
+          handlerLoader: {
+            load: vi.fn(),
+            has: vi.fn().mockReturnValue(true),
+            get: vi
+              .fn()
+              .mockReturnValue({ runtime: "edge", type: "APP_ROUTE", filePath: "edge.js" }),
+          } as any,
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          handlerTimeoutMs: 1_000,
+          routeExecutionTimeouts: { "/edge-stream": 100 },
+          edgeRouteRunner,
+        });
+        void dispatcher.dispatch(req, res, {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/edge-stream",
+          routeMatches: null,
+          resolvedHeaders: undefined,
+        });
+      }),
+    );
+
+    const outcome = await fetch(`http://127.0.0.1:${front.port}/edge-stream`)
+      .then((res) => res.text())
+      .then(() => "completed" as const)
+      .catch(() => "reset" as const);
+    expect(outcome).toBe("reset");
+  });
+
   it("terminates the response when the edge body stream throws after writeHead", async () => {
     const edgeRouteRunner = vi.fn(async () => ({
       waitUntil: Promise.resolve(),

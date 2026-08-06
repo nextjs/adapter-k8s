@@ -244,7 +244,8 @@ export function createRequestHandler(
     // x-nextjs-data is a client hint, not proof of a data request — Next only
     // honors it after the URL matches the build-scoped /_next/data protocol.
     // Mirrors the pool resolver (resolve.ts): drop it for non-data requests.
-    if (!prep.isDataRequest) headers.delete("x-nextjs-data");
+    if (prep.isDataRequest) headers.set("x-nextjs-data", "1");
+    else headers.delete("x-nextjs-data");
 
     // The shed signal handed to middleware: aborts when the per-request budget
     // expires (server.ts's withTimeout shed uses the same budget), so middleware

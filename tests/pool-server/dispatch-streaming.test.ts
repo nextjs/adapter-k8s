@@ -63,6 +63,8 @@ function timedGet(
         if (firstByteAtMs < 0) firstByteAtMs = Date.now() - start;
         body += String(chunk);
       });
+      res.on("aborted", () => reject(new Error("response aborted")));
+      res.on("error", reject);
       res.on("end", () =>
         resolve({
           status: res.statusCode ?? 0,
@@ -273,6 +275,31 @@ describe("handler invocation deadline", () => {
     expect(res.status).toBe(200);
     expect(res.body).toBe("chunk\nchunk\nchunk\nchunk\n");
     expect(res.endAtMs).toBeGreaterThan(300);
+  });
+
+  it("keeps route maxDuration active after a Node response starts streaming", async () => {
+    const front = await startFront(
+      {
+        handlerLoader: handlerLoaderFor("/bounded-stream", (_req, res) => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.flushHeaders();
+          res.write("first");
+          setTimeout(() => res.end("last"), 500);
+        }),
+        poolName: "main",
+        buildId: "b1",
+        staticAssets: [],
+        handlerTimeoutMs: 1_000,
+        routeExecutionTimeouts: { "/bounded-stream": 100 },
+      },
+      routeResolution("/bounded-stream"),
+    );
+    openServers.push(front.server);
+
+    const outcome = await timedGet(front.port, "/bounded-stream")
+      .then(() => "completed" as const)
+      .catch(() => "reset" as const);
+    expect(outcome).toBe("reset");
   });
 });
 
