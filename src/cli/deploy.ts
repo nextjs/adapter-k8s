@@ -33,6 +33,7 @@ import { isAlreadyGoneError } from "./destroy.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 import {
+  ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
   routingManifestSnapshotName,
   routingServiceDeploymentName,
 } from "../emit/templates/routing-manifest-configmap.js";
@@ -3212,8 +3213,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "-n",
         namespace,
         "-l",
-        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s,` +
-          `app.kubernetes.io/component=routing-manifest-snapshot`,
+        `app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
         "-o",
         'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
       ]);
