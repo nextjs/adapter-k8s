@@ -101,24 +101,12 @@ export function renderDeployment({
    * so a cached layer can never silently outlive a retag.
    */
   imageDigest?: string;
-  /**
-   * N66. A COMPLETE literal image reference, overriding registry/repository/tag. Used for
-   * a RETAINED previous-build render: see `resources` below.
-   */
+  /** A COMPLETE literal image reference, overriding registry/repository/tag. */
   image?: string;
   /**
-   * N66. Literal resource quantities, overriding the `.Values`-derived defaults per field.
-   *
-   * The retained previous Deployment is re-rendered by cli/deploy.ts through this same
-   * function, and everything resolved from `.Values` resolves against the NEW build's
-   * values. So changing `resources` in `next.config` between deploys mutated the pod
-   * template of the build still serving 100% of traffic → default RollingUpdate rolled it
-   * (previously with no preStop at all, see N63); flipping `containerStrategy` repointed
-   * the retained manifest at `nextjs-app-<pool>:<previousBuildId>`, a tag never pushed, so
-   * the serving build rolled into ImagePullBackOff BEFORE cutover. Passing literals
-   * snapshotted from what is actually running makes a retained render a byte-for-byte
-   * reproduction. (An earlier fix addressed the OMISSION of `resources` here; it did not
-   * address the SKEW.)
+   * Literal resource quantities, overriding the `.Values`-derived defaults per field.
+   * Outgoing live Deployments are deliberately never reconstructed with these overrides:
+   * deploy transfers the complete object to Helm's keep lifecycle instead.
    */
   resources?: DeploymentResourceLiterals;
   replicas?: number | undefined;
@@ -129,16 +117,7 @@ export function renderDeployment({
    * `/healthz` — a readiness endpoint that can legitimately 503 must never restart a pod.
    */
   readinessPath?: string;
-  /**
-   * N87. The internal dispatch Secret this pod template resolves INTERNAL_HEADER_SECRET from,
-   * as a LITERAL. Same rationale as `resources`/`readinessPath` above: for a RETAINED
-   * previous-build render, deploy mirrors what the live pod template actually references. A
-   * build deployed before per-build Secret names references the legacy stable name, and
-   * stamping the derived per-build name onto it would point the SERVING build's pods at a
-   * Secret nobody rendered (CreateContainerConfigError on every new pod, before cutover).
-   * Omitted ⇒ the name derived from this render's own build id, which is what a normal build
-   * wants.
-   */
+  /** Literal Secret name override. Omitted means the name derived from this build id. */
   internalSecretRef?: string;
   /** User-supplied runtime environment, already merged (top-level config + this pool). */
   env?: Record<string, EnvValue>;
@@ -174,8 +153,7 @@ export function renderDeployment({
   );
   // Always emit the Valkey env — the secret refs are `optional: true`, so this is inert when no
   // cache is configured (the pool only registers the handler when VALKEY_URL is actually set).
-  // Emitting it unconditionally keeps the pod template identical whether or not the cache is on,
-  // so toggling `cache.enabled` between deploys never rolls the retained previous deployment.
+  // Emitting it unconditionally keeps the generated pod template independent of cache.enabled.
   const valkeyEnv = "\n" + renderValkeyEnv(releaseName, "            ");
   // Built-in, so it renders BEFORE user env (user config can never shadow it). Quoted via
   // JSON + Helm-action escaping like every other user-shaped scalar in this template.
@@ -195,8 +173,7 @@ export function renderDeployment({
   const { userEnv, userEnvFrom } = renderUserEnvBlocks(env, envFrom);
 
   // N60. Literal quantities are validated here too: a `.Values`-sourced quantity is
-  // already checked in values-yaml.ts, but a literal from deploy's per-build snapshot
-  // reaches the pod spec through this template and nowhere else.
+  // already checked in values-yaml.ts, but a direct literal reaches the pod spec here.
   const valuesRef = (field: string) =>
     `{{ (index .Values.pools "${poolName}").resources.${field} }}`;
   const quantity = (literal: string | undefined, field: string, valuesPath: string): string => {
@@ -210,9 +187,8 @@ export function renderDeployment({
   const memoryLimit = quantity(resources?.memoryLimit, "resources.memoryLimit", "limits.memory");
   const ephemeralStorage = resources?.ephemeralStorage ?? EPHEMERAL_STORAGE_REQUEST;
   assertSafeQuantity(ephemeralStorage, `pool "${poolName}" resources.ephemeralStorage`);
-  // N85: same sink class as the quantities above. This value is no longer always a constant —
-  // deploy snapshots the LIVE pod template's probe path for a retained build (N66), so a
-  // cluster-sourced string reaches this bare YAML scalar. Validate at the consumption point.
+  // N85: same sink class as the quantities above. Validate this bare YAML scalar at the
+  // consumption point even when a direct caller supplies it.
   assertSafeProbePath(readinessPath, `pool "${poolName}" readinessPath`);
 
   // S7 (SECURITY). The digest can arrive two ways, and BOTH must be honored:
@@ -275,9 +251,8 @@ metadata:
     app.kubernetes.io/component: "${poolName}"
     app.kubernetes.io/version: "${safeBuildId}"
 spec:
-${replicaLine}  # N63. The other half of the 502/503 fix: a pool Deployment DOES get rolled — by an
-  # image/pod-template change, and (because deploy.ts re-renders the retained previous
-  # build through this same template) by any change to this file. With the default
+${replicaLine}  # N63. The other half of the 502/503 fix: a pool Deployment DOES get rolled by an
+  # image/pod-template change. With the default
   # RollingUpdate 25%/25% the pool can dip BELOW its live replica count while the active
   # Service still selects it. maxUnavailable: 0 + maxSurge: 1 never dips, and
   # minReadySeconds gives the GFE time to health-check each new pod into the NEG before the

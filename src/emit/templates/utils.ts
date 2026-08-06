@@ -273,8 +273,7 @@ export function assertSafeImageRegistry(registry: string): void {
   }
 }
 
-// N66. A COMPLETE OCI image reference, as read back from a running Deployment's container
-// spec and re-interpolated into a double-quoted YAML scalar for a retained render:
+// A COMPLETE OCI image reference for a direct Deployment render:
 // `<registry>/<repo>[:tag][@sha256:…]`. Deliberately excludes the `"`/`\`/whitespace that
 // could break the scalar, and any scheme.
 const IMAGE_REFERENCE_RE =
@@ -504,10 +503,8 @@ export function assertSafeQuantity(value: string, field: string): void {
 }
 
 // N85. `readinessProbe.httpGet.path: ${readinessPath}` (deployment.ts) is another BARE YAML
-// scalar sink, and its value is no longer a constant: deploy snapshots the LIVE pod template's
-// probe path so a retained previous build keeps a probe its pods can satisfy (N66), which means
-// a cluster-sourced string reaches this interpolation. Same posture as the quantities above —
-// a narrow charset, rejected rather than escaped. Absolute path, no whitespace, no YAML
+// scalar sink. Same posture as the quantities above — a narrow charset, rejected rather than
+// escaped. Absolute path, no whitespace, no YAML
 // metacharacters; query strings are allowed because the pool matches on the parsed pathname.
 const PROBE_PATH_RE = /^\/[A-Za-z0-9._~\-/]*(\?[A-Za-z0-9._~\-/=&%]*)?$/;
 
