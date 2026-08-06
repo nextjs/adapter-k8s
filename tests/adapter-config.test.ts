@@ -227,6 +227,7 @@ describe("onBuildComplete build-time guards", () => {
 
   beforeEach(() => {
     projectDir = mkdtempSync(path.join(os.tmpdir(), "adapter-build-"));
+    vi.spyOn(process, "cwd").mockReturnValue(projectDir);
     savedSkip = process.env.ADAPTER_K8S_SKIP_STAGING;
     process.env.ADAPTER_K8S_SKIP_STAGING = "1";
   });
@@ -234,6 +235,7 @@ describe("onBuildComplete build-time guards", () => {
   afterEach(() => {
     if (savedSkip === undefined) delete process.env.ADAPTER_K8S_SKIP_STAGING;
     else process.env.ADAPTER_K8S_SKIP_STAGING = savedSkip;
+    vi.restoreAllMocks();
     rmSync(projectDir, { recursive: true, force: true });
   });
 
@@ -296,21 +298,21 @@ describe("onBuildComplete build-time guards", () => {
   });
 
   it("fails when release+pool truncation collapses distinct build ids (composed-name guard)", async () => {
-    // 20-char release + 38-char pool = a 60-char `release-pool-` prefix: only 3
-    // build-id chars survive the 63-char truncation, so "abc12345xyz" and
-    // "abc99999xyz" produce IDENTICAL composed resource names even though
+    // 20-char release + 29-char pool = a 51-char `release-pool-` prefix: exactly 8
+    // build-id chars survive the 59-char HPA-name budget, so "abcdefgh123" and
+    // "abcdefgh999" produce IDENTICAL composed resource names even though
     // sanitizeK8sName(buildId) alone (the old guard's comparison) differs.
     writeInfra({ releaseName: "r".repeat(20) });
     writeFileSync(
       path.join(projectDir, ".k8s-adapter", "state.json"),
-      JSON.stringify({ buildId: "abc12345xyz", previousBuildId: null }),
+      JSON.stringify({ buildId: "abcdefgh123", previousBuildId: null }),
     );
     const adapter = createK8sAdapter({
       ...validConfig,
-      pools: { ["p".repeat(38)]: { routes: ["appPages"] } },
+      pools: { ["p".repeat(29)]: { routes: ["appPages"] } },
     });
     await adapter.modifyConfig!({} as any, {} as any);
-    await expect(adapter.onBuildComplete!(ctx("abc99999xyz"))).rejects.toThrow(
+    await expect(adapter.onBuildComplete!(ctx("abcdefgh999"))).rejects.toThrow(
       /sanitizes to the same K8s name as the previous build/,
     );
   });
