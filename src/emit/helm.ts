@@ -6,7 +6,7 @@ import { renderInternalSecret } from "./templates/internal-secret.js";
 import { renderValkeySecret } from "./templates/valkey-secret.js";
 import { renderValuesYaml } from "./templates/values-yaml.js";
 import { renderDeployment } from "./templates/deployment.js";
-import { renderService, renderActiveService } from "./templates/service.js";
+import { renderService, renderActiveService, renderOriginService } from "./templates/service.js";
 import { renderHPA } from "./templates/hpa.js";
 import {
   renderRoutingManifestConfigMap,
@@ -18,6 +18,10 @@ import { renderRoutingServiceHPA } from "./templates/routing-service-hpa.js";
 import { routeExtDocumentDigest } from "./templates/route-ext-configmap.js";
 import { renderNetworkPolicies } from "./templates/network-policy.js";
 import { resolveProvider } from "../providers/index.js";
+import { gkeProvider } from "../providers/gke.js";
+import type { CompiledKubernetesTarget } from "../target/types.js";
+import { renderComposedResources } from "./templates/composed-resources.js";
+import { renderCompositionPlanConfigMap } from "./templates/composition-plan-configmap.js";
 import {
   DEFAULT_TARGET_PLATFORM,
   targetArchitecture,
@@ -81,6 +85,7 @@ export function generateHelmChart({
   internalSecret,
   imageDigests,
   deploymentId,
+  compiledTarget,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
@@ -127,9 +132,19 @@ export function generateHelmChart({
    * must be re-rendered, or the digests injected, only once the images are pushed.
    */
   imageDigests?: Record<string, string>;
+  /** Validated build-time target composition. Required when `config.target` is used. */
+  compiledTarget?: CompiledKubernetesTarget;
 }): Record<string, string> {
   const files: Record<string, string> = {};
-  const provider = resolveProvider(config);
+  const provider = config.provider ? resolveProvider(config) : undefined;
+  if (!provider && !compiledTarget) {
+    throw new Error("generateHelmChart requires compiledTarget when config.target is used");
+  }
+  const defaultPool = pools.keys().next().value as string | undefined;
+  if (!defaultPool) throw new Error("generateHelmChart requires at least one pool");
+  const emitsHealthCheckPolicy = compiledTarget
+    ? compiledTarget.routingTier.registration === "gke-traffic-extension"
+    : provider!.emitsHealthCheckPolicyCrd;
   const secret = internalSecret;
   // N87: per-BUILD Secret name (and therefore one Secret per live build, annotated
   // `helm.sh/resource-policy: keep`). The FILENAME stays `templates/internal-secret.yaml`
@@ -203,15 +218,25 @@ export function generateHelmChart({
   // The ingress tier (Gateway + route + any CDN attachment) is the first seam to move behind
   // the provider interface — see plans/multi-provider-aks-eks-generic.md. Emitting nothing when
   // no gateway is configured stays the provider's decision, not this caller's.
-  Object.assign(
-    files,
-    provider.emitIngressTemplates({
+  if (compiledTarget) {
+    files["templates/origin-service.yaml"] = renderOriginService({
       releaseName,
-      pools,
-      routingManifest,
-      config,
-    }),
-  );
+      poolName: defaultPool,
+      emitHealthCheckPolicy: emitsHealthCheckPolicy,
+    });
+    files["templates/composition-plan.yaml"] = renderCompositionPlanConfigMap(compiledTarget.plan);
+    Object.assign(files, renderComposedResources(compiledTarget.plan.operations.resources.objects));
+  } else {
+    Object.assign(
+      files,
+      provider!.emitIngressTemplates({
+        releaseName,
+        pools,
+        routingManifest,
+        config,
+      }),
+    );
+  }
 
   // NetworkPolicies for both workload tiers. Always emitted — the template is wrapped
   // in a helm `if` on global.networkPolicy.podCidrs, so it renders nothing until the
@@ -223,12 +248,14 @@ export function generateHelmChart({
     // release's own Envoy proxy pods on an in-cluster gateway. Reachability to the routing
     // tier's :8443 IS the internal dispatch secret, so this is the control that makes the
     // in-cluster h2c hop safe.
-    ingressSources: provider.strictIngressSources({
-      releaseName,
-      pools,
-      routingManifest,
-      config,
-    }),
+    ingressSources: compiledTarget
+      ? compiledTarget.ingressSources
+      : provider!.strictIngressSources({
+          releaseName,
+          pools,
+          routingManifest,
+          config,
+        }),
   });
 
   for (const poolName of pools.keys()) {
@@ -257,7 +284,7 @@ export function generateHelmChart({
     files[`templates/${poolName}-active-service.yaml`] = renderActiveService({
       poolName,
       releaseName,
-      emitHealthCheckPolicy: provider.emitsHealthCheckPolicyCrd,
+      emitHealthCheckPolicy: emitsHealthCheckPolicy,
     });
     files[`templates/${poolName}-hpa.yaml`] = renderHPA({
       poolName,
@@ -275,8 +302,11 @@ export function generateHelmChart({
   // chart with NO routing tier: the app served, nothing looked broken, and every request
   // silently fell back to pool-local middleware. The edge tier this adapter exists for was
   // simply absent.
-  const wantsRoutingTier =
-    provider.extProcStrategy === "envoy-gateway" ? true : Boolean(extensionChainJson);
+  const wantsRoutingTier = compiledTarget
+    ? compiledTarget.routingTier.enabled
+    : provider!.extProcStrategy === "envoy-gateway"
+      ? true
+      : Boolean(extensionChainJson);
   if (wantsRoutingTier) {
     const rs = config.routingService;
     files["templates/routing-service-deployment.yaml"] = renderRoutingServiceDeployment({
@@ -285,7 +315,9 @@ export function generateHelmChart({
       imageRegistry,
       nodeArchitecture: targetArchitecture(targetPlatform),
       ...(rs?.resources ? { resources: rs.resources } : {}),
-      transport: provider.routingTransport,
+      transport: compiledTarget
+        ? compiledTarget.routingTier.transport!
+        : provider!.routingTransport,
       ...(routingFailOpen !== undefined ? { failOpen: routingFailOpen } : {}),
       ...(rs?.requestTimeoutMs !== undefined ? { requestTimeoutMs: rs.requestTimeoutMs } : {}),
       ...(imageDigests?.routingService ? { imageDigest: imageDigests.routingService } : {}),
@@ -298,12 +330,14 @@ export function generateHelmChart({
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,
-      annotations: provider.routingServiceAnnotations({
-        releaseName,
-        pools,
-        routingManifest,
-        config,
-      }),
+      annotations: compiledTarget
+        ? compiledTarget.routingTier.serviceAnnotations
+        : provider!.routingServiceAnnotations({
+            releaseName,
+            pools,
+            routingManifest,
+            config,
+          }),
     });
     files["templates/routing-service-hpa.yaml"] = renderRoutingServiceHPA({
       releaseName,
@@ -314,23 +348,26 @@ export function generateHelmChart({
     // Second seam: HOW the ext_proc callout attaches to the data plane. GKE emits a
     // privileged gcloud registration Job; envoy-gateway providers emit an
     // EnvoyExtensionPolicy and need no cloud IAM at all.
-    Object.assign(
-      files,
-      provider.emitExtProcTemplates({
-        releaseName,
-        pools,
-        routingManifest,
-        config,
-        buildId,
-        infrastructure,
-        extensionChainJson,
-        routeExtDocumentDigest,
-        routingFailOpen,
-        ...(config.routingService?.requestTimeoutMs !== undefined
-          ? { requestTimeoutMs: config.routingService.requestTimeoutMs }
-          : {}),
-      }),
-    );
+    if (!compiledTarget || compiledTarget.routingTier.registration === "gke-traffic-extension") {
+      const extProcEmitter = compiledTarget ? gkeProvider : provider!;
+      Object.assign(
+        files,
+        extProcEmitter.emitExtProcTemplates({
+          releaseName,
+          pools,
+          routingManifest,
+          config,
+          buildId,
+          infrastructure,
+          extensionChainJson,
+          routeExtDocumentDigest,
+          routingFailOpen,
+          ...(config.routingService?.requestTimeoutMs !== undefined
+            ? { requestTimeoutMs: config.routingService.requestTimeoutMs }
+            : {}),
+        }),
+      );
+    }
   }
 
   // S25: a secret-bearing template that is not in SECRET_CHART_FILES would be written 0644.

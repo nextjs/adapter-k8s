@@ -21,6 +21,7 @@ export function generateBuildMetadata({
   nextVersion,
   targetPlatform,
   poolNames,
+  defaultPool,
   generatedAt,
   provider,
   namespace,
@@ -34,12 +35,15 @@ export function generateBuildMetadata({
   incrementalCacheHandler,
   cacheMemorystore,
   distDir,
+  compositionPlan,
 }: {
   buildId: string;
   nextVersion: string;
   /** OCI platform used for native staging, image builds, digest selection, and scheduling. */
   targetPlatform: TargetPlatform;
   poolNames: string[];
+  /** Pool selected by the stable portable origin Service. */
+  defaultPool: string;
   /**
    * Project-relative dist dir (the S20-validated `distDirRel`, usually ".next"). The deploy
    * step needs it to re-stage `<distDir>/cache/fetch-cache` into the image contexts before
@@ -88,6 +92,7 @@ export function generateBuildMetadata({
   containerRegistry?: string | undefined;
   /** provider.generic.nodeCidrs, if set — deploy prefers it over live node discovery. */
   nodeCidrs?: string[] | undefined;
+  compositionPlan?: { digest: string; targetFingerprint: string } | undefined;
 }): string {
   const safeTargetPlatform = parseTargetPlatform(targetPlatform, "build metadata targetPlatform");
   return JSON.stringify(
@@ -100,6 +105,8 @@ export function generateBuildMetadata({
       ...(containerRegistry ? { containerRegistry } : {}),
       ...(nodeCidrs && nodeCidrs.length > 0 ? { nodeCidrs } : {}),
       pools: poolNames,
+      defaultPool,
+      ...(compositionPlan ? { compositionPlan } : {}),
       generatedAt,
       distDir,
       containerStrategy,

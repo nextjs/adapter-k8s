@@ -205,7 +205,10 @@ export function compileTarget(
     operations: {
       resources: { objects, readiness },
       network: cluster.network,
-      cache: { kind: "none" },
+      cache:
+        context.cache === "external"
+          ? { kind: "external", lifecycle: "operator-managed" }
+          : { kind: "none" },
       cdn: { kind: "none" },
       routing: routing.plan,
       cleanup: {

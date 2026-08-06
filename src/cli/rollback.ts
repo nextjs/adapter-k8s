@@ -31,6 +31,7 @@ import {
   outputDirName,
 } from "./infrastructure-validation.js";
 import { targetArchitecture, type TargetPlatform } from "../target-platform.js";
+import { sanitizeForTerminal } from "./terminal.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -1349,9 +1350,38 @@ export async function runRollback(options: {
   const patchedServices: { service: string; pool: string }[] = [];
   console.log(`  → Switching traffic to previous build...`);
   const fallbackTargetPool = poolNames[0]!;
+  let hasPortableOrigin = Boolean(state.defaultPools);
+  if (!dryRun) {
+    const originLookup = await execCapture("kubectl", [
+      "get",
+      "service",
+      sanitizeK8sName(`${releaseName}-origin`),
+      "-n",
+      namespace,
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (originLookup.exitCode !== 0) {
+      throw new Error(
+        `Could not determine whether the portable origin Service exists: ` +
+          `${sanitizeForTerminal(originLookup.stderr.trim()) || `kubectl exited ${originLookup.exitCode}`}`,
+      );
+    }
+    hasPortableOrigin =
+      originLookup.stdout.trim() === `service/${sanitizeK8sName(`${releaseName}-origin`)}`;
+  }
   const serviceDestinations = [
     ...poolNames.map((pool) => ({ servicePool: pool, targetPool: pool })),
     ...currentOnlyPools.map((pool) => ({ servicePool: pool, targetPool: fallbackTargetPool })),
+    ...(hasPortableOrigin
+      ? [
+          {
+            servicePool: "origin",
+            targetPool: state.defaultPools?.[previousBuildId] ?? fallbackTargetPool,
+          },
+        ]
+      : []),
   ];
   for (const { servicePool, targetPool } of serviceDestinations) {
     const svcName = sanitizeK8sName(`${releaseName}-${servicePool}`);
@@ -1511,6 +1541,15 @@ export async function runRollback(options: {
           [previousBuildId]: [...poolNames],
           [currentBuildId]: [...currentPoolNames],
         },
+        ...(state.defaultPools
+          ? {
+              defaultPools: Object.fromEntries(
+                Object.entries(state.defaultPools).filter(([build]) =>
+                  [currentBuildId, previousBuildId].includes(build),
+                ),
+              ),
+            }
+          : {}),
         // The pointer swap keeps these same two build artifacts in play. Prune any stale
         // provenance while preserving the exact platform recorded for both directions.
         ...(state.targetPlatforms

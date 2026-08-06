@@ -92,6 +92,8 @@ export interface AdapterState {
    * objects cannot prove the topology. Pruned to the current and previous builds.
    */
   poolTopologies?: Record<string, string[]>;
+  /** Default pool selected by the portable origin Service for each retained build. */
+  defaultPools?: Record<string, string>;
   /**
    * The container platform each retained build was produced for, keyed by build id.
    *

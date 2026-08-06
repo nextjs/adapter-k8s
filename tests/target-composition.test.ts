@@ -133,12 +133,13 @@ describe("Kubernetes target composition", () => {
   });
 
   it("keeps GKE-native routing explicit and derives release resource names without sentinels", () => {
+    const tlsHosts = [{ hostname: "app.example.com", tls: { enabled: true } }];
     const compiled = compileTarget(
       defineTarget({
         cluster: gkeCluster(),
         exposure: gatewayApiExposure({
           className: "gke-l7-global-external-managed",
-          hosts,
+          hosts: tlsHosts,
           controllerManagedTls: true,
           controllerManagedCertificate: {
             annotation: "networking.gke.io/certmap",
@@ -151,6 +152,10 @@ describe("Kubernetes target composition", () => {
       context({ infrastructure: { projectId: "sample-project", region: "us-central1" } }),
     );
     expect(compiled.routingTier.registration).toBe("gke-traffic-extension");
+    expect(compiled.plan.target.registry).toMatchObject({
+      authentication: { kind: "ambient-credentials" },
+      digestLookup: { kind: "oci-distribution" },
+    });
     expect(JSON.stringify(compiled.plan)).not.toContain("PLACEHOLDER");
     expect(JSON.stringify(compiled.plan)).toContain("test-app-certmap");
     expect(JSON.stringify(compiled.plan)).toContain("test-app-ip");

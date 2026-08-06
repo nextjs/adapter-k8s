@@ -22,6 +22,7 @@ export interface TargetBuildContext {
   pools: readonly string[];
   defaultPool: string;
   failurePolicy: "open" | "closed";
+  cache?: "none" | "external";
   infrastructure?: {
     projectId?: string;
     region?: string;
