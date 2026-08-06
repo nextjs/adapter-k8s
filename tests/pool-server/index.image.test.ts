@@ -119,6 +119,10 @@ function writeStagedDir(
     middlewareSource?: string;
     publicFiles?: string[];
     basePath?: string;
+    beforeMiddleware?: Record<string, unknown>[];
+    dynamicRoutes?: Record<string, unknown>[];
+    pathnames?: string[];
+    poolAssignments?: Record<string, string>;
   } = {},
 ): {
   dir: string;
@@ -174,16 +178,16 @@ function writeStagedDir(
     path.join(configDir, "routing-manifest.json"),
     JSON.stringify({
       routeGraph: {
-        beforeMiddleware: [],
+        beforeMiddleware: options.beforeMiddleware ?? [],
         beforeFiles: [],
         afterFiles: [],
-        dynamicRoutes: [],
+        dynamicRoutes: options.dynamicRoutes ?? [],
         onMatch: [],
         fallback: [],
         shouldNormalizeNextData: true,
         rsc: { header: "rsc", suffix: ".rsc" },
       },
-      pathnames: [],
+      pathnames: options.pathnames ?? [],
       i18n: null,
       buildId: "imgbuild1",
       basePath: options.basePath ?? "",
@@ -194,7 +198,7 @@ function writeStagedDir(
             matchers: [{ regexp: options.middlewareMatcher }],
           }
         : null,
-      poolAssignments: {},
+      poolAssignments: options.poolAssignments ?? {},
       pprRoutes: {},
       nextVersion: "16.2.10",
     }),
@@ -233,7 +237,14 @@ async function getFreePort(): Promise<number> {
   return port;
 }
 
-const envKeys = ["POOL_NAME", "NEXT_BUILD_ID", "PORT", "CONFIG_DIR", "RELEASE_NAME"];
+const envKeys = [
+  "POOL_NAME",
+  "NEXT_BUILD_ID",
+  "PORT",
+  "CONFIG_DIR",
+  "RELEASE_NAME",
+  "INTERNAL_HEADER_SECRET",
+];
 
 interface BootedServer {
   port: number;
@@ -257,6 +268,11 @@ function makeBooter() {
         middlewareSource?: string;
         publicFiles?: string[];
         basePath?: string;
+        beforeMiddleware?: Record<string, unknown>[];
+        dynamicRoutes?: Record<string, unknown>[];
+        pathnames?: string[];
+        poolAssignments?: Record<string, string>;
+        internalSecret?: string;
       } = {},
     ): Promise<BootedServer> {
       listenersBefore = Object.fromEntries(
@@ -270,6 +286,8 @@ function makeBooter() {
       process.env.NEXT_BUILD_ID = "imgbuild1";
       process.env.PORT = String(port);
       process.env.CONFIG_DIR = staged.configDir;
+      if (options.internalSecret) process.env.INTERNAL_HEADER_SECRET = options.internalSecret;
+      else delete process.env.INTERNAL_HEADER_SECRET;
       process.chdir(staged.dir);
       server = await startPoolServer();
       return { port, close: () => server!.close() };
@@ -1073,6 +1091,34 @@ describe("image optimizer — middleware coverage must still win over the cachea
     }
   });
 
+  it("does not run middleware twice after a trusted upstream verdict", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        internalSecret: "image-routing-secret",
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response("middleware ran twice", { status: 451 });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        headers: {
+          accept: "image/webp",
+          "x-internal-secret": "image-routing-secret",
+          "x-mw-evaluated": "ran",
+          "x-resolved-headers": JSON.stringify({ "x-image-upstream": "reused" }),
+          "x-mw-request-headers": JSON.stringify({ accept: "image/png" }),
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(res.headers.get("x-image-upstream")).toBe("reused");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
   it("carries middleware request and response header mutations into the optimizer", async () => {
     const scoped = makeBooter();
     try {
@@ -1095,6 +1141,106 @@ describe("image optimizer — middleware coverage must still win over the cachea
       expect(res.status).toBe(200);
       expect(res.headers.get("content-type")).toBe("image/png");
       expect(res.headers.get("x-image-middleware")).toBe("continued");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("continues the optimizer after middleware when an app catch-all also matches", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response(null, { headers: { "x-middleware-next": "1" } });
+}\n`,
+        pathnames: ["/[...slug]"],
+        poolAssignments: { "/[...slug]": "main" },
+        dynamicRoutes: [
+          {
+            source: "/[...slug]",
+            sourceRegex: "^\\/(?<nxtPslug>.+?)(?:\\/)?$",
+            destination: "/[...slug]?nxtPslug=$nxtPslug",
+          },
+        ],
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        headers: { accept: "image/png" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("runs headers rules before the optimizer without middleware", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        beforeMiddleware: [
+          {
+            source: "/_next/image",
+            sourceRegex: "^\\/_next\\/image(?:\\/)?$",
+            headers: { "x-image-rule": "applied" },
+          },
+        ],
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-image-rule")).toBe("applied");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("buffers a non-read body for middleware and then continues the optimizer", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export async function proxy(request) {
+  const body = await request.text();
+  return new Response(null, {
+    headers: { "x-middleware-next": "1", "x-image-request-body": body },
+  });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        method: "POST",
+        body: "optimizer-body",
+        headers: { accept: "image/png" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(res.headers.get("x-image-request-body")).toBe("optimizer-body");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("preserves middleware cookies with Expires commas exactly once", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  const headers = new Headers({ "x-middleware-next": "1" });
+  headers.append("set-cookie", "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/");
+  headers.append("set-cookie", "theme=dark; Path=/");
+  return new Response(null, { headers });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(200);
+      expect(res.headers.getSetCookie()).toEqual([
+        "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/",
+        "theme=dark; Path=/",
+      ]);
       await res.arrayBuffer();
     } finally {
       await scoped.cleanup();
@@ -1134,13 +1280,17 @@ describe("image optimizer — middleware coverage must still win over the cachea
 
 describe("image optimizer — basePath", () => {
   const booter = makeBooter();
+  let port: number;
+
+  beforeAll(async () => {
+    ({ port } = await booter.boot(null, { basePath: "/docs" }));
+  });
 
   afterAll(async () => {
     await booter.cleanup();
   });
 
   it("serves the basePath-prefixed platform route", async () => {
-    const { port } = await booter.boot(null, { basePath: "/docs" });
     const res = await fetch(
       `http://127.0.0.1:${port}/docs/_next/image?url=/docs/mislabeled.jpg&w=640&q=75`,
       { headers: { accept: "image/png" } },
@@ -1149,6 +1299,25 @@ describe("image optimizer — basePath", () => {
     expect(res.headers.get("content-type")).toBe("image/png");
     await res.arrayBuffer();
   });
+
+  it("serves the default loader source shape under a basePath", async () => {
+    const res = await fetch(
+      `http://127.0.0.1:${port}/docs/_next/image?url=/mislabeled.jpg&w=640&q=75`,
+      { headers: { accept: "image/png" } },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    await res.arrayBuffer();
+  });
+
+  it.each(["/_next/image", "/docsy/_next/image"])(
+    "does not recognize %s outside the configured basePath boundary",
+    async (pathname) => {
+      const res = await fetch(`http://127.0.0.1:${port}${pathname}?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type") ?? "").not.toContain("image/");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
