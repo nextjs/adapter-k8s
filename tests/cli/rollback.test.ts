@@ -41,6 +41,7 @@ const SNAP_M = routingManifestSnapshotName(RELEASE, "buildm");
 const SNAP_N = routingManifestSnapshotName(RELEASE, "buildn");
 const infraPath = path.join(PROJECT, ".k8s-adapter", "infrastructure.json");
 const metaPath = path.join(PROJECT, ".k8s-adapter", "output", "build-metadata.json");
+const POOL_TOPOLOGIES = { buildn: ["ssr"], buildm: ["ssr"] };
 const cdnFilter = path.join(
   PROJECT,
   ".k8s-adapter",
@@ -71,6 +72,7 @@ describe("runRollback — state and CDN invalidation", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -111,6 +113,7 @@ describe("runRollback — state and CDN invalidation", () => {
       buildId: "buildn",
       previousBuildId: "buildm",
       cdnTags,
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(execCapture).mockImplementation(capture(false) as never);
 
@@ -122,7 +125,13 @@ describe("runRollback — state and CDN invalidation", () => {
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
       // N69: rollback passes the generation it READ as writeState's floor.
-      { buildId: "buildm", previousBuildId: "buildn", cdnTags, basedOnGeneration: null },
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        cdnTags,
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: null,
+      },
       RELEASE,
       "default",
     );
@@ -139,7 +148,12 @@ describe("runRollback — state and CDN invalidation", () => {
     // No cdnTags key invented for the swapped state.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: null,
+      },
       RELEASE,
       "default",
     );
@@ -159,6 +173,7 @@ describe("runRollback — state and CDN invalidation", () => {
       cdnTags,
       routingImageDigests,
       unretainedManifestBuilds,
+      poolTopologies: POOL_TOPOLOGIES,
     };
     vi.mocked(readState).mockImplementation(async () => state as never);
     vi.mocked(writeState).mockImplementation(async (_projectDir, next) => {
@@ -249,6 +264,7 @@ describe("runRollback — state and CDN invalidation", () => {
         cdnTags,
         routingImageDigests,
         unretainedManifestBuilds,
+        poolTopologies: POOL_TOPOLOGIES,
         basedOnGeneration: 7,
       },
       {
@@ -257,6 +273,7 @@ describe("runRollback — state and CDN invalidation", () => {
         cdnTags,
         routingImageDigests,
         unretainedManifestBuilds,
+        poolTopologies: POOL_TOPOLOGIES,
         basedOnGeneration: 8,
       },
     ]);
@@ -344,7 +361,11 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(readState).mockResolvedValue({ buildId: CURR, previousBuildId: PREV } as never);
+    vi.mocked(readState).mockResolvedValue({
+      buildId: CURR,
+      previousBuildId: PREV,
+      poolTopologies: { [CURR]: ["ssr"], [PREV]: ["ssr"] },
+    } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
@@ -372,6 +393,9 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as never);
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -414,10 +438,185 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
     // The rollback completed: state swapped to the previous build.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: PREV, previousBuildId: CURR, basedOnGeneration: null },
+      {
+        buildId: PREV,
+        previousBuildId: CURR,
+        poolTopologies: { [PREV]: ["ssr"], [CURR]: ["ssr"] },
+        basedOnGeneration: null,
+      },
       LONG_RELEASE,
       "default",
     );
+  });
+});
+
+describe("runRollback — N70: build-scoped pool topology", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: { buildn: ["api"], buildm: ["legacy"] },
+    } as never);
+    vi.mocked(writeState).mockResolvedValue(undefined as never);
+    vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
+    vi.mocked(existsSync).mockImplementation((p) => p === infraPath);
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
+      return "";
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as never);
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("restores a removed pool and redirects stale Gateway backends before parking the new pool", async () => {
+    const servicePatches: { service: string; body: string }[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployments")) {
+        return {
+          exitCode: 0,
+          stdout: "rel-legacy-buildm|0\nrel-api-buildn|2\n",
+          stderr: "",
+        };
+      }
+      if (args.includes("pods")) {
+        return { exitCode: 0, stdout: "rel-legacy-buildm-abc\n", stderr: "" };
+      }
+      if (args.includes("exec")) return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "get" && args[1] === "service") {
+        const service = args[2]!;
+        const pool = service === "rel-legacy" ? "legacy" : "api";
+        const version = service === "rel-legacy" ? "buildm" : "buildn";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": "rel",
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": version,
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "patch" && args[1] === "service") {
+        servicePatches.push({ service: args[2]!, body: args[args.length - 1]! });
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      // No routing tier; no target HPA; live-capacity reads intentionally fall back to the
+      // configured floor. None of those absences makes the topology ambiguous.
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    expect(servicePatches.map((patch) => patch.service)).toEqual(["rel-legacy", "rel-api"]);
+    expect(servicePatches[1]!.body).toContain(
+      '"path":"/spec/selector/app.kubernetes.io~1component","value":"legacy"',
+    );
+    expect(servicePatches[1]!.body).toContain(
+      '"path":"/spec/selector/app.kubernetes.io~1version","value":"buildm"',
+    );
+    const mutatingArgs = vi.mocked(execOrThrow).mock.calls.map(([, args]) => args.join(" "));
+    expect(mutatingArgs.some((args) => args.includes("deployment/rel-legacy-buildm"))).toBe(true);
+    expect(
+      mutatingArgs.some(
+        (args) => args.includes("deployment/rel-api-buildn") && args.includes("--replicas=0"),
+      ),
+    ).toBe(true);
+    expect(mutatingArgs.some((args) => args.includes("delete hpa rel-api-buildn-hpa"))).toBe(true);
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: { buildm: ["legacy"], buildn: ["api"] },
+        basedOnGeneration: null,
+      },
+      RELEASE,
+      "default",
+    );
+  });
+
+  it("restores exact live selectors when a topology-changing patch only partly succeeds", async () => {
+    const servicePatches: { service: string; body: string }[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployments")) {
+        return {
+          exitCode: 0,
+          stdout: "rel-legacy-buildm|0\nrel-api-buildn|2\n",
+          stderr: "",
+        };
+      }
+      if (args.includes("pods")) {
+        return { exitCode: 0, stdout: "rel-legacy-buildm-abc\n", stderr: "" };
+      }
+      if (args.includes("exec")) return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "get" && args[1] === "service") {
+        const service = args[2]!;
+        const pool = service === "rel-legacy" ? "legacy" : "api";
+        const version = service === "rel-legacy" ? "buildm" : "buildn";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": "rel",
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": version,
+                "example.com/operator-selector": "preserve-me",
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "patch" && args[1] === "service") {
+        const patch = { service: args[2]!, body: args[args.length - 1]! };
+        servicePatches.push(patch);
+        if (patch.service === "rel-api" && patch.body.includes('"value":"buildm"')) {
+          return { exitCode: 1, stdout: "", stderr: "denied by webhook" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    expect(servicePatches.map((patch) => patch.service)).toEqual([
+      "rel-legacy",
+      "rel-api",
+      "rel-legacy",
+    ]);
+    const restore = JSON.parse(servicePatches[2]!.body) as { value: Record<string, string> }[];
+    expect(restore).toEqual([
+      {
+        op: "replace",
+        path: "/spec/selector",
+        value: {
+          "app.kubernetes.io/name": "rel",
+          "app.kubernetes.io/component": "legacy",
+          "app.kubernetes.io/version": "buildm",
+          "example.com/operator-selector": "preserve-me",
+        },
+      },
+    ]);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    expect(
+      vi.mocked(execOrThrow).mock.calls.some(([, args]) => args.includes("--replicas=0")),
+    ).toBe(false);
   });
 });
 
@@ -427,6 +626,7 @@ describe("runRollback — state read ordering", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -516,6 +716,7 @@ describe("runRollback — routing service revert", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -609,7 +810,12 @@ describe("runRollback — routing service revert", () => {
     // The rollback still completes the pool switch.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: null,
+      },
       RELEASE,
       "default",
     );
@@ -698,6 +904,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: { buildn: ["ssr", "api"], buildm: ["ssr", "api"] },
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -737,6 +944,11 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
       /process\.exit:1/,
     );
+    expect(
+      errorOutput()
+        .split("\n")
+        .filter((line) => line.includes("Service selector patch(es) failed")),
+    ).toHaveLength(1);
 
     const calls = vi.mocked(execCapture).mock.calls;
     // The ssr Service was restored to the CURRENT build after the api patch failed...
@@ -1080,6 +1292,7 @@ describe("runRollback — serving gate", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -1229,6 +1442,7 @@ describe("runRollback — N26: scales the target to the current build's live cap
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -1369,6 +1583,7 @@ describe("runRollback — N69: the generation floor travels through rollback's s
       buildId: "buildn",
       previousBuildId: "buildm",
       generation: 7,
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(execCapture).mockImplementation(clusterOutageOnStateWrite() as never);
 
@@ -1397,6 +1612,7 @@ describe("runRollback — N69: the generation floor travels through rollback's s
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(execCapture).mockImplementation(clusterOutageOnStateWrite() as never);
 

@@ -69,6 +69,27 @@ export interface PoolResourceNames {
   hcp: string;
 }
 
+export interface StablePoolResourceNames {
+  service: string;
+  pdb: string;
+  hcp: string;
+}
+
+/** Stable per-pool objects emitted together by renderActiveService. */
+export function stablePoolResourceNames(
+  releaseName: string,
+  poolName: string,
+): StablePoolResourceNames {
+  assertSafeReleaseName(releaseName);
+  assertSafePoolName(poolName);
+  const base = `${releaseName}-${poolName}`;
+  return {
+    service: sanitizeK8sName(base),
+    pdb: sanitizeK8sName(base, "-pdb"),
+    hcp: sanitizeK8sName(base, "-hcp"),
+  };
+}
+
 export function poolResourceNames(
   releaseName: string,
   poolName: string,
@@ -176,6 +197,62 @@ export function findEmittedNameCollision(
     buildIds.map((buildId) => routingManifestSnapshotName(releaseName, buildId)),
   ]);
 
+  for (const [kind, names] of buckets) {
+    const seen = new Set<string>();
+    for (const name of names) {
+      if (seen.has(name)) return { kind, name };
+      seen.add(name);
+    }
+  }
+  return null;
+}
+
+/**
+ * Deploy-time collision guard for two builds whose pool sets may differ.
+ *
+ * `findBuildIdNameCollision` deliberately projects both build ids over one pool list, which is
+ * correct at build time but invents `<previousBuild>-<newPool>` resources after a pool rename.
+ * That can false-positive on truncation while also missing a collision between differently named
+ * pools that really do coexist during blue/green. This variant enumerates only the resources each
+ * build actually emitted, plus the stable per-pool Services shared by their union.
+ */
+export function findBuildTopologyNameCollision(
+  releaseName: string,
+  current: { buildId: string; pools: string[] },
+  previous: { buildId: string; pools: string[] },
+): { kind: string; name: string } | null {
+  const deploymentish: string[] = [];
+  const hpas: string[] = [];
+  const hcps: string[] = [];
+
+  for (const build of [current, previous]) {
+    for (const pool of build.pools) {
+      const names = poolResourceNames(releaseName, pool, build.buildId);
+      deploymentish.push(names.deployment);
+      hpas.push(names.hpa);
+      hcps.push(names.hcp);
+    }
+  }
+  // A common pool has one shared stable Service/HCP, not one per build.
+  for (const pool of new Set([...current.pools, ...previous.pools])) {
+    deploymentish.push(sanitizeK8sName(`${releaseName}-${pool}`));
+    hcps.push(sanitizeK8sName(`${releaseName}-${pool}`, "-hcp"));
+  }
+  deploymentish.push(`${releaseName}-routing-service`);
+  hpas.push(`${releaseName}-routing-service-hpa`);
+
+  const buckets: Array<[string, string[]]> = [
+    ["Deployment/Service", deploymentish],
+    ["HorizontalPodAutoscaler", hpas],
+    ["HealthCheckPolicy", hcps],
+    [
+      "ConfigMap",
+      [
+        routingManifestSnapshotName(releaseName, current.buildId),
+        routingManifestSnapshotName(releaseName, previous.buildId),
+      ],
+    ],
+  ];
   for (const [kind, names] of buckets) {
     const seen = new Set<string>();
     for (const name of names) {
