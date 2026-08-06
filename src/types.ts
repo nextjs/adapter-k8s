@@ -33,7 +33,14 @@ export type EnvFromSource =
   | { configMap: string; prefix?: string; optional?: boolean };
 
 export interface PoolConfig {
-  routes: string[]; // OutputType name ('appPages', 'appRoutes', 'pages', 'pagesApi') or glob pattern
+  /**
+   * Output type name (`appPages`, `appRoutes`, `pages`, `pagesApi`) or a glob over the
+   * build-time route template pathname. Full Next.js dynamic segments (`[slug]`,
+   * `[...slug]`, `[[...slug]]`) are literal template names, not minimatch character classes.
+   * The same is true when an interception marker is glued to the segment, such as
+   * `(.)[slug]`, `(..)[...slug]`, or `(...)[[...slug]]`.
+   */
+  routes: string[];
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
   timeout?: number;

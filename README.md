@@ -177,7 +177,12 @@ pools: {
 },
 ```
 
-Routes match by output type (`appPages`, `appRoutes`, `pagesApi`) or glob pattern, first-match-wins in config order.
+Routes match by output type (`appPages`, `appRoutes`, `pagesApi`) or a glob over the build-time
+route template pathname, first-match-wins in config order. Next.js dynamic segments are literal:
+`/blog/[slug]` selects that template and `/[locale]/lab/**` selects templates below it. Dynamic
+segments glued to interception markers are literal too, including `(.)[user]`, `(..)[...slug]`,
+`(...)[[...slug]]`, and `(..)(..)[slug]`. Ordinary glob syntax remains available outside these
+Next-specific segment forms, such as `/api/v[12]/**`.
 
 ### Multiple hosts & wildcards
 
