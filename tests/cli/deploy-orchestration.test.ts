@@ -81,7 +81,12 @@ function stablePoolObject(
       resourceVersion: "123",
       labels: {
         "app.kubernetes.io/managed-by": "Helm",
-        ...(retained ? { "adapter-k8s.dev/release": RELEASE } : {}),
+        ...(retained
+          ? {
+              "adapter-k8s.dev/release": RELEASE,
+              "adapter-k8s.dev/retained-stable-pool": RELEASE,
+            }
+          : {}),
         ...(kind === "healthcheckpolicy" && legacyHcpLabels
           ? {}
           : {

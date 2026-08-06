@@ -1,12 +1,13 @@
 import { execCapture } from "./exec.js";
 import {
+  ADAPTER_RELEASE_LABEL,
   assertSafePoolName,
   assertSafeReleaseName,
   resolveK8sNamespace,
   stablePoolResourceNames,
 } from "../emit/templates/utils.js";
 
-export const RETAINED_STABLE_POOL_LABEL = "adapter-k8s.dev/release";
+export const RETAINED_STABLE_POOL_LABEL = "adapter-k8s.dev/retained-stable-pool";
 const KEEP_ANNOTATION = "helm.sh/resource-policy";
 const KEEP_VALUE = "keep";
 const GKE_HCP_CRD = "healthcheckpolicies.networking.gke.io";
@@ -72,7 +73,11 @@ function validateStableResource(
         `(release=${JSON.stringify(helmRelease ?? null)}, namespace=${JSON.stringify(helmNamespace ?? null)}).`,
     );
   }
-  if (requireRetainedLabel && labels?.[RETAINED_STABLE_POOL_LABEL] !== releaseName) {
+  const retainedMarker = labels?.[RETAINED_STABLE_POOL_LABEL] === releaseName;
+  const legacyRetained =
+    labels?.[ADAPTER_RELEASE_LABEL] === releaseName &&
+    annotations?.[KEEP_ANNOTATION] === KEEP_VALUE;
+  if (requireRetainedLabel && !retainedMarker && !legacyRetained) {
     throw new Error(
       `Stable ${kind} ${wantedName} is missing retained-resource ownership label ` +
         `${RETAINED_STABLE_POOL_LABEL}=${releaseName}.`,
@@ -227,6 +232,7 @@ export async function retainRemovedPoolResources(options: {
           labels: {
             "app.kubernetes.io/name": releaseName,
             "app.kubernetes.io/component": pool,
+            [ADAPTER_RELEASE_LABEL]: releaseName,
             [RETAINED_STABLE_POOL_LABEL]: releaseName,
           },
           annotations: { [KEEP_ANNOTATION]: KEEP_VALUE },
@@ -279,7 +285,7 @@ export async function cleanupRetainedStablePoolResources(options: {
       "-n",
       namespace,
       "-l",
-      `app.kubernetes.io/name=${releaseName},${RETAINED_STABLE_POOL_LABEL}=${releaseName}`,
+      `app.kubernetes.io/name=${releaseName},${ADAPTER_RELEASE_LABEL}=${releaseName}`,
       "-o",
       "json",
     ]);
@@ -305,7 +311,19 @@ export async function cleanupRetainedStablePoolResources(options: {
       continue;
     }
     for (const item of items) {
-      const labels = objectRecord(objectRecord(item)?.metadata)?.labels;
+      const metadata = objectRecord(objectRecord(item)?.metadata);
+      const labels = objectRecord(metadata?.labels);
+      const annotations = objectRecord(metadata?.annotations);
+      const marker = labels?.[RETAINED_STABLE_POOL_LABEL];
+      if (marker !== undefined && marker !== releaseName) {
+        failures.push(
+          `retained ${kind} candidate has foreign marker ${RETAINED_STABLE_POOL_LABEL}=` +
+            JSON.stringify(marker),
+        );
+        continue;
+      }
+      const legacyRetained = annotations?.[KEEP_ANNOTATION] === KEEP_VALUE;
+      if (marker !== releaseName && !legacyRetained) continue;
       const pool = objectRecord(labels)?.["app.kubernetes.io/component"];
       if (typeof pool !== "string" || pool === "routing-service") {
         failures.push(`retained ${kind} candidate is missing a non-routing pool component`);

@@ -27,7 +27,12 @@ function stableObject(
     kind === "service" ? base : kind === "poddisruptionbudget" ? `${base}-pdb` : `${base}-hcp`;
   const labels: Record<string, string> = {
     "app.kubernetes.io/managed-by": opts.manager ?? "Helm",
-    ...(opts.retained ? { "adapter-k8s.dev/release": RELEASE } : {}),
+    ...(opts.retained
+      ? {
+          "adapter-k8s.dev/release": RELEASE,
+          "adapter-k8s.dev/retained-stable-pool": RELEASE,
+        }
+      : {}),
   };
   if (!(kind === "healthcheckpolicy" && opts.legacyHcpLabels)) {
     labels["app.kubernetes.io/name"] = RELEASE;
@@ -133,6 +138,7 @@ describe("retainRemovedPoolResources", () => {
           "app.kubernetes.io/name": RELEASE,
           "app.kubernetes.io/component": "legacy",
           "adapter-k8s.dev/release": RELEASE,
+          "adapter-k8s.dev/retained-stable-pool": RELEASE,
         },
         annotations: { "helm.sh/resource-policy": "keep" },
       });
@@ -283,6 +289,84 @@ describe("cleanupRetainedStablePoolResources", () => {
     expect(result.deleted).toEqual([]);
     expect(result.failures.join("\n")).toMatch(/identity mismatch/);
     expect(vi.mocked(execCapture).mock.calls.some(([, args]) => args[0] === "delete")).toBe(false);
+  });
+
+  it("ignores release-owned stable resources that were never retained as pool resources", async () => {
+    vi.mocked(execCapture).mockImplementation(async (_cmd, args) => {
+      if (args[0] === "get") {
+        if (args[1] !== "service") {
+          return { exitCode: 0, stdout: '{"items":[]}', stderr: "" };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            items: [
+              {
+                metadata: {
+                  name: "rel-origin",
+                  resourceVersion: "123",
+                  labels: {
+                    "adapter-k8s.dev/release": RELEASE,
+                    "app.kubernetes.io/name": RELEASE,
+                    "app.kubernetes.io/component": "origin",
+                  },
+                  annotations: {
+                    "meta.helm.sh/release-name": RELEASE,
+                    "meta.helm.sh/release-namespace": NAMESPACE,
+                  },
+                },
+                spec: {
+                  selector: {
+                    "app.kubernetes.io/name": RELEASE,
+                    "app.kubernetes.io/component": "web",
+                  },
+                },
+              },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await expect(
+      cleanupRetainedStablePoolResources({
+        releaseName: RELEASE,
+        namespace: NAMESPACE,
+        keepPools: ["web"],
+        healthCheckPolicyCrd: false,
+      }),
+    ).resolves.toEqual({ deleted: [], failures: [] });
+    expect(vi.mocked(execCapture).mock.calls.some(([, args]) => args[0] === "delete")).toBe(false);
+  });
+
+  it("recognizes markerless resources retained by an older adapter", async () => {
+    vi.mocked(execCapture).mockImplementation(async (_cmd, args) => {
+      if (args[0] === "get") {
+        if (args[1] !== "service") {
+          return { exitCode: 0, stdout: '{"items":[]}', stderr: "" };
+        }
+        const legacy = stableObject("service", "obsolete");
+        legacy.metadata.labels["adapter-k8s.dev/release"] = RELEASE;
+        legacy.metadata.annotations["helm.sh/resource-policy"] = "keep";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ items: [legacy] }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await expect(
+      cleanupRetainedStablePoolResources({
+        releaseName: RELEASE,
+        namespace: NAMESPACE,
+        keepPools: [],
+        healthCheckPolicyCrd: false,
+      }),
+    ).resolves.toEqual({ deleted: ["service/rel-obsolete"], failures: [] });
   });
 
   it("keeps the Service anchor when a companion delete fails", async () => {
