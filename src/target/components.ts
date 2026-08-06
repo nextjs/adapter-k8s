@@ -19,6 +19,7 @@ import type {
   DefineTargetOptions,
   ExposureBuildContext,
   ExposureBuildResult,
+  ExposureCapability,
   ExposureComponent,
   GkeClusterOptions,
   IngressSourceSet,
@@ -27,6 +28,7 @@ import type {
   KubernetesTargetDefinition,
   ResourceComponent,
   RoutingBuildResult,
+  RoutingBuildContext,
   RoutingComponent,
   TargetBuildContext,
 } from "./types.js";
@@ -71,6 +73,29 @@ function backend(context: TargetBuildContext): KubernetesServiceRef {
     namespace: context.namespace,
     port: 3000,
   };
+}
+
+function gatewayCapability(
+  context: RoutingBuildContext,
+  routingName: string,
+  className: string,
+): Extract<ExposureCapability, { kind: "gateway-api" }> {
+  const capability = context.exposureCapabilities.find(
+    (entry): entry is Extract<ExposureCapability, { kind: "gateway-api" }> =>
+      entry.kind === "gateway-api" && entry.className === className,
+  );
+  if (!capability) {
+    throw new Error(
+      `Routing component "${routingName}" requires Gateway API class "${className}", ` +
+        "but the exposure does not provide it",
+    );
+  }
+  if (capability.applicationRoutes.length === 0) {
+    throw new Error(
+      `Routing component "${routingName}" requires at least one application HTTPRoute`,
+    );
+  }
+  return capability;
 }
 
 function object(
@@ -209,6 +234,19 @@ export function defineResourceComponent(options: {
   return {
     componentType: "resource",
     name: safeComponentName(options.name),
+    build: options.build,
+  };
+}
+
+export function defineRoutingComponent(options: {
+  name: string;
+  backend(context: TargetBuildContext): KubernetesServiceRef;
+  build(context: RoutingBuildContext): RoutingBuildResult;
+}): RoutingComponent {
+  return {
+    componentType: "routing",
+    name: safeComponentName(options.name),
+    backend: options.backend,
     build: options.build,
   };
 }
@@ -438,7 +476,14 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         ],
         readiness: [gatewayReady, routeReady, ...(redirectReady ? [redirectReady] : [])],
         ingressSources: copyIngressSources(options.ingressSources),
-        capabilities: [{ kind: "gateway-api", className: options.className }],
+        capabilities: [
+          {
+            kind: "gateway-api",
+            className: options.className,
+            gateway: gatewayReady.object,
+            applicationRoutes: [routeReady.object],
+          },
+        ],
       };
     },
   });
@@ -524,6 +569,7 @@ export function portableRouting(): RoutingComponent {
   return {
     componentType: "routing",
     name: "portable",
+    backend,
     build(context): RoutingBuildResult {
       const service = backend(context);
       const readiness: RoutingReadiness[] = [
@@ -535,7 +581,6 @@ export function portableRouting(): RoutingComponent {
           failurePolicy: "closed",
           dataplane: { kind: "portable-http-origin", service, readiness },
         },
-        backend: service,
         readiness,
         routingTier: {
           enabled: false,
@@ -551,14 +596,19 @@ export function envoyNativeRouting(
   options: {
     gatewayClassName?: string;
     messageTimeoutMs?: number;
+    escapedSlashes?: "policy" | "external";
   } = {},
 ): RoutingComponent {
   return {
     componentType: "routing",
     name: "envoy-native",
+    backend,
     build(context): RoutingBuildResult {
+      const className = options.gatewayClassName ?? "eg";
+      const exposure = gatewayCapability(context, "envoy-native", className);
       const policyName = sanitizeK8sName(`${context.releaseName}-routing-extproc`);
-      const routeName = sanitizeK8sName(`${context.releaseName}-routes`);
+      const clientPolicyName = sanitizeK8sName(`${context.releaseName}-client-traffic`);
+      const emitsClientPolicy = (options.escapedSlashes ?? "policy") === "policy";
       const readiness: RoutingReadiness[] = [
         {
           kind: "kubernetes-condition",
@@ -589,13 +639,11 @@ export function envoyNativeRouting(
         context.namespace,
         {
           spec: {
-            targetRefs: [
-              {
-                group: "gateway.networking.k8s.io",
-                kind: "HTTPRoute",
-                name: routeName,
-              },
-            ],
+            targetRefs: exposure.applicationRoutes.map((route) => ({
+              group: "gateway.networking.k8s.io",
+              kind: "HTTPRoute",
+              name: route.name,
+            })),
             extProc: [
               {
                 backendRefs: [{ name: `${context.releaseName}-routing-service`, port: 8443 }],
@@ -613,23 +661,75 @@ export function envoyNativeRouting(
           },
         },
       );
+      const clientPolicy = object(
+        "gateway.envoyproxy.io/v1alpha1",
+        "ClientTrafficPolicy",
+        "clienttrafficpolicies",
+        clientPolicyName,
+        context.namespace,
+        {
+          spec: {
+            targetRefs: [
+              {
+                group: "gateway.networking.k8s.io",
+                kind: "Gateway",
+                name: exposure.gateway.name,
+              },
+            ],
+            http1: {},
+            path: { escapedSlashesAction: "KeepUnchanged" },
+          },
+        },
+        {
+          labels: {
+            "app.kubernetes.io/name": context.releaseName,
+            "app.kubernetes.io/component": "routing-service",
+          },
+        },
+      );
+      const clientPolicyReady: RoutingReadiness = {
+        kind: "kubernetes-condition",
+        object: {
+          apiVersion: "gateway.envoyproxy.io/v1alpha1",
+          resource: "clienttrafficpolicies",
+          name: clientPolicyName,
+          namespace: context.namespace,
+        },
+        conditionsAt: {
+          kind: "ancestors",
+          controllerName: "gateway.envoyproxy.io/gatewayclass-controller",
+        },
+        condition: {
+          type: "Accepted",
+          status: "True",
+          observedGeneration: "must-equal-metadata-generation",
+        },
+        timeoutSeconds: 600,
+      };
       return {
         plan: {
           protocol: "envoy-ext-proc-v3",
           failurePolicy: context.failurePolicy,
           dataplane: { kind: "external-ext-proc", transport: "h2c", readiness },
         },
-        backend: backend(context),
-        objects: [policy],
+        objects: [policy, ...(emitsClientPolicy ? [clientPolicy] : [])],
         requirements: [
           {
             apiVersion: "gateway.envoyproxy.io/v1alpha1",
             resource: "envoyextensionpolicies",
             optional: false,
           },
+          ...(emitsClientPolicy
+            ? [
+                {
+                  apiVersion: "gateway.envoyproxy.io/v1alpha1",
+                  resource: "clienttrafficpolicies",
+                  optional: false,
+                },
+              ]
+            : []),
         ],
-        readiness,
-        requiresExposure: { kind: "gateway-api", className: options.gatewayClassName ?? "eg" },
+        readiness: [...readiness, ...(emitsClientPolicy ? [clientPolicyReady] : [])],
         routingTier: {
           enabled: true,
           transport: "h2c",
@@ -652,7 +752,13 @@ export function gkeNativeRouting(
   return {
     componentType: "routing",
     name: "gke-native",
+    backend,
     build(context): RoutingBuildResult {
+      gatewayCapability(
+        context,
+        "gke-native",
+        options.gatewayClassName ?? "gke-l7-global-external-managed",
+      );
       const projectId = options.projectId ?? context.infrastructure?.projectId;
       if (!projectId) throw new Error("gkeNativeRouting requires a projectId");
       assertSafeProjectId(projectId);
@@ -671,7 +777,6 @@ export function gkeNativeRouting(
           failurePolicy: context.failurePolicy,
           dataplane: { kind: "external-ext-proc", transport: "tls", readiness },
         },
-        backend: backend(context),
         readiness,
         requirements: [
           {
@@ -680,10 +785,6 @@ export function gkeNativeRouting(
             optional: false,
           },
         ],
-        requiresExposure: {
-          kind: "gateway-api",
-          className: options.gatewayClassName ?? "gke-l7-global-external-managed",
-        },
         routingTier: {
           enabled: true,
           transport: "tls",
@@ -706,17 +807,29 @@ export function defineTarget(options: DefineTargetOptions): KubernetesTargetDefi
   if (options.cluster?.componentType !== "cluster") {
     throw new Error("defineTarget.cluster must be a cluster component");
   }
+  if (typeof options.cluster.build !== "function") {
+    throw new Error("defineTarget.cluster must implement build()");
+  }
   if (options.exposure?.componentType !== "exposure") {
     throw new Error("defineTarget.exposure must be an exposure component");
+  }
+  if (typeof options.exposure.build !== "function") {
+    throw new Error("defineTarget.exposure must implement build()");
   }
   const routing = options.routing ?? portableRouting();
   if (routing.componentType !== "routing") {
     throw new Error("defineTarget.routing must be a routing component");
   }
+  if (typeof routing.backend !== "function" || typeof routing.build !== "function") {
+    throw new Error("defineTarget.routing must implement backend() and build()");
+  }
   const resources = [...(options.resources ?? [])];
   for (const resource of resources) {
     if (resource.componentType !== "resource") {
       throw new Error("defineTarget.resources must contain resource components");
+    }
+    if (typeof resource.build !== "function") {
+      throw new Error("defineTarget resource components must implement build()");
     }
   }
   return {

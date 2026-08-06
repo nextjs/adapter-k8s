@@ -130,6 +130,63 @@ describe("Kubernetes target composition", () => {
         kind: "EnvoyExtensionPolicy",
       }),
     );
+    expect(compiled.plan.operations.resources.objects).toContainEqual(
+      expect.objectContaining({
+        apiVersion: "gateway.envoyproxy.io/v1alpha1",
+        kind: "ClientTrafficPolicy",
+      }),
+    );
+  });
+
+  it("binds native routing to exposure-provided object identities", () => {
+    const exposure = defineExposureComponent({
+      name: "shared-gateway-route",
+      hosts,
+      build(ctx) {
+        return {
+          ingressSources: { cidrs: [], podSelectors: [] },
+          capabilities: [
+            {
+              kind: "gateway-api",
+              className: "eg",
+              gateway: {
+                apiVersion: "gateway.networking.k8s.io/v1",
+                resource: "gateways",
+                name: "shared-edge",
+                namespace: ctx.namespace,
+              },
+              applicationRoutes: [
+                {
+                  apiVersion: "gateway.networking.k8s.io/v1",
+                  resource: "httproutes",
+                  name: "custom-app-route",
+                  namespace: ctx.namespace,
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure,
+        routing: envoyNativeRouting({ escapedSlashes: "external" }),
+      }),
+      context(),
+    );
+    const policy = compiled.plan.operations.resources.objects.find(
+      (entry) => entry.kind === "EnvoyExtensionPolicy",
+    );
+    expect(policy?.body).toMatchObject({
+      spec: { targetRefs: [{ name: "custom-app-route" }] },
+    });
+    expect(
+      compiled.plan.operations.resources.objects.some(
+        (entry) => entry.kind === "ClientTrafficPolicy",
+      ),
+    ).toBe(false);
   });
 
   it("keeps GKE-native routing explicit and derives release resource names without sentinels", () => {
