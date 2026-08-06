@@ -3219,39 +3219,88 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     console.log(`  → Switching traffic to new build...`);
     const patchFailures: { pool: string; service: string; stderr: string }[] = [];
     const patchedServices: string[] = [];
+    const originalServiceSelectors = new Map<string, Record<string, string>>();
+
+    // A topology-changing rollback may have redirected a stable Service to a fallback pool.
+    // Read every selector before changing any of them so cutover restores both component and
+    // version, and a partial failure can put the exact live selectors back.
     for (const pool of pools) {
       const activeServiceName = sanitizeK8sName(`${releaseName}-${pool}`);
-      const patchResult = await execCapture("kubectl", [
-        "patch",
+      const read = await execCapture("kubectl", [
+        "get",
         "service",
         activeServiceName,
         "-n",
         namespace,
-        "--type=json",
-        // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
-        // path that prevents the next upgrade conflicting on the selector we flip here;
-        // Helm 3's client-side merge does not enforce managed-field conflicts.
-        // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
-        // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
-        // no conflict override.
-        "--field-manager=helm",
-        "-p",
-        JSON.stringify([
-          {
-            op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1version",
-            value: safeBuildId,
-          },
-        ]),
+        "-o",
+        "json",
       ]);
-      if (patchResult.exitCode !== 0) {
+      let selector: unknown;
+      if (read.exitCode === 0) {
+        try {
+          selector = JSON.parse(read.stdout)?.spec?.selector;
+        } catch {
+          selector = undefined;
+        }
+      }
+      if (
+        !selector ||
+        typeof selector !== "object" ||
+        Array.isArray(selector) ||
+        Object.values(selector).some((value) => typeof value !== "string")
+      ) {
         patchFailures.push({
           pool,
           service: activeServiceName,
-          stderr: patchResult.stderr.trim(),
+          stderr:
+            read.stderr.trim() ||
+            `could not read an exact Service selector (kubectl exited ${read.exitCode})`,
         });
-      } else {
-        patchedServices.push(activeServiceName);
+        continue;
+      }
+      originalServiceSelectors.set(activeServiceName, selector as Record<string, string>);
+    }
+
+    if (patchFailures.length === 0) {
+      for (const pool of pools) {
+        const activeServiceName = sanitizeK8sName(`${releaseName}-${pool}`);
+        const originalSelector = originalServiceSelectors.get(activeServiceName)!;
+        const patchResult = await execCapture("kubectl", [
+          "patch",
+          "service",
+          activeServiceName,
+          "-n",
+          namespace,
+          "--type=json",
+          // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
+          // path that prevents the next upgrade conflicting on the selector we flip here;
+          // Helm 3's client-side merge does not enforce managed-field conflicts.
+          // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
+          // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
+          // no conflict override.
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify([
+            {
+              op: "replace",
+              path: "/spec/selector",
+              value: {
+                ...originalSelector,
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": safeBuildId,
+              },
+            },
+          ]),
+        ]);
+        if (patchResult.exitCode !== 0) {
+          patchFailures.push({
+            pool,
+            service: activeServiceName,
+            stderr: patchResult.stderr.trim(),
+          });
+        } else {
+          patchedServices.push(activeServiceName);
+        }
       }
     }
 
@@ -3261,28 +3310,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // rather than proceeding to the cleanup below and printing "Deploy complete".
     if (patchFailures.length > 0) {
       const revertFailures: string[] = [];
-      if (previousBuildId) {
-        const safePreviousBuildId = sanitizeK8sName(previousBuildId);
-        for (const serviceName of patchedServices) {
-          const revertResult = await execCapture("kubectl", [
-            "patch",
-            "service",
-            serviceName,
-            "-n",
-            namespace,
-            "--type=json",
-            "--field-manager=helm",
-            "-p",
-            JSON.stringify([
-              {
-                op: "replace",
-                path: "/spec/selector/app.kubernetes.io~1version",
-                value: safePreviousBuildId,
-              },
-            ]),
-          ]);
-          if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
-        }
+      for (const serviceName of patchedServices) {
+        const originalSelector = originalServiceSelectors.get(serviceName)!;
+        const revertResult = await execCapture("kubectl", [
+          "patch",
+          "service",
+          serviceName,
+          "-n",
+          namespace,
+          "--type=json",
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify([
+            {
+              op: "replace",
+              path: "/spec/selector",
+              value: originalSelector,
+            },
+          ]),
+        ]);
+        if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
       }
       // N25: the pools stay on the previous build, so the edge must too.
       const edge = await restoreEdgeToPreviousBuild();
@@ -3304,8 +3351,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `  WARNING: failed to restore selector(s) for: ${revertFailures.join(", ")}.`,
         );
         console.error(`  Traffic may be split across builds; repair those Services manually.`);
-      } else if (previousBuildId) {
-        console.error(`  Any successful selector patches were reverted to the previous build.`);
+      } else if (patchedServices.length > 0) {
+        console.error(`  Any successful selector patches were restored to their prior values.`);
       }
       console.error(`  Old deployments were left in place.`);
       for (const line of edgeStatusLines(edge)) console.error(line);
