@@ -26,7 +26,6 @@ import { renderDeployment, POOL_READINESS_PATH } from "../emit/templates/deploym
  */
 const LIVENESS_PATH_FOR_MIGRATION = "/healthz";
 import { renderService } from "../emit/templates/service.js";
-import { renderHPA } from "../emit/templates/hpa.js";
 import { renderValkeySecret } from "../emit/templates/valkey-secret.js";
 import { provisionMemorystore, buildDeleteMemorystoreCommand } from "./provision-cache.js";
 import { isAlreadyGoneError } from "./destroy.js";
@@ -1791,8 +1790,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // have no live capacity to match.
   const previousReplicasByPool = new Map<string, number>();
 
-  // Inject previous build's deployment+service into the chart so Helm doesn't delete it.
-  // Without this, helm upgrade only sees the current build's templates and deletes the previous.
+  // Inject the previous build's Deployment+Service into the chart so Helm doesn't delete them.
+  // Its HPA remains LIVE but is deliberately omitted from the new release manifest: before the
+  // upgrade we annotate the object `keep`, so Helm stops owning it without deleting or mutating
+  // it. That preserves autoscaling for the build carrying traffic throughout warm-up (and every
+  // pre-cutover abort), while making deploy solely responsible for deleting the HPA before it
+  // parks the rollback Deployment at zero after a durable cutover. This also adopts the same
+  // lifecycle for an HPA created imperatively by rollback.
   if (previousBuildId && previousBuildId !== buildId) {
     for (const poolName of pools) {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
@@ -2003,7 +2007,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
       // Render retained resources through the same canonical templates as a normal build.
       // Hand-copying this Deployment previously omitted resources, changing the serving pod
-      // template and rolling the old build during every upgrade.
+      // template and rolling the old build during every upgrade. Do not render its HPA into the
+      // new release: the live object remains active under the explicit keep transfer below, so
+      // Helm cannot rewrite its scaling policy from the incoming build's values.
       // L13: dry-run must not write into the chart — report the planned writes instead.
       const retainedFiles: [string, string][] = [
         [
@@ -2027,10 +2033,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `${poolName}-prev-service.yaml`,
           renderService({ poolName, buildId: previousBuildId, releaseName }),
         ],
-        [
-          `${poolName}-prev-hpa.yaml`,
-          renderHPA({ poolName, buildId: previousBuildId, releaseName }),
-        ],
       ];
       for (const [fileName, content] of retainedFiles) {
         const target = path.join(chartTemplatesDir, fileName);
@@ -2038,6 +2040,62 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           console.log(`    [dry-run] would write ${target}`);
         } else {
           writeFileSync(target, content);
+        }
+      }
+
+      // Keep the outgoing HPA active and byte-for-byte unchanged while its Deployment still
+      // carries traffic, but remove it from Helm's next release manifest. Rendering it here
+      // would overwrite a rollback-created HPA's incident-sized min/max with the incoming
+      // build's config; merely omitting it would let Helm prune it before the new build is ready.
+      // The live keep annotation makes the ownership transfer explicit. On every abort before
+      // the durable state commit the HPA remains present and active; step 7f deletes it only
+      // after traffic and state have moved to the new build.
+      const outgoingHpa = poolResourceNames(releaseName, poolName, previousBuildId).hpa;
+      const keepAnnotation = "helm.sh/resource-policy=keep";
+      if (dryRun) {
+        console.log(
+          `    [dry-run] kubectl annotate hpa ${outgoingHpa} -n ${namespace} ` +
+            `${keepAnnotation} --overwrite (if it exists)`,
+        );
+      } else {
+        const foundHpa = await execCapture("kubectl", [
+          "get",
+          "hpa",
+          outgoingHpa,
+          "-n",
+          namespace,
+          "--ignore-not-found",
+          "-o",
+          "name",
+        ]);
+        if (foundHpa.exitCode !== 0) {
+          throw new Error(
+            `Could not determine whether the outgoing HPA ${outgoingHpa} exists (kubectl ` +
+              `exited ${foundHpa.exitCode}: ${foundHpa.stderr.trim()}). Refusing to run ` +
+              `\`helm upgrade\`: omitting an HPA that Helm still owns could delete the ` +
+              `autoscaler for build ${previousBuildId} while it is serving traffic. Fix ` +
+              `kubectl access and re-run.`,
+          );
+        }
+        if (foundHpa.stdout.trim()) {
+          const keptHpa = await execCapture("kubectl", [
+            "annotate",
+            "hpa",
+            outgoingHpa,
+            "-n",
+            namespace,
+            keepAnnotation,
+            "--overwrite",
+          ]);
+          if (keptHpa.exitCode !== 0) {
+            throw new Error(
+              `Could not transfer the outgoing HPA ${outgoingHpa} out of Helm ownership ` +
+                `(${keptHpa.stderr.trim() || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
+                `to run \`helm upgrade\`: the serving build must keep autoscaling until ` +
+                `cutover. Fix kubectl access and re-run.`,
+            );
+          }
+          console.log(`  → Preserved outgoing autoscaler (${outgoingHpa}) through cutover`);
         }
       }
     }
@@ -3060,7 +3118,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // build down to 0. It served through the rollout and remains as the rollback target.
     // Best-effort: success is already durable (7d) — a failure here warns instead of
     // failing the whole deploy (the previous build just keeps burning replicas until the
-    // next deploy or a manual scale-down).
+    // next deploy or a manual scale-down). The outgoing HPA was transferred out of Helm
+    // ownership before the upgrade so it could remain active while this build served. Delete it
+    // now and wait for that deletion to finish BEFORE setting replicas=0; if deletion fails,
+    // leave the Deployment alone rather than asking a still-live HPA to fight the scale command.
     if (previousBuildId && previousBuildId !== buildId) {
       let scaleDownFailed = false;
       for (const poolName of pools) {
@@ -3082,6 +3143,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           namespace,
           "--ignore-not-found",
         ]);
+        if (hpaDelete.exitCode !== 0) {
+          scaleDownFailed = true;
+          console.warn(
+            `  ! Could not remove outgoing autoscaler ${poolPrevHpa}; leaving ` +
+              `${poolPrevName} at its current replica count because that HPA could immediately ` +
+              `undo a scale to zero: ${hpaDelete.stderr.trim() || "unknown error"}`,
+          );
+          continue;
+        }
         const scaleDown = await execCapture("kubectl", [
           "scale",
           `deployment/${poolPrevName}`,
@@ -3089,11 +3159,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           namespace,
           "--replicas=0",
         ]);
-        if (hpaDelete.exitCode !== 0 || scaleDown.exitCode !== 0) {
+        if (scaleDown.exitCode !== 0) {
           scaleDownFailed = true;
           console.warn(
             `  ! Could not scale down ${poolPrevName}: ` +
-              `${(scaleDown.stderr || hpaDelete.stderr).trim() || "unknown error"}`,
+              `${scaleDown.stderr.trim() || "unknown error"}`,
           );
         }
       }

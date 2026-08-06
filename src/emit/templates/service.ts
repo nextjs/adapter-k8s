@@ -76,7 +76,7 @@ export function renderActiveService({
   const stableHcpName = sanitizeK8sName(`${releaseName}-${poolName}`, "-hcp");
   // N65. The per-pool PodDisruptionBudget lives here, with the other STABLE per-pool
   // objects: this template is rendered exactly once per pool (helm.ts), whereas the
-  // versioned Deployment/Service/HPA templates are rendered a second time by deploy.ts for
+  // versioned Deployment/Service templates are rendered a second time by deploy.ts for
   // the retained previous build — a PDB in one of those would either duplicate a name or
   // need per-build cleanup. Selecting on name+component (no `version`) is also what makes
   // it correct THROUGH a cutover, when both builds' pods exist.
