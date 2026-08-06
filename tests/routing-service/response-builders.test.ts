@@ -44,4 +44,22 @@ describe("buildHeaderMutationResponse", () => {
     const resp = buildHeaderMutationResponse([]);
     expect(resp.requestHeaders!.response!.headerMutation!.setHeaders).toHaveLength(0);
   });
+
+  it("clears Envoy's route cache when the selected pool changes", () => {
+    const resp = buildHeaderMutationResponse([{ key: "x-upstream-pool", value: "legacy" }]);
+
+    expect(resp.requestHeaders!.response!.clearRouteCache).toBe(true);
+  });
+
+  it("clears Envoy's route cache when a spoofed pool header is removed", () => {
+    const resp = buildHeaderMutationResponse([], ["x-upstream-pool"]);
+
+    expect(resp.requestHeaders!.response!.clearRouteCache).toBe(true);
+  });
+
+  it("keeps the existing route for unrelated header mutations", () => {
+    const resp = buildHeaderMutationResponse([{ key: "x-output-id", value: "/legacy" }]);
+
+    expect(resp.requestHeaders!.response!.clearRouteCache).toBeUndefined();
+  });
 });
