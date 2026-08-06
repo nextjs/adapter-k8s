@@ -1083,7 +1083,7 @@ export async function runRollback(options: {
         `represent both targets; deploy the older target definition explicitly instead.`,
     );
   }
-  if (targetComposition) {
+  if (!dryRun && targetComposition) {
     await inspectKubernetesRequirements(targetComposition.plan);
   }
 

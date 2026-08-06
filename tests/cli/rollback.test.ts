@@ -24,6 +24,16 @@ import {
   SNAPSHOT_BUILD_ID_ANNOTATION,
 } from "../../src/cli/rollback.js";
 import type { LoadedCompositionPlan } from "../../src/cli/composition-plan.js";
+import {
+  canonicalCompositionPlanJson,
+  fingerprintCompositionPlan,
+} from "../../src/composition-plan/index.js";
+import {
+  compileTarget,
+  defineTarget,
+  kubernetesCluster,
+  manualExposure,
+} from "../../src/target/index.js";
 import { execCapture, execCaptureStdin, execOrThrow } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
@@ -43,6 +53,7 @@ const SNAP_M = routingManifestSnapshotName(RELEASE, "buildm");
 const SNAP_N = routingManifestSnapshotName(RELEASE, "buildn");
 const infraPath = path.join(PROJECT, ".k8s-adapter", "infrastructure.json");
 const metaPath = path.join(PROJECT, ".k8s-adapter", "output", "build-metadata.json");
+const planPath = path.join(PROJECT, ".k8s-adapter", "output", "composition-plan.json");
 const POOL_TOPOLOGIES = { buildn: ["ssr"], buildm: ["ssr"] };
 const cdnFilter = path.join(
   PROJECT,
@@ -427,6 +438,66 @@ describe("runRollback — state and CDN invalidation", () => {
     await expect(
       runRollback({ projectDir: PROJECT, releaseName: RELEASE, dryRun: true }),
     ).rejects.toThrow(/LOCAL state file/);
+  });
+
+  it("keeps a reverse composed rollback dry-run offline when the local plan is the target", async () => {
+    const targetPlan = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({
+          hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+        }),
+      }),
+      {
+        releaseName: RELEASE,
+        namespace: "default",
+        buildId: "buildn",
+        imageRegistry: "ghcr.io/example/rel",
+        pools: ["ssr"],
+        defaultPool: "ssr",
+        failurePolicy: "closed",
+        cache: "none",
+      },
+    ).plan;
+    const targetDigest = fingerprintCompositionPlan(targetPlan);
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildn",
+      poolTopologies: POOL_TOPOLOGIES,
+      compositionPlans: {
+        buildm: { digest: PLAN_DIGEST_M, targetFingerprint: targetPlan.target.fingerprint },
+        buildn: { digest: targetDigest, targetFingerprint: targetPlan.target.fingerprint },
+      },
+    } as never);
+    vi.mocked(existsSync).mockImplementation(
+      (p) => p === infraPath || p === metaPath || p === planPath,
+    );
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
+      if (p === metaPath)
+        return JSON.stringify({
+          buildId: "buildn",
+          compositionPlan: {
+            digest: targetDigest,
+            targetFingerprint: targetPlan.target.fingerprint,
+          },
+        });
+      if (p === planPath) return canonicalCompositionPlanJson(targetPlan);
+      return "";
+    });
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE, dryRun: true });
+
+    expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    const printed = vi
+      .mocked(console.log)
+      .mock.calls.map((call) => String(call[0]))
+      .join("\n");
+    expect(printed).toContain("[dry-run] Rollback plan: buildm → buildn");
+    expect(printed).toContain("[dry-run] Would swap state: buildId=buildn, previousBuildId=buildm");
   });
 });
 
