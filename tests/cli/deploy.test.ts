@@ -11,6 +11,7 @@ import {
   discoverClusterPodCidr,
   discoverClusterNodeCidrs,
   discoverNodeCidrsFromCluster,
+  discoverPodCidrsFromCluster,
   resolveRegistryDigest,
   resolveRegistryDigestAny,
   resolveDeployImageDigests,
@@ -235,6 +236,46 @@ describe("buildDockerCommands", () => {
 
     const routingBuild = commands.find((c) => c.description.includes("routing service"));
     expect(routingBuild).toBeDefined();
+  });
+
+  it("uses the composed registry authentication operation instead of hostname inference", () => {
+    const registry = "us-central1-docker.pkg.dev/my-project/nextjs";
+    const ambient = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry,
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+      registryAuthentication: { kind: "ambient-credentials" },
+    });
+    expect(ambient.some((command) => command.command === "gcloud")).toBe(false);
+
+    expect(() =>
+      buildDockerCommands({
+        pools: ["ssr"],
+        buildId: "abc123",
+        registry,
+        outputDir: "out",
+        containerStrategy: "traced-assets",
+        registryAuthentication: {
+          kind: "gcloud-docker-helper",
+          registryHost: "europe-west1-docker.pkg.dev",
+        },
+      }),
+    ).toThrow(/authentication names host.*repository uses/i);
+  });
+
+  it("omits the routing image for portable pool-local routing", () => {
+    const commands = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry: "ghcr.io/example/app",
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+      includeRoutingService: false,
+    });
+    expect(commands).toHaveLength(2);
+    expect(commands.some((command) => command.description.includes("routing service"))).toBe(false);
   });
 });
 
@@ -1040,6 +1081,34 @@ describe("S27: image integrity must not depend on the CLOUD", () => {
       }),
     ).rejects.toThrow(/--allow-mutable-tags/);
   });
+
+  it("does not probe Artifact Registry when the plan selects OCI distribution", async () => {
+    const SHA = "sha256:" + "d".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (command: string, args: string[]) => {
+      if (command === "crane" && args[0] === "manifest") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            schemaVersion: 2,
+            manifests: [{ digest: SHA, platform: { os: "linux", architecture: "amd64" } }],
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+
+    await expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "us-central1-docker.pkg.dev/proj/repo/app:b1"]],
+        projectId: "proj",
+        digestLookup: { kind: "oci-distribution" },
+      }),
+    ).resolves.toEqual({ ssr: SHA });
+    expect(vi.mocked(exec.execCapture).mock.calls.some(([command]) => command === "gcloud")).toBe(
+      false,
+    );
+  });
 });
 
 describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => {
@@ -1329,6 +1398,45 @@ describe("discoverNodeCidrsFromCluster (S27: generic clusters have no gcloud)", 
       stderr: "",
     } as never);
     await expect(discoverNodeCidrsFromCluster()).resolves.toBeNull();
+  });
+});
+
+describe("discoverPodCidrsFromCluster", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  it("collects and de-duplicates dual-stack Node podCIDRs", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        items: [
+          { spec: { podCIDRs: ["10.42.0.0/24", "fd00:42::/64"] } },
+          { spec: { podCIDRs: ["10.42.1.0/24", "fd00:42::/64"] } },
+        ],
+      }),
+      stderr: "",
+    } as never);
+
+    await expect(discoverPodCidrsFromCluster()).resolves.toBe(
+      "10.42.0.0/24,fd00:42::/64,10.42.1.0/24",
+    );
+  });
+
+  it("rejects malformed CIDRs and unreadable API responses", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: JSON.stringify({ items: [{ spec: { podCIDR: "10.42.0.0/99" } }] }),
+      stderr: "",
+    } as never);
+    await expect(discoverPodCidrsFromCluster()).resolves.toBeNull();
+
+    vi.mocked(exec.execCapture).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: "not json",
+      stderr: "",
+    } as never);
+    await expect(discoverPodCidrsFromCluster()).resolves.toBeNull();
   });
 });
 

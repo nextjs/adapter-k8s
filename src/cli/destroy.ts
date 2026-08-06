@@ -17,6 +17,15 @@ import {
   stablePoolResourceNames,
 } from "../emit/templates/utils.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
+import { readState, StateUnavailableError } from "./state.js";
+import {
+  compositionPlanNeedsExplicitConfirmation,
+  loadDeployedCompositionPlan,
+  loadProjectCompositionPlan,
+  preflightCompositionPlan,
+  type LoadedCompositionPlan,
+} from "./composition-plan.js";
+import type { ExternalCleanupOperation, KubernetesOwnedObject } from "../composition-plan/index.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -377,6 +386,176 @@ export function buildReleaseScopedGcpResources(
   ];
 }
 
+export function buildExternalCleanupCommand(operation: ExternalCleanupOperation): {
+  desc: string;
+  command: "gcloud";
+  args: string[];
+} {
+  switch (operation.kind) {
+    case "gcp-storage-bucket":
+      return {
+        desc: `GCS bucket "${operation.bucket}"`,
+        command: "gcloud",
+        args: [
+          "storage",
+          "rm",
+          "-r",
+          `gs://${operation.bucket}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-service-account":
+      return {
+        desc: `service account "${operation.email}"`,
+        command: "gcloud",
+        args: [
+          "iam",
+          "service-accounts",
+          "delete",
+          operation.email,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-memorystore":
+      return {
+        desc: `Memorystore instance "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "redis",
+          "instances",
+          "delete",
+          operation.name,
+          `--region=${operation.region}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-traffic-extension":
+      return {
+        desc: `traffic extension "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "service-extensions",
+          "lb-traffic-extensions",
+          "delete",
+          operation.name,
+          `--location=${operation.location}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-backend-service":
+      return {
+        desc: `backend service "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "compute",
+          "backend-services",
+          "delete",
+          operation.name,
+          `--${operation.scope}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-health-check":
+      return {
+        desc: `health check "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "compute",
+          "health-checks",
+          "delete",
+          operation.name,
+          `--${operation.scope}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-global-address":
+      return {
+        desc: `global address "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "compute",
+          "addresses",
+          "delete",
+          operation.name,
+          "--global",
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-custom-iam-role":
+      return {
+        desc: `custom IAM role "${operation.roleId}"`,
+        command: "gcloud",
+        args: [
+          "iam",
+          "roles",
+          "delete",
+          operation.roleId,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+  }
+}
+
+export async function removePlannedKubernetesObject(
+  owned: KubernetesOwnedObject,
+  dryRun: boolean,
+): Promise<string | null> {
+  const ref = owned.ref;
+  const namespaceArgs = ref.namespace ? ["-n", ref.namespace] : [];
+  const getArgs = [
+    "get",
+    ref.resource,
+    ref.name,
+    ...namespaceArgs,
+    "--ignore-not-found",
+    "-o",
+    "json",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${getArgs.join(" ")}`);
+    console.log(
+      `  [dry-run] would verify ${owned.ownership.releaseLabel.key}=` +
+        `${owned.ownership.releaseLabel.value} before exact deletion`,
+    );
+    return null;
+  }
+  const read = await execCapture("kubectl", getArgs);
+  if (read.exitCode !== 0) {
+    return `${ref.resource} ${ref.name}: ${sanitizeForTerminal(read.stderr.trim()) || `exit ${read.exitCode}`}`;
+  }
+  if (!read.stdout.trim()) return null;
+  let labels: Record<string, unknown> | undefined;
+  try {
+    labels = JSON.parse(read.stdout)?.metadata?.labels;
+  } catch {
+    return `${ref.resource} ${ref.name}: invalid Kubernetes object JSON`;
+  }
+  if (labels?.[owned.ownership.releaseLabel.key] !== owned.ownership.releaseLabel.value) {
+    return (
+      `${ref.resource} ${ref.name}: ownership label ` +
+      `${owned.ownership.releaseLabel.key} does not match ${owned.ownership.releaseLabel.value}`
+    );
+  }
+  const deleted = await execCapture("kubectl", [
+    "delete",
+    ref.resource,
+    ref.name,
+    ...namespaceArgs,
+    "--ignore-not-found",
+  ]);
+  return deleted.exitCode === 0
+    ? null
+    : `${ref.resource} ${ref.name}: ${sanitizeForTerminal(deleted.stderr.trim()) || `exit ${deleted.exitCode}`}`;
+}
+
 function promptConfirmation(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
@@ -398,6 +577,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   const namespace = resolveK8sNamespace(infra?.namespace);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
+  const localComposition = loadProjectCompositionPlan(projectDir);
 
   // L12: destroying is irreversible — gate it. --yes (or -y) skips the prompt and is
   // REQUIRED non-interactively; --dry-run never deletes and skips the gate entirely.
@@ -457,7 +637,34 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // current, and destroying the wrong cluster's release is unrecoverable. Every other
   // command (deploy/rollback/doctor) already does this; destroy historically did not.
   // Dry-run must not mutate the operator's kubeconfig (L13).
-  if (!dryRun && projectId && region) {
+  if (!dryRun && localComposition) {
+    let explicitlyConfirmed = yes === true;
+    if (compositionPlanNeedsExplicitConfirmation(localComposition.plan) && !explicitlyConfirmed) {
+      const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+      const currentContext =
+        ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+      console.warn(
+        `\n  !!! WARNING: the composition plan requires explicit confirmation of the ` +
+          `current kubectl context:\n      ${currentContext || "(unavailable)"}\n`,
+      );
+      const answer = await promptConfirmation(
+        `  Type "yes" to confirm this is the release's intended cluster: `,
+      );
+      if (answer.trim() !== "yes") {
+        throw new Error(
+          "Destroy aborted: the composition-plan cluster was not confirmed. No resources were deleted.",
+        );
+      }
+      explicitlyConfirmed = true;
+    }
+    const preflight = await preflightCompositionPlan(localComposition.plan, {
+      explicitlyConfirmed,
+    });
+    console.log(
+      `  → Composition plan verified: ${preflight.clusterIdentity}; Kubernetes ` +
+        `${preflight.serverVersion}`,
+    );
+  } else if (!dryRun && projectId && region) {
     const clusterName = `${releaseName}-cluster`;
     console.log(`  → Connecting to GKE cluster "${clusterName}"...`);
     const cred = await execCapture("gcloud", [
@@ -478,7 +685,12 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       );
     }
   } else if (dryRun) {
-    if (projectId && region) {
+    if (localComposition) {
+      console.log(
+        `  [dry-run] Verified local composition plan ${localComposition.digest}; cluster ` +
+          `access and identity checks are skipped because they would read or change context.`,
+      );
+    } else if (projectId && region) {
       console.log(
         `  [dry-run] Skipping "gcloud container clusters get-credentials" (it would mutate your kubeconfig).`,
       );
@@ -525,6 +737,61 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         );
       }
       console.log("");
+    }
+  }
+
+  // Retain verified plans in memory before any ConfigMap or Helm deletion. State provides the
+  // independent digest/fingerprint anchor; the local build plan is the bootstrap identity.
+  const plannedSnapshots: LoadedCompositionPlan[] = localComposition ? [localComposition] : [];
+  let usesCompositionPlan = localComposition !== null;
+  if (!dryRun) {
+    const state = await readState(projectDir, releaseName, { namespace }).catch(
+      (error: unknown) => {
+        if (!(error instanceof StateUnavailableError)) throw error;
+        if (localComposition) {
+          console.warn(
+            `  ! Deploy state is unavailable; continuing from the locally verified composition ` +
+              `plan only: ${sanitizeForTerminal(error.message.split("\n")[0]!)}`,
+          );
+        }
+        return null;
+      },
+    );
+    if (state?.compositionPlans) {
+      usesCompositionPlan = true;
+      for (const buildId of [state.buildId, state.previousBuildId].filter(
+        (value): value is string => typeof value === "string",
+      )) {
+        const expected = state.compositionPlans[buildId];
+        if (!expected) continue;
+        if (
+          localComposition?.plan.metadata.buildId === buildId &&
+          (localComposition.digest !== expected.digest ||
+            localComposition.plan.target.fingerprint !== expected.targetFingerprint)
+        ) {
+          throw new Error(
+            `Local composition plan for ${buildId} does not match committed deploy state. ` +
+              `No resources were deleted.`,
+          );
+        }
+        const snapshot =
+          localComposition?.plan.metadata.buildId === buildId
+            ? localComposition
+            : await loadDeployedCompositionPlan({
+                releaseName,
+                namespace,
+                buildId,
+                expected,
+              });
+        if (!snapshot) {
+          throw new Error(
+            `Committed composition plan for ${buildId} is missing. No resources were deleted.`,
+          );
+        }
+        if (!plannedSnapshots.some((entry) => entry.digest === snapshot.digest)) {
+          plannedSnapshots.push(snapshot);
+        }
+      }
     }
   }
 
@@ -748,6 +1015,23 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
+  const plannedObjects = new Map<string, KubernetesOwnedObject>();
+  for (const snapshot of plannedSnapshots) {
+    for (const owned of snapshot.plan.operations.cleanup.kubernetes.contributedObjects) {
+      plannedObjects.set(
+        `${owned.ref.apiVersion}|${owned.ref.resource}|${owned.ref.namespace ?? ""}|${owned.ref.name}`,
+        owned,
+      );
+    }
+  }
+  for (const owned of plannedObjects.values()) {
+    const failure = await removePlannedKubernetesObject(owned, dryRun === true);
+    if (failure) {
+      console.warn(`    WARNING: planned Kubernetes cleanup failed: ${failure}`);
+      failures.push(failure);
+    }
+  }
+
   // 1b. Delete the adapter-written ConfigMaps helm doesn't own: the deploy-state
   // ConfigMap (state.ts writes it via kubectl apply) and any retained routing-manifest
   // snapshot ConfigMaps (rollback/deploy retention). A stale state ConfigMap otherwise
@@ -857,7 +1141,33 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   }
 
   // 2. Clean up GCP resources from infrastructure.json
-  if (infra) {
+  if (usesCompositionPlan) {
+    const operations = new Map<string, ExternalCleanupOperation>();
+    for (const snapshot of plannedSnapshots) {
+      for (const operation of snapshot.plan.operations.cleanup.external) {
+        operations.set(JSON.stringify(operation), operation);
+      }
+    }
+    for (const operation of operations.values()) {
+      const cleanup = buildExternalCleanupCommand(operation);
+      if (dryRun) {
+        console.log(`  [dry-run] ${cleanup.command} ${cleanup.args.join(" ")}`);
+        continue;
+      }
+      console.log(`  → Deleting ${cleanup.desc}`);
+      const result = await execCapture(cleanup.command, cleanup.args);
+      if (result.exitCode !== 0 && !isAlreadyGoneError(result.stderr)) {
+        console.warn(
+          `    WARNING: deletion failed: ` +
+            `${sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`}`,
+        );
+        failures.push(cleanup.desc);
+      }
+    }
+    if (operations.size === 0) {
+      console.log("  → No adapter-owned external cleanup operations in the composition plan");
+    }
+  } else if (infra) {
     // Delete GCS bucket
     if (infra.gcsBucket) {
       const bucketArgs = ["storage", "rm", "-r", `gs://${infra.gcsBucket}`, "--quiet"];
@@ -981,12 +1291,19 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // releases and expensive/slow to recreate, so nuking them from a per-release `destroy` is
   // unsafe. Surface them with exact commands instead of silently leaving them AND deleting
   // the state needed to find them (the previous behavior).
-  console.log("\n✓ Removed: Helm release, retained pool rollout/rollback resources, GCS bucket,");
-  console.log("  both service accounts, and the release-scoped ext_proc resources");
-  console.log(
-    "  (traffic extension, routing backend, health check, static IP, custom IAM role).\n",
-  );
-  if (projectId) {
+  if (usesCompositionPlan) {
+    console.log(
+      "\n✓ Removed: Helm release, retained rollout/rollback resources, and every " +
+        "adapter-owned cleanup operation declared by the verified composition plan.\n",
+    );
+  } else {
+    console.log("\n✓ Removed: Helm release, retained pool rollout/rollback resources, GCS bucket,");
+    console.log("  both service accounts, and the release-scoped ext_proc resources");
+    console.log(
+      "  (traffic extension, routing backend, health check, static IP, custom IAM role).\n",
+    );
+  }
+  if (!usesCompositionPlan && projectId) {
     console.log("  Left in place (shared / expensive — remove manually if truly unused):");
     console.log(
       `    • GKE cluster:        gcloud container clusters delete ${releaseName}-cluster --region ${region ?? "REGION"} --project ${projectId}`,

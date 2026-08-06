@@ -32,6 +32,15 @@ import {
 } from "./infrastructure-validation.js";
 import { targetArchitecture, type TargetPlatform } from "../target-platform.js";
 import { sanitizeForTerminal } from "./terminal.js";
+import {
+  assertCompositionPlanInvocation,
+  compositionPlanNeedsExplicitConfirmation,
+  inspectKubernetesRequirements,
+  loadDeployedCompositionPlan,
+  loadProjectCompositionPlan,
+  preflightCompositionPlan,
+  waitForCompositionPlanReadiness,
+} from "./composition-plan.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -895,21 +904,37 @@ export async function runRollback(options: {
   projectDir: string;
   releaseName: string;
   dryRun?: boolean;
+  yes?: boolean;
 }): Promise<void> {
-  const { projectDir, releaseName, dryRun } = options;
+  const { projectDir, releaseName, dryRun, yes } = options;
 
   const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
   const namespace = resolveK8sNamespace(infra?.namespace);
+  const localComposition = loadProjectCompositionPlan(projectDir);
 
   // Pin kubectl at THIS release's cluster BEFORE any cluster read — the state ConfigMap
   // read below previously ran against whatever context happened to be current, so a
   // rollback could read (and then act on) another cluster's build state. Dry-run must
   // not mutate the operator's kubeconfig (L13), so it skips this and reads local
   // state only.
-  if (!dryRun && infra?.projectId && infra?.region) {
+  if (!dryRun && localComposition) {
+    if (compositionPlanNeedsExplicitConfirmation(localComposition.plan) && !yes) {
+      throw new Error(
+        `Rollback target access is not independently verifiable. Confirm the current kubectl ` +
+          `context, then re-run with --yes. No cluster state was read or changed.`,
+      );
+    }
+    const preflight = await preflightCompositionPlan(localComposition.plan, {
+      explicitlyConfirmed: yes === true,
+    });
+    console.log(
+      `  → Composition plan verified: ${preflight.clusterIdentity}; Kubernetes ` +
+        `${preflight.serverVersion}`,
+    );
+  } else if (!dryRun && infra?.projectId && infra?.region) {
     const credResult = await execCapture("gcloud", [
       "container",
       "clusters",
@@ -945,6 +970,73 @@ export async function runRollback(options: {
   }
 
   const { buildId: currentBuildId, previousBuildId } = state;
+  if (localComposition) {
+    assertCompositionPlanInvocation(localComposition.plan, {
+      releaseName,
+      namespace,
+      buildId: currentBuildId,
+    });
+  }
+
+  const currentAnchor = state.compositionPlans?.[currentBuildId];
+  const targetAnchor = state.compositionPlans?.[previousBuildId];
+  if (
+    currentAnchor &&
+    localComposition &&
+    (localComposition.digest !== currentAnchor.digest ||
+      localComposition.plan.target.fingerprint !== currentAnchor.targetFingerprint)
+  ) {
+    throw new Error(
+      `The local composition plan for ${currentBuildId} does not match committed deploy state. ` +
+        `Restore the deployed build artifact before rolling back.`,
+    );
+  }
+  const currentComposition =
+    !dryRun && currentAnchor
+      ? localComposition?.plan.metadata.buildId === currentBuildId
+        ? localComposition
+        : await loadDeployedCompositionPlan({
+            releaseName,
+            namespace,
+            buildId: currentBuildId,
+            expected: currentAnchor,
+          })
+      : localComposition;
+  const targetComposition =
+    !dryRun && targetAnchor
+      ? await loadDeployedCompositionPlan({
+          releaseName,
+          namespace,
+          buildId: previousBuildId,
+          expected: targetAnchor,
+        })
+      : null;
+  if (!dryRun && currentAnchor && !currentComposition) {
+    throw new Error(
+      `Committed state requires a composition plan for current build ${currentBuildId}, but its ` +
+        `retained ConfigMap is missing. Refusing rollback without a verified target identity.`,
+    );
+  }
+  if (!dryRun && targetAnchor && !targetComposition) {
+    throw new Error(
+      `Committed state requires a composition plan for rollback build ${previousBuildId}, but ` +
+        `its retained ConfigMap is missing.`,
+    );
+  }
+  if (
+    currentComposition &&
+    targetComposition &&
+    currentComposition.plan.target.fingerprint !== targetComposition.plan.target.fingerprint
+  ) {
+    throw new Error(
+      `Rollback crosses incompatible deployment targets (${currentComposition.plan.target.fingerprint} ` +
+        `→ ${targetComposition.plan.target.fingerprint}). The current Helm resources cannot ` +
+        `represent both targets; deploy the older target definition explicitly instead.`,
+    );
+  }
+  if (targetComposition) {
+    await inspectKubernetesRequirements(targetComposition.plan);
+  }
 
   // N70: rollback has TWO independent topologies. Local build-metadata describes whichever
   // build happened to run last in this checkout, not necessarily the rollback target (and a
@@ -1271,6 +1363,10 @@ export async function runRollback(options: {
         `app.kubernetes.io/version=${safePreviousBuild}) and ` +
         `re-run the rollback.`,
     );
+  }
+  if (targetComposition) {
+    console.log("  → Verifying rollback target composition readiness...");
+    await waitForCompositionPlanReadiness(targetComposition.plan);
   }
 
   // N70: Helm is not rolled back, so HTTPRoute still carries the former-current topology.

@@ -294,7 +294,12 @@ async function main(): Promise<void> {
     }
 
     case "rollback": {
-      await runRollback({ projectDir, releaseName, dryRun });
+      await runRollback({
+        projectDir,
+        releaseName,
+        dryRun,
+        yes: flags["yes"] === true || flags["y"] === true,
+      });
       break;
     }
 

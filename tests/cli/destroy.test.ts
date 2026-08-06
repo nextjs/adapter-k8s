@@ -1,8 +1,10 @@
 // tests/cli/destroy.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  buildExternalCleanupCommand,
   buildReleaseScopedGcpResources,
   isAlreadyGoneError,
+  removePlannedKubernetesObject,
   runDestroy,
 } from "../../src/cli/destroy.js";
 import { deployExtRoleId } from "../../src/cli/init.js";
@@ -76,6 +78,73 @@ describe("buildReleaseScopedGcpResources", () => {
       "--project=my-project",
       "--quiet",
     ]);
+  });
+});
+
+describe("composition-plan cleanup", () => {
+  it("translates typed external operations without inferred names", () => {
+    expect(
+      buildExternalCleanupCommand({
+        kind: "gcp-global-address",
+        projectId: "project-123",
+        name: "shared-edge-address",
+      }),
+    ).toEqual({
+      desc: 'global address "shared-edge-address"',
+      command: "gcloud",
+      args: [
+        "compute",
+        "addresses",
+        "delete",
+        "shared-edge-address",
+        "--global",
+        "--project=project-123",
+        "--quiet",
+      ],
+    });
+  });
+
+  it("verifies the release ownership label before exact Kubernetes deletion", async () => {
+    const owned = {
+      ref: {
+        apiVersion: "networking.k8s.io/v1",
+        resource: "ingresses",
+        name: "custom-entry",
+        namespace: "apps",
+      },
+      lifecycle: "helm" as const,
+      ownership: {
+        releaseLabel: { key: "adapter-k8s.dev/release" as const, value: "my-app" },
+        helmRelease: { name: "my-app", namespace: "apps" },
+      },
+    };
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          metadata: { labels: { "adapter-k8s.dev/release": "my-app" } },
+        }),
+        stderr: "",
+      })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "", stderr: "" });
+    await expect(removePlannedKubernetesObject(owned, false)).resolves.toBeNull();
+    expect(vi.mocked(exec.execCapture).mock.calls[1]).toEqual([
+      "kubectl",
+      ["delete", "ingresses", "custom-entry", "-n", "apps", "--ignore-not-found"],
+    ]);
+
+    vi.mocked(exec.execCapture).mockReset();
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        metadata: { labels: { "adapter-k8s.dev/release": "another-app" } },
+      }),
+      stderr: "",
+    });
+    await expect(removePlannedKubernetesObject(owned, false)).resolves.toMatch(
+      /ownership label.*does not match/i,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledTimes(1);
   });
 });
 

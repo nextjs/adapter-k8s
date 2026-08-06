@@ -11,6 +11,15 @@ import {
   infrastructurePath,
   outputDirName,
 } from "./infrastructure-validation.js";
+import {
+  describeCompositionPlan,
+  evaluateCompositionPlanDiagnostics,
+  evaluateCompositionPlanReadiness,
+  inspectKubernetesRequirements,
+  loadDeployedCompositionPlan,
+  loadProjectCompositionPlan,
+  preflightCompositionPlan,
+} from "./composition-plan.js";
 
 // Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
 // WHICH file is corrupt.
@@ -27,6 +36,34 @@ interface CheckResult {
   status: "pass" | "fail" | "warn";
   message: string;
   fix?: string;
+}
+
+function printCheckResults(results: CheckResult[]): void {
+  console.log("");
+  let fails = 0;
+  let warns = 0;
+  let checkCount = 0;
+  for (const result of results) {
+    if (result.name.startsWith("---")) {
+      console.log(`\n  \x1b[1m${result.name.replace(/^-+\s*/, "").replace(/\s*-+$/, "")}\x1b[0m`);
+      continue;
+    }
+    checkCount++;
+    const icon =
+      result.status === "pass"
+        ? "\x1b[32mPASS\x1b[0m"
+        : result.status === "warn"
+          ? "\x1b[33mWARN\x1b[0m"
+          : "\x1b[31mFAIL\x1b[0m";
+    console.log(`  ${icon}  ${result.name}: ${result.message}`);
+    if (result.fix && result.status !== "pass") console.log(`         Fix: ${result.fix}`);
+    if (result.status === "fail") fails++;
+    if (result.status === "warn") warns++;
+  }
+  console.log(
+    `\n  ${checkCount} checks: ${checkCount - fails - warns} passed, ${warns} warnings, ${fails} failures\n`,
+  );
+  if (fails > 0) process.exit(1);
 }
 
 async function checkTool(name: string, args: string[]): Promise<CheckResult> {
@@ -186,10 +223,32 @@ export async function runDoctor(options: {
   const { projectDir, releaseName } = options;
   const results: CheckResult[] = [];
   let namespace = resolveK8sNamespace();
+  const localComposition = loadProjectCompositionPlan(projectDir);
 
   // Ensure kubectl is pointing at the right cluster
   const infraPathForCtx = infrastructurePath(projectDir);
-  if (existsSync(infraPathForCtx)) {
+  if (localComposition) {
+    namespace = localComposition.plan.metadata.namespace;
+    try {
+      const preflight = await preflightCompositionPlan(localComposition.plan, {
+        // doctor is read-only; an unverified identity is reported as the current context rather
+        // than turning the diagnostic command into an interactive workflow.
+        explicitlyConfirmed: true,
+      });
+      results.push({
+        name: "Composition target",
+        status: "pass",
+        message: `${preflight.clusterIdentity}; Kubernetes ${preflight.serverVersion}`,
+      });
+    } catch (error) {
+      results.push({
+        name: "Composition target",
+        status: "fail",
+        message: sanitizeForTerminal(error instanceof Error ? error.message : String(error)),
+        fix: "Restore target cluster access or rebuild for the intended cluster",
+      });
+    }
+  } else if (existsSync(infraPathForCtx)) {
     const infraCtx = readJsonFile<{ projectId?: string; region?: string; namespace?: string }>(
       infraPathForCtx,
     );
@@ -225,7 +284,7 @@ export async function runDoctor(options: {
   console.log("\nRunning health checks...\n");
 
   // --- Prerequisites ---
-  results.push(await checkTool("gcloud", ["--version"]));
+  if (!localComposition) results.push(await checkTool("gcloud", ["--version"]));
   results.push(await checkTool("kubectl", ["version", "--client", "-o", "yaml"]));
   results.push(await checkTool("helm", ["version", "--short"]));
   // S24: any of docker/podman/nerdctl works, so check for a usable runtime rather than
@@ -304,7 +363,7 @@ export async function runDoctor(options: {
 
   // --- GCP resources (only if infrastructure.json exists) ---
   let projectId = "";
-  if (existsSync(infraPath)) {
+  if (!localComposition && existsSync(infraPath)) {
     const infra = readJsonFile<{
       projectId?: string;
       region?: string;
@@ -409,6 +468,63 @@ export async function runDoctor(options: {
   const kubectlOk = await execCapture("kubectl", ["cluster-info"]).catch(() => null);
   if (kubectlOk && kubectlOk.exitCode === 0) {
     results.push({ name: "K8s cluster", status: "pass", message: "Connected" });
+
+    if (state?.buildId) {
+      try {
+        const snapshot = await loadDeployedCompositionPlan({
+          releaseName,
+          namespace,
+          buildId: state.buildId,
+          ...(state.compositionPlans?.[state.buildId]
+            ? { expected: state.compositionPlans[state.buildId] }
+            : {}),
+        });
+        if (snapshot) {
+          const description = describeCompositionPlan(snapshot.plan);
+          results.push({
+            name: "Composition plan",
+            status: "pass",
+            message:
+              `${snapshot.digest} (${description.resources.length} contributed resources, ` +
+              `${description.cleanup.kubernetes.length + description.cleanup.external.length} cleanup operations)`,
+          });
+          try {
+            const compatibility = await inspectKubernetesRequirements(snapshot.plan);
+            results.push({
+              name: "Composition plan APIs",
+              status: compatibility.missingOptional.length > 0 ? "warn" : "pass",
+              message:
+                compatibility.missingOptional.length > 0
+                  ? `Kubernetes ${compatibility.serverVersion}; optional APIs missing: ` +
+                    compatibility.missingOptional
+                      .map((entry) => `${entry.apiVersion}/${entry.resource}`)
+                      .join(", ")
+                  : `Kubernetes ${compatibility.serverVersion}; all required APIs discovered`,
+            });
+          } catch (error) {
+            results.push({
+              name: "Composition plan APIs",
+              status: "fail",
+              message: sanitizeForTerminal(error instanceof Error ? error.message : String(error)),
+              fix: "Install the missing API/controller or rebuild for this cluster",
+            });
+          }
+          results.push(...(await evaluateCompositionPlanReadiness(snapshot.plan)));
+          results.push(...(await evaluateCompositionPlanDiagnostics(snapshot.plan)));
+        }
+      } catch (error) {
+        results.push({
+          name: "Composition plan",
+          status: "fail",
+          message: sanitizeForTerminal(error instanceof Error ? error.message : String(error)),
+          fix: "Rebuild and redeploy to replace the invalid retained plan snapshot",
+        });
+      }
+    }
+    if (localComposition) {
+      printCheckResults(results);
+      return;
+    }
 
     // Gateway
     const gwResult = await execCapture("kubectl", [
@@ -1181,37 +1297,7 @@ export async function runDoctor(options: {
     });
   }
 
-  // --- Print results ---
-  console.log("");
-  let fails = 0;
-  let warns = 0;
-  let checkCount = 0;
-  for (const r of results) {
-    // Section separator
-    if (r.name.startsWith("---")) {
-      console.log(`\n  \x1b[1m${r.name.replace(/^-+\s*/, "").replace(/\s*-+$/, "")}\x1b[0m`);
-      continue;
-    }
-    checkCount++;
-    const icon =
-      r.status === "pass"
-        ? "\x1b[32mPASS\x1b[0m"
-        : r.status === "warn"
-          ? "\x1b[33mWARN\x1b[0m"
-          : "\x1b[31mFAIL\x1b[0m";
-    console.log(`  ${icon}  ${r.name}: ${r.message}`);
-    if (r.fix && r.status !== "pass") {
-      console.log(`         Fix: ${r.fix}`);
-    }
-    if (r.status === "fail") fails++;
-    if (r.status === "warn") warns++;
-  }
-
-  console.log(
-    `\n  ${checkCount} checks: ${checkCount - fails - warns} passed, ${warns} warnings, ${fails} failures\n`,
-  );
-
-  if (fails > 0) process.exit(1);
+  printCheckResults(results);
 }
 
 // Standalone domain checks — called after deploy to show pending DNS/cert work
