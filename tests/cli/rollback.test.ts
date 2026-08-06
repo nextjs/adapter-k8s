@@ -1748,6 +1748,63 @@ describe("revertRoutingServiceToBuild — env stays truthful", () => {
     expect(body).toContain("NEXT_BUILD_ID");
     expect(body).toContain("target-build");
   });
+
+  it("does not snapshot an uncertain edge during deploy recovery", async () => {
+    vi.clearAllMocks();
+    vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    } as never);
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "deployment") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:uncertain",
+                      env: [{ name: "NEXT_BUILD_ID", value: "uncertain" }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "get" && args[1] === "configmap") {
+        return { exitCode: 0, stdout: `configmap/${args[2]}\n`, stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "secret") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target-build",
+      registry: "gcr.io/p",
+      retainCurrentManifest: false,
+    });
+
+    const configMapReads = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "get" && args[1] === "configmap")
+      .map(([, args]) => args[2]);
+    expect(configMapReads).toEqual([routingManifestSnapshotName("rel", "target-build")]);
+    expect(execCaptureStdin).not.toHaveBeenCalled();
+  });
 });
 
 // N87 (SECURITY). The internal dispatch secret is per BUILD, so the edge's secretKeyRef has to
