@@ -765,8 +765,8 @@ export function planRollbackCapacity(
   );
   const replicas = Math.max(ROLLBACK_MIN_REPLICAS, scaling.min, live);
   // The HPA must not immediately undo the scale-up (min) and must be able to grow past
-  // where the current build already was (max). The next deploy re-renders the HPA from
-  // config, so this widening is scoped to the incident.
+  // where the current build already was (max). The next deploy omits this HPA when it parks
+  // the build again, so this widening is scoped to the incident.
   return { replicas, min: replicas, max: Math.max(scaling.max, observed.hpaMax ?? 0, replicas) };
 }
 
