@@ -117,9 +117,7 @@ export function generateHelmChart({
    * Nothing supplies these at BUILD time and nothing can: `next build` runs before
    * `docker build`/`docker push`, so no digest exists yet. This is the seam for the
    * deploy-side resolve-after-push step (see the handoff note in adapter.ts) — the chart
-   * must be re-rendered, or the digests injected, only once the images are pushed. A
-   * retained previous-build render must reuse the digest RECORDED FOR THAT BUILD; never
-   * re-resolve it from the tag, which is the very thing that may have moved.
+   * must be re-rendered, or the digests injected, only once the images are pushed.
    */
   imageDigests?: Record<string, string>;
 }): Record<string, string> {

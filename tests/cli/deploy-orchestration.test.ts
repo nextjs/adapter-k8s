@@ -133,23 +133,56 @@ function setupFs({
   });
 }
 
-/**
- * What the previous build's LIVE Deployment reports — deliberately DIFFERENT from the new
- * build's `.Values` (a smaller pool, the shared-image repository, and the pre-/readyz
- * readiness path), so a retained render that resolved from `.Values` is detectable (N66).
- */
+/** What the previous build's LIVE Deployment reports to the capacity gate. */
 const DEFAULT_PREV_LIVE = {
   replicas: 2,
   image: `${REGISTRY}/nextjs-app-ssr:buildm`,
-  cpu: "750m",
-  memory: "1536Mi",
-  ephemeralStorage: "3Gi",
-  cpuLimit: "1500m",
-  memoryLimit: "3Gi",
-  readinessPath: "/healthz",
-  // N87: a previous build deployed BEFORE per-build Secret names — it references the legacy
-  // stable name, which the retained render must mirror rather than repoint.
   internalSecretRef: legacyInternalSecretName(RELEASE),
+};
+
+// Deliberately richer than the current emitter. Retention must preserve unknown/custom pod
+// fields as well as every env form because it must not serialize this template at all.
+const DEFAULT_PREV_POD_TEMPLATE = {
+  metadata: {
+    labels: { "app.kubernetes.io/version": "buildm", "example.com/variant": "legacy" },
+    annotations: { "example.com/injected": "kept" },
+  },
+  spec: {
+    serviceAccountName: "legacy-runtime",
+    nodeSelector: { "kubernetes.io/arch": "arm64" },
+    tolerations: [{ key: "dedicated", operator: "Equal", value: "nextjs", effect: "NoSchedule" }],
+    containers: [
+      {
+        name: "pool-server",
+        image: DEFAULT_PREV_LIVE.image,
+        env: [
+          { name: "APP_VARIANT", value: "catalog" },
+          { name: "POOL_ROLE", value: "legacy-pages" },
+          {
+            name: "INTERNAL_HEADER_SECRET",
+            valueFrom: {
+              secretKeyRef: { name: DEFAULT_PREV_LIVE.internalSecretRef, key: "secret" },
+            },
+          },
+          {
+            name: "DATABASE_URL",
+            valueFrom: { secretKeyRef: { name: "runtime-database", key: "url", optional: false } },
+          },
+          {
+            name: "POD_NAME",
+            valueFrom: { fieldRef: { apiVersion: "v1", fieldPath: "metadata.name" } },
+          },
+        ],
+        envFrom: [
+          { configMapRef: { name: "runtime-config", optional: true } },
+          { secretRef: { name: "runtime-secrets", optional: false } },
+        ],
+        volumeMounts: [{ name: "runtime", mountPath: "/runtime", readOnly: true }],
+      },
+      { name: "telemetry-sidecar", image: "example.invalid/telemetry@sha256:abc" },
+    ],
+    volumes: [{ name: "runtime", secret: { secretName: "runtime-files" } }],
+  },
 };
 
 /**
@@ -169,7 +202,7 @@ function happyCluster(
     activeServices?: string; // jsonpath rows: name|component|versionSelector
     activeServicesFail?: boolean;
     servingImages?: string; // jsonpath rows: name|image
-    // N66: the previous build's LIVE pod template, as the retained render must mirror it.
+    // The previous build's live replica count; its pod template is never re-rendered.
     prevLive?: Partial<typeof DEFAULT_PREV_LIVE>;
     // N64: the new build's rendered replica count, and how many of its pods are Ready.
     newBuildReplicas?: number;
@@ -190,6 +223,7 @@ function happyCluster(
     outgoingHpaProbeFails?: boolean;
     outgoingHpaAnnotateFails?: boolean;
     outgoingHpaDeleteFails?: boolean;
+    outgoingDeploymentAnnotateFails?: boolean;
     // N87: internal dispatch Secret lifecycle. The legacy stable-named Secret (migrated past
     // helm upgrade), and the per-build ones the post-cutover sweep prunes.
     legacySecretPresent?: boolean;
@@ -293,10 +327,14 @@ function happyCluster(
     if (args.includes("deployments") && j.includes("containers[0].image")) {
       return ok(overrides.servingImages ?? `rel-ssr-buildm|${REGISTRY}/nextjs-app-ssr:buildm\n`);
     }
-    // N66: retained-manifest probe — ONE call returning name|replicas plus the live pod
-    // template fields the retained render must reproduce (image, four quantities, readiness
-    // path). The N64 capacity probe below asks the same resource with the SHORT jsonpath.
-    if (j.includes("containers[0].image") && j.includes("{.spec.replicas}")) {
+    // Complete outgoing Deployment read. Deploy extracts only replicas; the pod template is
+    // deliberately unknown to it and must never be re-rendered into the incoming chart.
+    if (
+      args[0] === "get" &&
+      args[1] === "deployment" &&
+      args.includes("--ignore-not-found") &&
+      args[args.indexOf("-o") + 1] === "json"
+    ) {
       if (overrides.replicasProbeGone) return ok("");
       if (overrides.replicasProbeFails) {
         return { exitCode: 1, stdout: "", stderr: "connection refused" };
@@ -304,19 +342,22 @@ function happyCluster(
       const name = args[args.indexOf("deployment") + 1]!;
       const live = { ...DEFAULT_PREV_LIVE, ...overrides.prevLive };
       return ok(
-        [
-          name,
-          String(live.replicas),
-          live.image,
-          live.cpu,
-          live.memory,
-          live.ephemeralStorage,
-          live.cpuLimit,
-          live.memoryLimit,
-          live.readinessPath,
-          live.internalSecretRef,
-        ].join("|"),
+        JSON.stringify({
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { name, namespace: "default", annotations: { "example.com/live": "yes" } },
+          spec: { replicas: live.replicas, template: DEFAULT_PREV_POD_TEMPLATE },
+        }),
       );
+    }
+    if (args[0] === "annotate" && args[1] === "deployment") {
+      events.push(
+        `annotate-deployment:${args[2]}:${args.find((a) => a.includes("resource-policy"))}`,
+      );
+      if (overrides.outgoingDeploymentAnnotateFails) {
+        return { exitCode: 1, stdout: "", stderr: "deployment annotation denied" };
+      }
+      return ok();
     }
     // N64: pre-cutover capacity probe on the NEW build's Deployment (short jsonpath).
     if (j.includes("jsonpath={.metadata.name}|{.spec.replicas}")) {
@@ -608,14 +649,15 @@ describe("runDeploy — orchestration", () => {
       .mocked(writeFileSync)
       .mock.calls.filter(([p]) => String(p).includes("-prev-"));
     const retainedNames = retainedWrites.map(([p]) => path.basename(String(p)));
-    expect(retainedNames).toContain("ssr-prev-deployment.yaml");
+    expect(retainedNames).not.toContain("ssr-prev-deployment.yaml");
     expect(retainedNames).toContain("ssr-prev-service.yaml");
     expect(retainedNames).not.toContain("ssr-prev-hpa.yaml");
 
-    const retainedDeployment = retainedWrites.find(([p]) =>
-      String(p).endsWith("ssr-prev-deployment.yaml"),
+    const keepDeployment = events.indexOf(
+      "annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep",
     );
-    expect(String(retainedDeployment?.[1])).toContain("replicas: 5");
+    expect(keepDeployment).toBeGreaterThanOrEqual(0);
+    expect(keepDeployment).toBeLessThan(events.indexOf("helm"));
 
     const keepHpa = events.indexOf("annotate-hpa:rel-ssr-buildm-hpa:helm.sh/resource-policy=keep");
     expect(keepHpa).toBeGreaterThanOrEqual(0);
@@ -868,11 +910,11 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/replica count/);
+    ).rejects.toThrow(/currently-serving deployment/);
     expect(events).not.toContain("helm");
   });
 
-  it("self-heals when the previous Deployment is NotFound: warns, renders default replicas, deploy proceeds", async () => {
+  it("self-heals when the previous Deployment is NotFound without fabricating it", async () => {
     // Regression: the retention probe aborted on ANY kubectl failure, including
     // NotFound (state names a build whose Deployment was deleted manually), which
     // bricked every future deploy of the release. N31: the pool's stable active Service
@@ -910,12 +952,13 @@ describe("runDeploy — guards and teardown", () => {
           (c) => String(c[0]).includes("rel-ssr-buildm") && String(c[0]).includes("not found"),
         ),
     ).toBe(true);
-    // ...and the retained manifest fell back to the default replica count.
-    const prevDeploymentWrite = vi
-      .mocked(writeFileSync)
-      .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"));
-    expect(prevDeploymentWrite).toBeDefined();
-    expect(String(prevDeploymentWrite![1])).toContain("replicas: 2");
+    // ...and no incoming template was applied under the old build's identity.
+    expect(
+      vi
+        .mocked(writeFileSync)
+        .mock.calls.some(([p]) => String(p).endsWith("ssr-prev-deployment.yaml")),
+    ).toBe(false);
+    expect(events.some((event) => event.startsWith("annotate-deployment:"))).toBe(false);
   });
 
   it("aborts when COMPOSED truncated names collide even though the bare build ids differ", async () => {
@@ -1375,11 +1418,10 @@ describe("runDeploy — N20: unreadable deploy state must never read as a first 
     // helm was told about the live build, not "no previous build".
     expect(helmArgLine()).toContain("previousBuildId=buildm");
     expect(helmArgLine()).toContain("activeBuildId=buildm");
-    // ...and the serving build's Deployment was retained so helm cannot prune it.
-    const retained = vi
-      .mocked(writeFileSync)
-      .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"));
-    expect(retained).toBeDefined();
+    // ...and the serving build's live Deployment was kept before Helm could prune it.
+    const keep = events.indexOf("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    expect(keep).toBeGreaterThanOrEqual(0);
+    expect(keep).toBeLessThan(events.indexOf("helm"));
     expect(printedWarnings()).toContain('Recovered the currently-serving build "buildm"');
   });
 
@@ -1600,7 +1642,12 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
     // serving N≫2 down to 2 mid-deploy.
     const cluster = happyCluster(events);
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      if (args.join(" ").includes("jsonpath={.metadata.name}|{.spec.replicas}")) {
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args.includes("--ignore-not-found") &&
+        args[args.indexOf("-o") + 1] === "json"
+      ) {
         return {
           exitCode: 1,
           stdout: "",
@@ -1612,7 +1659,7 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/Could not read the live replica count/);
+    ).rejects.toThrow(/Could not read the currently-serving deployment/);
     expect(events).not.toContain("helm");
     // Nothing was rendered at the dangerous default.
     expect(vi.mocked(writeFileSync).mock.calls.some(([p]) => String(p).includes("-prev-"))).toBe(
@@ -1632,10 +1679,14 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
       readyPerPool: { ssr: 3, api: 1 },
     });
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      const j = args.join(" ");
-      // The retained probe (long jsonpath) for the pool that is ABSENT in the previous
-      // build: exit 0 + empty stdout, the --ignore-not-found absence signal.
-      if (j.includes("containers[0].image") && j.includes("{.spec.replicas}")) {
+      // The complete Deployment read for the pool that is ABSENT in the previous build:
+      // exit 0 + empty stdout, the --ignore-not-found absence signal.
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args.includes("--ignore-not-found") &&
+        args[args.indexOf("-o") + 1] === "json"
+      ) {
         const name = args[args.indexOf("deployment") + 1];
         if (name !== "rel-ssr-buildm") return { exitCode: 0, stdout: "", stderr: "" };
       }
@@ -1654,14 +1705,11 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
       .mocked(writeFileSync)
       .mock.calls.map(([p]) => String(p))
       .filter((p) => p.includes("-prev-"));
-    expect(retainedFiles.some((p) => p.endsWith("ssr-prev-deployment.yaml"))).toBe(true);
+    expect(retainedFiles.some((p) => p.endsWith("ssr-prev-deployment.yaml"))).toBe(false);
+    expect(retainedFiles.some((p) => p.endsWith("ssr-prev-service.yaml"))).toBe(true);
     expect(retainedFiles.some((p) => p.includes("api-prev-"))).toBe(false);
     expect(printedLogs()).toContain('Pool "api" is new in this build');
-    // The pool that DID exist was still retained at its live count.
-    const ssrDeployment = vi
-      .mocked(writeFileSync)
-      .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"))!;
-    expect(String(ssrDeployment[1])).toContain("replicas: 3");
+    expect(events).toContain("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
   });
 
   it("aborts when the pool-existed-before probe itself fails", async () => {
@@ -1862,11 +1910,12 @@ describe("runDeploy — N32: stale *-prev-*.yaml never survives into another dep
     expect(unlinked).toContain(path.join(chartTemplatesDir, "ssr-prev-deployment.yaml"));
     expect(unlinked).toContain(path.join(chartTemplatesDir, "reaped-prev-service.yaml"));
     expect(unlinked).not.toContain(path.join(chartTemplatesDir, "deployment.yaml"));
-    // The wipe happens BEFORE the fresh retained render (which writes the same name).
-    const rewritten = vi
-      .mocked(writeFileSync)
-      .mock.calls.findIndex(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"));
-    expect(rewritten).toBeGreaterThanOrEqual(0);
+    // A live Deployment is retained by annotation, never re-created from this stale file.
+    expect(
+      vi
+        .mocked(writeFileSync)
+        .mock.calls.some(([p]) => String(p).endsWith("ssr-prev-deployment.yaml")),
+    ).toBe(false);
   });
 
   it("runs unconditionally, even on a first deploy with no previous build", async () => {
@@ -2053,14 +2102,8 @@ describe("runDeploy — N33: domain checks run before the completion banner", ()
   });
 });
 
-describe("runDeploy — N66: the retained previous Deployment mirrors what is RUNNING", () => {
+describe("runDeploy — N66: the outgoing Deployment pod template is never re-rendered", () => {
   let events: string[];
-  const retainedYaml = (): string =>
-    String(
-      vi
-        .mocked(writeFileSync)
-        .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"))![1],
-    );
 
   beforeEach(() => {
     events = [];
@@ -2068,165 +2111,97 @@ describe("runDeploy — N66: the retained previous Deployment mirrors what is RU
   });
   afterEach(() => vi.restoreAllMocks());
 
-  // N87. The previous build may predate per-build Secret names, in which case its pods resolve
-  // the legacy stable-named Secret. Stamping the derived per-build name onto the retained render
-  // would repoint the pod template of the build serving 100% of traffic at a Secret nobody
-  // rendered — CreateContainerConfigError on every new pod, before cutover. Same failure shape
-  // as the containerStrategy flip this suite exists for.
-  it("mirrors the live INTERNAL_HEADER_SECRET secretKeyRef instead of deriving it", async () => {
+  it("keeps every env/valueFrom and pod-spec field by omitting the Deployment from the chart", async () => {
+    const before = structuredClone(DEFAULT_PREV_POD_TEMPLATE);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const yaml = retainedYaml();
-    expect(yaml).toContain(`name: ${legacyInternalSecretName(RELEASE)}`);
-    expect(yaml).not.toContain(internalSecretName(RELEASE, "buildm"));
+    expect(DEFAULT_PREV_POD_TEMPLATE).toEqual(before);
+    expect(
+      vi
+        .mocked(writeFileSync)
+        .mock.calls.some(([p]) => String(p).endsWith("ssr-prev-deployment.yaml")),
+    ).toBe(false);
+    expect(events).toContain("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    expect(events).not.toContain("rollout:deployment/rel-ssr-buildm");
   });
 
-  it("derives the per-build Secret name when the live template already carries one", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { internalSecretRef: internalSecretName(RELEASE, "buildm") },
-      }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    expect(retainedYaml()).toContain(`name: ${internalSecretName(RELEASE, "buildm")}`);
-  });
-
-  it("falls back to the derived name (with a warning) for an unusable live ref", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { internalSecretRef: 'x"\n              hostNetwork: true' },
-      }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    expect(yaml).toContain(`name: ${internalSecretName(RELEASE, "buildm")}`);
-    expect(yaml).not.toContain("hostNetwork");
-    expect(warn.mock.calls.flat().join(" ")).toMatch(/not a plain Secret name/);
-  });
-
-  it("renders the live image + all four quantities as LITERALS, with no .Values left", async () => {
-    // Everything the retained render resolved from `.Values` resolved against the NEW
-    // build's values: changing `resources` in next.config mutated the pod template of the
-    // build serving 100% of traffic (→ RollingUpdate rolled it), and flipping
-    // containerStrategy repointed it at a tag that was never pushed (ImagePullBackOff on
-    // the SERVING build, before cutover).
+  it("retains only through top-level metadata before Helm, so no ReplicaSet rollout is requested", async () => {
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const yaml = retainedYaml();
-    expect(yaml).not.toContain(".Values");
-    expect(yaml).not.toContain("{{");
-    expect(yaml).toContain(`image: "${DEFAULT_PREV_LIVE.image}"`);
-    expect(yaml).toContain(`cpu: "${DEFAULT_PREV_LIVE.cpu}"`);
-    expect(yaml).toContain(`memory: "${DEFAULT_PREV_LIVE.memory}"`);
-    expect(yaml).toContain(`ephemeral-storage: "${DEFAULT_PREV_LIVE.ephemeralStorage}"`);
-    expect(yaml).toContain(`cpu: "${DEFAULT_PREV_LIVE.cpuLimit}"`);
-    expect(yaml).toContain(`memory: "${DEFAULT_PREV_LIVE.memoryLimit}"`);
-    // ...and the live replica count, as before.
-    expect(yaml).toContain(`replicas: ${DEFAULT_PREV_LIVE.replicas}`);
+    const keep = events.indexOf("annotate-deployment:rel-ssr-buildm:helm.sh/resource-policy=keep");
+    expect(keep).toBeGreaterThanOrEqual(0);
+    expect(keep).toBeLessThan(events.indexOf("helm"));
+
+    const mutations = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) =>
+          args.includes("deployment") &&
+          args.includes("rel-ssr-buildm") &&
+          ["apply", "patch", "replace", "set"].includes(args[0] ?? ""),
+      );
+    expect(mutations).toEqual([]);
   });
 
-  it("keeps the OLD repository when containerStrategy flips between builds", async () => {
-    // shared-image renders `nextjs-app`; the serving build was built per-pool
-    // (`nextjs-app-ssr`). The retained manifest must name what is running, not what this
-    // build would produce.
+  it("passes the configured namespace to both the read and keep annotation", async () => {
     setupFs({
+      infra: { ...BASE_INFRA, namespace: "tenant-apps" },
       metadata: {
         buildId: "buildn",
         pools: ["ssr"],
         cacheEnabled: false,
-        containerStrategy: "shared-image",
+        namespace: "tenant-apps",
       },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const yaml = retainedYaml();
-    expect(yaml).toContain(`${REGISTRY}/nextjs-app-ssr:buildm`);
-    expect(yaml).not.toContain("nextjs-app:buildn");
-    expect(yaml).not.toContain(".Values");
+    const deploymentCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) => args.includes("rel-ssr-buildm") && args.includes("deployment"),
+      );
+    expect(deploymentCalls).toHaveLength(2);
+    for (const [, args] of deploymentCalls) {
+      expect(args.slice(args.indexOf("-n"), args.indexOf("-n") + 2)).toEqual(["-n", "tenant-apps"]);
+    }
   });
 
-  it("mirrors the live readiness path so the SERVING build's probe never changes", async () => {
-    // The retained build may predate /readyz; stamping the current default onto it would
-    // change the serving build's pod template into a probe its pods cannot satisfy.
-    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    // Scope to the readinessProbe block itself: the startup/liveness probes are /healthz
-    // too, so a substring search over the whole document would pass vacuously.
-    expect(yaml).toMatch(
-      new RegExp(
-        `readinessProbe:\\s*\\n\\s*httpGet:\\s*\\n\\s*path: ${DEFAULT_PREV_LIVE.readinessPath}\\b`,
-      ),
-    );
-    // The current default must appear NOWHERE in a manifest that mirrors an older build.
-    expect(yaml).not.toContain("/readyz");
-  });
-
-  it("falls back to .Values only where there is no live object to mirror (NotFound self-heal)", async () => {
+  it("aborts before Helm when keep cannot be applied", async () => {
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { replicasProbeGone: true }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    expect(yaml).toContain("replicas: 2");
-    // Nothing was invented: the template's own .Values expressions remain.
-    expect(yaml).toContain(".Values");
-  });
-
-  it("omits only the fields the live object lacks (an older build with no limits)", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { cpuLimit: "", memoryLimit: "", ephemeralStorage: "" },
-      }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    // Requests were mirrored...
-    expect(yaml).toContain(`cpu: "${DEFAULT_PREV_LIVE.cpu}"`);
-    // ...and exactly the absent fields stayed on the .Values fallback.
-    expect(yaml).toContain('(index .Values.pools "ssr").resources.limits.cpu');
-    expect(yaml).toContain('(index .Values.pools "ssr").resources.limits.memory');
-  });
-
-  it("aborts when a live quantity is not a valid Kubernetes quantity (never spliced raw)", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { memory: '1Gi"\n      hostNetwork: true\n      _pad: "' },
-      }) as never,
+      happyCluster(events, { outgoingDeploymentAnnotateFails: true }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/Invalid Kubernetes quantity/);
+    ).rejects.toThrow(
+      /Could not transfer the outgoing Deployment.*Refusing to run `helm upgrade`/s,
+    );
     expect(events).not.toContain("helm");
   });
 
-  it("warns and uses the template default when the live readiness path is not a plain path", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { prevLive: { readinessPath: '/x"\n            port: 22' } }) as never,
-    );
+  it("rejects malformed live JSON rather than falling back to a generated Deployment", async () => {
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args[args.indexOf("-o") + 1] === "json"
+      ) {
+        return { exitCode: 0, stdout: "{not-json", stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    expect(printedWarnings()).toContain("is not a plain URL path");
-    expect(retainedYaml()).not.toContain("port: 22");
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not parse the live deployment/);
+    expect(events).not.toContain("helm");
   });
 });
 

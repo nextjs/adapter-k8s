@@ -2,7 +2,7 @@
 //
 // build-metadata.json — the hand-off from build to `adapter-k8s deploy` (which reads
 // cacheEnabled/cacheManaged to provision or tear down the managed Memorystore, and pools
-// to render the previous build's templates).
+// to coordinate versioned resources across a cutover).
 //
 // N50 (review, Medium): every field used to be optional with a `??` default HERE:
 //   - `failureModeAllow ?? true` defaulted to fail-OPEN — the middleware-BYPASS direction —

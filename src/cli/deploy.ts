@@ -17,7 +17,7 @@ import { readState, writeState, StateUnavailableError, type AdapterState } from 
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import { cdnTagForBuildId } from "../cdn-tags.js";
 import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "./rollback.js";
-import { renderDeployment, POOL_READINESS_PATH } from "../emit/templates/deployment.js";
+import { POOL_READINESS_PATH } from "../emit/templates/deployment.js";
 
 /**
  * The liveness path, used ONLY as the one-cycle fallback for the stable HealthCheckPolicy when
@@ -52,8 +52,6 @@ import { sanitizeK8sName } from "../emit/templates/utils.js";
 import {
   assertSafeBuildId,
   assertSafePoolName as assertSafePoolNameCharset,
-  assertSafeQuantity,
-  assertSafeImageReference,
   findBuildIdNameCollision,
   findEmittedNameCollision,
   assertSafeImageRegistry,
@@ -125,20 +123,6 @@ export interface DeployOptions {
    */
   yes?: boolean;
 }
-
-// N66: a plain URL path, the only shape safe to splice into the rendered pod spec's
-// `path:` scalar. Used to vet the readiness path read back from a LIVE Deployment before
-// it is mirrored into the retained manifest (renderDeployment interpolates it bare).
-const LIVE_PROBE_PATH_RE = /^\/[A-Za-z0-9._~/-]{0,128}$/;
-
-/**
- * N87. Charset gate for the live pod template's INTERNAL_HEADER_SECRET secretKeyRef name,
- * mirrored into the retained previous-build render. Same reason as LIVE_PROBE_PATH_RE: the
- * value comes from the cluster and reaches a bare YAML scalar. DNS-1123 subdomain minus dots
- * (every name this adapter emits goes through sanitizeK8sName), matching the validator the
- * template itself applies.
- */
-const LIVE_SECRET_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$/;
 
 // N29: same shape as destroy's confirmation prompt (that file's copy is not exported).
 function promptConfirmation(question: string): Promise<string> {
@@ -1856,8 +1840,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // The build-time collision guard (adapter.ts) can't see deploy-time state: if any of
   // this build's COMPOSED resource names sanitizes to the SAME K8s name as the
   // currently-serving build's, the two builds' resources become indistinguishable —
-  // pods carry identical version labels (split-brain cutover), retained previous-build
-  // manifests overwrite the serving ones, and cleanup deletes the wrong build.
+  // pods carry identical version labels (split-brain cutover), the keep transfer can target
+  // the wrong Deployment, and cleanup can delete the serving build.
   // Comparing the bare sanitized build ids is NOT enough: names collide on the COMPOSED
   // truncated form — a long `<release>-<pool>-` prefix can push the differing part of
   // the build id past the 63-char boundary even when the ids differ well inside their
@@ -1990,49 +1974,28 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // have no live capacity to match.
   const previousReplicasByPool = new Map<string, number>();
 
-  // Inject the previous build's Deployment+Service into the chart so Helm doesn't delete them.
-  // Its HPA remains LIVE but is deliberately omitted from the new release manifest: before the
-  // upgrade we annotate the object `keep`, so Helm stops owning it without deleting or mutating
-  // it. That preserves autoscaling for the build carrying traffic throughout warm-up (and every
-  // pre-cutover abort), while making deploy solely responsible for deleting the HPA before it
-  // parks the rollback Deployment at zero after a durable cutover. This also adopts the same
-  // lifecycle for an HPA created imperatively by rollback.
+  // Preserve the previous build's LIVE Deployment without rendering it into the new chart.
+  // Re-rendering can never be lossless: a build may carry arbitrary user env/envFrom and a pod
+  // template emitted by an older adapter. Every field we failed to copy made Helm see a template
+  // change and roll the build still serving 100% of traffic. Instead, annotate the top-level
+  // Deployment with Helm's keep policy before omitting it from the next release manifest. Helm
+  // then neither patches nor deletes it; in particular `.spec.template` stays byte-for-byte the
+  // live object and no ReplicaSet is created. Deploy still owns the post-cutover scale-to-zero and
+  // old-build cleanup, both of which address the object by its exact versioned name.
+  //
+  // The versioned Service remains rendered: unlike a Deployment it has no executable template,
+  // and retaining it in the release keeps Helm's ordinary lifecycle for a resource whose shape is
+  // fully canonical. The HPA follows the same keep transfer as the Deployment so it remains active
+  // throughout warm-up and every pre-cutover abort.
   if (previousBuildId && previousBuildId !== buildId) {
     for (const poolName of pools) {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
 
-      // The "previous" build is the one CURRENTLY SERVING traffic. Render its Deployment at
-      // its current replica count — NOT 0 — so `helm upgrade` doesn't scale it to zero while
-      // the active Service still selects it, which would black-hole the origin on every
-      // deploy until the new pods are ready and the selector switches. It keeps serving
-      // through the rollout; it is scaled to 0 only after state is committed (step 7f).
-      // Default replica count: used for dry-run (no cluster read) and for a previous
-      // Deployment that no longer exists (NotFound branch below).
-      let prevReplicas = 2;
-      // N66: everything the retained render must reproduce from the LIVE object instead of
-      // resolving from the NEW build's `.Values`. Left EMPTY for dry-run and for the
-      // NotFound self-heal, where there is no live pod template to mirror and the `.Values`
-      // fallback is the only option (and is the documented behavior there).
-      let prevSnapshot: {
-        image?: string;
-        resources?: {
-          cpu?: string;
-          memory?: string;
-          cpuLimit?: string;
-          memoryLimit?: string;
-          ephemeralStorage?: string;
-        };
-        readinessPath?: string;
-        internalSecretRef?: string;
-      } = {};
       if (!dryRun) {
-        // N28: ONE machine-readable probe. `--ignore-not-found` makes a genuinely absent
-        // Deployment exit 0 with empty stdout, and the name field distinguishes "absent"
-        // from "present with an unreadable replica count". The previous version keyed off
-        // `isAlreadyGoneError(stderr)`, which matches a bare "404"/"no such" ANYWHERE in
-        // stderr — so any proxy/auth/wrong-project error whose text contains 404 took the
-        // lenient branch and scaled a build serving N≫2 down to 2 mid-deploy, the exact
-        // regression the abort below was added to prevent.
+        // Read the complete object rather than selecting pod-template fields. The JSON is never
+        // rendered back into YAML: it only supplies the live capacity target. That is the key
+        // invariant — unfamiliar fields, every env/valueFrom entry, sidecars, scheduling policy,
+        // security context, and volumes survive because this process never serializes the spec.
         const r = await execCapture("kubectl", [
           "get",
           "deployment",
@@ -2041,62 +2004,25 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           namespace,
           "--ignore-not-found",
           "-o",
-          // N66: one probe, one round trip — every field the retained manifest must
-          // reproduce byte-for-byte. `ephemeral-storage` needs the bracket form (a hyphen
-          // is not a legal dotted jsonpath segment).
-          "jsonpath={.metadata.name}|{.spec.replicas}" +
-            "|{.spec.template.spec.containers[0].image}" +
-            "|{.spec.template.spec.containers[0].resources.requests.cpu}" +
-            "|{.spec.template.spec.containers[0].resources.requests.memory}" +
-            "|{.spec.template.spec.containers[0].resources.requests['ephemeral-storage']}" +
-            "|{.spec.template.spec.containers[0].resources.limits.cpu}" +
-            "|{.spec.template.spec.containers[0].resources.limits.memory}" +
-            "|{.spec.template.spec.containers[0].readinessProbe.httpGet.path}|" +
-            // N87: WHICH internal dispatch Secret the live pod template resolves. Per-build
-            // now, but a build deployed by an older adapter references the legacy stable name
-            // — re-rendering it with the derived name would repoint the SERVING build's pods
-            // at a Secret nobody rendered. The `range` form tolerates a container with no such
-            // env (an even older build) instead of failing the whole jsonpath.
-            '{range .spec.template.spec.containers[0].env[?(@.name=="INTERNAL_HEADER_SECRET")]}' +
-            "{.valueFrom.secretKeyRef.name}{end}",
+          "json",
         ]);
         if (r.exitCode !== 0) {
-          // Abort rather than guess: the probe previously defaulted to 2 on ANY failure,
-          // so a serving build at 5 replicas would be silently scaled DOWN to 2 by the
-          // retained manifest mid-deploy.
           throw new Error(
-            `Could not read the live replica count for the currently-serving deployment ` +
+            `Could not read the currently-serving deployment ` +
               `${poolPrevName} (kubectl exited ${r.exitCode}: ${r.stderr.trim()}). ` +
-              `The retained manifest must mirror the live count; refusing to guess. Fix ` +
-              `kubectl access and re-run the deploy.`,
+              `It must be transferred out of Helm's release manifest without changing its ` +
+              `pod template; refusing to guess. Fix kubectl access and re-run the deploy.`,
           );
         }
-        const [
-          foundName,
-          replicasField,
-          imageField,
-          cpuReqField,
-          memReqField,
-          ephReqField,
-          cpuLimField,
-          memLimField,
-          readinessPathField,
-          internalSecretRefField,
-        ] = r.stdout.trim().split("|");
-        if (!foundName) {
+        if (!r.stdout.trim()) {
           // N31: no Deployment for this pool in the previous build. Two very different
           // causes — tell them apart by whether the pool's STABLE active Service exists
           // (helm creates it with the pool; it outlives individual builds):
           //   * Service exists  → the pool existed before and its previous Deployment was
-          //     deleted (manually / partial cluster recovery). Keep the historical
-          //     self-heal: warn and render the retained manifest at the default, rather
-          //     than bricking every future deploy of the release.
+          //     deleted (manually / partial cluster recovery). Do NOT recreate it from the
+          //     incoming build's template: that is different code/config under an old identity.
           //   * Service absent  → the pool is NEW in this build, so there is nothing to
-          //     retain. Rendering anything here fabricated a previous-build Deployment
-          //     with `imageTag: previousBuildId` — a tag that was never built — giving the
-          //     whole deploy an ImagePullBackOff (step 7a only waits on the new build's
-          //     label) and turning the next rollback's clean "Previous deployment missing"
-          //     abort into a 120 s timeout.
+          //     retain.
           const activeServiceName = sanitizeK8sName(`${releaseName}-${poolName}`);
           const svc = await execCapture("kubectl", [
             "get",
@@ -2113,9 +2039,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `Could not determine whether pool "${poolName}" existed in the previous build ` +
                 `${previousBuildId}: neither its Deployment (${poolPrevName}) nor its active ` +
                 `Service (${activeServiceName}) could be read (kubectl exited ` +
-                `${svc.exitCode}: ${svc.stderr.trim()}). Refusing to guess — retaining a ` +
-                `manifest for a pool that never existed renders an image tag that was never ` +
-                `built. Fix kubectl access and re-run the deploy.`,
+                `${svc.exitCode}: ${svc.stderr.trim()}). Refusing to guess. Fix kubectl access ` +
+                `and re-run the deploy.`,
             );
           }
           if (!svc.stdout.trim()) {
@@ -2127,120 +2052,72 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           }
           console.warn(
             `  ! Previous deployment ${poolPrevName} (build ${previousBuildId}) not found — ` +
-              `it appears to have been deleted. Nothing is serving from it; rendering its ` +
-              `retained manifest at the default ${prevReplicas} replicas.`,
+              `it appears to have been deleted. Nothing is serving from it; it will not be ` +
+              `recreated from the incoming build's pod template.`,
           );
         } else {
-          const n = parseInt(replicasField ?? "", 10);
-          if (!Number.isFinite(n) || n <= 0) {
+          let live: { metadata?: { name?: unknown }; spec?: { replicas?: unknown } };
+          try {
+            live = JSON.parse(r.stdout) as typeof live;
+          } catch (err) {
+            throw new Error(
+              `Could not parse the live deployment ${poolPrevName}: ` +
+                `${err instanceof Error ? err.message : String(err)}. Refusing to run ` +
+                `\`helm upgrade\` without proving which Deployment will be retained.`,
+            );
+          }
+          if (live.metadata?.name !== poolPrevName) {
+            throw new Error(
+              `The live Deployment probe for ${poolPrevName} returned ` +
+                `${JSON.stringify(live.metadata?.name)}. Refusing to retain a different object.`,
+            );
+          }
+          const n = live.spec?.replicas;
+          if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
             throw new Error(
               `Could not read the live replica count for the currently-serving deployment ` +
-                `${poolPrevName} (replicas=${JSON.stringify(replicasField ?? "")}). ` +
-                `The retained manifest must mirror the live count; refusing to guess. Fix ` +
+                `${poolPrevName} (replicas=${JSON.stringify(n)}). Refusing to guess. Fix ` +
                 `kubectl access and re-run the deploy.`,
             );
           }
-          prevReplicas = n;
           previousReplicasByPool.set(poolName, n);
-          // N66: snapshot the live container spec. A field the live object does not carry
-          // (an older build predating ephemeral-storage, say) is simply omitted, which
-          // leaves that ONE field on the `.Values` fallback rather than inventing a value —
-          // omitting it is what the running object has, so the render still matches.
-          // Every literal is cluster-sourced and lands in the rendered pod spec, so it is
-          // validated HERE, at the point of consumption (AGENTS.md), not only inside the
-          // template: a value that fails validation aborts the deploy rather than being
-          // dropped (silently reverting that field to the new build's values would
-          // reintroduce exactly the skew this snapshot exists to prevent).
-          if (imageField) {
-            assertSafeImageReference(imageField);
-          }
-          const liveQuantity = (value: string, field: string): string => {
-            assertSafeQuantity(value, `live ${poolPrevName} ${field}`);
-            return value;
-          };
-          prevSnapshot = {
-            ...(imageField ? { image: imageField } : {}),
-            resources: {
-              ...(cpuReqField ? { cpu: liveQuantity(cpuReqField, "requests.cpu") } : {}),
-              ...(memReqField ? { memory: liveQuantity(memReqField, "requests.memory") } : {}),
-              ...(ephReqField
-                ? { ephemeralStorage: liveQuantity(ephReqField, "requests.ephemeral-storage") }
-                : {}),
-              ...(cpuLimField ? { cpuLimit: liveQuantity(cpuLimField, "limits.cpu") } : {}),
-              ...(memLimField ? { memoryLimit: liveQuantity(memLimField, "limits.memory") } : {}),
-            },
-            // N66: the readiness PATH is part of "what is running" too. The retained build
-            // may predate the pool server's `/readyz` endpoint, and stamping the current
-            // default onto it would change the SERVING build's pod template into a probe
-            // its pods cannot satisfy (a stalled RollingUpdate on the build carrying 100%
-            // of traffic). `renderDeployment` interpolates this as a BARE YAML scalar with
-            // no validation of its own, so a cluster-sourced value must be charset-checked
-            // here; anything unexpected falls back to the template default.
-            ...(readinessPathField && LIVE_PROBE_PATH_RE.test(readinessPathField)
-              ? { readinessPath: readinessPathField }
-              : {}),
-            // N87: mirror the live secretKeyRef. Cluster-sourced and spliced into a bare YAML
-            // scalar, so it is charset-checked here; anything unexpected falls back to the
-            // derived per-build name rather than aborting the deploy (same posture as the
-            // readiness path above).
-            ...(internalSecretRefField && LIVE_SECRET_NAME_RE.test(internalSecretRefField)
-              ? { internalSecretRef: internalSecretRefField }
-              : {}),
-          };
-          if (internalSecretRefField && !LIVE_SECRET_NAME_RE.test(internalSecretRefField)) {
-            console.warn(
-              `  ! Live INTERNAL_HEADER_SECRET secretKeyRef ${JSON.stringify(
-                internalSecretRefField,
-              )} on ${poolPrevName} is not a plain Secret name — the retained manifest will use ` +
-                `the per-build default instead of mirroring it.`,
+
+          const keptDeployment = await execCapture("kubectl", [
+            "annotate",
+            "deployment",
+            poolPrevName,
+            "-n",
+            namespace,
+            "helm.sh/resource-policy=keep",
+            "--overwrite",
+          ]);
+          if (keptDeployment.exitCode !== 0) {
+            throw new Error(
+              `Could not transfer the outgoing Deployment ${poolPrevName} out of Helm ` +
+                `ownership (${keptDeployment.stderr.trim() || `kubectl exited ${keptDeployment.exitCode}`}). ` +
+                `Refusing to run \`helm upgrade\`: re-rendering it would change the serving ` +
+                `pod template and omitting it without keep would delete it. Fix kubectl access ` +
+                `and re-run.`,
             );
           }
-          if (readinessPathField && !LIVE_PROBE_PATH_RE.test(readinessPathField)) {
-            console.warn(
-              `  ! Live readiness path ${JSON.stringify(readinessPathField)} on ` +
-                `${poolPrevName} is not a plain URL path — the retained manifest will use ` +
-                `the template default instead of mirroring it.`,
-            );
-          }
+          console.log(`  → Preserved outgoing Deployment (${poolPrevName}) without re-rendering`);
         }
+      } else {
+        console.log(
+          `    [dry-run] kubectl annotate deployment ${poolPrevName} -n ${namespace} ` +
+            `helm.sh/resource-policy=keep --overwrite (if it exists)`,
+        );
       }
 
-      // Render retained resources through the same canonical templates as a normal build.
-      // Hand-copying this Deployment previously omitted resources, changing the serving pod
-      // template and rolling the old build during every upgrade. Do not render its HPA into the
-      // new release: the live object remains active under the explicit keep transfer below, so
-      // Helm cannot rewrite its scaling policy from the incoming build's values.
-      // L13: dry-run must not write into the chart — report the planned writes instead.
-      const retainedFiles: [string, string][] = [
-        [
-          `${poolName}-prev-deployment.yaml`,
-          renderDeployment({
-            poolName,
-            buildId: previousBuildId,
-            releaseName,
-            imageTag: previousBuildId,
-            replicas: prevReplicas,
-            // N66: literals win over the `.Values` expressions, so changing `resources` in
-            // next.config — or flipping `containerStrategy`, which repoints the repository
-            // at `nextjs-app-<pool>` vs `nextjs-app` — cannot mutate (and therefore roll)
-            // the pod template of the build still serving 100% of traffic. Flipping
-            // containerStrategy previously pointed the retained manifest at a tag that was
-            // never pushed: ImagePullBackOff on the SERVING build, before cutover.
-            ...prevSnapshot,
-          }),
-        ],
-        [
-          `${poolName}-prev-service.yaml`,
+      // L13: dry-run must not write into the chart — report the planned Service write instead.
+      const retainedService = path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`);
+      if (dryRun) {
+        console.log(`    [dry-run] would write ${retainedService}`);
+      } else {
+        writeFileSync(
+          retainedService,
           renderService({ poolName, buildId: previousBuildId, releaseName }),
-        ],
-      ];
-      for (const [fileName, content] of retainedFiles) {
-        const target = path.join(chartTemplatesDir, fileName);
-        if (dryRun) {
-          console.log(`    [dry-run] would write ${target}`);
-        } else {
-          writeFileSync(target, content);
-        }
+        );
       }
 
       // Keep the outgoing HPA active and byte-for-byte unchanged while its Deployment still

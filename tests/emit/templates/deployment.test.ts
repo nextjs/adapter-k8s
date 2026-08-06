@@ -115,7 +115,7 @@ describe("renderDeployment", () => {
     expect(yaml).toMatch(/spec:\n {2}replicas:/);
   });
 
-  it("N64: an explicit replicas literal still wins (retained previous-build render)", () => {
+  it("N64: an explicit replicas literal still wins", () => {
     const yaml = renderDeployment({
       poolName: "ssr",
       buildId: "b1",
@@ -198,9 +198,9 @@ describe("renderDeployment", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // N66 — retained render must not resolve from the NEW build's .Values
+  // Direct literal overrides
   // ---------------------------------------------------------------------------
-  it("N66: literal resources + image reproduce a retained build byte-for-byte, with no .Values lookups", () => {
+  it("literal resources + image render with no .Values lookups", () => {
     const yaml = renderDeployment({
       poolName: "ssr",
       buildId: "old123",
@@ -209,9 +209,7 @@ describe("renderDeployment", () => {
       image: "us-central1-docker.pkg.dev/p/r/nextjs-app-ssr:old123",
       resources: { cpu: "500m", memory: "1Gi", cpuLimit: "2", memoryLimit: "2Gi" },
     });
-    // The whole point: NOTHING in the retained pod template is resolved by helm from the
-    // new build's values, so changing `resources` or flipping `containerStrategy` between
-    // deploys cannot mutate (and therefore roll) the build serving 100% of traffic.
+    // A fully literal direct render contains no deferred Helm values.
     expect(yaml).not.toContain(".Values");
     expect(yaml).not.toContain("{{");
     expect(yaml).toContain('image: "us-central1-docker.pkg.dev/p/r/nextjs-app-ssr:old123"');
@@ -222,7 +220,7 @@ describe("renderDeployment", () => {
     expect(yaml).toContain("replicas: 4");
   });
 
-  it("N66: rejects an unsafe literal image reference", () => {
+  it("rejects an unsafe literal image reference", () => {
     expect(() =>
       renderDeployment({
         poolName: "ssr",
@@ -440,10 +438,8 @@ describe("N60: pod-spec injection through pools.*.resources (values.yaml -> helm
 describe("renderDeployment rollout safety (N63, the other half of the 502/503 fix)", () => {
   it("never dips below the live replica count during a roll", () => {
     const yaml = renderDeployment({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });
-    // A pool Deployment IS rolled in practice: deploy.ts re-renders the RETAINED previous
-    // build through this template, so any pod-template change here rolls the build that is
-    // still serving 100% of traffic (the active Service still selects it until cutover).
-    // The default 25%/25% would dip below the live count while that is true.
+    // Any ordinary pool rollout must preserve available capacity; the default 25%/25% can
+    // dip below the live count for small pools.
     expect(yaml).toMatch(
       /strategy:\n\s+type: RollingUpdate\n\s+rollingUpdate:\n\s+maxUnavailable: 0\n\s+maxSurge: 1/,
     );

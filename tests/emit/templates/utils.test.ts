@@ -427,7 +427,7 @@ describe("assertSafeYamlScalar (N67)", () => {
   });
 });
 
-describe("assertSafeImageReference (N66)", () => {
+describe("assertSafeImageReference", () => {
   it("accepts a registry/repo:tag and a digest form", () => {
     expect(() =>
       assertSafeImageReference("us-central1-docker.pkg.dev/p/r/nextjs-app-ssr:build1"),
