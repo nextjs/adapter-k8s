@@ -1,10 +1,11 @@
 import { assertSafeReleaseName, escapeHelmActions } from "./utils.js";
 
 // A per-release Secret holding the Valkey connection URL + AUTH string that the pool servers
-// use for the shared `use cache` / PPR cache. It is created imperatively at deploy time — from
-// the managed Memorystore instance's discovery endpoint after provisioning, or from a
-// bring-your-own `cache.url`/`cache.password`. The pool reads VALKEY_URL / VALKEY_AUTH and, when
-// present, registers the Valkey cache handler.
+// use for the shared `use cache` / PPR cache. It is rendered into the Helm chart from the managed
+// Memorystore instance's discovery endpoint after provisioning, or from a bring-your-own
+// `cache.url`/`cache.password`. The pool reads VALKEY_URL / VALKEY_AUTH and, when present,
+// registers the Valkey cache handler. Older adapter releases applied the same rendered object
+// imperatively; deploy.ts migrates only that strictly identified legacy Secret into Helm.
 export const VALKEY_SECRET_NAME = "valkey";
 export const VALKEY_URL_KEY = "url";
 export const VALKEY_AUTH_KEY = "auth";
@@ -40,7 +41,7 @@ ${indent}      key: ${VALKEY_CA_KEY}
 ${indent}      optional: true`;
 }
 
-/** The Valkey connection Secret, created at deploy time (managed endpoint or BYO). */
+/** The Helm-owned Valkey connection Secret, rendered at build/deploy time (BYO or managed). */
 export function renderValkeySecret({
   releaseName,
   url,

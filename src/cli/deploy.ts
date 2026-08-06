@@ -26,7 +26,7 @@ import { renderDeployment, POOL_READINESS_PATH } from "../emit/templates/deploym
  */
 const LIVENESS_PATH_FOR_MIGRATION = "/healthz";
 import { renderService } from "../emit/templates/service.js";
-import { renderValkeySecret } from "../emit/templates/valkey-secret.js";
+import { renderValkeySecret, VALKEY_SECRET_NAME } from "../emit/templates/valkey-secret.js";
 import { provisionMemorystore, buildDeleteMemorystoreCommand } from "./provision-cache.js";
 import { isAlreadyGoneError } from "./destroy.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
@@ -60,6 +60,7 @@ import {
   assertSafeProbePath,
   assertSafeProjectId,
   assertSafeRegion,
+  assertSafeReleaseName,
   poolResourceNames,
   resolveK8sNamespace,
 } from "../emit/templates/utils.js";
@@ -731,6 +732,195 @@ export async function resolveImageDigest(
   return null;
 }
 
+export type HelmUpgradeMode = "client-side" | "server-side";
+
+function helmHelpHasFlag(help: string, flag: string): boolean {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Cobra renders options on their own indented rows. Do not accept a flag merely mentioned
+  // in a warning or description: a Helm wrapper saying it *does not support* --server-side
+  // must never make us construct an argv containing that flag.
+  return new RegExp(
+    `^[ \\t]*(?:-\\S+,[ \\t]+)?${escaped}(?:(?:[ \\t]+\\S+)?[ \\t]{2,}\\S.*)$`,
+    "m",
+  ).test(help);
+}
+
+/**
+ * Select the strongest Helm upgrade mode this installation supports without turning a
+ * Helm 3 deployment into an invalid Helm 4 command.
+ *
+ * Helm 3.2 introduced `--create-namespace`, the oldest Helm capability this deploy argv
+ * requires. Helm 4 introduced `--server-side` and `--force-conflicts`; those two are an
+ * optional apply implementation, not a reason to reject an otherwise capable installation.
+ * Probe Cobra's own option rows rather than parsing a version string so downstream builds
+ * remain compatible without treating flags mentioned only in prose as capabilities.
+ */
+export async function detectHelmUpgradeMode(): Promise<HelmUpgradeMode> {
+  let result: Awaited<ReturnType<typeof execCapture>>;
+  try {
+    result = await execCapture("helm", ["upgrade", "--help"]);
+  } catch (err) {
+    throw new Error(
+      `Could not inspect Helm upgrade capabilities: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Install Helm 3.2 or newer and re-run deploy.`,
+    );
+  }
+  if (result.exitCode !== 0) {
+    const detail = sanitizeForTerminal((result.stderr || result.stdout).trim());
+    throw new Error(
+      `Could not inspect Helm upgrade capabilities (helm upgrade --help exited ` +
+        `${result.exitCode}${detail ? `: ${detail}` : ""}). Install Helm 3.2 or newer and ` +
+        `re-run deploy.`,
+    );
+  }
+
+  const help = `${result.stdout}\n${result.stderr}`;
+  if (!helmHelpHasFlag(help, "--create-namespace")) {
+    throw new Error(
+      `This Helm installation does not support --create-namespace. The adapter requires ` +
+        `Helm 3.2 or newer. Upgrade Helm and re-run deploy.`,
+    );
+  }
+
+  // These flags are a pair: --force-conflicts is valid only with server-side apply. If a
+  // downstream Helm build exposes only one, use its portable client-side upgrade instead
+  // of constructing an argv that the CLI cannot honor safely.
+  const serverSide = helmHelpHasFlag(help, "--server-side");
+  const forceConflicts = helmHelpHasFlag(help, "--force-conflicts");
+  return serverSide && forceConflicts ? "server-side" : "client-side";
+}
+
+export type ValkeySecretOwnership = "absent" | "owned" | "adopted";
+
+/**
+ * Migrate only the exact legacy Valkey Secret that adapter versions before Helm ownership
+ * created with `kubectl apply`. Helm's `--take-ownership` applies release-wide and can steal any
+ * colliding object, so it must never be used for this one-resource migration.
+ *
+ * The old rendered Secret has a stable identity we can prove without reading its credential
+ * data: exact name, type Opaque, and the release/component labels below. Adoption is permitted
+ * only when all three Helm ownership fields are absent. Partial or foreign ownership is an
+ * abort, not something `--overwrite` may repair. The single merge patch makes the transition
+ * atomic; if Helm later fails, a retry sees the complete current-release ownership tuple.
+ */
+export async function ensureValkeySecretHelmOwnership(
+  releaseName: string,
+  configuredNamespace?: string,
+): Promise<ValkeySecretOwnership> {
+  assertSafeReleaseName(releaseName);
+  const namespace = resolveK8sNamespace(configuredNamespace);
+  const secretName = `${releaseName}-${VALKEY_SECRET_NAME}`;
+  const result = await execCapture("kubectl", [
+    "get",
+    "secret",
+    secretName,
+    "-n",
+    namespace,
+    "--ignore-not-found",
+    "-o",
+    "jsonpath={.metadata.name}|{.type}|{.metadata.labels.app\\.kubernetes\\.io/name}|" +
+      "{.metadata.labels.app\\.kubernetes\\.io/component}|" +
+      "{.metadata.labels.app\\.kubernetes\\.io/managed-by}|" +
+      "{.metadata.annotations.meta\\.helm\\.sh/release-name}|" +
+      "{.metadata.annotations.meta\\.helm\\.sh/release-namespace}|" +
+      "{.metadata.resourceVersion}",
+  ]);
+  if (result.exitCode !== 0) {
+    const detail = sanitizeForTerminal(result.stderr.trim());
+    throw new Error(
+      `Could not inspect cache Secret ${secretName} before Helm upgrade (kubectl exited ` +
+        `${result.exitCode}${detail ? `: ${detail}` : ""}). Refusing to guess whether it is ` +
+        `safe to adopt.`,
+    );
+  }
+
+  const line = result.stdout.trim();
+  if (!line) return "absent";
+  const fields = line.split("|");
+  if (fields.length !== 8) {
+    throw new Error(
+      `Could not validate cache Secret ${secretName}: kubectl returned an unexpected identity ` +
+        `shape. Refusing to adopt it.`,
+    );
+  }
+  const [name, type, appName, component, managedBy, ownerRelease, ownerNamespace, resourceVersion] =
+    fields;
+  const identityMatches =
+    name === secretName &&
+    type === "Opaque" &&
+    appName === releaseName &&
+    component === "valkey-secret";
+  const ownedByThisRelease =
+    managedBy === "Helm" && ownerRelease === releaseName && ownerNamespace === namespace;
+  if (ownedByThisRelease) {
+    if (!identityMatches) {
+      throw new Error(
+        `Cache Secret ${secretName} has this release's Helm ownership metadata but does not ` +
+          `match the adapter's Valkey Secret identity (expected type Opaque and labels ` +
+          `app.kubernetes.io/name=${releaseName}, app.kubernetes.io/component=valkey-secret). ` +
+          `Refusing to deploy over it.`,
+      );
+    }
+    return "owned";
+  }
+
+  if (managedBy || ownerRelease || ownerNamespace) {
+    const ownership = sanitizeForTerminal(
+      JSON.stringify({ managedBy, release: ownerRelease, namespace: ownerNamespace }),
+    );
+    throw new Error(
+      `Cache Secret ${secretName} has foreign or incomplete ownership metadata ` +
+        `${ownership}. Refusing to adopt it.`,
+    );
+  }
+  if (!identityMatches) {
+    throw new Error(
+      `An unowned Secret named ${secretName} exists but is not the adapter's legacy Valkey ` +
+        `Secret (expected type Opaque and labels app.kubernetes.io/name=${releaseName}, ` +
+        `app.kubernetes.io/component=valkey-secret). Refusing to adopt it.`,
+    );
+  }
+  if (!resourceVersion) {
+    throw new Error(
+      `Could not validate cache Secret ${secretName}: kubectl returned no resourceVersion. ` +
+        `Refusing an adoption patch without an optimistic-concurrency precondition.`,
+    );
+  }
+
+  const ownershipPatch = JSON.stringify({
+    metadata: {
+      // Prevent a get→patch race from overwriting ownership or identity changed after the
+      // validation above. Kubernetes rejects a stale resourceVersion with Conflict.
+      resourceVersion,
+      labels: { "app.kubernetes.io/managed-by": "Helm" },
+      annotations: {
+        "meta.helm.sh/release-name": releaseName,
+        "meta.helm.sh/release-namespace": namespace,
+      },
+    },
+  });
+  const patched = await execCapture("kubectl", [
+    "patch",
+    "secret",
+    secretName,
+    "-n",
+    namespace,
+    "--type=merge",
+    "--field-manager=adapter-k8s-legacy-adoption",
+    "-p",
+    ownershipPatch,
+  ]);
+  if (patched.exitCode !== 0) {
+    const detail = sanitizeForTerminal(patched.stderr.trim());
+    throw new Error(
+      `Could not attach Helm ownership to validated legacy cache Secret ${secretName} ` +
+        `(kubectl exited ${patched.exitCode}${detail ? `: ${detail}` : ""}). Aborting before ` +
+        `Helm upgrade.`,
+    );
+  }
+  return "adopted";
+}
+
 export function buildHelmUpgradeArgs(options: {
   releaseName: string;
   chartPath: string;
@@ -750,6 +940,8 @@ export function buildHelmUpgradeArgs(options: {
    * /readyz — see AdapterState.readinessPathSupported.
    */
   poolHealthCheckPath?: string;
+  /** Determined from `helm upgrade --help`; defaults to the historical Helm 4 behavior. */
+  helmUpgradeMode?: HelmUpgradeMode;
 }): string[] {
   const {
     releaseName,
@@ -763,6 +955,7 @@ export function buildHelmUpgradeArgs(options: {
     nodeCidrs,
     imageDigests,
     poolHealthCheckPath,
+    helmUpgradeMode = "server-side",
   } = options;
   const namespace = resolveK8sNamespace(configuredNamespace);
   // H2: these values land in `helm --set` assignments — reject helm metacharacters
@@ -776,11 +969,7 @@ export function buildHelmUpgradeArgs(options: {
     "--install",
     releaseName,
     chartPath,
-    "--server-side=true",
-    "--force-conflicts",
-    // Cache Secrets are Helm-owned in every enabled mode. This adopts Secrets created by older
-    // adapter versions that provisioned managed-cache credentials imperatively with kubectl.
-    "--take-ownership",
+    ...(helmUpgradeMode === "server-side" ? ["--server-side=true", "--force-conflicts"] : []),
     // The release lives in the namespace init binds Workload Identity to — pin it rather
     // than installing into whatever namespace the operator's context happens to have.
     "--namespace",
@@ -1132,6 +1321,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         ".k8s-adapter/infrastructure.json.",
     );
   }
+
+  // Probe before `next build`, image pushes, credentials, or any cluster mutation. Helm 3
+  // remains a supported deployment client; only Helm 4 receives its SSA-only flags. A dry
+  // run performs no subprocess reads by contract and prints both capability-dependent forms.
+  const helmUpgradeMode = dryRun ? null : await detectHelmUpgradeMode();
 
   // 1. Run next build (adapter's onBuildComplete generates artifacts)
   if (!skipBuild) {
@@ -1723,7 +1917,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   const overridesFile = path.join(projectDir, ".k8s-adapter", "helm", "values.override.yaml");
-  const helmArgs = buildHelmUpgradeArgs({
+  const helmArgsBase = {
     releaseName,
     chartPath: path.join(outputDir, "chart"),
     buildId,
@@ -1745,6 +1939,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     ...(previousBuildId && !state?.readinessPathSupported
       ? { poolHealthCheckPath: LIVENESS_PATH_FOR_MIGRATION }
       : {}),
+  };
+  const helmArgs = buildHelmUpgradeArgs({
+    ...helmArgsBase,
+    // Dry-run's first printed form is the Helm 3 client-side command. The Helm 4 form is
+    // rendered separately at the execution site below.
+    helmUpgradeMode: helmUpgradeMode ?? "client-side",
   });
 
   const chartTemplatesDir = path.join(outputDir, "chart", "templates");
@@ -2101,7 +2301,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // 6-pre. Retain the OUTGOING build's routing manifest as a build-named snapshot
+  // 6-pre. Adopt only the exact legacy Valkey Secret that older adapter versions created
+  // imperatively. This must happen before Helm sees the chart resource: without the ownership
+  // tuple Helm correctly rejects it, while release-wide --take-ownership would also seize any
+  // unrelated colliding resource. A dry-run cannot inspect the cluster, so describe the guarded
+  // conditional instead of claiming the Secret is present or adoptable.
+  if (metadata.cacheEnabled) {
+    if (dryRun) {
+      console.log(
+        `    [dry-run] if Secret ${releaseName}-${VALKEY_SECRET_NAME} exists without Helm ` +
+          `ownership, verify its exact legacy adapter identity and atomically assign it to ` +
+          `release ${releaseName}; abort on foreign, partial, or mismatched ownership`,
+      );
+    } else {
+      const ownership = await ensureValkeySecretHelmOwnership(releaseName, namespace);
+      if (ownership === "adopted") {
+        console.log(
+          `  → Adopted validated legacy cache Secret ` +
+            `${releaseName}-${VALKEY_SECRET_NAME} into Helm release ${releaseName}`,
+        );
+      }
+    }
+  }
+
+  // 6-pre-bis. Retain the OUTGOING build's routing manifest as a build-named snapshot
   // ConfigMap BEFORE helm overwrites the stable `<release>-routing-manifest` one — the
   // routing tier is updated in place per build, and rollback re-points it at the
   // snapshot. The snapshot keys off what the routing Deployment is ACTUALLY serving
@@ -2138,7 +2361,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // 6-pre-bis (N87). Preserve the LEGACY stable-named internal dispatch Secret across this
+  // 6-pre-ter (N87). Preserve the LEGACY stable-named internal dispatch Secret across this
   // upgrade. Internal secrets are now per-BUILD (`<release>-ihs-<build>-<digest>`,
   // emit/templates/internal-secret.ts), so the first upgrade under that scheme removes
   // `<release>-internal-header-secret` from the chart — and helm prunes what the chart no
@@ -2221,7 +2444,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     await execOrThrow("helm", helmArgs);
     helmApplied = true;
   } else {
-    console.log(`    [dry-run] helm ${helmArgs.join(" ")}`);
+    const helm4Args = buildHelmUpgradeArgs({ ...helmArgsBase, helmUpgradeMode: "server-side" });
+    console.log(`    [dry-run] helm ${helmArgs.join(" ")}  # Helm 3.2–3.x, client-side upgrade`);
+    console.log(`    [dry-run] helm ${helm4Args.join(" ")}  # Helm 4+, server-side upgrade`);
   }
 
   /**
@@ -2919,8 +3144,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "-n",
         namespace,
         "--type=json",
-        // Impersonate helm as the field manager so the next helm upgrade (server-side
-        // apply, manager "helm") does not conflict on the selector field we flip here.
+        // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
+        // path that prevents the next upgrade conflicting on the selector we flip here;
+        // Helm 3's client-side merge does not enforce managed-field conflicts.
         // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
         // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
         // no conflict override.
