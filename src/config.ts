@@ -1,6 +1,7 @@
 // src/config.ts
 import type { K8sAdapterConfig, PoolConfig } from "./types.js";
 import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
+import { targetForConfig } from "./target/legacy.js";
 import {
   assertSafeHostname,
   assertSafePoolName,
@@ -198,6 +199,13 @@ export function validateConfig(input: unknown, releaseName?: string): void {
           `rollback's edge revert all key off that exact name. Rename the pool.`,
       );
     }
+    if (name === "origin") {
+      throw new Error(
+        `pool name "origin" is reserved for the portable entrypoint ` +
+          `(<release>-origin): the pool's active Service would collide with the origin ` +
+          `Service. Rename the pool.`,
+      );
+    }
     // Pool names are spliced into `${releaseName}-${poolName}-${buildId}` K8s
     // resource names (63-char cap, DNS-1123; the `-hpa`/`-hcp` suffix variants
     // truncate 4 chars earlier, at 59). releaseName is itself capped at 40, so
@@ -254,23 +262,10 @@ export function validateConfig(input: unknown, releaseName?: string): void {
   validateResources(config.routingService?.resources, "routingService");
   validateScaling(config.routingService?.scaling, "routingService");
 
-  if (!config.provider) {
-    throw new Error("provider is required in adapter config");
-  }
-
-  // Every provider needs at least one host: the Gateway's listeners and the HTTPRoute's
-  // hostname matching are both derived from it, so a host-less config renders a Gateway that
-  // matches nothing. The message names the provider actually configured rather than always
-  // saying "gke".
-  const providerKey = "gke" in config.provider ? "gke" : "generic";
-  const gatewayHosts =
-    ("gke" in config.provider
-      ? config.provider.gke?.gateway?.hosts
-      : config.provider.generic?.gateway?.hosts) ?? [];
+  const target = targetForConfig(config);
+  const gatewayHosts = [...target.exposure.hosts];
   if (gatewayHosts.length === 0) {
-    throw new Error(
-      `provider.${providerKey}.gateway.hosts is required and must contain at least one host`,
-    );
+    throw new Error("target exposure must contain at least one host");
   }
 
   for (const hostConfig of gatewayHosts) {
@@ -290,7 +285,7 @@ export function validateConfig(input: unknown, releaseName?: string): void {
   // worst outcome available: the deploy succeeds, every resource reports healthy, and the app
   // serves credentials over plaintext. Someone who wrote `tls: { enabled: true }` has stated
   // their intent; refuse rather than quietly serve something less safe than they asked for.
-  if ("generic" in config.provider) {
+  if (config.provider && "generic" in config.provider) {
     // Managed cache provisioning is Memorystore, i.e. GCP-only. `cacheManaged` is derived from
     // "enabled with no url", so a generic config that just says `cache: { enabled: true }` would
     // either fail late in the deploy or actually provision a Google resource for a cluster that
@@ -354,23 +349,25 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
       ...config.routeExtension,
     },
     containerStrategy: config.containerStrategy ?? "traced-assets",
-    // CDN defaults are a GKE concept (Cloud CDN via GCPHTTPFilter). A generic config carries
-    // no CDN block at all, so it passes through untouched rather than growing an empty one.
-    provider: !("gke" in config.provider)
-      ? config.provider
-      : {
-          ...config.provider,
-          gke: {
-            ...config.provider.gke,
-            cdn: {
-              enabled: false,
-              bucket: "",
-              cacheMode: "USE_ORIGIN_HEADERS",
-              cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
-              invalidateOnDeploy: true,
-              ...config.provider.gke.cdn,
+    // CDN defaults are a GKE concept (Cloud CDN via GCPHTTPFilter). A target composition or
+    // generic legacy config passes through without growing a cloud block.
+    ...(config.provider && "gke" in config.provider
+      ? {
+          provider: {
+            ...config.provider,
+            gke: {
+              ...config.provider.gke,
+              cdn: {
+                enabled: false,
+                bucket: "",
+                cacheMode: "USE_ORIGIN_HEADERS" as const,
+                cacheKeyHeaders: DEFAULT_CDN_CACHE_KEY_HEADERS,
+                invalidateOnDeploy: true,
+                ...config.provider.gke.cdn,
+              },
             },
           },
-        },
+        }
+      : {}),
   };
 }

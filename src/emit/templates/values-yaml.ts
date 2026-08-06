@@ -46,7 +46,7 @@ export function renderValuesYaml({
   imageRegistry: string;
 }): string {
   // Output as JSON (valid YAML) with a comment header.
-  const gke = "gke" in config.provider ? config.provider.gke : undefined;
+  const gke = config.provider && "gke" in config.provider ? config.provider.gke : undefined;
 
   // Sanitize at the point of consumption (AGENTS.md): every value below is read straight
   // out of `next.config`/the build and lands in helm values that the templates splice into

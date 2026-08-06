@@ -151,21 +151,31 @@ export type RoutingReadiness =
       requireEveryForwardingRule: true;
     };
 
-export interface RoutingPlan {
-  protocol: "envoy-ext-proc-v3";
-  failurePolicy: "open" | "closed";
-  dataplane:
-    | {
-        kind: "external-ext-proc";
-        transport: "tls" | "h2c";
-        readiness: RoutingReadiness[];
-      }
-    | {
-        kind: "adapter-owned-envoy-proxy";
+export type RoutingPlan =
+  | {
+      protocol: "pool-local-v1";
+      failurePolicy: "closed";
+      dataplane: {
+        kind: "portable-http-origin";
         service: KubernetesServiceRef;
         readiness: RoutingReadiness[];
       };
-}
+    }
+  | {
+      protocol: "envoy-ext-proc-v3";
+      failurePolicy: "open" | "closed";
+      dataplane:
+        | {
+            kind: "external-ext-proc";
+            transport: "tls" | "h2c";
+            readiness: RoutingReadiness[];
+          }
+        | {
+            kind: "adapter-owned-envoy-proxy";
+            service: KubernetesServiceRef;
+            readiness: RoutingReadiness[];
+          };
+    };
 
 export interface KubernetesOwnedObject {
   ref: KubernetesObjectRef;
@@ -279,6 +289,34 @@ export interface KubernetesApiRequirement {
   optional: boolean;
 }
 
+export type KubernetesJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | KubernetesJsonValue[]
+  | { [key: string]: KubernetesJsonValue };
+
+/** A build-time Kubernetes object. Hooks emit JSON data, never raw YAML or runtime callbacks. */
+export interface KubernetesManifest {
+  apiVersion: string;
+  kind: string;
+  /** Kubernetes API resource name used for discovery and exact cleanup. */
+  resource: string;
+  metadata: {
+    name: string;
+    namespace?: string;
+    labels?: Record<string, string>;
+    annotations?: Record<string, string>;
+  };
+  body?: Record<string, KubernetesJsonValue>;
+}
+
+export interface KubernetesResourcePlan {
+  objects: KubernetesManifest[];
+  readiness: RoutingReadiness[];
+}
+
 export interface CompositionPlanV1 {
   apiVersion: typeof COMPOSITION_PLAN_API_VERSION;
   kind: typeof COMPOSITION_PLAN_KIND;
@@ -300,6 +338,7 @@ export interface CompositionPlanV1 {
     };
   };
   operations: {
+    resources: KubernetesResourcePlan;
     network: NetworkPlan;
     cache: CacheProvisioning;
     cdn: CdnInvalidation;

@@ -42,6 +42,7 @@ function basePlan(): Record<string, unknown> {
       },
     },
     operations: {
+      resources: { objects: [], readiness: [] },
       network: {
         podCidrs: { kind: "not-required" },
         nodeCidrs: { kind: "kubernetes-node-addresses", addressTypes: ["InternalIP"] },
