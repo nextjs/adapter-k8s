@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture, execCaptureStdin, execOrThrow } from "./exec.js";
-import { readState, writeState } from "./state.js";
+import { readState, writeState, type AdapterState } from "./state.js";
 import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import {
@@ -39,6 +39,7 @@ import {
   loadDeployedCompositionPlan,
   loadProjectCompositionPlan,
   preflightCompositionPlan,
+  type LoadedCompositionPlan,
   waitForCompositionPlanReadiness,
 } from "./composition-plan.js";
 
@@ -48,6 +49,59 @@ import {
 // detect that and refuse to clobber a different build's manifest (deploy also guards
 // the composed names up front — this is defense in depth at the point of overwrite).
 export const SNAPSHOT_BUILD_ID_ANNOTATION = "adapter-k8s/build-id";
+
+type RollbackCompositionRole = "current" | "target";
+
+/**
+ * A checkout may contain either side of a two-way rollback. Bind its plan to the matching
+ * committed anchor instead of assuming the local artifact is always the currently served build.
+ */
+export function classifyLocalRollbackComposition(options: {
+  local: LoadedCompositionPlan;
+  state: Pick<AdapterState, "buildId" | "previousBuildId" | "compositionPlans">;
+  releaseName: string;
+  namespace: string;
+}): RollbackCompositionRole {
+  const { local, state, releaseName, namespace } = options;
+  const localBuildId = local.plan.metadata.buildId;
+  const role: RollbackCompositionRole =
+    localBuildId === state.buildId
+      ? "current"
+      : localBuildId === state.previousBuildId
+        ? "target"
+        : (() => {
+            throw new Error(
+              `The local composition plan belongs to build ${localBuildId}, but rollback only ` +
+                `recognizes current build ${state.buildId} and target build ` +
+                `${state.previousBuildId ?? "<none>"}. Restore either retained build artifact.`,
+            );
+          })();
+
+  assertCompositionPlanInvocation(local.plan, {
+    releaseName,
+    namespace,
+    buildId: localBuildId,
+  });
+
+  const anchor = state.compositionPlans?.[localBuildId];
+  if (role === "target" && !anchor) {
+    throw new Error(
+      `The local composition plan belongs to rollback target ${localBuildId}, but committed ` +
+        `deploy state has no trust anchor for that build. Restore the currently deployed ` +
+        `build artifact before rolling back.`,
+    );
+  }
+  if (
+    anchor &&
+    (local.digest !== anchor.digest || local.plan.target.fingerprint !== anchor.targetFingerprint)
+  ) {
+    throw new Error(
+      `The local composition plan for ${localBuildId} does not match committed deploy state. ` +
+        `Restore that build artifact before rolling back.`,
+    );
+  }
+  return role;
+}
 
 interface RoutingServingConfig {
   /**
@@ -970,30 +1024,19 @@ export async function runRollback(options: {
   }
 
   const { buildId: currentBuildId, previousBuildId } = state;
-  if (localComposition) {
-    assertCompositionPlanInvocation(localComposition.plan, {
-      releaseName,
-      namespace,
-      buildId: currentBuildId,
-    });
-  }
-
   const currentAnchor = state.compositionPlans?.[currentBuildId];
   const targetAnchor = state.compositionPlans?.[previousBuildId];
-  if (
-    currentAnchor &&
-    localComposition &&
-    (localComposition.digest !== currentAnchor.digest ||
-      localComposition.plan.target.fingerprint !== currentAnchor.targetFingerprint)
-  ) {
-    throw new Error(
-      `The local composition plan for ${currentBuildId} does not match committed deploy state. ` +
-        `Restore the deployed build artifact before rolling back.`,
-    );
-  }
+  const localCompositionRole = localComposition
+    ? classifyLocalRollbackComposition({
+        local: localComposition,
+        state,
+        releaseName,
+        namespace,
+      })
+    : null;
   const currentComposition =
     !dryRun && currentAnchor
-      ? localComposition?.plan.metadata.buildId === currentBuildId
+      ? localCompositionRole === "current"
         ? localComposition
         : await loadDeployedCompositionPlan({
             releaseName,
@@ -1001,16 +1044,22 @@ export async function runRollback(options: {
             buildId: currentBuildId,
             expected: currentAnchor,
           })
-      : localComposition;
+      : localCompositionRole === "current"
+        ? localComposition
+        : null;
   const targetComposition =
     !dryRun && targetAnchor
-      ? await loadDeployedCompositionPlan({
-          releaseName,
-          namespace,
-          buildId: previousBuildId,
-          expected: targetAnchor,
-        })
-      : null;
+      ? localCompositionRole === "target"
+        ? localComposition
+        : await loadDeployedCompositionPlan({
+            releaseName,
+            namespace,
+            buildId: previousBuildId,
+            expected: targetAnchor,
+          })
+      : localCompositionRole === "target"
+        ? localComposition
+        : null;
   if (!dryRun && currentAnchor && !currentComposition) {
     throw new Error(
       `Committed state requires a composition plan for current build ${currentBuildId}, but its ` +

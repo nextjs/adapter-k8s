@@ -14,6 +14,7 @@ vi.mock("../../src/cli/cdn-invalidate.js");
 vi.mock("node:fs");
 
 import {
+  classifyLocalRollbackComposition,
   planRollbackCapacity,
   readRoutingServingConfig,
   revertRoutingServiceToBuild,
@@ -22,6 +23,7 @@ import {
   ROLLBACK_MIN_REPLICAS,
   SNAPSHOT_BUILD_ID_ANNOTATION,
 } from "../../src/cli/rollback.js";
+import type { LoadedCompositionPlan } from "../../src/cli/composition-plan.js";
 import { execCapture, execCaptureStdin, execOrThrow } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
@@ -50,6 +52,88 @@ const cdnFilter = path.join(
   "templates",
   "cdn-http-filter.yaml",
 );
+
+const PLAN_DIGEST_N = `sha256:${"a".repeat(64)}` as const;
+const PLAN_DIGEST_M = `sha256:${"b".repeat(64)}` as const;
+const TARGET_FINGERPRINT = `sha256:${"c".repeat(64)}` as const;
+
+function loadedComposition(buildId: string, digest: `sha256:${string}`): LoadedCompositionPlan {
+  return {
+    digest,
+    source: `/plans/${buildId}.json`,
+    plan: {
+      metadata: {
+        version: 1,
+        releaseName: RELEASE,
+        namespace: "default",
+        buildId,
+      },
+      target: { fingerprint: TARGET_FINGERPRINT },
+    } as LoadedCompositionPlan["plan"],
+  };
+}
+
+describe("classifyLocalRollbackComposition", () => {
+  const compositionPlans = {
+    buildn: { digest: PLAN_DIGEST_N, targetFingerprint: TARGET_FINGERPRINT },
+    buildm: { digest: PLAN_DIGEST_M, targetFingerprint: TARGET_FINGERPRINT },
+  };
+
+  it("accepts the rollback target artifact after state has swapped", () => {
+    expect(
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildn", PLAN_DIGEST_N),
+        state: { buildId: "buildm", previousBuildId: "buildn", compositionPlans },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toBe("target");
+  });
+
+  it("accepts the current artifact for states that predate plan anchors", () => {
+    expect(
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildm", PLAN_DIGEST_M),
+        state: { buildId: "buildm", previousBuildId: "buildn" },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toBe("current");
+  });
+
+  it("rejects an unanchored target artifact", () => {
+    expect(() =>
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildn", PLAN_DIGEST_N),
+        state: { buildId: "buildm", previousBuildId: "buildn" },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/no trust anchor/i);
+  });
+
+  it("rejects artifacts outside the two retained builds", () => {
+    expect(() =>
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildx", PLAN_DIGEST_N),
+        state: { buildId: "buildm", previousBuildId: "buildn", compositionPlans },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/only recognizes current build buildm and target build buildn/i);
+  });
+
+  it("rejects a retained build artifact that does not match its committed anchor", () => {
+    expect(() =>
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildn", PLAN_DIGEST_M),
+        state: { buildId: "buildm", previousBuildId: "buildn", compositionPlans },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/does not match committed deploy state/i);
+  });
+});
 
 /** execCapture stub: success everywhere except optionally the service selector patch. */
 function capture(patchFails: boolean) {
