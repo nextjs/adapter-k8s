@@ -3,7 +3,11 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { renderActiveService, renderService } from "../../../src/emit/templates/service.js";
+import {
+  renderActiveService,
+  renderOriginService,
+  renderService,
+} from "../../../src/emit/templates/service.js";
 import {
   findBuildIdNameCollision,
   findEmittedNameCollision,
@@ -69,6 +73,27 @@ describe("renderService (versioned)", () => {
     expect(() =>
       renderService({ poolName: "ssr", buildId: 'a"\nx: y', releaseName: "my-app" }),
     ).toThrow(/Invalid buildId/);
+  });
+});
+
+describe("renderOriginService (portable entrypoint)", () => {
+  it("selects the active default-pool pods through one stable Service", () => {
+    const yaml = renderOriginService({ poolName: "default", releaseName: "my-app" });
+    expect(yaml).toContain("name: my-app-origin");
+    expect(yaml).toContain('app.kubernetes.io/component: "default"');
+    expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
+    expect(yaml).toContain("port: 3000");
+    expect(yaml).not.toContain("kind: Deployment");
+    expect(yaml).not.toContain("kind: HorizontalPodAutoscaler");
+  });
+
+  it("validates release and pool names at the template boundary", () => {
+    expect(() => renderOriginService({ poolName: "default", releaseName: "BAD" })).toThrow(
+      /Invalid releaseName/,
+    );
+    expect(() => renderOriginService({ poolName: "-bad", releaseName: "my-app" })).toThrow(
+      /Invalid pool name/,
+    );
   });
 });
 

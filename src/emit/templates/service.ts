@@ -1,5 +1,6 @@
 // src/emit/templates/service.ts
 import {
+  ADAPTER_RELEASE_LABEL,
   sanitizeK8sName,
   assertSafeBuildId,
   assertSafePoolName,
@@ -47,6 +48,35 @@ spec:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: "${poolName}"
     app.kubernetes.io/version: "${safeBuildId}"
+  ports:
+    - port: 3000
+      targetPort: 3000
+`;
+}
+
+/** Stable portable entrypoint. Every generic exposure targets this Service. */
+export function renderOriginService({
+  releaseName,
+  poolName,
+}: {
+  releaseName: string;
+  poolName: string;
+}): string {
+  assertSafeReleaseName(releaseName);
+  assertSafePoolName(poolName);
+  return `apiVersion: v1
+kind: Service
+metadata:
+  name: ${sanitizeK8sName(`${releaseName}-origin`)}
+  labels:
+    ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: origin
+spec:
+  selector:
+    app.kubernetes.io/name: "${releaseName}"
+    app.kubernetes.io/component: "${poolName}"
+    app.kubernetes.io/version: "{{ .Values.activeBuildId }}"
   ports:
     - port: 3000
       targetPort: 3000

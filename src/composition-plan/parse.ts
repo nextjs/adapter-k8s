@@ -21,6 +21,8 @@ import {
   type ExternalCleanupOperation,
   type GcpLocation,
   type KubernetesApiRequirement,
+  type KubernetesJsonValue,
+  type KubernetesManifest,
   type KubernetesObjectRef,
   type KubernetesOwnedObject,
   type KubernetesServiceRef,
@@ -502,10 +504,30 @@ function parseRoutingReadiness(value: unknown, path: string): RoutingReadiness {
 function parseRouting(value: unknown, path: string): RoutingPlan {
   const parsed = object(value, path);
   exactKeys(parsed, ["protocol", "failurePolicy", "dataplane"], path);
+  const protocol = oneOf(
+    parsed.protocol,
+    ["pool-local-v1", "envoy-ext-proc-v3"] as const,
+    `${path}.protocol`,
+  );
   const dataplane = object(parsed.dataplane, `${path}.dataplane`);
   const kind = string(dataplane.kind, `${path}.dataplane.kind`);
   const readiness = (raw: unknown) =>
     array(raw, `${path}.dataplane.readiness`, parseRoutingReadiness, 64);
+  if (protocol === "pool-local-v1") {
+    if (kind !== "portable-http-origin") {
+      fail(`${path}.dataplane.kind`, 'pool-local-v1 requires "portable-http-origin"');
+    }
+    exactKeys(dataplane, ["kind", "service", "readiness"], `${path}.dataplane`);
+    return {
+      protocol,
+      failurePolicy: literal(parsed.failurePolicy, "closed", `${path}.failurePolicy`),
+      dataplane: {
+        kind,
+        service: parseKubernetesServiceRef(dataplane.service, `${path}.dataplane.service`),
+        readiness: readiness(dataplane.readiness),
+      },
+    };
+  }
   let parsedDataplane: RoutingPlan["dataplane"];
   switch (kind) {
     case "external-ext-proc":
@@ -532,7 +554,7 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
       fail(`${path}.dataplane.kind`, `unknown routing dataplane operation ${JSON.stringify(kind)}`);
   }
   return {
-    protocol: literal(parsed.protocol, "envoy-ext-proc-v3", `${path}.protocol`),
+    protocol,
     failurePolicy: oneOf(
       parsed.failurePolicy,
       ["open", "closed"] as const,
@@ -833,6 +855,91 @@ function parseKubernetesRequirement(value: unknown, path: string): KubernetesApi
   return { apiVersion, resource, optional: parsed.optional };
 }
 
+function parseKubernetesJson(value: unknown, path: string, depth = 0): KubernetesJsonValue {
+  if (depth > 64) fail(path, "exceeded maximum Kubernetes object depth of 64");
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) fail(path, "expected a finite JSON number");
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 1024) fail(path, "expected at most 1024 array entries");
+    return value.map((entry, index) => parseKubernetesJson(entry, `${path}[${index}]`, depth + 1));
+  }
+  const parsed = object(value, path);
+  const result: Record<string, KubernetesJsonValue> = {};
+  for (const [entryKey, entry] of Object.entries(parsed)) {
+    result[entryKey] = parseKubernetesJson(entry, `${path}.${entryKey}`, depth + 1);
+  }
+  return result;
+}
+
+function parseStringMap(value: unknown, path: string): Record<string, string> {
+  const parsed = object(value, path);
+  const result: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(parsed)) {
+    if (!isSafeMapKey(key) || typeof entry !== "string") {
+      fail(path, "expected printable string keys and string values");
+    }
+    result[key] = safeText(entry, `${path}.${key}`, 4096);
+  }
+  return result;
+}
+
+function isSafeMapKey(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 253 &&
+    ![...value].some((character) => {
+      const codePoint = character.codePointAt(0)!;
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    })
+  );
+}
+
+function parseKubernetesManifest(value: unknown, path: string): KubernetesManifest {
+  const parsed = object(value, path);
+  exactKeys(parsed, ["apiVersion", "kind", "resource", "metadata", "body"], path);
+  const apiVersion = string(parsed.apiVersion, `${path}.apiVersion`);
+  if (!API_VERSION_RE.test(apiVersion)) fail(`${path}.apiVersion`, "invalid Kubernetes apiVersion");
+  const kind = safeText(parsed.kind, `${path}.kind`, 63);
+  if (!/^[A-Z][A-Za-z0-9]*$/.test(kind)) fail(`${path}.kind`, "invalid Kubernetes kind");
+  if (kind === "Secret") {
+    fail(`${path}.kind`, "build-time resource hooks cannot emit Secrets into composition plans");
+  }
+  const resource = string(parsed.resource, `${path}.resource`);
+  if (!RESOURCE_RE.test(resource)) fail(`${path}.resource`, "invalid Kubernetes resource name");
+  const metadata = object(parsed.metadata, `${path}.metadata`);
+  exactKeys(metadata, ["name", "namespace", "labels", "annotations"], `${path}.metadata`);
+  const name = string(metadata.name, `${path}.metadata.name`);
+  if (!DNS_SUBDOMAIN_RE.test(name)) fail(`${path}.metadata.name`, "invalid Kubernetes object name");
+  const namespace = optionalString(metadata, "namespace", `${path}.metadata`, assertSafeNamespace);
+  const labels = Object.hasOwn(metadata, "labels")
+    ? parseStringMap(metadata.labels, `${path}.metadata.labels`)
+    : undefined;
+  const annotations = Object.hasOwn(metadata, "annotations")
+    ? parseStringMap(metadata.annotations, `${path}.metadata.annotations`)
+    : undefined;
+  const body = Object.hasOwn(parsed, "body")
+    ? (parseKubernetesJson(parsed.body, `${path}.body`) as Record<string, KubernetesJsonValue>)
+    : undefined;
+  if (body && ["apiVersion", "kind", "metadata", "status"].some((key) => key in body)) {
+    fail(`${path}.body`, "cannot replace identity fields or declare status");
+  }
+  return {
+    apiVersion,
+    kind,
+    resource,
+    metadata: {
+      name,
+      ...(namespace ? { namespace } : {}),
+      ...(labels ? { labels } : {}),
+      ...(annotations ? { annotations } : {}),
+    },
+    ...(body ? { body } : {}),
+  };
+}
+
 function parseVersion(version: string, path: string): [number, number, number] {
   const match = /^(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
   if (!match) fail(path, "expected a semantic version such as 1.33.0");
@@ -909,9 +1016,11 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
   const operations = object(parsed.operations, "$.operations");
   exactKeys(
     operations,
-    ["network", "cache", "cdn", "routing", "cleanup", "diagnostics", "logs"],
+    ["resources", "network", "cache", "cdn", "routing", "cleanup", "diagnostics", "logs"],
     "$.operations",
   );
+  const resourceOperations = object(operations.resources, "$.operations.resources");
+  exactKeys(resourceOperations, ["objects", "readiness"], "$.operations.resources");
 
   const releaseName = validated(
     metadata.releaseName,
@@ -942,6 +1051,18 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
       },
     },
     operations: {
+      resources: {
+        objects: array(
+          resourceOperations.objects,
+          "$.operations.resources.objects",
+          parseKubernetesManifest,
+        ),
+        readiness: array(
+          resourceOperations.readiness,
+          "$.operations.resources.readiness",
+          parseRoutingReadiness,
+        ),
+      },
       network: parseNetwork(operations.network, "$.operations.network"),
       cache: parseCache(operations.cache, "$.operations.cache"),
       cdn: parseCdn(operations.cdn, "$.operations.cdn"),
@@ -958,6 +1079,12 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
       "$.operations.cleanup.kubernetes.contributedObjects",
       plan.operations.cleanup.kubernetes.contributedObjects
         .map((entry) => entry.ref.namespace)
+        .filter((entry): entry is string => entry !== undefined),
+    ],
+    [
+      "$.operations.resources.objects",
+      plan.operations.resources.objects
+        .map((entry) => entry.metadata.namespace)
         .filter((entry): entry is string => entry !== undefined),
     ],
   ] as const) {

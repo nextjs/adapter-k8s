@@ -1,0 +1,36 @@
+export {
+  defineExposureComponent,
+  defineResourceComponent,
+  defineTarget,
+  envoyNativeRouting,
+  gatewayApiExposure,
+  gkeCluster,
+  gkeNativeRouting,
+  ingressExposure,
+  kubernetesCluster,
+  manualExposure,
+  portableRouting,
+} from "./components.js";
+export type { GatewayApiExposureOptions, IngressExposureOptions } from "./components.js";
+export { compileTarget } from "./compiler.js";
+export { targetForConfig, targetHosts } from "./legacy.js";
+export type {
+  ClusterBuildResult,
+  ClusterComponent,
+  CompiledKubernetesTarget,
+  DefineTargetOptions,
+  ExposureBuildContext,
+  ExposureBuildResult,
+  ExposureCapability,
+  ExposureComponent,
+  ExposureRequirement,
+  GkeClusterOptions,
+  IngressSourceSet,
+  KubernetesClusterOptions,
+  KubernetesContribution,
+  KubernetesTargetDefinition,
+  ResourceComponent,
+  RoutingBuildResult,
+  RoutingComponent,
+  TargetBuildContext,
+} from "./types.js";
