@@ -205,6 +205,90 @@ describe("Kubernetes target composition", () => {
     ).toBe(false);
   });
 
+  it("rejects an Envoy policy targeting a Gateway in another namespace", () => {
+    const exposure = defineExposureComponent({
+      name: "shared-gateway",
+      hosts,
+      build() {
+        return {
+          ingressSources: { cidrs: [], podSelectors: [] },
+          capabilities: [
+            {
+              kind: "gateway-api",
+              className: "eg",
+              gateway: {
+                apiVersion: "gateway.networking.k8s.io/v1",
+                resource: "gateways",
+                name: "shared-edge",
+                namespace: "edge-system",
+              },
+              applicationRoutes: [
+                {
+                  apiVersion: "gateway.networking.k8s.io/v1",
+                  resource: "httproutes",
+                  name: "custom-app-route",
+                  namespace: "apps",
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure,
+          routing: envoyNativeRouting(),
+        }),
+        context(),
+      ),
+    ).toThrow(/cannot target Gateway "edge-system\/shared-edge".*namespace-local/i);
+  });
+
+  it("rejects an Envoy policy targeting an HTTPRoute in another namespace", () => {
+    const exposure = defineExposureComponent({
+      name: "shared-route",
+      hosts,
+      build() {
+        return {
+          ingressSources: { cidrs: [], podSelectors: [] },
+          capabilities: [
+            {
+              kind: "gateway-api",
+              className: "eg",
+              gateway: {
+                apiVersion: "gateway.networking.k8s.io/v1",
+                resource: "gateways",
+                name: "shared-edge",
+                namespace: "apps",
+              },
+              applicationRoutes: [
+                {
+                  apiVersion: "gateway.networking.k8s.io/v1",
+                  resource: "httproutes",
+                  name: "custom-app-route",
+                  namespace: "edge-system",
+                },
+              ],
+            },
+          ],
+        };
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure,
+          routing: envoyNativeRouting(),
+        }),
+        context(),
+      ),
+    ).toThrow(/cannot target HTTPRoute "edge-system\/custom-app-route".*namespace-local/i);
+  });
+
   it("keeps GKE-native routing explicit and derives release resource names without sentinels", () => {
     const tlsHosts = [{ hostname: "app.example.com", tls: { enabled: true } }];
     const compiled = compileTarget(

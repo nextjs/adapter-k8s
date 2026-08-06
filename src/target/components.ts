@@ -95,6 +95,18 @@ function gatewayCapability(
       `Routing component "${routingName}" requires at least one application HTTPRoute`,
     );
   }
+  for (const [kind, ref] of [
+    ["Gateway", capability.gateway],
+    ...capability.applicationRoutes.map((route) => ["HTTPRoute", route] as const),
+  ] as const) {
+    if (ref.namespace && ref.namespace !== context.namespace) {
+      throw new Error(
+        `Routing component "${routingName}" cannot target ${kind} ` +
+          `"${ref.namespace}/${ref.name}" from namespace "${context.namespace}": ` +
+          "Envoy Gateway policy targetRefs are namespace-local",
+      );
+    }
+  }
   return capability;
 }
 
