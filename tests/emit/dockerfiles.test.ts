@@ -2,6 +2,8 @@
 import { describe, it, expect } from "vitest";
 import {
   generateDockerfile,
+  generateLayeredPoolDockerfile,
+  generatePoolBaseDockerfile,
   generatePoolDockerfile,
   generateRoutingServiceDockerfile,
   DEFAULT_EMITTED_NODE_VERSION,
@@ -168,6 +170,36 @@ describe("generatePoolDockerfile", () => {
   });
 });
 
+describe("shared pool image layers", () => {
+  it("installs dependencies once in a reusable base before copying build content", () => {
+    const result = generatePoolBaseDockerfile({
+      buildId: "abc123",
+      installSharpVersion: "0.34.5",
+    });
+    expect(result).toContain("FROM node:24-slim");
+    expect(result).toContain("COPY --chown=node:node dependencies/ .");
+    expect(result).toContain("COPY --chown=node:node content/ .");
+    expect(result).toContain("COPY --chown=node:node fetch-cache/ .");
+    expect(result.indexOf("dependencies/ .")).toBeLessThan(result.indexOf("RUN npm install"));
+    expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("content/ ."));
+    expect(result.indexOf("content/ .")).toBeLessThan(result.indexOf("fetch-cache/ ."));
+    expect(result).not.toContain("POOL_NAME");
+    expect(result).toContain('CMD ["node", "pool-server.cjs"]');
+  });
+
+  it("emits a thin pool image whose parent is supplied by the deploy step", () => {
+    const result = generateLayeredPoolDockerfile({ poolName: "api", buildId: "abc123" });
+    expect(result).toContain(
+      "ARG POOL_BASE_IMAGE=localhost/adapter-k8s-pool-base-required--update-cli:latest\n" +
+        "FROM ${POOL_BASE_IMAGE}\n",
+    );
+    expect(result).toContain("COPY --chown=node:node context/ .");
+    expect(result).toContain("ENV POOL_NAME=api");
+    expect(result).not.toContain("node:24-slim");
+    expect(result).not.toContain("npm install");
+  });
+});
+
 describe("generateRoutingServiceDockerfile", () => {
   it("generates a Dockerfile for the routing service", () => {
     const result = generateRoutingServiceDockerfile({ buildId: "abc123" });
@@ -178,6 +210,9 @@ describe("generateRoutingServiceDockerfile", () => {
     expect(result).toContain("COPY --chown=node:node context/ .");
     expect(result).toContain("USER node");
     expect(result).not.toContain("POOL_NAME");
+    expect(result.indexOf("apt-get install")).toBeLessThan(
+      result.indexOf("COPY --chown=node:node context/ ."),
+    );
   });
 
   it("does not bake a TLS cert into the image — the runtime generates one under /tmp/tls", () => {

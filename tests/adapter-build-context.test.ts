@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync
 import os from "node:os";
 import path from "node:path";
 import { createK8sAdapter } from "../src/adapter.js";
-import { mockOutputs, mockAppPage, mockRouting } from "./helpers/mock-outputs.js";
+import { mockOutputs, mockAppPage, mockAppRoute, mockRouting } from "./helpers/mock-outputs.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 
 const validConfig: K8sAdapterConfig = {
@@ -192,6 +192,50 @@ describe("CEL public-file handling (N40, post-exclusion-removal)", () => {
 });
 
 describe("pool build context staging", () => {
+  it("emits one shared runtime base and thin, disjoint deltas for multiple pools", async () => {
+    seedProject();
+    const route = writeFile(".next/server/app/api/hello/route.js", "module.exports={}");
+    const ctx = ctxFor() as any;
+    ctx.outputs.appRoutes = [mockAppRoute({ pathname: "/api/hello", filePath: route, assets: {} })];
+    const config: K8sAdapterConfig = {
+      ...structuredClone(validConfig),
+      pools: {
+        web: { routes: ["appPages"] },
+        api: { routes: ["appRoutes"] },
+      },
+    };
+
+    await createK8sAdapter(config).onBuildComplete!(ctx);
+
+    const output = path.join(projectDir, ".k8s-adapter/output");
+    expect(
+      existsSync(path.join(output, "pool-base/dependencies/node_modules/next/package.json")),
+    ).toBe(true);
+    expect(
+      existsSync(
+        path.join(output, "pool-base/content/.next/server/chunks/[root-of-the-server]__abc.js"),
+      ),
+    ).toBe(true);
+    expect(
+      existsSync(path.join(output, "pool-base/fetch-cache/.k8s-adapter/fetch-cache-seed/entry")),
+    ).toBe(true);
+    expect(existsSync(path.join(output, "pools/web/context/.next/server/app/page.js"))).toBe(true);
+    expect(
+      existsSync(path.join(output, "pools/api/context/.next/server/app/api/hello/route.js")),
+    ).toBe(true);
+    expect(existsSync(path.join(output, "pools/api/context/.next/server/app/page.js"))).toBe(false);
+    expect(
+      existsSync(path.join(output, "pools/web/context/.next/server/app/api/hello/route.js")),
+    ).toBe(false);
+    expect(readFileSync(path.join(output, "pools/web/Dockerfile"), "utf8")).toContain(
+      "FROM ${POOL_BASE_IMAGE}",
+    );
+    expect(readFileSync(path.join(output, "pool-base/Dockerfile"), "utf8")).toContain(
+      "COPY --chown=node:node dependencies/ .",
+    );
+    expect(JSON.parse(outputFile("build-metadata.json")).poolImageLayout).toBe("shared-base-v1");
+  });
+
   it("stages handler, traced assets, chunks, public files, next and @next/routing", async () => {
     const { chunk } = seedProject();
     await build({ handlerAssets: { ".next/server/app/page.js.nft.json": chunk } });
@@ -206,6 +250,22 @@ describe("pool build context staging", () => {
     expect(JSON.parse(readFileSync(poolContext("package.json"), "utf-8"))).toEqual({
       type: "commonjs",
     });
+  });
+
+  it("drops traced Sharp packages for other platforms but retains the selected Linux pair", async () => {
+    seedProject();
+    const darwin = writeFile("node_modules/@img/sharp-darwin-arm64/lib/sharp.node", "darwin");
+    const linux = writeFile("node_modules/@img/sharp-linux-x64/lib/sharp.node", "linux");
+
+    await build({
+      handlerAssets: {
+        "node_modules/@img/sharp-darwin-arm64/lib/sharp.node": darwin,
+        "node_modules/@img/sharp-linux-x64/lib/sharp.node": linux,
+      },
+    });
+
+    expect(existsSync(poolContext("node_modules/@img/sharp-darwin-arm64"))).toBe(false);
+    expect(existsSync(poolContext("node_modules/@img/sharp-linux-x64/lib/sharp.node"))).toBe(true);
   });
 
   // `next` is the APP's dependency: the staged copy must be the version the app builds

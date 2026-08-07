@@ -1,6 +1,7 @@
 // src/cli/deploy.ts
 import path from "node:path";
 import { isIP } from "node:net";
+import { createHash } from "node:crypto";
 import { infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import {
   chmodSync,
@@ -83,6 +84,11 @@ import {
 } from "../target-platform.js";
 import type { GcloudCommand } from "./init.js";
 import type { RegistryAuthentication, RegistryDigestLookup } from "../composition-plan/index.js";
+import {
+  parsePoolImageLayout,
+  SHARED_POOL_IMAGE_LAYOUT,
+  type PoolImageLayout,
+} from "../pool-image-layout.js";
 import {
   assertCompositionPlanInvocation,
   compositionPlanNeedsExplicitConfirmation,
@@ -308,6 +314,7 @@ export interface DockerCommandOptions {
   registry: string;
   outputDir: string;
   containerStrategy: "traced-assets" | "shared-image";
+  poolImageLayout?: PoolImageLayout;
   /**
    * S24: which container CLI to shell out to. Defaults to docker for compatibility; the
    * deploy resolves the real one via resolveContainerCli(). Every verb used here — build,
@@ -344,7 +351,12 @@ export interface DockerCommandOptions {
 export function refreshFetchCacheStaging(
   projectDir: string,
   outputDir: string,
-  metadata: { distDir?: unknown; pools: string[]; containerStrategy: string },
+  metadata: {
+    distDir?: unknown;
+    pools: string[];
+    containerStrategy: string;
+    poolImageLayout?: unknown;
+  },
 ): void {
   // Validate at the point of consumption: distDir comes from build-metadata.json, which is
   // build-controlled. The same escape S20 rejects at build time is rejected here — the dest
@@ -357,6 +369,18 @@ export function refreshFetchCacheStaging(
         `project-relative path inside the project (S20). Re-run the build.`,
     );
   }
+  const poolImageLayout = parsePoolImageLayout(metadata.poolImageLayout);
+  if (poolImageLayout === SHARED_POOL_IMAGE_LAYOUT) {
+    // An older CLI does not understand the layout: it refreshes every pool delta, then the
+    // sentinel FROM fails. A retry with this CLI must remove those seeds because the child
+    // COPY overlays its parent and would otherwise shadow every later base refresh.
+    for (const pool of metadata.pools) {
+      rmSync(path.join(outputDir, "pools", pool, "context", ".k8s-adapter", "fetch-cache-seed"), {
+        recursive: true,
+        force: true,
+      });
+    }
+  }
   const src = path.join(projectDir, distDirRel, "cache", "fetch-cache");
   // Observable either way (M1 spirit): the silent-return variant of this function cost a
   // debugging round — an image shipped without the files and nothing said which of the two
@@ -368,7 +392,9 @@ export function refreshFetchCacheStaging(
   const contexts =
     metadata.containerStrategy === "shared-image"
       ? [path.join(outputDir, "shared-context")]
-      : metadata.pools.map((pool) => path.join(outputDir, "pools", pool, "context"));
+      : poolImageLayout === SHARED_POOL_IMAGE_LAYOUT
+        ? [path.join(outputDir, "pool-base", "fetch-cache")]
+        : metadata.pools.map((pool) => path.join(outputDir, "pools", pool, "context"));
   for (const context of contexts) {
     // A context can legitimately be absent (ADAPTER_K8S_SKIP_STAGING builds have no
     // contexts, and those deploys never reach the docker step anyway).
@@ -394,6 +420,10 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
     "Docker target platform",
   )}`;
   const commands: GcloudCommand[] = [];
+  const poolImageLayout = parsePoolImageLayout(
+    options.poolImageLayout,
+    "Docker command poolImageLayout",
+  );
 
   // 0. Registry authentication — ONLY for Google registries.
   //
@@ -439,12 +469,37 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
       args: ["push", tag],
     });
   } else {
+    let poolBaseTag: string | undefined;
+    if (poolImageLayout === SHARED_POOL_IMAGE_LAYOUT) {
+      const localTag = createHash("sha256")
+        .update(`${registry}\0${buildId}`)
+        .digest("hex")
+        .slice(0, 24);
+      poolBaseTag = `localhost/adapter-k8s-pool-base:${localTag}`;
+      commands.push({
+        description: "Build shared pool base",
+        command: cli,
+        args: ["build", platformArg, "-t", poolBaseTag, `${outputDir}/pool-base`],
+      });
+      commands.push({
+        description: "Verify shared pool base is visible in the container CLI image store",
+        command: cli,
+        args: ["image", "inspect", poolBaseTag],
+      });
+    }
     for (const pool of pools) {
       const tag = `${registry}/nextjs-app-${pool}:${buildId}`;
       commands.push({
         description: `Build ${pool} image`,
         command: cli,
-        args: ["build", platformArg, "-t", tag, `${outputDir}/pools/${pool}`],
+        args: [
+          "build",
+          platformArg,
+          ...(poolBaseTag ? ["--build-arg", `POOL_BASE_IMAGE=${poolBaseTag}`] : []),
+          "-t",
+          tag,
+          `${outputDir}/pools/${pool}`,
+        ],
       });
       commands.push({
         description: `Push ${pool} image`,
@@ -2015,6 +2070,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // 3. Read adapter config to determine container strategy
   // Default to traced-assets if not specified
   const containerStrategy = metadata.containerStrategy ?? "traced-assets";
+  const poolImageLayout = parsePoolImageLayout(metadata.poolImageLayout);
 
   // 4. Docker build + push
   // S7/S23: filled in below by resolveDeployImageDigests, for BOTH the push and --skip-push
@@ -2029,6 +2085,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         distDir: metadata.distDir,
         pools,
         containerStrategy,
+        poolImageLayout,
       });
     }
     const dockerCommands = buildDockerCommands({
@@ -2037,6 +2094,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       registry: infra.containerRegistry,
       outputDir: outputDirRelative,
       containerStrategy,
+      ...(poolImageLayout ? { poolImageLayout } : {}),
       containerCli,
       targetPlatform: builtTargetPlatform,
       ...(compositionSnapshot

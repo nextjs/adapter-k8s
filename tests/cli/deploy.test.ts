@@ -88,6 +88,48 @@ describe("refreshFetchCacheStaging", () => {
     expect(existsSync(path.join(base, "stale"))).toBe(false);
   });
 
+  it("copies once into the shared pool base for the layered traced-assets layout", () => {
+    write(".next/cache/fetch-cache/abc123", "entry-bytes");
+    write(".k8s-adapter/output/pool-base/fetch-cache/.keep");
+    write(".k8s-adapter/output/pools/ssr/context/pool-manifest.json");
+    write(".k8s-adapter/output/pools/api/context/pool-manifest.json");
+    write(
+      ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed/stale",
+      "old-cli seed",
+    );
+    write(
+      ".k8s-adapter/output/pools/api/context/.k8s-adapter/fetch-cache-seed/stale",
+      "old-cli seed",
+    );
+
+    refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+      distDir: ".next",
+      pools: ["ssr", "api"],
+      containerStrategy: "traced-assets",
+      poolImageLayout: "shared-base-v1",
+    });
+
+    expect(
+      readFileSync(
+        path.join(
+          projectDir,
+          ".k8s-adapter/output/pool-base/fetch-cache/.k8s-adapter/fetch-cache-seed/abc123",
+        ),
+        "utf8",
+      ),
+    ).toBe("entry-bytes");
+    for (const pool of ["ssr", "api"]) {
+      expect(
+        existsSync(
+          path.join(
+            projectDir,
+            `.k8s-adapter/output/pools/${pool}/context/.k8s-adapter/fetch-cache-seed`,
+          ),
+        ),
+      ).toBe(false);
+    }
+  });
+
   it("no-ops when the build produced no fetch-cache, and skips absent contexts", () => {
     write(".k8s-adapter/output/pools/ssr/context/pool-server.cjs");
     refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
@@ -124,6 +166,17 @@ describe("refreshFetchCacheStaging", () => {
       rmSync(victim, { recursive: true, force: true });
     }
   });
+
+  it("refuses an image layout that this CLI does not understand", () => {
+    write(".next/cache/fetch-cache/abc", "x");
+    expect(() =>
+      refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+        pools: ["ssr"],
+        containerStrategy: "traced-assets",
+        poolImageLayout: "shared-base-v2",
+      }),
+    ).toThrow(/Unsupported.*shared-base-v2.*Upgrade/);
+  });
 });
 
 describe("buildDockerCommands", () => {
@@ -145,6 +198,52 @@ describe("buildDockerCommands", () => {
     expect(commands[1]!.args).toContain(`${registry}/nextjs-app-ssr:abc123`);
     expect(commands[2]!.args).toContain("push");
     expect(commands[2]!.args).toContain(`${registry}/nextjs-app-ssr:abc123`);
+  });
+
+  it("builds one local pool base and makes every thin pool image inherit it", () => {
+    const registry = "ghcr.io/example/app";
+    const commands = buildDockerCommands({
+      pools: ["web", "api"],
+      buildId: "abc123",
+      registry,
+      outputDir: ".k8s-adapter/output",
+      containerStrategy: "traced-assets",
+      poolImageLayout: "shared-base-v1",
+      includeRoutingService: false,
+    });
+
+    expect(commands).toHaveLength(6);
+    expect(commands[0]!.description).toBe("Build shared pool base");
+    expect(commands[0]!.args.at(-1)).toBe(".k8s-adapter/output/pool-base");
+    const baseTag = commands[0]!.args[commands[0]!.args.indexOf("-t") + 1]!;
+    expect(baseTag).toMatch(/^localhost\/adapter-k8s-pool-base:[a-f0-9]{24}$/);
+    expect(commands.filter((command) => command.description.includes("Push shared"))).toEqual([]);
+    expect(commands[1]).toEqual({
+      description: "Verify shared pool base is visible in the container CLI image store",
+      command: "docker",
+      args: ["image", "inspect", baseTag],
+    });
+    for (const pool of ["web", "api"]) {
+      const build = commands.find((command) => command.description === `Build ${pool} image`)!;
+      expect(build.args).toContain("--build-arg");
+      expect(build.args).toContain(`POOL_BASE_IMAGE=${baseTag}`);
+      expect(build.args.at(-1)).toBe(`.k8s-adapter/output/pools/${pool}`);
+    }
+    expect(commands[3]!.description).toBe("Push web image");
+    expect(commands[5]!.description).toBe("Push api image");
+  });
+
+  it("refuses build commands for an unknown pool image layout", () => {
+    expect(() =>
+      buildDockerCommands({
+        pools: ["web", "api"],
+        buildId: "abc123",
+        registry: "ghcr.io/example/app",
+        outputDir: "out",
+        containerStrategy: "traced-assets",
+        poolImageLayout: "shared-base-v2" as never,
+      }),
+    ).toThrow(/Unsupported.*shared-base-v2.*Upgrade/);
   });
 
   it("S24: uses the resolved container CLI, not a hardcoded docker", () => {

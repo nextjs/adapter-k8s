@@ -1,4 +1,4 @@
-import { open, opendir, stat } from "node:fs/promises";
+import { open, opendir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { targetArchitecture, type TargetPlatform } from "./target-platform.js";
 
@@ -16,6 +16,75 @@ const PRISMA_ENGINE_RE =
   /(?:^|\/)(?:lib)?(?:query|schema|migration|introspection)[-_]engine(?:[-_.]|$)|(?:^|\/)prisma-fmt(?:[-_.]|$)/i;
 const PRISMA_MUSL_ENGINE_RE =
   /(?:^|\/)(?:(?:lib)?(?:query|schema|migration|introspection)[-_]engine|prisma-fmt)[-_.]linux-musl(?:[-_.]|$)/i;
+const SHARP_PLATFORM_PACKAGE_RE = /^sharp(?:-libvips)?-/;
+
+export interface PrunedSharpPackages {
+  packages: number;
+  files: number;
+  bytes: number;
+}
+
+async function directoryFileUsage(root: string): Promise<{ files: number; bytes: number }> {
+  let files = 0;
+  let bytes = 0;
+  const entries = await opendir(root);
+  for await (const entry of entries) {
+    const absolute = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await directoryFileUsage(absolute);
+      files += nested.files;
+      bytes += nested.bytes;
+    } else if (entry.isFile()) {
+      files++;
+      bytes += (await stat(absolute)).size;
+    }
+  }
+  return { files, bytes };
+}
+
+/** Remove Sharp optional packages that cannot execute in the selected Linux image. */
+export async function pruneForeignSharpPackages(
+  contextRoot: string,
+  targetPlatform: TargetPlatform,
+): Promise<PrunedSharpPackages> {
+  const suffix = targetPlatform === "linux/arm64" ? "linux-arm64" : "linux-x64";
+  const keep = new Set([`sharp-${suffix}`, `sharp-libvips-${suffix}`]);
+  const result: PrunedSharpPackages = { packages: 0, files: 0, bytes: 0 };
+
+  const walk = async (directory: string): Promise<void> => {
+    const entries = await opendir(directory);
+    for await (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const absolute = path.join(directory, entry.name);
+      if (path.basename(directory) === "node_modules" && entry.name === "@img") {
+        const packages = await opendir(absolute);
+        for await (const packageEntry of packages) {
+          const packageDir = path.join(absolute, packageEntry.name);
+          if (
+            (packageEntry.isDirectory() || packageEntry.isSymbolicLink()) &&
+            SHARP_PLATFORM_PACKAGE_RE.test(packageEntry.name) &&
+            !keep.has(packageEntry.name)
+          ) {
+            if (packageEntry.isDirectory()) {
+              const usage = await directoryFileUsage(packageDir);
+              result.files += usage.files;
+              result.bytes += usage.bytes;
+            }
+            result.packages++;
+            await rm(packageDir, { recursive: true, force: true });
+          } else if (packageEntry.isDirectory()) {
+            await walk(packageDir);
+          }
+        }
+      } else {
+        await walk(absolute);
+      }
+    }
+  };
+
+  await walk(contextRoot);
+  return result;
+}
 
 // Sharp is the one native dependency this adapter retargets deliberately: staging selects the
 // requested @img pair, and the emitted Dockerfile installs that pair inside the target image

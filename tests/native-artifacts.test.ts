@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
   assertStagedNativeArtifactsTargetPlatform,
   findForeignNativeArtifacts,
+  pruneForeignSharpPackages,
 } from "../src/native-artifacts.js";
 
 const roots: string[] = [];
@@ -140,5 +141,47 @@ describe("staged native artifact target contract", () => {
     );
 
     await expect(findForeignNativeArtifacts(root, "linux/amd64")).resolves.toEqual([]);
+  });
+});
+
+describe("Sharp image-context pruning", () => {
+  it("removes host and foreign optional packages while retaining the target pair and colour", async () => {
+    const root = context();
+    write(root, "node_modules/@img/sharp-darwin-arm64/lib/sharp.node", Buffer.alloc(11));
+    write(root, "node_modules/@img/sharp-libvips-darwin-arm64/lib/libvips.dylib", Buffer.alloc(13));
+    write(root, "node_modules/@img/sharp-linux-x64/lib/sharp.node", Buffer.alloc(17));
+    write(root, "node_modules/@img/sharp-libvips-linux-x64/lib/libvips.so", Buffer.alloc(19));
+    write(root, "node_modules/@img/colour/index.js", Buffer.alloc(23));
+    write(
+      root,
+      "node_modules/wrapper/node_modules/@img/sharp-linux-arm64/lib/sharp.node",
+      Buffer.alloc(29),
+    );
+
+    await expect(pruneForeignSharpPackages(root, "linux/amd64")).resolves.toEqual({
+      packages: 3,
+      files: 3,
+      bytes: 53,
+    });
+    expect(existsSync(path.join(root, "node_modules/@img/sharp-darwin-arm64"))).toBe(false);
+    expect(existsSync(path.join(root, "node_modules/@img/sharp-libvips-darwin-arm64"))).toBe(false);
+    expect(
+      existsSync(path.join(root, "node_modules/wrapper/node_modules/@img/sharp-linux-arm64")),
+    ).toBe(false);
+    expect(existsSync(path.join(root, "node_modules/@img/sharp-linux-x64"))).toBe(true);
+    expect(existsSync(path.join(root, "node_modules/@img/sharp-libvips-linux-x64"))).toBe(true);
+    expect(existsSync(path.join(root, "node_modules/@img/colour"))).toBe(true);
+  });
+
+  it("retains the arm64 pair for an arm64 image", async () => {
+    const root = context();
+    write(root, "node_modules/@img/sharp-linux-arm64/lib/sharp.node", Buffer.alloc(7));
+    write(root, "node_modules/@img/sharp-libvips-linux-arm64/lib/libvips.so", Buffer.alloc(9));
+
+    await expect(pruneForeignSharpPackages(root, "linux/arm64")).resolves.toEqual({
+      packages: 0,
+      files: 0,
+      bytes: 0,
+    });
   });
 });

@@ -15,6 +15,7 @@
 // Both are fixed the same way: the fields are REQUIRED. Callers supply defaults once, in
 // applyDefaults (config.ts), and this file only serializes what it is given.
 import { parseTargetPlatform, type TargetPlatform } from "../target-platform.js";
+import type { PoolImageLayout } from "../pool-image-layout.js";
 
 export function generateBuildMetadata({
   buildId,
@@ -28,6 +29,7 @@ export function generateBuildMetadata({
   containerRegistry,
   nodeCidrs,
   containerStrategy,
+  poolImageLayout,
   hasMiddleware,
   failureModeAllow,
   cacheEnabled,
@@ -59,6 +61,8 @@ export function generateBuildMetadata({
    */
   generatedAt: string;
   containerStrategy: "traced-assets" | "shared-image";
+  /** Optional so a newer CLI can still deploy standalone contexts emitted by older builds. */
+  poolImageLayout?: PoolImageLayout | undefined;
   hasMiddleware: boolean;
   /** ext_proc callout failure policy. `false` = fail CLOSED (middleware is never bypassed). */
   failureModeAllow: boolean;
@@ -110,6 +114,7 @@ export function generateBuildMetadata({
       generatedAt,
       distDir,
       containerStrategy,
+      ...(poolImageLayout ? { poolImageLayout } : {}),
       hasMiddleware,
       failureModeAllow,
       cacheEnabled,

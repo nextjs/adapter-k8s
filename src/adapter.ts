@@ -1,6 +1,6 @@
 // src/adapter.ts
 import { writeFile, mkdir, copyFile, cp, rm, realpath, readdir, lstat } from "node:fs/promises";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { constants, existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -17,7 +17,15 @@ import { compileTarget, targetForConfig } from "./target/index.js";
 import { fingerprintCompositionPlan } from "./composition-plan/index.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 import { targetPlatform, type TargetPlatform } from "./target-platform.js";
-import { assertStagedNativeArtifactsTargetPlatform } from "./native-artifacts.js";
+import {
+  assertStagedNativeArtifactsTargetPlatform,
+  pruneForeignSharpPackages,
+} from "./native-artifacts.js";
+import {
+  factorSharedPoolFiles,
+  SHARED_POOL_IMAGE_LAYOUT,
+  type PoolImageLayout,
+} from "./pool-image-layout.js";
 
 // Get current directory in a way that works in ESM and CJS bundle
 const _dirname =
@@ -356,6 +364,8 @@ import {
 } from "./emit/templates/utils.js";
 import {
   generateDockerfile,
+  generateLayeredPoolDockerfile,
+  generatePoolBaseDockerfile,
   generatePoolDockerfile,
   generateRoutingServiceDockerfile,
 } from "./emit/dockerfiles.js";
@@ -525,15 +535,19 @@ export async function resolveAndCopyExternals(src: string, dest: string): Promis
       }
       const targetStat = statSync(realTarget);
       if (targetStat.isDirectory()) {
-        await cp(realTarget, destEntry, { recursive: true, dereference: true });
+        await cp(realTarget, destEntry, {
+          recursive: true,
+          dereference: true,
+          mode: constants.COPYFILE_FICLONE,
+        });
       } else {
-        await copyFile(realTarget, destEntry);
+        await copyFile(realTarget, destEntry, constants.COPYFILE_FICLONE);
       }
     } else if (stat.isDirectory()) {
       // Recurse into scoped package directories (e.g., @opentelemetry/)
       await resolveAndCopyExternals(srcEntry, destEntry);
     } else {
-      await copyFile(srcEntry, destEntry);
+      await copyFile(srcEntry, destEntry, constants.COPYFILE_FICLONE);
     }
   }
 }
@@ -719,9 +733,13 @@ export async function stageFile(
     const sourceStat = statSync(absSource);
     if (sourceStat.isDirectory()) {
       // dereference: true is required to pull in symlinked node_modules content
-      await cp(absSource, absDest, { recursive: true, dereference: true });
+      await cp(absSource, absDest, {
+        recursive: true,
+        dereference: true,
+        mode: constants.COPYFILE_FICLONE,
+      });
     } else {
-      await copyFile(absSource, absDest);
+      await copyFile(absSource, absDest, constants.COPYFILE_FICLONE);
     }
     // Mark done only AFTER a successful copy. Marking it up front meant a FAILED
     // destination was permanently recorded as staged, so a later call for the same dest
@@ -1433,7 +1451,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           const destDir = path.join(process.cwd(), ".k8s-adapter");
           await mkdir(destDir, { recursive: true });
           const dest = path.join(destDir, "cache-handler.cjs");
-          await copyFile(src, dest);
+          await copyFile(src, dest, constants.COPYFILE_FICLONE);
           modified.cacheHandler = dest;
           // Next keeps a per-process in-memory LRU IN FRONT of any custom cacheHandler
           // (cacheMaxMemorySize, 50MB default). With replicas that layer is incoherent by
@@ -1891,6 +1909,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // applyDefaults (config.ts) guarantees this; the local keeps the branch below and the
       // emitted build-metadata in agreement instead of re-defaulting in two places.
       const containerStrategy = cfg.containerStrategy ?? "traced-assets";
+      let poolImageLayout: PoolImageLayout | undefined;
+      let prunedSharpPackages = 0;
+      let prunedSharpBytes = 0;
+      const pruneSharpContext = async (context: string): Promise<void> => {
+        const pruned = await pruneForeignSharpPackages(context, imageTargetPlatform);
+        prunedSharpPackages += pruned.packages;
+        prunedSharpBytes += pruned.bytes;
+      };
 
       // N50 (review #33): every staging site is guarded by `existsSync`, which is correct for
       // the individually-optional subtrees (`server/chunks`, `node_modules`) but turned a
@@ -2116,6 +2142,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         await cp(distDir, path.join(projectDir, absSharedStageDir, distDirRel), {
           recursive: true,
           dereference: true,
+          mode: constants.COPYFILE_FICLONE,
           filter: (src) => src !== distCacheDir && !src.startsWith(distCacheDir + path.sep),
         });
         const sharedFetchCacheDir = path.join(distCacheDir, "fetch-cache");
@@ -2123,13 +2150,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           await cp(
             sharedFetchCacheDir,
             path.join(projectDir, absSharedStageDir, ".k8s-adapter", "fetch-cache-seed"),
-            { recursive: true, dereference: true },
+            { recursive: true, dereference: true, mode: constants.COPYFILE_FICLONE },
           );
         }
         await cp(
           path.join(projectDir, "node_modules"),
           path.join(projectDir, absSharedStageDir, "node_modules"),
-          { recursive: true, dereference: true },
+          { recursive: true, dereference: true, mode: constants.COPYFILE_FICLONE },
         );
         // The app's package.json, with `type` forced to commonjs. The image executes only
         // BUILD OUTPUT (`<dist>/server/**/*.js`, which Turbopack emits as CJS) plus
@@ -2147,6 +2174,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         );
 
         const sharpStaging = await stageCommonRuntimeFiles("shared", true);
+        await pruneSharpContext(path.join(projectDir, absSharedStageDir));
 
         // Keep .env secrets out of the shared image (built from this context).
         await writeOutputFile(
@@ -2201,6 +2229,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           absSharedStageDir,
         );
       } else {
+        const poolSharpStaging: Array<{ staged: boolean; sharpVersion?: string }> = [];
+        const poolBaseDir = path.join(OUTPUT_DIR(), "pool-base");
+        await rm(path.join(projectDir, poolBaseDir), { recursive: true, force: true });
         for (const [poolName, pool] of pools) {
           const poolDir = path.join(OUTPUT_DIR(), "pools", poolName);
           const poolStageDir = path.join(poolDir, "context");
@@ -2316,6 +2347,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           await stageFile(projectDir, nextPkgDir, "node_modules/next", poolName);
 
           const sharpStaging = await stageCommonRuntimeFiles(poolName, false);
+          poolSharpStaging.push(sharpStaging);
+          await pruneSharpContext(path.join(projectDir, poolStageDir));
 
           // Keep .env secrets out of the pool image. The Dockerfile's
           // `COPY context/ .` runs from this pool dir (the docker build
@@ -2371,6 +2404,70 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             poolDir,
           );
         }
+
+        if (pools.size > 1) {
+          const sharpDecisions = new Set(
+            poolSharpStaging.map((staging) =>
+              staging.staged
+                ? "staged"
+                : staging.sharpVersion
+                  ? `install:${staging.sharpVersion}`
+                  : "unavailable",
+            ),
+          );
+          if (sharpDecisions.size > 1) {
+            console.warn(
+              `[adapter-k8s] Pool staging produced different sharp requirements ` +
+                `(${[...sharpDecisions].join(", ")}); keeping standalone pool images so each ` +
+                `pool retains its own native-runtime setup.`,
+            );
+          } else {
+            const sharpDecision = [...sharpDecisions][0]!;
+            const installSharpVersion = sharpDecision.startsWith("install:")
+              ? sharpDecision.slice("install:".length)
+              : undefined;
+            const poolContexts = [...pools.keys()].map((poolName) =>
+              path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context"),
+            );
+
+            const baseContext = path.join(projectDir, poolBaseDir);
+            const shared = await factorSharedPoolFiles(poolContexts, baseContext);
+            await writeOutputFile(projectDir, ".dockerignore", generateDockerignore(), poolBaseDir);
+            await writeOutputFile(
+              projectDir,
+              "Dockerfile",
+              generatePoolBaseDockerfile({
+                buildId,
+                targetPlatform: imageTargetPlatform,
+                ...(installSharpVersion ? { installSharpVersion } : {}),
+              }),
+              poolBaseDir,
+            );
+            for (const poolName of pools.keys()) {
+              await writeOutputFile(
+                projectDir,
+                "Dockerfile",
+                generateLayeredPoolDockerfile({ poolName, buildId }),
+                path.join(OUTPUT_DIR(), "pools", poolName),
+              );
+            }
+            poolImageLayout = SHARED_POOL_IMAGE_LAYOUT;
+            const eliminatedBytes = shared.sharedBytes * (pools.size - 1);
+            console.log(
+              `[adapter-k8s] Shared ${shared.sharedFiles.toLocaleString()} identical files ` +
+                `(${(shared.sharedBytes / 1024 / 1024).toFixed(1)} MiB) across ${pools.size} ` +
+                `pool images; removed ${(eliminatedBytes / 1024 / 1024).toFixed(1)} MiB of ` +
+                `repeated build context data.`,
+            );
+          }
+        }
+      }
+
+      if (prunedSharpPackages > 0) {
+        console.log(
+          `[adapter-k8s] Removed ${prunedSharpPackages} target-incompatible Sharp package(s) ` +
+            `(${(prunedSharpBytes / 1024 / 1024).toFixed(1)} MiB) from Linux image contexts.`,
+        );
       }
 
       // 6. Write final artifacts to output root for CLI visibility
@@ -2467,7 +2564,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // rather than being shadowed by a stale copy from an earlier build.
           await rm(dest, { recursive: true, force: true });
           await mkdir(path.dirname(dest), { recursive: true });
-          await cp(depDir, dest, { recursive: true, dereference: true });
+          await cp(depDir, dest, {
+            recursive: true,
+            dereference: true,
+            mode: constants.COPYFILE_FICLONE,
+          });
         }
 
         // Keep .env secrets out of the routing-service image. `docker build`
@@ -2488,7 +2589,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           const mwRelPath = path.relative(projectDir, outputs.middleware.filePath);
           const mwDest = path.join(projectDir, routingServiceContextDir, mwRelPath);
           await mkdir(path.dirname(mwDest), { recursive: true });
-          await copyFile(outputs.middleware.filePath, mwDest);
+          await copyFile(outputs.middleware.filePath, mwDest, constants.COPYFILE_FICLONE);
           // Stage middleware's traced assets AND its wasmAssets (files and directories).
           // N50 (review #31): wasmAssets were never staged anywhere, and this tier is the one
           // that runs middleware at the edge — with ext_proc failing CLOSED whenever the app
@@ -2510,9 +2611,13 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               await mkdir(path.dirname(dest), { recursive: true });
               const stat = statSync(absAsset);
               if (stat.isDirectory()) {
-                await cp(absAsset, dest, { recursive: true, dereference: true });
+                await cp(absAsset, dest, {
+                  recursive: true,
+                  dereference: true,
+                  mode: constants.COPYFILE_FICLONE,
+                });
               } else {
-                await copyFile(absAsset, dest);
+                await copyFile(absAsset, dest, constants.COPYFILE_FICLONE);
               }
             }
           }
@@ -2561,7 +2666,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             // and shadow the current middleware's referenced chunk.
             await rm(chunksDest, { recursive: true, force: true });
             await mkdir(path.dirname(chunksDest), { recursive: true });
-            await cp(chunksDir, chunksDest, { recursive: true, dereference: true });
+            await cp(chunksDir, chunksDest, {
+              recursive: true,
+              dereference: true,
+              mode: constants.COPYFILE_FICLONE,
+            });
           }
         }
       } // end if (!skipStaging)
@@ -2570,9 +2679,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         const runtimeContexts =
           containerStrategy === "shared-image"
             ? [path.join(projectDir, OUTPUT_DIR(), "shared-context")]
-            : [...pools.keys()].map((poolName) =>
-                path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context"),
-              );
+            : [
+                ...(poolImageLayout === SHARED_POOL_IMAGE_LAYOUT
+                  ? [path.join(projectDir, OUTPUT_DIR(), "pool-base")]
+                  : []),
+                ...[...pools.keys()].map((poolName) =>
+                  path.join(projectDir, OUTPUT_DIR(), "pools", poolName, "context"),
+                ),
+              ];
         const routingContext = path.join(projectDir, OUTPUT_DIR(), "routing-service", "context");
         if (existsSync(routingContext)) runtimeContexts.push(routingContext);
         // next build traces bytes produced for the BUILD host. Docker's --platform flag does
@@ -2624,6 +2738,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // the <distDir>/BUILD_ID mtime — see manifest.ts stableBuiltAt).
           generatedAt: routingManifest.builtAt,
           containerStrategy,
+          ...(poolImageLayout ? { poolImageLayout } : {}),
           hasMiddleware: !!outputs.middleware,
           failureModeAllow,
           cacheEnabled: cfg.cache?.enabled ?? false,

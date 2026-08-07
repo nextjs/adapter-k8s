@@ -73,4 +73,12 @@ describe("generateBuildMetadata", () => {
         .cacheMemorystore,
     ).toEqual({ region: "us-central1" });
   });
+
+  it("records the shared pool image layout only when the build emitted it", () => {
+    expect(JSON.parse(generateBuildMetadata(base)).poolImageLayout).toBeUndefined();
+    expect(
+      JSON.parse(generateBuildMetadata({ ...base, poolImageLayout: "shared-base-v1" }))
+        .poolImageLayout,
+    ).toBe("shared-base-v1");
+  });
 });

@@ -156,6 +156,55 @@ CMD ["node", "pool-server.cjs"]
 `;
 }
 
+/** Parent image for traced-assets builds with more than one pool. */
+export function generatePoolBaseDockerfile({
+  nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
+  buildId,
+  installSharpVersion,
+}: {
+  nodeVersion?: string;
+  targetPlatform?: TargetPlatform;
+  buildId: string;
+  installSharpVersion?: string;
+}): string {
+  assertSupportedNodeVersion(nodeVersion);
+  const sharpInstall =
+    installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
+  return `FROM ${baseImageRef(nodeVersion)}
+WORKDIR /app
+COPY --chown=node:node dependencies/ .
+${sharpInstall}COPY --chown=node:node content/ .
+COPY --chown=node:node fetch-cache/ .
+ENV NODE_ENV=production
+ENV NEXT_BUILD_ID=${buildId}
+ENV CONFIG_DIR=/app/config
+EXPOSE 3000
+USER node
+CMD ["node", "pool-server.cjs"]
+`;
+}
+
+/** Thin pool delta layered over the local parent built by the deploy command. */
+export function generateLayeredPoolDockerfile({
+  poolName,
+  buildId,
+}: {
+  poolName: string;
+  buildId: string;
+}): string {
+  return `ARG POOL_BASE_IMAGE=localhost/adapter-k8s-pool-base-required--update-cli:latest
+FROM \${POOL_BASE_IMAGE}
+COPY --chown=node:node context/ .
+ENV POOL_NAME=${poolName}
+ENV NEXT_BUILD_ID=${buildId}
+ENV CONFIG_DIR=/app/config
+EXPOSE 3000
+USER node
+CMD ["node", "pool-server.cjs"]
+`;
+}
+
 export function generateRoutingServiceDockerfile({
   nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
   buildId,
@@ -174,9 +223,9 @@ export function generateRoutingServiceDockerfile({
   // TLS_KEY_FILE exist, and plaintext h2c otherwise (local emulate).
   return `FROM ${baseImageRef(nodeVersion)}
 WORKDIR /app
-COPY --chown=node:node context/ .
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \\
  && rm -rf /var/lib/apt/lists/*
+COPY --chown=node:node context/ .
 ENV NODE_ENV=production
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config
