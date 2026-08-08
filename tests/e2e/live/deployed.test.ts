@@ -9,6 +9,7 @@
 // deploy: route correctness, middleware executing at the ext_proc edge (rewrite +
 // header), the RSC-vs-HTML cache-key partition, and Cloud CDN edge caching of
 // cacheable content while dynamic responses stay uncacheable.
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeAll } from "vitest";
 
 const BASE = (process.env.E2E_BASE_URL ?? "https://adapter-gke.jamesdaniels.net").replace(
@@ -116,6 +117,21 @@ describe("routes", () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ received: "body-survived-rewrite" });
+  });
+
+  it("preserves exact request bytes through the routing tier", async () => {
+    const body = '{\n  "message": "adapter → kubernetes",\n  "nested": { "value": 1 }\n}\n';
+    const response = await fetch(`${BASE}/api/raw-body-probe`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      bytes: Buffer.byteLength(body),
+      sha256: createHash("sha256").update(body).digest("hex"),
+      contentType: "application/json; charset=utf-8",
+    });
   });
 
   it("revalidates a cached App route through the shared middle cache", async () => {
