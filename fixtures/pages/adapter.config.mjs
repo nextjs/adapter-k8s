@@ -4,7 +4,7 @@ import { createK8sAdapter } from "@next-community/adapter-k8s";
 // of emitting a standalone /404 handler. Keep it separate from the App Router/PPR fixture so the
 // App Router's /_not-found output cannot hide the Pages entrypoint contract under test.
 export default createK8sAdapter({
-  pools: { default: { routes: ["pages"] } },
+  pools: { default: { routes: ["pages", "pagesApi"] } },
   containerStrategy: "traced-assets",
   provider: {
     gke: {
