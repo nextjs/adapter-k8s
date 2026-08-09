@@ -101,18 +101,18 @@ Branch on the dominant symptom after reading doctor output:
 
 ## Reading Doctor Output
 
-| Doctor check               | FAIL means                                                | First move                                                  |
-| -------------------------- | --------------------------------------------------------- | ----------------------------------------------------------- |
-| Composition target         | kubectl points at the wrong cluster                       | Restore access or rebuild for the intended cluster          |
-| Deploy state               | cluster ConfigMap state unreadable                        | Fix cluster access; deploy is blocked until this passes     |
-| Gateway / HTTPRoute        | Gateway API object not Accepted                           | `kubectl describe gateway <release>-gateway -n <ns>`        |
-| Pool: `<name>`             | 0/N ready replicas                                        | `kubectl describe deployment/<name> -n <ns>`, then pod logs |
-| Active Service endpoints   | selector matches no ready pods — origin 503s              | Check `app.kubernetes.io/version` selector vs pod labels    |
-| ext_proc traffic extension | edge middleware not wired (GKE)                           | `npx adapter-k8s deploy` — the traffic-ext Job registers it |
-| routing backend scheme     | not EXTERNAL_MANAGED                                      | Delete the backend service, re-run init + deploy            |
+| Doctor check                | FAIL means                                                | First move                                                  |
+| --------------------------- | --------------------------------------------------------- | ----------------------------------------------------------- |
+| Composition target          | kubectl points at the wrong cluster                       | Restore access or rebuild for the intended cluster          |
+| Deploy state                | cluster ConfigMap state unreadable                        | Fix cluster access; deploy is blocked until this passes     |
+| Gateway / HTTPRoute         | Gateway API object not Accepted                           | `kubectl describe gateway <release>-gateway -n <ns>`        |
+| Pool: `<name>`              | 0/N ready replicas                                        | `kubectl describe deployment/<name> -n <ns>`, then pod logs |
+| Active Service endpoints    | selector matches no ready pods — origin 503s              | Check `app.kubernetes.io/version` selector vs pod labels    |
+| ext_proc traffic extension  | edge middleware not wired (GKE)                           | `npx adapter-k8s deploy` — the traffic-ext Job registers it |
+| routing backend scheme      | not EXTERNAL_MANAGED                                      | Delete the backend service, re-run init + deploy            |
 | routing health check (WARN) | not TCP — gRPC passes plaintext but the TLS callout fails | Delete `<release>-routing-hc`, re-run init                  |
-| Rollback ready (WARN)      | previous build's manifest was not retained                | Rollback would be image-only; see § Routing manifest        |
-| LB health                  | current-build backends unhealthy                          | `gcloud compute backend-services get-health …` (printed)    |
+| Rollback ready (WARN)       | previous build's manifest was not retained                | Rollback would be image-only; see § Routing manifest        |
+| LB health                   | current-build backends unhealthy                          | `gcloud compute backend-services get-health …` (printed)    |
 
 Roles in the deployment list: no tag = current build, `[previous]` at 0/0 = rollback target (healthy state), `[old]` at 0/0 = pending cleanup, `[unknown]` = no version label.
 
