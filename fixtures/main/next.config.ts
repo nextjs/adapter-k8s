@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url);
 const nextConfig: NextConfig = {
   // Keep `npm run build` honest: the local fixture must exercise the adapter hooks even when it is
   // not launched through the deploy CLI (which otherwise supplies NEXT_ADAPTER_PATH).
-  adapterPath: require.resolve("@next-community/adapter-k8s"),
+  adapterPath: process.env.NEXT_ADAPTER_PATH ?? require.resolve("@next-community/adapter-k8s"),
   cacheComponents: true,
   // Keep the local deployed-app probe small enough to make a duplicated PPR Link header obvious.
   // React owns truncation; the adapter must preserve that budget when joining shell + resume.

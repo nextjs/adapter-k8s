@@ -198,13 +198,17 @@ describe("renderHTTPRoute HTTP->HTTPS redirect (M8)", () => {
       /name: nextjs-routes\nspec:\n  parentRefs:\n    - name: nextjs-gateway\n      sectionName: https/,
     );
 
-    // The redirect route attaches to the http listener and 302-upgrades to https:443.
+    // The redirect route attaches to the http listener and 302-upgrades to https.
     expect(yaml).toContain("name: nextjs-http-redirect");
     expect(yaml).toMatch(
       /name: nextjs-http-redirect\nspec:\n  parentRefs:\n    - name: nextjs-gateway\n      sectionName: http/,
     );
     expect(yaml).toContain("type: RequestRedirect");
-    expect(yaml).toMatch(/requestRedirect:\n\s+scheme: https\n\s+port: 443\n\s+statusCode: 302/);
+    expect(yaml).toMatch(/requestRedirect:\n\s+scheme: https\n\s+statusCode: 302/);
+    // `port` must stay omitted: the GKE Gateway controller rejects it (GWCER104) and one
+    // invalid route blocks reconciliation of the whole Gateway (no-error-isolation), which
+    // stalls NEG programming for every subsequent backend change. https implies 443.
+    expect(yaml).not.toContain("port: 443");
     // Same hostnames on the redirect route.
     const redirectDoc = yaml.slice(yaml.indexOf("name: nextjs-http-redirect"));
     expect(redirectDoc).toContain('"app.example.com"');
