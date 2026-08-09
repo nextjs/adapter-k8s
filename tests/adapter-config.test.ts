@@ -227,6 +227,7 @@ describe("onBuildComplete build-time guards", () => {
 
   beforeEach(() => {
     projectDir = mkdtempSync(path.join(os.tmpdir(), "adapter-build-"));
+    vi.spyOn(process, "cwd").mockReturnValue(projectDir);
     savedSkip = process.env.ADAPTER_K8S_SKIP_STAGING;
     process.env.ADAPTER_K8S_SKIP_STAGING = "1";
   });
@@ -234,6 +235,7 @@ describe("onBuildComplete build-time guards", () => {
   afterEach(() => {
     if (savedSkip === undefined) delete process.env.ADAPTER_K8S_SKIP_STAGING;
     else process.env.ADAPTER_K8S_SKIP_STAGING = savedSkip;
+    vi.restoreAllMocks();
     rmSync(projectDir, { recursive: true, force: true });
   });
 
@@ -296,21 +298,21 @@ describe("onBuildComplete build-time guards", () => {
   });
 
   it("fails when release+pool truncation collapses distinct build ids (composed-name guard)", async () => {
-    // 20-char release + 38-char pool = a 60-char `release-pool-` prefix: only 3
-    // build-id chars survive the 63-char truncation, so "abc12345xyz" and
-    // "abc99999xyz" produce IDENTICAL composed resource names even though
+    // 20-char release + 29-char pool = a 51-char `release-pool-` prefix: exactly 8
+    // build-id chars survive the 59-char HPA-name budget, so "abcdefgh123" and
+    // "abcdefgh999" produce IDENTICAL composed resource names even though
     // sanitizeK8sName(buildId) alone (the old guard's comparison) differs.
     writeInfra({ releaseName: "r".repeat(20) });
     writeFileSync(
       path.join(projectDir, ".k8s-adapter", "state.json"),
-      JSON.stringify({ buildId: "abc12345xyz", previousBuildId: null }),
+      JSON.stringify({ buildId: "abcdefgh123", previousBuildId: null }),
     );
     const adapter = createK8sAdapter({
       ...validConfig,
-      pools: { ["p".repeat(38)]: { routes: ["appPages"] } },
+      pools: { ["p".repeat(29)]: { routes: ["appPages"] } },
     });
     await adapter.modifyConfig!({} as any, {} as any);
-    await expect(adapter.onBuildComplete!(ctx("abc99999xyz"))).rejects.toThrow(
+    await expect(adapter.onBuildComplete!(ctx("abcdefgh999"))).rejects.toThrow(
       /sanitizes to the same K8s name as the previous build/,
     );
   });
@@ -380,17 +382,26 @@ describe("onBuildComplete build-time guards", () => {
     await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
   });
 
-  it("rejects a non-default namespace from infrastructure.json (fail-fast, actionable)", async () => {
-    // The namespace feeds ONLY the ext_proc extension-chain authority; every
-    // kubectl/helm call pins the literal "default" (init binds Workload Identity
-    // there). Honoring "prod" here shipped workloads to default while the GXLB
-    // callout targeted prod — every edge callout failed. The build must refuse.
+  it("records a custom namespace in the build handoff", async () => {
     writeInfra({ namespace: "prod" });
     const adapter = createK8sAdapter(validConfig);
     await adapter.modifyConfig!({} as any, {} as any);
-    await expect(adapter.onBuildComplete!(ctx("b12345"))).rejects.toThrow(
-      /Unsupported namespace "prod".*deploys only to the "default" namespace.*Remove "namespace"/s,
-    );
+    await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
+    expect(
+      JSON.parse(
+        readFileSync(path.join(projectDir, ".k8s-adapter/output/build-metadata.json"), "utf-8"),
+      ).namespace,
+    ).toBe("prod");
+  });
+
+  it("qualifies the GKE extension-chain authority with the custom namespace", async () => {
+    writeInfra({ namespace: "prod", projectId: "my-project-1", region: "us-central1" });
+    const adapter = createK8sAdapter(validConfig);
+    await adapter.modifyConfig!({} as any, {} as any);
+    await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
+    expect(
+      readFileSync(path.join(projectDir, ".k8s-adapter/output/extension-chains.json"), "utf-8"),
+    ).toContain("-routing-service.prod.svc.cluster.local");
   });
 
   it('accepts an explicit namespace of "default" (and none at all)', async () => {

@@ -30,6 +30,7 @@ describe("state", () => {
   let tmpDir: string;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-test-"));
   });
 
@@ -62,6 +63,23 @@ describe("state", () => {
     expect(read!.generation).toBe(1);
   });
 
+  it("pins cluster state reads and writes to the configured namespace", async () => {
+    vi.clearAllMocks();
+    vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+    vi.mocked(execCaptureStdin).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await readState(tmpDir, "rel", { namespace: "apps" });
+    expect(vi.mocked(execCapture).mock.calls[0]![1]).toContain("apps");
+
+    await writeState(
+      tmpDir,
+      { buildId: "b1", previousBuildId: null, basedOnGeneration: null },
+      "rel",
+      "apps",
+    );
+    expect(vi.mocked(execCaptureStdin).mock.calls[0]![1]).toContain("apps");
+  });
+
   it("overwrites existing state", async () => {
     await writeState(tmpDir, { buildId: "first", previousBuildId: null, basedOnGeneration: null });
     await writeState(tmpDir, {
@@ -79,6 +97,16 @@ describe("state", () => {
       buildId: "buildn",
       previousBuildId: "buildm",
       cdnTags: { buildn: `build-${"ab".repeat(32)}`, buildm: `build-${"cd".repeat(32)}` },
+    };
+    await writeState(tmpDir, { ...state, basedOnGeneration: null });
+    expect(await readState(tmpDir)).toMatchObject(state);
+  });
+
+  it("round-trips recorded per-build target platforms", async () => {
+    const state: AdapterState = {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
     };
     await writeState(tmpDir, { ...state, basedOnGeneration: null });
     expect(await readState(tmpDir)).toMatchObject(state);

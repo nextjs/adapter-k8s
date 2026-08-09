@@ -8,6 +8,7 @@ import {
   resolveContainerCli,
   CONTAINER_CLI_CANDIDATES,
   TARGET_PLATFORM,
+  targetPlatform,
   resetContainerCliCache,
   checkContainerRuntime,
 } from "../../src/cli/container-runtime.js";
@@ -183,6 +184,14 @@ describe("resolveContainerCli", () => {
     // Without an explicit platform an Apple-Silicon host builds arm64 images that die with
     // `exec format error` on x86 nodes. Overridable for ARM (T2A) node pools.
     expect(TARGET_PLATFORM).toBe("linux/amd64");
+  });
+
+  it("supports linux/arm64 and rejects platforms the emitted runtime cannot stage", () => {
+    process.env.ADAPTER_K8S_TARGET_PLATFORM = "linux/arm64";
+    expect(targetPlatform()).toBe("linux/arm64");
+    process.env.ADAPTER_K8S_TARGET_PLATFORM = "linux/arm/v7";
+    expect(() => targetPlatform()).toThrow(/supported target platform/);
+    delete process.env.ADAPTER_K8S_TARGET_PLATFORM;
   });
 });
 

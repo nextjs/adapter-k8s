@@ -21,6 +21,8 @@ import {
 import type { CacheEntry } from "../../../src/pool-server/valkey-cache/types.js";
 import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
 
+const SERVER_CLOCK_TOLERANCE_MS = 100;
+
 // The `rediss://` (TLS) variant of the plaintext integration suites: the SAME paths those cover —
 // RESP round-trips, the tag-manifest `updateTags` EVAL, cross-replica revalidation through both
 // handlers — but over a real TLS handshake to a real Valkey configured with `--tls-port`. The unit
@@ -371,12 +373,13 @@ describe("readClientHelloSni (guards the L18 wire assertion from going vacuous)"
     const port = await new Promise<number>((r) => {
       server.listen(0, "127.0.0.1", () => r((server.address() as net.AddressInfo).port));
     });
-    const socket = tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false, ...options });
-    socket.on("error", () => undefined);
+    let socket: tls.TLSSocket | undefined;
     try {
+      socket = tls.connect({ host: "127.0.0.1", port, rejectUnauthorized: false, ...options });
+      socket.on("error", () => undefined);
       return await seen;
     } finally {
-      socket.destroy();
+      socket?.destroy();
       await new Promise<void>((r) => server.close(() => r()));
     }
   }
@@ -385,8 +388,17 @@ describe("readClientHelloSni (guards the L18 wire assertion from going vacuous)"
     expect(await sniOf({ servername: "valkey.example.internal" })).toBe("valkey.example.internal");
   });
 
-  it("reports an IP servername (Node sends it; this is what L18 must avoid)", async () => {
-    expect(await sniOf({ servername: "10.1.2.3" })).toBe("10.1.2.3");
+  it("reports an IP servername when the Node runtime permits sending one", async () => {
+    try {
+      expect(await sniOf({ servername: "10.1.2.3" })).toBe("10.1.2.3");
+    } catch (error) {
+      // Node 26 upgraded DEP0123 from a warning to a TypeError. That is a stronger runtime
+      // guarantee than L18 needs; Node 20/22/24 still exercise the ClientHello parser above.
+      expect(error).toBeInstanceOf(TypeError);
+      expect(String(error)).toContain(
+        "Setting the TLS ServerName to an IP address is not permitted",
+      );
+    }
   });
 
   it("reports null when no servername is set (the L18 shape)", async () => {
@@ -515,8 +527,8 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
       const after = Date.now();
       expect(Number(clamped)).toBe(1);
       const stored = JSON.parse((await c.hmget(key, "t"))[0]!);
-      expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
-      expect(stored.expired).toBeLessThanOrEqual(after + 5);
+      expect(stored.expired).toBeGreaterThanOrEqual(before - SERVER_CLOCK_TOLERANCE_MS);
+      expect(stored.expired).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
       expect(stored.expired).toBeLessThan(clientNow - MAX_CLOCK_SKEW_MS);
       expect(await c.ttl(key)).toBeGreaterThan(29 * 24 * 60 * 60); // M11 TTL applied over TLS too
     });

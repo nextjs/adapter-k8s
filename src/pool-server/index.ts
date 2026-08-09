@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.js";
 import {
   getRscConfig,
+  INTERNAL_EXECUTION_DEADLINE_HEADER,
   manifestNextConfig,
   middlewareMayCoverPath,
   INTERNAL_DISPATCH_HEADERS,
@@ -21,16 +22,22 @@ import {
   templateOutputCandidates,
   trailingSlashVariants,
   type MiddlewareMatcher,
-  type RscConfig,
 } from "../routing-common.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
 import { restoreFetchCacheSeed } from "./fetch-cache-seed.js";
 import { cdnCacheTag } from "../cdn-tags.js";
-import { createLocalResolver, hasCallableMiddlewareExport } from "./resolve.js";
 import {
+  createLocalResolver,
+  hasCallableMiddlewareExport,
+  resolvePlatformRequest,
+  targetsSamePlatformUrl,
+} from "./resolve.js";
+import {
+  applyMiddlewareRequestHeaders,
   createDispatcher,
   getContentType,
+  installResolvedResponseHeaders,
   isVerifiedPreviewRequest,
   mergeResolvedHeadersIntoHeadersArg,
 } from "./dispatch.js";
@@ -375,6 +382,15 @@ function createBufferedStream(body: Buffer | null): ReadableStream<Uint8Array> {
       controller.close();
     },
   });
+}
+
+function requestHeaders(req: IncomingMessage): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (typeof value === "string") headers.set(key, value);
+    else if (Array.isArray(value)) value.forEach((entry) => headers.append(key, entry));
+  }
+  return headers;
 }
 
 // Reconstruct a Headers from the routing extension's serialized x-resolved-headers (JSON of
@@ -2427,6 +2443,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // into the routing manifest; read defensively — older manifests (and any build
     // without it) fall back to pod-start anchoring inside the dispatcher.
     builtAt: (routingManifest as { builtAt?: string }).builtAt,
+    routeExecutionTimeouts: routingManifest.routeExecutionTimeouts,
+    poolResponseHeadTimeouts: routingManifest.poolResponseHeadTimeouts,
     revalidate,
     incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
@@ -2750,7 +2768,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           "content-type": getContentType(staticPathname),
           "cache-control": cacheControl,
           etag,
-          ...(headers ?? {}),
+          ...headers,
         };
         if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
           res.writeHead(304, responseHeaders);
@@ -2873,12 +2891,128 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
     }
 
+    const headers = requestHeaders(req);
+
+    let bodyBuffer: Buffer | null;
+    try {
+      bodyBuffer = isReadMethod(req.method) ? null : await readRequestBody(req, res);
+    } catch (err) {
+      const overLimit = err instanceof BodyTooLargeError;
+      const overBudget = err instanceof BodyBudgetExceededError;
+      if (overLimit || overBudget) {
+        // readRequestBody deliberately left the socket alive (paused, not destroyed):
+        // destroying first turns the 413 into an ECONNRESET the client can't read.
+        // Say we're closing, flush the response, and only then tear the socket down
+        // so the remainder of the oversized upload can't pin the connection.
+        //
+        // N34: the process-wide budget answers 503 + Retry-After, not 413 — the request itself
+        // was within the per-request limit; the POD is out of admission capacity. That is the
+        // distinction a client (and an operator reading logs) needs, and 503 is the status a
+        // load balancer will retry elsewhere.
+        if (overBudget) {
+          console.warn(
+            `[pool-server] refusing upload: in-flight request bodies would exceed ` +
+              `${MAX_INFLIGHT_BODY_BYTES} bytes (ADAPTER_K8S_MAX_INFLIGHT_BODY_BYTES)`,
+          );
+        }
+        res.writeHead(overBudget ? 503 : 413, {
+          "content-type": "text/plain; charset=utf-8",
+          connection: "close",
+          ...(overBudget ? { "retry-after": "1", "cache-control": "no-store" } : {}),
+        });
+        res.end(overBudget ? "Service Unavailable" : "Payload Too Large");
+        // 'finish' never fires if the socket dies first (client gone mid-flush) —
+        // listen for 'close' too so the paused oversized upload can't pin the
+        // connection. destroy() on an already-destroyed socket is a no-op.
+        const teardown = () => {
+          if (!req.destroyed) req.destroy();
+        };
+        res.once("finish", teardown);
+        res.once("close", teardown);
+        return;
+      }
+      throw err;
+    }
+    if (bodyBuffer) {
+      // Next.js action-handler checks request meta first when the original
+      // Node stream has already been consumed upstream.
+      addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
+    }
+
+    // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
+    // bodies routinely carry credentials, tokens, and PII, and were previously written to
+    // production logs on every action. Body length only, and only when explicitly enabled.
+    if (
+      process.env.ADAPTER_K8S_DEBUG_ACTIONS === "1" &&
+      isServerActionRequest(headers, req.method ?? "GET")
+    ) {
+      console.log("[pool-server] action request", {
+        url: url.pathname,
+        method: req.method,
+        nextAction: headers.get("next-action"),
+        rsc: headers.get("rsc"),
+        accept: headers.get("accept"),
+        nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
+        nextUrl: headers.get("next-url"),
+        contentType: headers.get("content-type"),
+        contentLength: headers.get("content-length"),
+        bodyLength: bodyBuffer?.length ?? 0,
+      });
+    }
+
+    const requestHasBasePath =
+      !basePath || url.pathname === basePath || url.pathname.startsWith(`${basePath}/`);
+    const imagePlatformPath = requestHasBasePath
+      ? stripBasePath(url.pathname, basePath)
+      : url.pathname;
+    const isImageRequest =
+      requestHasBasePath &&
+      (imagePlatformPath === "/_next/image" || imagePlatformPath === "/_next/image/");
+    const upstreamMiddlewareVerdict = req.headers["x-mw-evaluated"];
+    const upstreamAlreadyResolved =
+      typeof upstreamMiddlewareVerdict === "string" &&
+      MW_EVALUATED_TRUSTED.has(upstreamMiddlewareVerdict);
+    const upstreamInvokePath = req.headers["x-invoke-path"];
+    const upstreamRewrotePlatform =
+      upstreamAlreadyResolved &&
+      typeof upstreamInvokePath === "string" &&
+      !targetsSamePlatformUrl(upstreamInvokePath, url);
+    const shouldHandleImage = isImageRequest && !upstreamRewrotePlatform;
+
+    // Next routing runs before the optimizer for every method. Redirects, middleware-authored
+    // responses and rewrites away from the optimizer are terminal. An unchanged app catch-all is
+    // not: BaseServer gives its platform image route priority over the selected page output.
+    if (shouldHandleImage && upstreamAlreadyResolved) {
+      // A trusted routing extension already ran this phase. Reuse its result rather than running
+      // middleware twice; body-capable requests never carry this assertion because the header-only
+      // extension deliberately hands those to the pool for local resolution.
+      applyMiddlewareRequestHeaders(req, extMwRequestHeaders);
+      installResolvedResponseHeaders(res, extResolvedHeaders);
+    } else if (shouldHandleImage) {
+      const resolution = await resolvePlatformRequest(
+        resolver,
+        url,
+        headers,
+        req.method ?? "GET",
+        createBufferedStream(bodyBuffer),
+      );
+      if (resolution.kind !== "continue-platform") {
+        await dispatcher.dispatch(req, res, resolution);
+        return;
+      }
+      applyMiddlewareRequestHeaders(req, resolution.middlewareRequestHeaders);
+      installResolvedResponseHeaders(res, resolution.resolvedHeaders);
+      if (appCacheControl === null) {
+        appCacheControl = resolution.resolvedHeaders?.get("cache-control") ?? null;
+      }
+    }
+
     // Basic image optimization: /_next/image?url=...&w=...&q=...
     // Fetches the source image and serves it (with optimization if Sharp is available).
     // Both forms: a custom images.loaderFile commonly emits `/_next/image/?url=…` (the
     // upstream loader-config fixture does), and `trailingSlash: true` apps mirror it. The
     // exact match silently bypassed the optimizer for the slash form (canary.97 catch-up ②).
-    if (url.pathname === "/_next/image" || url.pathname === "/_next/image/") {
+    if (shouldHandleImage) {
       // The `url` gate FIRST, then `w`/`q` — upstream's order, and observable: with
       // `?url=/_next/image&w=16` `next start` answers "cannot be recursive" while the
       // adapter used to answer `"w" parameter (width) of 16 is not allowed`. See
@@ -2954,17 +3088,24 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // until afterwards, so `/..%2f..%2fpackage.json` reaches here intact and must be
           // refused. Pinned by test in tests/pool-server/index.image.test.ts.
           const decodedImagePath = urlParam.pathname;
+          const filesystemImagePath = stripBasePath(decodedImagePath, basePath);
+          const publicImagePath =
+            basePath &&
+            decodedImagePath !== basePath &&
+            !decodedImagePath.startsWith(`${basePath}/`)
+              ? `${basePath}${decodedImagePath}`
+              : decodedImagePath;
           const publicRoot = path.join(process.cwd(), "public");
           const staticRoot = path.join(process.cwd(), ".next", "static");
-          const publicFile = resolveWithinRoot(publicRoot, decodedImagePath);
-          const staticFile = decodedImagePath.startsWith("/_next/static/")
-            ? resolveWithinRoot(staticRoot, decodedImagePath.slice("/_next/static/".length))
+          const publicFile = resolveWithinRoot(publicRoot, filesystemImagePath);
+          const staticFile = filesystemImagePath.startsWith("/_next/static/")
+            ? resolveWithinRoot(staticRoot, filesystemImagePath.slice("/_next/static/".length))
             : null;
 
           // A null result means the path escaped its root — reject traversal.
           if (
             publicFile === null ||
-            (decodedImagePath.startsWith("/_next/static/") && staticFile === null)
+            (filesystemImagePath.startsWith("/_next/static/") && staticFile === null)
           ) {
             // No exact upstream counterpart: upstream NORMALIZES `..` away in
             // `new URL(url, "http://n")` and then simply misses the file, answering
@@ -2978,8 +3119,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // `immutable/media` variant), evaluated on the DECODED path so an encoded
           // prefix can't claim immutability for a public/ file.
           isStaticSource =
-            decodedImagePath.startsWith("/_next/static/media/") ||
-            decodedImagePath.startsWith("/_next/static/immutable/media/");
+            filesystemImagePath.startsWith("/_next/static/media/") ||
+            filesystemImagePath.startsWith("/_next/static/immutable/media/");
 
           // S3 (SECURITY + PARITY). Does middleware cover the SOURCE pathname? If so the disk
           // read below would serve bytes middleware was supposed to gate: the sibling fast
@@ -2999,10 +3140,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // for every request, not just the ones whose has/missing match (see S2).
           const sourceCoveredByMiddleware =
             !!(middlewareModule || edgeMiddlewareRunner) &&
-            middlewareMayCoverPath(
-              middlewareMatchers,
-              new URL(`${url.origin}${basePath}${decodedImagePath}`),
-            );
+            middlewareMayCoverPath(middlewareMatchers, new URL(`${url.origin}${publicImagePath}`));
 
           let localImageFile: string | null = null;
           let localImageSize = 0;
@@ -3045,7 +3183,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and the
             // SHARED MAX_IMAGE_BYTES cap (N35) so an oversized body can't exhaust memory —
             // the same number the external path enforces, which it previously did not.
-            const selfUrl = `http://127.0.0.1:${port}${imageUrl}`;
+            //
+            // The re-entry URL is the RAW validated `url` param, not the decoded pathname:
+            // upstream's fetchInternalImage hands the raw url to the full request pipeline,
+            // so `?url=%2Fapi%2Fog%3Ftitle%3DX` must reach the route as /api/og?title=X —
+            // the decoded pathname has the query stripped and re-decodes `%23`/`%3F` into
+            // characters that re-parse as fragment/query separators. basePath is prefixed
+            // exactly when the decoded-pathname check above decided it was missing.
+            const loopbackUrl =
+              publicImagePath === decodedImagePath ? urlParam.url : `${basePath}${urlParam.url}`;
+            const selfUrl = `http://127.0.0.1:${port}${loopbackUrl}`;
             const imgRes = await fetch(selfUrl, {
               signal: AbortSignal.timeout(5000),
               // The EXTERNAL path re-validates every redirect hop against the SSRF
@@ -3104,7 +3251,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             selfFetchContentType = imgRes.headers.get("content-type");
             upstreamCacheControl = imgRes.headers.get("cache-control");
           }
-          contentType = selfFetchContentType ?? getContentType(decodedImagePath);
+          contentType = selfFetchContentType ?? getContentType(filesystemImagePath);
         } else {
           // External image: only fetch allowlisted http(s) hosts, and only after
           // confirming the host resolves to a public address (SSRF / DNS-rebind guard).
@@ -3419,79 +3566,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // middleware headers. servePublicFileFromDisk remains as the last resort for files
     // the manifest missed (both phases, below).
 
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === "string") headers.set(key, value);
-      else if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
-    }
-
-    let bodyBuffer: Buffer | null;
-    try {
-      bodyBuffer = isReadMethod(req.method) ? null : await readRequestBody(req, res);
-    } catch (err) {
-      const overLimit = err instanceof BodyTooLargeError;
-      const overBudget = err instanceof BodyBudgetExceededError;
-      if (overLimit || overBudget) {
-        // readRequestBody deliberately left the socket alive (paused, not destroyed):
-        // destroying first turns the 413 into an ECONNRESET the client can't read.
-        // Say we're closing, flush the response, and only then tear the socket down
-        // so the remainder of the oversized upload can't pin the connection.
-        //
-        // N34: the process-wide budget answers 503 + Retry-After, not 413 — the request itself
-        // was within the per-request limit; the POD is out of admission capacity. That is the
-        // distinction a client (and an operator reading logs) needs, and 503 is the status a
-        // load balancer will retry elsewhere.
-        if (overBudget) {
-          console.warn(
-            `[pool-server] refusing upload: in-flight request bodies would exceed ` +
-              `${MAX_INFLIGHT_BODY_BYTES} bytes (ADAPTER_K8S_MAX_INFLIGHT_BODY_BYTES)`,
-          );
-        }
-        res.writeHead(overBudget ? 503 : 413, {
-          "content-type": "text/plain; charset=utf-8",
-          connection: "close",
-          ...(overBudget ? { "retry-after": "1", "cache-control": "no-store" } : {}),
-        });
-        res.end(overBudget ? "Service Unavailable" : "Payload Too Large");
-        // 'finish' never fires if the socket dies first (client gone mid-flush) —
-        // listen for 'close' too so the paused oversized upload can't pin the
-        // connection. destroy() on an already-destroyed socket is a no-op.
-        const teardown = () => {
-          if (!req.destroyed) req.destroy();
-        };
-        res.once("finish", teardown);
-        res.once("close", teardown);
-        return;
-      }
-      throw err;
-    }
-    if (bodyBuffer) {
-      // Next.js action-handler checks request meta first when the original
-      // Node stream has already been consumed upstream.
-      addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
-    }
-
-    // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
-    // bodies routinely carry credentials, tokens, and PII, and were previously written to
-    // production logs on every action. Body length only, and only when explicitly enabled.
-    if (
-      process.env.ADAPTER_K8S_DEBUG_ACTIONS === "1" &&
-      isServerActionRequest(headers, req.method ?? "GET")
-    ) {
-      console.log("[pool-server] action request", {
-        url: url.pathname,
-        method: req.method,
-        nextAction: headers.get("next-action"),
-        rsc: headers.get("rsc"),
-        accept: headers.get("accept"),
-        nextRouterStateTreeLength: headers.get("next-router-state-tree")?.length ?? 0,
-        nextUrl: headers.get("next-url"),
-        contentType: headers.get("content-type"),
-        contentLength: headers.get("content-length"),
-        bodyLength: bodyBuffer?.length ?? 0,
-      });
-    }
-
     // Phase 2+: if dispatch headers exist (from route extension), use them directly.
     // These are only present when the request passed the secret check in server.ts (else they
     // were stripped), so they can be trusted here.
@@ -3541,6 +3615,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // from an extension bug must not 500 the request — the invoker recovers the
       // query from the invocation path itself.
       const extInvokePath = req.headers["x-invoke-path"] as string | undefined;
+      const extDeadlineRaw = req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER] as string | undefined;
+      const extDeadlineParsed = extDeadlineRaw === undefined ? Number.NaN : Number(extDeadlineRaw);
+      const extDeadlineAt =
+        Number.isSafeInteger(extDeadlineParsed) && extDeadlineParsed > 0
+          ? extDeadlineParsed
+          : undefined;
       let extInvocationQuery: Record<string, string | string[]> | undefined;
       const extInvokeQueryRaw = req.headers["x-invoke-query"] as string | undefined;
       if (extInvokeQueryRaw) {
@@ -3574,6 +3654,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         ...(extMwRequestHeaders ? { middlewareRequestHeaders: extMwRequestHeaders } : {}),
         ...(extInvokePath ? { invokePath: extInvokePath } : {}),
         ...(extInvocationQuery ? { invocationQuery: extInvocationQuery } : {}),
+        ...(extDeadlineAt ? { executionDeadlineAt: extDeadlineAt } : {}),
       });
       return;
     }

@@ -4,11 +4,13 @@ import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
+import { splitCookiesString } from "next/dist/server/web/utils.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import type { StaticAssetEntry } from "../types.js";
 import {
+  INTERNAL_EXECUTION_DEADLINE_HEADER,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   localeAlignedRouteParamPathname,
@@ -62,14 +64,9 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
     if (lower === "x-next-cache-tags") continue;
     headers[key] = value;
   }
-  const setCookies =
-    webHeaders.getSetCookie?.() ??
-    (webHeaders.has("set-cookie")
-      ? webHeaders
-          .get("set-cookie")!
-          .split(/,(?=[^;]*=)/)
-          .map((c) => c.trim())
-      : []);
+  const setCookies = webHeaders
+    .getSetCookie()
+    .flatMap((maybeCompoundCookie) => splitCookiesString(maybeCompoundCookie));
   if (setCookies.length > 0) headers["set-cookie"] = setCookies;
   return headers;
 }
@@ -202,6 +199,13 @@ class ClientAbortError extends Error {
   }
 }
 
+class DeadlineExceededError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DeadlineExceededError";
+  }
+}
+
 // Cancel an upstream request when the client connection dies before the response
 // completes — otherwise a wedged/slow upstream keeps running into a dead socket.
 // Guarded because unit-test response doubles don't implement the EventEmitter surface.
@@ -221,13 +225,9 @@ function abortOnClientClose(res: ServerResponse, abort: () => void): void {
  */
 export const PROXY_ABSOLUTE_DEADLINE_MS = 600_000;
 
-// Bounded wait for proxied upstreams (external rewrites + cross-pool). A wedged target
-// must not pin the client connection and this pod's sockets until the server-wide
-// requestTimeout (300s default) fires.
-const PROXY_TIMEOUT_MS = 30_000;
-
-// N37: the same bound for a LOCAL handler invocation, which had none. The only bounded waits were
-// proxyTimeoutMs (proxied upstreams only) and the server-wide `requestTimeout`, which measures
+// N37: one default time-to-response-head budget for local handlers and cross-pool hops. Separate
+// 60s/30s defaults made the same route succeed or 502 depending only on which pool received it.
+// The server-wide `requestTimeout` measures
 // request RECEIPT and not handler runtime — so a handler that never answered held a listening
 // loopback server, an ephemeral port, its pendingWaitUntil set and the client socket for as long
 // as the process lived. This bounds TIME TO THE RESPONSE HEAD only, and is disarmed once the
@@ -235,10 +235,12 @@ const PROXY_TIMEOUT_MS = 30_000;
 // same reason — capping the streaming phase would kill SSE and long PPR resumes that a same-pool
 // route is expected to serve. Generous by default (a blocking SSG render on a cold pod is
 // legitimately slow); the point is that it is finite.
-const HANDLER_TIMEOUT_MS = Math.max(
+const REQUEST_HEAD_TIMEOUT_MS = Math.max(
   1_000,
   parseInt(process.env.ADAPTER_K8S_HANDLER_TIMEOUT_MS ?? "", 10) || 60_000,
 );
+const PROXY_TIMEOUT_MS = REQUEST_HEAD_TIMEOUT_MS;
+const HANDLER_TIMEOUT_MS = REQUEST_HEAD_TIMEOUT_MS;
 
 // RFC 9110 §7.6.1 hop-by-hop headers describe a single transport-level connection.
 // Forwarding an upstream's `connection`/`transfer-encoding`/etc. to our client
@@ -312,7 +314,7 @@ function deleteHeaderCaseInsensitive(
 function sanitizeStoredEntryHeaders(
   headers: Record<string, string> | undefined,
 ): Record<string, string> {
-  const out: Record<string, string> = { ...(headers ?? {}) };
+  const out: Record<string, string> = { ...headers };
   deleteHeaderCaseInsensitive(out, "x-next-cache-tags");
   return out;
 }
@@ -429,6 +431,10 @@ export function mergeResolvedHeadersIntoHeadersArg(
 ): unknown {
   if (headersArg === undefined || headersArg === null) return headersArg;
 
+  const resolvedSetCookies = resolvedHeaders
+    .getSetCookie()
+    .flatMap((maybeCompoundCookie) => splitCookiesString(maybeCompoundCookie));
+
   if (Array.isArray(headersArg)) {
     const pairs: [string, unknown][] = [];
     if (headersArg.length > 0 && !Array.isArray(headersArg[0])) {
@@ -442,17 +448,13 @@ export function mergeResolvedHeadersIntoHeadersArg(
       }
     }
     for (const [key, value] of resolvedHeaders.entries()) {
-      if (key.toLowerCase() === "set-cookie") {
-        for (const c of value.split(/,(?=[^;]*=)/)) {
-          pairs.push(["set-cookie", c.trim()]);
-        }
-      } else {
-        for (let i = pairs.length - 1; i >= 0; i--) {
-          if (pairs[i]![0].toLowerCase() === key.toLowerCase()) pairs.splice(i, 1);
-        }
-        pairs.push([key, value]);
+      if (key.toLowerCase() === "set-cookie") continue;
+      for (let i = pairs.length - 1; i >= 0; i--) {
+        if (pairs[i]![0].toLowerCase() === key.toLowerCase()) pairs.splice(i, 1);
       }
+      pairs.push([key, value]);
     }
+    for (const cookie of resolvedSetCookies) pairs.push(["set-cookie", cookie]);
     // Tuple form back to Node — it accepts tuples regardless of the input shape.
     return pairs;
   }
@@ -460,34 +462,75 @@ export function mergeResolvedHeadersIntoHeadersArg(
   if (typeof headersArg === "object") {
     const handlerHeaders = headersArg as Record<string, string | string[]>;
     for (const [key, value] of resolvedHeaders.entries()) {
-      if (key.toLowerCase() === "set-cookie") {
-        const existingKey = Object.keys(handlerHeaders).find(
-          (name) => name.toLowerCase() === "set-cookie",
-        );
-        const existing = existingKey ? handlerHeaders[existingKey] : undefined;
-        const arr: string[] = [];
-        if (existing) {
-          if (Array.isArray(existing)) arr.push(...existing);
-          else arr.push(existing);
+      if (key.toLowerCase() === "set-cookie") continue;
+      for (const existingKey of Object.keys(handlerHeaders)) {
+        if (existingKey.toLowerCase() === key.toLowerCase()) {
+          delete handlerHeaders[existingKey];
         }
-        for (const c of value.split(/,(?=[^;]*=)/)) {
-          arr.push(c.trim());
-        }
-        if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
-        handlerHeaders["set-cookie"] = arr;
-      } else {
-        for (const existingKey of Object.keys(handlerHeaders)) {
-          if (existingKey.toLowerCase() === key.toLowerCase()) {
-            delete handlerHeaders[existingKey];
-          }
-        }
-        handlerHeaders[key] = value;
       }
+      handlerHeaders[key] = value;
+    }
+    if (resolvedSetCookies.length > 0) {
+      const existingKey = Object.keys(handlerHeaders).find(
+        (name) => name.toLowerCase() === "set-cookie",
+      );
+      const existing = existingKey ? handlerHeaders[existingKey] : undefined;
+      const cookies = Array.isArray(existing)
+        ? [...existing, ...resolvedSetCookies]
+        : existing
+          ? [existing, ...resolvedSetCookies]
+          : resolvedSetCookies;
+      if (existingKey && existingKey !== "set-cookie") delete handlerHeaders[existingKey];
+      handlerHeaders["set-cookie"] = cookies;
     }
     return handlerHeaders;
   }
 
   return headersArg;
+}
+
+/** Apply Next middleware's authoritative request-header replacement to a Node request. */
+export function applyMiddlewareRequestHeaders(
+  req: IncomingMessage,
+  middlewareRequestHeaders: Headers | undefined,
+): void {
+  if (!middlewareRequestHeaders) return;
+  const originalHost = req.headers.host;
+  const nextHeaders: IncomingMessage["headers"] = {};
+  for (const [key, value] of middlewareRequestHeaders.entries()) {
+    if (key === "x-middleware-set-cookie") {
+      const cookies: string[] = [];
+      for (const setCookie of splitCookiesString(value)) {
+        const nameValue = setCookie.trim().split(";")[0];
+        if (nameValue) cookies.push(nameValue);
+      }
+      if (cookies.length > 0) {
+        const existing = middlewareRequestHeaders.get("cookie") ?? "";
+        nextHeaders.cookie = [existing, ...cookies].filter(Boolean).join("; ");
+      }
+      continue;
+    }
+    if (key.startsWith("x-middleware-")) continue;
+    nextHeaders[key] = value;
+  }
+  if (!nextHeaders.host && originalHost) nextHeaders.host = originalHost;
+  req.headers = nextHeaders;
+}
+
+/** Merge routing and middleware response headers into the next Node writeHead call. */
+export function installResolvedResponseHeaders(
+  res: ServerResponse,
+  resolvedHeaders: Headers | undefined,
+): void {
+  if (!resolvedHeaders) return;
+  const originalWriteHead = res.writeHead.bind(res);
+  res.writeHead = ((status: number, ...args: unknown[]) => {
+    const headersIndex = typeof args[0] === "string" ? 1 : 0;
+    if (args[headersIndex] !== undefined && args[headersIndex] !== null) {
+      args[headersIndex] = mergeResolvedHeadersIntoHeadersArg(resolvedHeaders, args[headersIndex]);
+    }
+    return Reflect.apply(originalWriteHead, res, [status, ...args]) as ServerResponse;
+  }) as typeof res.writeHead;
 }
 
 // Iteration 7: record a response's status/headers/body as it streams to the client, so a
@@ -536,7 +579,7 @@ function captureResponseForStore(res: ServerResponse, maxBytes: number) {
       | undefined {
       if (over) return undefined;
       const merged: Record<string, string | string[]> = {
-        ...((res.getHeaders?.() as Record<string, string | string[]>) ?? {}),
+        ...(res.getHeaders?.() as Record<string, string | string[]> | undefined),
         ...headHeaders,
       };
       // The stored copy replays under its own verdict; drop the first serve's.
@@ -761,7 +804,7 @@ async function writeWebResponseToNode(
   if (!res.writableEnded) res.end();
 }
 
-async function invokeLocalHandlerOverHttp({
+export async function invokeLocalHandlerOverHttp({
   handler,
   req,
   res,
@@ -784,6 +827,7 @@ async function invokeLocalHandlerOverHttp({
   revalidate,
   i18nLocales,
   handlerTimeoutMs = HANDLER_TIMEOUT_MS,
+  executionTimeoutMs,
   capturePostponedState = false,
   buildFallbackBacked = false,
   platformCacheSeen,
@@ -840,6 +884,8 @@ async function invokeLocalHandlerOverHttp({
   i18nLocales?: string[];
   /** N37: bound on time-to-response-head for this invocation. See HANDLER_TIMEOUT_MS. */
   handlerTimeoutMs?: number;
+  /** Next output maxDuration. Unlike the head timeout, this remains active while streaming. */
+  executionTimeoutMs?: number;
   /**
    * Rev-4 "Option D" (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md):
    * shell-less PPR-capable route running MINIMAL. Swap the inert onCacheEntryV2 stub for a
@@ -881,6 +927,9 @@ async function invokeLocalHandlerOverHttp({
       // has already been streamed to the client; this only keeps the invocation/server lifecycle
       // alive until Next's cache writes, revalidations, and after() work have completed.
       while (pendingWaitUntil.size > 0) {
+        // Snapshot the Set: callbacks may delete themselves and enqueue more work while this
+        // batch settles; the outer loop deliberately picks up the next fixed-point batch.
+        // oxlint-disable-next-line unicorn/no-useless-spread
         await Promise.all([...pendingWaitUntil]);
       }
     };
@@ -1087,6 +1136,8 @@ async function invokeLocalHandlerOverHttp({
       // (which closes the ephemeral server and releases the port through the error path below)
       // and the client gets a 504 if nothing has been written yet.
       let invocationTimedOut = false;
+      let executionTimedOut = false;
+      let activeClientRes: IncomingMessage | undefined;
       const invocationDeadline = setTimeout(() => {
         invocationTimedOut = true;
         console.error(
@@ -1106,13 +1157,19 @@ async function invokeLocalHandlerOverHttp({
           headers: reqHeaders,
         },
         (clientRes) => {
+          activeClientRes = clientRes;
           clearTimeout(invocationDeadline);
           const closeThenSettle = (onError: (error: unknown) => void): void => {
             // App Router wires after() through res.on("close"). Close the loopback response first
             // so that callback can register its waitUntil promise, then drain the complete batch.
             // Draining before server.close races the close callback and silently loses after().
             server.close(() => {
-              void settleWaitUntil().then(resolve).catch(onError);
+              void settleWaitUntil()
+                .then(resolve)
+                .catch(onError)
+                .finally(() => {
+                  if (executionDeadline) clearTimeout(executionDeadline);
+                });
             });
           };
           if (discardResponse) {
@@ -1186,18 +1243,48 @@ async function invokeLocalHandlerOverHttp({
           )
             .then(() => closeThenSettle(reject))
             .catch((error) => {
-              server.close(() => reject(error));
+              server.close(() => (executionTimedOut ? resolve() : reject(error)));
             });
         },
       );
 
+      const executionDeadline =
+        executionTimeoutMs !== undefined
+          ? setTimeout(() => {
+              executionTimedOut = true;
+              console.error(
+                `[pool-server] handler for ${matchedPathname} exceeded maxDuration after ` +
+                  `${executionTimeoutMs}ms — aborting the invocation`,
+              );
+              const error = new DeadlineExceededError(
+                `handler execution timed out after ${executionTimeoutMs}ms`,
+              );
+              activeClientRes?.destroy(error);
+              clientReq.destroy(error);
+              if (!discardResponse && !res.headersSent) {
+                res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+                res.end("Gateway Timeout");
+              } else if (!discardResponse && !res.writableEnded) {
+                res.destroy(error);
+              }
+              server.close(() => resolve());
+            }, executionTimeoutMs)
+          : undefined;
+      executionDeadline?.unref?.();
+
       clientReq.once("error", (error) => {
         clearTimeout(invocationDeadline);
+        // Cleared on EVERY exit from this handler, including the timed-out branch below: a
+        // head-timeout abort used to leave the (unref'd) execution timer armed, and when it
+        // fired minutes later it logged a bogus "exceeded maxDuration" for a request that
+        // had already 504'd and re-destroyed the settled invocation. Clearing a timer that
+        // already fired (executionTimedOut) is a no-op.
+        if (executionDeadline) clearTimeout(executionDeadline);
         // N37: a deadline abort is the adapter's own teardown, not an entrypoint crash — answer
         // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
         // invocations share the outer `res` with a response already sent to the client, so they
         // must never write; they just release the socket and the port.
-        if (invocationTimedOut) {
+        if (invocationTimedOut || executionTimedOut) {
           if (!discardResponse && !res.headersSent) {
             res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
             res.end("Gateway Timeout");
@@ -1240,6 +1327,9 @@ export function extractRouteParams(
     const name = match[1] ?? match[2];
     if (!name) continue;
     const value = routeMatches?.[name] ?? routeMatches?.[`nxtP${name}`];
+    // RegExp.test intentionally preserves the legacy coercion behaviour for a malformed
+    // secret-gated route-matches value; startsWith would throw before the existing shape path.
+    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
     if (value === undefined || /^\$nxtP/.test(value)) continue;
     if (match[1]) {
       const segments = value.split("/");
@@ -1662,6 +1752,9 @@ export interface DispatcherOptions {
   /** N37: bound on time-to-response-head for a LOCAL handler invocation. Defaults to
    * HANDLER_TIMEOUT_MS (ADAPTER_K8S_HANDLER_TIMEOUT_MS); injectable for the same reason. */
   handlerTimeoutMs?: number | undefined;
+  /** Build-derived route execution and pool response-head budgets. */
+  routeExecutionTimeouts?: Record<string, number> | undefined;
+  poolResponseHeadTimeouts?: Record<string, number> | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
@@ -1718,6 +1811,8 @@ export function createDispatcher(options: DispatcherOptions) {
     builtAt,
     proxyTimeoutMs = PROXY_TIMEOUT_MS,
     handlerTimeoutMs = HANDLER_TIMEOUT_MS,
+    routeExecutionTimeouts = {},
+    poolResponseHeadTimeouts = {},
   } = options;
 
   // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
@@ -2002,6 +2097,33 @@ export function createDispatcher(options: DispatcherOptions) {
       // listener Node crashes the process. Guard the outer client response up front.
       guardStreamErrors(res);
 
+      const configuredRequestHeadTimeoutMs =
+        resolution.kind === "route"
+          ? (poolResponseHeadTimeouts[resolution.pool] ?? handlerTimeoutMs)
+          : handlerTimeoutMs;
+      const configuredExecutionTimeoutMs =
+        resolution.kind === "route"
+          ? routeExecutionTimeouts[resolution.matchedPathname]
+          : undefined;
+      const localExecutionDeadlineAt =
+        configuredExecutionTimeoutMs !== undefined
+          ? Date.now() + configuredExecutionTimeoutMs
+          : undefined;
+      const propagatedExecutionDeadlineAt =
+        resolution.kind === "route" ? resolution.executionDeadlineAt : undefined;
+      const executionDeadlineAt =
+        localExecutionDeadlineAt !== undefined && propagatedExecutionDeadlineAt !== undefined
+          ? Math.min(localExecutionDeadlineAt, propagatedExecutionDeadlineAt)
+          : (localExecutionDeadlineAt ?? propagatedExecutionDeadlineAt);
+      const remainingExecutionMs =
+        executionDeadlineAt !== undefined
+          ? Math.max(1, executionDeadlineAt - Date.now())
+          : undefined;
+      const requestHeadTimeoutMs =
+        remainingExecutionMs !== undefined
+          ? Math.min(configuredRequestHeadTimeoutMs, remainingExecutionMs)
+          : configuredRequestHeadTimeoutMs;
+
       // base-server deletes the RSC cache-busting param NEXT_RSC_UNION_QUERY ('_rsc') from
       // the render query (base-server.ts:2719-2722) — it exists only to partition
       // browser/CDN caches. The generated entrypoint parses req.url directly under our
@@ -2043,21 +2165,7 @@ export function createDispatcher(options: DispatcherOptions) {
         (resolution.kind === "route" || resolution.kind === "not-found") &&
         resolution.resolvedHeaders
       ) {
-        const resolvedHeaders = resolution.resolvedHeaders;
-        const origWriteHead = res.writeHead.bind(res);
-        (res as any).writeHead = (status: number, ...args: any[]) => {
-          // writeHead(status, headers) or writeHead(status, msg, headers). The headers
-          // argument may be an object OR an array (tuple/flat) — the merge helper
-          // handles every shape Node accepts.
-          const headersArgIdx = typeof args[0] === "string" ? 1 : 0;
-          if (args[headersArgIdx] !== undefined && args[headersArgIdx] !== null) {
-            args[headersArgIdx] = mergeResolvedHeadersIntoHeadersArg(
-              resolvedHeaders,
-              args[headersArgIdx],
-            );
-          }
-          return origWriteHead(status, ...args);
-        };
+        installResolvedResponseHeaders(res, resolution.resolvedHeaders);
       }
 
       // Resolve the handler output id up front (shared by the static fast path
@@ -2322,7 +2430,10 @@ export function createDispatcher(options: DispatcherOptions) {
                 discardResponse: true,
                 render404: render404FromEntrypoint,
                 renderError: renderErrorFromEntrypoint,
-                handlerTimeoutMs,
+                handlerTimeoutMs: requestHeadTimeoutMs,
+                ...(remainingExecutionMs !== undefined
+                  ? { executionTimeoutMs: remainingExecutionMs }
+                  : {}),
                 ...(revalidate ? { revalidate } : {}),
               }),
             )
@@ -2351,7 +2462,9 @@ export function createDispatcher(options: DispatcherOptions) {
             "http://localhost",
           ).pathname;
           const storedKey = storedConcrete === "/" ? "/index" : storedConcrete;
-          const stored = await platformCache.readStored(storedKey, { kind: "APP_PAGE" }).catch(() => null);
+          const stored = await platformCache
+            .readStored(storedKey, { kind: "APP_PAGE" })
+            .catch(() => null);
           const sv = stored?.value as
             | { kind?: string; html?: unknown; headers?: Record<string, string>; status?: number }
             | undefined;
@@ -2633,6 +2746,7 @@ export function createDispatcher(options: DispatcherOptions) {
           const proxyMod =
             target.protocol === "https:" ? await import("node:https") : await import("node:http");
           return new Promise<void>((resolve) => {
+            let deadlineExceeded = false;
             const bufferedBody = (
               req as IncomingMessage & {
                 [NEXT_REQUEST_META]?: { actionBody?: Buffer };
@@ -2658,9 +2772,9 @@ export function createDispatcher(options: DispatcherOptions) {
                 path: target.pathname + target.search,
                 method: req.method,
                 headers: forwardHeaders,
-                timeout: proxyTimeoutMs,
               },
               (proxyRes) => {
+                clearTimeout(responseHeadDeadline);
                 res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
                 // pipeline handles errors on either end (e.g. client disconnect) and
                 // cleans up both streams, unlike a bare .pipe().
@@ -2668,9 +2782,13 @@ export function createDispatcher(options: DispatcherOptions) {
               },
             );
 
-            proxyReq.on("timeout", () => {
-              proxyReq.destroy(new Error(`external rewrite to ${target.origin} timed out`));
-            });
+            const responseHeadDeadline = setTimeout(() => {
+              deadlineExceeded = true;
+              proxyReq.destroy(
+                new DeadlineExceededError(`external rewrite to ${target.origin} timed out`),
+              );
+            }, proxyTimeoutMs);
+            responseHeadDeadline.unref?.();
 
             // S19 (AVAILABILITY). `timeout` above is an IDLE timeout — an upstream that emits
             // one byte just inside each interval holds a client socket, an upstream socket and
@@ -2678,6 +2796,7 @@ export function createDispatcher(options: DispatcherOptions) {
             // memory. The image fetch grew an absolute deadline for exactly this shape (N35);
             // the proxy path did not. Bound the WHOLE exchange, connect through body.
             const absoluteDeadline = setTimeout(() => {
+              deadlineExceeded = true;
               proxyReq.destroy(
                 new Error(
                   `external rewrite to ${target.origin} exceeded the ${PROXY_ABSOLUTE_DEADLINE_MS}ms absolute deadline`,
@@ -2692,6 +2811,7 @@ export function createDispatcher(options: DispatcherOptions) {
             proxyReq.on("close", () => clearTimeout(absoluteDeadline));
 
             proxyReq.on("error", (err) => {
+              clearTimeout(responseHeadDeadline);
               // A client abort is our own deliberate teardown, not an upstream failure —
               // log it at info level and skip the 502 (the client is gone anyway).
               if (err instanceof ClientAbortError) {
@@ -2708,8 +2828,8 @@ export function createDispatcher(options: DispatcherOptions) {
                 err,
               );
               if (!res.headersSent) {
-                res.writeHead(502, { "content-type": "text/plain" });
-                res.end("Bad Gateway");
+                res.writeHead(deadlineExceeded ? 504 : 502, { "content-type": "text/plain" });
+                res.end(deadlineExceeded ? "Gateway Timeout" : "Bad Gateway");
               }
               resolve();
             });
@@ -2743,7 +2863,7 @@ export function createDispatcher(options: DispatcherOptions) {
             res,
             bufferedBody,
             basePath,
-              notFoundIsPrerendered,
+            notFoundIsPrerendered,
           );
           return;
         }
@@ -2802,7 +2922,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 res,
                 undefined,
                 basePath,
-              notFoundIsPrerendered,
+                notFoundIsPrerendered,
               );
               return;
             }
@@ -2813,34 +2933,15 @@ export function createDispatcher(options: DispatcherOptions) {
           // x-middleware-override-headers, and x-middleware-request-* headers.
           // The override list is authoritative: a listed header with no corresponding
           // x-middleware-request-* value means deletion. Merging would resurrect it.
-          if (resolution.middlewareRequestHeaders) {
-            const originalHost = req.headers.host;
-            const nextHeaders: IncomingMessage["headers"] = {};
-            for (const [key, value] of resolution.middlewareRequestHeaders.entries()) {
-              if (key === "x-middleware-set-cookie") {
-                // Parse Set-Cookie values and merge into cookie header so the
-                // handler can read middleware-set cookies in the same request.
-                const parts: string[] = [];
-                for (const sc of value.split(/,(?=[^;]*=)/)) {
-                  const nameVal = sc.trim().split(";")[0];
-                  if (nameVal) parts.push(nameVal);
-                }
-                if (parts.length > 0) {
-                  const existing = resolution.middlewareRequestHeaders.get("cookie") ?? "";
-                  nextHeaders.cookie = [existing, ...parts].filter(Boolean).join("; ");
-                }
-                continue;
-              }
-              // Skip internal x-middleware-* control headers
-              if (key.startsWith("x-middleware-")) continue;
-              nextHeaders[key] = value;
-            }
-            if (!nextHeaders.host && originalHost) nextHeaders.host = originalHost;
-            req.headers = nextHeaders;
-          }
+          applyMiddlewareRequestHeaders(req, resolution.middlewareRequestHeaders);
 
-          // If this output belongs to another pool, proxy the request
-          if (resolution.pool !== poolName && !handlerLoader.has(handlerPathname)) {
+          // Pool ownership is authoritative. A broad local dynamic template can match the
+          // same concrete pathname as an exact route assigned elsewhere (for example an App
+          // `/[locale]` beside a Pages `/legacy`). Serving merely because this image has that
+          // template runs the wrong router and can feed a Pages cache entry to an App handler.
+          // Shared static files have already returned through the fast path above; every
+          // remaining foreign execution must go to its assigned pool.
+          if (resolution.pool !== poolName) {
             return proxyToPool(
               req,
               res,
@@ -2848,7 +2949,8 @@ export function createDispatcher(options: DispatcherOptions) {
               releaseName,
               buildId,
               internalSecret,
-              proxyTimeoutMs,
+              requestHeadTimeoutMs,
+              executionDeadlineAt,
             );
           }
 
@@ -2955,26 +3057,66 @@ export function createDispatcher(options: DispatcherOptions) {
                 console.error(`Edge background work failed for ${handlerPathname}:`, error);
               });
             };
+            let executionTimer: ReturnType<typeof setTimeout> | undefined;
+            const executionExceeded =
+              remainingExecutionMs !== undefined
+                ? new Promise<never>((_resolve, reject) => {
+                    executionTimer = setTimeout(
+                      () =>
+                        reject(
+                          new DeadlineExceededError(
+                            `edge route ${handlerPathname} exceeded maxDuration`,
+                          ),
+                        ),
+                      remainingExecutionMs,
+                    );
+                    executionTimer.unref?.();
+                  })
+                : undefined;
+            const withinExecution = <T>(promise: Promise<T>): Promise<T> =>
+              executionExceeded ? Promise.race([promise, executionExceeded]) : promise;
             try {
-              const result = await edgeRouteRunner({
-                name: handlerPathname,
-                paths: [filePath],
-                request: {
-                  url: fullUrl.toString(),
-                  method: req.method,
-                  headers: headerObj,
-                  body:
-                    req.method !== "GET" && req.method !== "HEAD"
-                      ? (
-                          req as IncomingMessage & { [NEXT_REQUEST_META]?: { actionBody?: Buffer } }
-                        )[NEXT_REQUEST_META]?.actionBody
-                      : undefined,
-                  page: {
+              let headTimer: ReturnType<typeof setTimeout> | undefined;
+              const responseHeadExceeded = new Promise<never>((_resolve, reject) => {
+                headTimer = setTimeout(
+                  () =>
+                    reject(
+                      new DeadlineExceededError(
+                        `edge route ${handlerPathname} exceeded its response-head deadline`,
+                      ),
+                    ),
+                  requestHeadTimeoutMs,
+                );
+                headTimer.unref?.();
+              });
+              const result = await withinExecution(
+                Promise.race([
+                  edgeRouteRunner({
                     name: handlerPathname,
-                    ...(Object.keys(edgeRouteParams).length > 0 && { params: edgeRouteParams }),
-                  },
-                  waitUntil,
-                },
+                    paths: [filePath],
+                    request: {
+                      url: fullUrl.toString(),
+                      method: req.method,
+                      headers: headerObj,
+                      body:
+                        req.method !== "GET" && req.method !== "HEAD"
+                          ? (
+                              req as IncomingMessage & {
+                                [NEXT_REQUEST_META]?: { actionBody?: Buffer };
+                              }
+                            )[NEXT_REQUEST_META]?.actionBody
+                          : undefined,
+                      page: {
+                        name: handlerPathname,
+                        ...(Object.keys(edgeRouteParams).length > 0 && { params: edgeRouteParams }),
+                      },
+                      waitUntil,
+                    },
+                  }),
+                  responseHeadExceeded,
+                ]),
+              ).finally(() => {
+                if (headTimer) clearTimeout(headTimer);
               });
               const edgeRes = result.response;
               res.writeHead(edgeRes.status, webHeadersToNodeHeaders(edgeRes.headers));
@@ -2982,7 +3124,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 const reader = edgeRes.body.getReader();
                 try {
                   while (true) {
-                    const { done, value } = await reader.read();
+                    const { done, value } = await withinExecution(reader.read());
                     if (done) break;
                     if (value && !(await writeChunkSafely(res, Buffer.from(value)))) break;
                   }
@@ -2994,10 +3136,23 @@ export function createDispatcher(options: DispatcherOptions) {
               // The body is already complete, but the platform invocation must remain alive until
               // Edge after()/cache work settles. This mirrors the Node entrypoint lifecycle above
               // and prevents a pod/request teardown from dropping revalidation side effects.
-              await result.waitUntil?.catch((error) => {
-                console.error(`Edge background work failed for ${handlerPathname}:`, error);
-              });
+              if (result.waitUntil) {
+                await withinExecution(result.waitUntil).catch((error) => {
+                  if (error instanceof DeadlineExceededError) throw error;
+                  console.error(`Edge background work failed for ${handlerPathname}:`, error);
+                });
+              }
             } catch (err) {
+              if (err instanceof DeadlineExceededError) {
+                console.error(`[pool-server] ${err.message}`);
+                if (!res.headersSent) {
+                  res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+                  res.end("Gateway Timeout");
+                } else if (!res.writableEnded) {
+                  res.destroy(err);
+                }
+                return;
+              }
               console.error(`Edge route handler failed for ${handlerPathname}:`, err);
               if (!res.headersSent) {
                 res.writeHead(500, { "content-type": "text/plain" });
@@ -3010,6 +3165,8 @@ export function createDispatcher(options: DispatcherOptions) {
                 if (typeof res.destroy === "function") res.destroy();
                 else res.end();
               }
+            } finally {
+              if (executionTimer) clearTimeout(executionTimer);
             }
             return;
           }
@@ -3377,7 +3534,10 @@ export function createDispatcher(options: DispatcherOptions) {
             // A STORED entry's postponed token injects even when the SEED is stale — the
             // stored entry passed the handler's own tag check. The disk-shell path keeps
             // the shellUsable gate.
-            if (!isDynamicRsc && (entryPostponed !== undefined || (shellUsable && shellAvailable))) {
+            if (
+              !isDynamicRsc &&
+              (entryPostponed !== undefined || (shellUsable && shellAvailable))
+            ) {
               const meta = ((req as any)[NEXT_REQUEST_META] as Record<string, unknown>) ?? {};
               // The materialized entry's token wins over the build token — it carries the
               // regenerated Resume Data Cache.
@@ -3567,19 +3727,19 @@ export function createDispatcher(options: DispatcherOptions) {
               // (no Suspense boundary above the params access) is rendered dynamically by
               // upstream, and running it non-minimal made Next resume a fallback shell upstream
               // deliberately skips (app-dir/fallback-shells).
+              // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
+              // mode, where the entrypoint's own filesystem cache holds the build shells
+              // and Next resumes internally. Under a SHARED cache the entrypoints are
+              // per-request render modules with no route-shell orchestration (measured:
+              // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
+              // take the same minimal+inject path as the no-classic-handler case below.
+              // Shell-LESS root-param templates still need non-minimal in both modes (N16).
+              // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
+              // next start serves these through the full server, so getStaticProps sees
+              // revalidateReason 'on-demand' and the fresh entry persists through the
+              // registered cache handler. The minimal rungs exist for platform-cache
+              // emulation, which must never intercept an authenticated revalidation.
               (
-                // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
-                // mode, where the entrypoint's own filesystem cache holds the build shells
-                // and Next resumes internally. Under a SHARED cache the entrypoints are
-                // per-request render modules with no route-shell orchestration (measured:
-                // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
-                // take the same minimal+inject path as the no-classic-handler case below.
-                // Shell-LESS root-param templates still need non-minimal in both modes (N16).
-                // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
-                // next start serves these through the full server, so getStaticProps sees
-                // revalidateReason 'on-demand' and the fresh entry persists through the
-                // registered cache handler. The minimal rungs exist for platform-cache
-                // emulation, which must never intercept an authenticated revalidation.
                 isVerifiedPreviewRequest(req) ||
                 ((entrypointOwnsPprShell ||
                   // partialPrefetching builds get NO injection (the partialFallback serving
@@ -3655,7 +3815,10 @@ export function createDispatcher(options: DispatcherOptions) {
               !!dispatchStaticAsset?.prerender && handlerOutputInfo?.type === "PAGES",
             render404: render404FromEntrypoint,
             renderError: renderErrorFromEntrypoint,
-            handlerTimeoutMs,
+            handlerTimeoutMs: requestHeadTimeoutMs,
+            ...(remainingExecutionMs !== undefined
+              ? { executionTimeoutMs: remainingExecutionMs }
+              : {}),
             // Option D (spec rev 4): shell-less PPR template with no root params — if this
             // MINIMAL render postpones live, the invoker captures the state and performs the
             // canonical POST resume itself. Excluded: shell-bearing routes (their injection
@@ -3694,6 +3857,7 @@ const ASSERTED_BY_THIS_HOP: Record<string, true> = {
   "x-mw-evaluated": true,
   "x-invoke-path": true,
   "x-invoke-query": true,
+  [INTERNAL_EXECUTION_DEADLINE_HEADER]: true,
   [INTERNAL_SECRET_HEADER]: true,
 };
 
@@ -3705,8 +3869,10 @@ function proxyToPool(
   buildId: string,
   internalSecret?: string,
   proxyTimeoutMs: number = PROXY_TIMEOUT_MS,
+  executionDeadlineAt?: number,
 ): Promise<void> {
   return new Promise((resolve) => {
+    let deadlineExceeded = false;
     const targetHost = sanitizeK8sName(`${releaseName}-${resolution.pool}-${buildId}`);
     const bufferedBody = (
       req as IncomingMessage & {
@@ -3730,6 +3896,9 @@ function proxyToPool(
       ...(resolution.invokePath ? { "x-invoke-path": resolution.invokePath } : {}),
       ...(resolution.invocationQuery
         ? { "x-invoke-query": JSON.stringify(resolution.invocationQuery) }
+        : {}),
+      ...(executionDeadlineAt !== undefined
+        ? { [INTERNAL_EXECUTION_DEADLINE_HEADER]: String(executionDeadlineAt) }
         : {}),
       // This pool already ran the middleware stage in its Phase-1 resolve before deciding
       // to proxy; assert it so the target pool trusts the skip instead of re-running
@@ -3768,17 +3937,9 @@ function proxyToPool(
         path: req.url,
         method: req.method,
         headers: forwardHeaders,
-        timeout: proxyTimeoutMs,
       },
       (proxyRes) => {
-        // The timeout option is an IDLE timeout that stays armed while the response
-        // streams — a cross-pool SSE/streaming response quiet for >proxyTimeoutMs (or
-        // stalled on client backpressure) was destroyed mid-stream, while the same
-        // route served same-pool has no such cap (parity break). Disarm it once
-        // response headers arrive; the cap still bounds connect/headers, and
-        // client-abort propagation plus the server-wide requestTimeout still bound
-        // the streaming phase.
-        proxyReq.setTimeout(0);
+        clearTimeout(responseHeadDeadline);
         res.writeHead(proxyRes.statusCode ?? 502, stripHopByHopHeaders(proxyRes.headers));
         // pipeline handles errors on either end (e.g. client disconnect) and cleans up
         // both streams, unlike a bare .pipe().
@@ -3786,11 +3947,20 @@ function proxyToPool(
       },
     );
 
-    proxyReq.on("timeout", () => {
-      proxyReq.destroy(new Error(`cross-pool proxy to pool "${resolution.pool}" timed out`));
-    });
+    // A socket idle timeout is not a deadline: DNS/connect and informational traffic can reset
+    // it. This wall-clock timer starts before dialing and is cleared only by final headers.
+    const responseHeadDeadline = setTimeout(() => {
+      deadlineExceeded = true;
+      proxyReq.destroy(
+        new DeadlineExceededError(
+          `cross-pool proxy to pool "${resolution.pool}" exceeded its response-head deadline`,
+        ),
+      );
+    }, proxyTimeoutMs);
+    responseHeadDeadline.unref?.();
 
     proxyReq.on("error", (err) => {
+      clearTimeout(responseHeadDeadline);
       // A client abort is our own deliberate teardown, not a pool failure — log it at
       // info level and skip the 502 (the client is gone anyway).
       if (err instanceof ClientAbortError) {
@@ -3807,8 +3977,8 @@ function proxyToPool(
         err,
       );
       if (!res.headersSent) {
-        res.writeHead(502, { "content-type": "text/plain" });
-        res.end("Bad Gateway");
+        res.writeHead(deadlineExceeded ? 504 : 502, { "content-type": "text/plain" });
+        res.end(deadlineExceeded ? "Gateway Timeout" : "Bad Gateway");
       }
       resolve();
     });

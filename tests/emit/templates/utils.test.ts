@@ -8,6 +8,7 @@ import {
   routingManifestSnapshotName,
   composedBuildResourceNames,
   findBuildIdNameCollision,
+  findBuildTopologyNameCollision,
   findEmittedNameCollision,
   poolResourceNames,
   assertSafeQuantity,
@@ -16,6 +17,8 @@ import {
   assertSafePoolName,
   assertSafeYamlScalar,
   assertSafeImageReference,
+  assertSafeNamespace,
+  resolveK8sNamespace,
   K8S_NAMESPACE,
 } from "../../../src/emit/templates/utils.js";
 // The snapshot name must be importable from its historical home too — deploy.ts and
@@ -38,7 +41,7 @@ describe("sanitizeK8sName", () => {
   it("strips trailing hyphens introduced by the 63-char boundary", () => {
     const result = sanitizeK8sName("valid-name-" + "x".repeat(60) + "-suffix");
     expect(result.length).toBeLessThanOrEqual(63);
-    expect(/-$/.test(result)).toBe(false);
+    expect(result.endsWith("-")).toBe(false);
   });
 
   it("handles all-special-character input", () => {
@@ -88,6 +91,21 @@ describe("sanitizeK8sName", () => {
     // Short names are untouched apart from the suffix.
     expect(sanitizeK8sName("nextjs-ssr", "-hcp")).toBe("nextjs-ssr-hcp");
   });
+});
+
+describe("Kubernetes namespace validation", () => {
+  it("accepts DNS-1123 labels and defaults only absent values", () => {
+    expect(resolveK8sNamespace()).toBe(K8S_NAMESPACE);
+    expect(resolveK8sNamespace("apps-3")).toBe("apps-3");
+    expect(() => assertSafeNamespace("a".repeat(63))).not.toThrow();
+  });
+
+  it.each(["-prod", "prod-", "---", "Prod", "", "a".repeat(64), 123, null])(
+    "rejects an invalid namespace value: %j",
+    (namespace) => {
+      expect(() => assertSafeNamespace(namespace)).toThrow(/Invalid namespace/);
+    },
+  );
 });
 
 describe("routingManifestSnapshotName", () => {
@@ -269,6 +287,35 @@ describe("findBuildIdNameCollision (composed blue/green resource names)", () => 
   });
 });
 
+describe("findBuildTopologyNameCollision", () => {
+  it("does not invent previous-build resources for a newly-added pool", () => {
+    const release = "a".repeat(30);
+    const newPool = "p".repeat(20);
+    // Projecting both ids over newPool collides because the long prefix truncates the ids.
+    expect(
+      findBuildIdNameCollision(release, [newPool], "sharedprefix-one", "sharedprefix-two"),
+    ).not.toBeNull();
+    // The previous build never had newPool, so those colliding objects do not exist.
+    expect(
+      findBuildTopologyNameCollision(
+        release,
+        { buildId: "sharedprefix-one", pools: [newPool] },
+        { buildId: "sharedprefix-two", pools: ["legacy"] },
+      ),
+    ).toBeNull();
+  });
+
+  it("detects collisions between different pools that really coexist", () => {
+    expect(
+      findBuildTopologyNameCollision(
+        "nextjs",
+        { buildId: "v2", pools: ["api"] },
+        { buildId: "old", pools: ["api-v2"] },
+      ),
+    ).toEqual({ kind: "Deployment/Service", name: "nextjs-api-v2" });
+  });
+});
+
 describe("assertSafeReleaseName", () => {
   it("accepts safe release names", () => {
     expect(() => assertSafeReleaseName("nextjs")).not.toThrow();
@@ -410,7 +457,7 @@ describe("assertSafeYamlScalar (N67)", () => {
   });
 });
 
-describe("assertSafeImageReference (N66)", () => {
+describe("assertSafeImageReference", () => {
   it("accepts a registry/repo:tag and a digest form", () => {
     expect(() =>
       assertSafeImageReference("us-central1-docker.pkg.dev/p/r/nextjs-app-ssr:build1"),

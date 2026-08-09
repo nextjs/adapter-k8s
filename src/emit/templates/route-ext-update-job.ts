@@ -4,7 +4,6 @@ import {
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeBuildId,
-  K8S_NAMESPACE,
 } from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
@@ -62,6 +61,11 @@ spec:
   template:
     spec:
       serviceAccountName: ${releaseName}-deploy-sa
+      # This Job uses the same immutable multi-platform image index on amd64 and arm64. Keep
+      # it on the release's target architecture so registration follows the same scheduling
+      # contract as the adapter-built workloads.
+      nodeSelector:
+        kubernetes.io/arch: "{{ .Values.global.targetArchitecture }}"
       # NOTE: the SA token stays automounted — this Job needs Workload Identity to call
       # gcloud. It still runs as an unprivileged user with a locked-down container.
       securityContext:
@@ -74,13 +78,10 @@ spec:
         - name: update-ext
           # Pinned by digest: this Job runs under the privileged deploy Workload
           # Identity, so a retagged/compromised mutable tag would execute under
-          # those permissions. Pinned 2026-07-21 via
-          # "docker manifest inspect -v gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
-          # (Descriptor digest). NOTE: :slim publishes a single-arch (amd64)
-          # manifest — on arm64 node pools, re-pin to the arm64 digest or use a
-          # manifest-list tag. To update: re-resolve the digest, replace, and
-          # bump this comment's date; verify a route-ext registration Job run.
-          image: gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:4ff69e21bec9a7d0ed54d0134a9b9682fc8008252cb5f173a23ddd70b8e024a4
+          # those permissions. The pinned OCI index contains linux/amd64 and linux/arm64
+          # children (verified with docker manifest inspect -v on 2026-08-06); kubelet selects
+          # the child matching the nodeSelector above. Re-resolve the INDEX digest when updating.
+          image: gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:6fd292185f0efc136eff2f6d20287870e5b66619818d5108c31ad55311722028
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -178,10 +179,10 @@ spec:
               # A rewritten \`service\`/\`authority\` would point this LB's callout at a
               # DIFFERENT backend — i.e. insert a middleware tier that sees and rewrites
               # every request. Both values are fully determined by the release name,
-              # project, and the single supported namespace, so verify them against the
+              # project, and the Helm release namespace, so verify them against the
               # values this Job was RENDERED with instead of trusting the mount. (The
               # residual IAM exposure — the binding is project-wide, so any principal who
-              # can create a pod in "${K8S_NAMESPACE}" can set
+              # can create a pod in this release namespace can set
               # serviceAccountName: ${releaseName}-deploy-sa and inherit it — needs a
               # resource condition on the binding in cli/init.ts; that is tracked
               # separately.)
@@ -216,7 +217,7 @@ spec:
                 echo "route-extension.yaml matches the rendered chart (sha256) ✓"
               fi
               EXPECT_SERVICE="projects/${projectId}/global/backendServices/${releaseName}-routing-service"
-              EXPECT_AUTHORITY="${releaseName}-routing-service.${K8S_NAMESPACE}.svc.cluster.local"
+              EXPECT_AUTHORITY="${releaseName}-routing-service.{{ .Release.Namespace }}.svc.cluster.local"
               GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
               GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
               if [ "$GOT_SERVICE" != "$EXPECT_SERVICE" ]; then

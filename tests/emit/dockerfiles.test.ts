@@ -2,6 +2,8 @@
 import { describe, it, expect } from "vitest";
 import {
   generateDockerfile,
+  generateLayeredPoolDockerfile,
+  generatePoolBaseDockerfile,
   generatePoolDockerfile,
   generateRoutingServiceDockerfile,
   DEFAULT_EMITTED_NODE_VERSION,
@@ -67,7 +69,12 @@ describe("generateDockerfile", () => {
       buildId: "abc123",
       installSharpVersion: "0.34.5",
     });
-    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    expect(result).toContain(
+      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund",
+    );
+    expect(result).toContain("--os=linux --cpu=x64 --libc=glibc sharp@0.34.5");
+    expect(result).toContain("cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/");
+    expect(result).not.toContain("RUN npm install --no-save");
     expect(result.indexOf("COPY --chown=node:node . .")).toBeLessThan(
       result.indexOf("RUN npm install"),
     );
@@ -121,13 +128,30 @@ describe("generatePoolDockerfile", () => {
       buildId: "abc123",
       installSharpVersion: "0.34.5",
     });
-    expect(result).toContain("RUN npm install --no-save --no-audit --no-fund sharp@0.34.5");
+    expect(result).toContain(
+      "RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund",
+    );
+    expect(result).toContain("--os=linux --cpu=x64 --libc=glibc sharp@0.34.5");
+    expect(result).toContain("cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/");
+    expect(result).not.toContain("RUN npm install --no-save");
     // Must run after the context is copied (needs /app) and before dropping to the
     // non-root user (npm writes node_modules as root at build time).
     expect(result.indexOf("COPY --chown=node:node context/ .")).toBeLessThan(
       result.indexOf("RUN npm install"),
     );
     expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("USER node"));
+  });
+
+  it("installs the arm64 binding when the arm64 pair could not be staged", () => {
+    const result = generatePoolDockerfile({
+      poolName: "ssr",
+      buildId: "abc123",
+      targetPlatform: "linux/arm64",
+      installSharpVersion: "0.35.3",
+    });
+    expect(result).toContain("Build host had no linux/arm64 sharp binding");
+    expect(result).toContain("--os=linux --cpu=arm64 --libc=glibc sharp@0.35.3");
+    expect(result).not.toContain("--cpu=x64");
   });
 
   it("emits no npm install by default (packages staged into the context instead)", () => {
@@ -146,6 +170,36 @@ describe("generatePoolDockerfile", () => {
   });
 });
 
+describe("shared pool image layers", () => {
+  it("installs dependencies once in a reusable base before copying build content", () => {
+    const result = generatePoolBaseDockerfile({
+      buildId: "abc123",
+      installSharpVersion: "0.34.5",
+    });
+    expect(result).toContain("FROM node:24-slim");
+    expect(result).toContain("COPY --chown=node:node dependencies/ .");
+    expect(result).toContain("COPY --chown=node:node content/ .");
+    expect(result).toContain("COPY --chown=node:node fetch-cache/ .");
+    expect(result.indexOf("dependencies/ .")).toBeLessThan(result.indexOf("RUN npm install"));
+    expect(result.indexOf("RUN npm install")).toBeLessThan(result.indexOf("content/ ."));
+    expect(result.indexOf("content/ .")).toBeLessThan(result.indexOf("fetch-cache/ ."));
+    expect(result).not.toContain("POOL_NAME");
+    expect(result).toContain('CMD ["node", "pool-server.cjs"]');
+  });
+
+  it("emits a thin pool image whose parent is supplied by the deploy step", () => {
+    const result = generateLayeredPoolDockerfile({ poolName: "api", buildId: "abc123" });
+    expect(result).toContain(
+      "ARG POOL_BASE_IMAGE=localhost/adapter-k8s-pool-base-required--update-cli:latest\n" +
+        "FROM ${POOL_BASE_IMAGE}\n",
+    );
+    expect(result).toContain("COPY --chown=node:node context/ .");
+    expect(result).toContain("ENV POOL_NAME=api");
+    expect(result).not.toContain("node:24-slim");
+    expect(result).not.toContain("npm install");
+  });
+});
+
 describe("generateRoutingServiceDockerfile", () => {
   it("generates a Dockerfile for the routing service", () => {
     const result = generateRoutingServiceDockerfile({ buildId: "abc123" });
@@ -156,6 +210,9 @@ describe("generateRoutingServiceDockerfile", () => {
     expect(result).toContain("COPY --chown=node:node context/ .");
     expect(result).toContain("USER node");
     expect(result).not.toContain("POOL_NAME");
+    expect(result.indexOf("apt-get install")).toBeLessThan(
+      result.indexOf("COPY --chown=node:node context/ ."),
+    );
   });
 
   it("does not bake a TLS cert into the image — the runtime generates one under /tmp/tls", () => {

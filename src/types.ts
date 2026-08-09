@@ -2,6 +2,7 @@
 import type { NextAdapter, AdapterOutput } from "next";
 import type { ResolveRoutesParams } from "@next/routing";
 import type { MiddlewareMatcher } from "./routing-common.js";
+import type { KubernetesTargetDefinition } from "./target/types.js";
 
 // Use AdapterOutputs from the stable adapter API
 // Re-exported from the BuildCompleteContext parameter type
@@ -33,9 +34,17 @@ export type EnvFromSource =
   | { configMap: string; prefix?: string; optional?: boolean };
 
 export interface PoolConfig {
-  routes: string[]; // OutputType name ('appPages', 'appRoutes', 'pages', 'pagesApi') or glob pattern
+  /**
+   * Output type name (`appPages`, `appRoutes`, `pages`, `pagesApi`) or a glob over the
+   * build-time route template pathname. Full Next.js dynamic segments (`[slug]`,
+   * `[...slug]`, `[[...slug]]`) are literal template names, not minimatch character classes.
+   * The same is true when an interception marker is glued to the segment, such as
+   * `(.)[slug]`, `(..)[...slug]`, or `(...)[[...slug]]`.
+   */
+  routes: string[];
   scaling?: { min: number; max: number; targetCPU: number };
   resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
+  /** Pool time-to-response-headers budget in seconds. Streaming is unbounded after headers. */
   timeout?: number;
   /** Merged OVER the top-level `env`, so a pool can override a shared default. */
   env?: Record<string, EnvValue>;
@@ -74,6 +83,8 @@ export interface GKEProviderConfig {
 
 export interface K8sAdapterConfig {
   pools: Record<string, PoolConfig>;
+  /** Pool that hosts the stable portable origin. Defaults to the first declared pool. */
+  defaultPool?: string;
   /**
    * Runtime environment for every app container. `.env` files are deliberately never staged
    * into an image (they can hold secrets and would be baked into pushed layers), so this is
@@ -143,7 +154,10 @@ export interface K8sAdapterConfig {
      */
     failureMode?: "auto" | "open" | "closed";
   };
-  provider: { gke: GKEProviderConfig } | { generic: GenericProviderConfig };
+  /** Build-time Kubernetes composition. Legacy `provider` blocks are translated into this. */
+  target?: KubernetesTargetDefinition;
+  /** @deprecated Use `target: defineTarget(...)`. */
+  provider?: { gke: GKEProviderConfig } | { generic: GenericProviderConfig };
 }
 
 /**
@@ -201,7 +215,7 @@ export interface GenericProviderConfig {
  * that explicit at each site is the point of the union.
  */
 export function gkeConfigOf(config: K8sAdapterConfig): GKEProviderConfig | undefined {
-  return "gke" in config.provider ? config.provider.gke : undefined;
+  return config.provider && "gke" in config.provider ? config.provider.gke : undefined;
 }
 
 /**
@@ -210,13 +224,16 @@ export function gkeConfigOf(config: K8sAdapterConfig): GKEProviderConfig | undef
  * rather than a provider-specific path.
  */
 export function providerGatewayHosts(config: K8sAdapterConfig): HostConfig[] {
-  if ("gke" in config.provider) return config.provider.gke?.gateway?.hosts ?? [];
-  return config.provider.generic?.gateway?.hosts ?? [];
+  if (config.target) return [...config.target.exposure.hosts];
+  if (config.provider && "gke" in config.provider) {
+    return config.provider.gke?.gateway?.hosts ?? [];
+  }
+  return config.provider?.generic?.gateway?.hosts ?? [];
 }
 
 /** The generic block when this config targets a plain Kubernetes cluster, else undefined. */
 export function genericConfigOf(config: K8sAdapterConfig): GenericProviderConfig | undefined {
-  return "generic" in config.provider ? config.provider.generic : undefined;
+  return config.provider && "generic" in config.provider ? config.provider.generic : undefined;
 }
 
 // --- Internal Types ---
@@ -254,6 +271,9 @@ export interface RoutingManifest {
     matchers?: MiddlewareMatcher[];
   } | null;
   poolAssignments: Record<string, string>;
+  /** Next route execution limits and pool response-head limits, in milliseconds. */
+  routeExecutionTimeouts?: Record<string, number>;
+  poolResponseHeadTimeouts?: Record<string, number>;
   pprRoutes: Record<
     string,
     {

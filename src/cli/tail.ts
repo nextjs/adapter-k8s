@@ -1,10 +1,10 @@
 // src/cli/tail.ts
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import path from "node:path";
 import { execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
+import { resolveK8sNamespace } from "../emit/templates/utils.js";
 
 const COLORS = [
   "\x1b[36m", // cyan
@@ -24,18 +24,21 @@ const RED = "\x1b[31m";
 
 export async function runTail(options: { projectDir: string; releaseName: string }): Promise<void> {
   const { projectDir, releaseName } = options;
+  let namespace = resolveK8sNamespace();
 
   // Connect to the right cluster
   const infraPath = infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
-    let infra: { projectId?: string; region?: string };
+    let infra: { projectId?: string; region?: string; namespace?: string };
     try {
       infra = JSON.parse(readFileSync(infraPath, "utf-8"));
       // S13: validate before these reach a gcloud/kubectl argv.
       assertSafeInfrastructure(infra);
+      namespace = resolveK8sNamespace(infra.namespace);
     } catch (err) {
-      // Name the file — a bare SyntaxError gives no clue WHICH file is corrupt.
-      throw new Error(`Failed to parse ${infraPath}: ${(err as Error).message}`);
+      // Name the file — this covers both malformed JSON and a parsed value that fails
+      // infrastructure validation (for example, an invalid namespace).
+      throw new Error(`Invalid ${infraPath}: ${(err as Error).message}`);
     }
     if (infra.projectId && infra.region) {
       const credResult = await execCapture("gcloud", [
@@ -78,7 +81,7 @@ export async function runTail(options: { projectDir: string; releaseName: string
     const shortId = podName.split("-").pop()!.slice(0, 5);
     const badge = `${component}/${shortId}`;
 
-    const child = spawn("kubectl", ["logs", "-f", "--tail=10", podName], {
+    const child = spawn("kubectl", ["logs", "-f", "--tail=10", "-n", namespace, podName], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -122,6 +125,8 @@ export async function runTail(options: { projectDir: string; releaseName: string
     const podsResult = await execCapture("kubectl", [
       "get",
       "pods",
+      "-n",
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",

@@ -1,4 +1,5 @@
 // src/cli/scaffold.ts
+import { K8S_NAMESPACE } from "../emit/templates/utils.js";
 
 export interface ScaffoldOptions {
   projectId: string;
@@ -57,6 +58,7 @@ export interface InfrastructureConfig {
   gatewayName: string;
   routeExtensionName: string;
   releaseName: string;
+  namespace?: string;
 }
 
 export function generateInfrastructureJson(config: InfrastructureConfig): string {
@@ -70,6 +72,7 @@ export function generateInfrastructureJson(config: InfrastructureConfig): string
       gatewayName: config.gatewayName,
       routeExtensionName: config.routeExtensionName,
       releaseName: config.releaseName,
+      namespace: config.namespace ?? K8S_NAMESPACE,
     },
     null,
     2,

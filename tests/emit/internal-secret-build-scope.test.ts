@@ -255,10 +255,8 @@ describe("N87: a restarted build-A pod cannot trust build B's middleware verdict
     }
   });
 
-  it("mirrors a legacy Secret name when the retained render passes one, and validates it", () => {
-    // The literal override exists for exactly one caller: deploy's retained previous-build
-    // render, mirroring a live pod template that predates per-build names (see
-    // renderInternalSecretEnv). It is cluster-sourced, so the charset is enforced here.
+  it("accepts and validates a literal legacy Secret name override", () => {
+    // Direct template callers can preserve a legacy Secret ref without opening a YAML sink.
     const legacy = legacyInternalSecretName(RELEASE);
     expect(renderInternalSecretEnv(RELEASE, A.buildId, "  ", legacy)).toContain(`name: ${legacy}`);
     expect(renderInternalSecretEnv(RELEASE, A.buildId, "  ")).toContain(

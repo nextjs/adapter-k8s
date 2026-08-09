@@ -13,6 +13,7 @@ import {
   readFileSync,
   existsSync,
   lstatSync,
+  realpathSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -543,6 +544,26 @@ describe("stageSharpRuntimePackages", () => {
     }
   });
 
+  it("stages the linux-arm64 sharp pair for an arm64 target", async () => {
+    const armPackages = ["@img/sharp-linux-arm64", "@img/sharp-libvips-linux-arm64"];
+    const dirs = new Map([
+      ...armPackages.map((p) => [p, writePkg(p)] as const),
+      ["sharp", writePkg("sharp", "0.35.0")] as const,
+    ]);
+    const result = await stageSharpRuntimePackages(
+      tmpDir,
+      "ssr",
+      (dep) => dirs.get(dep),
+      false,
+      "linux/arm64",
+    );
+    expect(result).toEqual({ staged: true });
+    for (const pkg of armPackages) {
+      expect(existsSync(path.join(poolCtx(), "node_modules", pkg, "package.json"))).toBe(true);
+    }
+    expect(existsSync(path.join(poolCtx(), "node_modules/@img/sharp-linux-x64"))).toBe(false);
+  });
+
   it("falls back to the app's sharp version when the platform pair is missing (non-linux-x64 build host)", async () => {
     // Only sharp's JS package resolves — npm installed the host platform's @img/*.
     const sharpDir = writePkg("sharp", "0.34.5");
@@ -587,7 +608,7 @@ describe("resolveSharpDepDir", () => {
         exports: { "./sharp.node": "./sharp.node", "./package": "./package.json" },
       }),
     );
-    expect(resolveSharpDepDir("@img/sharp-testonly-linux-x64", tmpDir)).toBe(dir);
+    expect(resolveSharpDepDir("@img/sharp-testonly-linux-x64", tmpDir)).toBe(realpathSync(dir));
   });
 
   it("falls back to the sibling of a resolvable sharp copy when exports block resolution entirely", () => {
@@ -609,7 +630,7 @@ describe("resolveSharpDepDir", () => {
         exports: { "./sharp.node": "./sharp.node" },
       }),
     );
-    expect(resolveSharpDepDir("@img/sharp-testonly-sibling", tmpDir)).toBe(dir);
+    expect(resolveSharpDepDir("@img/sharp-testonly-sibling", tmpDir)).toBe(realpathSync(dir));
   });
 
   it("returns undefined for an unresolvable package", () => {

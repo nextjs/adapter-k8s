@@ -151,12 +151,8 @@ stringData:
 //
 // N87: the referenced NAME is build-scoped, so this pod template can only ever resolve the
 // secret of ITS OWN build — including on a restart inside another build's deploy window.
-// `secretName` overrides the derived name with a LITERAL one. Used only for a retained
-// previous-build render (cli/deploy.ts, the N66 live-pod-template snapshot): a build deployed
-// before per-build names references the legacy stable Secret, and re-rendering it with the
-// derived name would change the pod template of the build still serving 100% of traffic —
-// pointing it at a Secret that does not exist, so `helm upgrade` would roll it into
-// CreateContainerConfigError BEFORE cutover. Same failure shape as N66's containerStrategy flip.
+// `secretName` overrides the derived name with a validated LITERAL one. Deploy never uses this
+// to reconstruct an outgoing build: that live Deployment is kept without touching its template.
 export function renderInternalSecretEnv(
   releaseName: string,
   buildId: string,

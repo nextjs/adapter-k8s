@@ -3,6 +3,7 @@
 // build-time seed anchoring, header hygiene, and bounded bookkeeping.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  applyMiddlewareRequestHeaders,
   createDispatcher,
   mergeResolvedHeadersIntoHeadersArg,
   mergeResponseHeaders,
@@ -405,6 +406,37 @@ describe("mergeResolvedHeadersIntoHeadersArg", () => {
   it("leaves undefined/null untouched (writeHead(status) keeps its behavior)", () => {
     expect(mergeResolvedHeadersIntoHeadersArg(resolved(), undefined)).toBeUndefined();
     expect(mergeResolvedHeadersIntoHeadersArg(resolved(), null)).toBeNull();
+  });
+
+  it("preserves separate cookies when Expires contains a comma", () => {
+    const headers = new Headers();
+    headers.append("set-cookie", "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/");
+    headers.append("set-cookie", "theme=dark; Path=/");
+
+    const out = mergeResolvedHeadersIntoHeadersArg(headers, {
+      "set-cookie": "app=existing; Path=/",
+    }) as Record<string, string | string[]>;
+
+    expect(out["set-cookie"]).toEqual([
+      "app=existing; Path=/",
+      "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/",
+      "theme=dark; Path=/",
+    ]);
+  });
+});
+
+describe("applyMiddlewareRequestHeaders", () => {
+  it("adds compound middleware cookies without splitting an Expires date", () => {
+    const req = mockReq("/", { cookie: "app=existing" });
+    const headers = new Headers({
+      cookie: "app=existing",
+      "x-middleware-set-cookie":
+        "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/, theme=dark; Path=/",
+    });
+
+    applyMiddlewareRequestHeaders(req, headers);
+
+    expect(req.headers.cookie).toBe("app=existing; session=one; theme=dark");
   });
 });
 

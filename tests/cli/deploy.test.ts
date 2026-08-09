@@ -11,10 +11,13 @@ import {
   discoverClusterPodCidr,
   discoverClusterNodeCidrs,
   discoverNodeCidrsFromCluster,
+  discoverPodCidrsFromCluster,
   resolveRegistryDigest,
   resolveRegistryDigestAny,
   resolveDeployImageDigests,
   discoverServingBuildId,
+  detectHelmUpgradeMode,
+  ensureValkeySecretHelmOwnership,
   resolveImageDigest,
   refreshFetchCacheStaging,
 } from "../../src/cli/deploy.js";
@@ -85,6 +88,48 @@ describe("refreshFetchCacheStaging", () => {
     expect(existsSync(path.join(base, "stale"))).toBe(false);
   });
 
+  it("copies once into the shared pool base for the layered traced-assets layout", () => {
+    write(".next/cache/fetch-cache/abc123", "entry-bytes");
+    write(".k8s-adapter/output/pool-base/fetch-cache/.keep");
+    write(".k8s-adapter/output/pools/ssr/context/pool-manifest.json");
+    write(".k8s-adapter/output/pools/api/context/pool-manifest.json");
+    write(
+      ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed/stale",
+      "old-cli seed",
+    );
+    write(
+      ".k8s-adapter/output/pools/api/context/.k8s-adapter/fetch-cache-seed/stale",
+      "old-cli seed",
+    );
+
+    refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+      distDir: ".next",
+      pools: ["ssr", "api"],
+      containerStrategy: "traced-assets",
+      poolImageLayout: "shared-base-v1",
+    });
+
+    expect(
+      readFileSync(
+        path.join(
+          projectDir,
+          ".k8s-adapter/output/pool-base/fetch-cache/.k8s-adapter/fetch-cache-seed/abc123",
+        ),
+        "utf8",
+      ),
+    ).toBe("entry-bytes");
+    for (const pool of ["ssr", "api"]) {
+      expect(
+        existsSync(
+          path.join(
+            projectDir,
+            `.k8s-adapter/output/pools/${pool}/context/.k8s-adapter/fetch-cache-seed`,
+          ),
+        ),
+      ).toBe(false);
+    }
+  });
+
   it("no-ops when the build produced no fetch-cache, and skips absent contexts", () => {
     write(".k8s-adapter/output/pools/ssr/context/pool-server.cjs");
     refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
@@ -94,7 +139,10 @@ describe("refreshFetchCacheStaging", () => {
     });
     expect(
       existsSync(
-        path.join(projectDir, ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed"),
+        path.join(
+          projectDir,
+          ".k8s-adapter/output/pools/ssr/context/.k8s-adapter/fetch-cache-seed",
+        ),
       ),
     ).toBe(false);
   });
@@ -113,14 +161,21 @@ describe("refreshFetchCacheStaging", () => {
           containerStrategy: "traced-assets",
         }),
       ).toThrow(/distDir/);
-      expect(
-        existsSync(
-          path.join(projectDir, ".k8s-adapter/output/pools/ssr/context"),
-        ),
-      ).toBe(true);
+      expect(existsSync(path.join(projectDir, ".k8s-adapter/output/pools/ssr/context"))).toBe(true);
     } finally {
       rmSync(victim, { recursive: true, force: true });
     }
+  });
+
+  it("refuses an image layout that this CLI does not understand", () => {
+    write(".next/cache/fetch-cache/abc", "x");
+    expect(() =>
+      refreshFetchCacheStaging(projectDir, path.join(projectDir, ".k8s-adapter/output"), {
+        pools: ["ssr"],
+        containerStrategy: "traced-assets",
+        poolImageLayout: "shared-base-v2",
+      }),
+    ).toThrow(/Unsupported.*shared-base-v2.*Upgrade/);
   });
 });
 
@@ -143,6 +198,52 @@ describe("buildDockerCommands", () => {
     expect(commands[1]!.args).toContain(`${registry}/nextjs-app-ssr:abc123`);
     expect(commands[2]!.args).toContain("push");
     expect(commands[2]!.args).toContain(`${registry}/nextjs-app-ssr:abc123`);
+  });
+
+  it("builds one local pool base and makes every thin pool image inherit it", () => {
+    const registry = "ghcr.io/example/app";
+    const commands = buildDockerCommands({
+      pools: ["web", "api"],
+      buildId: "abc123",
+      registry,
+      outputDir: ".k8s-adapter/output",
+      containerStrategy: "traced-assets",
+      poolImageLayout: "shared-base-v1",
+      includeRoutingService: false,
+    });
+
+    expect(commands).toHaveLength(6);
+    expect(commands[0]!.description).toBe("Build shared pool base");
+    expect(commands[0]!.args.at(-1)).toBe(".k8s-adapter/output/pool-base");
+    const baseTag = commands[0]!.args[commands[0]!.args.indexOf("-t") + 1]!;
+    expect(baseTag).toMatch(/^localhost\/adapter-k8s-pool-base:[a-f0-9]{24}$/);
+    expect(commands.filter((command) => command.description.includes("Push shared"))).toEqual([]);
+    expect(commands[1]).toEqual({
+      description: "Verify shared pool base is visible in the container CLI image store",
+      command: "docker",
+      args: ["image", "inspect", baseTag],
+    });
+    for (const pool of ["web", "api"]) {
+      const build = commands.find((command) => command.description === `Build ${pool} image`)!;
+      expect(build.args).toContain("--build-arg");
+      expect(build.args).toContain(`POOL_BASE_IMAGE=${baseTag}`);
+      expect(build.args.at(-1)).toBe(`.k8s-adapter/output/pools/${pool}`);
+    }
+    expect(commands[3]!.description).toBe("Push web image");
+    expect(commands[5]!.description).toBe("Push api image");
+  });
+
+  it("refuses build commands for an unknown pool image layout", () => {
+    expect(() =>
+      buildDockerCommands({
+        pools: ["web", "api"],
+        buildId: "abc123",
+        registry: "ghcr.io/example/app",
+        outputDir: "out",
+        containerStrategy: "traced-assets",
+        poolImageLayout: "shared-base-v2" as never,
+      }),
+    ).toThrow(/Unsupported.*shared-base-v2.*Upgrade/);
   });
 
   it("S24: uses the resolved container CLI, not a hardcoded docker", () => {
@@ -191,6 +292,20 @@ describe("buildDockerCommands", () => {
     }
   });
 
+  it("pins every build to the platform recorded by the build artifact", () => {
+    const commands = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry: "reg/nextjs",
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+      targetPlatform: "linux/arm64",
+    });
+    const builds = commands.filter((c) => c.args.includes("build"));
+    expect(builds).toHaveLength(2);
+    for (const command of builds) expect(command.args).toContain("--platform=linux/arm64");
+  });
+
   it("generates single docker build for shared-image strategy with auth", () => {
     const registry = "us-central1-docker.pkg.dev/my-project/nextjs";
     const commands = buildDockerCommands({
@@ -221,6 +336,46 @@ describe("buildDockerCommands", () => {
     const routingBuild = commands.find((c) => c.description.includes("routing service"));
     expect(routingBuild).toBeDefined();
   });
+
+  it("uses the composed registry authentication operation instead of hostname inference", () => {
+    const registry = "us-central1-docker.pkg.dev/my-project/nextjs";
+    const ambient = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry,
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+      registryAuthentication: { kind: "ambient-credentials" },
+    });
+    expect(ambient.some((command) => command.command === "gcloud")).toBe(false);
+
+    expect(() =>
+      buildDockerCommands({
+        pools: ["ssr"],
+        buildId: "abc123",
+        registry,
+        outputDir: "out",
+        containerStrategy: "traced-assets",
+        registryAuthentication: {
+          kind: "gcloud-docker-helper",
+          registryHost: "europe-west1-docker.pkg.dev",
+        },
+      }),
+    ).toThrow(/authentication names host.*repository uses/i);
+  });
+
+  it("omits the routing image for portable pool-local routing", () => {
+    const commands = buildDockerCommands({
+      pools: ["ssr"],
+      buildId: "abc123",
+      registry: "ghcr.io/example/app",
+      outputDir: "out",
+      containerStrategy: "traced-assets",
+      includeRoutingService: false,
+    });
+    expect(commands).toHaveLength(2);
+    expect(commands.some((command) => command.description.includes("routing service"))).toBe(false);
+  });
 });
 
 describe("buildHelmUpgradeArgs", () => {
@@ -239,7 +394,24 @@ describe("buildHelmUpgradeArgs", () => {
     expect(args).toContain(".k8s-adapter/output/chart");
     expect(args.join(" ")).toContain("global.image.tag=abc123");
     expect(args.join(" ")).toContain("activeBuildId=abc123");
-    expect(args).toContain("--take-ownership");
+    expect(args).not.toContain("--take-ownership");
+    expect(args).toContain("--server-side=true");
+    expect(args).toContain("--force-conflicts");
+  });
+
+  it("omits Helm 4-only flags and any release-wide ownership bypass in client-side mode", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "abc123",
+      registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+      previousBuildId: null,
+      helmUpgradeMode: "client-side",
+    });
+
+    expect(args).not.toContain("--take-ownership");
+    expect(args).not.toContain("--server-side=true");
+    expect(args).not.toContain("--force-conflicts");
   });
 
   it("includes previousBuildId when set", () => {
@@ -255,6 +427,19 @@ describe("buildHelmUpgradeArgs", () => {
     expect(args.join(" ")).toContain("activeBuildId=abc123");
   });
 
+  it("pins Helm to the configured namespace", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "abc123",
+      registry: "us-central1-docker.pkg.dev/my-project/nextjs",
+      previousBuildId: null,
+      namespace: "apps",
+    });
+
+    expect(args.join(" ")).toContain("--namespace apps --create-namespace");
+  });
+
   it("sanitizes the serving build selector used during the upgrade", () => {
     const args = buildHelmUpgradeArgs({
       releaseName: "my-app",
@@ -265,6 +450,261 @@ describe("buildHelmUpgradeArgs", () => {
     });
 
     expect(args.join(" ")).toContain("activeBuildId=b-123old");
+  });
+
+  it("keeps the origin on the outgoing default pool until cutover", () => {
+    const args = buildHelmUpgradeArgs({
+      releaseName: "my-app",
+      chartPath: ".k8s-adapter/output/chart",
+      buildId: "new-build",
+      registry: "ghcr.io/example/app",
+      previousBuildId: "old-build",
+      defaultPool: "api",
+      previousDefaultPool: "ssr",
+    });
+
+    expect(args.join(" ")).toContain("activeDefaultPool=ssr");
+    expect(args.join(" ")).not.toContain("activeDefaultPool=api");
+  });
+});
+
+describe("detectHelmUpgradeMode", () => {
+  const CREATE_NAMESPACE =
+    "      --create-namespace    if --install is set, create the release namespace";
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it("selects Helm 4 server-side apply from actual Cobra option rows", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout:
+        `${CREATE_NAMESPACE}\n` +
+        `      --force-conflicts    force server-side apply conflicts\n` +
+        `      --server-side string    must be true, false, or auto\n`,
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).resolves.toBe("server-side");
+  });
+
+  it("selects Helm 3 client-side upgrade and ignores flag names mentioned only in prose", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout:
+        `${CREATE_NAMESPACE}\n` +
+        `This downstream build does not support --server-side or --force-conflicts.\n`,
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).resolves.toBe("client-side");
+  });
+
+  it.each([
+    ["server-side only", "      --server-side string    must be true, false, or auto"],
+    ["force-conflicts only", "      --force-conflicts    force server-side apply conflicts"],
+  ])("uses client-side mode when a downstream build exposes %s", async (_name, row) => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: `${CREATE_NAMESPACE}\n${row}\n`,
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).resolves.toBe("client-side");
+  });
+
+  it("rejects Helm older than the --create-namespace capability floor", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "Usage: helm upgrade [RELEASE] [CHART]",
+      stderr: "",
+    });
+
+    await expect(detectHelmUpgradeMode()).rejects.toThrow(/Helm 3\.2 or newer/);
+  });
+
+  it("reports a non-zero capability probe without leaking terminal controls", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 2,
+      stdout: "",
+      stderr: "\u001b[31munknown command\u001b[0m",
+    });
+
+    let message = "";
+    try {
+      await detectHelmUpgradeMode();
+    } catch (err) {
+      message = err instanceof Error ? err.message : String(err);
+    }
+    expect(message).toContain("helm upgrade --help exited 2:");
+    expect(message).toContain("unknown command");
+    expect(message).not.toContain("\u001b");
+  });
+
+  it("reports a failed capability probe invocation", async () => {
+    vi.mocked(exec.execCapture).mockRejectedValue(new Error("spawn helm ENOENT"));
+
+    await expect(detectHelmUpgradeMode()).rejects.toThrow(/spawn helm ENOENT.*Helm 3\.2/s);
+  });
+});
+
+describe("ensureValkeySecretHelmOwnership", () => {
+  const response = (
+    fields: [string, string, string, string, string, string, string, string],
+  ): { exitCode: number; stdout: string; stderr: string } => ({
+    exitCode: 0,
+    stdout: fields.join("|"),
+    stderr: "",
+  });
+
+  beforeEach(() => vi.clearAllMocks());
+
+  it("atomically adopts only the exact unowned legacy adapter Valkey Secret", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(
+        response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", "123"]),
+      )
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "secret/rel-valkey patched", stderr: "" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).resolves.toBe("adopted");
+
+    const calls = vi.mocked(exec.execCapture).mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual([
+      "kubectl",
+      expect.arrayContaining(["get", "secret", "rel-valkey", "--ignore-not-found"]),
+    ]);
+    const patchArgs = calls[1]![1];
+    expect(patchArgs).toEqual(
+      expect.arrayContaining(["patch", "secret", "rel-valkey", "--type=merge", "-p"]),
+    );
+    const body = JSON.parse(patchArgs[patchArgs.indexOf("-p") + 1]!) as {
+      metadata: {
+        resourceVersion: string;
+        labels: Record<string, string>;
+        annotations: Record<string, string>;
+      };
+    };
+    expect(body.metadata).toEqual({
+      resourceVersion: "123",
+      labels: { "app.kubernetes.io/managed-by": "Helm" },
+      annotations: {
+        "meta.helm.sh/release-name": "rel",
+        "meta.helm.sh/release-namespace": "default",
+      },
+    });
+  });
+
+  it("accepts an exact Secret already owned by this release without patching it", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "valkey-secret", "Helm", "rel", "default", "123"]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).resolves.toBe("owned");
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("adopts the legacy Secret into the configured namespace", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(
+        response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", "123"]),
+      )
+      .mockResolvedValueOnce({ exitCode: 0, stdout: "secret/rel-valkey patched", stderr: "" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel", "prod")).resolves.toBe("adopted");
+
+    for (const [, args] of vi.mocked(exec.execCapture).mock.calls) {
+      expect(args).toEqual(expect.arrayContaining(["-n", "prod"]));
+    }
+    const patchArgs = vi.mocked(exec.execCapture).mock.calls[1]![1];
+    const body = JSON.parse(patchArgs[patchArgs.indexOf("-p") + 1]!) as {
+      metadata: { annotations: Record<string, string> };
+    };
+    expect(body.metadata.annotations["meta.helm.sh/release-namespace"]).toBe("prod");
+  });
+
+  it("does nothing when the exact Secret is absent", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).resolves.toBe("absent");
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("cannot adopt a foreign-owned non-cache resource with the colliding name", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response([
+        "rel-valkey",
+        "Opaque",
+        "foreign-app",
+        "database-credentials",
+        "Helm",
+        "foreign-release",
+        "default",
+        "123",
+      ]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /foreign or incomplete ownership metadata/,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("cannot adopt an unowned non-cache resource with the colliding name", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "database-credentials", "", "", "", "123"]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /is not the adapter's legacy Valkey Secret/,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("aborts on partial ownership instead of overwriting it", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "valkey-secret", "Helm", "", "", "123"]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /foreign or incomplete ownership metadata/,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("refuses an adoption patch without a resourceVersion precondition", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue(
+      response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", ""]),
+    );
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /no resourceVersion.*optimistic-concurrency/s,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("aborts when the Secret identity cannot be read", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "secrets is forbidden",
+    });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /Could not inspect cache Secret.*secrets is forbidden/s,
+    );
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledOnce();
+  });
+
+  it("aborts when the validated Secret cannot be patched", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(
+        response(["rel-valkey", "Opaque", "rel", "valkey-secret", "", "", "", "123"]),
+      )
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "forbidden" });
+
+    await expect(ensureValkeySecretHelmOwnership("rel")).rejects.toThrow(
+      /Could not attach Helm ownership.*forbidden/s,
+    );
   });
 });
 
@@ -449,19 +889,27 @@ describe("resolveRegistryDigestAny (S28: works on ECR/ACR/Harbor, not just Artif
 
   const REF = "myregistry.example.com/ns/app:b1";
   const SHA = "sha256:" + "d".repeat(64);
+  const singleManifest = JSON.stringify({ schemaVersion: 2, config: { digest: SHA }, layers: [] });
+  const imageConfig = (architecture = "amd64") => JSON.stringify({ os: "linux", architecture });
 
   it("prefers crane when it is available", async () => {
-    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
-      cmd === "crane"
-        ? { exitCode: 0, stdout: SHA + "\n", stderr: "" }
-        : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd !== "crane") return { exitCode: 127, stdout: "", stderr: "not found" };
+      if (args[0] === "manifest") return { exitCode: 0, stdout: singleManifest, stderr: "" };
+      if (args[0] === "config") return { exitCode: 0, stdout: imageConfig(), stderr: "" };
+      return { exitCode: 0, stdout: SHA + "\n", stderr: "" };
+    }) as never);
     await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBe(SHA);
   });
 
   it("falls back to skopeo", async () => {
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
       cmd === "skopeo"
-        ? { exitCode: 0, stdout: SHA + "\n", stderr: "" }
+        ? {
+            exitCode: 0,
+            stdout: JSON.stringify({ Digest: SHA, Os: "linux", Architecture: "amd64" }),
+            stderr: "",
+          }
         : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
     await expect(resolveRegistryDigestAny(REF, "podman")).resolves.toBe(SHA);
   });
@@ -474,7 +922,13 @@ describe("resolveRegistryDigestAny (S28: works on ECR/ACR/Harbor, not just Artif
       if (cmd === "docker" && args.includes("manifest")) {
         return {
           exitCode: 0,
-          stdout: JSON.stringify({ Descriptor: { digest: SHA, size: 1995 } }),
+          stdout: JSON.stringify({
+            Descriptor: {
+              digest: SHA,
+              size: 1995,
+              platform: { os: "linux", architecture: "amd64" },
+            },
+          }),
           stderr: "",
         };
       }
@@ -504,6 +958,22 @@ describe("resolveRegistryDigestAny (S28: works on ECR/ACR/Harbor, not just Artif
     await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBe(SHA);
   });
 
+  it("uses the build artifact platform when selecting a manifest-list child", async () => {
+    const ARM = "sha256:" + "a".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) =>
+      cmd === "docker" && args.includes("manifest")
+        ? {
+            exitCode: 0,
+            stdout: JSON.stringify([
+              { Descriptor: { digest: SHA, platform: { os: "linux", architecture: "amd64" } } },
+              { Descriptor: { digest: ARM, platform: { os: "linux", architecture: "arm64" } } },
+            ]),
+            stderr: "",
+          }
+        : { exitCode: 127, stdout: "", stderr: "x" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker", "linux/arm64")).resolves.toBe(ARM);
+  });
+
   it("refuses a manifest LIST with no child for the platform we deploy", async () => {
     // Pinning an image that cannot run is worse than failing: it deploys, then CrashLoops with
     // `exec format error` after cutover has begun.
@@ -519,6 +989,46 @@ describe("resolveRegistryDigestAny (S28: works on ECR/ACR/Harbor, not just Artif
           }
         : { exitCode: 127, stdout: "", stderr: "x" }) as never);
     await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBeNull();
+  });
+
+  it("rejects an amd64-only crane index when arm64 is requested", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) =>
+      cmd === "crane" && args[0] === "manifest"
+        ? {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              schemaVersion: 2,
+              manifests: [
+                {
+                  digest: SHA,
+                  platform: { os: "linux", architecture: "amd64" },
+                },
+              ],
+            }),
+            stderr: "",
+          }
+        : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker", "linux/arm64")).resolves.toBeNull();
+  });
+
+  it("rejects a skopeo result whose reported platform differs from the request", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
+      cmd === "skopeo"
+        ? {
+            exitCode: 0,
+            stdout: JSON.stringify({ Digest: SHA, Os: "linux", Architecture: "amd64" }),
+            stderr: "",
+          }
+        : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "podman", "linux/arm64")).resolves.toBeNull();
+  });
+
+  it("rejects a single docker manifest without target-platform evidence", async () => {
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) =>
+      cmd === "docker" && args.includes("manifest")
+        ? { exitCode: 0, stdout: JSON.stringify({ Descriptor: { digest: SHA } }), stderr: "" }
+        : { exitCode: 127, stdout: "", stderr: "not found" }) as never);
+    await expect(resolveRegistryDigestAny(REF, "docker", "linux/arm64")).resolves.toBeNull();
   });
 
   it("does NOT use `docker manifest inspect` for a non-docker runtime", async () => {
@@ -544,10 +1054,12 @@ describe("resolveRegistryDigestAny (S28: works on ECR/ACR/Harbor, not just Artif
   });
 
   it("rejects a malformed digest rather than passing it to helm", async () => {
-    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
-      cmd === "crane"
-        ? { exitCode: 0, stdout: "not-a-digest\n", stderr: "" }
-        : { exitCode: 127, stdout: "", stderr: "x" }) as never);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd !== "crane") return { exitCode: 127, stdout: "", stderr: "x" };
+      if (args[0] === "manifest") return { exitCode: 0, stdout: singleManifest, stderr: "" };
+      if (args[0] === "config") return { exitCode: 0, stdout: imageConfig(), stderr: "" };
+      return { exitCode: 0, stdout: "not-a-digest\n", stderr: "" };
+    }) as never);
     await expect(resolveRegistryDigestAny(REF, "docker")).resolves.toBeNull();
   });
 });
@@ -566,15 +1078,50 @@ describe("resolveRegistryDigest (S23: the registry is authoritative, not the loc
   // digest. VERIFIED live — `gcloud artifacts docker images describe` returned byte-identical
   // sha256 to `docker inspect` for the same ref.
   it("resolves the digest from the registry", async () => {
-    vi.mocked(exec.execCapture).mockResolvedValue({
-      exitCode: 0,
-      stdout: "sha256:" + "a".repeat(64) + "\n",
-      stderr: "",
-    });
+    const digest = "sha256:" + "a".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") return { exitCode: 0, stdout: digest + "\n", stderr: "" };
+      if (cmd === "crane" && args[0] === "manifest") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            schemaVersion: 2,
+            manifests: [{ digest, platform: { os: "linux", architecture: "amd64" } }],
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
     await expect(resolveRegistryDigest(REF, "proj")).resolves.toBe("sha256:" + "a".repeat(64));
     const args = vi.mocked(exec.execCapture).mock.calls[0]?.[1];
     expect(args).toContain("--format=value(image_summary.digest)");
     expect(args).toContain(REF);
+  });
+
+  it("does not accept an amd64-only Artifact Registry index for an arm64 deploy", async () => {
+    const index = "sha256:" + "f".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") return { exitCode: 0, stdout: index + "\n", stderr: "" };
+      if (cmd === "crane" && args[0] === "manifest") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            schemaVersion: 2,
+            manifests: [
+              {
+                digest: "sha256:" + "a".repeat(64),
+                platform: { os: "linux", architecture: "amd64" },
+              },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+
+    await expect(resolveRegistryDigest(REF, "proj", "linux/arm64")).resolves.toBeNull();
   });
 
   it("returns null when the registry cannot be reached", async () => {
@@ -604,11 +1151,11 @@ describe("S27: image integrity must not depend on the CLOUD", () => {
     // rather than an accident. The registry probe is provider-specific; the REQUIREMENT is not.
     const SHA = "sha256:" + "c".repeat(64);
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      if (cmd === "docker") {
+      if (cmd === "docker" && args[0] === "inspect") {
         const ref = args[args.length - 1]!;
         return {
           exitCode: 0,
-          stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${SHA}\n`,
+          stdout: `linux/amd64\n${ref.slice(0, ref.lastIndexOf(":"))}@${SHA}\n`,
           stderr: "",
         };
       }
@@ -633,6 +1180,59 @@ describe("S27: image integrity must not depend on the CLOUD", () => {
       }),
     ).rejects.toThrow(/--allow-mutable-tags/);
   });
+
+  it("runs the platform-aware probe chain once per image, even when it comes up empty", async () => {
+    // resolveRegistryDigest ends by running the crane/skopeo/docker-manifest chain; the
+    // caller's ?? fallback used to run the IDENTICAL chain again whenever that answer was
+    // null — doubling every probe subprocess on exactly the slow path (no crane/skopeo
+    // installed, image genuinely unresolvable).
+    vi.mocked(exec.execCapture).mockImplementation((async (command: string) => {
+      if (command === "gcloud") {
+        return { exitCode: 0, stdout: "sha256:" + "e".repeat(64) + "\n", stderr: "" };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+
+    await expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "us-central1-docker.pkg.dev/proj/repo/app:b1"]],
+        projectId: "proj",
+        allowMutableTags: true,
+      }),
+    ).resolves.toEqual({});
+    const craneCalls = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(([command, args]) => command === "crane" && args?.[0] === "manifest");
+    expect(craneCalls).toHaveLength(1);
+  });
+
+  it("does not probe Artifact Registry when the plan selects OCI distribution", async () => {
+    const SHA = "sha256:" + "d".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (command: string, args: string[]) => {
+      if (command === "crane" && args[0] === "manifest") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            schemaVersion: 2,
+            manifests: [{ digest: SHA, platform: { os: "linux", architecture: "amd64" } }],
+          }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+
+    await expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "us-central1-docker.pkg.dev/proj/repo/app:b1"]],
+        projectId: "proj",
+        digestLookup: { kind: "oci-distribution" },
+      }),
+    ).resolves.toEqual({ ssr: SHA });
+    expect(vi.mocked(exec.execCapture).mock.calls.some(([command]) => command === "gcloud")).toBe(
+      false,
+    );
+  });
 });
 
 describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => {
@@ -648,7 +1248,21 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
   const SHA_B = "sha256:" + "b".repeat(64);
   const dockerOk = (ref: string, sha: string) => ({
     exitCode: 0,
-    stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${sha}\n`,
+    stdout: `linux/amd64\n${ref.slice(0, ref.lastIndexOf(":"))}@${sha}\n`,
+    stderr: "",
+  });
+  const craneIndex = (ref: string, digest: string, architecture = "amd64") => ({
+    exitCode: 0,
+    stdout: JSON.stringify({
+      schemaVersion: 2,
+      manifests: [
+        {
+          digest,
+          platform: { os: "linux", architecture },
+          annotations: { ref },
+        },
+      ],
+    }),
     stderr: "",
   });
 
@@ -656,7 +1270,7 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
   // and an explicit "no registry round-trip" check. Running a real podman deploy disproved
   // that premise (see the S25 cases below): podman's local RepoDigest is not the digest the
   // registry stores, and deploying it fails the rollout. Registry-first is the contract now.
-  it("uses the local daemon's digest when it agrees with the registry", async () => {
+  it("uses the platform-validated registry digest", async () => {
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (cmd === "gcloud") {
         const ref = args.find((a) => a.includes("/")) ?? "";
@@ -666,8 +1280,11 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
           stderr: "",
         };
       }
-      const ref = args[args.length - 1]!;
-      return dockerOk(ref, ref.includes("routing") ? SHA_B : SHA_A);
+      if (cmd === "crane" && args[0] === "manifest") {
+        const ref = args[1]!;
+        return craneIndex(ref, ref.includes("routing") ? SHA_B : SHA_A);
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
     }) as never);
 
     await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).resolves.toEqual({
@@ -688,12 +1305,9 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     const REGISTRY = "sha256:" + "7".repeat(64);
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (cmd === "gcloud") return { exitCode: 0, stdout: REGISTRY + "\n", stderr: "" };
-      const ref = args[args.length - 1]!;
-      return {
-        exitCode: 0,
-        stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`,
-        stderr: "",
-      };
+      if (cmd === "crane" && args[0] === "manifest") return craneIndex(args[1]!, REGISTRY);
+      if (cmd === "docker" && args[0] === "inspect") return dockerOk(args.at(-1)!, LOCAL);
+      return { exitCode: 127, stdout: "", stderr: "not found" };
     }) as never);
 
     const out = await resolveDeployImageDigests({ refs: REFS, projectId: "proj" });
@@ -705,9 +1319,9 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     // An ECR/ACR/Harbor deploy has no projectId, so the AR probe no-ops. Before this it fell
     // straight to the local daemon — the path podman gets wrong.
     const SHA = "sha256:" + "9".repeat(64);
-    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) =>
-      cmd === "crane"
-        ? { exitCode: 0, stdout: SHA + "\n", stderr: "" }
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) =>
+      cmd === "crane" && args[0] === "manifest"
+        ? craneIndex(args[1]!, SHA)
         : { exitCode: 127, stdout: "", stderr: "x" }) as never);
 
     const out = await resolveDeployImageDigests({
@@ -722,14 +1336,10 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     const LOCAL = "sha256:" + "e".repeat(64);
     const REGISTRY = "sha256:" + "7".repeat(64);
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      if (cmd === "crane") return { exitCode: 0, stdout: REGISTRY + "\n", stderr: "" };
+      if (cmd === "crane" && args[0] === "manifest") return craneIndex(args[1]!, REGISTRY);
       if (cmd === "docker" && args.includes("inspect")) {
         const ref = args[args.length - 1]!;
-        return {
-          exitCode: 0,
-          stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`,
-          stderr: "",
-        };
+        return dockerOk(ref, LOCAL);
       }
       return { exitCode: 127, stdout: "", stderr: "x" };
     }) as never);
@@ -768,16 +1378,53 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
     ).rejects.toThrow(/crane|skopeo/);
   });
 
+  it("rejects an amd64-only registry and local image when the artifact targets arm64", async () => {
+    const INDEX = "sha256:" + "1".repeat(64);
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") return { exitCode: 0, stdout: INDEX + "\n", stderr: "" };
+      if (cmd === "crane" && args[0] === "manifest") {
+        return craneIndex(args[1]!, SHA_A, "amd64");
+      }
+      if (cmd === "skopeo") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ Digest: INDEX, Os: "linux", Architecture: "amd64" }),
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args.includes("manifest")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([
+            {
+              Descriptor: {
+                digest: SHA_A,
+                platform: { os: "linux", architecture: "amd64" },
+              },
+            },
+          ]),
+          stderr: "",
+        };
+      }
+      if (cmd === "docker" && args[0] === "inspect") return dockerOk(args.at(-1)!, SHA_A);
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+
+    await expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "us-docker.pkg.dev/p/r/app:b1"]],
+        projectId: "p",
+        targetPlatform: "linux/arm64",
+      }),
+    ).rejects.toThrow(/No registry probe could pin/);
+  });
+
   it("S25: falls back to the local daemon when the registry is unreachable", async () => {
     const LOCAL = "sha256:" + "e".repeat(64);
     vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
       if (cmd === "gcloud") return { exitCode: 1, stdout: "", stderr: "offline" };
-      const ref = args[args.length - 1]!;
-      return {
-        exitCode: 0,
-        stdout: `${ref.slice(0, ref.lastIndexOf(":"))}@${LOCAL}\n`,
-        stderr: "",
-      };
+      if (cmd === "docker" && args[0] === "inspect") return dockerOk(args.at(-1)!, LOCAL);
+      return { exitCode: 127, stdout: "", stderr: "not found" };
     }) as never);
 
     const out = await resolveDeployImageDigests({ refs: REFS, projectId: "proj" });
@@ -787,9 +1434,13 @@ describe("resolveDeployImageDigests (S23: image integrity fails closed)", () => 
   it("falls back to the registry when the local daemon has no RepoDigest", async () => {
     // The podman / buildx / pushed-elsewhere case. Previously this silently deployed the
     // mutable tag; now the registry answers it.
-    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string) => {
-      if (cmd === "docker") return { exitCode: 0, stdout: "\n", stderr: "" }; // no RepoDigests
-      return { exitCode: 0, stdout: SHA_A + "\n", stderr: "" };
+    vi.mocked(exec.execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud") return { exitCode: 0, stdout: SHA_A + "\n", stderr: "" };
+      if (cmd === "crane" && args[0] === "manifest") return craneIndex(args[1]!, SHA_A);
+      if (cmd === "docker" && args[0] === "inspect") {
+        return { exitCode: 0, stdout: "linux/amd64\n", stderr: "" };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
     }) as never);
 
     await expect(resolveDeployImageDigests({ refs: REFS, projectId: "proj" })).resolves.toEqual({
@@ -871,6 +1522,45 @@ describe("discoverNodeCidrsFromCluster (S27: generic clusters have no gcloud)", 
       stderr: "",
     } as never);
     await expect(discoverNodeCidrsFromCluster()).resolves.toBeNull();
+  });
+});
+
+describe("discoverPodCidrsFromCluster", () => {
+  beforeEach(() => {
+    vi.mocked(exec.execCapture).mockReset();
+  });
+
+  it("collects and de-duplicates dual-stack Node podCIDRs", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        items: [
+          { spec: { podCIDRs: ["10.42.0.0/24", "fd00:42::/64"] } },
+          { spec: { podCIDRs: ["10.42.1.0/24", "fd00:42::/64"] } },
+        ],
+      }),
+      stderr: "",
+    } as never);
+
+    await expect(discoverPodCidrsFromCluster()).resolves.toBe(
+      "10.42.0.0/24,fd00:42::/64,10.42.1.0/24",
+    );
+  });
+
+  it("rejects malformed CIDRs and unreadable API responses", async () => {
+    vi.mocked(exec.execCapture).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: JSON.stringify({ items: [{ spec: { podCIDR: "10.42.0.0/99" } }] }),
+      stderr: "",
+    } as never);
+    await expect(discoverPodCidrsFromCluster()).resolves.toBeNull();
+
+    vi.mocked(exec.execCapture).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: "not json",
+      stderr: "",
+    } as never);
+    await expect(discoverPodCidrsFromCluster()).resolves.toBeNull();
   });
 });
 
@@ -1014,7 +1704,11 @@ describe("resolveImageDigest", () => {
   const DIGEST_B = `sha256:${"b".repeat(64)}`;
 
   function mockInspect(stdout: string, exitCode = 0) {
-    vi.mocked(exec.execCapture).mockResolvedValue({ exitCode, stdout, stderr: "" });
+    vi.mocked(exec.execCapture).mockResolvedValue({
+      exitCode,
+      stdout: exitCode === 0 ? `linux/amd64\n${stdout}` : stdout,
+      stderr: "",
+    });
   }
 
   it("selects the entry whose repository matches the pushed image", async () => {
@@ -1039,6 +1733,13 @@ describe("resolveImageDigest", () => {
   it("rejects a malformed digest", async () => {
     mockInspect("gcr.io/proj/nextjs-app-ssr@sha256:nope\n");
     await expect(resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1")).resolves.toBeNull();
+  });
+
+  it("rejects a local image built for a different platform", async () => {
+    mockInspect(`gcr.io/proj/nextjs-app-ssr@${DIGEST_A}\n`);
+    await expect(
+      resolveImageDigest("gcr.io/proj/nextjs-app-ssr:b1", "docker", "linux/arm64"),
+    ).resolves.toBeNull();
   });
 });
 

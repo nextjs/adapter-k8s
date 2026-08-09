@@ -8,7 +8,7 @@ const require = createRequire(import.meta.url);
 const nextConfig: NextConfig = {
   // Keep `npm run build` honest: the local fixture must exercise the adapter hooks even when it is
   // not launched through the deploy CLI (which otherwise supplies NEXT_ADAPTER_PATH).
-  adapterPath: require.resolve("@next-community/adapter-k8s"),
+  adapterPath: process.env.NEXT_ADAPTER_PATH ?? require.resolve("@next-community/adapter-k8s"),
   cacheComponents: true,
   // Keep the local deployed-app probe small enough to make a duplicated PPR Link header obvious.
   // React owns truncation; the adapter must preserve that budget when joining shell + resume.
@@ -34,9 +34,7 @@ const nextConfig: NextConfig = {
         // Service workers are mutable build artifacts: the browser must check for an update, but
         // an ETag should turn an unchanged check into a body-less 304. This local fixture locks the
         // same cache contract as Next's generated `_next/static/service-worker/*` output.
-        headers: [
-          { key: "Cache-Control", value: "public, max-age=0, must-revalidate" },
-        ],
+        headers: [{ key: "Cache-Control", value: "public, max-age=0, must-revalidate" }],
       },
     ];
   },

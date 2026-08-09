@@ -66,6 +66,71 @@ const routeExtJobYaml = path.join(
   "route-ext-update-job.yaml",
 );
 
+function stablePoolObject(
+  kind: "service" | "poddisruptionbudget" | "healthcheckpolicy",
+  pool: string,
+  retained = false,
+  legacyHcpLabels = false,
+) {
+  const base = `${RELEASE}-${pool}`;
+  const name =
+    kind === "service" ? base : kind === "poddisruptionbudget" ? `${base}-pdb` : `${base}-hcp`;
+  return {
+    metadata: {
+      name,
+      resourceVersion: "123",
+      labels: {
+        "app.kubernetes.io/managed-by": "Helm",
+        ...(retained
+          ? {
+              "adapter-k8s.dev/release": RELEASE,
+              "adapter-k8s.dev/retained-stable-pool": RELEASE,
+            }
+          : {}),
+        ...(kind === "healthcheckpolicy" && legacyHcpLabels
+          ? {}
+          : {
+              "app.kubernetes.io/name": RELEASE,
+              "app.kubernetes.io/component": pool,
+            }),
+      },
+      annotations: {
+        "meta.helm.sh/release-name": RELEASE,
+        "meta.helm.sh/release-namespace": "default",
+      },
+    },
+    spec:
+      kind === "service"
+        ? {
+            selector: {
+              "app.kubernetes.io/name": RELEASE,
+              "app.kubernetes.io/component": pool,
+              "app.kubernetes.io/version": "buildm",
+            },
+          }
+        : kind === "poddisruptionbudget"
+          ? {
+              selector: {
+                matchLabels: {
+                  "app.kubernetes.io/name": RELEASE,
+                  "app.kubernetes.io/component": pool,
+                },
+              },
+            }
+          : { targetRef: { group: "", kind: "Service", name: base } },
+  };
+}
+
+const HELM_4_UPGRADE_HELP = `
+      --create-namespace   if --install is set, create the release namespace
+      --force-conflicts    if set server-side apply will force changes against conflicts
+      --server-side string    must be "true", "false" or "auto"
+`;
+
+const HELM_3_UPGRADE_HELP = `
+      --create-namespace   if --install is set, create the release namespace
+`;
+
 interface InfraFixture {
   projectId?: string;
   region?: string;
@@ -89,39 +154,90 @@ function setupFs({
   infra = BASE_INFRA,
   metadata = { buildId: "buildn", pools: ["ssr"], cacheEnabled: false },
   cdn = true,
+  outputName = "output",
+  infrastructureName = "infrastructure.json",
 }: {
   infra?: InfraFixture;
   metadata?: Record<string, unknown>;
   cdn?: boolean;
+  outputName?: string;
+  infrastructureName?: string;
 } = {}) {
   fixturePools = Array.isArray(metadata.pools) ? (metadata.pools as string[]) : ["ssr"];
+  const fixtureInfraPath = path.join(PROJECT, ".k8s-adapter", infrastructureName);
+  const fixtureOutput = path.join(PROJECT, ".k8s-adapter", outputName);
+  const fixtureMetaPath = path.join(fixtureOutput, "build-metadata.json");
+  const fixtureCdnFilter = path.join(fixtureOutput, "chart", "templates", "cdn-http-filter.yaml");
+  const fixtureRouteExtJobYaml = path.join(
+    fixtureOutput,
+    "chart",
+    "templates",
+    "route-ext-update-job.yaml",
+  );
   vi.mocked(existsSync).mockImplementation(
-    (p) => p === infraPath || p === metaPath || (cdn && p === cdnFilter) || p === routeExtJobYaml,
+    (p) =>
+      p === fixtureInfraPath ||
+      p === fixtureMetaPath ||
+      (cdn && p === fixtureCdnFilter) ||
+      p === fixtureRouteExtJobYaml,
   );
   vi.mocked(readFileSync).mockImplementation((p) => {
-    if (p === infraPath) return JSON.stringify(infra);
-    if (p === metaPath) return JSON.stringify(metadata);
+    if (p === fixtureInfraPath) return JSON.stringify(infra);
+    if (p === fixtureMetaPath) return JSON.stringify(metadata);
     return "";
   });
 }
 
-/**
- * What the previous build's LIVE Deployment reports — deliberately DIFFERENT from the new
- * build's `.Values` (a smaller pool, the shared-image repository, and the pre-/readyz
- * readiness path), so a retained render that resolved from `.Values` is detectable (N66).
- */
+/** What the previous build's LIVE Deployment reports to the capacity gate. */
 const DEFAULT_PREV_LIVE = {
   replicas: 2,
   image: `${REGISTRY}/nextjs-app-ssr:buildm`,
-  cpu: "750m",
-  memory: "1536Mi",
-  ephemeralStorage: "3Gi",
-  cpuLimit: "1500m",
-  memoryLimit: "3Gi",
-  readinessPath: "/healthz",
-  // N87: a previous build deployed BEFORE per-build Secret names — it references the legacy
-  // stable name, which the retained render must mirror rather than repoint.
   internalSecretRef: legacyInternalSecretName(RELEASE),
+};
+
+// Deliberately richer than the current emitter. Retention must preserve unknown/custom pod
+// fields as well as every env form because it must not serialize this template at all.
+const DEFAULT_PREV_POD_TEMPLATE = {
+  metadata: {
+    labels: { "app.kubernetes.io/version": "buildm", "example.com/variant": "legacy" },
+    annotations: { "example.com/injected": "kept" },
+  },
+  spec: {
+    serviceAccountName: "legacy-runtime",
+    nodeSelector: { "kubernetes.io/arch": "arm64" },
+    tolerations: [{ key: "dedicated", operator: "Equal", value: "nextjs", effect: "NoSchedule" }],
+    containers: [
+      {
+        name: "pool-server",
+        image: DEFAULT_PREV_LIVE.image,
+        env: [
+          { name: "APP_VARIANT", value: "catalog" },
+          { name: "POOL_ROLE", value: "legacy-pages" },
+          {
+            name: "INTERNAL_HEADER_SECRET",
+            valueFrom: {
+              secretKeyRef: { name: DEFAULT_PREV_LIVE.internalSecretRef, key: "secret" },
+            },
+          },
+          {
+            name: "DATABASE_URL",
+            valueFrom: { secretKeyRef: { name: "runtime-database", key: "url", optional: false } },
+          },
+          {
+            name: "POD_NAME",
+            valueFrom: { fieldRef: { apiVersion: "v1", fieldPath: "metadata.name" } },
+          },
+        ],
+        envFrom: [
+          { configMapRef: { name: "runtime-config", optional: true } },
+          { secretRef: { name: "runtime-secrets", optional: false } },
+        ],
+        volumeMounts: [{ name: "runtime", mountPath: "/runtime", readOnly: true }],
+      },
+      { name: "telemetry-sidecar", image: "example.invalid/telemetry@sha256:abc" },
+    ],
+    volumes: [{ name: "runtime", secret: { secretName: "runtime-files" } }],
+  },
 };
 
 /**
@@ -136,25 +252,35 @@ function happyCluster(
     poolServiceMissing?: boolean; // N31: the pool is NEW in this build
     poolServiceProbeFails?: boolean;
     patchFailsFor?: string; // service name whose selector patch fails
+    activeSelectorByPool?: Record<string, Record<string, string>>;
+    activeSelectorReadFailsFor?: string;
     podsNeverReady?: boolean;
     // N20: active-Service discovery (used only when deploy state is unavailable).
     activeServices?: string; // jsonpath rows: name|component|versionSelector
     activeServicesFail?: boolean;
     servingImages?: string; // jsonpath rows: name|image
-    // N66: the previous build's LIVE pod template, as the retained render must mirror it.
+    // The previous build's live replica count; its pod template is never re-rendered.
     prevLive?: Partial<typeof DEFAULT_PREV_LIVE>;
     // N64: the new build's rendered replica count, and how many of its pods are Ready.
     newBuildReplicas?: number;
     newBuildReplicasProbeFails?: boolean;
     podReplicas?: number;
     readyPerPool?: Record<string, number>;
-    // N67: the chart-rendered HPA the new build's Deployment is bound to. `null` = the
-    // pool has no HPA at all (autoscaling disabled). Default min 1 / max 3 mirrors
-    // renderValuesYaml, and covers DEFAULT_PREV_LIVE.replicas so the common case needs
-    // no widening at all.
+    // N67: the chart-rendered HPA the new build's Deployment is bound to. `null` simulates
+    // a partial Helm apply where that required object is missing. Default min 1 / max 3
+    // mirrors renderValuesYaml and covers DEFAULT_PREV_LIVE.replicas, so the common case
+    // needs no widening at all.
     newBuildHpa?: { min?: number; max: number } | null;
     newBuildHpaReadFails?: boolean;
     newBuildHpaPatchFails?: boolean;
+    // The outgoing HPA may have been created imperatively by rollback rather than by the
+    // current Helm revision. Deploy protects either shape by probing the live object by name,
+    // transferring it to `keep`, then deleting it only after cutover is durable.
+    outgoingHpaPresent?: boolean;
+    outgoingHpaProbeFails?: boolean;
+    outgoingHpaMetadataPatchFails?: boolean;
+    outgoingHpaDeleteFails?: boolean;
+    outgoingDeploymentMetadataPatchFails?: boolean;
     // N87: internal dispatch Secret lifecycle. The legacy stable-named Secret (migrated past
     // helm upgrade), and the per-build ones the post-cutover sweep prunes.
     legacySecretPresent?: boolean;
@@ -169,6 +295,9 @@ function happyCluster(
   return vi.fn(async (_cmd: string, args: string[]) => {
     const j = args.join(" ");
     const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+    if (_cmd === "helm" && args[0] === "upgrade" && args.includes("--help")) {
+      return ok(HELM_4_UPGRADE_HELP);
+    }
     // N87 (before the generic `secret` branch below, which answers the cache-Secret delete).
     if (args[0] === "get" && args[1] === "secret" && args.includes("--ignore-not-found")) {
       if (overrides.legacySecretProbeFails) {
@@ -190,6 +319,26 @@ function happyCluster(
     }
     if (args.includes("secrets")) {
       return ok(`${(overrides.internalSecretsInCluster ?? []).join("\n")}\n`);
+    }
+    // N70: legacy-state pool-topology migration reads build-scoped Deployments as JSON.
+    if (
+      args.includes("deployments") &&
+      args.includes("json") &&
+      j.includes("app.kubernetes.io/version=buildm")
+    ) {
+      return ok(
+        JSON.stringify({
+          items: fixturePools.map((pool) => ({
+            metadata: {
+              name: `rel-${pool}-buildm`,
+              labels: {
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": "buildm",
+              },
+            },
+          })),
+        }),
+      );
     }
     if (args.includes("deployments") && args.includes("json")) {
       if (overrides.referencedSecrets === "unreadable") {
@@ -231,7 +380,7 @@ function happyCluster(
     // daemon knows the digest; the registry fallback is never reached on the happy path.
     if (args.includes("inspect") && j.includes("RepoDigests")) {
       const ref = args[args.length - 1]!;
-      return ok(`${ref.slice(0, ref.lastIndexOf(":"))}@sha256:${"a".repeat(64)}\n`);
+      return ok(`linux/amd64\n${ref.slice(0, ref.lastIndexOf(":"))}@sha256:${"a".repeat(64)}\n`);
     }
     if (j.includes("clusterIpv4Cidr")) return ok("10.4.0.0/14\n");
     // S22: strict-posture node-range discovery — cluster subnetwork, then its primary
@@ -255,10 +404,14 @@ function happyCluster(
     if (args.includes("deployments") && j.includes("containers[0].image")) {
       return ok(overrides.servingImages ?? `rel-ssr-buildm|${REGISTRY}/nextjs-app-ssr:buildm\n`);
     }
-    // N66: retained-manifest probe — ONE call returning name|replicas plus the live pod
-    // template fields the retained render must reproduce (image, four quantities, readiness
-    // path). The N64 capacity probe below asks the same resource with the SHORT jsonpath.
-    if (j.includes("containers[0].image") && j.includes("{.spec.replicas}")) {
+    // Complete outgoing Deployment read. Deploy extracts only replicas; the pod template is
+    // deliberately unknown to it and must never be re-rendered into the incoming chart.
+    if (
+      args[0] === "get" &&
+      args[1] === "deployment" &&
+      args.includes("--ignore-not-found") &&
+      args[args.indexOf("-o") + 1] === "json"
+    ) {
       if (overrides.replicasProbeGone) return ok("");
       if (overrides.replicasProbeFails) {
         return { exitCode: 1, stdout: "", stderr: "connection refused" };
@@ -266,19 +419,25 @@ function happyCluster(
       const name = args[args.indexOf("deployment") + 1]!;
       const live = { ...DEFAULT_PREV_LIVE, ...overrides.prevLive };
       return ok(
-        [
-          name,
-          String(live.replicas),
-          live.image,
-          live.cpu,
-          live.memory,
-          live.ephemeralStorage,
-          live.cpuLimit,
-          live.memoryLimit,
-          live.readinessPath,
-          live.internalSecretRef,
-        ].join("|"),
+        JSON.stringify({
+          apiVersion: "apps/v1",
+          kind: "Deployment",
+          metadata: { name, namespace: "default", annotations: { "example.com/live": "yes" } },
+          spec: { replicas: live.replicas, template: DEFAULT_PREV_POD_TEMPLATE },
+        }),
       );
+    }
+    if (args[0] === "patch" && args[1] === "deployment") {
+      const body = JSON.parse(args[args.length - 1]!) as {
+        metadata?: { annotations?: Record<string, string>; labels?: Record<string, string> };
+      };
+      events.push(
+        `preserve-deployment:${args[2]}:${body.metadata?.labels?.["adapter-k8s.dev/release"]}`,
+      );
+      if (overrides.outgoingDeploymentMetadataPatchFails) {
+        return { exitCode: 1, stdout: "", stderr: "deployment metadata patch denied" };
+      }
+      return ok();
     }
     // N64: pre-cutover capacity probe on the NEW build's Deployment (short jsonpath).
     if (j.includes("jsonpath={.metadata.name}|{.spec.replicas}")) {
@@ -294,7 +453,55 @@ function happyCluster(
         return { exitCode: 1, stdout: "", stderr: "Unable to connect to the server" };
       }
       const svcName = args[args.indexOf("service") + 1]!;
-      return overrides.poolServiceMissing ? ok("") : ok(`service/${svcName}\n`);
+      if (overrides.poolServiceMissing) return ok("");
+      if (args[args.indexOf("-o") + 1] === "json") {
+        const pool = svcName.slice(`${RELEASE}-`.length);
+        return ok(
+          JSON.stringify({
+            kind: "Service",
+            metadata: {
+              name: svcName,
+              resourceVersion: "123",
+              labels: {
+                "app.kubernetes.io/name": RELEASE,
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/managed-by": "Helm",
+              },
+              annotations: {
+                "meta.helm.sh/release-name": RELEASE,
+                "meta.helm.sh/release-namespace": "default",
+              },
+            },
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": RELEASE,
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": "buildm",
+              },
+            },
+          }),
+        );
+      }
+      return ok(`service/${svcName}\n`);
+    }
+    if (args[0] === "get" && args[1] === "service" && args.includes("json")) {
+      const svcName = args[2]!;
+      if (svcName === overrides.activeSelectorReadFailsFor) {
+        return { exitCode: 1, stdout: "", stderr: "services is forbidden" };
+      }
+      const pool = svcName.slice(`${RELEASE}-`.length);
+      return ok(
+        JSON.stringify({
+          metadata: { name: svcName },
+          spec: {
+            selector: overrides.activeSelectorByPool?.[pool] ?? {
+              "app.kubernetes.io/name": RELEASE,
+              "app.kubernetes.io/component": pool,
+              "app.kubernetes.io/version": "buildm",
+            },
+          },
+        }),
+      );
     }
     if (args.includes("configmaps")) {
       // Snapshot-pruning listing: previous build's snapshot + a stale one.
@@ -325,21 +532,53 @@ function happyCluster(
       });
       return ok(`${rows.join("\n")}\n`);
     }
-    // N67: the new build's HPA — read (min|max), widened for the warm-up, restored after.
-    // MUST come before the generic `patch` branch below, which assumes a Service.
+    // The outgoing HPA is deliberately omitted from the new Helm manifest, but must stay live
+    // while its build serves. Its by-name read/keep/delete lifecycle is separate from N67's
+    // new-build HPA read/patch lifecycle below.
     if (args.includes("hpa")) {
       const hpaName = args[args.indexOf("hpa") + 1]!;
+      if (args[0] === "get" && args.includes("-o") && args[args.indexOf("-o") + 1] === "name") {
+        if (overrides.outgoingHpaProbeFails) {
+          return { exitCode: 1, stdout: "", stderr: "horizontalpodautoscalers is forbidden" };
+        }
+        return overrides.outgoingHpaPresent === false
+          ? ok("")
+          : ok(`horizontalpodautoscaler.autoscaling/${hpaName}\n`);
+      }
+      if (args[0] === "patch") {
+        const body = JSON.parse(args[args.length - 1]!) as {
+          metadata?: { annotations?: Record<string, string>; labels?: Record<string, string> };
+          spec?: { maxReplicas?: number; minReplicas?: number };
+        };
+        if (body.metadata?.annotations?.["helm.sh/resource-policy"] === "keep") {
+          events.push(
+            `preserve-hpa:${hpaName}:${body.metadata.labels?.["adapter-k8s.dev/release"]}`,
+          );
+          if (overrides.outgoingHpaMetadataPatchFails) {
+            return { exitCode: 1, stdout: "", stderr: "hpa metadata patch denied" };
+          }
+          return ok();
+        }
+      }
+      if (args.includes("delete")) {
+        events.push(`delete-hpa:${hpaName}`);
+        if (overrides.outgoingHpaDeleteFails) {
+          return { exitCode: 1, stdout: "", stderr: "hpa deletion denied" };
+        }
+        return ok("");
+      }
+      // N67: the new build's HPA — read (min|max), raised for the warm-up, restored after.
+      // MUST come before the generic `patch` branch below, which assumes a Service.
       if (args.includes("patch")) {
         const body = JSON.parse(args[args.length - 1]!) as {
           spec: { maxReplicas?: number; minReplicas?: number };
         };
-        events.push(`hpa-max:${hpaName}:${body.spec.maxReplicas}`);
+        events.push(`hpa-bounds:${hpaName}:${body.spec.minReplicas}:${body.spec.maxReplicas}`);
         if (overrides.newBuildHpaPatchFails) {
           return { exitCode: 1, stdout: "", stderr: "hpa patch denied by webhook" };
         }
         return ok();
       }
-      if (args.includes("delete")) return ok(""); // 7f parks the previous build
       if (overrides.newBuildHpaReadFails) {
         return { exitCode: 1, stdout: "", stderr: "connection refused" };
       }
@@ -349,6 +588,10 @@ function happyCluster(
       return ok(`${hpaName}|${min}|${max}`);
     }
     if (args.includes("patch")) {
+      if (args.includes("--type=merge") && args[args.length - 1]?.includes("resourceVersion")) {
+        events.push(`retain-stable:${args[1]}:${args[2]}`);
+        return ok();
+      }
       const svc = args[args.indexOf("service") + 1]!;
       events.push(`patch:${svc}`);
       if (svc === overrides.patchFailsFor) {
@@ -395,6 +638,7 @@ describe("runDeploy — orchestration", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildm",
       previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
     } as never);
     vi.mocked(writeState).mockImplementation((async () => {
       events.push("writeState");
@@ -417,8 +661,41 @@ describe("runDeploy — orchestration", () => {
   });
 
   afterEach(() => {
+    delete process.env.ADAPTER_K8S_TARGET_PLATFORM;
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("rejects a deploy-time platform override that differs from the built artifact", async () => {
+    setupFs({
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: false,
+        targetPlatform: "linux/arm64",
+      },
+    });
+    process.env.ADAPTER_K8S_TARGET_PLATFORM = "linux/amd64";
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/targets "linux\/arm64".*requested "linux\/amd64"/s);
+    // The lifecycle stack probes Helm capabilities before reading skipped-build metadata; this
+    // is read-only and still occurs before every build/push/credential/cluster mutation.
+    expect(execCapture).toHaveBeenCalledOnce();
+    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"]);
+  });
+
+  it("treats pre-platform metadata as amd64 instead of relabeling its x64 Sharp staging", async () => {
+    process.env.ADAPTER_K8S_TARGET_PLATFORM = "linux/arm64";
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/targets "linux\/amd64".*requested "linux\/arm64"/s);
+    expect(execCapture).toHaveBeenCalledOnce();
+    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"]);
   });
 
   it("happy path: build → push → helm → rollout → health → selector patch → state commit → CDN invalidate → previous scaled down, in that order", async () => {
@@ -447,6 +724,7 @@ describe("runDeploy — orchestration", () => {
       {
         buildId: "buildn",
         previousBuildId: "buildm",
+        poolTopologies: { buildm: ["ssr"], buildn: ["ssr"] },
         cdnTags: { buildn: cdnTagForBuildId("buildn") },
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
@@ -454,10 +732,12 @@ describe("runDeploy — orchestration", () => {
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        targetPlatforms: { buildn: "linux/amd64" },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
     // CDN invalidated for the OUTGOING build. Prior state (legacy) recorded no tag for
     // it, so no recordedTag is passed — cdn-invalidate falls back to the full purge (M13).
@@ -472,6 +752,9 @@ describe("runDeploy — orchestration", () => {
     // Helm pinned to the namespace init binds Workload Identity to.
     const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
     expect(helmCall?.[1].join(" ")).toContain("--namespace default --create-namespace");
+    expect(helmCall?.[1]).not.toContain("--take-ownership");
+    expect(helmCall?.[1]).toContain("--server-side=true");
+    expect(helmCall?.[1]).toContain("--force-conflicts");
     // Docker push happened for the pool and the routing service.
     const dockerCalls = vi
       .mocked(execOrThrow)
@@ -500,6 +783,144 @@ describe("runDeploy — orchestration", () => {
     });
   });
 
+  it("builds every container from the selected variant output", async () => {
+    process.env.ADAPTER_K8S_CONFIG = "staging";
+    try {
+      setupFs({
+        outputName: "output.staging",
+        infrastructureName: "infrastructure.staging.json",
+      });
+      vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+      await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+      const dockerBuilds = vi
+        .mocked(execOrThrow)
+        .mock.calls.filter(([cmd, args]) => cmd === "docker" && args.includes("build"))
+        .map(([, args]) => args.join(" "));
+      expect(dockerBuilds).toHaveLength(2);
+      expect(dockerBuilds).toEqual([
+        expect.stringContaining(".k8s-adapter/output.staging/pools/ssr"),
+        expect.stringContaining(".k8s-adapter/output.staging/routing-service"),
+      ]);
+    } finally {
+      delete process.env.ADAPTER_K8S_CONFIG;
+    }
+  });
+
+  it("keeps a rollback-created HPA active through warm-up, then deletes it before parking", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { replicas: 5 },
+        readyPerPool: { ssr: 5 },
+        // The object exists only in the cluster, as after rollback's `kubectl autoscale`.
+        // It is intentionally absent from the retained files asserted below.
+        outgoingHpaPresent: true,
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const retainedWrites = vi
+      .mocked(writeFileSync)
+      .mock.calls.filter(([p]) => String(p).includes("-prev-"));
+    const retainedNames = retainedWrites.map(([p]) => path.basename(String(p)));
+    expect(retainedNames).not.toContain("ssr-prev-deployment.yaml");
+    expect(retainedNames).toContain("ssr-prev-service.yaml");
+    expect(retainedNames).not.toContain("ssr-prev-hpa.yaml");
+
+    const keepDeployment = events.indexOf("preserve-deployment:rel-ssr-buildm:rel");
+    expect(keepDeployment).toBeGreaterThanOrEqual(0);
+    expect(keepDeployment).toBeLessThan(events.indexOf("helm"));
+    const deploymentTransfer = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([, args]) =>
+          args[0] === "patch" && args[1] === "deployment" && args[2] === "rel-ssr-buildm",
+      );
+    const deploymentMetadata = JSON.parse(
+      deploymentTransfer![1][deploymentTransfer![1].length - 1]!,
+    ).metadata;
+    expect(deploymentMetadata).toMatchObject({
+      annotations: { "helm.sh/resource-policy": "keep" },
+      labels: { "adapter-k8s.dev/release": "rel" },
+    });
+    expect(deploymentMetadata.labels).not.toHaveProperty("app.kubernetes.io/managed-by");
+
+    const keepHpa = events.indexOf("preserve-hpa:rel-ssr-buildm-hpa:rel");
+    expect(keepHpa).toBeGreaterThanOrEqual(0);
+    expect(keepHpa).toBeLessThan(events.indexOf("helm"));
+    const hpaTransfer = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([, args]) => args[0] === "patch" && args[1] === "hpa" && args[2] === "rel-ssr-buildm-hpa",
+      );
+    const hpaMetadata = JSON.parse(hpaTransfer![1][hpaTransfer![1].length - 1]!).metadata;
+    expect(hpaMetadata).toMatchObject({
+      annotations: { "helm.sh/resource-policy": "keep" },
+      labels: {
+        "adapter-k8s.dev/release": "rel",
+        "app.kubernetes.io/name": "rel",
+        "app.kubernetes.io/component": "ssr",
+        "app.kubernetes.io/version": "buildm",
+      },
+    });
+    expect(hpaMetadata.labels).not.toHaveProperty("app.kubernetes.io/managed-by");
+
+    const stateCommit = events.indexOf("writeState");
+    const deleteHpa = events.indexOf("delete-hpa:rel-ssr-buildm-hpa");
+    const scaleDown = events.indexOf("scale:deployment/rel-ssr-buildm");
+    expect(stateCommit).toBeGreaterThanOrEqual(0);
+    expect(deleteHpa).toBeGreaterThan(stateCommit);
+    expect(scaleDown).toBeGreaterThan(deleteHpa);
+  });
+
+  it("leaves the rollback Deployment running when its outgoing HPA cannot be deleted", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { outgoingHpaDeleteFails: true }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events).toContain("writeState");
+    expect(events).toContain("delete-hpa:rel-ssr-buildm-hpa");
+    expect(events).not.toContain("scale:deployment/rel-ssr-buildm");
+    expect(printedWarnings()).toContain("could immediately undo a scale to zero");
+  });
+
+  it("uses Helm 3's client-side upgrade without passing Helm 4-only flags", async () => {
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "helm" && args[0] === "upgrade" && args.includes("--help")) {
+        return { exitCode: 0, stdout: HELM_3_UPGRADE_HELP, stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
+    expect(helmCall?.[1]).not.toContain("--take-ownership");
+    expect(helmCall?.[1]).not.toContain("--server-side=true");
+    expect(helmCall?.[1]).not.toContain("--force-conflicts");
+  });
+
+  it("rejects Helm older than 3.2 before any deployment mutation", async () => {
+    vi.mocked(execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "Usage: helm upgrade [RELEASE] [CHART]",
+      stderr: "",
+    } as never);
+
+    await expect(runDeploy({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /does not support --create-namespace/,
+    );
+
+    expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
   it("new build never healthy: no selector patch, no state commit, non-zero exit, previous keeps serving", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, { podsNeverReady: true }) as never,
@@ -515,6 +936,12 @@ describe("runDeploy — orchestration", () => {
     expect(events).not.toContain("writeState");
     expect(events).not.toContain("cdn-invalidate");
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+    // The outgoing autoscaler was transferred out of Helm before the upgrade and is never
+    // deleted on this abort, so the build that still carries traffic keeps autoscaling.
+    const keepHpa = events.indexOf("preserve-hpa:rel-ssr-buildm-hpa:rel");
+    expect(keepHpa).toBeGreaterThanOrEqual(0);
+    expect(keepHpa).toBeLessThan(events.indexOf("helm"));
+    expect(events).not.toContain("delete-hpa:rel-ssr-buildm-hpa");
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     const printed = vi
       .mocked(console.error)
@@ -526,28 +953,119 @@ describe("runDeploy — orchestration", () => {
     expect(printed).toContain("previous build's pools are still serving");
   });
 
+  it("aborts before Helm when the outgoing HPA cannot be read", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { outgoingHpaProbeFails: true }) as never,
+    );
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing HPA.*Refusing to run `helm upgrade`/s);
+
+    expect(events).not.toContain("helm");
+    expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+  });
+
+  it("aborts before Helm when the outgoing HPA cannot be transferred to keep", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, { outgoingHpaMetadataPatchFails: true }) as never,
+    );
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/preserve the outgoing HPA.*serving build must keep autoscaling/s);
+
+    expect(events).not.toContain("helm");
+    expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+  });
+
   it("selector patch failure: reverts the successful patches, no state commit, non-zero exit", async () => {
     setupFs({ metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr", "api"], buildm0: ["ssr", "api"] },
+    } as never);
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { patchFailsFor: "rel-api" }) as never,
+      happyCluster(events, {
+        patchFailsFor: "rel-api",
+        activeSelectorByPool: {
+          ssr: {
+            "app.kubernetes.io/name": "rel",
+            "app.kubernetes.io/component": "legacy-fallback",
+            "app.kubernetes.io/version": "buildm",
+            "example.com/custom": "kept",
+          },
+        },
+      }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
     ).rejects.toThrow(/process\.exit:1/);
 
-    // rel-ssr was patched to buildn, then reverted back to buildm after rel-api failed.
+    // rel-ssr was patched to its canonical pool/build, then restored byte-for-byte after the
+    // rel-api patch failed.
     const patchCalls = vi
       .mocked(execCapture)
       .mock.calls.filter(
         ([, a]) => a.includes("patch") && a.includes("service") && a.includes("rel-ssr"),
       );
     expect(patchCalls).toHaveLength(2);
-    expect(patchCalls[0]![1].join(" ")).toContain('"value":"buildn"');
-    expect(patchCalls[1]![1].join(" ")).toContain('"value":"buildm"');
+    const forward = JSON.parse(patchCalls[0]![1].at(-1)!)[0].value;
+    expect(forward).toMatchObject({
+      "app.kubernetes.io/component": "ssr",
+      "app.kubernetes.io/version": "buildn",
+      "example.com/custom": "kept",
+    });
+    const restored = JSON.parse(patchCalls[1]![1].at(-1)!)[0].value;
+    expect(restored).toEqual({
+      "app.kubernetes.io/name": "rel",
+      "app.kubernetes.io/component": "legacy-fallback",
+      "app.kubernetes.io/version": "buildm",
+      "example.com/custom": "kept",
+    });
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     expect(vi.mocked(invalidateCdnBuildTag)).not.toHaveBeenCalled();
     expect(events.some((e) => e.startsWith("scale:"))).toBe(false);
+    // Both outgoing autoscalers remain active after the partial selector flip is reverted.
+    expect(events).toContain("preserve-hpa:rel-ssr-buildm-hpa:rel");
+    expect(events).toContain("preserve-hpa:rel-api-buildm-hpa:rel");
+    expect(events.some((e) => e.startsWith("delete-hpa:"))).toBe(false);
+  });
+
+  it("restores a re-added pool's component selector after topology rollback redirection", async () => {
+    setupFs({ metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr", "api"] },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        activeSelectorByPool: {
+          api: {
+            "app.kubernetes.io/name": "rel",
+            "app.kubernetes.io/component": "ssr",
+            "app.kubernetes.io/version": "buildm",
+          },
+        },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const apiPatch = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([, args]) => args[0] === "patch" && args[1] === "service" && args[2] === "rel-api",
+      );
+    const selector = JSON.parse(apiPatch![1].at(-1)!)[0].value;
+    expect(selector).toEqual({
+      "app.kubernetes.io/name": "rel",
+      "app.kubernetes.io/component": "api",
+      "app.kubernetes.io/version": "buildn",
+    });
   });
 
   it("dry-run: prints the plan and mutates nothing", async () => {
@@ -569,6 +1087,14 @@ describe("runDeploy — orchestration", () => {
       .join("\n");
     expect(printed).toContain("[dry-run] helm upgrade");
     expect(printed).toContain("--namespace default --create-namespace");
+    const helmPlans = printed.split("\n").filter((line) => line.includes("[dry-run] helm upgrade"));
+    expect(helmPlans).toHaveLength(2);
+    expect(helmPlans[0]).toContain("Helm 3.2–3.x, client-side upgrade");
+    expect(helmPlans[0]).not.toContain("--server-side=true");
+    expect(helmPlans[0]).not.toContain("--force-conflicts");
+    expect(helmPlans[1]).toContain("Helm 4+, server-side upgrade");
+    expect(helmPlans[1]).toContain("--server-side=true");
+    expect(helmPlans[1]).toContain("--force-conflicts");
   });
 });
 
@@ -584,6 +1110,7 @@ describe("runDeploy — guards and teardown", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildm",
       previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
@@ -649,53 +1176,20 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/replica count/);
+    ).rejects.toThrow(/currently-serving deployment/);
     expect(events).not.toContain("helm");
   });
 
-  it("self-heals when the previous Deployment is NotFound: warns, renders default replicas, deploy proceeds", async () => {
-    // Regression: the retention probe aborted on ANY kubectl failure, including
-    // NotFound (state names a build whose Deployment was deleted manually), which
-    // bricked every future deploy of the release. N31: the pool's stable active Service
-    // still exists, which is what proves the pool existed in the previous build.
+  it("fails closed when a recorded rollback Deployment is missing", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, { replicasProbeGone: true }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    // The deploy completed: cutover happened and state was committed.
-    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
-      PROJECT,
-      {
-        buildId: "buildn",
-        previousBuildId: "buildm",
-        cdnTags: { buildn: cdnTagForBuildId("buildn") },
-        // The build just installed serves /readyz, so the NEXT deploy may flip the load
-        // balancer's HealthCheckPolicy to readiness without stranding it.
-        readinessPathSupported: true,
-        // S23: the routing image is now pinned to its digest on every path (the harness's
-        // `docker inspect` answers, as a real daemon does after a push), so state records it.
-        routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
-        // N69: the floor writeState stamps above — the prior state carried no generation.
-        basedOnGeneration: null,
-      },
-      RELEASE,
-    );
-    // A loud warning named the missing deployment...
-    expect(
-      vi
-        .mocked(console.warn)
-        .mock.calls.some(
-          (c) => String(c[0]).includes("rel-ssr-buildm") && String(c[0]).includes("not found"),
-        ),
-    ).toBe(true);
-    // ...and the retained manifest fell back to the default replica count.
-    const prevDeploymentWrite = vi
-      .mocked(writeFileSync)
-      .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"));
-    expect(prevDeploymentWrite).toBeDefined();
-    expect(String(prevDeploymentWrite![1])).toContain("replicas: 2");
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/recorded pool topology.*versioned Deployment.*missing/s);
+    expect(events).not.toContain("helm");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 
   it("aborts when COMPOSED truncated names collide even though the bare build ids differ", async () => {
@@ -708,6 +1202,7 @@ describe("runDeploy — guards and teardown", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "build-two",
       previousBuildId: null,
+      poolTopologies: { "build-two": [longPool] },
     } as never);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
@@ -754,7 +1249,8 @@ describe("runDeploy — guards and teardown", () => {
       .mock.calls.find(([, a]) => a.includes("configmaps"))![1]
       .join(" ");
     expect(listing).toContain("app.kubernetes.io/component=routing-manifest-snapshot");
-    expect(listing).toContain("app.kubernetes.io/managed-by=adapter-k8s");
+    expect(listing).toContain(`app.kubernetes.io/name=${RELEASE}`);
+    expect(listing).not.toContain("app.kubernetes.io/managed-by=adapter-k8s");
   });
 
   it("fails fast when a pool rollout status fails (exit code is not discarded)", async () => {
@@ -783,6 +1279,7 @@ describe("runDeploy — guards and teardown", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "abc-", // sanitizes to "abc" — identical to the new build's label
       previousBuildId: "abc0",
+      poolTopologies: { "abc-": ["ssr"], abc0: ["ssr"] },
     } as never);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
@@ -792,21 +1289,73 @@ describe("runDeploy — guards and teardown", () => {
     expect(events).not.toContain("helm");
   });
 
-  it("rejects a non-default namespace in infrastructure.json before touching anything", async () => {
-    // The chart/extension chain were built for the ext_proc authority in
-    // infra.namespace, but every kubectl/helm call pins "default" — deploying would
-    // skew the GXLB callout target away from the workloads. Fail fast instead.
-    setupFs({ infra: { ...BASE_INFRA, namespace: "prod" } });
+  it("uses a custom namespace for Helm, cluster state, and routing retention", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, namespace: "prod" },
+    });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const helmCall = vi.mocked(execOrThrow).mock.calls.find(([cmd]) => cmd === "helm");
+    expect(helmCall?.[1].join(" ")).toContain("--namespace prod --create-namespace");
+    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, { namespace: "prod" });
+    expect(vi.mocked(retainLiveRoutingManifest)).toHaveBeenCalledWith(RELEASE, "prod");
+    const outgoingHpaCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args.includes("hpa") && args.includes("rel-ssr-buildm-hpa"));
+    expect(outgoingHpaCalls).not.toHaveLength(0);
+    for (const [, args] of outgoingHpaCalls) {
+      expect(args).toEqual(expect.arrayContaining(["-n", "prod"]));
+    }
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      expect.objectContaining({ buildId: "buildn", previousBuildId: "buildm" }),
+      RELEASE,
+      "prod",
+    );
+  });
+
+  it("refuses build output emitted for a different namespace", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: false,
+        namespace: "staging",
+      },
+    });
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(
-      /Unsupported namespace "prod".*deploys only to the "default" namespace.*Remove "namespace"/s,
-    );
+    ).rejects.toThrow(/emitted for namespace "staging".*targets "prod"/s);
     expect(events).not.toContain("helm");
-    expect(events).not.toContain("get-credentials");
-    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("treats legacy build output with no namespace as default", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false },
+    });
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/emitted for namespace "default".*targets "prod"/s);
+    expect(events).not.toContain("helm");
+  });
+
+  it("rejects malformed namespace metadata instead of bypassing the fingerprint", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, namespace: 123 },
+    });
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Invalid namespace/);
+    expect(events).not.toContain("helm");
   });
 
   it('accepts an explicit namespace of "default" in infrastructure.json', async () => {
@@ -820,6 +1369,7 @@ describe("runDeploy — guards and teardown", () => {
       {
         buildId: "buildn",
         previousBuildId: "buildm",
+        poolTopologies: { buildm: ["ssr"], buildn: ["ssr"] },
         cdnTags: { buildn: cdnTagForBuildId("buildn") },
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
@@ -827,10 +1377,12 @@ describe("runDeploy — guards and teardown", () => {
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        targetPlatforms: { buildn: "linux/amd64" },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
   });
 
@@ -844,6 +1396,8 @@ describe("runDeploy — guards and teardown", () => {
       buildId: "buildm",
       previousBuildId: "buildm0",
       cdnTags: { buildm: recordedPrev },
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      targetPlatforms: { buildm: "linux/arm64", buildm0: "linux/amd64" },
     } as never);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
@@ -857,15 +1411,19 @@ describe("runDeploy — guards and teardown", () => {
       {
         buildId: "buildn",
         previousBuildId: "buildm",
+        poolTopologies: { buildm: ["ssr"], buildn: ["ssr"] },
         // Carried verbatim + the new build's own recording; buildm0 pruned (out of play).
         cdnTags: { buildm: recordedPrev, buildn: cdnTagForBuildId("buildn") },
         readinessPathSupported: true,
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        // The outgoing rollback target is carried; the older, out-of-play build is pruned.
+        targetPlatforms: { buildm: "linux/arm64", buildn: "linux/amd64" },
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
   });
 
@@ -881,6 +1439,7 @@ describe("runDeploy — guards and teardown", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: prevBuild,
       previousBuildId: null,
+      poolTopologies: { [prevBuild]: ["ssr"] },
     } as never);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
@@ -952,6 +1511,40 @@ describe("runDeploy — guards and teardown", () => {
     expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
   });
 
+  it("aborts before Helm rather than adopting a foreign-owned non-cache Secret", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
+    });
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "get" &&
+        args[1] === "secret" &&
+        args[2] === "rel-valkey" &&
+        args.some((arg) => arg.includes("resourceVersion"))
+      ) {
+        return {
+          exitCode: 0,
+          stdout:
+            "rel-valkey|Opaque|foreign-app|database-credentials|Helm|foreign-release|default|123",
+          stderr: "",
+        };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/foreign or incomplete ownership metadata/);
+
+    expect(events).not.toContain("helm");
+    const valkeyPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "patch" && args[2] === "rel-valkey");
+    expect(valkeyPatches).toHaveLength(0);
+  });
+
   it("cache disabled: removes the Secret AND the managed instance (regression)", async () => {
     setupFs({
       infra: { ...BASE_INFRA, cacheRegion: "us-east1" },
@@ -995,6 +1588,7 @@ function standardBeforeEach(events: string[]): void {
   vi.mocked(readState).mockResolvedValue({
     buildId: "buildm",
     previousBuildId: "buildm0",
+    poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
   } as never);
   vi.mocked(writeState).mockImplementation((async () => {
     events.push("writeState");
@@ -1066,11 +1660,10 @@ describe("runDeploy — N20: unreadable deploy state must never read as a first 
     // helm was told about the live build, not "no previous build".
     expect(helmArgLine()).toContain("previousBuildId=buildm");
     expect(helmArgLine()).toContain("activeBuildId=buildm");
-    // ...and the serving build's Deployment was retained so helm cannot prune it.
-    const retained = vi
-      .mocked(writeFileSync)
-      .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"));
-    expect(retained).toBeDefined();
+    // ...and the serving build's live Deployment was kept before Helm could prune it.
+    const keep = events.indexOf("preserve-deployment:rel-ssr-buildm:rel");
+    expect(keep).toBeGreaterThanOrEqual(0);
+    expect(keep).toBeLessThan(events.indexOf("helm"));
     expect(printedWarnings()).toContain('Recovered the currently-serving build "buildm"');
   });
 
@@ -1189,11 +1782,41 @@ describe("runDeploy — N25: every post-helm abort puts the ext_proc edge back",
 
     expect(vi.mocked(revertRoutingServiceToBuild)).toHaveBeenCalledWith({
       releaseName: RELEASE,
+      namespace: "default",
       targetBuildId: "buildm",
       registry: REGISTRY,
+      targetImageDigest: undefined,
+      retainCurrentManifest: false,
     });
     expect(printedErrors()).toContain("reverted to build buildm");
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("reverts the edge when Helm exits after a partial apply", async () => {
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+    vi.mocked(execOrThrow).mockImplementation((async (cmd: string) => {
+      if (cmd === "helm") {
+        events.push("helm");
+        throw new Error("upgrade failed: connection reset by peer");
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(
+      /Helm upgrade failed and may have partially applied.*edge and pools are consistent/s,
+    );
+
+    expect(events).toContain("revert-edge");
+    expect(revertRoutingServiceToBuild).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetBuildId: "buildm",
+        retainCurrentManifest: false,
+      }),
+    );
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(writeState).not.toHaveBeenCalled();
   });
 
   it("names the edge's ACTUAL state (and the recovery command) when the revert also fails", async () => {
@@ -1289,7 +1912,12 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
     // serving N≫2 down to 2 mid-deploy.
     const cluster = happyCluster(events);
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      if (args.join(" ").includes("jsonpath={.metadata.name}|{.spec.replicas}")) {
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args.includes("--ignore-not-found") &&
+        args[args.indexOf("-o") + 1] === "json"
+      ) {
         return {
           exitCode: 1,
           stdout: "",
@@ -1301,7 +1929,7 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/Could not read the live replica count/);
+    ).rejects.toThrow(/Could not read the currently-serving deployment/);
     expect(events).not.toContain("helm");
     // Nothing was rendered at the dangerous default.
     expect(vi.mocked(writeFileSync).mock.calls.some(([p]) => String(p).includes("-prev-"))).toBe(
@@ -1321,10 +1949,14 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
       readyPerPool: { ssr: 3, api: 1 },
     });
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      const j = args.join(" ");
-      // The retained probe (long jsonpath) for the pool that is ABSENT in the previous
-      // build: exit 0 + empty stdout, the --ignore-not-found absence signal.
-      if (j.includes("containers[0].image") && j.includes("{.spec.replicas}")) {
+      // The complete Deployment read for the pool that is ABSENT in the previous build:
+      // exit 0 + empty stdout, the --ignore-not-found absence signal.
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args.includes("--ignore-not-found") &&
+        args[args.indexOf("-o") + 1] === "json"
+      ) {
         const name = args[args.indexOf("deployment") + 1];
         if (name !== "rel-ssr-buildm") return { exitCode: 0, stdout: "", stderr: "" };
       }
@@ -1343,24 +1975,20 @@ describe("runDeploy — N28/N31: retained-manifest classification without free-t
       .mocked(writeFileSync)
       .mock.calls.map(([p]) => String(p))
       .filter((p) => p.includes("-prev-"));
-    expect(retainedFiles.some((p) => p.endsWith("ssr-prev-deployment.yaml"))).toBe(true);
+    expect(retainedFiles.some((p) => p.endsWith("ssr-prev-deployment.yaml"))).toBe(false);
+    expect(retainedFiles.some((p) => p.endsWith("ssr-prev-service.yaml"))).toBe(true);
     expect(retainedFiles.some((p) => p.includes("api-prev-"))).toBe(false);
-    expect(printedLogs()).toContain('Pool "api" is new in this build');
-    // The pool that DID exist was still retained at its live count.
-    const ssrDeployment = vi
-      .mocked(writeFileSync)
-      .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"))!;
-    expect(String(ssrDeployment[1])).toContain("replicas: 3");
+    expect(events).toContain("preserve-deployment:rel-ssr-buildm:rel");
   });
 
-  it("aborts when the pool-existed-before probe itself fails", async () => {
+  it("does not guess from a stable Service when the recorded Deployment is missing", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, { replicasProbeGone: true, poolServiceProbeFails: true }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/Could not determine whether pool "ssr" existed in the previous build/);
+    ).rejects.toThrow(/recorded pool topology.*versioned Deployment.*missing/s);
     expect(events).not.toContain("helm");
   });
 });
@@ -1484,6 +2112,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
       PROJECT,
       expect.objectContaining({ unretainedManifestBuilds: ["buildm"] }),
       RELEASE,
+      "default",
     );
     expect(printedWarnings()).toContain("revert the routing IMAGE only");
   });
@@ -1501,6 +2130,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
       {
         buildId: "buildn",
         previousBuildId: "buildm",
+        poolTopologies: { buildm: ["ssr"], buildn: ["ssr"] },
         cdnTags: { buildn: cdnTagForBuildId("buildn") },
         // The build just installed serves /readyz, so the NEXT deploy may flip the load
         // balancer's HealthCheckPolicy to readiness without stranding it.
@@ -1508,10 +2138,12 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
         // S23: the routing image is now pinned to its digest on every path (the harness's
         // `docker inspect` answers, as a real daemon does after a push), so state records it.
         routingImageDigests: { buildn: `sha256:${"a".repeat(64)}` },
+        targetPlatforms: { buildn: "linux/amd64" },
         // N69: the floor writeState stamps above — the prior state carried no generation.
         basedOnGeneration: null,
       },
       RELEASE,
+      "default",
     );
   });
 });
@@ -1549,11 +2181,12 @@ describe("runDeploy — N32: stale *-prev-*.yaml never survives into another dep
     expect(unlinked).toContain(path.join(chartTemplatesDir, "ssr-prev-deployment.yaml"));
     expect(unlinked).toContain(path.join(chartTemplatesDir, "reaped-prev-service.yaml"));
     expect(unlinked).not.toContain(path.join(chartTemplatesDir, "deployment.yaml"));
-    // The wipe happens BEFORE the fresh retained render (which writes the same name).
-    const rewritten = vi
-      .mocked(writeFileSync)
-      .mock.calls.findIndex(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"));
-    expect(rewritten).toBeGreaterThanOrEqual(0);
+    // A live Deployment is retained by annotation, never re-created from this stale file.
+    expect(
+      vi
+        .mocked(writeFileSync)
+        .mock.calls.some(([p]) => String(p).endsWith("ssr-prev-deployment.yaml")),
+    ).toBe(false);
   });
 
   it("runs unconditionally, even on a first deploy with no previous build", async () => {
@@ -1740,14 +2373,8 @@ describe("runDeploy — N33: domain checks run before the completion banner", ()
   });
 });
 
-describe("runDeploy — N66: the retained previous Deployment mirrors what is RUNNING", () => {
+describe("runDeploy — N66: the outgoing Deployment pod template is never re-rendered", () => {
   let events: string[];
-  const retainedYaml = (): string =>
-    String(
-      vi
-        .mocked(writeFileSync)
-        .mock.calls.find(([p]) => String(p).endsWith("ssr-prev-deployment.yaml"))![1],
-    );
 
   beforeEach(() => {
     events = [];
@@ -1755,165 +2382,269 @@ describe("runDeploy — N66: the retained previous Deployment mirrors what is RU
   });
   afterEach(() => vi.restoreAllMocks());
 
-  // N87. The previous build may predate per-build Secret names, in which case its pods resolve
-  // the legacy stable-named Secret. Stamping the derived per-build name onto the retained render
-  // would repoint the pod template of the build serving 100% of traffic at a Secret nobody
-  // rendered — CreateContainerConfigError on every new pod, before cutover. Same failure shape
-  // as the containerStrategy flip this suite exists for.
-  it("mirrors the live INTERNAL_HEADER_SECRET secretKeyRef instead of deriving it", async () => {
+  it("keeps every env/valueFrom and pod-spec field by omitting the Deployment from the chart", async () => {
+    const before = structuredClone(DEFAULT_PREV_POD_TEMPLATE);
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const yaml = retainedYaml();
-    expect(yaml).toContain(`name: ${legacyInternalSecretName(RELEASE)}`);
-    expect(yaml).not.toContain(internalSecretName(RELEASE, "buildm"));
+    expect(DEFAULT_PREV_POD_TEMPLATE).toEqual(before);
+    expect(
+      vi
+        .mocked(writeFileSync)
+        .mock.calls.some(([p]) => String(p).endsWith("ssr-prev-deployment.yaml")),
+    ).toBe(false);
+    expect(events).toContain("preserve-deployment:rel-ssr-buildm:rel");
+    expect(events).not.toContain("rollout:deployment/rel-ssr-buildm");
   });
 
-  it("derives the per-build Secret name when the live template already carries one", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { internalSecretRef: internalSecretName(RELEASE, "buildm") },
-      }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    expect(retainedYaml()).toContain(`name: ${internalSecretName(RELEASE, "buildm")}`);
-  });
-
-  it("falls back to the derived name (with a warning) for an unusable live ref", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { internalSecretRef: 'x"\n              hostNetwork: true' },
-      }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    expect(yaml).toContain(`name: ${internalSecretName(RELEASE, "buildm")}`);
-    expect(yaml).not.toContain("hostNetwork");
-    expect(warn.mock.calls.flat().join(" ")).toMatch(/not a plain Secret name/);
-  });
-
-  it("renders the live image + all four quantities as LITERALS, with no .Values left", async () => {
-    // Everything the retained render resolved from `.Values` resolved against the NEW
-    // build's values: changing `resources` in next.config mutated the pod template of the
-    // build serving 100% of traffic (→ RollingUpdate rolled it), and flipping
-    // containerStrategy repointed it at a tag that was never pushed (ImagePullBackOff on
-    // the SERVING build, before cutover).
+  it("retains only through top-level metadata before Helm, so no ReplicaSet rollout is requested", async () => {
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const yaml = retainedYaml();
-    expect(yaml).not.toContain(".Values");
-    expect(yaml).not.toContain("{{");
-    expect(yaml).toContain(`image: "${DEFAULT_PREV_LIVE.image}"`);
-    expect(yaml).toContain(`cpu: "${DEFAULT_PREV_LIVE.cpu}"`);
-    expect(yaml).toContain(`memory: "${DEFAULT_PREV_LIVE.memory}"`);
-    expect(yaml).toContain(`ephemeral-storage: "${DEFAULT_PREV_LIVE.ephemeralStorage}"`);
-    expect(yaml).toContain(`cpu: "${DEFAULT_PREV_LIVE.cpuLimit}"`);
-    expect(yaml).toContain(`memory: "${DEFAULT_PREV_LIVE.memoryLimit}"`);
-    // ...and the live replica count, as before.
-    expect(yaml).toContain(`replicas: ${DEFAULT_PREV_LIVE.replicas}`);
+    const keep = events.indexOf("preserve-deployment:rel-ssr-buildm:rel");
+    expect(keep).toBeGreaterThanOrEqual(0);
+    expect(keep).toBeLessThan(events.indexOf("helm"));
+
+    const mutations = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) =>
+          args.includes("deployment") &&
+          args.includes("rel-ssr-buildm") &&
+          ["apply", "patch", "replace", "set"].includes(args[0] ?? ""),
+      );
+    expect(mutations).toHaveLength(1);
+    const patch = JSON.parse(mutations[0]![1][mutations[0]![1].length - 1]!);
+    expect(patch).toEqual({
+      metadata: {
+        annotations: { "helm.sh/resource-policy": "keep" },
+        labels: { "adapter-k8s.dev/release": "rel" },
+      },
+    });
+    expect(patch).not.toHaveProperty("spec");
   });
 
-  it("keeps the OLD repository when containerStrategy flips between builds", async () => {
-    // shared-image renders `nextjs-app`; the serving build was built per-pool
-    // (`nextjs-app-ssr`). The retained manifest must name what is running, not what this
-    // build would produce.
+  it("passes the configured namespace to both the read and keep metadata patch", async () => {
     setupFs({
+      infra: { ...BASE_INFRA, namespace: "tenant-apps" },
       metadata: {
         buildId: "buildn",
         pools: ["ssr"],
         cacheEnabled: false,
-        containerStrategy: "shared-image",
+        namespace: "tenant-apps",
       },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const yaml = retainedYaml();
-    expect(yaml).toContain(`${REGISTRY}/nextjs-app-ssr:buildm`);
-    expect(yaml).not.toContain("nextjs-app:buildn");
-    expect(yaml).not.toContain(".Values");
+    const deploymentCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) => args.includes("rel-ssr-buildm") && args.includes("deployment"),
+      );
+    expect(deploymentCalls).toHaveLength(2);
+    for (const [, args] of deploymentCalls) {
+      expect(args.slice(args.indexOf("-n"), args.indexOf("-n") + 2)).toEqual(["-n", "tenant-apps"]);
+    }
   });
 
-  it("mirrors the live readiness path so the SERVING build's probe never changes", async () => {
-    // The retained build may predate /readyz; stamping the current default onto it would
-    // change the serving build's pod template into a probe its pods cannot satisfy.
-    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    // Scope to the readinessProbe block itself: the startup/liveness probes are /healthz
-    // too, so a substring search over the whole document would pass vacuously.
-    expect(yaml).toMatch(
-      new RegExp(
-        `readinessProbe:\\s*\\n\\s*httpGet:\\s*\\n\\s*path: ${DEFAULT_PREV_LIVE.readinessPath}\\b`,
-      ),
-    );
-    // The current default must appear NOWHERE in a manifest that mirrors an older build.
-    expect(yaml).not.toContain("/readyz");
-  });
-
-  it("falls back to .Values only where there is no live object to mirror (NotFound self-heal)", async () => {
+  it("aborts before Helm when keep cannot be applied", async () => {
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { replicasProbeGone: true }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    expect(yaml).toContain("replicas: 2");
-    // Nothing was invented: the template's own .Values expressions remain.
-    expect(yaml).toContain(".Values");
-  });
-
-  it("omits only the fields the live object lacks (an older build with no limits)", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { cpuLimit: "", memoryLimit: "", ephemeralStorage: "" },
-      }) as never,
-    );
-
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
-
-    const yaml = retainedYaml();
-    // Requests were mirrored...
-    expect(yaml).toContain(`cpu: "${DEFAULT_PREV_LIVE.cpu}"`);
-    // ...and exactly the absent fields stayed on the .Values fallback.
-    expect(yaml).toContain('(index .Values.pools "ssr").resources.limits.cpu');
-    expect(yaml).toContain('(index .Values.pools "ssr").resources.limits.memory');
-  });
-
-  it("aborts when a live quantity is not a valid Kubernetes quantity (never spliced raw)", async () => {
-    vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, {
-        prevLive: { memory: '1Gi"\n      hostNetwork: true\n      _pad: "' },
-      }) as never,
+      happyCluster(events, { outgoingDeploymentMetadataPatchFails: true }) as never,
     );
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/Invalid Kubernetes quantity/);
+    ).rejects.toThrow(
+      /Could not preserve the outgoing Deployment.*Refusing to run `helm upgrade`/s,
+    );
     expect(events).not.toContain("helm");
   });
 
-  it("warns and uses the template default when the live readiness path is not a plain path", async () => {
+  it("rejects malformed live JSON rather than falling back to a generated Deployment", async () => {
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args[args.indexOf("-o") + 1] === "json"
+      ) {
+        return { exitCode: 0, stdout: "{not-json", stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not parse the live deployment/);
+    expect(events).not.toContain("helm");
+  });
+});
+
+describe("runDeploy — N70: build-scoped pool topology", () => {
+  let events: string[];
+
+  beforeEach(() => {
+    events = [];
+    standardBeforeEach(events);
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("preserves a removed pool and records a newly-added replacement without fabricating images", async () => {
+    setupFs({ metadata: { buildId: "buildn", pools: ["api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["legacy"], buildm0: ["legacy"] },
+    } as never);
     vi.mocked(execCapture).mockImplementation(
-      happyCluster(events, { prevLive: { readinessPath: '/x"\n            port: 22' } }) as never,
+      happyCluster(events, { readyPerPool: { api: 1 } }) as never,
     );
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    expect(printedWarnings()).toContain("is not a plain URL path");
-    expect(retainedYaml()).not.toContain("port: 22");
+    expect(events).toContain("preserve-deployment:rel-legacy-buildm:rel");
+    expect(events).toContain("preserve-hpa:rel-legacy-buildm-hpa:rel");
+    expect(events).toContain("retain-stable:service:rel-legacy");
+    expect(events).toContain("scale:deployment/rel-legacy-buildm");
+    expect(events).toContain("patch:rel-api");
+    expect(events).not.toContain("patch:rel-legacy");
+
+    const retainedPaths = vi
+      .mocked(writeFileSync)
+      .mock.calls.map(([p]) => String(p))
+      .filter((p) => p.includes("-prev-"));
+    expect(retainedPaths.some((p) => p.endsWith("legacy-prev-service.yaml"))).toBe(true);
+    expect(retainedPaths.some((p) => p.includes("api-prev-"))).toBe(false);
+    expect(retainedPaths.some((p) => p.endsWith("-deployment.yaml"))).toBe(false);
+
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      expect.objectContaining({
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        poolTopologies: { buildm: ["legacy"], buildn: ["api"] },
+      }),
+      RELEASE,
+      "default",
+    );
+  });
+
+  it("fails before Helm when a removed pool's stable rollback Service cannot be proven", async () => {
+    setupFs({ metadata: { buildId: "buildn", pools: ["api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: null,
+      poolTopologies: { buildm: ["legacy"] },
+    } as never);
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "service" && args[2] === "rel-legacy") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Required stable Service rel-legacy.*missing/s);
+    expect(events).not.toContain("helm");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("retains the removed pool's stable PDB and GKE HealthCheckPolicy before Helm", async () => {
+    setupFs({ metadata: { buildId: "buildn", pools: ["api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: null,
+      poolTopologies: { buildm: ["legacy"] },
+    } as never);
+    const cluster = happyCluster(events, { readyPerPool: { api: 1 } });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "poddisruptionbudget" && args[2] === "rel-legacy-pdb") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify(stablePoolObject("poddisruptionbudget", "legacy")),
+          stderr: "",
+        };
+      }
+      if (args[0] === "get" && args[1] === "healthcheckpolicy" && args[2] === "rel-legacy-hcp") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify(stablePoolObject("healthcheckpolicy", "legacy", false, true)),
+          stderr: "",
+        };
+      }
+      // Post-commit retained-resource lists are empty in this fixture.
+      if (
+        args[0] === "get" &&
+        args.includes("-l") &&
+        args.join(" ").includes("adapter-k8s.dev/release=")
+      ) {
+        return { exitCode: 0, stdout: '{"items":[]}', stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    for (const event of [
+      "retain-stable:service:rel-legacy",
+      "retain-stable:poddisruptionbudget:rel-legacy-pdb",
+      "retain-stable:healthcheckpolicy:rel-legacy-hcp",
+    ]) {
+      expect(events).toContain(event);
+      expect(events.indexOf(event)).toBeLessThan(events.indexOf("helm"));
+    }
+  });
+
+  it("deletes obsolete retained stable groups only after the new state is committed", async () => {
+    setupFs({ metadata: { buildId: "buildn", pools: ["api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: null,
+      poolTopologies: { buildm: ["legacy"] },
+    } as never);
+    const cluster = happyCluster(events, { readyPerPool: { api: 1 } });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        args[0] === "get" &&
+        args.includes("-l") &&
+        args.join(" ").includes("adapter-k8s.dev/release=")
+      ) {
+        const kind = args[1] as "service" | "poddisruptionbudget" | "healthcheckpolicy";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            items: [stablePoolObject(kind, "obsolete", true)],
+          }),
+          stderr: "",
+        };
+      }
+      if (
+        args[0] === "delete" &&
+        ["service", "poddisruptionbudget", "healthcheckpolicy"].includes(args[1]!)
+      ) {
+        events.push(`delete-stable:${args[1]}:${args[2]}`);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const deletions = [
+      "delete-stable:healthcheckpolicy:rel-obsolete-hcp",
+      "delete-stable:poddisruptionbudget:rel-obsolete-pdb",
+      "delete-stable:service:rel-obsolete",
+    ];
+    for (const deletion of deletions) {
+      expect(events).toContain(deletion);
+      expect(events.indexOf(deletion)).toBeGreaterThan(events.indexOf("writeState"));
+    }
   });
 });
 
@@ -1978,6 +2709,11 @@ describe("runDeploy — N64: the cutover gate requires the outgoing build's capa
 
   it("gates per pool: one pool at full capacity cannot cover another that is short", async () => {
     setupFs({ metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false } });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr", "api"], buildm0: ["ssr", "api"] },
+    } as never);
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 3 },
@@ -2079,25 +2815,26 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     vi.restoreAllMocks();
   });
 
-  it("widens maxReplicas above the chart ceiling, warms up, then restores the ceiling after cutover", async () => {
-    // The outgoing build runs 6; the new chart caps the pool at 3. helm already installed
-    // that HPA, so the N64 scale-up to 6 was reconciled straight back down to 3 and the
-    // capacity gate waited for a count that could never be reached — every such deploy
-    // hung for the full health budget and aborted BEFORE cutover.
+  it("raises the HPA floor before warm-up even when its ceiling already covers capacity", async () => {
+    // This is the live failure shape: maxReplicas allowed the outgoing count, but the idle
+    // new pool's desired count was still minReplicas. The autoscaler undid kubectl scale
+    // before the capacity gate could pass.
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
         newBuildReplicas: 1,
-        newBuildHpa: { min: 1, max: 3 },
+        newBuildHpa: { min: 1, max: 10 },
         readyPerPool: { ssr: 6 },
       }) as never,
     );
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    // Widened to the warm-up target BEFORE the scale-up, and the scale-up asked for 6.
-    expect(events).toContain(`hpa-max:${NEW_HPA}:6`);
-    expect(events.indexOf(`hpa-max:${NEW_HPA}:6`)).toBeLessThan(
+    // The floor was raised while the already-sufficient ceiling stayed exact, BEFORE scale.
+    const warmBounds = `hpa-bounds:${NEW_HPA}:6:10`;
+    const chartBounds = `hpa-bounds:${NEW_HPA}:1:10`;
+    expect(events).toContain(warmBounds);
+    expect(events.indexOf(warmBounds)).toBeLessThan(
       events.indexOf("scaleup:deployment/rel-ssr-buildn"),
     );
     const scaleUp = vi
@@ -2107,29 +2844,48 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     // Cutover happened (the gate was satisfiable) and state was committed.
     expect(events).toContain("patch:rel-ssr");
     expect(events).toContain("writeState");
-    // ...and the chart's ceiling is back, AFTER the cutover was committed.
-    expect(events).toContain(`hpa-max:${NEW_HPA}:3`);
-    expect(events.indexOf("writeState")).toBeLessThan(events.indexOf(`hpa-max:${NEW_HPA}:3`));
-    // The LAST thing done to that HPA is the restore — no widened HPA is left behind.
-    const hpaEvents = events.filter((e) => e.startsWith("hpa-max:"));
-    expect(hpaEvents).toEqual([`hpa-max:${NEW_HPA}:6`, `hpa-max:${NEW_HPA}:3`]);
+    // ...and BOTH exact chart bounds are back after the cutover was committed.
+    expect(events).toContain(chartBounds);
+    expect(events.indexOf("writeState")).toBeLessThan(events.indexOf(chartBounds));
+    const hpaEvents = events.filter((e) => e.startsWith("hpa-bounds:"));
+    expect(hpaEvents).toEqual([warmBounds, chartBounds]);
     // The restore patch impersonates helm, which owns the chart-rendered HPA.
     const restore = vi
       .mocked(execCapture)
       .mock.calls.filter(([, a]) => a.includes("patch") && a.includes("hpa"))
       .at(-1)!;
     expect(restore[1]).toContain("--field-manager=helm");
-    expect(JSON.parse(restore[1].at(-1)!)).toEqual({ spec: { maxReplicas: 3 } });
+    expect(JSON.parse(restore[1].at(-1)!)).toEqual({
+      spec: { minReplicas: 1, maxReplicas: 10 },
+    });
   });
 
-  it("restores the chart ceiling when the deploy ABORTS mid-warm-up", async () => {
-    // A deploy that aborts before cutover must not leave a widened autoscaler behind:
-    // the abandoned build would keep the right to autoscale past its configured ceiling.
+  it("raises maxReplicas with the floor when the chart ceiling is below capacity", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
         newBuildReplicas: 1,
-        newBuildHpa: { min: 1, max: 3 },
+        newBuildHpa: { min: 2, max: 3 },
+        readyPerPool: { ssr: 6 },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:2:3`,
+    ]);
+  });
+
+  it("restores both exact chart bounds when the deploy aborts mid-warm-up", async () => {
+    // A deploy that aborts before cutover must not leave a raised floor on its abandoned
+    // build. Non-default original bounds prove the restore does not guess chart defaults.
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { replicas: 6 },
+        newBuildReplicas: 1,
+        newBuildHpa: { min: 2, max: 9 },
         readyPerPool: { ssr: 3 }, // never reaches 6 → the gate expires
       }) as never,
     );
@@ -2142,12 +2898,12 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
 
     expect(events.some((e) => e.startsWith("patch:rel-ssr"))).toBe(false);
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
-    const hpaEvents = events.filter((e) => e.startsWith("hpa-max:"));
-    expect(hpaEvents).toEqual([`hpa-max:${NEW_HPA}:6`, `hpa-max:${NEW_HPA}:3`]);
+    const hpaEvents = events.filter((e) => e.startsWith("hpa-bounds:"));
+    expect(hpaEvents).toEqual([`hpa-bounds:${NEW_HPA}:6:9`, `hpa-bounds:${NEW_HPA}:2:9`]);
     expect(printedErrors()).toContain("ssr: 3/6 ready");
   });
 
-  it("restores the chart ceiling when the selector cutover fails", async () => {
+  it("restores both chart bounds when the selector cutover fails", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2163,13 +2919,13 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     ).rejects.toThrow(/process\.exit:1/);
 
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
-    expect(events.filter((e) => e.startsWith("hpa-max:"))).toEqual([
-      `hpa-max:${NEW_HPA}:6`,
-      `hpa-max:${NEW_HPA}:3`,
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
     ]);
   });
 
-  it("restores the chart ceiling when the post-cutover state commit fails", async () => {
+  it("restores both chart bounds when the post-cutover state commit fails", async () => {
     // The third exit path: traffic HAS switched but state could not be persisted. The
     // process still leaves here, so the HPA must be chart-intended before it does.
     vi.mocked(execCapture).mockImplementation(
@@ -2186,16 +2942,16 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
     ).rejects.toThrow(/process\.exit:1/);
 
-    expect(events.filter((e) => e.startsWith("hpa-max:"))).toEqual([
-      `hpa-max:${NEW_HPA}:6`,
-      `hpa-max:${NEW_HPA}:3`,
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
     ]);
     expect(printedErrors()).toContain("persisting deploy state failed");
   });
 
-  it("warns with a repair command when the ceiling cannot be restored", async () => {
-    // Never silent: an HPA left widened outlives the deploy, so name it and the fix.
-    let widenSeen = false;
+  it("warns with an exact repair command when the chart bounds cannot be restored", async () => {
+    // Never silent: a raised HPA floor outlives the deploy, so name it and both exact bounds.
+    let warmSeen = false;
     const cluster = happyCluster(events, {
       prevLive: { replicas: 6 },
       newBuildReplicas: 1,
@@ -2203,9 +2959,9 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       readyPerPool: { ssr: 6 },
     });
     vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
-      if (args.includes("patch") && args.includes("hpa")) {
-        if (widenSeen) return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
-        widenSeen = true;
+      if (args[0] === "patch" && args[1] === "hpa" && (args.at(-1) ?? "").includes('"spec"')) {
+        if (warmSeen) return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
+        warmSeen = true;
       }
       return cluster(cmd, args);
     }) as never);
@@ -2213,16 +2969,54 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
     const warned = printedWarnings();
-    expect(warned).toContain(`Could not restore ${NEW_HPA} to the chart's maxReplicas=3`);
+    expect(warned).toContain(
+      `Could not restore ${NEW_HPA} to the chart's minReplicas=1, maxReplicas=3`,
+    );
     expect(warned).toContain(`patch hpa ${NEW_HPA}`);
+    expect(warned).toContain('"minReplicas":1,"maxReplicas":3');
+    const hpaPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) =>
+          args[0] === "patch" && args[1] === "hpa" && (args.at(-1) ?? "").includes('"spec"'),
+      );
+    expect(hpaPatches).toHaveLength(4); // temporary bounds + three restore attempts
   });
 
-  it("leaves the HPA alone when its ceiling already covers the outgoing capacity", async () => {
+  it("retries a transient chart-bounds restore failure", async () => {
+    let hpaPatches = 0;
+    const cluster = happyCluster(events, {
+      prevLive: { replicas: 6 },
+      newBuildReplicas: 1,
+      newBuildHpa: { min: 1, max: 3 },
+      readyPerPool: { ssr: 6 },
+    });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "patch" && args[1] === "hpa" && (args.at(-1) ?? "").includes('"spec"')) {
+        hpaPatches++;
+        if (hpaPatches === 2) {
+          return { exitCode: 1, stdout: "", stderr: "etcdserver: leader changed" };
+        }
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    expect(hpaPatches).toBe(3); // temporary bounds + failed restore + successful retry
+    expect(events.filter((event) => event.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
+    ]);
+    expect(printedWarnings()).not.toContain(`Could not restore ${NEW_HPA}`);
+  });
+
+  it("leaves the HPA alone when its floor already covers the outgoing capacity", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 3 },
         newBuildReplicas: 1,
-        newBuildHpa: { min: 1, max: 10 },
+        newBuildHpa: { min: 3, max: 10 },
         readyPerPool: { ssr: 3 },
       }) as never,
     );
@@ -2230,35 +3024,32 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
     expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
-    expect(events.some((e) => e.startsWith("hpa-max:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
   });
 
-  it("cuts over at the ceiling it could not raise instead of waiting for an unreachable count", async () => {
-    // An un-widenable HPA (RBAC, webhook) must not turn into a hung deploy: the ceiling
-    // IS the most capacity this pool can have under this chart, so the gate asks for it.
+  it("aborts before scale or cutover when the temporary HPA bounds are rejected", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
         newBuildReplicas: 1,
         newBuildHpa: { min: 1, max: 3 },
         newBuildHpaPatchFails: true,
-        readyPerPool: { ssr: 3 },
+        readyPerPool: { ssr: 6 },
       }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not set temporary warm-up bounds.*Nothing was cut over/s);
 
-    expect(events).toContain("patch:rel-ssr");
-    const scaleUp = vi
-      .mocked(execCapture)
-      .mock.calls.find(([, a]) => a.includes("scale") && a.includes("deployment/rel-ssr-buildn"))!;
-    expect(scaleUp[1]).toContain("--replicas=3");
-    expect(printedWarnings()).toContain("caps pool");
-    // Nothing to restore — the widen never took effect.
-    expect(events.filter((e) => e.startsWith("hpa-max:"))).toEqual([`hpa-max:${NEW_HPA}:6`]);
+    expect(events).toContain(`hpa-bounds:${NEW_HPA}:6:6`);
+    expect(events).toContain("revert-edge");
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("patch:rel-ssr"))).toBe(false);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 
-  it("warns but still scales up when the HPA cannot be read", async () => {
+  it("aborts before scale or cutover when the HPA cannot be read", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2268,13 +3059,134 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not read the new build's HPA.*Nothing was cut over/s);
 
-    expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
-    expect(printedWarnings()).toContain(`Could not read the new build's HPA ${NEW_HPA}`);
+    expect(events).toContain("revert-edge");
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("patch:rel-ssr"))).toBe(false);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
   });
 
-  it("needs no widening when the pool has no HPA at all", async () => {
+  it("restores earlier pools and scales none when a later HPA read fails", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr", "heavy"], cacheEnabled: false },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr", "heavy"], buildm0: ["ssr", "heavy"] },
+    } as never);
+    const heavyHpa = poolResourceNames(RELEASE, "heavy", "buildn").hpa;
+    const cluster = happyCluster(events, {
+      prevLive: { replicas: 6 },
+      newBuildReplicas: 1,
+      newBuildHpa: { min: 1, max: 3 },
+    });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "hpa" && args[2] === heavyHpa) {
+        return { exitCode: 1, stdout: "", stderr: "horizontalpodautoscalers is forbidden" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(new RegExp(`Could not read the new build's HPA ${heavyHpa}`));
+
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
+    ]);
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("restores earlier pools and scales none when a later HPA patch fails", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr", "heavy"], cacheEnabled: false },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr", "heavy"], buildm0: ["ssr", "heavy"] },
+    } as never);
+    const heavyHpa = poolResourceNames(RELEASE, "heavy", "buildn").hpa;
+    const cluster = happyCluster(events, {
+      prevLive: { replicas: 6 },
+      newBuildReplicas: 1,
+      newBuildHpa: { min: 1, max: 3 },
+    });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "patch" && args[1] === "hpa" && args[2] === heavyHpa) {
+        return { exitCode: 1, stdout: "", stderr: "hpa patch denied by webhook" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(new RegExp(`Could not set temporary warm-up bounds on ${heavyHpa}`));
+
+    expect(events.filter((e) => e.startsWith("hpa-bounds:"))).toEqual([
+      `hpa-bounds:${NEW_HPA}:6:6`,
+      `hpa-bounds:${NEW_HPA}:1:3`,
+    ]);
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("aborts safely when an existing HPA returns malformed bounds", async () => {
+    const cluster = happyCluster(events, { prevLive: { replicas: 6 } });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "hpa" && args[2] === NEW_HPA) {
+        return { exitCode: 0, stdout: `${NEW_HPA}|unknown|3`, stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Could not parse.*minReplicas="unknown".*Nothing was cut over/s);
+
+    expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
+    expect(events.some((e) => e.startsWith("scaleup:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+  });
+
+  it("uses the configured namespace for every warm-up HPA read and patch", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: false,
+        namespace: "prod",
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        prevLive: { replicas: 6 },
+        newBuildHpa: { min: 1, max: 3 },
+        readyPerPool: { ssr: 6 },
+      }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const warmupCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args.includes("hpa") && args.includes(NEW_HPA));
+    expect(warmupCalls).toHaveLength(3); // read, temporary bounds, exact restore
+    for (const [, args] of warmupCalls) {
+      expect(args).toEqual(expect.arrayContaining(["-n", "prod"]));
+    }
+  });
+
+  it("aborts when Helm did not create the pool's expected HPA", async () => {
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, {
         prevLive: { replicas: 6 },
@@ -2284,10 +3196,49 @@ describe("runDeploy — N67: the new build's HPA must not undo the pre-cutover w
       }) as never,
     );
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/expected HPA.*was not found.*partially applied build/s);
 
-    expect(events).toContain("scaleup:deployment/rel-ssr-buildn");
-    expect(events.some((e) => e.startsWith("hpa-max:"))).toBe(false);
+    expect(events).toContain("revert-edge");
+    expect(events.some((event) => event.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((event) => event.startsWith("patch:rel-ssr"))).toBe(false);
+    expect(writeState).not.toHaveBeenCalled();
+    expect(events.some((e) => e.startsWith("hpa-bounds:"))).toBe(false);
+  });
+
+  it("requires the expected HPA for a newly added pool too", async () => {
+    setupFs({
+      metadata: { buildId: "buildn", pools: ["ssr", "api"], cacheEnabled: false },
+    });
+    const apiHpa = poolResourceNames(RELEASE, "api", "buildn").hpa;
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        args[0] === "get" &&
+        args[1] === "deployment" &&
+        args[2] === "rel-api-buildm" &&
+        args.includes("--ignore-not-found") &&
+        args.includes("json")
+      ) {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "service" && args[2] === "rel-api") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "hpa" && args[2] === apiHpa) {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(new RegExp(`expected HPA ${apiHpa} was not found`));
+
+    expect(events.some((event) => event.startsWith("scaleup:"))).toBe(false);
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(writeState).not.toHaveBeenCalled();
   });
 });
 

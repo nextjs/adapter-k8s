@@ -917,7 +917,11 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tagmerge1", now: () => 1000 });
     await h.set(
       "sharedfetchkey",
-      { kind: "FETCH", data: { body: "x", headers: {}, status: 200 }, revalidate: 31536000 } as never,
+      {
+        kind: "FETCH",
+        data: { body: "x", headers: {}, status: 200 },
+        revalidate: 31536000,
+      } as never,
       { tags: ["other-page-tag"] },
     );
 

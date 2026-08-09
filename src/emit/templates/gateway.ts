@@ -311,8 +311,11 @@ ${rules}
   if (!hasTls) return appRoute;
 
   // HTTP -> HTTPS redirect: a rule whose only filter is RequestRedirect short-circuits
-  // before any backendRef (GKE Gateway API supports RequestRedirect with scheme/port/
-  // statusCode), so http:// traffic gets a 302 to https:// instead of plaintext service.
+  // before any backendRef, so http:// traffic gets a 302 to https:// instead of plaintext
+  // service. `port` MUST be omitted: the GKE Gateway controller rejects it (GWCER104) and,
+  // with no-error-isolation, one invalid route blocks reconciliation of the ENTIRE Gateway —
+  // NEG programming for every later backend change silently stalls (surfaced as LB 503s the
+  // first time a deploy actually changed backends). Scheme https already implies 443.
   const redirectRoute = `---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -329,7 +332,6 @@ ${hostnameLines}
         - type: RequestRedirect
           requestRedirect:
             scheme: https
-            port: 443
             statusCode: 302
 `;
 

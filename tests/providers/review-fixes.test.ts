@@ -1,6 +1,6 @@
 // Fixes from the second external review of the multi-provider work. Each case is the failure the
 // review described, written so it fails if the fix regresses.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import { resolveProvider } from "../../src/providers/index.js";
 import { renderNetworkPolicies } from "../../src/emit/templates/network-policy.js";
 import { buildDockerCommands } from "../../src/cli/deploy.js";

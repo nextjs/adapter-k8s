@@ -7,6 +7,11 @@
 // same flags docker does. The hardcoded `"docker"` string was therefore the only thing tying
 // the adapter to one runtime, and this module removes it.
 import { execCapture } from "./exec.js";
+export {
+  DEFAULT_TARGET_PLATFORM as TARGET_PLATFORM,
+  parseTargetPlatform,
+  targetPlatform,
+} from "../target-platform.js";
 
 /**
  * Probe order. docker first because it is the most common and the one every existing deploy
@@ -22,21 +27,6 @@ export type ContainerCli = (typeof CONTAINER_CLI_CANDIDATES)[number];
  * nodes this chart targets — loud, but only after a rollout. Override with
  * `ADAPTER_K8S_TARGET_PLATFORM` for an ARM (T2A) node pool.
  */
-export const TARGET_PLATFORM = "linux/amd64";
-
-export function targetPlatform(): string {
-  const override = process.env.ADAPTER_K8S_TARGET_PLATFORM?.trim();
-  // Reaches argv as `--platform=<value>`; keep it to the os/arch[/variant] shape.
-  if (override && /^[a-z0-9]+\/[a-z0-9]+(\/[a-z0-9]+)?$/.test(override)) return override;
-  if (override) {
-    throw new Error(
-      `ADAPTER_K8S_TARGET_PLATFORM=${JSON.stringify(override)} is not a valid platform. ` +
-        `Expected something like "linux/amd64" or "linux/arm64".`,
-    );
-  }
-  return TARGET_PLATFORM;
-}
-
 /**
  * Can this runtime actually BUILD, not merely talk to its daemon?
  *
@@ -71,9 +61,11 @@ async function canBuild(candidate: ContainerCli): Promise<boolean> {
         "",
       ];
   for (const host of hosts) {
-    const res = await execCapture("buildctl", ["debug", "workers"], {
-      ...(host ? { env: { BUILDKIT_HOST: host } } : {}),
-    }).catch(() => null);
+    const res = await execCapture(
+      "buildctl",
+      ["debug", "workers"],
+      host ? { env: { BUILDKIT_HOST: host } } : {},
+    ).catch(() => null);
     if (res && res.exitCode === 0) return true;
   }
   return false;

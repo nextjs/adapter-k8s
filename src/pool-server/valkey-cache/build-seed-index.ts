@@ -22,8 +22,6 @@
 // (same rule as the Valkey client; see cache-handler-entry.ts).
 import type { SeedEntry } from "./incremental-cache-handler.js";
 
-declare const require: (id: string) => any;
-
 interface StaticAssetRecord {
   pathname: string;
   filePath: string;
@@ -106,9 +104,8 @@ export function buildSeedSources(assets: StaticAssetRecord[]): Map<string, SeedS
 // bundled into next.config.cacheHandler which the edge middleware graph pulls in. The seed
 // lookup only ever RUNS in the Node pool; in the edge bundle this is dead code that parses.
 function builtin<T>(id: string): T {
-  const getBuiltin = (
-    globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }
-  ).process?.getBuiltinModule;
+  const getBuiltin = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } })
+    .process?.getBuiltinModule;
   if (!getBuiltin) {
     throw new Error(`[valkey-cache] process.getBuiltinModule unavailable loading ${id}`);
   }
@@ -177,11 +174,12 @@ function fetchCacheSeed(appRoot: string, cacheKey: string): SeedEntry | null {
  * `<key>.segments/`. Returns null (miss) when the html is absent or the entry would be
  * half-usable.
  */
-function fsMirrorSeed(appRoot: string, cacheKey: string, ctx?: SeedLookupCtx): SeedEntry | null {
+function fsMirrorSeed(appRoot: string, cacheKey: string, _ctx?: SeedLookupCtx): SeedEntry | null {
   const fs = builtin<typeof import("node:fs")>("node:fs");
   const path = builtin<typeof import("node:path")>("node:path");
   const base = path.join(appRoot, ".next", "server", "app", ...cacheKey.split("/").filter(Boolean));
-  const htmlAbs = cacheKey === "/" ? path.join(appRoot, ".next", "server", "app", "index.html") : `${base}.html`;
+  const htmlAbs =
+    cacheKey === "/" ? path.join(appRoot, ".next", "server", "app", "index.html") : `${base}.html`;
   if (!fs.existsSync(htmlAbs)) return null;
   const stat = fs.statSync(htmlAbs);
   const html = fs.readFileSync(htmlAbs, "utf8");

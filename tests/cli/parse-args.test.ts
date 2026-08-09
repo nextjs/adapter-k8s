@@ -35,8 +35,9 @@ describe("parseArgs", () => {
   });
 
   it("supports the --flag value form", () => {
-    const { flags } = parseArgs(argv("init", "--project-id", "my-proj"));
+    const { flags } = parseArgs(argv("init", "--project-id", "my-proj", "--namespace", "apps"));
     expect(flags["project-id"]).toBe("my-proj");
+    expect(flags["namespace"]).toBe("apps");
   });
 
   it("value flags hard-error when the value is missing", () => {

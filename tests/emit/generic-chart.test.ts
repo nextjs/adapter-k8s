@@ -34,7 +34,10 @@ const pools = new Map<string, PoolDefinition>([
   ["default", { name: "default", outputs: [], config: { routes: ["appPages"] } }],
 ]);
 
-function genericChart(over: Record<string, unknown> = {}): Record<string, string> {
+function genericChart(
+  over: Record<string, unknown> = {},
+  targetPlatform: "linux/amd64" | "linux/arm64" = "linux/amd64",
+): Record<string, string> {
   const config = {
     pools: {},
     provider: {
@@ -49,6 +52,7 @@ function genericChart(over: Record<string, unknown> = {}): Record<string, string
     pools,
     buildId: "b1",
     nextVersion: "16.3.0",
+    targetPlatform,
     config,
     imageRegistry: "registry.example.com/ns",
     routingManifest,
@@ -57,6 +61,18 @@ function genericChart(over: Record<string, unknown> = {}): Record<string, string
     // A generic cluster has NO GCP infrastructure. That is the normal case, not an error.
   });
 }
+
+describe("target platform wiring", () => {
+  it("pins both adapter-built workload tiers to arm64", () => {
+    const files = genericChart({}, "linux/arm64");
+    const values = JSON.parse(files["values.yaml"].slice(files["values.yaml"].indexOf("{")));
+    expect(values.global.targetArchitecture).toBe("arm64");
+    expect(files["templates/default-deployment.yaml"]).toContain('kubernetes.io/arch: "arm64"');
+    expect(files["templates/routing-service-deployment.yaml"]).toContain(
+      'kubernetes.io/arch: "arm64"',
+    );
+  });
+});
 
 // Merged-gateway lane support (Phase 2, 2026-07-30): with EnvoyProxy `mergeGateways`, every
 // Gateway's listeners land in ONE data plane, and Gateway API requires the
@@ -90,21 +106,23 @@ describe("generic gateway listeners under merged gateways", () => {
   it("stamps the hostname on the listener for a single-host release", () => {
     const yaml = renderGenericGateway({
       releaseName: "e2e-lane1",
-      className: "eg",
-      hosts: [{ hostname: "lane1.localhost", tls: { enabled: false } }],
-    } as never);
+      gatewayClassName: "eg",
+      hosts: [{ hostname: "lane1.localhost", tls: { enabled: true } }],
+      tlsSecretName: "lane1-tls",
+    });
     expect(yaml).toMatch(/- name: http\n\s+hostname: "lane1\.localhost"/);
+    expect(yaml).toMatch(/- name: https\n\s+hostname: "lane1\.localhost"/);
   });
 
   it("keeps the hostname-less listener for multi-host releases (sectionName contract)", () => {
     const yaml = renderGenericGateway({
       releaseName: "multi",
-      className: "eg",
+      gatewayClassName: "eg",
       hosts: [
         { hostname: "a.example.com", tls: { enabled: false } },
         { hostname: "b.example.com", tls: { enabled: false } },
       ],
-    } as never);
+    });
     expect(yaml).not.toContain("hostname:");
   });
 });

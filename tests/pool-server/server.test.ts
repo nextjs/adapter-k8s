@@ -211,6 +211,51 @@ describe("internal header security", () => {
       expect(authHeader).toBe("Bearer token123");
     });
 
+    it("always strips client-supplied Next internal headers on a trusted dispatch hop", async () => {
+      let outputId: string | undefined;
+      let seen: Record<string, string | string[] | undefined> = {};
+      const onRequest = vi.fn((req: IncomingMessage, res: ServerResponse) => {
+        outputId = req.headers["x-output-id"] as string | undefined;
+        seen = { ...req.headers };
+        res.writeHead(200);
+        res.end("ok");
+      });
+
+      server = createPoolServer({
+        onRequest,
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        method: "POST",
+        headers: {
+          "x-internal-secret": "the-secret",
+          "x-output-id": "/page",
+          "next-resume": "1",
+          "x-next-resume-state-length": "32",
+          "x-now-route-matches": "spoofed",
+          "x-matched-path": "/private",
+          "x-nextjs-data": "1",
+          "x-middleware-next": "1",
+        },
+        body: "attacker-controlled-postponed-state",
+      });
+
+      expect(outputId).toBe("/page");
+      for (const header of [
+        "next-resume",
+        "x-next-resume-state-length",
+        "x-now-route-matches",
+        "x-matched-path",
+        "x-nextjs-data",
+        "x-middleware-next",
+      ]) {
+        expect(seen[header]).toBeUndefined();
+      }
+    });
+
     it("preserves the public Pages Router middleware prefetch hint", async () => {
       let prefetchHeader: string | undefined;
       let privateHeader: string | undefined;

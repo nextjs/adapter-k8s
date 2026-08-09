@@ -2,7 +2,7 @@
 //
 // build-metadata.json — the hand-off from build to `adapter-k8s deploy` (which reads
 // cacheEnabled/cacheManaged to provision or tear down the managed Memorystore, and pools
-// to render the previous build's templates).
+// to coordinate versioned resources across a cutover).
 //
 // N50 (review, Medium): every field used to be optional with a `??` default HERE:
 //   - `failureModeAllow ?? true` defaulted to fail-OPEN — the middleware-BYPASS direction —
@@ -14,15 +14,22 @@
 //     config.ts `applyDefaults`, so the two would drift the moment either changed.
 // Both are fixed the same way: the fields are REQUIRED. Callers supply defaults once, in
 // applyDefaults (config.ts), and this file only serializes what it is given.
+import { parseTargetPlatform, type TargetPlatform } from "../target-platform.js";
+import type { PoolImageLayout } from "../pool-image-layout.js";
+
 export function generateBuildMetadata({
   buildId,
   nextVersion,
+  targetPlatform,
   poolNames,
+  defaultPool,
   generatedAt,
   provider,
+  namespace,
   containerRegistry,
   nodeCidrs,
   containerStrategy,
+  poolImageLayout,
   hasMiddleware,
   failureModeAllow,
   cacheEnabled,
@@ -30,10 +37,15 @@ export function generateBuildMetadata({
   incrementalCacheHandler,
   cacheMemorystore,
   distDir,
+  compositionPlan,
 }: {
   buildId: string;
   nextVersion: string;
+  /** OCI platform used for native staging, image builds, digest selection, and scheduling. */
+  targetPlatform: TargetPlatform;
   poolNames: string[];
+  /** Pool selected by the stable portable origin Service. */
+  defaultPool: string;
   /**
    * Project-relative dist dir (the S20-validated `distDirRel`, usually ".next"). The deploy
    * step needs it to re-stage `<distDir>/cache/fetch-cache` into the image contexts before
@@ -49,6 +61,8 @@ export function generateBuildMetadata({
    */
   generatedAt: string;
   containerStrategy: "traced-assets" | "shared-image";
+  /** Optional so a newer CLI can still deploy standalone contexts emitted by older builds. */
+  poolImageLayout?: PoolImageLayout | undefined;
   hasMiddleware: boolean;
   /** ext_proc callout failure policy. `false` = fail CLOSED (middleware is never bypassed). */
   failureModeAllow: boolean;
@@ -72,6 +86,8 @@ export function generateBuildMetadata({
    * discover NetworkPolicy ranges through gcloud.
    */
   provider: string;
+  /** Namespace qualified into the ext_proc authority at build time. */
+  namespace: string;
   /**
    * Registry the emitted chart's image references were built against. The routing tier's image
    * is baked into its Deployment template at BUILD time, so a chart is only valid for the
@@ -80,18 +96,25 @@ export function generateBuildMetadata({
   containerRegistry?: string | undefined;
   /** provider.generic.nodeCidrs, if set — deploy prefers it over live node discovery. */
   nodeCidrs?: string[] | undefined;
+  compositionPlan?: { digest: string; targetFingerprint: string } | undefined;
 }): string {
+  const safeTargetPlatform = parseTargetPlatform(targetPlatform, "build metadata targetPlatform");
   return JSON.stringify(
     {
       buildId,
       nextVersion,
+      targetPlatform: safeTargetPlatform,
       provider,
+      namespace,
       ...(containerRegistry ? { containerRegistry } : {}),
       ...(nodeCidrs && nodeCidrs.length > 0 ? { nodeCidrs } : {}),
       pools: poolNames,
+      defaultPool,
+      ...(compositionPlan ? { compositionPlan } : {}),
       generatedAt,
       distDir,
       containerStrategy,
+      ...(poolImageLayout ? { poolImageLayout } : {}),
       hasMiddleware,
       failureModeAllow,
       cacheEnabled,

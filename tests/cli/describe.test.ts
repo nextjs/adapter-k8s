@@ -63,6 +63,26 @@ describe("runDescribe", () => {
     expect(depCall![1].join(" ")).toContain("-n default");
   });
 
+  it("uses the configured namespace for state and deployment reads", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({
+        projectId: "proj-12345",
+        region: "us-central1",
+        hosts: [],
+        namespace: "apps",
+      }),
+    );
+
+    await runDescribe({ projectDir: tmpDir, releaseName: RELEASE });
+
+    expect(readState).toHaveBeenCalledWith(tmpDir, RELEASE, { namespace: "apps" });
+    const depCall = vi
+      .mocked(execCapture)
+      .mock.calls.find(([cmd, args]) => cmd === "kubectl" && args.includes("deployments"));
+    expect(depCall?.[1].join(" ")).toContain("-n apps");
+  });
+
   it("classifies builds by EXACT version label, not prefix matching", async () => {
     // Two build ids sharing a 12-char normalized prefix must not both classify as
     // "current" (the prefix-substring technique caused a production 503 — see deploy.ts).

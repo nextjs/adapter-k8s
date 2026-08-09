@@ -257,10 +257,21 @@ export function buildRoutingManifest({
   // Also track output id → pool so prerenders can inherit their parent's pool.
   const poolAssignments: Record<string, string> = {};
   const poolByOutputId: Record<string, string> = {};
+  const routeExecutionTimeoutByOutputId: Record<string, number> = {};
+  const routeExecutionTimeouts: Record<string, number> = {};
+  const poolResponseHeadTimeouts: Record<string, number> = {};
   for (const [poolName, pool] of pools) {
+    if (pool.config.timeout !== undefined) {
+      poolResponseHeadTimeouts[poolName] = pool.config.timeout * 1000;
+    }
     for (const output of pool.outputs) {
       poolAssignments[output.pathname] = poolName;
       poolByOutputId[output.id] = poolName;
+      const maxDuration = (output.config as { maxDuration?: unknown } | undefined)?.maxDuration;
+      if (typeof maxDuration === "number" && Number.isFinite(maxDuration) && maxDuration > 0) {
+        routeExecutionTimeouts[output.pathname] = Math.round(maxDuration * 1000);
+        routeExecutionTimeoutByOutputId[output.id] = routeExecutionTimeouts[output.pathname]!;
+      }
     }
   }
 
@@ -274,6 +285,10 @@ export function buildRoutingManifest({
     const parentPool = parentOutputId ? poolByOutputId[parentOutputId] : undefined;
     if (parentPool) {
       poolAssignments[prerender.pathname] = parentPool;
+      const parentTimeout = parentOutputId
+        ? routeExecutionTimeoutByOutputId[parentOutputId]
+        : undefined;
+      if (parentTimeout !== undefined) routeExecutionTimeouts[prerender.pathname] = parentTimeout;
     }
   }
 
@@ -481,6 +496,8 @@ export function buildRoutingManifest({
         }
       : null,
     poolAssignments,
+    ...(Object.keys(routeExecutionTimeouts).length > 0 ? { routeExecutionTimeouts } : {}),
+    ...(Object.keys(poolResponseHeadTimeouts).length > 0 ? { poolResponseHeadTimeouts } : {}),
     pprRoutes,
     // Sorted for byte-identical chart regeneration, like pprCapableRoutes below.
     pprStatePrerenders: Object.fromEntries(

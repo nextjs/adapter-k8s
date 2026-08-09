@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   infrastructurePath,
+  infrastructureWritePath,
   outputDirName,
   stateFileName,
 } from "../src/cli/infrastructure-validation.js";
@@ -54,6 +55,14 @@ describe("infrastructurePath — config variants", () => {
     const dir = project({ ".k8s-adapter/infrastructure.json": "{}" });
     process.env.ADAPTER_K8S_CONFIG = "nosuch";
     expect(() => infrastructurePath(dir)).toThrow(/nosuch/);
+  });
+
+  it("lets init select the missing variant path without falling back", () => {
+    const dir = project({ ".k8s-adapter/infrastructure.json": "{}" });
+    process.env.ADAPTER_K8S_CONFIG = "scaleway";
+    expect(infrastructureWritePath(dir)).toBe(
+      path.join(dir, ".k8s-adapter", "infrastructure.scaleway.json"),
+    );
   });
 
   it("rejects a variant that is a PATH rather than a name", () => {

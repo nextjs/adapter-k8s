@@ -1,5 +1,7 @@
 // src/cli/deploy.ts
 import path from "node:path";
+import { isIP } from "node:net";
+import { createHash } from "node:crypto";
 import { infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import {
   chmodSync,
@@ -14,10 +16,16 @@ import {
 import readline from "node:readline";
 import { execOrThrow, execCapture } from "./exec.js";
 import { readState, writeState, StateUnavailableError, type AdapterState } from "./state.js";
+import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
+import {
+  cleanupRetainedStablePoolResources,
+  hasHealthCheckPolicyCrd,
+  retainRemovedPoolResources,
+} from "./stable-pool-resources.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import { cdnTagForBuildId } from "../cdn-tags.js";
 import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "./rollback.js";
-import { renderDeployment, POOL_READINESS_PATH } from "../emit/templates/deployment.js";
+import { POOL_READINESS_PATH } from "../emit/templates/deployment.js";
 
 /**
  * The liveness path, used ONLY as the one-cycle fallback for the stable HealthCheckPolicy when
@@ -26,16 +34,20 @@ import { renderDeployment, POOL_READINESS_PATH } from "../emit/templates/deploym
  */
 const LIVENESS_PATH_FOR_MIGRATION = "/healthz";
 import { renderService } from "../emit/templates/service.js";
-import { renderHPA } from "../emit/templates/hpa.js";
-import { renderValkeySecret } from "../emit/templates/valkey-secret.js";
+import { renderValkeySecret, VALKEY_SECRET_NAME } from "../emit/templates/valkey-secret.js";
 import { provisionMemorystore, buildDeleteMemorystoreCommand } from "./provision-cache.js";
 import { isAlreadyGoneError } from "./destroy.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 import {
+  ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
   routingManifestSnapshotName,
   routingServiceDeploymentName,
 } from "../emit/templates/routing-manifest-configmap.js";
+import {
+  COMPOSITION_PLAN_COMPONENT,
+  compositionPlanConfigMapName,
+} from "../emit/templates/composition-plan-configmap.js";
 // N87: internal dispatch Secrets are per BUILD and annotated `helm.sh/resource-policy: keep`,
 // so deploy owns both halves of their lifecycle — migrating the legacy stable-named one past
 // `helm upgrade`, and pruning the ones nothing references any more.
@@ -50,26 +62,41 @@ import {
 // omitted the `b-` prefix drained the Service to zero endpoints and 503'd the site.
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 import {
+  ADAPTER_RELEASE_LABEL,
   assertSafeBuildId,
   assertSafePoolName as assertSafePoolNameCharset,
-  assertSafeQuantity,
-  assertSafeImageReference,
-  findBuildIdNameCollision,
+  findBuildTopologyNameCollision,
   findEmittedNameCollision,
   assertSafeImageRegistry,
-  assertSafeNamespace,
   assertSafeProbePath,
   assertSafeProjectId,
   assertSafeRegion,
+  assertSafeReleaseName,
   poolResourceNames,
-  // init binds Workload Identity to [default/<release>-deploy-sa]; the release lives
-  // in the literal "default" namespace. Pin it on every kubectl/helm call instead of
-  // trusting whatever namespace the operator's context happens to have.
-  K8S_NAMESPACE,
+  resolveK8sNamespace,
 } from "../emit/templates/utils.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveContainerCli, targetPlatform } from "./container-runtime.js";
+import {
+  DEFAULT_TARGET_PLATFORM,
+  parseTargetPlatform,
+  type TargetPlatform,
+} from "../target-platform.js";
 import type { GcloudCommand } from "./init.js";
+import type { RegistryAuthentication, RegistryDigestLookup } from "../composition-plan/index.js";
+import {
+  parsePoolImageLayout,
+  SHARED_POOL_IMAGE_LAYOUT,
+  type PoolImageLayout,
+} from "../pool-image-layout.js";
+import {
+  assertCompositionPlanInvocation,
+  compositionPlanNeedsExplicitConfirmation,
+  currentKubeContext,
+  loadLocalCompositionPlan,
+  preflightCompositionPlan,
+  waitForCompositionPlanReadiness,
+} from "./composition-plan.js";
 
 /**
  * How long to wait for a Deployment rollout.
@@ -129,20 +156,6 @@ export interface DeployOptions {
   yes?: boolean;
 }
 
-// N66: a plain URL path, the only shape safe to splice into the rendered pod spec's
-// `path:` scalar. Used to vet the readiness path read back from a LIVE Deployment before
-// it is mirrored into the retained manifest (renderDeployment interpolates it bare).
-const LIVE_PROBE_PATH_RE = /^\/[A-Za-z0-9._~/-]{0,128}$/;
-
-/**
- * N87. Charset gate for the live pod template's INTERNAL_HEADER_SECRET secretKeyRef name,
- * mirrored into the retained previous-build render. Same reason as LIVE_PROBE_PATH_RE: the
- * value comes from the cluster and reaches a bare YAML scalar. DNS-1123 subdomain minus dots
- * (every name this adapter emits goes through sanitizeK8sName), matching the validator the
- * template itself applies.
- */
-const LIVE_SECRET_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$/;
-
 // N29: same shape as destroy's confirmation prompt (that file's copy is not exported).
 function promptConfirmation(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -172,17 +185,21 @@ function promptConfirmation(question: string): Promise<string> {
  * Throws (never returns a guess) when the cluster cannot be read, when pools disagree, or
  * when the selected build has no Deployment.
  */
-export async function discoverServingBuildId(releaseName: string): Promise<string> {
+export async function discoverServingBuildId(
+  releaseName: string,
+  configuredNamespace?: string,
+): Promise<string> {
+  const namespace = resolveK8sNamespace(configuredNamespace);
   const REPAIR =
     `Repair deploy state before deploying: run \`npx adapter-k8s doctor\`, then either ` +
     `restore .k8s-adapter/state.json or fix access to the ${releaseName}-adapter-state ` +
-    `ConfigMap in namespace ${K8S_NAMESPACE}.`;
+    `ConfigMap in namespace ${namespace}.`;
 
   const svcResult = await execCapture("kubectl", [
     "get",
     "svc",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName}`,
     "-o",
@@ -210,7 +227,7 @@ export async function discoverServingBuildId(releaseName: string): Promise<strin
   if (labels.size === 0) {
     throw new Error(
       `Deploy state could not be determined and no active pool Service in namespace ` +
-        `${K8S_NAMESPACE} carries an app.kubernetes.io/version selector, so the live build ` +
+        `${namespace} carries an app.kubernetes.io/version selector, so the live build ` +
         `is unknown. Refusing to deploy as if this were a first deploy. ${REPAIR}`,
     );
   }
@@ -227,7 +244,7 @@ export async function discoverServingBuildId(releaseName: string): Promise<strin
     "get",
     "deployments",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${label},` +
       `app.kubernetes.io/component!=routing-service`,
@@ -297,12 +314,19 @@ export interface DockerCommandOptions {
   registry: string;
   outputDir: string;
   containerStrategy: "traced-assets" | "shared-image";
+  poolImageLayout?: PoolImageLayout;
   /**
    * S24: which container CLI to shell out to. Defaults to docker for compatibility; the
    * deploy resolves the real one via resolveContainerCli(). Every verb used here — build,
    * push — is accepted identically by podman and nerdctl.
    */
   containerCli?: string;
+  /** Platform recorded by the build artifact; never re-infer it from the deploy host. */
+  targetPlatform?: TargetPlatform;
+  /** Exact authentication operation declared by a composed target. Omitted for legacy builds. */
+  registryAuthentication?: RegistryAuthentication;
+  /** Portable routing has no routing-service workload or image. */
+  includeRoutingService?: boolean;
 }
 
 /**
@@ -327,7 +351,12 @@ export interface DockerCommandOptions {
 export function refreshFetchCacheStaging(
   projectDir: string,
   outputDir: string,
-  metadata: { distDir?: unknown; pools: string[]; containerStrategy: string },
+  metadata: {
+    distDir?: unknown;
+    pools: string[];
+    containerStrategy: string;
+    poolImageLayout?: unknown;
+  },
 ): void {
   // Validate at the point of consumption: distDir comes from build-metadata.json, which is
   // build-controlled. The same escape S20 rejects at build time is rejected here — the dest
@@ -340,6 +369,18 @@ export function refreshFetchCacheStaging(
         `project-relative path inside the project (S20). Re-run the build.`,
     );
   }
+  const poolImageLayout = parsePoolImageLayout(metadata.poolImageLayout);
+  if (poolImageLayout === SHARED_POOL_IMAGE_LAYOUT) {
+    // An older CLI does not understand the layout: it refreshes every pool delta, then the
+    // sentinel FROM fails. A retry with this CLI must remove those seeds because the child
+    // COPY overlays its parent and would otherwise shadow every later base refresh.
+    for (const pool of metadata.pools) {
+      rmSync(path.join(outputDir, "pools", pool, "context", ".k8s-adapter", "fetch-cache-seed"), {
+        recursive: true,
+        force: true,
+      });
+    }
+  }
   const src = path.join(projectDir, distDirRel, "cache", "fetch-cache");
   // Observable either way (M1 spirit): the silent-return variant of this function cost a
   // debugging round — an image shipped without the files and nothing said which of the two
@@ -351,7 +392,9 @@ export function refreshFetchCacheStaging(
   const contexts =
     metadata.containerStrategy === "shared-image"
       ? [path.join(outputDir, "shared-context")]
-      : metadata.pools.map((pool) => path.join(outputDir, "pools", pool, "context"));
+      : poolImageLayout === SHARED_POOL_IMAGE_LAYOUT
+        ? [path.join(outputDir, "pool-base", "fetch-cache")]
+        : metadata.pools.map((pool) => path.join(outputDir, "pools", pool, "context"));
   for (const context of contexts) {
     // A context can legitimately be absent (ADAPTER_K8S_SKIP_STAGING builds have no
     // contexts, and those deploys never reach the docker step anyway).
@@ -372,8 +415,15 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   // S24: pin the build architecture. Without it a host-native build on Apple Silicon
   // produces arm64 images that fail with `exec format error` on GKE's x86 nodes — and only
   // at rollout, not at build time. Never passed to `push`, which has no such flag.
-  const platformArg = `--platform=${targetPlatform()}`;
+  const platformArg = `--platform=${parseTargetPlatform(
+    options.targetPlatform ?? targetPlatform(),
+    "Docker target platform",
+  )}`;
   const commands: GcloudCommand[] = [];
+  const poolImageLayout = parsePoolImageLayout(
+    options.poolImageLayout,
+    "Docker command poolImageLayout",
+  );
 
   // 0. Registry authentication — ONLY for Google registries.
   //
@@ -383,11 +433,22 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
   // the registry's business: for anything non-Google we assume the operator's existing
   // credential setup (docker login, ECR credential helper, az acr login, a pull secret) — the
   // same assumption every other tool makes.
-  const registryHost = registry.split("/")[0];
-  const isGoogleRegistry =
-    !!registryHost &&
-    (registryHost.endsWith("-docker.pkg.dev") || /(^|\.)gcr\.io$/.test(registryHost));
-  if (registryHost && isGoogleRegistry) {
+  const registryHost = registry.split("/")[0]!;
+  const authentication = options.registryAuthentication;
+  const shouldConfigureGcloud = authentication
+    ? authentication.kind === "gcloud-docker-helper"
+    : registryHost.endsWith("-docker.pkg.dev") || /(^|\.)gcr\.io$/.test(registryHost);
+  if (
+    authentication?.kind === "gcloud-docker-helper" &&
+    authentication.registryHost !== registryHost
+  ) {
+    throw new Error(
+      `Composition plan registry authentication names host ` +
+        `${JSON.stringify(authentication.registryHost)}, but the image repository uses ` +
+        `${JSON.stringify(registryHost)}. Rebuild the target plan.`,
+    );
+  }
+  if (shouldConfigureGcloud) {
     commands.push({
       description: `Configure Docker authentication for ${registryHost}`,
       command: "gcloud",
@@ -408,12 +469,37 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
       args: ["push", tag],
     });
   } else {
+    let poolBaseTag: string | undefined;
+    if (poolImageLayout === SHARED_POOL_IMAGE_LAYOUT) {
+      const localTag = createHash("sha256")
+        .update(`${registry}\0${buildId}`)
+        .digest("hex")
+        .slice(0, 24);
+      poolBaseTag = `localhost/adapter-k8s-pool-base:${localTag}`;
+      commands.push({
+        description: "Build shared pool base",
+        command: cli,
+        args: ["build", platformArg, "-t", poolBaseTag, `${outputDir}/pool-base`],
+      });
+      commands.push({
+        description: "Verify shared pool base is visible in the container CLI image store",
+        command: cli,
+        args: ["image", "inspect", poolBaseTag],
+      });
+    }
     for (const pool of pools) {
       const tag = `${registry}/nextjs-app-${pool}:${buildId}`;
       commands.push({
         description: `Build ${pool} image`,
         command: cli,
-        args: ["build", platformArg, "-t", tag, `${outputDir}/pools/${pool}`],
+        args: [
+          "build",
+          platformArg,
+          ...(poolBaseTag ? ["--build-arg", `POOL_BASE_IMAGE=${poolBaseTag}`] : []),
+          "-t",
+          tag,
+          `${outputDir}/pools/${pool}`,
+        ],
       });
       commands.push({
         description: `Push ${pool} image`,
@@ -423,26 +509,27 @@ export function buildDockerCommands(options: DockerCommandOptions): GcloudComman
     }
   }
 
-  // Always build routing service image
-  const routingTag = `${registry}/routing-service:${buildId}`;
-  commands.push({
-    description: "Build routing service image",
-    command: cli,
-    args: [
-      "build",
-      platformArg,
-      "-f",
-      `${outputDir}/routing-service/Dockerfile`,
-      "-t",
-      routingTag,
-      `${outputDir}/routing-service`,
-    ],
-  });
-  commands.push({
-    description: "Push routing service image",
-    command: cli,
-    args: ["push", routingTag],
-  });
+  if (options.includeRoutingService !== false) {
+    const routingTag = `${registry}/routing-service:${buildId}`;
+    commands.push({
+      description: "Build routing service image",
+      command: cli,
+      args: [
+        "build",
+        platformArg,
+        "-f",
+        `${outputDir}/routing-service/Dockerfile`,
+        "-t",
+        routingTag,
+        `${outputDir}/routing-service`,
+      ],
+    });
+    commands.push({
+      description: "Push routing service image",
+      command: cli,
+      args: ["push", routingTag],
+    });
+  }
 
   return commands;
 }
@@ -512,10 +599,16 @@ export async function resolveDeployImageDigests(opts: {
   projectId: string;
   allowMutableTags?: boolean;
   containerCli?: string;
+  targetPlatform?: TargetPlatform;
+  digestLookup?: RegistryDigestLookup;
 }): Promise<Record<string, string>> {
   const digests: Record<string, string> = {};
   const unresolved: string[] = [];
   const cliLabel = opts.containerCli ?? "docker";
+  const platform = parseTargetPlatform(
+    opts.targetPlatform ?? targetPlatform(),
+    "image digest target platform",
+  );
   for (const [key, ref] of opts.refs) {
     // S25: REGISTRY FIRST. kubelet pulls from the registry, so the registry's digest is the
     // only one that can actually be deployed. The local daemon merely usually agrees —
@@ -533,10 +626,25 @@ export async function resolveDeployImageDigests(opts: {
     // can rewrite the manifest. An unreliable digest is worse than none — it deploys and then
     // ImagePullBackOffs at rollout, after cutover has started, whereas refusing fails at deploy
     // time with something actionable.
+    const artifactRegistryProject =
+      opts.digestLookup?.kind === "gcp-artifact-registry"
+        ? opts.digestLookup.projectId
+        : opts.digestLookup?.kind === "oci-distribution"
+          ? null
+          : opts.projectId;
+    // Single-flight for the crane/skopeo/docker-manifest chain: resolveRegistryDigest ends
+    // by running it, and the `??` fallback used to run the IDENTICAL chain a second time
+    // whenever the first came back null — doubled subprocess latency on exactly the slow
+    // path (no crane/skopeo installed). Memoizing keeps the gcloud-failed case (where the
+    // chain has NOT run yet) probing exactly once.
+    let anyProbePromise: Promise<string | null> | undefined;
+    const probeAny = () => (anyProbePromise ??= resolveRegistryDigestAny(ref, cli, platform));
     const digest =
-      (await resolveRegistryDigest(ref, opts.projectId)) ??
-      (await resolveRegistryDigestAny(ref, cli)) ??
-      (cli === "docker" ? await resolveImageDigest(ref, cli) : null);
+      (artifactRegistryProject !== null
+        ? await resolveRegistryDigest(ref, artifactRegistryProject, platform, cli, probeAny)
+        : null) ??
+      (await probeAny()) ??
+      (cli === "docker" ? await resolveImageDigest(ref, cli, platform) : null);
     if (digest) digests[key] = digest;
     else unresolved.push(ref);
   }
@@ -547,8 +655,9 @@ export async function resolveDeployImageDigests(opts: {
           `could pin these images, so deploying would run them by TAG — a retag would change ` +
           `what runs on the next pod start, on pods that hold the internal dispatch secret and ` +
           `cache credentials. Refusing to deploy without image integrity.\n` +
-          `Fix by installing a registry client (\`crane\` or \`skopeo\`), or check registry ` +
-          `access (Artifact Registry: \`gcloud artifacts docker images describe <ref>\`).\n` +
+          `Fix registry access for a platform-aware client (\`crane\`, \`skopeo\`, or ` +
+          `\`docker manifest inspect\`). An Artifact Registry summary digest alone is not ` +
+          `enough because it may name an index with no ${platform} child.\n` +
           `Note: the local ${cliLabel} daemon is only trusted as a digest source for docker — ` +
           `podman rewrites manifests on push, so its local digest can differ from the registry's ` +
           `and deploying it fails at rollout. Pass --allow-mutable-tags to deploy anyway.`,
@@ -575,9 +684,9 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
  * that value yields ImagePullBackOff (measured: podman said e04a0a5b…, the registry held
  * 27fa476b…). Shipping EKS/AKS on the local-daemon fallback would inherit a known-broken path.
  *
- * Probe order, first answer wins:
- *  1. `crane digest` — purpose-built, no daemon needed.
- *  2. `skopeo inspect` — the podman ecosystem's equivalent.
+ * Probe order, first platform-validated answer wins:
+ *  1. `crane manifest/config/digest` — inspect the index or single-image config before digest.
+ *  2. `skopeo inspect --override-*` — require its selected image to report the target platform.
  *  3. `docker manifest inspect -v` — needs NO extra tooling, and VERIFIED against Artifact
  *     Registry to report a digest byte-identical to `gcloud artifacts docker images describe`.
  *     Docker-only: nerdctl has no such subcommand, and podman's `manifest inspect` operates on
@@ -588,22 +697,81 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 export async function resolveRegistryDigestAny(
   imageRef: string,
   containerCli: string,
+  platform: TargetPlatform = targetPlatform(),
 ): Promise<string | null> {
-  const crane = await execCapture("crane", ["digest", imageRef]).catch(() => null);
-  if (crane?.exitCode === 0) {
-    const d = crane.stdout.trim();
-    if (DIGEST_RE.test(d)) return d;
+  const safePlatform = parseTargetPlatform(platform, "registry digest target platform");
+  const [targetOs, targetArch, targetVariant] = safePlatform.split("/");
+  const matches = (candidate: {
+    os?: string | undefined;
+    architecture?: string | undefined;
+    variant?: string | undefined;
+  }) =>
+    candidate.os === targetOs &&
+    candidate.architecture === targetArch &&
+    (candidate.variant ?? undefined) === (targetVariant ?? undefined);
+
+  const craneManifest = await execCapture("crane", ["manifest", imageRef]).catch(() => null);
+  if (craneManifest?.exitCode === 0) {
+    try {
+      const manifest = JSON.parse(craneManifest.stdout) as {
+        manifests?: Array<{
+          digest?: string;
+          platform?: { os?: string; architecture?: string; variant?: string };
+        }>;
+      };
+      if (Array.isArray(manifest.manifests)) {
+        const child = manifest.manifests.find((entry) => entry.platform && matches(entry.platform));
+        return child?.digest && DIGEST_RE.test(child.digest) ? child.digest : null;
+      }
+
+      // A single-image manifest has no platform field. Its config is the authoritative OS/arch.
+      const config = await execCapture("crane", ["config", imageRef]).catch(() => null);
+      if (config?.exitCode !== 0) return null;
+      const imageConfig = JSON.parse(config.stdout) as {
+        os?: string;
+        architecture?: string;
+        variant?: string;
+      };
+      if (!matches(imageConfig)) return null;
+      const digest = await execCapture("crane", ["digest", imageRef]).catch(() => null);
+      const value = digest?.stdout.trim() ?? "";
+      return digest?.exitCode === 0 && DIGEST_RE.test(value) ? value : null;
+    } catch {
+      // Malformed output is not proof of a platform; try the next independent probe.
+    }
   }
 
-  const skopeo = await execCapture("skopeo", [
+  const skopeoArgs = [
     "inspect",
-    "--format",
-    "{{.Digest}}",
+    "--override-os",
+    targetOs!,
+    "--override-arch",
+    targetArch!,
+    ...(targetVariant ? ["--override-variant", targetVariant] : []),
     `docker://${imageRef}`,
-  ]).catch(() => null);
+  ];
+  const skopeo = await execCapture("skopeo", skopeoArgs).catch(() => null);
   if (skopeo?.exitCode === 0) {
-    const d = skopeo.stdout.trim();
-    if (DIGEST_RE.test(d)) return d;
+    try {
+      const inspected = JSON.parse(skopeo.stdout) as {
+        Digest?: string;
+        Os?: string;
+        Architecture?: string;
+        Variant?: string;
+      };
+      if (
+        !matches({
+          os: inspected.Os,
+          architecture: inspected.Architecture,
+          variant: inspected.Variant,
+        })
+      ) {
+        return null;
+      }
+      return inspected.Digest && DIGEST_RE.test(inspected.Digest) ? inspected.Digest : null;
+    } catch {
+      // Try docker's registry view when skopeo did not return usable JSON.
+    }
   }
 
   if (containerCli === "docker") {
@@ -623,8 +791,6 @@ export async function resolveRegistryDigestAny(
         // deploy is fixed (see targetPlatform()), select the matching child explicitly and
         // refuse rather than guess when it is absent.
         if (Array.isArray(parsed)) {
-          const want = targetPlatform(); // "linux/amd64" unless overridden
-          const [os, arch, variant] = want.split("/");
           const match = parsed.find((entry) => {
             const p = (
               entry as {
@@ -633,12 +799,7 @@ export async function resolveRegistryDigestAny(
                 };
               }
             ).Descriptor?.platform;
-            if (!p || p.os !== os || p.architecture !== arch) return false;
-            // The VARIANT matters: `linux/arm/v7` and `linux/arm/v6` are different images, so
-            // ignoring it let registry ORDER decide which ARM build got pinned — the same class
-            // of bug as taking element [0]. An unspecified variant matches only an entry with
-            // none, rather than whichever happens to be first.
-            return (p.variant ?? undefined) === (variant ?? undefined);
+            return !!p && matches(p);
           });
           const d = (match as { Descriptor?: { digest?: string } } | undefined)?.Descriptor?.digest;
           if (typeof d === "string" && DIGEST_RE.test(d)) return d;
@@ -646,9 +807,22 @@ export async function resolveRegistryDigestAny(
           // closed rather than pinning an image that cannot run.
           return null;
         }
-        const digest = (parsed as { Descriptor?: { digest?: string } } | undefined)?.Descriptor
-          ?.digest;
-        if (typeof digest === "string" && DIGEST_RE.test(digest)) return digest;
+        const descriptor = (
+          parsed as {
+            Descriptor?: {
+              digest?: string;
+              platform?: { os?: string; architecture?: string; variant?: string };
+            };
+          }
+        )?.Descriptor;
+        if (
+          descriptor?.platform &&
+          matches(descriptor.platform) &&
+          typeof descriptor.digest === "string" &&
+          DIGEST_RE.test(descriptor.digest)
+        ) {
+          return descriptor.digest;
+        }
       } catch {
         // Unparseable output is not a digest; fall through to null.
       }
@@ -675,10 +849,16 @@ export async function resolveRegistryDigestAny(
 export async function resolveRegistryDigest(
   imageRef: string,
   projectId: string,
+  platform: TargetPlatform = targetPlatform(),
+  containerCli: string = "docker",
+  // Injectable so a caller that ALSO falls back to resolveRegistryDigestAny can share one
+  // memoized probe instead of running the whole crane/skopeo/docker chain twice.
+  probeAny: () => Promise<string | null> = () =>
+    resolveRegistryDigestAny(imageRef, containerCli, platform),
 ): Promise<string | null> {
-  // Artifact Registry only. Without a GCP project there is nothing to ask — the caller falls
-  // back to the local daemon, and fails closed if that cannot pin it either. A registry-native
-  // probe for ECR/ACR/generic (crane, skopeo) is Phase 2 of the multi-provider plan.
+  // Artifact Registry only. Without a GCP project there is nothing to ask. The summary is a
+  // useful authoritative existence/digest check, but it is never sufficient by itself because
+  // an index digest does not prove that the requested platform is present.
   if (!projectId) return null;
   const res = await execCapture("gcloud", [
     "artifacts",
@@ -693,34 +873,39 @@ export async function resolveRegistryDigest(
   const digest = res.stdout.trim();
   // Validated at the point of consumption: this string reaches a helm --set and then the pod
   // spec's image reference.
-  return /^sha256:[a-f0-9]{64}$/.test(digest) ? digest : null;
+  if (!DIGEST_RE.test(digest)) return null;
+  // Artifact Registry's summary digest can name an OCI INDEX and says nothing about which
+  // children it contains. Never return it directly: a requested arm64 deploy previously
+  // accepted an amd64-only index here before any platform-aware probe ran.
+  return probeAny();
 }
 
 export async function resolveImageDigest(
   imageRef: string,
   containerCli: string = "docker",
+  platform: TargetPlatform = targetPlatform(),
 ): Promise<string | null> {
   // ALL RepoDigests, not just index 0: they belong to the image ID, and one local image tagged
   // and pushed to more than one repository carries an entry per repository. Taking the first and
   // pairing its digest with THIS repository could reference a manifest that does not exist
   // there, leaving the new pods in ImagePullBackOff. Select the entry whose repository matches.
   // podman and nerdctl both implement `inspect --format` with the same Go template fields.
+  const safePlatform = parseTargetPlatform(platform, "local image target platform");
   const res = await execCapture(containerCli, [
     "inspect",
     "--format",
-    "{{range .RepoDigests}}{{println .}}{{end}}",
+    "{{.Os}}/{{.Architecture}}\n{{range .RepoDigests}}{{println .}}{{end}}",
     imageRef,
   ]);
   if (res.exitCode !== 0) return null;
+  const [reportedPlatform, ...digestLines] = res.stdout.split("\n");
+  if (reportedPlatform?.trim() !== safePlatform) return null;
   // The repository is the reference without its tag — `registry/host/repo:tag` → `…/repo`.
   // (A digest never appears here: this is the tag we just pushed.)
   const colon = imageRef.lastIndexOf(":");
   const slash = imageRef.lastIndexOf("/");
   const repository = colon > slash ? imageRef.slice(0, colon) : imageRef;
-  const entries = res.stdout
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const entries = digestLines.map((l) => l.trim()).filter(Boolean);
   for (const entry of entries) {
     const at = entry.lastIndexOf("@");
     if (at === -1) continue;
@@ -731,12 +916,204 @@ export async function resolveImageDigest(
   return null;
 }
 
+export type HelmUpgradeMode = "client-side" | "server-side";
+
+function helmHelpHasFlag(help: string, flag: string): boolean {
+  const escaped = flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Cobra renders options on their own indented rows. Do not accept a flag merely mentioned
+  // in a warning or description: a Helm wrapper saying it *does not support* --server-side
+  // must never make us construct an argv containing that flag.
+  return new RegExp(
+    `^[ \\t]*(?:-\\S+,[ \\t]+)?${escaped}(?:(?:[ \\t]+\\S+)?[ \\t]{2,}\\S.*)$`,
+    "m",
+  ).test(help);
+}
+
+/**
+ * Select the strongest Helm upgrade mode this installation supports without turning a
+ * Helm 3 deployment into an invalid Helm 4 command.
+ *
+ * Helm 3.2 introduced `--create-namespace`, the oldest Helm capability this deploy argv
+ * requires. Helm 4 introduced `--server-side` and `--force-conflicts`; those two are an
+ * optional apply implementation, not a reason to reject an otherwise capable installation.
+ * Probe Cobra's own option rows rather than parsing a version string so downstream builds
+ * remain compatible without treating flags mentioned only in prose as capabilities.
+ */
+export async function detectHelmUpgradeMode(): Promise<HelmUpgradeMode> {
+  let result: Awaited<ReturnType<typeof execCapture>>;
+  try {
+    result = await execCapture("helm", ["upgrade", "--help"]);
+  } catch (err) {
+    throw new Error(
+      `Could not inspect Helm upgrade capabilities: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Install Helm 3.2 or newer and re-run deploy.`,
+    );
+  }
+  if (result.exitCode !== 0) {
+    const detail = sanitizeForTerminal((result.stderr || result.stdout).trim());
+    throw new Error(
+      `Could not inspect Helm upgrade capabilities (helm upgrade --help exited ` +
+        `${result.exitCode}${detail ? `: ${detail}` : ""}). Install Helm 3.2 or newer and ` +
+        `re-run deploy.`,
+    );
+  }
+
+  const help = `${result.stdout}\n${result.stderr}`;
+  if (!helmHelpHasFlag(help, "--create-namespace")) {
+    throw new Error(
+      `This Helm installation does not support --create-namespace. The adapter requires ` +
+        `Helm 3.2 or newer. Upgrade Helm and re-run deploy.`,
+    );
+  }
+
+  // These flags are a pair: --force-conflicts is valid only with server-side apply. If a
+  // downstream Helm build exposes only one, use its portable client-side upgrade instead
+  // of constructing an argv that the CLI cannot honor safely.
+  const serverSide = helmHelpHasFlag(help, "--server-side");
+  const forceConflicts = helmHelpHasFlag(help, "--force-conflicts");
+  return serverSide && forceConflicts ? "server-side" : "client-side";
+}
+
+export type ValkeySecretOwnership = "absent" | "owned" | "adopted";
+
+/**
+ * Migrate only the exact legacy Valkey Secret that adapter versions before Helm ownership
+ * created with `kubectl apply`. Helm's `--take-ownership` applies release-wide and can steal any
+ * colliding object, so it must never be used for this one-resource migration.
+ *
+ * The old rendered Secret has a stable identity we can prove without reading its credential
+ * data: exact name, type Opaque, and the release/component labels below. Adoption is permitted
+ * only when all three Helm ownership fields are absent. Partial or foreign ownership is an
+ * abort, not something `--overwrite` may repair. The single merge patch makes the transition
+ * atomic; if Helm later fails, a retry sees the complete current-release ownership tuple.
+ */
+export async function ensureValkeySecretHelmOwnership(
+  releaseName: string,
+  configuredNamespace?: string,
+): Promise<ValkeySecretOwnership> {
+  assertSafeReleaseName(releaseName);
+  const namespace = resolveK8sNamespace(configuredNamespace);
+  const secretName = `${releaseName}-${VALKEY_SECRET_NAME}`;
+  const result = await execCapture("kubectl", [
+    "get",
+    "secret",
+    secretName,
+    "-n",
+    namespace,
+    "--ignore-not-found",
+    "-o",
+    "jsonpath={.metadata.name}|{.type}|{.metadata.labels.app\\.kubernetes\\.io/name}|" +
+      "{.metadata.labels.app\\.kubernetes\\.io/component}|" +
+      "{.metadata.labels.app\\.kubernetes\\.io/managed-by}|" +
+      "{.metadata.annotations.meta\\.helm\\.sh/release-name}|" +
+      "{.metadata.annotations.meta\\.helm\\.sh/release-namespace}|" +
+      "{.metadata.resourceVersion}",
+  ]);
+  if (result.exitCode !== 0) {
+    const detail = sanitizeForTerminal(result.stderr.trim());
+    throw new Error(
+      `Could not inspect cache Secret ${secretName} before Helm upgrade (kubectl exited ` +
+        `${result.exitCode}${detail ? `: ${detail}` : ""}). Refusing to guess whether it is ` +
+        `safe to adopt.`,
+    );
+  }
+
+  const line = result.stdout.trim();
+  if (!line) return "absent";
+  const fields = line.split("|");
+  if (fields.length !== 8) {
+    throw new Error(
+      `Could not validate cache Secret ${secretName}: kubectl returned an unexpected identity ` +
+        `shape. Refusing to adopt it.`,
+    );
+  }
+  const [name, type, appName, component, managedBy, ownerRelease, ownerNamespace, resourceVersion] =
+    fields;
+  const identityMatches =
+    name === secretName &&
+    type === "Opaque" &&
+    appName === releaseName &&
+    component === "valkey-secret";
+  const ownedByThisRelease =
+    managedBy === "Helm" && ownerRelease === releaseName && ownerNamespace === namespace;
+  if (ownedByThisRelease) {
+    if (!identityMatches) {
+      throw new Error(
+        `Cache Secret ${secretName} has this release's Helm ownership metadata but does not ` +
+          `match the adapter's Valkey Secret identity (expected type Opaque and labels ` +
+          `app.kubernetes.io/name=${releaseName}, app.kubernetes.io/component=valkey-secret). ` +
+          `Refusing to deploy over it.`,
+      );
+    }
+    return "owned";
+  }
+
+  if (managedBy || ownerRelease || ownerNamespace) {
+    const ownership = sanitizeForTerminal(
+      JSON.stringify({ managedBy, release: ownerRelease, namespace: ownerNamespace }),
+    );
+    throw new Error(
+      `Cache Secret ${secretName} has foreign or incomplete ownership metadata ` +
+        `${ownership}. Refusing to adopt it.`,
+    );
+  }
+  if (!identityMatches) {
+    throw new Error(
+      `An unowned Secret named ${secretName} exists but is not the adapter's legacy Valkey ` +
+        `Secret (expected type Opaque and labels app.kubernetes.io/name=${releaseName}, ` +
+        `app.kubernetes.io/component=valkey-secret). Refusing to adopt it.`,
+    );
+  }
+  if (!resourceVersion) {
+    throw new Error(
+      `Could not validate cache Secret ${secretName}: kubectl returned no resourceVersion. ` +
+        `Refusing an adoption patch without an optimistic-concurrency precondition.`,
+    );
+  }
+
+  const ownershipPatch = JSON.stringify({
+    metadata: {
+      // Prevent a get→patch race from overwriting ownership or identity changed after the
+      // validation above. Kubernetes rejects a stale resourceVersion with Conflict.
+      resourceVersion,
+      labels: { "app.kubernetes.io/managed-by": "Helm" },
+      annotations: {
+        "meta.helm.sh/release-name": releaseName,
+        "meta.helm.sh/release-namespace": namespace,
+      },
+    },
+  });
+  const patched = await execCapture("kubectl", [
+    "patch",
+    "secret",
+    secretName,
+    "-n",
+    namespace,
+    "--type=merge",
+    "--field-manager=adapter-k8s-legacy-adoption",
+    "-p",
+    ownershipPatch,
+  ]);
+  if (patched.exitCode !== 0) {
+    const detail = sanitizeForTerminal(patched.stderr.trim());
+    throw new Error(
+      `Could not attach Helm ownership to validated legacy cache Secret ${secretName} ` +
+        `(kubectl exited ${patched.exitCode}${detail ? `: ${detail}` : ""}). Aborting before ` +
+        `Helm upgrade.`,
+    );
+  }
+  return "adopted";
+}
+
 export function buildHelmUpgradeArgs(options: {
   releaseName: string;
   chartPath: string;
   buildId: string;
   registry: string;
   previousBuildId: string | null;
+  defaultPool?: string;
+  previousDefaultPool?: string;
+  namespace?: string;
   overridesFile?: string;
   podCidrs?: string | null;
   /** S22: node/subnet range(s) for the strict posture's kubelet allowance. */
@@ -749,6 +1126,8 @@ export function buildHelmUpgradeArgs(options: {
    * /readyz — see AdapterState.readinessPathSupported.
    */
   poolHealthCheckPath?: string;
+  /** Determined from `helm upgrade --help`; defaults to the historical Helm 4 behavior. */
+  helmUpgradeMode?: HelmUpgradeMode;
 }): string[] {
   const {
     releaseName,
@@ -756,32 +1135,35 @@ export function buildHelmUpgradeArgs(options: {
     buildId,
     registry,
     previousBuildId,
+    defaultPool,
+    previousDefaultPool,
+    namespace: configuredNamespace,
     overridesFile,
     podCidrs,
     nodeCidrs,
     imageDigests,
     poolHealthCheckPath,
+    helmUpgradeMode = "server-side",
   } = options;
+  const namespace = resolveK8sNamespace(configuredNamespace);
   // H2: these values land in `helm --set` assignments — reject helm metacharacters
   // (","  "\"  quotes) before they can split one assignment into several. The buildId
   // comes from generateBuildId()/git refs and the registry from infrastructure.json.
   assertSafeBuildId(buildId);
   assertSafeImageRegistry(registry);
   if (previousBuildId) assertSafeBuildId(previousBuildId);
+  if (defaultPool !== undefined) assertSafePoolName(defaultPool);
+  if (previousDefaultPool !== undefined) assertSafePoolName(previousDefaultPool);
   const args = [
     "upgrade",
     "--install",
     releaseName,
     chartPath,
-    "--server-side=true",
-    "--force-conflicts",
-    // Cache Secrets are Helm-owned in every enabled mode. This adopts Secrets created by older
-    // adapter versions that provisioned managed-cache credentials imperatively with kubectl.
-    "--take-ownership",
+    ...(helmUpgradeMode === "server-side" ? ["--server-side=true", "--force-conflicts"] : []),
     // The release lives in the namespace init binds Workload Identity to — pin it rather
     // than installing into whatever namespace the operator's context happens to have.
     "--namespace",
-    "default",
+    namespace,
     "--create-namespace",
     "--set",
     `global.image.tag=${buildId}`,
@@ -792,6 +1174,10 @@ export function buildHelmUpgradeArgs(options: {
     "--set",
     `activeBuildId=${sanitizeK8sName(previousBuildId ?? buildId)}`,
   ];
+
+  if (defaultPool !== undefined) {
+    args.push("--set", `activeDefaultPool=${previousDefaultPool ?? defaultPool}`);
+  }
 
   if (poolHealthCheckPath !== undefined) {
     // Validated at the consumption point like every other --set value; it also lands in a bare
@@ -941,6 +1327,44 @@ export async function discoverNodeCidrsFromCluster(): Promise<string | null> {
     }
   }
   return seen.length > 0 ? seen.join(",") : null;
+}
+
+/** Discover the pod CIDRs declared by the Kubernetes Nodes, without assuming a cloud provider. */
+export async function discoverPodCidrsFromCluster(): Promise<string | null> {
+  const result = await execCapture("kubectl", ["get", "nodes", "-o", "json"]).catch(() => null);
+  if (!result || result.exitCode !== 0) return null;
+  let object: { items?: Array<{ spec?: { podCIDR?: unknown; podCIDRs?: unknown } }> };
+  try {
+    object = JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+  const cidrs: string[] = [];
+  for (const node of object.items ?? []) {
+    const candidates = Array.isArray(node.spec?.podCIDRs)
+      ? node.spec.podCIDRs
+      : node.spec?.podCIDR !== undefined
+        ? [node.spec.podCIDR]
+        : [];
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") return null;
+      const [address, prefix, extra] = candidate.split("/");
+      const family = address ? isIP(address) : 0;
+      const bits = Number(prefix);
+      if (
+        extra !== undefined ||
+        family === 0 ||
+        !Number.isInteger(bits) ||
+        bits < 0 ||
+        (family === 4 && bits > 32) ||
+        (family === 6 && bits > 128)
+      ) {
+        return null;
+      }
+      if (!cidrs.includes(candidate)) cidrs.push(candidate);
+    }
+  }
+  return cidrs.length > 0 ? cidrs.join(",") : null;
 }
 
 /**
@@ -1118,22 +1542,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // assignments / docker tags (containerRegistry) — validate before any use.
   if (infra.projectId) assertSafeProjectId(infra.projectId);
   if (infra.region) assertSafeRegion(infra.region);
-  if (infra.namespace) assertSafeNamespace(infra.namespace);
-  // Same fail-fast as build time (adapter.ts): every kubectl/helm call below pins
-  // K8S_NAMESPACE, but the build-time extension chain derives the ext_proc authority
-  // from infra.namespace — honoring any other value would put the workloads in
-  // "default" while the GXLB callout targets the other namespace, failing every edge
-  // callout. Reject instead of deploying skewed. (Deploy-time too, not just build
-  // time: --skip-build deploys ship a chart built elsewhere, possibly before this
-  // guard existed.)
-  if (infra.namespace !== undefined && infra.namespace !== K8S_NAMESPACE) {
-    throw new Error(
-      `Unsupported namespace "${infra.namespace}" in .k8s-adapter/infrastructure.json: ` +
-        `this adapter version deploys only to the "${K8S_NAMESPACE}" namespace (init binds ` +
-        `Workload Identity to ${K8S_NAMESPACE}/<release>-deploy-sa and every kubectl/helm ` +
-        `call pins it). Remove "namespace" from infrastructure.json.`,
-    );
-  }
+  const namespace = resolveK8sNamespace(infra.namespace);
   if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
   // Without a registry, docker tags and the helm --set image registry can't be formed —
   // fail with a pointer to the fix instead of a raw TypeError deep in the deploy.
@@ -1144,6 +1553,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         ".k8s-adapter/infrastructure.json.",
     );
   }
+
+  // Probe before `next build`, image pushes, credentials, or any cluster mutation. Helm 3
+  // remains a supported deployment client; only Helm 4 receives its SSA-only flags. A dry
+  // run performs no subprocess reads by contract and prints both capability-dependent forms.
+  const helmUpgradeMode = dryRun ? null : await detectHelmUpgradeMode();
 
   // 1. Run next build (adapter's onBuildComplete generates artifacts)
   if (!skipBuild) {
@@ -1156,7 +1570,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 2. Read build metadata to get buildId and pool names
-  const outputDir = path.join(projectDir, ".k8s-adapter", outputDirName());
+  const outputDirRelative = path.join(".k8s-adapter", outputDirName());
+  const outputDir = path.join(projectDir, outputDirRelative);
   const metadataPath = path.join(outputDir, "build-metadata.json");
   if (!existsSync(metadataPath)) {
     throw new Error(`Build metadata not found at ${metadataPath}. Did next build run?`);
@@ -1166,15 +1581,54 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // H2: the buildId comes from generateBuildId()/git refs and is spliced into helm
   // --set assignments and image tags — reject helm/shell metacharacters up front.
   assertSafeBuildId(buildId);
+  const compositionSnapshot = loadLocalCompositionPlan(outputDir, metadata);
+  if (compositionSnapshot) {
+    assertCompositionPlanInvocation(compositionSnapshot.plan, {
+      releaseName,
+      namespace,
+      buildId,
+    });
+    if (compositionSnapshot.plan.target.registry.repository !== infra.containerRegistry) {
+      throw new Error(
+        `Composition plan registry ${JSON.stringify(compositionSnapshot.plan.target.registry.repository)} ` +
+          `does not match infrastructure registry ${JSON.stringify(infra.containerRegistry)}. ` +
+          `Rebuild for the selected target.`,
+      );
+    }
+  }
   const pools: string[] = metadata.pools;
+  const defaultPool: string | undefined =
+    typeof metadata.defaultPool === "string" ? metadata.defaultPool : pools?.[0];
+  const hasPortableOrigin = existsSync(
+    path.join(outputDir, "chart", "templates", "origin-service.yaml"),
+  );
   // Which provider this build targets. Older metadata predates the field; default to gke,
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
+  // Native dependencies are staged during `next build`, so deploy must consume the artifact's
+  // platform instead of re-reading a possibly different environment. Older artifacts did not
+  // record it and always staged the amd64 Sharp pair, so they are amd64 artifacts regardless
+  // of a deploy-time override.
+  const builtTargetPlatform =
+    metadata.targetPlatform === undefined
+      ? DEFAULT_TARGET_PLATFORM
+      : parseTargetPlatform(metadata.targetPlatform, "build-metadata.json targetPlatform");
+  const requestedTargetPlatform = process.env.ADAPTER_K8S_TARGET_PLATFORM?.trim();
+  if (
+    requestedTargetPlatform &&
+    parseTargetPlatform(requestedTargetPlatform) !== builtTargetPlatform
+  ) {
+    throw new Error(
+      `The build output in .k8s-adapter/output targets "${builtTargetPlatform}", but this ` +
+        `deploy requested "${requestedTargetPlatform}" through ADAPTER_K8S_TARGET_PLATFORM. ` +
+        `Sharp's native packages and the chart's node selector are fixed at build time. Re-run ` +
+        `without --skip-build so every artifact targets the same platform.`,
+    );
+  }
 
-  // TARGET FINGERPRINT. `.k8s-adapter/output` is shared across config variants, and the routing
-  // tier's image registry is baked into its Deployment template at BUILD time — so `--skip-build`
-  // will happily deploy another target's chart. MEASURED: a Scaleway deploy reused a GKE chart
-  // from minutes earlier and its routing pods went ImagePullBackOff trying to pull
+  // TARGET FINGERPRINT. The routing tier's image registry is baked into its Deployment template
+  // at BUILD time, so copied or pre-variant output can still belong to another target. MEASURED:
+  // a Scaleway deploy reused a GKE chart and its routing pods went ImagePullBackOff trying to pull
   // `us-central1-docker.pkg.dev/...` with a 403, after helm had already applied.
   //
   // Refuse before helm instead. This compares what the chart was BUILT for against what we are
@@ -1183,12 +1637,24 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     typeof metadata.containerRegistry === "string" ? metadata.containerRegistry : undefined;
   if (builtRegistry !== undefined && builtRegistry !== infra.containerRegistry) {
     throw new Error(
-      `The build output in .k8s-adapter/output was emitted for registry ` +
+      `The build output in ${outputDirRelative} was emitted for registry ` +
         `"${builtRegistry}", but this deploy targets "${infra.containerRegistry}". The chart bakes ` +
         `image references at build time, so deploying it would pull another target's images ` +
         `(and fail to authenticate against a registry this cluster cannot reach).\n` +
-        `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the output directory is shared between variants.\n` : ""}` +
+        `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the selected variant output does not match its infrastructure.\n` : ""}` +
         `Re-run without --skip-build so the chart is emitted for this target.`,
+    );
+  }
+  // Build metadata predating namespace support has no field and therefore targets the
+  // historical default namespace.
+  const builtNamespace = resolveK8sNamespace(metadata.namespace);
+  if (builtNamespace !== namespace) {
+    throw new Error(
+      `The build output in ${outputDirRelative} was emitted for namespace ` +
+        `"${builtNamespace}", but this deploy targets "${namespace}". The ext_proc authority ` +
+        `is namespace-qualified at build time, so deploying this chart would make routing ` +
+        `callouts target the wrong Service. Re-run without --skip-build so the chart is ` +
+        `emitted for this target.`,
     );
   }
 
@@ -1196,6 +1662,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     throw new Error(`build-metadata.json is missing a "pools" array. Did next build run?`);
   }
   for (const poolName of pools) assertSafePoolName(poolName);
+  if (!defaultPool || !pools.includes(defaultPool)) {
+    throw new Error(
+      `build-metadata.json defaultPool must name one of its pools; got ${JSON.stringify(defaultPool)}`,
+    );
+  }
 
   // 0. Ensure kubectl is pointing at the right cluster.
   //
@@ -1210,53 +1681,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // GKE pinning and helm-upgraded whatever context was current; gke→generic pinned the GKE
   // cluster). Nothing here touches the cluster before this point, so ordering it after the build
   // costs nothing.
-  const targetsGke = buildProvider === "gke";
-  const canPinContext = Boolean(targetsGke && infra.projectId && infra.region && releaseName);
-  if (!dryRun && canPinContext) {
-    const clusterName = `${releaseName}-cluster`;
-    console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
-    await execOrThrow("gcloud", [
-      "container",
-      "clusters",
-      "get-credentials",
-      clusterName,
-      "--region",
-      infra.region!,
-      "--project",
-      infra.projectId!,
-      "--quiet",
-    ]);
-  } else if (!canPinContext) {
-    // N29: context pinning is IMPOSSIBLE (no projectId/region in infrastructure.json), so
-    // EVERYTHING below — helm upgrade, the Service selector patches, the state ConfigMap
-    // write — would run against whatever kubectl context happens to be current. This
-    // silently-skipped get-credentials is the same hole destroy's C1 guard closed; deploy
-    // had no equivalent (invariant 6). Surface the context and require confirmation.
+  if (compositionSnapshot) {
     if (dryRun) {
       console.log(
-        `  [dry-run] infrastructure.json is missing projectId/region — kubectl context ` +
-          `pinning is impossible. A real deploy would target whatever kubectl context is ` +
-          `current (and ask you to confirm it).`,
+        `  [dry-run] verified composition plan ${compositionSnapshot.digest}; a real deploy ` +
+          `would verify cluster identity, Kubernetes ` +
+          `${compositionSnapshot.plan.requirements.kubernetes.minimumVersion}+, and every ` +
+          `required API before mutating the release.`,
       );
     } else {
-      const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
-      // L14: the context name is kubeconfig-sourced — strip terminal control chars.
-      const currentContext =
-        ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
-      console.warn(
-        `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
-          `NOT be pinned to this release's cluster.\n` +
-          `      The ENTIRE deploy (helm upgrade, Service selector cutover, deploy-state ` +
-          `ConfigMap) will run against your CURRENT kubectl context:\n` +
-          `      ${currentContext || "(no current context / kubectl unavailable)"}\n`,
-      );
-      if (!yes) {
+      let explicitlyConfirmed = yes === true;
+      if (
+        compositionPlanNeedsExplicitConfirmation(compositionSnapshot.plan) &&
+        !explicitlyConfirmed
+      ) {
+        const context = await currentKubeContext();
+        console.warn(
+          `\n  !!! WARNING: the composition plan cannot prove that the current kubectl ` +
+            `context is the intended cluster:\n      ${context ?? "(no current context / kubectl unavailable)"}\n`,
+        );
         if (!process.stdin.isTTY) {
           throw new Error(
-            "Refusing to deploy against an unpinned kubectl context non-interactively. " +
-              "Restore projectId/region in .k8s-adapter/infrastructure.json (re-run " +
-              "`npx adapter-k8s init`) so the context can be pinned, or re-run with --yes " +
-              "only if the context above is the intended cluster.",
+            "Refusing to deploy an explicitly-unverified composition plan non-interactively. " +
+              "Use a verifiable cluster identity, or re-run with --yes only after confirming " +
+              "the context above.",
           );
         }
         const answer = await promptConfirmation(
@@ -1264,11 +1712,92 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         );
         if (answer.trim() !== "yes") {
           throw new Error(
-            "Deploy aborted: the current kubectl context was not confirmed as the intended " +
-              "cluster. Nothing was changed.",
+            "Deploy aborted: the composition plan's cluster identity was not explicitly " +
+              "confirmed. Nothing was changed.",
           );
         }
+        explicitlyConfirmed = true;
         console.log("");
+      }
+      const preflight = await preflightCompositionPlan(compositionSnapshot.plan, {
+        explicitlyConfirmed,
+      });
+      console.log(
+        `\n  → Composition plan verified: ${preflight.clusterIdentity}; Kubernetes ` +
+          `${preflight.serverVersion}`,
+      );
+      if (preflight.missingOptional.length > 0) {
+        console.warn(
+          `  ! Optional Kubernetes APIs unavailable: ${preflight.missingOptional
+            .map((entry) => `${entry.apiVersion}/${entry.resource}`)
+            .join(", ")}`,
+        );
+      }
+    }
+  } else {
+    // Compatibility path for artifacts emitted before composition plans. New targets carry an
+    // exact access/identity operation above; legacy metadata still uses the historical provider
+    // marker until it is rebuilt.
+    const targetsGke = buildProvider === "gke";
+    const canPinContext = Boolean(targetsGke && infra.projectId && infra.region && releaseName);
+    if (!dryRun && canPinContext) {
+      const clusterName = `${releaseName}-cluster`;
+      console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
+      await execOrThrow("gcloud", [
+        "container",
+        "clusters",
+        "get-credentials",
+        clusterName,
+        "--region",
+        infra.region!,
+        "--project",
+        infra.projectId!,
+        "--quiet",
+      ]);
+    } else if (!canPinContext) {
+      // N29: context pinning is IMPOSSIBLE (no projectId/region in infrastructure.json), so
+      // EVERYTHING below — helm upgrade, the Service selector patches, the state ConfigMap
+      // write — would run against whatever kubectl context happens to be current. This
+      // silently-skipped get-credentials is the same hole destroy's C1 guard closed; deploy
+      // had no equivalent (invariant 6). Surface the context and require confirmation.
+      if (dryRun) {
+        console.log(
+          `  [dry-run] infrastructure.json is missing projectId/region — kubectl context ` +
+            `pinning is impossible. A real deploy would target whatever kubectl context is ` +
+            `current (and ask you to confirm it).`,
+        );
+      } else {
+        const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+        // L14: the context name is kubeconfig-sourced — strip terminal control chars.
+        const currentContext =
+          ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+        console.warn(
+          `\n  !!! WARNING: infrastructure.json is missing projectId/region, so kubectl could ` +
+            `NOT be pinned to this release's cluster.\n` +
+            `      The ENTIRE deploy (helm upgrade, Service selector cutover, deploy-state ` +
+            `ConfigMap) will run against your CURRENT kubectl context:\n` +
+            `      ${currentContext || "(no current context / kubectl unavailable)"}\n`,
+        );
+        if (!yes) {
+          if (!process.stdin.isTTY) {
+            throw new Error(
+              "Refusing to deploy against an unpinned kubectl context non-interactively. " +
+                "Restore projectId/region in .k8s-adapter/infrastructure.json (re-run " +
+                "`npx adapter-k8s init`) so the context can be pinned, or re-run with --yes " +
+                "only if the context above is the intended cluster.",
+            );
+          }
+          const answer = await promptConfirmation(
+            `  Type "yes" to confirm this kubectl context is the intended cluster: `,
+          );
+          if (answer.trim() !== "yes") {
+            throw new Error(
+              "Deploy aborted: the current kubectl context was not confirmed as the intended " +
+                "cluster. Nothing was changed.",
+            );
+          }
+          console.log("");
+        }
       }
     }
   }
@@ -1299,7 +1828,68 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // entirely, so the secure posture is what an ordinary deploy gets.
   let podCidr: string | null = null;
   let nodeCidr: string | null = null;
-  if (!dryRun && infra.projectId && infra.region && releaseName) {
+  if (!dryRun && compositionSnapshot) {
+    const network = compositionSnapshot.plan.operations.network;
+    const resolvePlanSource = async (
+      source: typeof network.podCidrs,
+      purpose: "pod" | "node",
+    ): Promise<string | null> => {
+      switch (source.kind) {
+        case "not-required":
+          return null;
+        case "static":
+          return source.cidrs.join(",");
+        case "kubernetes-node-pod-cidrs":
+          return discoverPodCidrsFromCluster();
+        case "kubernetes-node-addresses":
+          return discoverNodeCidrsFromCluster();
+        case "gke-pod-range":
+          if (source.location.kind !== "region") {
+            throw new Error(
+              `Composition-plan ${purpose} CIDR discovery uses a zonal GKE location, but ` +
+                `the current GKE discovery operation requires a region. Rebuild with a ` +
+                `regional target or configure static CIDRs.`,
+            );
+          }
+          return discoverClusterPodCidr({
+            clusterName: source.clusterName,
+            region: source.location.name,
+            projectId: source.projectId,
+            allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
+          });
+        case "gke-node-subnet":
+          if (source.location.kind !== "region") {
+            throw new Error(
+              `Composition-plan ${purpose} CIDR discovery uses a zonal GKE location, but ` +
+                `the current GKE discovery operation requires a region. Rebuild with a ` +
+                `regional target or configure static CIDRs.`,
+            );
+          }
+          return discoverClusterNodeCidrs({
+            clusterName: source.clusterName,
+            region: source.location.name,
+            projectId: source.projectId,
+            allowNoNetworkPolicy: allowNoNetworkPolicy ?? false,
+          });
+      }
+    };
+    podCidr = await resolvePlanSource(network.podCidrs, "pod");
+    nodeCidr = await resolvePlanSource(network.nodeCidrs, "node");
+    for (const [purpose, source, resolved] of [
+      ["pod", network.podCidrs, podCidr],
+      ["node", network.nodeCidrs, nodeCidr],
+    ] as const) {
+      if (source.kind !== "not-required" && !resolved && !allowNoNetworkPolicy) {
+        throw new Error(
+          `Composition-plan ${purpose} CIDR source ${source.kind} returned no ranges. The ` +
+            `plan's missingSourcePolicy is fail, so refusing to deploy without network ` +
+            `isolation. Fix cluster access, configure static CIDRs, or explicitly pass ` +
+            `--allow-no-network-policy.`,
+        );
+      }
+    }
+  } else if (!dryRun && infra.projectId && infra.region && releaseName) {
+    // Legacy artifacts predate typed network sources and use the historical GKE convention.
     podCidr = await discoverClusterPodCidr({
       clusterName: `${releaseName}-cluster`,
       region: infra.region,
@@ -1439,7 +2029,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // its old mode, so a previously world-readable secret file would stay that way.
     chmodSync(secretPath, 0o600);
     console.log(`    Cache Secret ${releaseName}-valkey staged for Helm → ${url}`);
-  } else if (!cacheManaged && !dryRun) {
+  } else if (!compositionSnapshot && !cacheManaged && !dryRun) {
     // The current build is NOT using the managed cache (disabled entirely, or BYO via
     // cache.url). If a managed Memorystore was previously provisioned for this release
     // (infra.cacheRegion persisted at provision time), tear it down — otherwise the
@@ -1455,7 +2045,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "secret",
         `${releaseName}-valkey`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
       ]);
       if (secretDelete.stdout.trim())
@@ -1491,6 +2081,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // 3. Read adapter config to determine container strategy
   // Default to traced-assets if not specified
   const containerStrategy = metadata.containerStrategy ?? "traced-assets";
+  const poolImageLayout = parsePoolImageLayout(metadata.poolImageLayout);
 
   // 4. Docker build + push
   // S7/S23: filled in below by resolveDeployImageDigests, for BOTH the push and --skip-push
@@ -1505,15 +2096,25 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         distDir: metadata.distDir,
         pools,
         containerStrategy,
+        poolImageLayout,
       });
     }
     const dockerCommands = buildDockerCommands({
       pools,
       buildId,
       registry: infra.containerRegistry,
-      outputDir: ".k8s-adapter/output",
+      outputDir: outputDirRelative,
       containerStrategy,
+      ...(poolImageLayout ? { poolImageLayout } : {}),
       containerCli,
+      targetPlatform: builtTargetPlatform,
+      ...(compositionSnapshot
+        ? {
+            registryAuthentication: compositionSnapshot.plan.target.registry.authentication,
+            includeRoutingService:
+              compositionSnapshot.plan.operations.routing.protocol !== "pool-local-v1",
+          }
+        : {}),
     });
 
     for (const cmd of dockerCommands) {
@@ -1541,7 +2142,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       containerStrategy === "shared-image"
         ? pools.map((p) => [p, `${registry}/nextjs-app:${buildId}`])
         : pools.map((p) => [p, `${registry}/nextjs-app-${p}:${buildId}`]);
-    refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
+    if (
+      !compositionSnapshot ||
+      compositionSnapshot.plan.operations.routing.protocol !== "pool-local-v1"
+    ) {
+      refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
+    }
     Object.assign(
       imageDigests,
       await resolveDeployImageDigests({
@@ -1550,15 +2156,28 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         projectId: infra.projectId ?? "",
         allowMutableTags: allowMutableTags ?? false,
         containerCli,
+        targetPlatform: builtTargetPlatform,
+        ...(compositionSnapshot
+          ? { digestLookup: compositionSnapshot.plan.target.registry.digestLookup }
+          : {}),
       }),
     );
     const pinned = Object.keys(imageDigests).length;
     if (pinned > 0) console.log(`    Pinned ${pinned} image(s) to immutable digests`);
   }
 
-  // 5. Pre-flight: ensure static IP exists (Gateway needs it)
-  if (!dryRun && infra.projectId) {
-    const ipName = `${releaseName}-ip`;
+  // 5. Pre-flight: ensure the exact address named by a GCP traffic-extension plan exists.
+  // Legacy artifacts retain their historical infrastructure-derived convention.
+  const plannedTrafficExtension = compositionSnapshot
+    ? compositionSnapshot.plan.operations.routing.dataplane.readiness.find(
+        (entry) => entry.kind === "gcp-traffic-extension",
+      )
+    : undefined;
+  const addressProject =
+    plannedTrafficExtension?.projectId ?? (!compositionSnapshot ? infra.projectId : undefined);
+  const addressName = plannedTrafficExtension?.addressName ?? `${releaseName}-ip`;
+  if (!dryRun && addressProject) {
+    const ipName = addressName;
     const ipCheck = await execCapture("gcloud", [
       "compute",
       "addresses",
@@ -1566,7 +2185,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       ipName,
       "--global",
       "--project",
-      infra.projectId,
+      addressProject,
       "--format=value(address)",
     ]);
     if (ipCheck.exitCode !== 0) {
@@ -1578,7 +2197,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         ipName,
         "--global",
         "--project",
-        infra.projectId,
+        addressProject,
         "--quiet",
       ]);
     }
@@ -1632,7 +2251,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     state = await readState(projectDir).catch(() => null);
   } else {
     try {
-      state = await readState(projectDir, releaseName);
+      state = await readState(projectDir, releaseName, { namespace });
     } catch (err) {
       if (!(err instanceof StateUnavailableError)) throw err;
       stateUnavailable = err.message;
@@ -1649,7 +2268,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     console.warn(
       `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
     );
-    previousBuildId = await discoverServingBuildId(releaseName);
+    previousBuildId = await discoverServingBuildId(releaseName, namespace);
     console.warn(
       `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
         `Service selector. Proceeding with it as the previous build — its recorded CDN tag ` +
@@ -1662,8 +2281,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // The build-time collision guard (adapter.ts) can't see deploy-time state: if any of
   // this build's COMPOSED resource names sanitizes to the SAME K8s name as the
   // currently-serving build's, the two builds' resources become indistinguishable —
-  // pods carry identical version labels (split-brain cutover), retained previous-build
-  // manifests overwrite the serving ones, and cleanup deletes the wrong build.
+  // pods carry identical version labels (split-brain cutover), the keep transfer can target
+  // the wrong Deployment, and cleanup can delete the serving build.
   // Comparing the bare sanitized build ids is NOT enough: names collide on the COMPOSED
   // truncated form — a long `<release>-<pool>-` prefix can push the differing part of
   // the build id past the 63-char boundary even when the ids differ well inside their
@@ -1687,10 +2306,54 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `a \`generateBuildId\` that changes per build.`,
     );
   }
+
+  // N70: the outgoing build owns its own pool topology. The incoming build metadata cannot
+  // describe pools that were removed or renamed: iterating `pools` here used to omit those
+  // outgoing Deployments/HPAs from retention, so Helm deleted the rollback target before the
+  // new build was healthy. Current states record the exact topology per build. Legacy states
+  // are migrated from immutable, versioned Deployments; dry-run cannot do that without cluster
+  // access and therefore fails closed instead of printing an incomplete plan.
+  let previousPools: string[] = [];
   if (previousBuildId && previousBuildId !== buildId) {
-    // Same helper as the build-time guard in adapter.ts so both sides agree on the
-    // full composed-name set (pool Deployment/Service, -hpa/-hcp variants, snapshot).
-    const collision = findBuildIdNameCollision(releaseName, pools, buildId, previousBuildId);
+    previousPools = state ? (recordedBuildPools(state, previousBuildId) ?? []) : [];
+    if (previousPools.length === 0) {
+      if (dryRun) {
+        throw new Error(
+          `Deploy state predates per-build pool topology for build "${previousBuildId}". ` +
+            `Dry-run cannot recover it without cluster access; run a real deploy to migrate ` +
+            `the state, or restore poolTopologies in .k8s-adapter/state.json.`,
+        );
+      }
+      // `missingBuild: "empty"`: a cluster holding NOTHING of the previous build (rebuilt
+      // cluster, externally cleaned namespace) has no rollback target to preserve or to
+      // strand — failing closed here bricked every subsequent deploy against unrepairable
+      // state. Partial or inconsistent topologies still throw inside discoverBuildPools.
+      previousPools = await discoverBuildPools(releaseName, previousBuildId, namespace, {
+        missingBuild: "empty",
+      });
+      if (previousPools.length === 0) {
+        console.warn(
+          `  ! Deploy state records previous build "${previousBuildId}", but the cluster ` +
+            `has NO Deployments for it (rebuilt cluster or externally cleaned namespace). ` +
+            `Nothing to preserve for rollback — continuing as a first deploy.`,
+        );
+      } else {
+        console.warn(
+          `  ! Recovered legacy pool topology for build "${previousBuildId}" from its ` +
+            `versioned Deployments: ${previousPools.join(", ")}. The successful deploy will ` +
+            `record it in adapter state.`,
+        );
+      }
+    }
+  }
+  if (previousBuildId && previousBuildId !== buildId) {
+    // Compare the exact resource pairs that coexist during this rollout. Projecting both
+    // build ids over the incoming pool list invents previous-build resources after a rename.
+    const collision = findBuildTopologyNameCollision(
+      releaseName,
+      { buildId, pools },
+      { buildId: previousBuildId, pools: previousPools },
+    );
     if (collision) {
       throw new Error(
         `Build id "${buildId}" collides with the currently-serving build "${previousBuildId}" ` +
@@ -1723,16 +2386,21 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   const overridesFile = path.join(projectDir, ".k8s-adapter", "helm", "values.override.yaml");
-  const helmArgs = buildHelmUpgradeArgs({
+  const helmArgsBase = {
     releaseName,
     chartPath: path.join(outputDir, "chart"),
     buildId,
     registry: infra.containerRegistry,
     previousBuildId,
+    namespace,
     overridesFile,
     podCidrs: podCidr,
     nodeCidrs: nodeCidr,
     imageDigests,
+    defaultPool,
+    previousDefaultPool: previousBuildId
+      ? (state?.defaultPools?.[previousBuildId] ?? previousPools[0] ?? defaultPool)
+      : defaultPool,
     // First-upgrade probe migration. `helm upgrade` rewrites the stable HealthCheckPolicy
     // BEFORE the cutover, while the ACTIVE pods are still the OUTGOING build's — and a build
     // produced by an adapter from before /readyz existed answers only /healthz. Flipping the
@@ -1744,6 +2412,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     ...(previousBuildId && !state?.readinessPathSupported
       ? { poolHealthCheckPath: LIVENESS_PATH_FOR_MIGRATION }
       : {}),
+  };
+  const helmArgs = buildHelmUpgradeArgs({
+    ...helmArgsBase,
+    // Dry-run's first printed form is the Helm 3 client-side command. The Helm 4 form is
+    // rendered separately at the execution site below.
+    helmUpgradeMode: helmUpgradeMode ?? "client-side",
   });
 
   const chartTemplatesDir = path.join(outputDir, "chart", "templates");
@@ -1789,259 +2463,250 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // have no live capacity to match.
   const previousReplicasByPool = new Map<string, number>();
 
-  // Inject previous build's deployment+service into the chart so Helm doesn't delete it.
-  // Without this, helm upgrade only sees the current build's templates and deletes the previous.
+  // Preserve the previous build's LIVE Deployment without rendering it into the new chart.
+  // Re-rendering can never be lossless: a build may carry arbitrary user env/envFrom and a pod
+  // template emitted by an older adapter. Every field we failed to copy made Helm see a template
+  // change and roll the build still serving 100% of traffic. Instead, annotate the top-level
+  // Deployment with Helm's keep policy before omitting it from the next release manifest. Helm
+  // then neither patches nor deletes it; in particular `.spec.template` stays byte-for-byte the
+  // live object and no ReplicaSet is created. Deploy still owns the post-cutover scale-to-zero and
+  // old-build cleanup, both of which address the object by its exact versioned name.
+  //
+  // The versioned Service remains rendered: unlike a Deployment it has no executable template,
+  // and retaining it in the release keeps Helm's ordinary lifecycle for a resource whose shape is
+  // fully canonical. The HPA follows the same keep transfer as the Deployment so it remains active
+  // throughout warm-up and every pre-cutover abort.
   if (previousBuildId && previousBuildId !== buildId) {
-    for (const poolName of pools) {
+    const incomingPoolSet = new Set(pools);
+    // Provider capability, not a cluster-wide CRD permission probe: generic operators need no
+    // CRD-list RBAC and legitimately have no GKE HealthCheckPolicy object.
+    const healthCheckPolicyCrd = buildProvider === "gke";
+    for (const poolName of previousPools) {
       const poolPrevName = sanitizeK8sName(`${releaseName}-${poolName}-${previousBuildId}`);
-
-      // The "previous" build is the one CURRENTLY SERVING traffic. Render its Deployment at
-      // its current replica count — NOT 0 — so `helm upgrade` doesn't scale it to zero while
-      // the active Service still selects it, which would black-hole the origin on every
-      // deploy until the new pods are ready and the selector switches. It keeps serving
-      // through the rollout; it is scaled to 0 only after state is committed (step 7f).
-      // Default replica count: used for dry-run (no cluster read) and for a previous
-      // Deployment that no longer exists (NotFound branch below).
-      let prevReplicas = 2;
-      // N66: everything the retained render must reproduce from the LIVE object instead of
-      // resolving from the NEW build's `.Values`. Left EMPTY for dry-run and for the
-      // NotFound self-heal, where there is no live pod template to mirror and the `.Values`
-      // fallback is the only option (and is the documented behavior there).
-      let prevSnapshot: {
-        image?: string;
-        resources?: {
-          cpu?: string;
-          memory?: string;
-          cpuLimit?: string;
-          memoryLimit?: string;
-          ephemeralStorage?: string;
-        };
-        readinessPath?: string;
-        internalSecretRef?: string;
-      } = {};
       if (!dryRun) {
-        // N28: ONE machine-readable probe. `--ignore-not-found` makes a genuinely absent
-        // Deployment exit 0 with empty stdout, and the name field distinguishes "absent"
-        // from "present with an unreadable replica count". The previous version keyed off
-        // `isAlreadyGoneError(stderr)`, which matches a bare "404"/"no such" ANYWHERE in
-        // stderr — so any proxy/auth/wrong-project error whose text contains 404 took the
-        // lenient branch and scaled a build serving N≫2 down to 2 mid-deploy, the exact
-        // regression the abort below was added to prevent.
+        // Read the complete object rather than selecting pod-template fields. The JSON is never
+        // rendered back into YAML: it only supplies the live capacity target. That is the key
+        // invariant — unfamiliar fields, every env/valueFrom entry, sidecars, scheduling policy,
+        // security context, and volumes survive because this process never serializes the spec.
         const r = await execCapture("kubectl", [
           "get",
           "deployment",
           poolPrevName,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--ignore-not-found",
           "-o",
-          // N66: one probe, one round trip — every field the retained manifest must
-          // reproduce byte-for-byte. `ephemeral-storage` needs the bracket form (a hyphen
-          // is not a legal dotted jsonpath segment).
-          "jsonpath={.metadata.name}|{.spec.replicas}" +
-            "|{.spec.template.spec.containers[0].image}" +
-            "|{.spec.template.spec.containers[0].resources.requests.cpu}" +
-            "|{.spec.template.spec.containers[0].resources.requests.memory}" +
-            "|{.spec.template.spec.containers[0].resources.requests['ephemeral-storage']}" +
-            "|{.spec.template.spec.containers[0].resources.limits.cpu}" +
-            "|{.spec.template.spec.containers[0].resources.limits.memory}" +
-            "|{.spec.template.spec.containers[0].readinessProbe.httpGet.path}|" +
-            // N87: WHICH internal dispatch Secret the live pod template resolves. Per-build
-            // now, but a build deployed by an older adapter references the legacy stable name
-            // — re-rendering it with the derived name would repoint the SERVING build's pods
-            // at a Secret nobody rendered. The `range` form tolerates a container with no such
-            // env (an even older build) instead of failing the whole jsonpath.
-            '{range .spec.template.spec.containers[0].env[?(@.name=="INTERNAL_HEADER_SECRET")]}' +
-            "{.valueFrom.secretKeyRef.name}{end}",
+          "json",
         ]);
         if (r.exitCode !== 0) {
-          // Abort rather than guess: the probe previously defaulted to 2 on ANY failure,
-          // so a serving build at 5 replicas would be silently scaled DOWN to 2 by the
-          // retained manifest mid-deploy.
           throw new Error(
-            `Could not read the live replica count for the currently-serving deployment ` +
+            `Could not read the currently-serving deployment ` +
               `${poolPrevName} (kubectl exited ${r.exitCode}: ${r.stderr.trim()}). ` +
-              `The retained manifest must mirror the live count; refusing to guess. Fix ` +
-              `kubectl access and re-run the deploy.`,
+              `It must be transferred out of Helm's release manifest without changing its ` +
+              `pod template; refusing to guess. Fix kubectl access and re-run the deploy.`,
           );
         }
-        const [
-          foundName,
-          replicasField,
-          imageField,
-          cpuReqField,
-          memReqField,
-          ephReqField,
-          cpuLimField,
-          memLimField,
-          readinessPathField,
-          internalSecretRefField,
-        ] = r.stdout.trim().split("|");
-        if (!foundName) {
-          // N31: no Deployment for this pool in the previous build. Two very different
-          // causes — tell them apart by whether the pool's STABLE active Service exists
-          // (helm creates it with the pool; it outlives individual builds):
-          //   * Service exists  → the pool existed before and its previous Deployment was
-          //     deleted (manually / partial cluster recovery). Keep the historical
-          //     self-heal: warn and render the retained manifest at the default, rather
-          //     than bricking every future deploy of the release.
-          //   * Service absent  → the pool is NEW in this build, so there is nothing to
-          //     retain. Rendering anything here fabricated a previous-build Deployment
-          //     with `imageTag: previousBuildId` — a tag that was never built — giving the
-          //     whole deploy an ImagePullBackOff (step 7a only waits on the new build's
-          //     label) and turning the next rollback's clean "Previous deployment missing"
-          //     abort into a 120 s timeout.
-          const activeServiceName = sanitizeK8sName(`${releaseName}-${poolName}`);
-          const svc = await execCapture("kubectl", [
-            "get",
-            "service",
-            activeServiceName,
-            "-n",
-            K8S_NAMESPACE,
-            "--ignore-not-found",
-            "-o",
-            "name",
-          ]);
-          if (svc.exitCode !== 0) {
-            throw new Error(
-              `Could not determine whether pool "${poolName}" existed in the previous build ` +
-                `${previousBuildId}: neither its Deployment (${poolPrevName}) nor its active ` +
-                `Service (${activeServiceName}) could be read (kubectl exited ` +
-                `${svc.exitCode}: ${svc.stderr.trim()}). Refusing to guess — retaining a ` +
-                `manifest for a pool that never existed renders an image tag that was never ` +
-                `built. Fix kubectl access and re-run the deploy.`,
-            );
-          }
-          if (!svc.stdout.trim()) {
-            console.log(
-              `  → Pool "${poolName}" is new in this build (no active Service ` +
-                `${activeServiceName}) — nothing to retain for build ${previousBuildId}.`,
-            );
-            continue;
-          }
-          console.warn(
-            `  ! Previous deployment ${poolPrevName} (build ${previousBuildId}) not found — ` +
-              `it appears to have been deleted. Nothing is serving from it; rendering its ` +
-              `retained manifest at the default ${prevReplicas} replicas.`,
+        if (!r.stdout.trim()) {
+          throw new Error(
+            `The recorded pool topology says build "${previousBuildId}" contains pool ` +
+              `"${poolName}", but its versioned Deployment ${poolPrevName} is missing. ` +
+              `Refusing to run \`helm upgrade\`: fabricating it from the incoming build would ` +
+              `run different code under the rollback build's identity.`,
           );
         } else {
-          const n = parseInt(replicasField ?? "", 10);
-          if (!Number.isFinite(n) || n <= 0) {
+          let live: { metadata?: { name?: unknown }; spec?: { replicas?: unknown } };
+          try {
+            live = JSON.parse(r.stdout) as typeof live;
+          } catch (err) {
+            throw new Error(
+              `Could not parse the live deployment ${poolPrevName}: ` +
+                `${err instanceof Error ? err.message : String(err)}. Refusing to run ` +
+                `\`helm upgrade\` without proving which Deployment will be retained.`,
+            );
+          }
+          if (live.metadata?.name !== poolPrevName) {
+            throw new Error(
+              `The live Deployment probe for ${poolPrevName} returned ` +
+                `${JSON.stringify(live.metadata?.name)}. Refusing to retain a different object.`,
+            );
+          }
+          const n = live.spec?.replicas;
+          if (typeof n !== "number" || !Number.isInteger(n) || n <= 0) {
             throw new Error(
               `Could not read the live replica count for the currently-serving deployment ` +
-                `${poolPrevName} (replicas=${JSON.stringify(replicasField ?? "")}). ` +
-                `The retained manifest must mirror the live count; refusing to guess. Fix ` +
+                `${poolPrevName} (replicas=${JSON.stringify(n)}). Refusing to guess. Fix ` +
                 `kubectl access and re-run the deploy.`,
             );
           }
-          prevReplicas = n;
           previousReplicasByPool.set(poolName, n);
-          // N66: snapshot the live container spec. A field the live object does not carry
-          // (an older build predating ephemeral-storage, say) is simply omitted, which
-          // leaves that ONE field on the `.Values` fallback rather than inventing a value —
-          // omitting it is what the running object has, so the render still matches.
-          // Every literal is cluster-sourced and lands in the rendered pod spec, so it is
-          // validated HERE, at the point of consumption (AGENTS.md), not only inside the
-          // template: a value that fails validation aborts the deploy rather than being
-          // dropped (silently reverting that field to the new build's values would
-          // reintroduce exactly the skew this snapshot exists to prevent).
-          if (imageField) {
-            assertSafeImageReference(imageField);
-          }
-          const liveQuantity = (value: string, field: string): string => {
-            assertSafeQuantity(value, `live ${poolPrevName} ${field}`);
-            return value;
-          };
-          prevSnapshot = {
-            ...(imageField ? { image: imageField } : {}),
-            resources: {
-              ...(cpuReqField ? { cpu: liveQuantity(cpuReqField, "requests.cpu") } : {}),
-              ...(memReqField ? { memory: liveQuantity(memReqField, "requests.memory") } : {}),
-              ...(ephReqField
-                ? { ephemeralStorage: liveQuantity(ephReqField, "requests.ephemeral-storage") }
-                : {}),
-              ...(cpuLimField ? { cpuLimit: liveQuantity(cpuLimField, "limits.cpu") } : {}),
-              ...(memLimField ? { memoryLimit: liveQuantity(memLimField, "limits.memory") } : {}),
-            },
-            // N66: the readiness PATH is part of "what is running" too. The retained build
-            // may predate the pool server's `/readyz` endpoint, and stamping the current
-            // default onto it would change the SERVING build's pod template into a probe
-            // its pods cannot satisfy (a stalled RollingUpdate on the build carrying 100%
-            // of traffic). `renderDeployment` interpolates this as a BARE YAML scalar with
-            // no validation of its own, so a cluster-sourced value must be charset-checked
-            // here; anything unexpected falls back to the template default.
-            ...(readinessPathField && LIVE_PROBE_PATH_RE.test(readinessPathField)
-              ? { readinessPath: readinessPathField }
-              : {}),
-            // N87: mirror the live secretKeyRef. Cluster-sourced and spliced into a bare YAML
-            // scalar, so it is charset-checked here; anything unexpected falls back to the
-            // derived per-build name rather than aborting the deploy (same posture as the
-            // readiness path above).
-            ...(internalSecretRefField && LIVE_SECRET_NAME_RE.test(internalSecretRefField)
-              ? { internalSecretRef: internalSecretRefField }
-              : {}),
-          };
-          if (internalSecretRefField && !LIVE_SECRET_NAME_RE.test(internalSecretRefField)) {
-            console.warn(
-              `  ! Live INTERNAL_HEADER_SECRET secretKeyRef ${JSON.stringify(
-                internalSecretRefField,
-              )} on ${poolPrevName} is not a plain Secret name — the retained manifest will use ` +
-                `the per-build default instead of mirroring it.`,
+
+          const keptDeployment = await execCapture("kubectl", [
+            "patch",
+            "deployment",
+            poolPrevName,
+            "-n",
+            namespace,
+            "--type=merge",
+            "-p",
+            JSON.stringify({
+              metadata: {
+                annotations: { "helm.sh/resource-policy": "keep" },
+                labels: { [ADAPTER_RELEASE_LABEL]: releaseName },
+              },
+            }),
+          ]);
+          if (keptDeployment.exitCode !== 0) {
+            throw new Error(
+              `Could not preserve the outgoing Deployment ${poolPrevName} across the Helm ` +
+                `upgrade (${keptDeployment.stderr.trim() || `kubectl exited ${keptDeployment.exitCode}`}). ` +
+                `Refusing to run \`helm upgrade\`: re-rendering it would change the serving ` +
+                `pod template and omitting it without keep would delete it. Fix kubectl access ` +
+                `and re-run.`,
             );
           }
-          if (readinessPathField && !LIVE_PROBE_PATH_RE.test(readinessPathField)) {
-            console.warn(
-              `  ! Live readiness path ${JSON.stringify(readinessPathField)} on ` +
-                `${poolPrevName} is not a plain URL path — the retained manifest will use ` +
-                `the template default instead of mirroring it.`,
-            );
-          }
+          console.log(`  → Preserved outgoing Deployment (${poolPrevName}) without re-rendering`);
+        }
+
+        // A pool removed or renamed by the incoming build disappears from the generated chart.
+        // Transfer the complete stable resource group (Service, PDB, and the optional GKE HCP)
+        // out of Helm's deletion set. Service is required for rollback DNS/backend identity;
+        // PDB/HCP are optional only because older adapters/generic providers may not emit them.
+        if (!incomingPoolSet.has(poolName)) {
+          const retained = await retainRemovedPoolResources({
+            releaseName,
+            pool: poolName,
+            namespace,
+            healthCheckPolicyCrd,
+          });
+          console.log(
+            `  → Preserved rollback resources for removed pool "${poolName}": ` +
+              retained.join(", "),
+          );
+        }
+      } else {
+        console.log(
+          `    [dry-run] kubectl patch deployment ${poolPrevName} -n ${namespace} ` +
+            `--type=merge (set helm.sh/resource-policy=keep and ${ADAPTER_RELEASE_LABEL}, ` +
+            `if it exists)`,
+        );
+        if (!incomingPoolSet.has(poolName)) {
+          console.log(
+            `    [dry-run] would retain the stable Service/PDB and provider HCP for removed ` +
+              `pool "${poolName}" with exact identity checks`,
+          );
         }
       }
 
-      // Render retained resources through the same canonical templates as a normal build.
-      // Hand-copying this Deployment previously omitted resources, changing the serving pod
-      // template and rolling the old build during every upgrade.
-      // L13: dry-run must not write into the chart — report the planned writes instead.
-      const retainedFiles: [string, string][] = [
-        [
-          `${poolName}-prev-deployment.yaml`,
-          renderDeployment({
-            poolName,
-            buildId: previousBuildId,
-            releaseName,
-            imageTag: previousBuildId,
-            replicas: prevReplicas,
-            // N66: literals win over the `.Values` expressions, so changing `resources` in
-            // next.config — or flipping `containerStrategy`, which repoints the repository
-            // at `nextjs-app-<pool>` vs `nextjs-app` — cannot mutate (and therefore roll)
-            // the pod template of the build still serving 100% of traffic. Flipping
-            // containerStrategy previously pointed the retained manifest at a tag that was
-            // never pushed: ImagePullBackOff on the SERVING build, before cutover.
-            ...prevSnapshot,
-          }),
-        ],
-        [
-          `${poolName}-prev-service.yaml`,
+      // L13: dry-run must not write into the chart — report the planned Service write instead.
+      const retainedService = path.join(chartTemplatesDir, `${poolName}-prev-service.yaml`);
+      if (dryRun) {
+        console.log(`    [dry-run] would write ${retainedService}`);
+      } else {
+        writeFileSync(
+          retainedService,
           renderService({ poolName, buildId: previousBuildId, releaseName }),
-        ],
-        [
-          `${poolName}-prev-hpa.yaml`,
-          renderHPA({ poolName, buildId: previousBuildId, releaseName }),
-        ],
-      ];
-      for (const [fileName, content] of retainedFiles) {
-        const target = path.join(chartTemplatesDir, fileName);
-        if (dryRun) {
-          console.log(`    [dry-run] would write ${target}`);
-        } else {
-          writeFileSync(target, content);
+        );
+      }
+
+      // Keep the outgoing HPA active and byte-for-byte unchanged while its Deployment still
+      // carries traffic, but remove it from Helm's next release manifest. Rendering it here
+      // would overwrite a rollback-created HPA's incident-sized min/max with the incoming
+      // build's config; merely omitting it would let Helm prune it before the new build is ready.
+      // The live keep annotation makes the retention transfer explicit. On every abort before
+      // the durable state commit the HPA remains present and active; step 7f deletes it only
+      // after traffic and state have moved to the new build.
+      const outgoingHpa = poolResourceNames(releaseName, poolName, previousBuildId).hpa;
+      const keepAnnotation = "helm.sh/resource-policy=keep";
+      if (dryRun) {
+        console.log(
+          `    [dry-run] kubectl patch hpa ${outgoingHpa} -n ${namespace} --type=merge ` +
+            `(set ${keepAnnotation} and release/build ownership labels, if it exists)`,
+        );
+      } else {
+        const foundHpa = await execCapture("kubectl", [
+          "get",
+          "hpa",
+          outgoingHpa,
+          "-n",
+          namespace,
+          "--ignore-not-found",
+          "-o",
+          "name",
+        ]);
+        if (foundHpa.exitCode !== 0) {
+          throw new Error(
+            `Could not determine whether the outgoing HPA ${outgoingHpa} exists (kubectl ` +
+              `exited ${foundHpa.exitCode}: ${foundHpa.stderr.trim()}). Refusing to run ` +
+              `\`helm upgrade\`: omitting an HPA that Helm still owns could delete the ` +
+              `autoscaler for build ${previousBuildId} while it is serving traffic. Fix ` +
+              `kubectl access and re-run.`,
+          );
+        }
+        if (foundHpa.stdout.trim()) {
+          // Older charts did not stamp pool HPAs with the release/build labels destroy needs
+          // for a namespace-safe sweep, and rollback can create one imperatively. Transfer the
+          // keep annotation and complete adapter identity in one merge patch, without changing
+          // Helm's managed-by label or release annotations: a retry must still pass Helm's
+          // ownership validation. If admission rejects the patch, neither half is left behind
+          // and Helm is never allowed to prune the serving build's autoscaler.
+          const keptHpa = await execCapture("kubectl", [
+            "patch",
+            "hpa",
+            outgoingHpa,
+            "-n",
+            namespace,
+            "--type=merge",
+            "-p",
+            JSON.stringify({
+              metadata: {
+                annotations: { "helm.sh/resource-policy": "keep" },
+                labels: {
+                  [ADAPTER_RELEASE_LABEL]: releaseName,
+                  "app.kubernetes.io/name": releaseName,
+                  "app.kubernetes.io/component": poolName,
+                  "app.kubernetes.io/version": sanitizeK8sName(previousBuildId),
+                },
+              },
+            }),
+          ]);
+          if (keptHpa.exitCode !== 0) {
+            throw new Error(
+              `Could not preserve the outgoing HPA ${outgoingHpa} across the Helm upgrade ` +
+                `(${keptHpa.stderr.trim() || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
+                `to run \`helm upgrade\`: the serving build must keep autoscaling until ` +
+                `cutover. Fix kubectl access and re-run.`,
+            );
+          }
+          console.log(`  → Preserved outgoing autoscaler (${outgoingHpa}) through cutover`);
         }
       }
     }
   }
 
-  // 6-pre. Retain the OUTGOING build's routing manifest as a build-named snapshot
+  // 6-pre. Adopt only the exact legacy Valkey Secret that older adapter versions created
+  // imperatively. This must happen before Helm sees the chart resource: without the ownership
+  // tuple Helm correctly rejects it, while release-wide --take-ownership would also seize any
+  // unrelated colliding resource. A dry-run cannot inspect the cluster, so describe the guarded
+  // conditional instead of claiming the Secret is present or adoptable.
+  if (metadata.cacheEnabled) {
+    if (dryRun) {
+      console.log(
+        `    [dry-run] if Secret ${releaseName}-${VALKEY_SECRET_NAME} exists without Helm ` +
+          `ownership, verify its exact legacy adapter identity and atomically assign it to ` +
+          `release ${releaseName}; abort on foreign, partial, or mismatched ownership`,
+      );
+    } else {
+      const ownership = await ensureValkeySecretHelmOwnership(releaseName, namespace);
+      if (ownership === "adopted") {
+        console.log(
+          `  → Adopted validated legacy cache Secret ` +
+            `${releaseName}-${VALKEY_SECRET_NAME} into Helm release ${releaseName}`,
+        );
+      }
+    }
+  }
+
+  // 6-pre-bis. Retain the OUTGOING build's routing manifest as a build-named snapshot
   // ConfigMap BEFORE helm overwrites the stable `<release>-routing-manifest` one — the
   // routing tier is updated in place per build, and rollback re-points it at the
   // snapshot. The snapshot keys off what the routing Deployment is ACTUALLY serving
@@ -2055,7 +2720,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // revert the edge IMAGE — silently, with the degradation recorded nowhere.
   let unretainedManifestBuild: string | null = null;
   if (!dryRun) {
-    const retention = await retainLiveRoutingManifest(releaseName);
+    const retention = await retainLiveRoutingManifest(releaseName, namespace);
     if (retention.status === "failed") {
       if (!allowUnretainedManifest) {
         throw new Error(
@@ -2078,7 +2743,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  // 6-pre-bis (N87). Preserve the LEGACY stable-named internal dispatch Secret across this
+  // 6-pre-ter (N87). Preserve the LEGACY stable-named internal dispatch Secret across this
   // upgrade. Internal secrets are now per-BUILD (`<release>-ihs-<build>-<digest>`,
   // emit/templates/internal-secret.ts), so the first upgrade under that scheme removes
   // `<release>-internal-header-secret` from the chart — and helm prunes what the chart no
@@ -2095,7 +2760,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const keepAnnotation = "helm.sh/resource-policy=keep";
     if (dryRun) {
       console.log(
-        `    [dry-run] kubectl annotate secret ${legacySecret} -n ${K8S_NAMESPACE} ` +
+        `    [dry-run] kubectl annotate secret ${legacySecret} -n ${namespace} ` +
           `${keepAnnotation} --overwrite (if it exists)`,
       );
     } else {
@@ -2104,7 +2769,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "secret",
         legacySecret,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
         "-o",
         "name",
@@ -2126,7 +2791,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "secret",
           legacySecret,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           keepAnnotation,
           "--overwrite",
         ]);
@@ -2150,40 +2815,33 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
 
-  console.log("\n  → Running helm upgrade...");
-  // N25: from here on, the ext_proc edge runs the NEW build — helm overwrites the stable
-  // `<release>-routing-manifest` ConfigMap the routing Deployment mounts BY NAME, and
-  // kubelet volume sync propagates it even to routing pods that never rolled. Every abort
-  // below must therefore put the edge back on the previous build (rollback has the
-  // symmetric roll-forward; deploy had none) and say what state the edge is in.
-  let helmApplied = false;
-  if (!dryRun) {
-    await execOrThrow("helm", helmArgs);
-    helmApplied = true;
-  } else {
-    console.log(`    [dry-run] helm ${helmArgs.join(" ")}`);
-  }
-
   /**
-   * N25: re-point the routing tier (image + retained manifest snapshot) at the previous
-   * build after a post-`helm upgrade` abort, so the edge and the pools agree on which
-   * build is live. Returns what actually happened so the abort message can be accurate
-   * instead of asserting "no cutover performed" while the edge serves the new build.
+   * Re-point the routing tier (image + retained manifest snapshot) at the previous build after
+   * Helm was invoked. A non-zero Helm exit is not proof that nothing changed: client-side Helm
+   * can fail after applying earlier resources, and server-side apply can return an error after
+   * admission or transport uncertainty. Recovery therefore starts when mutation is attempted,
+   * not only after the command reports success.
    */
+  let helmMutationAttempted = false;
   const restoreEdgeToPreviousBuild = async (): Promise<{
     attempted: boolean;
     restored: boolean;
     error: string;
   }> => {
-    if (!helmApplied || !previousBuildId || previousBuildId === buildId) {
+    if (!helmMutationAttempted || !previousBuildId || previousBuildId === buildId) {
       return { attempted: false, restored: false, error: "" };
     }
     try {
       await revertRoutingServiceToBuild({
         releaseName,
+        namespace,
         targetBuildId: previousBuildId,
         registry: infra.containerRegistry,
         targetImageDigest: state?.routingImageDigests?.[previousBuildId],
+        targetPlatform: state?.targetPlatforms?.[previousBuildId],
+        // The outgoing manifest was snapshotted before Helm. Do not retain the uncertain
+        // image/manifest pair left by a failed or aborted deploy under either build's name.
+        retainCurrentManifest: false,
       });
       return { attempted: true, restored: true, error: "" };
     } catch (err) {
@@ -2214,11 +2872,35 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       `  The edge (ext_proc) is running build ${buildId}'s middleware and routing manifest ` +
         `while the pools serve ${previousBuildId}. Mismatched routes fall back to pool-local ` +
         `re-resolution (invariant 1), but edge middleware is the NEW build's until repaired:`,
-      `    kubectl -n ${K8S_NAMESPACE} set image deployment/` +
+      `    kubectl -n ${namespace} set image deployment/` +
         `${routingServiceDeploymentName(releaseName)} routing-service=` +
         `${infra.containerRegistry}/routing-service:${previousBuildId}`,
     ];
   };
+
+  console.log("\n  → Running helm upgrade...");
+  // From this point the edge MAY run the new build. Helm overwrites the stable routing-manifest
+  // ConfigMap, and a non-zero exit can still mean that write reached the API server. Every later
+  // abort, including the Helm call itself, must put the edge back and report the actual result.
+  if (!dryRun) {
+    helmMutationAttempted = true;
+    try {
+      await execOrThrow("helm", helmArgs);
+    } catch (err) {
+      const edge = await restoreEdgeToPreviousBuild();
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        [
+          `Helm upgrade failed and may have partially applied the new release: ${detail}`,
+          ...edgeStatusLines(edge),
+        ].join("\n"),
+      );
+    }
+  } else {
+    const helm4Args = buildHelmUpgradeArgs({ ...helmArgsBase, helmUpgradeMode: "server-side" });
+    console.log(`    [dry-run] helm ${helmArgs.join(" ")}  # Helm 3.2–3.x, client-side upgrade`);
+    console.log(`    [dry-run] helm ${helm4Args.join(" ")}  # Helm 4+, server-side upgrade`);
+  }
 
   // 6b. Best-effort CDN verification: confirm the applied HTTPRoute carries the CDN filter.
   // The chart is the source of truth; this is confirmation only, never fatal.
@@ -2228,7 +2910,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "httproute",
       `${releaseName}-routes`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-o",
       "jsonpath={.spec.rules[*].filters[*].extensionRef.kind}",
     ]);
@@ -2237,7 +2919,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     } else {
       console.warn(
         "  ! Could not confirm the Cloud CDN filter on the HTTPRoute (non-fatal). " +
-          `Inspect with: kubectl get httproute ${releaseName}-routes -o yaml`,
+          `Inspect with: kubectl get httproute ${releaseName}-routes -n ${namespace} -o yaml`,
       );
     }
   }
@@ -2263,7 +2945,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
       "-o",
@@ -2284,7 +2966,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "status",
         `deployment/${deployName}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         KUBECTL_ROLLOUT_TIMEOUT,
       ]);
       // The pod-health gate below is the real readiness gate, but don't walk into it on
@@ -2300,7 +2982,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `NOT switched — the previous build's pools are still serving.`,
             // L14: kubectl rollout output carries controller/admission messages.
             `${sanitizeForTerminal((rollout.stderr || rollout.stdout).trim())}`,
-            `Inspect: kubectl logs deployment/${deployName} -n ${K8S_NAMESPACE} --tail=40`,
+            `Inspect: kubectl logs deployment/${deployName} -n ${namespace} --tail=40`,
             ...edgeStatusLines(edge),
           ].join("\n"),
         );
@@ -2317,7 +2999,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "deployment",
       routingDeploy,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--ignore-not-found",
       "-o",
       "name",
@@ -2329,7 +3011,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "status",
         `deployment/${routingDeploy}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         KUBECTL_ROLLOUT_TIMEOUT,
       ]);
       if (rsRollout.exitCode !== 0) {
@@ -2342,7 +3024,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             `Routing service (${routingDeploy}) did not become healthy. Traffic was NOT ` +
               `switched — the previous build's pools are still serving.`,
             `${(rsRollout.stderr || rsRollout.stdout).trim()}`,
-            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${K8S_NAMESPACE} --tail=40`,
+            `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${namespace} --tail=40`,
             ...edgeStatusLines(edge),
           ].join("\n"),
         );
@@ -2360,7 +3042,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "--for=condition=complete",
         `job/${currentRouteExtJob}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--timeout=600s",
       ]);
       if (wait.exitCode !== 0) {
@@ -2371,7 +3053,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `traffic cutover because middleware may not be wired.`,
             // L14: kubectl wait output carries controller/admission messages.
             `${sanitizeForTerminal((wait.stderr || wait.stdout).trim())}`,
-            `Inspect: kubectl logs job/${currentRouteExtJob} -n ${K8S_NAMESPACE}`,
+            `Inspect: kubectl logs job/${currentRouteExtJob} -n ${namespace}`,
             ...edgeStatusLines(edge),
           ].join("\n"),
         );
@@ -2406,7 +3088,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "envoyextensionpolicy",
           policyName,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "-o",
           "json",
         ]);
@@ -2457,7 +3139,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
               `${status || "unknown"}); refusing traffic cutover because middleware would not ` +
               `run at the edge.`,
             sanitizeForTerminal(detail),
-            `Inspect: kubectl describe envoyextensionpolicy ${policyName} -n ${K8S_NAMESPACE}`,
+            `Inspect: kubectl describe envoyextensionpolicy ${policyName} -n ${namespace}`,
             `Common causes: the GatewayClass controller is not Envoy Gateway (an ` +
               `EnvoyExtensionPolicy only applies to one), or the Gateway it targets does not exist.`,
             ...edgeStatusLines(edge),
@@ -2465,6 +3147,23 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         );
       }
       console.log("  → ext_proc EnvoyExtensionPolicy accepted ✓");
+    }
+
+    if (compositionSnapshot) {
+      console.log("  → Verifying composition-plan readiness...");
+      try {
+        await waitForCompositionPlanReadiness(compositionSnapshot.plan);
+      } catch (error) {
+        const edge = await restoreEdgeToPreviousBuild();
+        throw new Error(
+          [
+            `Composition-plan readiness failed; refusing traffic cutover: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+            ...edgeStatusLines(edge),
+          ].join("\n"),
+        );
+      }
+      console.log("  → Composition-plan resources are ready ✓");
     }
 
     // 7a-ter. N64: match the outgoing build's CAPACITY before the gate below can pass.
@@ -2483,53 +3182,67 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // reconciles the manual scale below straight back down within one control loop, and the
     // gate at 7b then waits for a count that can NEVER be reached: the deploy burned the
     // whole health budget and aborted BEFORE cutover, i.e. the capacity gate blocked every
-    // such deploy. So raise the ceiling for the warm-up, remember the chart-rendered value,
-    // and put it back on EVERY exit path (success AND abort) — an aborted deploy must not
-    // leave a widened autoscaler behind on the build it abandoned.
-    //
-    // Only `maxReplicas` is touched. `minReplicas` cannot undo the scale-up inside this
-    // window: HPA scale-DOWN is gated by `behavior.scaleDown.stabilizationWindowSeconds`
-    // (300s by default) while the gate below is bounded at 120s, so widening the floor too
-    // would be a second mutation to restore for no reachability gain — and after cutover
-    // real load, under the chart's own bounds, is exactly what should decide the count.
-    const widenedHpas: { name: string; max: number }[] = [];
-    let widenedHpasRestored = false;
-    const restoreWidenedHpas = async (): Promise<void> => {
-      if (widenedHpasRestored) return;
-      widenedHpasRestored = true; // idempotent: every exit path calls this
-      for (const { name, max } of widenedHpas) {
-        const restore = await execCapture("kubectl", [
-          "patch",
-          "hpa",
-          name,
-          "-n",
-          K8S_NAMESPACE,
-          "--type=merge",
-          // Same field-manager rationale as the Service/Deployment patches: helm owns the
-          // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify({ spec: { maxReplicas: max } }),
-        ]);
-        if (restore.exitCode === 0) {
-          console.log(`  → Restored ${name} to the chart's maxReplicas=${max}`);
-        } else {
+    // such deploy. Raising only maxReplicas is not enough: an idle new build has no load,
+    // so the HPA's desired count remains its configured minReplicas and it can reconcile a
+    // manual `kubectl scale` straight back to that floor. Do not assume a scale-down
+    // stabilization window protects the warm-up — that behavior is configurable and is not
+    // part of the generated HPA. Temporarily lift BOTH bounds around the capacity gate,
+    // remember their exact chart-rendered values, and put both back on EVERY exit path
+    // (success AND abort). After cutover, real load under the chart's own bounds decides the
+    // count again.
+    const warmedHpas: { name: string; min: number; max: number }[] = [];
+    const restoredWarmedHpas = new Set<string>();
+    const restoreWarmedHpas = async (): Promise<void> => {
+      for (const { name, min, max } of warmedHpas) {
+        if (restoredWarmedHpas.has(name)) continue;
+        let lastFailure = "";
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          const restore = await execCapture("kubectl", [
+            "patch",
+            "hpa",
+            name,
+            "-n",
+            namespace,
+            "--type=merge",
+            // Same field-manager rationale as the Service/Deployment patches: helm owns the
+            // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
+            "--field-manager=helm",
+            "-p",
+            JSON.stringify({ spec: { minReplicas: min, maxReplicas: max } }),
+          ]);
+          if (restore.exitCode === 0) {
+            restoredWarmedHpas.add(name);
+            console.log(
+              `  → Restored ${name} to the chart's minReplicas=${min}, maxReplicas=${max}`,
+            );
+            break;
+          }
+          lastFailure = restore.stderr.trim() || `exit ${restore.exitCode}`;
+        }
+        if (!restoredWarmedHpas.has(name)) {
           console.warn(
-            `  ! Could not restore ${name} to the chart's maxReplicas=${max} ` +
-              `(${restore.stderr.trim() || `exit ${restore.exitCode}`}) — it is STILL widened ` +
-              `for the pre-cutover warm-up, so this pool may autoscale above its configured ` +
-              `ceiling until the next \`helm upgrade\` re-renders it. Fix it with: kubectl -n ` +
-              `${K8S_NAMESPACE} patch hpa ${name} --type=merge -p ` +
-              `'{"spec":{"maxReplicas":${max}}}'`,
+            `  ! Could not restore ${name} to the chart's minReplicas=${min}, ` +
+              `maxReplicas=${max} after 3 attempts (${lastFailure}) — ` +
+              `it still has the temporary pre-cutover bounds, so this pool may retain warm-up ` +
+              `capacity until the next \`helm upgrade\` re-renders it. Fix it with: kubectl -n ` +
+              `${namespace} patch hpa ${name} --type=merge -p ` +
+              `'{"spec":{"minReplicas":${min},"maxReplicas":${max}}}'`,
           );
         }
       }
     };
 
-    // N67: the per-pool count the gate at 7b requires. Starts at the outgoing build's live
-    // count and is only ever LOWERED — to a ceiling we could not raise, because asking for
-    // more than the autoscaler permits is unreachable by construction.
-    //
+    // A partial warm-up setup cannot safely continue. If the HPA cannot be read, its
+    // original bounds cannot be restored; if the temporary patch is rejected, it may
+    // immediately lower the idle Deployment again. Restore every pool already prepared and
+    // put ext_proc back on the serving build before failing, without waiting out the health
+    // budget for a capacity target that is not stable.
+    const abortWarmupSetup = async (message: string): Promise<never> => {
+      const edge = await restoreEdgeToPreviousBuild();
+      await restoreWarmedHpas();
+      throw new Error([message, ...edgeStatusLines(edge)].join("\n"));
+    };
+
     // S18: seeded from EVERY configured pool at a floor of one, not only from pools with a
     // live predecessor. previousReplicasByPool has no entry for a pool that is new in this
     // build, nor for any pool on a first deploy, so those pools used to contribute no
@@ -2540,89 +3253,107 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // DO have a predecessor the real count below overwrites it immediately.
     const capacityTargets = new Map<string, number>(pools.map((poolName) => [poolName, 1]));
     for (const [poolName, replicas] of previousReplicasByPool) {
-      capacityTargets.set(poolName, replicas);
+      // A removed/renamed pool has no incoming Deployment to warm. It remains in
+      // previousReplicasByPool because deploy must preserve and later park it, but adding it
+      // here creates an impossible health target and makes every topology-changing deploy time
+      // out before cutover. Only common pools inherit outgoing capacity; newly-added pools keep
+      // the one-ready-pod floor above.
+      if (capacityTargets.has(poolName)) capacityTargets.set(poolName, replicas);
     }
 
     const shortfalls: string[] = [];
-    for (const [poolName, outgoing] of previousReplicasByPool) {
-      const { deployment: newDeployName, hpa: newHpaName } = poolResourceNames(
-        releaseName,
-        poolName,
-        buildId,
-      );
+    for (const poolName of pools) {
+      const outgoing = previousReplicasByPool.get(poolName);
+      const { hpa: newHpaName } = poolResourceNames(releaseName, poolName, buildId);
 
-      // N67: machine-readable HPA probe — `--ignore-not-found` makes a genuinely absent
-      // HPA (autoscaling disabled for the pool) exit 0 with empty stdout, so a non-zero
-      // exit is a real read failure and the name field tells the two apart.
+      // The chart always renders one HPA per pool. A missing HPA after Helm means the release
+      // was only partially applied; accepting it would cut traffic to an unautoscaled pool.
+      // Probe every pool, including first-deploy and newly added pools, before scaling any of
+      // them. `--ignore-not-found` keeps absence machine-readable without hiding read errors.
       const hpaRead = await execCapture("kubectl", [
         "get",
         "hpa",
         newHpaName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
         "-o",
         "jsonpath={.metadata.name}|{.spec.minReplicas}|{.spec.maxReplicas}",
       ]);
       if (hpaRead.exitCode !== 0) {
-        console.warn(
-          `  ! Could not read the new build's HPA ${newHpaName} (kubectl exited ` +
-            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${hpaRead.stderr.trim()}` : ""}) — ` +
-            `if its maxReplicas is below ${outgoing} it will undo the scale-up below and the ` +
-            `capacity gate cannot be satisfied.`,
+        await abortWarmupSetup(
+          `Could not read the new build's HPA ${newHpaName} (kubectl exited ` +
+            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${hpaRead.stderr.trim()}` : ""}). ` +
+            `Refusing to warm pool "${poolName}" because its original bounds cannot be ` +
+            `preserved or its capacity kept stable. Nothing was cut over.`,
         );
-      } else {
-        const [hpaFound, hpaMinField, hpaMaxField] = hpaRead.stdout.trim().split("|");
-        const hpaMin = parseInt(hpaMinField ?? "", 10);
-        const hpaMax = parseInt(hpaMaxField ?? "", 10);
-        if (hpaFound && Number.isFinite(hpaMax) && hpaMax < outgoing) {
-          // maxReplicas must stay >= minReplicas (the API server rejects otherwise); an
-          // unset minReplicas defaults to 1, which is also what the chart renders.
-          const widened = Math.max(outgoing, Number.isFinite(hpaMin) ? hpaMin : 1);
-          console.log(
-            `  → Widening ${newHpaName} maxReplicas ${hpaMax} → ${widened} so the warm-up to ` +
-              `the outgoing build's ${outgoing} replicas is not autoscaled back down ` +
-              `(restored to ${hpaMax} after cutover)`,
-          );
-          const widen = await execCapture("kubectl", [
-            "patch",
-            "hpa",
-            newHpaName,
-            "-n",
-            K8S_NAMESPACE,
-            "--type=merge",
-            "--field-manager=helm",
-            "-p",
-            JSON.stringify({ spec: { maxReplicas: widened } }),
-          ]);
-          if (widen.exitCode === 0) {
-            widenedHpas.push({ name: newHpaName, max: hpaMax });
-          } else {
-            // The ceiling stands, so asking the gate for more than it allows would hang the
-            // deploy until the health budget expired and then abort — a deploy-blocking
-            // failure for a pool that simply cannot exceed its configured maximum. Lower
-            // the target to what the autoscaler permits and say so.
-            capacityTargets.set(poolName, hpaMax);
-            console.warn(
-              `  ! Could not widen ${newHpaName} to maxReplicas=${widened} ` +
-                `(${widen.stderr.trim() || `exit ${widen.exitCode}`}). That HPA caps pool ` +
-                `"${poolName}" at ${hpaMax} replicas, below the outgoing build's ${outgoing} — ` +
-                `cutting over at ${hpaMax} (the configured ceiling, the most this pool can ` +
-                `ever run under this chart) instead of waiting for a count the autoscaler ` +
-                `forbids. Raise pools.${poolName}.replicas.max in adapter config if the ` +
-                `outgoing capacity is what this pool actually needs.`,
-            );
-          }
-        }
       }
 
+      const [hpaFound, hpaMinField, hpaMaxField] = hpaRead.stdout.trim().split("|");
+      if (!hpaFound) {
+        await abortWarmupSetup(
+          `The new build's expected HPA ${newHpaName} was not found after Helm applied the ` +
+            `release. Refusing to cut over pool "${poolName}" to a partially applied build. ` +
+            `Nothing was cut over.`,
+        );
+      }
+      const hpaMin = Number(hpaMinField);
+      const hpaMax = Number(hpaMaxField);
+      if (!Number.isInteger(hpaMin) || hpaMin < 1 || !Number.isInteger(hpaMax) || hpaMax < hpaMin) {
+        await abortWarmupSetup(
+          `Could not parse the new build's HPA ${newHpaName} bounds ` +
+            `(minReplicas=${JSON.stringify(hpaMinField ?? "")}, ` +
+            `maxReplicas=${JSON.stringify(hpaMaxField ?? "")}). Refusing to warm pool ` +
+            `"${poolName}" because its original bounds cannot be restored safely. ` +
+            `Nothing was cut over.`,
+        );
+      }
+
+      if (outgoing !== undefined && hpaMin < outgoing) {
+        const warmMin = outgoing;
+        const warmMax = Math.max(hpaMax, warmMin);
+        console.log(
+          `  → Warming ${newHpaName} at minReplicas=${warmMin}, ` +
+            `maxReplicas=${warmMax} so the idle new pool keeps the outgoing build's ` +
+            `${outgoing} replicas (restored to minReplicas=${hpaMin}, ` +
+            `maxReplicas=${hpaMax} after cutover)`,
+        );
+        const warm = await execCapture("kubectl", [
+          "patch",
+          "hpa",
+          newHpaName,
+          "-n",
+          namespace,
+          "--type=merge",
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify({ spec: { minReplicas: warmMin, maxReplicas: warmMax } }),
+        ]);
+        if (warm.exitCode !== 0) {
+          await abortWarmupSetup(
+            `Could not set temporary warm-up bounds on ${newHpaName} ` +
+              `(minReplicas=${warmMin}, maxReplicas=${warmMax}; ` +
+              `${warm.stderr.trim() || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
+              `scale or cut over pool "${poolName}" because its HPA could immediately ` +
+              `remove the required capacity. Nothing was cut over.`,
+          );
+        }
+        warmedHpas.push({ name: newHpaName, min: hpaMin, max: hpaMax });
+      }
+    }
+
+    // Prepare every autoscaler before scaling any Deployment. A read or admission failure
+    // on a later pool then restores the earlier HPA patches without leaving part of the new
+    // build manually scaled above its chart state.
+    for (const [poolName, outgoing] of previousReplicasByPool) {
+      const { deployment: newDeployName } = poolResourceNames(releaseName, poolName, buildId);
       const expected = capacityTargets.get(poolName) ?? outgoing;
       const cur = await execCapture("kubectl", [
         "get",
         "deployment",
         newDeployName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--ignore-not-found",
         "-o",
         "jsonpath={.metadata.name}|{.spec.replicas}",
@@ -2648,7 +3379,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "scale",
         `deployment/${newDeployName}`,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         `--replicas=${expected}`,
       ]);
       if (scaleUp.exitCode !== 0) {
@@ -2688,7 +3419,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "pods",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         // The routing service shares the version label; exclude it by its component label
         // (exact — a name substring match would also drop pool pods named similarly).
@@ -2710,9 +3441,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           if (component) readyByPool.set(component, (readyByPool.get(component) ?? 0) + 1);
         }
       }
-      // Per-pool capacity check against the build being replaced (N67: against the
-      // possibly-lowered target, so an autoscaler ceiling we could not raise aborts the
-      // deploy here only when the pods really are short of that ceiling).
+      // Per-pool capacity check against the build being replaced.
       const missing: string[] = [];
       for (const [poolName, expected] of capacityTargets) {
         const ready = readyByPool.get(poolName) ?? 0;
@@ -2734,9 +3463,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // `helm upgrade` (stable manifest ConfigMap + in-place routing Deployment), so
       // "no cutover performed" was only ever true of the POOLS.
       const edge = await restoreEdgeToPreviousBuild();
-      // N67: and the warm-up widening goes back before we leave — this build is being
-      // abandoned, so it must not keep the right to autoscale past its chart ceiling.
-      await restoreWidenedHpas();
+      // N67: and both temporary warm-up bounds go back before we leave — this build is
+      // being abandoned, so it must not keep the raised replica floor.
+      await restoreWarmedHpas();
       console.error(`\n  DEPLOY FAILED: New build did not become healthy within 2 minutes.`);
       console.error(
         `  The previous build's pools are still serving traffic. No pool cutover was performed.`,
@@ -2758,7 +3487,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "pods",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
         "-o",
@@ -2780,7 +3509,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "exec",
             podName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--",
             "node",
             "-e",
@@ -2804,7 +3533,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             "logs",
             podName,
             "-n",
-            K8S_NAMESPACE,
+            namespace,
             "--tail=20",
           ]);
           if (logsResult.exitCode === 0) {
@@ -2849,38 +3578,92 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     console.log(`  → Switching traffic to new build...`);
     const patchFailures: { pool: string; service: string; stderr: string }[] = [];
     const patchedServices: string[] = [];
-    for (const pool of pools) {
-      const activeServiceName = sanitizeK8sName(`${releaseName}-${pool}`);
-      const patchResult = await execCapture("kubectl", [
-        "patch",
+    const originalServiceSelectors = new Map<string, Record<string, string>>();
+
+    // A topology-changing rollback may have redirected a stable Service to a fallback pool.
+    // Read every selector before changing any of them so cutover restores both component and
+    // version, and a partial failure can put the exact live selectors back.
+    const serviceDestinations = [
+      ...pools.map((pool) => ({ servicePool: pool, targetPool: pool })),
+      ...(hasPortableOrigin ? [{ servicePool: "origin", targetPool: defaultPool }] : []),
+    ];
+    for (const { servicePool } of serviceDestinations) {
+      const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
+      const read = await execCapture("kubectl", [
+        "get",
         "service",
         activeServiceName,
         "-n",
-        K8S_NAMESPACE,
-        "--type=json",
-        // Impersonate helm as the field manager so the next helm upgrade (server-side
-        // apply, manager "helm") does not conflict on the selector field we flip here.
-        // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
-        // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
-        // no conflict override.
-        "--field-manager=helm",
-        "-p",
-        JSON.stringify([
-          {
-            op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1version",
-            value: safeBuildId,
-          },
-        ]),
+        namespace,
+        "-o",
+        "json",
       ]);
-      if (patchResult.exitCode !== 0) {
+      let selector: unknown;
+      if (read.exitCode === 0) {
+        try {
+          selector = JSON.parse(read.stdout)?.spec?.selector;
+        } catch {
+          selector = undefined;
+        }
+      }
+      if (
+        !selector ||
+        typeof selector !== "object" ||
+        Array.isArray(selector) ||
+        Object.values(selector).some((value) => typeof value !== "string")
+      ) {
         patchFailures.push({
-          pool,
+          pool: servicePool,
           service: activeServiceName,
-          stderr: patchResult.stderr.trim(),
+          stderr:
+            read.stderr.trim() ||
+            `could not read an exact Service selector (kubectl exited ${read.exitCode})`,
         });
-      } else {
-        patchedServices.push(activeServiceName);
+        continue;
+      }
+      originalServiceSelectors.set(activeServiceName, selector as Record<string, string>);
+    }
+
+    if (patchFailures.length === 0) {
+      for (const { servicePool, targetPool } of serviceDestinations) {
+        const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
+        const originalSelector = originalServiceSelectors.get(activeServiceName)!;
+        const patchResult = await execCapture("kubectl", [
+          "patch",
+          "service",
+          activeServiceName,
+          "-n",
+          namespace,
+          "--type=json",
+          // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
+          // path that prevents the next upgrade conflicting on the selector we flip here;
+          // Helm 3's client-side merge does not enforce managed-field conflicts.
+          // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
+          // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
+          // no conflict override.
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify([
+            {
+              op: "replace",
+              path: "/spec/selector",
+              value: {
+                ...originalSelector,
+                "app.kubernetes.io/component": targetPool,
+                "app.kubernetes.io/version": safeBuildId,
+              },
+            },
+          ]),
+        ]);
+        if (patchResult.exitCode !== 0) {
+          patchFailures.push({
+            pool: servicePool,
+            service: activeServiceName,
+            stderr: patchResult.stderr.trim(),
+          });
+        } else {
+          patchedServices.push(activeServiceName);
+        }
       }
     }
 
@@ -2890,36 +3673,34 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // rather than proceeding to the cleanup below and printing "Deploy complete".
     if (patchFailures.length > 0) {
       const revertFailures: string[] = [];
-      if (previousBuildId) {
-        const safePreviousBuildId = sanitizeK8sName(previousBuildId);
-        for (const serviceName of patchedServices) {
-          const revertResult = await execCapture("kubectl", [
-            "patch",
-            "service",
-            serviceName,
-            "-n",
-            K8S_NAMESPACE,
-            "--type=json",
-            "--field-manager=helm",
-            "-p",
-            JSON.stringify([
-              {
-                op: "replace",
-                path: "/spec/selector/app.kubernetes.io~1version",
-                value: safePreviousBuildId,
-              },
-            ]),
-          ]);
-          if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
-        }
+      for (const serviceName of patchedServices) {
+        const originalSelector = originalServiceSelectors.get(serviceName)!;
+        const revertResult = await execCapture("kubectl", [
+          "patch",
+          "service",
+          serviceName,
+          "-n",
+          namespace,
+          "--type=json",
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify([
+            {
+              op: "replace",
+              path: "/spec/selector",
+              value: originalSelector,
+            },
+          ]),
+        ]);
+        if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
       }
       // N25: the pools stay on the previous build, so the edge must too.
       const edge = await restoreEdgeToPreviousBuild();
-      // N67: restore the chart's autoscaling ceiling on the build we are abandoning.
-      await restoreWidenedHpas();
+      // N67: restore the chart's autoscaling bounds on the build we are abandoning.
+      await restoreWarmedHpas();
       console.error(`\n  DEPLOY FAILED: traffic was NOT switched to the new build.`);
       console.error(
-        `  ${patchFailures.length} of ${pools.length} pool Service selector patch(es) failed:`,
+        `  ${patchFailures.length} of ${serviceDestinations.length} Service selector patch(es) failed:`,
       );
       for (const f of patchFailures) {
         console.error(
@@ -2933,8 +3714,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `  WARNING: failed to restore selector(s) for: ${revertFailures.join(", ")}.`,
         );
         console.error(`  Traffic may be split across builds; repair those Services manually.`);
-      } else if (previousBuildId) {
-        console.error(`  Any successful selector patches were reverted to the previous build.`);
+      } else if (patchedServices.length > 0) {
+        console.error(`  Any successful selector patches were restored to their prior values.`);
       }
       console.error(`  Old deployments were left in place.`);
       for (const line of edgeStatusLines(edge)) console.error(line);
@@ -2976,12 +3757,40 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (imageDigests.routingService) {
         routingImageDigests[buildId] = imageDigests.routingService;
       }
+      // The stable routing Deployment is updated in place, so rollback must move its
+      // architecture selector with the target image. Record this build's exact platform and
+      // carry only the outgoing rollback target when its provenance is known.
+      const targetPlatforms: Record<string, TargetPlatform> = {};
+      const recordedPrevPlatform = previousBuildId
+        ? state?.targetPlatforms?.[previousBuildId]
+        : undefined;
+      if (previousBuildId && recordedPrevPlatform) {
+        targetPlatforms[previousBuildId] = recordedPrevPlatform;
+      }
+      targetPlatforms[buildId] = builtTargetPlatform;
       // N30: carry (and prune to the builds in play) the record of which builds have NO
       // retained routing manifest, so doctor can qualify "rollback ready" honestly.
       const unretainedManifestBuilds = [
         ...(state?.unretainedManifestBuilds ?? []).filter((b) => b === previousBuildId),
         ...(unretainedManifestBuild ? [unretainedManifestBuild] : []),
       ].filter((b, i, all) => all.indexOf(b) === i);
+      const compositionPlans: NonNullable<AdapterState["compositionPlans"]> = {};
+      const previousCompositionPlan = previousBuildId
+        ? state?.compositionPlans?.[previousBuildId]
+        : undefined;
+      if (previousBuildId && previousCompositionPlan) {
+        compositionPlans[previousBuildId] = previousCompositionPlan;
+      }
+      if (compositionSnapshot) {
+        compositionPlans[buildId] = {
+          digest: compositionSnapshot.digest,
+          targetFingerprint: compositionSnapshot.plan.target.fingerprint,
+        };
+      }
+      // A previous build with no surviving Deployments (previousPools === []) is recorded
+      // as ABSENT, not as an empty topology: recordedBuildPools rejects [] as malformed on
+      // the next read, and there is nothing for rollback to target anyway.
+      const recordablePreviousBuildId = previousPools.length > 0 ? previousBuildId : undefined;
       await writeState(
         projectDir,
         {
@@ -2989,6 +3798,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           previousBuildId,
           cdnTags,
           ...(Object.keys(routingImageDigests).length > 0 ? { routingImageDigests } : {}),
+          poolTopologies: {
+            ...(recordablePreviousBuildId
+              ? { [recordablePreviousBuildId]: [...previousPools] }
+              : {}),
+            [buildId]: [...pools],
+          },
+          ...(hasPortableOrigin || state?.defaultPools
+            ? {
+                defaultPools: {
+                  ...(recordablePreviousBuildId
+                    ? {
+                        [recordablePreviousBuildId]:
+                          state?.defaultPools?.[recordablePreviousBuildId] ?? previousPools[0]!,
+                      }
+                    : {}),
+                  [buildId]: defaultPool,
+                },
+              }
+            : {}),
+          targetPlatforms,
+          ...(Object.keys(compositionPlans).length > 0 ? { compositionPlans } : {}),
           // The build this deploy just installed serves /readyz, so the NEXT deploy can flip
           // the load balancer's HealthCheckPolicy to readiness without stranding it.
           readinessPathSupported: true,
@@ -3000,12 +3830,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           basedOnGeneration: state?.generation ?? null,
         },
         releaseName,
+        namespace,
       );
     } catch (err) {
-      // N67: the warm-up widening is scoped to the warm-up on this path too — traffic HAS
+      // N67: the temporary warm-up bounds are scoped to the warm-up on this path too — traffic HAS
       // switched, so the chart's own bounds are the right ones to autoscale under, and a
-      // deploy that exits here must not leave a widened autoscaler for the operator to find.
-      await restoreWidenedHpas();
+      // deploy that exits here must not leave a raised replica floor for the operator to find.
+      await restoreWarmedHpas();
       console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
       // L14: the error wraps cluster-sourced write/read failures.
       console.error(`  ${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}`);
@@ -3024,7 +3855,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // never be able to lose a confirmed cutover) and BEFORE the best-effort steps below, so
     // the HPA is chart-intended on every path out of this function. Scaling DOWN from here
     // is the autoscaler's decision under real load, bounded by the operator's config.
-    await restoreWidenedHpas();
+    await restoreWarmedHpas();
 
     // 7e. State is durable. Now invalidate the PREVIOUS build's Cloud CDN entries
     // (best-effort, non-fatal; TTL self-heals) so its stale content stops serving.
@@ -3032,7 +3863,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // are dropped — but after the state commit (7d) so a failure here can't leave
     // cluster state pointing at the outgoing build.
     const cdnFilterPath = path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml");
-    if (existsSync(cdnFilterPath) && infra.projectId) {
+    if (!compositionSnapshot && existsSync(cdnFilterPath) && infra.projectId) {
       try {
         await invalidateCdnBuildTag({
           projectId: infra.projectId,
@@ -3056,10 +3887,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // build down to 0. It served through the rollout and remains as the rollback target.
     // Best-effort: success is already durable (7d) — a failure here warns instead of
     // failing the whole deploy (the previous build just keeps burning replicas until the
-    // next deploy or a manual scale-down).
+    // next deploy or a manual scale-down). The outgoing HPA was transferred out of Helm
+    // release-manifest lifecycle before the upgrade so it could remain active while this build
+    // served. Delete it
+    // now and wait for that deletion to finish BEFORE setting replicas=0; if deletion fails,
+    // leave the Deployment alone rather than asking a still-live HPA to fight the scale command.
     if (previousBuildId && previousBuildId !== buildId) {
       let scaleDownFailed = false;
-      for (const poolName of pools) {
+      for (const poolName of previousPools) {
         // The HPA name must come from the SAME suffix-reserving helper the template
         // uses (hpa.ts truncates the base at 59, then appends "-hpa") — concatenating
         // "-hpa" onto the 63-truncated deployment name diverges past that boundary
@@ -3075,21 +3910,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "hpa",
           poolPrevHpa,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--ignore-not-found",
         ]);
+        if (hpaDelete.exitCode !== 0) {
+          scaleDownFailed = true;
+          console.warn(
+            `  ! Could not remove outgoing autoscaler ${poolPrevHpa}; leaving ` +
+              `${poolPrevName} at its current replica count because that HPA could immediately ` +
+              `undo a scale to zero: ${hpaDelete.stderr.trim() || "unknown error"}`,
+          );
+          continue;
+        }
         const scaleDown = await execCapture("kubectl", [
           "scale",
           `deployment/${poolPrevName}`,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--replicas=0",
         ]);
-        if (hpaDelete.exitCode !== 0 || scaleDown.exitCode !== 0) {
+        if (scaleDown.exitCode !== 0) {
           scaleDownFailed = true;
           console.warn(
             `  ! Could not scale down ${poolPrevName}: ` +
-              `${(scaleDown.stderr || hpaDelete.stderr).trim() || "unknown error"}`,
+              `${scaleDown.stderr.trim() || "unknown error"}`,
           );
         }
       }
@@ -3112,14 +3956,14 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       pools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${buildId}`)),
     );
     const previousDeployNames = previousBuildId
-      ? new Set(pools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
+      ? new Set(previousPools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
       : undefined;
 
     const allDeploys = await execCapture("kubectl", [
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -3150,10 +3994,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         }
         // Delete everything else
         console.log(`  → Deleting old build: ${name}`);
-        await execCapture("kubectl", ["delete", "deployment", name, "-n", K8S_NAMESPACE]);
-        await execCapture("kubectl", ["delete", "service", name, "-n", K8S_NAMESPACE]).catch(
-          () => {},
-        );
+        await execCapture("kubectl", ["delete", "deployment", name, "-n", namespace]);
+        await execCapture("kubectl", ["delete", "service", name, "-n", namespace]).catch(() => {});
         // This build's raw release/pool/buildId parts are unknowable here (`name` is a
         // cluster-listed deployment of a build state no longer tracks), so the HCP name
         // can't go through poolResourceNames. Re-sanitizing the deployment name with the
@@ -3167,9 +4009,49 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "healthcheckpolicy",
           sanitizeK8sName(name, "-hcp"),
           "-n",
-          K8S_NAMESPACE,
+          namespace,
         ]).catch(() => {});
       }
+    }
+
+    // Stable resources transferred out of Helm's deletion set deliberately survive without
+    // rewriting their managed-by label while their pool belongs to either build in play. Once a
+    // later successful cutover removes that pool from BOTH topologies, delete the exact
+    // adapter-retained Service/PDB/HCP group. This is post-state
+    // commit and best-effort: cleanup failure leaks bounded objects but cannot invalidate the
+    // serving cutover. The helper validates ownership, labels, names, and selectors before any
+    // deletion and keeps the Service as a retry anchor when a companion delete fails.
+    try {
+      let healthCheckPolicyCrd = false;
+      try {
+        healthCheckPolicyCrd = await hasHealthCheckPolicyCrd();
+      } catch (err) {
+        // Post-commit cleanup can still safely classify Service/PDB without cluster-wide CRD
+        // permission. Preserve a truthful warning that HCP cleanup was skipped.
+        console.warn(
+          `  ! Could not classify retained HealthCheckPolicy objects: ` +
+            `${err instanceof Error ? err.message : String(err)}. Service/PDB cleanup will ` +
+            `continue; any retained HCP was left in place.`,
+        );
+      }
+      const stableCleanup = await cleanupRetainedStablePoolResources({
+        releaseName,
+        namespace,
+        keepPools: new Set([...pools, ...previousPools]),
+        healthCheckPolicyCrd,
+      });
+      for (const deleted of stableCleanup.deleted) {
+        console.log(`  → Deleted obsolete retained stable resource: ${deleted}`);
+      }
+      for (const failure of stableCleanup.failures) {
+        console.warn(`  ! Retained stable-resource cleanup incomplete: ${failure}`);
+      }
+    } catch (err) {
+      console.warn(
+        `  ! Retained stable-resource cleanup could not run: ` +
+          `${err instanceof Error ? err.message : String(err)}. The deploy is committed; ` +
+          `the retained objects were left in place for a later retry.`,
+      );
     }
 
     // Clean up OLD route-ext Jobs (K8s Jobs are immutable; each deploy creates a fresh
@@ -3180,7 +4062,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "jobs",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
       "-o",
@@ -3189,7 +4071,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (oldJobs.exitCode === 0) {
       for (const jobName of oldJobs.stdout.trim().split("\n")) {
         if (!jobName || jobName === currentRouteExtJob) continue;
-        await execCapture("kubectl", ["delete", "job", jobName, "-n", K8S_NAMESPACE]);
+        await execCapture("kubectl", ["delete", "job", jobName, "-n", namespace]);
       }
     }
 
@@ -3209,10 +4091,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "configmaps",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
-        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s,` +
-          `app.kubernetes.io/component=routing-manifest-snapshot`,
+        `app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
         "-o",
         'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
       ]);
@@ -3220,7 +4102,31 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         for (const cmName of snapshots.stdout.trim().split("\n")) {
           if (!cmName || keepSnapshots.has(cmName)) continue;
           console.log(`  → Deleting old routing-manifest snapshot: ${cmName}`);
-          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", K8S_NAMESPACE]);
+          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
+        }
+      }
+
+      if (hasPortableOrigin) {
+        const keepPlans = new Set([
+          compositionPlanConfigMapName(releaseName, buildId),
+          compositionPlanConfigMapName(releaseName, previousBuildId),
+        ]);
+        const plans = await execCapture("kubectl", [
+          "get",
+          "configmaps",
+          "-n",
+          namespace,
+          "-l",
+          `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
+          "-o",
+          'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ]);
+        if (plans.exitCode === 0) {
+          for (const cmName of plans.stdout.trim().split("\n")) {
+            if (!cmName || keepPlans.has(cmName)) continue;
+            console.log(`  → Deleting old composition plan: ${cmName}`);
+            await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
+          }
         }
       }
     }
@@ -3245,7 +4151,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       "get",
       "deployments",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
@@ -3297,7 +4203,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         "get",
         "secrets",
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "-l",
         `app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
@@ -3308,7 +4214,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         for (const secretName of internalSecrets.stdout.trim().split("\n")) {
           if (!secretName || referencedSecrets.has(secretName)) continue;
           console.log(`  → Deleting unreferenced internal dispatch Secret: ${secretName}`);
-          await execCapture("kubectl", ["delete", "secret", secretName, "-n", K8S_NAMESPACE]);
+          await execCapture("kubectl", ["delete", "secret", secretName, "-n", namespace]);
         }
       }
     }

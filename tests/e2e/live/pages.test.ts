@@ -3,6 +3,31 @@ import { describe, expect, it } from "vitest";
 const BASE = process.env.E2E_PAGES_BASE_URL?.replace(/\/$/, "");
 
 describe.skipIf(!BASE)("deployed Pages entrypoint fixture", () => {
+  it("keeps static, SSR, ISR, and API outputs distinct", async () => {
+    const staticResponse = await fetch(`${BASE}/static-vary`);
+    expect(staticResponse.status).toBe(200);
+    expect(await staticResponse.text()).toContain("Pages static RSC vary probe");
+
+    const ssrResponse = await fetch(`${BASE}/ssr-probe`);
+    expect(ssrResponse.status).toBe(200);
+    const ssrDocument = await ssrResponse.text();
+    expect(ssrDocument).toContain('id="optional-catchall-slug"');
+    expect(ssrDocument).toContain("ssr-probe");
+
+    const slug = `live-${crypto.randomUUID()}`;
+    const isrResponse = await fetch(`${BASE}/isr/${slug}`);
+    expect(isrResponse.status).toBe(200);
+    expect(await isrResponse.text()).toContain(slug);
+
+    const apiResponse = await fetch(`${BASE}/api/probe?value=pages`);
+    expect(apiResponse.status).toBe(200);
+    expect(await apiResponse.json()).toEqual({
+      router: "pages-api",
+      method: "GET",
+      query: { value: "pages" },
+    });
+  });
+
   it("keeps the Pages data protocol out of root optional catch-all params", async () => {
     const documentResponse = await fetch(`${BASE}/`);
     expect(documentResponse.status).toBe(200);

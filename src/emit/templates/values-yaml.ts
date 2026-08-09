@@ -11,6 +11,11 @@ import {
   UNCONFIGURED_IMAGE_REGISTRY,
 } from "./utils.js";
 import { POOL_READINESS_PATH } from "./deployment.js";
+import {
+  DEFAULT_TARGET_PLATFORM,
+  targetArchitecture,
+  type TargetPlatform,
+} from "../../target-platform.js";
 
 /**
  * Pool defaults. Exported so the tests (and deploy's per-build snapshot) can pin the
@@ -29,17 +34,21 @@ export function renderValuesYaml({
   pools,
   buildId,
   nextVersion,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
   config,
   imageRegistry,
+  defaultPool = pools.keys().next().value,
 }: {
   pools: Map<string, PoolDefinition>;
   buildId: string;
   nextVersion: string;
+  targetPlatform?: TargetPlatform;
   config: K8sAdapterConfig;
   imageRegistry: string;
+  defaultPool?: string;
 }): string {
   // Output as JSON (valid YAML) with a comment header.
-  const gke = "gke" in config.provider ? config.provider.gke : undefined;
+  const gke = config.provider && "gke" in config.provider ? config.provider.gke : undefined;
 
   // Sanitize at the point of consumption (AGENTS.md): every value below is read straight
   // out of `next.config`/the build and lands in helm values that the templates splice into
@@ -52,6 +61,10 @@ export function renderValuesYaml({
 
   const values = {
     global: {
+      // The adapter publishes one platform per build, not a multi-arch index. Constrain every
+      // adapter-built workload to nodes that can execute that image; otherwise a mixed-arch
+      // cluster can schedule it onto the wrong node and fail only at image start.
+      targetArchitecture: targetArchitecture(targetPlatform),
       image: {
         registry: imageRegistry,
         repository: "nextjs-app",
@@ -141,6 +154,7 @@ export function renderValuesYaml({
       containerStrategy: config.containerStrategy ?? "traced-assets",
     },
     activeBuildId: sanitizeK8sName(buildId),
+    activeDefaultPool: defaultPool,
     // The path the LOAD BALANCER's HealthCheckPolicy probes on pool backends. Defaults to
     // readiness; `deploy` overrides it to the liveness path for one cycle when the outgoing
     // build may predate /readyz (see AdapterState.readinessPathSupported).

@@ -5,7 +5,11 @@ import { generateBuildMetadata } from "../../src/emit/metadata.js";
 const base = {
   buildId: "b12345",
   nextVersion: "16.2.0",
+  provider: "generic",
+  namespace: "apps",
+  targetPlatform: "linux/arm64" as const,
   poolNames: ["ssr"],
+  defaultPool: "ssr",
   generatedAt: "2026-01-01T00:00:00.000Z",
   containerStrategy: "traced-assets" as const,
   hasMiddleware: true,
@@ -20,7 +24,11 @@ describe("generateBuildMetadata", () => {
     expect(JSON.parse(generateBuildMetadata(base))).toEqual({
       buildId: "b12345",
       nextVersion: "16.2.0",
+      provider: "generic",
+      namespace: "apps",
+      targetPlatform: "linux/arm64",
       pools: ["ssr"],
+      defaultPool: "ssr",
       generatedAt: "2026-01-01T00:00:00.000Z",
       containerStrategy: "traced-assets",
       hasMiddleware: true,
@@ -64,5 +72,13 @@ describe("generateBuildMetadata", () => {
       JSON.parse(generateBuildMetadata({ ...base, cacheMemorystore: { region: "us-central1" } }))
         .cacheMemorystore,
     ).toEqual({ region: "us-central1" });
+  });
+
+  it("records the shared pool image layout only when the build emitted it", () => {
+    expect(JSON.parse(generateBuildMetadata(base)).poolImageLayout).toBeUndefined();
+    expect(
+      JSON.parse(generateBuildMetadata({ ...base, poolImageLayout: "shared-base-v1" }))
+        .poolImageLayout,
+    ).toBe("shared-base-v1");
   });
 });

@@ -24,6 +24,7 @@ function render(poolConfig: Record<string, unknown> = {}, overrides: Record<stri
     nextVersion: "16.2.0",
     config,
     imageRegistry: "us-docker.pkg.dev/p/r",
+    targetPlatform: "linux/amd64",
     ...overrides,
   } as Parameters<typeof renderValuesYaml>[0]);
 }
@@ -36,6 +37,14 @@ describe("renderValuesYaml", () => {
       limits: { cpu: DEFAULT_POOL_RESOURCES.cpuLimit, memory: DEFAULT_POOL_RESOURCES.memoryLimit },
     });
     expect(values.pools.ssr.replicas).toEqual(DEFAULT_POOL_SCALING);
+    expect(values.global.targetArchitecture).toBe("amd64");
+  });
+
+  it("records arm64 scheduling for an arm64 image build", () => {
+    const values = JSON.parse(
+      render({}, { targetPlatform: "linux/arm64" }).slice(render().indexOf("{")),
+    );
+    expect(values.global.targetArchitecture).toBe("arm64");
   });
 
   // -------------------------------------------------------------------------

@@ -1,16 +1,18 @@
 // src/emit/templates/utils.ts
 import { createHash } from "node:crypto";
 
-/**
- * The ONLY namespace this adapter deploys to. init binds Workload Identity to
- * `default/<release>-deploy-sa`, and every kubectl/helm call in the CLI pins this
- * literal instead of trusting the operator's current context. Build time
- * (adapter.ts) and deploy time (deploy.ts) both REJECT an infrastructure.json
- * `namespace` other than this: honoring it only in the ext_proc extension-chain
- * authority (extension-chain.ts) while workloads land in "default" skewed the
- * GXLB callout target and failed every edge callout.
- */
+/** Default release namespace when infrastructure.json does not declare one. */
 export const K8S_NAMESPACE = "default";
+
+/** Exact adapter ownership boundary for release-scoped Kubernetes resources. */
+export const ADAPTER_RELEASE_LABEL = "adapter-k8s.dev/release";
+
+/** Resolve and validate the release namespace at each cluster/YAML consumption boundary. */
+export function resolveK8sNamespace(namespace?: unknown): string {
+  const resolved = namespace ?? K8S_NAMESPACE;
+  assertSafeNamespace(resolved);
+  return resolved;
+}
 
 export function sanitizeK8sName(name: string, suffix = ""): string {
   // Lowercase, replace non-alphanumeric with hyphens
@@ -51,6 +53,10 @@ export function routingManifestSnapshotName(releaseName: string, buildId: string
   return sanitizeK8sName(`${releaseName}-rm-${buildId}`, `-${digest}`);
 }
 
+export function compositionPlanResourceName(releaseName: string, buildId: string): string {
+  return sanitizeK8sName(`${releaseName}-composition-${buildId}`);
+}
+
 /**
  * The per-pool, per-build sanitized resource names EXACTLY as the templates render
  * them: the versioned Deployment (deployment.ts) and its same-named Service
@@ -68,6 +74,27 @@ export interface PoolResourceNames {
   deployment: string;
   hpa: string;
   hcp: string;
+}
+
+export interface StablePoolResourceNames {
+  service: string;
+  pdb: string;
+  hcp: string;
+}
+
+/** Stable per-pool objects emitted together by renderActiveService. */
+export function stablePoolResourceNames(
+  releaseName: string,
+  poolName: string,
+): StablePoolResourceNames {
+  assertSafeReleaseName(releaseName);
+  assertSafePoolName(poolName);
+  const base = `${releaseName}-${poolName}`;
+  return {
+    service: sanitizeK8sName(base),
+    pdb: sanitizeK8sName(base, "-pdb"),
+    hcp: sanitizeK8sName(base, "-hcp"),
+  };
 }
 
 export function poolResourceNames(
@@ -174,9 +201,70 @@ export function findEmittedNameCollision(
   // truncation-proof, but the guard should not silently assume that).
   buckets.push([
     "ConfigMap",
-    buildIds.map((buildId) => routingManifestSnapshotName(releaseName, buildId)),
+    buildIds.flatMap((buildId) => [
+      routingManifestSnapshotName(releaseName, buildId),
+      compositionPlanResourceName(releaseName, buildId),
+    ]),
   ]);
 
+  for (const [kind, names] of buckets) {
+    const seen = new Set<string>();
+    for (const name of names) {
+      if (seen.has(name)) return { kind, name };
+      seen.add(name);
+    }
+  }
+  return null;
+}
+
+/**
+ * Deploy-time collision guard for two builds whose pool sets may differ.
+ *
+ * `findBuildIdNameCollision` deliberately projects both build ids over one pool list, which is
+ * correct at build time but invents `<previousBuild>-<newPool>` resources after a pool rename.
+ * That can false-positive on truncation while also missing a collision between differently named
+ * pools that really do coexist during blue/green. This variant enumerates only the resources each
+ * build actually emitted, plus the stable per-pool Services shared by their union.
+ */
+export function findBuildTopologyNameCollision(
+  releaseName: string,
+  current: { buildId: string; pools: string[] },
+  previous: { buildId: string; pools: string[] },
+): { kind: string; name: string } | null {
+  const deploymentish: string[] = [];
+  const hpas: string[] = [];
+  const hcps: string[] = [];
+
+  for (const build of [current, previous]) {
+    for (const pool of build.pools) {
+      const names = poolResourceNames(releaseName, pool, build.buildId);
+      deploymentish.push(names.deployment);
+      hpas.push(names.hpa);
+      hcps.push(names.hcp);
+    }
+  }
+  // A common pool has one shared stable Service/HCP, not one per build.
+  for (const pool of new Set([...current.pools, ...previous.pools])) {
+    deploymentish.push(sanitizeK8sName(`${releaseName}-${pool}`));
+    hcps.push(sanitizeK8sName(`${releaseName}-${pool}`, "-hcp"));
+  }
+  deploymentish.push(`${releaseName}-routing-service`);
+  hpas.push(`${releaseName}-routing-service-hpa`);
+
+  const buckets: Array<[string, string[]]> = [
+    ["Deployment/Service", deploymentish],
+    ["HorizontalPodAutoscaler", hpas],
+    ["HealthCheckPolicy", hcps],
+    [
+      "ConfigMap",
+      [
+        routingManifestSnapshotName(releaseName, current.buildId),
+        routingManifestSnapshotName(releaseName, previous.buildId),
+        compositionPlanResourceName(releaseName, current.buildId),
+        compositionPlanResourceName(releaseName, previous.buildId),
+      ],
+    ],
+  ];
   for (const [kind, names] of buckets) {
     const seen = new Set<string>();
     for (const name of names) {
@@ -233,7 +321,7 @@ const IMAGE_REGISTRY_RE =
 // Next.js build ids (default or from `generateBuildId()` — commonly a git ref in CI).
 // Excludes helm `--set` metacharacters (`,` `\`) and YAML/template breakouts (`"` `'` `{`).
 const BUILD_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
-const NAMESPACE_RE = /^[a-z0-9-]{1,63}$/;
+const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // GCS bucket naming rules (https://cloud.google.com/storage/docs/buckets#naming).
 const BUCKET_RE = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;
 
@@ -274,8 +362,7 @@ export function assertSafeImageRegistry(registry: string): void {
   }
 }
 
-// N66. A COMPLETE OCI image reference, as read back from a running Deployment's container
-// spec and re-interpolated into a double-quoted YAML scalar for a retained render:
+// A COMPLETE OCI image reference for a direct Deployment render:
 // `<registry>/<repo>[:tag][@sha256:…]`. Deliberately excludes the `"`/`\`/whitespace that
 // could break the scalar, and any scheme.
 const IMAGE_REFERENCE_RE =
@@ -301,11 +388,12 @@ export function assertSafeBuildId(buildId: string): void {
   }
 }
 
-export function assertSafeNamespace(namespace: string): void {
-  if (!NAMESPACE_RE.test(namespace)) {
+export function assertSafeNamespace(namespace: unknown): asserts namespace is string {
+  if (typeof namespace !== "string" || !NAMESPACE_RE.test(namespace)) {
     throw new Error(
-      `Invalid namespace "${namespace}": must match ${NAMESPACE_RE} ` +
-        `(lowercase letters, digits, and hyphens only, max 63 chars).`,
+      `Invalid namespace ${JSON.stringify(namespace)}: must be a DNS-1123 label ` +
+        `(lowercase letters, digits, and hyphens only, max 63 chars, and must start ` +
+        `and end with a letter or digit).`,
     );
   }
 }
@@ -504,10 +592,8 @@ export function assertSafeQuantity(value: string, field: string): void {
 }
 
 // N85. `readinessProbe.httpGet.path: ${readinessPath}` (deployment.ts) is another BARE YAML
-// scalar sink, and its value is no longer a constant: deploy snapshots the LIVE pod template's
-// probe path so a retained previous build keeps a probe its pods can satisfy (N66), which means
-// a cluster-sourced string reaches this interpolation. Same posture as the quantities above —
-// a narrow charset, rejected rather than escaped. Absolute path, no whitespace, no YAML
+// scalar sink. Same posture as the quantities above — a narrow charset, rejected rather than
+// escaped. Absolute path, no whitespace, no YAML
 // metacharacters; query strings are allowed because the pool matches on the parsed pathname.
 const PROBE_PATH_RE = /^\/[A-Za-z0-9._~\-/]*(\?[A-Za-z0-9._~\-/=&%]*)?$/;
 

@@ -3,7 +3,11 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { renderActiveService, renderService } from "../../../src/emit/templates/service.js";
+import {
+  renderActiveService,
+  renderOriginService,
+  renderService,
+} from "../../../src/emit/templates/service.js";
 import {
   findBuildIdNameCollision,
   findEmittedNameCollision,
@@ -72,17 +76,56 @@ describe("renderService (versioned)", () => {
   });
 });
 
+describe("renderOriginService (portable entrypoint)", () => {
+  it("selects the active default-pool pods through one stable Service", () => {
+    const yaml = renderOriginService({ poolName: "default", releaseName: "my-app" });
+    expect(yaml).toContain("name: my-app-origin");
+    expect(yaml).toContain('app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"');
+    expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
+    expect(yaml).toContain("port: 3000");
+    expect(yaml).not.toContain("kind: Deployment");
+    expect(yaml).not.toContain("kind: HorizontalPodAutoscaler");
+  });
+
+  it("validates release and pool names at the template boundary", () => {
+    expect(() => renderOriginService({ poolName: "default", releaseName: "BAD" })).toThrow(
+      /Invalid releaseName/,
+    );
+    expect(() => renderOriginService({ poolName: "-bad", releaseName: "my-app" })).toThrow(
+      /Invalid pool name/,
+    );
+  });
+
+  it("attaches the GKE health check to the origin backend when requested", () => {
+    const yaml = renderOriginService({
+      poolName: "default",
+      releaseName: "my-app",
+      emitHealthCheckPolicy: true,
+    });
+    expect(yaml).toContain("kind: HealthCheckPolicy");
+    expect(yaml).toContain("name: my-app-origin-hcp");
+    expect(yaml).toContain("name: my-app-origin");
+    expect(yaml).toContain("requestPath: {{ .Values.poolHealthCheckPath }}");
+  });
+});
+
 describe("renderActiveService (stable)", () => {
   it("keeps the cutover-patched selector on activeBuildId", () => {
     const yaml = renderActiveService({ poolName: "ssr", releaseName: "my-app" });
     expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
     expect(yaml).toContain("app.kubernetes.io/managed-by: adapter-k8s-active");
+    for (const document of yaml.split("---")) {
+      expect(document).toContain('helm.sh/resource-policy: ""');
+    }
   });
 
   it("carries the stable HealthCheckPolicy, probing READINESS not liveness (N32)", () => {
     const yaml = renderActiveService({ poolName: "ssr", releaseName: "my-app" });
     expect(yaml).toContain("kind: HealthCheckPolicy");
     expect(yaml).toContain("name: my-app-ssr-hcp");
+    const hcpDoc = yaml.split("---").find((d) => d.includes("HealthCheckPolicy"))!;
+    expect(hcpDoc).toContain('app.kubernetes.io/name: "my-app"');
+    expect(hcpDoc).toContain('app.kubernetes.io/component: "ssr"');
     // N32: this policy is the load balancer's OWN verdict — the last /healthz gate in the
     // cutover path. /healthz is a hardcoded 200 emitted before any routing/handler/manifest
     // work, so it cannot fail; /readyz 503s until the pod can actually serve.
@@ -110,8 +153,8 @@ describe("renderActiveService (stable)", () => {
   });
 
   it("N65: the PDB lives here (rendered once per pool), never in the per-build templates", () => {
-    // deploy.ts re-renders renderDeployment/renderService/renderHPA for the RETAINED
-    // previous build. A PDB in one of those would either duplicate a resource name or
+    // deploy.ts retains the previous versioned Service during cutover. A PDB there would
+    // either duplicate a resource name or
     // need per-build cleanup; renderActiveService is emitted exactly once per pool.
     const versioned = renderService({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });
     expect(versioned).not.toContain("PodDisruptionBudget");

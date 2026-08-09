@@ -1,5 +1,8 @@
 // src/emit/templates/routing-manifest-configmap.ts
-import { sanitizeK8sName, routingManifestSnapshotName as routingManifestSnapshotNameLocal } from "./utils.js";
+import {
+  sanitizeK8sName,
+  routingManifestSnapshotName as routingManifestSnapshotNameLocal,
+} from "./utils.js";
 import { renderConfigMap } from "./configmap.js";
 
 /**
@@ -17,6 +20,7 @@ import { renderConfigMap } from "./configmap.js";
 
 // Volume name in the routing-service Deployment template (routing-service-deployment.ts).
 export const ROUTING_MANIFEST_VOLUME_NAME = "routing-manifest";
+export const ROUTING_MANIFEST_SNAPSHOT_COMPONENT = "routing-manifest-snapshot";
 
 /** The stable ConfigMap the chart renders and helm overwrites each deploy. */
 export function routingManifestConfigMapName(releaseName: string): string {
@@ -66,6 +70,15 @@ export function renderRoutingManifestSnapshotConfigMap({
     name: suffix,
     releaseName,
     data: { "routing-manifest.json": routingManifestJson },
+    labels: {
+      "app.kubernetes.io/name": releaseName,
+      "app.kubernetes.io/component": ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
+    },
+    annotations: {
+      // The previous routing ReplicaSet mounts this exact name during the next rollout and
+      // rollback. Helm must retain it when the following chart stops rendering this build.
+      "helm.sh/resource-policy": "keep",
+    },
   });
 }
 

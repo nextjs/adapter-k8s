@@ -101,9 +101,7 @@ describe("createBuildSeedLookup", () => {
   });
 
   it("declines a prerender with no .rsc sibling rather than emit a half-usable entry", async () => {
-    writeManifest([
-      asset({ pathname: "/no-rsc", filePath: ".next/server/app/no-rsc.html" }),
-    ]);
+    writeManifest([asset({ pathname: "/no-rsc", filePath: ".next/server/app/no-rsc.html" })]);
     stage(".next/server/app/no-rsc.html", "<html>x</html>");
     const lookup = createBuildSeedLookup({ appRoot });
     expect(await lookup("/no-rsc")).toBeNull();
@@ -285,7 +283,10 @@ describe("filesystem-mirror seeds (PPR shells, segments — sub-shell-generation
     ]);
     stage(".next/server/app/covered.html", "<html>covered</html>");
     stage(".next/server/app/covered.rsc", "rsc");
-    stage(".next/server/app/covered.meta", JSON.stringify({ headers: { "x-next-cache-tags": "disk-tag" } }));
+    stage(
+      ".next/server/app/covered.meta",
+      JSON.stringify({ headers: { "x-next-cache-tags": "disk-tag" } }),
+    );
     const lookup = createBuildSeedLookup({ appRoot });
 
     const entry = await lookup("/covered", { kind: "APP_PAGE" });

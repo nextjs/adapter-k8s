@@ -1,8 +1,5 @@
 export const runtime = "edge";
 
-export async function GET(
-  _request: Request,
-  { params }: { params: Promise<{ slug?: string[] }> },
-) {
+export async function GET(_request: Request, { params }: { params: Promise<{ slug?: string[] }> }) {
   return Response.json(await params);
 }

@@ -1,4 +1,5 @@
 // src/emit/dockerfiles.ts
+import { DEFAULT_TARGET_PLATFORM, targetNodeCpu, type TargetPlatform } from "../target-platform.js";
 
 // N24: the emitted routing manifest wraps rewrite/redirect/header/fallback sources in
 // inline regexp modifiers — `(?i:…)` (manifest.ts caseInsensitiveSources) — so custom
@@ -65,28 +66,36 @@ function assertSafeSharpVersion(version: string): void {
 }
 
 // The in-image sharp install, shared by both emitted app Dockerfiles.
-function sharpInstallStep(installSharpVersion: string): string {
+// Keep it outside /app: npm would otherwise prune traced packages that are deliberately
+// absent from the minimal staged package.json before the container ever starts.
+function sharpInstallStep(installSharpVersion: string, targetPlatform: TargetPlatform): string {
   assertSafeSharpVersion(installSharpVersion);
-  return `# Build host had no linux-x64 sharp binding to stage — install it in-image so
-# /_next/image works (pool-server.cjs requires @img/sharp-linux-x64 at runtime).
-RUN npm install --no-save --no-audit --no-fund sharp@${installSharpVersion} \\
+  const cpu = targetNodeCpu(targetPlatform);
+  return `# Build host had no ${targetPlatform} sharp binding to stage — install it in-image so
+# /_next/image gets the native package matching this single-platform image.
+RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund \\
+    --os=linux --cpu=${cpu} --libc=glibc sharp@${installSharpVersion} \\
+ && cp -R /tmp/adapter-k8s-sharp/node_modules/. /app/node_modules/ \\
+ && rm -rf /tmp/adapter-k8s-sharp \\
  && npm cache clean --force
 `;
 }
 
 export function generateDockerfile({
-  containerStrategy,
+  containerStrategy: _containerStrategy,
   nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
 }: {
   containerStrategy: "shared-image" | "traced-assets";
   nodeVersion?: string;
+  targetPlatform?: TargetPlatform;
   buildId: string;
   /**
    * See generatePoolDockerfile. N50 (review #30): the shared-image context copies the app's
    * node_modules, which contains the BUILD HOST's @img/* platform packages — on a
-   * darwin/arm64 or musl host that is not the linux-x64 pair the emitted glibc image needs,
+   * host platform, which may not match the selected Linux/glibc target,
    * so this strategy needs the same in-image install fallback.
    */
   installSharpVersion?: string;
@@ -95,7 +104,7 @@ export function generateDockerfile({
   // `=== undefined` (not falsy): an EMPTY version string must reach the validator, which
   // rejects it, rather than silently skipping the install step.
   const sharpInstall =
-    installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion);
+    installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
   return `FROM ${baseImageRef(nodeVersion)}
 WORKDIR /app
 COPY --chown=node:node . .
@@ -111,18 +120,20 @@ CMD ["node", "pool-server.cjs"]
 export function generatePoolDockerfile({
   poolName,
   nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
 }: {
   poolName: string;
   nodeVersion?: string;
+  targetPlatform?: TargetPlatform;
   buildId: string;
   /**
-   * When the build host could not supply sharp's linux-x64 native packages
+   * When the build host could not supply the target platform's native sharp packages
    * (adapter.ts stageSharpRuntimePackages), install sharp inside the image —
    * npm running in the target container resolves the correct platform binding.
    * Pinned to the app's resolved sharp version so the native ABI matches the
-   * sharp JS inlined into pool-server.cjs.
+   * staged sharp JS package.
    */
   installSharpVersion?: string;
 }): string {
@@ -130,12 +141,61 @@ export function generatePoolDockerfile({
   // `=== undefined` (not falsy): an EMPTY version string must reach the validator, which
   // rejects it, rather than silently skipping the install step.
   const sharpInstall =
-    installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion);
+    installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
   // context/ is prepared by the adapter with exactly what's needed.
   return `FROM ${baseImageRef(nodeVersion)}
 WORKDIR /app
 COPY --chown=node:node context/ .
 ${sharpInstall}ENV NODE_ENV=production
+ENV POOL_NAME=${poolName}
+ENV NEXT_BUILD_ID=${buildId}
+ENV CONFIG_DIR=/app/config
+EXPOSE 3000
+USER node
+CMD ["node", "pool-server.cjs"]
+`;
+}
+
+/** Parent image for traced-assets builds with more than one pool. */
+export function generatePoolBaseDockerfile({
+  nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
+  targetPlatform = DEFAULT_TARGET_PLATFORM,
+  buildId,
+  installSharpVersion,
+}: {
+  nodeVersion?: string;
+  targetPlatform?: TargetPlatform;
+  buildId: string;
+  installSharpVersion?: string;
+}): string {
+  assertSupportedNodeVersion(nodeVersion);
+  const sharpInstall =
+    installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
+  return `FROM ${baseImageRef(nodeVersion)}
+WORKDIR /app
+COPY --chown=node:node dependencies/ .
+${sharpInstall}COPY --chown=node:node content/ .
+COPY --chown=node:node fetch-cache/ .
+ENV NODE_ENV=production
+ENV NEXT_BUILD_ID=${buildId}
+ENV CONFIG_DIR=/app/config
+EXPOSE 3000
+USER node
+CMD ["node", "pool-server.cjs"]
+`;
+}
+
+/** Thin pool delta layered over the local parent built by the deploy command. */
+export function generateLayeredPoolDockerfile({
+  poolName,
+  buildId,
+}: {
+  poolName: string;
+  buildId: string;
+}): string {
+  return `ARG POOL_BASE_IMAGE=localhost/adapter-k8s-pool-base-required--update-cli:latest
+FROM \${POOL_BASE_IMAGE}
+COPY --chown=node:node context/ .
 ENV POOL_NAME=${poolName}
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config
@@ -163,9 +223,9 @@ export function generateRoutingServiceDockerfile({
   // TLS_KEY_FILE exist, and plaintext h2c otherwise (local emulate).
   return `FROM ${baseImageRef(nodeVersion)}
 WORKDIR /app
-COPY --chown=node:node context/ .
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \\
  && rm -rf /var/lib/apt/lists/*
+COPY --chown=node:node context/ .
 ENV NODE_ENV=production
 ENV NEXT_BUILD_ID=${buildId}
 ENV CONFIG_DIR=/app/config

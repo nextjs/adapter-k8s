@@ -46,12 +46,18 @@ export type ResolveResult =
       invokePath?: string | undefined;
       /** Resolved user query for the documented handler context. */
       invocationQuery?: Record<string, string | string[]> | undefined;
+      /** Trusted absolute Unix execution deadline propagated across pool hops. */
+      executionDeadlineAt?: number | undefined;
     }
   | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
   | { kind: "error"; status: number }
   | { kind: "middleware-response"; response: Response }
   | { kind: "external-rewrite"; url: URL }
-  | { kind: "not-found"; resolvedHeaders?: Headers | undefined };
+  | {
+      kind: "not-found";
+      resolvedHeaders?: Headers | undefined;
+      middlewareRequestHeaders?: Headers | undefined;
+    };
 
 export function createLocalResolver(
   manifest: RoutingManifest,
@@ -110,7 +116,8 @@ export function createLocalResolver(
       // the build-scoped /_next/data protocol; accepting it on an arbitrary
       // document URL makes middleware redirects lose Location.
       const routingHeaders = new Headers(headers);
-      if (!prep.isDataRequest) routingHeaders.delete("x-nextjs-data");
+      if (prep.isDataRequest) routingHeaders.set("x-nextjs-data", "1");
+      else routingHeaders.delete("x-nextjs-data");
 
       // A declared middleware policy without an executable implementation is a server error,
       // never an implicit `next()`. This resolver is the security fallback when ext_proc is
@@ -508,7 +515,11 @@ export function createLocalResolver(
       if (!pool) {
         // Preserve headers set by middleware (NextResponse.next() with headers)
         // and route rules — they must still reach the 404 response.
-        return { kind: "not-found", resolvedHeaders: resolution.resolvedHeaders ?? undefined };
+        return {
+          kind: "not-found",
+          resolvedHeaders: resolution.resolvedHeaders ?? undefined,
+          middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
+        };
       }
 
       // Output-key resolution (normalize → prefer a concrete output over a dynamic
@@ -662,3 +673,63 @@ function isSameDeploymentRewrite(requestUrl: URL, rewriteUrl: URL): boolean {
 }
 
 export type LocalResolver = ReturnType<typeof createLocalResolver>;
+
+export type PlatformResolveResult =
+  | Exclude<ResolveResult, { kind: "not-found" }>
+  | {
+      kind: "continue-platform";
+      resolvedHeaders?: Headers | undefined;
+      middlewareRequestHeaders?: Headers | undefined;
+    };
+
+/**
+ * Run the normal Next routing phase before a platform-owned route such as the image optimizer.
+ * A filesystem route selected only because it broadly matches the original pathname must not
+ * displace the platform route. Rewrites are different: an invocation target that is not the same
+ * normalized public URL remains terminal.
+ */
+export async function resolvePlatformRequest(
+  resolver: LocalResolver,
+  url: URL,
+  headers: Headers,
+  method: string,
+  requestBody: ReadableStream<Uint8Array>,
+): Promise<PlatformResolveResult> {
+  const resolution = await resolver.resolve(url, headers, method, requestBody);
+  if (
+    resolution.kind === "not-found" ||
+    (resolution.kind === "route" &&
+      (resolution.invokePath === undefined || targetsSamePlatformUrl(resolution.invokePath, url)))
+  ) {
+    return {
+      kind: "continue-platform",
+      resolvedHeaders: resolution.resolvedHeaders,
+      middlewareRequestHeaders: resolution.middlewareRequestHeaders,
+    };
+  }
+  return resolution;
+}
+
+export function targetsSamePlatformUrl(invokePath: string, requestUrl: URL): boolean {
+  const target = new URL(invokePath, requestUrl);
+  return (
+    target.origin === requestUrl.origin &&
+    target.pathname === requestUrl.pathname &&
+    equalSearchParams(target.searchParams, requestUrl.searchParams)
+  );
+}
+
+function equalSearchParams(left: URLSearchParams, right: URLSearchParams): boolean {
+  const keys = new Set([...left.keys(), ...right.keys()]);
+  for (const key of keys) {
+    const leftValues = left.getAll(key);
+    const rightValues = right.getAll(key);
+    if (
+      leftValues.length !== rightValues.length ||
+      leftValues.some((value, index) => value !== rightValues[index])
+    ) {
+      return false;
+    }
+  }
+  return true;
+}

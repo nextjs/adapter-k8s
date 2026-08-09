@@ -1,13 +1,35 @@
 // src/cli/destroy.ts
-import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import readline from "node:readline";
 import { execCapture } from "./exec.js";
 import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
-import { K8S_NAMESPACE } from "../emit/templates/utils.js";
+import { ROUTING_MANIFEST_SNAPSHOT_COMPONENT } from "../emit/templates/routing-manifest-configmap.js";
+import { COMPOSITION_PLAN_COMPONENT } from "../emit/templates/composition-plan-configmap.js";
+import {
+  ADAPTER_RELEASE_LABEL,
+  assertSafePoolName,
+  assertSafeReleaseName,
+  poolResourceNames,
+  resolveK8sNamespace,
+  sanitizeK8sName,
+  stablePoolResourceNames,
+} from "../emit/templates/utils.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
+import { readState, StateUnavailableError } from "./state.js";
+import {
+  compositionPlanNeedsExplicitConfirmation,
+  loadDeployedCompositionPlan,
+  loadProjectCompositionPlan,
+  preflightCompositionPlan,
+  type LoadedCompositionPlan,
+} from "./composition-plan.js";
+import type {
+  ExternalCleanupOperation,
+  KubernetesOwnedObject,
+  RetainedExternalResource,
+} from "../composition-plan/index.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -56,6 +78,227 @@ export function isAlreadyGoneError(stderr: string): boolean {
     s.includes("does not exist") ||
     s.includes("was not found") ||
     s.includes("release: not found")
+  );
+}
+
+function parseKubernetesList(stdout: string, description: string): unknown[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (err) {
+    throw new Error(
+      `${description} returned invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const items = (parsed as { items?: unknown })?.items;
+  if (!Array.isArray(items)) {
+    throw new Error(`${description} did not contain an items array`);
+  }
+  return items;
+}
+
+interface PoolDeploymentIdentity {
+  name: string;
+}
+
+/**
+ * Prove the exact versioned pool Deployments whose autoscalers this release may own.
+ *
+ * The API-server selector is intentionally broad enough to find pre-ownership-label releases.
+ * The runtime env, component/version labels and exact adapter-derived name must all agree before
+ * a Deployment becomes an HPA ownership root; never infer ownership from a name prefix or generic
+ * Helm labels.
+ */
+function parsePoolDeploymentIdentities(
+  stdout: string,
+  releaseName: string,
+): PoolDeploymentIdentity[] {
+  const result: PoolDeploymentIdentity[] = [];
+  const names = new Set<string>();
+  for (const item of parseKubernetesList(stdout, "Versioned pool Deployment listing") as {
+    metadata?: { name?: unknown; labels?: Record<string, unknown> };
+    spec?: {
+      template?: {
+        spec?: {
+          containers?: { name?: unknown; env?: { name?: unknown; value?: unknown }[] }[];
+        };
+      };
+    };
+  }[]) {
+    const name = item?.metadata?.name;
+    const labels = item?.metadata?.labels;
+    const component = labels?.["app.kubernetes.io/component"];
+    const version = labels?.["app.kubernetes.io/version"];
+    const poolContainer = item?.spec?.template?.spec?.containers?.find(
+      (container) => container?.name === "pool-server",
+    );
+    const env = new Map(
+      (poolContainer?.env ?? [])
+        .filter(
+          (entry): entry is { name: string; value: string } =>
+            typeof entry?.name === "string" && typeof entry.value === "string",
+        )
+        .map((entry) => [entry.name, entry.value]),
+    );
+    const rawBuildId = env.get("NEXT_BUILD_ID");
+    const rawPool = env.get("POOL_NAME");
+    const rawRelease = env.get("RELEASE_NAME");
+
+    // This list is intentionally broad enough to find pre-label resources. A foreign Helm
+    // Deployment can share the generic app/version labels, so unprovable objects are skipped,
+    // not promoted into deletion authority. The runtime identity and exact adapter-derived name
+    // are what make a legacy Deployment an HPA ownership root.
+    if (
+      typeof name !== "string" ||
+      labels?.["app.kubernetes.io/name"] !== releaseName ||
+      typeof component !== "string" ||
+      component === "routing-service" ||
+      typeof version !== "string" ||
+      rawRelease !== releaseName ||
+      rawPool !== component ||
+      typeof rawBuildId !== "string"
+    ) {
+      continue;
+    }
+    try {
+      assertSafePoolName(component);
+      const expected = poolResourceNames(releaseName, component, rawBuildId);
+      if (name !== expected.deployment || version !== sanitizeK8sName(rawBuildId)) continue;
+    } catch {
+      continue;
+    }
+    if (names.has(name)) {
+      throw new Error(`Versioned pool Deployment listing repeated Deployment "${name}"`);
+    }
+    names.add(name);
+    result.push({ name });
+  }
+  return result;
+}
+
+/** Select only adapter-named HPAs that target one of the exact owned Deployment identities. */
+function parseOwnedHpaNames(stdout: string, deployments: PoolDeploymentIdentity[]): string[] {
+  const targets = new Set(deployments.map(({ name }) => name));
+  const names = new Set<string>();
+  for (const item of parseKubernetesList(stdout, "HPA listing") as {
+    metadata?: { name?: unknown };
+    spec?: {
+      scaleTargetRef?: { apiVersion?: unknown; kind?: unknown; name?: unknown };
+    };
+  }[]) {
+    const target = item?.spec?.scaleTargetRef;
+    if (typeof target?.name !== "string" || !targets.has(target.name)) continue;
+
+    const name = item?.metadata?.name;
+    const expected = sanitizeK8sName(target.name, "-hpa");
+    if (
+      target.apiVersion !== "apps/v1" ||
+      target.kind !== "Deployment" ||
+      typeof name !== "string" ||
+      name !== expected
+    ) {
+      // A foreign autoscaler can target an adapter Deployment. Its target does not make it
+      // adapter-owned; only the exact name emitted by hpa.ts is eligible for deletion.
+      continue;
+    }
+    names.add(name);
+  }
+  return [...names];
+}
+
+type StablePoolResourceKind = "service" | "poddisruptionbudget" | "healthcheckpolicy";
+
+/** Validate topology-retained stable pool objects before deleting any exact name. */
+function parseStablePoolResourceNames(
+  stdout: string,
+  kind: StablePoolResourceKind,
+  releaseName: string,
+  namespace: string,
+): string[] {
+  const names = new Set<string>();
+  for (const item of parseKubernetesList(stdout, `Retained ${kind} listing`) as {
+    metadata?: {
+      name?: unknown;
+      labels?: Record<string, unknown>;
+      annotations?: Record<string, unknown>;
+    };
+    spec?: {
+      selector?: Record<string, unknown>;
+      targetRef?: { group?: unknown; kind?: unknown; name?: unknown };
+    };
+  }[]) {
+    const name = item?.metadata?.name;
+    const labels = item?.metadata?.labels;
+    const annotations = item?.metadata?.annotations;
+    const component = labels?.["app.kubernetes.io/component"];
+    if (
+      typeof name !== "string" ||
+      labels?.["app.kubernetes.io/name"] !== releaseName ||
+      labels?.[ADAPTER_RELEASE_LABEL] !== releaseName ||
+      annotations?.["meta.helm.sh/release-name"] !== releaseName ||
+      annotations?.["meta.helm.sh/release-namespace"] !== namespace ||
+      typeof component !== "string"
+    ) {
+      throw new Error(
+        `Retained ${kind} listing contained an object without the exact pool identity`,
+      );
+    }
+    if (component === "routing-service") continue;
+    assertSafePoolName(component);
+    const resourceNames = stablePoolResourceNames(releaseName, component);
+    const expected =
+      kind === "service"
+        ? resourceNames.service
+        : kind === "poddisruptionbudget"
+          ? resourceNames.pdb
+          : resourceNames.hcp;
+    if (name !== expected) {
+      throw new Error(
+        `Retained ${kind} "${name}" claims pool "${component}", but its adapter-derived ` +
+          `name is "${expected}"`,
+      );
+    }
+    const selector = item?.spec?.selector;
+    if (
+      kind === "service" &&
+      (selector?.["app.kubernetes.io/name"] !== releaseName ||
+        selector?.["app.kubernetes.io/component"] !== component)
+    ) {
+      throw new Error(`Retained service "${name}" does not select its exact pool identity`);
+    }
+    if (kind === "poddisruptionbudget") {
+      const matchLabels = selector?.matchLabels as Record<string, unknown> | undefined;
+      if (
+        matchLabels?.["app.kubernetes.io/name"] !== releaseName ||
+        matchLabels?.["app.kubernetes.io/component"] !== component
+      ) {
+        throw new Error(
+          `Retained poddisruptionbudget "${name}" does not select its exact pool identity`,
+        );
+      }
+    }
+    if (
+      kind === "healthcheckpolicy" &&
+      (item?.spec?.targetRef?.group !== "" ||
+        item.spec.targetRef.kind !== "Service" ||
+        item.spec.targetRef.name !== resourceNames.service)
+    ) {
+      throw new Error(
+        `Retained healthcheckpolicy "${name}" does not target its exact stable Service`,
+      );
+    }
+    names.add(name);
+  }
+  return [...names];
+}
+
+function isOptionalHealthCheckPolicyApiMissing(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  if (NOT_GONE_MARKERS.some((marker) => s.includes(marker))) return false;
+  return (
+    s.includes('the server doesn\'t have a resource type "healthcheckpolicy"') ||
+    s.includes('no matches for kind "healthcheckpolicy"') ||
+    s.includes("could not find the requested resource")
   );
 }
 
@@ -147,6 +390,207 @@ export function buildReleaseScopedGcpResources(
   ];
 }
 
+export function buildExternalCleanupCommand(operation: ExternalCleanupOperation): {
+  desc: string;
+  command: "gcloud";
+  args: string[];
+} {
+  switch (operation.kind) {
+    case "gcp-storage-bucket":
+      return {
+        desc: `GCS bucket "${operation.bucket}"`,
+        command: "gcloud",
+        args: [
+          "storage",
+          "rm",
+          "-r",
+          `gs://${operation.bucket}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-service-account":
+      return {
+        desc: `service account "${operation.email}"`,
+        command: "gcloud",
+        args: [
+          "iam",
+          "service-accounts",
+          "delete",
+          operation.email,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-memorystore":
+      return {
+        desc: `Memorystore instance "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "redis",
+          "instances",
+          "delete",
+          operation.name,
+          `--region=${operation.region}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-traffic-extension":
+      return {
+        desc: `traffic extension "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "service-extensions",
+          "lb-traffic-extensions",
+          "delete",
+          operation.name,
+          `--location=${operation.location}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-backend-service":
+      return {
+        desc: `backend service "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "compute",
+          "backend-services",
+          "delete",
+          operation.name,
+          `--${operation.scope}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-health-check":
+      return {
+        desc: `health check "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "compute",
+          "health-checks",
+          "delete",
+          operation.name,
+          `--${operation.scope}`,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-global-address":
+      return {
+        desc: `global address "${operation.name}"`,
+        command: "gcloud",
+        args: [
+          "compute",
+          "addresses",
+          "delete",
+          operation.name,
+          "--global",
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+    case "gcp-custom-iam-role":
+      return {
+        desc: `custom IAM role "${operation.roleId}"`,
+        command: "gcloud",
+        args: [
+          "iam",
+          "roles",
+          "delete",
+          operation.roleId,
+          `--project=${operation.projectId}`,
+          "--quiet",
+        ],
+      };
+  }
+}
+
+function retainedResourceGuidance(resource: RetainedExternalResource): {
+  description: string;
+  command: string;
+} {
+  switch (resource.kind) {
+    case "gke-cluster": {
+      const locationFlag = resource.location.kind === "zone" ? "--zone" : "--region";
+      return {
+        description: `GKE cluster "${resource.clusterName}"`,
+        command:
+          `gcloud container clusters delete ${resource.clusterName} ${locationFlag} ` +
+          `${resource.location.name} --project ${resource.projectId}`,
+      };
+    }
+    case "gcp-artifact-registry":
+      return {
+        description: `Artifact Registry "${resource.repository}"`,
+        command:
+          `gcloud artifacts repositories delete ${resource.repository} --location ` +
+          `${resource.region} --project ${resource.projectId}`,
+      };
+    case "gcp-certificate-manager":
+      return {
+        description: `Certificate Manager resources prefixed "${resource.releasePrefix}"`,
+        command:
+          `gcloud certificate-manager maps list --project ${resource.projectId} ` +
+          `--filter=name:${resource.releasePrefix}`,
+      };
+  }
+}
+
+export async function removePlannedKubernetesObject(
+  owned: KubernetesOwnedObject,
+  dryRun: boolean,
+): Promise<string | null> {
+  const ref = owned.ref;
+  const namespaceArgs = ref.namespace ? ["-n", ref.namespace] : [];
+  const getArgs = [
+    "get",
+    ref.resource,
+    ref.name,
+    ...namespaceArgs,
+    "--ignore-not-found",
+    "-o",
+    "json",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${getArgs.join(" ")}`);
+    console.log(
+      `  [dry-run] would verify ${owned.ownership.releaseLabel.key}=` +
+        `${owned.ownership.releaseLabel.value} before exact deletion`,
+    );
+    return null;
+  }
+  const read = await execCapture("kubectl", getArgs);
+  if (read.exitCode !== 0) {
+    return `${ref.resource} ${ref.name}: ${sanitizeForTerminal(read.stderr.trim()) || `exit ${read.exitCode}`}`;
+  }
+  if (!read.stdout.trim()) return null;
+  let labels: Record<string, unknown> | undefined;
+  try {
+    labels = JSON.parse(read.stdout)?.metadata?.labels;
+  } catch {
+    return `${ref.resource} ${ref.name}: invalid Kubernetes object JSON`;
+  }
+  if (labels?.[owned.ownership.releaseLabel.key] !== owned.ownership.releaseLabel.value) {
+    return (
+      `${ref.resource} ${ref.name}: ownership label ` +
+      `${owned.ownership.releaseLabel.key} does not match ${owned.ownership.releaseLabel.value}`
+    );
+  }
+  const deleted = await execCapture("kubectl", [
+    "delete",
+    ref.resource,
+    ref.name,
+    ...namespaceArgs,
+    "--ignore-not-found",
+  ]);
+  return deleted.exitCode === 0
+    ? null
+    : `${ref.resource} ${ref.name}: ${sanitizeForTerminal(deleted.stderr.trim()) || `exit ${deleted.exitCode}`}`;
+}
+
 function promptConfirmation(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
@@ -160,12 +604,15 @@ function promptConfirmation(question: string): Promise<string> {
 export async function runDestroy(options: DestroyOptions): Promise<void> {
   const { projectDir, releaseName, dryRun, yes } = options;
 
+  assertSafeReleaseName(releaseName);
   const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
+  const namespace = resolveK8sNamespace(infra?.namespace);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
+  const localComposition = loadProjectCompositionPlan(projectDir);
 
   // L12: destroying is irreversible — gate it. --yes (or -y) skips the prompt and is
   // REQUIRED non-interactively; --dry-run never deletes and skips the gate entirely.
@@ -225,7 +672,34 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // current, and destroying the wrong cluster's release is unrecoverable. Every other
   // command (deploy/rollback/doctor) already does this; destroy historically did not.
   // Dry-run must not mutate the operator's kubeconfig (L13).
-  if (!dryRun && projectId && region) {
+  if (!dryRun && localComposition) {
+    let explicitlyConfirmed = yes === true;
+    if (compositionPlanNeedsExplicitConfirmation(localComposition.plan) && !explicitlyConfirmed) {
+      const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+      const currentContext =
+        ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
+      console.warn(
+        `\n  !!! WARNING: the composition plan requires explicit confirmation of the ` +
+          `current kubectl context:\n      ${currentContext || "(unavailable)"}\n`,
+      );
+      const answer = await promptConfirmation(
+        `  Type "yes" to confirm this is the release's intended cluster: `,
+      );
+      if (answer.trim() !== "yes") {
+        throw new Error(
+          "Destroy aborted: the composition-plan cluster was not confirmed. No resources were deleted.",
+        );
+      }
+      explicitlyConfirmed = true;
+    }
+    const preflight = await preflightCompositionPlan(localComposition.plan, {
+      explicitlyConfirmed,
+    });
+    console.log(
+      `  → Composition plan verified: ${preflight.clusterIdentity}; Kubernetes ` +
+        `${preflight.serverVersion}`,
+    );
+  } else if (!dryRun && projectId && region) {
     const clusterName = `${releaseName}-cluster`;
     console.log(`  → Connecting to GKE cluster "${clusterName}"...`);
     const cred = await execCapture("gcloud", [
@@ -246,7 +720,12 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       );
     }
   } else if (dryRun) {
-    if (projectId && region) {
+    if (localComposition) {
+      console.log(
+        `  [dry-run] Verified local composition plan ${localComposition.digest}; cluster ` +
+          `access and identity checks are skipped because they would read or change context.`,
+      );
+    } else if (projectId && region) {
       console.log(
         `  [dry-run] Skipping "gcloud container clusters get-credentials" (it would mutate your kubeconfig).`,
       );
@@ -296,13 +775,138 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
-  // 1. Helm uninstall. The release lives in the "default" namespace — the same one init
-  // binds Workload Identity to — so pin it instead of trusting the context's namespace.
+  // Retain verified plans in memory before any ConfigMap or Helm deletion. Cluster state may
+  // select label-verified Kubernetes objects, but external cleanup is authorized separately by
+  // the authenticated local build plan below.
+  const plannedSnapshots: LoadedCompositionPlan[] = localComposition ? [localComposition] : [];
+  let usesCompositionPlan = localComposition !== null;
+  if (!dryRun) {
+    const state = await readState(projectDir, releaseName, { namespace }).catch(
+      (error: unknown) => {
+        if (!(error instanceof StateUnavailableError)) throw error;
+        if (localComposition) {
+          console.warn(
+            `  ! Deploy state is unavailable; continuing from the locally verified composition ` +
+              `plan only: ${sanitizeForTerminal(error.message.split("\n")[0]!)}`,
+          );
+        }
+        return null;
+      },
+    );
+    if (state?.compositionPlans) {
+      usesCompositionPlan = true;
+      for (const buildId of [state.buildId, state.previousBuildId].filter(
+        (value): value is string => typeof value === "string",
+      )) {
+        const expected = state.compositionPlans[buildId];
+        if (!expected) continue;
+        if (
+          localComposition?.plan.metadata.buildId === buildId &&
+          (localComposition.digest !== expected.digest ||
+            localComposition.plan.target.fingerprint !== expected.targetFingerprint)
+        ) {
+          throw new Error(
+            `Local composition plan for ${buildId} does not match committed deploy state. ` +
+              `No resources were deleted.`,
+          );
+        }
+        const snapshot =
+          localComposition?.plan.metadata.buildId === buildId
+            ? localComposition
+            : await loadDeployedCompositionPlan({
+                releaseName,
+                namespace,
+                buildId,
+                expected,
+              });
+        if (!snapshot) {
+          throw new Error(
+            `Committed composition plan for ${buildId} is missing. No resources were deleted.`,
+          );
+        }
+        if (!plannedSnapshots.some((entry) => entry.digest === snapshot.digest)) {
+          plannedSnapshots.push(snapshot);
+        }
+      }
+    }
+  }
+
+  // Snapshot exact versioned Deployment identities BEFORE Helm removes the current release.
+  // Legacy/rollback-created HPAs have no labels at all, so after their target Deployment is gone
+  // there is no safe way to distinguish them from another operator's autoscaler. The target
+  // relation is the migration seam: only the adapter-derived HPA name pointing at one of these
+  // exact, strongly-labeled Deployments is eligible for the post-uninstall exact-name sweep.
+  const legacyRolloutDiscoverySelector = `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version`;
+  const retainedRolloutSelector =
+    `${ADAPTER_RELEASE_LABEL}=${releaseName},` +
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version`;
+  const poolDeploymentListArgs = [
+    "get",
+    "deployments",
+    "-n",
+    namespace,
+    "-l",
+    legacyRolloutDiscoverySelector,
+    "-o",
+    "json",
+  ];
+  const hpaListArgs = ["get", "hpa", "-n", namespace, "-o", "json"];
+  let exactOwnedHpas: string[] = [];
   if (dryRun) {
-    console.log(`  [dry-run] helm uninstall ${releaseName} --namespace default`);
+    console.log(`  [dry-run] kubectl ${poolDeploymentListArgs.join(" ")}`);
+    console.log(`  [dry-run] kubectl ${hpaListArgs.join(" ")}`);
+    console.log(
+      "  [dry-run] would delete only adapter-named HPAs whose scaleTargetRef matches an " +
+        "exact selected Deployment",
+    );
+  } else {
+    const deploymentList = await execCapture("kubectl", poolDeploymentListArgs);
+    if (deploymentList.exitCode !== 0) {
+      throw new Error(
+        `Could not discover versioned pool Deployment identities before Helm uninstall: ` +
+          `${sanitizeForTerminal(deploymentList.stderr.trim()) || `exit ${deploymentList.exitCode}`}. ` +
+          `No resources were deleted; refusing to orphan legacy unlabeled HPAs.`,
+      );
+    }
+
+    let deployments: PoolDeploymentIdentity[];
+    try {
+      deployments = parsePoolDeploymentIdentities(deploymentList.stdout, releaseName);
+    } catch (err) {
+      throw new Error(
+        `Could not validate versioned pool Deployment identities before Helm uninstall: ` +
+          `${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}. ` +
+          `No resources were deleted; refusing to orphan legacy unlabeled HPAs.`,
+      );
+    }
+
+    if (deployments.length > 0) {
+      const hpaList = await execCapture("kubectl", hpaListArgs);
+      if (hpaList.exitCode !== 0) {
+        throw new Error(
+          `Could not discover retained HPAs before Helm uninstall: ` +
+            `${sanitizeForTerminal(hpaList.stderr.trim()) || `exit ${hpaList.exitCode}`}. ` +
+            `No resources were deleted.`,
+        );
+      }
+      try {
+        exactOwnedHpas = parseOwnedHpaNames(hpaList.stdout, deployments);
+      } catch (err) {
+        throw new Error(
+          `Could not validate retained HPAs before Helm uninstall: ` +
+            `${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}. ` +
+            `No resources were deleted.`,
+        );
+      }
+    }
+  }
+
+  // Pin every cluster-side deletion to the release namespace instead of trusting the context.
+  if (dryRun) {
+    console.log(`  [dry-run] helm uninstall ${releaseName} --namespace ${namespace}`);
   } else {
     console.log("  → Running helm uninstall...");
-    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", "default"]);
+    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", namespace]);
     if (res.exitCode !== 0) {
       if (isAlreadyGoneError(res.stderr)) {
         console.log("    (release not found or already uninstalled)");
@@ -315,6 +919,155 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
+  // Deploy transfers the outgoing pool Deployments and HPAs out of Helm's release manifest
+  // with `helm.sh/resource-policy: keep`. That is required for an abort-safe blue/green rollout,
+  // but it also means `helm uninstall` intentionally leaves those objects behind. A failed deploy
+  // can leave the incoming build behind as well. Sweep every versioned pool object after uninstall
+  // instead of relying on deploy state, which may describe only the last successful cutover.
+  //
+  // The deletion selector is deliberately stricter than generic Kubernetes conventions:
+  // namespace + the adapter's exact release ownership label + matching app/version identity. A
+  // foreign Helm resource can legitimately share app.kubernetes.io/name and managed-by values;
+  // neither is deletion authority. The version requirement excludes the stable routing tier.
+  for (const hpaName of exactOwnedHpas) {
+    const exactDelete = await execCapture("kubectl", [
+      "delete",
+      "hpa",
+      hpaName,
+      "-n",
+      namespace,
+      "--ignore-not-found",
+    ]);
+    if (exactDelete.exitCode !== 0 && !isAlreadyGoneError(exactDelete.stderr)) {
+      console.warn(
+        `    WARNING: could not delete retained HPA ${hpaName}: ` +
+          `${sanitizeForTerminal(exactDelete.stderr.trim()) || `exit ${exactDelete.exitCode}`}.`,
+      );
+      failures.push(`retained HPA "${hpaName}"`);
+    }
+  }
+  for (const { kind, description } of [
+    { kind: "deployment", description: "retained pool Deployments" },
+    { kind: "hpa", description: "retained pool HPAs" },
+  ]) {
+    const deleteArgs = [
+      "delete",
+      kind,
+      "-n",
+      namespace,
+      "-l",
+      retainedRolloutSelector,
+      "--ignore-not-found",
+    ];
+    if (dryRun) {
+      console.log(`  [dry-run] kubectl ${deleteArgs.join(" ")}`);
+      continue;
+    }
+
+    const res = await execCapture("kubectl", deleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete ${description}: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}.`,
+      );
+      failures.push(description);
+    }
+  }
+
+  // A topology-changing deploy can retain a removed pool's stable Service, PDB and (on GKE)
+  // HealthCheckPolicy for rollback. The topology transfer stamps these adapter-owned objects
+  // without a version label, so they need a separate sweep from build-scoped resources. List by
+  // exact dedicated release identity, then validate every component and helper-equivalent derived
+  // name before deleting it by exact name. The routing tier uses component=routing-service and is
+  // intentionally excluded even if a future migration gives it the same ownership label.
+  const retainedStableSelector = `${ADAPTER_RELEASE_LABEL}=${releaseName},app.kubernetes.io/name=${releaseName}`;
+  for (const { kind, description, apiOptional } of [
+    { kind: "service", description: "retained stable pool Services", apiOptional: false },
+    {
+      kind: "poddisruptionbudget",
+      description: "retained stable pool PodDisruptionBudgets",
+      apiOptional: false,
+    },
+    {
+      kind: "healthcheckpolicy",
+      description: "retained stable pool HealthCheckPolicies",
+      apiOptional: true,
+    },
+  ] as const) {
+    const listArgs = ["get", kind, "-n", namespace, "-l", retainedStableSelector, "-o", "json"];
+    if (dryRun) {
+      console.log(`  [dry-run] kubectl ${listArgs.join(" ")}`);
+      console.log(
+        `  [dry-run] would delete exact validated ${kind} names from that adapter-owned list`,
+      );
+      continue;
+    }
+
+    const listed = await execCapture("kubectl", listArgs);
+    if (
+      listed.exitCode !== 0 &&
+      apiOptional &&
+      isOptionalHealthCheckPolicyApiMissing(listed.stderr)
+    ) {
+      continue;
+    }
+    if (listed.exitCode !== 0) {
+      console.warn(
+        `    WARNING: could not discover ${description}: ` +
+          `${sanitizeForTerminal(listed.stderr.trim()) || `exit ${listed.exitCode}`}.`,
+      );
+      failures.push(description);
+      continue;
+    }
+
+    let names: string[];
+    try {
+      names = parseStablePoolResourceNames(listed.stdout, kind, releaseName, namespace);
+    } catch (err) {
+      console.warn(
+        `    WARNING: could not validate ${description}: ` +
+          `${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}.`,
+      );
+      failures.push(description);
+      continue;
+    }
+
+    for (const name of names) {
+      const deleted = await execCapture("kubectl", [
+        "delete",
+        kind,
+        name,
+        "-n",
+        namespace,
+        "--ignore-not-found",
+      ]);
+      if (deleted.exitCode !== 0 && !isAlreadyGoneError(deleted.stderr)) {
+        console.warn(
+          `    WARNING: could not delete ${kind} ${name}: ` +
+            `${sanitizeForTerminal(deleted.stderr.trim()) || `exit ${deleted.exitCode}`}.`,
+        );
+        failures.push(`${description}: "${name}"`);
+      }
+    }
+  }
+
+  const plannedObjects = new Map<string, KubernetesOwnedObject>();
+  for (const snapshot of plannedSnapshots) {
+    for (const owned of snapshot.plan.operations.cleanup.kubernetes.contributedObjects) {
+      plannedObjects.set(
+        `${owned.ref.apiVersion}|${owned.ref.resource}|${owned.ref.namespace ?? ""}|${owned.ref.name}`,
+        owned,
+      );
+    }
+  }
+  for (const owned of plannedObjects.values()) {
+    const failure = await removePlannedKubernetesObject(owned, dryRun === true);
+    if (failure) {
+      console.warn(`    WARNING: planned Kubernetes cleanup failed: ${failure}`);
+      failures.push(failure);
+    }
+  }
+
   // 1b. Delete the adapter-written ConfigMaps helm doesn't own: the deploy-state
   // ConfigMap (state.ts writes it via kubectl apply) and any retained routing-manifest
   // snapshot ConfigMaps (rollback/deploy retention). A stale state ConfigMap otherwise
@@ -324,7 +1077,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     "delete",
     "configmap",
     "-n",
-    "default",
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s`,
     "--ignore-not-found",
@@ -337,8 +1090,55 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       console.warn(
         `    WARNING: could not delete adapter state ConfigMaps: ` +
           `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
-          `(kubectl delete configmap -n default -l app.kubernetes.io/name=${releaseName},` +
+          `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
+      );
+    }
+  }
+
+  // Helm-owned per-build routing snapshots carry resource-policy: keep so an outgoing
+  // ReplicaSet and rollback target never lose the ConfigMap they mount. Helm uninstall
+  // deliberately leaves them behind; remove the release-scoped snapshots explicitly.
+  const snapshotDeleteArgs = [
+    "delete",
+    "configmap",
+    "-n",
+    namespace,
+    "-l",
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
+    "--ignore-not-found",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${snapshotDeleteArgs.join(" ")}`);
+  } else {
+    const res = await execCapture("kubectl", snapshotDeleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete retained routing-manifest ConfigMaps: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
+          `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
+          `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}).`,
+      );
+    }
+  }
+
+  const compositionDeleteArgs = [
+    "delete",
+    "configmap",
+    "-n",
+    namespace,
+    "-l",
+    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
+    "--ignore-not-found",
+  ];
+  if (dryRun) {
+    console.log(`  [dry-run] kubectl ${compositionDeleteArgs.join(" ")}`);
+  } else {
+    const res = await execCapture("kubectl", compositionDeleteArgs);
+    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
+      console.warn(
+        `    WARNING: could not delete retained composition-plan ConfigMaps: ` +
+          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}.`,
       );
     }
   }
@@ -355,7 +1155,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     "delete",
     "secret",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
     "--ignore-not-found",
@@ -368,7 +1168,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       console.warn(
         `    WARNING: could not delete the internal-dispatch Secrets: ` +
           `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them ` +
-          `manually (kubectl delete secret -n ${K8S_NAMESPACE} -l ` +
+          `manually (kubectl delete secret -n ${namespace} -l ` +
           `app.kubernetes.io/name=${releaseName},` +
           `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}); they are retained by ` +
           `resource-policy and helm uninstall will not remove them.`,
@@ -376,8 +1176,57 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
-  // 2. Clean up GCP resources from infrastructure.json
-  if (infra) {
+  const retainedResources = new Map<string, RetainedExternalResource>();
+  for (const snapshot of plannedSnapshots) {
+    for (const resource of snapshot.plan.operations.cleanup.retained) {
+      retainedResources.set(JSON.stringify(resource), resource);
+    }
+  }
+
+  // A plan retained in Kubernetes is useful for exact Kubernetes cleanup because every object is
+  // independently checked for its release ownership label before deletion. It is not authority to
+  // spend the operator's ambient cloud credentials: a namespace actor can rewrite both deploy state
+  // and retained plan ConfigMaps. Only operations also present in the authenticated local build
+  // artifact may execute automatically.
+  const locallyAuthorizedExternalOperations = new Set(
+    (localComposition?.plan.operations.cleanup.external ?? []).map((operation) =>
+      JSON.stringify(operation),
+    ),
+  );
+  const skippedExternalCleanup: ReturnType<typeof buildExternalCleanupCommand>[] = [];
+
+  // 2. Clean up external resources from the composition plan, or the legacy infrastructure file.
+  if (usesCompositionPlan) {
+    const operations = new Map<string, ExternalCleanupOperation>();
+    for (const snapshot of plannedSnapshots) {
+      for (const operation of snapshot.plan.operations.cleanup.external) {
+        operations.set(JSON.stringify(operation), operation);
+      }
+    }
+    for (const [operationKey, operation] of operations) {
+      const cleanup = buildExternalCleanupCommand(operation);
+      if (!locallyAuthorizedExternalOperations.has(operationKey)) {
+        skippedExternalCleanup.push(cleanup);
+        continue;
+      }
+      if (dryRun) {
+        console.log(`  [dry-run] ${cleanup.command} ${cleanup.args.join(" ")}`);
+        continue;
+      }
+      console.log(`  → Deleting ${cleanup.desc}`);
+      const result = await execCapture(cleanup.command, cleanup.args);
+      if (result.exitCode !== 0 && !isAlreadyGoneError(result.stderr)) {
+        console.warn(
+          `    WARNING: deletion failed: ` +
+            `${sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`}`,
+        );
+        failures.push(cleanup.desc);
+      }
+    }
+    if (operations.size === 0) {
+      console.log("  → No adapter-owned external cleanup operations in the composition plan");
+    }
+  } else if (infra) {
     // Delete GCS bucket
     if (infra.gcsBucket) {
       const bucketArgs = ["storage", "rm", "-r", `gs://${infra.gcsBucket}`, "--quiet"];
@@ -473,6 +1322,26 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
   }
 
+  if (skippedExternalCleanup.length > 0) {
+    console.warn(
+      "\n  ! External cleanup was NOT executed because these operations were available only " +
+        "from cluster-writable deploy state and composition plans. Automatic execution requires " +
+        "the matching local build output to be present when destroy starts. Confirm each resource " +
+        `belongs to release "${releaseName}" before running these commands manually:`,
+    );
+    for (const cleanup of skippedExternalCleanup) {
+      console.warn(`    • ${cleanup.desc}: ${cleanup.command} ${cleanup.args.join(" ")}`);
+    }
+  }
+
+  if (retainedResources.size > 0) {
+    console.log("\n  Left in place by the composition plan (remove manually only if unused):");
+    for (const resource of retainedResources.values()) {
+      const guidance = retainedResourceGuidance(resource);
+      console.log(`    • ${guidance.description}: ${guidance.command}`);
+    }
+  }
+
   if (dryRun) {
     console.log(
       `\n[dry-run] No resources were deleted. Re-run without --dry-run (and with --yes ` +
@@ -501,10 +1370,22 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // releases and expensive/slow to recreate, so nuking them from a per-release `destroy` is
   // unsafe. Surface them with exact commands instead of silently leaving them AND deleting
   // the state needed to find them (the previous behavior).
-  console.log("\n✓ Removed: Helm release, GCS bucket, both service accounts, and the");
-  console.log("  release-scoped ext_proc resources (traffic extension, routing backend,");
-  console.log("  health check, static IP, custom IAM role).\n");
-  if (projectId) {
+  if (usesCompositionPlan) {
+    console.log(
+      skippedExternalCleanup.length > 0
+        ? "\n✓ Removed: Helm release, retained rollout/rollback resources, and verified " +
+            "Kubernetes cleanup. Cluster-only external cleanup was left for manual review.\n"
+        : "\n✓ Removed: Helm release, retained rollout/rollback resources, and every " +
+            "adapter-owned cleanup operation corroborated by the local composition plan.\n",
+    );
+  } else {
+    console.log("\n✓ Removed: Helm release, retained pool rollout/rollback resources, GCS bucket,");
+    console.log("  both service accounts, and the release-scoped ext_proc resources");
+    console.log(
+      "  (traffic extension, routing backend, health check, static IP, custom IAM role).\n",
+    );
+  }
+  if (!usesCompositionPlan && projectId) {
     console.log("  Left in place (shared / expensive — remove manually if truly unused):");
     console.log(
       `    • GKE cluster:        gcloud container clusters delete ${releaseName}-cluster --region ${region ?? "REGION"} --project ${projectId}`,
@@ -517,9 +1398,8 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       `      authorizations named "${releaseName}-*" — list: gcloud certificate-manager maps list --project ${projectId}`,
     );
   }
-  // Preserve .k8s-adapter/infrastructure.json: it names the resources left above, so the
-  // manual commands and any retry stay possible. (Previously this was deleted, orphaning them.)
-  console.log(
-    `\n  Local state (.k8s-adapter) preserved so the resources above remain discoverable.\n`,
-  );
+  // Preserve .k8s-adapter/infrastructure.json: legacy targets need it to find retained resources,
+  // and composed targets may still have a local build plan there. Cluster-only plans are removed
+  // with the release, so their exact manual commands are printed above before returning.
+  console.log(`\n  Local state (.k8s-adapter) preserved.\n`);
 }

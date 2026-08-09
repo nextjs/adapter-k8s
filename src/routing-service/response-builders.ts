@@ -58,11 +58,20 @@ export function buildHeaderMutationResponse(
   if (removeHeaders && removeHeaders.length > 0) {
     headerMutation.removeHeaders = removeHeaders;
   }
+  // Envoy chooses an HTTPRoute before ext_proc runs. The generic provider's per-pool
+  // rules match x-upstream-pool, so setting (or stripping a client-spoofed copy of) that
+  // header must invalidate the first decision. Without this, the mutation reaches the
+  // selected backend but never participates in backend selection; wrong-pool local
+  // resolution hides most cases and metadata/rewrites can fail outright.
+  const changesPoolRoute =
+    mutations.some(({ key }) => key.toLowerCase() === "x-upstream-pool") ||
+    (removeHeaders?.some((key) => key.toLowerCase() === "x-upstream-pool") ?? false);
   return {
     requestHeaders: {
       response: {
         headerMutation,
         status: "CONTINUE",
+        ...(changesPoolRoute ? { clearRouteCache: true } : {}),
       },
     },
   };

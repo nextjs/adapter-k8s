@@ -98,7 +98,7 @@ describe("runDoctor", () => {
   let tmpDir: string;
   const infraDir = () => path.join(tmpDir, ".k8s-adapter");
 
-  function writeInfra(hosts: string[] = []): void {
+  function writeInfra(hosts: string[] = [], namespace?: string): void {
     mkdirSync(infraDir(), { recursive: true });
     writeFileSync(
       path.join(infraDir(), "infrastructure.json"),
@@ -109,6 +109,7 @@ describe("runDoctor", () => {
         gcsBucket: "proj-nextjs-static",
         containerRegistry: "us-central1-docker.pkg.dev/proj/nextjs",
         releaseName: RELEASE,
+        ...(namespace ? { namespace } : {}),
       }),
     );
   }
@@ -398,5 +399,26 @@ describe("runDoctor", () => {
       expect(call, `kubectl ${resource} call`).toBeDefined();
       expect(call!.join(" "), `kubectl ${resource} pinned to -n default`).toContain("-n default");
     }
+  });
+
+  it("includes the configured namespace in kubectl remediation commands", async () => {
+    writeInfra([], "apps");
+    vi.mocked(readState).mockResolvedValue({ buildId: "buildn", previousBuildId: null } as never);
+    stubCluster({
+      deployments: "rel-ssr-buildn|0/1|buildn",
+      services: "rel-ssr|ssr",
+      endpoints: "false",
+      pods: "rel-ssr-buildn-a",
+      logs: "FATAL startup failed",
+    });
+
+    await expect(runDoctor({ projectDir: tmpDir, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    const out = printed();
+    expect(out).toContain("kubectl describe deployment/rel-ssr-buildn -n apps");
+    expect(out).toContain("kubectl get svc rel-ssr -n apps");
+    expect(out).toContain("kubectl logs rel-ssr-buildn-a -n apps --tail=50");
   });
 });

@@ -47,6 +47,10 @@ describe("renderRouteExtUpdateJob", () => {
     // Attaches the standalone routing NEG to the ext_proc backend service
     expect(yaml).toContain("my-app-routing-neg");
     expect(yaml).toContain("add-backend");
+    expect(yaml).toContain(
+      "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:6fd292185f0efc136eff2f6d20287870e5b66619818d5108c31ad55311722028",
+    );
+    expect(yaml).toContain('kubernetes.io/arch: "{{ .Values.global.targetArchitecture }}"');
   });
 
   it("renders the exact job name from routeExtJobName (deploy cleanup matches this)", () => {
@@ -92,7 +96,7 @@ describe("renderRouteExtUpdateJob", () => {
       region: "us-central1",
       buildId: "abc123",
     });
-    expect(yaml).toMatch(/cloud-sdk:slim@sha256:[0-9a-f]{64}/);
+    expect(yaml).toMatch(/google-cloud-cli@sha256:[0-9a-f]{64}/);
   });
 
   it("ships the hardened job/pod posture (ttl, non-root, read-only FS, gcloud config home)", () => {
@@ -412,12 +416,14 @@ describe("N73: route-ext Job verifies the mounted route-extension.yaml", () => {
 
   it("pins the expected service and authority to the values it was RENDERED with", () => {
     const yaml = job();
-    // Both are fully determined by release name + project + the single supported namespace
-    // (K8S_NAMESPACE), so they can be re-derived rather than trusted from /config.
+    // Both are fully determined by release name + project + the Helm release namespace,
+    // so they can be re-derived rather than trusted from /config.
     expect(yaml).toContain(
       'EXPECT_SERVICE="projects/my-project/global/backendServices/my-app-routing-service"',
     );
-    expect(yaml).toContain('EXPECT_AUTHORITY="my-app-routing-service.default.svc.cluster.local"');
+    expect(yaml).toContain(
+      'EXPECT_AUTHORITY="my-app-routing-service.{{ .Release.Namespace }}.svc.cluster.local"',
+    );
   });
 
   it("aborts before the privileged import when either value mismatches", () => {

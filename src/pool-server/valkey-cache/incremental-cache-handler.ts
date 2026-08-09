@@ -496,7 +496,9 @@ export class ValkeyIncrementalCacheHandler {
       const seed = await this.seedLookup(cacheKey, {
         ...(ctx.kind !== undefined ? { kind: ctx.kind } : {}),
         ...(ctx.isFallback !== undefined ? { isFallback: ctx.isFallback } : {}),
-        ...(ctx.isRoutePPREnabled !== undefined ? { isRoutePPREnabled: ctx.isRoutePPREnabled } : {}),
+        ...(ctx.isRoutePPREnabled !== undefined
+          ? { isRoutePPREnabled: ctx.isRoutePPREnabled }
+          : {}),
       });
       if (!seed) return null;
       const softTags = ctx.softTags ?? ctx.tags ?? [];

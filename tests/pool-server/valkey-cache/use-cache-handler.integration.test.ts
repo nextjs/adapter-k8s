@@ -30,6 +30,9 @@ try {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Docker Desktop and virtualized CI clocks can differ from the host wall clock by more than
+// 5 ms. This remains tiny beside the 60-second production skew clamp the assertions protect.
+const SERVER_CLOCK_TOLERANCE_MS = 100;
 
 function makeEntry(
   text: string,
@@ -356,11 +359,11 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     // The script reports the skew to the caller (feeds warnOnClockSkewClamp).
     expect(Number(clamped)).toBe(1);
     const stored = JSON.parse((await raw.hget(key, "t"))!);
-    expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
-    expect(stored.expired).toBeLessThanOrEqual(after + 5);
+    expect(stored.expired).toBeGreaterThanOrEqual(before - SERVER_CLOCK_TOLERANCE_MS);
+    expect(stored.expired).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
     expect(stored.expired).toBeLessThan(clientNow - MAX_CLOCK_SKEW_MS);
     // `at` was rewritten to the SERVER clock, not the skewed client clock.
-    expect(stored.at).toBeLessThanOrEqual(after + 5);
+    expect(stored.at).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
   });
 
   it("N78 hard expire, clock 5min BEHIND: the watermark is dragged FORWARD to the server's now", async () => {
@@ -383,8 +386,8 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     const after = Date.now();
     expect(Number(clamped)).toBe(1);
     const stored = JSON.parse((await raw.hget(key, "t"))!);
-    expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
-    expect(stored.expired).toBeLessThanOrEqual(after + 5);
+    expect(stored.expired).toBeGreaterThanOrEqual(before - SERVER_CLOCK_TOLERANCE_MS);
+    expect(stored.expired).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
     expect(stored.expired).toBeGreaterThan(clientNow + MAX_CLOCK_SKEW_MS);
   });
 
@@ -407,8 +410,8 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     const after = Date.now();
     expect(Number(clamped)).toBe(1);
     const stored = JSON.parse((await raw.hget(key, "t"))!);
-    expect(stored.stale).toBeGreaterThanOrEqual(before - 5);
-    expect(stored.stale).toBeLessThanOrEqual(after + 5);
+    expect(stored.stale).toBeGreaterThanOrEqual(before - SERVER_CLOCK_TOLERANCE_MS);
+    expect(stored.stale).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
     expect(stored.expired - stored.stale).toBe(300_000);
   });
 
@@ -456,8 +459,8 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
       const after = Date.now();
       expect(warn.mock.calls.some((c) => /clock/i.test(String(c[0])))).toBe(true);
       const stored = JSON.parse((await raw.hget("k8s:skew-handler:tags", "t"))!);
-      expect(stored.expired).toBeGreaterThanOrEqual(before - 5);
-      expect(stored.expired).toBeLessThanOrEqual(after + 5);
+      expect(stored.expired).toBeGreaterThanOrEqual(before - SERVER_CLOCK_TOLERANCE_MS);
+      expect(stored.expired).toBeLessThanOrEqual(after + SERVER_CLOCK_TOLERANCE_MS);
       // The whole point: a correctly-clocked replica drops the entry NOW.
       expect(await reader.get("k", [])).toBeUndefined();
     } finally {

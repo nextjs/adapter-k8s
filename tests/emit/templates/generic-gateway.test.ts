@@ -47,6 +47,8 @@ describe("renderGenericGateway", () => {
     expect(y).toContain("port: 443");
     expect(y).toContain("certificateRefs:");
     expect(y).toContain("name: app-tls");
+    expect(y).toMatch(/- name: http\n\s+hostname: "app\.example\.com"/);
+    expect(y).toMatch(/- name: https\n\s+hostname: "app\.example\.com"/);
   });
 
   it("omits HTTPS when TLS is enabled but no cert Secret was supplied", () => {

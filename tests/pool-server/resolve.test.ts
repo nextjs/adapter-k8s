@@ -1,6 +1,10 @@
 // tests/pool-server/resolve.test.ts
 import { describe, it, expect, vi } from "vitest";
-import { createLocalResolver, hasCallableMiddlewareExport } from "../../src/pool-server/resolve.js";
+import {
+  createLocalResolver,
+  hasCallableMiddlewareExport,
+  resolvePlatformRequest,
+} from "../../src/pool-server/resolve.js";
 import { mockRouting } from "../helpers/mock-outputs.js";
 import type { RoutingManifest } from "../../src/types.js";
 
@@ -75,6 +79,79 @@ describe("createLocalResolver", () => {
     expect(result.kind).toBe("route");
     if (result.kind === "route") {
       expect(result.pool).toBe("ssr");
+    }
+  });
+
+  it("continues a platform route when only an unchanged catch-all matched", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/[...slug]"],
+      poolAssignments: { "/[...slug]": "ssr" },
+    });
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/[...slug]",
+      invocationTarget: { pathname: "/_next/image" },
+      routeMatches: { nxtPslug: "_next/image" },
+    });
+
+    const result = await resolvePlatformRequest(
+      createLocalResolver(manifest),
+      new URL("http://localhost/_next/image"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("continue-platform");
+  });
+
+  it("keeps a rewrite away from a platform route terminal", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/target"],
+      poolAssignments: { "/target": "ssr" },
+    });
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/target",
+      invocationTarget: { pathname: "/target" },
+    });
+
+    const result = await resolvePlatformRequest(
+      createLocalResolver(manifest),
+      new URL("http://localhost/_next/image"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") expect(result.invokePath).toBe("/target");
+  });
+
+  it("keeps a query rewrite on a platform pathname terminal", async () => {
+    const manifest = makeManifest({
+      pathnames: ["/[...slug]"],
+      poolAssignments: { "/[...slug]": "ssr" },
+    });
+    (resolveRoutes as any).mockResolvedValue({
+      resolvedPathname: "/[...slug]",
+      resolvedQuery: { url: "/other.png", w: "640", q: "75" },
+      invocationTarget: {
+        pathname: "/_next/image",
+        query: { url: "/other.png", w: "640", q: "75" },
+      },
+      routeMatches: { nxtPslug: "_next/image" },
+    });
+
+    const result = await resolvePlatformRequest(
+      createLocalResolver(manifest),
+      new URL("http://localhost/_next/image?url=/original.png&w=640&q=75"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
+
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.invokePath).toBe("/_next/image?url=%2Fother.png&w=640&q=75");
     }
   });
 

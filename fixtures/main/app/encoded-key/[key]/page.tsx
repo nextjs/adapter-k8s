@@ -1,11 +1,7 @@
 import { connection } from "next/server";
 import { Suspense } from "react";
 
-async function EncodedKey({
-  params,
-}: {
-  params: Promise<{ key: string }>;
-}) {
+async function EncodedKey({ params }: { params: Promise<{ key: string }> }) {
   await connection();
   const { key } = await params;
   return (

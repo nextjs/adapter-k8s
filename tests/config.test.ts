@@ -16,7 +16,7 @@ describe("validateConfig", () => {
 
   it("throws error if provider is missing", () => {
     const config = { pools: { ssr: { routes: ["appPages"] } } } as any;
-    expect(() => validateConfig(config)).toThrow(/provider is required/);
+    expect(() => validateConfig(config)).toThrow(/target is required/);
   });
 
   it("throws error if a pool has no routes", () => {
@@ -35,12 +35,31 @@ describe("validateConfig", () => {
     expect(() => validateConfig(config)).toThrow(/pool "ssr" must have at least one route/);
   });
 
+  it.each([0, -1, 1.5, 86_401, Number.NaN])(
+    "rejects invalid pool response-head timeout %s",
+    (timeout) => {
+      const config = {
+        pools: { ssr: { routes: ["appPages"], timeout } },
+        provider: {
+          gke: {
+            gateway: {
+              type: "gateway-api",
+              className: "gke",
+              hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+            },
+          },
+        },
+      } as K8sAdapterConfig;
+      expect(() => validateConfig(config)).toThrow(/timeout must be an integer from 1 to 86400/);
+    },
+  );
+
   it("throws error if hosts is missing or empty", () => {
     const config = {
       pools: { ssr: { routes: ["appPages"] } },
       provider: { gke: { gateway: { hosts: [] } } },
     } as any;
-    expect(() => validateConfig(config)).toThrow(/provider.gke.gateway.hosts is required/);
+    expect(() => validateConfig(config)).toThrow(/at least one host/);
   });
 
   it("rejects a hostname that would break out of the quoted YAML scalar", () => {
@@ -194,6 +213,39 @@ describe("validateConfig", () => {
       },
     };
     expect(() => validateConfig(config)).toThrow(/reserved for the routing tier/);
+  });
+
+  it("reserves the pool name 'origin' for the portable entrypoint", () => {
+    const config: K8sAdapterConfig = {
+      pools: { origin: { routes: ["appPages"] } },
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: false } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).toThrow(/reserved for the portable entrypoint/);
+  });
+
+  it("requires defaultPool to name a configured pool", () => {
+    const config: K8sAdapterConfig = {
+      pools: { web: { routes: ["appPages"] } },
+      defaultPool: "missing",
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: false } }],
+          },
+        },
+      },
+    };
+    expect(() => validateConfig(config)).toThrow(/defaultPool.*configured pool/);
   });
 
   it("enforces the combined release+pool budget when the release name is known", () => {

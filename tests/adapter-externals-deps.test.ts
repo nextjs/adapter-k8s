@@ -79,6 +79,35 @@ describe("stageExternalsDependencies", () => {
     expect(staged("node_modules/left-pad/package.json")).toBe(true);
   });
 
+  it("stages dependencies whose exports hide package.json", async () => {
+    const externals = path.join(projectDir, ".next", "node_modules");
+    writePkg(path.join(externals, "external-123"), {
+      name: "external",
+      dependencies: { locked: "1.0.0" },
+    });
+    const nm = path.join(projectDir, "node_modules");
+    writePkg(
+      path.join(nm, "locked"),
+      {
+        name: "locked",
+        exports: { ".": "./dist/index.js" },
+        dependencies: { "locked-child": "1.0.0" },
+      },
+      { "dist/index.js": "module.exports = {};" },
+    );
+    writePkg(
+      path.join(nm, "locked-child"),
+      { name: "locked-child", exports: { ".": "./index.js" } },
+      { "index.js": "module.exports = {};" },
+    );
+
+    const result = await stageExternalsDependencies(projectDir, externals, "ssr", false);
+
+    expect(result.unresolved).toEqual([]);
+    expect(staged("node_modules/locked/package.json")).toBe(true);
+    expect(staged("node_modules/locked-child/package.json")).toBe(true);
+  });
+
   it("reports (not throws) an unresolvable dependency and continues", async () => {
     const externals = path.join(projectDir, ".next", "node_modules");
     writePkg(path.join(externals, "thing-123"), {

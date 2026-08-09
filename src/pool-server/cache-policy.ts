@@ -75,6 +75,8 @@ export function createPprRouteMatcher(
       pathnameOrOutputId,
       ...rscParentCandidates(pathnameOrOutputId, rscConfig),
     ]);
+    // Snapshot the initial seeds: the loop adds derived forms that must not recursively expand.
+    // oxlint-disable-next-line unicorn/no-useless-spread
     for (const seed of [...seeds]) {
       const withoutBase = stripBasePath(seed, basePath);
       seeds.add(withoutBase);

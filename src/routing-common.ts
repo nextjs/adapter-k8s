@@ -44,6 +44,9 @@ export const INTERNAL_DISPATCH_HEADERS = [
   // entirely (the handler would see only the client's original search params).
   "x-invoke-path",
   "x-invoke-query",
+  // Absolute time-to-response-head deadline propagated by a trusted cross-pool hop. Keeping one
+  // build-derived deadline prevents the target pool from minting a fresh maxDuration budget.
+  "x-adapter-k8s-execution-deadline",
   // N40 (SECURITY). The middleware's FINAL request-header set — what
   // `NextResponse.next({ request: { headers } })` produces. `responseToMiddlewareResult`
   // resolves `x-middleware-override-headers` / `x-middleware-request-*` /
@@ -56,6 +59,26 @@ export const INTERNAL_DISPATCH_HEADERS = [
   // told the pool the stage was already done. Secret-gated like every name in this list —
   // a client must never be able to forge its own request-header rewrite.
   "x-mw-request-headers",
+] as const;
+
+// Next.js treats these as private request-control headers. `next-resume: 1` tells the App Router
+// to deserialize the request body as trusted postponed state; `x-next-resume-state-length` frames
+// postponed state prepended to a Server Action body. They are NOT part of the adapter's
+// secret-gated dispatch protocol: no network hop is allowed to preserve client-supplied values.
+// The pool creates either header only after this boundary, so stripping them at both public
+// ingress tiers does not interfere with legitimate resume handling.
+export const UNTRUSTED_NEXT_REQUEST_HEADERS = [
+  "x-middleware-rewrite",
+  "x-middleware-redirect",
+  "x-middleware-set-cookie",
+  "x-middleware-skip",
+  "x-middleware-override-headers",
+  "x-middleware-next",
+  "x-now-route-matches",
+  "x-matched-path",
+  "x-nextjs-data",
+  "next-resume",
+  "x-next-resume-state-length",
 ] as const;
 
 // Recognized `x-mw-evaluated` verdicts that authorize the pool to skip its own middleware.
@@ -115,6 +138,7 @@ export function fitsPoolHeaderBudget(bytes: number): boolean {
 // Header carrying the shared secret that authenticates the dispatch headers above.
 // Present only on responses from the trusted routing extension / cross-pool proxy.
 export const INTERNAL_SECRET_HEADER = "x-internal-secret";
+export const INTERNAL_EXECUTION_DEADLINE_HEADER = "x-adapter-k8s-execution-deadline";
 
 // A compiled middleware matcher entry from middleware-manifest.json.
 export interface MiddlewareMatcher {
@@ -804,6 +828,8 @@ export function prepareRequest(
   // NextResponse.next()'s x-middleware-override-headers and materialized as a cookie the
   // client never set (app-middleware-proxy). The pool's server.ts does the same strip for
   // Phase 1; doing it here too is idempotent. The public prefetch hint is protocol, kept.
+  // Snapshot before deleting so iteration never depends on Map mutation semantics.
+  // oxlint-disable-next-line unicorn/no-useless-spread
   for (const name of [...headers.keys()]) {
     if (name.startsWith("x-middleware-") && name !== "x-middleware-prefetch") {
       headers.delete(name);
@@ -1241,6 +1267,7 @@ export function filterInternalQuery(
   for (const [k, v] of Object.entries(query)) {
     if (k.startsWith("nxtP") || k === "_rsc") continue;
     const values = Array.isArray(v) ? v : [v];
+    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
     if (values.some((value) => /^\$nxtP/.test(value))) continue;
     out[k] = v;
   }
@@ -1273,7 +1300,11 @@ export function sanitizeRouteMatches(
   matches: Record<string, string> | null | undefined,
 ): Record<string, string> | null {
   if (!matches) return null;
-  const unresolvedValues = new Set(Object.values(matches).filter((value) => /^\$nxtP/.test(value)));
+  const unresolvedValues = new Set(
+    // RegExp.test retains the previous coercion behaviour at this trust boundary.
+    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
+    Object.values(matches).filter((value) => /^\$nxtP/.test(value)),
+  );
   if (unresolvedValues.size === 0) return matches;
   const sanitized = Object.fromEntries(
     Object.entries(matches).filter(([, value]) => !unresolvedValues.has(value)),

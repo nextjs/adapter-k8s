@@ -114,7 +114,16 @@ const JP2_BODY = Buffer.from(
 
 function writeStagedDir(
   images: Record<string, unknown> | null,
-  options: { middlewareMatcher?: string; middlewareSource?: string; publicFiles?: string[] } = {},
+  options: {
+    middlewareMatcher?: string;
+    middlewareSource?: string;
+    publicFiles?: string[];
+    basePath?: string;
+    beforeMiddleware?: Record<string, unknown>[];
+    dynamicRoutes?: Record<string, unknown>[];
+    pathnames?: string[];
+    poolAssignments?: Record<string, string>;
+  } = {},
 ): {
   dir: string;
   configDir: string;
@@ -169,19 +178,19 @@ function writeStagedDir(
     path.join(configDir, "routing-manifest.json"),
     JSON.stringify({
       routeGraph: {
-        beforeMiddleware: [],
+        beforeMiddleware: options.beforeMiddleware ?? [],
         beforeFiles: [],
         afterFiles: [],
-        dynamicRoutes: [],
+        dynamicRoutes: options.dynamicRoutes ?? [],
         onMatch: [],
         fallback: [],
         shouldNormalizeNextData: true,
         rsc: { header: "rsc", suffix: ".rsc" },
       },
-      pathnames: [],
+      pathnames: options.pathnames ?? [],
       i18n: null,
       buildId: "imgbuild1",
-      basePath: "",
+      basePath: options.basePath ?? "",
       middleware: options.middlewareMatcher
         ? {
             filePath: path.join(dir, "mw.mjs"),
@@ -189,7 +198,7 @@ function writeStagedDir(
             matchers: [{ regexp: options.middlewareMatcher }],
           }
         : null,
-      poolAssignments: {},
+      poolAssignments: options.poolAssignments ?? {},
       pprRoutes: {},
       nextVersion: "16.2.10",
     }),
@@ -228,7 +237,14 @@ async function getFreePort(): Promise<number> {
   return port;
 }
 
-const envKeys = ["POOL_NAME", "NEXT_BUILD_ID", "PORT", "CONFIG_DIR", "RELEASE_NAME"];
+const envKeys = [
+  "POOL_NAME",
+  "NEXT_BUILD_ID",
+  "PORT",
+  "CONFIG_DIR",
+  "RELEASE_NAME",
+  "INTERNAL_HEADER_SECRET",
+];
 
 interface BootedServer {
   port: number;
@@ -238,6 +254,7 @@ interface BootedServer {
 function makeBooter() {
   let savedEnv: Record<string, string | undefined>;
   let listenersBefore: Record<string, Function[]>;
+  let savedCwd = REPO_ROOT;
   let staged: { dir: string; configDir: string } | undefined;
   let server: Awaited<ReturnType<typeof startPoolServer>> | undefined;
 
@@ -250,18 +267,27 @@ function makeBooter() {
         middlewareMatcher?: string;
         middlewareSource?: string;
         publicFiles?: string[];
+        basePath?: string;
+        beforeMiddleware?: Record<string, unknown>[];
+        dynamicRoutes?: Record<string, unknown>[];
+        pathnames?: string[];
+        poolAssignments?: Record<string, string>;
+        internalSecret?: string;
       } = {},
     ): Promise<BootedServer> {
       listenersBefore = Object.fromEntries(
         events.map((e) => [e, process.listeners(e as "SIGTERM") as Function[]]),
       );
       savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+      savedCwd = process.cwd();
       staged = writeStagedDir(images, options);
       const port = await getFreePort();
       process.env.POOL_NAME = "main";
       process.env.NEXT_BUILD_ID = "imgbuild1";
       process.env.PORT = String(port);
       process.env.CONFIG_DIR = staged.configDir;
+      if (options.internalSecret) process.env.INTERNAL_HEADER_SECRET = options.internalSecret;
+      else delete process.env.INTERNAL_HEADER_SECRET;
       process.chdir(staged.dir);
       server = await startPoolServer();
       return { port, close: () => server!.close() };
@@ -269,7 +295,7 @@ function makeBooter() {
     async cleanup(): Promise<void> {
       if (server) await server.close().catch(() => undefined);
       server = undefined;
-      process.chdir(REPO_ROOT);
+      process.chdir(savedCwd ?? REPO_ROOT);
       if (staged) rmSync(staged.dir, { recursive: true, force: true });
       staged = undefined;
       for (const key of envKeys) {
@@ -1044,6 +1070,214 @@ describe("image optimizer — middleware coverage must still win over the cachea
     await res.arrayBuffer();
   });
 
+  it("runs terminal middleware before the optimizer", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response("blocked by image middleware", {
+    status: 451,
+    headers: { "x-image-middleware": "ran" },
+  });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(451);
+      expect(res.headers.get("x-image-middleware")).toBe("ran");
+      expect(await res.text()).toBe("blocked by image middleware");
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("does not run middleware twice after a trusted upstream verdict", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        internalSecret: "image-routing-secret",
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response("middleware ran twice", { status: 451 });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        headers: {
+          accept: "image/webp",
+          "x-internal-secret": "image-routing-secret",
+          "x-mw-evaluated": "ran",
+          "x-resolved-headers": JSON.stringify({ "x-image-upstream": "reused" }),
+          "x-mw-request-headers": JSON.stringify({ accept: "image/png" }),
+        },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(res.headers.get("x-image-upstream")).toBe("reused");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("carries middleware request and response header mutations into the optimizer", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response(null, {
+    headers: {
+      "x-middleware-next": "1",
+      "x-middleware-override-headers": "accept",
+      "x-middleware-request-accept": "image/png",
+      "x-image-middleware": "continued",
+    },
+  });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        headers: { accept: "image/webp" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(res.headers.get("x-image-middleware")).toBe("continued");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("preserves the source url's query string on the loopback re-entry", async () => {
+    // Upstream parity: fetchInternalImage resolves a relative source through the FULL
+    // request pipeline with the raw url — `?url=%2Fdynamic-image%3Fv%3D42` reaches the
+    // route as /dynamic-image?v=42. Middleware here is both the re-entry trigger (source
+    // coverage forces the loopback) and the observer: it answers an ANIMATED GIF (which
+    // the optimizer passes through byte-for-byte) ONLY when the query survived, so a
+    // dropped query is a 400.
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/dynamic-image$",
+        middlewareSource: `const GIF = Buffer.from("${ANIMATED_GIF_BODY.toString("base64")}", "base64");
+export function proxy(request) {
+  const url = new URL(request.url);
+  if (url.pathname === "/dynamic-image" && url.search === "?v=42&t=a%2Fb") {
+    return new Response(GIF, { headers: { "content-type": "image/gif" } });
+  }
+  return new Response("query lost: " + url.search, { status: 404 });
+}\n`,
+      });
+      const res = await fetch(
+        `http://127.0.0.1:${p2}/_next/image?url=${encodeURIComponent("/dynamic-image?v=42&t=a%2Fb")}&w=640&q=75`,
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/gif");
+      expect(Buffer.from(await res.arrayBuffer()).equals(ANIMATED_GIF_BODY)).toBe(true);
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("continues the optimizer after middleware when an app catch-all also matches", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response(null, { headers: { "x-middleware-next": "1" } });
+}\n`,
+        pathnames: ["/[...slug]"],
+        poolAssignments: { "/[...slug]": "main" },
+        dynamicRoutes: [
+          {
+            source: "/[...slug]",
+            sourceRegex: "^\\/(?<nxtPslug>.+?)(?:\\/)?$",
+            destination: "/[...slug]?nxtPslug=$nxtPslug",
+          },
+        ],
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        headers: { accept: "image/png" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("runs headers rules before the optimizer without middleware", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        beforeMiddleware: [
+          {
+            source: "/_next/image",
+            sourceRegex: "^\\/_next\\/image(?:\\/)?$",
+            headers: { "x-image-rule": "applied" },
+          },
+        ],
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("x-image-rule")).toBe("applied");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("buffers a non-read body for middleware and then continues the optimizer", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export async function proxy(request) {
+  const body = await request.text();
+  return new Response(null, {
+    headers: { "x-middleware-next": "1", "x-image-request-body": body },
+  });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+        method: "POST",
+        body: "optimizer-body",
+        headers: { accept: "image/png" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/png");
+      expect(res.headers.get("x-image-request-body")).toBe("optimizer-body");
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
+  it("preserves middleware cookies with Expires commas exactly once", async () => {
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  const headers = new Headers({ "x-middleware-next": "1" });
+  headers.append("set-cookie", "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/");
+  headers.append("set-cookie", "theme=dark; Path=/");
+  return new Response(null, { headers });
+}\n`,
+      });
+      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(200);
+      expect(res.headers.getSetCookie()).toEqual([
+        "session=one; Expires=Wed, 21 Oct 2037 07:28:00 GMT; Path=/",
+        "theme=dark; Path=/",
+      ]);
+      await res.arrayBuffer();
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
   it("still answers If-None-Match with a 304 whose Cache-Control is the forced no-cache", async () => {
     const first = await rawGet(port, "/_next/image?url=/mislabeled.jpg&w=640&q=75", {
       accept: "image/webp",
@@ -1073,6 +1307,48 @@ describe("image optimizer — middleware coverage must still win over the cachea
       await scoped.cleanup();
     }
   }, 60_000);
+});
+
+describe("image optimizer — basePath", () => {
+  const booter = makeBooter();
+  let port: number;
+
+  beforeAll(async () => {
+    ({ port } = await booter.boot(null, { basePath: "/docs" }));
+  });
+
+  afterAll(async () => {
+    await booter.cleanup();
+  });
+
+  it("serves the basePath-prefixed platform route", async () => {
+    const res = await fetch(
+      `http://127.0.0.1:${port}/docs/_next/image?url=/docs/mislabeled.jpg&w=640&q=75`,
+      { headers: { accept: "image/png" } },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    await res.arrayBuffer();
+  });
+
+  it("serves the default loader source shape under a basePath", async () => {
+    const res = await fetch(
+      `http://127.0.0.1:${port}/docs/_next/image?url=/mislabeled.jpg&w=640&q=75`,
+      { headers: { accept: "image/png" } },
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    await res.arrayBuffer();
+  });
+
+  it.each(["/_next/image", "/docsy/_next/image"])(
+    "does not recognize %s outside the configured basePath boundary",
+    async (pathname) => {
+      const res = await fetch(`http://127.0.0.1:${port}${pathname}?url=/mislabeled.jpg&w=640&q=75`);
+      expect(res.status).toBe(404);
+      expect(res.headers.get("content-type") ?? "").not.toContain("image/");
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

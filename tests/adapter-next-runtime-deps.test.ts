@@ -81,15 +81,25 @@ describe("staging next's runtime dependency closure", () => {
     seedApp();
     const routingContext = path.join(projectDir, ".k8s-adapter", "routing-service", "context");
 
-    const result = await stageNextRuntimeDependencies(projectDir, "routing-service", false, undefined, {
-      stageDir: routingContext,
-    });
+    const result = await stageNextRuntimeDependencies(
+      projectDir,
+      "routing-service",
+      false,
+      undefined,
+      {
+        stageDir: routingContext,
+      },
+    );
 
     expect(result.staged).toContain("@swc/helpers");
     expect(
-      existsSync(path.join(routingContext, "node_modules/@swc/helpers/_/_interop_require_default.js")),
+      existsSync(
+        path.join(routingContext, "node_modules/@swc/helpers/_/_interop_require_default.js"),
+      ),
     ).toBe(true);
-    expect(existsSync(path.join(routingContext, "node_modules/styled-jsx/package.json"))).toBe(true);
+    expect(existsSync(path.join(routingContext, "node_modules/styled-jsx/package.json"))).toBe(
+      true,
+    );
   });
 
   it("stages @swc/helpers so the edge sandbox can load in the container", async () => {
@@ -126,9 +136,13 @@ describe("staging next's runtime dependency closure", () => {
       { name: "react-dom", version: "19.2.0", dependencies: { scheduler: "^0.27.0" } },
       { "client.js": "module.exports = {};" },
     );
-    writePkg(path.join(nm, "scheduler"), { name: "scheduler", version: "0.27.0" }, {
-      "index.js": "module.exports = {};",
-    });
+    writePkg(
+      path.join(nm, "scheduler"),
+      { name: "scheduler", version: "0.27.0" },
+      {
+        "index.js": "module.exports = {};",
+      },
+    );
     writePkg(path.join(nm, "react"), { name: "react", version: "19.2.0" });
 
     await stageNextRuntimeDependencies(projectDir, "ssr");
@@ -147,6 +161,21 @@ describe("staging next's runtime dependency closure", () => {
 
     expect(result.staged).toEqual(["styled-jsx"]);
     expect(staged("node_modules/@swc/helpers/package.json")).toBe(false);
+  });
+
+  it("stages a Next dependency whose exports hide package.json", async () => {
+    seedApp({ "locked-runtime": "1.0.0" });
+    writePkg(
+      path.join(projectDir, "node_modules", "locked-runtime"),
+      { name: "locked-runtime", exports: { ".": "./dist/index.js" } },
+      { "dist/index.js": "module.exports = {};" },
+    );
+
+    const result = await stageNextRuntimeDependencies(projectDir, "ssr");
+
+    expect(result.staged).toContain("locked-runtime");
+    expect(result.unresolved).not.toContain("locked-runtime");
+    expect(staged("node_modules/locked-runtime/package.json")).toBe(true);
   });
 
   it("warns and continues when a declared dependency is unresolvable", async () => {

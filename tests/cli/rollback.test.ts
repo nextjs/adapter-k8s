@@ -14,6 +14,7 @@ vi.mock("../../src/cli/cdn-invalidate.js");
 vi.mock("node:fs");
 
 import {
+  classifyLocalRollbackComposition,
   planRollbackCapacity,
   readRoutingServingConfig,
   revertRoutingServiceToBuild,
@@ -22,6 +23,17 @@ import {
   ROLLBACK_MIN_REPLICAS,
   SNAPSHOT_BUILD_ID_ANNOTATION,
 } from "../../src/cli/rollback.js";
+import type { LoadedCompositionPlan } from "../../src/cli/composition-plan.js";
+import {
+  canonicalCompositionPlanJson,
+  fingerprintCompositionPlan,
+} from "../../src/composition-plan/index.js";
+import {
+  compileTarget,
+  defineTarget,
+  kubernetesCluster,
+  manualExposure,
+} from "../../src/target/index.js";
 import { execCapture, execCaptureStdin, execOrThrow } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
@@ -41,6 +53,8 @@ const SNAP_M = routingManifestSnapshotName(RELEASE, "buildm");
 const SNAP_N = routingManifestSnapshotName(RELEASE, "buildn");
 const infraPath = path.join(PROJECT, ".k8s-adapter", "infrastructure.json");
 const metaPath = path.join(PROJECT, ".k8s-adapter", "output", "build-metadata.json");
+const planPath = path.join(PROJECT, ".k8s-adapter", "output", "composition-plan.json");
+const POOL_TOPOLOGIES = { buildn: ["ssr"], buildm: ["ssr"] };
 const cdnFilter = path.join(
   PROJECT,
   ".k8s-adapter",
@@ -49,6 +63,88 @@ const cdnFilter = path.join(
   "templates",
   "cdn-http-filter.yaml",
 );
+
+const PLAN_DIGEST_N = `sha256:${"a".repeat(64)}` as const;
+const PLAN_DIGEST_M = `sha256:${"b".repeat(64)}` as const;
+const TARGET_FINGERPRINT = `sha256:${"c".repeat(64)}` as const;
+
+function loadedComposition(buildId: string, digest: `sha256:${string}`): LoadedCompositionPlan {
+  return {
+    digest,
+    source: `/plans/${buildId}.json`,
+    plan: {
+      metadata: {
+        version: 1,
+        releaseName: RELEASE,
+        namespace: "default",
+        buildId,
+      },
+      target: { fingerprint: TARGET_FINGERPRINT },
+    } as LoadedCompositionPlan["plan"],
+  };
+}
+
+describe("classifyLocalRollbackComposition", () => {
+  const compositionPlans = {
+    buildn: { digest: PLAN_DIGEST_N, targetFingerprint: TARGET_FINGERPRINT },
+    buildm: { digest: PLAN_DIGEST_M, targetFingerprint: TARGET_FINGERPRINT },
+  };
+
+  it("accepts the rollback target artifact after state has swapped", () => {
+    expect(
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildn", PLAN_DIGEST_N),
+        state: { buildId: "buildm", previousBuildId: "buildn", compositionPlans },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toBe("target");
+  });
+
+  it("accepts the current artifact for states that predate plan anchors", () => {
+    expect(
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildm", PLAN_DIGEST_M),
+        state: { buildId: "buildm", previousBuildId: "buildn" },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toBe("current");
+  });
+
+  it("rejects an unanchored target artifact", () => {
+    expect(() =>
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildn", PLAN_DIGEST_N),
+        state: { buildId: "buildm", previousBuildId: "buildn" },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/no trust anchor/i);
+  });
+
+  it("rejects artifacts outside the two retained builds", () => {
+    expect(() =>
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildx", PLAN_DIGEST_N),
+        state: { buildId: "buildm", previousBuildId: "buildn", compositionPlans },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/only recognizes current build buildm and target build buildn/i);
+  });
+
+  it("rejects a retained build artifact that does not match its committed anchor", () => {
+    expect(() =>
+      classifyLocalRollbackComposition({
+        local: loadedComposition("buildn", PLAN_DIGEST_M),
+        state: { buildId: "buildm", previousBuildId: "buildn", compositionPlans },
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/does not match committed deploy state/i);
+  });
+});
 
 /** execCapture stub: success everywhere except optionally the service selector patch. */
 function capture(patchFails: boolean) {
@@ -65,12 +161,13 @@ function capture(patchFails: boolean) {
   });
 }
 
-describe("runRollback — CDN invalidation", () => {
+describe("runRollback — state and CDN invalidation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -111,6 +208,7 @@ describe("runRollback — CDN invalidation", () => {
       buildId: "buildn",
       previousBuildId: "buildm",
       cdnTags,
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(execCapture).mockImplementation(capture(false) as never);
 
@@ -122,8 +220,15 @@ describe("runRollback — CDN invalidation", () => {
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
       // N69: rollback passes the generation it READ as writeState's floor.
-      { buildId: "buildm", previousBuildId: "buildn", cdnTags, basedOnGeneration: null },
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        cdnTags,
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: null,
+      },
       RELEASE,
+      "default",
     );
   });
 
@@ -138,9 +243,145 @@ describe("runRollback — CDN invalidation", () => {
     // No cdnTags key invented for the swapped state.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: null,
+      },
       RELEASE,
+      "default",
     );
+  });
+
+  it("preserves per-build provenance across two-way rollbacks while clearing readiness", async () => {
+    const digestN = `sha256:${"a".repeat(64)}`;
+    const digestM = `sha256:${"b".repeat(64)}`;
+    const cdnTags = { buildn: `build-${"ef".repeat(32)}`, buildm: `build-${"0a".repeat(32)}` };
+    const routingImageDigests = { buildn: digestN, buildm: digestM };
+    const unretainedManifestBuilds = ["buildm"];
+    let state = {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      generation: 7,
+      readinessPathSupported: true,
+      cdnTags,
+      routingImageDigests,
+      unretainedManifestBuilds,
+      poolTopologies: POOL_TOPOLOGIES,
+    };
+    vi.mocked(readState).mockImplementation(async () => state as never);
+    vi.mocked(writeState).mockImplementation(async (_projectDir, next) => {
+      const { basedOnGeneration: _basedOnGeneration, ...body } = next;
+      state = { ...body, generation: state.generation + 1 } as typeof state;
+    });
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    } as never);
+    vi.mocked(existsSync).mockImplementation((p) => p === infraPath || p === metaPath);
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath)
+        return JSON.stringify({
+          projectId: "proj-12345",
+          region: "us-central1",
+          containerRegistry: "gcr.io/p",
+        });
+      if (p === metaPath) return '{"pools":["ssr"]}';
+      return "";
+    });
+
+    vi.mocked(execCapture).mockImplementation(async (_cmd, args) => {
+      const joined = args.join(" ");
+      if (args.includes("deployments")) {
+        return {
+          exitCode: 0,
+          stdout: "rel-ssr-buildm|2\nrel-ssr-buildn|2",
+          stderr: "",
+        };
+      }
+      if (joined.includes("get deployment rel-routing-service") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: `gcr.io/p/routing-service:${state.buildId}`,
+                      env: [{ name: "NEXT_BUILD_ID", value: state.buildId }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (joined.includes("get deployment rel-routing-service")) {
+        return { exitCode: 0, stdout: "deployment.apps/rel-routing-service\n", stderr: "" };
+      }
+      if (joined.includes("get configmap rel-rm-")) {
+        return { exitCode: 0, stdout: "configmap/snapshot\n", stderr: "" };
+      }
+      if (joined.includes("get configmap rel-routing-manifest") && args.includes("json")) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ data: { "routing-manifest.json": "{}" } }),
+          stderr: "",
+        };
+      }
+      if (args.includes("pods")) {
+        return {
+          exitCode: 0,
+          stdout: `rel-ssr-${state.previousBuildId}-abc\n`,
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const writes = vi.mocked(writeState).mock.calls.map((call) => call[1]);
+    expect(writes).toEqual([
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        cdnTags,
+        routingImageDigests,
+        unretainedManifestBuilds,
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: 7,
+      },
+      {
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        cdnTags,
+        routingImageDigests,
+        unretainedManifestBuilds,
+        poolTopologies: POOL_TOPOLOGIES,
+        basedOnGeneration: 8,
+      },
+    ]);
+
+    const edgePatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args.includes("patch") && args.includes("deployment"))
+      .map(([, args]) => args[args.length - 1] as string);
+    expect(edgePatches).toHaveLength(2);
+    expect(edgePatches[0]).toContain(`routing-service@${digestM}`);
+    expect(edgePatches[0]).not.toContain("routing-service:buildm");
+    expect(edgePatches[1]).toContain(`routing-service@${digestN}`);
+    expect(edgePatches[1]).not.toContain("routing-service:buildn");
   });
 
   it("does NOT invalidate anything when the selector switch fails", async () => {
@@ -163,7 +404,10 @@ describe("runRollback — CDN invalidation", () => {
     expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
     expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
     // State came from the LOCAL file only.
-    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, { localOnly: true });
+    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, {
+      localOnly: true,
+      namespace: "default",
+    });
     // No mutations of any kind.
     expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
@@ -195,6 +439,66 @@ describe("runRollback — CDN invalidation", () => {
       runRollback({ projectDir: PROJECT, releaseName: RELEASE, dryRun: true }),
     ).rejects.toThrow(/LOCAL state file/);
   });
+
+  it("keeps a reverse composed rollback dry-run offline when the local plan is the target", async () => {
+    const targetPlan = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({
+          hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+        }),
+      }),
+      {
+        releaseName: RELEASE,
+        namespace: "default",
+        buildId: "buildn",
+        imageRegistry: "ghcr.io/example/rel",
+        pools: ["ssr"],
+        defaultPool: "ssr",
+        failurePolicy: "closed",
+        cache: "none",
+      },
+    ).plan;
+    const targetDigest = fingerprintCompositionPlan(targetPlan);
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildn",
+      poolTopologies: POOL_TOPOLOGIES,
+      compositionPlans: {
+        buildm: { digest: PLAN_DIGEST_M, targetFingerprint: targetPlan.target.fingerprint },
+        buildn: { digest: targetDigest, targetFingerprint: targetPlan.target.fingerprint },
+      },
+    } as never);
+    vi.mocked(existsSync).mockImplementation(
+      (p) => p === infraPath || p === metaPath || p === planPath,
+    );
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
+      if (p === metaPath)
+        return JSON.stringify({
+          buildId: "buildn",
+          compositionPlan: {
+            digest: targetDigest,
+            targetFingerprint: targetPlan.target.fingerprint,
+          },
+        });
+      if (p === planPath) return canonicalCompositionPlanJson(targetPlan);
+      return "";
+    });
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE, dryRun: true });
+
+    expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    const printed = vi
+      .mocked(console.log)
+      .mock.calls.map((call) => String(call[0]))
+      .join("\n");
+    expect(printed).toContain("[dry-run] Rollback plan: buildm → buildn");
+    expect(printed).toContain("[dry-run] Would swap state: buildId=buildn, previousBuildId=buildm");
+  });
 });
 
 describe("runRollback — HPA names past the 59-char truncation boundary", () => {
@@ -212,7 +516,11 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
 
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(readState).mockResolvedValue({ buildId: CURR, previousBuildId: PREV } as never);
+    vi.mocked(readState).mockResolvedValue({
+      buildId: CURR,
+      previousBuildId: PREV,
+      poolTopologies: { [CURR]: ["ssr"], [PREV]: ["ssr"] },
+    } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
     vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
@@ -240,6 +548,9 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as never);
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -282,9 +593,185 @@ describe("runRollback — HPA names past the 59-char truncation boundary", () =>
     // The rollback completed: state swapped to the previous build.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: PREV, previousBuildId: CURR, basedOnGeneration: null },
+      {
+        buildId: PREV,
+        previousBuildId: CURR,
+        poolTopologies: { [PREV]: ["ssr"], [CURR]: ["ssr"] },
+        basedOnGeneration: null,
+      },
       LONG_RELEASE,
+      "default",
     );
+  });
+});
+
+describe("runRollback — N70: build-scoped pool topology", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: { buildn: ["api"], buildm: ["legacy"] },
+    } as never);
+    vi.mocked(writeState).mockResolvedValue(undefined as never);
+    vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined);
+    vi.mocked(existsSync).mockImplementation((p) => p === infraPath);
+    vi.mocked(readFileSync).mockImplementation((p) => {
+      if (p === infraPath) return '{"projectId":"proj-12345","region":"us-central1"}';
+      return "";
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code}`);
+    }) as never);
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("restores a removed pool and redirects stale Gateway backends before parking the new pool", async () => {
+    const servicePatches: { service: string; body: string }[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployments")) {
+        return {
+          exitCode: 0,
+          stdout: "rel-legacy-buildm|0\nrel-api-buildn|2\n",
+          stderr: "",
+        };
+      }
+      if (args.includes("pods")) {
+        return { exitCode: 0, stdout: "rel-legacy-buildm-abc\n", stderr: "" };
+      }
+      if (args.includes("exec")) return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "get" && args[1] === "service") {
+        const service = args[2]!;
+        const pool = service === "rel-legacy" ? "legacy" : "api";
+        const version = service === "rel-legacy" ? "buildm" : "buildn";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": "rel",
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": version,
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "patch" && args[1] === "service") {
+        servicePatches.push({ service: args[2]!, body: args[args.length - 1]! });
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      // No routing tier; no target HPA; live-capacity reads intentionally fall back to the
+      // configured floor. None of those absences makes the topology ambiguous.
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    expect(servicePatches.map((patch) => patch.service)).toEqual(["rel-legacy", "rel-api"]);
+    expect(servicePatches[1]!.body).toContain(
+      '"path":"/spec/selector/app.kubernetes.io~1component","value":"legacy"',
+    );
+    expect(servicePatches[1]!.body).toContain(
+      '"path":"/spec/selector/app.kubernetes.io~1version","value":"buildm"',
+    );
+    const mutatingArgs = vi.mocked(execOrThrow).mock.calls.map(([, args]) => args.join(" "));
+    expect(mutatingArgs.some((args) => args.includes("deployment/rel-legacy-buildm"))).toBe(true);
+    expect(
+      mutatingArgs.some(
+        (args) => args.includes("deployment/rel-api-buildn") && args.includes("--replicas=0"),
+      ),
+    ).toBe(true);
+    expect(mutatingArgs.some((args) => args.includes("delete hpa rel-api-buildn-hpa"))).toBe(true);
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: { buildm: ["legacy"], buildn: ["api"] },
+        basedOnGeneration: null,
+      },
+      RELEASE,
+      "default",
+    );
+  });
+
+  it("restores exact live selectors when a topology-changing patch only partly succeeds", async () => {
+    const servicePatches: { service: string; body: string }[] = [];
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args.includes("deployments")) {
+        return {
+          exitCode: 0,
+          stdout: "rel-legacy-buildm|0\nrel-api-buildn|2\n",
+          stderr: "",
+        };
+      }
+      if (args.includes("pods")) {
+        return { exitCode: 0, stdout: "rel-legacy-buildm-abc\n", stderr: "" };
+      }
+      if (args.includes("exec")) return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "get" && args[1] === "service") {
+        const service = args[2]!;
+        const pool = service === "rel-legacy" ? "legacy" : "api";
+        const version = service === "rel-legacy" ? "buildm" : "buildn";
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": "rel",
+                "app.kubernetes.io/component": pool,
+                "app.kubernetes.io/version": version,
+                "example.com/operator-selector": "preserve-me",
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "patch" && args[1] === "service") {
+        const patch = { service: args[2]!, body: args[args.length - 1]! };
+        servicePatches.push(patch);
+        if (patch.service === "rel-api" && patch.body.includes('"value":"buildm"')) {
+          return { exitCode: 1, stdout: "", stderr: "denied by webhook" };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    expect(servicePatches.map((patch) => patch.service)).toEqual([
+      "rel-legacy",
+      "rel-api",
+      "rel-legacy",
+    ]);
+    const restore = JSON.parse(servicePatches[2]!.body) as { value: Record<string, string> }[];
+    expect(restore).toEqual([
+      {
+        op: "replace",
+        path: "/spec/selector",
+        value: {
+          "app.kubernetes.io/name": "rel",
+          "app.kubernetes.io/component": "legacy",
+          "app.kubernetes.io/version": "buildm",
+          "example.com/operator-selector": "preserve-me",
+        },
+      },
+    ]);
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    expect(
+      vi.mocked(execOrThrow).mock.calls.some(([, args]) => args.includes("--replicas=0")),
+    ).toBe(false);
   });
 });
 
@@ -294,6 +781,7 @@ describe("runRollback — state read ordering", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -319,14 +807,19 @@ describe("runRollback — state read ordering", () => {
     expect(vi.mocked(execCapture).mock.calls[0]![1]).toContain("get-credentials");
     expect(stateOrder).toBeGreaterThan(credOrder);
     // Non-dry-run reads may hit the cluster ConfigMap (no localOnly flag).
-    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, undefined);
+    expect(vi.mocked(readState)).toHaveBeenCalledWith(PROJECT, RELEASE, {
+      namespace: "default",
+    });
   });
 });
 
 describe("runRollback — routing service revert", () => {
   const REGISTRY = "us-central1-docker.pkg.dev/proj/nextjs";
 
-  function routingCapture(opts: { targetSnapshotExists: boolean }) {
+  function routingCapture(opts: {
+    targetSnapshotExists: boolean;
+    liveArchitecture?: "amd64" | "arm64";
+  }) {
     return vi.fn(async (_cmd: string, args: string[]) => {
       const j = args.join(" ");
       if (args.includes("deployments"))
@@ -338,6 +831,9 @@ describe("runRollback — routing service revert", () => {
             spec: {
               template: {
                 spec: {
+                  nodeSelector: {
+                    "kubernetes.io/arch": opts.liveArchitecture ?? "arm64",
+                  },
                   containers: [
                     {
                       name: "routing-service",
@@ -381,6 +877,8 @@ describe("runRollback — routing service revert", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -427,6 +925,7 @@ describe("runRollback — routing service revert", () => {
     const patchBody = deployPatch![1][deployPatch![1].length - 1]!;
     expect(patchBody).toContain(`"image":"${REGISTRY}/routing-service:buildm"`);
     expect(patchBody).toContain(`"configMap":{"name":"${SNAP_M}"}`);
+    expect(patchBody).toContain('"kubernetes.io/arch":"amd64"');
 
     // 3. ...and its rollout was awaited. Through execCapture, not execOrThrow: the exit code
     // is needed, because a failed rollout must RESTORE the edge rather than throw with the
@@ -474,8 +973,46 @@ describe("runRollback — routing service revert", () => {
     // The rollback still completes the pool switch.
     expect(vi.mocked(writeState)).toHaveBeenCalledWith(
       PROJECT,
-      { buildId: "buildm", previousBuildId: "buildn", basedOnGeneration: null },
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: POOL_TOPOLOGIES,
+        targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
+        basedOnGeneration: null,
+      },
       RELEASE,
+      "default",
+    );
+  });
+
+  it("moves an amd64 routing edge to arm64 and preserves both platform records", async () => {
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
+      targetPlatforms: { buildn: "linux/amd64", buildm: "linux/arm64" },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      routingCapture({ targetSnapshotExists: true, liveArchitecture: "amd64" }) as never,
+    );
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE });
+
+    const deployPatch = vi
+      .mocked(execCapture)
+      .mock.calls.find(([, args]) => args.includes("patch") && args.includes("deployment"))!;
+    expect(deployPatch[1].at(-1)).toContain('"kubernetes.io/arch":"arm64"');
+    expect(vi.mocked(writeState)).toHaveBeenCalledWith(
+      PROJECT,
+      {
+        buildId: "buildm",
+        previousBuildId: "buildn",
+        poolTopologies: POOL_TOPOLOGIES,
+        targetPlatforms: { buildn: "linux/amd64", buildm: "linux/arm64" },
+        basedOnGeneration: null,
+      },
+      RELEASE,
+      "default",
     );
   });
 
@@ -499,7 +1036,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
 
   // Two pools; the ssr Service patch to the previous build succeeds, the api one
   // fails. The routing tier exists and serves buildn from the stable ConfigMap.
-  function partialFailCapture(opts: { edgeForwardFails?: boolean } = {}) {
+  function partialFailCapture(opts: { edgeForwardFails?: boolean; portableOrigin?: boolean } = {}) {
     return vi.fn(async (_cmd: string, args: string[]) => {
       const j = args.join(" ");
       const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
@@ -511,6 +1048,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
             spec: {
               template: {
                 spec: {
+                  nodeSelector: { "kubernetes.io/arch": "arm64" },
                   containers: [
                     { name: "routing-service", image: `${REGISTRY}/routing-service:buildn` },
                   ],
@@ -534,6 +1072,23 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
       }
       if (j.includes("get configmap rel-routing-manifest") && args.includes("json")) {
         return ok(JSON.stringify({ data: { "routing-manifest.json": "{}" } }));
+      }
+      if (j.includes("get service rel-origin") && args.includes("--ignore-not-found")) {
+        return ok(opts.portableOrigin ? "service/rel-origin\n" : "");
+      }
+      if (j.includes("get service rel-origin") && args.includes("json")) {
+        return ok(
+          JSON.stringify({
+            spec: {
+              selector: {
+                "app.kubernetes.io/name": "rel",
+                "app.kubernetes.io/component": "api",
+                "app.kubernetes.io/version": "buildn",
+                "example.com/operator-selector": "preserve-me",
+              },
+            },
+          }),
+        );
       }
       if (args.includes("patch") && args.includes("service")) {
         const svc = args[args.indexOf("service") + 1]!;
@@ -562,6 +1117,8 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: { buildn: ["ssr", "api"], buildm: ["ssr", "api"] },
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -601,6 +1158,11 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
       /process\.exit:1/,
     );
+    expect(
+      errorOutput()
+        .split("\n")
+        .filter((line) => line.includes("Service selector patch(es) failed")),
+    ).toHaveLength(1);
 
     const calls = vi.mocked(execCapture).mock.calls;
     // The ssr Service was restored to the CURRENT build after the api patch failed...
@@ -620,6 +1182,11 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
         a[a.length - 1]!.includes("routing-service:buildn"),
     );
     expect(edgeForwardIdx).toBeGreaterThan(svcRestoreIdx);
+    const edgePatches = calls
+      .filter(([, a]) => a.includes("patch") && a.includes("deployment"))
+      .map(([, a]) => a.at(-1)!);
+    expect(edgePatches[0]).toContain('"kubernetes.io/arch":"amd64"');
+    expect(edgePatches.at(-1)).toContain('"kubernetes.io/arch":"arm64"');
 
     const out = errorOutput();
     expect(out).toContain("ROLLBACK FAILED");
@@ -651,6 +1218,49 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
       "The routing edge (image + manifest) was restored to the current build.",
     );
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+  });
+
+  it("restores the portable origin's exact selector after a partial rollback", async () => {
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: { buildn: ["ssr", "api"], buildm: ["ssr", "api"] },
+      defaultPools: { buildn: "api", buildm: "ssr" },
+      targetPlatforms: { buildn: "linux/arm64", buildm: "linux/amd64" },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      partialFailCapture({ portableOrigin: true }) as never,
+    );
+
+    await expect(runRollback({ projectDir: PROJECT, releaseName: RELEASE })).rejects.toThrow(
+      /process\.exit:1/,
+    );
+
+    const originPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, args]) => args[0] === "patch" && args[1] === "service" && args[2] === "rel-origin",
+      )
+      .map(([, args]) => JSON.parse(args.at(-1)!) as Array<Record<string, unknown>>);
+    expect(originPatches).toHaveLength(2);
+    expect(originPatches[0]).toContainEqual(
+      expect.objectContaining({
+        path: "/spec/selector/app.kubernetes.io~1component",
+        value: "ssr",
+      }),
+    );
+    expect(originPatches[1]).toEqual([
+      {
+        op: "replace",
+        path: "/spec/selector",
+        value: {
+          "app.kubernetes.io/name": "rel",
+          "app.kubernetes.io/component": "api",
+          "app.kubernetes.io/version": "buildn",
+          "example.com/operator-selector": "preserve-me",
+        },
+      },
+    ]);
   });
 });
 
@@ -730,7 +1340,7 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
     // permanently destroys the rollback target's manifest once helm overwrites the stable
     // ConfigMap.
     vi.mocked(execCapture).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
-    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+    await expect(retainLiveRoutingManifest("rel", "prod")).resolves.toEqual({
       status: "no-routing-tier",
     });
     expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
@@ -816,10 +1426,48 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
       retainCapture({ existingSnapshotAnnotation: undefined }) as never,
     );
 
-    await expect(retainLiveRoutingManifest("rel")).resolves.toEqual({
+    await expect(retainLiveRoutingManifest("rel", "prod")).resolves.toEqual({
       status: "retained",
       snapshotName: SNAP_N,
     });
+  });
+
+  it("retains a chart-owned live snapshot before the next Helm upgrade", async () => {
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      const j = args.join(" ");
+      const ok = (stdout = "") => ({ exitCode: 0, stdout, stderr: "" });
+      if (j.includes("get deployment rel-routing-service") && args.includes("json")) {
+        return ok(
+          JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    { name: "routing-service", image: `${REGISTRY}/routing-service:buildn` },
+                  ],
+                  volumes: [{ name: "routing-manifest", configMap: { name: SNAP_N } }],
+                },
+              },
+            },
+          }),
+        );
+      }
+      return ok();
+    }) as never);
+
+    await expect(retainLiveRoutingManifest("rel", "prod")).resolves.toEqual({
+      status: "retained",
+      snapshotName: SNAP_N,
+    });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls).toContain(
+      `annotate configmap ${SNAP_N} -n prod helm.sh/resource-policy=keep --overwrite`,
+    );
+    expect(calls).toContain(
+      `label configmap ${SNAP_N} -n prod app.kubernetes.io/name=rel app.kubernetes.io/component=routing-manifest-snapshot --overwrite`,
+    );
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
   });
 
   it("N30: reports a failed apply as failed, with a reason", async () => {
@@ -895,6 +1543,7 @@ describe("retainLiveRoutingManifest — snapshot overwrite protection", () => {
     });
     const applied = JSON.parse(vi.mocked(execCaptureStdin).mock.calls[0]![2] as string);
     expect(applied.metadata.annotations[SNAPSHOT_BUILD_ID_ANNOTATION]).toBe("buildn");
+    expect(applied.metadata.annotations["helm.sh/resource-policy"]).toBe("keep");
     expect(applied.metadata.labels["app.kubernetes.io/managed-by"]).toBe("adapter-k8s");
   });
 });
@@ -905,6 +1554,7 @@ describe("runRollback — serving gate", () => {
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -1054,6 +1704,7 @@ describe("runRollback — N26: scales the target to the current build's live cap
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(writeState).mockResolvedValue(undefined as never);
     vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
@@ -1194,6 +1845,7 @@ describe("runRollback — N69: the generation floor travels through rollback's s
       buildId: "buildn",
       previousBuildId: "buildm",
       generation: 7,
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(execCapture).mockImplementation(clusterOutageOnStateWrite() as never);
 
@@ -1222,6 +1874,7 @@ describe("runRollback — N69: the generation floor travels through rollback's s
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
+      poolTopologies: POOL_TOPOLOGIES,
     } as never);
     vi.mocked(execCapture).mockImplementation(clusterOutageOnStateWrite() as never);
 
@@ -1356,6 +2009,63 @@ describe("revertRoutingServiceToBuild — env stays truthful", () => {
     expect(body).toContain("routing-service:target-build");
     expect(body).toContain("NEXT_BUILD_ID");
     expect(body).toContain("target-build");
+  });
+
+  it("does not snapshot an uncertain edge during deploy recovery", async () => {
+    vi.clearAllMocks();
+    vi.mocked(execOrThrow).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" } as never);
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    } as never);
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "get" && args[1] === "deployment") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:uncertain",
+                      env: [{ name: "NEXT_BUILD_ID", value: "uncertain" }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "get" && args[1] === "configmap") {
+        return { exitCode: 0, stdout: `configmap/${args[2]}\n`, stderr: "" };
+      }
+      if (args[0] === "get" && args[1] === "secret") {
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target-build",
+      registry: "gcr.io/p",
+      retainCurrentManifest: false,
+    });
+
+    const configMapReads = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "get" && args[1] === "configmap")
+      .map(([, args]) => args[2]);
+    expect(configMapReads).toEqual([routingManifestSnapshotName("rel", "target-build")]);
+    expect(execCaptureStdin).not.toHaveBeenCalled();
   });
 });
 
@@ -1556,7 +2266,11 @@ describe("revertRoutingServiceToBuild — the dispatch secret moves with the ima
 describe("revertRoutingServiceToBuild — failed rollout restores the edge", () => {
   const PRIOR_IMAGE = `gcr.io/p/routing-service@sha256:${"a".repeat(64)}`;
 
-  function mockCluster(opts: { rolloutFails: boolean; restoreFails?: boolean }) {
+  function mockCluster(opts: {
+    rolloutFails: boolean;
+    restoreFails?: boolean;
+    priorNodeArchitecture?: "arm64" | null;
+  }) {
     let patches = 0;
     vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
       const j = args.join(" ");
@@ -1567,6 +2281,14 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
             spec: {
               template: {
                 spec: {
+                  ...(opts.priorNodeArchitecture === null
+                    ? {}
+                    : {
+                        nodeSelector: {
+                          "kubernetes.io/arch": opts.priorNodeArchitecture ?? "arm64",
+                          "topology.kubernetes.io/zone": "zone-a",
+                        },
+                      }),
                   containers: [
                     {
                       name: "routing-service",
@@ -1609,6 +2331,7 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
         releaseName: "rel",
         targetBuildId: "target",
         registry: "gcr.io/p",
+        targetPlatform: "linux/amd64",
       }),
     ).rejects.toThrow(/did not roll out.*restored to what it was serving before/s);
 
@@ -1621,6 +2344,53 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
     const body = restore[1][restore[1].length - 1]!;
     expect(body).toContain(PRIOR_IMAGE);
     expect(body).toContain("prior-build");
+    const patchBodies = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .map(([, a]) => a.at(-1)!)
+      .slice(-2);
+    expect(patchBodies[0]).toContain('"kubernetes.io/arch":"amd64"');
+    expect(patchBodies.at(-1)).toContain('"kubernetes.io/arch":"arm64"');
+    // Only the architecture key is patched; strategic merge preserves unrelated selectors.
+    expect(patchBodies.at(-1)).not.toContain("topology.kubernetes.io/zone");
+  });
+
+  it("removes the architecture key when a failed revert started without one", async () => {
+    mockCluster({ rolloutFails: true, priorNodeArchitecture: null });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target",
+        registry: "gcr.io/p",
+        targetPlatform: "linux/arm64",
+      }),
+    ).rejects.toThrow(/did not roll out/);
+
+    const restoreBody = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .at(-1)![1]
+      .at(-1)!;
+    expect(restoreBody).toContain('"kubernetes.io/arch":null');
+  });
+
+  it("does not touch the selector while restoring a failed legacy-platform revert", async () => {
+    mockCluster({ rolloutFails: true });
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "legacy-target",
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/did not roll out/);
+
+    const patchBodies = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "patch")
+      .map(([, a]) => a.at(-1)!)
+      .slice(-2);
+    expect(patchBodies).toHaveLength(2);
+    expect(patchBodies.every((body) => !body.includes("nodeSelector"))).toBe(true);
   });
 
   it("says so explicitly when the restore ALSO fails — that is a different situation", async () => {
@@ -1630,6 +2400,7 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
         releaseName: "rel",
         targetBuildId: "target",
         registry: "gcr.io/p",
+        targetPlatform: "linux/amd64",
       }),
     ).rejects.toThrow(/could NOT be restored.*DIFFERENT builds/s);
   });
@@ -1640,6 +2411,7 @@ describe("revertRoutingServiceToBuild — failed rollout restores the edge", () 
       releaseName: "rel",
       targetBuildId: "target",
       registry: "gcr.io/p",
+      targetPlatform: "linux/amd64",
     });
     expect(patchCount()).toBe(1);
   });
@@ -1696,9 +2468,11 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
       targetBuildId: "target",
       registry: "gcr.io/p",
       targetImageDigest: DIGEST,
+      targetPlatform: "linux/arm64",
     });
     expect(patchBody()).toContain(`routing-service@${DIGEST}`);
     expect(patchBody()).not.toContain("routing-service:target");
+    expect(patchBody()).toContain('"kubernetes.io/arch":"arm64"');
   });
 
   it("falls back to the tag for a build with no recorded digest, and warns", async () => {
@@ -1710,7 +2484,9 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
       registry: "gcr.io/p",
     });
     expect(patchBody()).toContain("routing-service:legacy");
+    expect(patchBody()).not.toContain("nodeSelector");
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reverting the edge by\s+TAG/i));
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/No recorded target platform/i));
     warn.mockRestore();
   });
 });

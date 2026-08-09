@@ -35,6 +35,7 @@ import {
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_SECRET_HEADER,
   parseRequestUrl,
+  UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../src/routing-common.js";
 
 const ORIGIN = "http://app.example.com";
@@ -725,7 +726,11 @@ describe("Phase 1 / Phase 2 middleware response parity (N40 / findings #16, #35,
     // … and must clear the WHOLE vocabulary (plus the secret) so the pool re-resolves untrusted.
     expect(r.phase2.dispatch("x-mw-evaluated")).toBeUndefined();
     expect(new Set(r.phase2.removeHeaders)).toEqual(
-      new Set([...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]),
+      new Set([
+        ...INTERNAL_DISPATCH_HEADERS,
+        ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+        INTERNAL_SECRET_HEADER,
+      ]),
     );
   });
 
@@ -1078,7 +1083,7 @@ describe("Phase 1 / Phase 2 client rewrite-signal parity", () => {
    * `isRSCRequest` / `isRSCRequestHeader` guards at both upstream emission sites). */
   const rscTiers = (args: Parameters<typeof bothTiers>[0]) => {
     const rscHeader = args.manifest.routeGraph.rsc?.header ?? "rsc";
-    return bothTiers({ ...args, headers: { [rscHeader]: "1", ...(args.headers ?? {}) } });
+    return bothTiers({ ...args, headers: { [rscHeader]: "1", ...args.headers } });
   };
 
   it("emits the rewrite signal for a next.config rewrite on BOTH tiers (repeated query keys)", async () => {

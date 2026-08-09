@@ -2,19 +2,18 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { execCapture, execCaptureStdin, execOrThrow } from "./exec.js";
-import { readState, writeState } from "./state.js";
+import { readState, writeState, type AdapterState } from "./state.js";
+import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
 import {
   assertSafeBuildId,
   assertSafeImageRegistry,
   poolResourceNames,
   sanitizeK8sName,
-  // init binds Workload Identity to [default/<release>-deploy-sa]; the release lives
-  // in the literal "default" namespace. Pin it on every kubectl call instead of
-  // trusting whatever namespace the operator's context happens to have.
-  K8S_NAMESPACE,
+  resolveK8sNamespace,
 } from "../emit/templates/utils.js";
 import {
+  ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
   ROUTING_MANIFEST_VOLUME_NAME,
   routingManifestSnapshotName,
   routingServiceDeploymentName,
@@ -31,6 +30,18 @@ import {
   infrastructurePath,
   outputDirName,
 } from "./infrastructure-validation.js";
+import { targetArchitecture, type TargetPlatform } from "../target-platform.js";
+import { sanitizeForTerminal } from "./terminal.js";
+import {
+  assertCompositionPlanInvocation,
+  compositionPlanNeedsExplicitConfirmation,
+  inspectKubernetesRequirements,
+  loadDeployedCompositionPlan,
+  loadProjectCompositionPlan,
+  preflightCompositionPlan,
+  type LoadedCompositionPlan,
+  waitForCompositionPlanReadiness,
+} from "./composition-plan.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -38,6 +49,59 @@ import {
 // detect that and refuse to clobber a different build's manifest (deploy also guards
 // the composed names up front — this is defense in depth at the point of overwrite).
 export const SNAPSHOT_BUILD_ID_ANNOTATION = "adapter-k8s/build-id";
+
+type RollbackCompositionRole = "current" | "target";
+
+/**
+ * A checkout may contain either side of a two-way rollback. Bind its plan to the matching
+ * committed anchor instead of assuming the local artifact is always the currently served build.
+ */
+export function classifyLocalRollbackComposition(options: {
+  local: LoadedCompositionPlan;
+  state: Pick<AdapterState, "buildId" | "previousBuildId" | "compositionPlans">;
+  releaseName: string;
+  namespace: string;
+}): RollbackCompositionRole {
+  const { local, state, releaseName, namespace } = options;
+  const localBuildId = local.plan.metadata.buildId;
+  const role: RollbackCompositionRole =
+    localBuildId === state.buildId
+      ? "current"
+      : localBuildId === state.previousBuildId
+        ? "target"
+        : (() => {
+            throw new Error(
+              `The local composition plan belongs to build ${localBuildId}, but rollback only ` +
+                `recognizes current build ${state.buildId} and target build ` +
+                `${state.previousBuildId ?? "<none>"}. Restore either retained build artifact.`,
+            );
+          })();
+
+  assertCompositionPlanInvocation(local.plan, {
+    releaseName,
+    namespace,
+    buildId: localBuildId,
+  });
+
+  const anchor = state.compositionPlans?.[localBuildId];
+  if (role === "target" && !anchor) {
+    throw new Error(
+      `The local composition plan belongs to rollback target ${localBuildId}, but committed ` +
+        `deploy state has no trust anchor for that build. Restore the currently deployed ` +
+        `build artifact before rolling back.`,
+    );
+  }
+  if (
+    anchor &&
+    (local.digest !== anchor.digest || local.plan.target.fingerprint !== anchor.targetFingerprint)
+  ) {
+    throw new Error(
+      `The local composition plan for ${localBuildId} does not match committed deploy state. ` +
+        `Restore that build artifact before rolling back.`,
+    );
+  }
+  return role;
+}
 
 interface RoutingServingConfig {
   /**
@@ -61,6 +125,8 @@ interface RoutingServingConfig {
    * Deployment carries no such env (an adapter version predating the injection).
    */
   internalSecretRef: string | null;
+  /** Exact value of the routing pod's Kubernetes architecture selector, if present. */
+  nodeArchitecture: string | null;
 }
 
 /**
@@ -89,14 +155,18 @@ type RoutingServingRead =
  * it from the image reference broke once images became digest-pinned (see the NEXT_BUILD_ID note
  * inside).
  */
-export async function readRoutingServingConfig(releaseName: string): Promise<RoutingServingRead> {
+export async function readRoutingServingConfig(
+  releaseName: string,
+  configuredNamespace?: string,
+): Promise<RoutingServingRead> {
+  const namespace = resolveK8sNamespace(configuredNamespace);
   const deployName = routingServiceDeploymentName(releaseName);
   const res = await execCapture("kubectl", [
     "get",
     "deployment",
     deployName,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--ignore-not-found",
     "-o",
     "json",
@@ -124,7 +194,7 @@ export async function readRoutingServingConfig(releaseName: string): Promise<Rou
     };
   }
   const podSpec = (parsed as { spec?: { template?: { spec?: unknown } } })?.spec?.template?.spec as
-    | { containers?: unknown; volumes?: unknown }
+    | { containers?: unknown; volumes?: unknown; nodeSelector?: unknown }
     | undefined;
   const containers: unknown[] = Array.isArray(podSpec?.containers) ? podSpec.containers : [];
   const volumes: unknown[] = Array.isArray(podSpec?.volumes) ? podSpec.volumes : [];
@@ -155,6 +225,10 @@ export async function readRoutingServingConfig(releaseName: string): Promise<Rou
   const internalSecretRef =
     envEntries.find((e) => e?.name === "INTERNAL_HEADER_SECRET")?.valueFrom?.secretKeyRef?.name ??
     null;
+  const nodeArchitecture =
+    podSpec?.nodeSelector && typeof podSpec.nodeSelector === "object"
+      ? ((podSpec.nodeSelector as Record<string, unknown>)["kubernetes.io/arch"] ?? null)
+      : null;
   // A TAG-pinned image names its own build, and the image is what actually runs — so when the
   // reference carries a tag, that tag wins. The env is the source only for a DIGEST-pinned
   // image, where the reference cannot name a build at all.
@@ -197,6 +271,7 @@ export async function readRoutingServingConfig(releaseName: string): Promise<Rou
       image: typeof image === "string" ? image : "",
       manifestConfigMap: cmName,
       internalSecretRef,
+      nodeArchitecture: typeof nodeArchitecture === "string" ? nodeArchitecture : null,
     },
   };
 }
@@ -223,9 +298,11 @@ export type RetainManifestResult =
 // by deploy (pre-helm-upgrade) to retain the outgoing build.
 export async function retainLiveRoutingManifest(
   releaseName: string,
+  configuredNamespace?: string,
   log: (msg: string) => void = (m) => console.log(m),
 ): Promise<RetainManifestResult> {
-  const read = await readRoutingServingConfig(releaseName);
+  const namespace = resolveK8sNamespace(configuredNamespace);
+  const read = await readRoutingServingConfig(releaseName, namespace);
   // N68: absence (proven by --ignore-not-found) is the ONLY outcome that means "nothing to
   // retain". A read failure is a retention failure, which deploy treats as fatal unless
   // --allow-unretained-manifest — otherwise helm overwrites the stable ConfigMap and the
@@ -240,8 +317,45 @@ export async function retainLiveRoutingManifest(
   }
   const serving = read.config;
   const snapshotName = routingManifestSnapshotName(releaseName, serving.imageTag);
-  // Already serving from this build's snapshot (post-rollback state) — nothing to copy.
-  if (serving.manifestConfigMap === snapshotName) return { status: "retained", snapshotName };
+  // A current chart renders the serving build's snapshot as a Helm-owned object. Merely
+  // observing that it already has the right name is not retention: Helm deletes resources
+  // that disappear from the next chart. Stamp the keep policy and classification labels
+  // before upgrade so the outgoing routing ReplicaSet and rollback target keep mounting it.
+  // This also migrates snapshots emitted before the chart carried the policy itself.
+  if (serving.manifestConfigMap === snapshotName) {
+    const annotated = await execCapture("kubectl", [
+      "annotate",
+      "configmap",
+      snapshotName,
+      "-n",
+      namespace,
+      "helm.sh/resource-policy=keep",
+      "--overwrite",
+    ]);
+    if (annotated.exitCode !== 0) {
+      return {
+        status: "failed",
+        reason: `could not retain the live snapshot ${snapshotName}: ${annotated.stderr.trim() || `kubectl annotate exited ${annotated.exitCode}`}`,
+      };
+    }
+    const labeled = await execCapture("kubectl", [
+      "label",
+      "configmap",
+      snapshotName,
+      "-n",
+      namespace,
+      `app.kubernetes.io/name=${releaseName}`,
+      `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
+      "--overwrite",
+    ]);
+    if (labeled.exitCode !== 0) {
+      return {
+        status: "failed",
+        reason: `could not classify the live snapshot ${snapshotName}: ${labeled.stderr.trim() || `kubectl label exited ${labeled.exitCode}`}`,
+      };
+    }
+    return { status: "retained", snapshotName };
+  }
   // Overwrite protection: if a ConfigMap already exists under this snapshot name but is
   // stamped with a DIFFERENT build id, the two builds' snapshot names collide after
   // sanitization — overwriting would destroy that build's only retained manifest.
@@ -253,7 +367,7 @@ export async function retainLiveRoutingManifest(
     "configmap",
     snapshotName,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--ignore-not-found",
     "-o",
     "json",
@@ -283,7 +397,7 @@ export async function retainLiveRoutingManifest(
     "configmap",
     serving.manifestConfigMap,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-o",
     "json",
   ]);
@@ -315,10 +429,11 @@ export async function retainLiveRoutingManifest(
         "app.kubernetes.io/name": releaseName,
         // kubectl-created (not helm-owned) — destroy deletes by this label pair.
         "app.kubernetes.io/managed-by": "adapter-k8s",
-        "app.kubernetes.io/component": "routing-manifest-snapshot",
+        "app.kubernetes.io/component": ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
       },
       // An ANNOTATION, not a label: build ids may exceed the 63-char label-value limit.
       annotations: {
+        "helm.sh/resource-policy": "keep",
         [SNAPSHOT_BUILD_ID_ANNOTATION]: serving.imageTag,
       },
     },
@@ -328,7 +443,7 @@ export async function retainLiveRoutingManifest(
   // argv length, and secrets never go on argv.
   const applied = await execCaptureStdin(
     "kubectl",
-    ["apply", "-n", K8S_NAMESPACE, "-f", "-"],
+    ["apply", "-n", namespace, "-f", "-"],
     JSON.stringify(snapshot),
   );
   if (applied.exitCode !== 0) {
@@ -366,23 +481,33 @@ export async function retainLiveRoutingManifest(
 // still serving traffic. No cutover performed."
 export async function revertRoutingServiceToBuild(opts: {
   releaseName: string;
+  namespace?: string;
   targetBuildId: string;
   registry: string | undefined;
+  /**
+   * Preserve the edge being replaced as another rollback target. Deploy recovery disables this:
+   * a failed Helm command may have updated the stable manifest without updating the image, so
+   * naming that uncertain pair after either build could overwrite a valid snapshot.
+   */
+  retainCurrentManifest?: boolean;
   /**
    * The target build's recorded routing-image digest (`AdapterState.routingImageDigests`), when
    * one exists. Without it the reference can only be a TAG, which leaves a rolled-back edge one
    * step less immutable than a freshly deployed one.
    */
   targetImageDigest?: string | undefined;
+  /** The target build's recorded platform. Unknown legacy builds leave the selector alone. */
+  targetPlatform?: TargetPlatform | undefined;
 }): Promise<void> {
-  const { releaseName, targetBuildId, registry, targetImageDigest } = opts;
+  const { releaseName, targetBuildId, registry, targetImageDigest, targetPlatform } = opts;
+  const namespace = resolveK8sNamespace(opts.namespace);
   const deployName = routingServiceDeploymentName(releaseName);
   // N68: same distinction as retention — a read failure here used to return silently, i.e.
   // report "this release has no routing tier" and let the caller believe the edge was
   // reverted (deploy's abort path prints "the routing edge was reverted") while the edge
   // kept serving the other build's middleware. Absence is exit 0 + empty stdout; anything
   // else throws so the caller can say what it does not know.
-  const exists = await readRoutingServingConfig(releaseName);
+  const exists = await readRoutingServingConfig(releaseName, namespace);
   if (exists.status === "failed") {
     throw new Error(
       `Could not determine what the routing tier (${deployName}) is serving: ${exists.reason}. ` +
@@ -408,11 +533,14 @@ export async function revertRoutingServiceToBuild(opts: {
     image: exists.config.image || null,
     manifestConfigMap: exists.config.manifestConfigMap || null,
     internalSecretRef: exists.config.internalSecretRef,
+    nodeArchitecture: exists.config.nodeArchitecture,
   };
 
   // Retain the manifest we are about to roll AWAY from, so the symmetric roll-forward
   // can restore it (its stable-ConfigMap content is otherwise lost on the next deploy).
-  await retainLiveRoutingManifest(releaseName);
+  if (opts.retainCurrentManifest !== false) {
+    await retainLiveRoutingManifest(releaseName, namespace);
+  }
 
   const targetSnapshot = routingManifestSnapshotName(releaseName, targetBuildId);
   const snap = await execCapture("kubectl", [
@@ -420,7 +548,7 @@ export async function revertRoutingServiceToBuild(opts: {
     "configmap",
     targetSnapshot,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--ignore-not-found",
     "-o",
     "name",
@@ -447,6 +575,14 @@ export async function revertRoutingServiceToBuild(opts: {
         `next deploy records a digest so a later rollback can pin it.`,
     );
   }
+  if (!targetPlatform) {
+    console.warn(
+      `  ! No recorded target platform for build ${targetBuildId}. This build predates ` +
+        `platform-aware deploy state, so the routing Deployment's kubernetes.io/arch ` +
+        `selector will NOT be changed. Verify that the live selector can run this image; ` +
+        `new builds record platform provenance, but this legacy build ID remains unknown.`,
+    );
+  }
   // N87: the internal dispatch secret is per BUILD, so the edge's secretKeyRef must move with
   // the image for the same reason NEXT_BUILD_ID does — otherwise a reverted edge presents the
   // rolled-away-from build's secret to the rolled-back pools, which reject it and re-resolve
@@ -466,7 +602,7 @@ export async function revertRoutingServiceToBuild(opts: {
       "secret",
       candidate,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--ignore-not-found",
       "-o",
       "name",
@@ -493,6 +629,13 @@ export async function revertRoutingServiceToBuild(opts: {
     spec: {
       template: {
         spec: {
+          ...(targetPlatform
+            ? {
+                nodeSelector: {
+                  "kubernetes.io/arch": targetArchitecture(targetPlatform),
+                },
+              }
+            : {}),
           containers: [
             {
               name: "routing-service",
@@ -547,7 +690,7 @@ export async function revertRoutingServiceToBuild(opts: {
     "deployment",
     deployName,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--type=strategic",
     // Same field-manager rationale as the Service selector patches below: helm owns this
     // Deployment, so the next `helm upgrade` must not conflict on the fields we flip here.
@@ -577,12 +720,17 @@ export async function revertRoutingServiceToBuild(opts: {
     "status",
     `deployment/${deployName}`,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     `--timeout=${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s`,
   ]);
   if (rollout.exitCode !== 0) {
     const detail = rollout.stderr.trim() || rollout.stdout.trim() || `exit ${rollout.exitCode}`;
-    const restored = await restoreRoutingSpec(deployName, priorSpec);
+    const restored = await restoreRoutingSpec(
+      deployName,
+      priorSpec,
+      namespace,
+      targetPlatform !== undefined,
+    );
     throw new Error(
       `The routing service did not roll out to build ${targetBuildId} within ` +
         `${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s: ${detail}\n` +
@@ -590,7 +738,7 @@ export async function revertRoutingServiceToBuild(opts: {
           ? `  The edge was restored to what it was serving before (${priorSpec.buildId ?? "unknown build"}), ` +
             `so the pools and the edge still agree. Traffic was NOT switched.`
           : `  !! The edge could NOT be restored, so the pools and the edge may now be on ` +
-            `DIFFERENT builds. Check \`kubectl -n ${K8S_NAMESPACE} describe deployment ` +
+            `DIFFERENT builds. Check \`kubectl -n ${namespace} describe deployment ` +
             `${deployName}\` and the routing pod logs — a manifest that does not match the ` +
             `image makes the pod refuse to start on purpose.`) +
         `\n  Traffic was NOT switched.`,
@@ -613,6 +761,8 @@ interface RoutingSpecSnapshot {
   manifestConfigMap: string | null;
   /** N87: the per-build internal dispatch Secret the container resolved from. */
   internalSecretRef: string | null;
+  /** Exact prior selector value; null means the key was absent and must be removed. */
+  nodeArchitecture: string | null;
 }
 
 /**
@@ -623,12 +773,25 @@ interface RoutingSpecSnapshot {
 async function restoreRoutingSpec(
   deployName: string,
   prior: RoutingSpecSnapshot,
+  namespace: string,
+  restoreNodeArchitecture: boolean,
 ): Promise<boolean> {
   if (!prior.image) return false;
   const patch = {
     spec: {
       template: {
         spec: {
+          // Restore only fields this invocation changed. A legacy target with unknown platform
+          // deliberately leaves the selector alone in the forward patch, so touching it here
+          // would break patch/restore symmetry and trust parser fidelity unnecessarily.
+          ...(restoreNodeArchitecture
+            ? {
+                // Strategic merge treats null as deletion and preserves unrelated selectors.
+                nodeSelector: {
+                  "kubernetes.io/arch": prior.nodeArchitecture,
+                },
+              }
+            : {}),
           containers: [
             {
               name: "routing-service",
@@ -677,7 +840,7 @@ async function restoreRoutingSpec(
     "deployment",
     deployName,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--type=strategic",
     "--field-manager=helm",
     "-p",
@@ -720,8 +883,8 @@ export function planRollbackCapacity(
   );
   const replicas = Math.max(ROLLBACK_MIN_REPLICAS, scaling.min, live);
   // The HPA must not immediately undo the scale-up (min) and must be able to grow past
-  // where the current build already was (max). The next deploy re-renders the HPA from
-  // config, so this widening is scoped to the incident.
+  // where the current build already was (max). The next deploy omits this HPA when it parks
+  // the build again, so this widening is scoped to the incident.
   return { replicas, min: replicas, max: Math.max(scaling.max, observed.hpaMax ?? 0, replicas) };
 }
 
@@ -735,6 +898,7 @@ async function readLiveCapacity(
   releaseName: string,
   pool: string,
   currentBuildId: string,
+  namespace: string,
 ): Promise<{ observed: LiveCapacity; unreadable: string[] }> {
   const { deployment, hpa } = poolResourceNames(releaseName, pool, currentBuildId);
   const unreadable: string[] = [];
@@ -750,7 +914,7 @@ async function readLiveCapacity(
     "deployment",
     deployment,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--ignore-not-found",
     "-o",
     "jsonpath={.metadata.name}|{.spec.replicas}|{.status.readyReplicas}",
@@ -771,7 +935,7 @@ async function readLiveCapacity(
     "hpa",
     hpa,
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "--ignore-not-found",
     "-o",
     "jsonpath={.metadata.name}|{.status.desiredReplicas}|{.spec.maxReplicas}",
@@ -794,20 +958,37 @@ export async function runRollback(options: {
   projectDir: string;
   releaseName: string;
   dryRun?: boolean;
+  yes?: boolean;
 }): Promise<void> {
-  const { projectDir, releaseName, dryRun } = options;
+  const { projectDir, releaseName, dryRun, yes } = options;
 
   const infraPath = infrastructurePath(projectDir);
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
+  const namespace = resolveK8sNamespace(infra?.namespace);
+  const localComposition = loadProjectCompositionPlan(projectDir);
 
   // Pin kubectl at THIS release's cluster BEFORE any cluster read — the state ConfigMap
   // read below previously ran against whatever context happened to be current, so a
   // rollback could read (and then act on) another cluster's build state. Dry-run must
   // not mutate the operator's kubeconfig (L13), so it skips this and reads local
   // state only.
-  if (!dryRun && infra?.projectId && infra?.region) {
+  if (!dryRun && localComposition) {
+    if (compositionPlanNeedsExplicitConfirmation(localComposition.plan) && !yes) {
+      throw new Error(
+        `Rollback target access is not independently verifiable. Confirm the current kubectl ` +
+          `context, then re-run with --yes. No cluster state was read or changed.`,
+      );
+    }
+    const preflight = await preflightCompositionPlan(localComposition.plan, {
+      explicitlyConfirmed: yes === true,
+    });
+    console.log(
+      `  → Composition plan verified: ${preflight.clusterIdentity}; Kubernetes ` +
+        `${preflight.serverVersion}`,
+    );
+  } else if (!dryRun && infra?.projectId && infra?.region) {
     const credResult = await execCapture("gcloud", [
       "container",
       "clusters",
@@ -824,7 +1005,10 @@ export async function runRollback(options: {
     }
   }
 
-  const state = await readState(projectDir, releaseName, dryRun ? { localOnly: true } : undefined);
+  const state = await readState(projectDir, releaseName, {
+    ...(dryRun ? { localOnly: true } : {}),
+    namespace,
+  });
   if (!state?.previousBuildId) {
     // Dry-run deliberately reads the LOCAL state file only (L13 — no cluster access),
     // so "no previous build" may just mean the local file is missing/stale while the
@@ -840,21 +1024,96 @@ export async function runRollback(options: {
   }
 
   const { buildId: currentBuildId, previousBuildId } = state;
+  const currentAnchor = state.compositionPlans?.[currentBuildId];
+  const targetAnchor = state.compositionPlans?.[previousBuildId];
+  const localCompositionRole = localComposition
+    ? classifyLocalRollbackComposition({
+        local: localComposition,
+        state,
+        releaseName,
+        namespace,
+      })
+    : null;
+  const currentComposition =
+    !dryRun && currentAnchor
+      ? localCompositionRole === "current"
+        ? localComposition
+        : await loadDeployedCompositionPlan({
+            releaseName,
+            namespace,
+            buildId: currentBuildId,
+            expected: currentAnchor,
+          })
+      : localCompositionRole === "current"
+        ? localComposition
+        : null;
+  const targetComposition =
+    !dryRun && targetAnchor
+      ? localCompositionRole === "target"
+        ? localComposition
+        : await loadDeployedCompositionPlan({
+            releaseName,
+            namespace,
+            buildId: previousBuildId,
+            expected: targetAnchor,
+          })
+      : localCompositionRole === "target"
+        ? localComposition
+        : null;
+  if (!dryRun && currentAnchor && !currentComposition) {
+    throw new Error(
+      `Committed state requires a composition plan for current build ${currentBuildId}, but its ` +
+        `retained ConfigMap is missing. Refusing rollback without a verified target identity.`,
+    );
+  }
+  if (!dryRun && targetAnchor && !targetComposition) {
+    throw new Error(
+      `Committed state requires a composition plan for rollback build ${previousBuildId}, but ` +
+        `its retained ConfigMap is missing.`,
+    );
+  }
+  if (
+    currentComposition &&
+    targetComposition &&
+    currentComposition.plan.target.fingerprint !== targetComposition.plan.target.fingerprint
+  ) {
+    throw new Error(
+      `Rollback crosses incompatible deployment targets (${currentComposition.plan.target.fingerprint} ` +
+        `→ ${targetComposition.plan.target.fingerprint}). The current Helm resources cannot ` +
+        `represent both targets; deploy the older target definition explicitly instead.`,
+    );
+  }
+  if (!dryRun && targetComposition) {
+    await inspectKubernetesRequirements(targetComposition.plan);
+  }
 
-  // Pool names come from local build metadata (the same source deploy's cutover uses) —
-  // readable without touching the cluster, so the dry-run plan can be printed before any
-  // cluster interaction.
-  let poolNames: string[] = [];
-  const metaPath = path.join(projectDir, ".k8s-adapter", outputDirName(), "build-metadata.json");
-  if (existsSync(metaPath)) {
-    try {
-      const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
-      if (Array.isArray(meta.pools)) {
-        poolNames = meta.pools.filter((p: unknown): p is string => typeof p === "string");
-      }
-    } catch {
-      // fall through to the empty guard
-    }
+  // N70: rollback has TWO independent topologies. Local build-metadata describes whichever
+  // build happened to run last in this checkout, not necessarily the rollback target (and a
+  // renamed pool makes the two sets differ by definition). Current states record both exact
+  // build-scoped sets. Legacy states are migrated from immutable versioned Deployments; dry-run
+  // cannot perform that cluster read and fails closed rather than fabricating a plan.
+  let poolNames = recordedBuildPools(state, previousBuildId);
+  let currentPoolNames = recordedBuildPools(state, currentBuildId);
+  if (dryRun && (!poolNames || !currentPoolNames)) {
+    throw new Error(
+      `Deploy state predates per-build pool topology for ${!poolNames ? `rollback target "${previousBuildId}"` : `current build "${currentBuildId}"`}. ` +
+        `Dry-run cannot recover it without cluster access; run rollback without --dry-run to ` +
+        `migrate the state, or restore poolTopologies in .k8s-adapter/state.json.`,
+    );
+  }
+  if (!poolNames) {
+    poolNames = await discoverBuildPools(releaseName, previousBuildId, namespace);
+    console.warn(
+      `  ! Recovered legacy pool topology for rollback target "${previousBuildId}" from ` +
+        `its versioned Deployments: ${poolNames.join(", ")}.`,
+    );
+  }
+  if (!currentPoolNames) {
+    currentPoolNames = await discoverBuildPools(releaseName, currentBuildId, namespace);
+    console.warn(
+      `  ! Recovered legacy pool topology for current build "${currentBuildId}" from its ` +
+        `versioned Deployments: ${currentPoolNames.join(", ")}.`,
+    );
   }
 
   // L13: dry-run must not mutate anything — and get-credentials mutates the operator's
@@ -890,13 +1149,6 @@ export async function runRollback(options: {
     return;
   }
 
-  if (poolNames.length === 0) {
-    throw new Error(
-      "Could not determine pool names from .k8s-adapter/output/build-metadata.json; " +
-        "cannot safely roll back. Aborting before touching traffic.",
-    );
-  }
-
   console.log(`\nRolling back: ${currentBuildId} → ${previousBuildId}\n`);
 
   // Find the previous deployment
@@ -904,7 +1156,7 @@ export async function runRollback(options: {
     "get",
     "deployments",
     "-n",
-    K8S_NAMESPACE,
+    namespace,
     "-l",
     `app.kubernetes.io/name=${releaseName}`,
     "-o",
@@ -960,10 +1212,12 @@ export async function runRollback(options: {
   const missingPrev: string[] = [];
   for (const pool of poolNames) {
     const prev = poolResourceNames(releaseName, pool, previousBuildId);
-    const curr = poolResourceNames(releaseName, pool, currentBuildId);
     if (discovered.has(prev.deployment)) {
       previousDeploys.push({ pool, name: prev.deployment, hpa: prev.hpa });
     } else missingPrev.push(pool);
+  }
+  for (const pool of currentPoolNames) {
+    const curr = poolResourceNames(releaseName, pool, currentBuildId);
     if (discovered.has(curr.deployment)) {
       currentDeploys.push({ pool, name: curr.deployment, hpa: curr.hpa });
     }
@@ -987,6 +1241,7 @@ export async function runRollback(options: {
       releaseName,
       previousDeploy.pool,
       currentBuildId,
+      namespace,
     );
     if (unreadable.length > 0) {
       console.warn(
@@ -1010,7 +1265,7 @@ export async function runRollback(options: {
       "scale",
       `deployment/${previousDeploy.name}`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       `--replicas=${plan.replicas}`,
     ]);
   }
@@ -1035,7 +1290,7 @@ export async function runRollback(options: {
       "hpa",
       hpaName,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--ignore-not-found",
       "-o",
       "name",
@@ -1046,7 +1301,7 @@ export async function runRollback(options: {
         "deployment",
         previousDeploy.name,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         `--name=${hpaName}`,
         `--min=${plan.min}`,
         `--max=${plan.max}`,
@@ -1058,7 +1313,7 @@ export async function runRollback(options: {
         "hpa",
         hpaName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--type=merge",
         // Same field-manager rationale as the Service/Deployment patches: helm owns the
         // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
@@ -1084,7 +1339,7 @@ export async function runRollback(options: {
       "status",
       `deployment/${previousDeploy.name}`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--timeout=120s",
     ]);
   }
@@ -1108,7 +1363,7 @@ export async function runRollback(options: {
       "get",
       "pods",
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "-l",
       `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safePreviousBuild},app.kubernetes.io/component!=routing-service`,
       "-o",
@@ -1129,7 +1384,7 @@ export async function runRollback(options: {
           "exec",
           pod,
           "-n",
-          K8S_NAMESPACE,
+          namespace,
           "--",
           "node",
           "-e",
@@ -1153,9 +1408,97 @@ export async function runRollback(options: {
     throw new Error(
       `Previous build ${previousBuildId} did not pass /healthz within 2 minutes. Traffic ` +
         `was NOT switched — the current build is still serving. Both builds were left scaled ` +
-        `up; investigate (kubectl logs -l app.kubernetes.io/version=${safePreviousBuild}) and ` +
+        `up; investigate (kubectl logs -n ${namespace} -l ` +
+        `app.kubernetes.io/version=${safePreviousBuild}) and ` +
         `re-run the rollback.`,
     );
+  }
+  if (targetComposition) {
+    console.log("  → Verifying rollback target composition readiness...");
+    await waitForCompositionPlanReadiness(targetComposition.plan);
+  }
+
+  // N70: Helm is not rolled back, so HTTPRoute still carries the former-current topology.
+  // Every Service selector that will be changed must be captured before the edge is reverted.
+  // This is required even when pool topology is unchanged: the portable origin's component is
+  // the build's default pool, not the Service suffix "origin", so a guessed partial-failure
+  // restore would drain it to zero endpoints.
+  const targetPoolSet = new Set(poolNames);
+  const currentOnlyPools = currentPoolNames.filter((pool) => !targetPoolSet.has(pool));
+  const topologyChanged =
+    currentOnlyPools.length > 0 || poolNames.some((pool) => !currentPoolNames.includes(pool));
+  const fallbackTargetPool = poolNames[0]!;
+  let hasPortableOrigin = Boolean(state.defaultPools);
+  if (!dryRun) {
+    const originLookup = await execCapture("kubectl", [
+      "get",
+      "service",
+      sanitizeK8sName(`${releaseName}-origin`),
+      "-n",
+      namespace,
+      "--ignore-not-found",
+      "-o",
+      "name",
+    ]);
+    if (originLookup.exitCode !== 0) {
+      throw new Error(
+        `Could not determine whether the portable origin Service exists: ` +
+          `${sanitizeForTerminal(originLookup.stderr.trim()) || `kubectl exited ${originLookup.exitCode}`}`,
+      );
+    }
+    hasPortableOrigin =
+      originLookup.stdout.trim() === `service/${sanitizeK8sName(`${releaseName}-origin`)}`;
+  }
+  const serviceDestinations = [
+    ...poolNames.map((pool) => ({ servicePool: pool, targetPool: pool })),
+    ...currentOnlyPools.map((pool) => ({ servicePool: pool, targetPool: fallbackTargetPool })),
+    ...(hasPortableOrigin
+      ? [
+          {
+            servicePool: "origin",
+            targetPool: state.defaultPools?.[previousBuildId] ?? fallbackTargetPool,
+          },
+        ]
+      : []),
+  ];
+  const originalSelectors = new Map<string, Record<string, string>>();
+  for (const { servicePool } of serviceDestinations) {
+    // Same-topology pool Services can be reconstructed from their own pool suffix and the
+    // current build. The origin cannot: its component is whichever pool that build declared
+    // as default, so it always needs an exact snapshot.
+    if (!topologyChanged && servicePool !== "origin") continue;
+    const serviceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
+    if (originalSelectors.has(serviceName)) continue;
+    const read = await execCapture("kubectl", [
+      "get",
+      "service",
+      serviceName,
+      "-n",
+      namespace,
+      "-o",
+      "json",
+    ]);
+    let selector: unknown;
+    if (read.exitCode === 0) {
+      try {
+        selector = JSON.parse(read.stdout)?.spec?.selector;
+      } catch {
+        selector = undefined;
+      }
+    }
+    if (
+      !selector ||
+      typeof selector !== "object" ||
+      Array.isArray(selector) ||
+      Object.values(selector).some((value) => typeof value !== "string")
+    ) {
+      throw new Error(
+        `Could not read the exact selector for rollback Service ` +
+          `${serviceName} (kubectl exited ${read.exitCode}${read.stderr.trim() ? `: ${read.stderr.trim()}` : ""}). ` +
+          `Traffic was NOT switched; refusing to patch selectors without a reversible snapshot.`,
+      );
+    }
+    originalSelectors.set(serviceName, selector as Record<string, string>);
   }
 
   // 3b. Revert the routing tier (image + manifest) to the previous build BEFORE flipping
@@ -1165,9 +1508,11 @@ export async function runRollback(options: {
   if (infra?.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
   await revertRoutingServiceToBuild({
     releaseName,
+    namespace,
     targetBuildId: previousBuildId,
     registry: infra?.containerRegistry,
     targetImageDigest: state.routingImageDigests?.[previousBuildId],
+    targetPlatform: state.targetPlatforms?.[previousBuildId],
   });
 
   // 4. Switch traffic: patch active Service selectors to the previous build.
@@ -1177,28 +1522,33 @@ export async function runRollback(options: {
   // draining the active Service to zero endpoints and 503'ing the site on rollback.
   // (safePreviousBuild is computed once in step 3 above and reused here.)
 
-  // Switch each active Service (`<release>-<pool>`) by NAME, exactly as deploy's cutover
-  // does — reusing the pool list resolved above. (The active-service template's
+  // Switch each target Service (`<release>-<pool>`) by NAME, then redirect Services that only
+  // exist in the still-installed HTTPRoute topology to a real target pool. (The template's
   // `managed-by: adapter-k8s-active` label is overwritten by Helm to `managed-by: Helm`,
   // so a label selector would match nothing, patch ZERO Services, skip the failure guard,
   // and strand the site when the current build is scaled down.)
   const patchFailures: { service: string; stderr: string }[] = [];
-  const patchedServices: string[] = [];
+  const patchedServices: { service: string; pool: string }[] = [];
   console.log(`  → Switching traffic to previous build...`);
-  for (const pool of poolNames) {
-    const svcName = sanitizeK8sName(`${releaseName}-${pool}`);
+  for (const { servicePool, targetPool } of serviceDestinations) {
+    const svcName = sanitizeK8sName(`${releaseName}-${servicePool}`);
     const patchResult = await execCapture("kubectl", [
       "patch",
       "service",
       svcName,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--type=json",
       // --force-conflicts is NOT a valid `kubectl patch` flag (only `apply
       // --server-side` accepts it); a JSON patch needs no conflict override.
       "--field-manager=helm",
       "-p",
       JSON.stringify([
+        {
+          op: "replace",
+          path: "/spec/selector/app.kubernetes.io~1component",
+          value: targetPool,
+        },
         {
           op: "replace",
           path: "/spec/selector/app.kubernetes.io~1version",
@@ -1209,7 +1559,7 @@ export async function runRollback(options: {
     if (patchResult.exitCode !== 0) {
       patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
     } else {
-      patchedServices.push(svcName);
+      patchedServices.push({ service: svcName, pool: servicePool });
     }
   }
 
@@ -1219,23 +1569,33 @@ export async function runRollback(options: {
   if (patchFailures.length > 0) {
     const safeCurrentBuild = sanitizeK8sName(currentBuildId);
     const revertFailures: string[] = [];
-    for (const serviceName of patchedServices) {
+    for (const { service: serviceName, pool } of patchedServices) {
+      const original = originalSelectors.get(serviceName);
       const revertResult = await execCapture("kubectl", [
         "patch",
         "service",
         serviceName,
         "-n",
-        K8S_NAMESPACE,
+        namespace,
         "--type=json",
         "--field-manager=helm",
         "-p",
-        JSON.stringify([
-          {
-            op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1version",
-            value: safeCurrentBuild,
-          },
-        ]),
+        JSON.stringify(
+          original
+            ? [{ op: "replace", path: "/spec/selector", value: original }]
+            : [
+                {
+                  op: "replace",
+                  path: "/spec/selector/app.kubernetes.io~1component",
+                  value: pool,
+                },
+                {
+                  op: "replace",
+                  path: "/spec/selector/app.kubernetes.io~1version",
+                  value: safeCurrentBuild,
+                },
+              ],
+        ),
       ]);
       if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
     }
@@ -1252,9 +1612,11 @@ export async function runRollback(options: {
       assertSafeBuildId(currentBuildId);
       await revertRoutingServiceToBuild({
         releaseName,
+        namespace,
         targetBuildId: currentBuildId,
         registry: infra?.containerRegistry,
         targetImageDigest: state.routingImageDigests?.[currentBuildId],
+        targetPlatform: state.targetPlatforms?.[currentBuildId],
       });
       edgeRestored = true;
     } catch (err) {
@@ -1287,7 +1649,7 @@ export async function runRollback(options: {
       );
       console.error(`  Recover by re-running the rollback, or restore the edge manually:`);
       console.error(
-        `    kubectl -n ${K8S_NAMESPACE} set image deployment/` +
+        `    kubectl -n ${namespace} set image deployment/` +
           `${routingServiceDeploymentName(releaseName)} routing-service=` +
           `${infra?.containerRegistry ?? "<registry>"}/routing-service:${currentBuildId}`,
       );
@@ -1304,15 +1666,48 @@ export async function runRollback(options: {
   // already points at the previous build but either version remains safe to select during
   // recovery.
   try {
+    // A rollback swaps the two build pointers; it does not create a new build. Preserve every
+    // other durable state field by default so per-build provenance remains available in BOTH
+    // directions. Keeping an allowlist here already lost routingImageDigests and
+    // unretainedManifestBuilds in production, which made the next rollback downgrade the edge
+    // from an immutable digest to a mutable tag and hid the retained-manifest warning.
+    //
+    // generation/updatedAt belong to writeState, and readinessPathSupported is the one
+    // deliberate exception: it describes the build that is NOW serving, so rolling back to an
+    // older build must conservatively clear it (see below).
+    const { generation, updatedAt, readinessPathSupported, ...durableState } = state;
+    void updatedAt;
+    void readinessPathSupported;
     await writeState(
       projectDir,
       {
+        ...durableState,
         buildId: previousBuildId,
         previousBuildId: currentBuildId,
-        // M13: carry the recorded per-build CDN tags verbatim — a rollback keeps both
-        // builds in play, and each build's tag is only ever the one recorded at ITS
-        // deploy (re-deriving under newer code is exactly the M13 failure).
-        ...(state.cdnTags ? { cdnTags: state.cdnTags } : {}),
+        poolTopologies: {
+          [previousBuildId]: [...poolNames],
+          [currentBuildId]: [...currentPoolNames],
+        },
+        ...(state.defaultPools
+          ? {
+              defaultPools: Object.fromEntries(
+                Object.entries(state.defaultPools).filter(([build]) =>
+                  [currentBuildId, previousBuildId].includes(build),
+                ),
+              ),
+            }
+          : {}),
+        // The pointer swap keeps these same two build artifacts in play. Prune any stale
+        // provenance while preserving the exact platform recorded for both directions.
+        ...(state.targetPlatforms
+          ? {
+              targetPlatforms: Object.fromEntries(
+                Object.entries(state.targetPlatforms).filter(([build]) =>
+                  [currentBuildId, previousBuildId].includes(build),
+                ),
+              ),
+            }
+          : {}),
         // `readinessPathSupported` is deliberately NOT carried forward. It means "the build
         // now serving answers /readyz", and after a rollback the serving build is an OLDER
         // one that may predate it — so dropping it is the conservative answer, and the next
@@ -1328,9 +1723,10 @@ export async function runRollback(options: {
         // so a post-cutover cluster outage stamped local generation 1 while the stale
         // cluster record sat at N — and readState prefers the higher generation, so the
         // next operation re-drained the build this rollback had just switched TO.
-        basedOnGeneration: state.generation ?? null,
+        basedOnGeneration: generation ?? null,
       },
       releaseName,
+      namespace,
     );
   } catch (err) {
     console.error(`\n  Rollback traffic switch succeeded, but persisting state failed:`);
@@ -1380,14 +1776,14 @@ export async function runRollback(options: {
       "hpa",
       currentDeploy.hpa,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--ignore-not-found",
     ]);
     await execOrThrow("kubectl", [
       "scale",
       `deployment/${currentDeploy.name}`,
       "-n",
-      K8S_NAMESPACE,
+      namespace,
       "--replicas=0",
     ]);
   }

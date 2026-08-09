@@ -4,13 +4,13 @@
 // entrypoint response. These need the REAL loopback invoker (invokeLocalHandlerOverHttp is
 // module-private), so every case drives createDispatcher over an actual HTTP server, in the
 // style of tests/pool-server/server.test.ts.
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { createServer, get as httpGet, type IncomingMessage, type Server } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
-import { createDispatcher } from "../../src/pool-server/dispatch.js";
+import { createDispatcher, invokeLocalHandlerOverHttp } from "../../src/pool-server/dispatch.js";
 import { STATIC_STREAM_THRESHOLD_BYTES } from "../../src/pool-server/http-cache.js";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
 
@@ -63,6 +63,8 @@ function timedGet(
         if (firstByteAtMs < 0) firstByteAtMs = Date.now() - start;
         body += String(chunk);
       });
+      res.on("aborted", () => reject(new Error("response aborted")));
+      res.on("error", reject);
       res.on("end", () =>
         resolve({
           status: res.statusCode ?? 0,
@@ -221,6 +223,37 @@ describe("streamed responses commit headers before the first body byte", () => {
 // request RECEIPT rather than handler runtime. A wedged handler therefore held a listening
 // socket, an ephemeral port, its pendingWaitUntil set and the client socket indefinitely.
 describe("handler invocation deadline", () => {
+  it("never mutates the outer response when a detached fill exceeds maxDuration", async () => {
+    const outerRes = {
+      headersSent: false,
+      writableEnded: false,
+      writeHead: vi.fn(),
+      end: vi.fn(),
+      destroy: vi.fn(),
+    } as unknown as import("node:http").ServerResponse;
+    const outerReq = {
+      method: "GET",
+      url: "/fill",
+      headers: { host: "localhost" },
+    } as IncomingMessage;
+
+    await invokeLocalHandlerOverHttp({
+      handler: () => undefined,
+      req: outerReq,
+      res: outerRes,
+      matchedPathname: "/fill",
+      routeMatches: null,
+      bufferedBody: undefined,
+      discardResponse: true,
+      handlerTimeoutMs: 1_000,
+      executionTimeoutMs: 50,
+    });
+
+    expect(outerRes.writeHead).not.toHaveBeenCalled();
+    expect(outerRes.end).not.toHaveBeenCalled();
+    expect(outerRes.destroy).not.toHaveBeenCalled();
+  });
+
   it("504s a handler that never answers, instead of pinning the request forever", async () => {
     const front = await startFront(
       {
@@ -273,6 +306,67 @@ describe("handler invocation deadline", () => {
     expect(res.status).toBe(200);
     expect(res.body).toBe("chunk\nchunk\nchunk\nchunk\n");
     expect(res.endAtMs).toBeGreaterThan(300);
+  });
+
+  it("keeps route maxDuration active after a Node response starts streaming", async () => {
+    const front = await startFront(
+      {
+        handlerLoader: handlerLoaderFor("/bounded-stream", (_req, res) => {
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.flushHeaders();
+          res.write("first");
+          setTimeout(() => res.end("last"), 500);
+        }),
+        poolName: "main",
+        buildId: "b1",
+        staticAssets: [],
+        handlerTimeoutMs: 1_000,
+        routeExecutionTimeouts: { "/bounded-stream": 100 },
+      },
+      routeResolution("/bounded-stream"),
+    );
+    openServers.push(front.server);
+
+    const outcome = await timedGet(front.port, "/bounded-stream")
+      .then(() => "completed" as const)
+      .catch(() => "reset" as const);
+    expect(outcome).toBe("reset");
+  });
+
+  it("disarms the maxDuration timer when the head timeout aborts the invocation first", async () => {
+    // A handler that stalls past the HEAD timeout takes the invocationTimedOut branch
+    // (504). The still-armed execution timer used to fire later anyway, logging a bogus
+    // "exceeded maxDuration" for an invocation that had already settled — noise that
+    // misleads anyone triaging timeout incidents.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const front = await startFront(
+        {
+          handlerLoader: handlerLoaderFor("/stalls-at-head", () => {
+            // Never writes a head, never ends: the head timeout must win.
+          }),
+          poolName: "main",
+          buildId: "b1",
+          staticAssets: [],
+          handlerTimeoutMs: 100,
+          routeExecutionTimeouts: { "/stalls-at-head": 400 },
+        },
+        routeResolution("/stalls-at-head"),
+      );
+      openServers.push(front.server);
+
+      const res = await timedGet(front.port, "/stalls-at-head");
+      expect(res.status).toBe(504);
+
+      // Cross the (disarmed) execution deadline, then assert it never spoke.
+      await new Promise((r) => setTimeout(r, 500));
+      const maxDurationLogs = errorSpy.mock.calls.filter((call) =>
+        String(call[0]).includes("exceeded maxDuration"),
+      );
+      expect(maxDurationLogs).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 
