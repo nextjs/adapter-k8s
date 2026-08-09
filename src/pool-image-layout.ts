@@ -111,7 +111,7 @@ async function removeEmptiedDirectories(root: string, directories: Set<string>):
   }
 }
 
-async function runBounded<T>(
+export async function runBounded<T>(
   values: readonly T[],
   limit: number,
   operation: (value: T) => Promise<void>,

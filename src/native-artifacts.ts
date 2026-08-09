@@ -1,5 +1,6 @@
 import { open, opendir, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { runBounded } from "./pool-image-layout.js";
 import { targetArchitecture, type TargetPlatform } from "./target-platform.js";
 
 type NativeFormat = "ELF" | "Mach-O" | "PE" | "unknown native addon";
@@ -176,12 +177,17 @@ async function inspectCandidate(
   }
 }
 
+const MAX_CONCURRENT_INSPECTIONS = 64;
+
 export async function findForeignNativeArtifacts(
   contextRoot: string,
   targetPlatform: TargetPlatform,
 ): Promise<ForeignNativeArtifact[]> {
-  const problems: ForeignNativeArtifact[] = [];
-
+  // Enumerate serially — directory metadata is cheap and open directory handles are finite —
+  // then stat/inspect concurrently: each file is independent, and one awaited syscall at a
+  // time made this walk the scan's critical path on multi-pool traced contexts (hundreds of
+  // thousands of files per context). Same worker shape as factorSharedPoolFiles' hashing.
+  const files: Array<{ absolute: string; relative: string }> = [];
   const walk = async (dir: string): Promise<void> => {
     const entries = await opendir(dir);
     for await (const entry of entries) {
@@ -193,18 +199,24 @@ export async function findForeignNativeArtifacts(
       if (!entry.isFile()) continue;
       const relative = path.relative(contextRoot, absolute).split(path.sep).join("/");
       if (isManagedSharpArtifact(relative)) continue;
-      // Named native libraries go straight to header inspection. Other files need a mode
-      // lookup so extensionless executables are not missed.
-      if (!namedNativeCandidate(relative)) {
-        const info = await stat(absolute);
-        if ((info.mode & 0o111) === 0) continue;
-      }
-      const problem = await inspectCandidate(absolute, relative, targetPlatform);
-      if (problem) problems.push(problem);
+      files.push({ absolute, relative });
     }
   };
-
   await walk(contextRoot);
+
+  const problems: ForeignNativeArtifact[] = [];
+  await runBounded(files, MAX_CONCURRENT_INSPECTIONS, async ({ absolute, relative }) => {
+    // Named native libraries go straight to header inspection. Other files need a mode
+    // lookup so extensionless executables are not missed.
+    if (!namedNativeCandidate(relative)) {
+      const info = await stat(absolute);
+      if ((info.mode & 0o111) === 0) return;
+    }
+    const problem = await inspectCandidate(absolute, relative, targetPlatform);
+    if (problem) problems.push(problem);
+  });
+  // The sort was always part of the contract; under concurrency it is what keeps the report
+  // deterministic (push order now depends on scheduling).
   return problems.sort((left, right) => left.file.localeCompare(right.file));
 }
 

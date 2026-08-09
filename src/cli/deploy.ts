@@ -3790,8 +3790,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // A previous build with no surviving Deployments (previousPools === []) is recorded
       // as ABSENT, not as an empty topology: recordedBuildPools rejects [] as malformed on
       // the next read, and there is nothing for rollback to target anyway.
-      const recordablePreviousBuildId =
-        previousPools.length > 0 ? previousBuildId : undefined;
+      const recordablePreviousBuildId = previousPools.length > 0 ? previousBuildId : undefined;
       await writeState(
         projectDir,
         {
