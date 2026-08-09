@@ -1274,6 +1274,12 @@ export async function invokeLocalHandlerOverHttp({
 
       clientReq.once("error", (error) => {
         clearTimeout(invocationDeadline);
+        // Cleared on EVERY exit from this handler, including the timed-out branch below: a
+        // head-timeout abort used to leave the (unref'd) execution timer armed, and when it
+        // fired minutes later it logged a bogus "exceeded maxDuration" for a request that
+        // had already 504'd and re-destroyed the settled invocation. Clearing a timer that
+        // already fired (executionTimedOut) is a no-op.
+        if (executionDeadline) clearTimeout(executionDeadline);
         // N37: a deadline abort is the adapter's own teardown, not an entrypoint crash — answer
         // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
         // invocations share the outer `res` with a response already sent to the client, so they
@@ -1288,7 +1294,6 @@ export async function invokeLocalHandlerOverHttp({
           server.close(() => resolve());
           return;
         }
-        if (executionDeadline) clearTimeout(executionDeadline);
         server.close(() => reject(error));
       });
 

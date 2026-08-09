@@ -332,6 +332,42 @@ describe("handler invocation deadline", () => {
       .catch(() => "reset" as const);
     expect(outcome).toBe("reset");
   });
+
+  it("disarms the maxDuration timer when the head timeout aborts the invocation first", async () => {
+    // A handler that stalls past the HEAD timeout takes the invocationTimedOut branch
+    // (504). The still-armed execution timer used to fire later anyway, logging a bogus
+    // "exceeded maxDuration" for an invocation that had already settled — noise that
+    // misleads anyone triaging timeout incidents.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const front = await startFront(
+        {
+          handlerLoader: handlerLoaderFor("/stalls-at-head", () => {
+            // Never writes a head, never ends: the head timeout must win.
+          }),
+          poolName: "main",
+          buildId: "b1",
+          staticAssets: [],
+          handlerTimeoutMs: 100,
+          routeExecutionTimeouts: { "/stalls-at-head": 400 },
+        },
+        routeResolution("/stalls-at-head"),
+      );
+      openServers.push(front.server);
+
+      const res = await timedGet(front.port, "/stalls-at-head");
+      expect(res.status).toBe(504);
+
+      // Cross the (disarmed) execution deadline, then assert it never spoke.
+      await new Promise((r) => setTimeout(r, 500));
+      const maxDurationLogs = errorSpy.mock.calls.filter((call) =>
+        String(call[0]).includes("exceeded maxDuration"),
+      );
+      expect(maxDurationLogs).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 // N30 (SECURITY/CACHE), leak-guard half: writeInnerResponse rewrites an origin-oriented

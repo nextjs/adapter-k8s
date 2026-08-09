@@ -1147,6 +1147,37 @@ describe("image optimizer — middleware coverage must still win over the cachea
     }
   });
 
+  it("preserves the source url's query string on the loopback re-entry", async () => {
+    // Upstream parity: fetchInternalImage resolves a relative source through the FULL
+    // request pipeline with the raw url — `?url=%2Fdynamic-image%3Fv%3D42` reaches the
+    // route as /dynamic-image?v=42. Middleware here is both the re-entry trigger (source
+    // coverage forces the loopback) and the observer: it answers an ANIMATED GIF (which
+    // the optimizer passes through byte-for-byte) ONLY when the query survived, so a
+    // dropped query is a 400.
+    const scoped = makeBooter();
+    try {
+      const { port: p2 } = await scoped.boot(null, {
+        middlewareMatcher: "^\\/dynamic-image$",
+        middlewareSource: `const GIF = Buffer.from("${ANIMATED_GIF_BODY.toString("base64")}", "base64");
+export function proxy(request) {
+  const url = new URL(request.url);
+  if (url.pathname === "/dynamic-image" && url.search === "?v=42&t=a%2Fb") {
+    return new Response(GIF, { headers: { "content-type": "image/gif" } });
+  }
+  return new Response("query lost: " + url.search, { status: 404 });
+}\n`,
+      });
+      const res = await fetch(
+        `http://127.0.0.1:${p2}/_next/image?url=${encodeURIComponent("/dynamic-image?v=42&t=a%2Fb")}&w=640&q=75`,
+      );
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("image/gif");
+      expect(Buffer.from(await res.arrayBuffer()).equals(ANIMATED_GIF_BODY)).toBe(true);
+    } finally {
+      await scoped.cleanup();
+    }
+  });
+
   it("continues the optimizer after middleware when an app catch-all also matches", async () => {
     const scoped = makeBooter();
     try {

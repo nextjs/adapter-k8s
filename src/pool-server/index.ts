@@ -3183,7 +3183,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // Bound it: a 5s timeout so a slow/hung origin can't pin the request, and the
             // SHARED MAX_IMAGE_BYTES cap (N35) so an oversized body can't exhaust memory —
             // the same number the external path enforces, which it previously did not.
-            const selfUrl = `http://127.0.0.1:${port}${publicImagePath}`;
+            //
+            // The re-entry URL is the RAW validated `url` param, not the decoded pathname:
+            // upstream's fetchInternalImage hands the raw url to the full request pipeline,
+            // so `?url=%2Fapi%2Fog%3Ftitle%3DX` must reach the route as /api/og?title=X —
+            // the decoded pathname has the query stripped and re-decodes `%23`/`%3F` into
+            // characters that re-parse as fragment/query separators. basePath is prefixed
+            // exactly when the decoded-pathname check above decided it was missing.
+            const loopbackUrl =
+              publicImagePath === decodedImagePath ? urlParam.url : `${basePath}${urlParam.url}`;
+            const selfUrl = `http://127.0.0.1:${port}${loopbackUrl}`;
             const imgRes = await fetch(selfUrl, {
               signal: AbortSignal.timeout(5000),
               // The EXTERNAL path re-validates every redirect hop against the SSRF
