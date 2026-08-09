@@ -242,6 +242,16 @@ Defaults, in brief—the full model is in [SECURITY.md](./SECURITY.md):
 - [docs/ci-cd.md](./docs/ci-cd.md) — running the pipeline without the CLI
 - [SECURITY.md](./SECURITY.md) — the security model
 
+## Agent skills
+
+The package ships [Agent Skills](https://agentskills.io) in [`skills/`](./skills) — the same convention Next.js and Vercel use to make their tools legible to coding agents. Once the package is installed, point your agent at them (tools following the [`skills/` in npm packages convention](https://github.com/antfu/skills-npm) discover `node_modules/@next-community/adapter-k8s/skills/*/SKILL.md` automatically):
+
+- **configure** — inspects the cluster access you already have (kubeconfig context, GatewayClasses, IngressClasses, registry credentials) and writes a working `adapter.config.mjs`, asking only for what it cannot discover
+- **deploy** — walks a deploy end to end and interprets each blue/green readiness gate, with a failure playbook
+- **troubleshoot** — doctor-first symptom decision tree for a deployed release
+
+A prompt like "prepare this project to deploy to my cluster" is enough: the configure skill handles discovery, target selection, and validation.
+
 ## Roadmap
 
 - Skew protection (versioned routing for zero-mismatch deploys)

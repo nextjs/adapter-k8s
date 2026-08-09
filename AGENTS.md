@@ -62,6 +62,11 @@ Run `npm test` and `npx tsc --noEmit` before considering any change done.
 - `docs/` — tracked user-facing docs: `targets.md` (target model + journeys), `configuration.md`
   (config reference), `lifecycle.md` (deploy/rollback/destroy/doctor/state), `verification.md`,
   `ci-cd.md`. `reports/` is gitignored.
+- `skills/` — Agent Skills SHIPPED IN THE PUBLISHED PACKAGE (package.json `files`), for agents
+  working in apps that depend on this adapter — not tooling for this repo. Keep them consumer-
+  facing: no references to this repo's internals (src/ paths, fixture-only headers). Every
+  command, flag, and config key they mention must exist; re-audit against src/ when the CLI or
+  config surface changes.
 
 ## Conventions
 
