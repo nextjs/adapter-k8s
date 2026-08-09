@@ -1181,6 +1181,31 @@ describe("S27: image integrity must not depend on the CLOUD", () => {
     ).rejects.toThrow(/--allow-mutable-tags/);
   });
 
+  it("runs the platform-aware probe chain once per image, even when it comes up empty", async () => {
+    // resolveRegistryDigest ends by running the crane/skopeo/docker-manifest chain; the
+    // caller's ?? fallback used to run the IDENTICAL chain again whenever that answer was
+    // null — doubling every probe subprocess on exactly the slow path (no crane/skopeo
+    // installed, image genuinely unresolvable).
+    vi.mocked(exec.execCapture).mockImplementation((async (command: string) => {
+      if (command === "gcloud") {
+        return { exitCode: 0, stdout: "sha256:" + "e".repeat(64) + "\n", stderr: "" };
+      }
+      return { exitCode: 127, stdout: "", stderr: "not found" };
+    }) as never);
+
+    await expect(
+      resolveDeployImageDigests({
+        refs: [["ssr", "us-central1-docker.pkg.dev/proj/repo/app:b1"]],
+        projectId: "proj",
+        allowMutableTags: true,
+      }),
+    ).resolves.toEqual({});
+    const craneCalls = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(([command, args]) => command === "crane" && args?.[0] === "manifest");
+    expect(craneCalls).toHaveLength(1);
+  });
+
   it("does not probe Artifact Registry when the plan selects OCI distribution", async () => {
     const SHA = "sha256:" + "d".repeat(64);
     vi.mocked(exec.execCapture).mockImplementation((async (command: string, args: string[]) => {

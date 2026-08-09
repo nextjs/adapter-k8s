@@ -632,11 +632,18 @@ export async function resolveDeployImageDigests(opts: {
         : opts.digestLookup?.kind === "oci-distribution"
           ? null
           : opts.projectId;
+    // Single-flight for the crane/skopeo/docker-manifest chain: resolveRegistryDigest ends
+    // by running it, and the `??` fallback used to run the IDENTICAL chain a second time
+    // whenever the first came back null — doubled subprocess latency on exactly the slow
+    // path (no crane/skopeo installed). Memoizing keeps the gcloud-failed case (where the
+    // chain has NOT run yet) probing exactly once.
+    let anyProbePromise: Promise<string | null> | undefined;
+    const probeAny = () => (anyProbePromise ??= resolveRegistryDigestAny(ref, cli, platform));
     const digest =
       (artifactRegistryProject !== null
-        ? await resolveRegistryDigest(ref, artifactRegistryProject, platform, cli)
+        ? await resolveRegistryDigest(ref, artifactRegistryProject, platform, cli, probeAny)
         : null) ??
-      (await resolveRegistryDigestAny(ref, cli, platform)) ??
+      (await probeAny()) ??
       (cli === "docker" ? await resolveImageDigest(ref, cli, platform) : null);
     if (digest) digests[key] = digest;
     else unresolved.push(ref);
@@ -844,6 +851,10 @@ export async function resolveRegistryDigest(
   projectId: string,
   platform: TargetPlatform = targetPlatform(),
   containerCli: string = "docker",
+  // Injectable so a caller that ALSO falls back to resolveRegistryDigestAny can share one
+  // memoized probe instead of running the whole crane/skopeo/docker chain twice.
+  probeAny: () => Promise<string | null> = () =>
+    resolveRegistryDigestAny(imageRef, containerCli, platform),
 ): Promise<string | null> {
   // Artifact Registry only. Without a GCP project there is nothing to ask. The summary is a
   // useful authoritative existence/digest check, but it is never sufficient by itself because
@@ -866,7 +877,7 @@ export async function resolveRegistryDigest(
   // Artifact Registry's summary digest can name an OCI INDEX and says nothing about which
   // children it contains. Never return it directly: a requested arm64 deploy previously
   // accepted an amd64-only index here before any platform-aware probe ran.
-  return resolveRegistryDigestAny(imageRef, containerCli, platform);
+  return probeAny();
 }
 
 export async function resolveImageDigest(
@@ -2313,12 +2324,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             `the state, or restore poolTopologies in .k8s-adapter/state.json.`,
         );
       }
-      previousPools = await discoverBuildPools(releaseName, previousBuildId, namespace);
-      console.warn(
-        `  ! Recovered legacy pool topology for build "${previousBuildId}" from its ` +
-          `versioned Deployments: ${previousPools.join(", ")}. The successful deploy will ` +
-          `record it in adapter state.`,
-      );
+      // `missingBuild: "empty"`: a cluster holding NOTHING of the previous build (rebuilt
+      // cluster, externally cleaned namespace) has no rollback target to preserve or to
+      // strand — failing closed here bricked every subsequent deploy against unrepairable
+      // state. Partial or inconsistent topologies still throw inside discoverBuildPools.
+      previousPools = await discoverBuildPools(releaseName, previousBuildId, namespace, {
+        missingBuild: "empty",
+      });
+      if (previousPools.length === 0) {
+        console.warn(
+          `  ! Deploy state records previous build "${previousBuildId}", but the cluster ` +
+            `has NO Deployments for it (rebuilt cluster or externally cleaned namespace). ` +
+            `Nothing to preserve for rollback — continuing as a first deploy.`,
+        );
+      } else {
+        console.warn(
+          `  ! Recovered legacy pool topology for build "${previousBuildId}" from its ` +
+            `versioned Deployments: ${previousPools.join(", ")}. The successful deploy will ` +
+            `record it in adapter state.`,
+        );
+      }
     }
   }
   if (previousBuildId && previousBuildId !== buildId) {
@@ -3762,6 +3787,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           targetFingerprint: compositionSnapshot.plan.target.fingerprint,
         };
       }
+      // A previous build with no surviving Deployments (previousPools === []) is recorded
+      // as ABSENT, not as an empty topology: recordedBuildPools rejects [] as malformed on
+      // the next read, and there is nothing for rollback to target anyway.
+      const recordablePreviousBuildId =
+        previousPools.length > 0 ? previousBuildId : undefined;
       await writeState(
         projectDir,
         {
@@ -3770,16 +3800,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           cdnTags,
           ...(Object.keys(routingImageDigests).length > 0 ? { routingImageDigests } : {}),
           poolTopologies: {
-            ...(previousBuildId ? { [previousBuildId]: [...previousPools] } : {}),
+            ...(recordablePreviousBuildId
+              ? { [recordablePreviousBuildId]: [...previousPools] }
+              : {}),
             [buildId]: [...pools],
           },
           ...(hasPortableOrigin || state?.defaultPools
             ? {
                 defaultPools: {
-                  ...(previousBuildId
+                  ...(recordablePreviousBuildId
                     ? {
-                        [previousBuildId]:
-                          state?.defaultPools?.[previousBuildId] ?? previousPools[0]!,
+                        [recordablePreviousBuildId]:
+                          state?.defaultPools?.[recordablePreviousBuildId] ?? previousPools[0]!,
                       }
                     : {}),
                   [buildId]: defaultPool,

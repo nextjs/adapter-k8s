@@ -126,4 +126,51 @@ describe("discoverBuildPools", () => {
       /claims pool "api".*adapter-derived name is "rel-api-buildm"/s,
     );
   });
+
+  it('missingBuild "empty" downgrades ONLY the fully-absent topology', async () => {
+    // A rebuilt cluster (or an externally cleaned namespace) holds NOTHING of the recorded
+    // previous build. Deploy opts into [] here — refusing bricked every subsequent deploy
+    // against state the operator could only repair by hand-editing state.json.
+    vi.mocked(execCapture).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: '{"items":[]}',
+      stderr: "",
+    });
+    await expect(
+      discoverBuildPools("rel", "buildm", undefined, { missingBuild: "empty" }),
+    ).resolves.toEqual([]);
+
+    // Everything short of fully-absent still fails closed in the SAME mode: a kubectl
+    // error hides an unknown amount of topology…
+    vi.mocked(execCapture).mockResolvedValueOnce({
+      exitCode: 1,
+      stdout: "",
+      stderr: "deployments is forbidden",
+    });
+    await expect(
+      discoverBuildPools("rel", "buildm", undefined, { missingBuild: "empty" }),
+    ).rejects.toThrow(/incomplete topology can delete or strand rollback pools/);
+
+    // …and an inconsistently-labelled Deployment is a PARTIAL topology, not an absent one.
+    vi.mocked(execCapture).mockResolvedValueOnce({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        items: [
+          {
+            metadata: {
+              name: "rel-not-api-buildm",
+              labels: {
+                "app.kubernetes.io/component": "api",
+                "app.kubernetes.io/version": "buildm",
+              },
+            },
+          },
+        ],
+      }),
+      stderr: "",
+    });
+    await expect(
+      discoverBuildPools("rel", "buildm", undefined, { missingBuild: "empty" }),
+    ).rejects.toThrow(/Refusing to trust inconsistent labels/);
+  });
 });

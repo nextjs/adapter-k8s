@@ -108,12 +108,21 @@ function elfArchitecture(header: Buffer): string | undefined {
 function isMachO(header: Buffer): boolean {
   if (header.length < 4) return false;
   const magic = header.readUInt32BE(0);
+  if (magic === 0xcafebabe) {
+    // 0xCAFEBABE is ALSO the Java class-file magic. Disambiguate the way `file` does: the
+    // next 32-bit word is nfat_arch for a fat Mach-O (a handful at most) but
+    // (minor_version << 16 | major_version) for a class file — major_version is ≥ 45 for
+    // every Java release, and any nonzero minor pushes the word far higher. Without this, an
+    // executable-bit .class file in a staged dependency aborted an otherwise valid build as
+    // a "foreign Mach-O". Too short to read the word: stay fail-closed as Mach-O.
+    if (header.length >= 8 && header.readUInt32BE(4) > 30) return false;
+    return true;
+  }
   return (
     magic === 0xfeedface ||
     magic === 0xcefaedfe ||
     magic === 0xfeedfacf ||
     magic === 0xcffaedfe ||
-    magic === 0xcafebabe ||
     magic === 0xbebafeca ||
     magic === 0xcafebabf ||
     magic === 0xbfbafeca

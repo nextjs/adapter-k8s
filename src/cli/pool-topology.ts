@@ -64,6 +64,19 @@ export async function discoverBuildPools(
   releaseName: string,
   buildId: string,
   configuredNamespace?: string,
+  options?: {
+    /**
+     * What a topology with ZERO matching Deployments means. The default ("fail") is right
+     * for rollback: a build with no Deployments cannot be rolled back to. Deploy passes
+     * "empty": when the cluster holds NOTHING of the previous build (rebuilt cluster,
+     * externally cleaned namespace), there is no rollback target to preserve OR to strand,
+     * and refusing would brick every future deploy against state the operator cannot
+     * repair without hand-editing state.json. Partial/inconsistent topologies (kubectl
+     * errors, label mismatches) still throw in BOTH modes — only the fully-absent case is
+     * downgraded.
+     */
+    missingBuild?: "fail" | "empty";
+  },
 ): Promise<string[]> {
   assertSafeReleaseName(releaseName);
   assertSafeBuildId(buildId);
@@ -138,6 +151,7 @@ export async function discoverBuildPools(
   }
 
   if (pools.size === 0) {
+    if (options?.missingBuild === "empty") return [];
     throw new Error(
       `Could not recover any pool Deployment for build "${buildId}" in namespace ` +
         `"${namespace}". Refusing to continue: the rollback topology is unknown.`,

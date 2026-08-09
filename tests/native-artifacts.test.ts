@@ -118,6 +118,29 @@ describe("staged native artifact target contract", () => {
     ]);
   });
 
+  it("distinguishes a Java class file from a fat Mach-O sharing the CAFEBABE magic", async () => {
+    const root = context();
+    // Java 17 class file: magic, minor 0, major 61 — the second word (0x0000003d) is far
+    // above any real fat-header nfat_arch. Executable bit set, the exact shape that used to
+    // abort the build as a foreign "Mach-O".
+    write(
+      root,
+      "node_modules/some-tool/Runner.class",
+      Buffer.from("cafebabe0000003d", "hex"),
+      0o755,
+    );
+    // A REAL fat Mach-O (nfat_arch = 2) must still be rejected.
+    write(
+      root,
+      "node_modules/bcrypt/prebuilds/darwin-universal/bcrypt.node",
+      Buffer.from("cafebabe00000002", "hex"),
+    );
+
+    const failures = await findForeignNativeArtifacts(root, "linux/amd64");
+    expect(failures).toEqual([expect.objectContaining({ format: "Mach-O" })]);
+    expect(failures[0]!.file).toContain("bcrypt");
+  });
+
   it("fails closed on an unrecognized .node binary", async () => {
     const root = context();
     write(root, "node_modules/addon/build/Release/addon.node", Buffer.from("not a library"));
