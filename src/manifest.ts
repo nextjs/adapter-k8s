@@ -372,7 +372,7 @@ export function buildRoutingManifest({
         pprCapableRoutes[prerender.pathname] = {
           rootParams,
           wouldPostpone,
-          // Matrix iteration 5: shell-less templates partition the platform cache key too
+          // Shell-less templates partition the platform cache key too
           // (the with-root same-entry cells prove sharing through the header alone).
           ...(Array.isArray(config.allowQuery)
             ? {
@@ -425,7 +425,7 @@ export function buildRoutingManifest({
         ...(tags && tags.length > 0 ? { tags } : {}),
         ...(typeof fb.initialRevalidate === "number" ? { revalidate: fb.initialRevalidate } : {}),
         ...(typeof fb.initialExpiration === "number" ? { expire: fb.initialExpiration } : {}),
-        // Matrix iteration 4: the build's statement of which params PARTITION the platform
+        // The build's statement of which params PARTITION the platform
         // cache key (never-enumerable params are excluded). Dispatch's seen-key registry
         // computes HIT-vs-PRERENDER from exactly this list.
         ...(Array.isArray(config.allowQuery)

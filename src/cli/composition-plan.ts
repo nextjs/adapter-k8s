@@ -747,7 +747,7 @@ function readinessKey(readiness: RoutingReadiness): string {
   return JSON.stringify(readiness);
 }
 
-export function compositionPlanReadiness(plan: CompositionPlan): RoutingReadiness[] {
+function compositionPlanReadiness(plan: CompositionPlan): RoutingReadiness[] {
   const routingReadiness = plan.operations.routing.dataplane.readiness;
   const unique = new Map<string, RoutingReadiness>();
   for (const readiness of [...plan.operations.resources.readiness, ...routingReadiness]) {

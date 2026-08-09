@@ -213,7 +213,7 @@ export async function discoverServingBuildId(
   if (svcResult.exitCode !== 0) {
     throw new Error(
       `Deploy state could not be determined AND the active Services could not be listed ` +
-        `(kubectl exited ${svcResult.exitCode}${svcResult.stderr.trim() ? `: ${svcResult.stderr.trim()}` : ""}). ` +
+        `(kubectl exited ${svcResult.exitCode}${svcResult.stderr.trim() ? `: ${sanitizeForTerminal(svcResult.stderr.trim())}` : ""}). ` +
         `Refusing to deploy: treating this as a first deploy would make helm delete the ` +
         `Deployment that is currently serving traffic. ${REPAIR}`,
     );
@@ -270,7 +270,7 @@ export async function discoverServingBuildId(
     throw new Error(
       `Deploy state could not be determined and the Deployments for the serving build ` +
         `label "${label}" could not be listed (kubectl exited ${depResult.exitCode}` +
-        `${depResult.stderr.trim() ? `: ${depResult.stderr.trim()}` : ""}). ${REPAIR}`,
+        `${depResult.stderr.trim() ? `: ${sanitizeForTerminal(depResult.stderr.trim())}` : ""}). ${REPAIR}`,
     );
   }
   const tags = new Set<string>();
@@ -572,32 +572,24 @@ export function assertSafePoolName(poolName: string): void {
 }
 
 /**
- * S7 (SECURITY). Resolve the immutable digest of an image that was just pushed.
- *
- * Images were deployed by MUTABLE tag while the deploy identity holds registry write access —
- * and that identity is assumable by anyone who can create a Pod in the namespace (Workload
- * Identity), while the pods themselves carry INTERNAL_HEADER_SECRET and the cache credentials
- * in env. So a retag of an already-deployed build id silently changed what the pool runs on its
- * next restart or scale-up, turning pod-creation into dispatch-secret theft — and from there
- * into a cluster-wide middleware bypass. The route-ext Job's own image was digest-pinned for
- * exactly this reason; the images holding the secrets were not.
- *
- * `docker inspect` reports RepoDigests only AFTER a successful push (the digest is assigned by
- * the registry), which is why this runs here and not at chart-generation time. Returns null
- * rather than throwing: a resolvable digest is a hardening win, not a reason to fail a deploy
- * on a daemon that reports RepoDigests differently (podman/buildx shims). The caller says so.
- */
-/**
  * S23: pin every deployed image to an immutable digest, or refuse the deploy.
  *
  * Two sources, local first (fast, offline) then the registry (authoritative). If an image
- * still cannot be pinned this THROWS, because the alternative — what this used to do — is
- * deploying the mutable `:${buildId}` tag on pods that receive the internal dispatch secret
- * and the cache credentials. A registry writer who retags that tag then changes the code
- * running on the next pod start or scale-up, which is exactly the escalation the split
- * `<release>-cli` identity exists to prevent (it is deliberately writer, not repoAdmin, for
- * this reason). Degrading to that silently on a `docker inspect` quirk gives the quirk the
- * same effect as the attack.
+ * still cannot be pinned this THROWS, because the alternative is deploying the mutable
+ * `:${buildId}` tag on pods that receive the internal dispatch secret and the cache
+ * credentials. A registry writer who retags that tag then changes the code running on the
+ * next pod start or scale-up, which is exactly the escalation the split `<release>-cli`
+ * identity exists to prevent (it is deliberately writer, not repoAdmin, for this reason).
+ * Degrading to that silently on a `docker inspect` quirk gives the quirk the same effect
+ * as the attack.
+ *
+ * S7 (SECURITY): the deploy identity's registry write access is assumable by anyone who can
+ * create a Pod in the namespace (Workload Identity), while the pods themselves carry
+ * INTERNAL_HEADER_SECRET and the cache credentials in env — so a retag of an already-deployed
+ * build id turns pod-creation into dispatch-secret theft, and from there into a cluster-wide
+ * middleware bypass. `docker inspect` reports RepoDigests only AFTER a successful push (the
+ * digest is assigned by the registry), which is why this runs here and not at
+ * chart-generation time.
  *
  * `--allow-mutable-tags` is the explicit opt-out, mirroring `--allow-no-network-policy`:
  * fail-closed by default, and an operator who really wants it has to say so.
@@ -618,12 +610,6 @@ export async function resolveDeployImageDigests(opts: {
     "image digest target platform",
   );
   for (const [key, ref] of opts.refs) {
-    // S25: REGISTRY FIRST. kubelet pulls from the registry, so the registry's digest is the
-    // only one that can actually be deployed. The local daemon merely usually agrees —
-    // MEASURED with podman 6.0.1, it does not: podman converts the manifest on push, so its
-    // RepoDigest describes the local copy and pointing a Deployment at it yields
-    // ImagePullBackOff (observed live: podman said e04a0a5b…, the registry held 27fa476b…,
-    // and the rollout failed). The local probe stays as the offline/unreachable fallback.
     // REGISTRY FIRST, on ANY registry (S25/S28). kubelet pulls from the registry, so only the
     // registry's digest can actually be deployed; the local daemon merely usually agrees, and
     // podman measurably does not. Artifact Registry is asked through gcloud (proven, and works
@@ -935,7 +921,7 @@ export async function resolveImageDigest(
     if (at === -1) continue;
     if (entry.slice(0, at) !== repository) continue;
     const digest = entry.slice(at + 1);
-    if (/^sha256:[a-f0-9]{64}$/.test(digest)) return digest;
+    if (DIGEST_RE.test(digest)) return digest;
   }
   return null;
 }
@@ -1222,7 +1208,7 @@ export function buildHelmUpgradeArgs(options: {
   // same reason as buildId/registry above — these land in `helm --set` assignments, and the
   // charset check is what keeps one assignment from splitting into several.
   for (const [key, digest] of Object.entries(imageDigests ?? {})) {
-    if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
+    if (!DIGEST_RE.test(digest)) {
       throw new Error(
         `Invalid image digest for "${key}": ${JSON.stringify(digest)} — expected sha256:<64 hex>.`,
       );
@@ -2566,7 +2552,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         if (r.exitCode !== 0) {
           throw new Error(
             `Could not read the currently-serving deployment ` +
-              `${poolPrevName} (kubectl exited ${r.exitCode}: ${r.stderr.trim()}). ` +
+              `${poolPrevName} (kubectl exited ${r.exitCode}: ${sanitizeForTerminal(r.stderr.trim())}). ` +
               `It must be transferred out of Helm's release manifest without changing its ` +
               `pod template; refusing to guess. Fix kubectl access and re-run the deploy.`,
           );
@@ -2627,7 +2613,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           if (keptDeployment.exitCode !== 0) {
             throw new Error(
               `Could not preserve the outgoing Deployment ${poolPrevName} across the Helm ` +
-                `upgrade (${keptDeployment.stderr.trim() || `kubectl exited ${keptDeployment.exitCode}`}). ` +
+                `upgrade (${sanitizeForTerminal(keptDeployment.stderr.trim()) || `kubectl exited ${keptDeployment.exitCode}`}). ` +
                 `Refusing to run \`helm upgrade\`: re-rendering it would change the serving ` +
                 `pod template and omitting it without keep would delete it. Fix kubectl access ` +
                 `and re-run.`,
@@ -2700,7 +2686,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         if (foundHpa.exitCode !== 0) {
           throw new Error(
             `Could not determine whether the outgoing HPA ${outgoingHpa} exists (kubectl ` +
-              `exited ${foundHpa.exitCode}: ${foundHpa.stderr.trim()}). Refusing to run ` +
+              `exited ${foundHpa.exitCode}: ${sanitizeForTerminal(foundHpa.stderr.trim())}). Refusing to run ` +
               `\`helm upgrade\`: omitting an HPA that Helm still owns could delete the ` +
               `autoscaler for build ${previousBuildId} while it is serving traffic. Fix ` +
               `kubectl access and re-run.`,
@@ -2740,7 +2726,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           if (keptHpa.exitCode !== 0) {
             throw new Error(
               `Could not preserve the outgoing HPA ${outgoingHpa} across the Helm upgrade ` +
-                `(${keptHpa.stderr.trim() || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
+                `(${sanitizeForTerminal(keptHpa.stderr.trim()) || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
                 `to run \`helm upgrade\`: the serving build must keep autoscaling until ` +
                 `cutover. Fix kubectl access and re-run.`,
             );
@@ -2840,7 +2826,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (found.exitCode !== 0) {
         throw new Error(
           `Could not determine whether the legacy internal dispatch Secret ${legacySecret} ` +
-            `exists (kubectl exited ${found.exitCode}: ${found.stderr.trim()}). ` +
+            `exists (kubectl exited ${found.exitCode}: ${sanitizeForTerminal(found.stderr.trim())}). ` +
             `--ignore-not-found makes a genuinely absent Secret exit 0, so this is a ` +
             `connectivity/RBAC failure. Refusing to run \`helm upgrade\`: if that Secret DOES ` +
             `exist, helm would prune it and the build it belongs to could no longer start a ` +
@@ -2858,7 +2844,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           throw new Error(
             `Could not annotate the legacy internal dispatch Secret ${legacySecret} with ` +
               `helm.sh/resource-policy=keep (kubectl exited ${annotated.exitCode}: ` +
-              `${annotated.stderr.trim()}). \`helm upgrade\` would prune it, leaving the ` +
+              `${sanitizeForTerminal(annotated.stderr.trim())}). \`helm upgrade\` would prune it, leaving the ` +
               `outgoing build unable to start a pod (its pod template references that Secret ` +
               `by name) — so both a restart inside this deploy window and a rollback to it ` +
               `would fail. Nothing was changed; fix kubectl access and re-run.`,
@@ -3284,7 +3270,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             );
             break;
           }
-          lastFailure = restore.stderr.trim() || `exit ${restore.exitCode}`;
+          lastFailure = sanitizeForTerminal(restore.stderr.trim()) || `exit ${restore.exitCode}`;
         }
         if (!restoredWarmedHpas.has(name)) {
           console.warn(
@@ -3354,7 +3340,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (hpaRead.exitCode !== 0) {
         await abortWarmupSetup(
           `Could not read the new build's HPA ${newHpaName} (kubectl exited ` +
-            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${hpaRead.stderr.trim()}` : ""}). ` +
+            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${sanitizeForTerminal(hpaRead.stderr.trim())}` : ""}). ` +
             `Refusing to warm pool "${poolName}" because its original bounds cannot be ` +
             `preserved or its capacity kept stable. Nothing was cut over.`,
         );
@@ -3408,7 +3394,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           await abortWarmupSetup(
             `Could not set temporary warm-up bounds on ${newHpaName} ` +
               `(minReplicas=${warmMin}, maxReplicas=${warmMax}; ` +
-              `${warm.stderr.trim() || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
+              `${sanitizeForTerminal(warm.stderr.trim()) || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
               `scale or cut over pool "${poolName}" because its HPA could immediately ` +
               `remove the required capacity. Nothing was cut over.`,
           );
@@ -3444,7 +3430,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         // closed if the capacity never materializes. Say why we could not pre-scale.
         console.warn(
           `  ! Could not read the new build's replica count for ${newDeployName} ` +
-            `(kubectl exited ${cur.exitCode}${cur.stderr.trim() ? `: ${cur.stderr.trim()}` : ""}) ` +
+            `(kubectl exited ${cur.exitCode}${cur.stderr.trim() ? `: ${sanitizeForTerminal(cur.stderr.trim())}` : ""}) ` +
             `— skipping the pre-cutover scale-up to the outgoing build's ${expected} replicas.`,
         );
         continue;
@@ -3462,7 +3448,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (scaleUp.exitCode !== 0) {
         shortfalls.push(
           `${newDeployName}: could not scale to ${expected} ` +
-            `(${scaleUp.stderr.trim() || `exit ${scaleUp.exitCode}`})`,
+            `(${sanitizeForTerminal(scaleUp.stderr.trim()) || `exit ${scaleUp.exitCode}`})`,
         );
       }
     }
@@ -3980,9 +3966,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // failing the whole deploy (the previous build just keeps burning replicas until the
     // next deploy or a manual scale-down). The outgoing HPA was transferred out of Helm
     // release-manifest lifecycle before the upgrade so it could remain active while this build
-    // served. Delete it
-    // now and wait for that deletion to finish BEFORE setting replicas=0; if deletion fails,
-    // leave the Deployment alone rather than asking a still-live HPA to fight the scale command.
+    // served. Delete it now and wait for that deletion to finish BEFORE setting replicas=0;
+    // if deletion fails, leave the Deployment alone rather than asking a still-live HPA to
+    // fight the scale command.
     if (previousBuildId && previousBuildId !== buildId) {
       let scaleDownFailed = false;
       for (const poolName of previousPools) {
@@ -4006,7 +3992,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           console.warn(
             `  ! Could not remove outgoing autoscaler ${poolPrevHpa}; leaving ` +
               `${poolPrevName} at its current replica count because that HPA could immediately ` +
-              `undo a scale to zero: ${hpaDelete.stderr.trim() || "unknown error"}`,
+              `undo a scale to zero: ${sanitizeForTerminal(hpaDelete.stderr.trim()) || "unknown error"}`,
           );
           continue;
         }
@@ -4019,7 +4005,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           scaleDownFailed = true;
           console.warn(
             `  ! Could not scale down ${poolPrevName}: ` +
-              `${scaleDown.stderr.trim() || "unknown error"}`,
+              `${sanitizeForTerminal(scaleDown.stderr.trim()) || "unknown error"}`,
           );
         }
       }

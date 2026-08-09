@@ -974,8 +974,8 @@ export async function runRollback(options: {
   const namespace = resolveK8sNamespace(infra?.namespace);
   const localComposition = loadProjectCompositionPlan(projectDir);
 
-  // Pin kubectl at THIS release's cluster BEFORE any cluster read — the state ConfigMap
-  // read below previously ran against whatever context happened to be current, so a
+  // Pin kubectl at THIS release's cluster BEFORE any cluster read — otherwise the state
+  // ConfigMap read below runs against whatever context happens to be current, and a
   // rollback could read (and then act on) another cluster's build state. Dry-run must
   // not mutate the operator's kubeconfig (L13), so it skips this and reads local
   // state only.
@@ -1010,7 +1010,11 @@ export async function runRollback(options: {
       { timeoutMs: EXEC_TIMEOUTS.kubectl },
     );
     if (credResult.exitCode !== 0) {
-      throw new Error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
+      // L14: gcloud stderr is externally influenced; strip control sequences before printing.
+      throw new Error(
+        `Failed to connect to cluster "${releaseName}-cluster": ` +
+          `${sanitizeForTerminal(credResult.stderr.trim())}`,
+      );
     }
   }
 
@@ -1160,7 +1164,6 @@ export async function runRollback(options: {
 
   console.log(`\nRolling back: ${currentBuildId} → ${previousBuildId}\n`);
 
-  // Find the previous deployment
   const deploysResult = await execCapture(
     "kubectl",
     [
@@ -1791,7 +1794,7 @@ export async function runRollback(options: {
     }
   }
 
-  // 6. State is durable; scale down every former-current Deployment. The HPA must be
+  // 5. State is durable; scale down every former-current Deployment. The HPA must be
   // deleted first (by its template-derived name — see the discovery-loop note) or the
   // autoscaler immediately rescales the parked build back to minReplicas.
   for (const currentDeploy of currentDeploys) {

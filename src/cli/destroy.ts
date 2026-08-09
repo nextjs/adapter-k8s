@@ -667,8 +667,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
 
   // Pin kubectl at THIS release's cluster before any cluster mutation — helm uninstall
   // and the state-ConfigMap delete otherwise run against whatever context happens to be
-  // current, and destroying the wrong cluster's release is unrecoverable. Every other
-  // command (deploy/rollback/doctor) already does this; destroy historically did not.
+  // current, and destroying the wrong cluster's release is unrecoverable.
   // Dry-run must not mutate the operator's kubeconfig (L13).
   if (!dryRun && localComposition) {
     let explicitlyConfirmed = yes === true;
@@ -1241,7 +1240,6 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       console.log("  → No adapter-owned external cleanup operations in the composition plan");
     }
   } else if (infra) {
-    // Delete GCS bucket
     if (infra.gcsBucket) {
       const bucketArgs = ["storage", "rm", "-r", `gs://${infra.gcsBucket}`, "--quiet"];
       if (dryRun) {

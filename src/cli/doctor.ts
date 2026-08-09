@@ -86,8 +86,7 @@ async function checkTool(name: string, args: string[]): Promise<CheckResult> {
   return { name: `${name} installed`, status: "pass", message: version };
 }
 
-// Per-host DNS/TLS checks shared by runDoctor and runDomainChecks (previously two
-// near-identical copies that had already drifted in messages and edge handling).
+// Per-host DNS/TLS checks shared by runDoctor and runDomainChecks.
 // gatewayIp/certStatus are resolved once by the caller; certStatus === null with a
 // projectId set means "certificate not found".
 async function checkDomainForHost(opts: {
@@ -166,7 +165,6 @@ async function checkDomainForHost(opts: {
       const cnameHost = parts[0] ?? "";
       const cnameTarget = parts[2] ?? parts[1] ?? "";
 
-      // Check if the CNAME actually resolves
       const cnameResolved = await resolveCname(cnameHost)
         .then((r) => r[0] ?? null)
         .catch(() => null);
@@ -571,7 +569,6 @@ export async function runDoctor(options: {
       if (accepted === "True") {
         results.push({ name: "Gateway", status: "pass", message: "Accepted" });
       } else {
-        // Get the reason
         const reasonResult = await execCapture(
           "kubectl",
           [
@@ -715,7 +712,6 @@ export async function runDoctor(options: {
         const shortName = name.replace(`${releaseName}-`, "");
         const isRouting = shortName === "routing-service";
 
-        // Determine role
         let role: "current" | "previous" | "old" | "unknown" = versionLabel ? "old" : "unknown";
         if (isRouting) role = "current";
         else if (currentBuildLabel && versionLabel === currentBuildLabel) role = "current";
@@ -1436,7 +1432,6 @@ export async function runDomainChecks(options: {
     if (ipResult.exitCode === 0) gatewayIp = ipResult.stdout.trim();
   }
 
-  // Certificate status
   let certStatus: string | null = null;
   if (projectId) {
     const certResult = await execCapture(
@@ -1463,7 +1458,6 @@ export async function runDomainChecks(options: {
     );
   }
 
-  // Print
   const hasIssues = results.some((r) => !r.name.startsWith("---") && r.status !== "pass");
   if (hasIssues) {
     console.log("\n  Domain status:");

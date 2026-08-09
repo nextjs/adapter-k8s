@@ -227,7 +227,7 @@ function readLocalStateQuiet(projectDir: string): AdapterState | null {
  * `previousBuildId` is the other's `buildId` recorded a later cutover, which is exactly
  * the failed-ConfigMap-write sequence (local={B, prev A}, cluster={A, prev A0}).
  */
-export function chooseNewerState(local: AdapterState, cluster: AdapterState): AdapterState {
+function chooseNewerState(local: AdapterState, cluster: AdapterState): AdapterState {
   const localGen = generationOf(local);
   const clusterGen = generationOf(cluster);
   if (clusterGen > localGen) return cluster;
