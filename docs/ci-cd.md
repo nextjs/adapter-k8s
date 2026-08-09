@@ -1,6 +1,6 @@
 # CI/CD without the CLI
 
-The `adapter-k8s` CLI is a convenience wrapper: everything `deploy` does can be reproduced with a container runtime, `helm`, and (on GKE) `gcloud`. This page covers the pieces you need to carry over into your own pipeline, and the runtime gotchas we've hit doing it.
+The `adapter-k8s` CLI is a convenience wrapper: everything `deploy` does can be reproduced with a container runtime, `helm`, and (on GKE) `gcloud`. This page covers the pieces to carry over into your own pipeline, and the known runtime requirements.
 
 ## The pipeline shape
 
@@ -39,7 +39,7 @@ The Helm chart is self-contained: it includes the traffic-extension registration
 
 Deploy images by immutable `@sha256:` digest, not by tag—the pods hold the internal dispatch secret, and a mutable tag lets a retag change what runs on the next restart (see [SECURITY.md](../SECURITY.md#image-provenance)).
 
-Resolve the digest **from the registry**, never from the local daemon:
+Resolve the digest from the registry, never from the local daemon:
 
 ```bash
 DIGEST=$(gcloud artifacts docker images describe \
@@ -48,7 +48,7 @@ DIGEST=$(gcloud artifacts docker images describe \
 # deploy $REGISTRY/nextjs-app-default@$DIGEST
 ```
 
-This is a correctness requirement, not a preference: **podman converts the manifest on push, so its local `RepoDigest` does not match what the registry stores** (measured with podman 6.0.1 against Artifact Registry). Deploying the local value yields `ImagePullBackOff`, because kubelet pulls from the registry and the registry is the authority.
+This is a correctness requirement: podman converts the manifest on push, so its local `RepoDigest` does not match what the registry stores (measured with podman 6.0.1 against Artifact Registry). Deploying the local value yields `ImagePullBackOff`, because kubelet pulls from the registry and the registry is the authority.
 
 ## The blue/green cutover
 
@@ -59,7 +59,7 @@ kubectl patch service <release>-<pool> --type=json \
   -p '[{"op":"replace","path":"/spec/selector/app.kubernetes.io~1version","value":"<sanitized-build-id>"}]'
 ```
 
-Before patching, verify each new pod answers `/readyz` **directly on the pod** (e.g. `kubectl exec`/port-forward), not via load-balancer backend health—`/readyz` is the pod's own verdict and answers 503 until instrumentation registration has succeeded and at least one route module has imported.
+Before patching, verify each new pod answers `/readyz` directly on the pod (e.g. `kubectl exec`/port-forward), not via load-balancer backend health—`/readyz` is the pod's own verdict and answers 503 until instrumentation registration has succeeded and at least one route module has imported.
 
 The selector flip is atomic, but the load balancer reprograms the standalone NEG asynchronously; expect a few seconds where the LB catches up to the new endpoints.
 
@@ -73,10 +73,10 @@ If your pipeline impersonates a service account, use `<release>-cli`—it holds 
 
 All three supported runtimes accept the same verb set (`build`, `push`, `inspect`, `run`, `rm`, `exec`) with identical flags, and all three are validated by deploying the repo's e2e fixture to a live cluster.
 
-| runtime   | requires |
-| --------- | -------- |
-| `docker`  | a reachable daemon |
-| `podman`  | a reachable daemon |
+| Runtime   | Requires                                                                           |
+| --------- | ---------------------------------------------------------------------------------- |
+| `docker`  | a reachable daemon                                                                 |
+| `podman`  | a reachable daemon                                                                 |
 | `nerdctl` | containerd **and** buildkit reachable from your user—containerd alone cannot build |
 
 **Platform pinning.** Always pass `--platform=linux/amd64` or `--platform=linux/arm64` explicitly in a manual image pipeline. With the adapter CLI, set `ADAPTER_K8S_TARGET_PLATFORM` before `next build`; the emitted artifact records it and deploy rejects a different override. Each build publishes one platform, not a multi-architecture index, and its pods are scheduled only on matching nodes. Docker cannot convert native files already produced by `next build`: Sharp is retargeted explicitly, while detectable foreign Prisma engines, ELF/Mach-O/PE binaries, and `.node` addons abort artifact generation. Run dependency installation and `next build` on a matching Linux runner/container when the app has other native dependencies.
@@ -90,4 +90,10 @@ containerd-rootless-setuptool.sh install-buildkit-containerd
 
 `BUILDKIT_HOST` is honoured if you set it.
 
-**Using the CLI in CI anyway.** If you'd rather script the CLI than replicate it, it is CI-friendly: `--yes` skips the unpinned-kubectl-context confirmation, runtime resolution happens in preflight before anything with side effects, and `ADAPTER_K8S_CONTAINER_CLI` forces a specific runtime. `ADAPTER_K8S_CONFIG=<name>` selects a config variant (`adapter.config.<name>.mjs` + matching state file) so one repo can deploy to several clusters without mutating files between jobs.
+**Using the CLI in CI anyway.** If you'd rather script the CLI than replicate it, it is CI-friendly: `--yes` skips the unpinned-kubectl-context confirmation, the container runtime is resolved before anything with mutating side effects, and `ADAPTER_K8S_CONTAINER_CLI` forces a specific runtime. `ADAPTER_K8S_CONFIG=<name>` selects a config variant (`adapter.config.<name>.mjs` + matching state file) so one repo can deploy to several clusters without mutating files between jobs. See [config variants](./configuration.md#config-variants).
+
+## See also
+
+- [Lifecycle](./lifecycle.md) — what the CLI's deploy/rollback do, in full
+- [Configuration](./configuration.md) — container strategy, platforms, variants
+- [Targets](./targets.md) — what the chart contains per target
