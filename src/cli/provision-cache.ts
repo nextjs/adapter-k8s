@@ -3,7 +3,7 @@
 // Used when `cache.enabled` is set without a BYO `cache.url`. The instance's endpoint is
 // injected into the pods via the `${releaseName}-valkey` Secret, which deploy renders into
 // the chart (Helm-owned) once provisioning reveals the private IP.
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 
 export interface ProvisionCacheOptions {
   projectId: string;
@@ -52,17 +52,21 @@ async function describeInstance(
   region: string,
   projectId: string,
 ): Promise<InstanceInfo | null> {
-  const res = await execCapture("gcloud", [
-    "redis",
-    "instances",
-    "describe",
-    name,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=value(state,host,port)",
-  ]);
+  const res = await execCapture(
+    "gcloud",
+    [
+      "redis",
+      "instances",
+      "describe",
+      name,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=value(state,host,port)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (res.exitCode !== 0) return null; // not found (or transient API error)
   const out = res.stdout.trim();
   if (!out) return null;
@@ -94,17 +98,21 @@ async function describeInstanceAuth(
   region: string,
   projectId: string,
 ): Promise<{ authEnabled: boolean; transitEncryption: boolean } | null> {
-  const res = await execCapture("gcloud", [
-    "redis",
-    "instances",
-    "describe",
-    name,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=json(authEnabled,transitEncryptionMode)",
-  ]);
+  const res = await execCapture(
+    "gcloud",
+    [
+      "redis",
+      "instances",
+      "describe",
+      name,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=json(authEnabled,transitEncryptionMode)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (res.exitCode !== 0 || !res.stdout.trim()) return null;
   try {
     const parsed = JSON.parse(res.stdout) as {
@@ -123,17 +131,21 @@ async function describeInstanceAuth(
 // Fetch the instance AUTH string. Requires redis.instances.getAuthString, which the
 // deployer (who created the instance) has.
 async function fetchAuthString(name: string, region: string, projectId: string): Promise<string> {
-  const res = await execCapture("gcloud", [
-    "redis",
-    "instances",
-    "get-auth-string",
-    name,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=value(authString)",
-  ]);
+  const res = await execCapture(
+    "gcloud",
+    [
+      "redis",
+      "instances",
+      "get-auth-string",
+      name,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=value(authString)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   const auth = res.stdout.trim();
   if (res.exitCode !== 0 || !auth) {
     throw new Error(
@@ -146,17 +158,21 @@ async function fetchAuthString(name: string, region: string, projectId: string):
 // Fetch the PEM of the instance's server CA for in-transit encryption. The pool pins TLS to
 // this CA — Memorystore certs are not publicly rooted, so default trust stores reject them.
 async function fetchServerCaCert(name: string, region: string, projectId: string): Promise<string> {
-  const res = await execCapture("gcloud", [
-    "redis",
-    "instances",
-    "describe",
-    name,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=json(serverCaCerts)",
-  ]);
+  const res = await execCapture(
+    "gcloud",
+    [
+      "redis",
+      "instances",
+      "describe",
+      name,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=json(serverCaCerts)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (res.exitCode !== 0) {
     throw new Error(
       `Failed to read the server CA for Memorystore instance ${name}: ${res.stderr.trim()}`,
@@ -229,14 +245,11 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
   }
 
   log("    Ensuring redis.googleapis.com is enabled…");
-  await execCapture("gcloud", [
-    "services",
-    "enable",
-    "redis.googleapis.com",
-    "--project",
-    projectId,
-    "--quiet",
-  ]);
+  await execCapture(
+    "gcloud",
+    ["services", "enable", "redis.googleapis.com", "--project", projectId, "--quiet"],
+    { timeoutMs: EXEC_TIMEOUTS.cloudOperation },
+  );
 
   // Attach the AUTH string + CA to a ready endpoint when AUTH mode is on.
   const withAuth = async (

@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve4, resolveCname } from "node:dns/promises";
 import path from "node:path";
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { checkContainerRuntime } from "./container-runtime.js";
 import { resolveK8sNamespace, sanitizeK8sName } from "../emit/templates/utils.js";
@@ -67,10 +67,12 @@ function printCheckResults(results: CheckResult[]): void {
 }
 
 async function checkTool(name: string, args: string[]): Promise<CheckResult> {
-  const result = await execCapture(name, args).catch((err: NodeJS.ErrnoException) => {
-    if (err.code === "ENOENT") return null; // command not found
-    return { exitCode: 1, stdout: "", stderr: err.message }; // other error
-  });
+  const result = await execCapture(name, args, { timeoutMs: EXEC_TIMEOUTS.kubectl }).catch(
+    (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return null; // command not found
+      return { exitCode: 1, stdout: "", stderr: err.message }; // other error
+    },
+  );
   if (!result) {
     return {
       name: `${name} installed`,
@@ -146,15 +148,19 @@ async function checkDomainForHost(opts: {
   // CNAME for DNS authorization (Certificate Manager)
   if (projectId) {
     const authName = `${releaseName}-dns-auth-${safeName}`;
-    const authResult = await execCapture("gcloud", [
-      "certificate-manager",
-      "dns-authorizations",
-      "describe",
-      authName,
-      "--project",
-      projectId,
-      "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
-    ]);
+    const authResult = await execCapture(
+      "gcloud",
+      [
+        "certificate-manager",
+        "dns-authorizations",
+        "describe",
+        authName,
+        "--project",
+        projectId,
+        "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (authResult.exitCode === 0 && authResult.stdout.trim()) {
       const parts = authResult.stdout.trim().split(/\s+/);
       const cnameHost = parts[0] ?? "";
@@ -257,17 +263,21 @@ export async function runDoctor(options: {
     namespace = resolveK8sNamespace(infraCtx.namespace);
     if (infraCtx.projectId && infraCtx.region) {
       const clusterName = `${releaseName}-cluster`;
-      const credResult = await execCapture("gcloud", [
-        "container",
-        "clusters",
-        "get-credentials",
-        clusterName,
-        "--region",
-        infraCtx.region,
-        "--project",
-        infraCtx.projectId,
-        "--quiet",
-      ]);
+      const credResult = await execCapture(
+        "gcloud",
+        [
+          "container",
+          "clusters",
+          "get-credentials",
+          clusterName,
+          "--region",
+          infraCtx.region,
+          "--project",
+          infraCtx.projectId,
+          "--quiet",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (credResult.exitCode !== 0) {
         // L14: gcloud stderr is externally influenced; strip control sequences before printing.
         console.error(
@@ -373,7 +383,9 @@ export async function runDoctor(options: {
     projectId = infra.projectId ?? "";
 
     // gcloud auth
-    const authResult = await execCapture("gcloud", ["auth", "print-access-token", "--quiet"]);
+    const authResult = await execCapture("gcloud", ["auth", "print-access-token", "--quiet"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
     results.push(
       authResult.exitCode === 0
         ? { name: "gcloud auth", status: "pass", message: "Authenticated" }
@@ -387,16 +399,20 @@ export async function runDoctor(options: {
 
     // Static IP
     const ipName = `${releaseName}-ip`;
-    const ipResult = await execCapture("gcloud", [
-      "compute",
-      "addresses",
-      "describe",
-      ipName,
-      "--global",
-      "--project",
-      projectId,
-      "--format=value(address)",
-    ]);
+    const ipResult = await execCapture(
+      "gcloud",
+      [
+        "compute",
+        "addresses",
+        "describe",
+        ipName,
+        "--global",
+        "--project",
+        projectId,
+        "--format=value(address)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (ipResult.exitCode === 0) {
       results.push({
         name: "Static IP",
@@ -414,15 +430,19 @@ export async function runDoctor(options: {
 
     // GCS bucket
     if (infra.gcsBucket) {
-      const bucketResult = await execCapture("gcloud", [
-        "storage",
-        "buckets",
-        "describe",
-        `gs://${infra.gcsBucket}`,
-        "--project",
-        projectId,
-        "--format=value(name)",
-      ]);
+      const bucketResult = await execCapture(
+        "gcloud",
+        [
+          "storage",
+          "buckets",
+          "describe",
+          `gs://${infra.gcsBucket}`,
+          "--project",
+          projectId,
+          "--format=value(name)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       results.push(
         bucketResult.exitCode === 0
           ? { name: "GCS bucket", status: "pass", message: infra.gcsBucket }
@@ -438,19 +458,23 @@ export async function runDoctor(options: {
     // Artifact Registry
     if (infra.containerRegistry) {
       const repoName = infra.containerRegistry.split("/").pop() ?? "nextjs";
-      const arResult = await execCapture("gcloud", [
-        "artifacts",
-        "repositories",
-        "describe",
-        repoName,
-        "--location",
-        // init always writes region; ?? "" keeps a malformed file from putting
-        // `undefined` on gcloud's argv (spawn throws) — the describe just fails.
-        infra.region ?? "",
-        "--project",
-        projectId,
-        "--format=value(name)",
-      ]);
+      const arResult = await execCapture(
+        "gcloud",
+        [
+          "artifacts",
+          "repositories",
+          "describe",
+          repoName,
+          "--location",
+          // init always writes region; ?? "" keeps a malformed file from putting
+          // `undefined` on gcloud's argv (spawn throws) — the describe just fails.
+          infra.region ?? "",
+          "--project",
+          projectId,
+          "--format=value(name)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       results.push(
         arResult.exitCode === 0
           ? { name: "Artifact Registry", status: "pass", message: infra.containerRegistry }
@@ -465,7 +489,9 @@ export async function runDoctor(options: {
   }
 
   // --- Kubernetes resources ---
-  const kubectlOk = await execCapture("kubectl", ["cluster-info"]).catch(() => null);
+  const kubectlOk = await execCapture("kubectl", ["cluster-info"], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  }).catch(() => null);
   if (kubectlOk && kubectlOk.exitCode === 0) {
     results.push({ name: "K8s cluster", status: "pass", message: "Connected" });
 
@@ -527,30 +553,38 @@ export async function runDoctor(options: {
     }
 
     // Gateway
-    const gwResult = await execCapture("kubectl", [
-      "get",
-      "gateway",
-      `${releaseName}-gateway`,
-      "-n",
-      namespace,
-      "-o",
-      "jsonpath={.status.conditions[?(@.type=='Accepted')].status}",
-    ]);
+    const gwResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "gateway",
+        `${releaseName}-gateway`,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.status.conditions[?(@.type=='Accepted')].status}",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (gwResult.exitCode === 0) {
       const accepted = gwResult.stdout.trim();
       if (accepted === "True") {
         results.push({ name: "Gateway", status: "pass", message: "Accepted" });
       } else {
         // Get the reason
-        const reasonResult = await execCapture("kubectl", [
-          "get",
-          "gateway",
-          `${releaseName}-gateway`,
-          "-n",
-          namespace,
-          "-o",
-          "jsonpath={.status.conditions[?(@.type=='Accepted')].message}",
-        ]);
+        const reasonResult = await execCapture(
+          "kubectl",
+          [
+            "get",
+            "gateway",
+            `${releaseName}-gateway`,
+            "-n",
+            namespace,
+            "-o",
+            "jsonpath={.status.conditions[?(@.type=='Accepted')].message}",
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         results.push({
           name: "Gateway",
           status: "fail",
@@ -570,30 +604,38 @@ export async function runDoctor(options: {
 
     // Gateway IP — check both Gateway status and the static IP from gcloud
     let gatewayIp: string | null = null;
-    const gwIpResult = await execCapture("kubectl", [
-      "get",
-      "gateway",
-      `${releaseName}-gateway`,
-      "-n",
-      namespace,
-      "-o",
-      "jsonpath={.status.addresses[0].value}",
-    ]);
+    const gwIpResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "gateway",
+        `${releaseName}-gateway`,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.status.addresses[0].value}",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (gwIpResult.exitCode === 0 && gwIpResult.stdout.trim()) {
       gatewayIp = gwIpResult.stdout.trim();
     }
     // Fallback: if Gateway status doesn't have it, use the reserved static IP
     if (!gatewayIp && projectId) {
-      const staticIpResult = await execCapture("gcloud", [
-        "compute",
-        "addresses",
-        "describe",
-        `${releaseName}-ip`,
-        "--global",
-        "--project",
-        projectId,
-        "--format=value(address)",
-      ]);
+      const staticIpResult = await execCapture(
+        "gcloud",
+        [
+          "compute",
+          "addresses",
+          "describe",
+          `${releaseName}-ip`,
+          "--global",
+          "--project",
+          projectId,
+          "--format=value(address)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (staticIpResult.exitCode === 0 && staticIpResult.stdout.trim()) {
         gatewayIp = staticIpResult.stdout.trim();
       }
@@ -609,15 +651,19 @@ export async function runDoctor(options: {
     }
 
     // HTTPRoute
-    const routeResult = await execCapture("kubectl", [
-      "get",
-      "httproute",
-      `${releaseName}-routes`,
-      "-n",
-      namespace,
-      "-o",
-      "jsonpath={.status.parents[0].conditions[?(@.type=='Accepted')].status}",
-    ]);
+    const routeResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "httproute",
+        `${releaseName}-routes`,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.status.parents[0].conditions[?(@.type=='Accepted')].status}",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (routeResult.exitCode === 0) {
       const accepted = routeResult.stdout.trim();
       results.push(
@@ -635,16 +681,20 @@ export async function runDoctor(options: {
     }
 
     // Per-deployment health with rollout awareness
-    const deploysResult = await execCapture("kubectl", [
-      "get",
-      "deployments",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName}`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.metadata.labels.app\\.kubernetes\\.io/version}{"\\n"}{end}',
-    ]);
+    const deploysResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "deployments",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.metadata.labels.app\\.kubernetes\\.io/version}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     // Classify by the EXACT `app.kubernetes.io/version` label — the same
     // sanitizeK8sName value the chart stamps and the cutover patches Services to. The
     // old 12-char normalized-prefix substring match misclassified two builds sharing
@@ -762,16 +812,20 @@ export async function runDoctor(options: {
     // metadata only when cluster discovery finds nothing, and say so in the output.
     let svcNames: string[] = [];
     let svcSource: "cluster" | "local" | null = null;
-    const svcResult = await execCapture("kubectl", [
-      "get",
-      "svc",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName}`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}{"\\n"}{end}',
-    ]);
+    const svcResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "svc",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (svcResult.exitCode === 0 && svcResult.stdout.trim()) {
       svcNames = svcResult.stdout
         .trim()
@@ -815,16 +869,20 @@ export async function runDoctor(options: {
       });
     }
     for (const svc of svcNames) {
-      const epResult = await execCapture("kubectl", [
-        "get",
-        "endpointslice",
-        "-n",
-        namespace,
-        "-l",
-        `kubernetes.io/service-name=${svc}`,
-        "-o",
-        'jsonpath={range .items[*]}{range .endpoints[*]}{.conditions.ready}{"\\n"}{end}{end}',
-      ]);
+      const epResult = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "endpointslice",
+          "-n",
+          namespace,
+          "-l",
+          `kubernetes.io/service-name=${svc}`,
+          "-o",
+          'jsonpath={range .items[*]}{range .endpoints[*]}{.conditions.ready}{"\\n"}{end}{end}',
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       const readyEndpoints =
         epResult.exitCode === 0
           ? epResult.stdout
@@ -890,16 +948,20 @@ export async function runDoctor(options: {
     // pod used to miss a crash-looping sibling entirely). Transient app-level "error"
     // lines (a failed request, a retried fetch) are a WARNING — hard FAIL is reserved
     // for fatal signatures that mean the workload can't serve at all.
-    const podsResult = await execCapture("kubectl", [
-      "get",
-      "pods",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName}`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-    ]);
+    const podsResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "pods",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (podsResult.exitCode === 0 && podsResult.stdout.trim()) {
       const isFatal = (l: string) => l.includes("FATAL") || l.includes("Cannot find module");
       const isError = (l: string) => l.includes("Error") || l.includes("error");
@@ -907,13 +969,11 @@ export async function runDoctor(options: {
       let fatalHit: { pod: string; line: string } | null = null;
       const errorPods: string[] = [];
       for (const pod of podsToCheck) {
-        const logsResult = await execCapture("kubectl", [
-          "logs",
-          pod,
-          "-n",
-          namespace,
-          "--tail=50",
-        ]);
+        const logsResult = await execCapture(
+          "kubectl",
+          ["logs", pod, "-n", namespace, "--tail=50"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (logsResult.exitCode !== 0) continue;
         const lines = logsResult.stdout.split("\n");
         const fatalLine = lines.find(isFatal);
@@ -948,17 +1008,21 @@ export async function runDoctor(options: {
     // GCP backend health checks — query actual LB health status
     if (projectId) {
       // List backend services associated with this release
-      const bsResult = await execCapture("gcloud", [
-        "compute",
-        "backend-services",
-        "list",
-        "--project",
-        projectId,
-        "--global",
-        "--filter",
-        `name~${releaseName}`,
-        "--format=value(name)",
-      ]);
+      const bsResult = await execCapture(
+        "gcloud",
+        [
+          "compute",
+          "backend-services",
+          "list",
+          "--project",
+          projectId,
+          "--global",
+          "--filter",
+          `name~${releaseName}`,
+          "--format=value(name)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (bsResult.exitCode === 0 && bsResult.stdout.trim()) {
         for (const bsName of bsResult.stdout.trim().split("\n")) {
           if (!bsName) continue;
@@ -969,16 +1033,20 @@ export async function runDoctor(options: {
           // Service name as `-defau<lt>-<svc>-`; ours all start with `${releaseName}-`).
           if (!bsName.startsWith(`${releaseName}-`) && !bsName.includes(`-${releaseName}-`))
             continue;
-          const healthResult = await execCapture("gcloud", [
-            "compute",
-            "backend-services",
-            "get-health",
-            bsName,
-            "--project",
-            projectId,
-            "--global",
-            "--format=json",
-          ]);
+          const healthResult = await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "backend-services",
+              "get-health",
+              bsName,
+              "--project",
+              projectId,
+              "--global",
+              "--format=json",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (healthResult.exitCode === 0) {
             try {
               const data = JSON.parse(healthResult.stdout);
@@ -1051,14 +1119,18 @@ export async function runDoctor(options: {
       // is what the GKE NEG controller reports) — conditions[0] is whichever condition
       // happens to sort first, so the old positional read could report a healthy NEG
       // as not-ready (or vice versa).
-      const negResult = await execCapture("kubectl", [
-        "get",
-        "svcneg",
-        "-n",
-        namespace,
-        "-o",
-        "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=='Initialized')].status}{\"\\n\"}{end}",
-      ]);
+      const negResult = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "svcneg",
+          "-n",
+          namespace,
+          "-o",
+          "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=='Initialized')].status}{\"\\n\"}{end}",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (negResult.exitCode === 0 && negResult.stdout.trim()) {
         for (const line of negResult.stdout.trim().split("\n")) {
           const [negName, negStatus] = line.split("|");
@@ -1090,16 +1162,20 @@ export async function runDoctor(options: {
       // Traffic extension registered AND covering EVERY forwarding rule. A missing HTTP
       // rule lets http:// bypass middleware (auth/rewrites); a missing extension means the
       // edge middleware never runs at all.
-      const teFrs = await execCapture("gcloud", [
-        "service-extensions",
-        "lb-traffic-extensions",
-        "describe",
-        `${releaseName}-traffic-ext`,
-        "--location=global",
-        "--project",
-        projectId,
-        "--format=value(forwardingRules)",
-      ]);
+      const teFrs = await execCapture(
+        "gcloud",
+        [
+          "service-extensions",
+          "lb-traffic-extensions",
+          "describe",
+          `${releaseName}-traffic-ext`,
+          "--location=global",
+          "--project",
+          projectId,
+          "--format=value(forwardingRules)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (teFrs.exitCode !== 0 || !teFrs.stdout.trim()) {
         results.push({
           name: "ext_proc traffic extension",
@@ -1115,28 +1191,36 @@ export async function runDoctor(options: {
         // "myapp2"), producing false coverage failures.
         let frCount: number | null = null;
         const ipAddr = (
-          await execCapture("gcloud", [
-            "compute",
-            "addresses",
-            "describe",
-            `${releaseName}-ip`,
-            "--global",
-            "--project",
-            projectId,
-            "--format=value(address)",
-          ])
+          await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "addresses",
+              "describe",
+              `${releaseName}-ip`,
+              "--global",
+              "--project",
+              projectId,
+              "--format=value(address)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          )
         ).stdout.trim();
         if (ipAddr) {
-          const frList = await execCapture("gcloud", [
-            "compute",
-            "forwarding-rules",
-            "list",
-            "--project",
-            projectId,
-            "--filter",
-            `IPAddress=${ipAddr}`,
-            "--format=value(name)",
-          ]);
+          const frList = await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "forwarding-rules",
+              "list",
+              "--project",
+              projectId,
+              "--filter",
+              `IPAddress=${ipAddr}`,
+              "--format=value(name)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (frList.exitCode === 0) {
             frCount = frList.stdout.trim().split("\n").filter(Boolean).length;
           }
@@ -1180,16 +1264,20 @@ export async function runDoctor(options: {
 
       // Routing backend service must be EXTERNAL_MANAGED with a NEG attached.
       const bsScheme = (
-        await execCapture("gcloud", [
-          "compute",
-          "backend-services",
-          "describe",
-          `${releaseName}-routing-service`,
-          "--global",
-          "--project",
-          projectId,
-          "--format=value(loadBalancingScheme)",
-        ])
+        await execCapture(
+          "gcloud",
+          [
+            "compute",
+            "backend-services",
+            "describe",
+            `${releaseName}-routing-service`,
+            "--global",
+            "--project",
+            projectId,
+            "--format=value(loadBalancingScheme)",
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        )
       ).stdout
         .trim()
         .toUpperCase();
@@ -1207,16 +1295,20 @@ export async function runDoctor(options: {
           message: "EXTERNAL_MANAGED",
         });
         const backends = (
-          await execCapture("gcloud", [
-            "compute",
-            "backend-services",
-            "describe",
-            `${releaseName}-routing-service`,
-            "--global",
-            "--project",
-            projectId,
-            "--format=value(backends)",
-          ])
+          await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "backend-services",
+              "describe",
+              `${releaseName}-routing-service`,
+              "--global",
+              "--project",
+              projectId,
+              "--format=value(backends)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          )
         ).stdout.trim();
         results.push(
           backends
@@ -1233,16 +1325,20 @@ export async function runDoctor(options: {
       // Routing health check must be TCP — a plaintext gRPC check passes against a TLS
       // ext_proc server yet the callout still fails (the failure mode that hid for months).
       const hcType = (
-        await execCapture("gcloud", [
-          "compute",
-          "health-checks",
-          "describe",
-          `${releaseName}-routing-hc`,
-          "--global",
-          "--project",
-          projectId,
-          "--format=value(type)",
-        ])
+        await execCapture(
+          "gcloud",
+          [
+            "compute",
+            "health-checks",
+            "describe",
+            `${releaseName}-routing-hc`,
+            "--global",
+            "--project",
+            projectId,
+            "--format=value(type)",
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        )
       ).stdout
         .trim()
         .toUpperCase();
@@ -1270,15 +1366,19 @@ export async function runDoctor(options: {
       // Get certificate status from Certificate Manager
       let certStatus: string | null = null;
       if (projectId) {
-        const certResult = await execCapture("gcloud", [
-          "certificate-manager",
-          "certificates",
-          "describe",
-          `${releaseName}-cert`,
-          "--project",
-          projectId,
-          "--format=value(managed.state)",
-        ]);
+        const certResult = await execCapture(
+          "gcloud",
+          [
+            "certificate-manager",
+            "certificates",
+            "describe",
+            `${releaseName}-cert`,
+            "--project",
+            projectId,
+            "--format=value(managed.state)",
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         certStatus = certResult.exitCode === 0 ? certResult.stdout.trim() : null;
       }
 
@@ -1319,31 +1419,39 @@ export async function runDomainChecks(options: {
   // Resolve Gateway IP (try static IP from gcloud)
   let gatewayIp: string | null = null;
   if (projectId) {
-    const ipResult = await execCapture("gcloud", [
-      "compute",
-      "addresses",
-      "describe",
-      `${releaseName}-ip`,
-      "--global",
-      "--project",
-      projectId,
-      "--format=value(address)",
-    ]);
+    const ipResult = await execCapture(
+      "gcloud",
+      [
+        "compute",
+        "addresses",
+        "describe",
+        `${releaseName}-ip`,
+        "--global",
+        "--project",
+        projectId,
+        "--format=value(address)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (ipResult.exitCode === 0) gatewayIp = ipResult.stdout.trim();
   }
 
   // Certificate status
   let certStatus: string | null = null;
   if (projectId) {
-    const certResult = await execCapture("gcloud", [
-      "certificate-manager",
-      "certificates",
-      "describe",
-      `${releaseName}-cert`,
-      "--project",
-      projectId,
-      "--format=value(managed.state)",
-    ]);
+    const certResult = await execCapture(
+      "gcloud",
+      [
+        "certificate-manager",
+        "certificates",
+        "describe",
+        `${releaseName}-cert`,
+        "--project",
+        projectId,
+        "--format=value(managed.state)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     certStatus = certResult.exitCode === 0 ? certResult.stdout.trim() : null;
   }
 

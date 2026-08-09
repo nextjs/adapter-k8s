@@ -2,6 +2,7 @@
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { sanitizeForTerminal } from "./terminal.js";
+import { EXEC_TIMEOUTS } from "./exec.js";
 import { RECORDED_CDN_TAG_PATTERN } from "../cdn-tags.js";
 
 export type Runner = (
@@ -40,26 +41,34 @@ export async function resolveCdnUrlMaps(
   run: Runner,
 ): Promise<string[]> {
   const ip = okOut(
-    await run("gcloud", [
-      "compute",
-      "addresses",
-      "describe",
-      `${releaseName}-ip`,
-      "--global",
-      `--project=${projectId}`,
-      "--format=value(address)",
-    ]),
+    await run(
+      "gcloud",
+      [
+        "compute",
+        "addresses",
+        "describe",
+        `${releaseName}-ip`,
+        "--global",
+        `--project=${projectId}`,
+        "--format=value(address)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    ),
   );
   if (!ip) return [];
 
-  const frRes = await run("gcloud", [
-    "compute",
-    "forwarding-rules",
-    "list",
-    `--project=${projectId}`,
-    `--filter=IPAddress=${ip}`,
-    "--format=value(target)",
-  ]);
+  const frRes = await run(
+    "gcloud",
+    [
+      "compute",
+      "forwarding-rules",
+      "list",
+      `--project=${projectId}`,
+      `--filter=IPAddress=${ip}`,
+      "--format=value(target)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (frRes.exitCode !== 0) return [];
 
   const targets = frRes.stdout
@@ -75,15 +84,19 @@ export async function resolveCdnUrlMaps(
         : null;
     if (!kind) continue; // unknown target type — do not guess
     const urlMap = okOut(
-      await run("gcloud", [
-        "compute",
-        kind,
-        "describe",
-        basename(target),
-        "--global",
-        `--project=${projectId}`,
-        "--format=value(urlMap)",
-      ]),
+      await run(
+        "gcloud",
+        [
+          "compute",
+          kind,
+          "describe",
+          basename(target),
+          "--global",
+          `--project=${projectId}`,
+          "--format=value(urlMap)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      ),
     );
     if (!urlMap) continue; // this proxy is unreadable — keep going, the others still matter
     const name = basename(urlMap);

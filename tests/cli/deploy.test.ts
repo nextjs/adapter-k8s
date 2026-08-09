@@ -572,6 +572,7 @@ describe("ensureValkeySecretHelmOwnership", () => {
     expect(calls[0]).toEqual([
       "kubectl",
       expect.arrayContaining(["get", "secret", "rel-valkey", "--ignore-not-found"]),
+      { timeoutMs: exec.EXEC_TIMEOUTS.kubectl },
     ]);
     const patchArgs = calls[1]![1];
     expect(patchArgs).toEqual(

@@ -83,6 +83,7 @@ describe("discoverBuildPools", () => {
         "app.kubernetes.io/name=rel,app.kubernetes.io/version=buildm,app.kubernetes.io/component!=routing-service",
         "json",
       ]),
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
     );
   });
 

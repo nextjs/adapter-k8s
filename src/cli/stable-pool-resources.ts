@@ -1,4 +1,4 @@
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import {
   ADAPTER_RELEASE_LABEL,
   assertSafePoolName,
@@ -134,16 +134,11 @@ async function readExact(
   name: string,
   namespace: string,
 ): Promise<{ status: "absent" } | { status: "read"; value: unknown }> {
-  const result = await execCapture("kubectl", [
-    "get",
-    typeForKind[kind],
-    name,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "json",
-  ]);
+  const result = await execCapture(
+    "kubectl",
+    ["get", typeForKind[kind], name, "-n", namespace, "--ignore-not-found", "-o", "json"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (result.exitCode !== 0) {
     throw new Error(
       `Could not read ${kind} ${name} (kubectl exited ${result.exitCode}` +
@@ -162,14 +157,11 @@ async function readExact(
 
 /** Whether this cluster can contain GKE HealthCheckPolicy resources. */
 export async function hasHealthCheckPolicyCrd(): Promise<boolean> {
-  const result = await execCapture("kubectl", [
-    "get",
-    "crd",
-    GKE_HCP_CRD,
-    "--ignore-not-found",
-    "-o",
-    "name",
-  ]);
+  const result = await execCapture(
+    "kubectl",
+    ["get", "crd", GKE_HCP_CRD, "--ignore-not-found", "-o", "name"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (result.exitCode !== 0) {
     throw new Error(
       `Could not determine whether the ${GKE_HCP_CRD} CRD exists (kubectl exited ` +
@@ -218,27 +210,31 @@ export async function retainRemovedPoolResources(options: {
       pool,
       namespace,
     );
-    const patch = await execCapture("kubectl", [
-      "patch",
-      typeForKind[resource.kind],
-      resource.name,
-      "-n",
-      namespace,
-      "--type=merge",
-      "-p",
-      JSON.stringify({
-        metadata: {
-          resourceVersion: resource.resourceVersion,
-          labels: {
-            "app.kubernetes.io/name": releaseName,
-            "app.kubernetes.io/component": pool,
-            [ADAPTER_RELEASE_LABEL]: releaseName,
-            [RETAINED_STABLE_POOL_LABEL]: releaseName,
+    const patch = await execCapture(
+      "kubectl",
+      [
+        "patch",
+        typeForKind[resource.kind],
+        resource.name,
+        "-n",
+        namespace,
+        "--type=merge",
+        "-p",
+        JSON.stringify({
+          metadata: {
+            resourceVersion: resource.resourceVersion,
+            labels: {
+              "app.kubernetes.io/name": releaseName,
+              "app.kubernetes.io/component": pool,
+              [ADAPTER_RELEASE_LABEL]: releaseName,
+              [RETAINED_STABLE_POOL_LABEL]: releaseName,
+            },
+            annotations: { [KEEP_ANNOTATION]: KEEP_VALUE },
           },
-          annotations: { [KEEP_ANNOTATION]: KEEP_VALUE },
-        },
-      }),
-    ]);
+        }),
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (patch.exitCode !== 0) {
       throw new Error(
         `Could not retain stable ${resource.kind} ${resource.name} for removed pool ` +
@@ -279,16 +275,20 @@ export async function cleanupRetainedStablePoolResources(options: {
   const resources: StableResource[] = [];
   const failures: string[] = [];
   for (const kind of kinds) {
-    const list = await execCapture("kubectl", [
-      "get",
-      typeForKind[kind],
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName},${ADAPTER_RELEASE_LABEL}=${releaseName}`,
-      "-o",
-      "json",
-    ]);
+    const list = await execCapture(
+      "kubectl",
+      [
+        "get",
+        typeForKind[kind],
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},${ADAPTER_RELEASE_LABEL}=${releaseName}`,
+        "-o",
+        "json",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (list.exitCode !== 0) {
       failures.push(
         `could not list retained ${kind} objects: ` +
@@ -367,14 +367,18 @@ export async function cleanupRetainedStablePoolResources(options: {
     let companionFailed = false;
     for (const resource of ordered) {
       if (resource.kind === "service" && companionFailed) continue;
-      const result = await execCapture("kubectl", [
-        "delete",
-        typeForKind[resource.kind],
-        resource.name,
-        "-n",
-        namespace,
-        "--ignore-not-found",
-      ]);
+      const result = await execCapture(
+        "kubectl",
+        [
+          "delete",
+          typeForKind[resource.kind],
+          resource.name,
+          "-n",
+          namespace,
+          "--ignore-not-found",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (result.exitCode !== 0) {
         failures.push(
           `could not delete retained ${resource.kind} ${resource.name}: ` +

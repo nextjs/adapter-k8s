@@ -6,7 +6,7 @@
 // `push`, `inspect --format`, `run`, `rm`, `exec` — which podman and nerdctl accept with the
 // same flags docker does. The hardcoded `"docker"` string was therefore the only thing tying
 // the adapter to one runtime, and this module removes it.
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 export {
   DEFAULT_TARGET_PLATFORM as TARGET_PLATFORM,
   parseTargetPlatform,
@@ -64,7 +64,9 @@ async function canBuild(candidate: ContainerCli): Promise<boolean> {
     const res = await execCapture(
       "buildctl",
       ["debug", "workers"],
-      host ? { env: { BUILDKIT_HOST: host } } : {},
+      host
+        ? { env: { BUILDKIT_HOST: host }, timeoutMs: EXEC_TIMEOUTS.kubectl }
+        : { timeoutMs: EXEC_TIMEOUTS.kubectl },
     ).catch(() => null);
     if (res && res.exitCode === 0) return true;
   }
@@ -111,7 +113,9 @@ export async function resolveContainerCli(): Promise<ContainerCli> {
     // and no buildctl in PATH — it reports the CLIENT only. `nerdctl info` (like `images`)
     // exits 1 there. Probing `version` would select a runtime that cannot build anything and
     // push the failure out to the first build. docker and podman answer `info` 0 when healthy.
-    const res = await execCapture(candidate, ["info"]).catch(() => null);
+    const res = await execCapture(candidate, ["info"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    }).catch(() => null);
     if (!res || res.exitCode !== 0) continue;
     if (!(await canBuild(candidate))) continue;
     cached = candidate;
@@ -148,9 +152,13 @@ export async function checkContainerRuntime(): Promise<{
   for (const candidate of CONTAINER_CLI_CANDIDATES) {
     // Same daemon-reachability probe as resolveContainerCli — doctor must agree with what the
     // deploy will actually pick, including rejecting an installed-but-daemonless nerdctl.
-    const reachable = await execCapture(candidate, ["info"]).catch(() => null);
+    const reachable = await execCapture(candidate, ["info"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    }).catch(() => null);
     if (!reachable || reachable.exitCode !== 0) continue;
-    const ver = await execCapture(candidate, ["version"]).catch(() => null);
+    const ver = await execCapture(candidate, ["version"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    }).catch(() => null);
     const version = ((ver?.stdout || ver?.stderr) ?? "").trim().split("\n")[0] || candidate;
     return { name: "container runtime", status: "pass", message: `${candidate} — ${version}` };
   }

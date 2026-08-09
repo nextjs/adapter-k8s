@@ -20,7 +20,7 @@ vi.mock("../../src/cli/provision-cache.js", async (importOriginal) => {
 vi.mock("node:fs");
 
 import { runDeploy, discoverServingBuildId } from "../../src/cli/deploy.js";
-import { execCapture, execCaptureStdin, execOrThrow } from "../../src/cli/exec.js";
+import { execCapture, execCaptureStdin, execOrThrow, EXEC_TIMEOUTS } from "../../src/cli/exec.js";
 import {
   readState,
   writeState,
@@ -684,7 +684,9 @@ describe("runDeploy — orchestration", () => {
     // The lifecycle stack probes Helm capabilities before reading skipped-build metadata; this
     // is read-only and still occurs before every build/push/credential/cluster mutation.
     expect(execCapture).toHaveBeenCalledOnce();
-    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"]);
+    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
   });
 
   it("treats pre-platform metadata as amd64 instead of relabeling its x64 Sharp staging", async () => {
@@ -695,7 +697,9 @@ describe("runDeploy — orchestration", () => {
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
     ).rejects.toThrow(/targets "linux\/amd64".*requested "linux\/arm64"/s);
     expect(execCapture).toHaveBeenCalledOnce();
-    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"]);
+    expect(execCapture).toHaveBeenCalledWith("helm", ["upgrade", "--help"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
   });
 
   it("happy path: build → push → helm → rollout → health → selector patch → state commit → CDN invalidate → previous scaled down, in that order", async () => {

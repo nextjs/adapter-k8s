@@ -1,7 +1,7 @@
 // src/cli/init.ts
 import { existsSync, writeFileSync, appendFileSync, readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { execCapture } from "./exec.js";
+import { execCapture, EXEC_TIMEOUTS } from "./exec.js";
 import { generateAdapterConfig, generateInfrastructureJson } from "./scaffold.js";
 import { gkeVersionAtLeast, MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import { sanitizeForTerminal } from "./terminal.js";
@@ -558,30 +558,38 @@ async function checkRoutingResourceShape(releaseName: string, projectId: string)
   const hc = `${releaseName}-routing-hc`;
   const bs = `${releaseName}-routing-service`;
   const hcType = (
-    await execCapture("gcloud", [
-      "compute",
-      "health-checks",
-      "describe",
-      hc,
-      "--global",
-      "--project",
-      projectId,
-      "--format=value(type)",
-    ])
+    await execCapture(
+      "gcloud",
+      [
+        "compute",
+        "health-checks",
+        "describe",
+        hc,
+        "--global",
+        "--project",
+        projectId,
+        "--format=value(type)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    )
   ).stdout
     .trim()
     .toUpperCase();
   const bsScheme = (
-    await execCapture("gcloud", [
-      "compute",
-      "backend-services",
-      "describe",
-      bs,
-      "--global",
-      "--project",
-      projectId,
-      "--format=value(loadBalancingScheme)",
-    ])
+    await execCapture(
+      "gcloud",
+      [
+        "compute",
+        "backend-services",
+        "describe",
+        bs,
+        "--global",
+        "--project",
+        projectId,
+        "--format=value(loadBalancingScheme)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    )
   ).stdout
     .trim()
     .toUpperCase();
@@ -675,22 +683,18 @@ export async function runInit(options: InitOptions): Promise<void> {
       `    [dry-run]   (on "already exists": gcloud iam roles update ${extRoleId} with the same permissions)`,
     );
   } else {
-    const created = await execCapture("gcloud", [
-      "iam",
-      "roles",
-      "create",
-      extRoleId,
-      ...extRoleArgs,
-    ]);
+    const created = await execCapture(
+      "gcloud",
+      ["iam", "roles", "create", extRoleId, ...extRoleArgs],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (created.exitCode !== 0) {
       if (/already exists|ALREADY_EXISTS/.test(created.stderr)) {
-        const updated = await execCapture("gcloud", [
-          "iam",
-          "roles",
-          "update",
-          extRoleId,
-          ...extRoleArgs,
-        ]);
+        const updated = await execCapture(
+          "gcloud",
+          ["iam", "roles", "update", extRoleId, ...extRoleArgs],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (updated.exitCode !== 0) {
           throw new Error(
             `Updating custom IAM role ${extRoleId} failed:\n${sanitizeForTerminal(updated.stderr)}`,
@@ -724,7 +728,9 @@ export async function runInit(options: InitOptions): Promise<void> {
     }
     // Use execCapture to check stderr for "already exists" — gcloud puts
     // error messages in stderr, not in the thrown Error message.
-    let result = await execCapture(cmd.command, cmd.args);
+    let result = await execCapture(cmd.command, cmd.args, {
+      timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+    });
 
     if (result.exitCode !== 0) {
       // Broad substrings ("Conflict", bare "409") are NOT already-exists signals: the
@@ -757,15 +763,19 @@ export async function runInit(options: InitOptions): Promise<void> {
       if (isBucketCreate) {
         // Verify the existing bucket is visible to THIS project before skipping; a
         // foreign-owned name must fail loudly so the operator picks another one.
-        const check = await execCapture("gcloud", [
-          "storage",
-          "buckets",
-          "describe",
-          `gs://${bucket}`,
-          "--project",
-          projectId,
-          "--format=value(name)",
-        ]);
+        const check = await execCapture(
+          "gcloud",
+          [
+            "storage",
+            "buckets",
+            "describe",
+            `gs://${bucket}`,
+            "--project",
+            projectId,
+            "--format=value(name)",
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (check.exitCode === 0) {
           console.log(`    (already exists — verified accessible — skipping)`);
         } else {
@@ -790,7 +800,9 @@ export async function runInit(options: InitOptions): Promise<void> {
         for (let attempt = 1; attempt <= 6 && !ok; attempt++) {
           console.log(`    (IAM binding not ready — retry ${attempt}/6)`);
           await new Promise((r) => setTimeout(r, iamRetryDelayMs));
-          result = await execCapture(cmd.command, cmd.args);
+          result = await execCapture(cmd.command, cmd.args, {
+            timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+          });
           ok =
             result.exitCode === 0 ||
             /already exists|ALREADY_EXISTS|already own it/.test(result.stderr) ||
@@ -833,18 +845,22 @@ export async function runInit(options: InitOptions): Promise<void> {
   // config enables CDN by default. Warn here; `deploy` hard-fails via CRD detection when a
   // CDN-enabled chart targets an unsupported cluster.
   if (!dryRun) {
-    const versionResult = await execCapture("gcloud", [
-      "container",
-      "clusters",
-      "describe",
-      `${releaseName}-cluster`,
-      "--location",
-      region,
-      "--project",
-      projectId,
-      "--format=value(currentMasterVersion)",
-      "--quiet",
-    ]);
+    const versionResult = await execCapture(
+      "gcloud",
+      [
+        "container",
+        "clusters",
+        "describe",
+        `${releaseName}-cluster`,
+        "--location",
+        region,
+        "--project",
+        projectId,
+        "--format=value(currentMasterVersion)",
+        "--quiet",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (versionResult.exitCode === 0) {
       const version = versionResult.stdout.trim();
       const supported = gkeVersionAtLeast(version, MIN_GKE_VERSION_FOR_CDN);
@@ -862,13 +878,11 @@ export async function runInit(options: InitOptions): Promise<void> {
   // GKE Autopilot uses the container-engine-robot service agent for image pulls
   if (!dryRun) {
     console.log("  → Granting Artifact Registry reader for GKE image pulls");
-    const projNumResult = await execCapture("gcloud", [
-      "projects",
-      "describe",
-      projectId,
-      "--format=value(projectNumber)",
-      "--quiet",
-    ]);
+    const projNumResult = await execCapture(
+      "gcloud",
+      ["projects", "describe", projectId, "--format=value(projectNumber)", "--quiet"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (projNumResult.exitCode === 0) {
       const projectNumber = projNumResult.stdout.trim();
       const serviceAgents = [
@@ -876,22 +890,26 @@ export async function runInit(options: InitOptions): Promise<void> {
         `${projectNumber}-compute@developer.gserviceaccount.com`,
       ];
       for (const sa of serviceAgents) {
-        const grant = await execCapture("gcloud", [
-          "artifacts",
-          "repositories",
-          "add-iam-policy-binding",
-          "nextjs",
-          "--location",
-          region,
-          "--member",
-          `serviceAccount:${sa}`,
-          "--role",
-          "roles/artifactregistry.reader",
-          "--project",
-          projectId,
-          "--condition=None",
-          "--quiet",
-        ]);
+        const grant = await execCapture(
+          "gcloud",
+          [
+            "artifacts",
+            "repositories",
+            "add-iam-policy-binding",
+            "nextjs",
+            "--location",
+            region,
+            "--member",
+            `serviceAccount:${sa}`,
+            "--role",
+            "roles/artifactregistry.reader",
+            "--project",
+            projectId,
+            "--condition=None",
+            "--quiet",
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         // A failed grant used to be swallowed — the first symptom was ImagePullBackOff
         // at deploy time, far from the cause. Warn loudly (non-fatal: the operator may
         // manage these grants centrally).
@@ -970,15 +988,19 @@ export async function runInit(options: InitOptions): Promise<void> {
     for (const host of hosts) {
       const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
       const authName = `${releaseName}-dns-auth-${safeName}`;
-      const dnsAuthResult = await execCapture("gcloud", [
-        "certificate-manager",
-        "dns-authorizations",
-        "describe",
-        authName,
-        "--project",
-        projectId,
-        "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
-      ]);
+      const dnsAuthResult = await execCapture(
+        "gcloud",
+        [
+          "certificate-manager",
+          "dns-authorizations",
+          "describe",
+          authName,
+          "--project",
+          projectId,
+          "--format=value(dnsResourceRecord.name,dnsResourceRecord.type,dnsResourceRecord.data)",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (dnsAuthResult.exitCode === 0 && dnsAuthResult.stdout.trim()) {
         const [name, type, data] = dnsAuthResult.stdout.trim().split("\t");
         console.log(`    ${name}  ${type}  ${data}`);

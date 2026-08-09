@@ -1,4 +1,4 @@
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import type { AdapterState } from "./state.js";
 import {
   assertSafeBuildId,
@@ -82,17 +82,21 @@ export async function discoverBuildPools(
   assertSafeBuildId(buildId);
   const namespace = resolveK8sNamespace(configuredNamespace);
   const version = sanitizeK8sName(buildId);
-  const result = await execCapture("kubectl", [
-    "get",
-    "deployments",
-    "-n",
-    namespace,
-    "-l",
-    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${version},` +
-      `app.kubernetes.io/component!=routing-service`,
-    "-o",
-    "json",
-  ]);
+  const result = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "deployments",
+      "-n",
+      namespace,
+      "-l",
+      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${version},` +
+        `app.kubernetes.io/component!=routing-service`,
+      "-o",
+      "json",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (result.exitCode !== 0) {
     throw new Error(
       `Could not recover the pool topology for build "${buildId}" from Kubernetes ` +

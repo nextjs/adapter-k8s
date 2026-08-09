@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import boxen from "boxen";
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveK8sNamespace, sanitizeK8sName } from "../emit/templates/utils.js";
 import {
@@ -63,17 +63,21 @@ export async function runDescribe(options: {
       process.exit(1);
     }
   } else if (infra?.projectId && infra?.region) {
-    const credResult = await execCapture("gcloud", [
-      "container",
-      "clusters",
-      "get-credentials",
-      `${releaseName}-cluster`,
-      "--region",
-      infra.region,
-      "--project",
-      infra.projectId,
-      "--quiet",
-    ]);
+    const credResult = await execCapture(
+      "gcloud",
+      [
+        "container",
+        "clusters",
+        "get-credentials",
+        `${releaseName}-cluster`,
+        "--region",
+        infra.region,
+        "--project",
+        infra.projectId,
+        "--quiet",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (credResult.exitCode !== 0) {
       // L14: gcloud stderr is externally influenced; strip control sequences before printing.
       console.error(
@@ -148,40 +152,52 @@ export async function runDescribe(options: {
 
   const compositionUsesGcp = compositionPlan?.target.identity.kind === "gke-resource";
   if (infra?.projectId && (!localComposition || compositionUsesGcp)) {
-    const ipResult = await execCapture("gcloud", [
-      "compute",
-      "addresses",
-      "describe",
-      `${releaseName}-ip`,
-      "--global",
-      "--project",
-      projectId,
-      "--format=value(address)",
-    ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+    const ipResult = await execCapture(
+      "gcloud",
+      [
+        "compute",
+        "addresses",
+        "describe",
+        `${releaseName}-ip`,
+        "--global",
+        "--project",
+        projectId,
+        "--format=value(address)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    ).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
     if (ipResult.exitCode === 0) gatewayIp = ipResult.stdout.trim();
 
-    const certResult = await execCapture("gcloud", [
-      "certificate-manager",
-      "certificates",
-      "describe",
-      `${releaseName}-cert`,
-      "--project",
-      projectId,
-      "--format=value(managed.state)",
-    ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+    const certResult = await execCapture(
+      "gcloud",
+      [
+        "certificate-manager",
+        "certificates",
+        "describe",
+        `${releaseName}-cert`,
+        "--project",
+        projectId,
+        "--format=value(managed.state)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    ).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
     if (certResult.exitCode === 0) certStatus = certResult.stdout.trim().toLowerCase();
   }
 
-  const deploymentsResult = await execCapture("kubectl", [
-    "get",
-    "deployments",
-    "-n",
-    namespace,
-    "-l",
-    `app.kubernetes.io/name=${releaseName}`,
-    "-o",
-    'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.spec.template.spec.containers[0].image}|{.metadata.labels.app\\.kubernetes\\.io/version}{"\\n"}{end}',
-  ]).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
+  const deploymentsResult = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "deployments",
+      "-n",
+      namespace,
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}|{.status.readyReplicas}/{.status.replicas}|{.spec.template.spec.containers[0].image}|{.metadata.labels.app\\.kubernetes\\.io/version}{"\\n"}{end}',
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  ).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
 
   interface DeployInfo {
     shortName: string;

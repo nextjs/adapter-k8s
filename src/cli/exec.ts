@@ -37,6 +37,21 @@ export interface ExecOptions {
   env?: Record<string, string>;
 }
 
+// Shared subprocess timeout tiers. Every non-interactive shell-out must pass one of
+// these (or a bespoke value) — an unbounded kubectl/gcloud/helm call wedged on a stuck
+// API server otherwise hangs the CLI forever. Streaming commands that are expected to
+// run until interrupted (log tails, emulate servers) are the only exception.
+export const EXEC_TIMEOUTS = {
+  /** kubectl reads, patches, scales, small gcloud describes: fail fast. */
+  kubectl: 60_000,
+  /** kubectl rollout/wait-style polling with its own --timeout flag; give the child
+   *  headroom past the flag so kubectl reports the failure, not us. */
+  rollout: 15 * 60 * 1000,
+  /** gcloud operations that poll a long-running GCP op (cluster/addon changes,
+   *  Memorystore, CDN invalidation), helm upgrade/uninstall, docker build/push. */
+  cloudOperation: 20 * 60 * 1000,
+} as const;
+
 // M2: never route arguments through a shell we don't escape for. The old blanket
 // `shell: process.platform === "win32"` sent every argument through `cmd.exe /s /c`, so a
 // metacharacter in any arg (build id, git branch, pool name) was a command-injection sink
