@@ -1122,7 +1122,7 @@ export async function runRollback(options: {
     const prevNames = poolNames.map((p) =>
       sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`),
     );
-    const currNames = poolNames.map((p) =>
+    const currNames = currentPoolNames.map((p) =>
       sanitizeK8sName(`${releaseName}-${p}-${currentBuildId}`),
     );
     console.log(`\n  [dry-run] Rollback plan: ${currentBuildId} → ${previousBuildId}`);

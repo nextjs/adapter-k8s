@@ -141,8 +141,12 @@ describe("the per-process memory cache is disabled when the shared cache is regi
   // it, so a tagged fetch entry pins for its whole revalidate window. Measured on GKE via
   // upstream app-static's "revalidate tag correctly with edge route handler" (2026-07-30).
   it("sets cacheMaxMemorySize: 0 alongside the cacheHandler", async () => {
+    // A stub bundle keeps this test independent of `npm run build` — modifyConfig only
+    // checks that the bundle file exists before wiring its path into next.config.
+    const bundleDir = mkdtempSync(path.join(os.tmpdir(), "adapter-bundles-"));
+    writeFileSync(path.join(bundleDir, "cache-handler.cjs"), "module.exports = class {};");
     const saved = process.env.ADAPTER_K8S_BUNDLE_DIR;
-    process.env.ADAPTER_K8S_BUNDLE_DIR = path.join(__dirname, "..", "dist");
+    process.env.ADAPTER_K8S_BUNDLE_DIR = bundleDir;
     try {
       const adapter = createK8sAdapter({ ...validConfig, cache: { enabled: true } });
       const modified = await adapter.modifyConfig!({} as any, {} as any);
@@ -151,6 +155,7 @@ describe("the per-process memory cache is disabled when the shared cache is regi
     } finally {
       if (saved === undefined) delete process.env.ADAPTER_K8S_BUNDLE_DIR;
       else process.env.ADAPTER_K8S_BUNDLE_DIR = saved;
+      rmSync(bundleDir, { recursive: true, force: true });
     }
   });
 

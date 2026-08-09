@@ -25,9 +25,10 @@ export default createK8sAdapter({
   },
 
   containerStrategy: 'traced-assets',
-  // Not yet implemented — uncomment once the corresponding feature ships, otherwise these
-  // validate but do nothing:
-  //   cache: { enabled: true, provider: 'valkey' },   // shared middle cache (in progress)
+  // Shared cross-replica cache (ISR/PPR revalidation, fetch cache). Requires a Valkey
+  // instance — provisioned automatically on GKE, or bring your own via cache.endpoint:
+  //   cache: { enabled: true, provider: 'valkey' },
+  // Not yet implemented (validates but throws at build time):
   //   skewProtection: { enabled: true, duration: '5m' },
 
   provider: {
