@@ -233,6 +233,15 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "delete"]
+  # E6's retained stable-resource sweep lists PodDisruptionBudgets by label, reads each
+  # to confirm it selects the pool it claims to, and deletes the obsolete ones. Without
+  # this rule the sweep is forbidden — non-fatal (it runs after the state commit and is
+  # best-effort), but every Job logs the failure and removed pools' PDBs are never GC'd.
+  # HealthCheckPolicies need no rule: the cluster-scoped CRD probe fails first under the
+  # Job's namespaced Role and drops that kind from the sweep entirely.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "delete"]
   # D4/D5 generation-guarded Accepted gate — read-only.
   - apiGroups: ["gateway.envoyproxy.io"]
     resources: ["envoyextensionpolicies"]

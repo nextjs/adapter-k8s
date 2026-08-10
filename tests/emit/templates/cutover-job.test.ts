@@ -231,6 +231,9 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
       configmaps: ["get", "list", "create", "update", "patch", "delete"],
       // The edge revert probes the target build's dispatch Secret by name (N87); E6 prunes.
       secrets: ["get", "list", "delete"],
+      // E6's retained stable-resource sweep lists PDBs by label, reads each to confirm it
+      // selects the pool it claims to, and deletes the obsolete ones.
+      "policy/poddisruptionbudgets": ["get", "list", "delete"],
       // D4/D5 generation-guarded Accepted gate — read-only.
       "gateway.envoyproxy.io/envoyextensionpolicies": ["get"],
     });
@@ -251,14 +254,14 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
     expect(rules.get("pods")).toEqual(["get", "list"]);
   });
 
-  it("DOCUMENTS a gap: E6's retained stable-PDB sweep has no rule (best-effort, warns)", () => {
-    // gcSupersededResources → cleanupRetainedStablePoolResources lists and deletes retained
-    // `poddisruptionbudget` objects, but the Role grants nothing on policy/PDBs. That step
-    // is post-state-commit and best-effort (its failures surface as "Retained
-    // stable-resource cleanup incomplete" warnings), so a promotion still succeeds — it
-    // just leaks obsolete retained PDBs in Job mode. Pinned as current behaviour.
+  it("grants E6's retained stable-PDB sweep exactly what it executes", () => {
+    // gcSupersededResources → cleanupRetainedStablePoolResources lists retained
+    // `poddisruptionbudget` objects by label, reads each to verify it selects the pool it
+    // claims to, and deletes the obsolete ones. The sweep is post-state-commit and
+    // best-effort, so a missing rule did not fail promotions — it just logged "Retained
+    // stable-resource cleanup incomplete" on every Job and leaked PDBs from removed pools.
     const rules = roleRules(renderCutoverRbac({ releaseName: RELEASE }));
-    expect(rules.has("policy/poddisruptionbudgets")).toBe(false);
+    expect(rules.get("policy/poddisruptionbudgets")).toEqual(["get", "list", "delete"]);
     // HealthCheckPolicy is the deliberately-degraded case: without the cluster-scoped CRD
     // probe the sweep never classifies HCPs at all, so no rule is needed.
     expect(rules.has("networking.gke.io/healthcheckpolicies")).toBe(false);
