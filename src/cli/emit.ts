@@ -385,8 +385,10 @@ export function findSopsConfig(startDir: string): string | null {
  * existing encrypted file is REUSED when sops can still decrypt it (recipients unchanged)
  * and its plaintext matches what this emit would encrypt; when decryption fails
  * (recipients rotated, key unavailable) or the plaintext differs, it is re-encrypted.
- * The comparison trims both sides — sops re-serializes YAML on decrypt, and a false
- * mismatch merely costs one re-encryption, never correctness.
+ * The comparison is decrypt-to-decrypt: sops re-serializes YAML on decrypt (indent,
+ * quoting), so the template plaintext is round-tripped through sops encrypt+decrypt and
+ * compared against the prior file's decrypt output — both sides normalized by the same
+ * serializer. A false mismatch merely costs one re-encryption, never correctness.
  */
 export async function emitBundleSopsSecrets(opts: {
   bundleDir: string;
@@ -410,16 +412,43 @@ export async function emitBundleSopsSecrets(opts: {
     const relPath = path.relative(configDir, outPath);
     const priorBody = prior.get(outName);
     if (priorBody !== undefined) {
-      // Re-emit path: decrypt the PRIOR file and compare. Decryption failing is not an
+      // Re-emit path: keep the prior encrypted file when its plaintext is unchanged, so
+      // a changed secrets/ file in the diff means the plaintext or recipients changed —
+      // never noise. sops re-serializes YAML on decrypt (indent, quoting), so decrypted
+      // output can NEVER be compared to our template plaintext textually; both sides must
+      // pass through sops's own serializer. Encrypt the candidate plaintext to a temp
+      // file, decrypt both, compare decrypt-to-decrypt. Prior-decrypt failure is not an
       // error — it is the recipients-changed signal, answered by re-encrypting below.
       writeFileSync(outPath, priorBody, { mode: 0o600 });
-      const dec = await execCapture("sops", [...configArgs, "--decrypt", relPath], {
+      const decPrior = await execCapture("sops", [...configArgs, "--decrypt", relPath], {
         cwd: configDir,
         timeoutMs: EXEC_TIMEOUTS.kubectl,
       }).catch(() => null);
-      if (dec && dec.exitCode === 0 && dec.stdout.trim() === plaintext.trim()) {
-        written.push(`secrets/${outName}`);
-        continue;
+      if (decPrior && decPrior.exitCode === 0) {
+        // Same directory, so the same creation_rules path_regex governs the temp file.
+        const tmpName = `${fileName}.reemit-check.sops.yaml`;
+        const tmpPath = path.join(secretsDir, tmpName);
+        const tmpRel = path.relative(configDir, tmpPath);
+        try {
+          writeFileSync(tmpPath, plaintext, { mode: 0o600 });
+          const encTmp = await execCapture("sops", [...configArgs, "--encrypt", tmpRel], {
+            cwd: configDir,
+            timeoutMs: EXEC_TIMEOUTS.kubectl,
+          });
+          if (encTmp.exitCode === 0 && encTmp.stdout.includes("sops:")) {
+            writeFileSync(tmpPath, encTmp.stdout, { mode: 0o600 });
+            const decTmp = await execCapture("sops", [...configArgs, "--decrypt", tmpRel], {
+              cwd: configDir,
+              timeoutMs: EXEC_TIMEOUTS.kubectl,
+            });
+            if (decTmp.exitCode === 0 && decTmp.stdout === decPrior.stdout) {
+              written.push(`secrets/${outName}`);
+              continue;
+            }
+          }
+        } finally {
+          rmSync(tmpPath, { force: true });
+        }
       }
       rmSync(outPath, { force: true });
     }
