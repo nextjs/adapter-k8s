@@ -55,6 +55,11 @@ function render(body: string, sets: string[]): string {
         "  image:",
         '    digest: ""',
         "activeBuildId: b1",
+        // Mirrors the chart's own default (values-yaml.ts). Since GitOps PR2 the per-build
+        // templates gate keep-at-birth annotations on `.Values.cutover.mode`; without the
+        // key helm fails with a nil-pointer before reaching the digest seam under test.
+        "cutover:",
+        "  mode: none",
       ].join("\n") + "\n",
     );
     writeFileSync(path.join(dir, "templates", "obj.yaml"), body);

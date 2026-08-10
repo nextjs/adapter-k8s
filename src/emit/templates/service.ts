@@ -5,8 +5,27 @@ import {
   assertSafeBuildId,
   assertSafePoolName,
   assertSafeReleaseName,
+  renderKeepAtBirthAnnotations,
   stablePoolResourceNames,
 } from "./utils.js";
+
+/**
+ * GitOps PR2 (§4.2): the stable Services' version selector. Under `cutover.mode: job`
+ * the selector renders at the PREVIOUS build (`.Values.previousBuildId` — sync is not
+ * cutover; the Job repoints it after the gates pass); under `mode: none` it stays
+ * `.Values.activeBuildId` (imperative deploy's values trick, unchanged). A Helm
+ * ternary keeps the template a single line in both modes.
+ */
+const ACTIVE_SELECTOR_VERSION = `{{ if eq .Values.cutover.mode "job" }}{{ .Values.previousBuildId }}{{ else }}{{ .Values.activeBuildId }}{{ end }}`;
+/** Same gate for the origin Service's component (the previous build's default pool). */
+const ACTIVE_SELECTOR_DEFAULT_POOL = `{{ if eq .Values.cutover.mode "job" }}{{ .Values.previousDefaultPool }}{{ else }}{{ .Values.activeDefaultPool }}{{ end }}`;
+/**
+ * §4.2 item 1: stable active Services under mode: job carry `adapter-k8s.io/cutover:
+ * pending` — the machine-readable "this selector awaits the Job's promotion" marker.
+ */
+const CUTOVER_PENDING_ANNOTATION = `{{- if eq .Values.cutover.mode "job" }}
+    adapter-k8s.io/cutover: pending
+{{- end }}`;
 
 // Versioned Service — points to a specific build's pods
 export function renderService({
@@ -37,7 +56,9 @@ export function renderService({
 kind: Service
 metadata:
   name: ${name}
-  labels:
+  # GitOps PR2 keep-at-birth (§4.2): a PER-BUILD resource must protect itself from the
+  # sync that applies the NEXT bundle — see renderKeepAtBirthAnnotations.
+${renderKeepAtBirthAnnotations("  ")}  labels:
     app.kubernetes.io/name: "${releaseName}"
     # N61: QUOTED — an unquoted pool name like "on"/"no"/"true"/"123" renders a YAML
     # boolean/int that the apiserver refuses to unmarshal into map[string]string.
@@ -71,6 +92,13 @@ export function renderOriginService({
 kind: Service
 metadata:
   name: ${sanitizeK8sName(`${releaseName}-origin`)}
+  # GitOps PR2 (§4.2): under cutover.mode: job the selector below renders at the
+  # PREVIOUS build/default pool (sync is not cutover — the Job repoints it), and the
+  # pending annotation marks the Service as awaiting promotion.
+{{- if eq .Values.cutover.mode "job" }}
+  annotations:
+    adapter-k8s.io/cutover: pending
+{{- end }}
   labels:
     ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"
@@ -78,8 +106,8 @@ metadata:
 spec:
   selector:
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"
-    app.kubernetes.io/version: "{{ .Values.activeBuildId }}"
+    app.kubernetes.io/component: "${ACTIVE_SELECTOR_DEFAULT_POOL}"
+    app.kubernetes.io/version: "${ACTIVE_SELECTOR_VERSION}"
   ports:
     - port: 3000
       targetPort: 3000
@@ -150,8 +178,11 @@ metadata:
   name: ${stableName}
   # Explicit empty policy lets Helm clear a previous rollback-retention keep annotation when a
   # removed pool re-enters the current topology. Omission is not enough under three-way/SSA merge.
+  # GitOps PR2 (§4.2): under cutover.mode: job the version selector renders at the
+  # PREVIOUS build (sync is not cutover — the Job repoints it after the gates pass) and
+  # the pending annotation marks this Service as awaiting the Job's promotion.
   annotations:
-    helm.sh/resource-policy: ""
+    helm.sh/resource-policy: ""${CUTOVER_PENDING_ANNOTATION}
   labels:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: "${poolName}"
@@ -160,7 +191,7 @@ spec:
   selector:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: "${poolName}"
-    app.kubernetes.io/version: "{{ .Values.activeBuildId }}"
+    app.kubernetes.io/version: "${ACTIVE_SELECTOR_VERSION}"
   ports:
     - port: 3000
       targetPort: 3000

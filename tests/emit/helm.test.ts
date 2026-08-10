@@ -151,9 +151,11 @@ describe("generateHelmChart", () => {
     });
 
     expect(result["templates/origin-service.yaml"]).toContain("name: site-origin");
-    expect(result["templates/origin-service.yaml"]).toContain(
-      'app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"',
-    );
+    // GitOps PR2: mode-gated selector — `none` (the default, and every imperative deploy)
+    // resolves to activeDefaultPool exactly as before; `job` resolves to the previous
+    // build's default pool because sync is not cutover.
+    expect(result["templates/origin-service.yaml"]).toContain(".Values.activeDefaultPool");
+    expect(result["templates/origin-service.yaml"]).toContain(".Values.previousDefaultPool");
     expect(Object.keys(result)).toContain("templates/composition-plan.yaml");
     expect(
       JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{"))),
@@ -332,9 +334,9 @@ describe("generateHelmChart", () => {
     expect(result["values.yaml"]).toContain('"activeBuildId": "abc123"');
     expect(result["templates/ssr-deployment.yaml"]).toBeDefined();
     expect(result["templates/ssr-service.yaml"]).toBeDefined();
-    expect(result["templates/ssr-active-service.yaml"]).toContain(
-      'app.kubernetes.io/version: "{{ .Values.activeBuildId }}"',
-    );
+    // GitOps PR2: mode-gated (see the origin-service assertion above).
+    expect(result["templates/ssr-active-service.yaml"]).toContain(".Values.activeBuildId");
+    expect(result["templates/ssr-active-service.yaml"]).toContain(".Values.previousBuildId");
     expect(result["templates/ssr-hpa.yaml"]).toBeDefined();
     expect(result["templates/routing-manifest-configmap.yaml"]).toBeDefined();
     expect(result["templates/http-route.yaml"]).toBeDefined();

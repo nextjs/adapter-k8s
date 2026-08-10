@@ -57,6 +57,7 @@ import {
 export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Promise<void> {
   const {
     projectDir,
+    stateStore,
     releaseName,
     namespace,
     buildId,
@@ -241,6 +242,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
       },
       releaseName,
       namespace,
+      { clusterOnly: stateStore === "cluster-only" },
     );
   } catch (err) {
     // N67: the temporary warm-up bounds are scoped to the warm-up on this path too — traffic HAS
@@ -250,9 +252,12 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     console.error(`\n  Cutover succeeded, but persisting deploy state failed:`);
     // L14: the error wraps cluster-sourced write/read failures.
     console.error(`  ${sanitizeForTerminal(err instanceof Error ? err.message : String(err))}`);
-    console.error(`  The new build IS serving, but the cluster ConfigMap was not updated. Restore`);
     console.error(
-      `  connectivity and re-run so cluster/local state agree before the next deploy.\n`,
+      stateStore === "cluster-only"
+        ? `  The new build IS serving, but the cluster ConfigMap was not updated. Re-run the\n` +
+            `  cutover Job (it re-reads the cluster) so state agrees before the next promotion.\n`
+        : `  The new build IS serving, but the cluster ConfigMap was not updated. Restore\n` +
+            `  connectivity and re-run so cluster/local state agree before the next deploy.\n`,
     );
     throw new CutoverExitError(1);
   }

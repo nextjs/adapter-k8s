@@ -155,6 +155,34 @@ export function renderValuesYaml({
     },
     activeBuildId: sanitizeK8sName(buildId),
     activeDefaultPool: defaultPool,
+    // GitOps PR2 (§4.2): the cutover-model values gate. "none" (default) keeps today's
+    // semantics — selectors render from activeBuildId, promotion is out-of-band. "job"
+    // (set by `emit --cutover job`, never by the build) makes the stable Services render
+    // their selector from `previousBuildId` below, stamps keep-at-birth annotations on
+    // every per-build resource, and renders the in-cluster cutover Job + RBAC +
+    // emit-metadata ConfigMap that emit writes into the bundle chart. Always present so
+    // templates can gate on `.Values.cutover.mode` without nil-guarding.
+    cutover: {
+      mode: "none",
+      // The in-cluster cutover Job's image (only consumed under mode: job). Emit pins it;
+      // the default names the release train's image so a hand-set `mode: job` on an
+      // unmodified chart still points somewhere real.
+      image: "ghcr.io/next-community/adapter-k8s-cutover:latest",
+      // Poison-pill override (design §8 risk 4): re-promote a build the Job previously
+      // recorded as FAILED. Off by default; the Job refuses poisoned builds otherwise.
+      forcePromotion: false,
+    },
+    // §4.2 invariant-3 clause: under cutover.mode: job the stable Services' selector
+    // renders from THIS value (the previous build), not activeBuildId. Written by emit
+    // through sanitizeK8sName exactly like activeBuildId — an unsanitized value drains
+    // the Service to zero endpoints. Defaults to the sanitized new build id so a chart
+    // applied without emit's pinning (or a genuine first deploy) selects its own pods.
+    previousBuildId: sanitizeK8sName(buildId),
+    // The previous build's default pool — the origin Service's component selector under
+    // cutover.mode: job (pairing previousBuildId with the NEW build's default pool after
+    // a pool rename is a selector pair that matches nothing — the emit-metadata
+    // previousDefaultPool incident, same shape). Defaults to this build's default pool.
+    previousDefaultPool: defaultPool,
     // The path the LOAD BALANCER's HealthCheckPolicy probes on pool backends. Defaults to
     // readiness; `deploy` overrides it to the liveness path for one cycle when the outgoing
     // build may predate /readyz (see AdapterState.readinessPathSupported).

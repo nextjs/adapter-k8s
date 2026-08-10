@@ -64,6 +64,13 @@ export interface CutoverDeps {
  */
 export interface CutoverInputs {
   projectDir: string;
+  /**
+   * Which store(s) the E2 state commit writes. "dual" (default — the CLI path) keeps
+   * today's local-file + cluster-ConfigMap behavior; "cluster-only" is the in-cluster
+   * cutover Job's mode (no persistent `.k8s-adapter/`, so writeState skips the local
+   * file and INVERTS the recovery semantics — see state.ts).
+   */
+  stateStore?: "dual" | "cluster-only";
   releaseName: string;
   namespace: string;
   buildId: string;

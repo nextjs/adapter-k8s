@@ -12,6 +12,7 @@ import { runDescribe } from "./describe.js";
 import { runRollback } from "./rollback.js";
 import { runTail } from "./tail.js";
 import { runEmulate } from "./emulate.js";
+import { runMigrate } from "./migrate.js";
 import { assertSafeReleaseName } from "../emit/templates/utils.js";
 
 // Boolean flags NEVER consume the following argument. The old parser let `--dry-run foo`
@@ -54,6 +55,8 @@ const VALUE_FLAGS = new Set([
   "secrets",
   // --secrets sops: explicit sops config path (default: walk up from the bundle dir).
   "sops-config",
+  // GitOps PR2: the bundle's cutover model (none | job).
+  "cutover",
 ]);
 
 export function parseArgs(argv: string[]): {
@@ -149,6 +152,9 @@ Commands:
   describe   Show architecture diagram with live cluster status
   doctor     Run health checks on your deployment
   tail       Tail logs from all workloads
+  migrate    Annotate a live imperative release's retained set with the GitOps
+             prune-protection annotations (hard prerequisite before pointing a pruning
+             reconciler at this release — see docs/gitops.md)
   destroy    Tear down this release's resources (shared infrastructure is retained)
 
 Options:
@@ -163,7 +169,8 @@ Options:
   --skip-build             Skip next build (deploy, emulate)
   --skip-push              Skip docker build + push (deploy)
   --port <port>            Listener port for the local Envoy proxy (emulate; default: 8080)
-  --yes, -y                Skip the confirmation prompt (destroy; deploy's unpinned-context guard)
+  --yes, -y                Skip the confirmation prompt (destroy; deploy's and migrate's
+                              unpinned-context guards)
   --allow-unretained-manifest  Deploy even if the outgoing build's routing manifest cannot
                               be retained (rollback to it becomes image-only; recorded in
                               deploy state so doctor can report it)
@@ -191,6 +198,11 @@ Options:
                               inline: verbatim chart with a loud warning (emit)
   --sops-config <path>     Explicit sops config file (emit --secrets sops; default: walk
                               up from the bundle directory for .sops.yaml)
+  --cutover <mode>         none (default): the sync never repoints traffic; cut over per
+                              docs/ci-cd.md. job: the bundle chart renders the in-cluster
+                              cutover Job (plain versioned Job + RBAC + emit-metadata CM);
+                              selectors render at the previous build and the Job promotes
+                              after its gate battery passes (emit)
   --dry-run                Show what would be done without executing
 
 Flags may be given as --flag value or --flag=value. Boolean flags (e.g. --dry-run)
@@ -320,6 +332,12 @@ async function main(): Promise<void> {
         if (sopsConfig !== undefined && secrets !== "sops") {
           throw new Error(`Flag --sops-config only applies with --secrets sops`);
         }
+        const cutover = flags["cutover"] as string | undefined;
+        if (cutover !== undefined && cutover !== "none" && cutover !== "job") {
+          throw new Error(
+            `Flag --cutover must be "none" or "job" (got ${JSON.stringify(cutover)})`,
+          );
+        }
         await runEmit({
           projectDir,
           releaseName,
@@ -334,6 +352,7 @@ async function main(): Promise<void> {
             : {}),
           ...(secrets ? { secrets } : {}),
           ...(sopsConfig !== undefined ? { sopsConfig } : {}),
+          ...(cutover !== undefined ? { cutover } : {}),
         });
         break;
       }
@@ -386,6 +405,16 @@ async function main(): Promise<void> {
     case "tail":
     case "logs": {
       await runTail({ projectDir, releaseName });
+      break;
+    }
+
+    case "migrate": {
+      await runMigrate({
+        projectDir,
+        releaseName,
+        dryRun,
+        yes: flags["yes"] === true || flags["y"] === true,
+      });
       break;
     }
 
