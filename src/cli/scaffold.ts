@@ -19,15 +19,15 @@ export function generateAdapterConfig(options: ScaffoldOptions): string {
 export default createK8sAdapter({
   pools: {
     default: {
-      routes: ['appPages', 'appRoutes', 'pagesApi'],
+      routes: ['appPages', 'appRoutes', 'pagesApi', 'pages'],
       scaling: { min: 2, max: 10, targetCPU: 70 },
     },
   },
 
   containerStrategy: 'traced-assets',
   // Shared cross-replica cache (ISR/PPR revalidation, fetch cache). Requires a Valkey
-  // instance — provisioned automatically on GKE, or bring your own via cache.endpoint:
-  //   cache: { enabled: true, provider: 'valkey' },
+  // instance — provisioned automatically on GKE, or bring your own via cache.url:
+  //   cache: { enabled: true, provider: 'valkey', url: 'redis://my-valkey.internal:6379' },
   // Not yet implemented (validates but throws at build time):
   //   skewProtection: { enabled: true, duration: '5m' },
 
