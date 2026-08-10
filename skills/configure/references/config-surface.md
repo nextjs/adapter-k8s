@@ -129,6 +129,8 @@ Cannot mix TLS and plaintext hosts. Emits Gateway + HTTPRoute (+ HTTP→HTTPS re
 `{ gatewayClassName? /* default 'eg' */, messageTimeoutMs? /* default 4000 */, escapedSlashes? /* 'policy' | 'external' */ }`.
 Requires the exposure to provide a Gateway API capability with the SAME class, and that class must be controlled by `gateway.envoyproxy.io/gatewayclass-controller` — emits `EnvoyExtensionPolicy` (+ `ClientTrafficPolicy` unless `escapedSlashes: 'external'`).
 
+Merged-gateway caveat (EnvoyProxy `mergeGateways: true`): Envoy Gateway rejects a ClientTrafficPolicy whose listener shares a port with another Gateway's HTTP listener — deploying a SECOND adapter release onto the same merged port flips BOTH releases' policies to `Accepted=False` and the new deploy stalls at composition-plan readiness. On merged-gateway classes set `escapedSlashes: 'external'` (skips the CTP; handle escaped-slash pass-through at the class level, e.g. an EnvoyPatchPolicy) or give each release its own listener port.
+
 ### `gkeNativeRouting(options?)`
 
 `{ projectId?, addressName?, extensionName?, gatewayClassName? /* default 'gke-l7-global-external-managed' */ }` — GCP traffic-extension ext_proc over TLS. Requires matching Gateway API exposure and a projectId.
