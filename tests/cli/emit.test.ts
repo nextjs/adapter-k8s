@@ -23,6 +23,7 @@ import {
   parseChartValues,
   readPriorBundleMetadata,
   renderBundleReadme,
+  renderRenovateFence,
   resolvePreviousBuildId,
   runEmit,
   type EmitMetadata,
@@ -628,6 +629,70 @@ describe("bundle assembly", () => {
     expect(second).toEqual(first);
     // Spot-guard the determinism rule directly: nothing in the bundle carries a timestamp.
     expect(JSON.stringify(first)).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
+  });
+});
+
+describe("update-bot fence (Renovate / Flux image-automation — gap #6)", () => {
+  it("emits renovate.json5 at the bundle root with an ignorePaths entry covering the bundle path", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    await runEmit({ ...baseOptions(), firstDeploy: true });
+    const fence = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "renovate.json5"),
+      "utf-8",
+    );
+    // The load-bearing entry: the glob must cover the whole bundle directory, so no
+    // tag/digest field inside it is ever bot-writable.
+    expect(fence).toContain('".k8s-adapter/gitops/**"');
+    // The WHY: manifest-digest coupling — a bot edit desyncs the routing pod's
+    // fail-closed byte-match check and crashloops it.
+    expect(fence).toMatch(/manifest-digest/);
+    expect(fence).toMatch(/crashloop/);
+    // The HOW: the artifact is a copy source for the repo's EXISTING config, not a file
+    // Renovate auto-discovers at this path.
+    expect(fence).toMatch(/copy source/i);
+    expect(fence).toMatch(/existing renovate config/i);
+    // And it parses as JSON5-shaped config (strip comments, tolerate trailing commas).
+    const body = fence
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("//"))
+      .join("\n")
+      .replace(/,(\s*[\]}])/g, "$1")
+      .replace(/ignorePaths/, '"ignorePaths"');
+    expect(JSON.parse(body)).toEqual({ ignorePaths: [".k8s-adapter/gitops/**"] });
+  });
+
+  it("the README's 'Update bots' section directs bots at the app repo and shows the exact merge entry", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    await runEmit({ ...baseOptions(), firstDeploy: true });
+    const readme = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "README.md"),
+      "utf-8",
+    );
+    expect(readme).toContain("## Update bots");
+    // Point automation at the app repo, never at bundle contents; the bundle updates
+    // only by re-emitting.
+    expect(readme).toMatch(/APP repo/);
+    expect(readme).toMatch(/never at bundle contents/);
+    expect(readme).toMatch(/re-emitting/);
+    // Flux image-automation is named alongside Renovate — $imagepolicy markers are the
+    // same hazard through a different bot.
+    expect(readme).toContain("$imagepolicy");
+    // The exact additive ignorePaths entry to merge into an EXISTING repo config.
+    expect(readme).toContain('"ignorePaths": [".k8s-adapter/gitops/**"]');
+    // And the replaces-defaults footgun is called out (ignorePaths is not additive in
+    // Renovate itself — the operator must keep their existing entries).
+    expect(readme).toMatch(/replaces the defaults/i);
+  });
+
+  it("renderRenovateFence is deterministic and scopes the glob to the given bundle path (variant dirs)", () => {
+    expect(renderRenovateFence(".k8s-adapter/gitops")).toBe(
+      renderRenovateFence(".k8s-adapter/gitops"),
+    );
+    const variant = renderRenovateFence(".k8s-adapter/gitops.staging");
+    expect(variant).toContain('".k8s-adapter/gitops.staging/**"');
+    expect(variant).not.toContain('".k8s-adapter/gitops/**"');
+    // No timestamps — same N68 rule as the rest of the bundle.
+    expect(variant).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/);
   });
 });
 

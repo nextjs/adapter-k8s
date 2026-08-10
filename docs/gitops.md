@@ -9,7 +9,8 @@
 │                        #   activeBuildId pinned to the PREVIOUS build (cutover.mode: none)
 ├── manifests/all.yaml   # local `helm template` output (skipped, with a note, when helm is absent)
 ├── emit-metadata.json   # buildId, previousBuildId, digests, cdnTag, pool topology, platforms
-└── README.md            # cutover model + required Secret names/keys
+├── renovate.json5       # update-bot fence (copy source — see "Renovate and image automation")
+└── README.md            # cutover model + required Secret names/keys + update-bot fence
 ```
 
 When the config sets `imagePullSecrets` (private registries—see [configuration.md](./configuration.md#registry-pull-auth)), every pod spec in the bundle references those Secrets and the README lists them as an operator prerequisite: they must exist in the target namespace before the bundle is applied, delivered by your secrets flow—the bundle never carries them.
@@ -55,6 +56,18 @@ Argo additionally shows Gateway API objects (HTTPRoute, EnvoyExtensionPolicy) as
 ## ⛔ Prune deletes your rollback target
 
 The parked previous build's objects (Deployment, HPA, dispatch Secret, manifest snapshot) are **not in the new bundle's rendered manifest**. Argo CD with `prune: true` deletes them on the first sync—including, observed live in the same audit, **the still-serving previous build's Deployment while the stable Service still selected it** (endpoints not-ready, pods Terminating, mid-outage). The keep-annotated dispatch Secret, manifest snapshot, and composition-plan ConfigMap were deleted too: Helm honors `helm.sh/resource-policy: keep`; Argo's prune does not. Builds deployed by the imperative CLI carry no prune-protection annotations at all, so the _first_ pruning sync over an existing release deletes your rollback target. Until keep-at-birth rendering and the `migrate` subcommand ship (PR2), run reconcilers with prune disabled against releases that have imperative deploy history.
+
+## ⛔ Renovate and image automation
+
+Nothing inside the bundle may be independently updated—it is a build artifact of one `emit` run, and the routing tier refuses a manifest that does not byte-match the digest baked into its own image (the manifest-digest check, fail-closed by design). A bot edit to any image tag/digest field in the bundle—Renovate's `helm-values` manager, Flux image-automation's `$imagepolicy` markers—desyncs that check and **crashloops the routing pod after automerge**. Point Renovate and Flux image-automation at your **app repo** (where the next build runs), never at bundle contents; new images reach the cluster via the next `emit`, which replaces the directory wholesale.
+
+The bundle ships a `renovate.json5` fence at its root. Renovate does not auto-discover config at that path—it is a **copy source**: merge its entry into your repo's existing Renovate config (note `ignorePaths` _replaces_ Renovate's defaults when set, so keep your existing entries alongside it):
+
+```json5
+"ignorePaths": [".k8s-adapter/gitops/**"]
+```
+
+Config variants emit to `.k8s-adapter/gitops.<variant>/`; the bundled fence carries the matching path.
 
 ## Workflow (Mode 0 with rendered inputs)
 

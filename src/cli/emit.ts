@@ -713,9 +713,21 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     JSON.stringify(emitMetadata, null, 2) + "\n",
   );
 
-  // 7e. README.md — what a reviewer of the bundle PR needs, including (under external
+  // 7e. renovate.json5 — the update-bot fence (real-cluster gap #6). 78% of the target
+  // population runs Renovate (often automerge), and Flux image-automation writes
+  // $imagepolicy-marked fields; a bot edit to any image tag/digest INSIDE the bundle
+  // desyncs the routing tier's manifest-digest check (it refuses a manifest that does not
+  // byte-match its image — by design) → crashloop after automerge. The artifact is a COPY
+  // SOURCE for the repo's existing Renovate config, not a file Renovate discovers here.
+  const bundleDirPosix = bundleDirRelative.split(path.sep).join("/");
+  writeFileSync(path.join(bundleDir, "renovate.json5"), renderRenovateFence(bundleDirPosix));
+
+  // 7f. README.md — what a reviewer of the bundle PR needs, including (under external
   // secrets) the exact Secret names/keys the operator must make exist.
-  writeFileSync(path.join(bundleDir, "README.md"), renderBundleReadme(emitMetadata));
+  writeFileSync(
+    path.join(bundleDir, "README.md"),
+    renderBundleReadme(emitMetadata, bundleDirPosix),
+  );
 
   console.log(
     `\n  ✓ Bundle written. Commit ${bundleDirRelative}/ and apply it per docs/ci-cd.md ` +
@@ -723,8 +735,49 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   );
 }
 
+/**
+ * The bundle's update-bot fence artifact (real-cluster gap #6) — deterministic (the only
+ * input is the bundle path, which is fixed per variant). This is a COPY SOURCE: Renovate
+ * only auto-discovers config at the repo root (renovate.json[5], .renovaterc*, .github/…),
+ * never at this path, so merging the ignorePaths entry into the repo's EXISTING config is
+ * the required step, documented here and in the README's "Update bots" section.
+ */
+export function renderRenovateFence(bundleDirPosix: string): string {
+  return `// renovate.json5 — update-bot fence for the adapter-k8s GitOps bundle.
+//
+// WHY: every file in this bundle is a build artifact of ONE \`adapter-k8s emit\` run. The
+// routing tier verifies at startup that its manifest byte-matches the digest baked into
+// its own image (the manifest-digest check — fail-closed by design). A bot edit to any
+// image tag/digest field inside the bundle (Renovate's helm-values manager, Flux
+// image-automation's $imagepolicy markers) breaks that match and crashloops the routing
+// pod — silently, after automerge. NOTHING inside the bundle may be independently
+// updated; the bundle changes only by re-emitting it wholesale.
+//
+// HOW TO USE: Renovate does NOT discover this file at this path — it is a copy source.
+// Merge the ignorePaths entry below into your repo's EXISTING Renovate config
+// (renovate.json, renovate.json5, .renovaterc, or .github/renovate.json5):
+//
+//   "ignorePaths": ["${bundleDirPosix}/**"]
+//
+// (ignorePaths REPLACES the default list when set — keep your existing entries and the
+// defaults you rely on, e.g. "**/node_modules/**", alongside this one.)
+//
+// Point Renovate and Flux image-automation at your APP repo — where the next build runs —
+// never at bundle contents. New images reach the cluster via the next \`emit\`, which
+// re-resolves digests and replaces this directory wholesale.
+{
+  ignorePaths: [
+    "${bundleDirPosix}/**",
+  ],
+}
+`;
+}
+
 /** The bundle's own README — deterministic (per-build facts only, no timestamps). */
-export function renderBundleReadme(meta: EmitMetadata): string {
+export function renderBundleReadme(
+  meta: EmitMetadata,
+  bundleDirPosix = ".k8s-adapter/gitops",
+): string {
   const pullSecretsSection =
     meta.imagePullSecrets && meta.imagePullSecrets.length > 0
       ? `## Image pull secrets (operator prerequisite)
@@ -785,6 +838,24 @@ bundle stands the new build up WITHOUT repointing traffic. Cut over per docs/ci-
 reconciler at this bundle without the ignore rules described in
 plans/gitops-deployment-strategies.md — drift correction of the selector after a manual
 cutover is an outage.
+
+## Update bots (Renovate / Flux image-automation)
+
+Nothing inside this bundle may be independently updated: the routing tier refuses a
+manifest that does not byte-match the digest baked into its image (the manifest-digest
+check, fail-closed by design), so a bot edit to any image tag/digest field here —
+Renovate's \`helm-values\` manager, Flux image-automation's \`$imagepolicy\` markers —
+crashloops the routing pod after automerge. Point Renovate and Flux image-automation at
+your APP repo (where the next build runs), never at bundle contents; the bundle updates
+only by re-emitting it.
+
+Renovate does not auto-discover the bundled \`renovate.json5\` at this path — it is a
+copy source. Merge this entry into your repo's EXISTING Renovate config (ignorePaths
+replaces the defaults when set; keep your existing entries alongside it):
+
+\`\`\`json5
+"ignorePaths": ["${bundleDirPosix}/**"]
+\`\`\`
 
 ${pullSecretsSection}${secretSection}`;
 }
