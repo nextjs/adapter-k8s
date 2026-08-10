@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { gitopsDirName, infrastructurePath, outputDirName } from "./infrastructure-validation.js";
-import { execCapture, execOrThrow, EXEC_TIMEOUTS } from "./exec.js";
+import { execCapture, execOrThrow, EXEC_TIMEOUTS, type ExecCaptureResult } from "./exec.js";
 import { resolveContainerCli } from "./container-runtime.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { assertCompositionPlanInvocation, loadLocalCompositionPlan } from "./composition-plan.js";
@@ -60,7 +60,7 @@ import { parsePoolImageLayout } from "../pool-image-layout.js";
 /** Bump when the bundle layout changes shape; consumers refuse versions they don't know. */
 export const EMIT_VERSION = 1;
 
-export type EmitSecretsMode = "inline" | "external";
+export type EmitSecretsMode = "inline" | "external" | "sops";
 
 export interface EmitOptions {
   projectDir: string;
@@ -88,6 +88,15 @@ export interface EmitOptions {
   firstDeploy?: boolean;
   /** Default: external — the bundle chart carries no secret material (§3 item 3). */
   secrets?: EmitSecretsMode;
+  /**
+   * --sops-config <path> (sops mode only): explicit sops config file, passed to every
+   * sops invocation as `--config`. Escape hatch for repos whose .sops.yaml does not live
+   * on the walk-up path from the bundle directory. Without it, emit walks UP from the
+   * bundle directory looking for `.sops.yaml` and runs sops with cwd at that directory,
+   * so the repo's own creation_rules (path_regex against the bundle-relative path)
+   * govern recipients — emit NEVER passes recipients on argv.
+   */
+  sopsConfig?: string;
 }
 
 /** The per-bundle facts file — the emit-side analogue of what state.json records per build. */
@@ -114,6 +123,14 @@ export interface EmitMetadata {
   defaultPool: string;
   targetPlatforms: Record<string, string>;
   secretsMode: EmitSecretsMode;
+  /**
+   * --secrets sops: the encrypted files written under secrets/ (deterministic names,
+   * derived from the chart's secret template filenames). Recorded so the README and a
+   * reviewer of the bundle PR can see exactly which files carry encrypted material —
+   * and so the determinism caveat (secrets/ is excluded from byte-determinism, see
+   * emitBundleSopsSecrets) names its own scope precisely.
+   */
+  sopsFiles?: string[];
   /**
    * config `imagePullSecrets` baked into every rendered pod spec (from build metadata).
    * Recorded so the bundle README can state the operator prerequisite: these Secrets must
@@ -284,6 +301,120 @@ export function resolvePreviousBuildId(opts: {
   );
 }
 
+/**
+ * Walk UP from `startDir` looking for `.sops.yaml` — the repo's sops config, whose
+ * creation_rules select the encryption recipients. Returns the config file's absolute
+ * path, or null when no directory on the walk has one. The walk starts at the bundle
+ * directory (which need not exist yet) so a `.sops.yaml` at the repo root, or anywhere
+ * between it and the bundle, governs — the same discovery sops itself performs from its
+ * cwd.
+ */
+export function findSopsConfig(startDir: string): string | null {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    const candidate = path.join(dir, ".sops.yaml");
+    if (existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * `--secrets sops`: encrypt the chart's secret manifests into `<bundle>/secrets/` as
+ * `<name>.sops.yaml`, via the sops CLI, honoring the repo's `.sops.yaml` creation_rules.
+ *
+ * Recipient discipline: emit NEVER passes recipients on argv. sops runs with cwd at the
+ * config's directory and a config-relative file path, so the repo's own creation_rules
+ * (path_regex) pick the age/PGP/KMS recipients — exactly what they do for every other
+ * secret in the repo.
+ *
+ * Fail-closed: any sops failure removes the file being worked on and throws — a bundle
+ * NEVER carries plaintext secrets as a fallback (the plaintext exists on disk only for
+ * the moment between write and encrypt, mode 0600, and is deleted on every error path).
+ *
+ * Determinism: sops embeds fresh data keys and MACs on every encryption, so secrets/ can
+ * NOT be byte-deterministic across re-encryptions and is excluded from the bundle's
+ * byte-determinism guarantee. To keep the re-emit diff quiet in the common case, an
+ * existing encrypted file is REUSED when sops can still decrypt it (recipients unchanged)
+ * and its plaintext matches what this emit would encrypt; when decryption fails
+ * (recipients rotated, key unavailable) or the plaintext differs, it is re-encrypted.
+ * The comparison trims both sides — sops re-serializes YAML on decrypt, and a false
+ * mismatch merely costs one re-encryption, never correctness.
+ */
+export async function emitBundleSopsSecrets(opts: {
+  bundleDir: string;
+  /** `fileName` is the chart template's basename minus .yaml (e.g. "internal-secret"). */
+  sources: Array<{ fileName: string; plaintext: string }>;
+  /** Prior bundle's encrypted files (name → bytes), captured before the wholesale rm. */
+  prior: Map<string, string>;
+  config: { configPath: string; explicit: boolean };
+}): Promise<string[]> {
+  const { bundleDir, sources, prior, config } = opts;
+  const configDir = path.dirname(config.configPath);
+  // `--config` only when the operator named one explicitly; otherwise sops discovers the
+  // .sops.yaml from its cwd, exactly like a human running sops in the repo.
+  const configArgs = config.explicit ? ["--config", config.configPath] : [];
+  const secretsDir = path.join(bundleDir, "secrets");
+  mkdirSync(secretsDir, { recursive: true });
+  const written: string[] = [];
+  for (const { fileName, plaintext } of sources) {
+    const outName = `${fileName}.sops.yaml`;
+    const outPath = path.join(secretsDir, outName);
+    const relPath = path.relative(configDir, outPath);
+    const priorBody = prior.get(outName);
+    if (priorBody !== undefined) {
+      // Re-emit path: decrypt the PRIOR file and compare. Decryption failing is not an
+      // error — it is the recipients-changed signal, answered by re-encrypting below.
+      writeFileSync(outPath, priorBody, { mode: 0o600 });
+      const dec = await execCapture("sops", [...configArgs, "--decrypt", relPath], {
+        cwd: configDir,
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
+      if (dec && dec.exitCode === 0 && dec.stdout.trim() === plaintext.trim()) {
+        written.push(`secrets/${outName}`);
+        continue;
+      }
+      rmSync(outPath, { force: true });
+    }
+    // Fresh encryption. The plaintext must exist at the FINAL path so the repo's
+    // creation_rules path_regex matches the same path a human would encrypt; capture
+    // stdout instead of --in-place so a failed run leaves nothing to clean but our own
+    // write (deleted on every error path).
+    writeFileSync(outPath, plaintext, { mode: 0o600 });
+    let enc: ExecCaptureResult;
+    try {
+      enc = await execCapture("sops", [...configArgs, "--encrypt", relPath], {
+        cwd: configDir,
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      });
+    } catch (err) {
+      rmSync(outPath, { force: true });
+      throw new Error(
+        `sops --encrypt could not run for ${outName}: ` +
+          `${err instanceof Error ? err.message : String(err)}. The plaintext was removed — ` +
+          `a bundle never carries unencrypted secrets.`,
+      );
+    }
+    // The `sops:` metadata block is what makes the file decryptable at all — output
+    // without it (or an empty output) is not an encrypted file, whatever the exit code.
+    if (enc.exitCode !== 0 || !/^sops:/m.test(enc.stdout)) {
+      rmSync(outPath, { force: true });
+      throw new Error(
+        `sops --encrypt failed for ${outName} (exit ${enc.exitCode})` +
+          (enc.stderr.trim() ? `: ${sanitizeForTerminal(enc.stderr.trim())}` : "") +
+          (enc.exitCode === 0 ? ` — output carries no sops metadata block` : "") +
+          `. The plaintext was removed — emit never falls back to writing unencrypted ` +
+          `secrets. Check the repo's .sops.yaml creation_rules cover ` +
+          `secrets/${outName} and that the recipients' keys are available.`,
+      );
+    }
+    writeFileSync(outPath, enc.stdout, { mode: 0o600 });
+    written.push(`secrets/${outName}`);
+  }
+  return written;
+}
+
 /** Recursively list files under `dir` as sorted relative paths (deterministic order). */
 function listFilesRecursive(dir: string, prefix = ""): string[] {
   const out: string[] = [];
@@ -329,12 +460,86 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     firstDeploy,
   } = options;
   const secretsMode: EmitSecretsMode = options.secrets ?? "external";
-  if (secretsMode !== "external" && secretsMode !== "inline") {
+  if (secretsMode !== "external" && secretsMode !== "inline" && secretsMode !== "sops") {
     throw new Error(
       `Invalid --secrets mode ${JSON.stringify(secretsMode as string)}: expected "external" ` +
-        `(default — the bundle chart carries no secret material) or "inline" (verbatim ` +
-        `chart, for private repos, loudly warned about).`,
+        `(default — the bundle chart carries no secret material), "sops" (encrypt the secret ` +
+        `manifests into secrets/ with the repo's .sops.yaml creation rules), or "inline" ` +
+        `(verbatim chart, for private repos, loudly warned about).`,
     );
+  }
+
+  // PR1 review note #2 (design §4.2 "determinism trap"): the modes that EMBED secret
+  // material in the bundle (inline, sops) need the dispatch secret to be REPRODUCIBLE.
+  // deriveInternalSecret (adapter.ts) is an HMAC of "<release>\0<buildId>" under a key
+  // from ADAPTER_K8S_INTERNAL_SECRET_KEY or .k8s-adapter/internal-secret.key — and when
+  // NEITHER exists the build MINTS a fresh random key. A fresh CI checkout is exactly that
+  // case: every emit of the same build would then derive a DIFFERENT dispatch secret,
+  // breaking bundle determinism (the re-emit diff is the N50 audit) and rotating a value
+  // the already-rendered pods disagree about. Refuse HERE, before `next build` can mint
+  // one silently — "no key anywhere" is the would-mint-fresh signature.
+  if (secretsMode === "inline" || secretsMode === "sops") {
+    const envKey = process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
+    const keyFile = path.join(projectDir, ".k8s-adapter", "internal-secret.key");
+    if (!(envKey && envKey.length > 0) && !existsSync(keyFile)) {
+      throw new Error(
+        `--secrets ${secretsMode} embeds the internal dispatch secret in the bundle, so its ` +
+          `key source must be STABLE across emits — but neither ` +
+          `ADAPTER_K8S_INTERNAL_SECRET_KEY nor ${keyFile} exists, and the build would mint ` +
+          `a fresh random key (deriveInternalSecret), giving every re-emit of the same ` +
+          `build a different secret. Set ADAPTER_K8S_INTERNAL_SECRET_KEY (CI: from the CI ` +
+          `secret store) or restore the gitignored key file, then re-run.`,
+      );
+    }
+  }
+
+  const bundleDirRelative = path.join(".k8s-adapter", gitopsDirName());
+  const bundleDir = path.join(projectDir, bundleDirRelative);
+
+  // --secrets sops preflight — BEFORE the build/push so a refusal costs nothing. Both
+  // prerequisites are fail-closed: a missing binary and a missing config are hard errors,
+  // NEVER a plaintext fallback.
+  let sopsConfig: { configPath: string; explicit: boolean } | null = null;
+  if (secretsMode === "sops") {
+    let probe: ExecCaptureResult | null = null;
+    try {
+      probe = await execCapture("sops", ["--version"], { timeoutMs: EXEC_TIMEOUTS.kubectl });
+    } catch {
+      probe = null;
+    }
+    if (!probe || probe.exitCode !== 0) {
+      throw new Error(
+        `--secrets sops requires the \`sops\` binary on PATH, which is ` +
+          (probe
+            ? `present but failing (exit ${probe.exitCode}: ` +
+              `${sanitizeForTerminal(probe.stderr.trim())})`
+            : `not there`) +
+          `. Install sops (https://github.com/getsops/sops) or pick another --secrets ` +
+          `mode — emit never falls back to writing plaintext secrets.`,
+      );
+    }
+    if (options.sopsConfig !== undefined) {
+      const explicit = path.resolve(projectDir, options.sopsConfig);
+      if (!existsSync(explicit)) {
+        throw new Error(
+          `--sops-config ${JSON.stringify(options.sopsConfig)} does not exist ` +
+            `(resolved to ${explicit}).`,
+        );
+      }
+      sopsConfig = { configPath: explicit, explicit: true };
+    } else {
+      const discovered = findSopsConfig(bundleDir);
+      if (!discovered) {
+        throw new Error(
+          `--secrets sops found no .sops.yaml walking up from ${bundleDir}. The repo's ` +
+            `creation_rules are what select recipients — emit never passes recipients on ` +
+            `argv, and it NEVER falls back to emitting plaintext. Create a .sops.yaml ` +
+            `whose creation_rules cover ${bundleDirRelative}/secrets/*.sops.yaml, or name ` +
+            `one explicitly with --sops-config <path>.`,
+        );
+      }
+      sopsConfig = { configPath: discovered, explicit: false };
+    }
   }
 
   const infraPath = infrastructurePath(projectDir);
@@ -425,8 +630,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   console.log(`  Pools: ${pools.join(", ")}`);
 
   // 3. Previous-build semantics — BEFORE any push, so a refusal costs nothing.
-  const bundleDirRelative = path.join(".k8s-adapter", gitopsDirName());
-  const bundleDir = path.join(projectDir, bundleDirRelative);
+  // (bundleDir/bundleDirRelative resolved above, before the sops preflight.)
   const priorBundle = readPriorBundleMetadata(bundleDir, { releaseName, namespace });
   const { previousBuildId, previousDefaultPool, previousPools } = resolvePreviousBuildId({
     buildId,
@@ -563,18 +767,33 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   if (pinned > 0) console.log(`    Pinned ${pinned} image(s) to immutable digests`);
 
   // 7. Assemble the bundle. Replaced WHOLESALE (the repo flow commits it that way), so a
-  // stale file from a removed pool can never linger.
+  // stale file from a removed pool can never linger. Under --secrets sops the prior
+  // bundle's encrypted files are captured FIRST: a re-emit reuses one when it still
+  // decrypts to the same plaintext, keeping the re-emit diff quiet (sops output is
+  // otherwise fresh-keyed per run — see emitBundleSopsSecrets).
   console.log(`\n  → Writing GitOps bundle to ${bundleDirRelative}/`);
+  const priorSopsFiles = new Map<string, string>();
+  if (secretsMode === "sops" && existsSync(path.join(bundleDir, "secrets"))) {
+    for (const entry of readdirSync(path.join(bundleDir, "secrets"), { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".sops.yaml")) {
+        priorSopsFiles.set(
+          entry.name,
+          readFileSync(path.join(bundleDir, "secrets", entry.name), "utf-8"),
+        );
+      }
+    }
+  }
   rmSync(bundleDir, { recursive: true, force: true });
   mkdirSync(path.join(bundleDir, "chart"), { recursive: true });
   mkdirSync(path.join(bundleDir, "values"), { recursive: true });
 
-  // 7a. chart/ — verbatim, minus the secret templates under --secrets external (§3 item 3:
-  // committing chart/ commits credentials, and the 0600 mode does not survive Git).
+  // 7a. chart/ — verbatim, minus the secret templates under --secrets external AND sops
+  // (§3 item 3: committing chart/ commits credentials, and the 0600 mode does not survive
+  // Git; under sops the same objects ship ENCRYPTED under secrets/ instead).
   const chartFiles = listFilesRecursive(chartSrcDir);
   const excluded: string[] = [];
   for (const rel of chartFiles) {
-    if (secretsMode === "external" && SECRET_CHART_FILES.has(rel)) {
+    if (secretsMode !== "inline" && SECRET_CHART_FILES.has(rel)) {
       excluded.push(rel);
       continue;
     }
@@ -583,7 +802,46 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     // cpSync preserves the source mode — the 0600 secret files stay 0600 under inline.
     cpSync(path.join(chartSrcDir, rel), dest);
   }
-  if (secretsMode === "external") {
+  let sopsFiles: string[] | undefined;
+  if (secretsMode === "sops") {
+    // The same secret OBJECTS inline mode ships in-chart, as plain YAML sources. The
+    // rendered templates are plain YAML UNLESS a secret value contained a literal "{{"
+    // — escapeHelmActions then wrote a Helm action ({{ "{{" }}) that only Helm would
+    // undo, and these files bypass Helm (the GitOps engine applies them decrypted, raw).
+    // The dispatch secret is HMAC hex so it never trips this; a Valkey URL/AUTH could.
+    // Refuse rather than deliver a mangled credential.
+    const sources = excluded.map((rel) => {
+      const plaintext = readFileSync(path.join(chartSrcDir, rel), "utf-8");
+      if (plaintext.includes("{{")) {
+        throw new Error(
+          `--secrets sops: ${rel} contains Helm template syntax ("{{" — a secret value ` +
+            `with a literal "{{" was Helm-escaped at render time), but sops-mode secrets ` +
+            `are applied WITHOUT Helm, so the escape would reach the cluster verbatim. ` +
+            `Remove the "{{" from the secret value (cache.url/cache.password), or use ` +
+            `--secrets external/inline.`,
+        );
+      }
+      return { fileName: path.basename(rel, ".yaml"), plaintext };
+    });
+    if (sources.length === 0) {
+      throw new Error(
+        `--secrets sops: the build's chart carries no secret templates to encrypt ` +
+          `(expected ${[...SECRET_CHART_FILES].join(", ")} under ${chartSrcDir}). ` +
+          `Did next build run with the adapter configured?`,
+      );
+    }
+    sopsFiles = await emitBundleSopsSecrets({
+      bundleDir,
+      sources,
+      prior: priorSopsFiles,
+      config: sopsConfig!,
+    });
+    console.log(
+      `    Secrets: sops — omitted ${excluded.join(", ")} from chart/; encrypted ` +
+        `${sopsFiles.join(", ")} (config: ${sopsConfig!.configPath}). Apply them via your ` +
+        `GitOps engine's SOPS decryption (see the bundle README).`,
+    );
+  } else if (secretsMode === "external") {
     const includeValkey = chartFiles.includes("templates/valkey-secret.yaml");
     writeFileSync(
       path.join(bundleDir, "chart", "templates", "external-secret.yaml"),
@@ -705,6 +963,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     defaultPool: defaultPool as string,
     targetPlatforms: { [buildId]: builtTargetPlatform },
     secretsMode,
+    ...(sopsFiles ? { sopsFiles } : {}),
     ...(imagePullSecrets.length > 0 ? { imagePullSecrets } : {}),
     ...(manifestsNote ? { manifests: manifestsNote } : {}),
   };
@@ -793,8 +1052,42 @@ never carries them, and a missing one is ImagePullBackOff on every pod that refe
 `
       : "";
   const secretSection =
-    meta.secretsMode === "external"
-      ? `## Secrets (externalized)
+    meta.secretsMode === "sops"
+      ? `## Secrets (SOPS-encrypted)
+
+This bundle's chart carries NO plaintext secret material. The secret manifests —
+${(meta.sopsFiles ?? []).map((f) => `\`${f}\``).join(", ")} — are encrypted with the
+repo's \`.sops.yaml\` creation rules and live under \`secrets/\`, to be decrypted and
+applied by your GitOps engine's SOPS integration. With Flux, point a Kustomization at
+\`secrets/\` with a decryption block:
+
+\`\`\`yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+spec:
+  path: ./${bundleDirPosix}/secrets
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age   # the Secret holding your age key (flux create secret ...)
+\`\`\`
+
+(Argo CD needs a SOPS plugin, e.g. KSOPS; \`sops -d secrets/<f> | kubectl apply -f -\`
+works for hand-applied flows.)
+
+Determinism caveat: \`secrets/\` is EXCLUDED from the bundle's byte-determinism
+guarantee — sops embeds fresh data keys and MACs on every encryption, so two encryptions
+of the same plaintext differ byte-wise. To keep re-emit diffs quiet, emit REUSES an
+existing encrypted file when it still decrypts (recipients unchanged) to the same
+plaintext, and re-encrypts otherwise. A changed \`secrets/\` file in a re-emit diff
+therefore means the plaintext OR the recipients changed — never noise.
+
+A build's dispatch Secret must OUTLIVE the sync that applies the next build's bundle —
+the retained previous build's pods reference it by name (rollback target). Keep the
+superseded builds' encrypted files applied until their build is garbage-collected.
+`
+      : meta.secretsMode === "external"
+        ? `## Secrets (externalized)
 
 This bundle's chart deliberately carries NO secret material. The pods reference these
 Secrets by name via \`secretKeyRef\`; make them exist by any mechanism you trust
@@ -810,7 +1103,7 @@ A build's dispatch Secret must OUTLIVE the sync that applies the next build's bu
 the retained previous build's pods reference it by name (rollback target). Keep
 superseded build-scoped entries in your store until their build is garbage-collected.
 `
-      : `## Secrets (INLINE — read this)
+        : `## Secrets (INLINE — read this)
 
 This bundle was emitted with \`--secrets inline\`: \`chart/templates/internal-secret.yaml\`
 (and the Valkey Secret, when present) contain REAL credentials. Committing this bundle

@@ -20,6 +20,7 @@ import { execCapture, execOrThrow } from "../../src/cli/exec.js";
 import { resolveDeployImageDigests } from "../../src/pipeline/digests.js";
 import {
   EMIT_VERSION,
+  findSopsConfig,
   parseChartValues,
   readPriorBundleMetadata,
   renderBundleReadme,
@@ -38,6 +39,13 @@ const BUILD = "build2abc";
 const PREV_BUILD = "build1xyz";
 
 let projectDir: string;
+let savedInternalSecretKey: string | undefined;
+
+/** The stable key file that satisfies the inline/sops would-mint-fresh guard. */
+function writeInternalSecretKey(): void {
+  mkdirSync(path.join(projectDir, ".k8s-adapter"), { recursive: true });
+  writeFileSync(path.join(projectDir, ".k8s-adapter", "internal-secret.key"), "0".repeat(64));
+}
 
 function chartValuesFixture(buildId: string): string {
   const values = {
@@ -175,6 +183,9 @@ const baseOptions = () => ({
 beforeEach(() => {
   vi.clearAllMocks();
   projectDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-emit-"));
+  // The stable-key guard (inline/sops) reads this env var — isolate it per test.
+  savedInternalSecretKey = process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
+  delete process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
   vi.mocked(resolveDeployImageDigests).mockResolvedValue({
     ssr: DIGEST_SSR,
     routingService: DIGEST_ROUTING,
@@ -186,6 +197,11 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(projectDir, { recursive: true, force: true });
+  if (savedInternalSecretKey !== undefined) {
+    process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY = savedInternalSecretKey;
+  } else {
+    delete process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
+  }
 });
 
 describe("previous-build semantics (N20's new front door)", () => {
@@ -489,6 +505,7 @@ describe("secret externalization", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+      writeInternalSecretKey(); // inline embeds the secret — the stable-key guard applies
       await runEmit({ ...baseOptions(), firstDeploy: true, secrets: "inline" });
       const templates = path.join(projectDir, ".k8s-adapter", "gitops", "chart", "templates");
       expect(readFileSync(path.join(templates, "internal-secret.yaml"), "utf-8")).toContain(
@@ -507,6 +524,353 @@ describe("secret externalization", () => {
     await expect(
       runEmit({ ...baseOptions(), firstDeploy: true, secrets: "sealed" as never }),
     ).rejects.toThrow(/--secrets/);
+  });
+
+  it("inline REFUSES when the internal-secret key source is unstable (would-mint-fresh — PR1 note #2)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    // No ADAPTER_K8S_INTERNAL_SECRET_KEY (cleared in beforeEach), no key file.
+    await expect(
+      runEmit({ ...baseOptions(), firstDeploy: true, secrets: "inline" }),
+    ).rejects.toThrow(/ADAPTER_K8S_INTERNAL_SECRET_KEY/);
+    expect(existsSync(path.join(projectDir, ".k8s-adapter", "gitops"))).toBe(false);
+  });
+
+  it("the ENV key alone satisfies the stable-key guard (fresh CI checkout, no key file)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY = "k".repeat(64);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await runEmit({ ...baseOptions(), firstDeploy: true, secrets: "inline" });
+      expect(bundleMetadata().secretsMode).toBe("inline");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// --secrets sops: the sops CLI is mocked at the exec seam (real sops NOT required).
+// A successful mock encryption wraps the plaintext in a recognizable envelope carrying a
+// per-call nonce (sops embeds fresh data keys/MACs per run — the mock mirrors that
+// non-determinism so the reuse test proves something); decryption unwraps it.
+describe("secret externalization: --secrets sops", () => {
+  const SOPS_PREFIX = "ENC[";
+  // NOT reset per mockSops call: fresh encryptions must differ byte-wise across runs
+  // (mirroring sops' fresh data keys/MACs), or the reuse/re-encrypt tests prove nothing.
+  let nonce = 0;
+
+  function mockSops(opts?: {
+    absent?: boolean;
+    encryptExit?: number;
+    encryptStderr?: string;
+    decryptFails?: boolean;
+  }): void {
+    vi.mocked(execCapture).mockImplementation(async (cmd, args, execOpts) => {
+      if (cmd === "sops") {
+        if (opts?.absent) throw Object.assign(new Error("spawn sops ENOENT"), { code: "ENOENT" });
+        if (args[0] === "--version") return { exitCode: 0, stdout: "sops 3.9.0", stderr: "" };
+        const fileArg = args[args.length - 1]!;
+        const filePath = path.resolve((execOpts as { cwd?: string })?.cwd ?? "", fileArg);
+        const body = readFileSync(filePath, "utf-8");
+        if (args.includes("--encrypt")) {
+          if (opts?.encryptExit) {
+            return {
+              exitCode: opts.encryptExit,
+              stdout: "",
+              stderr: opts.encryptStderr ?? "config file not found",
+            };
+          }
+          nonce++;
+          return {
+            exitCode: 0,
+            stdout: `${SOPS_PREFIX}${nonce}]\n${body}\nsops:\n  mac: mac-${nonce}\n`,
+            stderr: "",
+          };
+        }
+        if (args.includes("--decrypt")) {
+          if (opts?.decryptFails) {
+            return { exitCode: 128, stdout: "", stderr: "no matching age key" };
+          }
+          const m = body.match(/^ENC\[\d+\]\n([\s\S]*?)\nsops:\n/);
+          if (!m) return { exitCode: 1, stdout: "", stderr: "not an encrypted file" };
+          return { exitCode: 0, stdout: m[1]!, stderr: "" };
+        }
+      }
+      // helm probe: absent by default, as in beforeEach.
+      return { exitCode: 1, stdout: "", stderr: "" };
+    });
+  }
+
+  function writeSopsRepoConfig(): void {
+    // Repo root = projectDir; the walk up from .k8s-adapter/gitops/ finds it.
+    writeFileSync(
+      path.join(projectDir, ".sops.yaml"),
+      `creation_rules:\n  - path_regex: .*\\.sops\\.yaml$\n    age: age1example\n`,
+    );
+  }
+
+  const sopsOptions = () => ({ ...baseOptions(), firstDeploy: true, secrets: "sops" as const });
+
+  function secretsDirFiles(): string[] {
+    const dir = path.join(projectDir, ".k8s-adapter", "gitops", "secrets");
+    return existsSync(dir) ? readdirSync(dir).sort() : [];
+  }
+
+  it("encrypts the secret manifests into secrets/*.sops.yaml and excludes the templates from chart/ (like external)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    await runEmit(sopsOptions());
+    expect(secretsDirFiles()).toEqual(["internal-secret.sops.yaml", "valkey-secret.sops.yaml"]);
+    const enc = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    // The encrypted envelope carries the plaintext object (mock) plus sops metadata.
+    expect(enc).toContain("sops:");
+    expect(enc.startsWith(SOPS_PREFIX)).toBe(true);
+    // Chart exclusion — the sops files are applied by the GitOps engine, not Helm.
+    const templates = path.join(projectDir, ".k8s-adapter", "gitops", "chart", "templates");
+    expect(existsSync(path.join(templates, "internal-secret.yaml"))).toBe(false);
+    expect(existsSync(path.join(templates, "valkey-secret.yaml"))).toBe(false);
+    // No ExternalSecret placeholder either — that is external mode's artifact.
+    expect(existsSync(path.join(templates, "external-secret.yaml"))).toBe(false);
+    const meta = bundleMetadata();
+    expect(meta.secretsMode).toBe("sops");
+    expect(meta.sopsFiles).toEqual([
+      "secrets/internal-secret.sops.yaml",
+      "secrets/valkey-secret.sops.yaml",
+    ]);
+  });
+
+  it("sops runs with cwd at the .sops.yaml directory and NO recipients on argv", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    await runEmit(sopsOptions());
+    const encryptCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([cmd, args]) => cmd === "sops" && args.includes("--encrypt"));
+    expect(encryptCalls.length).toBe(2);
+    for (const [, args, execOpts] of encryptCalls) {
+      // The repo's creation_rules govern: cwd is the config's directory, and neither
+      // recipients nor --config appear on argv (discovery, like a human running sops).
+      expect((execOpts as { cwd?: string }).cwd).toBe(projectDir);
+      expect(args.join(" ")).not.toMatch(/--age|--pgp|--kms|--config/);
+    }
+  });
+
+  it("--sops-config uses the named config explicitly (escape hatch)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    const configPath = path.join(projectDir, "custom-sops-config.yaml");
+    writeFileSync(configPath, "creation_rules: []\n");
+    mockSops();
+    await runEmit({ ...sopsOptions(), sopsConfig: configPath });
+    const encryptCalls = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([cmd, args]) => cmd === "sops" && args.includes("--encrypt"));
+    expect(encryptCalls.length).toBe(2);
+    for (const [, args] of encryptCalls) {
+      expect(args).toContain("--config");
+      expect(args).toContain(configPath);
+    }
+  });
+
+  it("FAIL-CLOSED: sops binary missing is a hard error naming the flag — never plaintext", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops({ absent: true });
+    await expect(runEmit(sopsOptions())).rejects.toThrow(/--secrets sops requires the `sops`/);
+    // Refused before the bundle write — nothing (plaintext or otherwise) was emitted.
+    expect(existsSync(path.join(projectDir, ".k8s-adapter", "gitops"))).toBe(false);
+  });
+
+  it("FAIL-CLOSED: no .sops.yaml found is a hard error — never a plaintext fallback", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    mockSops(); // binary present; config absent (none written anywhere up the tree)
+    await expect(runEmit(sopsOptions())).rejects.toThrow(/no \.sops\.yaml/);
+    expect(existsSync(path.join(projectDir, ".k8s-adapter", "gitops"))).toBe(false);
+  });
+
+  it("FAIL-CLOSED: a nonzero sops exit is a hard error carrying its stderr, and the plaintext is removed", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops({ encryptExit: 3, encryptStderr: "no matching creation rules" });
+    await expect(runEmit(sopsOptions())).rejects.toThrow(/no matching creation rules/);
+    // The failed file's plaintext must NOT survive in the bundle.
+    for (const f of secretsDirFiles()) {
+      const body = readFileSync(
+        path.join(projectDir, ".k8s-adapter", "gitops", "secrets", f),
+        "utf-8",
+      );
+      expect(body).not.toContain("hunter2");
+      expect(body).not.toContain("redis://cache:6379");
+    }
+  });
+
+  it("FAIL-CLOSED: exit 0 with no sops metadata block is still an error (not an encrypted file)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    let calls = 0;
+    vi.mocked(execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "sops" && args[0] === "--version") {
+        return { exitCode: 0, stdout: "sops 3.9.0", stderr: "" };
+      }
+      if (cmd === "sops" && args.includes("--encrypt")) {
+        calls++;
+        return {
+          exitCode: 0,
+          stdout: "kind: Secret\nstringData:\n  secret: hunter2\n",
+          stderr: "",
+        };
+      }
+      return { exitCode: 1, stdout: "", stderr: "" };
+    });
+    await expect(runEmit(sopsOptions())).rejects.toThrow(/no sops metadata block/);
+    expect(calls).toBeGreaterThan(0);
+  });
+
+  it("REFUSES when the internal-secret key source is unstable (would-mint-fresh — PR1 note #2)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeSopsRepoConfig();
+    mockSops();
+    // No env key (cleared in beforeEach), no .k8s-adapter/internal-secret.key.
+    await expect(runEmit(sopsOptions())).rejects.toThrow(/ADAPTER_K8S_INTERNAL_SECRET_KEY/);
+    expect(existsSync(path.join(projectDir, ".k8s-adapter", "gitops"))).toBe(false);
+  });
+
+  it("RE-EMIT reuses an existing encrypted file that still decrypts to the same plaintext (quiet diff)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    await runEmit({ ...sopsOptions(), firstDeploy: false, previousBuild: PREV_BUILD });
+    const firstBytes = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    // Second emit of the SAME build (consumes the first bundle's metadata). The mock's
+    // nonce guarantees a re-encryption would produce DIFFERENT bytes — identical bytes
+    // prove the decrypt-and-compare reuse path ran.
+    await runEmit({ ...baseOptions(), secrets: "sops" });
+    const secondBytes = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    expect(secondBytes).toBe(firstBytes);
+    // And a decrypt call happened for the reuse check.
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(([cmd, args]) => cmd === "sops" && args.includes("--decrypt")),
+    ).toBe(true);
+  });
+
+  it("RE-EMIT re-encrypts when the existing file no longer decrypts (recipients rotated)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    await runEmit({ ...sopsOptions(), firstDeploy: false, previousBuild: PREV_BUILD });
+    const firstBytes = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    mockSops({ decryptFails: true });
+    await runEmit({ ...baseOptions(), secrets: "sops" });
+    const secondBytes = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    expect(secondBytes).not.toBe(firstBytes);
+    expect(secondBytes).toContain("sops:");
+  });
+
+  it("sops: NO plaintext secret material survives anywhere in the bundle (whole-tree scan, mock-envelope aware)", async () => {
+    // The mock's envelope deliberately carries the plaintext (so decrypt can invert it) —
+    // this scan therefore only checks OUTSIDE secrets/: chart/, values/, metadata, README.
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    await runEmit(sopsOptions());
+    const bundleDir = path.join(projectDir, ".k8s-adapter", "gitops");
+    const offenders: string[] = [];
+    const walk = (dir: string, prefix: string): void => {
+      for (const entry of readFileSyncDirents(dir)) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (rel === "secrets" && entry.isDirectory()) continue;
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        else {
+          const body = readFileSync(path.join(dir, entry.name), "utf-8");
+          if (/^\s*stringData:/m.test(body) || body.includes("hunter2")) offenders.push(rel);
+        }
+      }
+    };
+    walk(bundleDir, "");
+    expect(offenders).toEqual([]);
+  });
+
+  it("the README documents the Flux decryption block and the secrets/ determinism caveat", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    await runEmit(sopsOptions());
+    const readme = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "README.md"),
+      "utf-8",
+    );
+    expect(readme).toContain("Secrets (SOPS-encrypted)");
+    expect(readme).toContain("kustomize.toolkit.fluxcd.io");
+    expect(readme).toContain("provider: sops");
+    expect(readme).toContain("secrets/internal-secret.sops.yaml");
+    // The determinism caveat: secrets/ is excluded from byte-determinism, and the
+    // reuse rule that keeps re-emit diffs meaningful is stated.
+    expect(readme).toMatch(/EXCLUDED from the bundle's byte-determinism/);
+    expect(readme).toMatch(/fresh data keys and MACs/);
+    expect(readme).toMatch(/REUSES an\s+existing encrypted file/);
+    // The retention rule follows the secret material wherever it lives.
+    expect(readme).toMatch(/OUTLIVE the sync/);
+  });
+
+  it("refuses a rendered secret template that carries Helm template syntax (sops files bypass Helm)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+    // Simulate a Valkey URL that contained a literal "{{" — escapeHelmActions wrote a
+    // Helm action into the rendered template, which only Helm would undo.
+    const valkeyPath = path.join(
+      projectDir,
+      ".k8s-adapter",
+      "output",
+      "chart",
+      "templates",
+      "valkey-secret.yaml",
+    );
+    writeFileSync(
+      valkeyPath,
+      `apiVersion: v1\nkind: Secret\nmetadata:\n  name: ${RELEASE}-valkey\nstringData:\n  url: "redis://user:{{ "{{" }}pw@cache:6379"\n`,
+    );
+    await expect(runEmit(sopsOptions())).rejects.toThrow(/Helm template syntax/);
+  });
+
+  it("findSopsConfig walks up and returns the nearest config; null when none exists", () => {
+    const nested = path.join(projectDir, "a", "b", "c");
+    mkdirSync(nested, { recursive: true });
+    expect(findSopsConfig(nested)).toBeNull();
+    writeFileSync(path.join(projectDir, ".sops.yaml"), "creation_rules: []\n");
+    expect(findSopsConfig(nested)).toBe(path.join(projectDir, ".sops.yaml"));
+    // A nearer config wins.
+    writeFileSync(path.join(projectDir, "a", ".sops.yaml"), "creation_rules: []\n");
+    expect(findSopsConfig(nested)).toBe(path.join(projectDir, "a", ".sops.yaml"));
   });
 });
 

@@ -50,6 +50,8 @@ const VALUE_FLAGS = new Set([
   // GitOps PR1 (emit): the previous-build pin and the secret externalization mode.
   "previous-build",
   "secrets",
+  // --secrets sops: explicit sops config path (default: walk up from the bundle dir).
+  "sops-config",
 ]);
 
 export function parseArgs(argv: string[]): {
@@ -174,7 +176,13 @@ Options:
                               build (emit; never inferred from a missing prior bundle)
   --secrets <mode>         external (default): omit secret templates from the bundle chart
                               and emit an ExternalSecret placeholder + README key table.
+                              sops: encrypt the secret manifests into secrets/*.sops.yaml
+                              via the sops CLI, honoring the repo's .sops.yaml creation
+                              rules (fail-closed: no sops binary or no config is an error,
+                              never plaintext).
                               inline: verbatim chart with a loud warning (emit)
+  --sops-config <path>     Explicit sops config file (emit --secrets sops; default: walk
+                              up from the bundle directory for .sops.yaml)
   --dry-run                Show what would be done without executing
 
 Flags may be given as --flag value or --flag=value. Boolean flags (e.g. --dry-run)
@@ -290,10 +298,19 @@ async function main(): Promise<void> {
       // both run the pipeline-safe steps and write the bundle, never touching a cluster.
       if (command === "emit" || flags["render-only"] === true) {
         const secrets = flags["secrets"] as string | undefined;
-        if (secrets !== undefined && secrets !== "external" && secrets !== "inline") {
+        if (
+          secrets !== undefined &&
+          secrets !== "external" &&
+          secrets !== "inline" &&
+          secrets !== "sops"
+        ) {
           throw new Error(
-            `Flag --secrets must be "external" or "inline" (got ${JSON.stringify(secrets)})`,
+            `Flag --secrets must be "external", "sops" or "inline" (got ${JSON.stringify(secrets)})`,
           );
+        }
+        const sopsConfig = flags["sops-config"] as string | undefined;
+        if (sopsConfig !== undefined && secrets !== "sops") {
+          throw new Error(`Flag --sops-config only applies with --secrets sops`);
         }
         await runEmit({
           projectDir,
@@ -305,6 +322,7 @@ async function main(): Promise<void> {
           previousBuild: flags["previous-build"] as string | undefined,
           firstDeploy: flags["first-deploy"] === true,
           ...(secrets ? { secrets } : {}),
+          ...(sopsConfig !== undefined ? { sopsConfig } : {}),
         });
         break;
       }

@@ -8,6 +8,7 @@
 ├── values/values.yaml   # digests pinned, registry/tag set, CIDRs from config,
 │                        #   activeBuildId pinned to the PREVIOUS build (cutover.mode: none)
 ├── manifests/all.yaml   # local `helm template` output (skipped, with a note, when helm is absent)
+├── secrets/             # --secrets sops only: the secret manifests, SOPS-encrypted (*.sops.yaml)
 ├── emit-metadata.json   # buildId, previousBuildId, digests, cdnTag, pool topology, platforms
 ├── renovate.json5       # update-bot fence (copy source — see "Renovate and image automation")
 └── README.md            # cutover model + required Secret names/keys + update-bot fence
@@ -91,9 +92,28 @@ A present-but-corrupt prior bundle is an error, never a first deploy. Re-emittin
 
 `--secrets external` (default): the bundle chart omits `internal-secret.yaml`/`valkey-secret.yaml` and emits `templates/external-secret.yaml`—ExternalSecrets gated on `externalSecrets.storeName` in values—plus a README table of the exact Secret names/keys the pods reference. Load the values into your store from the build output (the gitignored `chart/templates/internal-secret.yaml` holds the rendered dispatch secret).
 
+`--secrets sops`: the same secret objects inline mode ships in-chart—the per-build dispatch Secret and, when the cache is enabled, the Valkey connection Secret—are written as plain YAML and encrypted through the `sops` CLI into `secrets/<name>.sops.yaml`. The chart omits the secret templates (like external mode); the encrypted files are applied by your GitOps engine's SOPS integration. **Recipients come from the repo's own `.sops.yaml` creation rules**: emit walks up from the bundle directory for `.sops.yaml` and runs sops with its cwd at that directory, never passing recipients on argv—so the same rules that govern every other secret in the repo govern these (`--sops-config <path>` names a config explicitly). Fail-closed: a missing `sops` binary, no discoverable `.sops.yaml`, or a nonzero sops exit is a hard error—emit **never** falls back to writing plaintext.
+
+With Flux, decrypt via a Kustomization pointed at `secrets/`:
+
+```yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+spec:
+  path: ./.k8s-adapter/gitops/secrets
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age # the Secret holding your age key
+```
+
+(Argo CD needs a SOPS plugin such as KSOPS; `sops -d secrets/<f> | kubectl apply -f -` works for hand-applied flows.)
+
+**Determinism caveat**: `secrets/` is excluded from the bundle's byte-determinism guarantee—sops embeds fresh data keys and MACs per encryption. Emit keeps re-emit diffs quiet by reusing an existing encrypted file when it still decrypts (recipients unchanged) to the identical plaintext, re-encrypting otherwise; a changed `secrets/` file in a re-emit diff therefore means the plaintext or the recipients changed, never noise. As with external mode, a build's dispatch Secret must outlive the sync that applies the next build's bundle (the retained previous build references it by name—the rollback target).
+
 `--secrets inline`: today's chart verbatim, with a loud warning—committing the bundle commits real credentials, and Git does not preserve the 0600 file mode.
 
-Either way, CI must pin `ADAPTER_K8S_INTERNAL_SECRET_KEY` (or restore `.k8s-adapter/internal-secret.key`): the dispatch secret is an HMAC of the build id under that key, and without a stable key every emit of the same build derives a different secret, breaking bundle determinism.
+CI must pin `ADAPTER_K8S_INTERNAL_SECRET_KEY` (or restore `.k8s-adapter/internal-secret.key`): the dispatch secret is an HMAC of the build id under that key, and without a stable key every emit of the same build derives a different secret, breaking bundle determinism. Under `--secrets inline` and `--secrets sops`—the modes that embed the secret material in the bundle—emit **refuses to run** when neither key source exists (the build would silently mint a fresh random key and every re-emit would rotate the secret).
 
 ## CIDRs
 
