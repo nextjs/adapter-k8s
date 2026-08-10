@@ -119,10 +119,7 @@ Full option surface, env/cache/pool details, and a complete non-GKE example: [re
 3. Validate without touching the cluster. Config validation and target compilation run inside `next build` (the adapter's hooks), so build first; `--dry-run` alone reads the previous build's output and fails with "Build metadata not found" on a fresh project:
 
 ```bash
-# Absolute file path, not the bare package name — Next resolves adapterPath with
-# require.resolve(), and the package's exports map is ESM-only, so
-# NEXT_ADAPTER_PATH=@next-community/adapter-k8s fails with ERR_PACKAGE_PATH_NOT_EXPORTED.
-export NEXT_ADAPTER_PATH="$PWD/node_modules/@next-community/adapter-k8s/dist/index.js"
+export NEXT_ADAPTER_PATH=@next-community/adapter-k8s
 npx next build                    # validates config, compiles the target
 npx adapter-k8s deploy --dry-run  # prints the deploy plan; never builds or touches the cluster
 ```
