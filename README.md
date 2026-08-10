@@ -174,17 +174,18 @@ This idempotently provisions the cluster, static IP, Artifact Registry repo, GCS
 
 ## CLI commands
 
-| Command    | What it does                                                                                                                             |
-| ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `init`     | Provision cloud infrastructure and scaffold config. `--project-id`, `--region`, `--host`, `--dry-run`                                    |
-| `deploy`   | Build, push, and deploy with blue/green cutover. `--skip-build`, `--skip-push`, `--dry-run`                                              |
-| `emit`     | Render a committable GitOps bundle—no cluster contact at all. `--secrets`, `--previous-bundle`. See [docs/gitops.md](./docs/gitops.md)   |
-| `rollback` | Return to the previous build—pools scale back up, the routing tier reverts, traffic cuts over. Symmetric: running it again rolls forward |
-| `doctor`   | Health-check the whole stack: prerequisites, cloud resources, Kubernetes state, LB backend health, DNS + TLS                             |
-| `emulate`  | Run the full request path locally: Envoy → routing service → pool server                                                                 |
-| `describe` | Live architecture diagram of your deployment with pod counts and revision tags                                                           |
-| `tail`     | Stream color-coded logs from all workloads                                                                                               |
-| `destroy`  | Tear down release-scoped resources; shared infrastructure (cluster, registry, certs) is kept and reported                                |
+| Command    | What it does                                                                                                                                        |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `init`     | Provision cloud infrastructure and scaffold config. `--project-id`, `--region`, `--host`, `--dry-run`                                               |
+| `deploy`   | Build, push, and deploy with blue/green cutover. `--skip-build`, `--skip-push`, `--dry-run`                                                         |
+| `emit`     | Render a committable GitOps bundle—no cluster contact at all. `--cutover`, `--secrets`, `--previous-bundle`. See [docs/gitops.md](./docs/gitops.md) |
+| `migrate`  | Annotate an existing release's retained set before pointing a pruning reconciler at it (GitOps prerequisite)                                        |
+| `rollback` | Return to the previous build—pools scale back up, the routing tier reverts, traffic cuts over. Symmetric: running it again rolls forward            |
+| `doctor`   | Health-check the whole stack: prerequisites, cloud resources, Kubernetes state, LB backend health, DNS + TLS                                        |
+| `emulate`  | Run the full request path locally: Envoy → routing service → pool server                                                                            |
+| `describe` | Live architecture diagram of your deployment with pod counts and revision tags                                                                      |
+| `tail`     | Stream color-coded logs from all workloads                                                                                                          |
+| `destroy`  | Tear down release-scoped resources; shared infrastructure (cluster, registry, certs) is kept and reported                                           |
 
 Run `adapter-k8s --help` for the full flag list. Deploy, rollback, destroy, doctor, and state semantics are documented in [docs/lifecycle.md](./docs/lifecycle.md).
 
@@ -250,9 +251,9 @@ npx adapter-k8s emit --secrets sops        # or --secrets external (default)
 
 Commit the bundle; your reconciler applies it. Because a build's chart is an artifact of _that_ build, it is replaced wholesale on each emit—never edited in place, and never a target for Renovate or Flux image automation (the bundle ships a fence for both).
 
-> **Do not point an auto-syncing reconciler at a chart produced by `deploy`.** The chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto a build that has been scaled to zero. Measured against real Argo CD: reverted in ~2.4 minutes, with the Application still reporting Synced. `emit` renders the reconciler-owned inputs without moving traffic; promotion remains the explicit, gated cutover documented in [docs/ci-cd.md](./docs/ci-cd.md).
+> **Do not point an auto-syncing reconciler at a chart produced by `deploy`.** The chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto a build that has been scaled to zero. Measured against real Argo CD: reverted in ~2.4 minutes, with the Application still reporting Synced. `emit --cutover job` is the answer—the promotion runs in-cluster, gated by the same checks the CLI runs.
 
-The required selector-ignore and prune safeguards, plus the evidence behind them, are documented in [docs/gitops.md](./docs/gitops.md) and [plans/gitops-deployment-strategies.md](./plans/gitops-deployment-strategies.md).
+Run `migrate` once on any release that was previously deployed imperatively: it applies the prune-protection annotations that keep a reconciler from deleting the rollback target. Full recipes, ignore rules, and the evidence behind all of this: [docs/gitops.md](./docs/gitops.md) and [plans/gitops-deployment-strategies.md](./plans/gitops-deployment-strategies.md).
 
 ## Security
 

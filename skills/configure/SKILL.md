@@ -136,7 +136,7 @@ If validation fails, fix the exact reported key — the validators name the offe
 npx adapter-k8s deploy
 ```
 
-**If the cluster is reconciled by Argo CD or Flux**, `deploy` is the wrong verb — CI has no kubeconfig there and the reconciler owns apply. Point the user at `npx adapter-k8s emit` instead (renders a committable bundle, no cluster contact), and at `skills/deploy` plus `docs/gitops.md` for the flow. Use `--secrets sops` (or the default `external`) so the bundle never carries plaintext secrets; the emitted bundle does not move traffic, so promotion remains the explicit gated cutover in `docs/ci-cd.md`.
+**If the cluster is reconciled by Argo CD or Flux**, `deploy` is the wrong verb — CI has no kubeconfig there and the reconciler owns apply. Point the user at `npx adapter-k8s emit` instead (renders a committable bundle, no cluster contact), and at `skills/deploy` plus `docs/gitops.md` for the flow. Two things to raise before they commit anything: run `npx adapter-k8s migrate` first on a release that was previously deployed imperatively, and use `--secrets sops` (or the default `external`) so the bundle never carries plaintext secrets.
 
 ## Gotchas
 
