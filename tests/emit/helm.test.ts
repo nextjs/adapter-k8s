@@ -12,6 +12,7 @@ import {
   compileTarget,
   defineTarget,
   gatewayApiExposure,
+  httpRouteExposure,
   kubernetesCluster,
 } from "../../src/target/index.js";
 
@@ -160,6 +161,48 @@ describe("generateHelmChart", () => {
     expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(true);
     expect(Object.values(result).some((body) => body.includes('"kind": "HTTPRoute"'))).toBe(true);
     expect(result["templates/routing-service-deployment.yaml"]).toBeUndefined();
+  });
+
+  it("renders an httpRouteExposure target with an HTTPRoute and no Gateway anywhere", () => {
+    const target = defineTarget({
+      cluster: kubernetesCluster(),
+      exposure: httpRouteExposure({
+        className: "envoy",
+        parentRefs: [{ name: "envoy-external", namespace: "network", sectionName: "https" }],
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "ghcr.io/example/site",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "ghcr.io/example/site",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      compiledTarget,
+    });
+
+    const routeTemplate = Object.entries(result).find(([, body]) =>
+      body.includes('"kind": "HTTPRoute"'),
+    );
+    expect(routeTemplate).toBeDefined();
+    expect(routeTemplate![1]).toContain('"name": "envoy-external"');
+    expect(routeTemplate![1]).toContain('"namespace": "network"');
+    expect(routeTemplate![1]).toContain('"sectionName": "https"');
+    // The whole chart contains no Gateway object — the shared parent is not ours.
+    expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(false);
   });
 
   it("translates flat pool resource settings into Kubernetes requests and limits", () => {

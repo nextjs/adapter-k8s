@@ -9,6 +9,7 @@ import {
   gatewayApiExposure,
   gkeCluster,
   gkeNativeRouting,
+  httpRouteExposure,
   ingressExposure,
   kubernetesCluster,
   manualExposure,
@@ -247,7 +248,7 @@ describe("Kubernetes target composition", () => {
     ).toBe(false);
   });
 
-  it("rejects an Envoy policy targeting a Gateway in another namespace", () => {
+  it("allows a cross-namespace Gateway and suppresses the ClientTrafficPolicy", () => {
     const exposure = defineExposureComponent({
       name: "shared-gateway",
       hosts,
@@ -277,16 +278,38 @@ describe("Kubernetes target composition", () => {
         };
       },
     });
+    // Default escapedSlashes (would be "policy" locally) is suppressed cross-namespace:
+    // a ClientTrafficPolicy targets the Gateway namespace-locally and cannot reach it.
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure,
+        routing: envoyNativeRouting(),
+      }),
+      context(),
+    );
+    expect(
+      compiled.plan.operations.resources.objects.some(
+        (entry) => entry.kind === "ClientTrafficPolicy",
+      ),
+    ).toBe(false);
+    expect(
+      compiled.plan.operations.resources.objects.find(
+        (entry) => entry.kind === "EnvoyExtensionPolicy",
+      )?.body,
+    ).toMatchObject({ spec: { targetRefs: [{ name: "custom-app-route" }] } });
+
+    // An EXPLICIT "policy" against a cross-namespace Gateway is a build error naming it.
     expect(() =>
       compileTarget(
         defineTarget({
           cluster: kubernetesCluster(),
           exposure,
-          routing: envoyNativeRouting(),
+          routing: envoyNativeRouting({ escapedSlashes: "policy" }),
         }),
         context(),
       ),
-    ).toThrow(/cannot target Gateway "edge-system\/shared-edge".*namespace-local/i);
+    ).toThrow(/"edge-system\/shared-edge".*namespace-local/i);
   });
 
   it("rejects an Envoy policy targeting an HTTPRoute in another namespace", () => {
@@ -329,6 +352,284 @@ describe("Kubernetes target composition", () => {
         context(),
       ),
     ).toThrow(/cannot target HTTPRoute "edge-system\/custom-app-route".*namespace-local/i);
+  });
+
+  it("attaches an HTTPRoute to existing shared Gateways via verbatim parentRefs", () => {
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: httpRouteExposure({
+          className: "envoy",
+          parentRefs: [
+            { name: "envoy-external", namespace: "network", sectionName: "https" },
+            { name: "envoy-internal", namespace: "network" },
+          ],
+          hosts,
+        }),
+      }),
+      context(),
+    );
+    const objects = compiled.plan.operations.resources.objects;
+    expect(objects).toHaveLength(1);
+    const route = objects[0]!;
+    expect(route).toMatchObject({
+      apiVersion: "gateway.networking.k8s.io/v1",
+      kind: "HTTPRoute",
+      resource: "httproutes",
+      metadata: { name: "test-app-routes", namespace: "apps" },
+    });
+    expect(route.body).toMatchObject({
+      spec: {
+        parentRefs: [
+          { name: "envoy-external", namespace: "network", sectionName: "https" },
+          { name: "envoy-internal", namespace: "network" },
+        ],
+        hostnames: ["app.example.com"],
+        rules: [
+          {
+            matches: [{ path: { type: "PathPrefix", value: "/" } }],
+            backendRefs: [{ name: "test-app-origin", port: 3000 }],
+          },
+        ],
+      },
+    });
+    // No Gateway is emitted or required — attaching to the fleet's shared Gateway is
+    // the whole point; a Gateway requirement or object would be a regression.
+    expect(objects.some((entry) => entry.kind === "Gateway")).toBe(false);
+    expect(compiled.plan.requirements.kubernetes.resources).toContainEqual({
+      apiVersion: "gateway.networking.k8s.io/v1",
+      resource: "httproutes",
+      optional: false,
+    });
+    expect(
+      compiled.plan.requirements.kubernetes.resources.some(
+        (entry) => entry.resource === "gateways",
+      ),
+    ).toBe(false);
+    // Failure output shows the shared gateways' programmed addresses.
+    expect(compiled.plan.operations.diagnostics).toEqual([
+      {
+        kind: "kubernetes-gateway-address",
+        gateway: {
+          apiVersion: "gateway.networking.k8s.io/v1",
+          resource: "gateways",
+          name: "envoy-external",
+          namespace: "network",
+        },
+      },
+      {
+        kind: "kubernetes-gateway-address",
+        gateway: {
+          apiVersion: "gateway.networking.k8s.io/v1",
+          resource: "gateways",
+          name: "envoy-internal",
+          namespace: "network",
+        },
+      },
+    ]);
+  });
+
+  it("gates httpRouteExposure readiness on Accepted and ResolvedRefs from every named parent", () => {
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: httpRouteExposure({
+          className: "envoy",
+          parentRefs: [
+            { name: "envoy-external", namespace: "network", sectionName: "https" },
+            { name: "envoy-internal", namespace: "network" },
+          ],
+          hosts,
+        }),
+      }),
+      context(),
+    );
+    const routeRef = {
+      apiVersion: "gateway.networking.k8s.io/v1",
+      resource: "httproutes",
+      name: "test-app-routes",
+      namespace: "apps",
+    };
+    // Default portable routing contributes its own service-endpoints entry; the
+    // exposure's contribution is exactly the two route conditions.
+    const routeReadiness = compiled.plan.operations.resources.readiness.filter(
+      (entry) => entry.kind === "kubernetes-condition",
+    );
+    expect(routeReadiness).toEqual(
+      (["Accepted", "ResolvedRefs"] as const).map((type) => ({
+        kind: "kubernetes-condition",
+        object: routeRef,
+        // minimumCount = parentRefs.length: a nonexistent parent Gateway reports NO
+        // status.parents entry, which must not let the others pass readiness.
+        conditionsAt: { kind: "parents", minimumCount: 2 },
+        condition: {
+          type,
+          status: "True",
+          observedGeneration: "must-equal-metadata-generation",
+        },
+        timeoutSeconds: 600,
+      })),
+    );
+  });
+
+  it("binds envoyNativeRouting to the httpRouteExposure route without any ClientTrafficPolicy", () => {
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: httpRouteExposure({
+          className: "eg",
+          parentRefs: [{ name: "envoy-external", namespace: "network" }],
+          hosts,
+        }),
+        routing: envoyNativeRouting(),
+      }),
+      context(),
+    );
+    const policy = compiled.plan.operations.resources.objects.find(
+      (entry) => entry.kind === "EnvoyExtensionPolicy",
+    );
+    expect(policy?.body).toMatchObject({
+      spec: { targetRefs: [{ kind: "HTTPRoute", name: "test-app-routes" }] },
+    });
+    // Suppressed by default (not only under an explicit "external"): the CTP cannot
+    // target the shared Gateway in ns "network", and the fleet may already run one.
+    expect(
+      compiled.plan.operations.resources.objects.some(
+        (entry) => entry.kind === "ClientTrafficPolicy",
+      ),
+    ).toBe(false);
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: httpRouteExposure({
+            className: "eg",
+            parentRefs: [{ name: "envoy-external", namespace: "network" }],
+            hosts,
+          }),
+          routing: envoyNativeRouting({ escapedSlashes: "policy" }),
+        }),
+        context(),
+      ),
+    ).toThrow(/"network\/envoy-external".*namespace-local/i);
+  });
+
+  it("keeps httpRouteExposure fingerprints distinct and stable", () => {
+    const httpRoute = () =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: httpRouteExposure({
+            className: "eg",
+            parentRefs: [{ name: "envoy-external", namespace: "network" }],
+            hosts,
+          }),
+        }),
+        context(),
+      );
+    const gateway = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: gatewayApiExposure({ className: "eg", hosts }),
+      }),
+      context(),
+    );
+    const manual = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({ hosts }),
+      }),
+      context(),
+    );
+    const compiled = httpRoute();
+    expect(compiled.plan.target.fingerprint).not.toBe(gateway.plan.target.fingerprint);
+    expect(compiled.plan.target.fingerprint).not.toBe(manual.plan.target.fingerprint);
+    expect(
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: httpRouteExposure({
+            className: "eg",
+            parentRefs: [{ name: "envoy-external", namespace: "network" }],
+            hosts,
+          }),
+        }),
+        context({ buildId: "another-build" }),
+      ).plan.target.fingerprint,
+    ).toBe(compiled.plan.target.fingerprint);
+  });
+
+  it("validates httpRouteExposure options eagerly", () => {
+    const valid = {
+      className: "eg",
+      parentRefs: [{ name: "envoy-external", namespace: "network" }],
+      hosts,
+    };
+    expect(() => httpRouteExposure({ ...valid, parentRefs: [] })).toThrow(
+      /at least one parentRef/i,
+    );
+    expect(() => httpRouteExposure({ ...valid, hosts: [] })).toThrow(/at least one host/i);
+    expect(() => httpRouteExposure({ ...valid, className: "Bad_Class" })).toThrow(
+      /invalid gatewayclass name/i,
+    );
+    expect(() =>
+      httpRouteExposure({
+        ...valid,
+        parentRefs: [{ name: "envoy-external", sectionName: "HTTPS listener" }],
+      }),
+    ).toThrow(/invalid parentRef sectionName/i);
+    expect(() => httpRouteExposure({ ...valid, parentRefs: [{ name: "-bad-gateway" }] })).toThrow(
+      /invalid parentRef Gateway name/i,
+    );
+    expect(() =>
+      httpRouteExposure({
+        ...valid,
+        parentRefs: [{ name: "envoy-external", namespace: "Bad Namespace" }],
+      }),
+    ).toThrow(/invalid namespace/i);
+    expect(() => httpRouteExposure({ ...valid, escapedSlashes: "policy" as never })).toThrow(
+      /only supports escapedSlashes: "external"/i,
+    );
+  });
+
+  it("passes httpRouteExposure ingressSources through to the compiled target", () => {
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: httpRouteExposure({
+          className: "envoy",
+          parentRefs: [{ name: "envoy-external", namespace: "network" }],
+          hosts,
+          ingressSources: {
+            cidrs: [],
+            podSelectors: [
+              {
+                namespace: "network",
+                labels: {
+                  "app.kubernetes.io/name": "envoy",
+                  "gateway.envoyproxy.io/owning-gateway-name": "envoy-external",
+                  "gateway.envoyproxy.io/owning-gateway-namespace": "network",
+                },
+              },
+            ],
+          },
+        }),
+      }),
+      context(),
+    );
+    expect(compiled.ingressSources).toEqual({
+      cidrs: [],
+      podSelectors: [
+        {
+          namespace: "network",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gateway-name": "envoy-external",
+            "gateway.envoyproxy.io/owning-gateway-namespace": "network",
+          },
+        },
+      ],
+    });
   });
 
   it("keeps GKE-native routing explicit and derives release resource names without sentinels", () => {

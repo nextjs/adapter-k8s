@@ -8,12 +8,17 @@ export {
   gatewayApiExposure,
   gkeCluster,
   gkeNativeRouting,
+  httpRouteExposure,
   ingressExposure,
   kubernetesCluster,
   manualExposure,
   portableRouting,
 } from "./components.js";
-export type { GatewayApiExposureOptions, IngressExposureOptions } from "./components.js";
+export type {
+  GatewayApiExposureOptions,
+  HttpRouteExposureOptions,
+  IngressExposureOptions,
+} from "./components.js";
 export { compileTarget } from "./compiler.js";
 export { targetForConfig, targetHosts } from "./legacy.js";
 export type {

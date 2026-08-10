@@ -538,6 +538,17 @@ function conditionStatus(
       owners = controllerName
         ? parents.filter((entry) => entry.controllerName === controllerName)
         : parents;
+      // A parentRef naming a nonexistent Gateway produces NO status.parents entry, so
+      // without a floor the remaining parents would satisfy the check and readiness
+      // would pass wrongly. Fail non-final until every expected parent has reported.
+      const minimumCount = readiness.conditionsAt.minimumCount;
+      if (minimumCount !== undefined && owners.length < minimumCount) {
+        return {
+          ready: false,
+          final: false,
+          message: `${owners.length}/${minimumCount} parents have reported status (a parentRef may name a nonexistent Gateway)`,
+        };
+      }
       break;
     }
     case "ancestors": {

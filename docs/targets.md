@@ -2,15 +2,15 @@
 
 `defineTarget` composes four independent layers into a single deployment target. Each layer is a component with a typed `build()` hook; the compiler turns the composition into one versioned plan that every lifecycle command consumes—deploy, rollback, doctor, describe, and destroy all read the same plan, including cluster identity, API requirements, readiness, diagnostics, and exact cleanup ownership.
 
-| Layer     | Built-ins                                                   | Extension hook            |
-| --------- | ----------------------------------------------------------- | ------------------------- |
-| cluster   | `kubernetesCluster`, `gkeCluster`                           | `defineClusterComponent`  |
-| exposure  | `gatewayApiExposure`, `ingressExposure`, `manualExposure`   | `defineExposureComponent` |
-| routing   | `portableRouting`, `envoyNativeRouting`, `gkeNativeRouting` | `defineRoutingComponent`  |
-| resources | none required                                               | `defineResourceComponent` |
+| Layer     | Built-ins                                                                      | Extension hook            |
+| --------- | ------------------------------------------------------------------------------ | ------------------------- |
+| cluster   | `kubernetesCluster`, `gkeCluster`                                              | `defineClusterComponent`  |
+| exposure  | `httpRouteExposure`, `gatewayApiExposure`, `ingressExposure`, `manualExposure` | `defineExposureComponent` |
+| routing   | `portableRouting`, `envoyNativeRouting`, `gkeNativeRouting`                    | `defineRoutingComponent`  |
+| resources | none required                                                                  | `defineResourceComponent` |
 
 - **cluster** — how the CLI reaches the cluster (kubeconfig context or `gcloud get-credentials`), how it verifies it's the _right_ cluster, how images are pushed and digests resolved, and where the NetworkPolicy CIDRs come from.
-- **exposure** — how traffic enters: a Gateway API Gateway + HTTPRoute, an Ingress, or nothing (you own the exposure).
+- **exposure** — how traffic enters: an HTTPRoute attached to an existing shared Gateway, a Gateway API Gateway + HTTPRoute the release owns, an Ingress, or nothing (you own the exposure).
 - **routing** — where `@next/routing` executes: in the application origin (portable, the default), or at the data plane as an ext_proc callout (Envoy Gateway in-cluster, or a GKE traffic extension).
 - **resources** — additional typed Kubernetes objects deployed and cleaned up with the release.
 
@@ -54,6 +54,89 @@ export default createK8sAdapter({
 ```
 
 Use `gatewayApiExposure` instead for any conformant GatewayClass.
+
+## Shared Gateways (recommended for clusters with existing Gateways)
+
+Most fleets already run shared Gateways — a home-ops cluster typically has `envoy-external` and `envoy-internal` in a `network` namespace, with TLS, DNS, cert-manager, and tunnel ingress solved once for every app. `httpRouteExposure` is the exposure for that pattern: it emits **exactly one HTTPRoute** in the app's namespace, attached to the named parent Gateway(s) via `spec.parentRefs`, and nothing else — no per-app Gateway (which would spawn a whole proxy deployment and LoadBalancer IP), no Certificate, no traffic policies. TLS terminates at the parent; certificates and DNS remain the gateway owner's job, where the fleet already solves them.
+
+```js
+import {
+  createK8sAdapter,
+  defineTarget,
+  httpRouteExposure,
+  kubernetesCluster,
+} from "@next-community/adapter-k8s";
+
+export default createK8sAdapter({
+  pools: {
+    default: { routes: ["appPages", "appRoutes"], scaling: { min: 2, max: 6, targetCPU: 70 } },
+  },
+  target: defineTarget({
+    cluster: kubernetesCluster({
+      access: { kind: "kubeconfig-context", context: "home-ops" },
+      identity: {
+        kind: "kubernetes-namespace-uid",
+        namespace: "kube-system",
+        uid: "EXPECTED-CLUSTER-UID",
+      },
+    }),
+    exposure: httpRouteExposure({
+      className: "envoy", // the shared GatewayClass
+      parentRefs: [{ name: "envoy-external", namespace: "network", sectionName: "https" }],
+      hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+    }),
+  }),
+});
+```
+
+Notes on this journey:
+
+- **parentRefs are verbatim.** Each `name` must match an existing Gateway exactly; `namespace` defaults to the release namespace (per Gateway API); `sectionName` picks a listener (e.g. `"https"`). The parent Gateway's `allowedRoutes` must admit the app's namespace — deploy surfaces `Accepted=False` / `NotAllowedByListeners` in-band if it doesn't, and `NoMatchingListenerHostname` when the hostnames don't intersect the listener.
+- **Readiness** gates on the emitted HTTPRoute reporting `Accepted=True` and `ResolvedRefs=True` from **every** named parent, and on every named parent having reported at all — a parentRef naming a nonexistent Gateway produces no status entry, which would otherwise pass silently. Failure output includes each parent Gateway's programmed address.
+- **`host.tls.enabled`** only informs post-deploy verification (which scheme to probe); it has no structural effect — termination is the parent's.
+- **No HTTP→HTTPS redirect route is emitted.** On a typical fleet the shared gateway's http listener already carries a fleet-wide redirect; a per-app redirect would require the owner to permit a second attach on the http listener and buys nothing there.
+- **Escaped slashes**: `gatewayApiExposure` + `envoyNativeRouting` normally emits a `ClientTrafficPolicy` (`escapedSlashesAction: KeepUnchanged`) for `next start` parity on paths like `/a%2Fb`. A ClientTrafficPolicy is Gateway-scoped and namespace-local, so it **cannot** reach a shared Gateway in another namespace — and Envoy Gateway rejects a second conflicting CTP per listener anyway. With a cross-namespace parent, the policy is suppressed automatically and an explicit `escapedSlashes: "policy"` is a build error. Escaped-slash parity becomes a documented requirement on the shared gateway's owner (a CTP or EnvoyPatchPolicy in the gateway's namespace).
+- **Envoy Gateway version floor** for `envoyNativeRouting` on this exposure: the EnvoyExtensionPolicy attaches to the app's HTTPRoute by name (route-scoped ext_proc — the callout fires only for this app's route, not every app on the shared gateway). Route-targeted ext_proc requires **Envoy Gateway ≥ 1.1.0**; the adapter's proven baseline is v1.5.4.
+
+### NetworkPolicy under `strict` with a shared gateway
+
+The shared gateway's proxy pods live in the **parent's** namespace, not the app's. Under `networkPolicy.strict`, `ingressSources` is the allowlist admitting traffic to the pools (`:3000`) and the routing tier (`:8443`) — and reachability to `:8443` _is_ the internal dispatch secret. Omitting `ingressSources` with strict NetworkPolicy means an **empty allowlist**: the shared gateway's proxies are blocked and every request fails closed.
+
+Both selector values are static strings (the parent's namespace is known at config time):
+
+```js
+exposure: httpRouteExposure({
+  className: "envoy",
+  parentRefs: [{ name: "envoy-external", namespace: "network", sectionName: "https" }],
+  hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+  ingressSources: {
+    cidrs: [],
+    podSelectors: [
+      {
+        // The proxy namespace — where the Envoy data-plane pods run
+        // (e.g. "envoy-gateway-system", or "network" if proxies deploy beside the Gateway).
+        namespace: "network",
+        labels: {
+          "app.kubernetes.io/name": "envoy",
+          "gateway.envoyproxy.io/owning-gateway-name": "envoy-external",
+          "gateway.envoyproxy.io/owning-gateway-namespace": "network",
+        },
+      },
+      {
+        // Merged/class-owned proxies (EnvoyProxy mergeGateways) carry ONLY the class label,
+        // never the per-gateway pair above.
+        namespace: "network",
+        labels: {
+          "app.kubernetes.io/name": "envoy",
+          "gateway.envoyproxy.io/owning-gatewayclass": "envoy",
+        },
+      },
+    ],
+  },
+}),
+```
+
+The proxy-pod labels are verified against a live Envoy Gateway v1.5.4 data plane — the data-plane pods carry `app.kubernetes.io/name: envoy` plus the `owning-gateway-{name,namespace}` (or, merged, `owning-gatewayclass`) labels; the controller deployment does not serve traffic.
 
 Notes on this journey:
 
