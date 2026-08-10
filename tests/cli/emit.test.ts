@@ -272,6 +272,44 @@ describe("previous-build semantics (N20's new front door)", () => {
       /build/i,
     );
   });
+
+  it("runs the CROSS-BUILD collision guard against the prior bundle's recorded topology", async () => {
+    // The prior build id differs from the new one (so N14 passes) but sanitizes to the
+    // SAME composed Deployment name (lowercasing erases the difference) — the exact class
+    // the bare-id comparison cannot see. The prior bundle's poolTopology supplies the
+    // previous pools, standing in for the cluster emit never contacts.
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    priorBundleFixture({ buildId: "Build2abc" });
+    await expect(runEmit(baseOptions())).rejects.toThrow(
+      /collides with the currently-serving build/,
+    );
+  });
+
+  it("--previous-build without a prior bundle WARNS that the cross-build check is skipped (topology unknowable without a cluster)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+      await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("cross-build name-collision check is skipped"),
+      );
+      // The degradation is warn-and-continue, never silent-and-continue — and the
+      // self-collision guard still ran (the bundle exists, so nothing refused).
+      expect(bundleMetadata().previousBuildId).toBe(PREV_BUILD);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("pins activeDefaultPool to the PREVIOUS build's default pool alongside the selector pin", async () => {
+    // The default pool routes unmatched traffic; leaving it at the NEW build's value while
+    // the selectors pin to the previous build would split the pre-cutover route decision
+    // across two builds.
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    priorBundleFixture({ defaultPool: "api", poolTopology: ["ssr", "api"] });
+    await runEmit(baseOptions());
+    expect(bundleValues().activeDefaultPool).toBe("api");
+  });
 });
 
 describe("CIDR config surface (fail-closed, A4 'replaced')", () => {
@@ -328,6 +366,29 @@ describe("secret externalization", () => {
     );
     expect(readme).toContain("Secrets (externalized)");
     expect(readme).toContain(`${RELEASE}-valkey`);
+  });
+
+  it("external: NO stringData secret material survives anywhere in the bundle (whole-tree scan)", async () => {
+    // Belt-and-braces over the filename-based exclusion above: scan every emitted file.
+    // If a THIRD secret-bearing template ever appears (the S25 hazard emit/helm.ts guards
+    // against), the copy loop's SECRET_CHART_FILES check would miss it — this catches the
+    // credential in the output no matter which file carries it.
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    await runEmit({ ...baseOptions(), firstDeploy: true });
+    const bundleDir = path.join(projectDir, ".k8s-adapter", "gitops");
+    const offenders: string[] = [];
+    const walk = (dir: string, prefix: string): void => {
+      for (const entry of readFileSyncDirents(dir)) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        else {
+          const body = readFileSync(path.join(dir, entry.name), "utf-8");
+          if (/^\s*stringData:/m.test(body) || body.includes("hunter2")) offenders.push(rel);
+        }
+      }
+    };
+    walk(bundleDir, "");
+    expect(offenders).toEqual([]);
   });
 
   it("external without a cache: no Valkey ExternalSecret is emitted", async () => {

@@ -240,6 +240,7 @@ Defaults, in brief—the full model is in [SECURITY.md](./SECURITY.md):
 - [docs/lifecycle.md](./docs/lifecycle.md) — deploy, blue/green, rollback, destroy, doctor, state
 - [docs/verification.md](./docs/verification.md) — what is verified, and how
 - [docs/ci-cd.md](./docs/ci-cd.md) — running the pipeline without the CLI
+- [docs/gitops.md](./docs/gitops.md) — `adapter-k8s emit`: committable GitOps bundles, and the reconciler hazards to know first
 - [SECURITY.md](./SECURITY.md) — the security model
 
 ## Agent skills

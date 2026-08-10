@@ -35,6 +35,25 @@ jobs:
 
 The Helm chart is self-contained: it includes the traffic-extension registration Job that attaches the routing-service NEG and registers the ext_proc extension, so `helm upgrade` wires the load balancer for you.
 
+> Rendering the chart in CI instead of hand-assembling this pipeline? `adapter-k8s emit` produces a committable bundle with the digests, CIDRs, and traffic pointer already pinned — see [GitOps](./gitops.md). The cutover and retention steps below still apply to it verbatim (`cutover.mode: none`).
+
+## The NetworkPolicy CIDR guard
+
+A bare `helm template chart/` (or `helm upgrade` without the CLI) exits 1 on the chart's defaults: `global.networkPolicy.strict: true` requires `global.networkPolicy.nodeCidrs`, and the template `{{- fail }}`s without it. This is deliberate — kubelet liveness/readiness probes come from the **node** IP, and a strict allowlist without the node range leaves every pod permanently unready (with Calico, silently). The CLI discovers the ranges from the cluster at deploy time; a manual pipeline must supply them:
+
+```bash
+# Escape hatch 1: pass the cluster subnet range(s) explicitly
+helm upgrade --install my-app chart/ \
+  --set 'global.networkPolicy.nodeCidrs={10.128.0.0/20}'
+# (gcloud compute networks subnets describe SUBNET --region REGION --format='value(ipCidrRange)')
+
+# Escape hatch 2: disable the strict posture — deliberately, understanding that the
+# routing service then stays reachable from other in-cluster pods
+helm upgrade --install my-app chart/ --set global.networkPolicy.strict=false
+```
+
+Or set `networkPolicy.nodeCidrs` in adapter config so the ranges are baked into the chart's values at build time — see [static NetworkPolicy ranges](./configuration.md#static-networkpolicy-ranges-adapter-k8s-emit).
+
 ## Deploy by digest, resolved from the registry
 
 Deploy images by immutable `@sha256:` digest, not by tag—the pods hold the internal dispatch secret, and a mutable tag lets a retag change what runs on the next restart (see [SECURITY.md](../SECURITY.md#image-provenance)).
@@ -62,6 +81,23 @@ kubectl patch service <release>-<pool> --type=json \
 Before patching, verify each new pod answers `/readyz` directly on the pod (e.g. `kubectl exec`/port-forward), not via load-balancer backend health—`/readyz` is the pod's own verdict and answers 503 until instrumentation registration has succeeded and at least one route module has imported.
 
 The selector flip is atomic, but the load balancer reprograms the standalone NEG asynchronously; expect a few seconds where the LB catches up to the new endpoints.
+
+### Retention: `helm upgrade` deletes your rollback target unless you keep it
+
+The rollback story below assumes the previous build's Deployment still exists at 0 replicas — and a plain `helm upgrade` breaks that assumption. The new build's chart does not contain the previous build's Deployment or HPA, so Helm prunes both during the upgrade unless the **live** objects carry `helm.sh/resource-policy: keep`. The CLI patches that annotation onto the outgoing Deployment and HPA immediately before every upgrade (and later scales the outgoing build to zero instead of deleting it). A manual pipeline must do the same:
+
+```bash
+# BEFORE helm upgrade: keep the serving build's workload out of Helm's prune
+kubectl annotate deployment <release>-<pool>-<old-build-id> \
+  helm.sh/resource-policy=keep --overwrite
+kubectl annotate hpa <release>-<pool>-<old-build-id>-hpa \
+  helm.sh/resource-policy=keep --overwrite   # repeat per pool
+
+# AFTER the cutover verifies: park the old build instead of deleting it
+kubectl scale deployment <release>-<pool>-<old-build-id> --replicas=0
+```
+
+Skipping this is a valid choice — it means **single-build rollback semantics**: the only rollback is a full redeploy of the previous build, not a seconds-fast selector flip. Choose it knowingly; do not let `helm upgrade` choose it for you. (The per-build dispatch Secret and routing-manifest snapshot ConfigMap are already rendered with `keep` by the chart itself and survive the upgrade either way. Note `keep` is a Helm semantic — Argo CD's prune does not honor it; see [GitOps](./gitops.md) before pointing a reconciler at the chart.)
 
 To roll back, patch the selector to the previous build's label and scale that Deployment back up (it is kept at 0 replicas). Note that a full rollback also reverts the routing tier to the target build's image and manifest snapshot—the routing pod refuses to start on a manifest that doesn't match its image, so a mismatched pair fails loudly rather than serving another build's route classification. If a routing rollout is stuck after a manual rollback, that mismatch is the usual cause.
 
@@ -94,6 +130,7 @@ containerd-rootless-setuptool.sh install-buildkit-containerd
 
 ## See also
 
+- [GitOps](./gitops.md) — `adapter-k8s emit`: rendered, committable bundles for this pipeline's inputs
 - [Lifecycle](./lifecycle.md) — what the CLI's deploy/rollback do, in full
 - [Configuration](./configuration.md) — container strategy, platforms, variants
 - [Targets](./targets.md) — what the chart contains per target
