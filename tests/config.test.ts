@@ -481,3 +481,60 @@ describe("N61: pool-name charset", () => {
     expect(() => validateConfig(withName("a".repeat(41)))).toThrow(/too long.*max 40/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GitOps PR1 — static NetworkPolicy CIDRs for `emit` (no cluster to discover from).
+// ---------------------------------------------------------------------------
+describe("networkPolicy CIDR config surface", () => {
+  const withNetworkPolicy = (networkPolicy: unknown): K8sAdapterConfig =>
+    ({
+      pools: { ssr: { routes: ["appPages"] } },
+      networkPolicy,
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    }) as K8sAdapterConfig;
+
+  it("accepts well-formed pod and node CIDR lists", () => {
+    expect(() =>
+      validateConfig(
+        withNetworkPolicy({ podCidrs: ["10.8.0.0/14"], nodeCidrs: ["10.0.0.0/16", "fd00::/64"] }),
+      ),
+    ).not.toThrow();
+  });
+
+  it("accepts either key alone, and an absent block", () => {
+    expect(() => validateConfig(withNetworkPolicy({ nodeCidrs: ["10.0.0.0/16"] }))).not.toThrow();
+    expect(() => validateConfig(withNetworkPolicy(undefined))).not.toThrow();
+  });
+
+  it("rejects a non-object block", () => {
+    expect(() => validateConfig(withNetworkPolicy(["10.0.0.0/16"]))).toThrow(
+      /networkPolicy must be an object/,
+    );
+  });
+
+  it("rejects malformed CIDRs with the offending value named — these reach the rendered values verbatim", () => {
+    expect(() => validateConfig(withNetworkPolicy({ nodeCidrs: ["10.0.0.0"] }))).toThrow(
+      /networkPolicy\.nodeCidrs contains invalid CIDR\(s\): "10\.0\.0\.0"/,
+    );
+    expect(() =>
+      validateConfig(withNetworkPolicy({ podCidrs: ['10.0.0.0/16",\n  injected: true'] })),
+    ).toThrow(/networkPolicy\.podCidrs contains invalid CIDR/);
+    expect(() => validateConfig(withNetworkPolicy({ podCidrs: [42] }))).toThrow(
+      /networkPolicy\.podCidrs contains invalid CIDR/,
+    );
+  });
+
+  it("rejects a non-array CIDR list", () => {
+    expect(() => validateConfig(withNetworkPolicy({ nodeCidrs: "10.0.0.0/16" }))).toThrow(
+      /must be an array of CIDR strings/,
+    );
+  });
+});

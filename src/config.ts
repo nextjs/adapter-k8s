@@ -154,10 +154,50 @@ function validateEnvFrom(envFrom: unknown, where: string): void {
   }
 }
 
+/**
+ * One IPv4 or IPv6 CIDR. Deliberately the same charset shape deploy.ts accepts for
+ * `provider.generic.nodeCidrs` (`/^[0-9a-fA-F:.]+\/\d{1,3}$/`) — these values reach a helm
+ * `--set` brace list on the deploy path and a JSON values array on the emit path, so the
+ * charset is what keeps one list entry from splitting into several. Exported for the emit
+ * verb, which consumes `networkPolicy.podCidrs`/`nodeCidrs` at values-write time
+ * (sanitize-at-consumption, AGENTS.md).
+ */
+export const CIDR_RE = /^[0-9a-fA-F:.]+\/\d{1,3}$/;
+
+export function assertSafeCidrList(cidrs: unknown, where: string): asserts cidrs is string[] {
+  if (!Array.isArray(cidrs)) {
+    throw new Error(`${where} must be an array of CIDR strings (e.g. ["10.0.0.0/16"])`);
+  }
+  const bad = cidrs.filter((c) => typeof c !== "string" || !CIDR_RE.test(c));
+  if (bad.length > 0) {
+    throw new Error(
+      `${where} contains invalid CIDR(s): ${bad.map((c) => JSON.stringify(c)).join(", ")}. ` +
+        `Expected entries like "10.0.0.0/16" (matching ${CIDR_RE}).`,
+    );
+  }
+}
+
 export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
   validateEnvMap(config.env, "adapter config");
   validateEnvFrom(config.envFrom, "adapter config");
+  // GitOps PR1: static NetworkPolicy ranges for `emit`, which renders with no cluster to
+  // discover them from. Validated at config time AND at the emit-time consumption point.
+  if (config.networkPolicy !== undefined) {
+    if (
+      typeof config.networkPolicy !== "object" ||
+      config.networkPolicy === null ||
+      Array.isArray(config.networkPolicy)
+    ) {
+      throw new Error("networkPolicy must be an object with podCidrs/nodeCidrs arrays");
+    }
+    if (config.networkPolicy.podCidrs !== undefined) {
+      assertSafeCidrList(config.networkPolicy.podCidrs, "networkPolicy.podCidrs");
+    }
+    if (config.networkPolicy.nodeCidrs !== undefined) {
+      assertSafeCidrList(config.networkPolicy.nodeCidrs, "networkPolicy.nodeCidrs");
+    }
+  }
   if (!config.pools) {
     throw new Error("pools is required in adapter config");
   }

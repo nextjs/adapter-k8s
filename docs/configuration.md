@@ -137,6 +137,19 @@ provider: {
 
 The adapter attaches a Cloud CDN filter to the HTTPRoute with a Next.js-aware cache key (RSC/prefetch `Vary` headers partition App Router HTML and RSC payloads correctly). Mutable cacheable responses carry a per-build `Cache-Tag`, and `deploy`/`rollback` purge the outgoing build's tag on cutover—so a new build never serves the previous build's stale content from the edge. Content-hashed `/_next/static/*` assets are shared across builds and never purged.
 
+## Static NetworkPolicy ranges (`adapter-k8s emit`)
+
+```js
+networkPolicy: {
+  nodeCidrs: ['10.0.0.0/16'],  // node/subnet range(s) the strict posture admits for kubelet probes
+  podCidrs: ['10.8.0.0/14'],   // cluster pod range(s) for the broad posture (optional)
+},
+```
+
+`deploy` discovers these ranges from the cluster at deploy time and never needs this block. `adapter-k8s emit` cannot—it renders the GitOps bundle with **no cluster contact at all**—so the ranges must come from config. With `strict: true` (the default posture) and no `nodeCidrs` configured, `emit` refuses to render; `--allow-no-network-policy` is the explicit opt-out and emits the bundle without network isolation. The legacy `provider.generic.nodeCidrs` key still maps in when `networkPolicy.nodeCidrs` is absent.
+
+Static ranges do not follow node autoscale: give the enclosing subnet range, not per-node addresses, and prefer letting `deploy` discover them when you are not using `emit`.
+
 ## Config variants
 
 `ADAPTER_K8S_CONFIG=scaleway npx adapter-k8s deploy` selects a complete target: `adapter.config.scaleway.mjs`, `.k8s-adapter/infrastructure.scaleway.json`, its own build output, and its own deploy state. One project can therefore target several clusters without editing files between deploys.

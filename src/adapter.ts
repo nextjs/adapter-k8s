@@ -2713,9 +2713,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // registry does not match the infrastructure it is deploying with.
           containerRegistry: imageRegistry,
           ...(() => {
-            const n = genericConfigOf(cfg)?.nodeCidrs;
+            // networkPolicy.nodeCidrs (GitOps PR1) wins; provider.generic.nodeCidrs keeps
+            // working by mapping in when the new key is absent.
+            const n = cfg.networkPolicy?.nodeCidrs ?? genericConfigOf(cfg)?.nodeCidrs;
             return n !== undefined ? { nodeCidrs: n } : {};
           })(),
+          ...(cfg.networkPolicy?.podCidrs !== undefined
+            ? { podCidrs: cfg.networkPolicy.podCidrs }
+            : {}),
           poolNames: [...pools.keys()],
           defaultPool: configuredDefaultPool,
           ...(compiledTarget

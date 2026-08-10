@@ -5,6 +5,7 @@ import { sanitizeForTerminal } from "./terminal.js";
 import { existsSync, readFileSync } from "node:fs";
 import { runInit } from "./init.js";
 import { runDeploy } from "./deploy.js";
+import { runEmit } from "./emit.js";
 import { runDestroy } from "./destroy.js";
 import { runDoctor } from "./doctor.js";
 import { runDescribe } from "./describe.js";
@@ -27,6 +28,10 @@ const BOOLEAN_FLAGS = new Set([
   "allow-mutable-tags",
   "allow-unretained-manifest",
   "standard",
+  // GitOps PR1 (emit): render the committable bundle instead of deploying, and the
+  // explicit first-deploy assertion (never inferred — see resolvePreviousBuildId).
+  "render-only",
+  "first-deploy",
   "help",
   "h",
 ]);
@@ -42,6 +47,9 @@ const VALUE_FLAGS = new Set([
   "release-name",
   "namespace",
   "port",
+  // GitOps PR1 (emit): the previous-build pin and the secret externalization mode.
+  "previous-build",
+  "secrets",
 ]);
 
 export function parseArgs(argv: string[]): {
@@ -130,6 +138,8 @@ Usage: npx adapter-k8s <command> [options]
 Commands:
   init       Provision GCP infrastructure, scaffold adapter config
   deploy     Build, push images, helm upgrade
+  emit       Render a committable GitOps bundle (.k8s-adapter/gitops/) — build, push,
+             resolve digests, NO cluster contact. Alias: deploy --render-only
   emulate    Run the full infrastructure locally (Envoy + routing + pool server)
   rollback   Roll back to the previous deployment
   describe   Show architecture diagram with live cluster status
@@ -157,6 +167,14 @@ Options:
   --allow-mutable-tags     Deploy by image tag when no digest can be resolved
                               (NetworkPolicies skipped — the routing service stays
                               reachable from in-cluster pods; not recommended)
+  --previous-build <id>    The build the bundle's Service selectors stay pinned to (emit).
+                              Default: the prior bundle's emit-metadata.json. With neither,
+                              emit refuses — assert a genuine first deploy explicitly.
+  --first-deploy           Assert a genuine first deploy: selectors render at the NEW
+                              build (emit; never inferred from a missing prior bundle)
+  --secrets <mode>         external (default): omit secret templates from the bundle chart
+                              and emit an ExternalSecret placeholder + README key table.
+                              inline: verbatim chart with a loud warning (emit)
   --dry-run                Show what would be done without executing
 
 Flags may be given as --flag value or --flag=value. Boolean flags (e.g. --dry-run)
@@ -266,7 +284,30 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "emit":
     case "deploy": {
+      // `deploy --render-only` is the documented alias for `emit` (GitOps PR1, §4.2):
+      // both run the pipeline-safe steps and write the bundle, never touching a cluster.
+      if (command === "emit" || flags["render-only"] === true) {
+        const secrets = flags["secrets"] as string | undefined;
+        if (secrets !== undefined && secrets !== "external" && secrets !== "inline") {
+          throw new Error(
+            `Flag --secrets must be "external" or "inline" (got ${JSON.stringify(secrets)})`,
+          );
+        }
+        await runEmit({
+          projectDir,
+          releaseName,
+          skipBuild: flags["skip-build"] === true,
+          skipPush: flags["skip-push"] === true,
+          allowMutableTags: flags["allow-mutable-tags"] === true,
+          allowNoNetworkPolicy: flags["allow-no-network-policy"] === true,
+          previousBuild: flags["previous-build"] as string | undefined,
+          firstDeploy: flags["first-deploy"] === true,
+          ...(secrets ? { secrets } : {}),
+        });
+        break;
+      }
       await runDeploy({
         projectDir,
         releaseName,

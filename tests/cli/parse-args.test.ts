@@ -69,6 +69,28 @@ describe("parseArgs", () => {
     expect(flags["standard"]).toBe(true);
   });
 
+  it("recognizes the emit flags (GitOps PR1)", () => {
+    const { command, flags } = parseArgs(
+      argv("emit", "--first-deploy", "--secrets", "external", "--skip-push"),
+    );
+    expect(command).toBe("emit");
+    expect(flags["first-deploy"]).toBe(true);
+    expect(flags["secrets"]).toBe("external");
+    expect(flags["skip-push"]).toBe(true);
+  });
+
+  it("parses --previous-build and the deploy --render-only alias", () => {
+    const { command, flags } = parseArgs(
+      argv("deploy", "--render-only", "--previous-build=abc123"),
+    );
+    expect(command).toBe("deploy");
+    expect(flags["render-only"]).toBe(true);
+    expect(flags["previous-build"]).toBe("abc123");
+    // Value flag discipline: a missing value is a hard error, never a silent boolean —
+    // a --previous-build that parsed as `true` would defeat the N20 fail-closed pinning.
+    expect(() => parseArgs(argv("emit", "--previous-build"))).toThrow(/requires a value/);
+  });
+
   it("boolean flags reject an inline value with a warning but stay enabled", () => {
     // `--dry-run=false` must NOT disable dry-run — failing safe beats guessing intent.
     const { flags } = parseArgs(argv("destroy", "--dry-run=false"));

@@ -81,4 +81,21 @@ describe("generateBuildMetadata", () => {
         .poolImageLayout,
     ).toBe("shared-base-v1");
   });
+
+  // GitOps PR1: static NetworkPolicy ranges flow build → metadata → emit's values pinning
+  // (emit performs no discovery, so this hand-off is the only CIDR source it has).
+  it("records networkPolicy CIDRs when configured, omits empty/absent lists", () => {
+    const meta = JSON.parse(
+      generateBuildMetadata({
+        ...base,
+        nodeCidrs: ["10.0.0.0/16"],
+        podCidrs: ["10.8.0.0/14"],
+      }),
+    );
+    expect(meta.nodeCidrs).toEqual(["10.0.0.0/16"]);
+    expect(meta.podCidrs).toEqual(["10.8.0.0/14"]);
+    const bare = JSON.parse(generateBuildMetadata({ ...base, nodeCidrs: [], podCidrs: [] }));
+    expect(bare.nodeCidrs).toBeUndefined();
+    expect(bare.podCidrs).toBeUndefined();
+  });
 });

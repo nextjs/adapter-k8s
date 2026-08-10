@@ -154,6 +154,26 @@ export interface K8sAdapterConfig {
      */
     failureMode?: "auto" | "open" | "closed";
   };
+  /**
+   * Static NetworkPolicy source ranges, for pipelines with no cluster to ask.
+   *
+   * Imperative `deploy` DISCOVERS these at deploy time (gcloud on GKE, the Kubernetes API
+   * elsewhere) and never needs this block. `adapter-k8s emit` cannot: it renders with no
+   * cluster contact at all, so the CIDRs must be config-supplied (GitOps PR1 — see
+   * plans/gitops-deployment-strategies.md §4.2, deploy inventory A4 "replaced"). Both keys
+   * also flow into build-metadata.json, and deploy prefers them over live discovery the
+   * same way `provider.generic.nodeCidrs` already works — which this block supersedes
+   * (that key still maps in when this one is absent).
+   *
+   * The same staleness trade as provider.generic.nodeCidrs applies: a static range does
+   * not follow node autoscale. Give the enclosing subnet range(s), not per-node addresses.
+   */
+  networkPolicy?: {
+    /** Cluster pod range(s) for the broad (non-strict) posture's pod-isolation denylist. */
+    podCidrs?: string[];
+    /** Node/subnet range(s) the strict posture admits for kubelet probes (S22). */
+    nodeCidrs?: string[];
+  };
   /** Build-time Kubernetes composition. Legacy `provider` blocks are translated into this. */
   target?: KubernetesTargetDefinition;
   /** @deprecated Use `target: defineTarget(...)`. */
