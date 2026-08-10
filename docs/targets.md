@@ -117,7 +117,7 @@ Notes on this journey:
 - **`host.tls.enabled`** only informs post-deploy verification (which scheme to probe); it has no structural effect — termination is the parent's.
 - **No HTTP→HTTPS redirect route is emitted.** On a typical fleet the shared gateway's http listener already carries a fleet-wide redirect; a per-app redirect would require the owner to permit a second attach on the http listener and buys nothing there.
 - **Escaped slashes**: `gatewayApiExposure` + `envoyNativeRouting` normally emits a `ClientTrafficPolicy` (`escapedSlashesAction: KeepUnchanged`) for `next start` parity on paths like `/a%2Fb`. A ClientTrafficPolicy is Gateway-scoped and namespace-local, so it **cannot** reach a shared Gateway in another namespace — and Envoy Gateway rejects a second conflicting CTP per listener anyway. With a cross-namespace parent, the policy is suppressed automatically and an explicit `escapedSlashes: "policy"` is a build error. Escaped-slash parity becomes a documented requirement on the shared gateway's owner (a CTP or EnvoyPatchPolicy in the gateway's namespace).
-- **Envoy Gateway version floor** for `envoyNativeRouting` on this exposure: the EnvoyExtensionPolicy attaches to the app's HTTPRoute by name (route-scoped ext_proc — the callout fires only for this app's route, not every app on the shared gateway). Route-targeted ext_proc requires **Envoy Gateway ≥ 1.1.0**; the adapter's proven baseline is v1.5.4.
+- **Envoy Gateway version floor** for `envoyNativeRouting` on this exposure: the EnvoyExtensionPolicy attaches to the app's HTTPRoute by name (route-scoped ext_proc — the callout fires only for this app's route, not every app on the shared gateway). Route-targeted ext_proc requires **Envoy Gateway ≥ 1.1.0**; the adapter's live-verified range is **>=1.5.4 <1.9** (see [Envoy Gateway native routing](#envoy-gateway-native-routing)).
 
 ### NetworkPolicy under `strict` with a shared gateway
 
@@ -197,6 +197,18 @@ target: defineTarget({
 ```
 
 - **Gateway class** must be controlled by `gateway.envoyproxy.io/gatewayclass-controller`—`deploy` verifies the extension policy reports `Accepted=True` before cutting traffic. A non-Envoy class would program the Gateway and then silently never call the routing service.
+- **Verified Envoy Gateway range: >=1.5.4 <1.9.** The adapter's full surface (ext_proc, ClientTrafficPolicy, deploy gates, cutover, rollback) is live-verified on Envoy Gateway v1.5.4, v1.5.5, and v1.8.3 — identical manifests Accepted on all, no adapter-visible behavior change between 1.5.5 and 1.8.3 (1.6/1.7 are untested but inside the range). `deploy` and `doctor` print a soft warning (never a failure) when the detected controller image is outside this range.
+- **Upgrading Envoy Gateway 1.5.x → 1.8.x in place: apply the CRDs first.** `helm upgrade` never touches the chart's `crds/` subchart, and Envoy Gateway ≥ 1.8 unconditionally watches `ListenerSet` — so an in-place upgrade crashloops the new controller with `no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"`. Server-side-apply the chart's CRD bundle **before** upgrading the controller (verified live: applied over live CRDs with no data loss, traffic served throughout):
+
+  ```bash
+  helm pull oci://docker.io/envoyproxy/gateway-helm --version v1.8.3 --untar
+  kubectl apply --server-side --force-conflicts -f gateway-helm/charts/crds/crds/gatewayapi-crds.yaml
+  kubectl apply --server-side --force-conflicts -f gateway-helm/charts/crds/crds/generated/
+  ```
+
+  `doctor` reports the ListenerSet CRD's presence as an informational line when the controller is ≥ 1.8.
+
+- **An explicit `ingressSources` override replaces the strict default entirely** — including the two proxy-pod selector sets the adapter emits by default (the per-gateway `owning-gateway-{name,namespace}` pair AND the merged-mode `owning-gatewayclass` label). Non-merged proxy pods carry only the per-gateway pair, never the class label (verified in Envoy Gateway source at v1.5.5 and v1.8.3: the class label is applied only under `mergeGateways`). An override listing only the class label therefore blocks Envoy→ext_proc under `networkPolicy.strict`, and because the routing tier fails closed when the app has middleware, the symptom is total: every request returns 500 (`ext_proc_error_gRPC_error_14`) and pool traffic 503s. If you override `ingressSources`, include the per-gateway labels (`gateway.envoyproxy.io/owning-gateway-name: <release>-gateway`, `gateway.envoyproxy.io/owning-gateway-namespace: <ns>`) unless the EnvoyProxy resource sets `mergeGateways: true`.
 - **NetworkPolicy** is what isolates the routing tier in-cluster, so your CNI must enforce it (verified on Cilium). The in-cluster callout is plain h2c; reachability to the routing service is equivalent to holding the dispatch credential. See [SECURITY.md](../SECURITY.md#generic-clusters-envoy-gateway).
 - **Node CIDRs.** Left unconfigured, `deploy` discovers the node addresses and allows exactly those—correct, but a snapshot: a node added afterwards can't probe the pods it hosts, so they never become ready. On any cluster that autoscales or replaces nodes, pin the node subnet with a static CIDR source on the cluster component (or `nodeCidrs` in the legacy `provider.generic` block).
 - **Failure mode** follows the routing-service policy: fail-closed when the app has middleware, fail-open otherwise. See [routing service tuning](./configuration.md#routing-service-tuning).

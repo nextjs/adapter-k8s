@@ -80,6 +80,17 @@ cache: {
 
 Managed provisioning is currently supplied only by the GKE preset, and only through the legacy `provider.gke` config shape (which is what `init` scaffolds). An explicit `target: defineTarget(...)` composition—including one built on `gkeCluster()`—must set `cache.url` when the cache is enabled; the build fails otherwise. Every other target uses `cache.url` against an operator-managed Valkey/Redis endpoint. Disabling the cache makes ISR/PPR revalidation per-replica.
 
+### Dragonfly (verified)
+
+[Dragonfly](https://www.dragonflydb.io/) works as the `valkey`/`redis` provider endpoint: **fully compatible, verified live on v1.40.1** across the handler's entire wire surface — GET/SET EX/SET NX EX (the revalidation lock), hashes, MULTI/EXEC transactional entry writes, binary payloads up to the handlers' 16 MiB cap, the tag-manifest Lua script (including its server-`TIME` clock rebasing and `cjson`), 1-year TTLs, and AUTH via `requirepass`. Cross-pod ISR, `revalidatePath`, and `revalidateTag` all behaved identically to Valkey in a live multi-pod app.
+
+Operational caveats:
+
+- **Memory sizing is thread-coupled.** Dragonfly refuses to start unless `--maxmemory >= 256MiB × proactor_threads` (measured: 2 threads with `--maxmemory=256mb` crashloops with "There are 2 threads, so 512.00MiB are required. Exiting"). Pin both flags in the pod spec — e.g. `--proactor_threads=2 --maxmemory=512mb` with a 768Mi container limit.
+- **A restart is a cold cache.** The stock container has no persistence volume, so a Dragonfly pod restart returns an empty keyspace. The adapter degrades gracefully — cache reads degrade to a miss on store failure (the pods log `read failed; treating it as a miss`, then open a circuit breaker and fail fast; no pod restarts), pages re-render and re-populate the store — but on large sites that warm-up is a thundering re-render. Use the Dragonfly operator's snapshotting if that matters.
+- **Do not enable `--cluster_mode`.** The adapter's client is single-endpoint by design (no MOVED/ASK redirection). Dragonfly's emulated cluster mode is off by default, which is exactly what the client needs.
+- **Password via Secret, not config.** `redis://:pass@…` in `cache.url` works, but `adapter.config.mjs` is typically committed — keep the URL secret-free and deliver the password through the generated Valkey `Secret` / `VALKEY_AUTH` env path instead (see the note on `cache.password` above).
+
 ## Container strategy
 
 ```js

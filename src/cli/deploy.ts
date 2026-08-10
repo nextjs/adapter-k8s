@@ -113,6 +113,7 @@ import {
   preflightCompositionPlan,
   waitForCompositionPlanReadiness,
 } from "./composition-plan.js";
+import { evaluateEnvoyGatewayPreflight } from "./envoy-gateway-preflight.js";
 
 /**
  * How long to wait for a Deployment rollout.
@@ -1129,6 +1130,17 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             .map((entry) => `${entry.apiVersion}/${entry.resource}`)
             .join(", ")}`,
         );
+      }
+      // Soft Envoy Gateway compat information (live-verified controller range +
+      // the 1.8 ListenerSet CRD install-order trap). WARN-only by design: an
+      // out-of-range controller is unverified, not known-broken, so it must never
+      // block a deploy. Silent when the target doesn't use Envoy Gateway or the
+      // controller image is not detectable.
+      for (const check of await evaluateEnvoyGatewayPreflight(compositionSnapshot.plan)) {
+        if (check.status === "warn") {
+          console.warn(`  ! ${check.name}: ${check.message}`);
+          if (check.fix) console.warn(`    Fix: ${check.fix}`);
+        }
       }
     }
   } else {

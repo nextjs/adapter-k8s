@@ -61,6 +61,22 @@ Common causes, verbatim from the deploy error: the GatewayClass controller is no
 
 **Fail-closed is expected.** With the routing service scaled to zero, requests return 500 rather than serving with middleware skipped (`routingService.failureMode: "auto"` fails closed whenever the app has middleware). A wall of 500s with healthy pools means the routing tier is down, not the app.
 
+**Every request 500s (`ext_proc_error_gRPC_error_14`) after overriding `ingressSources`.** Observed live on Envoy Gateway 1.8.3: a hand-written `ingressSources` podSelector admitted only the `gateway.envoyproxy.io/owning-gatewayclass` label. Non-merged Envoy proxy pods carry the `owning-gateway-name`/`owning-gateway-namespace` pair and **not** the class label (identical in Envoy Gateway 1.5.5 and 1.8.3 — the class label is applied only under `mergeGateways`), so strict NetworkPolicy blocked Envoy→ext_proc — fail-closed 500 on every request, plus 503 on Envoy→pool. The adapter's default emits BOTH selector sets; an explicit `ingressSources` override replaces that default entirely. Fix: add the per-gateway labels (`owning-gateway-name: <release>-gateway`, `owning-gateway-namespace: <ns>`) to the override, or delete the override to restore the default.
+
+```bash
+kubectl get pods -n envoy-gateway-system --show-labels | grep owning-gateway
+kubectl get networkpolicy -n <ns> -o yaml | grep -A6 podSelector
+```
+
+**Envoy Gateway controller CrashLoopBackOff right after a 1.5.x → 1.8.x helm upgrade.** Controller log: `no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"`. Envoy Gateway ≥ 1.8 unconditionally watches ListenerSet, but `helm upgrade` never touches the chart's `crds/` subchart, so an in-place upgrade leaves the old CRDs behind. Doctor surfaces this as the `ListenerSet CRD` line when the controller is ≥ 1.8. Fix (verified live — server-side apply over live CRDs, no data loss, traffic served throughout):
+
+```bash
+helm pull oci://docker.io/envoyproxy/gateway-helm --version v1.8.3 --untar
+kubectl apply --server-side --force-conflicts -f gateway-helm/charts/crds/crds/gatewayapi-crds.yaml
+kubectl apply --server-side --force-conflicts -f gateway-helm/charts/crds/crds/generated/
+kubectl delete pod -n envoy-gateway-system -l control-plane=envoy-gateway   # restart the crashlooping controller
+```
+
 ## Service selector drain (503 while everything looks green)
 
 Doctor signature: `Active Service endpoints: <svc>: FAIL — 0 ready endpoints — selector matches no ready pods (origin will 503)`.

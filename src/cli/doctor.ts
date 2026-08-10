@@ -20,6 +20,7 @@ import {
   loadProjectCompositionPlan,
   preflightCompositionPlan,
 } from "./composition-plan.js";
+import { evaluateEnvoyGatewayPreflight } from "./envoy-gateway-preflight.js";
 
 // Name the file in parse errors — a bare SyntaxError from JSON.parse gives no clue
 // WHICH file is corrupt.
@@ -533,6 +534,11 @@ export async function runDoctor(options: {
               fix: "Install the missing API/controller or rebuild for this cluster",
             });
           }
+          // Soft Envoy Gateway compat information (live-verified range + the
+          // 1.8 helm-upgrade-doesn't-upgrade-CRDs ListenerSet trap). Never fails;
+          // silent when the target doesn't use Envoy Gateway or no controller is
+          // detectable.
+          results.push(...(await evaluateEnvoyGatewayPreflight(snapshot.plan)));
           results.push(...(await evaluateCompositionPlanReadiness(snapshot.plan)));
           results.push(...(await evaluateCompositionPlanDiagnostics(snapshot.plan)));
         }
