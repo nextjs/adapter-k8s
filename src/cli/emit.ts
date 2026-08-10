@@ -94,6 +94,16 @@ export interface EmitMetadata {
   emitVersion: number;
   buildId: string;
   previousBuildId: string | null;
+  /**
+   * The default pool the bundle's `activeDefaultPool` was pinned to (null on first
+   * deploy). Recorded so a RE-EMIT of the same build reproduces the same pin: the
+   * previous build's default pool exists nowhere else once the prior bundle has been
+   * replaced wholesale — `defaultPool` below describes THIS build, and without this
+   * field a re-emit after a pool rename silently flipped `activeDefaultPool` to the new
+   * build's pool, pairing it with the still-previous `activeBuildId` in the origin
+   * Service selector (a pair that matches nothing — zero endpoints at sync time).
+   */
+  previousDefaultPool?: string | null;
   releaseName: string;
   namespace: string;
   registry: string;
@@ -153,6 +163,10 @@ export function readPriorBundleMetadata(
   // resource-name comparisons.
   assertSafeBuildId(meta.buildId);
   if (meta.previousBuildId != null) assertSafeBuildId(meta.previousBuildId);
+  // Same rule for the pool names this file can feed into values.activeDefaultPool (the
+  // origin Service selector) and the cross-build name comparisons.
+  if (meta.defaultPool !== undefined) assertSafePoolName(meta.defaultPool);
+  if (meta.previousDefaultPool != null) assertSafePoolName(meta.previousDefaultPool);
   // A bundle emitted for another release/namespace must never supply THIS release's
   // previous build — same cross-wiring hazard the variant-scoped state file closes.
   if (meta.releaseName !== undefined && meta.releaseName !== expected.releaseName) {
@@ -230,12 +244,18 @@ export function resolvePreviousBuildId(opts: {
       );
     }
     if (priorBundle.buildId === buildId) {
-      // Re-emit of the same build: reproduce the same bundle, byte-identical.
+      // Re-emit of the same build: reproduce the same bundle, byte-identical. The
+      // previous build's default pool comes from the prior bundle's OWN recorded pin
+      // (previousDefaultPool) — its `defaultPool` describes THIS build, and falling back
+      // to it after a pool rename would flip activeDefaultPool to the new build's pool
+      // while activeBuildId stays at the previous build: an origin-Service selector pair
+      // that matches nothing. The poolTopology likewise describes THIS build, so the
+      // cross-build collision check has nothing new to compare.
       return {
         previousBuildId: priorBundle.previousBuildId,
-        // The re-emitted bundle keeps pinning to the same previous build's default pool;
-        // the prior bundle's poolTopology describes THIS build, not the previous one, so
-        // the cross-build collision check has nothing new to compare.
+        ...(priorBundle.previousDefaultPool != null
+          ? { previousDefaultPool: priorBundle.previousDefaultPool }
+          : {}),
       };
     }
     return {
@@ -595,10 +615,14 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     }
   }
   values.activeBuildId = sanitizeK8sName(previousBuildId ?? buildId);
+  // The pin actually written (recorded in emit-metadata.json as previousDefaultPool so a
+  // re-emit of the same build reproduces it byte-identically — see EmitMetadata).
+  let pinnedDefaultPool: string | null = null;
   if (values.activeDefaultPool !== undefined) {
     values.activeDefaultPool = previousBuildId
       ? (previousDefaultPool ?? (values.activeDefaultPool as string))
       : (defaultPool as string);
+    if (previousBuildId) pinnedDefaultPool = values.activeDefaultPool as string;
   }
   const valuesPath = path.join(bundleDir, "values", "values.yaml");
   writeFileSync(valuesPath, header + JSON.stringify(values, null, 2));
@@ -653,6 +677,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     emitVersion: EMIT_VERSION,
     buildId,
     previousBuildId,
+    ...(pinnedDefaultPool !== null ? { previousDefaultPool: pinnedDefaultPool } : {}),
     releaseName,
     namespace,
     registry,

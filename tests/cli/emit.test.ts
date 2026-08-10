@@ -309,6 +309,39 @@ describe("previous-build semantics (N20's new front door)", () => {
     priorBundleFixture({ defaultPool: "api", poolTopology: ["ssr", "api"] });
     await runEmit(baseOptions());
     expect(bundleValues().activeDefaultPool).toBe("api");
+    // Recorded so a re-emit of the same build can reproduce the pin (the previous build's
+    // default pool exists nowhere else after the wholesale bundle replace).
+    expect(bundleMetadata().previousDefaultPool).toBe("api");
+  });
+
+  it("a RE-EMIT keeps activeDefaultPool at the PREVIOUS build's pool after a default-pool rename", async () => {
+    // The prior bundle's `defaultPool` describes the bundle's OWN build. On a re-emit of
+    // the same build after a pool rename, falling back to it would flip activeDefaultPool
+    // to the NEW build's pool while activeBuildId stays at the previous build — an
+    // origin-Service selector pair that matches nothing (zero endpoints at sync time),
+    // and a broken byte-idempotence guarantee. The recorded previousDefaultPool is what
+    // makes the second emit reproduce the first.
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    // Previous build's default pool was "legacy"; this build's is "ssr".
+    priorBundleFixture({ defaultPool: "legacy", poolTopology: ["legacy"] });
+    await runEmit(baseOptions());
+    expect(bundleValues().activeDefaultPool).toBe("legacy");
+
+    // Second emit consumes the FIRST bundle (same buildId) — must reproduce the pin.
+    await runEmit(baseOptions());
+    expect(bundleValues().activeBuildId).toBe(PREV_BUILD);
+    expect(bundleValues().activeDefaultPool).toBe("legacy");
+    expect(bundleMetadata().previousDefaultPool).toBe("legacy");
+  });
+
+  it("rejects a prior bundle whose previousDefaultPool fails the pool-name charset (selector sink)", () => {
+    priorBundleFixture({ previousDefaultPool: "bad pool{{ }}" } as never);
+    expect(() =>
+      readPriorBundleMetadata(path.join(projectDir, ".k8s-adapter", "gitops"), {
+        releaseName: RELEASE,
+        namespace: "default",
+      }),
+    ).toThrow(/pool/i);
   });
 });
 
