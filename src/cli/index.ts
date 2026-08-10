@@ -49,6 +49,8 @@ const VALUE_FLAGS = new Set([
   "port",
   // GitOps PR1 (emit): the previous-build pin and the secret externalization mode.
   "previous-build",
+  // Split app/cluster repos (gap #7): path to the prior bundle in a foreign checkout.
+  "previous-bundle",
   "secrets",
   // --secrets sops: explicit sops config path (default: walk up from the bundle dir).
   "sops-config",
@@ -172,6 +174,12 @@ Options:
   --previous-build <id>    The build the bundle's Service selectors stay pinned to (emit).
                               Default: the prior bundle's emit-metadata.json. With neither,
                               emit refuses — assert a genuine first deploy explicitly.
+  --previous-bundle <path> Path to the PRIOR bundle in another checkout (emit; split
+                              app/cluster repos): the bundle directory or its
+                              emit-metadata.json. Authoritative — the same-repo lookup
+                              is skipped, and a missing/unreadable path is a hard error,
+                              never a first deploy. Contradicts --previous-build and
+                              --first-deploy.
   --first-deploy           Assert a genuine first deploy: selectors render at the NEW
                               build (emit; never inferred from a missing prior bundle)
   --secrets <mode>         external (default): omit secret templates from the bundle chart
@@ -321,6 +329,9 @@ async function main(): Promise<void> {
           allowNoNetworkPolicy: flags["allow-no-network-policy"] === true,
           previousBuild: flags["previous-build"] as string | undefined,
           firstDeploy: flags["first-deploy"] === true,
+          ...(flags["previous-bundle"] !== undefined
+            ? { previousBundle: flags["previous-bundle"] as string }
+            : {}),
           ...(secrets ? { secrets } : {}),
           ...(sopsConfig !== undefined ? { sopsConfig } : {}),
         });

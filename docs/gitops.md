@@ -82,11 +82,29 @@ Mode `none` is exactly the ci-cd.md flow with rendered inputs: emit replaces the
 
 The bundle's `activeBuildId` pins to the previous build, so emit must know it:
 
-1. `--previous-build <id>` — explicit.
-2. Otherwise the prior bundle's `emit-metadata.json` in `.k8s-adapter/gitops/` (the normal CI flow: the last committed bundle is checked out).
-3. Otherwise emit **refuses**. "No prior bundle found" is _not_ "first deploy"—a shallow, sparse, or wrong-directory checkout looks exactly like a first deploy, and rendering first-deploy semantics against a serving cluster pins the selectors at the unverified new build. Assert a genuine first deploy explicitly with `--first-deploy`.
+1. `--previous-bundle <path>` — the prior bundle in **another checkout** (split app/cluster repos, below). Authoritative when given: the same-repo lookup is skipped, and a missing or unreadable path is a hard error—never a fallback.
+2. `--previous-build <id>` — explicit bare id.
+3. Otherwise the prior bundle's `emit-metadata.json` in `.k8s-adapter/gitops/` (the monorepo CI flow: the last committed bundle is checked out).
+4. Otherwise emit **refuses**. "No prior bundle found" is _not_ "first deploy"—a shallow, sparse, or wrong-directory checkout looks exactly like a first deploy, and rendering first-deploy semantics against a serving cluster pins the selectors at the unverified new build. Assert a genuine first deploy explicitly with `--first-deploy`.
 
-A present-but-corrupt prior bundle is an error, never a first deploy. Re-emitting the same build reuses the prior bundle's own previous-build pointer, so re-emits are byte-idempotent (the re-emit diff is the audit for chart determinism).
+A present-but-corrupt prior bundle is an error, never a first deploy. Re-emitting the same build reuses the prior bundle's own previous-build pointer, so re-emits are byte-idempotent (the re-emit diff is the audit for chart determinism). `--previous-bundle` contradicts `--first-deploy` (one names a prior bundle, the other asserts none exists) and `--previous-build` (two sources of truth); either pair is refused.
+
+## Split app/cluster repos (`--previous-bundle`)
+
+When the app repo runs CI/`emit` and a separate cluster repo holds the committed bundles, the same-repo lookup never finds a prior bundle—every emit would look like a first deploy and refuse. Point emit at the cluster-repo checkout instead:
+
+```yaml
+# app-repo CI (shape, not a literal workflow)
+- checkout: cluster-repo # e.g. into ../cluster-repo
+- run: npx adapter-k8s emit \
+    --previous-bundle ../cluster-repo/apps/myapp/.k8s-adapter/gitops
+- run: | # replace the cluster repo's bundle WHOLESALE
+    rm -rf ../cluster-repo/apps/myapp/.k8s-adapter/gitops
+    cp -R .k8s-adapter/gitops ../cluster-repo/apps/myapp/.k8s-adapter/gitops
+- commit + PR against cluster-repo
+```
+
+The path may name the bundle directory or its `emit-metadata.json` directly (relative paths resolve against the project directory). The foreign bundle passes the **same** validation battery as a same-repo one—wrong release, wrong namespace, newer `emitVersion`, or corrupt JSON are refusals, and its `previousDefaultPool` is consumed identically on a re-emit of the same build. The flag is fail-closed in the direction that matters for CI: a wrong path (or a checkout step that silently didn't run) is a hard error, never silently treated as a first deploy. The genuine first deploy of a split-repo release uses `--first-deploy` with no `--previous-bundle`.
 
 ## Secrets
 

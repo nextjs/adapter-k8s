@@ -91,6 +91,15 @@ describe("parseArgs", () => {
     expect(() => parseArgs(argv("emit", "--previous-build"))).toThrow(/requires a value/);
   });
 
+  it("parses --previous-bundle as a value flag (split app/cluster repos — gap #7)", () => {
+    const { flags } = parseArgs(
+      argv("emit", "--previous-bundle", "../cluster-repo/apps/myapp/.k8s-adapter/gitops"),
+    );
+    expect(flags["previous-bundle"]).toBe("../cluster-repo/apps/myapp/.k8s-adapter/gitops");
+    // Same value-flag discipline: a bare flag is a hard error, never a silent boolean.
+    expect(() => parseArgs(argv("emit", "--previous-bundle"))).toThrow(/requires a value/);
+  });
+
   it("boolean flags reject an inline value with a warning but stay enabled", () => {
     // `--dry-run=false` must NOT disable dry-run — failing safe beats guessing intent.
     const { flags } = parseArgs(argv("destroy", "--dry-run=false"));

@@ -22,6 +22,7 @@ import {
   EMIT_VERSION,
   findSopsConfig,
   parseChartValues,
+  readPreviousBundleMetadata,
   readPriorBundleMetadata,
   renderBundleReadme,
   renderRenovateFence,
@@ -368,6 +369,208 @@ describe("previous-build semantics (N20's new front door)", () => {
         namespace: "default",
       }),
     ).toThrow(/pool/i);
+  });
+});
+
+// --previous-bundle (split app/cluster repos — real-cluster gap #7): the prior bundle
+// lives in ANOTHER repo's checkout. The flag is authoritative (same-repo lookup skipped)
+// and fail-closed (missing/unreadable path is a hard error, never first-deploy).
+describe("--previous-bundle (split app/cluster repos — gap #7)", () => {
+  let clusterDir: string;
+
+  beforeEach(() => {
+    clusterDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-cluster-repo-"));
+  });
+  afterEach(() => rmSync(clusterDir, { recursive: true, force: true }));
+
+  /** Write a prior bundle into the FOREIGN (cluster-repo) checkout. */
+  function foreignBundleFixture(overrides?: Partial<EmitMetadata>): string {
+    const bundleDir = path.join(clusterDir, "apps", RELEASE, ".k8s-adapter", "gitops");
+    mkdirSync(bundleDir, { recursive: true });
+    writeFileSync(
+      path.join(bundleDir, "emit-metadata.json"),
+      JSON.stringify({
+        emitVersion: EMIT_VERSION,
+        buildId: PREV_BUILD,
+        previousBuildId: null,
+        releaseName: RELEASE,
+        namespace: "default",
+        registry: REGISTRY,
+        digests: {},
+        cdnTag: "build-" + "0".repeat(64),
+        poolTopology: ["ssr"],
+        defaultPool: "ssr",
+        targetPlatforms: { [PREV_BUILD]: "linux/amd64" },
+        secretsMode: "external",
+        ...overrides,
+      }),
+    );
+    return bundleDir;
+  }
+
+  it("reads the previous build AND default pool from the foreign bundle (happy path)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture({ defaultPool: "api", poolTopology: ["ssr", "api"] });
+    await runEmit({ ...baseOptions(), previousBundle: foreign });
+    expect(bundleValues().activeBuildId).toBe(PREV_BUILD);
+    // The previous build's default pool pins alongside the selector — identical to the
+    // same-repo path's consumption.
+    expect(bundleValues().activeDefaultPool).toBe("api");
+    const meta = bundleMetadata();
+    expect(meta.previousBuildId).toBe(PREV_BUILD);
+    expect(meta.previousDefaultPool).toBe("api");
+  });
+
+  it("accepts a path directly to the foreign bundle's emit-metadata.json", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture();
+    await runEmit({
+      ...baseOptions(),
+      previousBundle: path.join(foreign, "emit-metadata.json"),
+    });
+    expect(bundleValues().activeBuildId).toBe(PREV_BUILD);
+    expect(bundleMetadata().previousBuildId).toBe(PREV_BUILD);
+  });
+
+  it("SKIPS the same-repo lookup entirely when the flag is set (a corrupt same-repo bundle would otherwise throw)", async () => {
+    // Behavioral spy: a present-but-corrupt SAME-repo bundle is a guaranteed throw for
+    // the same-repo lookup (readPriorBundleMetadata fail-closed). Success here proves
+    // that lookup was never consulted — the flag is the single source of truth.
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const sameRepoBundle = path.join(projectDir, ".k8s-adapter", "gitops");
+    mkdirSync(sameRepoBundle, { recursive: true });
+    writeFileSync(path.join(sameRepoBundle, "emit-metadata.json"), "{ truncated");
+    const foreign = foreignBundleFixture();
+    await runEmit({ ...baseOptions(), previousBundle: foreign });
+    expect(bundleMetadata().previousBuildId).toBe(PREV_BUILD);
+  });
+
+  it("a MISSING path is a hard error — never a fallback to the same-repo bundle or first-deploy", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    // A perfectly valid same-repo prior bundle exists — falling back to it would succeed,
+    // so a refusal proves the flag never falls back.
+    priorBundleFixture();
+    await expect(
+      runEmit({ ...baseOptions(), previousBundle: path.join(clusterDir, "no-such-dir") }),
+    ).rejects.toThrow(/names no prior bundle/);
+    await expect(
+      runEmit({ ...baseOptions(), previousBundle: path.join(clusterDir, "no-such-dir") }),
+    ).rejects.toThrow(/NOT a first deploy/);
+    // The same-repo bundle was NOT consumed and nothing was replaced: the fixture's
+    // metadata is still exactly what priorBundleFixture wrote.
+    expect(bundleMetadata().buildId).toBe(PREV_BUILD);
+  });
+
+  it("a corrupt foreign emit-metadata.json throws — it is not a first deploy", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture();
+    writeFileSync(path.join(foreign, "emit-metadata.json"), "{ truncated");
+    await expect(runEmit({ ...baseOptions(), previousBundle: foreign })).rejects.toThrow(
+      /NOT a first deploy/,
+    );
+  });
+
+  it("a foreign bundle from ANOTHER release is refused (same battery as same-repo)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture({ releaseName: "other-app" });
+    await expect(runEmit({ ...baseOptions(), previousBundle: foreign })).rejects.toThrow(
+      /emitted for release "other-app"/,
+    );
+  });
+
+  it("a foreign bundle from ANOTHER namespace is refused", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture({ namespace: "staging" });
+    await expect(runEmit({ ...baseOptions(), previousBundle: foreign })).rejects.toThrow(
+      /emitted for namespace "staging"/,
+    );
+  });
+
+  it("a foreign bundle with a NEWER emitVersion is refused (unknowable layout)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture({ emitVersion: EMIT_VERSION + 1 });
+    await expect(runEmit({ ...baseOptions(), previousBundle: foreign })).rejects.toThrow(
+      /emitVersion/,
+    );
+  });
+
+  it("--previous-bundle + --first-deploy contradict and refuse (before any work)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture();
+    await expect(
+      runEmit({ ...baseOptions(), previousBundle: foreign, firstDeploy: true }),
+    ).rejects.toThrow(/contradict/);
+    expect(existsSync(path.join(projectDir, ".k8s-adapter", "gitops"))).toBe(false);
+  });
+
+  it("--previous-bundle + --previous-build contradict and refuse (one source of truth)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture();
+    await expect(
+      runEmit({ ...baseOptions(), previousBundle: foreign, previousBuild: PREV_BUILD }),
+    ).rejects.toThrow(/both given|two sources of truth/);
+    expect(existsSync(path.join(projectDir, ".k8s-adapter", "gitops"))).toBe(false);
+  });
+
+  it("N14 still fires: a foreign bundle whose previous-build pointer equals the new build is refused", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    // A hand-edited/corrupted cluster-repo bundle recording the new build as both its own
+    // and its previous build — the re-emit path consumes previousBuildId, and the N14
+    // guard must still catch the identical-build result.
+    const foreign = foreignBundleFixture({ buildId: BUILD, previousBuildId: BUILD });
+    await expect(runEmit({ ...baseOptions(), previousBundle: foreign })).rejects.toThrow(
+      /IDENTICAL to the currently-serving build/,
+    );
+  });
+
+  it("re-emitting the SAME build via the foreign bundle reuses its own previousBuildId and previousDefaultPool", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture({
+      buildId: BUILD,
+      previousBuildId: PREV_BUILD,
+      previousDefaultPool: "legacy",
+      defaultPool: "ssr",
+    });
+    await runEmit({ ...baseOptions(), previousBundle: foreign });
+    expect(bundleValues().activeBuildId).toBe(PREV_BUILD);
+    expect(bundleValues().activeDefaultPool).toBe("legacy");
+    expect(bundleMetadata().previousDefaultPool).toBe("legacy");
+  });
+
+  it("runs the CROSS-BUILD collision guard against the foreign bundle's recorded topology", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    // Same class as the same-repo test: differs by case, collides after sanitization.
+    const foreign = foreignBundleFixture({ buildId: "Build2abc" });
+    await expect(runEmit({ ...baseOptions(), previousBundle: foreign })).rejects.toThrow(
+      /collides with the currently-serving build/,
+    );
+  });
+
+  it("the bundle README documents the split-repo CI recipe with --previous-bundle", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    const foreign = foreignBundleFixture();
+    await runEmit({ ...baseOptions(), previousBundle: foreign });
+    const readme = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "README.md"),
+      "utf-8",
+    );
+    expect(readme).toContain("## CI recipe (split app/cluster repos)");
+    expect(readme).toContain("--previous-bundle");
+    expect(readme).toContain(`../cluster-repo/apps/${RELEASE}/.k8s-adapter/gitops`);
+    // The fail-closed posture is stated where the CI author reads it.
+    expect(readme).toMatch(/never treated as a first deploy|hard error/);
+  });
+
+  it("readPreviousBundleMetadata unit: dir path and metadata path resolve identically; missing throws", () => {
+    const foreign = foreignBundleFixture();
+    const expected = { releaseName: RELEASE, namespace: "default" };
+    expect(readPreviousBundleMetadata(foreign, expected).buildId).toBe(PREV_BUILD);
+    expect(
+      readPreviousBundleMetadata(path.join(foreign, "emit-metadata.json"), expected).buildId,
+    ).toBe(PREV_BUILD);
+    expect(() => readPreviousBundleMetadata(path.join(clusterDir, "absent"), expected)).toThrow(
+      /names no prior bundle/,
+    );
   });
 });
 

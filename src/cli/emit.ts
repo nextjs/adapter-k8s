@@ -86,6 +86,15 @@ export interface EmitOptions {
    * see resolvePreviousBuildId below (N20's new front door).
    */
   firstDeploy?: boolean;
+  /**
+   * --previous-bundle <path> (split app/cluster repos — real-cluster gap #7): path to the
+   * PRIOR bundle's directory, or directly to its emit-metadata.json, in another repo's
+   * checkout (the cluster repo holding committed bundles). AUTHORITATIVE when given: the
+   * same-repo lookup at .k8s-adapter/gitops/ is skipped entirely, and a missing or
+   * unreadable path is a hard error — never a fallback. Contradicts --first-deploy and
+   * --previous-build. See readPreviousBundleMetadata.
+   */
+  previousBundle?: string;
   /** Default: external — the bundle chart carries no secret material (§3 item 3). */
   secrets?: EmitSecretsMode;
   /**
@@ -214,6 +223,43 @@ export function readPriorBundleMetadata(
     }
   }
   return meta as EmitMetadata;
+}
+
+/**
+ * `--previous-bundle <path>` (real-cluster gap #7): read the prior bundle from a FOREIGN
+ * checkout — the split app/cluster-repo flow, where the app repo runs CI/emit and the
+ * cluster repo holds the committed bundles, so the same-repo lookup at
+ * `.k8s-adapter/gitops/` always looks like a first deploy.
+ *
+ * The path names either the bundle DIRECTORY or its emit-metadata.json directly; both
+ * resolve to the same read. Validation is readPriorBundleMetadata — the SAME fail-closed
+ * battery the same-repo path runs (wrong release/namespace/emitVersion refusals,
+ * previousDefaultPool consumption), not a parallel copy.
+ *
+ * Fail-closed, stricter than the same-repo lookup: the flag ASSERTS a prior bundle
+ * exists, so a missing or unreadable path is a HARD error — never null, never a fallback
+ * to the same-repo lookup or to first-deploy semantics. (A wrong --previous-bundle path
+ * in CI is exactly the shallow-checkout shape N20 fails closed against.)
+ */
+export function readPreviousBundleMetadata(
+  previousBundlePath: string,
+  expected: { releaseName: string; namespace: string },
+): EmitMetadata {
+  const resolved = path.resolve(previousBundlePath);
+  const bundleDir =
+    path.basename(resolved) === "emit-metadata.json" ? path.dirname(resolved) : resolved;
+  const meta = readPriorBundleMetadata(bundleDir, expected);
+  if (meta === null) {
+    throw new Error(
+      `--previous-bundle ${JSON.stringify(previousBundlePath)} names no prior bundle: ` +
+        `${path.join(bundleDir, "emit-metadata.json")} does not exist. The flag asserts a ` +
+        `prior bundle — a missing one is NOT a first deploy (a wrong path or a shallow ` +
+        `cluster-repo checkout looks exactly like this). Fix the path (it must point at ` +
+        `the bundle directory or its emit-metadata.json in the cluster-repo checkout), ` +
+        `or — for a genuine first deploy — drop the flag and pass --first-deploy.`,
+    );
+  }
+  return meta;
 }
 
 /**
@@ -458,7 +504,25 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     allowNoNetworkPolicy,
     previousBuild,
     firstDeploy,
+    previousBundle,
   } = options;
+  // --previous-bundle contradictions — refused HERE, before any build/push cost. Each
+  // pair has two sources of truth for the same fact; guessing which wins is exactly how
+  // a CI variable typo turns into wrong selector semantics.
+  if (previousBundle !== undefined && firstDeploy) {
+    throw new Error(
+      `--previous-bundle and --first-deploy contradict each other: one names a checkout ` +
+        `holding the prior bundle, the other asserts no prior deploy exists. Pass exactly ` +
+        `one.`,
+    );
+  }
+  if (previousBundle !== undefined && previousBuild !== undefined) {
+    throw new Error(
+      `--previous-bundle and --previous-build were both given — two sources of truth for ` +
+        `the previous build. Pass exactly one: --previous-bundle reads (and validates) the ` +
+        `prior bundle's emit-metadata.json; --previous-build pins a bare id.`,
+    );
+  }
   const secretsMode: EmitSecretsMode = options.secrets ?? "external";
   if (secretsMode !== "external" && secretsMode !== "inline" && secretsMode !== "sops") {
     throw new Error(
@@ -631,7 +695,16 @@ export async function runEmit(options: EmitOptions): Promise<void> {
 
   // 3. Previous-build semantics — BEFORE any push, so a refusal costs nothing.
   // (bundleDir/bundleDirRelative resolved above, before the sops preflight.)
-  const priorBundle = readPriorBundleMetadata(bundleDir, { releaseName, namespace });
+  // --previous-bundle (split app/cluster repos) is AUTHORITATIVE: the same-repo lookup is
+  // skipped entirely, and its read is fail-closed (a missing path throws, never falls
+  // back). Both paths run the identical readPriorBundleMetadata validation battery.
+  const priorBundle =
+    previousBundle !== undefined
+      ? readPreviousBundleMetadata(path.resolve(projectDir, previousBundle), {
+          releaseName,
+          namespace,
+        })
+      : readPriorBundleMetadata(bundleDir, { releaseName, namespace });
   const { previousBuildId, previousDefaultPool, previousPools } = resolvePreviousBuildId({
     buildId,
     previousBuildFlag: previousBuild,
@@ -1131,6 +1204,30 @@ bundle stands the new build up WITHOUT repointing traffic. Cut over per docs/ci-
 reconciler at this bundle without the ignore rules described in
 plans/gitops-deployment-strategies.md — drift correction of the selector after a manual
 cutover is an outage.
+
+## CI recipe (split app/cluster repos)
+
+When the bundle lives in a separate cluster repo (this app repo runs CI and \`emit\`; the
+cluster repo holds the committed bundles), the prior bundle is not at this repo's
+\`${bundleDirPosix}/\` — point emit at the cluster-repo checkout instead with
+\`--previous-bundle\` (authoritative: the same-repo lookup is skipped, and a missing or
+unreadable path is a hard error, never treated as a first deploy):
+
+\`\`\`yaml
+# app-repo CI (shape, not a literal workflow)
+- checkout: cluster-repo            # e.g. into ../cluster-repo
+- run: npx adapter-k8s emit \\
+    --previous-bundle ../cluster-repo/apps/${meta.releaseName}/.k8s-adapter/gitops
+- run: |                            # replace the cluster repo's bundle WHOLESALE
+    rm -rf ../cluster-repo/apps/${meta.releaseName}/.k8s-adapter/gitops
+    cp -R ${bundleDirPosix} ../cluster-repo/apps/${meta.releaseName}/.k8s-adapter/gitops
+- commit + PR against cluster-repo
+\`\`\`
+
+The path may name the bundle directory or its \`emit-metadata.json\` directly. The same
+release/namespace/emitVersion cross-checks apply to it as to a same-repo prior bundle.
+Monorepo flows (bundle committed to this repo) need no flag: emit reads the last
+committed bundle from \`${bundleDirPosix}/\` automatically.
 
 ## Update bots (Renovate / Flux image-automation)
 
