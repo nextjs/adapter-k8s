@@ -17,7 +17,6 @@ metadata:
     - '\badapter-k8s\s+tail\b'
     - '\badapter-k8s\s+describe\b'
     - '\bnpx\s+adapter-k8s\b'
-    - '\bkubectl\s+get\s+pods\b'
     - '\bkubectl\s+describe\s+(gateway|httproute|envoyextensionpolicy)\b'
   promptSignals:
     phrases:
@@ -127,4 +126,4 @@ npx adapter-k8s doctor          # must exit 0
 curl -sI https://<host>/ | grep -i <your-middleware-header>
 ```
 
-`npx adapter-k8s emulate` reproduces the full Envoy → routing → pool path locally when you need to isolate cluster problems from build problems. `docs/verification.md` records what each verification layer can and structurally cannot see.
+`npx adapter-k8s emulate` reproduces the full Envoy → routing → pool path locally when you need to isolate cluster problems from build problems.

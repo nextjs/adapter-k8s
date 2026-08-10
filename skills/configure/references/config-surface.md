@@ -1,6 +1,6 @@
 # adapter.config.mjs Surface
 
-Everything here exists in `src/types.ts` (K8sAdapterConfig) and `src/target/components.ts`. Do not use keys not listed.
+Everything here exists in `K8sAdapterConfig` (shipped as `dist/types.d.ts` in the installed package) and `dist/target/components.d.ts`. Do not use keys not listed.
 
 ## Top-level `K8sAdapterConfig`
 
@@ -12,9 +12,9 @@ Everything here exists in `src/types.ts` (K8sAdapterConfig) and `src/target/comp
 | `envFrom`           | `EnvFromSource[]`                                           | Bulk `envFrom`; individual `env` entries win                                                                                                                                               |
 | `cache`             | see below                                                   | Shared Valkey/Redis for ISR/PPR/fetch cache                                                                                                                                                |
 | `containerStrategy` | `'traced-assets' \| 'shared-image'`                         | Default `traced-assets` (per-pool minimal images)                                                                                                                                          |
-| `imageOptimizer`    | `{ enabled: boolean; mode: 'sidecar' }`                     |                                                                                                                                                                                            |
+| `imageOptimizer`    | `{ enabled: boolean; mode: 'sidecar' }`                     | Validates but `enabled: true` throws at build time — not yet implemented                                                                                                                   |
 | `skewProtection`    | `{ enabled: boolean; duration: string }`                    | Validates but throws at build time — not yet implemented                                                                                                                                   |
-| `routeExtension`    | `{ mode: 'auto' \| 'wasm' \| 'extproc' }`                   |                                                                                                                                                                                            |
+| `routeExtension`    | `{ mode: 'auto' \| 'wasm' \| 'extproc' }`                   | `'wasm'` throws at build time — not implemented; use `'auto'` or `'extproc'`                                                                                                               |
 | `routingService`    | `{ resources?, scaling?, requestTimeoutMs?, failureMode? }` | `failureMode: 'auto'` (default) fails closed when middleware exists                                                                                                                        |
 | `target`            | `defineTarget(...)`                                         | Preferred composition API                                                                                                                                                                  |
 | `provider`          | `{ gke } \| { generic }`                                    | Deprecated legacy blocks; exactly one; never combined with `target`                                                                                                                        |
@@ -65,7 +65,7 @@ cache: {
 },
 ```
 
-## Target components (`src/target/components.ts`)
+## Target components (`dist/target/components.d.ts`)
 
 | Layer     | Built-ins                                                                             | Custom hook               |
 | --------- | ------------------------------------------------------------------------------------- | ------------------------- |

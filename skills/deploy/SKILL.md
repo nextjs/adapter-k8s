@@ -15,7 +15,6 @@ metadata:
     - '^\s*npx\s+adapter-k8s(?:\s|$)'
     - '\bNEXT_ADAPTER_PATH='
     - '\bADAPTER_K8S_(CONFIG|CONTAINER_CLI|TARGET_PLATFORM)='
-    - '\bhelm\s+rollback\b'
   promptSignals:
     phrases:
       - "deploy to kubernetes"
@@ -71,15 +70,15 @@ You are guiding a deploy of a Next.js app to Kubernetes with `@next-community/ad
 
 Check before anything else; `npx adapter-k8s doctor` runs these as its Prerequisites section.
 
-| Requirement       | Check                                                                                           | Notes                                                                                                                                     |
-| ----------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| Node.js >= 20.9.0 | `node --version`                                                                                | `engines` requirement of the package                                                                                                      |
-| kubectl in PATH   | `kubectl version --client`                                                                      | context must point at the target cluster                                                                                                  |
-| Helm >= 3.2       | `helm version --short`                                                                          | deploy probes `--create-namespace` support and aborts on older Helm; Helm 3 = client-side upgrade, Helm 4 = server-side apply             |
-| Container runtime | `docker`/`podman`/`nerdctl`                                                                     | probed in that order; force one with `ADAPTER_K8S_CONTAINER_CLI`                                                                          |
-| Adapter wired     | `NEXT_ADAPTER_PATH=@next-community/adapter-k8s` exported, or `adapterPath` set in `next.config` | wires the adapter into `next build`; without it the build emits no `.k8s-adapter` output and deploy fails with "Build metadata not found" |
-| Adapter config    | `adapter.config.mjs`/`.ts`/`.js` in the project root                                            | `init` scaffolds it; missing config falls back to defaults with a console note                                                            |
-| Infra config      | `.k8s-adapter/infrastructure.json` exists                                                       | written by `npx adapter-k8s init`; deploy fails without `containerRegistry`                                                               |
+| Requirement       | Check                                                                                                                                    | Notes                                                                                                                                                                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node.js >= 20.9.0 | `node --version`                                                                                                                         | `engines` requirement of the package                                                                                                                                                                                                                                               |
+| kubectl in PATH   | `kubectl version --client`                                                                                                               | context must point at the target cluster                                                                                                                                                                                                                                           |
+| Helm >= 3.2       | `helm version --short`                                                                                                                   | deploy probes `--create-namespace` support and aborts on older Helm; Helm 3 = client-side upgrade, Helm 4 = server-side apply                                                                                                                                                      |
+| Container runtime | `docker`/`podman`/`nerdctl`                                                                                                              | probed in that order; force one with `ADAPTER_K8S_CONTAINER_CLI`                                                                                                                                                                                                                   |
+| Adapter wired     | `NEXT_ADAPTER_PATH=<abs path to node_modules/@next-community/adapter-k8s/dist/index.js>` exported, or `adapterPath` set in `next.config` | wires the adapter into `next build`; without it the build emits no `.k8s-adapter` output and deploy fails with "Build metadata not found". Must be an absolute file path — the bare package name fails `require.resolve` with ERR_PACKAGE_PATH_NOT_EXPORTED (ESM-only exports map) |
+| Adapter config    | `adapter.config.mjs`/`.ts`/`.js` in the project root                                                                                     | `init` scaffolds it; missing config falls back to defaults with a console note                                                                                                                                                                                                     |
+| Infra config      | `.k8s-adapter/infrastructure.json` exists                                                                                                | written by `npx adapter-k8s init`; deploy fails without `containerRegistry`                                                                                                                                                                                                        |
 
 ## Quick Start
 
@@ -87,8 +86,10 @@ Check before anything else; `npx adapter-k8s doctor` runs these as its Prerequis
 # 1) One-time: provision infra + scaffold adapter.config.mjs (GKE preset shown)
 npx adapter-k8s init --project-id my-project --host app.example.com
 
-# 2) Wire the adapter for every next build in this shell (or set adapterPath in next.config)
-export NEXT_ADAPTER_PATH=@next-community/adapter-k8s
+# 2) Wire the adapter for every next build in this shell (or set adapterPath in next.config).
+#    ABSOLUTE PATH REQUIRED: the bare package name @next-community/adapter-k8s fails with
+#    ERR_PACKAGE_PATH_NOT_EXPORTED (Next require.resolve()s it; the exports map is ESM-only).
+export NEXT_ADAPTER_PATH="$PWD/node_modules/@next-community/adapter-k8s/dist/index.js"
 
 # 3) Deploy — runs next build itself (the adapter's onBuildComplete emits chart,
 #    Dockerfiles, manifests), then builds/pushes images and helm-upgrades
@@ -136,8 +137,8 @@ See [references/failure-playbook.md](references/failure-playbook.md) for:
 
 ## Gotchas
 
-- **Wrong cluster**: deploy prompts `Type "yes" to confirm this kubectl context` when the context cannot be verified as the intended cluster. In CI pass `--yes` only after pinning the context.
+- **Wrong cluster**: deploy prompts `Type "yes" to confirm this kubectl context` when the context cannot be verified as the intended cluster. In CI pass `--yes` only after pinning the context. `rollback` gates on the same confirmation — an unpinned context makes it exit with "Rollback target access is not independently verifiable"; re-run with `--yes` after confirming the context.
 - **Release name drift**: commands resolve the release from `--release-name`, then `.k8s-adapter/infrastructure.json`, then the sanitized directory name. Running from a differently-named directory without the persisted file targets the wrong release.
 - **Multi-target projects**: `ADAPTER_K8S_CONFIG=<variant>` selects `adapter.config.<variant>.mjs` + `.k8s-adapter/infrastructure.<variant>.json` + its own build output. Mixing a variant's flags with another's output is rejected by the target fingerprint.
 - **`/healthz` and `/readyz` are reserved** — an app route at either path fails the build; `/readyz` is the cutover gate.
-- **ARM nodes**: set `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` for BOTH `next build` and `deploy`; the platform is baked into the artifact and a mismatch is rejected.
+- **ARM nodes**: the platform DEFAULTS to `linux/amd64` regardless of the host or cluster — check first (`kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.architecture}'`) and set `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` for BOTH `next build` and `deploy` on arm64 nodes (Apple Silicon k3d/kind, Graviton, GKE T2A); the platform is baked into the artifact and a mismatch is rejected. The chart also stamps a `kubernetes.io/arch` node selector, so a wrong-platform build does not `exec format error` — pods sit **Pending** with `FailedScheduling: node(s) didn't match Pod's node affinity/selector` until the rollout gate times out.

@@ -63,18 +63,22 @@ You are a configuration author for `@next-community/adapter-k8s`. Your job is to
 - **Never put a secret in `adapter.config.mjs`** — it is committed. Use `{ secret, key }` / `{ configMap, key }` env references. `NEXT_PUBLIC_*` in `env` is rejected by validation (build-time only).
 - **`envoyNativeRouting` only for Envoy-controlled classes.** A non-Envoy GatewayClass programs the Gateway and then silently never calls the routing service. When unsure, omit `routing` — the default `portableRouting()` works on any exposure.
 - **One of `target` or legacy `provider`, never both** — config validation rejects the pair.
-- Every key you write must exist in `K8sAdapterConfig` (`src/types.ts`) and every component in `src/target/components.ts`. Do not invent options.
+- Every key you write must exist in `K8sAdapterConfig` (shipped as `dist/types.d.ts` in the installed package) and every component in `dist/target/components.d.ts`. Do not invent options.
 
 ## Step 1 — Inspect what access exists
 
 ```bash
 # Cluster access and flavor (a *.gke.gcloud.google.com context or gke_* name means GKE)
-kubectl config current-context
+kubectl config get-contexts -o name   # zero contexts -> stop: no cluster access to configure against
+kubectl config current-context        # may fail even when contexts exist (none selected)
 kubectl cluster-info
 
 # Exposure options actually installed
 kubectl get gatewayclass          # CONTROLLER column: gateway.envoyproxy.io/... = Envoy Gateway
 kubectl get ingressclass
+
+# Node CPU architecture — decides ADAPTER_K8S_TARGET_PLATFORM (default linux/amd64)
+kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' | sort -u
 
 # GCP auth + registry hints
 gcloud config get-value project 2>/dev/null
@@ -87,11 +91,12 @@ ls adapter.config.* 2>/dev/null
 
 ## Step 2 — Ask only what is undiscoverable
 
-| Always ask                     | Ask only if                                                                                   |
-| ------------------------------ | --------------------------------------------------------------------------------------------- |
-| Hostname(s) the app will serve | TLS secret name — TLS wanted and no cert-manager/controller-managed cert found                |
-|                                | Registry — no `.k8s-adapter/infrastructure.json` and no usable hint from gcloud/docker config |
-|                                | Which GatewayClass/IngressClass — more than one plausible candidate exists                    |
+| Always ask                     | Ask only if                                                                                                                                                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Hostname(s) the app will serve | TLS secret name — TLS wanted and no cert-manager/controller-managed cert found                                                                                                                                     |
+|                                | Registry — no `.k8s-adapter/infrastructure.json` and no usable hint from gcloud/docker config                                                                                                                      |
+|                                | Which GatewayClass/IngressClass — more than one plausible candidate exists                                                                                                                                         |
+|                                | Which kubectl context — more than one exists or none is current; pin the choice with `kubernetesCluster({ access: { kind: 'kubeconfig-context', context: '<name>' } })` so deploy stops prompting for confirmation |
 
 Do not ask about pools, scaling, cache, or container strategy up front — scaffold sensible defaults (one `default` pool, `routes: ['appPages', 'appRoutes', 'pagesApi']`, `scaling: { min: 2, max: 10, targetCPU: 70 }`) and mention they are tunable.
 
@@ -114,8 +119,12 @@ Full option surface, env/cache/pool details, and a complete non-GKE example: [re
 3. Validate without touching the cluster. Config validation and target compilation run inside `next build` (the adapter's hooks), so build first; `--dry-run` alone reads the previous build's output and fails with "Build metadata not found" on a fresh project:
 
 ```bash
-NEXT_ADAPTER_PATH=@next-community/adapter-k8s npx next build   # validates config, compiles the target
-npx adapter-k8s deploy --dry-run                               # prints the deploy plan; never builds or touches the cluster
+# Absolute file path, not the bare package name — Next resolves adapterPath with
+# require.resolve(), and the package's exports map is ESM-only, so
+# NEXT_ADAPTER_PATH=@next-community/adapter-k8s fails with ERR_PACKAGE_PATH_NOT_EXPORTED.
+export NEXT_ADAPTER_PATH="$PWD/node_modules/@next-community/adapter-k8s/dist/index.js"
+npx next build                    # validates config, compiles the target
+npx adapter-k8s deploy --dry-run  # prints the deploy plan; never builds or touches the cluster
 ```
 
 If validation fails, fix the exact reported key — the validators name the offending field. Then tell the user the next command is:
@@ -127,7 +136,8 @@ npx adapter-k8s deploy
 ## Gotchas
 
 - **`.env` files never reach the containers** — supply runtime env via `env` / `envFrom` in the config (secret/configMap references preferred).
-- **`nodeCidrs`**: leave unset on fixed-size clusters; set it (node subnet, e.g. `['10.0.0.0/16']`) on any cluster that autoscales or replaces nodes, or new nodes' kubelets cannot probe pods.
+- **`nodeCidrs`**: leave unset on fixed-size clusters; set it on any cluster that autoscales or replaces nodes, or new nodes' kubelets cannot probe pods. Shape for `kubernetesCluster()`: `network: { nodeCidrs: { kind: 'static', cidrs: ['10.0.0.0/16'] } }` (the bare-array form belongs to the legacy `provider.generic` block only).
 - **Cache off = per-replica ISR/PPR revalidation.** For shared revalidation set `cache: { enabled: true, provider: 'valkey' }`. Every `target` composition requires `cache.url` (`redis://`/`rediss://`) when cache is enabled; managed Memorystore provisioning happens only on the legacy `provider.gke` path (what `init` scaffolds).
 - **Multi-cluster projects**: use variants (`adapter.config.<name>.mjs` + `.k8s-adapter/infrastructure.<name>.json`, selected by `ADAPTER_K8S_CONFIG=<name>`) instead of editing one file back and forth. A variant must provide both files — there is no fallback.
+- **arm64 nodes need an explicit platform.** The image platform defaults to `linux/amd64` on every host (including Apple Silicon) and the chart stamps a matching `kubernetes.io/arch` node selector. If discovery showed `arm64` nodes, export `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` before `next build` AND `deploy` — otherwise pods sit Pending with `FailedScheduling` (not `exec format error`).
 - **`/healthz` and `/readyz` are reserved** — an app route or public file at either path fails the build.

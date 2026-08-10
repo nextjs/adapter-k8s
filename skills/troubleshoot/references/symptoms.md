@@ -25,7 +25,7 @@ kubectl logs <pod> -n <ns> --tail=50
 1. A failed registry-reader IAM grant during `init` (init now warns: "Pods may fail with ImagePullBackOff"). Re-run `npx adapter-k8s init` or grant the node service account Artifact Registry Reader.
 2. A chart built for a different target: the registry is baked into the Deployment template at build time, so reusing output across targets pulls the wrong registry (measured: a Scaleway deploy reusing a GKE chart pulled `us-central1-docker.pkg.dev/...` with a 403). Deploy now refuses before helm on a registry/namespace mismatch — obey the error and re-run without `--skip-build`.
 
-**Wrong platform image (`exec format error`).** An Apple Silicon default build produces arm64 images that die on x86 nodes. Sharp's native packages and the chart's node selector are fixed at build time; `ADAPTER_K8S_TARGET_PLATFORM` must match the built artifact, and deploy throws if it does not. Fix by rebuilding for the node architecture (no `--skip-build`). The adapter does not publish a multi-arch index — one platform per build.
+**Wrong platform (`Pending`/`FailedScheduling` or `exec format error`).** The build platform defaults to `linux/amd64` on every host — including Apple Silicon. The chart stamps a `kubernetes.io/arch` node selector from that platform, so the usual symptom of a mismatch is pods stuck **Pending** with `node(s) didn't match Pod's node affinity/selector` (an amd64-default build against arm64 nodes: Apple Silicon k3d/kind, Graviton, GKE T2A). `exec format error` only appears when the selector is absent or hand-edited. Sharp's native packages and the node selector are fixed at build time; `ADAPTER_K8S_TARGET_PLATFORM` must match the built artifact, and deploy throws if it does not. Check node arch (`kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.architecture}'`), then rebuild with the matching `ADAPTER_K8S_TARGET_PLATFORM` (no `--skip-build`). The adapter does not publish a multi-arch index — one platform per build.
 
 ## Routing manifest vs build
 
@@ -85,7 +85,7 @@ Check in order:
 3. **VALKEY_URL reaching the pods?** The bundled handler falls back to the file-system cache silently when `VALKEY_URL` is absent. `kubectl exec` into a pool pod and check `env | grep VALKEY`. Managed Memorystore provisioning requires `projectId` in `infrastructure.json`; BYO uses `cache.url`.
 4. **Old adapter build.** Historical versions silently skipped cache-handler registration for edge-middleware apps and for missing bundles while `build-metadata.json` still claimed `cacheEnabled: true`. Rebuild on a current adapter version — the modern build throws instead of skipping.
 
-Cache AUTH warnings on deploy (`accepts UNAUTHENTICATED connections`) are a security posture issue, not a sharing failure — see `cache.memorystore.auth` in `src/types.ts`.
+Cache AUTH warnings on deploy (`accepts UNAUTHENTICATED connections`) are a security posture issue, not a sharing failure — see `cache.memorystore.auth` in the shipped `dist/types.d.ts`.
 
 ## NetworkPolicy
 
