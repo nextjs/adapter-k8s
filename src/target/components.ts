@@ -326,10 +326,129 @@ export function manualExposure(options: {
   });
 }
 
+/**
+ * cert-manager issuance for a dedicated exposure's in-namespace TLS Secret.
+ *
+ * Wildcard-cert fleets keep their certificate in the gateway owner's namespace (e.g.
+ * `network`), which a dedicated Gateway/Ingress in the app namespace cannot reference —
+ * Gateway `certificateRefs` and Ingress `spec.tls` are namespace-local. This option emits
+ * a `cert-manager.io/v1` Certificate alongside the exposure so the Secret exists where the
+ * listener needs it. With `httpRouteExposure` none of this applies: TLS terminates at the
+ * parent Gateway and certificates stay the gateway owner's job.
+ */
+export interface CertManagerTlsOptions {
+  issuerRef: {
+    name: string;
+    kind: "ClusterIssuer" | "Issuer";
+    /** Issuer API group. Defaults to `cert-manager.io` (external issuers override it). */
+    group?: string;
+  };
+}
+
+// cert-manager Issuer/ClusterIssuer names are DNS subdomains; asserted verbatim (NOT
+// sanitized) because the ref must match an existing issuer exactly — same contract as
+// httpRouteExposure's parentRef Gateway names.
+const ISSUER_NAME_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
+// Kubernetes API group: DNS subdomain (e.g. "cert-manager.io", "awspca.cert-manager.io").
+const API_GROUP_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
+
+function validateCertManagerOptions(
+  certManager: CertManagerTlsOptions,
+  exposureName: string,
+  wantsTls: boolean,
+): void {
+  if (!wantsTls) {
+    throw new Error(
+      `${exposureName} certManager requires at least one host with tls.enabled — a ` +
+        "Certificate for a plaintext-only exposure would issue a cert nothing references",
+    );
+  }
+  const issuerRef = certManager.issuerRef;
+  if (!issuerRef || typeof issuerRef !== "object") {
+    throw new Error(`${exposureName} certManager requires an issuerRef`);
+  }
+  if (typeof issuerRef.name !== "string" || !ISSUER_NAME_RE.test(issuerRef.name)) {
+    throw new Error(`Invalid certManager issuerRef name ${JSON.stringify(issuerRef.name)}`);
+  }
+  if (issuerRef.kind !== "ClusterIssuer" && issuerRef.kind !== "Issuer") {
+    throw new Error(
+      `Invalid certManager issuerRef kind ${JSON.stringify(issuerRef.kind)}: ` +
+        'expected "ClusterIssuer" or "Issuer"',
+    );
+  }
+  if (issuerRef.group !== undefined && !API_GROUP_RE.test(issuerRef.group)) {
+    throw new Error(`Invalid certManager issuerRef group ${JSON.stringify(issuerRef.group)}`);
+  }
+}
+
+/**
+ * The Certificate + its API requirement + its readiness gate. `secretName` doubles as the
+ * Certificate name (cert-manager's own convention), so re-runs against the same config are
+ * idempotent and the object diff in a GitOps bundle is stable.
+ */
+function certManagerContribution(
+  certManager: CertManagerTlsOptions,
+  secretName: string,
+  dnsNames: string[],
+  context: ExposureBuildContext,
+): {
+  certificate: KubernetesManifest;
+  requirement: { apiVersion: string; resource: string; optional: false };
+  readiness: RoutingReadiness;
+} {
+  const issuerRef = certManager.issuerRef;
+  const certificate = object(
+    "cert-manager.io/v1",
+    "Certificate",
+    "certificates",
+    secretName,
+    context.namespace,
+    {
+      spec: {
+        secretName,
+        dnsNames,
+        issuerRef: {
+          name: issuerRef.name,
+          kind: issuerRef.kind,
+          ...(issuerRef.group !== undefined ? { group: issuerRef.group } : {}),
+        },
+      },
+    },
+    { labels: { "app.kubernetes.io/name": context.releaseName } },
+  );
+  return {
+    certificate,
+    requirement: { apiVersion: "cert-manager.io/v1", resource: "certificates", optional: false },
+    readiness: {
+      kind: "kubernetes-condition",
+      object: {
+        apiVersion: "cert-manager.io/v1",
+        resource: "certificates",
+        name: secretName,
+        namespace: context.namespace,
+      },
+      conditionsAt: { kind: "object" },
+      condition: {
+        type: "Ready",
+        status: "True",
+        observedGeneration: "must-equal-metadata-generation",
+      },
+      timeoutSeconds: 600,
+    },
+  };
+}
+
 export interface GatewayApiExposureOptions {
   className: string;
   hosts: readonly HostConfig[];
   tlsSecretName?: string;
+  /**
+   * Emit a cert-manager Certificate for the HTTPS listener's Secret. `tlsSecretName`
+   * becomes the Certificate's `secretName` when both are set; without it the Secret is
+   * derived as `<release>-tls`. Mutually exclusive with `controllerManagedTls` (two
+   * certificate managers for one listener).
+   */
+  certManager?: CertManagerTlsOptions;
   controllerManagedTls?: boolean;
   controllerManagedCertificate?: { annotation: string; nameSuffix: string };
   annotations?: Record<string, string>;
@@ -349,16 +468,36 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
       "gatewayApiExposure cannot mix TLS and plaintext hosts in one exposure; compose separate releases or use matching TLS settings",
     );
   }
-  if (wantsTls && !options.tlsSecretName && !options.controllerManagedTls) {
+  if (wantsTls && !options.tlsSecretName && !options.controllerManagedTls && !options.certManager) {
     throw new Error(
-      "gatewayApiExposure requires tlsSecretName or controllerManagedTls when TLS is enabled",
+      "gatewayApiExposure requires tlsSecretName, certManager, or controllerManagedTls when TLS is enabled",
     );
+  }
+  if (options.certManager && options.controllerManagedTls) {
+    throw new Error(
+      "gatewayApiExposure cannot combine certManager with controllerManagedTls: the " +
+        "controller already provisions the listener certificate",
+    );
+  }
+  if (options.certManager) {
+    validateCertManagerOptions(options.certManager, "gatewayApiExposure", wantsTls);
   }
   return defineExposureComponent({
     name: "gateway-api",
     hosts,
     build(context) {
       const gatewayName = sanitizeK8sName(`${context.releaseName}-gateway`);
+      const tlsSecretName =
+        options.tlsSecretName ??
+        (options.certManager ? sanitizeK8sName(`${context.releaseName}-tls`) : undefined);
+      const certManaged = options.certManager
+        ? certManagerContribution(
+            options.certManager,
+            tlsSecretName!,
+            hosts.filter((host) => host.tls.enabled).map((host) => host.hostname),
+            context,
+          )
+        : undefined;
       const routeName = sanitizeK8sName(`${context.releaseName}-routes`);
       const annotations = {
         ...options.annotations,
@@ -397,7 +536,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             ? {
                 tls: {
                   mode: "Terminate",
-                  certificateRefs: [{ kind: "Secret", name: options.tlsSecretName! }],
+                  certificateRefs: [{ kind: "Secret", name: tlsSecretName! }],
                 },
               }
             : {}),
@@ -521,7 +660,12 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
           }
         : undefined;
       return {
-        objects: [gateway, route, ...(redirectRoute ? [redirectRoute] : [])],
+        objects: [
+          gateway,
+          route,
+          ...(redirectRoute ? [redirectRoute] : []),
+          ...(certManaged ? [certManaged.certificate] : []),
+        ],
         requirements: [
           { apiVersion: "gateway.networking.k8s.io/v1", resource: "gateways", optional: false },
           {
@@ -529,8 +673,14 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             resource: "httproutes",
             optional: false,
           },
+          ...(certManaged ? [certManaged.requirement] : []),
         ],
-        readiness: [gatewayReady, routeReady, ...(redirectReady ? [redirectReady] : [])],
+        readiness: [
+          gatewayReady,
+          routeReady,
+          ...(redirectReady ? [redirectReady] : []),
+          ...(certManaged ? [certManaged.readiness] : []),
+        ],
         ingressSources: copyIngressSources(options.ingressSources),
         capabilities: [
           {
@@ -717,19 +867,51 @@ export interface IngressExposureOptions {
   className: string;
   hosts: readonly HostConfig[];
   tlsSecretName?: string;
+  /**
+   * Emit a cert-manager Certificate for the Ingress's TLS Secret. `tlsSecretName`
+   * becomes the Certificate's `secretName` when both are set; without it the Secret is
+   * derived as `<release>-tls`.
+   *
+   * ALWAYS emits the Certificate object rather than the `cert-manager.io/cluster-issuer`
+   * annotation, deliberately: an emitted Certificate is adapter-owned (visible in the
+   * GitOps bundle diff, cleaned up with the release), its `Ready` condition gates
+   * readiness by a name known at render time, the cert-manager CRD requirement is
+   * preflight-checked, and `issuerRef` supports `kind: Issuer` and external issuer
+   * groups — none of which the annotation can express, and the shim-created Certificate
+   * it produces is invisible to readiness until the shim has run. The lighter annotation
+   * path needs no adapter surface at all: pass the annotation via `annotations` with a
+   * `tlsSecretName` and ingress-shim owns issuance (no Certificate emitted, no CRD
+   * requirement declared, no readiness gate).
+   */
+  certManager?: CertManagerTlsOptions;
   annotations?: Record<string, string>;
   ingressSources?: IngressSourceSet;
 }
 
 export function ingressExposure(options: IngressExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
-  if (hosts.some((host) => host.tls.enabled) && !options.tlsSecretName) {
-    throw new Error("ingressExposure requires tlsSecretName when TLS is enabled");
+  const wantsTls = hosts.some((host) => host.tls.enabled);
+  if (wantsTls && !options.tlsSecretName && !options.certManager) {
+    throw new Error("ingressExposure requires tlsSecretName or certManager when TLS is enabled");
+  }
+  if (options.certManager) {
+    validateCertManagerOptions(options.certManager, "ingressExposure", wantsTls);
   }
   return defineExposureComponent({
     name: "ingress",
     hosts,
     build(context) {
+      const tlsSecretName =
+        options.tlsSecretName ??
+        (options.certManager ? sanitizeK8sName(`${context.releaseName}-tls`) : undefined);
+      const certManaged = options.certManager
+        ? certManagerContribution(
+            options.certManager,
+            tlsSecretName!,
+            hosts.filter((host) => host.tls.enabled).map((host) => host.hostname),
+            context,
+          )
+        : undefined;
       return {
         objects: [
           object(
@@ -741,14 +923,14 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
             {
               spec: {
                 ingressClassName: options.className,
-                ...(options.tlsSecretName
+                ...(tlsSecretName
                   ? {
                       tls: [
                         {
                           hosts: hosts
                             .filter((host) => host.tls.enabled)
                             .map((host) => host.hostname),
-                          secretName: options.tlsSecretName,
+                          secretName: tlsSecretName,
                         },
                       ],
                     }
@@ -777,11 +959,13 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
               ...(options.annotations ? { annotations: options.annotations } : {}),
             },
           ),
+          ...(certManaged ? [certManaged.certificate] : []),
         ],
         requirements: [
           { apiVersion: "networking.k8s.io/v1", resource: "ingresses", optional: false },
+          ...(certManaged ? [certManaged.requirement] : []),
         ],
-        readiness: [],
+        readiness: certManaged ? [certManaged.readiness] : [],
         ingressSources: copyIngressSources(options.ingressSources),
         capabilities: [{ kind: "ingress", className: options.className }],
       };

@@ -55,6 +55,27 @@ export default createK8sAdapter({
 
 Use `gatewayApiExposure` instead for any conformant GatewayClass.
 
+### TLS for dedicated exposures (cert-manager)
+
+A dedicated Gateway or Ingress terminates TLS from a Secret **in the app's namespace** — Gateway `certificateRefs` and Ingress `spec.tls` are namespace-local. Wildcard-cert fleets typically keep their certificate in the gateway owner's namespace (e.g. `network`), so no such Secret exists per app namespace. Both dedicated exposures accept `certManager` to emit a `cert-manager.io/v1` Certificate that issues it in place:
+
+```js
+exposure: gatewayApiExposure({          // or ingressExposure({ className: "nginx", ...
+  className: "eg",
+  hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+  certManager: {
+    issuerRef: { name: "letsencrypt-production", kind: "ClusterIssuer" }, // or kind: "Issuer" (+ optional group)
+  },
+}),
+```
+
+- **Secret naming.** `tlsSecretName` becomes the Certificate's `secretName` when both are set; without it the Secret derives as `<release>-tls`. The Certificate object shares the Secret's name (cert-manager's own convention), so re-emits are idempotent and GitOps diffs stay stable.
+- **`dnsNames`** covers every `tls.enabled` host in the exposure.
+- **Preflight** checks the `cert-manager.io/v1` `certificates` API exists (same mechanism as the Gateway API CRD checks) and **readiness** gates on the Certificate's `Ready` condition alongside the exposure's own readiness — a deploy will not cut traffic to a listener whose certificate never issued.
+- **Validation**: `certManager` with no `tls.enabled` host is a config error (nothing would reference the cert), as is combining it with `controllerManagedTls` (two certificate managers for one listener). `issuerRef.name` must name the existing issuer exactly and is asserted K8s-safe, never sanitized.
+- **Why a Certificate object rather than the `cert-manager.io/cluster-issuer` annotation on Ingress**: the emitted Certificate is adapter-owned (visible in the bundle diff, cleaned up with the release), its `Ready` condition is checkable by a name known at render time, the CRD requirement is preflight-checked, and `issuerRef` can express namespaced `Issuer`s and external issuer groups — the ingress-shim annotation can do none of that, and the Certificate it creates behind the scenes is invisible to readiness. If you want the annotation path anyway it needs no adapter surface: pass it via `annotations` with a `tlsSecretName`, and ingress-shim owns issuance (no readiness gate).
+- **Wildcard-cert fleets**: if the cluster already runs shared Gateways with fleet-managed TLS, prefer [`httpRouteExposure`](#shared-gateways-recommended-for-clusters-with-existing-gateways) — the route inherits the parent Gateway's termination and needs no per-namespace Secret, no Certificate, and none of this section.
+
 ## Shared Gateways (recommended for clusters with existing Gateways)
 
 Most fleets already run shared Gateways — a home-ops cluster typically has `envoy-external` and `envoy-internal` in a `network` namespace, with TLS, DNS, cert-manager, and tunnel ingress solved once for every app. `httpRouteExposure` is the exposure for that pattern: it emits **exactly one HTTPRoute** in the app's namespace, attached to the named parent Gateway(s) via `spec.parentRefs`, and nothing else — no per-app Gateway (which would spawn a whole proxy deployment and LoadBalancer IP), no Certificate, no traffic policies. TLS terminates at the parent; certificates and DNS remain the gateway owner's job, where the fleet already solves them.
@@ -142,7 +163,7 @@ Notes on this journey:
 
 - **Cluster access and identity.** Pinning `access` to a named kubeconfig context and `identity` to the cluster's `kube-system` namespace UID makes a deploy refuse to run against the wrong cluster. If either is left at its default (`kubeconfig-current-context`, `unverified`), the CLI requires explicit confirmation of the current context before mutating anything (`--yes` in CI).
 - **Registry.** The CLI reads `containerRegistry` from `.k8s-adapter/infrastructure.json`—create it by hand for an existing cluster (see the README quick start). Digest lookup uses the OCI distribution API by default; authentication uses your ambient credentials.
-- **TLS** terminates from a Kubernetes Secret; `tls.enabled` without `tlsSecretName` is a config error.
+- **TLS** terminates from a Kubernetes Secret; `tls.enabled` without a TLS source (`tlsSecretName` or [`certManager`](#tls-for-dedicated-exposures-cert-manager)) is a config error.
 - **CDN**: put any CDN in front of the exposure. The routing tier always runs post-cache (see the architecture note in the README).
 - **Cache**: bring your own Valkey/Redis via `cache.url`. Disabling the cache makes ISR/PPR revalidation per-replica. Set `managedCache: "none"` for custom clusters—managed cache provisioning is currently supplied only by the GKE preset. See [configuration](./configuration.md#distributed-cache-cache-components--ppr).
 

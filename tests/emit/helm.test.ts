@@ -205,6 +205,52 @@ describe("generateHelmChart", () => {
     expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(false);
   });
 
+  it("renders a cert-manager Certificate for a certManager gatewayApiExposure", () => {
+    const target = defineTarget({
+      cluster: kubernetesCluster(),
+      exposure: gatewayApiExposure({
+        className: "eg",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+        certManager: { issuerRef: { name: "letsencrypt-production", kind: "ClusterIssuer" } },
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "ghcr.io/example/site",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "ghcr.io/example/site",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      compiledTarget,
+    });
+
+    const certTemplate = Object.entries(result).find(([, body]) =>
+      body.includes('"kind": "Certificate"'),
+    );
+    expect(certTemplate).toBeDefined();
+    expect(certTemplate![1]).toContain('"apiVersion": "cert-manager.io/v1"');
+    expect(certTemplate![1]).toContain('"secretName": "site-tls"');
+    expect(certTemplate![1]).toContain('"name": "letsencrypt-production"');
+    expect(certTemplate![1]).toContain('"app.example.com"');
+    // The Gateway's HTTPS listener terminates from the derived Secret.
+    const gatewayTemplate = Object.entries(result).find(([, body]) =>
+      body.includes('"kind": "Gateway"'),
+    );
+    expect(gatewayTemplate![1]).toContain('"name": "site-tls"');
+  });
+
   it("translates flat pool resource settings into Kubernetes requests and limits", () => {
     const pools = new Map<string, PoolDefinition>([
       [

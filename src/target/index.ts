@@ -15,6 +15,7 @@ export {
   portableRouting,
 } from "./components.js";
 export type {
+  CertManagerTlsOptions,
   GatewayApiExposureOptions,
   HttpRouteExposureOptions,
   IngressExposureOptions,

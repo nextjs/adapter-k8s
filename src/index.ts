@@ -74,6 +74,7 @@ export type {
   RoutingReadiness,
 } from "./composition-plan/index.js";
 export type {
+  CertManagerTlsOptions,
   ClusterBuildResult,
   ClusterComponent,
   CompiledKubernetesTarget,
