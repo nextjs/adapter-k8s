@@ -70,6 +70,7 @@ function writeFixture(opts?: {
   nodeCidrs?: string[];
   podCidrs?: string[];
   omitValkey?: boolean;
+  imagePullSecrets?: string[];
 }): void {
   const buildId = opts?.buildId ?? BUILD;
   const outputDir = path.join(projectDir, ".k8s-adapter", "output");
@@ -98,6 +99,7 @@ function writeFixture(opts?: {
       incrementalCacheHandler: false,
       ...(opts?.nodeCidrs ? { nodeCidrs: opts.nodeCidrs } : {}),
       ...(opts?.podCidrs ? { podCidrs: opts.podCidrs } : {}),
+      ...(opts?.imagePullSecrets ? { imagePullSecrets: opts.imagePullSecrets } : {}),
     }),
   );
   writeFileSync(path.join(outputDir, "chart", "values.yaml"), chartValuesFixture(buildId));
@@ -114,7 +116,14 @@ function writeFixture(opts?: {
   }
   writeFileSync(
     path.join(chartDir, "ssr-deployment.yaml"),
-    "apiVersion: apps/v1\nkind: Deployment\n",
+    "apiVersion: apps/v1\nkind: Deployment\n" +
+      // The build bakes config imagePullSecrets into the pod spec (renderDeployment);
+      // mirror that here so the bundle-copy assertion below exercises the pass-through.
+      (opts?.imagePullSecrets?.length
+        ? `spec:\n  template:\n    spec:\n      imagePullSecrets:\n${opts.imagePullSecrets
+            .map((s) => `        - name: "${s}"`)
+            .join("\n")}\n`
+        : ""),
   );
 }
 
@@ -373,6 +382,47 @@ describe("CIDR config surface (fail-closed, A4 'replaced')", () => {
   it("rejects malformed CIDRs from build metadata at the point of consumption", async () => {
     writeFixture({ nodeCidrs: ["not-a-cidr"] });
     await expect(runEmit({ ...baseOptions(), firstDeploy: true })).rejects.toThrow(/invalid CIDR/);
+  });
+});
+
+describe("imagePullSecrets (private registries — gap #2)", () => {
+  it("carries the configured pull-secret names into emit-metadata.json and the bundle README", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"], imagePullSecrets: ["docker-regcred"] });
+    await runEmit({ ...baseOptions(), firstDeploy: true });
+    expect(bundleMetadata().imagePullSecrets).toEqual(["docker-regcred"]);
+    const readme = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "README.md"),
+      "utf-8",
+    );
+    // The operator prerequisite: the Secret must exist in the target namespace before a
+    // sync — the bundle never carries it.
+    expect(readme).toContain("Image pull secrets");
+    expect(readme).toContain("`docker-regcred`");
+    expect(readme).toContain("ImagePullBackOff");
+    // The bundle's chart copy carries the baked pod-spec reference through verbatim.
+    const dep = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "chart", "templates", "ssr-deployment.yaml"),
+      "utf-8",
+    );
+    expect(dep).toMatch(/imagePullSecrets:\n\s+- name: "docker-regcred"/);
+  });
+
+  it("omits the key and the README section entirely when unconfigured", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    await runEmit({ ...baseOptions(), firstDeploy: true });
+    expect(bundleMetadata().imagePullSecrets).toBeUndefined();
+    const readme = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "README.md"),
+      "utf-8",
+    );
+    expect(readme).not.toContain("Image pull secrets");
+  });
+
+  it("rejects a build-metadata pull-secret name outside the Secret-name charset (README/metadata sink)", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"], imagePullSecrets: ["Bad_Name"] });
+    await expect(runEmit({ ...baseOptions(), firstDeploy: true })).rejects.toThrow(
+      /Invalid Secret name/,
+    );
   });
 });
 
@@ -699,5 +749,17 @@ describe("renderBundleReadme", () => {
     const readme = renderBundleReadme({ ...meta, secretsMode: "inline" });
     expect(readme).toContain("INLINE");
     expect(readme).toContain("REAL credentials");
+  });
+
+  it("lists configured imagePullSecrets as an operator prerequisite, naming the namespace", () => {
+    const readme = renderBundleReadme({
+      ...meta,
+      imagePullSecrets: ["docker-regcred", "gh-regcred"],
+    });
+    expect(readme).toContain("Image pull secrets");
+    expect(readme).toContain("`docker-regcred`, `gh-regcred`");
+    expect(readme).toContain("namespace\n`default`");
+    // Unconfigured bundles carry no section (and no scary prerequisite that isn't one).
+    expect(renderBundleReadme(meta)).not.toContain("Image pull secrets");
   });
 });

@@ -95,6 +95,16 @@ Sharp is the only native dependency the adapter retargets itself; staged foreign
 
 Runtime-specific requirements (nerdctl's buildkit socket, podman's digest rewriting) are in [docs/ci-cd.md](./ci-cd.md#container-runtimes).
 
+## Registry pull auth
+
+**Node-level credentials.** On clusters where the nodes themselves can authenticate to the registry—GKE nodes pulling from Artifact Registry in the same project, EKS with an ECR instance role, or any cluster whose kubelets carry a machine-level `config.json`—no adapter config is needed: the kubelet authenticates every pull and the chart's image references just work. This is the default assumption, and it is why the emitted pod specs carried no `imagePullSecrets` at all before this key existed.
+
+**`imagePullSecrets`.** Everywhere else—a private ghcr.io image on stock Talos or k3s nodes, any registry the kubelet has no ambient credentials for—every pod is `ImagePullBackOff` without a pull secret. Set `imagePullSecrets: ['docker-regcred']` (top-level; names must be K8s-name-safe) and the adapter renders `imagePullSecrets` into **every** pod-creating template: each pool Deployment, the routing-service Deployment, and the GKE traffic-extension registration Job. The named `kubernetes.io/dockerconfigjson` Secret(s) must already exist in the app namespace (`kubectl create secret docker-registry docker-regcred --docker-server=… --docker-username=… --docker-password=…`, or your ExternalSecrets/SealedSecrets flow)—the adapter never creates or carries them, and `adapter-k8s emit` lists them in the bundle README as an operator prerequisite.
+
+```js
+imagePullSecrets: ['docker-regcred'],
+```
+
 ## Routing service tuning
 
 Applies when the target hosts a routing tier (`envoyNativeRouting`, `gkeNativeRouting`):

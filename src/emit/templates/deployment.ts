@@ -10,6 +10,7 @@ import {
   assertSafeReleaseName,
   assertSafeReplicaCount,
   escapeHelmActions,
+  renderImagePullSecrets,
   renderUserEnvBlocks,
 } from "./utils.js";
 import type { EnvValue, EnvFromSource } from "../../types.js";
@@ -88,6 +89,7 @@ export function renderDeployment({
   envFrom,
   deploymentId,
   nodeArchitecture = "amd64",
+  pullSecrets,
 }: {
   poolName: string;
   buildId: string;
@@ -133,6 +135,12 @@ export function renderDeployment({
   deploymentId?: string;
   /** Literal architecture for this newly emitted build. */
   nodeArchitecture?: TargetArchitecture;
+  /**
+   * `imagePullSecrets` names (config `imagePullSecrets`) — required for private registries
+   * on nodes with no machine-level credentials. Baked like user env (committed config,
+   * knowable at render time), not values-driven like the digest (which is not).
+   */
+  pullSecrets?: string[];
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -245,6 +253,9 @@ export function renderDeployment({
     `      # the matching node architecture in mixed-architecture clusters.\n` +
     `      nodeSelector:\n` +
     `        kubernetes.io/arch: "${nodeArchitecture}"\n`;
+  // Registry pull auth (config imagePullSecrets) — empty string when unconfigured, so
+  // charts for public registries stay byte-identical to before the surface existed.
+  const pullSecretsBlock = renderImagePullSecrets(pullSecrets, "      ");
 
   return `apiVersion: apps/v1
 kind: Deployment
@@ -286,7 +297,7 @@ ${podLabels}
     spec:
       # The pool server never calls the Kubernetes API — don't mount a SA token.
       automountServiceAccountToken: false
-${nodeSelector}      securityContext:
+${pullSecretsBlock}${nodeSelector}      securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000

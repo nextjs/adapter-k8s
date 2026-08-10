@@ -2721,6 +2721,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           ...(cfg.networkPolicy?.podCidrs !== undefined
             ? { podCidrs: cfg.networkPolicy.podCidrs }
             : {}),
+          // Registry pull auth: emit's bundle README surfaces these names as an operator
+          // prerequisite (the Secrets must exist in the target namespace before a sync).
+          ...(cfg.imagePullSecrets !== undefined ? { imagePullSecrets: cfg.imagePullSecrets } : {}),
           poolNames: [...pools.keys()],
           defaultPool: configuredDefaultPool,
           ...(compiledTarget

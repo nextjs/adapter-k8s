@@ -245,6 +245,20 @@ describe("renderRoutingServiceDeployment — review findings", () => {
       }),
     ).toThrow(/requestTimeoutMs/);
   });
+
+  it("renders imagePullSecrets on the pod spec when configured; nothing when not (gap #2)", () => {
+    const yaml = renderRoutingServiceDeployment({ ...base, pullSecrets: ["docker-regcred"] });
+    expect(yaml).toMatch(
+      /automountServiceAccountToken: false\n\s+imagePullSecrets:\n\s+- name: "docker-regcred"\n/,
+    );
+    expect(renderRoutingServiceDeployment(base)).not.toContain("imagePullSecrets");
+  });
+
+  it("validates pull-secret names at the point of consumption", () => {
+    expect(() => renderRoutingServiceDeployment({ ...base, pullSecrets: ["Bad_Name"] })).toThrow(
+      /Invalid Secret name/,
+    );
+  });
 });
 
 describe("renderRoutingServiceService — provider annotations", () => {

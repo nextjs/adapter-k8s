@@ -143,6 +143,10 @@ export function generateHelmChart({
   const defaultPool =
     compiledTarget?.defaultPool ?? (pools.keys().next().value as string | undefined);
   if (!defaultPool) throw new Error("generateHelmChart requires at least one pool");
+  // Registry pull auth: stamped on EVERY pod-creating template (pool Deployments, the
+  // routing tier, and the registration Job via the provider seam) — a private registry
+  // that only some pods can pull from is ImagePullBackOff on the rest.
+  const pullSecrets = config.imagePullSecrets;
   const emitsHealthCheckPolicy = compiledTarget
     ? compiledTarget.routingTier.registration === "gke-traffic-extension"
     : provider!.emitsHealthCheckPolicyCrd;
@@ -276,6 +280,7 @@ export function generateHelmChart({
       ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
       ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),
       ...(deploymentId !== undefined ? { deploymentId } : {}),
+      ...(pullSecrets && pullSecrets.length > 0 ? { pullSecrets } : {}),
     });
     files[`templates/${poolName}-service.yaml`] = renderService({
       poolName,
@@ -329,6 +334,7 @@ export function generateHelmChart({
       ...(Object.keys(config.env ?? {}).length > 0 ? { env: config.env } : {}),
       ...((config.envFrom ?? []).length > 0 ? { envFrom: config.envFrom } : {}),
       ...(deploymentId !== undefined ? { deploymentId } : {}),
+      ...(pullSecrets && pullSecrets.length > 0 ? { pullSecrets } : {}),
     });
     files["templates/routing-service-service.yaml"] = renderRoutingServiceService({
       releaseName,

@@ -37,6 +37,7 @@ import {
   assertSafeBuildId,
   assertSafeImageRegistry,
   assertSafeNamespace,
+  assertSafeSecretName,
   resolveK8sNamespace,
   sanitizeK8sName,
 } from "../emit/templates/utils.js";
@@ -113,6 +114,13 @@ export interface EmitMetadata {
   defaultPool: string;
   targetPlatforms: Record<string, string>;
   secretsMode: EmitSecretsMode;
+  /**
+   * config `imagePullSecrets` baked into every rendered pod spec (from build metadata).
+   * Recorded so the bundle README can state the operator prerequisite: these Secrets must
+   * exist in the target namespace, delivered by the user's own secrets flow — the bundle
+   * never carries them.
+   */
+  imagePullSecrets?: string[];
   manifests?: { skipped: true; note: string };
 }
 
@@ -393,6 +401,12 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   const pools: string[] = metadata.pools;
   const defaultPool: string | undefined =
     typeof metadata.defaultPool === "string" ? metadata.defaultPool : pools?.[0];
+  // config imagePullSecrets, via build metadata — validated at the point of consumption
+  // (the names land in the bundle README and emit-metadata.json).
+  const imagePullSecrets: string[] = Array.isArray(metadata.imagePullSecrets)
+    ? metadata.imagePullSecrets.filter((s: unknown): s is string => typeof s === "string")
+    : [];
+  for (const name of imagePullSecrets) assertSafeSecretName(name);
   const builtTargetPlatform = resolveBuiltTargetPlatform(metadata);
   assertTargetFingerprint({
     outputDirRelative,
@@ -691,6 +705,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     defaultPool: defaultPool as string,
     targetPlatforms: { [buildId]: builtTargetPlatform },
     secretsMode,
+    ...(imagePullSecrets.length > 0 ? { imagePullSecrets } : {}),
     ...(manifestsNote ? { manifests: manifestsNote } : {}),
   };
   writeFileSync(
@@ -710,6 +725,20 @@ export async function runEmit(options: EmitOptions): Promise<void> {
 
 /** The bundle's own README — deterministic (per-build facts only, no timestamps). */
 export function renderBundleReadme(meta: EmitMetadata): string {
+  const pullSecretsSection =
+    meta.imagePullSecrets && meta.imagePullSecrets.length > 0
+      ? `## Image pull secrets (operator prerequisite)
+
+Every pod spec in this bundle references \`imagePullSecrets\`: ${meta.imagePullSecrets
+          .map((s) => `\`${s}\``)
+          .join(", ")}.
+The named \`kubernetes.io/dockerconfigjson\` Secret(s) must EXIST in namespace
+\`${meta.namespace}\` before this bundle is applied — deliver them via your secrets flow
+(\`kubectl create secret docker-registry\`, ExternalSecrets, SealedSecrets). The bundle
+never carries them, and a missing one is ImagePullBackOff on every pod that references it.
+
+`
+      : "";
   const secretSection =
     meta.secretsMode === "external"
       ? `## Secrets (externalized)
@@ -757,5 +786,5 @@ reconciler at this bundle without the ignore rules described in
 plans/gitops-deployment-strategies.md — drift correction of the selector after a manual
 cutover is an outage.
 
-${secretSection}`;
+${pullSecretsSection}${secretSection}`;
 }

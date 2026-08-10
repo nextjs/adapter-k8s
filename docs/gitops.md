@@ -12,6 +12,8 @@
 └── README.md            # cutover model + required Secret names/keys
 ```
 
+When the config sets `imagePullSecrets` (private registries—see [configuration.md](./configuration.md#registry-pull-auth)), every pod spec in the bundle references those Secrets and the README lists them as an operator prerequisite: they must exist in the target namespace before the bundle is applied, delivered by your secrets flow—the bundle never carries them.
+
 Design and rationale: [plans/gitops-deployment-strategies.md](../plans/gitops-deployment-strategies.md). This page covers what ships today (`cutover.mode: none` only—the in-cluster cutover Job and the Argo/Flux recipes are later PRs).
 
 ## ⛔ The drift hazard, first

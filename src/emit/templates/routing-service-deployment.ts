@@ -6,6 +6,7 @@ import {
   assertSafeReleaseName,
   UNCONFIGURED_IMAGE_REGISTRY,
   routingManifestSnapshotName as routingManifestSnapshotNameFor,
+  renderImagePullSecrets,
   renderUserEnvBlocks,
   escapeHelmActions,
 } from "./utils.js";
@@ -65,6 +66,7 @@ export function renderRoutingServiceDeployment({
   envFrom,
   deploymentId,
   nodeArchitecture = "amd64",
+  pullSecrets,
 }: {
   releaseName: string;
   buildId: string;
@@ -89,6 +91,8 @@ export function renderRoutingServiceDeployment({
   /** next.config `deploymentId` — see renderDeployment; node middleware runs here. */
   deploymentId?: string;
   nodeArchitecture?: TargetArchitecture;
+  /** `imagePullSecrets` names — see renderDeployment's `pullSecrets` (same pattern). */
+  pullSecrets?: string[];
 }): string {
   // Sanitize at the point of consumption (AGENTS.md) — this template splices all three
   // into resource names, a quoted image reference, and `value: "…"` env scalars.
@@ -144,6 +148,9 @@ export function renderRoutingServiceDeployment({
   const deploymentIdEnv = deploymentId
     ? `\n            - name: NEXT_DEPLOYMENT_ID\n              value: ${escapeHelmActions(JSON.stringify(deploymentId))}`
     : "";
+  // Registry pull auth (config imagePullSecrets) — "" when unconfigured (byte-identical
+  // charts for public registries). Same baked pattern as renderDeployment.
+  const pullSecretsBlock = renderImagePullSecrets(pullSecrets, "      ");
   return `apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -177,7 +184,7 @@ spec:
     spec:
       # The routing service never calls the Kubernetes API — don't mount a SA token.
       automountServiceAccountToken: false
-      nodeSelector:
+${pullSecretsBlock}      nodeSelector:
         kubernetes.io/arch: "${nodeArchitecture}"
       securityContext:
         runAsNonRoot: true

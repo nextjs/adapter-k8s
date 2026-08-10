@@ -404,6 +404,54 @@ describe("generateHelmChart", () => {
     expect(result["templates/route-ext-update-job.yaml"]).toBeDefined();
   });
 
+  // Gap #2 (real-cluster gap analysis): the chart rendered NO imagePullSecrets anywhere,
+  // so a private registry on nodes with no machine-level credentials was
+  // ImagePullBackOff on every pod. One config key must reach EVERY pod-creating template.
+  it("stamps config imagePullSecrets on every pod-creating template (pools, routing tier, registration Job)", () => {
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        imagePullSecrets: ["docker-regcred"],
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+      internalSecret: "deadbeef",
+      extensionChainJson: MINIMAL_CHAIN_JSON,
+      infrastructure: { projectId: "p-123456", region: "us-central1" },
+    });
+    for (const file of [
+      "templates/ssr-deployment.yaml",
+      "templates/routing-service-deployment.yaml",
+      "templates/route-ext-update-job.yaml",
+    ]) {
+      expect(result[file], file).toMatch(/imagePullSecrets:\n\s+- name: "docker-regcred"/);
+    }
+    // Exhaustive: NO rendered template creates a pod without the reference. Every document
+    // carrying a pod template (spec.template.spec) must carry imagePullSecrets.
+    for (const [name, body] of Object.entries(result)) {
+      if (!name.startsWith("templates/")) continue;
+      if (
+        /^\s{4}spec:$/m.test(body) &&
+        /kind: (Deployment|Job|StatefulSet|DaemonSet|CronJob)/.test(body)
+      ) {
+        expect(body, `${name} renders a pod template without imagePullSecrets`).toContain(
+          "imagePullSecrets",
+        );
+      }
+    }
+  });
+
+  it("renders no imagePullSecrets anywhere when the key is absent (charts stay byte-identical)", () => {
+    const result = chartFor("abc123");
+    for (const [name, body] of Object.entries(result)) {
+      expect(body, name).not.toContain("imagePullSecrets");
+    }
+  });
+
   // N50 (review, Medium): the route-extension update Job and its ServiceAccount used to
   // vanish with a bare `if (projectId && region)` and no else — the chart installed the
   // routing service but NEVER registered the GXLB traffic extension, so the edge kept the

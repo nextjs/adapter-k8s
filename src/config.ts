@@ -7,6 +7,7 @@ import {
   assertSafePoolName,
   assertSafeQuantity,
   assertSafeReplicaCount,
+  assertSafeSecretName,
   assertSafeTargetCPU,
 } from "./emit/templates/utils.js";
 
@@ -181,6 +182,18 @@ export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
   validateEnvMap(config.env, "adapter config");
   validateEnvFrom(config.envFrom, "adapter config");
+  // Registry pull auth for private registries. Each name lands in `imagePullSecrets` on
+  // every rendered pod spec — validated here AND at the consumption point
+  // (renderImagePullSecrets in emit/templates/utils.ts), per AGENTS.md.
+  if (config.imagePullSecrets !== undefined) {
+    if (!Array.isArray(config.imagePullSecrets)) {
+      throw new Error(
+        `imagePullSecrets must be an array of Kubernetes Secret names (e.g. ` +
+          `["docker-regcred"]), got ${JSON.stringify(config.imagePullSecrets)}`,
+      );
+    }
+    for (const name of config.imagePullSecrets) assertSafeSecretName(name);
+  }
   // GitOps PR1: static NetworkPolicy ranges for `emit`, which renders with no cluster to
   // discover them from. Validated at config time AND at the emit-time consumption point.
   if (config.networkPolicy !== undefined) {

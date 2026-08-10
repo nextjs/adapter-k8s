@@ -485,6 +485,53 @@ describe("N61: pool-name charset", () => {
 // ---------------------------------------------------------------------------
 // GitOps PR1 — static NetworkPolicy CIDRs for `emit` (no cluster to discover from).
 // ---------------------------------------------------------------------------
+describe("imagePullSecrets config surface", () => {
+  const withPullSecrets = (imagePullSecrets: unknown): K8sAdapterConfig =>
+    ({
+      pools: { ssr: { routes: ["appPages"] } },
+      imagePullSecrets,
+      provider: {
+        gke: {
+          gateway: {
+            type: "gateway-api",
+            className: "gke",
+            hosts: [{ hostname: "test.com", tls: { enabled: true } }],
+          },
+        },
+      },
+    }) as K8sAdapterConfig;
+
+  it("accepts well-formed Secret names, and an absent key", () => {
+    expect(() => validateConfig(withPullSecrets(["docker-regcred"]))).not.toThrow();
+    expect(() => validateConfig(withPullSecrets(["a", "gh-cred-2"]))).not.toThrow();
+    expect(() => validateConfig(withPullSecrets(undefined))).not.toThrow();
+    expect(() => validateConfig(withPullSecrets([]))).not.toThrow();
+  });
+
+  it("rejects a non-array value", () => {
+    expect(() => validateConfig(withPullSecrets("docker-regcred"))).toThrow(
+      /imagePullSecrets must be an array/,
+    );
+  });
+
+  it("rejects names outside the K8s Secret-name charset — these land in every rendered pod spec", () => {
+    // Uppercase, underscore, edge hyphens, dots (adapter names never carry them), and a
+    // YAML-breakout payload all refuse.
+    for (const bad of [
+      "Docker-Regcred",
+      "reg_cred",
+      "-regcred",
+      "regcred-",
+      "reg.cred",
+      'regcred"\n      hostNetwork: true',
+      "",
+      42,
+    ]) {
+      expect(() => validateConfig(withPullSecrets([bad]))).toThrow(/Invalid Secret name/);
+    }
+  });
+});
+
 describe("networkPolicy CIDR config surface", () => {
   const withNetworkPolicy = (networkPolicy: unknown): K8sAdapterConfig =>
     ({
