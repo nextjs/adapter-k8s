@@ -262,6 +262,13 @@ function chooseNewerState(local: AdapterState, cluster: AdapterState): AdapterSt
 // failure mode (N20).
 // `localOnly` skips the cluster read entirely — required for dry-run paths (L13: the
 // kubectl context may point anywhere, and pinning it would mutate the kubeconfig).
+//
+// GitOps PR2 NOTE (behavior unchanged this phase): the LOCAL-FILE assumption lives in the
+// unconditional `readLocalState` call below and in the `chooseNewerState` reconcile. The
+// in-cluster cutover Job has no persistent `.k8s-adapter/`, so its cluster-CM-only mode
+// (next phase) must skip both — N20 is then carried by the cluster half alone
+// (STATE_GET_ARGS `--ignore-not-found` discipline + ClusterStateReadError on nonzero exit),
+// and chooseNewerState's "rm the local file" repair advice must never be emitted there.
 export async function readState(
   projectDir: string,
   releaseName?: string,
@@ -311,6 +318,16 @@ export type StateWrite = Omit<AdapterState, "generation" | "updatedAt"> & {
 // `basedOnGeneration` is the FLOOR — the generation this write is based on. Callers pass the
 // generation of the state they read at the start of the operation so the stamped value stays
 // above the cluster's even when the pre-write cluster read fails (see StateWrite, N69).
+//
+// GitOps PR2 NOTE (behavior unchanged this phase): the LOCAL-FILE assumptions in this write
+// path are (1) the `readLocalStateQuiet` generation lookup and its term in the Math.max
+// floor, (2) the atomic tmp+rename local write, and (3) the recovery-semantics doc above —
+// "write local first, throw the failed cluster read AFTER, so the re-run's local copy is
+// provably newer". Cluster-CM-only mode (the cutover Job, next phase) must drop (1) and (2),
+// and INVERT (3): with no local file, a failed readClusterStateForWrite must throw BEFORE
+// any write, and recovery becomes "re-run; the Job re-reads the cluster". The S19 semantic-
+// generation guard and the N23 resourceVersion precondition are store-agnostic and move
+// unchanged.
 export async function writeState(
   projectDir: string,
   state: StateWrite,
