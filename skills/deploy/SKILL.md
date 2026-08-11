@@ -1,6 +1,6 @@
 ---
 name: deploy
-description: adapter-k8s deploy expert guidance. Use when deploying a Next.js app to Kubernetes with @next-community/adapter-k8s, running next build with the adapter, reading blue/green cutover output, verifying a deploy with doctor/describe/tail, or recovering from a failed readiness gate. Do not use for Vercel or generic Helm deployments.
+description: adapter-k8s deploy expert guidance. Use when deploying a Next.js app to Kubernetes with @next-community/adapter-k8s, running next build with the adapter, reading blue/green cutover output, verifying a deploy with doctor/describe/tail, recovering from a failed readiness gate, or rendering a GitOps bundle with emit for an Argo CD / Flux cluster. Do not use for Vercel or generic Helm deployments.
 metadata:
   priority: 8
   docs:
@@ -11,7 +11,7 @@ metadata:
   importPatterns:
     - "@next-community/adapter-k8s"
   bashPatterns:
-    - '\badapter-k8s\s+(deploy|rollback|doctor|describe|tail|init|emulate|destroy)\b'
+    - '\badapter-k8s\s+(deploy|emit|rollback|doctor|describe|tail|init|emulate|destroy)\b'
     - '^\s*npx\s+adapter-k8s(?:\s|$)'
     - '\bNEXT_ADAPTER_PATH='
     - '\bADAPTER_K8S_(CONFIG|CONTAINER_CLI|TARGET_PLATFORM)='
@@ -22,6 +22,9 @@ metadata:
       - "blue/green cutover"
       - "readiness gate"
       - "pods not ready"
+      - "gitops bundle"
+      - "argo cd"
+      - "flux"
     allOf:
       - [deploy, kubernetes]
       - [next, k8s]
@@ -123,6 +126,17 @@ npx adapter-k8s tail        # watch for runtime errors under first traffic
 ```
 
 Confirm each checkpoint: doctor shows 0 failures; `describe` shows the new build id serving; `tail` shows no crash loops. If verification fails, stop and report the exact failing check plus its printed `Fix:` line.
+
+## GitOps clusters: emit, do not deploy
+
+If the cluster is reconciled by Argo CD or Flux, `deploy` is the wrong verb: CI has no kubeconfig, and pointing an auto-syncing reconciler at a chart produced by `deploy` causes an outage — the chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto the build that was just scaled to zero (measured against real Argo CD: ~2.4 minutes, Application still reporting Synced).
+
+```bash
+npx adapter-k8s emit --secrets sops         # or the default --secrets external
+# commit .k8s-adapter/gitops/ ; the reconciler applies it
+```
+
+The emitted bundle is intentionally inert: its stable Services remain pinned to the previous build, and you cut over only after the gates in `docs/ci-cd.md` pass. Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy. The selector-ignore and prune safeguards a reconciler needs are in `docs/gitops.md`.
 
 ## Failure Playbook
 

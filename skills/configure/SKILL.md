@@ -1,6 +1,6 @@
 ---
 name: configure
-description: adapter.config.mjs authoring expert guidance for @next-community/adapter-k8s. Use when creating or editing adapter.config.mjs, picking a target composition (kubernetesCluster, gkeCluster, gatewayApiExposure, ingressExposure, manualExposure, envoyNativeRouting), setting up pools, or preparing a project to run npx adapter-k8s deploy.
+description: adapter.config.mjs authoring expert guidance for @next-community/adapter-k8s. Use when creating or editing adapter.config.mjs, picking a target composition (kubernetesCluster, gkeCluster, gatewayApiExposure, httpRouteExposure, ingressExposure, manualExposure, envoyNativeRouting), setting up pools, or preparing a project to run npx adapter-k8s deploy or emit.
 metadata:
   priority: 8
   docs:
@@ -48,6 +48,7 @@ retrieval:
     - defineTarget
     - kubernetesCluster
     - gatewayApiExposure
+    - httpRouteExposure
     - envoyNativeRouting
     - gkeCluster
     - infrastructure.json
@@ -76,6 +77,8 @@ kubectl cluster-info
 # Exposure options actually installed
 kubectl get gatewayclass          # CONTROLLER column: gateway.envoyproxy.io/... = Envoy Gateway
 kubectl get ingressclass
+# Shared Gateways already serving other apps — PREFER attaching to one (see step 3)
+kubectl get gateway -A
 
 # Node CPU architecture — decides ADAPTER_K8S_TARGET_PLATFORM (default linux/amd64)
 kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' | sort -u
@@ -97,18 +100,21 @@ ls adapter.config.* 2>/dev/null
 |                                | Registry — no `.k8s-adapter/infrastructure.json` and no usable hint from gcloud/docker config                                                                                                                      |
 |                                | Which GatewayClass/IngressClass — more than one plausible candidate exists                                                                                                                                         |
 |                                | Which kubectl context — more than one exists or none is current; pin the choice with `kubernetesCluster({ access: { kind: 'kubeconfig-context', context: '<name>' } })` so deploy stops prompting for confirmation |
+|                                | Which shared Gateway to attach to — `kubectl get gateway -A` returned more than one candidate                                                                                                                      |
+|                                | `imagePullSecrets` — the registry is private and the nodes have no ambient pull credentials (fleet convention is a `docker-regcred` Secret in the app namespace; the adapter references it, you create it)         |
 
-Do not ask about pools, scaling, cache, or container strategy up front — scaffold sensible defaults (one `default` pool, `routes: ['appPages', 'appRoutes', 'pagesApi']`, `scaling: { min: 2, max: 10, targetCPU: 70 }`) and mention they are tunable.
+Do not ask about pools, scaling, cache, or container strategy up front — scaffold sensible defaults (one `default` pool, `routes: ['appPages', 'appRoutes', 'pagesApi', 'pages']`, `scaling: { min: 2, max: 10, targetCPU: 70 }`) and mention they are tunable. Include `pages` even for App Router projects: it is one of the four output types, and omitting it fails classification the moment a Pages Router file appears.
 
 ## Step 3 — Pick the target composition
 
+- **A shared Gateway already exists** (`kubectl get gateway -A` returned one serving other apps — the common fleet pattern, where TLS/DNS/tunnels are solved once) → `kubernetesCluster()` + `httpRouteExposure({ className, parentRefs: [{ name, namespace }], hosts })`. This emits HTTPRoutes ONLY — no Gateway, no Certificate, no ClientTrafficPolicy — so the adapter never touches a fleet-owned object and TLS stays the Gateway owner's concern. Add `envoyNativeRouting()` when that Gateway is Envoy-managed: the extension policy targets the emitted HTTPRoute, not the shared Gateway. Prefer this over creating a second Gateway, which on some fleets provisions a whole new proxy deployment and load-balancer IP per app.
 - **GKE cluster** (context/cluster is GKE, gcloud authed) → `gkeCluster()` + `gatewayApiExposure({ className: 'gke-l7-global-external-managed', ... })` + `gkeNativeRouting()`; `npx adapter-k8s init --project-id <id> --host <host>` scaffolds and provisions this path end to end (as a legacy `provider.gke` block, which translates to the same composition) — prefer it over hand-writing.
-- **Envoy Gateway class present** (controller `gateway.envoyproxy.io/gatewayclass-controller`, class usually `eg`) → `kubernetesCluster()` + `gatewayApiExposure({ className: 'eg', ... })` + `envoyNativeRouting({ gatewayClassName: 'eg' })`.
+- **Envoy Gateway class present, no shared Gateway to attach to** (controller `gateway.envoyproxy.io/gatewayclass-controller`, class usually `eg`) → `kubernetesCluster()` + `gatewayApiExposure({ className: 'eg', ... })` + `envoyNativeRouting({ gatewayClassName: 'eg' })`.
 - **Any other GatewayClass** → `kubernetesCluster()` + `gatewayApiExposure({ className, hosts, tlsSecretName })`, no `routing` (portable default).
 - **Only IngressClasses** → `kubernetesCluster()` + `ingressExposure({ className, hosts, tlsSecretName })`.
 - **User manages exposure themselves** (mesh, existing LB) → `kubernetesCluster()` + `manualExposure({ hosts })`.
 
-`gatewayApiExposure` requires `tlsSecretName` or `controllerManagedTls` when any host has `tls.enabled`; it cannot mix TLS and plaintext hosts in one exposure. `ingressExposure` requires `tlsSecretName` when TLS is enabled.
+`gatewayApiExposure` requires `tlsSecretName`, `certManager`, or `controllerManagedTls` when any host has `tls.enabled`; it cannot mix TLS and plaintext hosts in one exposure. `ingressExposure` requires `tlsSecretName` or `certManager` when TLS is enabled. Either dedicated exposure can issue its own certificate with `certManager: { issuerRef: { name: 'letsencrypt-production', kind: 'ClusterIssuer' } }`; the adapter emits a cert-manager `Certificate` and gates readiness on it. `httpRouteExposure` takes none of these — it inherits the parent Gateway's TLS.
 
 Full option surface, env/cache/pool details, and a complete non-GKE example: [references/config-surface.md](references/config-surface.md).
 
@@ -129,6 +135,8 @@ If validation fails, fix the exact reported key — the validators name the offe
 ```bash
 npx adapter-k8s deploy
 ```
+
+**If the cluster is reconciled by Argo CD or Flux**, `deploy` is the wrong verb — CI has no kubeconfig there and the reconciler owns apply. Point the user at `npx adapter-k8s emit` instead (renders a committable bundle, no cluster contact), and at `skills/deploy` plus `docs/gitops.md` for the flow. Use `--secrets sops` (or the default `external`) so the bundle never carries plaintext secrets; the emitted bundle does not move traffic, so promotion remains the explicit gated cutover in `docs/ci-cd.md`.
 
 ## Gotchas
 

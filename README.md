@@ -85,7 +85,7 @@ import {
 export default createK8sAdapter({
   pools: {
     default: {
-      routes: ["appPages", "appRoutes", "pagesApi"],
+      routes: ["appPages", "appRoutes", "pagesApi", "pages"],
       scaling: { min: 2, max: 10, targetCPU: 70 },
     },
   },
@@ -103,6 +103,18 @@ export default createK8sAdapter({
 ```
 
 Use `ingressExposure({ className: "nginx", ... })` instead for an Ingress controller—Gateway API and Ingress are exposure choices, not providers. `deploy` asks you to confirm the target cluster (`--yes` in CI) unless both the kubeconfig context (`access`, pinned above) and the cluster identity (`identity`) are pinned—see [cluster access and identity](./docs/targets.md#portable-gateway-api-or-ingress).
+
+**Already run a shared Gateway?** Most clusters terminate TLS, DNS, and tunnels once on a fleet-wide Gateway rather than per app. Use `httpRouteExposure` to attach to it instead of creating another one—the adapter then emits HTTPRoutes only, and TLS stays the Gateway owner's concern:
+
+```js
+exposure: httpRouteExposure({
+  className: "envoy",
+  parentRefs: [{ name: "envoy-external", namespace: "network" }],
+  hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+}),
+```
+
+If the images are in a private registry, add `imagePullSecrets: ["docker-regcred"]` at the top level—the Secret is yours to create; the adapter only references it.
 
 ### 3. Declare the registry
 
@@ -146,6 +158,10 @@ target: defineTarget({
 
 `deploy` verifies the `EnvoyExtensionPolicy` reports `Accepted=True` before cutting traffic. The in-cluster callout is plain h2c bounded by NetworkPolicy, so your CNI must actually enforce policy (verified on Cilium)—read [SECURITY.md](./SECURITY.md) before using this on a shared cluster. Full journey: [docs/targets.md](./docs/targets.md#envoy-gateway-native-routing).
 
+Verified against Envoy Gateway 1.5.4–1.8.3; `deploy` warns (never fails) outside that range. Upgrading Envoy Gateway across a minor needs its CRDs applied first—`helm upgrade` does not upgrade CRDs, and 1.8 crashloops without `ListenerSet` until they are.
+
+`httpRouteExposure` composes with this: when the shared Gateway is Envoy-managed, the extension policy targets the emitted HTTPRoute rather than the fleet's Gateway, so middleware runs at the edge without the adapter touching a shared object.
+
 ## Managed GKE: provisioned infrastructure
 
 For GKE, `init` provisions everything and scaffolds the config:
@@ -162,6 +178,7 @@ This idempotently provisions the cluster, static IP, Artifact Registry repo, GCS
 | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `init`     | Provision cloud infrastructure and scaffold config. `--project-id`, `--region`, `--host`, `--dry-run`                                    |
 | `deploy`   | Build, push, and deploy with blue/green cutover. `--skip-build`, `--skip-push`, `--dry-run`                                              |
+| `emit`     | Render a committable GitOps bundle—no cluster contact at all. `--secrets`, `--previous-bundle`. See [docs/gitops.md](./docs/gitops.md)   |
 | `rollback` | Return to the previous build—pools scale back up, the routing tier reverts, traffic cuts over. Symmetric: running it again rolls forward |
 | `doctor`   | Health-check the whole stack: prerequisites, cloud resources, Kubernetes state, LB backend health, DNS + TLS                             |
 | `emulate`  | Run the full request path locally: Envoy → routing service → pool server                                                                 |
@@ -221,6 +238,21 @@ pools: {
 ## CI/CD
 
 The CLI is a convenience wrapper—everything it does can be done with a container runtime, `helm`, and (on GKE) `gcloud`. The chart is self-contained, including the load-balancer extension registration. See [docs/ci-cd.md](./docs/ci-cd.md) for the pipeline shape, the blue/green cutover commands, and known runtime requirements—including why image digests must be resolved from the registry, not the local daemon.
+
+## GitOps: Argo CD and Flux
+
+`deploy` needs cluster credentials and performs the traffic cutover itself. On GitOps clusters neither is available: CI has no kubeconfig, and a reconciler owns apply. `emit` renders the same build's artifacts as a committable bundle instead—digest-pinned values, secrets externalized or SOPS-encrypted, no cluster contact at any point:
+
+```bash
+npx adapter-k8s emit --secrets sops        # or --secrets external (default)
+# → .k8s-adapter/gitops/ : chart/ values/ manifests/ secrets/ emit-metadata.json
+```
+
+Commit the bundle; your reconciler applies it. Because a build's chart is an artifact of _that_ build, it is replaced wholesale on each emit—never edited in place, and never a target for Renovate or Flux image automation (the bundle ships a fence for both).
+
+> **Do not point an auto-syncing reconciler at a chart produced by `deploy`.** The chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto a build that has been scaled to zero. Measured against real Argo CD: reverted in ~2.4 minutes, with the Application still reporting Synced. `emit` renders the reconciler-owned inputs without moving traffic; promotion remains the explicit, gated cutover documented in [docs/ci-cd.md](./docs/ci-cd.md).
+
+The required selector-ignore and prune safeguards, plus the evidence behind them, are documented in [docs/gitops.md](./docs/gitops.md) and [plans/gitops-deployment-strategies.md](./plans/gitops-deployment-strategies.md).
 
 ## Security
 
