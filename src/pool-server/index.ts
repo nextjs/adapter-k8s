@@ -1881,14 +1881,27 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // requests are served/404'd like un-prefixed ones. (URL assetPrefixes point at a separate host,
   // so those requests never reach the pool.)
   let assetPrefix = "";
+  let webSocketAllowedOrigins: string[] = [];
   try {
     const rsf = JSON.parse(
       readFileSync(path.join(process.cwd(), ".next", "required-server-files.json"), "utf-8"),
     );
     const ap = String(rsf?.config?.assetPrefix ?? "");
     if (ap.startsWith("/")) assetPrefix = ap.replace(/\/$/, "");
+    const webSocketConfig = rsf?.config?.experimental?.webSocketRouteHandlers;
+    const configuredOrigins =
+      webSocketConfig && typeof webSocketConfig === "object"
+        ? webSocketConfig.allowedOrigins
+        : undefined;
+    if (Array.isArray(configuredOrigins)) {
+      // Next validates the canonical HTTP(S)-origin shape at build time. Re-check the serialized
+      // artifact's element types at consumption so malformed build output cannot broaden policy.
+      webSocketAllowedOrigins = configuredOrigins.filter(
+        (origin: unknown): origin is string => typeof origin === "string",
+      );
+    }
   } catch {
-    // no assetPrefix
+    // No assetPrefix or WebSocket cross-origin exception. Same-origin remains the safe default.
   }
 
   // Set preview/draft mode env vars from prerender manifest.
@@ -2333,6 +2346,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     middlewareMatchers,
   );
   const appRequire = createRequire(path.join(process.cwd(), "package.json"));
+  const pinnedWebSocket = appRequire("next/dist/compiled/ws") as {
+    extension?: { parse?: (value: string) => unknown };
+  };
+  const parseWebSocketExtensions = pinnedWebSocket.extension?.parse;
   const { createRequestResponseMocks } = appRequire("next/dist/server/lib/mock-request") as {
     createRequestResponseMocks(options: {
       url: string;
@@ -3745,6 +3762,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     reason: readinessReason,
   });
 
+  // Next's generated WebSocket entrypoint accepts a framework-owned lifecycle scope only when it
+  // is stamped on the raw request before the Adapter handoff. Keep one stable object for this
+  // server: a per-request scope would defeat Next's connection registry and shutdown bookkeeping.
+  const webSocketRegistryScope = {};
+
   // Create and start server
   const server = createPoolServer({
     port,
@@ -3764,6 +3786,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           releaseName,
           buildId,
           internalSecret,
+          webSocketRegistryScope,
+          webSocketAllowedOrigins,
+          parseWebSocketExtensions,
           handshakeTimeoutMs: REQUEST_HEAD_TIMEOUT_MS,
         },
         req,

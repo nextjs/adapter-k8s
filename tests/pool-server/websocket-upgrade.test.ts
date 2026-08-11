@@ -33,17 +33,20 @@ class NetworkLikeSocket extends Duplex {
 }
 
 function request(url = "/rooms/alpha?existing=1", headers: Record<string, string> = {}) {
+  const requestHeaders = {
+    host: "example.com",
+    connection: "Upgrade",
+    upgrade: "websocket",
+    "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+    "sec-websocket-version": "13",
+    ...headers,
+  };
   return {
     method: "GET",
+    httpVersion: "1.1",
     url,
-    headers: {
-      host: "example.com",
-      connection: "Upgrade",
-      upgrade: "websocket",
-      "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
-      "sec-websocket-version": "13",
-      ...headers,
-    },
+    headers: requestHeaders,
+    rawHeaders: Object.entries(requestHeaders).flatMap(([name, value]) => [name, value]),
   } as any;
 }
 
@@ -66,7 +69,7 @@ function dependencies(
   const resolve = vi.fn(async () => resolution as any);
   const handlerLoader = {
     has: vi.fn(() => true),
-    get: vi.fn(() => ({ runtime: options.runtime ?? "nodejs" })),
+    get: vi.fn(() => ({ runtime: options.runtime ?? "nodejs", type: "APP_ROUTE" })),
     loadUpgrade: vi.fn(async () => options.upgradeHandler),
   } as any;
   return {
@@ -76,6 +79,11 @@ function dependencies(
       poolName: "default",
       releaseName: "app",
       buildId: "b1",
+      webSocketRegistryScope: {},
+      parseWebSocketExtensions(value: string) {
+        if (value === "permessage-deflate; =") throw new SyntaxError("invalid extension");
+        return {};
+      },
       handshakeTimeoutMs: options.handshakeTimeoutMs,
     } as any,
     resolve,
@@ -85,7 +93,7 @@ function dependencies(
 
 describe("handleWebSocketUpgrade", () => {
   it("invokes Next's generated entrypoint once with raw primitives and request metadata", async () => {
-    const upgradeHandler = vi.fn(async () => undefined);
+    const upgradeHandler = vi.fn(async () => ({ upgraded: true, statusCode: 101 }));
     const { deps } = dependencies({ upgradeHandler });
     const req = request(undefined, { "x-forwarded-proto": "https" });
     const { socket } = captureSocket();
@@ -107,11 +115,48 @@ describe("handleWebSocketUpgrade", () => {
     socket.destroy();
   });
 
+  it("supplies Next's generated lifecycle scope, routing headers, and outcome contract", async () => {
+    const resolvedHeaders = new Headers({ "x-route-header": "present" });
+    resolvedHeaders.append("set-cookie", "route-a=1; Path=/");
+    resolvedHeaders.append("set-cookie", "route-b=2; Path=/");
+    const upgradeHandler = vi.fn(async (context, { node }) => {
+      const metadata = (node.req as any)[Symbol.for("NextInternalRequestMeta")];
+      expect(metadata.webSocketRegistryScope).toBe(deps.webSocketRegistryScope);
+      expect(context.responseHeaders).toEqual({
+        "set-cookie": ["route-a=1; Path=/", "route-b=2; Path=/"],
+        "x-route-header": "present",
+      });
+      return { upgraded: false, statusCode: 401 };
+    });
+    const { deps } = dependencies({
+      upgradeHandler,
+      resolution: { resolvedHeaders },
+    });
+    const { socket } = captureSocket();
+
+    await expect(handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0))).resolves.toBe(
+      "rejected",
+    );
+    expect(upgradeHandler).toHaveBeenCalledOnce();
+    socket.destroy();
+  });
+
+  it("fails closed when a generated handler returns a malformed outcome", async () => {
+    const { deps } = dependencies({ upgradeHandler: async () => undefined });
+    const { socket } = captureSocket();
+
+    await expect(handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0))).rejects.toThrow(
+      /invalid upgrade outcome/,
+    );
+    socket.destroy();
+  });
+
   it("reuses a trusted phase-two verdict and does not execute middleware/routing twice", async () => {
     const upgradeHandler = vi.fn(async (_context, { node }) => {
       expect(node.req.headers["x-authenticated-user"]).toBe("david");
       expect(node.req.headers["x-output-id"]).toBeUndefined();
       expect(node.req.headers["x-mw-request-headers"]).toBeUndefined();
+      return { upgraded: true, statusCode: 101 };
     });
     const { deps, resolve } = dependencies({ upgradeHandler });
     const req = request("/socket", {
@@ -139,7 +184,7 @@ describe("handleWebSocketUpgrade", () => {
   });
 
   it("falls back to local routing when an upstream middleware verdict is incomplete", async () => {
-    const upgradeHandler = vi.fn(async () => undefined);
+    const upgradeHandler = vi.fn(async () => ({ upgraded: true, statusCode: 101 }));
     const { deps, resolve } = dependencies({ upgradeHandler });
     const req = request("/rooms/alpha", {
       "x-output-id": "/forged",
@@ -153,22 +198,40 @@ describe("handleWebSocketUpgrade", () => {
     socket.destroy();
   });
 
-  it("flushes 426 for an ordinary HTTP-only route", async () => {
+  it("falls back to local routing when trusted dispatch metadata is malformed", async () => {
+    const upgradeHandler = vi.fn(async () => ({ upgraded: true, statusCode: 101 }));
+    const { deps, resolve } = dependencies({ upgradeHandler });
+    const req = request("/rooms/alpha", {
+      "x-output-id": "/rooms/[room]",
+      "x-mw-evaluated": "ran",
+      "x-mw-request-headers": JSON.stringify({ authorization: [123] }),
+    });
+    const { socket } = captureSocket();
+
+    await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
+      "accepted",
+    );
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(req.headers["x-mw-request-headers"]).toBeUndefined();
+    socket.destroy();
+  });
+
+  it("returns 404 when an App Route has no generated upgrade entrypoint", async () => {
     const { deps } = dependencies({ upgradeHandler: undefined });
     const { socket, text } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0))).resolves.toBe(
       "rejected",
     );
-    expect(text()).toContain("HTTP/1.1 426 Upgrade Required");
-    expect(text()).toContain("upgrade: websocket");
+    expect(text()).toContain("HTTP/1.1 404 Not Found");
+    expect(text()).toContain("Not Found");
+    expect(text()).toContain("cache-control: private, no-cache, no-store");
   });
 
   it("rejects non-WebSocket upgrades before routing", async () => {
     const upgradeHandler = vi.fn();
     const { deps, resolve } = dependencies({ upgradeHandler });
-    const req = request();
-    req.headers.upgrade = "h2c";
+    const req = request(undefined, { upgrade: "h2c" });
     const { socket, text } = captureSocket();
 
     await handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0));
@@ -176,6 +239,124 @@ describe("handleWebSocketUpgrade", () => {
     expect(resolve).not.toHaveBeenCalled();
     expect(upgradeHandler).not.toHaveBeenCalled();
   });
+
+  it("rejects malformed handshake fields before middleware or route resolution", async () => {
+    for (const [headers, status, message] of [
+      [{ "sec-websocket-key": "invalid" }, 400, "Invalid Sec-WebSocket-Key header."],
+      [{ "sec-websocket-version": "12" }, 426, "Unsupported WebSocket version."],
+      [{ "sec-websocket-protocol": "chat, chat" }, 400, "Invalid Sec-WebSocket-Protocol header."],
+      [
+        { "sec-websocket-extensions": "permessage-deflate; =" },
+        400,
+        "Invalid Sec-WebSocket-Extensions header.",
+      ],
+    ] as const) {
+      const { deps, resolve } = dependencies({
+        upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+      });
+      const { socket, text } = captureSocket();
+
+      await handleWebSocketUpgrade(deps, request(undefined, headers), socket, Buffer.alloc(0));
+
+      expect(text()).toContain(`HTTP/1.1 ${status}`);
+      expect(text()).toContain(message);
+      expect(resolve).not.toHaveBeenCalled();
+    }
+  });
+
+  it("enforces same-origin and configured cross-origin policy before routing", async () => {
+    const denied = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    const deniedSocket = captureSocket();
+    await handleWebSocketUpgrade(
+      denied.deps,
+      request(undefined, { origin: "https://attacker.example" }),
+      deniedSocket.socket,
+      Buffer.alloc(0),
+    );
+    expect(deniedSocket.text()).toContain("HTTP/1.1 403 Forbidden");
+    expect(deniedSocket.text()).toContain("WebSocket origin is not allowed.");
+    expect(denied.resolve).not.toHaveBeenCalled();
+
+    const accepted = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    accepted.deps.webSocketAllowedOrigins = ["https://client.example"];
+    const acceptedSocket = captureSocket();
+    await expect(
+      handleWebSocketUpgrade(
+        accepted.deps,
+        request(undefined, { origin: "https://client.example" }),
+        acceptedSocket.socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("accepted");
+    expect(accepted.resolve).toHaveBeenCalledOnce();
+    acceptedSocket.socket.destroy();
+  });
+
+  it("preserves only framework-authored middleware cookies into the generated request", async () => {
+    const middlewareRequestHeaders = new Headers({
+      host: "example.com",
+      connection: "Upgrade",
+      upgrade: "websocket",
+      "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+      "sec-websocket-version": "13",
+      "x-middleware-set-cookie": "proxy-cookie=present; Path=/",
+    });
+    const upgradeHandler = vi.fn(async (_context, { node }) => {
+      expect(node.req.headers["x-middleware-set-cookie"]).toBe("proxy-cookie=present; Path=/");
+      expect(node.req.headers["x-nextjs-data"]).toBeUndefined();
+      expect((node.req as any)[Symbol.for("next.websocket.upgrade-headers-filtered")]).toBe(true);
+      expect(node.req.rawHeaders.map((value: string) => value.toLowerCase())).not.toContain(
+        "x-middleware-set-cookie",
+      );
+      return { upgraded: true, statusCode: 101 };
+    });
+    const { deps } = dependencies({
+      upgradeHandler,
+      resolution: { middlewareRequestHeaders },
+    });
+    const req = request(undefined, {
+      "x-middleware-set-cookie": "forged=attacker; Path=/",
+      "x-nextjs-data": "forged",
+    });
+    // createPoolServer's shared trust boundary performs this normalized-header deletion before
+    // handing the request to handleWebSocketUpgrade; keep the direct unit invocation faithful.
+    delete req.headers["x-middleware-set-cookie"];
+    delete req.headers["x-nextjs-data"];
+    const { socket } = captureSocket();
+
+    await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
+      "accepted",
+    );
+    expect(upgradeHandler).toHaveBeenCalledOnce();
+    socket.destroy();
+  });
+
+  it.each(["content-length", "transfer-encoding", "expect", "trailer"])(
+    "rejects the ambiguous %s framing header before routing",
+    async (name) => {
+      const { deps, resolve, handlerLoader } = dependencies({
+        upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+      });
+      const { socket, text } = captureSocket();
+
+      await expect(
+        handleWebSocketUpgrade(
+          deps,
+          request(undefined, { [name]: name === "content-length" ? "0" : "present" }),
+          socket,
+          Buffer.alloc(0),
+        ),
+      ).resolves.toBe("rejected");
+      expect(text()).toContain("HTTP/1.1 400 Bad Request");
+      expect(text()).toContain("WebSocket upgrade requests cannot include HTTP body framing.");
+      expect(resolve).not.toHaveBeenCalled();
+      expect(handlerLoader.loadUpgrade).not.toHaveBeenCalled();
+    },
+  );
 
   it("relays a bounded middleware rejection with cookies but no internal headers", async () => {
     const headers = new Headers({
@@ -202,13 +383,42 @@ describe("handleWebSocketUpgrade", () => {
     expect(text()).not.toContain("x-middleware-rewrite");
   });
 
-  it("rejects Edge outputs before attempting a raw Node upgrade", async () => {
+  it("fails closed with Next's external-rewrite response instead of dialing the target", async () => {
+    const { deps } = dependencies({
+      resolution: { kind: "external-rewrite", url: new URL("http://127.0.0.1:9/socket") },
+    });
+    const { socket, text } = captureSocket();
+
+    await handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0));
+
+    expect(text()).toContain("HTTP/1.1 501 Not Implemented");
+    expect(text()).toContain(
+      "External WebSocket rewrite targets are not proxied while webSocketRouteHandlers is enabled.",
+    );
+  });
+
+  it("returns 404 for a non-App-Route output", async () => {
+    const { deps, handlerLoader } = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    handlerLoader.get.mockReturnValue({ runtime: "nodejs", type: "APP_PAGE" });
+    const { socket, text } = captureSocket();
+
+    await handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0));
+
+    expect(text()).toContain("HTTP/1.1 404 Not Found");
+    expect(text()).toContain("Not Found");
+    expect(handlerLoader.loadUpgrade).not.toHaveBeenCalled();
+  });
+
+  it("returns 404 for Edge outputs before attempting a raw Node upgrade", async () => {
     const upgradeHandler = vi.fn();
     const { deps, handlerLoader } = dependencies({ runtime: "edge", upgradeHandler });
     const { socket, text } = captureSocket();
 
     await handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0));
-    expect(text()).toContain("HTTP/1.1 501 Not Implemented");
+    expect(text()).toContain("HTTP/1.1 404 Not Found");
+    expect(text()).toContain("Not Found");
     expect(handlerLoader.loadUpgrade).not.toHaveBeenCalled();
   });
 
@@ -232,16 +442,22 @@ describe("handleWebSocketUpgrade", () => {
 
     const middlewareHeaders = new Headers({
       host: "example.com",
-      connection: "Upgrade",
+      connection: "keep-alive, Upgrade, x-remove-on-hop",
+      "keep-alive": "timeout=5",
+      "proxy-authorization": "Basic must-not-cross",
       upgrade: "websocket",
       "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
       "sec-websocket-version": "13",
       "x-authenticated-user": "david",
+      "x-remove-on-hop": "private",
     });
+    const resolvedHeaders = new Headers({ "x-route-header": "present" });
+    resolvedHeaders.append("set-cookie", "route=1; Path=/");
     const { deps } = dependencies({
       resolution: {
         pool: "chat",
         middlewareRequestHeaders: middlewareHeaders,
+        resolvedHeaders,
         invokePath: "/rooms/alpha?joined=1",
         invocationQuery: { joined: "1" },
       },
@@ -250,16 +466,31 @@ describe("handleWebSocketUpgrade", () => {
     deps.resolvePoolEndpoint = () => ({ hostname: "127.0.0.1", port: address.port });
     const socket = new NetworkLikeSocket();
     const earlyFrame = Buffer.from([0x81, 0x00]);
+    const clientRequest = request(undefined, {
+      connection: "keep-alive, Upgrade, x-remove-on-hop",
+      "keep-alive": "timeout=5",
+      "proxy-authorization": "Basic must-not-cross",
+      "x-remove-on-hop": "private",
+    });
 
     try {
-      await expect(handleWebSocketUpgrade(deps, request(), socket, earlyFrame)).resolves.toBe(
+      await expect(handleWebSocketUpgrade(deps, clientRequest, socket, earlyFrame)).resolves.toBe(
         "accepted",
       );
       expect(siblingHeaders?.["x-output-id"]).toBe("/rooms/[room]");
       expect(siblingHeaders?.["x-mw-evaluated"]).toBe("ran");
       expect(siblingHeaders?.["x-internal-secret"]).toBe("internal-secret");
-      expect(siblingHeaders?.["x-authenticated-user"]).toBe("david");
+      expect(siblingHeaders?.["x-authenticated-user"]).toBeUndefined();
+      expect(siblingHeaders?.["x-mw-request-headers"]).toBe(
+        JSON.stringify(Object.fromEntries(middlewareHeaders.entries())),
+      );
       expect(siblingHeaders?.["x-invoke-query"]).toBe(JSON.stringify({ joined: "1" }));
+      expect(siblingHeaders?.["x-resolved-headers"]).toBe(
+        JSON.stringify({ "x-route-header": "present", "set-cookie": ["route=1; Path=/"] }),
+      );
+      expect(siblingHeaders?.["keep-alive"]).toBeUndefined();
+      expect(siblingHeaders?.["proxy-authorization"]).toBeUndefined();
+      expect(siblingHeaders?.["x-remove-on-hop"]).toBeUndefined();
       expect(socket.text()).toContain("101 Switching Protocols");
       expect(socket.text().toLowerCase()).toContain("set-cookie: a=1; path=/");
       expect(socket.text().toLowerCase()).toContain("set-cookie: b=2; path=/");
@@ -286,6 +517,35 @@ describe("handleWebSocketUpgrade", () => {
       /handshake deadline/,
     );
     socket.destroy();
+  });
+
+  it("bounds and cancels a middleware rejection body that never produces bytes", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull: () => new Promise(() => undefined),
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const { deps } = dependencies({
+      handshakeTimeoutMs: 20,
+      resolution: {
+        kind: "middleware-response",
+        response: new Response(body, { status: 401 }),
+      },
+    });
+    const { socket } = captureSocket();
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await expect(handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0))).resolves.toBe(
+        "rejected",
+      );
+      expect(cancelled).toBe(true);
+      expect(socket.destroyed).toBe(true);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("bounds local route resolution before a module is selected", async () => {

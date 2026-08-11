@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   applyMiddlewareRequestHeaders,
   createDispatcher,
+  installResolvedResponseHeaders,
   mergeResolvedHeadersIntoHeadersArg,
   mergeResponseHeaders,
 } from "../../src/pool-server/dispatch.js";
@@ -437,6 +438,58 @@ describe("applyMiddlewareRequestHeaders", () => {
     applyMiddlewareRequestHeaders(req, headers);
 
     expect(req.headers.cookie).toBe("app=existing; session=one; theme=dark");
+  });
+
+  it("preserves framework-authored middleware cookies for a generated WebSocket handoff", () => {
+    const req = mockReq("/", { cookie: "app=existing" });
+    const headers = new Headers({
+      cookie: "app=existing",
+      "x-middleware-set-cookie": "session=one; Path=/",
+    });
+
+    applyMiddlewareRequestHeaders(req, headers, { preserveMiddlewareCookieHeader: true });
+
+    expect(req.headers.cookie).toBe("app=existing");
+    expect(req.headers["x-middleware-set-cookie"]).toBe("session=one; Path=/");
+  });
+});
+
+describe("generated WebSocket fallback response headers", () => {
+  it("keeps Next's canonical 426 framing after routing-header inheritance", () => {
+    let written: unknown;
+    const res = {
+      writeHead(_status: number, headers: unknown) {
+        written = headers;
+        return res;
+      },
+    } as unknown as ServerResponse;
+    const resolved = new Headers({
+      connection: "x-routing-secret",
+      "content-length": "999999",
+      "x-routing-secret": "secret",
+      "x-response-layer": "routing",
+    });
+    resolved.append("set-cookie", "routing=present; Path=/");
+    installResolvedResponseHeaders(res, resolved);
+
+    res.writeHead(426, {
+      connection: "close",
+      "content-length": "51",
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "private, no-cache, no-store, max-age=0, must-revalidate",
+      upgrade: "websocket",
+      "sec-websocket-version": "13",
+      "x-response-layer": "handler",
+    });
+
+    const headers = new Headers(written as HeadersInit);
+    expect(headers.get("connection")).toBe("close");
+    expect(headers.get("content-length")).toBe("51");
+    expect(headers.get("upgrade")).toBe("websocket");
+    expect(headers.get("sec-websocket-version")).toBe("13");
+    expect(headers.get("x-routing-secret")).toBeNull();
+    expect(headers.get("x-response-layer")).toBe("handler");
+    expect(headers.get("set-cookie")).toContain("routing=present");
   });
 });
 

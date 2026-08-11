@@ -242,10 +242,40 @@ The pool runtime supports Next's generated Node.js `upgradeHandler` adapter cont
 additive entrypoint consumed by adapter-vercel. This is transport support for the experimental
 Next.js WebSocket work; stable Next.js does not yet expose `NextResponse.upgrade()`.
 
+On a compatible Next.js branch, enable the experiment and keep the route dynamic:
+
+```js
+// next.config.js
+export default {
+  experimental: { webSocketRouteHandlers: true },
+};
+```
+
+```ts
+// app/ws/route.ts
+import { NextResponse } from "next/server";
+
+export const dynamic = "force-dynamic";
+
+export function GET() {
+  return NextResponse.upgrade({
+    open(peer) {
+      peer.send("connected");
+    },
+    message(peer, message) {
+      peer.send(message.rawData);
+    },
+  });
+}
+```
+
 Once a compatible Next build generates the entrypoint, an upgrade follows the ordinary routing
 path: trusted routing-extension results are reused, untrusted or incomplete results are resolved
 locally, middleware and rewrites apply exactly once, and a route assigned to another pool is
-tunnelled to its owning pool. HTTP-only routes answer `426 Upgrade Required`.
+tunnelled to its owning pool. A Route Handler can return an ordinary `Response` to reject the
+upgrade; missing, non-Node, non-App-Route, and HTTP-only outputs answer `404 Not Found`, matching
+Next's route-ownership contract. An ordinary HTTP request to a handler that returns
+`NextResponse.upgrade()` receives Next's sanitized `426 Upgrade Required` fallback.
 
 Current boundaries are deliberate:
 

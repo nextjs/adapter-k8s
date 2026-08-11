@@ -496,16 +496,138 @@ export function mergeResolvedHeadersIntoHeadersArg(
   return headersArg;
 }
 
+const WEBSOCKET_FALLBACK_REPLACED_HEADERS = new Set([
+  "accept-ranges",
+  "age",
+  "cache-control",
+  "connection",
+  "content-digest",
+  "content-disposition",
+  "content-encoding",
+  "content-language",
+  "content-length",
+  "content-location",
+  "content-range",
+  "content-type",
+  "digest",
+  "edge-control",
+  "etag",
+  "expires",
+  "keep-alive",
+  "last-modified",
+  "proxy-connection",
+  "repr-digest",
+  "sec-websocket-accept",
+  "sec-websocket-extensions",
+  "sec-websocket-key",
+  "sec-websocket-protocol",
+  "sec-websocket-version",
+  "surrogate-control",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "x-lighttpd-send-file",
+  "x-sendfile",
+]);
+
+function headersArgPairs(headersArg: unknown): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  const append = (name: unknown, value: unknown) => {
+    if (Array.isArray(value)) {
+      for (const item of value) pairs.push([String(name), String(item)]);
+    } else if (value !== undefined) {
+      pairs.push([String(name), String(value)]);
+    }
+  };
+  if (Array.isArray(headersArg)) {
+    if (headersArg.length > 0 && !Array.isArray(headersArg[0])) {
+      for (let index = 0; index + 1 < headersArg.length; index += 2) {
+        append(headersArg[index], headersArg[index + 1]);
+      }
+    } else {
+      for (const entry of headersArg as Array<[unknown, unknown]>) append(entry[0], entry[1]);
+    }
+  } else if (headersArg && typeof headersArg === "object") {
+    for (const [name, value] of Object.entries(headersArg)) append(name, value);
+  }
+  return pairs;
+}
+
+function isGeneratedWebSocketFallback(status: number, headersArg: unknown): boolean {
+  if (status !== 426) return false;
+  const headers = new Headers(headersArgPairs(headersArg));
+  return (
+    headers.get("connection")?.toLowerCase() === "close" &&
+    headers.get("upgrade")?.toLowerCase() === "websocket" &&
+    headers.get("sec-websocket-version") === "13"
+  );
+}
+
+/**
+ * The generated App Route has already canonicalized an ordinary HTTP invocation of
+ * NextResponse.upgrade() into a safe 426. Routing headers live outside the loopback entrypoint in
+ * this adapter, so merging them with the normal "routing wins" rule would re-introduce forbidden
+ * Connection/framing/internal fields after Next removed them. Recreate the fallback's inheritance
+ * order: safe routing fields first, then handler fields, while its canonical transport fields win.
+ */
+function mergeResolvedHeadersIntoWebSocketFallback(
+  resolvedHeaders: Headers,
+  headersArg: unknown,
+): unknown {
+  const handlerPairs = headersArgPairs(headersArg);
+  const handlerNames = new Set(handlerPairs.map(([name]) => name.toLowerCase()));
+  const nominated = new Set(
+    (resolvedHeaders.get("connection") ?? "")
+      .split(",")
+      .map((name) => name.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const isForbidden = (name: string) => {
+    const lower = name.toLowerCase();
+    return (
+      WEBSOCKET_FALLBACK_REPLACED_HEADERS.has(lower) ||
+      nominated.has(lower) ||
+      lower.endsWith("-cache-control") ||
+      lower.startsWith("x-accel-") ||
+      lower.startsWith("x-middleware-") ||
+      lower.startsWith("x-nextjs-") ||
+      lower === INTERNAL_SECRET_HEADER ||
+      (INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(lower)
+    );
+  };
+
+  const inherited: Array<[string, string]> = [];
+  for (const [name, value] of resolvedHeaders.entries()) {
+    const lower = name.toLowerCase();
+    if (lower === "set-cookie" || isForbidden(lower) || handlerNames.has(lower)) continue;
+    inherited.push([name, value]);
+  }
+  if (!nominated.has("set-cookie")) {
+    for (const cookie of resolvedHeaders.getSetCookie()) inherited.push(["set-cookie", cookie]);
+  }
+  return [...inherited, ...handlerPairs];
+}
+
 /** Apply Next middleware's authoritative request-header replacement to a Node request. */
 export function applyMiddlewareRequestHeaders(
   req: IncomingMessage,
   middlewareRequestHeaders: Headers | undefined,
+  options: { preserveMiddlewareCookieHeader?: boolean } = {},
 ): void {
   if (!middlewareRequestHeaders) return;
   const originalHost = req.headers.host;
   const nextHeaders: IncomingMessage["headers"] = {};
   for (const [key, value] of middlewareRequestHeaders.entries()) {
     if (key === "x-middleware-set-cookie") {
+      // WebSocket routing is split across Node's `upgrade` event and Next's generated
+      // entrypoint. Next preserves this framework-authored header across that handoff so its
+      // request store can merge middleware cookies without treating a client-forged cookie as
+      // input. Ordinary HTTP dispatch keeps the historical cookie-header projection below.
+      if (options.preserveMiddlewareCookieHeader) {
+        nextHeaders[key] = value;
+        continue;
+      }
       const cookies: string[] = [];
       for (const setCookie of splitCookiesString(value)) {
         const nameValue = setCookie.trim().split(";")[0];
@@ -534,7 +656,9 @@ export function installResolvedResponseHeaders(
   res.writeHead = ((status: number, ...args: unknown[]) => {
     const headersIndex = typeof args[0] === "string" ? 1 : 0;
     if (args[headersIndex] !== undefined && args[headersIndex] !== null) {
-      args[headersIndex] = mergeResolvedHeadersIntoHeadersArg(resolvedHeaders, args[headersIndex]);
+      args[headersIndex] = isGeneratedWebSocketFallback(status, args[headersIndex])
+        ? mergeResolvedHeadersIntoWebSocketFallback(resolvedHeaders, args[headersIndex])
+        : mergeResolvedHeadersIntoHeadersArg(resolvedHeaders, args[headersIndex]);
     }
     return Reflect.apply(originalWriteHead, res, [status, ...args]) as ServerResponse;
   }) as typeof res.writeHead;
