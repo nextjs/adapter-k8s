@@ -67,7 +67,7 @@ export async function switchTrafficToNewBuild(opts: {
         pool: servicePool,
         service: activeServiceName,
         stderr:
-          read.stderr.trim() ||
+          sanitizeForTerminal(read.stderr.trim()) ||
           `could not read an exact Service selector (kubectl exited ${read.exitCode})`,
       });
       continue;
@@ -114,7 +114,7 @@ export async function switchTrafficToNewBuild(opts: {
         patchFailures.push({
           pool: servicePool,
           service: activeServiceName,
-          stderr: patchResult.stderr.trim(),
+          stderr: sanitizeForTerminal(patchResult.stderr.trim()),
         });
       } else {
         patchedServices.push(activeServiceName);
@@ -274,7 +274,7 @@ export async function snapshotRevertSelectors(opts: {
     ) {
       throw new Error(
         `Could not read the exact selector for rollback Service ` +
-          `${serviceName} (kubectl exited ${read.exitCode}${read.stderr.trim() ? `: ${read.stderr.trim()}` : ""}). ` +
+          `${serviceName} (kubectl exited ${read.exitCode}${read.stderr.trim() ? `: ${sanitizeForTerminal(read.stderr.trim())}` : ""}). ` +
           `Traffic was NOT switched; refusing to patch selectors without a reversible snapshot.`,
       );
     }
@@ -342,7 +342,10 @@ export async function flipSelectorsToPreviousBuild(opts: {
       { timeoutMs: EXEC_TIMEOUTS.kubectl },
     );
     if (patchResult.exitCode !== 0) {
-      patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
+      patchFailures.push({
+        service: svcName,
+        stderr: sanitizeForTerminal(patchResult.stderr.trim()),
+      });
     } else {
       patchedServices.push({ service: svcName, pool: servicePool });
     }

@@ -138,7 +138,7 @@ export async function waitRoutingRollout(ctx: GateContext): Promise<void> {
         [
           `Routing service (${routingDeploy}) did not become healthy. Traffic was NOT ` +
             `switched — the previous build's pools are still serving.`,
-          `${(rsRollout.stderr || rsRollout.stdout).trim()}`,
+          `${sanitizeForTerminal((rsRollout.stderr || rsRollout.stdout).trim())}`,
           `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${namespace} --tail=40`,
           ...deps.edgeStatusLines(edge),
         ].join("\n"),
@@ -207,7 +207,8 @@ export async function waitPolicyAccepted(ctx: GateContext): Promise<void> {
       ["get", "envoyextensionpolicy", policyName, "-n", namespace, "-o", "json"],
       { timeoutMs: EXEC_TIMEOUTS.kubectl },
     );
-    detail = (read.stderr || "").trim();
+    // L14: kubectl stderr can carry controller/admission messages — sanitize at capture.
+    detail = sanitizeForTerminal((read.stderr || "").trim());
     if (read.exitCode === 0) {
       try {
         const obj = JSON.parse(read.stdout) as {

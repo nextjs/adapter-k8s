@@ -6,6 +6,7 @@
 // in-cluster cutover Job revert the edge through these functions; src/cli/rollback.ts
 // re-exports them so its import surface (and the tests that mock it) are unchanged.
 import { EXEC_TIMEOUTS, execCapture, execCaptureStdin } from "../cli/exec.js";
+import { sanitizeForTerminal } from "../cli/terminal.js";
 import { resolveK8sNamespace } from "../emit/templates/utils.js";
 import {
   ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
@@ -97,7 +98,7 @@ export async function readRoutingServingConfig(
       status: "failed",
       reason:
         `the routing Deployment ${deployName} could not be read (kubectl exited ` +
-        `${res.exitCode}${res.stderr.trim() ? `: ${res.stderr.trim()}` : ""}). ` +
+        `${res.exitCode}${res.stderr.trim() ? `: ${sanitizeForTerminal(res.stderr.trim())}` : ""}). ` +
         `--ignore-not-found makes a genuinely absent Deployment exit 0, so this is a ` +
         `connectivity/RBAC failure, NOT "this release has no routing tier"`,
     };
@@ -260,7 +261,7 @@ export async function retainLiveRoutingManifest(
     if (annotated.exitCode !== 0) {
       return {
         status: "failed",
-        reason: `could not retain the live snapshot ${snapshotName}: ${annotated.stderr.trim() || `kubectl annotate exited ${annotated.exitCode}`}`,
+        reason: `could not retain the live snapshot ${snapshotName}: ${sanitizeForTerminal(annotated.stderr.trim()) || `kubectl annotate exited ${annotated.exitCode}`}`,
       };
     }
     const labeled = await execCapture(
@@ -280,7 +281,7 @@ export async function retainLiveRoutingManifest(
     if (labeled.exitCode !== 0) {
       return {
         status: "failed",
-        reason: `could not classify the live snapshot ${snapshotName}: ${labeled.stderr.trim() || `kubectl label exited ${labeled.exitCode}`}`,
+        reason: `could not classify the live snapshot ${snapshotName}: ${sanitizeForTerminal(labeled.stderr.trim()) || `kubectl label exited ${labeled.exitCode}`}`,
       };
     }
     return { status: "retained", snapshotName };
@@ -369,11 +370,11 @@ export async function retainLiveRoutingManifest(
   );
   if (applied.exitCode !== 0) {
     const reason = `kubectl apply of snapshot ${snapshotName} failed: ${
-      applied.stderr.trim() || `exit ${applied.exitCode}`
+      sanitizeForTerminal(applied.stderr.trim()) || `exit ${applied.exitCode}`
     }`;
     log(
       `  ! Could not retain the routing manifest for build ${serving.imageTag}: ` +
-        `${applied.stderr.trim() || `exit ${applied.exitCode}`} — a rollback to this ` +
+        `${sanitizeForTerminal(applied.stderr.trim()) || `exit ${applied.exitCode}`} — a rollback to this ` +
         `build would revert the edge image only.`,
     );
     return { status: "failed", reason };
@@ -616,7 +617,7 @@ export async function revertRoutingServiceToBuild(opts: {
   if (patched.exitCode !== 0) {
     throw new Error(
       `Failed to revert the routing service (${deployName}): ` +
-        `${patched.stderr.trim() || `exit ${patched.exitCode}`}. Traffic was NOT switched; ` +
+        `${sanitizeForTerminal(patched.stderr.trim()) || `exit ${patched.exitCode}`}. Traffic was NOT switched; ` +
         `the pools and the edge are still on the current build.`,
     );
   }

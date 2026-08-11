@@ -435,7 +435,7 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
       if (widen.exitCode !== 0) {
         console.warn(
           `  ! Could not raise ${hpaName} to min=${plan.min}/max=${plan.max}: ` +
-            `${widen.stderr.trim() || `exit ${widen.exitCode}`} — the rollback target may ` +
+            `${sanitizeForTerminal(widen.stderr.trim()) || `exit ${widen.exitCode}`} — the rollback target may ` +
             `autoscale back below the capacity the current build was serving.`,
         );
       }
