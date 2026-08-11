@@ -22,6 +22,10 @@
 import { runCutover } from "./run.js";
 import { createEdgeRecovery, revertRoutingServiceToBuild } from "./edge.js";
 import { CutoverExitError } from "./inputs.js";
+import { EXEC_TIMEOUTS, execCapture } from "../cli/exec.js";
+import { sanitizeForTerminal } from "../cli/terminal.js";
+import { sanitizeK8sName } from "../emit/templates/utils.js";
+import { CUTOVER_ANNOTATION_KEY } from "../emit/templates/service.js";
 import { readState, writeState, type AdapterState } from "../cli/state.js";
 import {
   buildCutoverInputsFromCluster,
@@ -222,6 +226,39 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
     await recordFailedPromotion({ state, buildId, releaseName, namespace });
     return err instanceof CutoverExitError ? err.code : 1;
   }
+
+  // The bundle stamps every stable active Service `adapter-k8s.io/cutover: pending`
+  // ("this selector awaits the Job's promotion"). The promotion is now durable (E2
+  // committed), so flip the value to complete — a live object must not read as pending
+  // forever, which is indistinguishable from a Job that never ran. The NEXT bundle's
+  // sync re-stamps pending, which is again true for that bundle's build. Best-effort:
+  // an annotate failure never fails a committed promotion.
+  const stableServices = [
+    ...metadata.poolTopology.map((pool) => sanitizeK8sName(`${releaseName}-${pool}`)),
+    ...(metadata.hasPortableOrigin ? [sanitizeK8sName(`${releaseName}-origin`)] : []),
+  ];
+  for (const svc of stableServices) {
+    const annotated = await execCapture(
+      "kubectl",
+      [
+        "annotate",
+        "service",
+        svc,
+        "-n",
+        namespace,
+        `${CUTOVER_ANNOTATION_KEY}=complete`,
+        "--overwrite",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (annotated.exitCode !== 0) {
+      console.warn(
+        `  ! Could not mark ${svc} ${CUTOVER_ANNOTATION_KEY}=complete (non-fatal): ` +
+          `${sanitizeForTerminal(annotated.stderr.trim()) || `exit ${annotated.exitCode}`}`,
+      );
+    }
+  }
+
   console.log(`\nPromotion complete: build "${buildId}" is serving.`);
   return 0;
 }

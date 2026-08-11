@@ -132,6 +132,20 @@ describe("renderCutoverJob", () => {
     expect(out).toContain("restartPolicy: Never");
   });
 
+  it("labels the POD template with the same name/component pair as the Job object", () => {
+    // Job labels do NOT propagate to pods — only template.metadata.labels do, and the
+    // batch controller adds only its own job-name labels. Without these, the documented
+    // operator pane (`kubectl logs -l app.kubernetes.io/component=cutover-job`) matches
+    // nothing. The pair is deliberately unmatched by every NetworkPolicy podSelector
+    // (those pair the name label with routing-service/pool components), so labeling the
+    // pod does not capture it into a policy and cut its apiserver egress.
+    const out = withoutComments(yaml());
+    const template = out.slice(out.indexOf("  template:"));
+    expect(template).toContain("metadata:");
+    expect(template).toContain(`app.kubernetes.io/name: "${RELEASE}"`);
+    expect(template).toContain(`app.kubernetes.io/component: ${CUTOVER_JOB_COMPONENT}`);
+  });
+
   it("wires the entrypoint's three inputs: release, downward-API namespace, mounted metadata", () => {
     const out = yaml();
     expect(out).toContain(`serviceAccountName: ${cutoverServiceAccountName(RELEASE)}`);

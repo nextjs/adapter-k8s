@@ -737,4 +737,68 @@ describe("jobMain — the poison pill", () => {
     await expect(jobMain(env())).rejects.toThrow(/Composition plan ConfigMap is missing/);
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
   });
+
+  // The cutover annotation flip: the bundle stamps the stable Services
+  // `adapter-k8s.io/cutover: pending`; the Job must rewrite it to complete once the
+  // promotion is durable — a live object stuck at pending is indistinguishable from a
+  // Job that never ran.
+  function annotateCalls(): Array<string[]> {
+    return vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => (a as string[])[0] === "annotate")
+      .map(([, a]) => a as string[]);
+  }
+
+  it("flips the stable Services' cutover annotation to complete AFTER the promotion commits", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+
+    expect(await jobMain(env())).toBe(0);
+
+    expect(annotateCalls()).toEqual([
+      [
+        "annotate",
+        "service",
+        `${RELEASE}-ssr`,
+        "-n",
+        NS,
+        "adapter-k8s.io/cutover=complete",
+        "--overwrite",
+      ],
+    ]);
+    // AFTER the state commit — a failure between patch and commit must leave pending.
+    const calls = vi.mocked(execCapture).mock.calls;
+    const annotateIdx = calls.findIndex(([, a]) => (a as string[])[0] === "annotate");
+    const patchIdx = calls.findIndex(
+      ([, a]) => (a as string[])[0] === "patch" && (a as string[])[1] === "service",
+    );
+    expect(patchIdx).toBeGreaterThanOrEqual(0);
+    expect(annotateIdx).toBeGreaterThan(patchIdx);
+  });
+
+  it("an annotate failure is NON-FATAL — the promotion is already committed", async () => {
+    const base = cluster();
+    vi.mocked(execCapture).mockImplementation(((cmd: string, args: string[], opts: unknown) => {
+      if (args[0] === "annotate") {
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "conflict" });
+      }
+      return base(cmd, args, opts as never);
+    }) as never);
+
+    expect(await jobMain(env())).toBe(0);
+    expect(
+      vi
+        .mocked(console.warn)
+        .mock.calls.map((c) => String(c[0]))
+        .join("\n"),
+    ).toContain("Could not mark rel-ssr adapter-k8s.io/cutover=complete");
+  });
+
+  it("a FAILED promotion never touches the annotation (pending stays truthful)", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ rolloutFailsFor: `${RELEASE}-ssr-${BUILD}` }) as never,
+    );
+
+    expect(await jobMain(env())).not.toBe(0);
+    expect(annotateCalls()).toEqual([]);
+  });
 });
