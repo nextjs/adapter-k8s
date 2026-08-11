@@ -109,6 +109,12 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   remaining PPR resume-data consistency case.
 - **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to.
 - **The generic provider is younger** than the GKE one and has correspondingly less real-world exposure, though it passes the same unit suite and its live verification covered the full request path.
+- **WebSocket Route Handlers are transport-tested, not yet framework-e2e verified.** The pool has
+  real-socket coverage for generated `upgradeHandler` dispatch, trusted and local routing,
+  cross-pool tunnelling, repeated handshake headers, and bounded shutdown. The public
+  `NextResponse.upgrade()` API and its upstream e2e fixture are still experimental/unpublished;
+  that suite must pass against the exact Next branch before this support is called framework
+  verified.
 
 ## Reproducing
 
