@@ -738,10 +738,14 @@ describe("jobMain — the poison pill", () => {
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
   });
 
-  // The cutover annotation flip: the bundle stamps the stable Services
-  // `adapter-k8s.io/cutover: pending`; the Job must rewrite it to complete once the
-  // promotion is durable — a live object stuck at pending is indistinguishable from a
-  // Job that never ran.
+  // The cutover marker lifecycle: the bundle stamps the stable Services
+  // `adapter-k8s.io/cutover: pending`; the Job must CLEAR it once the promotion is
+  // durable — a live object stuck at pending is indistinguishable from a Job that never
+  // ran. A REMOVAL, not a "complete" value: SSA ownership is (manager, operation), so
+  // both value-writing designs conflicted with helm's Apply re-stamp on the next sync
+  // (kubectl-annotate's manager AND --field-manager=helm — "helm"+Update ≠
+  // "helm"+Apply, both measured live). Updates ignore ownership and a removed field
+  // has no owner, so the next sync's pending applies cleanly.
   function annotateCalls(): Array<string[]> {
     return vi
       .mocked(execCapture)
@@ -749,21 +753,15 @@ describe("jobMain — the poison pill", () => {
       .map(([, a]) => a as string[]);
   }
 
-  it("flips the stable Services' cutover annotation to complete AFTER the promotion commits", async () => {
+  it("CLEARS the stable Services' pending marker AFTER the promotion commits", async () => {
     vi.mocked(execCapture).mockImplementation(cluster() as never);
 
     expect(await jobMain(env())).toBe(0);
 
+    // The trailing dash is kubectl's removal syntax — a value-writing form here is the
+    // measured SSA conflict re-introduced.
     expect(annotateCalls()).toEqual([
-      [
-        "annotate",
-        "service",
-        `${RELEASE}-ssr`,
-        "-n",
-        NS,
-        "adapter-k8s.io/cutover=complete",
-        "--overwrite",
-      ],
+      ["annotate", "service", `${RELEASE}-ssr`, "-n", NS, "adapter-k8s.io/cutover-"],
     ]);
     // AFTER the state commit — a failure between patch and commit must leave pending.
     const calls = vi.mocked(execCapture).mock.calls;
@@ -775,11 +773,11 @@ describe("jobMain — the poison pill", () => {
     expect(annotateIdx).toBeGreaterThan(patchIdx);
   });
 
-  it("an annotate failure is NON-FATAL — the promotion is already committed", async () => {
+  it("a clear failure is NON-FATAL — the promotion is already committed", async () => {
     const base = cluster();
     vi.mocked(execCapture).mockImplementation(((cmd: string, args: string[], opts: unknown) => {
       if (args[0] === "annotate") {
-        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "conflict" });
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "denied" });
       }
       return base(cmd, args, opts as never);
     }) as never);
@@ -790,10 +788,10 @@ describe("jobMain — the poison pill", () => {
         .mocked(console.warn)
         .mock.calls.map((c) => String(c[0]))
         .join("\n"),
-    ).toContain("Could not mark rel-ssr adapter-k8s.io/cutover=complete");
+    ).toContain("Could not clear the adapter-k8s.io/cutover: pending marker on rel-ssr");
   });
 
-  it("a FAILED promotion never touches the annotation (pending stays truthful)", async () => {
+  it("a FAILED promotion never touches the marker (pending stays truthful)", async () => {
     vi.mocked(execCapture).mockImplementation(
       cluster({ rolloutFailsFor: `${RELEASE}-ssr-${BUILD}` }) as never,
     );

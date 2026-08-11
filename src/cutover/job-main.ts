@@ -229,32 +229,37 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
 
   // The bundle stamps every stable active Service `adapter-k8s.io/cutover: pending`
   // ("this selector awaits the Job's promotion"). The promotion is now durable (E2
-  // committed), so flip the value to complete — a live object must not read as pending
-  // forever, which is indistinguishable from a Job that never ran. The NEXT bundle's
-  // sync re-stamps pending, which is again true for that bundle's build. Best-effort:
-  // an annotate failure never fails a committed promotion.
+  // committed), so CLEAR the marker — a live object must not read as pending forever,
+  // which is indistinguishable from a Job that never ran. The NEXT bundle's sync
+  // re-stamps pending, which is again true for that bundle's build.
+  //
+  // Clearing — not setting "complete" — is forced by server-side apply, measured live
+  // in both wrong designs: SSA ownership identity is (manager, OPERATION), so any
+  // annotate/patch is an Update-owner that can never impersonate helm's Apply-owner —
+  // kubectl's default manager conflicted, and --field-manager=helm STILL conflicted
+  // ("helm"+Update ≠ "helm"+Apply) — and each left the next sync's re-stamp to pending
+  // failing with a field conflict, i.e. a reconciler reports the release broken after
+  // every promotion. (The E1 selector patches never hit this because emit pins the next
+  // bundle's selector to the SAME value the promotion set; equal values don't
+  // conflict.) A REMOVAL is the design that cannot conflict: updates ignore ownership,
+  // deletion drops the field's managedFields entry, and the next apply finds no live
+  // value and no foreign owner. Absent = promoted; the state ConfigMap stays the
+  // authority. Best-effort: a failure here never fails a committed promotion.
   const stableServices = [
     ...metadata.poolTopology.map((pool) => sanitizeK8sName(`${releaseName}-${pool}`)),
     ...(metadata.hasPortableOrigin ? [sanitizeK8sName(`${releaseName}-origin`)] : []),
   ];
   for (const svc of stableServices) {
-    const annotated = await execCapture(
+    const cleared = await execCapture(
       "kubectl",
-      [
-        "annotate",
-        "service",
-        svc,
-        "-n",
-        namespace,
-        `${CUTOVER_ANNOTATION_KEY}=complete`,
-        "--overwrite",
-      ],
+      ["annotate", "service", svc, "-n", namespace, `${CUTOVER_ANNOTATION_KEY}-`],
       { timeoutMs: EXEC_TIMEOUTS.kubectl },
     );
-    if (annotated.exitCode !== 0) {
+    if (cleared.exitCode !== 0) {
       console.warn(
-        `  ! Could not mark ${svc} ${CUTOVER_ANNOTATION_KEY}=complete (non-fatal): ` +
-          `${sanitizeForTerminal(annotated.stderr.trim()) || `exit ${annotated.exitCode}`}`,
+        `  ! Could not clear the ${CUTOVER_ANNOTATION_KEY}: pending marker on ${svc} ` +
+          `(non-fatal): ` +
+          `${sanitizeForTerminal(cleared.stderr.trim()) || `exit ${cleared.exitCode}`}`,
       );
     }
   }
