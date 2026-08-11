@@ -8,6 +8,7 @@ import {
   execCapture,
   execCaptureStdin,
   execOrThrow,
+  resolveBuildTimeoutMs,
   resolveWindowsCommand,
 } from "../../src/cli/exec.js";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
@@ -275,5 +276,25 @@ describe("buildWindowsCmdInvocation", () => {
     expect(line).not.toMatch(/(^|[^^])[&|<>]/);
     // And every double quote other than the /s outer pair must be ^-escaped.
     expect(line.slice(1, -1)).not.toMatch(/(^|[^^\\])"/);
+  });
+});
+
+describe("resolveBuildTimeoutMs — the operator-tunable build tier", () => {
+  it("defaults to the 20-minute ceiling when unset or empty", () => {
+    expect(resolveBuildTimeoutMs(undefined)).toBe(20 * 60 * 1000);
+    expect(resolveBuildTimeoutMs("")).toBe(20 * 60 * 1000);
+  });
+
+  it("accepts a positive integer of milliseconds", () => {
+    expect(resolveBuildTimeoutMs("3600000")).toBe(3_600_000);
+    expect(resolveBuildTimeoutMs("1")).toBe(1);
+  });
+
+  it("REFUSES anything else — a typo must not silently fall back to the default", () => {
+    // A silent fallback would reintroduce the surprise mid-deploy timeout minutes after
+    // the operator believed they had raised it.
+    for (const bad of ["45m", "0", "-1", "1.5", "NaN", "1e6 ", "twenty"]) {
+      expect(() => resolveBuildTimeoutMs(bad)).toThrow(/ADAPTER_K8S_BUILD_TIMEOUT_MS/);
+    }
   });
 });

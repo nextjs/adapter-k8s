@@ -735,7 +735,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     console.log("\n  → Running next build...");
     await execOrThrow("npx", ["next", "build"], {
       cwd: projectDir,
-      timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      timeoutMs: EXEC_TIMEOUTS.build,
     });
   }
 
@@ -907,7 +907,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
       console.log(`\n  → ${cmd.description}`);
       await execOrThrow(cmd.command, cmd.args, {
         cwd: projectDir,
-        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        timeoutMs: EXEC_TIMEOUTS.build,
       });
     }
   }
