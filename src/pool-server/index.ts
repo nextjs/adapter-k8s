@@ -41,6 +41,7 @@ import {
   installResolvedResponseHeaders,
   isVerifiedPreviewRequest,
   mergeResolvedHeadersIntoHeadersArg,
+  REQUEST_HEAD_TIMEOUT_MS,
 } from "./dispatch.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
 import {
@@ -76,6 +77,7 @@ import {
   type ReadinessState,
 } from "./server.js";
 import { readWebBodyWithLimit } from "./body-limit.js";
+import { handleWebSocketUpgrade } from "./websocket-upgrade.js";
 import {
   registerValkeyCacheHandler,
   seedSandboxCacheHandlerRegistry,
@@ -3751,6 +3753,23 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     internalSecret,
     proofHeaderNames,
     onRequest: handleRequest,
+    // The generated upgrade entrypoint is additive: ordinary requests continue through the exact
+    // HTTP path above, while Node's separate `upgrade` event gets raw persistent-socket transport.
+    onUpgrade: (req, socket, head) =>
+      handleWebSocketUpgrade(
+        {
+          resolve: (url, headers, method, body) => resolver.resolve(url, headers, method, body),
+          handlerLoader,
+          poolName,
+          releaseName,
+          buildId,
+          internalSecret,
+          handshakeTimeoutMs: REQUEST_HEAD_TIMEOUT_MS,
+        },
+        req,
+        socket,
+        head,
+      ),
     readiness,
     // A probe path the APP owns must not be silently shadowed (it was: the old check also
     // ignored a query string, so `/healthz` was intercepted and `/healthz?x=1` was not).

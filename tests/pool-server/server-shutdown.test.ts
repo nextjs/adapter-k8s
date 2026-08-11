@@ -24,6 +24,75 @@ afterEach(async () => {
 });
 
 describe("createPoolServer().stop()", () => {
+  it("tracks upgraded sockets and closes them with WebSocket 1001 after the grace window", async () => {
+    pool = createPoolServer({
+      onRequest: () => undefined,
+      onUpgrade: (_req, socket) => {
+        socket.write(
+          "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        );
+        return "accepted";
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write(
+      "GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n" +
+        "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+        "Sec-WebSocket-Version: 13\r\n\r\n",
+    );
+    await new Promise<void>((resolve) => socket.once("data", () => resolve()));
+
+    await pool.stop({ graceMs: 80 });
+    const received = Buffer.concat(chunks);
+    expect(received.toString("latin1")).toContain("101 Switching Protocols");
+    expect(received.subarray(-4)).toEqual(Buffer.from([0x88, 0x02, 0x03, 0xe9]));
+    socket.destroy();
+    pool = null;
+  });
+
+  it("applies the same secret-gated request boundary to upgrade traffic", async () => {
+    const seen: Array<Record<string, string | string[] | undefined>> = [];
+    pool = createPoolServer({
+      onRequest: () => undefined,
+      onUpgrade: (req, socket) => {
+        seen.push({ ...req.headers });
+        socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+        return "rejected";
+      },
+      internalSecret: "correct-secret",
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    const send = (secret: string) =>
+      new Promise<void>((resolve, reject) => {
+        const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
+          socket.write(
+            "GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n" +
+              "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+              "Sec-WebSocket-Version: 13\r\nX-Output-Id: /admin\r\n" +
+              `X-Internal-Secret: ${secret}\r\n\r\n`,
+          );
+        });
+        socket.on("data", () => undefined);
+        socket.once("close", () => resolve());
+        socket.once("error", reject);
+      });
+
+    await send("wrong-secret");
+    await send("correct-secret");
+    expect(seen[0]?.["x-output-id"]).toBeUndefined();
+    expect(seen[1]?.["x-output-id"]).toBe("/admin");
+    expect(seen[0]?.["x-internal-secret"]).toBeUndefined();
+    expect(seen[1]?.["x-internal-secret"]).toBeUndefined();
+  });
+
   it("settles with an idle keep-alive connection open (close() alone would not)", async () => {
     pool = createPoolServer({
       onRequest: (_req: IncomingMessage, res: ServerResponse) => {

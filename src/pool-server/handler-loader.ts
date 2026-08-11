@@ -110,6 +110,33 @@ export function resolveRouteHandlerExport(
 }
 
 /**
+ * Resolve Next's generated adapter-facing WebSocket entrypoint.
+ *
+ * The public Route Handler API remains a normal `GET` that may eventually return
+ * `NextResponse.upgrade()`. Next compiles that API into an additive `upgradeHandler` export for
+ * adapters that own a persistent Node.js server. Do not inspect `routeModule.userland` here: a
+ * user-authored export with that name is not the adapter contract, and accepting it would let a
+ * fixture pass without proving that Next generated the real entrypoint.
+ *
+ * Dynamic `import()` of a CommonJS route can expose `module.exports` under `default`, hence the
+ * one wrapper shape in addition to the canonical top-level export.
+ */
+export function resolveUpgradeHandlerExport(
+  module: LoadedModule,
+): ArtifactRouteHandler | undefined {
+  if (typeof module.upgradeHandler === "function") {
+    return module.upgradeHandler as ArtifactRouteHandler;
+  }
+  if (module.default && typeof module.default === "object") {
+    const nested = module.default as Record<string, unknown>;
+    if (typeof nested.upgradeHandler === "function") {
+      return nested.upgradeHandler as ArtifactRouteHandler;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Un-latch the route module's ResponseCache mode (the rdc stale-forever root cause):
  * `RouteModule.getResponseCache` lazily constructs `new ResponseCache(minimalMode)` ONCE
  * per instance (route-module.ts:1101), latching the FIRST request's mode for the process
@@ -271,11 +298,52 @@ export function createHandlerLoader(
     if (resolvedCtor === null) resolvedCtor = defaultResponseCacheCtor();
     return resolvedCtor;
   };
-  const cache = new Map<string, Promise<ArtifactRouteHandler>>();
+  // Cache the imported module rather than only its HTTP handler. HTTP and WebSocket dispatch are
+  // two entrypoints on the SAME generated route module and must share initialization, module state,
+  // route-wide WebSocket peer tracking, and the ResponseCache patch below.
+  const moduleCache = new Map<string, Promise<LoadedModule>>();
+  const handlerCache = new Map<string, Promise<ArtifactRouteHandler>>();
+
+  function loadModuleForOutput(outputId: string): Promise<LoadedModule> {
+    const cached = moduleCache.get(outputId);
+    if (cached) return cached;
+
+    const output = manifest.outputs[outputId];
+    if (!output) {
+      return Promise.reject(
+        new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`),
+      );
+    }
+
+    const promise = loadModule(output.filePath).then(async (module): Promise<LoadedModule> => {
+      // Turbopack modules with top-level await (e.g., Genkit, heavy async deps) may export a
+      // Promise as module.exports. Await it to get the real exports.
+      let resolved: LoadedModule = module;
+      const defaultExport = module.default;
+      if (defaultExport instanceof Promise) {
+        resolved = (await defaultExport) as LoadedModule;
+      } else if (
+        defaultExport &&
+        typeof defaultExport === "object" &&
+        Object.getPrototypeOf(defaultExport)?.constructor?.name === "Promise"
+      ) {
+        resolved = await (defaultExport as Promise<LoadedModule>);
+      }
+      const ctor = responseCacheCtor();
+      if (ctor) unlatchResponseCache(resolved, ctor);
+      return resolved;
+    });
+    // A transient import failure must not poison either transport for the life of the pod.
+    promise.catch(() => {
+      if (moduleCache.get(outputId) === promise) moduleCache.delete(outputId);
+    });
+    moduleCache.set(outputId, promise);
+    return promise;
+  }
 
   return {
     async load(outputId: string): Promise<ArtifactRouteHandler> {
-      const cached = cache.get(outputId);
+      const cached = handlerCache.get(outputId);
       if (cached) return cached;
 
       const output = manifest.outputs[outputId];
@@ -283,42 +351,37 @@ export function createHandlerLoader(
         throw new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`);
       }
 
-      const promise = loadModule(output.filePath).then(
-        async (module): Promise<ArtifactRouteHandler> => {
-          // Turbopack modules with top-level await (e.g., Genkit, heavy async deps)
-          // may export a Promise as module.exports. Await it to get the real exports.
-          let resolved: LoadedModule = module;
-          const defaultExport = module.default;
-          if (defaultExport instanceof Promise) {
-            resolved = (await defaultExport) as LoadedModule;
-          } else if (
-            defaultExport &&
-            typeof defaultExport === "object" &&
-            Object.getPrototypeOf(defaultExport)?.constructor?.name === "Promise"
-          ) {
-            resolved = await (defaultExport as Promise<LoadedModule>);
-          }
-          try {
-            const ctor = responseCacheCtor();
-            if (ctor) unlatchResponseCache(resolved, ctor);
-            // The route's own pathname keys the _ENTRIES fallback — the registry is
-            // process-global, so a pool with several edge routes must select by key.
-            return resolveRouteHandlerExport(resolved, output.pathname);
-          } catch (err) {
-            throw new Error(
-              `Failed to resolve handler for outputId="${outputId}" ` +
-                `filePath="${output.filePath}": ${(err as Error).message}`,
-            );
-          }
-        },
-      );
-      // Evict a rejected load from the cache so a later request can retry —
-      // otherwise a transient import failure poisons the route for the pod's life.
-      promise.catch(() => {
-        if (cache.get(outputId) === promise) cache.delete(outputId);
+      const promise = loadModuleForOutput(outputId).then((resolved): ArtifactRouteHandler => {
+        try {
+          // The route's own pathname keys the _ENTRIES fallback — the registry is
+          // process-global, so a pool with several edge routes must select by key.
+          return resolveRouteHandlerExport(resolved, output.pathname);
+        } catch (err) {
+          throw new Error(
+            `Failed to resolve handler for outputId="${outputId}" ` +
+              `filePath="${output.filePath}": ${(err as Error).message}`,
+          );
+        }
       });
-      cache.set(outputId, promise);
+      // Handler-shape failures are retryable too. The module stays imported, but a later call can
+      // observe a generated registry entry that completed initialization in the meantime.
+      promise.catch(() => {
+        if (handlerCache.get(outputId) === promise) handlerCache.delete(outputId);
+      });
+      handlerCache.set(outputId, promise);
       return promise;
+    },
+
+    /**
+     * Load the optional generated WebSocket entrypoint. `undefined` is an ordinary HTTP-only route,
+     * not a module failure. Unknown outputs remain loud, matching `load()`.
+     */
+    async loadUpgrade(outputId: string): Promise<ArtifactRouteHandler | undefined> {
+      if (!manifest.outputs[outputId]) {
+        throw new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`);
+      }
+      const module = await loadModuleForOutput(outputId);
+      return resolveUpgradeHandlerExport(module);
     },
 
     has(outputId: string): boolean {

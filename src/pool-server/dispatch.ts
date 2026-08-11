@@ -242,7 +242,7 @@ const PROXY_ABSOLUTE_DEADLINE_MS = 600_000;
 // same reason — capping the streaming phase would kill SSE and long PPR resumes that a same-pool
 // route is expected to serve. Generous by default (a blocking SSG render on a cold pod is
 // legitimately slow); the point is that it is finite.
-const REQUEST_HEAD_TIMEOUT_MS = Math.max(
+export const REQUEST_HEAD_TIMEOUT_MS = Math.max(
   1_000,
   parseInt(process.env.ADAPTER_K8S_HANDLER_TIMEOUT_MS ?? "", 10) || 60_000,
 );
