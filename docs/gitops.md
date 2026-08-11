@@ -16,11 +16,11 @@
 
 When the config sets `imagePullSecrets` (private registries—see [configuration.md](./configuration.md#registry-pull-auth)), every pod spec in the bundle references those Secrets and the README lists them as an operator prerequisite: they must exist in the target namespace before the bundle is applied, delivered by your secrets flow—the bundle never carries them.
 
-Design and rationale: [plans/gitops-deployment-strategies.md](../plans/gitops-deployment-strategies.md). This page covers what ships today (`cutover.mode: none` only—the in-cluster cutover Job and the Argo/Flux recipes are later PRs).
+Design and rationale: [plans/gitops-deployment-strategies.md](../plans/gitops-deployment-strategies.md). Two cutover models ship today: `cutover.mode: none` (the default—promotion stays out-of-band, below) and `--cutover job` (the [in-cluster cutover Job](#in-cluster-cutover---cutover-job), which promotes inside the target namespace after the same gate battery `deploy` runs). The Argo CD/Flux recipes are a later PR.
 
 ## ⛔ The drift hazard, first
 
-**Do not point an auto-syncing reconciler (Argo CD `automated` + `selfHeal`, Flux drift detection) at this bundle without selector ignore rules.** The bundle renders the stable Services' selectors at the _previous_ build; cutover is an out-of-band patch (docs/ci-cd.md). A reconciler that "corrects" the selector after your cutover repoints production traffic at a build that has been scaled down—**this reverts a verified cutover onto an empty Deployment and the site 503s.** Measured live, not hypothesized (2026-08-10 audit, [design doc §3.1](../plans/gitops-deployment-strategies.md)): with auto-sync + selfHeal, Argo CD reverted a post-cutover selector in **~2.4 minutes** with the Application still reporting "Synced"—the stable Service drained to **zero endpoints** because the reverted-to build was parked at 0 replicas. A plain no-op `helm upgrade` (what Flux's helm-controller does every interval) reverted it **immediately**. HPA warm-up bounds and routing-image rollback patches were reverted identically; `--field-manager=helm` offers no protection.
+**Do not point an auto-syncing reconciler (Argo CD `automated` + `selfHeal`, Flux drift detection) at this bundle without selector ignore rules—under EITHER cutover mode.** The bundle renders the stable Services' selectors at the _previous_ build; the cutover that repoints them is a live-object patch (out-of-band under `mode: none`, the in-cluster Job's under `mode: job`—the bundle itself never moves traffic). A reconciler that "corrects" the selector after the promotion repoints production traffic at a build that has been scaled down—**this reverts a verified cutover onto an empty Deployment and the site 503s.** Measured live, not hypothesized (2026-08-10 audit, [design doc §3.1](../plans/gitops-deployment-strategies.md)): with auto-sync + selfHeal, Argo CD reverted a post-cutover selector in **~2.4 minutes** with the Application still reporting "Synced"—the stable Service drained to **zero endpoints** because the reverted-to build was parked at 0 replicas. A plain no-op `helm upgrade` (what Flux's helm-controller does every interval) reverted it **immediately**. HPA warm-up bounds and routing-image rollback patches were reverted identically; `--field-manager=helm` offers no protection.
 
 Until the recipes ship (PR3), hand-write the ignore rules, and target Services **by name, not by label** (Helm rewrites the `managed-by: adapter-k8s-active` label on live objects, so a label selector matches nothing and silently reverts every cutover):
 
@@ -56,7 +56,14 @@ Argo additionally shows Gateway API objects (HTTPRoute, EnvoyExtensionPolicy) as
 
 ## ⛔ Prune deletes your rollback target
 
-The parked previous build's objects (Deployment, HPA, dispatch Secret, manifest snapshot) are **not in the new bundle's rendered manifest**. Argo CD with `prune: true` deletes them on the first sync—including, observed live in the same audit, **the still-serving previous build's Deployment while the stable Service still selected it** (endpoints not-ready, pods Terminating, mid-outage). The keep-annotated dispatch Secret, manifest snapshot, and composition-plan ConfigMap were deleted too: Helm honors `helm.sh/resource-policy: keep`; Argo's prune does not. Builds deployed by the imperative CLI carry no prune-protection annotations at all, so the _first_ pruning sync over an existing release deletes your rollback target. Until keep-at-birth rendering and the `migrate` subcommand ship (PR2), run reconcilers with prune disabled against releases that have imperative deploy history.
+The parked previous build's objects (Deployment, HPA, dispatch Secret, manifest snapshot) are **not in the new bundle's rendered manifest**. Argo CD with `prune: true` deletes them on the first sync—including, observed live in the same audit, **the still-serving previous build's Deployment while the stable Service still selected it** (endpoints not-ready, pods Terminating, mid-outage). The keep-annotated dispatch Secret, manifest snapshot, and composition-plan ConfigMap were deleted too: Helm honors `helm.sh/resource-policy: keep`; Argo's prune does not.
+
+Two mechanisms close this, both shipped:
+
+- **`adapter-k8s migrate`** — run it ONCE against any release with imperative deploy history, _before_ enabling a pruning reconciler. Builds deployed by the imperative CLI carry no prune-protection annotations at all, so the _first_ pruning sync deletes your rollback target; `migrate` annotates the live retained set (per-build Deployments/Services/HPAs, dispatch Secrets, snapshot and plan ConfigMaps, the state ConfigMap) with all three engines' protections, is idempotent, and exits nonzero if anything could not be annotated.
+- **Keep-at-birth rendering** — under `cutover.mode: job` every per-build resource in the bundle carries `helm.sh/resource-policy: keep`, `argocd.argoproj.io/sync-options: Prune=false`, and `kustomize.toolkit.fluxcd.io/prune: disabled` from its own bundle onward, so the sync that applies build N+1 cannot prune build N out from under the stable Services.
+
+One gap remains (tracked on the PR): the in-chart Secret/ExternalSecret and per-build ConfigMap templates carry Helm's `keep` but not yet the Argo/Flux annotations at render time—`migrate` covers the live objects, but until the chart renders them keep prune disabled under Argo/Flux for those kinds or re-run `migrate` after each sync.
 
 ## ⛔ Renovate and image automation
 
@@ -69,6 +76,19 @@ The bundle ships a `renovate.json5` fence at its root. Renovate does not auto-di
 ```
 
 Config variants emit to `.k8s-adapter/gitops.<variant>/`; the bundled fence carries the matching path.
+
+## In-cluster cutover (`--cutover job`)
+
+`adapter-k8s emit --cutover job` renders the same bundle with three additions in the chart—a per-build-named **cutover Job**, its namespace-scoped ServiceAccount/Role/RoleBinding, and a per-build emit-metadata ConfigMap the Job mounts—and flips the stable Services to render their selectors at the _previous_ build with an `adapter-k8s.io/cutover: pending` annotation. The sync stands the new build up **without moving traffic**; the Job then runs the SAME gate battery imperative `deploy` runs (exact-version rollout waits, ext_proc registration/policy acceptance, HPA warm-up to the outgoing build's live capacity, per-pool `/readyz`) and only then patches the selectors, commits the state ConfigMap (cluster-only mode), and parks the previous build. On promotion the Job rewrites the stable Services' annotation to `adapter-k8s.io/cutover: complete`; the next bundle's sync re-stamps `pending`, which is again true for that bundle's build.
+
+Operational notes:
+
+- **It is a plain `batch/v1` Job**—no Argo hook or sync-wave semantics required (Flux has none). Its per-build name is the idempotency key: a no-op re-sync finds the completed Job and does nothing, and a re-created pod for an already-promoted build logs "already promoted" and exits 0 without touching HPAs.
+- **A gate failure restores the edge first, then exits nonzero** (the reconciler reports a failed Job), and records the build in the state ConfigMap's `failedPromotions` — the **poison pill**. Reconciler retries then refuse cheaply (one short-lived pod, no HPA warm-up wobble) until you fix the build and emit a new one, or override deliberately with `cutover.forcePromotion: true`. The pill clears on the next successful promotion. Find the pods with `kubectl logs -l app.kubernetes.io/component=cutover-job -n <ns>`.
+- **`cutover.image` must exist before the first job-mode sync.** Build it from this repo's [docker/cutover-job.Dockerfile](../docker/cutover-job.Dockerfile) (`npm run build`, then `docker build -f docker/cutover-job.Dockerfile …`), push it to your registry, and set the values key to the pushed image **by digest**. The chart default names the release-train tag, which your cluster may not be able to pull.
+- **Prerequisite for existing releases:** run [`adapter-k8s migrate`](#-prune-deletes-your-rollback-target) once before pointing a pruning reconciler at a release with imperative deploy history.
+- **Selector ignore rules are still required** (see [the drift hazard](#-the-drift-hazard-first)): the bundle renders selectors at the previous build, so a self-healing reconciler reverts the Job's promotion exactly as it reverts an out-of-band one.
+- **Known gaps** (tracked on the PR): the Job does not yet load the compiled composition readiness plan (HTTPRoute/Certificate readiness on composed targets), and CDN invalidation from inside the pod needs a workload identity—both fail non-fatal today.
 
 ## Workflow (Mode 0 with rendered inputs)
 
