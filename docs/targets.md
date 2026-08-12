@@ -198,6 +198,13 @@ target: defineTarget({
 
 - **Gateway class** must be controlled by `gateway.envoyproxy.io/gatewayclass-controller`—`deploy` verifies the extension policy reports `Accepted=True` before cutting traffic. A non-Envoy class would program the Gateway and then silently never call the routing service.
 - **Verified Envoy Gateway range: >=1.5.4 <1.9.** The adapter's full surface (ext_proc, ClientTrafficPolicy, deploy gates, cutover, rollback) is live-verified on Envoy Gateway v1.5.4, v1.5.5, and v1.8.3 — identical manifests Accepted on all, no adapter-visible behavior change between 1.5.5 and 1.8.3 (1.6/1.7 are untested but inside the range). `deploy` and `doctor` print a soft warning (never a failure) when the detected controller image is outside this range.
+- **Streaming timeout parity:** generated application rules set `timeouts.request: 0s`. Envoy's
+  default is a 15-second whole-response deadline, which is inappropriate for Route Handler
+  streams, RSC, and SSE because it expires even while a response is making progress. Disabling
+  that total deadline does not make dead requests immortal: the pool still bounds time to response
+  headers and route `maxDuration`, and Envoy retains its stream-idle timeout. Applications using
+  SSE should send periodic comment heartbeats frequently enough for their operator's gateway/CDN
+  idle timeout.
 - **Upgrading Envoy Gateway 1.5.x → 1.8.x in place: apply the CRDs first.** `helm upgrade` never touches the chart's `crds/` subchart, and Envoy Gateway ≥ 1.8 unconditionally watches `ListenerSet` — so an in-place upgrade crashloops the new controller with `no matches for kind "ListenerSet" in version "gateway.networking.k8s.io/v1"`. Server-side-apply the chart's CRD bundle **before** upgrading the controller (verified live: applied over live CRDs with no data loss, traffic served throughout):
 
   ```bash
