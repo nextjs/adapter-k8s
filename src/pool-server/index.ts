@@ -3859,7 +3859,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   let shuttingDown = false;
   const SHUTDOWN_GRACE_MS = Math.max(
     100,
-    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || 15_000,
+    // deployment.ts gives the process 90s after the 120s preStop inside the 210s pod grace.
+    // Spend 60s on application work and retain 30s for close-frame flushing, runtime cleanup,
+    // kubelet scheduling delay, and the hard-exit cushion. The old 15s budget then cut HTTP/SSE
+    // streams at its halfway mark (7.5s), despite the pod already reserving far more time.
+    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || 60_000,
   );
   const shutdown = async () => {
     if (shuttingDown) return;
@@ -3878,8 +3882,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       process.exit(0);
     }, SHUTDOWN_GRACE_MS + 1_000);
     hardExit.unref?.();
-    // Drops idle keep-alive sockets at once, tears down anything still streaming at the halfway
-    // mark, swallows the "already closing" rejection, and always settles — see server.stop().
+    // Drops idle keep-alive sockets at once, lets finite responses use the whole budget, then
+    // closes SSE/WebSockets protocol-appropriately and always settles — see server.stop().
     await server.stop({ graceMs: SHUTDOWN_GRACE_MS });
     clearTimeout(hardExit);
     process.exit(0);

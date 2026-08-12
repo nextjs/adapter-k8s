@@ -12,7 +12,7 @@
 // bug only exists at the socket layer, so a mock could not have caught it.
 import { describe, it, expect, afterEach } from "vitest";
 import net from "node:net";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { get as httpGet, type IncomingMessage, type ServerResponse } from "node:http";
 import { createPoolServer } from "../../src/pool-server/server.js";
 import { INTERNAL_DISPATCH_PROOF_HEADER } from "../../src/routing-common.js";
 import { signDispatch } from "../helpers/dispatch-proof.js";
@@ -130,33 +130,147 @@ describe("createPoolServer().stop()", () => {
     pool = null;
   });
 
-  it("settles while a response is actively streaming, and tears the stream down", async () => {
-    let clientSawBytes = 0;
+  it("lets a finite stream finish after the old halfway cutoff", async () => {
     pool = createPoolServer({
       onRequest: (_req: IncomingMessage, res: ServerResponse) => {
         res.writeHead(200, { "content-type": "text/plain" });
         res.flushHeaders();
-        // Never ends on its own — the SSE-shaped case.
-        const timer = setInterval(() => res.write("tick\n"), 20);
+        res.write("first\n");
+        // With graceMs=500 the former halfway close fired at 250ms and truncated this response.
+        setTimeout(() => res.end("last\n"), 350);
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    let responseStarted!: () => void;
+    const started = new Promise<void>((resolve) => (responseStarted = resolve));
+    const body = new Promise<string>((resolve, reject) => {
+      httpGet({ host: "127.0.0.1", port, path: "/finite" }, (res) => {
+        let value = "";
+        responseStarted();
+        res.on("data", (chunk) => (value += String(chunk)));
+        res.on("end", () => resolve(value));
+        res.on("aborted", () => reject(new Error("finite response aborted")));
+        res.on("error", reject);
+      }).on("error", reject);
+    });
+    await started;
+
+    const drain = pool.stop({ graceMs: 500 });
+    await expect(body).resolves.toBe("first\nlast\n");
+    await drain;
+    pool = null;
+  });
+
+  it("keeps SSE open for the full grace window, then ends it cleanly", async () => {
+    pool = createPoolServer({
+      onRequest: (_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+        res.flushHeaders();
+        const timer = setInterval(() => res.write(": heartbeat\n\n"), 20);
         res.on("close", () => clearInterval(timer));
       },
       port: 0,
     });
     const { port } = await pool.start();
 
-    const socket = net.createConnection({ host: "127.0.0.1", port });
-    await new Promise<void>((resolve) => socket.on("connect", () => resolve()));
-    socket.write("GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    socket.on("data", (chunk) => {
-      clientSawBytes += chunk.length;
+    let responseStarted!: () => void;
+    const started = new Promise<void>((resolve) => (responseStarted = resolve));
+    let clientSawBytes = 0;
+    const ended = new Promise<void>((resolve, reject) => {
+      httpGet({ host: "127.0.0.1", port, path: "/events" }, (res) => {
+        responseStarted();
+        res.on("data", (chunk) => (clientSawBytes += chunk.length));
+        res.on("end", resolve);
+        res.on("aborted", () => reject(new Error("SSE response aborted")));
+        res.on("error", reject);
+      }).on("error", reject);
     });
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    expect(clientSawBytes).toBeGreaterThan(0);
+    await started;
 
-    const started = Date.now();
-    await pool.stop({ graceMs: 400 });
-    // Settled, and well inside the grace window rather than hanging on the open stream.
-    expect(Date.now() - started).toBeLessThan(2_000);
+    const drainStartedAt = Date.now();
+    const drain = pool.stop({ graceMs: 300 });
+    await ended;
+    expect(Date.now() - drainStartedAt).toBeGreaterThanOrEqual(260);
+    expect(clientSawBytes).toBeGreaterThan(0);
+    await drain;
+    pool = null;
+  });
+
+  it("resets an unfinished finite body at the deadline instead of authenticating truncation", async () => {
+    pool = createPoolServer({
+      onRequest: (_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, { "content-type": "application/octet-stream" });
+        res.write("partial-body");
+        // Never finishes: a normal res.end() during drain would make the client accept these bytes
+        // as the complete representation even though the handler promised more.
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    let responseStarted!: () => void;
+    const started = new Promise<void>((resolve) => (responseStarted = resolve));
+    const aborted = new Promise<boolean>((resolve, reject) => {
+      httpGet({ host: "127.0.0.1", port, path: "/finite-never-ends" }, (res) => {
+        responseStarted();
+        res.on("data", () => undefined);
+        res.on("aborted", () => resolve(true));
+        res.on("end", () => resolve(false));
+        res.on("error", (error) => {
+          if ((error as NodeJS.ErrnoException).code === "ECONNRESET") resolve(true);
+          else reject(error);
+        });
+      }).on("error", reject);
+    });
+    await started;
+
+    const drainStartedAt = Date.now();
+    const drain = pool.stop({ graceMs: 180 });
+    await expect(aborted).resolves.toBe(true);
+    expect(Date.now() - drainStartedAt).toBeGreaterThanOrEqual(150);
+    await drain;
+    pool = null;
+  });
+
+  it("rejects pipelined work that arrives on an existing connection after drain starts", async () => {
+    let firstResponse!: ServerResponse;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => (firstStarted = resolve));
+    let requestCount = 0;
+    pool = createPoolServer({
+      onRequest: (_req: IncomingMessage, res: ServerResponse) => {
+        requestCount += 1;
+        if (requestCount === 1) {
+          firstResponse = res;
+          res.writeHead(200, { "content-type": "text/plain" });
+          res.write("first");
+          firstStarted();
+          return;
+        }
+        res.end("application handled second request");
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let received = "";
+    socket.on("data", (chunk) => (received += chunk.toString("latin1")));
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write("GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    await started;
+
+    const drain = pool.stop({ graceMs: 250 });
+    socket.write("GET /two HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    firstResponse.end();
+    await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    await drain;
+
+    expect(requestCount).toBe(1);
+    expect(received).toContain("503 Service Unavailable");
+    expect(received.toLowerCase()).toContain("retry-after: 1");
     socket.destroy();
     pool = null;
   });
