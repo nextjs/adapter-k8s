@@ -61,6 +61,17 @@ npx adapter-k8s tail              # color-coded logs from all workloads
 
 Any gate failure prints `Traffic was NOT switched — the previous build's pools are still serving`, restores the edge, and exits 1.
 
+### Long-lived requests at cutover
+
+The Service-selector flip sends new connections to the new build; it does not transfer an open
+connection or handler state between pods. The old pool drains finite HTTP/RSC responses for up to
+60 seconds after SIGTERM, ends surviving SSE responses with a clean EOF, and sends established
+WebSockets close code `1001` before forced teardown. SSE clients need event `id` fields plus shared
+replay storage for `Last-Event-ID`; WebSocket clients need reconnect/backoff and application-level
+resume state. An abrupt node/process failure can bypass those graceful signals. See
+`docs/lifecycle.md#long-lived-requests-during-cutover` in the package repository for the full
+contract.
+
 ## Post-Deploy Verification
 
 ```bash
