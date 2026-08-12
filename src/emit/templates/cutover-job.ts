@@ -18,6 +18,7 @@ import {
   assertSafeBuildId,
   assertSafeReleaseName,
   escapeHelmActions,
+  keepAtBirthAnnotationEntries,
   renderImagePullSecrets,
   sanitizeK8sName,
 } from "./utils.js";
@@ -86,7 +87,7 @@ export function renderCutoverJob({
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: ${cutoverJobName(releaseName, buildId)}
+  name: ${cutoverJobName(releaseName, buildId)}{{ if .Values.cutover.forcePromotion }}-force{{ end }}
   labels:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: ${CUTOVER_JOB_COMPONENT}
@@ -246,6 +247,23 @@ rules:
   - apiGroups: ["gateway.envoyproxy.io"]
     resources: ["envoyextensionpolicies"]
     verbs: ["get"]
+  # Composition-plan readiness (waitForCompositionPlanReadiness): HTTPRoute
+  # Accepted/ResolvedRefs, Gateway address, Ingress, cert-manager Certificate Ready,
+  # and EndpointSlice capacity. Read-only — the Job refuses promotion until they are
+  # ready; it never repairs them. Cross-namespace parent Gateways are not readable
+  # from this namespaced Role; HTTPRoute status in this namespace is the gate.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "gateways"]
+    verbs: ["get", "list"]
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["get", "list"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -294,7 +312,8 @@ metadata:
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: emit-metadata
     app.kubernetes.io/version: "${sanitizeK8sName(buildId)}"
-data:
+  annotations:
+${keepAtBirthAnnotationEntries("    ")}data:
   emit-metadata.json: |-
 ${indented}
 {{- end }}

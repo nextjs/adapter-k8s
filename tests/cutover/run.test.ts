@@ -17,6 +17,14 @@ import os from "node:os";
 
 vi.mock("../../src/cli/exec.js");
 vi.mock("../../src/cli/cdn-invalidate.js");
+vi.mock("../../src/cli/composition-plan.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/composition-plan.js")>();
+  return {
+    ...actual,
+    loadDeployedCompositionPlan: vi.fn(),
+    waitForCompositionPlanReadiness: vi.fn(),
+  };
+});
 // Only the two state FUNCTIONS are mocked: the error classes stay real (the orchestrators
 // and the Job branch on them).
 vi.mock("../../src/cli/state.js", async (importOriginal) => {
@@ -30,6 +38,7 @@ import { CutoverExitError, type CutoverInputs } from "../../src/cutover/inputs.j
 import { execCapture } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
+import { loadDeployedCompositionPlan } from "../../src/cli/composition-plan.js";
 import { routeExtJobName } from "../../src/emit/templates/route-ext-update-job.js";
 
 const RELEASE = "rel";
@@ -210,6 +219,18 @@ beforeEach(() => {
   };
   vi.mocked(writeState).mockResolvedValue(undefined);
   vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined as never);
+  vi.mocked(loadDeployedCompositionPlan).mockResolvedValue({
+    plan: {
+      operations: {
+        routing: { dataplane: { readiness: [] } },
+        resources: { readiness: [] },
+      },
+      target: { fingerprint: `sha256:${"c".repeat(64)}` },
+      metadata: { releaseName: RELEASE, namespace: NS, buildId: BUILD },
+    },
+    digest: `sha256:${"d".repeat(64)}`,
+    source: "test",
+  } as never);
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
@@ -708,5 +729,12 @@ describe("jobMain — the poison pill", () => {
       /Refusing to promote a cross-wired bundle/,
     );
     expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES to promote when the composition plan ConfigMap is missing", async () => {
+    vi.mocked(loadDeployedCompositionPlan).mockResolvedValue(null);
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+    await expect(jobMain(env())).rejects.toThrow(/Composition plan ConfigMap is missing/);
+    expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
   });
 });

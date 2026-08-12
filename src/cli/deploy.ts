@@ -2290,7 +2290,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     process.exit(1);
   }
 
-  console.log(`\n✓ Deploy complete (build: ${buildId})`);
+  if (dryRun) {
+    console.log(`\n[dry-run] Deploy plan complete (build: ${buildId}) — no cluster mutations.`);
+  } else {
+    console.log(`\n✓ Deploy complete (build: ${buildId})`);
+  }
 
   console.log("");
 }

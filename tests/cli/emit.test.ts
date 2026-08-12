@@ -35,6 +35,7 @@ import { cutoverJobName } from "../../src/emit/templates/cutover-job.js";
 
 const DIGEST_SSR = `sha256:${"a".repeat(64)}`;
 const DIGEST_ROUTING = `sha256:${"b".repeat(64)}`;
+const CUTOVER_IMAGE = `ghcr.io/next-community/adapter-k8s-cutover@sha256:${"c".repeat(64)}`;
 const REGISTRY = "us-central1-docker.pkg.dev/my-project/nextjs";
 const RELEASE = "my-app";
 const BUILD = "build2abc";
@@ -201,12 +202,21 @@ const baseOptions = () => ({
   // exercise the fail-closed default.
 });
 
+const jobOptions = (extra: Record<string, unknown> = {}) => ({
+  ...baseOptions(),
+  previousBuild: PREV_BUILD,
+  cutover: "job" as const,
+  cutoverImage: CUTOVER_IMAGE,
+  ...extra,
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   projectDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-emit-"));
   // The stable-key guard (inline/sops) reads this env var — isolate it per test.
   savedInternalSecretKey = process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
   delete process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
+  delete process.env.ADAPTER_K8S_CUTOVER_IMAGE;
   vi.mocked(resolveDeployImageDigests).mockResolvedValue({
     ssr: DIGEST_SSR,
     routingService: DIGEST_ROUTING,
@@ -679,6 +689,8 @@ describe("secret externalization", () => {
     expect(external).toContain("secretKey: secret");
     expect(external).toContain(`name: ${RELEASE}-valkey`);
     expect(external).toContain("helm.sh/resource-policy: keep");
+    expect(external).toContain("argocd.argoproj.io/sync-options: Prune=false");
+    expect(external).toContain("kustomize.toolkit.fluxcd.io/prune: disabled");
     // Gated so a bundle without a store renders nothing rather than failing.
     expect(external).toContain("{{- if and .Values.externalSecrets");
     expect(bundleMetadata().secretsMode).toBe("external");
@@ -1430,7 +1442,7 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
 
   it("renders the Job, its RBAC, and the emit-metadata ConfigMap INTO THE BUNDLE CHART", async () => {
     writeFixture({ nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
 
     // In chart/templates/, not a cutover/ sidecar: an Argo Application sourcing chart/
     // never applies files outside its source path, so a Job that lived only beside the
@@ -1466,10 +1478,10 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
 
   it("pins values: cutover.mode job, activeBuildId at the NEW build, selectors at the previous", async () => {
     writeFixture({ nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
 
     const values = bundleValues();
-    expect(values.cutover).toMatchObject({ mode: "job" });
+    expect(values.cutover).toMatchObject({ mode: "job", image: CUTOVER_IMAGE });
     // Under mode job activeBuildId is METADATA (no selector renders from it); the stable
     // Services render from previousBuildId, so the sync never repoints traffic.
     expect(values.activeBuildId).toBe(BUILD);
@@ -1481,14 +1493,14 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
     // An unsanitized selector value matches no pods and drains the Service to zero
     // endpoints — the same clause, on the new render path.
     writeFixture({ buildId: "9build", nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
-    await runEmit({ ...baseOptions(), previousBuild: "9prev", cutover: "job" });
+    await runEmit(jobOptions({ previousBuild: "9prev" }));
     expect(bundleValues().previousBuildId).toBe("b-9prev");
     expect(bundleValues().activeBuildId).toBe("b-9build");
   });
 
   it("records the cutover model and the previous default pool in emit-metadata.json", async () => {
     writeFixture({ nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
     expect(bundleMetadata()).toMatchObject({
       cutover: "job",
       previousBuildId: PREV_BUILD,
@@ -1514,7 +1526,7 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
     ]) {
       writeFileSync(path.join(chartDir, f), "apiVersion: v1\nkind: ConfigMap\n");
     }
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
     expect(bundleMetadata()).toMatchObject({
       hasRouteExtJob: true,
       hasEnvoyExtensionPolicy: true,
@@ -1529,8 +1541,23 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
       cutoverGate: true,
       imagePullSecrets: ["regcred"],
     });
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
     expect(chartTemplate("cutover-job.yaml")).toContain('- name: "regcred"');
+  });
+
+  it("REFUSES --cutover job without a digest-pinned cutover image", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
+    await expect(
+      runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" }),
+    ).rejects.toThrow(/digest-pinned cutover image/);
+    await expect(
+      runEmit({
+        ...baseOptions(),
+        previousBuild: PREV_BUILD,
+        cutover: "job",
+        cutoverImage: "ghcr.io/next-community/adapter-k8s-cutover:latest",
+      }),
+    ).rejects.toThrow(/digest-pinned cutover image/);
   });
 
   it("REFUSES a chart that predates the cutover values gate", async () => {
@@ -1592,11 +1619,11 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
     // ...and job mode IS a real delta on the same inputs (so the comparison above is not
     // vacuous), while itself staying deterministic across two runs.
     rmSync(bundleDir, { recursive: true, force: true });
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
     const job = snapshot();
     expect(job).not.toEqual(implicit);
     rmSync(bundleDir, { recursive: true, force: true });
-    await runEmit({ ...baseOptions(), previousBuild: PREV_BUILD, cutover: "job" });
+    await runEmit(jobOptions());
     expect(snapshot()).toEqual(job);
   });
 });

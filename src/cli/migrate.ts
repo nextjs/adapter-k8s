@@ -36,6 +36,7 @@ import { keepAtBirthAnnotationEntries } from "../emit/templates/utils.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
 import { ROUTING_MANIFEST_SNAPSHOT_COMPONENT } from "../emit/templates/routing-manifest-configmap.js";
 import { COMPOSITION_PLAN_COMPONENT } from "../emit/templates/composition-plan-configmap.js";
+import { EXTERNAL_SECRET_COMPONENT } from "../emit/templates/external-secret.js";
 
 export interface MigrateOptions {
   projectDir: string;
@@ -262,6 +263,15 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
     ...(await annotateByLabel({
       kind: "configmaps",
       labelSelector: `${releaseSelector},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
+      namespace,
+      dryRun,
+      failures,
+    })),
+    // Per-build ExternalSecrets (creationPolicy: Owner): pruning one garbage-collects
+    // the dispatch Secret the parked build still mounts.
+    ...(await annotateByLabel({
+      kind: "externalsecrets",
+      labelSelector: `${releaseSelector},app.kubernetes.io/component=${EXTERNAL_SECRET_COMPONENT}`,
       namespace,
       dryRun,
       failures,

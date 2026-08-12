@@ -100,6 +100,9 @@ describe("renderCutoverJob", () => {
     expect(out).toContain("apiVersion: batch/v1");
     expect(out).toContain("kind: Job");
     expect(out).toContain(`  name: ${cutoverJobName(RELEASE, BUILD)}`);
+    expect(out).toContain(
+      `  name: ${cutoverJobName(RELEASE, BUILD)}{{ if .Values.cutover.forcePromotion }}-force{{ end }}`,
+    );
     // The name carries only a digest, so the full build id rides an annotation (build ids
     // may exceed the 63-char label-value cap).
     expect(out).toContain(`adapter-k8s.dev/build-id: "${BUILD}"`);
@@ -236,6 +239,12 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
       "policy/poddisruptionbudgets": ["get", "list", "delete"],
       // D4/D5 generation-guarded Accepted gate — read-only.
       "gateway.envoyproxy.io/envoyextensionpolicies": ["get"],
+      // Composition-plan readiness — HTTPRoute/Gateway/Certificate/Ingress/EndpointSlice.
+      "gateway.networking.k8s.io/httproutes": ["get", "list"],
+      "gateway.networking.k8s.io/gateways": ["get", "list"],
+      "cert-manager.io/certificates": ["get", "list"],
+      "discovery.k8s.io/endpointslices": ["get", "list"],
+      "networking.k8s.io/ingresses": ["get", "list"],
     });
     for (const verbs of rules.values()) expect(verbs).not.toContain("*");
     expect(out).not.toContain('resources: ["*"]');
@@ -245,6 +254,8 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
     const rules = roleRules(out);
     // The policy gate is a poll, never a repair.
     expect(rules.get("gateway.envoyproxy.io/envoyextensionpolicies")).toEqual(["get"]);
+    expect(rules.get("gateway.networking.k8s.io/httproutes")).toEqual(["get", "list"]);
+    expect(rules.get("cert-manager.io/certificates")).toEqual(["get", "list"]);
     // Dispatch Secrets are probed and pruned — never created or mutated (their material
     // is the chart's/the external store's business).
     expect(rules.get("secrets")).not.toContain("create");
@@ -284,6 +295,9 @@ describe("renderEmitMetadataConfigMap — the facts the Job mounts", () => {
     expect(out.startsWith(VALUES_GATE)).toBe(true);
     expect(out).toContain(`  name: ${emitMetadataConfigMapName(RELEASE, BUILD)}`);
     expect(out).toContain(`app.kubernetes.io/version: "${sanitizeK8sName(BUILD)}"`);
+    expect(out).toContain("helm.sh/resource-policy: keep");
+    expect(out).toContain("argocd.argoproj.io/sync-options: Prune=false");
+    expect(out).toContain("kustomize.toolkit.fluxcd.io/prune: disabled");
     expect(out).toContain("  emit-metadata.json: |-");
     // Every line of the body is indented into the block scalar, unchanged otherwise.
     for (const line of json.split("\n")) expect(out).toContain(`    ${line}`);

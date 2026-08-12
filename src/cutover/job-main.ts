@@ -29,6 +29,7 @@ import {
   readJobEmitMetadata,
   readPreviousReplicas,
 } from "./from-cluster.js";
+import { loadDeployedCompositionPlan } from "../cli/composition-plan.js";
 
 const DEFAULT_METADATA_PATH = "/etc/adapter-k8s/emit-metadata.json";
 
@@ -155,6 +156,20 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
     );
   }
 
+  const compositionSnapshot = await loadDeployedCompositionPlan({
+    releaseName,
+    namespace,
+    buildId,
+  });
+  if (!compositionSnapshot) {
+    throw new Error(
+      `Composition plan ConfigMap is missing for build "${buildId}" in namespace ` +
+        `"${namespace}". The Job cannot verify HTTPRoute, Certificate, or other ` +
+        `target readiness without it; refusing to promote. Rebuild and re-emit so the ` +
+        `bundle chart renders the per-build composition-plan ConfigMap.`,
+    );
+  }
+
   const inputs = buildCutoverInputsFromCluster({
     metadata,
     state,
@@ -167,6 +182,7 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
             previousPools: state.poolTopologies?.[state.buildId] ?? [],
           })
         : new Map(),
+    compositionSnapshot,
   });
 
   // The same restore code as deploy's abort paths, wired DIRECTLY at the module function

@@ -65,6 +65,9 @@ const RETAINED: Record<string, string[]> = {
   "configmaps|app.kubernetes.io/name=my-app,app.kubernetes.io/managed-by=adapter-k8s": [
     "my-app-adapter-state",
   ],
+  "externalsecrets|app.kubernetes.io/name=my-app,app.kubernetes.io/component=external-secret": [
+    "my-app-ihs-buildn",
+  ],
 };
 
 let tmpDir: string;
@@ -178,6 +181,7 @@ describe("runMigrate — annotating the retained set", () => {
       "secrets/my-app-internal-buildn",
       "configmaps/my-app-routing-manifest-abc123",
       "configmaps/my-app-composition-plan-buildn",
+      "externalsecrets/my-app-ihs-buildn",
       // ...and the kubectl-created state ConfigMap
       "configmaps/my-app-adapter-state",
     ]);
@@ -208,6 +212,7 @@ describe("runMigrate — annotating the retained set", () => {
       "secrets -l app.kubernetes.io/name=my-app,app.kubernetes.io/component=internal-secret",
       "configmaps -l app.kubernetes.io/name=my-app,app.kubernetes.io/component=routing-manifest-snapshot",
       "configmaps -l app.kubernetes.io/name=my-app,app.kubernetes.io/component=composition-plan",
+      "externalsecrets -l app.kubernetes.io/name=my-app,app.kubernetes.io/component=external-secret",
       "configmaps -l app.kubernetes.io/name=my-app,app.kubernetes.io/managed-by=adapter-k8s",
     ]);
     // The stable active Services (no version label) are deliberately NOT swept: they ARE
@@ -240,7 +245,7 @@ describe("runMigrate — annotating the retained set", () => {
     const out = printed();
     expect(out).toContain("✓ deployments/my-app-ssr-buildm");
     expect(out).toContain("✓ configmaps/my-app-adapter-state");
-    expect(out).toContain("11 object(s) carry the keep-at-birth annotations");
+    expect(out).toContain("12 object(s) carry the keep-at-birth annotations");
     // ...and it names the annotations it applied, so the operator can verify by hand.
     for (const kv of keepAtBirthAnnotationArgs()) expect(out).toContain(kv);
   });
@@ -284,7 +289,7 @@ describe("runMigrate — annotating the retained set", () => {
     expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
     const out = printed();
     expect(out).toContain("[dry-run] kubectl annotate deployments my-app-ssr-buildm");
-    expect(out).toContain("11 object(s) would be annotated");
+    expect(out).toContain("12 object(s) would be annotated");
   });
 
   it("pins the kubectl context to the release's own cluster when it can", async () => {

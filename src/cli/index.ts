@@ -57,6 +57,8 @@ const VALUE_FLAGS = new Set([
   "sops-config",
   // GitOps PR2: the bundle's cutover model (none | job).
   "cutover",
+  // Digest-pinned image the in-cluster cutover Job pulls (`--cutover job`).
+  "cutover-image",
 ]);
 
 export function parseArgs(argv: string[]): {
@@ -203,6 +205,8 @@ Options:
                               cutover Job (plain versioned Job + RBAC + emit-metadata CM);
                               selectors render at the previous build and the Job promotes
                               after its gate battery passes (emit)
+  --cutover-image <ref>    Digest-pinned image the cutover Job pulls (emit --cutover job).
+                              Required; name@sha256:<64 hex>. :latest is refused.
   --dry-run                Show what would be done without executing
 
 Flags may be given as --flag value or --flag=value. Boolean flags (e.g. --dry-run)
@@ -338,6 +342,10 @@ async function main(): Promise<void> {
             `Flag --cutover must be "none" or "job" (got ${JSON.stringify(cutover)})`,
           );
         }
+        const cutoverImage = flags["cutover-image"] as string | undefined;
+        if (cutoverImage !== undefined && cutover !== "job") {
+          throw new Error(`Flag --cutover-image only applies with --cutover job`);
+        }
         await runEmit({
           projectDir,
           releaseName,
@@ -353,6 +361,7 @@ async function main(): Promise<void> {
           ...(secrets ? { secrets } : {}),
           ...(sopsConfig !== undefined ? { sopsConfig } : {}),
           ...(cutover !== undefined ? { cutover } : {}),
+          ...(cutoverImage !== undefined ? { cutoverImage } : {}),
         });
         break;
       }

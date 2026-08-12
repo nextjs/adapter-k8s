@@ -22,6 +22,18 @@ import {
 import { renderDeployment } from "../../../src/emit/templates/deployment.js";
 import { renderHPA } from "../../../src/emit/templates/hpa.js";
 import { renderActiveService, renderService } from "../../../src/emit/templates/service.js";
+import { renderInternalSecret } from "../../../src/emit/templates/internal-secret.js";
+import { renderRoutingManifestSnapshotConfigMap } from "../../../src/emit/templates/routing-manifest-configmap.js";
+import { renderExternalSecrets } from "../../../src/emit/templates/external-secret.js";
+import {
+  compileTarget,
+  defineTarget,
+  kubernetesCluster,
+  manualExposure,
+} from "../../../src/target/index.js";
+import { renderCompositionPlanConfigMap } from "../../../src/emit/templates/composition-plan-configmap.js";
+
+const JOB_MODE_GATE = '{{- if and .Values.cutover (eq .Values.cutover.mode "job") }}';
 
 const KEEP_ANNOTATIONS = [
   "helm.sh/resource-policy: keep",
@@ -41,7 +53,7 @@ function helmAvailable(): boolean {
 describe("renderKeepAtBirthAnnotations / keepAtBirthAnnotationEntries", () => {
   it("emits all THREE engines' annotations, gated on cutover.mode", () => {
     expect(renderKeepAtBirthAnnotations("  ")).toBe(
-      '  {{- if eq .Values.cutover.mode "job" }}\n' +
+      `  ${JOB_MODE_GATE}\n` +
         "  annotations:\n" +
         "    helm.sh/resource-policy: keep\n" +
         "    argocd.argoproj.io/sync-options: Prune=false\n" +
@@ -61,7 +73,7 @@ describe("renderKeepAtBirthAnnotations / keepAtBirthAnnotationEntries", () => {
 
   it("respects the caller's indent (the block sits under `metadata:`)", () => {
     const block = renderKeepAtBirthAnnotations("      ");
-    expect(block).toContain('      {{- if eq .Values.cutover.mode "job" }}\n');
+    expect(block).toContain(`      ${JOB_MODE_GATE}\n`);
     expect(block).toContain("      annotations:\n");
     expect(block).toContain("        helm.sh/resource-policy: keep\n");
     expect(block.endsWith("      {{- end }}\n")).toBe(true);
@@ -70,7 +82,7 @@ describe("renderKeepAtBirthAnnotations / keepAtBirthAnnotationEntries", () => {
   it("is wired into every per-build template (Deployment, HPA, versioned Service)", () => {
     const args = { poolName: "ssr", buildId: "b1", releaseName: "my-app" };
     for (const yaml of [renderDeployment(args), renderHPA(args), renderService(args)]) {
-      expect(yaml).toContain('{{- if eq .Values.cutover.mode "job" }}');
+      expect(yaml).toContain(JOB_MODE_GATE);
       for (const a of KEEP_ANNOTATIONS) expect(yaml).toContain(a);
     }
   });
@@ -83,6 +95,57 @@ describe("renderKeepAtBirthAnnotations / keepAtBirthAnnotationEntries", () => {
     expect(yaml).not.toContain("argocd.argoproj.io/sync-options");
     expect(yaml).not.toContain("kustomize.toolkit.fluxcd.io/prune");
     expect(yaml).toContain('helm.sh/resource-policy: ""');
+  });
+
+  it("stamps Argo/Flux prune protection on rollback-critical Secrets and ConfigMaps", () => {
+    const secret = renderInternalSecret({
+      releaseName: "my-app",
+      buildId: "b1",
+      secret: "x".repeat(64),
+    });
+    expect(secret).toContain("helm.sh/resource-policy: keep");
+    expect(secret).toContain(JOB_MODE_GATE);
+    for (const a of KEEP_ANNOTATIONS.slice(1)) expect(secret).toContain(a);
+
+    const snapshot = renderRoutingManifestSnapshotConfigMap({
+      releaseName: "my-app",
+      buildId: "b1",
+      routingManifestJson: "{}",
+    });
+    expect(snapshot).toContain("helm.sh/resource-policy");
+    expect(snapshot).toContain(JOB_MODE_GATE);
+    for (const a of KEEP_ANNOTATIONS.slice(1)) expect(snapshot).toContain(a);
+
+    const { plan } = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({
+          hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+        }),
+      }),
+      {
+        releaseName: "my-app",
+        namespace: "default",
+        buildId: "b1",
+        imageRegistry: "ghcr.io/example/app",
+        pools: ["ssr"],
+        defaultPool: "ssr",
+        failurePolicy: "closed",
+      },
+    );
+    const composition = renderCompositionPlanConfigMap(plan);
+    expect(composition).toContain("helm.sh/resource-policy: keep");
+    expect(composition).toContain(JOB_MODE_GATE);
+    for (const a of KEEP_ANNOTATIONS.slice(1)) expect(composition).toContain(a);
+
+    const external = renderExternalSecrets({
+      releaseName: "my-app",
+      buildId: "b1",
+      includeValkey: false,
+    });
+    expect(external).toContain("helm.sh/resource-policy: keep");
+    expect(external).toContain(JOB_MODE_GATE);
+    for (const a of KEEP_ANNOTATIONS.slice(1)) expect(external).toContain(a);
   });
 });
 

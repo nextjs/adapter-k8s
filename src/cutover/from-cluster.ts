@@ -27,6 +27,7 @@ import {
 import { parseTargetPlatform, type TargetPlatform } from "../target-platform.js";
 import type { EmitMetadata } from "../cli/emit.js";
 import type { CutoverInputs } from "./inputs.js";
+import type { LoadedCompositionPlan } from "../cli/composition-plan.js";
 
 /** The subset of EmitMetadata the Job consumes, after validation. */
 export interface JobEmitMetadata {
@@ -228,8 +229,9 @@ export function buildCutoverInputsFromCluster(opts: {
   metadata: JobEmitMetadata;
   state: AdapterState | null;
   previousReplicasByPool: Map<string, number>;
+  compositionSnapshot?: LoadedCompositionPlan | null;
 }): CutoverInputs {
-  const { metadata, state, previousReplicasByPool } = opts;
+  const { metadata, state, previousReplicasByPool, compositionSnapshot = null } = opts;
   // The previous build the gates verify against is what the CLUSTER says is serving
   // (state CM), not what emit assumed when the bundle was cut — the two agree in the
   // normal flow, and when they do not (a promotion landed between emit and this sync)
@@ -256,7 +258,7 @@ export function buildCutoverInputsFromCluster(opts: {
     hasPortableOrigin: metadata.hasPortableOrigin,
     previousReplicasByPool,
     state,
-    compositionSnapshot: null,
+    compositionSnapshot,
     imageDigests: metadata.digests,
     builtTargetPlatform: metadata.builtTargetPlatform,
     unretainedManifestBuild: null,

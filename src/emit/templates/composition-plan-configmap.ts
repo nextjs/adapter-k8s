@@ -9,6 +9,7 @@ import {
   assertSafeReleaseName,
   compositionPlanResourceName,
   escapeHelmActions,
+  renderJobModeReconcilerKeepEntries,
   sanitizeK8sName,
 } from "./utils.js";
 
@@ -33,7 +34,7 @@ metadata:
   name: ${compositionPlanConfigMapName(releaseName, buildId)}
   annotations:
     helm.sh/resource-policy: keep
-    adapter-k8s.dev/composition-digest: "${fingerprintCompositionPlan(plan)}"
+${renderJobModeReconcilerKeepEntries("    ")}    adapter-k8s.dev/composition-digest: "${fingerprintCompositionPlan(plan)}"
   labels:
     ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"

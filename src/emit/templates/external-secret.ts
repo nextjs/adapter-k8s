@@ -21,7 +21,11 @@ import {
   VALKEY_AUTH_KEY,
   VALKEY_CA_KEY,
 } from "./valkey-secret.js";
-import { assertSafeBuildId, assertSafeReleaseName } from "./utils.js";
+import {
+  assertSafeBuildId,
+  assertSafeReleaseName,
+  renderJobModeReconcilerKeepEntries,
+} from "./utils.js";
 
 /**
  * The store-relative key convention the placeholder reads each secret from. Kept as a
@@ -32,6 +36,8 @@ import { assertSafeBuildId, assertSafeReleaseName } from "./utils.js";
 export function externalSecretRemoteKey(releaseName: string, secretName: string): string {
   return `${releaseName}/${secretName}`;
 }
+
+export const EXTERNAL_SECRET_COMPONENT = "external-secret";
 
 export function renderExternalSecrets({
   releaseName,
@@ -63,13 +69,14 @@ metadata:
   name: ${dispatchName}
   labels:
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: external-secret
+    app.kubernetes.io/component: ${EXTERNAL_SECRET_COMPONENT}
   annotations:
     # N87: the per-build dispatch Secret must OUTLIVE the sync that applies the NEXT
     # build's bundle — the retained previous build's pods reference it by name and cannot
     # start without it (rollback target). Same keep-at-birth posture as the inline Secret.
+    # creationPolicy: Owner means pruning this ExternalSecret garbage-collects the Secret.
     helm.sh/resource-policy: keep
-spec:
+${renderJobModeReconcilerKeepEntries("    ")}spec:
   refreshInterval: 1h
 ${storeRef}
   target:
@@ -90,7 +97,7 @@ metadata:
   name: ${valkeyName}
   labels:
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: external-secret
+    app.kubernetes.io/component: ${EXTERNAL_SECRET_COMPONENT}
 spec:
   refreshInterval: 1h
 ${storeRef}

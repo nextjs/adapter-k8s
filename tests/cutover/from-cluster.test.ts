@@ -335,6 +335,21 @@ describe("buildCutoverInputsFromCluster — assembling CutoverInputs from the th
     expect(inputs.cdnEnabled).toBe(true);
   });
 
+  it("passes a loaded composition snapshot through (the Job must not drop target readiness)", () => {
+    const snapshot = {
+      plan: { metadata: { buildId: BUILD } },
+      digest: `sha256:${"a".repeat(64)}`,
+      source: "ConfigMap default/my-app-composition-buildn",
+    } as never;
+    const inputs = buildCutoverInputsFromCluster({
+      metadata: metadata(),
+      state: null,
+      previousReplicasByPool: new Map(),
+      compositionSnapshot: snapshot,
+    });
+    expect(inputs.compositionSnapshot).toBe(snapshot);
+  });
+
   it("the CLUSTER's serving build wins over emit's assumption (reverting to a non-serving build is N25)", () => {
     // A promotion landed between emit and this sync: emit-metadata says the previous build
     // is `buildm`, the state CM says `buildx` is serving. The gates verify against live truth.

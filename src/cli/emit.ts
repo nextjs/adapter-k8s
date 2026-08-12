@@ -121,6 +121,13 @@ export interface EmitOptions {
    * Argo hook semantics required for correctness.
    */
   cutover?: "none" | "job";
+  /**
+   * --cutover-image <name@sha256:…>. Required with `--cutover job`. The Job pod pulls
+   * this image; `:latest` and any un-digested tag are refused because the published
+   * `ghcr.io/next-community/adapter-k8s-cutover:latest` manifest does not exist and a
+   * mutable tag would let a later push change promotion code under a completed Job name.
+   */
+  cutoverImage?: string;
 }
 
 /** The per-bundle facts file — the emit-side analogue of what state.json records per build. */
@@ -533,6 +540,25 @@ function listFilesRecursive(dir: string, prefix = ""): string[] {
     else out.push(rel);
   }
   return out.sort();
+}
+
+const CUTOVER_IMAGE_DIGEST_RE = /^.+@sha256:[a-fA-F0-9]{64}$/;
+
+/**
+ * Job-mode cutover images must be digest-pinned. `:latest` is the chart default and is
+ * neither published nor immutable — a Job that pulled it would ImagePullBackOff, and a
+ * later retag would change promotion code under a completed Job name.
+ */
+export function assertDigestPinnedCutoverImage(image: string): void {
+  if (!CUTOVER_IMAGE_DIGEST_RE.test(image.trim())) {
+    throw new Error(
+      `--cutover job requires a digest-pinned cutover image (name@sha256:<64 hex>), ` +
+        `got ${JSON.stringify(image)}. The chart default ` +
+        `ghcr.io/next-community/adapter-k8s-cutover:latest is mutable and is not published. ` +
+        `Build an image that contains dist/cutover-job.cjs plus kubectl, push it by digest, ` +
+        `and pass --cutover-image (or ADAPTER_K8S_CUTOVER_IMAGE).`,
+    );
+  }
 }
 
 /**
@@ -1055,6 +1081,12 @@ export async function runEmit(options: EmitOptions): Promise<void> {
       );
     }
     cutoverValues.mode = "job";
+    const cutoverImage =
+      options.cutoverImage?.trim() ||
+      process.env.ADAPTER_K8S_CUTOVER_IMAGE?.trim() ||
+      (typeof cutoverValues.image === "string" ? cutoverValues.image : "");
+    assertDigestPinnedCutoverImage(cutoverImage);
+    cutoverValues.image = cutoverImage;
     // Invariant 3's mismatch clause verbatim on the new render path: the selector value
     // must pass through sanitizeK8sName exactly as activeBuildId does.
     values.previousBuildId = sanitizeK8sName(previousBuildId ?? buildId);

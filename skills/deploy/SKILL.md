@@ -135,11 +135,13 @@ If the cluster is reconciled by Argo CD or Flux, `deploy` is the wrong verb: CI 
 npx adapter-k8s migrate                     # ONCE per release previously deployed imperatively:
                                             # applies prune-protection to the retained rollback set
 npx adapter-k8s emit --cutover job \
+  --cutover-image ghcr.io/example/adapter-k8s-cutover@sha256:<digest> \
+
   --secrets sops                            # or the default --secrets external
 # commit .k8s-adapter/gitops/ ; the reconciler applies it
 ```
 
-Under `--cutover job` the bundle's stable Services render at the PREVIOUS build (sync is not cutover) and an in-cluster Job runs the same gate battery this skill describes, then promotes. Under the default `--cutover none` the bundle is inert: you cut over yourself per `docs/ci-cd.md`. Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy. Full recipes and the ignore rules a reconciler needs: `docs/gitops.md`.
+Under `--cutover job` the bundle's stable Services render at the PREVIOUS build (sync is not cutover) and an in-cluster Job runs the same gate battery this skill describes, then promotes. `--cutover-image` must be digest-pinned (`name@sha256:<64 hex>`); `:latest` is refused. Under the default `--cutover none` the bundle is inert: you cut over yourself per `docs/ci-cd.md`. Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy. Full recipes and the ignore rules a reconciler needs: `docs/gitops.md`.
 
 ## Failure Playbook
 

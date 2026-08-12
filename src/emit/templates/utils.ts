@@ -461,9 +461,11 @@ export function escapeHelmActions(value: string): string {
  *   - `kustomize.toolkit.fluxcd.io/prune: disabled`  — Flux Kustomization over raw
  *     manifests.
  * Rendered inside a Helm `if` on `.Values.cutover.mode` so charts under `mode: none`
- * stay byte-identical to before this existed. The cutover Job owns GC of the parked
- * superseded builds exactly as deploy's E5/E6 do — "never deleted by sync" is not
- * "never deleted".
+ * stay byte-identical to before this existed. The `and .Values.cutover` nil-guard is
+ * required: Helm evaluates `.Values.cutover.mode` to decide the `if`, and nil-pointers
+ * when `cutover` is absent (isolated `helm template` of one file, hand-rolled values).
+ * The cutover Job owns GC of the parked superseded builds exactly as deploy's E5/E6
+ * do — "never deleted by sync" is not "never deleted".
  *
  * `indent` is the column of the `metadata:` children (i.e. the annotation keys land at
  * `indent + "  "`). The returned block is "" under a chart with no gate, ends with "\n",
@@ -472,7 +474,7 @@ export function escapeHelmActions(value: string): string {
  */
 export function renderKeepAtBirthAnnotations(indent: string): string {
   return (
-    `${indent}{{- if eq .Values.cutover.mode "job" }}\n` +
+    `${indent}{{- if and .Values.cutover (eq .Values.cutover.mode "job") }}\n` +
     `${indent}annotations:\n` +
     keepAtBirthAnnotationEntries(`${indent}  `) +
     `${indent}{{- end }}\n`
@@ -485,6 +487,23 @@ export function keepAtBirthAnnotationEntries(indent: string): string {
     `${indent}helm.sh/resource-policy: keep\n` +
     `${indent}argocd.argoproj.io/sync-options: Prune=false\n` +
     `${indent}kustomize.toolkit.fluxcd.io/prune: disabled\n`
+  );
+}
+
+/**
+ * Argo/Flux prune protection for resources that already carry Helm `keep` on every
+ * path (dispatch Secrets, routing-manifest snapshots, composition-plan ConfigMaps,
+ * ExternalSecrets). Imperative `helm upgrade` honors `keep`; Argo does not. Gate the
+ * reconciler annotations on `cutover.mode: job` so mode-none charts stay byte-identical
+ * except for the Helm keep they already had. Nil-guard `.Values.cutover` — see
+ * renderKeepAtBirthAnnotations.
+ */
+export function renderJobModeReconcilerKeepEntries(indent: string): string {
+  return (
+    `${indent}{{- if and .Values.cutover (eq .Values.cutover.mode "job") }}\n` +
+    `${indent}argocd.argoproj.io/sync-options: Prune=false\n` +
+    `${indent}kustomize.toolkit.fluxcd.io/prune: disabled\n` +
+    `${indent}{{- end }}\n`
   );
 }
 

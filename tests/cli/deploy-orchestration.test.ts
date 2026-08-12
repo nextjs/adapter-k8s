@@ -1091,6 +1091,8 @@ describe("runDeploy — orchestration", () => {
       .mock.calls.map((c) => String(c[0]))
       .join("\n");
     expect(printed).toContain("[dry-run] helm upgrade");
+    expect(printed).toContain("[dry-run] Deploy plan complete");
+    expect(printed).not.toContain("✓ Deploy complete");
     expect(printed).toContain("--namespace default --create-namespace");
     const helmPlans = printed.split("\n").filter((line) => line.includes("[dry-run] helm upgrade"));
     expect(helmPlans).toHaveLength(2);

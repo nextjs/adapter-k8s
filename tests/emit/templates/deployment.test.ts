@@ -213,14 +213,14 @@ describe("renderDeployment", () => {
     });
     // A fully literal direct render defers NOTHING about the workload itself — image,
     // resources and replicas are baked. Since GitOps PR2 the only templating left is the
-    // metadata keep-at-birth gate (`.Values.cutover.mode`), which is chart-wide and
-    // input-independent; renderDeployment's sole call site is the chart builder
-    // (src/emit/helm.ts), so it is always rendered by helm and never applied raw.
+    // metadata keep-at-birth gate (`.Values.cutover` + `.Values.cutover.mode`), which is
+    // chart-wide and input-independent; renderDeployment's sole call site is the chart
+    // builder (src/emit/helm.ts), so it is always rendered by helm and never applied raw.
     const deferred = yaml.match(/\.Values\.[A-Za-z0-9_.]*/g) ?? [];
-    expect([...new Set(deferred)]).toEqual([".Values.cutover.mode"]);
+    expect([...new Set(deferred)]).toEqual([".Values.cutover", ".Values.cutover.mode"]);
     // Strip the gate block; everything that remains must be literal YAML.
     const withoutGate = yaml.replace(
-      /\{\{-? if eq \.Values\.cutover\.mode "job" \}\}[\s\S]*?\{\{-? end \}\}/g,
+      /\{\{-? if and \.Values\.cutover \(eq \.Values\.cutover\.mode "job"\) \}\}[\s\S]*?\{\{-? end \}\}/g,
       "",
     );
     expect(withoutGate).not.toContain("{{");

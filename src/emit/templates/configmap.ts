@@ -11,15 +11,21 @@ const METADATA_KEY_RE =
 function renderMetadataMap(
   field: "labels" | "annotations",
   values: Record<string, string> | undefined,
+  extraBlock?: string,
 ): string {
-  if (!values || Object.keys(values).length === 0) return "";
-  const entries = Object.entries(values).map(([key, value]) => {
-    if (!METADATA_KEY_RE.test(key)) {
-      throw new Error(`Invalid ConfigMap metadata key "${key}" in ${field}`);
-    }
-    return `    ${key}: ${escapeHelmActions(JSON.stringify(value))}`;
-  });
-  return `  ${field}:\n${entries.join("\n")}\n`;
+  const entries =
+    values && Object.keys(values).length > 0
+      ? Object.entries(values).map(([key, value]) => {
+          if (!METADATA_KEY_RE.test(key)) {
+            throw new Error(`Invalid ConfigMap metadata key "${key}" in ${field}`);
+          }
+          return `    ${key}: ${escapeHelmActions(JSON.stringify(value))}`;
+        })
+      : [];
+  if (entries.length === 0 && !extraBlock) return "";
+  const extra = extraBlock ?? "";
+  if (entries.length === 0) return `  ${field}:\n${extra}`;
+  return `  ${field}:\n${entries.join("\n")}\n${extra}`;
 }
 
 export function renderConfigMap({
@@ -28,12 +34,15 @@ export function renderConfigMap({
   data,
   labels,
   annotations,
+  annotationHelmBlock,
 }: {
   name: string;
   releaseName: string;
   data: Record<string, string>;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
+  /** Helm-gated annotation lines already indented to the annotation-key column. */
+  annotationHelmBlock?: string;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md) — nothing here was checked.
   assertSafeReleaseName(releaseName);
@@ -60,7 +69,7 @@ export function renderConfigMap({
 kind: ConfigMap
 metadata:
   name: ${safeName}
-${renderMetadataMap("labels", labels)}${renderMetadataMap("annotations", annotations)}data:
+${renderMetadataMap("labels", labels)}${renderMetadataMap("annotations", annotations, annotationHelmBlock)}data:
 ${dataEntries}
 `;
 }

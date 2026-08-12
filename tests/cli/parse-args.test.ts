@@ -100,6 +100,23 @@ describe("parseArgs", () => {
     expect(() => parseArgs(argv("emit", "--previous-bundle"))).toThrow(/requires a value/);
   });
 
+  it("parses --cutover and --cutover-image (GitOps PR2)", () => {
+    const { flags } = parseArgs(
+      argv(
+        "emit",
+        "--cutover",
+        "job",
+        "--cutover-image",
+        `ghcr.io/next-community/adapter-k8s-cutover@sha256:${"c".repeat(64)}`,
+      ),
+    );
+    expect(flags["cutover"]).toBe("job");
+    expect(flags["cutover-image"]).toBe(
+      `ghcr.io/next-community/adapter-k8s-cutover@sha256:${"c".repeat(64)}`,
+    );
+    expect(() => parseArgs(argv("emit", "--cutover-image"))).toThrow(/requires a value/);
+  });
+
   it("boolean flags reject an inline value with a warning but stay enabled", () => {
     // `--dry-run=false` must NOT disable dry-run — failing safe beats guessing intent.
     const { flags } = parseArgs(argv("destroy", "--dry-run=false"));
