@@ -4,6 +4,19 @@ The `adapter-k8s` CLI is a convenience wrapper: everything `deploy` does can be 
 
 ## The pipeline shape
 
+The adapter enables Next's experimental Turbopack filesystem cache for production builds unless
+the app explicitly sets `experimental.turbopackFileSystemCacheForBuild: false`. On a persistent
+worker, subsequent builds reuse compiler artifacts from `<distDir>/cache` automatically. On an
+ephemeral CI runner, restore that directory before `next build` and save it afterward; otherwise
+every build remains cold. For the default `distDir`, cache `.next/cache` with a key that includes
+the lockfile, Next version, Node version, operating system, and CPU architecture, and use a
+lockfile-based restore prefix so source changes can still reuse valid entries.
+
+This is a compilation cache, not a cross-build prerender cache. Next still evaluates
+`generateStaticParams` and generates the configured static pages on each build. Large route sets
+should use a bounded prerender subset plus on-demand generation/ISR when rebuilding every route is
+not required.
+
 ```yaml
 # GitHub Actions example
 jobs:

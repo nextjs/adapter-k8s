@@ -1419,6 +1419,27 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         };
       }
 
+      // Turbopack's production filesystem cache is still opt-in in Next 16. The adapter runs
+      // after Next has loaded next.config but before compilation, so this is the only adapter
+      // hook that can avoid repeating unchanged compilation work across builds. The cache lives
+      // under <distDir>/cache; local builds reuse it naturally, while ephemeral CI runners must
+      // restore that directory before `next build` (see docs/ci-cd.md). It does NOT reuse static
+      // generation output: generateStaticParams/prerendering still run according to Next's own
+      // build semantics.
+      //
+      // Keep an explicit app choice authoritative. This matters while the Next feature remains
+      // experimental: an app that encounters an upstream cache invalidation bug must be able to
+      // turn it off without replacing the adapter.
+      {
+        const userBuildCache = (
+          nextConfig.experimental as { turbopackFileSystemCacheForBuild?: boolean } | undefined
+        )?.turbopackFileSystemCacheForBuild;
+        modified.experimental = {
+          ...(modified.experimental as Record<string, unknown> | undefined),
+          turbopackFileSystemCacheForBuild: userBuildCache ?? true,
+        };
+      }
+
       // Local build profile: cap workers and memory for constrained environments
       // (e2e tests, local emulation). Set ADAPTER_K8S_BUILD_CPUS to activate.
       const buildCpus = parseInt(process.env.ADAPTER_K8S_BUILD_CPUS ?? "", 10);

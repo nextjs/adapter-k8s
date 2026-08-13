@@ -66,6 +66,38 @@ describe("createK8sAdapter config normalization", () => {
   });
 });
 
+describe("Turbopack production filesystem cache", () => {
+  it("enables cross-build compilation caching by default", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    const modified = (await adapter.modifyConfig!({} as any, {} as any)) as {
+      experimental?: { turbopackFileSystemCacheForBuild?: boolean };
+    };
+
+    expect(modified.experimental?.turbopackFileSystemCacheForBuild).toBe(true);
+  });
+
+  it("preserves an explicit app opt-out and unrelated experimental settings", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    const modified = (await adapter.modifyConfig!(
+      {
+        experimental: {
+          turbopackFileSystemCacheForBuild: false,
+          optimizePackageImports: ["example-package"],
+        },
+      } as any,
+      {} as any,
+    )) as {
+      experimental?: {
+        turbopackFileSystemCacheForBuild?: boolean;
+        optimizePackageImports?: string[];
+      };
+    };
+
+    expect(modified.experimental?.turbopackFileSystemCacheForBuild).toBe(false);
+    expect(modified.experimental?.optimizePackageImports).toEqual(["example-package"]);
+  });
+});
+
 // N50 (review #22): `nextConfig.generateBuildId ?? (() => …)` never fell through, because
 // Next's DEFAULT config value for generateBuildId is a FUNCTION — `() => null`
 // (next/dist/server/config-shared.js). So the adapter's "K8s-friendly" generator had never
