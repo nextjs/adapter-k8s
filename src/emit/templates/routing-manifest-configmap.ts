@@ -2,6 +2,7 @@
 import {
   sanitizeK8sName,
   routingManifestSnapshotName as routingManifestSnapshotNameLocal,
+  renderJobModeReconcilerKeepEntries,
 } from "./utils.js";
 import { renderConfigMap } from "./configmap.js";
 
@@ -79,6 +80,7 @@ export function renderRoutingManifestSnapshotConfigMap({
       // rollback. Helm must retain it when the following chart stops rendering this build.
       "helm.sh/resource-policy": "keep",
     },
+    annotationHelmBlock: renderJobModeReconcilerKeepEntries("    "),
   });
 }
 

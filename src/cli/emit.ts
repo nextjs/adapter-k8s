@@ -26,6 +26,11 @@ import {
 } from "node:fs";
 import { gitopsDirName, infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import { execCapture, execOrThrow, EXEC_TIMEOUTS, type ExecCaptureResult } from "./exec.js";
+import {
+  renderCutoverJob,
+  renderCutoverRbac,
+  renderEmitMetadataConfigMap,
+} from "../emit/templates/cutover-job.js";
 import { resolveContainerCli } from "./container-runtime.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { assertCompositionPlanInvocation, loadLocalCompositionPlan } from "./composition-plan.js";
@@ -106,6 +111,23 @@ export interface EmitOptions {
    * govern recipients — emit NEVER passes recipients on argv.
    */
   sopsConfig?: string;
+  /**
+   * --cutover <none|job> (GitOps PR2, design §4.2). Default "none" — PR1 semantics,
+   * byte-identical bundles. "job" sets the chart's cutover.mode values gate: selectors
+   * render from previousBuildId, every per-build resource carries the keep-at-birth
+   * annotations, and the bundle chart renders the per-build-named cutover Job + its
+   * namespace-scoped RBAC + the emit-metadata ConfigMap the Job mounts. The Job is a
+   * PLAIN versioned Job (Flux-native, real-cluster gap #4) — applied with the bundle, no
+   * Argo hook semantics required for correctness.
+   */
+  cutover?: "none" | "job";
+  /**
+   * --cutover-image <name@sha256:…>. Required with `--cutover job`. The Job pod pulls
+   * this image; `:latest` and any un-digested tag are refused because the published
+   * `ghcr.io/next-community/adapter-k8s-cutover:latest` manifest does not exist and a
+   * mutable tag would let a later push change promotion code under a completed Job name.
+   */
+  cutoverImage?: string;
 }
 
 /** The per-bundle facts file — the emit-side analogue of what state.json records per build. */
@@ -148,6 +170,25 @@ export interface EmitMetadata {
    */
   imagePullSecrets?: string[];
   manifests?: { skipped: true; note: string };
+  /**
+   * GitOps PR2 (`--cutover job`): the bundle's cutover model. Absent means "none" (PR1
+   * bundles predate the field). Under "job" the fields below carry what the in-cluster
+   * cutover Job's gates need but cannot learn from a chart directory it does not have —
+   * the three template-existence probes deploy performs on disk, the portable-origin
+   * fact, and the GCP project for CDN invalidation. Recorded ONLY under "job" so
+   * mode-none bundles stay byte-identical to PR1 output.
+   */
+  cutover?: "none" | "job";
+  /** Chart renders route-ext-update-job.yaml (D3 gate applies). Job mode only. */
+  hasRouteExtJob?: boolean;
+  /** Chart renders envoy-extension-policy.yaml (D4/D5 gate applies). Job mode only. */
+  hasEnvoyExtensionPolicy?: boolean;
+  /** Chart renders cdn-http-filter.yaml (E4 invalidation applies). Job mode only. */
+  cdnEnabled?: boolean;
+  /** Chart renders origin-service.yaml (the portable origin Service). Job mode only. */
+  hasPortableOrigin?: boolean;
+  /** infra.projectId — E4's gcloud CDN invalidation identity. Job mode only. */
+  projectId?: string;
 }
 
 /**
@@ -501,6 +542,25 @@ function listFilesRecursive(dir: string, prefix = ""): string[] {
   return out.sort();
 }
 
+const CUTOVER_IMAGE_DIGEST_RE = /^.+@sha256:[a-fA-F0-9]{64}$/;
+
+/**
+ * Job-mode cutover images must be digest-pinned. `:latest` is the chart default and is
+ * neither published nor immutable — a Job that pulled it would ImagePullBackOff, and a
+ * later retag would change promotion code under a completed Job name.
+ */
+export function assertDigestPinnedCutoverImage(image: string): void {
+  if (!CUTOVER_IMAGE_DIGEST_RE.test(image.trim())) {
+    throw new Error(
+      `--cutover job requires a digest-pinned cutover image (name@sha256:<64 hex>), ` +
+        `got ${JSON.stringify(image)}. The chart default ` +
+        `ghcr.io/next-community/adapter-k8s-cutover:latest is mutable and is not published. ` +
+        `Build an image that contains dist/cutover-job.cjs plus kubectl, push it by digest, ` +
+        `and pass --cutover-image (or ADAPTER_K8S_CUTOVER_IMAGE).`,
+    );
+  }
+}
+
 /**
  * Parse the chart's values.yaml (a comment header + a JSON body — see renderValuesYaml)
  * into { header, values } so emit can pin digests/CIDRs/activeBuildId and re-serialize in
@@ -535,6 +595,14 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     firstDeploy,
     previousBundle,
   } = options;
+  const cutoverMode: "none" | "job" = options.cutover ?? "none";
+  if (cutoverMode !== "none" && cutoverMode !== "job") {
+    throw new Error(
+      `Invalid --cutover mode ${JSON.stringify(cutoverMode as string)}: expected "none" ` +
+        `(default — the sync never repoints traffic; the operator cuts over per ` +
+        `docs/ci-cd.md) or "job" (the bundle chart renders the in-cluster cutover Job).`,
+    );
+  }
   // --previous-bundle contradictions — refused HERE, before any build/push cost. Each
   // pair has two sources of truth for the same fact; guessing which wins is exactly how
   // a CI variable typo turns into wrong selector semantics.
@@ -988,18 +1056,122 @@ export async function runEmit(options: EmitOptions): Promise<void> {
       valuePools[key].image.digest = digest;
     }
   }
-  values.activeBuildId = sanitizeK8sName(previousBuildId ?? buildId);
   // The pin actually written (recorded in emit-metadata.json as previousDefaultPool so a
   // re-emit of the same build reproduces it byte-identically — see EmitMetadata).
   let pinnedDefaultPool: string | null = null;
-  if (values.activeDefaultPool !== undefined) {
-    values.activeDefaultPool = previousBuildId
-      ? (previousDefaultPool ?? (values.activeDefaultPool as string))
+  if (cutoverMode === "job") {
+    // §4.2 cutover model: under mode job, activeBuildId names the NEW build
+    // (metadata-only — no selector renders from it), and the selectors render from
+    // previousBuildId/previousDefaultPool instead. The ordering, not the values trick,
+    // is what enforces safety: sync stands the build up pinned at the previous build,
+    // and the in-cluster Job repoints after the gates pass.
+    values.activeBuildId = sanitizeK8sName(buildId);
+    if (values.activeDefaultPool !== undefined) {
+      values.activeDefaultPool = defaultPool as string;
+    }
+    const cutoverValues = values.cutover as Record<string, unknown> | undefined;
+    if (!cutoverValues) {
+      // A chart without the cutover values gate predates PR2 — its templates cannot
+      // render the previous-build selectors or the Job, so pinning values alone would
+      // produce a bundle that LOOKS job-mode while behaving as mode none.
+      throw new Error(
+        `--cutover job requires a chart with the cutover values gate, but this build's ` +
+          `values.yaml has no "cutover" key. Rebuild with the current adapter version ` +
+          `(the chart templates render the gate), or emit with --cutover none.`,
+      );
+    }
+    cutoverValues.mode = "job";
+    const cutoverImage =
+      options.cutoverImage?.trim() ||
+      process.env.ADAPTER_K8S_CUTOVER_IMAGE?.trim() ||
+      (typeof cutoverValues.image === "string" ? cutoverValues.image : "");
+    assertDigestPinnedCutoverImage(cutoverImage);
+    cutoverValues.image = cutoverImage;
+    // Invariant 3's mismatch clause verbatim on the new render path: the selector value
+    // must pass through sanitizeK8sName exactly as activeBuildId does.
+    values.previousBuildId = sanitizeK8sName(previousBuildId ?? buildId);
+    const jobDefaultPool = previousBuildId
+      ? (previousDefaultPool ?? (defaultPool as string))
       : (defaultPool as string);
-    if (previousBuildId) pinnedDefaultPool = values.activeDefaultPool as string;
+    values.previousDefaultPool = jobDefaultPool;
+    if (previousBuildId) pinnedDefaultPool = jobDefaultPool;
+  } else {
+    values.activeBuildId = sanitizeK8sName(previousBuildId ?? buildId);
+    if (values.activeDefaultPool !== undefined) {
+      values.activeDefaultPool = previousBuildId
+        ? (previousDefaultPool ?? (values.activeDefaultPool as string))
+        : (defaultPool as string);
+      if (previousBuildId) pinnedDefaultPool = values.activeDefaultPool as string;
+    }
   }
   const valuesPath = path.join(bundleDir, "values", "values.yaml");
   writeFileSync(valuesPath, header + JSON.stringify(values, null, 2));
+
+  // 7b-bis (--cutover job): render the in-cluster cutover Job, its namespace-scoped
+  // RBAC, and the per-build emit-metadata ConfigMap INTO THE BUNDLE CHART, before the
+  // helm-template step below so manifests/all.yaml carries them too. In the chart (not
+  // only a cutover/ sidecar directory) because an Argo Application sourcing chart/ never
+  // applies files outside its source path — a Job that only lived beside the chart would
+  // silently never run (§4.2). Each template is values-gated on cutover.mode, so the
+  // SAME chart flipped to mode none renders none of them. The Job is a PLAIN versioned
+  // Job (Flux-native, gap #4): applied with the bundle, runs once per build name, no
+  // hook annotations — Argo PostSync sugar is PR3 recipe scope.
+  if (cutoverMode === "job") {
+    // The metadata the Job's gates consume — the same facts as the bundle-root
+    // emit-metadata.json plus the Job-only fields (the three chart-template existence
+    // probes deploy performs on disk, the portable-origin fact, and projectId for CDN
+    // invalidation). Derived from the BUILD's chart (chartFiles), not the bundle copy —
+    // the bundle chart under external/sops modes omits secret templates but never these.
+    const jobMetadata: EmitMetadata = {
+      emitVersion: EMIT_VERSION,
+      buildId,
+      previousBuildId,
+      ...(pinnedDefaultPool !== null ? { previousDefaultPool: pinnedDefaultPool } : {}),
+      releaseName,
+      namespace,
+      registry,
+      digests: Object.fromEntries(
+        Object.keys(imageDigests)
+          .sort()
+          .map((k) => [k, imageDigests[k]!]),
+      ),
+      cdnTag: cdnTagForBuildId(buildId),
+      poolTopology: pools,
+      defaultPool: defaultPool as string,
+      targetPlatforms: { [buildId]: builtTargetPlatform },
+      secretsMode,
+      ...(imagePullSecrets.length > 0 ? { imagePullSecrets } : {}),
+      cutover: "job",
+      hasRouteExtJob: chartFiles.includes("templates/route-ext-update-job.yaml"),
+      hasEnvoyExtensionPolicy: chartFiles.includes("templates/envoy-extension-policy.yaml"),
+      cdnEnabled: chartFiles.includes("templates/cdn-http-filter.yaml"),
+      hasPortableOrigin: chartFiles.includes("templates/origin-service.yaml"),
+      ...(infra.projectId ? { projectId: infra.projectId } : {}),
+    };
+    const templatesDir = path.join(bundleDir, "chart", "templates");
+    writeFileSync(
+      path.join(templatesDir, "cutover-job.yaml"),
+      renderCutoverJob({
+        releaseName,
+        buildId,
+        ...(imagePullSecrets.length > 0 ? { pullSecrets: imagePullSecrets } : {}),
+      }),
+    );
+    writeFileSync(path.join(templatesDir, "cutover-rbac.yaml"), renderCutoverRbac({ releaseName }));
+    writeFileSync(
+      path.join(templatesDir, "emit-metadata-configmap.yaml"),
+      renderEmitMetadataConfigMap({
+        releaseName,
+        buildId,
+        emitMetadataJson: JSON.stringify(jobMetadata, null, 2),
+      }),
+    );
+    console.log(
+      `    Cutover: job — rendered templates/cutover-job.yaml, templates/cutover-rbac.yaml, ` +
+        `templates/emit-metadata-configmap.yaml (values cutover.mode: job; selectors render ` +
+        `from previousBuildId; keep-at-birth annotations on every per-build resource).`,
+    );
+  }
 
   // 7c. manifests/all.yaml — `helm template` of chart+values, for raw-YAML appliers. Helm
   // is optional at emit time: absent ⇒ skip with a note in emit-metadata.json; present but
@@ -1068,6 +1240,20 @@ export async function runEmit(options: EmitOptions): Promise<void> {
     ...(sopsFiles ? { sopsFiles } : {}),
     ...(imagePullSecrets.length > 0 ? { imagePullSecrets } : {}),
     ...(manifestsNote ? { manifests: manifestsNote } : {}),
+    // Job mode records the cutover model and the Job-only facts in the bundle root too,
+    // so a reviewer (and the NEXT emit's prior-bundle read) sees the same facts the
+    // chart's emit-metadata ConfigMap mounts. Absent under mode none — PR1 bundles stay
+    // byte-identical.
+    ...(cutoverMode === "job"
+      ? {
+          cutover: "job" as const,
+          hasRouteExtJob: chartFiles.includes("templates/route-ext-update-job.yaml"),
+          hasEnvoyExtensionPolicy: chartFiles.includes("templates/envoy-extension-policy.yaml"),
+          cdnEnabled: chartFiles.includes("templates/cdn-http-filter.yaml"),
+          hasPortableOrigin: chartFiles.includes("templates/origin-service.yaml"),
+          ...(infra.projectId ? { projectId: infra.projectId } : {}),
+        }
+      : {}),
   };
   writeFileSync(
     path.join(bundleDir, "emit-metadata.json"),
@@ -1091,8 +1277,13 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   );
 
   console.log(
-    `\n  ✓ Bundle written. Commit ${bundleDirRelative}/ and apply it per docs/ci-cd.md ` +
-      `(cutover.mode: none — the sync never repoints traffic; the documented cutover does).`,
+    cutoverMode === "job"
+      ? `\n  ✓ Bundle written. Commit ${bundleDirRelative}/ and let your reconciler apply it ` +
+          `(cutover.mode: job — the sync stands the build up pinned at the previous build; ` +
+          `the in-cluster cutover Job promotes after its gates pass). Prerequisite for ` +
+          `releases with imperative deploy history: \`adapter-k8s migrate\` (docs/gitops.md).`
+      : `\n  ✓ Bundle written. Commit ${bundleDirRelative}/ and apply it per docs/ci-cd.md ` +
+          `(cutover.mode: none — the sync never repoints traffic; the documented cutover does).`,
   );
 }
 

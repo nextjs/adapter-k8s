@@ -109,6 +109,16 @@ export interface AdapterState {
    * Pruned to the current and previous builds, like `routingImageDigests`.
    */
   targetPlatforms?: Record<string, TargetPlatform>;
+  /**
+   * GitOps PR2 poison pill (design §8 risk 4): build ids whose in-cluster cutover Job
+   * FAILED its gate battery for this release. An auto-syncing reconciler retries the sync
+   * per its retry policy, re-running the plain versioned Job's pod — each retry re-runs
+   * the HPA warm-up against a build that will never pass (a capacity wobble on the
+   * serving build, every interval, forever). The Job records the failed build here and
+   * refuses re-promotion of the same build unless FORCE_PROMOTION is set. Cleared by the
+   * next successful promotion (the E2 state write does not carry it forward).
+   */
+  failedPromotions?: string[];
 }
 
 // Thrown when the local file was written but the cluster ConfigMap mirror failed.
@@ -262,11 +272,32 @@ function chooseNewerState(local: AdapterState, cluster: AdapterState): AdapterSt
 // failure mode (N20).
 // `localOnly` skips the cluster read entirely — required for dry-run paths (L13: the
 // kubectl context may point anywhere, and pinning it would mutate the kubeconfig).
+//
+// GitOps PR2: `clusterOnly` is the in-cluster cutover Job's mode. The Job has no
+// persistent `.k8s-adapter/` (every pod starts from a fresh filesystem), so the local
+// file is not consulted AND not reconciled — N20 is carried by the cluster half alone
+// (STATE_GET_ARGS `--ignore-not-found` discipline + ClusterStateReadError on nonzero
+// exit), and chooseNewerState's "rm the local file" repair advice is never emitted
+// (there is no local file to rm). `projectDir` is ignored in this mode; `releaseName`
+// becomes REQUIRED (a cluster-only read with nothing to read from is a caller bug,
+// not "no state").
 export async function readState(
   projectDir: string,
   releaseName?: string,
-  opts?: { localOnly?: boolean; namespace?: string },
+  opts?: { localOnly?: boolean; clusterOnly?: boolean; namespace?: string },
 ): Promise<AdapterState | null> {
+  if (opts?.clusterOnly) {
+    if (opts.localOnly) {
+      throw new Error("readState: localOnly and clusterOnly are mutually exclusive");
+    }
+    if (!releaseName) {
+      throw new Error(
+        "readState: clusterOnly requires releaseName — the cluster ConfigMap is the only store",
+      );
+    }
+    const { state } = await readClusterState(releaseName, resolveK8sNamespace(opts.namespace));
+    return state;
+  }
   const local = readLocalState(projectDir);
   if (!releaseName || opts?.localOnly) return local;
 
@@ -311,15 +342,34 @@ export type StateWrite = Omit<AdapterState, "generation" | "updatedAt"> & {
 // `basedOnGeneration` is the FLOOR — the generation this write is based on. Callers pass the
 // generation of the state they read at the start of the operation so the stamped value stays
 // above the cluster's even when the pre-write cluster read fails (see StateWrite, N69).
+//
+// GitOps PR2: cluster-CM-only mode (`opts.clusterOnly` — the in-cluster cutover Job). The
+// three LOCAL-FILE assumptions of the dual-store path are each answered:
+//  (1) the `readLocalStateQuiet` generation lookup contributes nothing (there is no file);
+//  (2) the atomic tmp+rename local write is skipped entirely;
+//  (3) the recovery semantics INVERT: the dual-store path writes local FIRST and throws a
+//      failed cluster read AFTER, so the operator's re-run reads a provably-newer local
+//      copy — with one store there is nothing to make newer, so a failed
+//      readClusterStateForWrite throws BEFORE any write and recovery is simply "re-run;
+//      the Job re-reads the cluster". Nothing is ever half-committed.
+// The S19 semantic-generation guard and the N23 resourceVersion precondition are
+// store-agnostic and apply identically in both modes.
 export async function writeState(
   projectDir: string,
   state: StateWrite,
   releaseName?: string,
   configuredNamespace?: string,
+  opts?: { clusterOnly?: boolean },
 ): Promise<void> {
   const namespace = resolveK8sNamespace(configuredNamespace);
+  const clusterOnly = opts?.clusterOnly === true;
+  if (clusterOnly && !releaseName) {
+    throw new Error(
+      "writeState: clusterOnly requires releaseName — the cluster ConfigMap is the only store",
+    );
+  }
   const { basedOnGeneration, ...body } = state;
-  const localExisting = readLocalStateQuiet(projectDir);
+  const localExisting = clusterOnly ? null : readLocalStateQuiet(projectDir);
 
   // N23: read the ConfigMap we are about to overwrite — it supplies both the generation
   // to continue and the resourceVersion precondition. Writing blind is how two
@@ -343,6 +393,11 @@ export async function writeState(
           : new ClusterStateWriteError(err instanceof Error ? err.message : String(err));
     }
   }
+
+  // Cluster-only: with a single store there is no "write local first so the re-run is
+  // provably newer" recovery — an unreadable cluster means NOTHING may be written, and
+  // recovery is a plain re-run against the (re-read) cluster.
+  if (clusterOnly && clusterReadError) throw clusterReadError;
 
   // S19: the resourceVersion precondition below closes BLIND writes, but not read-modify-
   // write staleness, which is the same lost update by a slower route. Deploy C reads state
@@ -396,12 +451,17 @@ export async function writeState(
   // sequenced after cutover, and a lock abandoned by a killed deploy would brick every
   // later deploy until manually removed. The lost-update race it would close is instead
   // caught cluster-side by the resourceVersion precondition below (N23).
-  const dir = path.join(projectDir, STATE_DIR);
-  mkdirSync(dir, { recursive: true });
-  const target = path.join(dir, STATE_FILE());
-  const tmp = path.join(dir, `${STATE_FILE()}.tmp`);
-  writeFileSync(tmp, JSON.stringify(stamped, null, 2));
-  renameSync(tmp, target);
+  // Cluster-only mode skips this entirely: the Job pod's filesystem is ephemeral, so a
+  // local write would be a write-only decoy that LOOKS like the dual-store recovery
+  // semantics while providing none of them.
+  if (!clusterOnly) {
+    const dir = path.join(projectDir, STATE_DIR);
+    mkdirSync(dir, { recursive: true });
+    const target = path.join(dir, STATE_FILE());
+    const tmp = path.join(dir, `${STATE_FILE()}.tmp`);
+    writeFileSync(tmp, JSON.stringify(stamped, null, 2));
+    renameSync(tmp, target);
+  }
 
   if (clusterReadError) throw clusterReadError;
 

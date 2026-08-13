@@ -449,6 +449,65 @@ export function escapeHelmActions(value: string): string {
 }
 
 /**
+ * GitOps PR2 keep-at-birth (design §4.2). Under `cutover.mode: job` every PER-BUILD
+ * resource (pool Deployments, HPAs, versioned Services) must carry all three engines'
+ * prune-protection annotations FROM ITS OWN BUNDLE ONWARD: when the next bundle replaces
+ * this one wholesale, the reconciler's sync would otherwise prune the build that is
+ * serving 100% of traffic (the sync happens BEFORE the cutover Job repoints selectors —
+ * zero endpoints, site down, Job never reached). The three are different engines'
+ * semantics and all are required:
+ *   - `helm.sh/resource-policy: keep`                — Helm / Flux helm-controller;
+ *   - `argocd.argoproj.io/sync-options: Prune=false` — Argo CD (ignores Helm's keep);
+ *   - `kustomize.toolkit.fluxcd.io/prune: disabled`  — Flux Kustomization over raw
+ *     manifests.
+ * Rendered inside a Helm `if` on `.Values.cutover.mode` so charts under `mode: none`
+ * stay byte-identical to before this existed. The `and .Values.cutover` nil-guard is
+ * required: Helm evaluates `.Values.cutover.mode` to decide the `if`, and nil-pointers
+ * when `cutover` is absent (isolated `helm template` of one file, hand-rolled values).
+ * The cutover Job owns GC of the parked superseded builds exactly as deploy's E5/E6
+ * do — "never deleted by sync" is not "never deleted".
+ *
+ * `indent` is the column of the `metadata:` children (i.e. the annotation keys land at
+ * `indent + "  "`). The returned block is "" under a chart with no gate, ends with "\n",
+ * and includes the `annotations:` key itself — callers with an EXISTING annotations block
+ * must use keepAtBirthAnnotationEntries instead.
+ */
+export function renderKeepAtBirthAnnotations(indent: string): string {
+  return (
+    `${indent}{{- if and .Values.cutover (eq .Values.cutover.mode "job") }}\n` +
+    `${indent}annotations:\n` +
+    keepAtBirthAnnotationEntries(`${indent}  `) +
+    `${indent}{{- end }}\n`
+  );
+}
+
+/** The three keep-at-birth entries alone, for templates that already render `annotations:`. */
+export function keepAtBirthAnnotationEntries(indent: string): string {
+  return (
+    `${indent}helm.sh/resource-policy: keep\n` +
+    `${indent}argocd.argoproj.io/sync-options: Prune=false\n` +
+    `${indent}kustomize.toolkit.fluxcd.io/prune: disabled\n`
+  );
+}
+
+/**
+ * Argo/Flux prune protection for resources that already carry Helm `keep` on every
+ * path (dispatch Secrets, routing-manifest snapshots, composition-plan ConfigMaps,
+ * ExternalSecrets). Imperative `helm upgrade` honors `keep`; Argo does not. Gate the
+ * reconciler annotations on `cutover.mode: job` so mode-none charts stay byte-identical
+ * except for the Helm keep they already had. Nil-guard `.Values.cutover` — see
+ * renderKeepAtBirthAnnotations.
+ */
+export function renderJobModeReconcilerKeepEntries(indent: string): string {
+  return (
+    `${indent}{{- if and .Values.cutover (eq .Values.cutover.mode "job") }}\n` +
+    `${indent}argocd.argoproj.io/sync-options: Prune=false\n` +
+    `${indent}kustomize.toolkit.fluxcd.io/prune: disabled\n` +
+    `${indent}{{- end }}\n`
+  );
+}
+
+/**
  * S29 (SECURITY). The CEL match condition goes into a SINGLE-quoted YAML scalar (a
  * double-quoted one cannot carry CEL's `\'` escape), so its unsafe set differs from
  * assertSafeYamlScalar's: a single quote is legal (it round-trips as `''`), but a control

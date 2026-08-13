@@ -11,6 +11,7 @@ import {
   assertSafeReplicaCount,
   escapeHelmActions,
   renderImagePullSecrets,
+  renderKeepAtBirthAnnotations,
   renderUserEnvBlocks,
 } from "./utils.js";
 import type { EnvValue, EnvFromSource } from "../../types.js";
@@ -261,7 +262,11 @@ export function renderDeployment({
 kind: Deployment
 metadata:
   name: ${name}
-  labels:
+  # GitOps PR2 keep-at-birth (§4.2): under cutover.mode: job every PER-BUILD resource
+  # protects itself from the sync that applies the NEXT bundle — without these the
+  # reconciler prunes the SERVING build's Deployment before the cutover Job ever runs
+  # (zero endpoints at sync time). The cutover Job owns GC, exactly as deploy E5/E6 do.
+${renderKeepAtBirthAnnotations("  ")}  labels:
     ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"
     # N61: QUOTED. A pool named "on"/"no"/"y"/"off"/"true"/"123" renders a YAML boolean or

@@ -5,6 +5,7 @@ import {
   assertSafeBuildId,
   assertSafePoolName,
   assertSafeReleaseName,
+  renderKeepAtBirthAnnotations,
 } from "./utils.js";
 
 export function renderHPA({
@@ -34,7 +35,8 @@ export function renderHPA({
 kind: HorizontalPodAutoscaler
 metadata:
   name: ${hpaName}
-  labels:
+  # GitOps PR2 keep-at-birth (§4.2): per-build resource — see deployment.ts.
+${renderKeepAtBirthAnnotations("  ")}  labels:
     ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"
     app.kubernetes.io/component: "${poolName}"

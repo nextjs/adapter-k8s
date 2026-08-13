@@ -29,6 +29,8 @@ describe("renderCompositionPlanConfigMap", () => {
     const yaml = renderCompositionPlanConfigMap(plan);
     expect(yaml).toContain("name: app-composition-build-1");
     expect(yaml).toContain("helm.sh/resource-policy: keep");
+    expect(yaml).toContain("argocd.argoproj.io/sync-options: Prune=false");
+    expect(yaml).toContain("kustomize.toolkit.fluxcd.io/prune: disabled");
     expect(yaml).toContain("immutable: true");
     expect(yaml).toMatch(/adapter-k8s\.dev\/composition-digest: "sha256:[a-f0-9]{64}"/);
     expect(yaml).toContain('"minimumVersion":"1.33.0"');

@@ -11,7 +11,7 @@ metadata:
   importPatterns:
     - "@next-community/adapter-k8s"
   bashPatterns:
-    - '\badapter-k8s\s+(deploy|emit|rollback|doctor|describe|tail|init|emulate|destroy)\b'
+    - '\badapter-k8s\s+(deploy|emit|migrate|rollback|doctor|describe|tail|init|emulate|destroy)\b'
     - '^\s*npx\s+adapter-k8s(?:\s|$)'
     - '\bNEXT_ADAPTER_PATH='
     - '\bADAPTER_K8S_(CONFIG|CONTAINER_CLI|TARGET_PLATFORM)='
@@ -132,11 +132,16 @@ Confirm each checkpoint: doctor shows 0 failures; `describe` shows the new build
 If the cluster is reconciled by Argo CD or Flux, `deploy` is the wrong verb: CI has no kubeconfig, and pointing an auto-syncing reconciler at a chart produced by `deploy` causes an outage — the chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto the build that was just scaled to zero (measured against real Argo CD: ~2.4 minutes, Application still reporting Synced).
 
 ```bash
-npx adapter-k8s emit --secrets sops         # or the default --secrets external
+npx adapter-k8s migrate                     # ONCE per release previously deployed imperatively:
+                                            # applies prune-protection to the retained rollback set
+npx adapter-k8s emit --cutover job \
+  --cutover-image ghcr.io/example/adapter-k8s-cutover@sha256:<digest> \
+
+  --secrets sops                            # or the default --secrets external
 # commit .k8s-adapter/gitops/ ; the reconciler applies it
 ```
 
-The emitted bundle is intentionally inert: its stable Services remain pinned to the previous build, and you cut over only after the gates in `docs/ci-cd.md` pass. Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy. The selector-ignore and prune safeguards a reconciler needs are in `docs/gitops.md`.
+Under `--cutover job` the bundle's stable Services render at the PREVIOUS build (sync is not cutover) and an in-cluster Job runs the same gate battery this skill describes, then promotes. `--cutover-image` must be digest-pinned (`name@sha256:<64 hex>`); `:latest` is refused. Under the default `--cutover none` the bundle is inert: you cut over yourself per `docs/ci-cd.md`. Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy. Full recipes and the ignore rules a reconciler needs: `docs/gitops.md`.
 
 ## Failure Playbook
 

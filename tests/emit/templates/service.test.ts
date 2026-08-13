@@ -28,7 +28,13 @@ function helmRender(files: Record<string, string>, sets: string[] = []) {
   try {
     mkdirSync(path.join(dir, "templates"));
     writeFileSync(path.join(dir, "Chart.yaml"), "apiVersion: v2\nname: s\nversion: 0.0.0\n");
-    writeFileSync(path.join(dir, "values.yaml"), "activeBuildId: someBuild\n");
+    // `cutover.mode` mirrors the chart's own default (values-yaml.ts): the stable-Service
+    // selectors are mode-gated since GitOps PR2, and `none` is the imperative-deploy path
+    // these tests pin. Without the key, `.Values.cutover.mode` is a nil-pointer render error.
+    writeFileSync(
+      path.join(dir, "values.yaml"),
+      "activeBuildId: someBuild\ncutover:\n  mode: none\n",
+    );
     for (const [name, content] of Object.entries(files)) {
       writeFileSync(path.join(dir, name), content);
     }
@@ -80,8 +86,19 @@ describe("renderOriginService (portable entrypoint)", () => {
   it("selects the active default-pool pods through one stable Service", () => {
     const yaml = renderOriginService({ poolName: "default", releaseName: "my-app" });
     expect(yaml).toContain("name: my-app-origin");
-    expect(yaml).toContain('app.kubernetes.io/component: "{{ .Values.activeDefaultPool }}"');
-    expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
+    // GitOps PR2: the selector is mode-gated — `cutover.mode: none` (imperative deploy and
+    // PR1 bundles) still resolves to activeBuildId/activeDefaultPool, so this Service's
+    // behavior is unchanged; `mode: job` renders the PREVIOUS build because sync is not
+    // cutover (the Job repoints it after the gates pass). Rendered-output equivalence under
+    // mode: none is pinned against real helm in tests/emit/helm.test.ts.
+    expect(yaml).toContain(
+      'app.kubernetes.io/component: "{{ if eq .Values.cutover.mode "job" }}' +
+        '{{ .Values.previousDefaultPool }}{{ else }}{{ .Values.activeDefaultPool }}{{ end }}"',
+    );
+    expect(yaml).toContain(
+      'app.kubernetes.io/version: "{{ if eq .Values.cutover.mode "job" }}' +
+        '{{ .Values.previousBuildId }}{{ else }}{{ .Values.activeBuildId }}{{ end }}"',
+    );
     expect(yaml).toContain("port: 3000");
     expect(yaml).not.toContain("kind: Deployment");
     expect(yaml).not.toContain("kind: HorizontalPodAutoscaler");
@@ -110,9 +127,15 @@ describe("renderOriginService (portable entrypoint)", () => {
 });
 
 describe("renderActiveService (stable)", () => {
-  it("keeps the cutover-patched selector on activeBuildId", () => {
+  it("keeps the cutover-patched selector on activeBuildId (mode: none) and previousBuildId (mode: job)", () => {
     const yaml = renderActiveService({ poolName: "ssr", releaseName: "my-app" });
-    expect(yaml).toContain('app.kubernetes.io/version: "{{ .Values.activeBuildId }}"');
+    // GitOps PR2: mode-gated. `none` keeps the imperative-deploy semantics this test has
+    // always pinned; `job` renders the previous build so applying the bundle never
+    // repoints traffic ahead of the Job's gate battery (design §4.2).
+    expect(yaml).toContain(
+      'app.kubernetes.io/version: "{{ if eq .Values.cutover.mode "job" }}' +
+        '{{ .Values.previousBuildId }}{{ else }}{{ .Values.activeBuildId }}{{ end }}"',
+    );
     expect(yaml).toContain("app.kubernetes.io/managed-by: adapter-k8s-active");
     for (const document of yaml.split("---")) {
       expect(document).toContain('helm.sh/resource-policy: ""');

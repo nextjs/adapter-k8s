@@ -742,6 +742,7 @@ describe("runDeploy — orchestration", () => {
       },
       RELEASE,
       "default",
+      { clusterOnly: false },
     );
     // CDN invalidated for the OUTGOING build. Prior state (legacy) recorded no tag for
     // it, so no recordedTag is passed — cdn-invalidate falls back to the full purge (M13).
@@ -1090,6 +1091,8 @@ describe("runDeploy — orchestration", () => {
       .mock.calls.map((c) => String(c[0]))
       .join("\n");
     expect(printed).toContain("[dry-run] helm upgrade");
+    expect(printed).toContain("[dry-run] Deploy plan complete");
+    expect(printed).not.toContain("✓ Deploy complete");
     expect(printed).toContain("--namespace default --create-namespace");
     const helmPlans = printed.split("\n").filter((line) => line.includes("[dry-run] helm upgrade"));
     expect(helmPlans).toHaveLength(2);
@@ -1318,6 +1321,7 @@ describe("runDeploy — guards and teardown", () => {
       expect.objectContaining({ buildId: "buildn", previousBuildId: "buildm" }),
       RELEASE,
       "prod",
+      { clusterOnly: false },
     );
   });
 
@@ -1387,6 +1391,7 @@ describe("runDeploy — guards and teardown", () => {
       },
       RELEASE,
       "default",
+      { clusterOnly: false },
     );
   });
 
@@ -1428,6 +1433,7 @@ describe("runDeploy — guards and teardown", () => {
       },
       RELEASE,
       "default",
+      { clusterOnly: false },
     );
   });
 
@@ -2117,6 +2123,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
       expect.objectContaining({ unretainedManifestBuilds: ["buildm"] }),
       RELEASE,
       "default",
+      { clusterOnly: false },
     );
     expect(printedWarnings()).toContain("revert the routing IMAGE only");
   });
@@ -2148,6 +2155,7 @@ describe("runDeploy — N30: routing-manifest retention failure is fatal by defa
       },
       RELEASE,
       "default",
+      { clusterOnly: false },
     );
   });
 });
@@ -2534,6 +2542,7 @@ describe("runDeploy — N70: build-scoped pool topology", () => {
       }),
       RELEASE,
       "default",
+      { clusterOnly: false },
     );
   });
 

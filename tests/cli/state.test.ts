@@ -537,3 +537,222 @@ describe("writeState — N22/N23: exec.ts only, and last-writer-wins is closed",
     expect(localState(tmpDir).unretainedManifestBuilds).toEqual(["B"]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// GitOps PR2 (design §4.2 / §6 PR2): the in-cluster cutover Job runs with ONE store.
+// The Job pod has no persistent `.k8s-adapter/`, so the local half of the dual-store
+// machinery must be absent — not merely unused — and the N20/N23/S19 guards must hold
+// with the cluster ConfigMap alone.
+// ---------------------------------------------------------------------------
+describe("state — clusterOnly (the cutover Job's single store)", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-cluster-only-"));
+    vi.mocked(execCaptureStdin).mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+  });
+  afterEach(() => rmSync(tmpDir, { recursive: true, force: true }));
+
+  it("reads ONLY the cluster ConfigMap — a local file that would throw is never opened", async () => {
+    // A local state.json that readLocalState would reject (LocalStateReadError) proves the
+    // local half is not consulted: the dual-store path throws on this file, clusterOnly
+    // must not even look at it.
+    writeLocal(tmpDir, "x");
+    writeFileSync(path.join(tmpDir, ".k8s-adapter", "state.json"), "{truncated");
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({ buildId: "cluster-build", previousBuildId: "older" }),
+    );
+
+    const state = await readState(tmpDir, "rel", { clusterOnly: true, namespace: "apps" });
+    expect(state).toMatchObject({ buildId: "cluster-build", previousBuildId: "older" });
+    // Exactly one kubectl read, pinned to the namespace, with the N20 absence discipline.
+    expect(vi.mocked(execCapture)).toHaveBeenCalledTimes(1);
+    const args = vi.mocked(execCapture).mock.calls[0]![1];
+    expect(args).toContain("--ignore-not-found");
+    expect(args).toContain("apps");
+    // ...and the dual-store path on the SAME directory still throws, so the file really
+    // is unreadable (this test would pass vacuously otherwise).
+    await expect(readState(tmpDir, "rel")).rejects.toBeInstanceOf(LocalStateReadError);
+  });
+
+  it("N20 holds with one store: a nonzero kubectl exit is unavailable, not 'no deploys yet'", async () => {
+    vi.mocked(execCapture).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "Error from server (Forbidden): configmaps is forbidden",
+    });
+    await expect(readState(tmpDir, "rel", { clusterOnly: true })).rejects.toBeInstanceOf(
+      ClusterStateReadError,
+    );
+    // A genuinely absent ConfigMap is still exit 0 + empty stdout ⇒ null (first deploy).
+    vi.mocked(execCapture).mockResolvedValue(CLUSTER_ABSENT);
+    expect(await readState(tmpDir, "rel", { clusterOnly: true })).toBeNull();
+  });
+
+  it("REFUSES a read with no releaseName — the only store would have nothing to read from", async () => {
+    await expect(readState(tmpDir, undefined, { clusterOnly: true })).rejects.toThrow(
+      /clusterOnly requires releaseName/,
+    );
+    // ...and that is a caller bug, not "no state": nothing was read, nothing returned.
+    expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+  });
+
+  it("REFUSES a write with no releaseName, before any cluster contact", async () => {
+    await expect(
+      writeState(
+        tmpDir,
+        { buildId: "C", previousBuildId: "B", basedOnGeneration: null },
+        undefined,
+        "default",
+        { clusterOnly: true },
+      ),
+    ).rejects.toThrow(/clusterOnly requires releaseName/);
+    expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    expect(existsSync(path.join(tmpDir, ".k8s-adapter", "state.json"))).toBe(false);
+  });
+
+  it("is mutually exclusive with localOnly (the two modes name opposite single stores)", async () => {
+    await expect(readState(tmpDir, "rel", { clusterOnly: true, localOnly: true })).rejects.toThrow(
+      /mutually exclusive/,
+    );
+    expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+  });
+
+  it("writes skip the local file ENTIRELY (no state.json, no .tmp decoy)", async () => {
+    vi.mocked(execCapture).mockResolvedValue(clusterGet({ buildId: "B", previousBuildId: "A" }));
+
+    await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "B", basedOnGeneration: null },
+      "rel",
+      "default",
+      { clusterOnly: true },
+    );
+
+    // The pod filesystem is ephemeral: a local write would LOOK like the dual-store
+    // recovery semantics while providing none of them.
+    expect(existsSync(path.join(tmpDir, ".k8s-adapter"))).toBe(false);
+    // The cluster commit still happened, through exec.ts, on stdin (N22).
+    expect(vi.mocked(execCaptureStdin)).toHaveBeenCalledTimes(1);
+    const stdin = vi.mocked(execCaptureStdin).mock.calls[0]![2] as string;
+    expect(JSON.parse(JSON.parse(stdin).data["state.json"]).buildId).toBe("C");
+  });
+
+  it("N23: the resourceVersion precondition still applies with one store", async () => {
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({ buildId: "B", previousBuildId: "A" }, { resourceVersion: "4242" }),
+    );
+
+    await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "B", basedOnGeneration: null },
+      "rel",
+      "default",
+      { clusterOnly: true },
+    );
+
+    const [, args, stdin] = vi.mocked(execCaptureStdin).mock.calls[0]!;
+    expect(args[0]).toBe("replace");
+    expect(JSON.parse(stdin as string).metadata.resourceVersion).toBe("4242");
+  });
+
+  it("N23: a ConfigMap that moved under the write still fails loudly as concurrent", async () => {
+    let reads = 0;
+    vi.mocked(execCapture).mockImplementation(async () => {
+      reads++;
+      return clusterGet(
+        { buildId: "B", previousBuildId: "A" },
+        { resourceVersion: reads === 1 ? "100" : "101" },
+      );
+    });
+    vi.mocked(execCaptureStdin).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "Operation cannot be fulfilled on configmaps: the object has been modified",
+    });
+
+    const err = await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "B", basedOnGeneration: null },
+      "rel",
+      "default",
+      { clusterOnly: true },
+    ).catch((e) => e);
+    expect(err).toBeInstanceOf(ClusterStateWriteError);
+    expect(err.concurrent).toBe(true);
+  });
+
+  it("S19: the semantic-generation guard still refuses a commit over a moved generation", async () => {
+    // Two cutover Jobs (a reconciler retry racing a fresh sync) are exactly the
+    // read-modify-write staleness S19 closes — and the Job is a NEW concurrent writer of
+    // the object those guards protect.
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({ buildId: "B", previousBuildId: "A", generation: 6 }),
+    );
+
+    const err = await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "A", basedOnGeneration: 5 },
+      "rel",
+      "default",
+      { clusterOnly: true },
+    ).catch((e) => e);
+
+    expect(err).toBeInstanceOf(ClusterStateWriteError);
+    expect(err.concurrent).toBe(true);
+    expect(err.message).toMatch(/generation 6/);
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    expect(existsSync(path.join(tmpDir, ".k8s-adapter", "state.json"))).toBe(false);
+  });
+
+  it("N69: the generation is still stamped above the cluster's", async () => {
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({ buildId: "B", previousBuildId: "A", generation: 7 }),
+    );
+    await writeState(
+      tmpDir,
+      { buildId: "C", previousBuildId: "B", basedOnGeneration: 7 },
+      "rel",
+      "default",
+      { clusterOnly: true },
+    );
+    const stdin = vi.mocked(execCaptureStdin).mock.calls[0]![2] as string;
+    expect(JSON.parse(JSON.parse(stdin).data["state.json"]).generation).toBe(8);
+  });
+
+  it("INVERTED recovery: a failed pre-write cluster read throws BEFORE anything is written", async () => {
+    // The dual-store path writes the local file FIRST and throws the read failure after,
+    // so the operator's re-run reads a provably-newer local copy. With one store there is
+    // nothing to make newer, so nothing may be written at all — recovery is "re-run; the
+    // Job re-reads the cluster".
+    vi.mocked(execCapture).mockResolvedValue({
+      exitCode: 1,
+      stdout: "",
+      stderr: "Unable to connect to the server",
+    });
+
+    await expect(
+      writeState(
+        tmpDir,
+        { buildId: "C", previousBuildId: "B", basedOnGeneration: 7 },
+        "rel",
+        "default",
+        { clusterOnly: true },
+      ),
+    ).rejects.toBeInstanceOf(ClusterStateWriteError);
+
+    // Nothing half-committed: no blind cluster write...
+    expect(vi.mocked(execCaptureStdin)).not.toHaveBeenCalled();
+    // ...and no local decoy either.
+    expect(existsSync(path.join(tmpDir, ".k8s-adapter"))).toBe(false);
+
+    // Contrast, same failure in DUAL mode: the local file IS written (and carries the
+    // floor-derived higher generation) before the error propagates.
+    await expect(
+      writeState(tmpDir, { buildId: "C", previousBuildId: "B", basedOnGeneration: 7 }, "rel"),
+    ).rejects.toBeInstanceOf(ClusterStateWriteError);
+    expect(localState(tmpDir)).toMatchObject({ buildId: "C", generation: 8 });
+  });
+});

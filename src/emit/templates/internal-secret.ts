@@ -4,6 +4,7 @@ import {
   assertSafeReleaseName,
   assertSafeSecretName,
   escapeHelmActions,
+  renderJobModeReconcilerKeepEntries,
   sanitizeK8sName,
 } from "./utils.js";
 
@@ -140,7 +141,7 @@ metadata:
     # without it (rollback target). deploy.ts step 7g deletes the ones no Deployment
     # references any more.
     helm.sh/resource-policy: keep
-    ${INTERNAL_SECRET_BUILD_ID_ANNOTATION}: ${escapeHelmActions(JSON.stringify(buildId))}
+${renderJobModeReconcilerKeepEntries("    ")}    ${INTERNAL_SECRET_BUILD_ID_ANNOTATION}: ${escapeHelmActions(JSON.stringify(buildId))}
 type: Opaque
 stringData:
   ${INTERNAL_SECRET_KEY}: ${escapeHelmActions(JSON.stringify(secret))}
