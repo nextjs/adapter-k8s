@@ -1426,6 +1426,22 @@ describe("renderBundleReadme", () => {
     // Unconfigured bundles carry no section (and no scary prerequisite that isn't one).
     expect(renderBundleReadme(meta)).not.toContain("Image pull secrets");
   });
+
+  it("describes the JOB cutover model for a job-mode bundle — never mode none's manual steps", () => {
+    // A job-mode bundle whose README hands the operator mode-none's out-of-band cutover
+    // instructions sends them to patch selectors the in-cluster Job owns.
+    const readme = renderBundleReadme({ ...meta, cutover: "job" });
+    expect(readme).toContain("cutover.mode: job");
+    expect(readme).toContain("## Cutover model (mode: job)");
+    expect(readme).toContain("templates/cutover-job.yaml");
+    // The two operator prerequisites, where the bundle-PR reviewer reads them.
+    expect(readme).toContain("docker/cutover-job.Dockerfile");
+    expect(readme).toContain("BY DIGEST");
+    expect(readme).toContain("adapter-k8s migrate");
+    expect(readme).not.toContain("mode: none");
+    // Absent and explicit none render the identical README (the byte-identical story).
+    expect(renderBundleReadme({ ...meta, cutover: "none" })).toBe(renderBundleReadme(meta));
+  });
 });
 
 // ---------------------------------------------------------------------------

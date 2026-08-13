@@ -22,9 +22,16 @@ const ACTIVE_SELECTOR_DEFAULT_POOL = `{{ if eq .Values.cutover.mode "job" }}{{ .
 /**
  * §4.2 item 1: stable active Services under mode: job carry `adapter-k8s.io/cutover:
  * pending` — the machine-readable "this selector awaits the Job's promotion" marker.
+ * The cutover Job CLEARS it once the promotion is durable (E2 committed), so a live
+ * object is unambiguous (absent = promoted); the next bundle's sync re-stamps pending,
+ * which is again true for that bundle's build. Clearing, not a "complete" value: SSA
+ * ownership is (manager, operation), so any Update-owner value the Job set conflicted
+ * with helm's Apply re-stamp on the NEXT sync (measured live; see job-main.ts).
+ * Exported so the Job's clear and the template render can never disagree on the key.
  */
+export const CUTOVER_ANNOTATION_KEY = "adapter-k8s.io/cutover";
 const CUTOVER_PENDING_ANNOTATION = `{{- if eq .Values.cutover.mode "job" }}
-    adapter-k8s.io/cutover: pending
+    ${CUTOVER_ANNOTATION_KEY}: pending
 {{- end }}`;
 
 // Versioned Service — points to a specific build's pods
@@ -97,7 +104,7 @@ metadata:
   # pending annotation marks the Service as awaiting promotion.
 {{- if eq .Values.cutover.mode "job" }}
   annotations:
-    adapter-k8s.io/cutover: pending
+    ${CUTOVER_ANNOTATION_KEY}: pending
 {{- end }}
   labels:
     ${ADAPTER_RELEASE_LABEL}: "${releaseName}"

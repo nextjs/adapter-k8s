@@ -504,6 +504,9 @@ function happyCluster(
       );
     }
     if (args.includes("configmaps")) {
+      // The GC sweeps are label-scoped per component; answer each listing with its own
+      // kind only (an imperative release has no emit-metadata ConfigMaps at all).
+      if (j.includes("component=emit-metadata")) return ok("");
       // Snapshot-pruning listing: previous build's snapshot + a stale one.
       return ok(`${SNAP_PREV}\n${SNAP_STALE}\n`);
     }

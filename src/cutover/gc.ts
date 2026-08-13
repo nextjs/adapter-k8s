@@ -16,6 +16,10 @@ import {
   COMPOSITION_PLAN_COMPONENT,
   compositionPlanConfigMapName,
 } from "../emit/templates/composition-plan-configmap.js";
+import {
+  EMIT_METADATA_COMPONENT,
+  emitMetadataConfigMapName,
+} from "../emit/templates/cutover-job.js";
 // N87: internal dispatch Secrets are per BUILD and annotated `helm.sh/resource-policy: keep`,
 // so the cutover owns the pruning half of their lifecycle (deploy owns the keep-at-upgrade
 // half): delete the ones nothing references any more.
@@ -313,6 +317,39 @@ export async function gcSupersededResources(opts: {
             timeoutMs: EXEC_TIMEOUTS.kubectl,
           });
         }
+      }
+    }
+
+    // Emit-metadata ConfigMaps (job-mode bundles), same policy. They carry keep-at-birth
+    // (a forcePromotion re-run of the parked previous build mounts ITS ConfigMap, so the
+    // reconciler must not prune it) — which also means no sync ever deletes them, so
+    // without this sweep they accumulate one per build forever. Imperative releases have
+    // none; the listing is just empty there.
+    const keepEmitMeta = new Set([
+      emitMetadataConfigMapName(releaseName, buildId),
+      emitMetadataConfigMapName(releaseName, previousBuildId),
+    ]);
+    const emitMetas = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "configmaps",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${EMIT_METADATA_COMPONENT}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (emitMetas.exitCode === 0) {
+      for (const cmName of emitMetas.stdout.trim().split("\n")) {
+        if (!cmName || keepEmitMeta.has(cmName)) continue;
+        console.log(`  → Deleting old emit-metadata ConfigMap: ${cmName}`);
+        await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace], {
+          timeoutMs: EXEC_TIMEOUTS.kubectl,
+        });
       }
     }
   }

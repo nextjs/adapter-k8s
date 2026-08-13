@@ -22,6 +22,10 @@
 import { runCutover } from "./run.js";
 import { createEdgeRecovery, revertRoutingServiceToBuild } from "./edge.js";
 import { CutoverExitError } from "./inputs.js";
+import { EXEC_TIMEOUTS, execCapture } from "../cli/exec.js";
+import { sanitizeForTerminal } from "../cli/terminal.js";
+import { sanitizeK8sName } from "../emit/templates/utils.js";
+import { CUTOVER_ANNOTATION_KEY } from "../emit/templates/service.js";
 import { readState, writeState, type AdapterState } from "../cli/state.js";
 import {
   buildCutoverInputsFromCluster,
@@ -156,12 +160,18 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
     );
   }
 
-  const compositionSnapshot = await loadDeployedCompositionPlan({
-    releaseName,
-    namespace,
-    buildId,
-  });
-  if (!compositionSnapshot) {
+  // Only composed-target bundles render a composition-plan ConfigMap (helm.ts gates it
+  // and origin-service.yaml on the same compiledTarget, which is what hasPortableOrigin
+  // records). For those, a missing plan is a hard refusal, not a silently skipped gate;
+  // provider-ingress bundles have no plan to load and promote on the base battery.
+  const compositionSnapshot = metadata.hasPortableOrigin
+    ? await loadDeployedCompositionPlan({
+        releaseName,
+        namespace,
+        buildId,
+      })
+    : null;
+  if (metadata.hasPortableOrigin && !compositionSnapshot) {
     throw new Error(
       `Composition plan ConfigMap is missing for build "${buildId}" in namespace ` +
         `"${namespace}". The Job cannot verify HTTPRoute, Certificate, or other ` +
@@ -222,6 +232,44 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
     await recordFailedPromotion({ state, buildId, releaseName, namespace });
     return err instanceof CutoverExitError ? err.code : 1;
   }
+
+  // The bundle stamps every stable active Service `adapter-k8s.io/cutover: pending`
+  // ("this selector awaits the Job's promotion"). The promotion is now durable (E2
+  // committed), so CLEAR the marker — a live object must not read as pending forever,
+  // which is indistinguishable from a Job that never ran. The NEXT bundle's sync
+  // re-stamps pending, which is again true for that bundle's build.
+  //
+  // Clearing — not setting "complete" — is forced by server-side apply, measured live
+  // in both wrong designs: SSA ownership identity is (manager, OPERATION), so any
+  // annotate/patch is an Update-owner that can never impersonate helm's Apply-owner —
+  // kubectl's default manager conflicted, and --field-manager=helm STILL conflicted
+  // ("helm"+Update ≠ "helm"+Apply) — and each left the next sync's re-stamp to pending
+  // failing with a field conflict, i.e. a reconciler reports the release broken after
+  // every promotion. (The E1 selector patches never hit this because emit pins the next
+  // bundle's selector to the SAME value the promotion set; equal values don't
+  // conflict.) A REMOVAL is the design that cannot conflict: updates ignore ownership,
+  // deletion drops the field's managedFields entry, and the next apply finds no live
+  // value and no foreign owner. Absent = promoted; the state ConfigMap stays the
+  // authority. Best-effort: a failure here never fails a committed promotion.
+  const stableServices = [
+    ...metadata.poolTopology.map((pool) => sanitizeK8sName(`${releaseName}-${pool}`)),
+    ...(metadata.hasPortableOrigin ? [sanitizeK8sName(`${releaseName}-origin`)] : []),
+  ];
+  for (const svc of stableServices) {
+    const cleared = await execCapture(
+      "kubectl",
+      ["annotate", "service", svc, "-n", namespace, `${CUTOVER_ANNOTATION_KEY}-`],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (cleared.exitCode !== 0) {
+      console.warn(
+        `  ! Could not clear the ${CUTOVER_ANNOTATION_KEY}: pending marker on ${svc} ` +
+          `(non-fatal): ` +
+          `${sanitizeForTerminal(cleared.stderr.trim()) || `exit ${cleared.exitCode}`}`,
+      );
+    }
+  }
+
   console.log(`\nPromotion complete: build "${buildId}" is serving.`);
   return 0;
 }

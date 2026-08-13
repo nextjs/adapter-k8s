@@ -40,6 +40,7 @@ import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
 import { loadDeployedCompositionPlan } from "../../src/cli/composition-plan.js";
 import { routeExtJobName } from "../../src/emit/templates/route-ext-update-job.js";
+import { emitMetadataConfigMapName } from "../../src/emit/templates/cutover-job.js";
 
 const RELEASE = "rel";
 const NS = "default";
@@ -94,6 +95,8 @@ interface ClusterOverrides {
   policyReadFails?: boolean;
   routeExtJobFails?: boolean;
   servicePatchFailsFor?: string;
+  /** Names the emit-metadata ConfigMap listing reports (job-mode GC sweep). */
+  emitMetaConfigMaps?: string[];
 }
 
 /** A scripted cluster for one release serving `buildm`, with `buildn` landing. */
@@ -186,6 +189,11 @@ function cluster(overrides: ClusterOverrides = {}) {
       const target = args.find((a) => a.startsWith("deployment/"));
       events.push(args.includes("--replicas=0") ? `park:${target}` : `scaleup:${target}`);
       return ok();
+    }
+    if (args[1] === "configmaps" && j.includes("component=emit-metadata")) {
+      return ok(
+        overrides.emitMetaConfigMaps?.length ? `${overrides.emitMetaConfigMaps.join("\n")}\n` : "",
+      );
     }
     if (args[0] === "exec") return ok('503 {"reason":"route module failed to load"}');
     if (args[0] === "logs") return ok("");
@@ -284,6 +292,30 @@ describe("runCutover — the happy path's ordering", () => {
     vi.mocked(writeState).mockClear();
     await runCutover(inputs(), deps);
     expect(vi.mocked(writeState).mock.calls[0]![4]).toEqual({ clusterOnly: false });
+  });
+
+  it("sweeps superseded emit-metadata ConfigMaps, keeping current and previous", async () => {
+    // Keep-at-birth makes these unpruneable by any reconciler (a forcePromotion re-run of
+    // the parked build mounts ITS ConfigMap), so the cutover owns their deletion — without
+    // this sweep they accumulate one per build forever.
+    const current = emitMetadataConfigMapName(RELEASE, BUILD);
+    const previous = emitMetadataConfigMapName(RELEASE, PREV);
+    const stale = emitMetadataConfigMapName(RELEASE, "buildk");
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ emitMetaConfigMaps: [current, previous, stale] }) as never,
+    );
+
+    await runCutover(inputs(), deps);
+
+    const deletes = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, a]) => (a as string[])[0] === "delete" && (a as string[])[1] === "configmap",
+      )
+      .map(([, a]) => (a as string[])[2]);
+    expect(deletes).toContain(stale);
+    expect(deletes).not.toContain(current);
+    expect(deletes).not.toContain(previous);
   });
 });
 
@@ -625,8 +657,7 @@ describe("jobMain — the poison pill", () => {
     poolTopologies: { [PREV]: ["ssr"] },
   };
 
-  function mountMetadata(): void {
-    metadataDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-jobmain-"));
+  function writeMetadata(extra: Record<string, unknown> = {}): void {
     writeFileSync(
       path.join(metadataDir, "emit-metadata.json"),
       JSON.stringify({
@@ -643,8 +674,14 @@ describe("jobMain — the poison pill", () => {
         targetPlatforms: { [BUILD]: "linux/amd64" },
         secretsMode: "external",
         cutover: "job",
+        ...extra,
       }),
     );
+  }
+
+  function mountMetadata(): void {
+    metadataDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-jobmain-"));
+    writeMetadata();
   }
 
   const env = (extra: Record<string, string> = {}) => ({
@@ -731,10 +768,82 @@ describe("jobMain — the poison pill", () => {
     expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
   });
 
-  it("REFUSES to promote when the composition plan ConfigMap is missing", async () => {
+  it("REFUSES to promote a composed-target bundle whose composition plan ConfigMap is missing", async () => {
+    writeMetadata({ hasPortableOrigin: true });
     vi.mocked(loadDeployedCompositionPlan).mockResolvedValue(null);
     vi.mocked(execCapture).mockImplementation(cluster() as never);
     await expect(jobMain(env())).rejects.toThrow(/Composition plan ConfigMap is missing/);
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
+  });
+
+  it("promotes a provider-ingress bundle WITHOUT a composition plan (none is rendered)", async () => {
+    // helm.ts renders composition-plan.yaml only for compiledTarget bundles — an
+    // unconditional refusal here would brick job mode for every provider-ingress release.
+    vi.mocked(loadDeployedCompositionPlan).mockResolvedValue(null);
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+    expect(await jobMain(env())).toBe(0);
+    expect(vi.mocked(loadDeployedCompositionPlan)).not.toHaveBeenCalled();
+  });
+
+  // The cutover marker lifecycle: the bundle stamps the stable Services
+  // `adapter-k8s.io/cutover: pending`; the Job must CLEAR it once the promotion is
+  // durable — a live object stuck at pending is indistinguishable from a Job that never
+  // ran. A REMOVAL, not a "complete" value: SSA ownership is (manager, operation), so
+  // both value-writing designs conflicted with helm's Apply re-stamp on the next sync
+  // (kubectl-annotate's manager AND --field-manager=helm — "helm"+Update ≠
+  // "helm"+Apply, both measured live). Updates ignore ownership and a removed field
+  // has no owner, so the next sync's pending applies cleanly.
+  function annotateCalls(): Array<string[]> {
+    return vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => (a as string[])[0] === "annotate")
+      .map(([, a]) => a as string[]);
+  }
+
+  it("CLEARS the stable Services' pending marker AFTER the promotion commits", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+
+    expect(await jobMain(env())).toBe(0);
+
+    // The trailing dash is kubectl's removal syntax — a value-writing form here is the
+    // measured SSA conflict re-introduced.
+    expect(annotateCalls()).toEqual([
+      ["annotate", "service", `${RELEASE}-ssr`, "-n", NS, "adapter-k8s.io/cutover-"],
+    ]);
+    // AFTER the state commit — a failure between patch and commit must leave pending.
+    const calls = vi.mocked(execCapture).mock.calls;
+    const annotateIdx = calls.findIndex(([, a]) => (a as string[])[0] === "annotate");
+    const patchIdx = calls.findIndex(
+      ([, a]) => (a as string[])[0] === "patch" && (a as string[])[1] === "service",
+    );
+    expect(patchIdx).toBeGreaterThanOrEqual(0);
+    expect(annotateIdx).toBeGreaterThan(patchIdx);
+  });
+
+  it("a clear failure is NON-FATAL — the promotion is already committed", async () => {
+    const base = cluster();
+    vi.mocked(execCapture).mockImplementation(((cmd: string, args: string[], opts: unknown) => {
+      if (args[0] === "annotate") {
+        return Promise.resolve({ exitCode: 1, stdout: "", stderr: "denied" });
+      }
+      return base(cmd, args, opts as never);
+    }) as never);
+
+    expect(await jobMain(env())).toBe(0);
+    expect(
+      vi
+        .mocked(console.warn)
+        .mock.calls.map((c) => String(c[0]))
+        .join("\n"),
+    ).toContain("Could not clear the adapter-k8s.io/cutover: pending marker on rel-ssr");
+  });
+
+  it("a FAILED promotion never touches the marker (pending stays truthful)", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ rolloutFailsFor: `${RELEASE}-ssr-${BUILD}` }) as never,
+    );
+
+    expect(await jobMain(env())).not.toBe(0);
+    expect(annotateCalls()).toEqual([]);
   });
 });

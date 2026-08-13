@@ -26,6 +26,9 @@ import {
 /** Component label on the Job (and the pane the operator greps for). */
 export const CUTOVER_JOB_COMPONENT = "cutover-job";
 
+/** Component label on the per-build emit-metadata ConfigMap — the GC sweep keys on it. */
+export const EMIT_METADATA_COMPONENT = "emit-metadata";
+
 /**
  * Per-build cutover Job name: `<release>-cutover-<12 hex>` — the same 48-bit digest
  * suffix idiom as routeExtJobName, for the same two reasons: Jobs are immutable (each
@@ -104,6 +107,15 @@ spec:
   # NO ttlSecondsAfterFinished: the per-build name is the idempotency key — a re-sync of
   # the same bundle must find the completed Job, not a swept one it would re-create.
   template:
+    metadata:
+      # The same name/component pair as the Job object, so \`kubectl logs -l
+      # app.kubernetes.io/component=${CUTOVER_JOB_COMPONENT}\` reaches the PODS (the batch
+      # controller only stamps its own job-name labels). Deliberately NOT matched by any
+      # NetworkPolicy podSelector (those pair the name label with routing-service/pool
+      # components), so the pod's apiserver egress stays unrestricted.
+      labels:
+        app.kubernetes.io/name: "${releaseName}"
+        app.kubernetes.io/component: ${CUTOVER_JOB_COMPONENT}
     spec:
       serviceAccountName: ${cutoverServiceAccountName(releaseName)}
       restartPolicy: Never
@@ -310,7 +322,7 @@ metadata:
   name: ${emitMetadataConfigMapName(releaseName, buildId)}
   labels:
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: emit-metadata
+    app.kubernetes.io/component: ${EMIT_METADATA_COMPONENT}
     app.kubernetes.io/version: "${sanitizeK8sName(buildId)}"
   annotations:
 ${keepAtBirthAnnotationEntries("    ")}data:

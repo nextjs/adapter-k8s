@@ -982,7 +982,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (!dryRun) {
       await execOrThrow("npx", ["next", "build"], {
         cwd: projectDir,
-        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        timeoutMs: EXEC_TIMEOUTS.build,
       });
     } else {
       console.log("    [dry-run] npx next build");
@@ -1506,7 +1506,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       if (!dryRun) {
         await execOrThrow(cmd.command, cmd.args, {
           cwd: projectDir,
-          timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+          timeoutMs: EXEC_TIMEOUTS.build,
         });
       } else {
         console.log(`    [dry-run] ${cmd.command} ${cmd.args.join(" ")}`);

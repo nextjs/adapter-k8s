@@ -37,6 +37,27 @@ export interface ExecOptions {
   env?: Record<string, string>;
 }
 
+/**
+ * Resolve the `build` tier from an operator-supplied override. Exported for tests.
+ * Accepts a positive integer of MILLISECONDS; anything else REFUSES loudly — a typo
+ * silently falling back to the default would reintroduce the surprise mid-deploy
+ * timeout minutes after the operator believed they had raised it.
+ */
+export function resolveBuildTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return 20 * 60 * 1000;
+  // Plain digits only — Number() also accepts "1e6", "0x10", and whitespace-padded
+  // forms, and accepting a value the operator probably didn't mean ("45m" minus a typo)
+  // is the same hazard as the silent fallback.
+  const parsed = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid ADAPTER_K8S_BUILD_TIMEOUT_MS ${JSON.stringify(raw)}: must be a positive ` +
+        `integer of milliseconds (e.g. 3600000 for one hour).`,
+    );
+  }
+  return parsed;
+}
+
 // Shared subprocess timeout tiers. Every non-interactive shell-out must pass one of
 // these (or a bespoke value) — an unbounded kubectl/gcloud/helm call wedged on a stuck
 // API server otherwise hangs the CLI forever. Streaming commands that are expected to
@@ -48,8 +69,14 @@ export const EXEC_TIMEOUTS = {
    *  headroom past the flag so kubectl reports the failure, not us. */
   rollout: 15 * 60 * 1000,
   /** gcloud operations that poll a long-running GCP op (cluster/addon changes,
-   *  Memorystore, CDN invalidation), helm upgrade/uninstall, docker build/push. */
+   *  Memorystore, CDN invalidation), helm upgrade/uninstall. */
   cloudOperation: 20 * 60 * 1000,
+  /** `next build` and each container build/push. Same default ceiling as
+   *  cloudOperation, but operator-tunable via ADAPTER_K8S_BUILD_TIMEOUT_MS: a large
+   *  app's build or a slow registry uplink legitimately exceeds 20 minutes, and these
+   *  are the only tier-bounded calls whose duration scales with the APP rather than
+   *  with cluster/API health (before the tiers existed they were unbounded). */
+  build: resolveBuildTimeoutMs(process.env.ADAPTER_K8S_BUILD_TIMEOUT_MS),
 } as const;
 
 // M2: never route arguments through a shell we don't escape for. The old blanket
