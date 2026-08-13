@@ -13,7 +13,7 @@ import {
 import { compositionPlanConfigMapName } from "../emit/templates/composition-plan-configmap.js";
 import { outputDirName } from "./infrastructure-validation.js";
 import { sanitizeForTerminal } from "./terminal.js";
-import { execCapture, execOrThrow } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture, execOrThrow } from "./exec.js";
 
 const PLAN_FILE = "composition-plan.json";
 const PLAN_DIGEST_ANNOTATION = "adapter-k8s.dev/composition-digest";
@@ -165,16 +165,11 @@ export async function loadDeployedCompositionPlan(options: {
   };
 }): Promise<LoadedCompositionPlan | null> {
   const name = compositionPlanConfigMapName(options.releaseName, options.buildId);
-  const result = await execCapture("kubectl", [
-    "get",
-    "configmap",
-    name,
-    "-n",
-    options.namespace,
-    "-o",
-    "json",
-    "--ignore-not-found",
-  ]);
+  const result = await execCapture(
+    "kubectl",
+    ["get", "configmap", name, "-n", options.namespace, "-o", "json", "--ignore-not-found"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (result.exitCode !== 0) {
     throw new Error(
       `Could not read deployed composition plan ConfigMap ${options.namespace}/${name}: ` +
@@ -256,7 +251,9 @@ export function compositionPlanNeedsExplicitConfirmation(plan: CompositionPlan):
 }
 
 async function readCurrentKubeContext(): Promise<string | null> {
-  const result = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+  const result = await execCapture("kubectl", ["config", "current-context"], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  }).catch(() => null);
   if (!result || result.exitCode !== 0) return null;
   return result.stdout.trim() || null;
 }
@@ -271,17 +268,21 @@ async function establishClusterAccess(plan: CompositionPlan): Promise<void> {
   switch (access.kind) {
     case "gke-get-credentials": {
       const locationFlag = access.location.kind === "zone" ? "--zone" : "--region";
-      await execOrThrow("gcloud", [
-        "container",
-        "clusters",
-        "get-credentials",
-        access.clusterName,
-        locationFlag,
-        access.location.name,
-        "--project",
-        access.projectId,
-        "--quiet",
-      ]);
+      await execOrThrow(
+        "gcloud",
+        [
+          "container",
+          "clusters",
+          "get-credentials",
+          access.clusterName,
+          locationFlag,
+          access.location.name,
+          "--project",
+          access.projectId,
+          "--quiet",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       return;
     }
     case "kubeconfig-context": {
@@ -301,7 +302,9 @@ async function establishClusterAccess(plan: CompositionPlan): Promise<void> {
 }
 
 async function rawKubernetes(pathname: string): Promise<unknown> {
-  const result = await execCapture("kubectl", ["get", "--raw", pathname]);
+  const result = await execCapture("kubectl", ["get", "--raw", pathname], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  });
   if (result.exitCode !== 0) {
     throw new Error(
       `Kubernetes API read ${pathname} failed: ` +
@@ -656,16 +659,20 @@ async function evaluateKubernetesReadiness(
 async function evaluateGcpTrafficExtension(
   readiness: Extract<RoutingReadiness, { kind: "gcp-traffic-extension" }>,
 ): Promise<ReadinessEvaluation> {
-  const extension = await execCapture("gcloud", [
-    "service-extensions",
-    "lb-traffic-extensions",
-    "describe",
-    readiness.extensionName,
-    "--location=global",
-    "--project",
-    readiness.projectId,
-    "--format=json",
-  ]);
+  const extension = await execCapture(
+    "gcloud",
+    [
+      "service-extensions",
+      "lb-traffic-extensions",
+      "describe",
+      readiness.extensionName,
+      "--location=global",
+      "--project",
+      readiness.projectId,
+      "--format=json",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (extension.exitCode !== 0) {
     return {
       ready: false,
@@ -681,28 +688,36 @@ async function evaluateGcpTrafficExtension(
       .filter((entry): entry is string => typeof entry === "string")
       .map((entry) => entry.split("/").pop()!),
   );
-  const address = await execCapture("gcloud", [
-    "compute",
-    "addresses",
-    "describe",
-    readiness.addressName,
-    "--global",
-    "--project",
-    readiness.projectId,
-    "--format=value(address)",
-  ]);
+  const address = await execCapture(
+    "gcloud",
+    [
+      "compute",
+      "addresses",
+      "describe",
+      readiness.addressName,
+      "--global",
+      "--project",
+      readiness.projectId,
+      "--format=value(address)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   const ip = address.exitCode === 0 ? address.stdout.trim() : "";
   if (!ip) return { ready: false, final: false, message: "release address is not ready" };
-  const rules = await execCapture("gcloud", [
-    "compute",
-    "forwarding-rules",
-    "list",
-    "--project",
-    readiness.projectId,
-    "--filter",
-    `IPAddress=${ip}`,
-    "--format=value(name)",
-  ]);
+  const rules = await execCapture(
+    "gcloud",
+    [
+      "compute",
+      "forwarding-rules",
+      "list",
+      "--project",
+      readiness.projectId,
+      "--filter",
+      `IPAddress=${ip}`,
+      "--format=value(name)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (rules.exitCode !== 0) {
     return {
       ready: false,
@@ -732,7 +747,7 @@ function readinessKey(readiness: RoutingReadiness): string {
   return JSON.stringify(readiness);
 }
 
-export function compositionPlanReadiness(plan: CompositionPlan): RoutingReadiness[] {
+function compositionPlanReadiness(plan: CompositionPlan): RoutingReadiness[] {
   const routingReadiness = plan.operations.routing.dataplane.readiness;
   const unique = new Map<string, RoutingReadiness>();
   for (const readiness of [...plan.operations.resources.readiness, ...routingReadiness]) {
@@ -798,68 +813,83 @@ export async function evaluateCompositionPlanDiagnostics(
           break;
         }
         case "gcp-auth": {
-          const result = await execCapture("gcloud", [
-            "auth",
-            "print-access-token",
-            `--project=${diagnostic.projectId}`,
-            "--quiet",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            ["auth", "print-access-token", `--project=${diagnostic.projectId}`, "--quiet"],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           status = result.exitCode === 0 ? "pass" : "fail";
           message = result.exitCode === 0 ? "authenticated" : result.stderr.trim();
           break;
         }
         case "gcp-global-address": {
-          const result = await execCapture("gcloud", [
-            "compute",
-            "addresses",
-            "describe",
-            diagnostic.name,
-            "--global",
-            `--project=${diagnostic.projectId}`,
-            "--format=value(address)",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "addresses",
+              "describe",
+              diagnostic.name,
+              "--global",
+              `--project=${diagnostic.projectId}`,
+              "--format=value(address)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           const address = result.exitCode === 0 ? result.stdout.trim() : "";
           status = address ? "pass" : "fail";
           message = address || result.stderr.trim() || "address not found";
           break;
         }
         case "gcp-storage-bucket": {
-          const result = await execCapture("gcloud", [
-            "storage",
-            "buckets",
-            "describe",
-            `gs://${diagnostic.bucket}`,
-            `--project=${diagnostic.projectId}`,
-            "--format=value(name)",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "storage",
+              "buckets",
+              "describe",
+              `gs://${diagnostic.bucket}`,
+              `--project=${diagnostic.projectId}`,
+              "--format=value(name)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           status = result.exitCode === 0 ? "pass" : "fail";
           message = result.stdout.trim() || result.stderr.trim() || "bucket not found";
           break;
         }
         case "gcp-artifact-registry": {
-          const result = await execCapture("gcloud", [
-            "artifacts",
-            "repositories",
-            "describe",
-            diagnostic.repository,
-            `--location=${diagnostic.region}`,
-            `--project=${diagnostic.projectId}`,
-            "--format=value(name)",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "artifacts",
+              "repositories",
+              "describe",
+              diagnostic.repository,
+              `--location=${diagnostic.region}`,
+              `--project=${diagnostic.projectId}`,
+              "--format=value(name)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           status = result.exitCode === 0 ? "pass" : "fail";
           message = result.stdout.trim() || result.stderr.trim() || "repository not found";
           break;
         }
         case "gcp-backend-health": {
-          const result = await execCapture("gcloud", [
-            "compute",
-            "backend-services",
-            "get-health",
-            `${diagnostic.releasePrefix}-routing-service`,
-            "--global",
-            `--project=${diagnostic.projectId}`,
-            "--format=json",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "backend-services",
+              "get-health",
+              `${diagnostic.releasePrefix}-routing-service`,
+              "--global",
+              `--project=${diagnostic.projectId}`,
+              "--format=json",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           status = result.exitCode === 0 ? "pass" : "fail";
           message = result.exitCode === 0 ? "backend health is readable" : result.stderr.trim();
           break;
@@ -877,15 +907,19 @@ export async function evaluateCompositionPlanDiagnostics(
           break;
         }
         case "gcp-backend-service-shape": {
-          const result = await execCapture("gcloud", [
-            "compute",
-            "backend-services",
-            "describe",
-            diagnostic.name,
-            "--global",
-            `--project=${diagnostic.projectId}`,
-            "--format=json",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "backend-services",
+              "describe",
+              diagnostic.name,
+              "--global",
+              `--project=${diagnostic.projectId}`,
+              "--format=json",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (result.exitCode !== 0) {
             message = result.stderr.trim() || "backend service not found";
             break;
@@ -907,29 +941,37 @@ export async function evaluateCompositionPlanDiagnostics(
           break;
         }
         case "gcp-health-check-shape": {
-          const result = await execCapture("gcloud", [
-            "compute",
-            "health-checks",
-            "describe",
-            diagnostic.name,
-            "--global",
-            `--project=${diagnostic.projectId}`,
-            "--format=value(type)",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "compute",
+              "health-checks",
+              "describe",
+              diagnostic.name,
+              "--global",
+              `--project=${diagnostic.projectId}`,
+              "--format=value(type)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           const actual = result.exitCode === 0 ? result.stdout.trim().toUpperCase() : "";
           status = actual === diagnostic.expectedType ? "pass" : "fail";
           message = actual || result.stderr.trim() || "health check not found";
           break;
         }
         case "gcp-certificate": {
-          const result = await execCapture("gcloud", [
-            "certificate-manager",
-            "certificates",
-            "describe",
-            diagnostic.name,
-            `--project=${diagnostic.projectId}`,
-            "--format=value(managed.state)",
-          ]);
+          const result = await execCapture(
+            "gcloud",
+            [
+              "certificate-manager",
+              "certificates",
+              "describe",
+              diagnostic.name,
+              `--project=${diagnostic.projectId}`,
+              "--format=value(managed.state)",
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           const state = result.exitCode === 0 ? result.stdout.trim().toUpperCase() : "";
           status = state === "ACTIVE" ? "pass" : state === "PROVISIONING" ? "warn" : "fail";
           message = state || result.stderr.trim() || "certificate not found";

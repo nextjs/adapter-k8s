@@ -3,9 +3,10 @@
 ## What this is
 
 `@next-community/adapter-k8s` — a Next.js adapter (Next 16.3+ `adapterPath` API) that deploys
-Next.js apps to GKE. At build time it analyzes the route structure and generates pool servers, an
-ext_proc routing service, a Helm chart, and Dockerfiles. A CLI (`adapter-k8s`) provisions GCP
-infrastructure and runs zero-downtime blue/green deploys.
+Next.js apps to Kubernetes (GKE preset plus portable/generic targets). At build time it analyzes
+the route structure and generates pool servers, an ext_proc routing service, a Helm chart, and
+Dockerfiles. A CLI (`adapter-k8s`) provisions GCP infrastructure where the target calls for it
+and runs zero-downtime blue/green deploys.
 
 Status: **experimental, correctness-first** ("make it work, make it correct, make it fast" — fast
 is deliberately last). Favor correct, bounded behavior over throughput.
@@ -57,7 +58,15 @@ Run `npm test` and `npx tsc --noEmit` before considering any change done.
 - `fixtures/` — Next.js test apps (main, pages, edge, i18n-rewrite, interception, ws-canary).
 - `tests/` — vitest suites. **`test/` (singular) is different**: deploy-test manifests for the
   e2e shell scripts.
-- `plans/adapter-gke-design-doc.md` — the design doc. `docs/` and `reports/` are gitignored.
+- `plans/adapter-gke-design-doc.md` — the design doc. `plans/` is tracked.
+- `docs/` — tracked user-facing docs: `targets.md` (target model + journeys), `configuration.md`
+  (config reference), `lifecycle.md` (deploy/rollback/destroy/doctor/state), `verification.md`,
+  `ci-cd.md`. `reports/` is gitignored.
+- `skills/` — Agent Skills SHIPPED IN THE PUBLISHED PACKAGE (package.json `files`), for agents
+  working in apps that depend on this adapter — not tooling for this repo. Keep them consumer-
+  facing: no references to this repo's internals (src/ paths, fixture-only headers). Every
+  command, flag, and config key they mention must exist; re-audit against src/ when the CLI or
+  config surface changes.
 
 ## Conventions
 

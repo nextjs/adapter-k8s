@@ -37,6 +37,14 @@ import { sanitizeK8sName } from "../emit/templates/utils.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 
+// The request body buffered under Next's request-meta symbol (set by the action-body
+// buffering upstream), if any.
+function bufferedActionBody(req: IncomingMessage): Buffer | undefined {
+  return (req as IncomingMessage & { [NEXT_REQUEST_META]?: { actionBody?: Buffer } })[
+    NEXT_REQUEST_META
+  ]?.actionBody;
+}
+
 function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> {
   const headers: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(req.headers)) {
@@ -223,7 +231,7 @@ function abortOnClientClose(res: ServerResponse, abort: () => void): void {
  * (10 min) because a legitimate streamed response may run long; the point is that it is
  * FINITE, so sockets and request state cannot accumulate without bound.
  */
-export const PROXY_ABSOLUTE_DEADLINE_MS = 600_000;
+const PROXY_ABSOLUTE_DEADLINE_MS = 600_000;
 
 // N37: one default time-to-response-head budget for local handlers and cross-pool hops. Separate
 // 60s/30s defaults made the same route succeed or 502 depending only on which pool received it.
@@ -533,7 +541,7 @@ export function installResolvedResponseHeaders(
   }) as typeof res.writeHead;
 }
 
-// Iteration 7: record a response's status/headers/body as it streams to the client, so a
+// Record a response's status/headers/body as it streams to the client, so a
 // fully-keyed platform entry can be replayed byte-identically on later serves. Patches the
 // live response object in place (per-request; same technique as the trust boundary wrapper).
 // An over-budget body abandons recording — the serve itself is never affected.
@@ -607,7 +615,7 @@ async function writeInnerResponse(
   // x-vercel-cache verdict when the entrypoint owns the serve (see the classifier below).
   buildFallbackBacked = false,
   // Seen-key registry verdict — a repeat serve of a known platform cache key is HIT
-  // regardless of how the bytes were produced (matrix iteration 4).
+  // regardless of how the bytes were produced.
   platformCacheSeen?: boolean,
 ): Promise<void> {
   // A direct adapter entrypoint can produce either of two valid shapes from postponed state:
@@ -681,7 +689,7 @@ async function writeInnerResponse(
               // reports x-nextjs-cache MISS (it rendered over the fallback and cached just
               // now), or — fresh-key shell+resume — the response carries only
               // `x-nextjs-postponed: 1` with no cache verdict at all. Both are PRERENDER
-              // by the platform contract (matrix iterations 2-3). Cached entries keep HIT:
+              // by the platform contract. Cached entries keep HIT:
               // the HIT/STALE arm above runs first.
               "PRERENDER"
             : "MISS";
@@ -1834,7 +1842,7 @@ export function createDispatcher(options: DispatcherOptions) {
   // resume a fallback shell for `without-suspense`/`without-io` routes, which upstream renders
   // dynamically (it answered `x-nextjs-postponed: 1` and a build-time root layout).
   const pprCapableRoutes = new Set(Object.keys(pprCapableRouteMap));
-  // Matrix iteration 4: the platform seen-key registry. Upstream's contract proves cache-
+  // The platform seen-key registry. Upstream's contract proves cache-
   // entry sharing THROUGH x-vercel-cache — a key's first serve is PRERENDER/MISS, every
   // later serve of the SAME key (params outside allowQuery mutated) is HIT, even when the
   // entry contributes zero bytes. Keyed template + allowQuery-param values; only routes
@@ -1852,7 +1860,7 @@ export function createDispatcher(options: DispatcherOptions) {
     platformSeenKeys.add(key);
     return false;
   }
-  // Iteration 7: the platform RESPONSE store, for FULLY-KEYED entries only (allowQuery
+  // The platform RESPONSE store, for FULLY-KEYED entries only (allowQuery
   // covers every template param → the entry is fully static and the platform must replay
   // the stored bytes on a seen key — on Vercel this replay lives in the edge cache, which
   // the per-request x-invocation-id correctly scopes away from the lambda LRU). Partial
@@ -2747,11 +2755,7 @@ export function createDispatcher(options: DispatcherOptions) {
             target.protocol === "https:" ? await import("node:https") : await import("node:http");
           return new Promise<void>((resolve) => {
             let deadlineExceeded = false;
-            const bufferedBody = (
-              req as IncomingMessage & {
-                [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-              }
-            )[NEXT_REQUEST_META]?.actionBody;
+            const bufferedBody = bufferedActionBody(req);
 
             // Hop-by-hop headers (and anything the client's Connection header
             // nominated) describe the client↔pool connection — strip them before
@@ -2850,11 +2854,7 @@ export function createDispatcher(options: DispatcherOptions) {
 
         case "not-found": {
           // Render the app's custom 404 (App Router /_not-found or Pages Router /404), else plain text.
-          const bufferedBody = (
-            req as IncomingMessage & {
-              [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-            }
-          )[NEXT_REQUEST_META]?.actionBody;
+          const bufferedBody = bufferedActionBody(req);
           await serveNotFound(
             handlerLoader,
             localHandlerInvoker,
@@ -2961,11 +2961,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 `[dispatch] 404: no handler for matchedPathname="${handlerPathname}" url="${req.url}"`,
               );
             }
-            const bufferedBody = (
-              req as IncomingMessage & {
-                [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-              }
-            )[NEXT_REQUEST_META]?.actionBody;
+            const bufferedBody = bufferedActionBody(req);
             await serveNotFound(
               handlerLoader,
               localHandlerInvoker,
@@ -3100,11 +3096,7 @@ export function createDispatcher(options: DispatcherOptions) {
                       headers: headerObj,
                       body:
                         req.method !== "GET" && req.method !== "HEAD"
-                          ? (
-                              req as IncomingMessage & {
-                                [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-                              }
-                            )[NEXT_REQUEST_META]?.actionBody
+                          ? bufferedActionBody(req)
                           : undefined,
                       page: {
                         name: handlerPathname,
@@ -3220,15 +3212,15 @@ export function createDispatcher(options: DispatcherOptions) {
           const handlerPprRootParams = pprCapableCandidates.some((candidate) =>
             pprRootParamRoutes.has(candidate),
           );
-          // Matrix iteration 4: platform cache key for the seen-key registry. First
+          // Platform cache key for the seen-key registry. First
           // candidate with a build-declared allowQuery wins; params resolve from the
           // routing verdict. Recorded on FIRST sight (a failed render then reports HIT on
           // the retry — acceptable: the contract's subjects always 200).
           let platformCacheSeen: boolean | undefined;
           let platformKey: string | undefined;
           let platformFullyKeyed = false;
-          // Byte-replay eligibility is NARROWER than key membership (iteration 8, measured
-          // against the canary.97 suite): only SHELL-LESS templates (pprCapableRoutes-
+          // Byte-replay eligibility is NARROWER than key membership (measured against the
+          // canary.97 suite): only SHELL-LESS templates (pprCapableRoutes-
           // sourced keys — the matrix's fully-static empty-shell class) and only DOCUMENT
           // requests. Shell-bearing routes replay through Next's own cache (and carry the
           // tag/revalidate surfaces the store must never serve stale); RSC/segment
@@ -3275,7 +3267,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 })
                 .join("&");
             // Fully keyed ⟺ every template param partitions the key ⟺ the entry is fully
-            // static ⟺ the platform replays stored bytes (iteration 7).
+            // static ⟺ the platform replays stored bytes (the platform response store).
             platformFullyKeyed = templateParamNames(candidate).every((name) =>
               bareAq.includes(name),
             );
@@ -3596,13 +3588,9 @@ export function createDispatcher(options: DispatcherOptions) {
 
           // Load and invoke the handler directly
           const handler = await handlerLoader.load(handlerPathname);
-          const bufferedBody = (
-            req as IncomingMessage & {
-              [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-            }
-          )[NEXT_REQUEST_META]?.actionBody;
+          const bufferedBody = bufferedActionBody(req);
 
-          // Iteration 7: first serve of a fully-keyed platform entry — record it so later
+          // First serve of a fully-keyed platform entry — record it so later
           // serves of the same key replay the stored bytes (see the early-serve above).
           if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
             // Rung-input dump for the runtime-static diagnosis (probe deployments only).
@@ -3874,11 +3862,7 @@ function proxyToPool(
   return new Promise((resolve) => {
     let deadlineExceeded = false;
     const targetHost = sanitizeK8sName(`${releaseName}-${resolution.pool}-${buildId}`);
-    const bufferedBody = (
-      req as IncomingMessage & {
-        [NEXT_REQUEST_META]?: { actionBody?: Buffer };
-      }
-    )[NEXT_REQUEST_META]?.actionBody;
+    const bufferedBody = bufferedActionBody(req);
 
     // Hop-by-hop headers (and anything the client's Connection header nominated) are
     // stripped before forwarding — they describe the client↔pool connection, and Node

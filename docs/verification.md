@@ -1,12 +1,10 @@
 # What is verified, and how
 
-The README's status claim—framework compatibility strongly validated, hardening pending—rests on the verification described here. It is organized by layer, and for each layer we state not just what it covers but what it structurally *cannot*—the gaps are as load-bearing as the coverage.
-
-<!-- TODO: link upstream-published conformance results here once Next.js publishes them. -->
+The README's status claim—framework compatibility verified, hardening pending—rests on the verification described here. It is organized by layer; each layer states what it covers and what it structurally _cannot_.
 
 ## The layers
 
-### 1. Unit suite—2,356 tests
+### 1. Unit suite—2,620 tests
 
 Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted templates. Several template tests render through **real `helm`**, because the question being asked is what helm does with the file, not what the file contains.
 
@@ -46,15 +44,19 @@ result:         ~4,438 passed / 27 failed / 1,082 suites
 reproduce:      bash scripts/e2e-lanes.sh 6 24   — ~3-4.5h, 6 concurrent lanes
 ```
 
-**The 27 failures, characterized rather than waved at:**
+The pass count is approximate because intermittent client-navigation timing races shift a
+handful of results between runs (see the "Timing races" group below); the failure set above
+is from the recorded run.
 
-| Group | Count | Status |
-| --- | --- | --- |
-| Server-action suites (`app-action` 5, `app-action-node-middleware` 5, `action-forward-loop` 1) | 11 | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
-| Timing races (`cached-navigations` 2, `prerender` 2, `vary-params-base-dynamic`, `catch-error`, `catch-error-react-compiler`, `client-params`) | 8 | Client-navigation waits that reproduce intermittently; rates and membership vary with host load |
-| PPR resume-data consistency (`resume-data-cache`) | 1 | After a tag revalidation, a regenerated page can retain the previous fetch-cache value in its resume data; under investigation |
-| `cache-components-prerender-matrix` | 3 | The `partialFallback` on-demand shell-specialization contract, which this adapter deliberately does not yet implement |
-| Singletons (`metadata-navigation`, `no-duplicate-headers-middleware`, `non-ascii-cache-tags`, `cache-components-allow-otel-spans`) | 4 | One test each; `no-duplicate-headers-middleware` is a documented, deliberate divergence |
+**The 27 failures:**
+
+| Group                                                                                                                                          | Count | Status                                                                                                                                               |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Server-action suites (`app-action` 5, `app-action-node-middleware` 5, `action-forward-loop` 1)                                                 | 11    | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
+| Timing races (`cached-navigations` 2, `prerender` 2, `vary-params-base-dynamic`, `catch-error`, `catch-error-react-compiler`, `client-params`) | 8     | Client-navigation waits that reproduce intermittently; rates and membership vary with host load                                                      |
+| PPR resume-data consistency (`resume-data-cache`)                                                                                              | 1     | After a tag revalidation, a regenerated page can retain the previous fetch-cache value in its resume data; under investigation                       |
+| `cache-components-prerender-matrix`                                                                                                            | 3     | The `partialFallback` on-demand shell-specialization contract, which this adapter deliberately does not yet implement                                |
+| Singletons (`metadata-navigation`, `no-duplicate-headers-middleware`, `non-ascii-cache-tags`, `cache-components-allow-otel-spans`)             | 4     | One test each; `no-duplicate-headers-middleware` is a documented, deliberate divergence                                                              |
 
 **Cannot see:** the real load balancer, CEL match-condition evaluation as GCP performs it,
 Cloud CDN interaction, or behaviour under load—both topologies are functional suites, not
@@ -79,24 +81,22 @@ The layer that finds what the others structurally cannot.
   - **NetworkPolicy is enforced, not merely accepted.** A pool pod attempting `routing-service:8443`—the port whose ext_proc reply carries the internal dispatch secret—was refused on both clusters (`ECONNREFUSED` on k3s, timeout on Cilium). Some CNIs accept policy objects and ignore them, which would make the whole in-cluster h2c posture decorative.
   - **Fail-closed is real.** With the routing service scaled to zero, requests returned 500 rather than being delivered with middleware silently skipped.
 - **Cross-platform builds**: the Scaleway nodes are arm64 while the build host is x86, so that deployment also exercises `ADAPTER_K8S_TARGET_PLATFORM`, arm64 native-package staging, and digest pinning of the single-platform image. The adapter does not publish a multi-architecture image index.
-- **Container runtimes**: docker, podman, and nerdctl are each validated by deploying the repo's e2e fixture to a live GKE cluster, not just by unit tests. This layer is why the digest resolution is registry-first: podman rewrites manifests on push, so its *local* digest can differ from what the registry stored, and deploying that value yields `ImagePullBackOff`.
+- **Container runtimes**: docker, podman, and nerdctl are each validated by deploying the repo's e2e fixture to a live GKE cluster, not just by unit tests. This layer is why the digest resolution is registry-first: podman rewrites manifests on push, so its _local_ digest can differ from what the registry stored, and deploying that value yields `ImagePullBackOff`.
 
 ## Semantics verified end-to-end
 
 The specific behaviors the architecture exists to get right, each confirmed against live multi-replica infrastructure:
 
-| Behavior | Verified |
-| --- | --- |
-| Middleware runs for every non-cached request, at the edge, with no edge compute platform | GKE (traffic extension) and generic (EnvoyExtensionPolicy) |
-| `use cache` entries shared across replicas | Live, multi-pod |
-| `revalidateTag` / `revalidatePath` on one pod seen by all | Live, multi-pod—including regeneration of a baked PPR shell and an ISR page |
-| PPR: static shell served, dynamic holes resumed pool-native, tail never CDN-cached | Live, behind Cloud CDN |
-| Cross-deploy CDN correctness: a new build never serves the previous build's stale same-URL content | Live, via per-build cache-tag invalidation on cutover |
-| Blue/green cutover and symmetric rollback, including the routing tier | Live, GKE |
+| Behavior                                                                                           | Verified                                                                    |
+| -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| Middleware runs for every non-cached request, at the edge, with no edge compute platform           | GKE (traffic extension) and generic (EnvoyExtensionPolicy)                  |
+| `use cache` entries shared across replicas                                                         | Live, multi-pod                                                             |
+| `revalidateTag` / `revalidatePath` on one pod seen by all                                          | Live, multi-pod—including regeneration of a baked PPR shell and an ISR page |
+| PPR: static shell served, dynamic holes resumed pool-native, tail never CDN-cached                 | Live, behind Cloud CDN                                                      |
+| Cross-deploy CDN correctness: a new build never serves the previous build's stale same-URL content | Live, via per-build cache-tag invalidation on cutover                       |
+| Blue/green cutover and symmetric rollback, including the routing tier                              | Live, GKE                                                                   |
 
 ## Known coverage gaps
-
-Stated plainly, because a reviewer will find them anyway:
 
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
@@ -107,7 +107,7 @@ Stated plainly, because a reviewer will find them anyway:
   layer 2). About a third are intermittent timing races; the substantive remainder are the
   server-action harness conditions, the unimplemented `partialFallback` contract, and one
   remaining PPR resume-data consistency case.
-- **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to—the claim here is correctness, not capacity.
+- **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to.
 - **The generic provider is younger** than the GKE one and has correspondingly less real-world exposure, though it passes the same unit suite and its live verification covered the full request path.
 
 ## Reproducing
@@ -117,3 +117,9 @@ Stated plainly, because a reviewer will find them anyway:
 - Upstream Next.js e2e (full cluster topology): `bash scripts/e2e-k3d-bootstrap.sh` once, then `bash scripts/e2e-lanes.sh 6 24`—expect 3–4.5 hours; `bash scripts/e2e-smoke.sh` runs the ~32-suite sensitive subset in ~35 minutes
 - ext_proc path locally: `npx adapter-k8s emulate` in `fixtures/main`
 - Live suite: `E2E_BASE_URL=https://<host> npm run test:e2e:live` against a deployed release
+
+## See also
+
+- [Targets](./targets.md) — the topologies these layers verify
+- [Lifecycle](./lifecycle.md) — the cutover and rollback mechanics under test
+- [CI/CD](./ci-cd.md) — running deploys from your own pipeline

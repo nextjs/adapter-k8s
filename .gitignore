@@ -4,11 +4,8 @@ dist/
 *.log
 
 *.tgz
-docs/**
-plans/**
 
 .plan.md
-.claude
 
 /reports/
 E2E-FAILURE-RUNBOOK.md

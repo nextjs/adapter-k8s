@@ -16,7 +16,8 @@
   "files": [
     "dist",
     "integration",
-    "scripts"
+    "scripts",
+    "skills"
   ],
   "type": "module",
   "main": "dist/index.js",

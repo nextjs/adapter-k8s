@@ -14,7 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import readline from "node:readline";
-import { execOrThrow, execCapture } from "./exec.js";
+import { execOrThrow, execCapture, EXEC_TIMEOUTS } from "./exec.js";
 import { readState, writeState, StateUnavailableError, type AdapterState } from "./state.js";
 import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
 import {
@@ -195,21 +195,25 @@ export async function discoverServingBuildId(
     `restore .k8s-adapter/state.json or fix access to the ${releaseName}-adapter-state ` +
     `ConfigMap in namespace ${namespace}.`;
 
-  const svcResult = await execCapture("kubectl", [
-    "get",
-    "svc",
-    "-n",
-    namespace,
-    "-l",
-    `app.kubernetes.io/name=${releaseName}`,
-    "-o",
-    "jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}|" +
-      '{.spec.selector.app\\.kubernetes\\.io/version}{"\\n"}{end}',
-  ]);
+  const svcResult = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "svc",
+      "-n",
+      namespace,
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      "jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}|" +
+        '{.spec.selector.app\\.kubernetes\\.io/version}{"\\n"}{end}',
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (svcResult.exitCode !== 0) {
     throw new Error(
       `Deploy state could not be determined AND the active Services could not be listed ` +
-        `(kubectl exited ${svcResult.exitCode}${svcResult.stderr.trim() ? `: ${svcResult.stderr.trim()}` : ""}). ` +
+        `(kubectl exited ${svcResult.exitCode}${svcResult.stderr.trim() ? `: ${sanitizeForTerminal(svcResult.stderr.trim())}` : ""}). ` +
         `Refusing to deploy: treating this as a first deploy would make helm delete the ` +
         `Deployment that is currently serving traffic. ${REPAIR}`,
     );
@@ -240,29 +244,33 @@ export async function discoverServingBuildId(
   }
   const label = [...labels][0]!;
 
-  const depResult = await execCapture("kubectl", [
-    "get",
-    "deployments",
-    "-n",
-    namespace,
-    "-l",
-    `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${label},` +
-      `app.kubernetes.io/component!=routing-service`,
-    "-o",
-    // The build id comes from the pod's own NEXT_BUILD_ID env, not from the image reference:
-    // digest-pinned images (S7) render `<registry>/<repo>@sha256:<hex>`, so slicing after the
-    // last colon yields the digest hex — per-pool images then disagree and this recovery
-    // aborted on every deployment created by the normal path. The image is still read as the
-    // pre-digest fallback.
-    "jsonpath={range .items[*]}{.metadata.name}|{.spec.template.spec.containers[0].image}|" +
-      '{range .spec.template.spec.containers[0].env[?(@.name=="NEXT_BUILD_ID")]}{.value}{end}' +
-      '{"\\n"}{end}',
-  ]);
+  const depResult = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "deployments",
+      "-n",
+      namespace,
+      "-l",
+      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${label},` +
+        `app.kubernetes.io/component!=routing-service`,
+      "-o",
+      // The build id comes from the pod's own NEXT_BUILD_ID env, not from the image reference:
+      // digest-pinned images (S7) render `<registry>/<repo>@sha256:<hex>`, so slicing after the
+      // last colon yields the digest hex — per-pool images then disagree and this recovery
+      // aborted on every deployment created by the normal path. The image is still read as the
+      // pre-digest fallback.
+      "jsonpath={range .items[*]}{.metadata.name}|{.spec.template.spec.containers[0].image}|" +
+        '{range .spec.template.spec.containers[0].env[?(@.name=="NEXT_BUILD_ID")]}{.value}{end}' +
+        '{"\\n"}{end}',
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (depResult.exitCode !== 0) {
     throw new Error(
       `Deploy state could not be determined and the Deployments for the serving build ` +
         `label "${label}" could not be listed (kubectl exited ${depResult.exitCode}` +
-        `${depResult.stderr.trim() ? `: ${depResult.stderr.trim()}` : ""}). ${REPAIR}`,
+        `${depResult.stderr.trim() ? `: ${sanitizeForTerminal(depResult.stderr.trim())}` : ""}). ${REPAIR}`,
     );
   }
   const tags = new Set<string>();
@@ -564,32 +572,24 @@ export function assertSafePoolName(poolName: string): void {
 }
 
 /**
- * S7 (SECURITY). Resolve the immutable digest of an image that was just pushed.
- *
- * Images were deployed by MUTABLE tag while the deploy identity holds registry write access —
- * and that identity is assumable by anyone who can create a Pod in the namespace (Workload
- * Identity), while the pods themselves carry INTERNAL_HEADER_SECRET and the cache credentials
- * in env. So a retag of an already-deployed build id silently changed what the pool runs on its
- * next restart or scale-up, turning pod-creation into dispatch-secret theft — and from there
- * into a cluster-wide middleware bypass. The route-ext Job's own image was digest-pinned for
- * exactly this reason; the images holding the secrets were not.
- *
- * `docker inspect` reports RepoDigests only AFTER a successful push (the digest is assigned by
- * the registry), which is why this runs here and not at chart-generation time. Returns null
- * rather than throwing: a resolvable digest is a hardening win, not a reason to fail a deploy
- * on a daemon that reports RepoDigests differently (podman/buildx shims). The caller says so.
- */
-/**
  * S23: pin every deployed image to an immutable digest, or refuse the deploy.
  *
  * Two sources, local first (fast, offline) then the registry (authoritative). If an image
- * still cannot be pinned this THROWS, because the alternative — what this used to do — is
- * deploying the mutable `:${buildId}` tag on pods that receive the internal dispatch secret
- * and the cache credentials. A registry writer who retags that tag then changes the code
- * running on the next pod start or scale-up, which is exactly the escalation the split
- * `<release>-cli` identity exists to prevent (it is deliberately writer, not repoAdmin, for
- * this reason). Degrading to that silently on a `docker inspect` quirk gives the quirk the
- * same effect as the attack.
+ * still cannot be pinned this THROWS, because the alternative is deploying the mutable
+ * `:${buildId}` tag on pods that receive the internal dispatch secret and the cache
+ * credentials. A registry writer who retags that tag then changes the code running on the
+ * next pod start or scale-up, which is exactly the escalation the split `<release>-cli`
+ * identity exists to prevent (it is deliberately writer, not repoAdmin, for this reason).
+ * Degrading to that silently on a `docker inspect` quirk gives the quirk the same effect
+ * as the attack.
+ *
+ * S7 (SECURITY): the deploy identity's registry write access is assumable by anyone who can
+ * create a Pod in the namespace (Workload Identity), while the pods themselves carry
+ * INTERNAL_HEADER_SECRET and the cache credentials in env — so a retag of an already-deployed
+ * build id turns pod-creation into dispatch-secret theft, and from there into a cluster-wide
+ * middleware bypass. `docker inspect` reports RepoDigests only AFTER a successful push (the
+ * digest is assigned by the registry), which is why this runs here and not at
+ * chart-generation time.
  *
  * `--allow-mutable-tags` is the explicit opt-out, mirroring `--allow-no-network-policy`:
  * fail-closed by default, and an operator who really wants it has to say so.
@@ -610,12 +610,6 @@ export async function resolveDeployImageDigests(opts: {
     "image digest target platform",
   );
   for (const [key, ref] of opts.refs) {
-    // S25: REGISTRY FIRST. kubelet pulls from the registry, so the registry's digest is the
-    // only one that can actually be deployed. The local daemon merely usually agrees —
-    // MEASURED with podman 6.0.1, it does not: podman converts the manifest on push, so its
-    // RepoDigest describes the local copy and pointing a Deployment at it yields
-    // ImagePullBackOff (observed live: podman said e04a0a5b…, the registry held 27fa476b…,
-    // and the rollout failed). The local probe stays as the offline/unreachable fallback.
     // REGISTRY FIRST, on ANY registry (S25/S28). kubelet pulls from the registry, so only the
     // registry's digest can actually be deployed; the local daemon merely usually agrees, and
     // podman measurably does not. Artifact Registry is asked through gcloud (proven, and works
@@ -710,7 +704,9 @@ export async function resolveRegistryDigestAny(
     candidate.architecture === targetArch &&
     (candidate.variant ?? undefined) === (targetVariant ?? undefined);
 
-  const craneManifest = await execCapture("crane", ["manifest", imageRef]).catch(() => null);
+  const craneManifest = await execCapture("crane", ["manifest", imageRef], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  }).catch(() => null);
   if (craneManifest?.exitCode === 0) {
     try {
       const manifest = JSON.parse(craneManifest.stdout) as {
@@ -725,7 +721,9 @@ export async function resolveRegistryDigestAny(
       }
 
       // A single-image manifest has no platform field. Its config is the authoritative OS/arch.
-      const config = await execCapture("crane", ["config", imageRef]).catch(() => null);
+      const config = await execCapture("crane", ["config", imageRef], {
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
       if (config?.exitCode !== 0) return null;
       const imageConfig = JSON.parse(config.stdout) as {
         os?: string;
@@ -733,7 +731,9 @@ export async function resolveRegistryDigestAny(
         variant?: string;
       };
       if (!matches(imageConfig)) return null;
-      const digest = await execCapture("crane", ["digest", imageRef]).catch(() => null);
+      const digest = await execCapture("crane", ["digest", imageRef], {
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
       const value = digest?.stdout.trim() ?? "";
       return digest?.exitCode === 0 && DIGEST_RE.test(value) ? value : null;
     } catch {
@@ -750,7 +750,9 @@ export async function resolveRegistryDigestAny(
     ...(targetVariant ? ["--override-variant", targetVariant] : []),
     `docker://${imageRef}`,
   ];
-  const skopeo = await execCapture("skopeo", skopeoArgs).catch(() => null);
+  const skopeo = await execCapture("skopeo", skopeoArgs, {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  }).catch(() => null);
   if (skopeo?.exitCode === 0) {
     try {
       const inspected = JSON.parse(skopeo.stdout) as {
@@ -775,9 +777,9 @@ export async function resolveRegistryDigestAny(
   }
 
   if (containerCli === "docker") {
-    const res = await execCapture("docker", ["manifest", "inspect", "-v", imageRef]).catch(
-      () => null,
-    );
+    const res = await execCapture("docker", ["manifest", "inspect", "-v", imageRef], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    }).catch(() => null);
     if (res?.exitCode === 0) {
       try {
         const parsed: unknown = JSON.parse(res.stdout);
@@ -860,15 +862,19 @@ export async function resolveRegistryDigest(
   // useful authoritative existence/digest check, but it is never sufficient by itself because
   // an index digest does not prove that the requested platform is present.
   if (!projectId) return null;
-  const res = await execCapture("gcloud", [
-    "artifacts",
-    "docker",
-    "images",
-    "describe",
-    imageRef,
-    "--format=value(image_summary.digest)",
-    `--project=${projectId}`,
-  ]);
+  const res = await execCapture(
+    "gcloud",
+    [
+      "artifacts",
+      "docker",
+      "images",
+      "describe",
+      imageRef,
+      "--format=value(image_summary.digest)",
+      `--project=${projectId}`,
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (res.exitCode !== 0) return null;
   const digest = res.stdout.trim();
   // Validated at the point of consumption: this string reaches a helm --set and then the pod
@@ -891,12 +897,16 @@ export async function resolveImageDigest(
   // there, leaving the new pods in ImagePullBackOff. Select the entry whose repository matches.
   // podman and nerdctl both implement `inspect --format` with the same Go template fields.
   const safePlatform = parseTargetPlatform(platform, "local image target platform");
-  const res = await execCapture(containerCli, [
-    "inspect",
-    "--format",
-    "{{.Os}}/{{.Architecture}}\n{{range .RepoDigests}}{{println .}}{{end}}",
-    imageRef,
-  ]);
+  const res = await execCapture(
+    containerCli,
+    [
+      "inspect",
+      "--format",
+      "{{.Os}}/{{.Architecture}}\n{{range .RepoDigests}}{{println .}}{{end}}",
+      imageRef,
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (res.exitCode !== 0) return null;
   const [reportedPlatform, ...digestLines] = res.stdout.split("\n");
   if (reportedPlatform?.trim() !== safePlatform) return null;
@@ -911,7 +921,7 @@ export async function resolveImageDigest(
     if (at === -1) continue;
     if (entry.slice(0, at) !== repository) continue;
     const digest = entry.slice(at + 1);
-    if (/^sha256:[a-f0-9]{64}$/.test(digest)) return digest;
+    if (DIGEST_RE.test(digest)) return digest;
   }
   return null;
 }
@@ -942,7 +952,7 @@ function helmHelpHasFlag(help: string, flag: string): boolean {
 export async function detectHelmUpgradeMode(): Promise<HelmUpgradeMode> {
   let result: Awaited<ReturnType<typeof execCapture>>;
   try {
-    result = await execCapture("helm", ["upgrade", "--help"]);
+    result = await execCapture("helm", ["upgrade", "--help"], { timeoutMs: EXEC_TIMEOUTS.kubectl });
   } catch (err) {
     throw new Error(
       `Could not inspect Helm upgrade capabilities: ${err instanceof Error ? err.message : String(err)}. ` +
@@ -994,21 +1004,25 @@ export async function ensureValkeySecretHelmOwnership(
   assertSafeReleaseName(releaseName);
   const namespace = resolveK8sNamespace(configuredNamespace);
   const secretName = `${releaseName}-${VALKEY_SECRET_NAME}`;
-  const result = await execCapture("kubectl", [
-    "get",
-    "secret",
-    secretName,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "jsonpath={.metadata.name}|{.type}|{.metadata.labels.app\\.kubernetes\\.io/name}|" +
-      "{.metadata.labels.app\\.kubernetes\\.io/component}|" +
-      "{.metadata.labels.app\\.kubernetes\\.io/managed-by}|" +
-      "{.metadata.annotations.meta\\.helm\\.sh/release-name}|" +
-      "{.metadata.annotations.meta\\.helm\\.sh/release-namespace}|" +
-      "{.metadata.resourceVersion}",
-  ]);
+  const result = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "secret",
+      secretName,
+      "-n",
+      namespace,
+      "--ignore-not-found",
+      "-o",
+      "jsonpath={.metadata.name}|{.type}|{.metadata.labels.app\\.kubernetes\\.io/name}|" +
+        "{.metadata.labels.app\\.kubernetes\\.io/component}|" +
+        "{.metadata.labels.app\\.kubernetes\\.io/managed-by}|" +
+        "{.metadata.annotations.meta\\.helm\\.sh/release-name}|" +
+        "{.metadata.annotations.meta\\.helm\\.sh/release-namespace}|" +
+        "{.metadata.resourceVersion}",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (result.exitCode !== 0) {
     const detail = sanitizeForTerminal(result.stderr.trim());
     throw new Error(
@@ -1083,17 +1097,21 @@ export async function ensureValkeySecretHelmOwnership(
       },
     },
   });
-  const patched = await execCapture("kubectl", [
-    "patch",
-    "secret",
-    secretName,
-    "-n",
-    namespace,
-    "--type=merge",
-    "--field-manager=adapter-k8s-legacy-adoption",
-    "-p",
-    ownershipPatch,
-  ]);
+  const patched = await execCapture(
+    "kubectl",
+    [
+      "patch",
+      "secret",
+      secretName,
+      "-n",
+      namespace,
+      "--type=merge",
+      "--field-manager=adapter-k8s-legacy-adoption",
+      "-p",
+      ownershipPatch,
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (patched.exitCode !== 0) {
     const detail = sanitizeForTerminal(patched.stderr.trim());
     throw new Error(
@@ -1190,7 +1208,7 @@ export function buildHelmUpgradeArgs(options: {
   // same reason as buildId/registry above — these land in `helm --set` assignments, and the
   // charset check is what keeps one assignment from splitting into several.
   for (const [key, digest] of Object.entries(imageDigests ?? {})) {
-    if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
+    if (!DIGEST_RE.test(digest)) {
       throw new Error(
         `Invalid image digest for "${key}": ${JSON.stringify(digest)} — expected sha256:<64 hex>.`,
       );
@@ -1250,17 +1268,21 @@ export async function discoverClusterPodCidr({
   projectId: string;
   allowNoNetworkPolicy?: boolean;
 }): Promise<string | null> {
-  const cidrResult = await execCapture("gcloud", [
-    "container",
-    "clusters",
-    "describe",
-    clusterName,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=value(clusterIpv4Cidr)",
-  ]);
+  const cidrResult = await execCapture(
+    "gcloud",
+    [
+      "container",
+      "clusters",
+      "describe",
+      clusterName,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=value(clusterIpv4Cidr)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   const discovered = cidrResult.exitCode === 0 ? cidrResult.stdout.trim() : "";
   if (CIDR_LIST_RE.test(discovered)) return discovered;
 
@@ -1300,12 +1322,16 @@ const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d
  * Returns null on any failure so the caller owns the fail-closed decision.
  */
 export async function discoverNodeCidrsFromCluster(): Promise<string | null> {
-  const res = await execCapture("kubectl", [
-    "get",
-    "nodes",
-    "-o",
-    "jsonpath={range .items[*]}{.status.addresses[?(@.type=='InternalIP')].address}{'\\n'}{end}",
-  ]).catch(() => null);
+  const res = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "nodes",
+      "-o",
+      "jsonpath={range .items[*]}{.status.addresses[?(@.type=='InternalIP')].address}{'\\n'}{end}",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  ).catch(() => null);
   if (!res || res.exitCode !== 0) return null;
 
   const seen: string[] = [];
@@ -1331,7 +1357,9 @@ export async function discoverNodeCidrsFromCluster(): Promise<string | null> {
 
 /** Discover the pod CIDRs declared by the Kubernetes Nodes, without assuming a cloud provider. */
 export async function discoverPodCidrsFromCluster(): Promise<string | null> {
-  const result = await execCapture("kubectl", ["get", "nodes", "-o", "json"]).catch(() => null);
+  const result = await execCapture("kubectl", ["get", "nodes", "-o", "json"], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  }).catch(() => null);
   if (!result || result.exitCode !== 0) return null;
   let object: { items?: Array<{ spec?: { podCIDR?: unknown; podCIDRs?: unknown } }> };
   try {
@@ -1420,17 +1448,21 @@ export async function discoverClusterNodeCidrs({
     );
   };
 
-  const subnetResult = await execCapture("gcloud", [
-    "container",
-    "clusters",
-    "describe",
-    clusterName,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=value(subnetwork)",
-  ]);
+  const subnetResult = await execCapture(
+    "gcloud",
+    [
+      "container",
+      "clusters",
+      "describe",
+      clusterName,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=value(subnetwork)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   const subnet = subnetResult.exitCode === 0 ? subnetResult.stdout.trim() : "";
   // The subnet name reaches gcloud argv; keep it to the GCP resource-name charset.
   if (!/^[a-z][-a-z0-9]{0,62}$/.test(subnet)) {
@@ -1446,18 +1478,22 @@ export async function discoverClusterNodeCidrs({
   // Distinguish "could not read it" from "read something unusable" — the operator fixes
   // those two differently (cluster/IAM access vs. an unexpected gcloud output shape).
   const rangeOf = async (subnetName: string): Promise<{ cidr: string } | { error: string }> => {
-    const r = await execCapture("gcloud", [
-      "compute",
-      "networks",
-      "subnets",
-      "describe",
-      subnetName,
-      "--region",
-      region,
-      "--project",
-      projectId,
-      "--format=value(ipCidrRange)",
-    ]);
+    const r = await execCapture(
+      "gcloud",
+      [
+        "compute",
+        "networks",
+        "subnets",
+        "describe",
+        subnetName,
+        "--region",
+        region,
+        "--project",
+        projectId,
+        "--format=value(ipCidrRange)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (r.exitCode !== 0) {
       return { error: `subnet "${subnetName}": gcloud exited ${r.exitCode}` };
     }
@@ -1476,18 +1512,22 @@ export async function discoverClusterNodeCidrs({
   const cidrs = [primary.cidr];
   // Best-effort: Standard clusters can put node pools in other subnets. Blocked on
   // Autopilot, where it is also unnecessary.
-  const poolsResult = await execCapture("gcloud", [
-    "container",
-    "node-pools",
-    "list",
-    "--cluster",
-    clusterName,
-    "--region",
-    region,
-    "--project",
-    projectId,
-    "--format=value(networkConfig.subnetwork)",
-  ]);
+  const poolsResult = await execCapture(
+    "gcloud",
+    [
+      "container",
+      "node-pools",
+      "list",
+      "--cluster",
+      clusterName,
+      "--region",
+      region,
+      "--project",
+      projectId,
+      "--format=value(networkConfig.subnetwork)",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (poolsResult.exitCode === 0) {
     const extra = new Set(
       poolsResult.stdout
@@ -1563,7 +1603,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   if (!skipBuild) {
     console.log("\n  → Running next build...");
     if (!dryRun) {
-      await execOrThrow("npx", ["next", "build"], { cwd: projectDir });
+      await execOrThrow("npx", ["next", "build"], {
+        cwd: projectDir,
+        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      });
     } else {
       console.log("    [dry-run] npx next build");
     }
@@ -1743,17 +1786,21 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (!dryRun && canPinContext) {
       const clusterName = `${releaseName}-cluster`;
       console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
-      await execOrThrow("gcloud", [
-        "container",
-        "clusters",
-        "get-credentials",
-        clusterName,
-        "--region",
-        infra.region!,
-        "--project",
-        infra.projectId!,
-        "--quiet",
-      ]);
+      await execOrThrow(
+        "gcloud",
+        [
+          "container",
+          "clusters",
+          "get-credentials",
+          clusterName,
+          "--region",
+          infra.region!,
+          "--project",
+          infra.projectId!,
+          "--quiet",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
     } else if (!canPinContext) {
       // N29: context pinning is IMPOSSIBLE (no projectId/region in infrastructure.json), so
       // EVERYTHING below — helm upgrade, the Service selector patches, the state ConfigMap
@@ -1767,7 +1814,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             `current (and ask you to confirm it).`,
         );
       } else {
-        const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+        const ctx = await execCapture("kubectl", ["config", "current-context"], {
+          timeoutMs: EXEC_TIMEOUTS.kubectl,
+        }).catch(() => null);
         // L14: the context name is kubeconfig-sourced — strip terminal control chars.
         const currentContext =
           ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
@@ -2040,14 +2089,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // Cache fully disabled: also remove the Secret so new pods stop receiving
       // VALKEY_URL (the pod template always mounts the optional Secret). Not done for
       // BYO: the chart then carries its own Helm-owned valkey-secret.yaml instead.
-      const secretDelete = await execCapture("kubectl", [
-        "delete",
-        "secret",
-        `${releaseName}-valkey`,
-        "-n",
-        namespace,
-        "--ignore-not-found",
-      ]);
+      const secretDelete = await execCapture(
+        "kubectl",
+        ["delete", "secret", `${releaseName}-valkey`, "-n", namespace, "--ignore-not-found"],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (secretDelete.stdout.trim())
         console.log(`\n  → Removed cache Secret ${releaseName}-valkey`);
     }
@@ -2062,7 +2108,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         infra.cacheRegion,
         infra.projectId ?? "",
       );
-      const res = await execCapture(del.command, del.args);
+      const res = await execCapture(del.command, del.args, {
+        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      });
       if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
         delete infra.cacheRegion;
         writeFileSync(infraPath, JSON.stringify(infra, null, 2));
@@ -2120,7 +2168,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     for (const cmd of dockerCommands) {
       console.log(`\n  → ${cmd.description}`);
       if (!dryRun) {
-        await execOrThrow(cmd.command, cmd.args, { cwd: projectDir });
+        await execOrThrow(cmd.command, cmd.args, {
+          cwd: projectDir,
+          timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        });
       } else {
         console.log(`    [dry-run] ${cmd.command} ${cmd.args.join(" ")}`);
       }
@@ -2178,28 +2229,36 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   const addressName = plannedTrafficExtension?.addressName ?? `${releaseName}-ip`;
   if (!dryRun && addressProject) {
     const ipName = addressName;
-    const ipCheck = await execCapture("gcloud", [
-      "compute",
-      "addresses",
-      "describe",
-      ipName,
-      "--global",
-      "--project",
-      addressProject,
-      "--format=value(address)",
-    ]);
-    if (ipCheck.exitCode !== 0) {
-      console.log(`\n  → Creating static IP "${ipName}"...`);
-      await execOrThrow("gcloud", [
+    const ipCheck = await execCapture(
+      "gcloud",
+      [
         "compute",
         "addresses",
-        "create",
+        "describe",
         ipName,
         "--global",
         "--project",
         addressProject,
-        "--quiet",
-      ]);
+        "--format=value(address)",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (ipCheck.exitCode !== 0) {
+      console.log(`\n  → Creating static IP "${ipName}"...`);
+      await execOrThrow(
+        "gcloud",
+        [
+          "compute",
+          "addresses",
+          "create",
+          ipName,
+          "--global",
+          "--project",
+          addressProject,
+          "--quiet",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
     }
   }
 
@@ -2210,14 +2269,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     path.join(outputDir, "chart", "templates", "cdn-http-filter.yaml"),
   );
   if (!dryRun && chartHasCdn) {
-    const crdCheck = await execCapture("kubectl", [
-      "get",
-      "crd",
-      "gcphttpfilters.networking.gke.io",
-      "--ignore-not-found",
-      "-o",
-      "name",
-    ]);
+    const crdCheck = await execCapture(
+      "kubectl",
+      ["get", "crd", "gcphttpfilters.networking.gke.io", "--ignore-not-found", "-o", "name"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (crdCheck.exitCode !== 0) {
       // kubectl itself failed (no context, expired credentials, unreachable API server) —
       // NOT a version problem. `--ignore-not-found` returns exit 0 for a genuinely absent
@@ -2488,20 +2544,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         // rendered back into YAML: it only supplies the live capacity target. That is the key
         // invariant — unfamiliar fields, every env/valueFrom entry, sidecars, scheduling policy,
         // security context, and volumes survive because this process never serializes the spec.
-        const r = await execCapture("kubectl", [
-          "get",
-          "deployment",
-          poolPrevName,
-          "-n",
-          namespace,
-          "--ignore-not-found",
-          "-o",
-          "json",
-        ]);
+        const r = await execCapture(
+          "kubectl",
+          ["get", "deployment", poolPrevName, "-n", namespace, "--ignore-not-found", "-o", "json"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (r.exitCode !== 0) {
           throw new Error(
             `Could not read the currently-serving deployment ` +
-              `${poolPrevName} (kubectl exited ${r.exitCode}: ${r.stderr.trim()}). ` +
+              `${poolPrevName} (kubectl exited ${r.exitCode}: ${sanitizeForTerminal(r.stderr.trim())}). ` +
               `It must be transferred out of Helm's release manifest without changing its ` +
               `pod template; refusing to guess. Fix kubectl access and re-run the deploy.`,
           );
@@ -2540,25 +2591,29 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           }
           previousReplicasByPool.set(poolName, n);
 
-          const keptDeployment = await execCapture("kubectl", [
-            "patch",
-            "deployment",
-            poolPrevName,
-            "-n",
-            namespace,
-            "--type=merge",
-            "-p",
-            JSON.stringify({
-              metadata: {
-                annotations: { "helm.sh/resource-policy": "keep" },
-                labels: { [ADAPTER_RELEASE_LABEL]: releaseName },
-              },
-            }),
-          ]);
+          const keptDeployment = await execCapture(
+            "kubectl",
+            [
+              "patch",
+              "deployment",
+              poolPrevName,
+              "-n",
+              namespace,
+              "--type=merge",
+              "-p",
+              JSON.stringify({
+                metadata: {
+                  annotations: { "helm.sh/resource-policy": "keep" },
+                  labels: { [ADAPTER_RELEASE_LABEL]: releaseName },
+                },
+              }),
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (keptDeployment.exitCode !== 0) {
             throw new Error(
               `Could not preserve the outgoing Deployment ${poolPrevName} across the Helm ` +
-                `upgrade (${keptDeployment.stderr.trim() || `kubectl exited ${keptDeployment.exitCode}`}). ` +
+                `upgrade (${sanitizeForTerminal(keptDeployment.stderr.trim()) || `kubectl exited ${keptDeployment.exitCode}`}). ` +
                 `Refusing to run \`helm upgrade\`: re-rendering it would change the serving ` +
                 `pod template and omitting it without keep would delete it. Fix kubectl access ` +
                 `and re-run.`,
@@ -2623,20 +2678,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             `(set ${keepAnnotation} and release/build ownership labels, if it exists)`,
         );
       } else {
-        const foundHpa = await execCapture("kubectl", [
-          "get",
-          "hpa",
-          outgoingHpa,
-          "-n",
-          namespace,
-          "--ignore-not-found",
-          "-o",
-          "name",
-        ]);
+        const foundHpa = await execCapture(
+          "kubectl",
+          ["get", "hpa", outgoingHpa, "-n", namespace, "--ignore-not-found", "-o", "name"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (foundHpa.exitCode !== 0) {
           throw new Error(
             `Could not determine whether the outgoing HPA ${outgoingHpa} exists (kubectl ` +
-              `exited ${foundHpa.exitCode}: ${foundHpa.stderr.trim()}). Refusing to run ` +
+              `exited ${foundHpa.exitCode}: ${sanitizeForTerminal(foundHpa.stderr.trim())}). Refusing to run ` +
               `\`helm upgrade\`: omitting an HPA that Helm still owns could delete the ` +
               `autoscaler for build ${previousBuildId} while it is serving traffic. Fix ` +
               `kubectl access and re-run.`,
@@ -2649,30 +2699,34 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           // Helm's managed-by label or release annotations: a retry must still pass Helm's
           // ownership validation. If admission rejects the patch, neither half is left behind
           // and Helm is never allowed to prune the serving build's autoscaler.
-          const keptHpa = await execCapture("kubectl", [
-            "patch",
-            "hpa",
-            outgoingHpa,
-            "-n",
-            namespace,
-            "--type=merge",
-            "-p",
-            JSON.stringify({
-              metadata: {
-                annotations: { "helm.sh/resource-policy": "keep" },
-                labels: {
-                  [ADAPTER_RELEASE_LABEL]: releaseName,
-                  "app.kubernetes.io/name": releaseName,
-                  "app.kubernetes.io/component": poolName,
-                  "app.kubernetes.io/version": sanitizeK8sName(previousBuildId),
+          const keptHpa = await execCapture(
+            "kubectl",
+            [
+              "patch",
+              "hpa",
+              outgoingHpa,
+              "-n",
+              namespace,
+              "--type=merge",
+              "-p",
+              JSON.stringify({
+                metadata: {
+                  annotations: { "helm.sh/resource-policy": "keep" },
+                  labels: {
+                    [ADAPTER_RELEASE_LABEL]: releaseName,
+                    "app.kubernetes.io/name": releaseName,
+                    "app.kubernetes.io/component": poolName,
+                    "app.kubernetes.io/version": sanitizeK8sName(previousBuildId),
+                  },
                 },
-              },
-            }),
-          ]);
+              }),
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (keptHpa.exitCode !== 0) {
             throw new Error(
               `Could not preserve the outgoing HPA ${outgoingHpa} across the Helm upgrade ` +
-                `(${keptHpa.stderr.trim() || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
+                `(${sanitizeForTerminal(keptHpa.stderr.trim()) || `kubectl exited ${keptHpa.exitCode}`}). Refusing ` +
                 `to run \`helm upgrade\`: the serving build must keep autoscaling until ` +
                 `cutover. Fix kubectl access and re-run.`,
             );
@@ -2764,20 +2818,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `${keepAnnotation} --overwrite (if it exists)`,
       );
     } else {
-      const found = await execCapture("kubectl", [
-        "get",
-        "secret",
-        legacySecret,
-        "-n",
-        namespace,
-        "--ignore-not-found",
-        "-o",
-        "name",
-      ]);
+      const found = await execCapture(
+        "kubectl",
+        ["get", "secret", legacySecret, "-n", namespace, "--ignore-not-found", "-o", "name"],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (found.exitCode !== 0) {
         throw new Error(
           `Could not determine whether the legacy internal dispatch Secret ${legacySecret} ` +
-            `exists (kubectl exited ${found.exitCode}: ${found.stderr.trim()}). ` +
+            `exists (kubectl exited ${found.exitCode}: ${sanitizeForTerminal(found.stderr.trim())}). ` +
             `--ignore-not-found makes a genuinely absent Secret exit 0, so this is a ` +
             `connectivity/RBAC failure. Refusing to run \`helm upgrade\`: if that Secret DOES ` +
             `exist, helm would prune it and the build it belongs to could no longer start a ` +
@@ -2786,20 +2835,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         );
       }
       if (found.stdout.trim()) {
-        const annotated = await execCapture("kubectl", [
-          "annotate",
-          "secret",
-          legacySecret,
-          "-n",
-          namespace,
-          keepAnnotation,
-          "--overwrite",
-        ]);
+        const annotated = await execCapture(
+          "kubectl",
+          ["annotate", "secret", legacySecret, "-n", namespace, keepAnnotation, "--overwrite"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (annotated.exitCode !== 0) {
           throw new Error(
             `Could not annotate the legacy internal dispatch Secret ${legacySecret} with ` +
               `helm.sh/resource-policy=keep (kubectl exited ${annotated.exitCode}: ` +
-              `${annotated.stderr.trim()}). \`helm upgrade\` would prune it, leaving the ` +
+              `${sanitizeForTerminal(annotated.stderr.trim())}). \`helm upgrade\` would prune it, leaving the ` +
               `outgoing build unable to start a pod (its pod template references that Secret ` +
               `by name) — so both a restart inside this deploy window and a rollback to it ` +
               `would fail. Nothing was changed; fix kubectl access and re-run.`,
@@ -2885,7 +2930,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   if (!dryRun) {
     helmMutationAttempted = true;
     try {
-      await execOrThrow("helm", helmArgs);
+      await execOrThrow("helm", helmArgs, { timeoutMs: EXEC_TIMEOUTS.cloudOperation });
     } catch (err) {
       const edge = await restoreEdgeToPreviousBuild();
       const detail = err instanceof Error ? err.message : String(err);
@@ -2905,15 +2950,19 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // 6b. Best-effort CDN verification: confirm the applied HTTPRoute carries the CDN filter.
   // The chart is the source of truth; this is confirmation only, never fatal.
   if (!dryRun && chartHasCdn) {
-    const routeCheck = await execCapture("kubectl", [
-      "get",
-      "httproute",
-      `${releaseName}-routes`,
-      "-n",
-      namespace,
-      "-o",
-      "jsonpath={.spec.rules[*].filters[*].extensionRef.kind}",
-    ]);
+    const routeCheck = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "httproute",
+        `${releaseName}-routes`,
+        "-n",
+        namespace,
+        "-o",
+        "jsonpath={.spec.rules[*].filters[*].extensionRef.kind}",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (routeCheck.exitCode === 0 && routeCheck.stdout.includes("GCPHTTPFilter")) {
       console.log("  → Cloud CDN filter attached to HTTPRoute rules ✓");
     } else {
@@ -2941,16 +2990,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
     // 7a. Wait for new deployment to be ready
     console.log(`\n  → Waiting for new pods to be ready...`);
-    const newDeployResult = await execCapture("kubectl", [
-      "get",
-      "deployments",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-    ]);
+    const newDeployResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "deployments",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     // The routing service carries the same version label but is a stable in-place Deployment,
     // verified separately below — exclude it here by EXACT name (a substring match would
     // also exclude a pool deployment that merely contains "routing-service" in its name).
@@ -2961,14 +3014,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
     for (const deployName of newDeploys) {
       console.log(`    Waiting for ${deployName}...`);
-      const rollout = await execCapture("kubectl", [
-        "rollout",
-        "status",
-        `deployment/${deployName}`,
-        "-n",
-        namespace,
-        KUBECTL_ROLLOUT_TIMEOUT,
-      ]);
+      const rollout = await execCapture(
+        "kubectl",
+        ["rollout", "status", `deployment/${deployName}`, "-n", namespace, KUBECTL_ROLLOUT_TIMEOUT],
+        { timeoutMs: EXEC_TIMEOUTS.rollout },
+      );
       // The pod-health gate below is the real readiness gate, but don't walk into it on
       // an already-failed rollout — the exit code was previously discarded, so a stuck
       // deployment burned the whole 2-minute health budget before failing.
@@ -2994,26 +3044,25 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // (e.g. a missing @next/routing) crashloop undetected for months while Kubernetes kept
     // the old ReplicaSet serving stale edge code and the deploy reported success. Verify it
     // actually rolls out; a stuck rollout is fatal.
-    const rsExists = await execCapture("kubectl", [
-      "get",
-      "deployment",
-      routingDeploy,
-      "-n",
-      namespace,
-      "--ignore-not-found",
-      "-o",
-      "name",
-    ]);
+    const rsExists = await execCapture(
+      "kubectl",
+      ["get", "deployment", routingDeploy, "-n", namespace, "--ignore-not-found", "-o", "name"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (rsExists.exitCode === 0 && rsExists.stdout.trim()) {
       console.log(`    Waiting for ${routingDeploy}...`);
-      const rsRollout = await execCapture("kubectl", [
-        "rollout",
-        "status",
-        `deployment/${routingDeploy}`,
-        "-n",
-        namespace,
-        KUBECTL_ROLLOUT_TIMEOUT,
-      ]);
+      const rsRollout = await execCapture(
+        "kubectl",
+        [
+          "rollout",
+          "status",
+          `deployment/${routingDeploy}`,
+          "-n",
+          namespace,
+          KUBECTL_ROLLOUT_TIMEOUT,
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.rollout },
+      );
       if (rsRollout.exitCode !== 0) {
         // The new routing pods can't roll — but the OLD routing pods already picked up the
         // new build's manifest from the (helm-overwritten) stable ConfigMap via kubelet
@@ -3037,14 +3086,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     const currentRouteExtJob = routeExtJobName(releaseName, buildId);
     const routeExtJobYaml = path.join(outputDir, "chart", "templates", "route-ext-update-job.yaml");
     if (existsSync(routeExtJobYaml)) {
-      const wait = await execCapture("kubectl", [
-        "wait",
-        "--for=condition=complete",
-        `job/${currentRouteExtJob}`,
-        "-n",
-        namespace,
-        "--timeout=600s",
-      ]);
+      const wait = await execCapture(
+        "kubectl",
+        [
+          "wait",
+          "--for=condition=complete",
+          `job/${currentRouteExtJob}`,
+          "-n",
+          namespace,
+          "--timeout=600s",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.rollout },
+      );
       if (wait.exitCode !== 0) {
         const edge = await restoreEdgeToPreviousBuild();
         throw new Error(
@@ -3083,15 +3136,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       let status = "";
       let detail = "";
       for (let attempt = 0; attempt < 30; attempt++) {
-        const read = await execCapture("kubectl", [
-          "get",
-          "envoyextensionpolicy",
-          policyName,
-          "-n",
-          namespace,
-          "-o",
-          "json",
-        ]);
+        const read = await execCapture(
+          "kubectl",
+          ["get", "envoyextensionpolicy", policyName, "-n", namespace, "-o", "json"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         detail = (read.stderr || "").trim();
         if (read.exitCode === 0) {
           try {
@@ -3197,19 +3246,23 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         if (restoredWarmedHpas.has(name)) continue;
         let lastFailure = "";
         for (let attempt = 1; attempt <= 3; attempt++) {
-          const restore = await execCapture("kubectl", [
-            "patch",
-            "hpa",
-            name,
-            "-n",
-            namespace,
-            "--type=merge",
-            // Same field-manager rationale as the Service/Deployment patches: helm owns the
-            // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
-            "--field-manager=helm",
-            "-p",
-            JSON.stringify({ spec: { minReplicas: min, maxReplicas: max } }),
-          ]);
+          const restore = await execCapture(
+            "kubectl",
+            [
+              "patch",
+              "hpa",
+              name,
+              "-n",
+              namespace,
+              "--type=merge",
+              // Same field-manager rationale as the Service/Deployment patches: helm owns the
+              // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
+              "--field-manager=helm",
+              "-p",
+              JSON.stringify({ spec: { minReplicas: min, maxReplicas: max } }),
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (restore.exitCode === 0) {
             restoredWarmedHpas.add(name);
             console.log(
@@ -3217,7 +3270,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             );
             break;
           }
-          lastFailure = restore.stderr.trim() || `exit ${restore.exitCode}`;
+          lastFailure = sanitizeForTerminal(restore.stderr.trim()) || `exit ${restore.exitCode}`;
         }
         if (!restoredWarmedHpas.has(name)) {
           console.warn(
@@ -3270,20 +3323,24 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       // was only partially applied; accepting it would cut traffic to an unautoscaled pool.
       // Probe every pool, including first-deploy and newly added pools, before scaling any of
       // them. `--ignore-not-found` keeps absence machine-readable without hiding read errors.
-      const hpaRead = await execCapture("kubectl", [
-        "get",
-        "hpa",
-        newHpaName,
-        "-n",
-        namespace,
-        "--ignore-not-found",
-        "-o",
-        "jsonpath={.metadata.name}|{.spec.minReplicas}|{.spec.maxReplicas}",
-      ]);
+      const hpaRead = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "hpa",
+          newHpaName,
+          "-n",
+          namespace,
+          "--ignore-not-found",
+          "-o",
+          "jsonpath={.metadata.name}|{.spec.minReplicas}|{.spec.maxReplicas}",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (hpaRead.exitCode !== 0) {
         await abortWarmupSetup(
           `Could not read the new build's HPA ${newHpaName} (kubectl exited ` +
-            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${hpaRead.stderr.trim()}` : ""}). ` +
+            `${hpaRead.exitCode}${hpaRead.stderr.trim() ? `: ${sanitizeForTerminal(hpaRead.stderr.trim())}` : ""}). ` +
             `Refusing to warm pool "${poolName}" because its original bounds cannot be ` +
             `preserved or its capacity kept stable. Nothing was cut over.`,
         );
@@ -3318,22 +3375,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             `${outgoing} replicas (restored to minReplicas=${hpaMin}, ` +
             `maxReplicas=${hpaMax} after cutover)`,
         );
-        const warm = await execCapture("kubectl", [
-          "patch",
-          "hpa",
-          newHpaName,
-          "-n",
-          namespace,
-          "--type=merge",
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify({ spec: { minReplicas: warmMin, maxReplicas: warmMax } }),
-        ]);
+        const warm = await execCapture(
+          "kubectl",
+          [
+            "patch",
+            "hpa",
+            newHpaName,
+            "-n",
+            namespace,
+            "--type=merge",
+            "--field-manager=helm",
+            "-p",
+            JSON.stringify({ spec: { minReplicas: warmMin, maxReplicas: warmMax } }),
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (warm.exitCode !== 0) {
           await abortWarmupSetup(
             `Could not set temporary warm-up bounds on ${newHpaName} ` +
               `(minReplicas=${warmMin}, maxReplicas=${warmMax}; ` +
-              `${warm.stderr.trim() || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
+              `${sanitizeForTerminal(warm.stderr.trim()) || `kubectl exited ${warm.exitCode}`}). Refusing to ` +
               `scale or cut over pool "${poolName}" because its HPA could immediately ` +
               `remove the required capacity. Nothing was cut over.`,
           );
@@ -3348,16 +3409,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     for (const [poolName, outgoing] of previousReplicasByPool) {
       const { deployment: newDeployName } = poolResourceNames(releaseName, poolName, buildId);
       const expected = capacityTargets.get(poolName) ?? outgoing;
-      const cur = await execCapture("kubectl", [
-        "get",
-        "deployment",
-        newDeployName,
-        "-n",
-        namespace,
-        "--ignore-not-found",
-        "-o",
-        "jsonpath={.metadata.name}|{.spec.replicas}",
-      ]);
+      const cur = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "deployment",
+          newDeployName,
+          "-n",
+          namespace,
+          "--ignore-not-found",
+          "-o",
+          "jsonpath={.metadata.name}|{.spec.replicas}",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       const [foundName, replicasField] = cur.stdout.trim().split("|");
       const current = parseInt(replicasField ?? "", 10);
       if (cur.exitCode !== 0 || !foundName || !Number.isFinite(current)) {
@@ -3365,7 +3430,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         // closed if the capacity never materializes. Say why we could not pre-scale.
         console.warn(
           `  ! Could not read the new build's replica count for ${newDeployName} ` +
-            `(kubectl exited ${cur.exitCode}${cur.stderr.trim() ? `: ${cur.stderr.trim()}` : ""}) ` +
+            `(kubectl exited ${cur.exitCode}${cur.stderr.trim() ? `: ${sanitizeForTerminal(cur.stderr.trim())}` : ""}) ` +
             `— skipping the pre-cutover scale-up to the outgoing build's ${expected} replicas.`,
         );
         continue;
@@ -3375,17 +3440,15 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         `  → Matching outgoing capacity for pool "${poolName}": scaling ${newDeployName} ` +
           `${current} → ${expected} replicas before cutover`,
       );
-      const scaleUp = await execCapture("kubectl", [
-        "scale",
-        `deployment/${newDeployName}`,
-        "-n",
-        namespace,
-        `--replicas=${expected}`,
-      ]);
+      const scaleUp = await execCapture(
+        "kubectl",
+        ["scale", `deployment/${newDeployName}`, "-n", namespace, `--replicas=${expected}`],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (scaleUp.exitCode !== 0) {
         shortfalls.push(
           `${newDeployName}: could not scale to ${expected} ` +
-            `(${scaleUp.stderr.trim() || `exit ${scaleUp.exitCode}`})`,
+            `(${sanitizeForTerminal(scaleUp.stderr.trim()) || `exit ${scaleUp.exitCode}`})`,
         );
       }
     }
@@ -3415,20 +3478,24 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       let allHealthy = true;
       let checkedCount = 0;
       const readyByPool = new Map<string, number>();
-      const podsResult = await execCapture("kubectl", [
-        "get",
-        "pods",
-        "-n",
-        namespace,
-        "-l",
-        // The routing service shares the version label; exclude it by its component label
-        // (exact — a name substring match would also drop pool pods named similarly).
-        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
-        "-o",
-        // The component label IS the pool name (deployment.ts stamps it), which is what
-        // makes the per-pool count below exact without parsing pod names.
-        'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.labels.app\\.kubernetes\\.io/component}{"\\n"}{end}',
-      ]);
+      const podsResult = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "pods",
+          "-n",
+          namespace,
+          "-l",
+          // The routing service shares the version label; exclude it by its component label
+          // (exact — a name substring match would also drop pool pods named similarly).
+          `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
+          "-o",
+          // The component label IS the pool name (deployment.ts stamps it), which is what
+          // makes the per-pool count below exact without parsing pod names.
+          'jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type=="Ready")].status}|{.metadata.labels.app\\.kubernetes\\.io/component}{"\\n"}{end}',
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (podsResult.exitCode === 0) {
         for (const line of podsResult.stdout.trim().split("\n")) {
           const [podName, ready, component] = line.split("|");
@@ -3483,16 +3550,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       console.error("");
 
       // Try to get more diagnostic info
-      const newPods = await execCapture("kubectl", [
-        "get",
-        "pods",
-        "-n",
-        namespace,
-        "-l",
-        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
-        "-o",
-        'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{"\\n"}{end}',
-      ]);
+      const newPods = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "pods",
+          "-n",
+          namespace,
+          "-l",
+          `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safeBuildId},app.kubernetes.io/component!=routing-service`,
+          "-o",
+          'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{"\\n"}{end}',
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (newPods.exitCode === 0 && newPods.stdout.trim()) {
         const podLines = newPods.stdout.trim().split("\n");
         for (const line of podLines) {
@@ -3505,16 +3576,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           // `/readyz` 503s until the pod can actually serve and its body carries a `reason`
           // ("instrumentation register() failed", "route module /x failed to load"), which
           // is the answer to "why is this pod not Ready?" — so print the body too.
-          const readyzResult = await execCapture("kubectl", [
-            "exec",
-            podName,
-            "-n",
-            namespace,
-            "--",
-            "node",
-            "-e",
-            `const http=require("http");http.get("http://localhost:3000${POOL_READINESS_PATH}",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>console.log(r.statusCode,d))}).on("error",e=>console.log("ERR",e.message))`,
-          ]);
+          const readyzResult = await execCapture(
+            "kubectl",
+            [
+              "exec",
+              podName,
+              "-n",
+              namespace,
+              "--",
+              "node",
+              "-e",
+              `const http=require("http");http.get("http://localhost:3000${POOL_READINESS_PATH}",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>console.log(r.statusCode,d))}).on("error",e=>console.log("ERR",e.message))`,
+            ],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (readyzResult.exitCode === 0 && readyzResult.stdout.trim()) {
             // L14: the body is pod-sourced text — strip terminal control characters.
             console.error(
@@ -3529,13 +3604,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             );
           }
           // Get last error from logs
-          const logsResult = await execCapture("kubectl", [
-            "logs",
-            podName,
-            "-n",
-            namespace,
-            "--tail=20",
-          ]);
+          const logsResult = await execCapture(
+            "kubectl",
+            ["logs", podName, "-n", namespace, "--tail=20"],
+            { timeoutMs: EXEC_TIMEOUTS.kubectl },
+          );
           if (logsResult.exitCode === 0) {
             const errorLines = logsResult.stdout
               .split("\n")
@@ -3589,15 +3662,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     ];
     for (const { servicePool } of serviceDestinations) {
       const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
-      const read = await execCapture("kubectl", [
-        "get",
-        "service",
-        activeServiceName,
-        "-n",
-        namespace,
-        "-o",
-        "json",
-      ]);
+      const read = await execCapture(
+        "kubectl",
+        ["get", "service", activeServiceName, "-n", namespace, "-o", "json"],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       let selector: unknown;
       if (read.exitCode === 0) {
         try {
@@ -3628,33 +3697,37 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       for (const { servicePool, targetPool } of serviceDestinations) {
         const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
         const originalSelector = originalServiceSelectors.get(activeServiceName)!;
-        const patchResult = await execCapture("kubectl", [
-          "patch",
-          "service",
-          activeServiceName,
-          "-n",
-          namespace,
-          "--type=json",
-          // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
-          // path that prevents the next upgrade conflicting on the selector we flip here;
-          // Helm 3's client-side merge does not enforce managed-field conflicts.
-          // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
-          // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
-          // no conflict override.
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify([
-            {
-              op: "replace",
-              path: "/spec/selector",
-              value: {
-                ...originalSelector,
-                "app.kubernetes.io/component": targetPool,
-                "app.kubernetes.io/version": safeBuildId,
+        const patchResult = await execCapture(
+          "kubectl",
+          [
+            "patch",
+            "service",
+            activeServiceName,
+            "-n",
+            namespace,
+            "--type=json",
+            // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
+            // path that prevents the next upgrade conflicting on the selector we flip here;
+            // Helm 3's client-side merge does not enforce managed-field conflicts.
+            // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
+            // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
+            // no conflict override.
+            "--field-manager=helm",
+            "-p",
+            JSON.stringify([
+              {
+                op: "replace",
+                path: "/spec/selector",
+                value: {
+                  ...originalSelector,
+                  "app.kubernetes.io/component": targetPool,
+                  "app.kubernetes.io/version": safeBuildId,
+                },
               },
-            },
-          ]),
-        ]);
+            ]),
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (patchResult.exitCode !== 0) {
           patchFailures.push({
             pool: servicePool,
@@ -3675,23 +3748,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       const revertFailures: string[] = [];
       for (const serviceName of patchedServices) {
         const originalSelector = originalServiceSelectors.get(serviceName)!;
-        const revertResult = await execCapture("kubectl", [
-          "patch",
-          "service",
-          serviceName,
-          "-n",
-          namespace,
-          "--type=json",
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify([
-            {
-              op: "replace",
-              path: "/spec/selector",
-              value: originalSelector,
-            },
-          ]),
-        ]);
+        const revertResult = await execCapture(
+          "kubectl",
+          [
+            "patch",
+            "service",
+            serviceName,
+            "-n",
+            namespace,
+            "--type=json",
+            "--field-manager=helm",
+            "-p",
+            JSON.stringify([
+              {
+                op: "replace",
+                path: "/spec/selector",
+                value: originalSelector,
+              },
+            ]),
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
       }
       // N25: the pools stay on the previous build, so the edge must too.
@@ -3889,9 +3966,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // failing the whole deploy (the previous build just keeps burning replicas until the
     // next deploy or a manual scale-down). The outgoing HPA was transferred out of Helm
     // release-manifest lifecycle before the upgrade so it could remain active while this build
-    // served. Delete it
-    // now and wait for that deletion to finish BEFORE setting replicas=0; if deletion fails,
-    // leave the Deployment alone rather than asking a still-live HPA to fight the scale command.
+    // served. Delete it now and wait for that deletion to finish BEFORE setting replicas=0;
+    // if deletion fails, leave the Deployment alone rather than asking a still-live HPA to
+    // fight the scale command.
     if (previousBuildId && previousBuildId !== buildId) {
       let scaleDownFailed = false;
       for (const poolName of previousPools) {
@@ -3905,35 +3982,30 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           poolName,
           previousBuildId,
         );
-        const hpaDelete = await execCapture("kubectl", [
-          "delete",
-          "hpa",
-          poolPrevHpa,
-          "-n",
-          namespace,
-          "--ignore-not-found",
-        ]);
+        const hpaDelete = await execCapture(
+          "kubectl",
+          ["delete", "hpa", poolPrevHpa, "-n", namespace, "--ignore-not-found"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (hpaDelete.exitCode !== 0) {
           scaleDownFailed = true;
           console.warn(
             `  ! Could not remove outgoing autoscaler ${poolPrevHpa}; leaving ` +
               `${poolPrevName} at its current replica count because that HPA could immediately ` +
-              `undo a scale to zero: ${hpaDelete.stderr.trim() || "unknown error"}`,
+              `undo a scale to zero: ${sanitizeForTerminal(hpaDelete.stderr.trim()) || "unknown error"}`,
           );
           continue;
         }
-        const scaleDown = await execCapture("kubectl", [
-          "scale",
-          `deployment/${poolPrevName}`,
-          "-n",
-          namespace,
-          "--replicas=0",
-        ]);
+        const scaleDown = await execCapture(
+          "kubectl",
+          ["scale", `deployment/${poolPrevName}`, "-n", namespace, "--replicas=0"],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (scaleDown.exitCode !== 0) {
           scaleDownFailed = true;
           console.warn(
             `  ! Could not scale down ${poolPrevName}: ` +
-              `${scaleDown.stderr.trim() || "unknown error"}`,
+              `${sanitizeForTerminal(scaleDown.stderr.trim()) || "unknown error"}`,
           );
         }
       }
@@ -3959,16 +4031,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       ? new Set(previousPools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
       : undefined;
 
-    const allDeploys = await execCapture("kubectl", [
-      "get",
-      "deployments",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName}`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-    ]);
+    const allDeploys = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "deployments",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (allDeploys.exitCode === 0) {
       for (const name of allDeploys.stdout.trim().split("\n")) {
         // The routing tier is a stable in-place Deployment — never a cleanup candidate.
@@ -3994,8 +4070,12 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         }
         // Delete everything else
         console.log(`  → Deleting old build: ${name}`);
-        await execCapture("kubectl", ["delete", "deployment", name, "-n", namespace]);
-        await execCapture("kubectl", ["delete", "service", name, "-n", namespace]).catch(() => {});
+        await execCapture("kubectl", ["delete", "deployment", name, "-n", namespace], {
+          timeoutMs: EXEC_TIMEOUTS.kubectl,
+        });
+        await execCapture("kubectl", ["delete", "service", name, "-n", namespace], {
+          timeoutMs: EXEC_TIMEOUTS.kubectl,
+        }).catch(() => {});
         // This build's raw release/pool/buildId parts are unknowable here (`name` is a
         // cluster-listed deployment of a build state no longer tracks), so the HCP name
         // can't go through poolResourceNames. Re-sanitizing the deployment name with the
@@ -4004,13 +4084,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         // same prefix the template truncated to (any trailing hyphens the template's
         // strip removed beyond 59 are re-stripped here). Bare `${name}-hcp` diverged
         // there — and could exceed 63 chars, an invalid name kubectl rejects.
-        await execCapture("kubectl", [
-          "delete",
-          "healthcheckpolicy",
-          sanitizeK8sName(name, "-hcp"),
-          "-n",
-          namespace,
-        ]).catch(() => {});
+        await execCapture(
+          "kubectl",
+          ["delete", "healthcheckpolicy", sanitizeK8sName(name, "-hcp"), "-n", namespace],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        ).catch(() => {});
       }
     }
 
@@ -4058,20 +4136,26 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // one). Skip the CURRENT job by EXACT name — a fuzzy build-id substring match here
     // (12-char slice vs the name's 10-char slice) previously deleted the running job
     // before it could register the extension, so the traffic ext never got reconciled.
-    const oldJobs = await execCapture("kubectl", [
-      "get",
-      "jobs",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-    ]);
+    const oldJobs = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "jobs",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=route-ext-job`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (oldJobs.exitCode === 0) {
       for (const jobName of oldJobs.stdout.trim().split("\n")) {
         if (!jobName || jobName === currentRouteExtJob) continue;
-        await execCapture("kubectl", ["delete", "job", jobName, "-n", namespace]);
+        await execCapture("kubectl", ["delete", "job", jobName, "-n", namespace], {
+          timeoutMs: EXEC_TIMEOUTS.kubectl,
+        });
       }
     }
 
@@ -4087,22 +4171,28 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
         routingManifestSnapshotName(releaseName, buildId),
         routingManifestSnapshotName(releaseName, previousBuildId),
       ]);
-      const snapshots = await execCapture("kubectl", [
-        "get",
-        "configmaps",
-        "-n",
-        namespace,
-        "-l",
-        `app.kubernetes.io/name=${releaseName},` +
-          `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
-        "-o",
-        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-      ]);
+      const snapshots = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "configmaps",
+          "-n",
+          namespace,
+          "-l",
+          `app.kubernetes.io/name=${releaseName},` +
+            `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
+          "-o",
+          'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (snapshots.exitCode === 0) {
         for (const cmName of snapshots.stdout.trim().split("\n")) {
           if (!cmName || keepSnapshots.has(cmName)) continue;
           console.log(`  → Deleting old routing-manifest snapshot: ${cmName}`);
-          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
+          await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace], {
+            timeoutMs: EXEC_TIMEOUTS.kubectl,
+          });
         }
       }
 
@@ -4111,21 +4201,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           compositionPlanConfigMapName(releaseName, buildId),
           compositionPlanConfigMapName(releaseName, previousBuildId),
         ]);
-        const plans = await execCapture("kubectl", [
-          "get",
-          "configmaps",
-          "-n",
-          namespace,
-          "-l",
-          `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
-          "-o",
-          'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-        ]);
+        const plans = await execCapture(
+          "kubectl",
+          [
+            "get",
+            "configmaps",
+            "-n",
+            namespace,
+            "-l",
+            `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
+            "-o",
+            'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+          ],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (plans.exitCode === 0) {
           for (const cmName of plans.stdout.trim().split("\n")) {
             if (!cmName || keepPlans.has(cmName)) continue;
             console.log(`  → Deleting old composition plan: ${cmName}`);
-            await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace]);
+            await execCapture("kubectl", ["delete", "configmap", cmName, "-n", namespace], {
+              timeoutMs: EXEC_TIMEOUTS.kubectl,
+            });
           }
         }
       }
@@ -4147,16 +4243,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // reference set skips the sweep entirely, because deleting a Secret a live pod template
     // needs would brick that build's restarts. Best-effort — state is already committed
     // (7d), so a failure here only leaks a handful of 64-byte Secrets.
-    const deploySpecs = await execCapture("kubectl", [
-      "get",
-      "deployments",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName}`,
-      "-o",
-      "json",
-    ]);
+    const deploySpecs = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "deployments",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        "json",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     let referencedSecrets: Set<string> | null = null;
     if (deploySpecs.exitCode === 0 && deploySpecs.stdout.trim()) {
       try {
@@ -4199,22 +4299,28 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `Old per-build dispatch Secrets stay until the next successful deploy.`,
       );
     } else {
-      const internalSecrets = await execCapture("kubectl", [
-        "get",
-        "secrets",
-        "-n",
-        namespace,
-        "-l",
-        `app.kubernetes.io/name=${releaseName},` +
-          `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
-        "-o",
-        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-      ]);
+      const internalSecrets = await execCapture(
+        "kubectl",
+        [
+          "get",
+          "secrets",
+          "-n",
+          namespace,
+          "-l",
+          `app.kubernetes.io/name=${releaseName},` +
+            `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
+          "-o",
+          'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (internalSecrets.exitCode === 0) {
         for (const secretName of internalSecrets.stdout.trim().split("\n")) {
           if (!secretName || referencedSecrets.has(secretName)) continue;
           console.log(`  → Deleting unreferenced internal dispatch Secret: ${secretName}`);
-          await execCapture("kubectl", ["delete", "secret", secretName, "-n", namespace]);
+          await execCapture("kubectl", ["delete", "secret", secretName, "-n", namespace], {
+            timeoutMs: EXEC_TIMEOUTS.kubectl,
+          });
         }
       }
     }

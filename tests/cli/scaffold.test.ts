@@ -65,7 +65,7 @@ describe("generateAdapterConfig", () => {
       };
     };
 
-    expect(config.pools.default.routes).toEqual(["appPages", "appRoutes", "pagesApi"]);
+    expect(config.pools.default.routes).toEqual(["appPages", "appRoutes", "pagesApi", "pages"]);
     expect(config.containerStrategy).toBe("traced-assets");
     expect(config.provider.gke.cdn).toEqual({ enabled: true, bucket: VALID.bucket });
     expect(config.provider.gke.gateway.type).toBe("gateway-api");

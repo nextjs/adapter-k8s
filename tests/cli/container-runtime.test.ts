@@ -13,10 +13,14 @@ import {
   checkContainerRuntime,
 } from "../../src/cli/container-runtime.js";
 
-vi.mock("../../src/cli/exec.js", () => ({
-  execCapture: vi.fn(),
-  execOrThrow: vi.fn(),
-}));
+vi.mock("../../src/cli/exec.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/exec.js")>();
+  return {
+    EXEC_TIMEOUTS: actual.EXEC_TIMEOUTS,
+    execCapture: vi.fn(),
+    execOrThrow: vi.fn(),
+  };
+});
 
 const ok = { exitCode: 0, stdout: "ok\n", stderr: "" };
 const missing = { exitCode: 127, stdout: "", stderr: "command not found" };

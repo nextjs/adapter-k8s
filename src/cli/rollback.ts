@@ -1,7 +1,7 @@
 // src/cli/rollback.ts
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { execCapture, execCaptureStdin, execOrThrow } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture, execCaptureStdin, execOrThrow } from "./exec.js";
 import { readState, writeState, type AdapterState } from "./state.js";
 import { discoverBuildPools, recordedBuildPools } from "./pool-topology.js";
 import { invalidateCdnBuildTag } from "./cdn-invalidate.js";
@@ -161,16 +161,11 @@ export async function readRoutingServingConfig(
 ): Promise<RoutingServingRead> {
   const namespace = resolveK8sNamespace(configuredNamespace);
   const deployName = routingServiceDeploymentName(releaseName);
-  const res = await execCapture("kubectl", [
-    "get",
-    "deployment",
-    deployName,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "json",
-  ]);
+  const res = await execCapture(
+    "kubectl",
+    ["get", "deployment", deployName, "-n", namespace, "--ignore-not-found", "-o", "json"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (res.exitCode !== 0) {
     return {
       status: "failed",
@@ -323,31 +318,39 @@ export async function retainLiveRoutingManifest(
   // before upgrade so the outgoing routing ReplicaSet and rollback target keep mounting it.
   // This also migrates snapshots emitted before the chart carried the policy itself.
   if (serving.manifestConfigMap === snapshotName) {
-    const annotated = await execCapture("kubectl", [
-      "annotate",
-      "configmap",
-      snapshotName,
-      "-n",
-      namespace,
-      "helm.sh/resource-policy=keep",
-      "--overwrite",
-    ]);
+    const annotated = await execCapture(
+      "kubectl",
+      [
+        "annotate",
+        "configmap",
+        snapshotName,
+        "-n",
+        namespace,
+        "helm.sh/resource-policy=keep",
+        "--overwrite",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (annotated.exitCode !== 0) {
       return {
         status: "failed",
         reason: `could not retain the live snapshot ${snapshotName}: ${annotated.stderr.trim() || `kubectl annotate exited ${annotated.exitCode}`}`,
       };
     }
-    const labeled = await execCapture("kubectl", [
-      "label",
-      "configmap",
-      snapshotName,
-      "-n",
-      namespace,
-      `app.kubernetes.io/name=${releaseName}`,
-      `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
-      "--overwrite",
-    ]);
+    const labeled = await execCapture(
+      "kubectl",
+      [
+        "label",
+        "configmap",
+        snapshotName,
+        "-n",
+        namespace,
+        `app.kubernetes.io/name=${releaseName}`,
+        `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
+        "--overwrite",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (labeled.exitCode !== 0) {
       return {
         status: "failed",
@@ -362,16 +365,11 @@ export async function retainLiveRoutingManifest(
   // Abort loudly instead of silently clobbering it. Unstamped snapshots (written by
   // pre-annotation versions of this CLI) are overwritten as before, and a failed read
   // stays best-effort (the apply below surfaces real cluster trouble).
-  const existing = await execCapture("kubectl", [
-    "get",
-    "configmap",
-    snapshotName,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "json",
-  ]);
+  const existing = await execCapture(
+    "kubectl",
+    ["get", "configmap", snapshotName, "-n", namespace, "--ignore-not-found", "-o", "json"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (existing.exitCode === 0 && existing.stdout.trim()) {
     let storedBuildId: unknown;
     try {
@@ -392,15 +390,11 @@ export async function retainLiveRoutingManifest(
       );
     }
   }
-  const cm = await execCapture("kubectl", [
-    "get",
-    "configmap",
-    serving.manifestConfigMap,
-    "-n",
-    namespace,
-    "-o",
-    "json",
-  ]);
+  const cm = await execCapture(
+    "kubectl",
+    ["get", "configmap", serving.manifestConfigMap, "-n", namespace, "-o", "json"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   let data: unknown;
   if (cm.exitCode === 0 && cm.stdout.trim()) {
     try {
@@ -445,6 +439,7 @@ export async function retainLiveRoutingManifest(
     "kubectl",
     ["apply", "-n", namespace, "-f", "-"],
     JSON.stringify(snapshot),
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
   );
   if (applied.exitCode !== 0) {
     const reason = `kubectl apply of snapshot ${snapshotName} failed: ${
@@ -543,16 +538,11 @@ export async function revertRoutingServiceToBuild(opts: {
   }
 
   const targetSnapshot = routingManifestSnapshotName(releaseName, targetBuildId);
-  const snap = await execCapture("kubectl", [
-    "get",
-    "configmap",
-    targetSnapshot,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "name",
-  ]);
+  const snap = await execCapture(
+    "kubectl",
+    ["get", "configmap", targetSnapshot, "-n", namespace, "--ignore-not-found", "-o", "name"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   const haveSnapshot = snap.exitCode === 0 && !!snap.stdout.trim();
   if (!haveSnapshot) {
     console.warn(
@@ -597,16 +587,11 @@ export async function revertRoutingServiceToBuild(opts: {
     internalSecretName(releaseName, targetBuildId),
     legacyInternalSecretName(releaseName),
   ]) {
-    const got = await execCapture("kubectl", [
-      "get",
-      "secret",
-      candidate,
-      "-n",
-      namespace,
-      "--ignore-not-found",
-      "-o",
-      "name",
-    ]);
+    const got = await execCapture(
+      "kubectl",
+      ["get", "secret", candidate, "-n", namespace, "--ignore-not-found", "-o", "name"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (got.exitCode === 0 && got.stdout.trim()) {
       targetSecretRef = candidate;
       break;
@@ -685,19 +670,23 @@ export async function revertRoutingServiceToBuild(opts: {
   console.log(
     `  → Reverting routing service to build ${targetBuildId}${haveSnapshot ? "" : " (image only)"}...`,
   );
-  const patched = await execCapture("kubectl", [
-    "patch",
-    "deployment",
-    deployName,
-    "-n",
-    namespace,
-    "--type=strategic",
-    // Same field-manager rationale as the Service selector patches below: helm owns this
-    // Deployment, so the next `helm upgrade` must not conflict on the fields we flip here.
-    "--field-manager=helm",
-    "-p",
-    JSON.stringify(patch),
-  ]);
+  const patched = await execCapture(
+    "kubectl",
+    [
+      "patch",
+      "deployment",
+      deployName,
+      "-n",
+      namespace,
+      "--type=strategic",
+      // Same field-manager rationale as the Service selector patches below: helm owns this
+      // Deployment, so the next `helm upgrade` must not conflict on the fields we flip here.
+      "--field-manager=helm",
+      "-p",
+      JSON.stringify(patch),
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (patched.exitCode !== 0) {
     throw new Error(
       `Failed to revert the routing service (${deployName}): ` +
@@ -715,14 +704,18 @@ export async function revertRoutingServiceToBuild(opts: {
   // `failureMode: closed` a routing outage in that window is 500s on every request. So a
   // failed rollout now RESTORES the edge to exactly the spec it had before this function
   // touched it, and says which of the two states the operator is in.
-  const rollout = await execCapture("kubectl", [
-    "rollout",
-    "status",
-    `deployment/${deployName}`,
-    "-n",
-    namespace,
-    `--timeout=${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s`,
-  ]);
+  const rollout = await execCapture(
+    "kubectl",
+    [
+      "rollout",
+      "status",
+      `deployment/${deployName}`,
+      "-n",
+      namespace,
+      `--timeout=${ROUTING_ROLLOUT_TIMEOUT_SECONDS}s`,
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.rollout },
+  );
   if (rollout.exitCode !== 0) {
     const detail = rollout.stderr.trim() || rollout.stdout.trim() || `exit ${rollout.exitCode}`;
     const restored = await restoreRoutingSpec(
@@ -835,17 +828,21 @@ async function restoreRoutingSpec(
       },
     },
   };
-  const res = await execCapture("kubectl", [
-    "patch",
-    "deployment",
-    deployName,
-    "-n",
-    namespace,
-    "--type=strategic",
-    "--field-manager=helm",
-    "-p",
-    JSON.stringify(patch),
-  ]);
+  const res = await execCapture(
+    "kubectl",
+    [
+      "patch",
+      "deployment",
+      deployName,
+      "-n",
+      namespace,
+      "--type=strategic",
+      "--field-manager=helm",
+      "-p",
+      JSON.stringify(patch),
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   return res.exitCode === 0;
 }
 
@@ -909,16 +906,20 @@ async function readLiveCapacity(
     hpaMax: null,
   };
 
-  const dep = await execCapture("kubectl", [
-    "get",
-    "deployment",
-    deployment,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "jsonpath={.metadata.name}|{.spec.replicas}|{.status.readyReplicas}",
-  ]);
+  const dep = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "deployment",
+      deployment,
+      "-n",
+      namespace,
+      "--ignore-not-found",
+      "-o",
+      "jsonpath={.metadata.name}|{.spec.replicas}|{.status.readyReplicas}",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (dep.exitCode !== 0) unreadable.push(`deployment ${deployment}`);
   else {
     const [name, spec, ready] = dep.stdout.trim().split("|");
@@ -930,16 +931,20 @@ async function readLiveCapacity(
     }
   }
 
-  const hpaRes = await execCapture("kubectl", [
-    "get",
-    "hpa",
-    hpa,
-    "-n",
-    namespace,
-    "--ignore-not-found",
-    "-o",
-    "jsonpath={.metadata.name}|{.status.desiredReplicas}|{.spec.maxReplicas}",
-  ]);
+  const hpaRes = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "hpa",
+      hpa,
+      "-n",
+      namespace,
+      "--ignore-not-found",
+      "-o",
+      "jsonpath={.metadata.name}|{.status.desiredReplicas}|{.spec.maxReplicas}",
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   if (hpaRes.exitCode !== 0) unreadable.push(`hpa ${hpa}`);
   else {
     const [name, desired, max] = hpaRes.stdout.trim().split("|");
@@ -969,8 +974,8 @@ export async function runRollback(options: {
   const namespace = resolveK8sNamespace(infra?.namespace);
   const localComposition = loadProjectCompositionPlan(projectDir);
 
-  // Pin kubectl at THIS release's cluster BEFORE any cluster read — the state ConfigMap
-  // read below previously ran against whatever context happened to be current, so a
+  // Pin kubectl at THIS release's cluster BEFORE any cluster read — otherwise the state
+  // ConfigMap read below runs against whatever context happens to be current, and a
   // rollback could read (and then act on) another cluster's build state. Dry-run must
   // not mutate the operator's kubeconfig (L13), so it skips this and reads local
   // state only.
@@ -989,19 +994,27 @@ export async function runRollback(options: {
         `${preflight.serverVersion}`,
     );
   } else if (!dryRun && infra?.projectId && infra?.region) {
-    const credResult = await execCapture("gcloud", [
-      "container",
-      "clusters",
-      "get-credentials",
-      `${releaseName}-cluster`,
-      "--region",
-      infra.region,
-      "--project",
-      infra.projectId,
-      "--quiet",
-    ]);
+    const credResult = await execCapture(
+      "gcloud",
+      [
+        "container",
+        "clusters",
+        "get-credentials",
+        `${releaseName}-cluster`,
+        "--region",
+        infra.region,
+        "--project",
+        infra.projectId,
+        "--quiet",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (credResult.exitCode !== 0) {
-      throw new Error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
+      // L14: gcloud stderr is externally influenced; strip control sequences before printing.
+      throw new Error(
+        `Failed to connect to cluster "${releaseName}-cluster": ` +
+          `${sanitizeForTerminal(credResult.stderr.trim())}`,
+      );
     }
   }
 
@@ -1122,7 +1135,7 @@ export async function runRollback(options: {
     const prevNames = poolNames.map((p) =>
       sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`),
     );
-    const currNames = poolNames.map((p) =>
+    const currNames = currentPoolNames.map((p) =>
       sanitizeK8sName(`${releaseName}-${p}-${currentBuildId}`),
     );
     console.log(`\n  [dry-run] Rollback plan: ${currentBuildId} → ${previousBuildId}`);
@@ -1151,17 +1164,20 @@ export async function runRollback(options: {
 
   console.log(`\nRolling back: ${currentBuildId} → ${previousBuildId}\n`);
 
-  // Find the previous deployment
-  const deploysResult = await execCapture("kubectl", [
-    "get",
-    "deployments",
-    "-n",
-    namespace,
-    "-l",
-    `app.kubernetes.io/name=${releaseName}`,
-    "-o",
-    'jsonpath={range .items[*]}{.metadata.name}|{.status.replicas}{"\\n"}{end}',
-  ]);
+  const deploysResult = await execCapture(
+    "kubectl",
+    [
+      "get",
+      "deployments",
+      "-n",
+      namespace,
+      "-l",
+      `app.kubernetes.io/name=${releaseName}`,
+      "-o",
+      'jsonpath={range .items[*]}{.metadata.name}|{.status.replicas}{"\\n"}{end}',
+    ],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
 
   if (deploysResult.exitCode !== 0) {
     throw new Error("Failed to list deployments. Is kubectl connected?");
@@ -1261,13 +1277,17 @@ export async function runRollback(options: {
     console.log(
       `  → Scaling up previous build: ${previousDeploy.name} → ${plan.replicas} replicas${observedNote}`,
     );
-    await execOrThrow("kubectl", [
-      "scale",
-      `deployment/${previousDeploy.name}`,
-      "-n",
-      namespace,
-      `--replicas=${plan.replicas}`,
-    ]);
+    await execOrThrow(
+      "kubectl",
+      [
+        "scale",
+        `deployment/${previousDeploy.name}`,
+        "-n",
+        namespace,
+        `--replicas=${plan.replicas}`,
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
   }
 
   // Recreate the rollback build's HPA. Deploy removes it before parking that build at zero,
@@ -1285,42 +1305,45 @@ export async function runRollback(options: {
       min: scaling.min,
       max: scaling.max,
     };
-    const hpa = await execCapture("kubectl", [
-      "get",
-      "hpa",
-      hpaName,
-      "-n",
-      namespace,
-      "--ignore-not-found",
-      "-o",
-      "name",
-    ]);
+    const hpa = await execCapture(
+      "kubectl",
+      ["get", "hpa", hpaName, "-n", namespace, "--ignore-not-found", "-o", "name"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (!hpa.stdout.trim()) {
-      await execOrThrow("kubectl", [
-        "autoscale",
-        "deployment",
-        previousDeploy.name,
-        "-n",
-        namespace,
-        `--name=${hpaName}`,
-        `--min=${plan.min}`,
-        `--max=${plan.max}`,
-        `--cpu=${scaling.targetCPU}%`,
-      ]);
+      await execOrThrow(
+        "kubectl",
+        [
+          "autoscale",
+          "deployment",
+          previousDeploy.name,
+          "-n",
+          namespace,
+          `--name=${hpaName}`,
+          `--min=${plan.min}`,
+          `--max=${plan.max}`,
+          `--cpu=${scaling.targetCPU}%`,
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
     } else {
-      const widen = await execCapture("kubectl", [
-        "patch",
-        "hpa",
-        hpaName,
-        "-n",
-        namespace,
-        "--type=merge",
-        // Same field-manager rationale as the Service/Deployment patches: helm owns the
-        // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
-        "--field-manager=helm",
-        "-p",
-        JSON.stringify({ spec: { minReplicas: plan.min, maxReplicas: plan.max } }),
-      ]);
+      const widen = await execCapture(
+        "kubectl",
+        [
+          "patch",
+          "hpa",
+          hpaName,
+          "-n",
+          namespace,
+          "--type=merge",
+          // Same field-manager rationale as the Service/Deployment patches: helm owns the
+          // chart-rendered HPA, so the next `helm upgrade` must not conflict here.
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify({ spec: { minReplicas: plan.min, maxReplicas: plan.max } }),
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (widen.exitCode !== 0) {
         console.warn(
           `  ! Could not raise ${hpaName} to min=${plan.min}/max=${plan.max}: ` +
@@ -1334,14 +1357,11 @@ export async function runRollback(options: {
   // 2. Wait for every previous pool's pods to be ready
   console.log(`  → Waiting for previous build pods to be ready...`);
   for (const previousDeploy of previousDeploys) {
-    await execOrThrow("kubectl", [
-      "rollout",
-      "status",
-      `deployment/${previousDeploy.name}`,
-      "-n",
-      namespace,
-      "--timeout=120s",
-    ]);
+    await execOrThrow(
+      "kubectl",
+      ["rollout", "status", `deployment/${previousDeploy.name}`, "-n", namespace, "--timeout=120s"],
+      { timeoutMs: EXEC_TIMEOUTS.rollout },
+    );
   }
 
   // 3. Prove the previous build is actually SERVING before cutting traffic. This replaces
@@ -1359,16 +1379,20 @@ export async function runRollback(options: {
   let serving = false;
   const maxServeAttempts = 24; // ~2 minutes at 5s intervals
   for (let attempt = 0; attempt < maxServeAttempts && !serving; attempt++) {
-    const podsResult = await execCapture("kubectl", [
-      "get",
-      "pods",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safePreviousBuild},app.kubernetes.io/component!=routing-service`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
-    ]);
+    const podsResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "pods",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName},app.kubernetes.io/version=${safePreviousBuild},app.kubernetes.io/component!=routing-service`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     const pods =
       podsResult.exitCode === 0 ? podsResult.stdout.trim().split("\n").filter(Boolean) : [];
     let allServing = pods.length > 0;
@@ -1380,16 +1404,11 @@ export async function runRollback(options: {
       const depPods = pods.filter((p) => p.startsWith(`${previousDeploy.name}-`));
       let depServing = false;
       for (const pod of depPods) {
-        const healthz = await execCapture("kubectl", [
-          "exec",
-          pod,
-          "-n",
-          namespace,
-          "--",
-          "node",
-          "-e",
-          HEALTHZ_SNIPPET,
-        ]);
+        const healthz = await execCapture(
+          "kubectl",
+          ["exec", pod, "-n", namespace, "--", "node", "-e", HEALTHZ_SNIPPET],
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
         if (healthz.exitCode === 0) {
           depServing = true;
           break;
@@ -1430,16 +1449,20 @@ export async function runRollback(options: {
   const fallbackTargetPool = poolNames[0]!;
   let hasPortableOrigin = Boolean(state.defaultPools);
   if (!dryRun) {
-    const originLookup = await execCapture("kubectl", [
-      "get",
-      "service",
-      sanitizeK8sName(`${releaseName}-origin`),
-      "-n",
-      namespace,
-      "--ignore-not-found",
-      "-o",
-      "name",
-    ]);
+    const originLookup = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "service",
+        sanitizeK8sName(`${releaseName}-origin`),
+        "-n",
+        namespace,
+        "--ignore-not-found",
+        "-o",
+        "name",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (originLookup.exitCode !== 0) {
       throw new Error(
         `Could not determine whether the portable origin Service exists: ` +
@@ -1469,15 +1492,11 @@ export async function runRollback(options: {
     if (!topologyChanged && servicePool !== "origin") continue;
     const serviceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
     if (originalSelectors.has(serviceName)) continue;
-    const read = await execCapture("kubectl", [
-      "get",
-      "service",
-      serviceName,
-      "-n",
-      namespace,
-      "-o",
-      "json",
-    ]);
+    const read = await execCapture(
+      "kubectl",
+      ["get", "service", serviceName, "-n", namespace, "-o", "json"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     let selector: unknown;
     if (read.exitCode === 0) {
       try {
@@ -1532,30 +1551,34 @@ export async function runRollback(options: {
   console.log(`  → Switching traffic to previous build...`);
   for (const { servicePool, targetPool } of serviceDestinations) {
     const svcName = sanitizeK8sName(`${releaseName}-${servicePool}`);
-    const patchResult = await execCapture("kubectl", [
-      "patch",
-      "service",
-      svcName,
-      "-n",
-      namespace,
-      "--type=json",
-      // --force-conflicts is NOT a valid `kubectl patch` flag (only `apply
-      // --server-side` accepts it); a JSON patch needs no conflict override.
-      "--field-manager=helm",
-      "-p",
-      JSON.stringify([
-        {
-          op: "replace",
-          path: "/spec/selector/app.kubernetes.io~1component",
-          value: targetPool,
-        },
-        {
-          op: "replace",
-          path: "/spec/selector/app.kubernetes.io~1version",
-          value: safePreviousBuild,
-        },
-      ]),
-    ]);
+    const patchResult = await execCapture(
+      "kubectl",
+      [
+        "patch",
+        "service",
+        svcName,
+        "-n",
+        namespace,
+        "--type=json",
+        // --force-conflicts is NOT a valid `kubectl patch` flag (only `apply
+        // --server-side` accepts it); a JSON patch needs no conflict override.
+        "--field-manager=helm",
+        "-p",
+        JSON.stringify([
+          {
+            op: "replace",
+            path: "/spec/selector/app.kubernetes.io~1component",
+            value: targetPool,
+          },
+          {
+            op: "replace",
+            path: "/spec/selector/app.kubernetes.io~1version",
+            value: safePreviousBuild,
+          },
+        ]),
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (patchResult.exitCode !== 0) {
       patchFailures.push({ service: svcName, stderr: patchResult.stderr.trim() });
     } else {
@@ -1571,32 +1594,36 @@ export async function runRollback(options: {
     const revertFailures: string[] = [];
     for (const { service: serviceName, pool } of patchedServices) {
       const original = originalSelectors.get(serviceName);
-      const revertResult = await execCapture("kubectl", [
-        "patch",
-        "service",
-        serviceName,
-        "-n",
-        namespace,
-        "--type=json",
-        "--field-manager=helm",
-        "-p",
-        JSON.stringify(
-          original
-            ? [{ op: "replace", path: "/spec/selector", value: original }]
-            : [
-                {
-                  op: "replace",
-                  path: "/spec/selector/app.kubernetes.io~1component",
-                  value: pool,
-                },
-                {
-                  op: "replace",
-                  path: "/spec/selector/app.kubernetes.io~1version",
-                  value: safeCurrentBuild,
-                },
-              ],
-        ),
-      ]);
+      const revertResult = await execCapture(
+        "kubectl",
+        [
+          "patch",
+          "service",
+          serviceName,
+          "-n",
+          namespace,
+          "--type=json",
+          "--field-manager=helm",
+          "-p",
+          JSON.stringify(
+            original
+              ? [{ op: "replace", path: "/spec/selector", value: original }]
+              : [
+                  {
+                    op: "replace",
+                    path: "/spec/selector/app.kubernetes.io~1component",
+                    value: pool,
+                  },
+                  {
+                    op: "replace",
+                    path: "/spec/selector/app.kubernetes.io~1version",
+                    value: safeCurrentBuild,
+                  },
+                ],
+          ),
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
     }
 
@@ -1755,7 +1782,8 @@ export async function runRollback(options: {
           // M13: the tag recorded when the rolled-away-from build deployed — never
           // re-derived here. Absent (pre-recording state) → full --path=/* purge.
           recordedTag: state.cdnTags?.[currentBuildId],
-          run: execCapture,
+          run: (cmd, args, o) =>
+            execCapture(cmd, args, { timeoutMs: EXEC_TIMEOUTS.cloudOperation, ...o }),
           log: (m) => console.log(m),
         });
       }
@@ -1766,26 +1794,21 @@ export async function runRollback(options: {
     }
   }
 
-  // 6. State is durable; scale down every former-current Deployment. The HPA must be
+  // 5. State is durable; scale down every former-current Deployment. The HPA must be
   // deleted first (by its template-derived name — see the discovery-loop note) or the
   // autoscaler immediately rescales the parked build back to minReplicas.
   for (const currentDeploy of currentDeploys) {
     console.log(`  → Scaling down current build: ${currentDeploy.name}`);
-    await execOrThrow("kubectl", [
-      "delete",
-      "hpa",
-      currentDeploy.hpa,
-      "-n",
-      namespace,
-      "--ignore-not-found",
-    ]);
-    await execOrThrow("kubectl", [
-      "scale",
-      `deployment/${currentDeploy.name}`,
-      "-n",
-      namespace,
-      "--replicas=0",
-    ]);
+    await execOrThrow(
+      "kubectl",
+      ["delete", "hpa", currentDeploy.hpa, "-n", namespace, "--ignore-not-found"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    await execOrThrow(
+      "kubectl",
+      ["scale", `deployment/${currentDeploy.name}`, "-n", namespace, "--replicas=0"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
   }
 
   console.log(`\n✓ Rollback complete. Now serving build: ${previousBuildId}`);

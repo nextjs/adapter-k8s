@@ -181,16 +181,20 @@ describe("composition-plan snapshots", () => {
       expected: { digest, targetFingerprint: TARGET_FINGERPRINT },
     });
     expect(loaded?.digest).toBe(digest);
-    expect(execCapture).toHaveBeenCalledWith("kubectl", [
-      "get",
-      "configmap",
-      compositionPlanConfigMapName(RELEASE, BUILD),
-      "-n",
-      NAMESPACE,
-      "-o",
-      "json",
-      "--ignore-not-found",
-    ]);
+    expect(execCapture).toHaveBeenCalledWith(
+      "kubectl",
+      [
+        "get",
+        "configmap",
+        compositionPlanConfigMapName(RELEASE, BUILD),
+        "-n",
+        NAMESPACE,
+        "-o",
+        "json",
+        "--ignore-not-found",
+      ],
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
 
     await expect(
       loadDeployedCompositionPlan({
@@ -295,17 +299,21 @@ describe("composition-plan cluster preflight", () => {
     const result = await preflightCompositionPlan(value, { explicitlyConfirmed: false });
     expect(result.serverVersion).toBe("v1.35.2-gke.10");
     expect(result.clusterIdentity).toContain("proj-12345/test-app-cluster");
-    expect(execOrThrow).toHaveBeenCalledWith("gcloud", [
-      "container",
-      "clusters",
-      "get-credentials",
-      "test-app-cluster",
-      "--region",
-      "europe-west2",
-      "--project",
-      "proj-12345",
-      "--quiet",
-    ]);
+    expect(execOrThrow).toHaveBeenCalledWith(
+      "gcloud",
+      [
+        "container",
+        "clusters",
+        "get-credentials",
+        "test-app-cluster",
+        "--region",
+        "europe-west2",
+        "--project",
+        "proj-12345",
+        "--quiet",
+      ],
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
   });
 
   it("requires explicit confirmation for an unverified current context", async () => {

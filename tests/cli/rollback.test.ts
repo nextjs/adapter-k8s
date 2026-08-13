@@ -428,6 +428,30 @@ describe("runRollback — state and CDN invalidation", () => {
     expect(printed).toContain("[dry-run] Would swap state: buildId=buildm, previousBuildId=buildn");
   });
 
+  it("dry-run scales down the CURRENT build's pools when topologies differ across builds", async () => {
+    // Regression: the scale-down plan was built from the rollback TARGET's pools, so a
+    // topology-changing rollback (e.g. buildn added an "api" pool that buildm never had)
+    // printed a plan that missed rel-api-buildn and invented rel-api-buildm.
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      poolTopologies: { buildn: ["ssr", "api"], buildm: ["ssr"] },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(capture(false) as never);
+
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE, dryRun: true });
+
+    const printed = vi
+      .mocked(console.log)
+      .mock.calls.map((c) => String(c[0]))
+      .join("\n");
+    expect(printed).toContain("[dry-run] Would scale up previous build: rel-ssr-buildm");
+    expect(printed).toContain(
+      "[dry-run] Would scale down current build: rel-ssr-buildn, rel-api-buildn",
+    );
+    expect(printed).not.toContain("rel-api-buildm");
+  });
+
   it("dry-run with no local previous build explains the local-only read instead of 'only one deploy'", async () => {
     vi.mocked(readState).mockResolvedValue({ buildId: "buildn" } as never);
 

@@ -1,7 +1,7 @@
 // src/cli/destroy.ts
 import { existsSync, readFileSync } from "node:fs";
 import readline from "node:readline";
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js";
@@ -562,7 +562,7 @@ export async function removePlannedKubernetesObject(
     );
     return null;
   }
-  const read = await execCapture("kubectl", getArgs);
+  const read = await execCapture("kubectl", getArgs, { timeoutMs: EXEC_TIMEOUTS.kubectl });
   if (read.exitCode !== 0) {
     return `${ref.resource} ${ref.name}: ${sanitizeForTerminal(read.stderr.trim()) || `exit ${read.exitCode}`}`;
   }
@@ -579,13 +579,11 @@ export async function removePlannedKubernetesObject(
       `${owned.ownership.releaseLabel.key} does not match ${owned.ownership.releaseLabel.value}`
     );
   }
-  const deleted = await execCapture("kubectl", [
-    "delete",
-    ref.resource,
-    ref.name,
-    ...namespaceArgs,
-    "--ignore-not-found",
-  ]);
+  const deleted = await execCapture(
+    "kubectl",
+    ["delete", ref.resource, ref.name, ...namespaceArgs, "--ignore-not-found"],
+    { timeoutMs: EXEC_TIMEOUTS.kubectl },
+  );
   return deleted.exitCode === 0
     ? null
     : `${ref.resource} ${ref.name}: ${sanitizeForTerminal(deleted.stderr.trim()) || `exit ${deleted.exitCode}`}`;
@@ -623,9 +621,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       // Best-effort sanity check: warn loudly when the operator's active gcloud project
       // differs from the project this release was deployed to. gcloud failures are
       // tolerated (the deletes below all pass --project explicitly anyway).
-      const cfg = await execCapture("gcloud", ["config", "get-value", "project", "--quiet"]).catch(
-        () => null,
-      );
+      const cfg = await execCapture("gcloud", ["config", "get-value", "project", "--quiet"], {
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
       const activeProject = cfg && cfg.exitCode === 0 ? cfg.stdout.trim() : "";
       if (activeProject && activeProject !== projectId) {
         console.warn(
@@ -669,13 +667,14 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
 
   // Pin kubectl at THIS release's cluster before any cluster mutation — helm uninstall
   // and the state-ConfigMap delete otherwise run against whatever context happens to be
-  // current, and destroying the wrong cluster's release is unrecoverable. Every other
-  // command (deploy/rollback/doctor) already does this; destroy historically did not.
+  // current, and destroying the wrong cluster's release is unrecoverable.
   // Dry-run must not mutate the operator's kubeconfig (L13).
   if (!dryRun && localComposition) {
     let explicitlyConfirmed = yes === true;
     if (compositionPlanNeedsExplicitConfirmation(localComposition.plan) && !explicitlyConfirmed) {
-      const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+      const ctx = await execCapture("kubectl", ["config", "current-context"], {
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
       const currentContext =
         ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
       console.warn(
@@ -702,17 +701,21 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   } else if (!dryRun && projectId && region) {
     const clusterName = `${releaseName}-cluster`;
     console.log(`  → Connecting to GKE cluster "${clusterName}"...`);
-    const cred = await execCapture("gcloud", [
-      "container",
-      "clusters",
-      "get-credentials",
-      clusterName,
-      "--region",
-      region,
-      "--project",
-      projectId,
-      "--quiet",
-    ]);
+    const cred = await execCapture(
+      "gcloud",
+      [
+        "container",
+        "clusters",
+        "get-credentials",
+        clusterName,
+        "--region",
+        region,
+        "--project",
+        projectId,
+        "--quiet",
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.cloudOperation },
+    );
     if (cred.exitCode !== 0) {
       throw new Error(
         `Failed to connect to cluster "${clusterName}" — aborting destroy before any ` +
@@ -743,7 +746,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     // the exact wrong-cluster failure the pinning above was added to close. Surface
     // the current context loudly and require explicit confirmation (--yes skips it,
     // same as the destruction gate).
-    const ctx = await execCapture("kubectl", ["config", "current-context"]).catch(() => null);
+    const ctx = await execCapture("kubectl", ["config", "current-context"], {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    }).catch(() => null);
     // L14: the context name is kubeconfig-sourced — strip terminal control chars.
     const currentContext = ctx && ctx.exitCode === 0 ? sanitizeForTerminal(ctx.stdout.trim()) : "";
     console.warn(
@@ -860,7 +865,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         "exact selected Deployment",
     );
   } else {
-    const deploymentList = await execCapture("kubectl", poolDeploymentListArgs);
+    const deploymentList = await execCapture("kubectl", poolDeploymentListArgs, {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
     if (deploymentList.exitCode !== 0) {
       throw new Error(
         `Could not discover versioned pool Deployment identities before Helm uninstall: ` +
@@ -881,7 +888,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
 
     if (deployments.length > 0) {
-      const hpaList = await execCapture("kubectl", hpaListArgs);
+      const hpaList = await execCapture("kubectl", hpaListArgs, {
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      });
       if (hpaList.exitCode !== 0) {
         throw new Error(
           `Could not discover retained HPAs before Helm uninstall: ` +
@@ -906,7 +915,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     console.log(`  [dry-run] helm uninstall ${releaseName} --namespace ${namespace}`);
   } else {
     console.log("  → Running helm uninstall...");
-    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", namespace]);
+    const res = await execCapture("helm", ["uninstall", releaseName, "--namespace", namespace], {
+      timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+    });
     if (res.exitCode !== 0) {
       if (isAlreadyGoneError(res.stderr)) {
         console.log("    (release not found or already uninstalled)");
@@ -930,14 +941,11 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // foreign Helm resource can legitimately share app.kubernetes.io/name and managed-by values;
   // neither is deletion authority. The version requirement excludes the stable routing tier.
   for (const hpaName of exactOwnedHpas) {
-    const exactDelete = await execCapture("kubectl", [
-      "delete",
-      "hpa",
-      hpaName,
-      "-n",
-      namespace,
-      "--ignore-not-found",
-    ]);
+    const exactDelete = await execCapture(
+      "kubectl",
+      ["delete", "hpa", hpaName, "-n", namespace, "--ignore-not-found"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
     if (exactDelete.exitCode !== 0 && !isAlreadyGoneError(exactDelete.stderr)) {
       console.warn(
         `    WARNING: could not delete retained HPA ${hpaName}: ` +
@@ -964,7 +972,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       continue;
     }
 
-    const res = await execCapture("kubectl", deleteArgs);
+    const res = await execCapture("kubectl", deleteArgs, { timeoutMs: EXEC_TIMEOUTS.kubectl });
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete ${description}: ` +
@@ -1003,7 +1011,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       continue;
     }
 
-    const listed = await execCapture("kubectl", listArgs);
+    const listed = await execCapture("kubectl", listArgs, { timeoutMs: EXEC_TIMEOUTS.kubectl });
     if (
       listed.exitCode !== 0 &&
       apiOptional &&
@@ -1033,14 +1041,11 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
 
     for (const name of names) {
-      const deleted = await execCapture("kubectl", [
-        "delete",
-        kind,
-        name,
-        "-n",
-        namespace,
-        "--ignore-not-found",
-      ]);
+      const deleted = await execCapture(
+        "kubectl",
+        ["delete", kind, name, "-n", namespace, "--ignore-not-found"],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
       if (deleted.exitCode !== 0 && !isAlreadyGoneError(deleted.stderr)) {
         console.warn(
           `    WARNING: could not delete ${kind} ${name}: ` +
@@ -1085,7 +1090,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   if (dryRun) {
     console.log(`  [dry-run] kubectl ${cmDeleteArgs.join(" ")}`);
   } else {
-    const res = await execCapture("kubectl", cmDeleteArgs);
+    const res = await execCapture("kubectl", cmDeleteArgs, { timeoutMs: EXEC_TIMEOUTS.kubectl });
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete adapter state ConfigMaps: ` +
@@ -1111,7 +1116,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   if (dryRun) {
     console.log(`  [dry-run] kubectl ${snapshotDeleteArgs.join(" ")}`);
   } else {
-    const res = await execCapture("kubectl", snapshotDeleteArgs);
+    const res = await execCapture("kubectl", snapshotDeleteArgs, {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete retained routing-manifest ConfigMaps: ` +
@@ -1134,7 +1141,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   if (dryRun) {
     console.log(`  [dry-run] kubectl ${compositionDeleteArgs.join(" ")}`);
   } else {
-    const res = await execCapture("kubectl", compositionDeleteArgs);
+    const res = await execCapture("kubectl", compositionDeleteArgs, {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete retained composition-plan ConfigMaps: ` +
@@ -1163,7 +1172,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   if (dryRun) {
     console.log(`  [dry-run] kubectl ${secretDeleteArgs.join(" ")}`);
   } else {
-    const res = await execCapture("kubectl", secretDeleteArgs);
+    const res = await execCapture("kubectl", secretDeleteArgs, {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
     if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
       console.warn(
         `    WARNING: could not delete the internal-dispatch Secrets: ` +
@@ -1214,7 +1225,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         continue;
       }
       console.log(`  → Deleting ${cleanup.desc}`);
-      const result = await execCapture(cleanup.command, cleanup.args);
+      const result = await execCapture(cleanup.command, cleanup.args, {
+        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      });
       if (result.exitCode !== 0 && !isAlreadyGoneError(result.stderr)) {
         console.warn(
           `    WARNING: deletion failed: ` +
@@ -1227,14 +1240,15 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       console.log("  → No adapter-owned external cleanup operations in the composition plan");
     }
   } else if (infra) {
-    // Delete GCS bucket
     if (infra.gcsBucket) {
       const bucketArgs = ["storage", "rm", "-r", `gs://${infra.gcsBucket}`, "--quiet"];
       if (dryRun) {
         console.log(`  [dry-run] gcloud ${bucketArgs.join(" ")}`);
       } else {
         console.log(`  → Deleting GCS bucket: ${infra.gcsBucket}`);
-        const res = await execCapture("gcloud", bucketArgs);
+        const res = await execCapture("gcloud", bucketArgs, {
+          timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        });
         if (res.exitCode !== 0) {
           if (isAlreadyGoneError(res.stderr)) {
             console.log("    (bucket not found or already deleted)");
@@ -1273,7 +1287,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
           continue;
         }
         console.log(`  → Deleting ${label} service account`);
-        const res = await execCapture("gcloud", saArgs);
+        const res = await execCapture("gcloud", saArgs, {
+          timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        });
         if (res.exitCode !== 0) {
           if (isAlreadyGoneError(res.stderr)) {
             // The normal case for `<release>-cli` on a release inited before the S6 split.
@@ -1306,7 +1322,9 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
           console.log(`  [dry-run] gcloud ${args.join(" ")}`);
         } else {
           console.log(`  → Deleting ${desc}`);
-          const res = await execCapture("gcloud", args);
+          const res = await execCapture("gcloud", args, {
+            timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+          });
           if (res.exitCode !== 0) {
             if (isAlreadyGoneError(res.stderr)) {
               console.log("    (not found or already deleted)");

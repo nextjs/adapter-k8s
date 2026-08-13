@@ -53,7 +53,10 @@ export async function runTail(options: { projectDir: string; releaseName: string
         "--quiet",
       ]);
       if (credResult.exitCode !== 0) {
-        console.error(`Failed to connect to cluster: ${credResult.stderr.trim()}`);
+        // L14: gcloud stderr is cluster-sourced — strip terminal control characters.
+        console.error(
+          `Failed to connect to cluster: ${sanitizeForTerminal(credResult.stderr.trim())}`,
+        );
         process.exit(1);
       }
     }

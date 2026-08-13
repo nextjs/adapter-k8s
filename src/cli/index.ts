@@ -135,7 +135,7 @@ Commands:
   describe   Show architecture diagram with live cluster status
   doctor     Run health checks on your deployment
   tail       Tail logs from all workloads
-  destroy    Tear down all resources
+  destroy    Tear down this release's resources (shared infrastructure is retained)
 
 Options:
   --project-id <id>        GCP project ID (init)

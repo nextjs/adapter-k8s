@@ -145,6 +145,7 @@ describe("composition-plan cleanup", () => {
     expect(vi.mocked(exec.execCapture).mock.calls[1]).toEqual([
       "kubectl",
       ["delete", "ingresses", "custom-entry", "-n", "apps", "--ignore-not-found"],
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
     ]);
 
     vi.mocked(exec.execCapture).mockReset();
@@ -360,14 +361,11 @@ describe("runDestroy — composition-plan trust boundary", () => {
     expect(vi.mocked(exec.execCapture).mock.calls.some(([command]) => command === "gcloud")).toBe(
       false,
     );
-    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledWith("kubectl", [
-      "delete",
-      "configmaps",
-      "custom-config",
-      "-n",
-      "default",
-      "--ignore-not-found",
-    ]);
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledWith(
+      "kubectl",
+      ["delete", "configmaps", "custom-config", "-n", "default", "--ignore-not-found"],
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
     const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join("\n");
     expect(warnings).toContain("External cleanup was NOT executed");
     expect(warnings).toContain(
@@ -381,15 +379,19 @@ describe("runDestroy — composition-plan trust boundary", () => {
 
     await destroyFromClusterPlans([value]);
 
-    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledWith("gcloud", [
-      "compute",
-      "addresses",
-      "delete",
-      "release-ip",
-      "--global",
-      "--project=project-123",
-      "--quiet",
-    ]);
+    expect(vi.mocked(exec.execCapture)).toHaveBeenCalledWith(
+      "gcloud",
+      [
+        "compute",
+        "addresses",
+        "delete",
+        "release-ip",
+        "--global",
+        "--project=project-123",
+        "--quiet",
+      ],
+      expect.objectContaining({ timeoutMs: expect.any(Number) }),
+    );
     expect(warnSpy.mock.calls.flat().join("\n")).not.toContain("External cleanup was NOT executed");
   });
 

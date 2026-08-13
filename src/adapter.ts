@@ -318,7 +318,7 @@ function scanSource(raw: string): ScannedSource {
   return { code, literals };
 }
 
-export function findMiddlewareSource(projectDir: string): string | undefined {
+function findMiddlewareSource(projectDir: string): string | undefined {
   for (const dir of [projectDir, path.join(projectDir, "src")]) {
     for (const name of MIDDLEWARE_FILENAMES) {
       const candidate = path.join(dir, name);
@@ -397,7 +397,7 @@ function bundleDir(): string {
 // handler it was worse — `next.config.cacheHandler` was silently dropped, so ISR/PPR-shell
 // revalidation stopped being cross-replica while build-metadata still claimed the cache was
 // enabled. Lines further down (@next/routing) show this class was already decided: throw.
-export function adapterBundlePath(name: string): string {
+function adapterBundlePath(name: string): string {
   const src = path.join(bundleDir(), name);
   if (!existsSync(src)) {
     throw new Error(
@@ -410,7 +410,7 @@ export function adapterBundlePath(name: string): string {
   return src;
 }
 
-export function readAdapterBundle(name: string): string {
+function readAdapterBundle(name: string): string {
   return readFileSync(adapterBundlePath(name), "utf-8");
 }
 
@@ -447,7 +447,7 @@ export function effectiveBuildId(buildId: string, deploymentId: string | undefin
   return `dpl-${sanitized.slice(0, 40)}-${hash}`.replace(/-+/g, "-");
 }
 
-export function assertDockerTagSafeBuildId(buildId: string): void {
+function assertDockerTagSafeBuildId(buildId: string): void {
   if (!/^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(buildId)) {
     throw new Error(
       `[adapter-k8s] buildId "${buildId}" cannot be used as a Docker image tag: a tag must ` +
@@ -648,7 +648,7 @@ export function assertNoStagingFailures(): void {
 // The staged destination must stay inside the build context. See the N50 note on
 // assetDestPath: without this assertion a `../`-prefixed traced-asset key either put the
 // file outside `context/` (silently absent from the image) or overwrote repo files.
-export function assertStagedWithin(stageDir: string, absDest: string, destRelativePath: string) {
+function assertStagedWithin(stageDir: string, absDest: string, destRelativePath: string) {
   if (absDest !== stageDir && !absDest.startsWith(stageDir + path.sep)) {
     throw new Error(
       `[adapter-k8s] Refusing to stage outside the Docker build context: ` +
@@ -770,9 +770,7 @@ const SHARP_RUNTIME_PACKAGES_BY_PLATFORM: Record<TargetPlatform, readonly [strin
 /** Backward-compatible default pair for callers/tests targeting the default amd64 platform. */
 export const SHARP_RUNTIME_PACKAGES = SHARP_RUNTIME_PACKAGES_BY_PLATFORM["linux/amd64"];
 
-export function sharpRuntimePackagesForPlatform(
-  platform: TargetPlatform,
-): readonly [string, string] {
+function sharpRuntimePackagesForPlatform(platform: TargetPlatform): readonly [string, string] {
   return SHARP_RUNTIME_PACKAGES_BY_PLATFORM[platform];
 }
 
@@ -1129,7 +1127,7 @@ function deriveReleaseName(projectDir: string): string {
 //      secret-bearing files).
 // A build cannot read the cluster (the other option the review floated), so the key file is
 // what makes the derivation stable across re-emits on the same machine/checkout.
-export async function deriveInternalSecret(
+async function deriveInternalSecret(
   projectDir: string,
   releaseName: string,
   buildId: string,
