@@ -555,8 +555,8 @@ export function assertDigestPinnedCutoverImage(image: string): void {
       `--cutover job requires a digest-pinned cutover image (name@sha256:<64 hex>), ` +
         `got ${JSON.stringify(image)}. The chart default ` +
         `ghcr.io/next-community/adapter-k8s-cutover:latest is mutable and is not published. ` +
-        `Build an image that contains dist/cutover-job.cjs plus kubectl, push it by digest, ` +
-        `and pass --cutover-image (or ADAPTER_K8S_CUTOVER_IMAGE).`,
+        `Build one from this repo's docker/cutover-job.Dockerfile (npm run build first), ` +
+        `push it, and pass the pushed digest via --cutover-image (or ADAPTER_K8S_CUTOVER_IMAGE).`,
     );
   }
 }
@@ -1416,10 +1416,11 @@ applying this bundle stands the new build up WITHOUT repointing traffic. The bun
 per-build cutover Job (\`templates/cutover-job.yaml\`) then promotes IN-CLUSTER after
 the same gate battery \`adapter-k8s deploy\` runs, patches the selectors, and commits
 the state ConfigMap; a failed gate reads as a failed Job and records a poison pill
-(docs/gitops.md). Prerequisites: \`cutover.image\` must name an image your cluster can
-pull — build it from this repo's docker/cutover-job.Dockerfile and pin it BY DIGEST —
-and a release with imperative deploy history needs \`adapter-k8s migrate\` once before
-a pruning reconciler is enabled. Selector ignore rules are STILL required for an
+(docs/gitops.md). \`cutover.image\` in values/values.yaml is pinned BY DIGEST to the
+image this emit was given (\`--cutover-image\`; built from the adapter repo's
+docker/cutover-job.Dockerfile) — your cluster must be able to pull it. A release with
+imperative deploy history needs \`adapter-k8s migrate\` once before a pruning
+reconciler is enabled. Selector ignore rules are STILL required for an
 auto-syncing reconciler (see docs/gitops.md) — drift correction of the selector after
 the Job's promotion is an outage.`
       : `## Cutover model (mode: none)

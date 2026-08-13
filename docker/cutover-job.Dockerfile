@@ -6,9 +6,10 @@
 #   docker build -f docker/cutover-job.Dockerfile -t <registry>/adapter-k8s-cutover:<version> .
 #   docker push <registry>/adapter-k8s-cutover:<version>
 #
-# Then set the pushed image — BY DIGEST — as `cutover.image` in the bundle values. The
-# chart default names the release train's image tag; a digest pin is what makes the
-# promotion reproducible (the same discipline emit applies to every other image).
+# Then pass the pushed image — BY DIGEST — to `emit --cutover job` via `--cutover-image`
+# (or ADAPTER_K8S_CUTOVER_IMAGE); emit refuses un-digested refs and writes the ref into
+# the bundle values. A digest pin is what makes the promotion reproducible (the same
+# discipline emit applies to every other image).
 #
 # glibc base, NOT alpine: the dl.k8s.io kubectl release binaries are glibc-linked and
 # fail to exec on musl.
