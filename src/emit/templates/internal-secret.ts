@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   assertSafeBuildId,
   assertSafeReleaseName,
+  assertSafeSecretName,
   escapeHelmActions,
   sanitizeK8sName,
 } from "./utils.js";
@@ -168,20 +169,6 @@ ${indent}      name: ${secretName ?? internalSecretName(releaseName, buildId)}
 ${indent}      key: ${INTERNAL_SECRET_KEY}`;
 }
 
-/**
- * The override above is CLUSTER-SOURCED (deploy reads it off the live pod template) and lands
- * in a bare YAML scalar, so it is validated here, at the point of consumption (AGENTS.md).
- * DNS-1123 subdomain minus the dots — every name this adapter emits goes through
- * sanitizeK8sName, so a dot means the value did not come from here.
- */
-const SECRET_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$/;
-
-export function assertSafeSecretName(name: string): void {
-  if (!SECRET_NAME_RE.test(name)) {
-    throw new Error(
-      `Invalid Secret name ${JSON.stringify(name)}: must match ${SECRET_NAME_RE} ` +
-        `(lowercase alphanumerics and "-", starting and ending alphanumeric, max 253 chars). ` +
-        `It is interpolated into a secretKeyRef as a bare YAML scalar.`,
-    );
-  }
-}
+// assertSafeSecretName moved to utils.ts when imagePullSecrets grew a second consumer of
+// the same charset — one validator, one error message, for every Secret-name sink.
+export { assertSafeSecretName } from "./utils.js";

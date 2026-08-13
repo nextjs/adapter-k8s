@@ -561,6 +561,54 @@ export function assertSafeRegion(region: string): void {
   }
 }
 
+/**
+ * Kubernetes Secret NAME charset — DNS-1123 subdomain minus the dots (every name this
+ * adapter emits goes through sanitizeK8sName, so a dot means the value did not come from
+ * here). Used for the internal-dispatch secretKeyRef override (cluster-sourced) and for
+ * `imagePullSecrets` names from `next.config` — both land in bare/quoted YAML scalars in
+ * the rendered pod spec, so they are validated at the point of consumption (AGENTS.md).
+ */
+const SECRET_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$/;
+
+export function assertSafeSecretName(name: string): void {
+  if (typeof name !== "string" || !SECRET_NAME_RE.test(name)) {
+    throw new Error(
+      `Invalid Secret name ${JSON.stringify(name)}: must match ${SECRET_NAME_RE} ` +
+        `(lowercase alphanumerics and "-", starting and ending alphanumeric, max 253 chars). ` +
+        `It is interpolated into the rendered pod spec as a YAML scalar.`,
+    );
+  }
+}
+
+/**
+ * `imagePullSecrets` block for a pod spec, or "" when nothing is configured.
+ *
+ * BAKED, not values-driven — the same pattern as user env/envFrom (the other operator
+ * config that lands in the pod spec): `imagePullSecrets` comes from committed
+ * `adapter.config.mjs`, is knowable at render time (unlike image digests, which only
+ * exist after `docker push`), and baking it adds no unescaped helm-values sink. It also
+ * keeps the fully-literal direct render (retained builds) free of `{{ }}` actions.
+ *
+ * Names are QUOTED (N61: `on`, `no`, `123` are valid Secret names but unquoted YAML
+ * booleans/ints, which the apiserver refuses to unmarshal into a string field) and
+ * validated here, at the point of consumption (AGENTS.md), even though validateConfig
+ * checks them upstream.
+ *
+ * `indent` is the pod-spec key indent (the `- name:` entries sit two spaces deeper).
+ * The returned block ends with "\n" so callers splice it flush between spec lines.
+ */
+export function renderImagePullSecrets(
+  pullSecrets: readonly string[] | undefined,
+  indent: string,
+): string {
+  if (pullSecrets === undefined || pullSecrets.length === 0) return "";
+  const entries = pullSecrets.map((name) => {
+    assertSafeSecretName(name);
+    return `${indent}  - name: "${name}"`;
+  });
+  return `${indent}imagePullSecrets:\n${entries.join("\n")}\n`;
+}
+
 // N60 (SECURITY). Kubernetes resource quantities from `next.config`
 // (`pools.*.resources.*`, `routingService.resources.*`) reach the rendered pod spec
 // through TWO sinks, and NEITHER escaped anything before this validator existed:

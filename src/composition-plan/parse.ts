@@ -429,9 +429,17 @@ function parseConditionLocation(
       exactKeys(parsed, ["kind"], path);
       return { kind };
     case "parents": {
-      exactKeys(parsed, ["kind", "controllerName"], path);
+      exactKeys(parsed, ["kind", "controllerName", "minimumCount"], path);
       const controllerName = optionalString(parsed, "controllerName", path);
-      return { kind, ...(controllerName ? { controllerName } : {}) };
+      const minimumCount =
+        parsed.minimumCount === undefined
+          ? undefined
+          : integer(parsed.minimumCount, `${path}.minimumCount`, 1, 64);
+      return {
+        kind,
+        ...(controllerName ? { controllerName } : {}),
+        ...(minimumCount !== undefined ? { minimumCount } : {}),
+      };
     }
     case "ancestors":
       exactKeys(parsed, ["kind", "controllerName"], path);
@@ -1123,9 +1131,10 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
         if (entry.kind === "kubernetes-condition") {
           return entry.check.object.namespace ? [entry.check.object.namespace] : [];
         }
-        if (entry.kind === "kubernetes-gateway-address") {
-          return entry.gateway.namespace ? [entry.gateway.namespace] : [];
-        }
+        // kubernetes-gateway-address is deliberately EXEMPT from the release-namespace
+        // rule: it is a read-only status lookup, and with httpRouteExposure the parent
+        // Gateway legitimately lives in another team's namespace (e.g. "network").
+        // Every mutating/owned reference above remains pinned to the release namespace.
         return [];
       }),
     ],

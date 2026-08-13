@@ -142,3 +142,16 @@ export function outputDirName(): string {
   if (variant && /^[a-z0-9][-a-z0-9_]*$/i.test(variant)) return `output.${variant}`;
   return "output";
 }
+
+/**
+ * The GitOps bundle directory (`adapter-k8s emit` output), scoped to the variant for the
+ * same reason as outputDirName(): a bundle pins one target's registry, digests and
+ * namespace, and `emit` reads the PRIOR bundle's emit-metadata.json from this directory to
+ * learn the previous build — sharing one directory across variants would pin target B's
+ * Service selectors to a build that only ever existed on target A.
+ */
+export function gitopsDirName(): string {
+  const variant = process.env.ADAPTER_K8S_CONFIG?.trim();
+  if (variant && /^[a-z0-9][-a-z0-9_]*$/i.test(variant)) return `gitops.${variant}`;
+  return "gitops";
+}

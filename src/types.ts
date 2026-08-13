@@ -139,6 +139,21 @@ export interface K8sAdapterConfig {
     };
   };
   containerStrategy?: "traced-assets" | "shared-image";
+  /**
+   * Names of `kubernetes.io/dockerconfigjson` Secrets (e.g. `docker-regcred`) in the app
+   * namespace, rendered as `imagePullSecrets` on EVERY pod the chart creates — pool
+   * Deployments, the routing-service Deployment, and the traffic-extension registration Job.
+   * Required when the registry is private and the nodes carry no machine-level credentials
+   * (a private ghcr.io image on stock Talos/k3s nodes is ImagePullBackOff on every pod
+   * without this). The adapter never creates the Secret — deliver it via your secrets flow
+   * (kubectl create secret docker-registry, ExternalSecrets, SealedSecrets) into the target
+   * namespace before the first deploy/sync.
+   *
+   * Top-level rather than under an `image` block because no image config block exists in
+   * this surface (image settings are flat keys, like `containerStrategy`); the name matches
+   * the Kubernetes pod-spec field verbatim so the rendered YAML is greppable from config.
+   */
+  imagePullSecrets?: string[];
   imageOptimizer?: { enabled: boolean; mode: "sidecar" };
   skewProtection?: { enabled: boolean; duration: string };
   routeExtension?: { mode: "auto" | "wasm" | "extproc" };
@@ -153,6 +168,26 @@ export interface K8sAdapterConfig {
      * middleware (never bypass auth), fail-open otherwise. "open"/"closed" force it.
      */
     failureMode?: "auto" | "open" | "closed";
+  };
+  /**
+   * Static NetworkPolicy source ranges, for pipelines with no cluster to ask.
+   *
+   * Imperative `deploy` DISCOVERS these at deploy time (gcloud on GKE, the Kubernetes API
+   * elsewhere) and never needs this block. `adapter-k8s emit` cannot: it renders with no
+   * cluster contact at all, so the CIDRs must be config-supplied (GitOps PR1 — see
+   * plans/gitops-deployment-strategies.md §4.2, deploy inventory A4 "replaced"). Both keys
+   * also flow into build-metadata.json, and deploy prefers them over live discovery the
+   * same way `provider.generic.nodeCidrs` already works — which this block supersedes
+   * (that key still maps in when this one is absent).
+   *
+   * The same staleness trade as provider.generic.nodeCidrs applies: a static range does
+   * not follow node autoscale. Give the enclosing subnet range(s), not per-node addresses.
+   */
+  networkPolicy?: {
+    /** Cluster pod range(s) for the broad (non-strict) posture's pod-isolation denylist. */
+    podCidrs?: string[];
+    /** Node/subnet range(s) the strict posture admits for kubelet probes (S22). */
+    nodeCidrs?: string[];
   };
   /** Build-time Kubernetes composition. Legacy `provider` blocks are translated into this. */
   target?: KubernetesTargetDefinition;

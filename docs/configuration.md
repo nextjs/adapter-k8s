@@ -80,6 +80,17 @@ cache: {
 
 Managed provisioning is currently supplied only by the GKE preset, and only through the legacy `provider.gke` config shape (which is what `init` scaffolds). An explicit `target: defineTarget(...)` composition—including one built on `gkeCluster()`—must set `cache.url` when the cache is enabled; the build fails otherwise. Every other target uses `cache.url` against an operator-managed Valkey/Redis endpoint. Disabling the cache makes ISR/PPR revalidation per-replica.
 
+### Dragonfly (verified)
+
+[Dragonfly](https://www.dragonflydb.io/) works as the `valkey`/`redis` provider endpoint: **fully compatible, verified live on v1.40.1** across the handler's entire wire surface — GET/SET EX/SET NX EX (the revalidation lock), hashes, MULTI/EXEC transactional entry writes, binary payloads up to the handlers' 16 MiB cap, the tag-manifest Lua script (including its server-`TIME` clock rebasing and `cjson`), 1-year TTLs, and AUTH via `requirepass`. Cross-pod ISR, `revalidatePath`, and `revalidateTag` all behaved identically to Valkey in a live multi-pod app.
+
+Operational caveats:
+
+- **Memory sizing is thread-coupled.** Dragonfly refuses to start unless `--maxmemory >= 256MiB × proactor_threads` (measured: 2 threads with `--maxmemory=256mb` crashloops with "There are 2 threads, so 512.00MiB are required. Exiting"). Pin both flags in the pod spec — e.g. `--proactor_threads=2 --maxmemory=512mb` with a 768Mi container limit.
+- **A restart is a cold cache.** The stock container has no persistence volume, so a Dragonfly pod restart returns an empty keyspace. The adapter degrades gracefully — cache reads degrade to a miss on store failure (the pods log `read failed; treating it as a miss`, then open a circuit breaker and fail fast; no pod restarts), pages re-render and re-populate the store — but on large sites that warm-up is a thundering re-render. Use the Dragonfly operator's snapshotting if that matters.
+- **Do not enable `--cluster_mode`.** The adapter's client is single-endpoint by design (no MOVED/ASK redirection). Dragonfly's emulated cluster mode is off by default, which is exactly what the client needs.
+- **Password via Secret, not config.** `redis://:pass@…` in `cache.url` works, but `adapter.config.mjs` is typically committed — keep the URL secret-free and deliver the password through the generated Valkey `Secret` / `VALKEY_AUTH` env path instead (see the note on `cache.password` above).
+
 ## Container strategy
 
 ```js
@@ -94,6 +105,16 @@ containerStrategy: 'traced-assets',  // default: per-pool minimal images
 Sharp is the only native dependency the adapter retargets itself; staged foreign ELF, Mach-O, PE, Prisma engines, and `.node` addons fail the build. Prisma `linux-musl` engines are also rejected because the emitted runtime is Debian/glibc, even when their CPU architecture matches. Apps with other native dependencies must install and build them on a matching Linux runner/container. This does not publish a multi-architecture image index.
 
 Runtime-specific requirements (nerdctl's buildkit socket, podman's digest rewriting) are in [docs/ci-cd.md](./ci-cd.md#container-runtimes).
+
+## Registry pull auth
+
+**Node-level credentials.** On clusters where the nodes themselves can authenticate to the registry—GKE nodes pulling from Artifact Registry in the same project, EKS with an ECR instance role, or any cluster whose kubelets carry a machine-level `config.json`—no adapter config is needed: the kubelet authenticates every pull and the chart's image references just work. This is the default assumption, and it is why the emitted pod specs carried no `imagePullSecrets` at all before this key existed.
+
+**`imagePullSecrets`.** Everywhere else—a private ghcr.io image on stock Talos or k3s nodes, any registry the kubelet has no ambient credentials for—every pod is `ImagePullBackOff` without a pull secret. Set `imagePullSecrets: ['docker-regcred']` (top-level; names must be K8s-name-safe) and the adapter renders `imagePullSecrets` into **every** pod-creating template: each pool Deployment, the routing-service Deployment, and the GKE traffic-extension registration Job. The named `kubernetes.io/dockerconfigjson` Secret(s) must already exist in the app namespace (`kubectl create secret docker-registry docker-regcred --docker-server=… --docker-username=… --docker-password=…`, or your ExternalSecrets/SealedSecrets flow)—the adapter never creates or carries them, and `adapter-k8s emit` lists them in the bundle README as an operator prerequisite.
+
+```js
+imagePullSecrets: ['docker-regcred'],
+```
 
 ## Routing service tuning
 
@@ -136,6 +157,19 @@ provider: {
 ```
 
 The adapter attaches a Cloud CDN filter to the HTTPRoute with a Next.js-aware cache key (RSC/prefetch `Vary` headers partition App Router HTML and RSC payloads correctly). Mutable cacheable responses carry a per-build `Cache-Tag`, and `deploy`/`rollback` purge the outgoing build's tag on cutover—so a new build never serves the previous build's stale content from the edge. Content-hashed `/_next/static/*` assets are shared across builds and never purged.
+
+## Static NetworkPolicy ranges (`adapter-k8s emit`)
+
+```js
+networkPolicy: {
+  nodeCidrs: ['10.0.0.0/16'],  // node/subnet range(s) the strict posture admits for kubelet probes
+  podCidrs: ['10.8.0.0/14'],   // cluster pod range(s) for the broad posture (optional)
+},
+```
+
+`deploy` discovers these ranges from the cluster at deploy time and never needs this block. `adapter-k8s emit` cannot—it renders the GitOps bundle with **no cluster contact at all**—so the ranges must come from config. With `strict: true` (the default posture) and no `nodeCidrs` configured, `emit` refuses to render; `--allow-no-network-policy` is the explicit opt-out and emits the bundle without network isolation. The legacy `provider.generic.nodeCidrs` key still maps in when `networkPolicy.nodeCidrs` is absent.
+
+Static ranges do not follow node autoscale: give the enclosing subnet range, not per-node addresses, and prefer letting `deploy` discover them when you are not using `emit`.
 
 ## Config variants
 

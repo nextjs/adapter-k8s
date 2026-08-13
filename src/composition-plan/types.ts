@@ -119,7 +119,11 @@ export type RoutingReadiness =
       object: KubernetesObjectRef;
       conditionsAt:
         | { kind: "object" }
-        | { kind: "parents"; controllerName?: string }
+        // minimumCount guards the shared-gateway case: a parentRef naming a NONEXISTENT
+        // Gateway produces no status.parents entry at all, so with >=2 parentRefs the
+        // remaining entries would satisfy the per-entry check and readiness would pass
+        // wrongly. Requiring at least parentRefs.length reported parents closes that hole.
+        | { kind: "parents"; controllerName?: string; minimumCount?: number }
         | { kind: "ancestors"; controllerName: string };
       condition: {
         type: string;

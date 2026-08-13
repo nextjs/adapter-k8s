@@ -4,20 +4,21 @@ Everything here exists in `K8sAdapterConfig` (shipped as `dist/types.d.ts` in th
 
 ## Top-level `K8sAdapterConfig`
 
-| Key                 | Type                                                        | Notes                                                                                                                                                                                      |
-| ------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `pools`             | `Record<string, PoolConfig>`                                | Required; at least one pool, max 15                                                                                                                                                        |
-| `defaultPool`       | `string`                                                    | Pool hosting the stable portable origin; defaults to first declared pool                                                                                                                   |
-| `env`               | `Record<string, EnvValue>`                                  | Runtime env for every app container; uppercase names only; `NEXT_PUBLIC_*` and reserved names (`NODE_ENV`, `NEXT_BUILD_ID`, `POOL_NAME`, `RELEASE_NAME`, `PORT`, `VALKEY_*`, ...) rejected |
-| `envFrom`           | `EnvFromSource[]`                                           | Bulk `envFrom`; individual `env` entries win                                                                                                                                               |
-| `cache`             | see below                                                   | Shared Valkey/Redis for ISR/PPR/fetch cache                                                                                                                                                |
-| `containerStrategy` | `'traced-assets' \| 'shared-image'`                         | Default `traced-assets` (per-pool minimal images)                                                                                                                                          |
-| `imageOptimizer`    | `{ enabled: boolean; mode: 'sidecar' }`                     | Validates but `enabled: true` throws at build time — not yet implemented                                                                                                                   |
-| `skewProtection`    | `{ enabled: boolean; duration: string }`                    | Validates but throws at build time — not yet implemented                                                                                                                                   |
-| `routeExtension`    | `{ mode: 'auto' \| 'wasm' \| 'extproc' }`                   | `'wasm'` throws at build time — not implemented; use `'auto'` or `'extproc'`                                                                                                               |
-| `routingService`    | `{ resources?, scaling?, requestTimeoutMs?, failureMode? }` | `failureMode: 'auto'` (default) fails closed when middleware exists                                                                                                                        |
-| `target`            | `defineTarget(...)`                                         | Preferred composition API                                                                                                                                                                  |
-| `provider`          | `{ gke } \| { generic }`                                    | Deprecated legacy blocks; exactly one; never combined with `target`                                                                                                                        |
+| Key                 | Type                                                        | Notes                                                                                                                                                                                                           |
+| ------------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pools`             | `Record<string, PoolConfig>`                                | Required; at least one pool, max 15                                                                                                                                                                             |
+| `defaultPool`       | `string`                                                    | Pool hosting the stable portable origin; defaults to first declared pool                                                                                                                                        |
+| `env`               | `Record<string, EnvValue>`                                  | Runtime env for every app container; uppercase names only; `NEXT_PUBLIC_*` and reserved names (`NODE_ENV`, `NEXT_BUILD_ID`, `POOL_NAME`, `RELEASE_NAME`, `PORT`, `VALKEY_*`, ...) rejected                      |
+| `envFrom`           | `EnvFromSource[]`                                           | Bulk `envFrom`; individual `env` entries win                                                                                                                                                                    |
+| `cache`             | see below                                                   | Shared Valkey/Redis for ISR/PPR/fetch cache                                                                                                                                                                     |
+| `containerStrategy` | `'traced-assets' \| 'shared-image'`                         | Default `traced-assets` (per-pool minimal images)                                                                                                                                                               |
+| `imagePullSecrets`  | `string[]`                                                  | `dockerconfigjson` Secret names rendered as `imagePullSecrets` on every pod; required for private registries when nodes have no machine-level pull credentials; Secrets must already exist in the app namespace |
+| `imageOptimizer`    | `{ enabled: boolean; mode: 'sidecar' }`                     | Validates but `enabled: true` throws at build time — not yet implemented                                                                                                                                        |
+| `skewProtection`    | `{ enabled: boolean; duration: string }`                    | Validates but throws at build time — not yet implemented                                                                                                                                                        |
+| `routeExtension`    | `{ mode: 'auto' \| 'wasm' \| 'extproc' }`                   | `'wasm'` throws at build time — not implemented; use `'auto'` or `'extproc'`                                                                                                                                    |
+| `routingService`    | `{ resources?, scaling?, requestTimeoutMs?, failureMode? }` | `failureMode: 'auto'` (default) fails closed when middleware exists                                                                                                                                             |
+| `target`            | `defineTarget(...)`                                         | Preferred composition API                                                                                                                                                                                       |
+| `provider`          | `{ gke } \| { generic }`                                    | Deprecated legacy blocks; exactly one; never combined with `target`                                                                                                                                             |
 
 ### `PoolConfig`
 
@@ -67,12 +68,12 @@ cache: {
 
 ## Target components (`dist/target/components.d.ts`)
 
-| Layer     | Built-ins                                                                             | Custom hook               |
-| --------- | ------------------------------------------------------------------------------------- | ------------------------- |
-| cluster   | `kubernetesCluster(options?)`, `gkeCluster(options?)`                                 | `defineClusterComponent`  |
-| exposure  | `gatewayApiExposure(opts)`, `ingressExposure(opts)`, `manualExposure(opts)`           | `defineExposureComponent` |
-| routing   | `portableRouting()` (default), `envoyNativeRouting(opts?)`, `gkeNativeRouting(opts?)` | `defineRoutingComponent`  |
-| resources | none required                                                                         | `defineResourceComponent` |
+| Layer     | Built-ins                                                                                              | Custom hook               |
+| --------- | ------------------------------------------------------------------------------------------------------ | ------------------------- |
+| cluster   | `kubernetesCluster(options?)`, `gkeCluster(options?)`                                                  | `defineClusterComponent`  |
+| exposure  | `gatewayApiExposure(opts)`, `httpRouteExposure(opts)`, `ingressExposure(opts)`, `manualExposure(opts)` | `defineExposureComponent` |
+| routing   | `portableRouting()` (default), `envoyNativeRouting(opts?)`, `gkeNativeRouting(opts?)`                  | `defineRoutingComponent`  |
+| resources | none required                                                                                          | `defineResourceComponent` |
 
 ### `kubernetesCluster(options?)`
 
@@ -115,6 +116,25 @@ gatewayApiExposure({
 ```
 
 Cannot mix TLS and plaintext hosts. Emits Gateway + HTTPRoute (+ HTTP→HTTPS redirect when TLS) and waits for `Programmed`/`Accepted`.
+
+Either dedicated exposure can issue its own certificate instead of referencing one: top-level `certManager: { issuerRef: { name, kind: 'ClusterIssuer' | 'Issuer', group? } }` emits a `cert-manager.io/v1 Certificate` (secretName = `tlsSecretName` or a derived `<release>-tls`), declares the CRD requirement, and gates readiness on its `Ready` condition. Mutually exclusive with `controllerManagedTls`.
+
+### `httpRouteExposure(options)`
+
+```js
+httpRouteExposure({
+  className: "envoy", // required; the parent's GatewayClass
+  parentRefs: [{ name: "envoy-external", namespace: "network" }], // required, >= 1; sectionName optional
+  hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+  escapedSlashes: "external", // only accepted value; attestation that the parent owns the policy
+  annotations: {},
+  ingressSources: {
+    podSelectors: [{ namespace: "network", labels: { "app.kubernetes.io/name": "envoy" } }],
+  },
+});
+```
+
+Attaches to a Gateway someone else owns: emits **HTTPRoutes only** — no Gateway, no Certificate, no ClientTrafficPolicy — and gates readiness on `Accepted` + `ResolvedRefs` per named parent. No `tlsSecretName` / `certManager`: TLS terminates on the parent. With `envoyNativeRouting()` the `EnvoyExtensionPolicy` targets the emitted HTTPRoute rather than the shared Gateway. Set `ingressSources` to the parent's proxy pods — the NetworkPolicy allowlist cannot infer a gateway in another namespace.
 
 ### `ingressExposure(options)`
 

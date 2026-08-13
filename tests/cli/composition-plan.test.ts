@@ -529,6 +529,56 @@ describe("composition-plan readiness and descriptions", () => {
     expect(checks.at(-1)?.message).toBe("2/2 ready service endpoints");
   });
 
+  it("parses and enforces a parents minimumCount (missing parent Gateway reports nothing)", async () => {
+    const routeReadiness = (minimumCount: number) =>
+      ({
+        kind: "kubernetes-condition",
+        object: {
+          apiVersion: "gateway.networking.k8s.io/v1",
+          resource: "httproutes",
+          name: "test-app-routes",
+          namespace: NAMESPACE,
+        },
+        conditionsAt: { kind: "parents", minimumCount },
+        condition: {
+          type: "Accepted",
+          status: "True",
+          observedGeneration: "must-equal-metadata-generation",
+        },
+        timeoutSeconds: 30,
+      }) as const;
+    // Parse round-trips minimumCount and rejects invalid values.
+    const parsed = plan({ readiness: [routeReadiness(2)] });
+    expect(parsed.operations.resources.readiness[0]).toMatchObject({
+      conditionsAt: { kind: "parents", minimumCount: 2 },
+    });
+    expect(() => plan({ readiness: [routeReadiness(0)] })).toThrow(
+      /minimumCount.*expected an integer/i,
+    );
+
+    // One of two named parents exists: its Accepted=True entry alone must NOT pass.
+    const oneParentReported = JSON.stringify({
+      metadata: { generation: 3 },
+      status: {
+        parents: [
+          {
+            controllerName: "gateway.envoyproxy.io/gatewayclass-controller",
+            conditions: [{ type: "Accepted", status: "True", observedGeneration: 3 }],
+          },
+        ],
+      },
+    });
+    vi.mocked(execCapture).mockResolvedValue(ok(oneParentReported));
+    await expect(evaluateCompositionPlanReadiness(parsed)).resolves.toMatchObject([
+      { status: "fail", message: expect.stringContaining("1/2 parents have reported status") },
+    ]);
+
+    // The same status satisfies minimumCount: 1.
+    await expect(
+      evaluateCompositionPlanReadiness(plan({ readiness: [routeReadiness(1)] })),
+    ).resolves.toMatchObject([{ status: "pass" }]);
+  });
+
   it("does not accept a stale observedGeneration", async () => {
     const value = plan({
       readiness: [

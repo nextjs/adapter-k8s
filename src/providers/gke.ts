@@ -71,6 +71,7 @@ export const gkeProvider: ProviderAdapter = {
     infrastructure,
     extensionChainJson,
     routeExtDocumentDigest,
+    config,
   }: ProviderExtProcContext) {
     if (!extensionChainJson) return {};
     // N50: without projectId/region the chain JSON renders
@@ -106,6 +107,10 @@ export const gkeProvider: ProviderAdapter = {
       buildId,
       // S9: pin the Job to the exact document the ConfigMap above rendered.
       documentDigest: routeExtDocumentDigest(),
+      // Same imagePullSecrets as every other pod the chart creates.
+      ...(config.imagePullSecrets && config.imagePullSecrets.length > 0
+        ? { pullSecrets: config.imagePullSecrets }
+        : {}),
     });
     files["templates/deploy-service-account.yaml"] = renderDeployServiceAccount({
       releaseName,

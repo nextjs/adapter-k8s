@@ -53,6 +53,23 @@ describe("renderRouteExtUpdateJob", () => {
     expect(yaml).toContain('kubernetes.io/arch: "{{ .Values.global.targetArchitecture }}"');
   });
 
+  it("renders imagePullSecrets on the Job pod spec when configured; nothing when not (gap #2)", () => {
+    const args = {
+      releaseName: "my-app",
+      projectId: "my-project",
+      region: "us-central1",
+      buildId: "abc123",
+    };
+    const yaml = renderRouteExtUpdateJob({ ...args, pullSecrets: ["docker-regcred"] });
+    expect(yaml).toMatch(
+      /serviceAccountName: my-app-deploy-sa\n\s+imagePullSecrets:\n\s+- name: "docker-regcred"\n/,
+    );
+    expect(renderRouteExtUpdateJob(args)).not.toContain("imagePullSecrets");
+    expect(() => renderRouteExtUpdateJob({ ...args, pullSecrets: ["Bad Name"] })).toThrow(
+      /Invalid Secret name/,
+    );
+  });
+
   it("renders the exact job name from routeExtJobName (deploy cleanup matches this)", () => {
     const buildId = "jpY1GCvqshOHB9PiQlgyf";
     const name = routeExtJobName("my-app", buildId);

@@ -1,0 +1,1280 @@
+// src/cli/emit.ts
+//
+// `adapter-k8s emit` (alias: `deploy --render-only`) — GitOps PR1, Mode 1 of
+// plans/gitops-deployment-strategies.md §4.2, shipping `cutover.mode: none` ONLY.
+//
+// Runs the PIPELINE-SAFE subset of deploy — A2 fingerprints, B2 collision guards, A6/A7
+// image build/push (opt-out --skip-push), A8 digest resolution — and writes a hydrated,
+// committable bundle to `.k8s-adapter/gitops/`. NO CLUSTER CONTACT WHATSOEVER: no kubectl,
+// no get-credentials, no helm upgrade. The only subprocesses are the container CLI + the
+// registry probes (CI is exactly where those belong) and an optional LOCAL `helm template`
+// for `manifests/all.yaml`.
+//
+// Under `cutover.mode: none` the bundle's values pin `activeBuildId` to the PREVIOUS build
+// — the deploy.ts buildHelmUpgradeArgs trick (`activeBuildId=${sanitize(previous ?? new)}`),
+// performed at VALUES-WRITE time instead of `--set` time, so applying the bundle never
+// repoints traffic. The operator cuts over per docs/ci-cd.md (Mode 0 with rendered inputs).
+import path from "node:path";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { gitopsDirName, infrastructurePath, outputDirName } from "./infrastructure-validation.js";
+import { execCapture, execOrThrow, EXEC_TIMEOUTS, type ExecCaptureResult } from "./exec.js";
+import { resolveContainerCli } from "./container-runtime.js";
+import { sanitizeForTerminal } from "./terminal.js";
+import { assertCompositionPlanInvocation, loadLocalCompositionPlan } from "./composition-plan.js";
+import { cdnTagForBuildId } from "../cdn-tags.js";
+import { assertSafeCidrList } from "../config.js";
+import { SECRET_CHART_FILES } from "../emit/helm.js";
+import { renderExternalSecrets } from "../emit/templates/external-secret.js";
+import {
+  assertSafeBuildId,
+  assertSafeImageRegistry,
+  assertSafeNamespace,
+  assertSafeSecretName,
+  resolveK8sNamespace,
+  sanitizeK8sName,
+} from "../emit/templates/utils.js";
+import {
+  assertSafePoolName,
+  buildDockerCommands,
+  refreshFetchCacheStaging,
+} from "../pipeline/images.js";
+import { resolveDeployImageDigests } from "../pipeline/digests.js";
+import {
+  assertBuildIdChangedSinceServing,
+  assertDeployablePoolTopology,
+  assertNoCrossBuildNameCollision,
+  assertNoSelfNameCollision,
+  assertTargetFingerprint,
+  resolveBuiltTargetPlatform,
+} from "../pipeline/fingerprints.js";
+import { parsePoolImageLayout } from "../pool-image-layout.js";
+
+/** Bump when the bundle layout changes shape; consumers refuse versions they don't know. */
+export const EMIT_VERSION = 1;
+
+export type EmitSecretsMode = "inline" | "external" | "sops";
+
+export interface EmitOptions {
+  projectDir: string;
+  releaseName: string;
+  skipBuild?: boolean;
+  skipPush?: boolean;
+  /** S23: same fail-closed image-integrity posture (and opt-out) as deploy. */
+  allowMutableTags?: boolean;
+  /**
+   * Same fail-closed NetworkPolicy posture as deploy: without it, `strict: true` (the
+   * values default) with no configured nodeCidrs REFUSES to render. With it, the bundle
+   * renders `strict: false` and (with no podCidrs either) NO NetworkPolicies at all.
+   */
+  allowNoNetworkPolicy?: boolean;
+  /**
+   * The build the bundle's stable Service selectors stay pinned to (`cutover.mode: none`).
+   * Explicit flag wins over the prior bundle's emit-metadata.json. Validated with
+   * assertSafeBuildId at the point of consumption.
+   */
+  previousBuild?: string | undefined;
+  /**
+   * Assert a GENUINE first deploy: selectors render at the NEW build. Never inferred —
+   * see resolvePreviousBuildId below (N20's new front door).
+   */
+  firstDeploy?: boolean;
+  /**
+   * --previous-bundle <path> (split app/cluster repos — real-cluster gap #7): path to the
+   * PRIOR bundle's directory, or directly to its emit-metadata.json, in another repo's
+   * checkout (the cluster repo holding committed bundles). AUTHORITATIVE when given: the
+   * same-repo lookup at .k8s-adapter/gitops/ is skipped entirely, and a missing or
+   * unreadable path is a hard error — never a fallback. Contradicts --first-deploy and
+   * --previous-build. See readPreviousBundleMetadata.
+   */
+  previousBundle?: string;
+  /** Default: external — the bundle chart carries no secret material (§3 item 3). */
+  secrets?: EmitSecretsMode;
+  /**
+   * --sops-config <path> (sops mode only): explicit sops config file, passed to every
+   * sops invocation as `--config`. Escape hatch for repos whose .sops.yaml does not live
+   * on the walk-up path from the bundle directory. Without it, emit walks UP from the
+   * bundle directory looking for `.sops.yaml` and runs sops with cwd at that directory,
+   * so the repo's own creation_rules (path_regex against the bundle-relative path)
+   * govern recipients — emit NEVER passes recipients on argv.
+   */
+  sopsConfig?: string;
+}
+
+/** The per-bundle facts file — the emit-side analogue of what state.json records per build. */
+export interface EmitMetadata {
+  emitVersion: number;
+  buildId: string;
+  previousBuildId: string | null;
+  /**
+   * The default pool the bundle's `activeDefaultPool` was pinned to (null on first
+   * deploy). Recorded so a RE-EMIT of the same build reproduces the same pin: the
+   * previous build's default pool exists nowhere else once the prior bundle has been
+   * replaced wholesale — `defaultPool` below describes THIS build, and without this
+   * field a re-emit after a pool rename silently flipped `activeDefaultPool` to the new
+   * build's pool, pairing it with the still-previous `activeBuildId` in the origin
+   * Service selector (a pair that matches nothing — zero endpoints at sync time).
+   */
+  previousDefaultPool?: string | null;
+  releaseName: string;
+  namespace: string;
+  registry: string;
+  digests: Record<string, string>;
+  cdnTag: string;
+  poolTopology: string[];
+  defaultPool: string;
+  targetPlatforms: Record<string, string>;
+  secretsMode: EmitSecretsMode;
+  /**
+   * --secrets sops: the encrypted files written under secrets/ (deterministic names,
+   * derived from the chart's secret template filenames). Recorded so the README and a
+   * reviewer of the bundle PR can see exactly which files carry encrypted material —
+   * and so the determinism caveat (secrets/ is excluded from byte-determinism, see
+   * emitBundleSopsSecrets) names its own scope precisely.
+   */
+  sopsFiles?: string[];
+  /**
+   * config `imagePullSecrets` baked into every rendered pod spec (from build metadata).
+   * Recorded so the bundle README can state the operator prerequisite: these Secrets must
+   * exist in the target namespace, delivered by the user's own secrets flow — the bundle
+   * never carries them.
+   */
+  imagePullSecrets?: string[];
+  manifests?: { skipped: true; note: string };
+}
+
+/**
+ * Read and validate the PRIOR bundle's emit-metadata.json.
+ *
+ * Fail-closed discipline (N20's front door, review-critical): "the file is unreadable or
+ * invalid" and "there is no prior bundle" MUST stay distinct. A present-but-corrupt file
+ * throws — treating it as absent would let a truncated checkout render first-deploy
+ * semantics against a serving cluster. Returns null only when the file genuinely does not
+ * exist.
+ */
+export function readPriorBundleMetadata(
+  bundleDir: string,
+  expected: { releaseName: string; namespace: string },
+): EmitMetadata | null {
+  const metadataPath = path.join(bundleDir, "emit-metadata.json");
+  if (!existsSync(metadataPath)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(metadataPath, "utf-8"));
+  } catch (err) {
+    throw new Error(
+      `The prior bundle's ${metadataPath} exists but is not valid JSON ` +
+        `(${err instanceof Error ? err.message : String(err)}). Refusing to emit: an ` +
+        `unreadable prior bundle is NOT a first deploy. Restore the file (it is committed ` +
+        `with the bundle), or delete the whole bundle directory and re-run with an explicit ` +
+        `--previous-build <id> / --first-deploy.`,
+    );
+  }
+  const meta = parsed as Partial<EmitMetadata>;
+  if (typeof meta.emitVersion !== "number" || meta.emitVersion > EMIT_VERSION) {
+    throw new Error(
+      `The prior bundle at ${metadataPath} records emitVersion ` +
+        `${JSON.stringify(meta.emitVersion)}, which this CLI does not understand (max ` +
+        `${EMIT_VERSION}). Upgrade @next-community/adapter-k8s, or pass --previous-build ` +
+        `explicitly.`,
+    );
+  }
+  if (typeof meta.buildId !== "string" || !meta.buildId) {
+    throw new Error(
+      `The prior bundle at ${metadataPath} has no buildId. Refusing to emit: an invalid ` +
+        `prior bundle is NOT a first deploy. Fix or remove the bundle, or pass ` +
+        `--previous-build <id> explicitly.`,
+    );
+  }
+  // Validated at the point of consumption: this value lands in values.yaml selectors and
+  // resource-name comparisons.
+  assertSafeBuildId(meta.buildId);
+  if (meta.previousBuildId != null) assertSafeBuildId(meta.previousBuildId);
+  // Same rule for the pool names this file can feed into values.activeDefaultPool (the
+  // origin Service selector) and the cross-build name comparisons.
+  if (meta.defaultPool !== undefined) assertSafePoolName(meta.defaultPool);
+  if (meta.previousDefaultPool != null) assertSafePoolName(meta.previousDefaultPool);
+  // A bundle emitted for another release/namespace must never supply THIS release's
+  // previous build — same cross-wiring hazard the variant-scoped state file closes.
+  if (meta.releaseName !== undefined && meta.releaseName !== expected.releaseName) {
+    throw new Error(
+      `The prior bundle at ${metadataPath} was emitted for release ` +
+        `${JSON.stringify(meta.releaseName)}, but this emit targets ` +
+        `${JSON.stringify(expected.releaseName)}. Refusing to use its previous-build ` +
+        `pointer. Remove the stale bundle or pass --previous-build explicitly.`,
+    );
+  }
+  if (meta.namespace !== undefined) {
+    assertSafeNamespace(meta.namespace);
+    if (meta.namespace !== expected.namespace) {
+      throw new Error(
+        `The prior bundle at ${metadataPath} was emitted for namespace ` +
+          `${JSON.stringify(meta.namespace)}, but this emit targets ` +
+          `${JSON.stringify(expected.namespace)}. Refusing to use its previous-build ` +
+          `pointer. Remove the stale bundle or pass --previous-build explicitly.`,
+      );
+    }
+  }
+  return meta as EmitMetadata;
+}
+
+/**
+ * `--previous-bundle <path>` (real-cluster gap #7): read the prior bundle from a FOREIGN
+ * checkout — the split app/cluster-repo flow, where the app repo runs CI/emit and the
+ * cluster repo holds the committed bundles, so the same-repo lookup at
+ * `.k8s-adapter/gitops/` always looks like a first deploy.
+ *
+ * The path names either the bundle DIRECTORY or its emit-metadata.json directly; both
+ * resolve to the same read. Validation is readPriorBundleMetadata — the SAME fail-closed
+ * battery the same-repo path runs (wrong release/namespace/emitVersion refusals,
+ * previousDefaultPool consumption), not a parallel copy.
+ *
+ * Fail-closed, stricter than the same-repo lookup: the flag ASSERTS a prior bundle
+ * exists, so a missing or unreadable path is a HARD error — never null, never a fallback
+ * to the same-repo lookup or to first-deploy semantics. (A wrong --previous-bundle path
+ * in CI is exactly the shallow-checkout shape N20 fails closed against.)
+ */
+export function readPreviousBundleMetadata(
+  previousBundlePath: string,
+  expected: { releaseName: string; namespace: string },
+): EmitMetadata {
+  const resolved = path.resolve(previousBundlePath);
+  const bundleDir =
+    path.basename(resolved) === "emit-metadata.json" ? path.dirname(resolved) : resolved;
+  const meta = readPriorBundleMetadata(bundleDir, expected);
+  if (meta === null) {
+    throw new Error(
+      `--previous-bundle ${JSON.stringify(previousBundlePath)} names no prior bundle: ` +
+        `${path.join(bundleDir, "emit-metadata.json")} does not exist. The flag asserts a ` +
+        `prior bundle — a missing one is NOT a first deploy (a wrong path or a shallow ` +
+        `cluster-repo checkout looks exactly like this). Fix the path (it must point at ` +
+        `the bundle directory or its emit-metadata.json in the cluster-repo checkout), ` +
+        `or — for a genuine first deploy — drop the flag and pass --first-deploy.`,
+    );
+  }
+  return meta;
+}
+
+/**
+ * Resolve the previous build id for `cutover.mode: none` selector pinning. Precedence:
+ *
+ *   1. `--previous-build <id>` — explicit, validated;
+ *   2. the prior bundle's emit-metadata.json in the output directory (the normal CI flow:
+ *      read the last committed bundle). A RE-EMIT of the same build reuses the prior
+ *      bundle's OWN previousBuildId, so re-emitting is byte-idempotent (the N50 re-emit
+ *      audit) instead of tripping the N14 identical-build guard on its own output;
+ *   3. `--first-deploy` — the operator ASSERTS a genuine first deploy; selectors render at
+ *      the new build.
+ *
+ * "No prior bundle found" is NOT "first deploy" — that inference is the N20 incident class
+ * arriving through a new door (a shallow/sparse/wrong-directory checkout would render
+ * first-deploy semantics against a serving cluster: selectors pinned to the unverified new
+ * build, no retained previous build). With none of the three sources this REFUSES.
+ */
+export function resolvePreviousBuildId(opts: {
+  buildId: string;
+  previousBuildFlag: string | undefined;
+  firstDeploy: boolean;
+  priorBundle: EmitMetadata | null;
+  bundleDir: string;
+}): { previousBuildId: string | null; previousDefaultPool?: string; previousPools?: string[] } {
+  const { buildId, previousBuildFlag, firstDeploy, priorBundle, bundleDir } = opts;
+  if (previousBuildFlag !== undefined && firstDeploy) {
+    throw new Error(
+      `--previous-build and --first-deploy contradict each other: one names the serving ` +
+        `build, the other asserts nothing is serving. Pass exactly one.`,
+    );
+  }
+  if (previousBuildFlag !== undefined) {
+    // H2-equivalent: the value lands in values.yaml selectors and composed-name checks.
+    assertSafeBuildId(previousBuildFlag);
+    return {
+      previousBuildId: previousBuildFlag,
+      ...(priorBundle && priorBundle.buildId === previousBuildFlag
+        ? {
+            previousDefaultPool: priorBundle.defaultPool,
+            previousPools: priorBundle.poolTopology,
+          }
+        : {}),
+    };
+  }
+  if (priorBundle) {
+    if (firstDeploy) {
+      throw new Error(
+        `--first-deploy was passed, but a prior bundle exists at ` +
+          `${path.join(bundleDir, "emit-metadata.json")} (build "${priorBundle.buildId}"). ` +
+          `A first deploy and an existing bundle contradict each other — if the release ` +
+          `really is gone, delete the bundle directory first; otherwise drop --first-deploy.`,
+      );
+    }
+    if (priorBundle.buildId === buildId) {
+      // Re-emit of the same build: reproduce the same bundle, byte-identical. The
+      // previous build's default pool comes from the prior bundle's OWN recorded pin
+      // (previousDefaultPool) — its `defaultPool` describes THIS build, and falling back
+      // to it after a pool rename would flip activeDefaultPool to the new build's pool
+      // while activeBuildId stays at the previous build: an origin-Service selector pair
+      // that matches nothing. The poolTopology likewise describes THIS build, so the
+      // cross-build collision check has nothing new to compare.
+      return {
+        previousBuildId: priorBundle.previousBuildId,
+        ...(priorBundle.previousDefaultPool != null
+          ? { previousDefaultPool: priorBundle.previousDefaultPool }
+          : {}),
+      };
+    }
+    return {
+      previousBuildId: priorBundle.buildId,
+      previousDefaultPool: priorBundle.defaultPool,
+      previousPools: priorBundle.poolTopology,
+    };
+  }
+  if (firstDeploy) return { previousBuildId: null };
+  throw new Error(
+    `Cannot determine the previous build: no --previous-build flag was given and no prior ` +
+      `bundle exists at ${path.join(bundleDir, "emit-metadata.json")}. Refusing to infer a ` +
+      `first deploy — a shallow or wrong-directory checkout looks exactly like this, and ` +
+      `rendering first-deploy semantics against a serving cluster pins the Service ` +
+      `selectors to the unverified new build (the N20 incident class). If this genuinely ` +
+      `is the first deploy of this release, assert it with --first-deploy; otherwise pass ` +
+      `--previous-build <id> or run emit where the prior bundle is checked out.`,
+  );
+}
+
+/**
+ * Walk UP from `startDir` looking for `.sops.yaml` — the repo's sops config, whose
+ * creation_rules select the encryption recipients. Returns the config file's absolute
+ * path, or null when no directory on the walk has one. The walk starts at the bundle
+ * directory (which need not exist yet) so a `.sops.yaml` at the repo root, or anywhere
+ * between it and the bundle, governs — the same discovery sops itself performs from its
+ * cwd.
+ */
+export function findSopsConfig(startDir: string): string | null {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    const candidate = path.join(dir, ".sops.yaml");
+    if (existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * `--secrets sops`: encrypt the chart's secret manifests into `<bundle>/secrets/` as
+ * `<name>.sops.yaml`, via the sops CLI, honoring the repo's `.sops.yaml` creation_rules.
+ *
+ * Recipient discipline: emit NEVER passes recipients on argv. sops runs with cwd at the
+ * config's directory and a config-relative file path, so the repo's own creation_rules
+ * (path_regex) pick the age/PGP/KMS recipients — exactly what they do for every other
+ * secret in the repo.
+ *
+ * Fail-closed: any sops failure removes the file being worked on and throws — a bundle
+ * NEVER carries plaintext secrets as a fallback (the plaintext exists on disk only for
+ * the moment between write and encrypt, mode 0600, and is deleted on every error path).
+ *
+ * Determinism: sops embeds fresh data keys and MACs on every encryption, so secrets/ can
+ * NOT be byte-deterministic across re-encryptions and is excluded from the bundle's
+ * byte-determinism guarantee. To keep the re-emit diff quiet in the common case, an
+ * existing encrypted file is REUSED when sops can still decrypt it (recipients unchanged)
+ * and its plaintext matches what this emit would encrypt; when decryption fails
+ * (recipients rotated, key unavailable) or the plaintext differs, it is re-encrypted.
+ * The comparison is decrypt-to-decrypt: sops re-serializes YAML on decrypt (indent,
+ * quoting), so the template plaintext is round-tripped through sops encrypt+decrypt and
+ * compared against the prior file's decrypt output — both sides normalized by the same
+ * serializer. A false mismatch merely costs one re-encryption, never correctness.
+ */
+export async function emitBundleSopsSecrets(opts: {
+  bundleDir: string;
+  /** `fileName` is the chart template's basename minus .yaml (e.g. "internal-secret"). */
+  sources: Array<{ fileName: string; plaintext: string }>;
+  /** Prior bundle's encrypted files (name → bytes), captured before the wholesale rm. */
+  prior: Map<string, string>;
+  config: { configPath: string; explicit: boolean };
+}): Promise<string[]> {
+  const { bundleDir, sources, prior, config } = opts;
+  const configDir = path.dirname(config.configPath);
+  // `--config` only when the operator named one explicitly; otherwise sops discovers the
+  // .sops.yaml from its cwd, exactly like a human running sops in the repo.
+  const configArgs = config.explicit ? ["--config", config.configPath] : [];
+  const secretsDir = path.join(bundleDir, "secrets");
+  mkdirSync(secretsDir, { recursive: true });
+  const written: string[] = [];
+  for (const { fileName, plaintext } of sources) {
+    const outName = `${fileName}.sops.yaml`;
+    const outPath = path.join(secretsDir, outName);
+    const relPath = path.relative(configDir, outPath);
+    const priorBody = prior.get(outName);
+    if (priorBody !== undefined) {
+      // Re-emit path: keep the prior encrypted file when its plaintext is unchanged, so
+      // a changed secrets/ file in the diff means the plaintext or recipients changed —
+      // never noise. sops re-serializes YAML on decrypt (indent, quoting), so decrypted
+      // output can NEVER be compared to our template plaintext textually; both sides must
+      // pass through sops's own serializer. Encrypt the candidate plaintext to a temp
+      // file, decrypt both, compare decrypt-to-decrypt. Prior-decrypt failure is not an
+      // error — it is the recipients-changed signal, answered by re-encrypting below.
+      writeFileSync(outPath, priorBody, { mode: 0o600 });
+      const decPrior = await execCapture("sops", [...configArgs, "--decrypt", relPath], {
+        cwd: configDir,
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
+      if (decPrior && decPrior.exitCode === 0) {
+        // Same directory, so the same creation_rules path_regex governs the temp file.
+        const tmpName = `${fileName}.reemit-check.sops.yaml`;
+        const tmpPath = path.join(secretsDir, tmpName);
+        const tmpRel = path.relative(configDir, tmpPath);
+        try {
+          writeFileSync(tmpPath, plaintext, { mode: 0o600 });
+          const encTmp = await execCapture("sops", [...configArgs, "--encrypt", tmpRel], {
+            cwd: configDir,
+            timeoutMs: EXEC_TIMEOUTS.kubectl,
+          });
+          if (encTmp.exitCode === 0 && encTmp.stdout.includes("sops:")) {
+            writeFileSync(tmpPath, encTmp.stdout, { mode: 0o600 });
+            const decTmp = await execCapture("sops", [...configArgs, "--decrypt", tmpRel], {
+              cwd: configDir,
+              timeoutMs: EXEC_TIMEOUTS.kubectl,
+            });
+            if (decTmp.exitCode === 0 && decTmp.stdout === decPrior.stdout) {
+              written.push(`secrets/${outName}`);
+              continue;
+            }
+          }
+        } finally {
+          rmSync(tmpPath, { force: true });
+        }
+      }
+      rmSync(outPath, { force: true });
+    }
+    // Fresh encryption. The plaintext must exist at the FINAL path so the repo's
+    // creation_rules path_regex matches the same path a human would encrypt; capture
+    // stdout instead of --in-place so a failed run leaves nothing to clean but our own
+    // write (deleted on every error path).
+    writeFileSync(outPath, plaintext, { mode: 0o600 });
+    let enc: ExecCaptureResult;
+    try {
+      enc = await execCapture("sops", [...configArgs, "--encrypt", relPath], {
+        cwd: configDir,
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      });
+    } catch (err) {
+      rmSync(outPath, { force: true });
+      throw new Error(
+        `sops --encrypt could not run for ${outName}: ` +
+          `${err instanceof Error ? err.message : String(err)}. The plaintext was removed — ` +
+          `a bundle never carries unencrypted secrets.`,
+      );
+    }
+    // The `sops:` metadata block is what makes the file decryptable at all — output
+    // without it (or an empty output) is not an encrypted file, whatever the exit code.
+    if (enc.exitCode !== 0 || !/^sops:/m.test(enc.stdout)) {
+      rmSync(outPath, { force: true });
+      throw new Error(
+        `sops --encrypt failed for ${outName} (exit ${enc.exitCode})` +
+          (enc.stderr.trim() ? `: ${sanitizeForTerminal(enc.stderr.trim())}` : "") +
+          (enc.exitCode === 0 ? ` — output carries no sops metadata block` : "") +
+          `. The plaintext was removed — emit never falls back to writing unencrypted ` +
+          `secrets. Check the repo's .sops.yaml creation_rules cover ` +
+          `secrets/${outName} and that the recipients' keys are available.`,
+      );
+    }
+    writeFileSync(outPath, enc.stdout, { mode: 0o600 });
+    written.push(`secrets/${outName}`);
+  }
+  return written;
+}
+
+/** Recursively list files under `dir` as sorted relative paths (deterministic order). */
+function listFilesRecursive(dir: string, prefix = ""): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...listFilesRecursive(path.join(dir, entry.name), rel));
+    else out.push(rel);
+  }
+  return out.sort();
+}
+
+/**
+ * Parse the chart's values.yaml (a comment header + a JSON body — see renderValuesYaml)
+ * into { header, values } so emit can pin digests/CIDRs/activeBuildId and re-serialize in
+ * the identical format.
+ */
+export function parseChartValues(content: string): {
+  header: string;
+  values: Record<string, unknown>;
+} {
+  const jsonStart = content.indexOf("{");
+  if (jsonStart === -1) {
+    throw new Error(
+      `The chart's values.yaml has no JSON body — it was not generated by this adapter's ` +
+        `renderValuesYaml. Re-run the build (adapter-k8s emits values as JSON-with-header).`,
+    );
+  }
+  return {
+    header: content.slice(0, jsonStart),
+    values: JSON.parse(content.slice(jsonStart)) as Record<string, unknown>,
+  };
+}
+
+export async function runEmit(options: EmitOptions): Promise<void> {
+  const {
+    projectDir,
+    releaseName,
+    skipBuild,
+    skipPush,
+    allowMutableTags,
+    allowNoNetworkPolicy,
+    previousBuild,
+    firstDeploy,
+    previousBundle,
+  } = options;
+  // --previous-bundle contradictions — refused HERE, before any build/push cost. Each
+  // pair has two sources of truth for the same fact; guessing which wins is exactly how
+  // a CI variable typo turns into wrong selector semantics.
+  if (previousBundle !== undefined && firstDeploy) {
+    throw new Error(
+      `--previous-bundle and --first-deploy contradict each other: one names a checkout ` +
+        `holding the prior bundle, the other asserts no prior deploy exists. Pass exactly ` +
+        `one.`,
+    );
+  }
+  if (previousBundle !== undefined && previousBuild !== undefined) {
+    throw new Error(
+      `--previous-bundle and --previous-build were both given — two sources of truth for ` +
+        `the previous build. Pass exactly one: --previous-bundle reads (and validates) the ` +
+        `prior bundle's emit-metadata.json; --previous-build pins a bare id.`,
+    );
+  }
+  const secretsMode: EmitSecretsMode = options.secrets ?? "external";
+  if (secretsMode !== "external" && secretsMode !== "inline" && secretsMode !== "sops") {
+    throw new Error(
+      `Invalid --secrets mode ${JSON.stringify(secretsMode as string)}: expected "external" ` +
+        `(default — the bundle chart carries no secret material), "sops" (encrypt the secret ` +
+        `manifests into secrets/ with the repo's .sops.yaml creation rules), or "inline" ` +
+        `(verbatim chart, for private repos, loudly warned about).`,
+    );
+  }
+
+  // PR1 review note #2 (design §4.2 "determinism trap"): the modes that EMBED secret
+  // material in the bundle (inline, sops) need the dispatch secret to be REPRODUCIBLE.
+  // deriveInternalSecret (adapter.ts) is an HMAC of "<release>\0<buildId>" under a key
+  // from ADAPTER_K8S_INTERNAL_SECRET_KEY or .k8s-adapter/internal-secret.key — and when
+  // NEITHER exists the build MINTS a fresh random key. A fresh CI checkout is exactly that
+  // case: every emit of the same build would then derive a DIFFERENT dispatch secret,
+  // breaking bundle determinism (the re-emit diff is the N50 audit) and rotating a value
+  // the already-rendered pods disagree about. Refuse HERE, before `next build` can mint
+  // one silently — "no key anywhere" is the would-mint-fresh signature.
+  if (secretsMode === "inline" || secretsMode === "sops") {
+    const envKey = process.env.ADAPTER_K8S_INTERNAL_SECRET_KEY;
+    const keyFile = path.join(projectDir, ".k8s-adapter", "internal-secret.key");
+    if (!(envKey && envKey.length > 0) && !existsSync(keyFile)) {
+      throw new Error(
+        `--secrets ${secretsMode} embeds the internal dispatch secret in the bundle, so its ` +
+          `key source must be STABLE across emits — but neither ` +
+          `ADAPTER_K8S_INTERNAL_SECRET_KEY nor ${keyFile} exists, and the build would mint ` +
+          `a fresh random key (deriveInternalSecret), giving every re-emit of the same ` +
+          `build a different secret. Set ADAPTER_K8S_INTERNAL_SECRET_KEY (CI: from the CI ` +
+          `secret store) or restore the gitignored key file, then re-run.`,
+      );
+    }
+  }
+
+  const bundleDirRelative = path.join(".k8s-adapter", gitopsDirName());
+  const bundleDir = path.join(projectDir, bundleDirRelative);
+
+  // --secrets sops preflight — BEFORE the build/push so a refusal costs nothing. Both
+  // prerequisites are fail-closed: a missing binary and a missing config are hard errors,
+  // NEVER a plaintext fallback.
+  let sopsConfig: { configPath: string; explicit: boolean } | null = null;
+  if (secretsMode === "sops") {
+    let probe: ExecCaptureResult | null = null;
+    try {
+      probe = await execCapture("sops", ["--version"], { timeoutMs: EXEC_TIMEOUTS.kubectl });
+    } catch {
+      probe = null;
+    }
+    if (!probe || probe.exitCode !== 0) {
+      throw new Error(
+        `--secrets sops requires the \`sops\` binary on PATH, which is ` +
+          (probe
+            ? `present but failing (exit ${probe.exitCode}: ` +
+              `${sanitizeForTerminal(probe.stderr.trim())})`
+            : `not there`) +
+          `. Install sops (https://github.com/getsops/sops) or pick another --secrets ` +
+          `mode — emit never falls back to writing plaintext secrets.`,
+      );
+    }
+    if (options.sopsConfig !== undefined) {
+      const explicit = path.resolve(projectDir, options.sopsConfig);
+      if (!existsSync(explicit)) {
+        throw new Error(
+          `--sops-config ${JSON.stringify(options.sopsConfig)} does not exist ` +
+            `(resolved to ${explicit}).`,
+        );
+      }
+      sopsConfig = { configPath: explicit, explicit: true };
+    } else {
+      const discovered = findSopsConfig(bundleDir);
+      if (!discovered) {
+        throw new Error(
+          `--secrets sops found no .sops.yaml walking up from ${bundleDir}. The repo's ` +
+            `creation_rules are what select recipients — emit never passes recipients on ` +
+            `argv, and it NEVER falls back to emitting plaintext. Create a .sops.yaml ` +
+            `whose creation_rules cover ${bundleDirRelative}/secrets/*.sops.yaml, or name ` +
+            `one explicitly with --sops-config <path>.`,
+        );
+      }
+      sopsConfig = { configPath: discovered, explicit: false };
+    }
+  }
+
+  const infraPath = infrastructurePath(projectDir);
+  if (!existsSync(infraPath)) {
+    throw new Error(
+      "infrastructure.json not found. Run `npx adapter-k8s init` first, " +
+        "or create .k8s-adapter/infrastructure.json manually.",
+    );
+  }
+  let infra: Record<string, string | undefined>;
+  try {
+    infra = JSON.parse(readFileSync(infraPath, "utf-8"));
+  } catch (err) {
+    throw new Error(
+      `Failed to parse ${infraPath}: ${err instanceof Error ? err.message : String(err)}. ` +
+        `Fix the file by hand or regenerate it with \`npx adapter-k8s init\`.`,
+    );
+  }
+  const namespace = resolveK8sNamespace(infra.namespace);
+  if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
+  if (!infra.containerRegistry) {
+    throw new Error(
+      "infrastructure.json is missing containerRegistry — image tags cannot be formed. " +
+        "Run `npx adapter-k8s init` to regenerate it, or set containerRegistry in " +
+        ".k8s-adapter/infrastructure.json.",
+    );
+  }
+  const registry = infra.containerRegistry;
+
+  // 1. next build (same opt-out as deploy).
+  if (!skipBuild) {
+    console.log("\n  → Running next build...");
+    await execOrThrow("npx", ["next", "build"], {
+      cwd: projectDir,
+      timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+    });
+  }
+
+  // 2. Build metadata + A2 fingerprints + topology (identical to deploy by construction).
+  const outputDirRelative = path.join(".k8s-adapter", outputDirName());
+  const outputDir = path.join(projectDir, outputDirRelative);
+  const metadataPath = path.join(outputDir, "build-metadata.json");
+  if (!existsSync(metadataPath)) {
+    throw new Error(`Build metadata not found at ${metadataPath}. Did next build run?`);
+  }
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf-8"));
+  const buildId: string = metadata.buildId;
+  assertSafeBuildId(buildId);
+  const compositionSnapshot = loadLocalCompositionPlan(outputDir, metadata);
+  if (compositionSnapshot) {
+    assertCompositionPlanInvocation(compositionSnapshot.plan, {
+      releaseName,
+      namespace,
+      buildId,
+    });
+    if (compositionSnapshot.plan.target.registry.repository !== registry) {
+      throw new Error(
+        `Composition plan registry ${JSON.stringify(compositionSnapshot.plan.target.registry.repository)} ` +
+          `does not match infrastructure registry ${JSON.stringify(registry)}. ` +
+          `Rebuild for the selected target.`,
+      );
+    }
+  }
+  const pools: string[] = metadata.pools;
+  const defaultPool: string | undefined =
+    typeof metadata.defaultPool === "string" ? metadata.defaultPool : pools?.[0];
+  // config imagePullSecrets, via build metadata — validated at the point of consumption
+  // (the names land in the bundle README and emit-metadata.json).
+  const imagePullSecrets: string[] = Array.isArray(metadata.imagePullSecrets)
+    ? metadata.imagePullSecrets.filter((s: unknown): s is string => typeof s === "string")
+    : [];
+  for (const name of imagePullSecrets) assertSafeSecretName(name);
+  const builtTargetPlatform = resolveBuiltTargetPlatform(metadata);
+  assertTargetFingerprint({
+    outputDirRelative,
+    metadata,
+    deployRegistry: registry,
+    deployNamespace: namespace,
+  });
+  assertDeployablePoolTopology(pools, defaultPool);
+
+  const chartSrcDir = path.join(outputDir, "chart");
+  if (!existsSync(path.join(chartSrcDir, "values.yaml"))) {
+    throw new Error(`No chart at ${chartSrcDir}. Did next build run with the adapter configured?`);
+  }
+
+  console.log(`\n  Build ID: ${buildId}`);
+  console.log(`  Pools: ${pools.join(", ")}`);
+
+  // 3. Previous-build semantics — BEFORE any push, so a refusal costs nothing.
+  // (bundleDir/bundleDirRelative resolved above, before the sops preflight.)
+  // --previous-bundle (split app/cluster repos) is AUTHORITATIVE: the same-repo lookup is
+  // skipped entirely, and its read is fail-closed (a missing path throws, never falls
+  // back). Both paths run the identical readPriorBundleMetadata validation battery.
+  const priorBundle =
+    previousBundle !== undefined
+      ? readPreviousBundleMetadata(path.resolve(projectDir, previousBundle), {
+          releaseName,
+          namespace,
+        })
+      : readPriorBundleMetadata(bundleDir, { releaseName, namespace });
+  const { previousBuildId, previousDefaultPool, previousPools } = resolvePreviousBuildId({
+    buildId,
+    previousBuildFlag: previousBuild,
+    firstDeploy: firstDeploy === true,
+    priorBundle,
+    bundleDir,
+  });
+  if (previousBuildId) {
+    console.log(`  Previous build (selectors stay pinned here): ${previousBuildId}`);
+  } else {
+    console.log(`  First deploy asserted (--first-deploy): selectors render at ${buildId}`);
+  }
+
+  // B2 collision guards (pipeline/fingerprints.ts — identical to deploy). N14 first.
+  assertBuildIdChangedSinceServing(buildId, previousBuildId);
+  if (previousBuildId && previousPools && previousPools.length > 0) {
+    for (const p of previousPools) assertSafePoolName(p);
+    assertNoCrossBuildNameCollision(
+      releaseName,
+      { buildId, pools },
+      { buildId: previousBuildId, pools: previousPools },
+    );
+  } else if (previousBuildId) {
+    // --previous-build without a prior bundle: the previous topology is unknowable without
+    // a cluster (which emit never contacts). The self-collision check below still runs;
+    // deploy re-runs the full cross-build check with cluster knowledge at cutover time.
+    console.warn(
+      `  ! Previous build "${previousBuildId}" has no prior bundle recording its pool ` +
+        `topology — the cross-build name-collision check is skipped (emit has no cluster ` +
+        `to ask). The imperative cutover path re-checks it.`,
+    );
+  }
+  assertNoSelfNameCollision(releaseName, pools, buildId);
+
+  // 4. CIDRs — from CONFIG, never discovery (deploy inventory A4 "replaced"). Fail-closed:
+  // the values default is `strict: true`, and the chart {{- fail }}s at render time when
+  // strict has no nodeCidrs — surface that here, at emit time, with the fix spelled out.
+  const nodeCidrs: string[] = Array.isArray(metadata.nodeCidrs)
+    ? metadata.nodeCidrs.filter((c: unknown): c is string => typeof c === "string")
+    : [];
+  const podCidrs: string[] = Array.isArray(metadata.podCidrs)
+    ? metadata.podCidrs.filter((c: unknown): c is string => typeof c === "string")
+    : [];
+  // Validated at the point of consumption: these land in the bundle's values arrays that
+  // the NetworkPolicy template splices into rendered YAML.
+  assertSafeCidrList(nodeCidrs, "networkPolicy.nodeCidrs (via build metadata)");
+  assertSafeCidrList(podCidrs, "networkPolicy.podCidrs (via build metadata)");
+  let strict = true;
+  if (nodeCidrs.length === 0) {
+    if (!allowNoNetworkPolicy) {
+      throw new Error(
+        `emit cannot render the strict NetworkPolicy posture: no node CIDRs are configured. ` +
+          `emit performs NO cluster discovery (that is the point — see ` +
+          `plans/gitops-deployment-strategies.md §4.2), so the ranges must come from config: ` +
+          `set networkPolicy.nodeCidrs (and optionally networkPolicy.podCidrs) in ` +
+          `adapter.config — docs/configuration.md — and rebuild. provider.generic.nodeCidrs ` +
+          `also still maps in. Or pass --allow-no-network-policy to emit a bundle WITHOUT ` +
+          `network isolation, deliberately.`,
+      );
+    }
+    strict = false;
+    console.warn(
+      "  ! No node CIDRs configured — emitting with strict NetworkPolicies OFF " +
+        "(--allow-no-network-policy). " +
+        (podCidrs.length > 0
+          ? "The broad pod-isolation posture still renders from networkPolicy.podCidrs."
+          : "With no podCidrs either, the bundle renders NO NetworkPolicies at all: the " +
+            "routing service stays reachable from in-cluster pods."),
+    );
+  }
+
+  // 5. A6/A7 — image build/push (CI is exactly where these belong). --skip-push opts out.
+  const containerStrategy = metadata.containerStrategy ?? "traced-assets";
+  const poolImageLayout = parsePoolImageLayout(metadata.poolImageLayout);
+  let containerCli = "docker";
+  if (!skipPush) {
+    containerCli = await resolveContainerCli();
+    if (containerCli !== "docker") console.log(`\n  Container runtime: ${containerCli}`);
+    refreshFetchCacheStaging(projectDir, outputDir, {
+      distDir: metadata.distDir,
+      pools,
+      containerStrategy,
+      poolImageLayout,
+    });
+    const dockerCommands = buildDockerCommands({
+      pools,
+      buildId,
+      registry,
+      outputDir: outputDirRelative,
+      containerStrategy,
+      ...(poolImageLayout ? { poolImageLayout } : {}),
+      containerCli,
+      targetPlatform: builtTargetPlatform,
+      ...(compositionSnapshot
+        ? {
+            registryAuthentication: compositionSnapshot.plan.target.registry.authentication,
+            includeRoutingService:
+              compositionSnapshot.plan.operations.routing.protocol !== "pool-local-v1",
+          }
+        : {}),
+    });
+    for (const cmd of dockerCommands) {
+      console.log(`\n  → ${cmd.description}`);
+      await execOrThrow(cmd.command, cmd.args, {
+        cwd: projectDir,
+        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      });
+    }
+  }
+
+  // 6. A8 — digest resolution, same fail-closed posture and same refs as deploy.
+  const refs: Array<[string, string]> =
+    containerStrategy === "shared-image"
+      ? pools.map((p) => [p, `${registry}/nextjs-app:${buildId}`])
+      : pools.map((p) => [p, `${registry}/nextjs-app-${p}:${buildId}`]);
+  if (
+    !compositionSnapshot ||
+    compositionSnapshot.plan.operations.routing.protocol !== "pool-local-v1"
+  ) {
+    refs.push(["routingService", `${registry}/routing-service:${buildId}`]);
+  }
+  const imageDigests = await resolveDeployImageDigests({
+    refs,
+    projectId: infra.projectId ?? "",
+    allowMutableTags: allowMutableTags ?? false,
+    containerCli,
+    targetPlatform: builtTargetPlatform,
+    ...(compositionSnapshot
+      ? { digestLookup: compositionSnapshot.plan.target.registry.digestLookup }
+      : {}),
+  });
+  const pinned = Object.keys(imageDigests).length;
+  if (pinned > 0) console.log(`    Pinned ${pinned} image(s) to immutable digests`);
+
+  // 7. Assemble the bundle. Replaced WHOLESALE (the repo flow commits it that way), so a
+  // stale file from a removed pool can never linger. Under --secrets sops the prior
+  // bundle's encrypted files are captured FIRST: a re-emit reuses one when it still
+  // decrypts to the same plaintext, keeping the re-emit diff quiet (sops output is
+  // otherwise fresh-keyed per run — see emitBundleSopsSecrets).
+  console.log(`\n  → Writing GitOps bundle to ${bundleDirRelative}/`);
+  const priorSopsFiles = new Map<string, string>();
+  if (secretsMode === "sops" && existsSync(path.join(bundleDir, "secrets"))) {
+    for (const entry of readdirSync(path.join(bundleDir, "secrets"), { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith(".sops.yaml")) {
+        priorSopsFiles.set(
+          entry.name,
+          readFileSync(path.join(bundleDir, "secrets", entry.name), "utf-8"),
+        );
+      }
+    }
+  }
+  rmSync(bundleDir, { recursive: true, force: true });
+  mkdirSync(path.join(bundleDir, "chart"), { recursive: true });
+  mkdirSync(path.join(bundleDir, "values"), { recursive: true });
+
+  // 7a. chart/ — verbatim, minus the secret templates under --secrets external AND sops
+  // (§3 item 3: committing chart/ commits credentials, and the 0600 mode does not survive
+  // Git; under sops the same objects ship ENCRYPTED under secrets/ instead).
+  const chartFiles = listFilesRecursive(chartSrcDir);
+  const excluded: string[] = [];
+  for (const rel of chartFiles) {
+    if (secretsMode !== "inline" && SECRET_CHART_FILES.has(rel)) {
+      excluded.push(rel);
+      continue;
+    }
+    const dest = path.join(bundleDir, "chart", rel);
+    mkdirSync(path.dirname(dest), { recursive: true });
+    // cpSync preserves the source mode — the 0600 secret files stay 0600 under inline.
+    cpSync(path.join(chartSrcDir, rel), dest);
+  }
+  let sopsFiles: string[] | undefined;
+  if (secretsMode === "sops") {
+    // The same secret OBJECTS inline mode ships in-chart, as plain YAML sources. The
+    // rendered templates are plain YAML UNLESS a secret value contained a literal "{{"
+    // — escapeHelmActions then wrote a Helm action ({{ "{{" }}) that only Helm would
+    // undo, and these files bypass Helm (the GitOps engine applies them decrypted, raw).
+    // The dispatch secret is HMAC hex so it never trips this; a Valkey URL/AUTH could.
+    // Refuse rather than deliver a mangled credential.
+    const sources = excluded.map((rel) => {
+      const plaintext = readFileSync(path.join(chartSrcDir, rel), "utf-8");
+      if (plaintext.includes("{{")) {
+        throw new Error(
+          `--secrets sops: ${rel} contains Helm template syntax ("{{" — a secret value ` +
+            `with a literal "{{" was Helm-escaped at render time), but sops-mode secrets ` +
+            `are applied WITHOUT Helm, so the escape would reach the cluster verbatim. ` +
+            `Remove the "{{" from the secret value (cache.url/cache.password), or use ` +
+            `--secrets external/inline.`,
+        );
+      }
+      return { fileName: path.basename(rel, ".yaml"), plaintext };
+    });
+    if (sources.length === 0) {
+      throw new Error(
+        `--secrets sops: the build's chart carries no secret templates to encrypt ` +
+          `(expected ${[...SECRET_CHART_FILES].join(", ")} under ${chartSrcDir}). ` +
+          `Did next build run with the adapter configured?`,
+      );
+    }
+    sopsFiles = await emitBundleSopsSecrets({
+      bundleDir,
+      sources,
+      prior: priorSopsFiles,
+      config: sopsConfig!,
+    });
+    console.log(
+      `    Secrets: sops — omitted ${excluded.join(", ")} from chart/; encrypted ` +
+        `${sopsFiles.join(", ")} (config: ${sopsConfig!.configPath}). Apply them via your ` +
+        `GitOps engine's SOPS decryption (see the bundle README).`,
+    );
+  } else if (secretsMode === "external") {
+    const includeValkey = chartFiles.includes("templates/valkey-secret.yaml");
+    writeFileSync(
+      path.join(bundleDir, "chart", "templates", "external-secret.yaml"),
+      renderExternalSecrets({ releaseName, buildId, includeValkey }),
+    );
+    console.log(
+      `    Secrets: external — omitted ${excluded.join(", ") || "(none present)"}; ` +
+        `emitted templates/external-secret.yaml (gated on externalSecrets.storeName). ` +
+        `See the bundle README for the required Secret names/keys.`,
+    );
+  } else {
+    console.warn(
+      `\n  !!! WARNING: --secrets inline — the bundle chart contains REAL credentials ` +
+        `(templates/internal-secret.yaml${chartFiles.includes("templates/valkey-secret.yaml") ? ", templates/valkey-secret.yaml" : ""}).\n` +
+        `      Committing this bundle commits those secrets, and Git does not preserve the ` +
+        `0600 file mode. Only do this for a private repo whose readership you would trust ` +
+        `with the dispatch secret itself. Prefer --secrets external.\n`,
+    );
+  }
+
+  // 7b. values/values.yaml — the chart's own values with the per-release facts pinned:
+  // registry/tag, resolved digests, config CIDRs, and — the load-bearing line —
+  // activeBuildId at the PREVIOUS build (deploy.ts's buildHelmUpgradeArgs trick, done at
+  // values-write time), so applying the bundle never repoints traffic.
+  const { header, values } = parseChartValues(
+    readFileSync(path.join(chartSrcDir, "values.yaml"), "utf-8"),
+  );
+  const global = values.global as {
+    image: Record<string, string>;
+    networkPolicy: Record<string, unknown>;
+  };
+  global.image.registry = registry;
+  global.image.tag = buildId;
+  global.networkPolicy.podCidrs = podCidrs;
+  global.networkPolicy.nodeCidrs = nodeCidrs;
+  global.networkPolicy.strict = strict;
+  const valuePools = values.pools as Record<string, { image: Record<string, string> }>;
+  for (const [key, digest] of Object.entries(imageDigests)) {
+    if (key === "routingService") {
+      (values.routingService as { image: Record<string, string> }).image.digest = digest;
+    } else if (valuePools[key]) {
+      valuePools[key].image.digest = digest;
+    }
+  }
+  values.activeBuildId = sanitizeK8sName(previousBuildId ?? buildId);
+  // The pin actually written (recorded in emit-metadata.json as previousDefaultPool so a
+  // re-emit of the same build reproduces it byte-identically — see EmitMetadata).
+  let pinnedDefaultPool: string | null = null;
+  if (values.activeDefaultPool !== undefined) {
+    values.activeDefaultPool = previousBuildId
+      ? (previousDefaultPool ?? (values.activeDefaultPool as string))
+      : (defaultPool as string);
+    if (previousBuildId) pinnedDefaultPool = values.activeDefaultPool as string;
+  }
+  const valuesPath = path.join(bundleDir, "values", "values.yaml");
+  writeFileSync(valuesPath, header + JSON.stringify(values, null, 2));
+
+  // 7c. manifests/all.yaml — `helm template` of chart+values, for raw-YAML appliers. Helm
+  // is optional at emit time: absent ⇒ skip with a note in emit-metadata.json; present but
+  // FAILING ⇒ hard error (a bundle whose chart cannot render should never be committed).
+  let manifestsNote: { skipped: true; note: string } | undefined;
+  const helmProbe = await execCapture("helm", ["version", "--short"], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  }).catch(() => null);
+  if (!helmProbe || helmProbe.exitCode !== 0) {
+    manifestsNote = {
+      skipped: true,
+      note:
+        "helm was not available at emit time, so manifests/all.yaml was not rendered. " +
+        "The chart/ + values/ pair is complete; re-run emit with helm on PATH to add the " +
+        "pre-rendered manifests.",
+    };
+    console.warn(`    ! ${manifestsNote.note}`);
+  } else {
+    const rendered = await execCapture(
+      "helm",
+      [
+        "template",
+        releaseName,
+        path.join(bundleDir, "chart"),
+        "--namespace",
+        namespace,
+        "-f",
+        valuesPath,
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (rendered.exitCode !== 0) {
+      throw new Error(
+        `helm template failed on the emitted bundle (exit ${rendered.exitCode}): ` +
+          `${sanitizeForTerminal(rendered.stderr.trim())}. The bundle is incomplete — fix ` +
+          `the render error before committing anything.`,
+      );
+    }
+    mkdirSync(path.join(bundleDir, "manifests"), { recursive: true });
+    writeFileSync(path.join(bundleDir, "manifests", "all.yaml"), rendered.stdout);
+    console.log(`    Rendered manifests/all.yaml (helm template)`);
+  }
+
+  // 7d. emit-metadata.json — the per-bundle facts (and the NEXT emit's previous-build
+  // source). Keys are written in a fixed order and digests sorted, so a re-emit of the
+  // same inputs is byte-identical (no timestamps anywhere in the bundle — the same N68
+  // determinism rule values.yaml follows).
+  const emitMetadata: EmitMetadata = {
+    emitVersion: EMIT_VERSION,
+    buildId,
+    previousBuildId,
+    ...(pinnedDefaultPool !== null ? { previousDefaultPool: pinnedDefaultPool } : {}),
+    releaseName,
+    namespace,
+    registry,
+    digests: Object.fromEntries(
+      Object.keys(imageDigests)
+        .sort()
+        .map((k) => [k, imageDigests[k]!]),
+    ),
+    cdnTag: cdnTagForBuildId(buildId),
+    poolTopology: pools,
+    defaultPool: defaultPool as string,
+    targetPlatforms: { [buildId]: builtTargetPlatform },
+    secretsMode,
+    ...(sopsFiles ? { sopsFiles } : {}),
+    ...(imagePullSecrets.length > 0 ? { imagePullSecrets } : {}),
+    ...(manifestsNote ? { manifests: manifestsNote } : {}),
+  };
+  writeFileSync(
+    path.join(bundleDir, "emit-metadata.json"),
+    JSON.stringify(emitMetadata, null, 2) + "\n",
+  );
+
+  // 7e. renovate.json5 — the update-bot fence (real-cluster gap #6). 78% of the target
+  // population runs Renovate (often automerge), and Flux image-automation writes
+  // $imagepolicy-marked fields; a bot edit to any image tag/digest INSIDE the bundle
+  // desyncs the routing tier's manifest-digest check (it refuses a manifest that does not
+  // byte-match its image — by design) → crashloop after automerge. The artifact is a COPY
+  // SOURCE for the repo's existing Renovate config, not a file Renovate discovers here.
+  const bundleDirPosix = bundleDirRelative.split(path.sep).join("/");
+  writeFileSync(path.join(bundleDir, "renovate.json5"), renderRenovateFence(bundleDirPosix));
+
+  // 7f. README.md — what a reviewer of the bundle PR needs, including (under external
+  // secrets) the exact Secret names/keys the operator must make exist.
+  writeFileSync(
+    path.join(bundleDir, "README.md"),
+    renderBundleReadme(emitMetadata, bundleDirPosix),
+  );
+
+  console.log(
+    `\n  ✓ Bundle written. Commit ${bundleDirRelative}/ and apply it per docs/ci-cd.md ` +
+      `(cutover.mode: none — the sync never repoints traffic; the documented cutover does).`,
+  );
+}
+
+/**
+ * The bundle's update-bot fence artifact (real-cluster gap #6) — deterministic (the only
+ * input is the bundle path, which is fixed per variant). This is a COPY SOURCE: Renovate
+ * only auto-discovers config at the repo root (renovate.json[5], .renovaterc*, .github/…),
+ * never at this path, so merging the ignorePaths entry into the repo's EXISTING config is
+ * the required step, documented here and in the README's "Update bots" section.
+ */
+export function renderRenovateFence(bundleDirPosix: string): string {
+  return `// renovate.json5 — update-bot fence for the adapter-k8s GitOps bundle.
+//
+// WHY: every file in this bundle is a build artifact of ONE \`adapter-k8s emit\` run. The
+// routing tier verifies at startup that its manifest byte-matches the digest baked into
+// its own image (the manifest-digest check — fail-closed by design). A bot edit to any
+// image tag/digest field inside the bundle (Renovate's helm-values manager, Flux
+// image-automation's $imagepolicy markers) breaks that match and crashloops the routing
+// pod — silently, after automerge. NOTHING inside the bundle may be independently
+// updated; the bundle changes only by re-emitting it wholesale.
+//
+// HOW TO USE: Renovate does NOT discover this file at this path — it is a copy source.
+// Merge the ignorePaths entry below into your repo's EXISTING Renovate config
+// (renovate.json, renovate.json5, .renovaterc, or .github/renovate.json5):
+//
+//   "ignorePaths": ["${bundleDirPosix}/**"]
+//
+// (ignorePaths REPLACES the default list when set — keep your existing entries and the
+// defaults you rely on, e.g. "**/node_modules/**", alongside this one.)
+//
+// Point Renovate and Flux image-automation at your APP repo — where the next build runs —
+// never at bundle contents. New images reach the cluster via the next \`emit\`, which
+// re-resolves digests and replaces this directory wholesale.
+{
+  ignorePaths: [
+    "${bundleDirPosix}/**",
+  ],
+}
+`;
+}
+
+/** The bundle's own README — deterministic (per-build facts only, no timestamps). */
+export function renderBundleReadme(
+  meta: EmitMetadata,
+  bundleDirPosix = ".k8s-adapter/gitops",
+): string {
+  const pullSecretsSection =
+    meta.imagePullSecrets && meta.imagePullSecrets.length > 0
+      ? `## Image pull secrets (operator prerequisite)
+
+Every pod spec in this bundle references \`imagePullSecrets\`: ${meta.imagePullSecrets
+          .map((s) => `\`${s}\``)
+          .join(", ")}.
+The named \`kubernetes.io/dockerconfigjson\` Secret(s) must EXIST in namespace
+\`${meta.namespace}\` before this bundle is applied — deliver them via your secrets flow
+(\`kubectl create secret docker-registry\`, ExternalSecrets, SealedSecrets). The bundle
+never carries them, and a missing one is ImagePullBackOff on every pod that references it.
+
+`
+      : "";
+  const secretSection =
+    meta.secretsMode === "sops"
+      ? `## Secrets (SOPS-encrypted)
+
+This bundle's chart carries NO plaintext secret material. The secret manifests —
+${(meta.sopsFiles ?? []).map((f) => `\`${f}\``).join(", ")} — are encrypted with the
+repo's \`.sops.yaml\` creation rules and live under \`secrets/\`, to be decrypted and
+applied by your GitOps engine's SOPS integration. With Flux, point a Kustomization at
+\`secrets/\` with a decryption block:
+
+\`\`\`yaml
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+spec:
+  path: ./${bundleDirPosix}/secrets
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age   # the Secret holding your age key (flux create secret ...)
+\`\`\`
+
+(Argo CD needs a SOPS plugin, e.g. KSOPS; \`sops -d secrets/<f> | kubectl apply -f -\`
+works for hand-applied flows.)
+
+Determinism caveat: \`secrets/\` is EXCLUDED from the bundle's byte-determinism
+guarantee — sops embeds fresh data keys and MACs on every encryption, so two encryptions
+of the same plaintext differ byte-wise. To keep re-emit diffs quiet, emit REUSES an
+existing encrypted file when it still decrypts (recipients unchanged) to the same
+plaintext, and re-encrypts otherwise. A changed \`secrets/\` file in a re-emit diff
+therefore means the plaintext OR the recipients changed — never noise.
+
+A build's dispatch Secret must OUTLIVE the sync that applies the next build's bundle —
+the retained previous build's pods reference it by name (rollback target). Keep the
+superseded builds' encrypted files applied until their build is garbage-collected.
+`
+      : meta.secretsMode === "external"
+        ? `## Secrets (externalized)
+
+This bundle's chart deliberately carries NO secret material. The pods reference these
+Secrets by name via \`secretKeyRef\`; make them exist by any mechanism you trust
+(ExternalSecrets via \`templates/external-secret.yaml\` — set \`externalSecrets.storeName\`
+in values — SealedSecrets, SOPS, or \`kubectl create secret\`):
+
+| Secret name | Key | Value |
+| --- | --- | --- |
+| \`${meta.releaseName}\`-scoped per-build dispatch secret (see \`emit-metadata.json\` buildId; name rendered in \`templates/external-secret.yaml\`) | \`secret\` | the deterministic per-build dispatch secret: HMAC-SHA256 of \`"<release>\\0<buildId>"\` under the operator key (\`ADAPTER_K8S_INTERNAL_SECRET_KEY\` / \`.k8s-adapter/internal-secret.key\`). The build output's \`chart/templates/internal-secret.yaml\` (gitignored, mode 0600) holds the rendered value for one-time loading into your store. |
+| \`${meta.releaseName}-valkey\` (only when the cache is enabled) | \`url\` (required), \`auth\`, \`ca\` (optional) | the Valkey/Redis connection URL, AUTH string, and server CA. |
+
+A build's dispatch Secret must OUTLIVE the sync that applies the next build's bundle —
+the retained previous build's pods reference it by name (rollback target). Keep
+superseded build-scoped entries in your store until their build is garbage-collected.
+`
+        : `## Secrets (INLINE — read this)
+
+This bundle was emitted with \`--secrets inline\`: \`chart/templates/internal-secret.yaml\`
+(and the Valkey Secret, when present) contain REAL credentials. Committing this bundle
+commits those secrets. Rotate them if this repo's readership ever widens.
+`;
+
+  return `# GitOps bundle — ${meta.releaseName} @ ${meta.buildId}
+
+Generated by \`adapter-k8s emit\` (cutover.mode: none). Replace this directory WHOLESALE
+per release; never hand-edit individual files (the routing tier refuses a manifest that
+does not match its build, by design).
+
+- **Build:** \`${meta.buildId}\`
+- **Selectors pinned to:** \`${meta.previousBuildId ?? `${meta.buildId} (first deploy)`}\`
+- **Namespace:** \`${meta.namespace}\`
+- **Registry:** \`${meta.registry}\`
+- **Pools:** ${meta.poolTopology.map((p) => `\`${p}\``).join(", ")} (default \`${meta.defaultPool}\`)
+
+## Cutover model (mode: none)
+
+\`values/values.yaml\` pins \`activeBuildId\` to the PREVIOUS build, so applying this
+bundle stands the new build up WITHOUT repointing traffic. Cut over per docs/ci-cd.md
+(verify \`/readyz\` per pod, then patch the stable Service selectors), or use
+\`adapter-k8s deploy\` from a credentialed machine. Do NOT point an auto-syncing
+reconciler at this bundle without the ignore rules described in
+plans/gitops-deployment-strategies.md — drift correction of the selector after a manual
+cutover is an outage.
+
+## CI recipe (split app/cluster repos)
+
+When the bundle lives in a separate cluster repo (this app repo runs CI and \`emit\`; the
+cluster repo holds the committed bundles), the prior bundle is not at this repo's
+\`${bundleDirPosix}/\` — point emit at the cluster-repo checkout instead with
+\`--previous-bundle\` (authoritative: the same-repo lookup is skipped, and a missing or
+unreadable path is a hard error, never treated as a first deploy):
+
+\`\`\`yaml
+# app-repo CI (shape, not a literal workflow)
+- checkout: cluster-repo            # e.g. into ../cluster-repo
+- run: npx adapter-k8s emit \\
+    --previous-bundle ../cluster-repo/apps/${meta.releaseName}/.k8s-adapter/gitops
+- run: |                            # replace the cluster repo's bundle WHOLESALE
+    rm -rf ../cluster-repo/apps/${meta.releaseName}/.k8s-adapter/gitops
+    cp -R ${bundleDirPosix} ../cluster-repo/apps/${meta.releaseName}/.k8s-adapter/gitops
+- commit + PR against cluster-repo
+\`\`\`
+
+The path may name the bundle directory or its \`emit-metadata.json\` directly. The same
+release/namespace/emitVersion cross-checks apply to it as to a same-repo prior bundle.
+Monorepo flows (bundle committed to this repo) need no flag: emit reads the last
+committed bundle from \`${bundleDirPosix}/\` automatically.
+
+## Update bots (Renovate / Flux image-automation)
+
+Nothing inside this bundle may be independently updated: the routing tier refuses a
+manifest that does not byte-match the digest baked into its image (the manifest-digest
+check, fail-closed by design), so a bot edit to any image tag/digest field here —
+Renovate's \`helm-values\` manager, Flux image-automation's \`$imagepolicy\` markers —
+crashloops the routing pod after automerge. Point Renovate and Flux image-automation at
+your APP repo (where the next build runs), never at bundle contents; the bundle updates
+only by re-emitting it.
+
+Renovate does not auto-discover the bundled \`renovate.json5\` at this path — it is a
+copy source. Merge this entry into your repo's EXISTING Renovate config (ignorePaths
+replaces the defaults when set; keep your existing entries alongside it):
+
+\`\`\`json5
+"ignorePaths": ["${bundleDirPosix}/**"]
+\`\`\`
+
+${pullSecretsSection}${secretSection}`;
+}

@@ -96,14 +96,16 @@ function gatewayCapability(
       `Routing component "${routingName}" requires at least one application HTTPRoute`,
     );
   }
-  for (const [kind, ref] of [
-    ["Gateway", capability.gateway],
-    ...capability.applicationRoutes.map((route) => ["HTTPRoute", route] as const),
-  ] as const) {
-    if (ref.namespace && ref.namespace !== context.namespace) {
+  // Only the HTTPRoute must be namespace-local: Envoy policy targetRefs are
+  // LocalPolicyTargetReferences, and the EnvoyExtensionPolicy targets the route.
+  // The Gateway may live in another namespace (httpRouteExposure attaching to a
+  // shared Gateway) — nothing routing-owned targets the Gateway there; the
+  // namespace-local ClientTrafficPolicy is suppressed instead (see envoyNativeRouting).
+  for (const route of capability.applicationRoutes) {
+    if (route.namespace && route.namespace !== context.namespace) {
       throw new Error(
-        `Routing component "${routingName}" cannot target ${kind} ` +
-          `"${ref.namespace}/${ref.name}" from namespace "${context.namespace}": ` +
+        `Routing component "${routingName}" cannot target HTTPRoute ` +
+          `"${route.namespace}/${route.name}" from namespace "${context.namespace}": ` +
           "Envoy Gateway policy targetRefs are namespace-local",
       );
     }
@@ -324,10 +326,129 @@ export function manualExposure(options: {
   });
 }
 
+/**
+ * cert-manager issuance for a dedicated exposure's in-namespace TLS Secret.
+ *
+ * Wildcard-cert fleets keep their certificate in the gateway owner's namespace (e.g.
+ * `network`), which a dedicated Gateway/Ingress in the app namespace cannot reference —
+ * Gateway `certificateRefs` and Ingress `spec.tls` are namespace-local. This option emits
+ * a `cert-manager.io/v1` Certificate alongside the exposure so the Secret exists where the
+ * listener needs it. With `httpRouteExposure` none of this applies: TLS terminates at the
+ * parent Gateway and certificates stay the gateway owner's job.
+ */
+export interface CertManagerTlsOptions {
+  issuerRef: {
+    name: string;
+    kind: "ClusterIssuer" | "Issuer";
+    /** Issuer API group. Defaults to `cert-manager.io` (external issuers override it). */
+    group?: string;
+  };
+}
+
+// cert-manager Issuer/ClusterIssuer names are DNS subdomains; asserted verbatim (NOT
+// sanitized) because the ref must match an existing issuer exactly — same contract as
+// httpRouteExposure's parentRef Gateway names.
+const ISSUER_NAME_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
+// Kubernetes API group: DNS subdomain (e.g. "cert-manager.io", "awspca.cert-manager.io").
+const API_GROUP_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
+
+function validateCertManagerOptions(
+  certManager: CertManagerTlsOptions,
+  exposureName: string,
+  wantsTls: boolean,
+): void {
+  if (!wantsTls) {
+    throw new Error(
+      `${exposureName} certManager requires at least one host with tls.enabled — a ` +
+        "Certificate for a plaintext-only exposure would issue a cert nothing references",
+    );
+  }
+  const issuerRef = certManager.issuerRef;
+  if (!issuerRef || typeof issuerRef !== "object") {
+    throw new Error(`${exposureName} certManager requires an issuerRef`);
+  }
+  if (typeof issuerRef.name !== "string" || !ISSUER_NAME_RE.test(issuerRef.name)) {
+    throw new Error(`Invalid certManager issuerRef name ${JSON.stringify(issuerRef.name)}`);
+  }
+  if (issuerRef.kind !== "ClusterIssuer" && issuerRef.kind !== "Issuer") {
+    throw new Error(
+      `Invalid certManager issuerRef kind ${JSON.stringify(issuerRef.kind)}: ` +
+        'expected "ClusterIssuer" or "Issuer"',
+    );
+  }
+  if (issuerRef.group !== undefined && !API_GROUP_RE.test(issuerRef.group)) {
+    throw new Error(`Invalid certManager issuerRef group ${JSON.stringify(issuerRef.group)}`);
+  }
+}
+
+/**
+ * The Certificate + its API requirement + its readiness gate. `secretName` doubles as the
+ * Certificate name (cert-manager's own convention), so re-runs against the same config are
+ * idempotent and the object diff in a GitOps bundle is stable.
+ */
+function certManagerContribution(
+  certManager: CertManagerTlsOptions,
+  secretName: string,
+  dnsNames: string[],
+  context: ExposureBuildContext,
+): {
+  certificate: KubernetesManifest;
+  requirement: { apiVersion: string; resource: string; optional: false };
+  readiness: RoutingReadiness;
+} {
+  const issuerRef = certManager.issuerRef;
+  const certificate = object(
+    "cert-manager.io/v1",
+    "Certificate",
+    "certificates",
+    secretName,
+    context.namespace,
+    {
+      spec: {
+        secretName,
+        dnsNames,
+        issuerRef: {
+          name: issuerRef.name,
+          kind: issuerRef.kind,
+          ...(issuerRef.group !== undefined ? { group: issuerRef.group } : {}),
+        },
+      },
+    },
+    { labels: { "app.kubernetes.io/name": context.releaseName } },
+  );
+  return {
+    certificate,
+    requirement: { apiVersion: "cert-manager.io/v1", resource: "certificates", optional: false },
+    readiness: {
+      kind: "kubernetes-condition",
+      object: {
+        apiVersion: "cert-manager.io/v1",
+        resource: "certificates",
+        name: secretName,
+        namespace: context.namespace,
+      },
+      conditionsAt: { kind: "object" },
+      condition: {
+        type: "Ready",
+        status: "True",
+        observedGeneration: "must-equal-metadata-generation",
+      },
+      timeoutSeconds: 600,
+    },
+  };
+}
+
 export interface GatewayApiExposureOptions {
   className: string;
   hosts: readonly HostConfig[];
   tlsSecretName?: string;
+  /**
+   * Emit a cert-manager Certificate for the HTTPS listener's Secret. `tlsSecretName`
+   * becomes the Certificate's `secretName` when both are set; without it the Secret is
+   * derived as `<release>-tls`. Mutually exclusive with `controllerManagedTls` (two
+   * certificate managers for one listener).
+   */
+  certManager?: CertManagerTlsOptions;
   controllerManagedTls?: boolean;
   controllerManagedCertificate?: { annotation: string; nameSuffix: string };
   annotations?: Record<string, string>;
@@ -347,16 +468,36 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
       "gatewayApiExposure cannot mix TLS and plaintext hosts in one exposure; compose separate releases or use matching TLS settings",
     );
   }
-  if (wantsTls && !options.tlsSecretName && !options.controllerManagedTls) {
+  if (wantsTls && !options.tlsSecretName && !options.controllerManagedTls && !options.certManager) {
     throw new Error(
-      "gatewayApiExposure requires tlsSecretName or controllerManagedTls when TLS is enabled",
+      "gatewayApiExposure requires tlsSecretName, certManager, or controllerManagedTls when TLS is enabled",
     );
+  }
+  if (options.certManager && options.controllerManagedTls) {
+    throw new Error(
+      "gatewayApiExposure cannot combine certManager with controllerManagedTls: the " +
+        "controller already provisions the listener certificate",
+    );
+  }
+  if (options.certManager) {
+    validateCertManagerOptions(options.certManager, "gatewayApiExposure", wantsTls);
   }
   return defineExposureComponent({
     name: "gateway-api",
     hosts,
     build(context) {
       const gatewayName = sanitizeK8sName(`${context.releaseName}-gateway`);
+      const tlsSecretName =
+        options.tlsSecretName ??
+        (options.certManager ? sanitizeK8sName(`${context.releaseName}-tls`) : undefined);
+      const certManaged = options.certManager
+        ? certManagerContribution(
+            options.certManager,
+            tlsSecretName!,
+            hosts.filter((host) => host.tls.enabled).map((host) => host.hostname),
+            context,
+          )
+        : undefined;
       const routeName = sanitizeK8sName(`${context.releaseName}-routes`);
       const annotations = {
         ...options.annotations,
@@ -395,7 +536,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             ? {
                 tls: {
                   mode: "Terminate",
-                  certificateRefs: [{ kind: "Secret", name: options.tlsSecretName! }],
+                  certificateRefs: [{ kind: "Secret", name: tlsSecretName! }],
                 },
               }
             : {}),
@@ -519,7 +660,12 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
           }
         : undefined;
       return {
-        objects: [gateway, route, ...(redirectRoute ? [redirectRoute] : [])],
+        objects: [
+          gateway,
+          route,
+          ...(redirectRoute ? [redirectRoute] : []),
+          ...(certManaged ? [certManaged.certificate] : []),
+        ],
         requirements: [
           { apiVersion: "gateway.networking.k8s.io/v1", resource: "gateways", optional: false },
           {
@@ -527,8 +673,14 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             resource: "httproutes",
             optional: false,
           },
+          ...(certManaged ? [certManaged.requirement] : []),
         ],
-        readiness: [gatewayReady, routeReady, ...(redirectReady ? [redirectReady] : [])],
+        readiness: [
+          gatewayReady,
+          routeReady,
+          ...(redirectReady ? [redirectReady] : []),
+          ...(certManaged ? [certManaged.readiness] : []),
+        ],
         ingressSources: copyIngressSources(options.ingressSources),
         capabilities: [
           {
@@ -543,23 +695,223 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
   });
 }
 
+export interface HttpRouteExposureOptions {
+  /**
+   * The shared GatewayClass (e.g. "envoy", "eg"). Required: envoyNativeRouting's
+   * capability match keys on className.
+   */
+  className: string;
+  /**
+   * Attached verbatim as the app HTTPRoute's spec.parentRefs. At least one. Each name
+   * must match an EXISTING Gateway exactly (asserted, never sanitized). The namespace
+   * may be another team's (e.g. "network"); omitted it defaults to the release
+   * namespace, per Gateway API. sectionName picks the listener (e.g. "https").
+   */
+  parentRefs: Array<{
+    name: string;
+    namespace?: string;
+    sectionName?: string;
+  }>;
+  hosts: readonly HostConfig[];
+  /**
+   * Escaped-slash parity (escapedSlashesAction: KeepUnchanged) is the GATEWAY OWNER's
+   * job on a shared gateway — ClientTrafficPolicy is Gateway-scoped and namespace-local.
+   * Only "external" is valid; it exists so config reads as an explicit attestation,
+   * mirroring envoyNativeRouting's option.
+   */
+  escapedSlashes?: "external";
+  annotations?: Record<string, string>;
+  /**
+   * Strict-NetworkPolicy admitted sources. The shared gateway's proxy pods live in the
+   * PARENT's namespace (e.g. envoy-gateway-system or network), so under
+   * networkPolicy.strict you MUST admit them here or every request fails closed —
+   * reachability to the routing tier's :8443 is the internal dispatch secret.
+   */
+  ingressSources?: IngressSourceSet;
+}
+
+// Kubernetes sectionName is a Gateway API SectionName: DNS-label charset.
+const SECTION_NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
+// Gateway names are DNS subdomains; asserted verbatim (NOT sanitized) because the ref
+// must match an existing Gateway exactly.
+const PARENT_GATEWAY_NAME_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
+
+/**
+ * Attach the app's HTTPRoute to EXISTING shared Gateway(s) via parentRefs — the common
+ * fleet pattern (HTTPRoute -> shared envoy-internal/envoy-external in ns "network").
+ * Emits exactly one HTTPRoute: no Gateway, no Certificate, no ClientTrafficPolicy.
+ * TLS termination, certs, DNS and escaped-slash parity are the gateway owner's job.
+ *
+ * With envoyNativeRouting, the EnvoyExtensionPolicy attaches to this route by name
+ * (route-scoped ext_proc — supported since Envoy Gateway v1.1.0; the adapter's proven
+ * baseline is v1.5.4).
+ */
+export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureComponent {
+  const hosts = copyHosts(options.hosts);
+  if (!/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(options.className)) {
+    throw new Error(`Invalid GatewayClass name ${JSON.stringify(options.className)}`);
+  }
+  if (!Array.isArray(options.parentRefs) || options.parentRefs.length === 0) {
+    throw new Error("httpRouteExposure requires at least one parentRef naming an existing Gateway");
+  }
+  const parentRefs = options.parentRefs.map((ref) => {
+    if (typeof ref.name !== "string" || !PARENT_GATEWAY_NAME_RE.test(ref.name)) {
+      throw new Error(`Invalid parentRef Gateway name ${JSON.stringify(ref.name)}`);
+    }
+    if (ref.namespace !== undefined) assertSafeNamespace(ref.namespace);
+    if (ref.sectionName !== undefined && !SECTION_NAME_RE.test(ref.sectionName)) {
+      throw new Error(`Invalid parentRef sectionName ${JSON.stringify(ref.sectionName)}`);
+    }
+    return {
+      name: ref.name,
+      ...(ref.namespace !== undefined ? { namespace: ref.namespace } : {}),
+      ...(ref.sectionName !== undefined ? { sectionName: ref.sectionName } : {}),
+    };
+  });
+  if (options.escapedSlashes !== undefined && options.escapedSlashes !== "external") {
+    throw new Error(
+      'httpRouteExposure only supports escapedSlashes: "external" — escaped-slash parity ' +
+        "on a shared gateway belongs to the gateway owner's ClientTrafficPolicy/EnvoyPatchPolicy",
+    );
+  }
+  return defineExposureComponent({
+    name: "http-route",
+    hosts,
+    build(context) {
+      const routeName = sanitizeK8sName(`${context.releaseName}-routes`);
+      const labels = { "app.kubernetes.io/name": context.releaseName };
+      const route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "httproutes",
+        routeName,
+        context.namespace,
+        {
+          spec: {
+            parentRefs,
+            hostnames: hosts.map((host) => host.hostname),
+            rules: [
+              {
+                matches: [{ path: { type: "PathPrefix", value: "/" } }],
+                backendRefs: [{ name: context.backend.name, port: context.backend.port }],
+              },
+            ],
+          },
+        },
+        {
+          labels,
+          ...(options.annotations && Object.keys(options.annotations).length > 0
+            ? { annotations: options.annotations }
+            : {}),
+        },
+      );
+      const routeRef = {
+        apiVersion: "gateway.networking.k8s.io/v1",
+        resource: "httproutes",
+        name: routeName,
+        namespace: context.namespace,
+      };
+      // Both conditions must be True-and-fresh on EVERY reported parent, and
+      // minimumCount forces every named parent to have reported at all — a parentRef
+      // naming a nonexistent Gateway produces no status.parents entry, which would
+      // otherwise let the remaining parents satisfy the check.
+      const readiness: RoutingReadiness[] = (["Accepted", "ResolvedRefs"] as const).map((type) => ({
+        kind: "kubernetes-condition",
+        object: routeRef,
+        conditionsAt: { kind: "parents", minimumCount: parentRefs.length },
+        condition: {
+          type,
+          status: "True",
+          observedGeneration: "must-equal-metadata-generation",
+        },
+        timeoutSeconds: 600,
+      }));
+      const parentGatewayRefs = parentRefs.map((ref) => ({
+        apiVersion: "gateway.networking.k8s.io/v1",
+        resource: "gateways",
+        name: ref.name,
+        namespace: ref.namespace ?? context.namespace,
+      }));
+      const uniqueParents = [
+        ...new Map(parentGatewayRefs.map((ref) => [`${ref.namespace}|${ref.name}`, ref])).values(),
+      ];
+      return {
+        objects: [route],
+        requirements: [
+          {
+            apiVersion: "gateway.networking.k8s.io/v1",
+            resource: "httproutes",
+            optional: false,
+          },
+        ],
+        readiness,
+        diagnostics: uniqueParents.map((gateway) => ({
+          kind: "kubernetes-gateway-address" as const,
+          gateway,
+        })),
+        ingressSources: copyIngressSources(options.ingressSources),
+        capabilities: [
+          {
+            kind: "gateway-api",
+            className: options.className,
+            gateway: parentGatewayRefs[0]!,
+            applicationRoutes: [routeRef],
+          },
+        ],
+      };
+    },
+  });
+}
+
 export interface IngressExposureOptions {
   className: string;
   hosts: readonly HostConfig[];
   tlsSecretName?: string;
+  /**
+   * Emit a cert-manager Certificate for the Ingress's TLS Secret. `tlsSecretName`
+   * becomes the Certificate's `secretName` when both are set; without it the Secret is
+   * derived as `<release>-tls`.
+   *
+   * ALWAYS emits the Certificate object rather than the `cert-manager.io/cluster-issuer`
+   * annotation, deliberately: an emitted Certificate is adapter-owned (visible in the
+   * GitOps bundle diff, cleaned up with the release), its `Ready` condition gates
+   * readiness by a name known at render time, the cert-manager CRD requirement is
+   * preflight-checked, and `issuerRef` supports `kind: Issuer` and external issuer
+   * groups — none of which the annotation can express, and the shim-created Certificate
+   * it produces is invisible to readiness until the shim has run. The lighter annotation
+   * path needs no adapter surface at all: pass the annotation via `annotations` with a
+   * `tlsSecretName` and ingress-shim owns issuance (no Certificate emitted, no CRD
+   * requirement declared, no readiness gate).
+   */
+  certManager?: CertManagerTlsOptions;
   annotations?: Record<string, string>;
   ingressSources?: IngressSourceSet;
 }
 
 export function ingressExposure(options: IngressExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
-  if (hosts.some((host) => host.tls.enabled) && !options.tlsSecretName) {
-    throw new Error("ingressExposure requires tlsSecretName when TLS is enabled");
+  const wantsTls = hosts.some((host) => host.tls.enabled);
+  if (wantsTls && !options.tlsSecretName && !options.certManager) {
+    throw new Error("ingressExposure requires tlsSecretName or certManager when TLS is enabled");
+  }
+  if (options.certManager) {
+    validateCertManagerOptions(options.certManager, "ingressExposure", wantsTls);
   }
   return defineExposureComponent({
     name: "ingress",
     hosts,
     build(context) {
+      const tlsSecretName =
+        options.tlsSecretName ??
+        (options.certManager ? sanitizeK8sName(`${context.releaseName}-tls`) : undefined);
+      const certManaged = options.certManager
+        ? certManagerContribution(
+            options.certManager,
+            tlsSecretName!,
+            hosts.filter((host) => host.tls.enabled).map((host) => host.hostname),
+            context,
+          )
+        : undefined;
       return {
         objects: [
           object(
@@ -571,14 +923,14 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
             {
               spec: {
                 ingressClassName: options.className,
-                ...(options.tlsSecretName
+                ...(tlsSecretName
                   ? {
                       tls: [
                         {
                           hosts: hosts
                             .filter((host) => host.tls.enabled)
                             .map((host) => host.hostname),
-                          secretName: options.tlsSecretName,
+                          secretName: tlsSecretName,
                         },
                       ],
                     }
@@ -607,11 +959,13 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
               ...(options.annotations ? { annotations: options.annotations } : {}),
             },
           ),
+          ...(certManaged ? [certManaged.certificate] : []),
         ],
         requirements: [
           { apiVersion: "networking.k8s.io/v1", resource: "ingresses", optional: false },
+          ...(certManaged ? [certManaged.requirement] : []),
         ],
-        readiness: [],
+        readiness: certManaged ? [certManaged.readiness] : [],
         ingressSources: copyIngressSources(options.ingressSources),
         capabilities: [{ kind: "ingress", className: options.className }],
       };
@@ -667,7 +1021,27 @@ export function envoyNativeRouting(
       const exposure = gatewayCapability(context, "envoy-native", className);
       const policyName = sanitizeK8sName(`${context.releaseName}-routing-extproc`);
       const clientPolicyName = sanitizeK8sName(`${context.releaseName}-client-traffic`);
-      const emitsClientPolicy = (options.escapedSlashes ?? "policy") === "policy";
+      // A ClientTrafficPolicy targets the Gateway by name, namespace-locally — it cannot
+      // reach a Gateway in another namespace (a shared gateway attached via
+      // httpRouteExposure). There, escaped-slash parity (KeepUnchanged) is the gateway
+      // OWNER's job (a CTP/EnvoyPatchPolicy on the shared Gateway), so the default flips
+      // to "external" and an explicit "policy" is a build error rather than a policy that
+      // never binds — Envoy Gateway also rejects a second conflicting CTP per listener.
+      const gatewayIsCrossNamespace =
+        exposure.gateway.namespace !== undefined &&
+        exposure.gateway.namespace !== context.namespace;
+      if (gatewayIsCrossNamespace && options.escapedSlashes === "policy") {
+        throw new Error(
+          `envoyNativeRouting cannot emit a ClientTrafficPolicy for Gateway ` +
+            `"${exposure.gateway.namespace}/${exposure.gateway.name}": ClientTrafficPolicy ` +
+            `targetRefs are namespace-local. Escaped-slash parity (escapedSlashesAction: ` +
+            `KeepUnchanged) must be configured by the shared gateway's owner via a ` +
+            `ClientTrafficPolicy or EnvoyPatchPolicy in that namespace; set ` +
+            `escapedSlashes: "external" to attest that.`,
+        );
+      }
+      const emitsClientPolicy =
+        !gatewayIsCrossNamespace && (options.escapedSlashes ?? "policy") === "policy";
       const readiness: RoutingReadiness[] = [
         {
           kind: "kubernetes-condition",

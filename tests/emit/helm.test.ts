@@ -12,6 +12,7 @@ import {
   compileTarget,
   defineTarget,
   gatewayApiExposure,
+  httpRouteExposure,
   kubernetesCluster,
 } from "../../src/target/index.js";
 
@@ -160,6 +161,94 @@ describe("generateHelmChart", () => {
     expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(true);
     expect(Object.values(result).some((body) => body.includes('"kind": "HTTPRoute"'))).toBe(true);
     expect(result["templates/routing-service-deployment.yaml"]).toBeUndefined();
+  });
+
+  it("renders an httpRouteExposure target with an HTTPRoute and no Gateway anywhere", () => {
+    const target = defineTarget({
+      cluster: kubernetesCluster(),
+      exposure: httpRouteExposure({
+        className: "envoy",
+        parentRefs: [{ name: "envoy-external", namespace: "network", sectionName: "https" }],
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "ghcr.io/example/site",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "ghcr.io/example/site",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      compiledTarget,
+    });
+
+    const routeTemplate = Object.entries(result).find(([, body]) =>
+      body.includes('"kind": "HTTPRoute"'),
+    );
+    expect(routeTemplate).toBeDefined();
+    expect(routeTemplate![1]).toContain('"name": "envoy-external"');
+    expect(routeTemplate![1]).toContain('"namespace": "network"');
+    expect(routeTemplate![1]).toContain('"sectionName": "https"');
+    // The whole chart contains no Gateway object — the shared parent is not ours.
+    expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(false);
+  });
+
+  it("renders a cert-manager Certificate for a certManager gatewayApiExposure", () => {
+    const target = defineTarget({
+      cluster: kubernetesCluster(),
+      exposure: gatewayApiExposure({
+        className: "eg",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+        certManager: { issuerRef: { name: "letsencrypt-production", kind: "ClusterIssuer" } },
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "ghcr.io/example/site",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "ghcr.io/example/site",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      compiledTarget,
+    });
+
+    const certTemplate = Object.entries(result).find(([, body]) =>
+      body.includes('"kind": "Certificate"'),
+    );
+    expect(certTemplate).toBeDefined();
+    expect(certTemplate![1]).toContain('"apiVersion": "cert-manager.io/v1"');
+    expect(certTemplate![1]).toContain('"secretName": "site-tls"');
+    expect(certTemplate![1]).toContain('"name": "letsencrypt-production"');
+    expect(certTemplate![1]).toContain('"app.example.com"');
+    // The Gateway's HTTPS listener terminates from the derived Secret.
+    const gatewayTemplate = Object.entries(result).find(([, body]) =>
+      body.includes('"kind": "Gateway"'),
+    );
+    expect(gatewayTemplate![1]).toContain('"name": "site-tls"');
   });
 
   it("translates flat pool resource settings into Kubernetes requests and limits", () => {
@@ -402,6 +491,54 @@ describe("generateHelmChart", () => {
     expect(result["templates/routing-service-hpa.yaml"]).toBeDefined();
     expect(result["templates/route-ext-config.yaml"]).toBeDefined();
     expect(result["templates/route-ext-update-job.yaml"]).toBeDefined();
+  });
+
+  // Gap #2 (real-cluster gap analysis): the chart rendered NO imagePullSecrets anywhere,
+  // so a private registry on nodes with no machine-level credentials was
+  // ImagePullBackOff on every pod. One config key must reach EVERY pod-creating template.
+  it("stamps config imagePullSecrets on every pod-creating template (pools, routing tier, registration Job)", () => {
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.2.0",
+      config: {
+        pools: { ssr: { routes: ["appPages"] } },
+        imagePullSecrets: ["docker-regcred"],
+        provider: { gke: {} },
+      } as K8sAdapterConfig,
+      imageRegistry: "gcr.io/my-project",
+      routingManifest: mockManifest,
+      internalSecret: "deadbeef",
+      extensionChainJson: MINIMAL_CHAIN_JSON,
+      infrastructure: { projectId: "p-123456", region: "us-central1" },
+    });
+    for (const file of [
+      "templates/ssr-deployment.yaml",
+      "templates/routing-service-deployment.yaml",
+      "templates/route-ext-update-job.yaml",
+    ]) {
+      expect(result[file], file).toMatch(/imagePullSecrets:\n\s+- name: "docker-regcred"/);
+    }
+    // Exhaustive: NO rendered template creates a pod without the reference. Every document
+    // carrying a pod template (spec.template.spec) must carry imagePullSecrets.
+    for (const [name, body] of Object.entries(result)) {
+      if (!name.startsWith("templates/")) continue;
+      if (
+        /^\s{4}spec:$/m.test(body) &&
+        /kind: (Deployment|Job|StatefulSet|DaemonSet|CronJob)/.test(body)
+      ) {
+        expect(body, `${name} renders a pod template without imagePullSecrets`).toContain(
+          "imagePullSecrets",
+        );
+      }
+    }
+  });
+
+  it("renders no imagePullSecrets anywhere when the key is absent (charts stay byte-identical)", () => {
+    const result = chartFor("abc123");
+    for (const [name, body] of Object.entries(result)) {
+      expect(body, name).not.toContain("imagePullSecrets");
+    }
   });
 
   // N50 (review, Medium): the route-extension update Job and its ServiceAccount used to

@@ -28,6 +28,7 @@ export function generateBuildMetadata({
   namespace,
   containerRegistry,
   nodeCidrs,
+  podCidrs,
   containerStrategy,
   poolImageLayout,
   hasMiddleware,
@@ -38,6 +39,7 @@ export function generateBuildMetadata({
   cacheMemorystore,
   distDir,
   compositionPlan,
+  imagePullSecrets,
 }: {
   buildId: string;
   nextVersion: string;
@@ -94,9 +96,20 @@ export function generateBuildMetadata({
    * registry it was emitted for — see the fingerprint check in deploy.ts.
    */
   containerRegistry?: string | undefined;
-  /** provider.generic.nodeCidrs, if set — deploy prefers it over live node discovery. */
+  /**
+   * networkPolicy.nodeCidrs (or the legacy provider.generic.nodeCidrs, which maps in) —
+   * deploy prefers it over live node discovery, and emit REQUIRES it for the strict posture.
+   */
   nodeCidrs?: string[] | undefined;
+  /** networkPolicy.podCidrs — the emit path's replacement for deploy-time pod-CIDR discovery. */
+  podCidrs?: string[] | undefined;
   compositionPlan?: { digest: string; targetFingerprint: string } | undefined;
+  /**
+   * config `imagePullSecrets` — the registry-pull Secret names baked into every rendered
+   * pod spec. Recorded so `adapter-k8s emit` can surface them in the bundle README (the
+   * operator must make them exist in the target namespace; the adapter never creates them).
+   */
+  imagePullSecrets?: string[] | undefined;
 }): string {
   const safeTargetPlatform = parseTargetPlatform(targetPlatform, "build metadata targetPlatform");
   return JSON.stringify(
@@ -108,6 +121,8 @@ export function generateBuildMetadata({
       namespace,
       ...(containerRegistry ? { containerRegistry } : {}),
       ...(nodeCidrs && nodeCidrs.length > 0 ? { nodeCidrs } : {}),
+      ...(podCidrs && podCidrs.length > 0 ? { podCidrs } : {}),
+      ...(imagePullSecrets && imagePullSecrets.length > 0 ? { imagePullSecrets } : {}),
       pools: poolNames,
       defaultPool,
       ...(compositionPlan ? { compositionPlan } : {}),

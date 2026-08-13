@@ -437,6 +437,45 @@ describe("N60: pod-spec injection through pools.*.resources (values.yaml -> helm
   );
 });
 
+describe("imagePullSecrets (private registries — gap #2)", () => {
+  it("renders imagePullSecrets on the pod spec when configured, quoted (N61)", () => {
+    const yaml = renderDeployment({
+      poolName: "ssr",
+      buildId: "b1",
+      releaseName: "my-app",
+      pullSecrets: ["docker-regcred", "gh-regcred"],
+    });
+    // Pod-spec level (sibling of automountServiceAccountToken), one entry per name, quoted
+    // so a YAML-boolean-shaped Secret name ("on", "123") survives the apiserver decode.
+    expect(yaml).toMatch(
+      /automountServiceAccountToken: false\n\s+imagePullSecrets:\n\s+- name: "docker-regcred"\n\s+- name: "gh-regcred"\n/,
+    );
+  });
+
+  it("emits NO imagePullSecrets key when unconfigured or empty (public-registry charts stay byte-identical)", () => {
+    const unset = renderDeployment({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });
+    expect(unset).not.toContain("imagePullSecrets");
+    const empty = renderDeployment({
+      poolName: "ssr",
+      buildId: "b1",
+      releaseName: "my-app",
+      pullSecrets: [],
+    });
+    expect(empty).toBe(unset);
+  });
+
+  it("validates each name at the point of consumption (bare pod-spec sink)", () => {
+    expect(() =>
+      renderDeployment({
+        poolName: "ssr",
+        buildId: "b1",
+        releaseName: "my-app",
+        pullSecrets: ['regcred"\n      hostNetwork: true'],
+      }),
+    ).toThrow(/Invalid Secret name/);
+  });
+});
+
 describe("renderDeployment rollout safety (N63, the other half of the 502/503 fix)", () => {
   it("never dips below the live replica count during a roll", () => {
     const yaml = renderDeployment({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });

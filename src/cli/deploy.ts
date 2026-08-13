@@ -1,15 +1,12 @@
 // src/cli/deploy.ts
 import path from "node:path";
 import { isIP } from "node:net";
-import { createHash } from "node:crypto";
 import { infrastructurePath, outputDirName } from "./infrastructure-validation.js";
 import {
   chmodSync,
-  cpSync,
   existsSync,
   readdirSync,
   readFileSync,
-  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -64,9 +61,6 @@ import { sanitizeK8sName } from "../emit/templates/utils.js";
 import {
   ADAPTER_RELEASE_LABEL,
   assertSafeBuildId,
-  assertSafePoolName as assertSafePoolNameCharset,
-  findBuildTopologyNameCollision,
-  findEmittedNameCollision,
   assertSafeImageRegistry,
   assertSafeProbePath,
   assertSafeProjectId,
@@ -76,19 +70,41 @@ import {
   resolveK8sNamespace,
 } from "../emit/templates/utils.js";
 import { sanitizeForTerminal } from "./terminal.js";
-import { resolveContainerCli, targetPlatform } from "./container-runtime.js";
+import { resolveContainerCli } from "./container-runtime.js";
+import type { TargetPlatform } from "../target-platform.js";
+import { parsePoolImageLayout } from "../pool-image-layout.js";
+// GitOps PR1: the pipeline-safe steps (A2 fingerprints, A6/A7 image build/push, A8 digest
+// resolution, B2 collision guards) live in src/pipeline/ so `emit` can run them in CI.
+// Deploy re-exports the moved functions below so existing importers keep working.
 import {
-  DEFAULT_TARGET_PLATFORM,
-  parseTargetPlatform,
-  type TargetPlatform,
-} from "../target-platform.js";
-import type { GcloudCommand } from "./init.js";
-import type { RegistryAuthentication, RegistryDigestLookup } from "../composition-plan/index.js";
+  assertSafePoolName,
+  buildDockerCommands,
+  refreshFetchCacheStaging,
+} from "../pipeline/images.js";
+import { DIGEST_RE, resolveDeployImageDigests } from "../pipeline/digests.js";
 import {
-  parsePoolImageLayout,
-  SHARED_POOL_IMAGE_LAYOUT,
-  type PoolImageLayout,
-} from "../pool-image-layout.js";
+  assertBuildIdChangedSinceServing,
+  assertDeployablePoolTopology,
+  assertNoCrossBuildNameCollision,
+  assertNoSelfNameCollision,
+  assertTargetFingerprint,
+  resolveBuiltTargetPlatform,
+} from "../pipeline/fingerprints.js";
+
+// Moved to src/pipeline/ (GitOps PR1); re-exported here so the import surface of the CLI
+// module is unchanged for existing consumers and tests-through-runDeploy.
+export {
+  assertSafePoolName,
+  buildDockerCommands,
+  refreshFetchCacheStaging,
+  type DockerCommandOptions,
+} from "../pipeline/images.js";
+export {
+  resolveDeployImageDigests,
+  resolveImageDigest,
+  resolveRegistryDigest,
+  resolveRegistryDigestAny,
+} from "../pipeline/digests.js";
 import {
   assertCompositionPlanInvocation,
   compositionPlanNeedsExplicitConfirmation,
@@ -97,6 +113,7 @@ import {
   preflightCompositionPlan,
   waitForCompositionPlanReadiness,
 } from "./composition-plan.js";
+import { evaluateEnvoyGatewayPreflight } from "./envoy-gateway-preflight.js";
 
 /**
  * How long to wait for a Deployment rollout.
@@ -314,616 +331,6 @@ export async function discoverServingBuildId(
     );
   }
   return buildId;
-}
-
-export interface DockerCommandOptions {
-  pools: string[];
-  buildId: string;
-  registry: string;
-  outputDir: string;
-  containerStrategy: "traced-assets" | "shared-image";
-  poolImageLayout?: PoolImageLayout;
-  /**
-   * S24: which container CLI to shell out to. Defaults to docker for compatibility; the
-   * deploy resolves the real one via resolveContainerCli(). Every verb used here — build,
-   * push — is accepted identically by podman and nerdctl.
-   */
-  containerCli?: string;
-  /** Platform recorded by the build artifact; never re-infer it from the deploy host. */
-  targetPlatform?: TargetPlatform;
-  /** Exact authentication operation declared by a composed target. Omitted for legacy builds. */
-  registryAuthentication?: RegistryAuthentication;
-  /** Portable routing has no routing-service workload or image. */
-  includeRoutingService?: boolean;
-}
-
-/**
- * Re-stage the build's fetch-cache (`<distDir>/cache/fetch-cache`) into every image build
- * context, right before `docker build`.
- *
- * WHY HERE and not (only) in onBuildComplete: the fetch-cache entries are written
- * ASYNCHRONOUSLY by the static-export workers, and upstream orders nothing between those
- * writes and handleBuildComplete — the workers are only torn down in `next build`'s
- * `finally`, AFTER the adapter hook. Measured 2026-08-04: a local repro build staged the
- * dir fine (the write landed ~750ms before the staging read) while two consecutive harness
- * builds of the same fixture shipped images WITHOUT it — the write lost the race with
- * onBuildComplete's existsSync. Deploy runs minutes after the build, when the artifact is
- * deterministically on disk. The staged copy is REPLACED wholesale so entries deleted from
- * the build's fetch-cache stop shipping (the #32 context-wipe rule).
- *
- * The files matter because `next start`'s filesystem cache starts WITH them: without them a
- * post-revalidateTag FETCH read is a miss, patch-fetch re-fetches under the prerender's
- * abort signal, and the cache-components background revalidation dies under load
- * (rdc stale-forever — see build-seed-index.ts fetchCacheSeed).
- */
-export function refreshFetchCacheStaging(
-  projectDir: string,
-  outputDir: string,
-  metadata: {
-    distDir?: unknown;
-    pools: string[];
-    containerStrategy: string;
-    poolImageLayout?: unknown;
-  },
-): void {
-  // Validate at the point of consumption: distDir comes from build-metadata.json, which is
-  // build-controlled. The same escape S20 rejects at build time is rejected here — the dest
-  // is built as `<context>/<distDir>` and a `../` form would land the recursive rm/cp
-  // OUTSIDE the build context. Older metadata predates the field; default to .next.
-  const distDirRel = typeof metadata.distDir === "string" ? metadata.distDir : ".next";
-  if (path.isAbsolute(distDirRel) || distDirRel.split(path.sep).includes("..")) {
-    throw new Error(
-      `Invalid distDir ${JSON.stringify(distDirRel)} in build-metadata.json: it must be a ` +
-        `project-relative path inside the project (S20). Re-run the build.`,
-    );
-  }
-  const poolImageLayout = parsePoolImageLayout(metadata.poolImageLayout);
-  if (poolImageLayout === SHARED_POOL_IMAGE_LAYOUT) {
-    // An older CLI does not understand the layout: it refreshes every pool delta, then the
-    // sentinel FROM fails. A retry with this CLI must remove those seeds because the child
-    // COPY overlays its parent and would otherwise shadow every later base refresh.
-    for (const pool of metadata.pools) {
-      rmSync(path.join(outputDir, "pools", pool, "context", ".k8s-adapter", "fetch-cache-seed"), {
-        recursive: true,
-        force: true,
-      });
-    }
-  }
-  const src = path.join(projectDir, distDirRel, "cache", "fetch-cache");
-  // Observable either way (M1 spirit): the silent-return variant of this function cost a
-  // debugging round — an image shipped without the files and nothing said which of the two
-  // silent paths (no source vs no re-stage) was taken.
-  if (!existsSync(src)) {
-    console.log(`    (no build fetch-cache at ${src} — nothing to re-stage)`);
-    return;
-  }
-  const contexts =
-    metadata.containerStrategy === "shared-image"
-      ? [path.join(outputDir, "shared-context")]
-      : poolImageLayout === SHARED_POOL_IMAGE_LAYOUT
-        ? [path.join(outputDir, "pool-base", "fetch-cache")]
-        : metadata.pools.map((pool) => path.join(outputDir, "pools", pool, "context"));
-  for (const context of contexts) {
-    // A context can legitimately be absent (ADAPTER_K8S_SKIP_STAGING builds have no
-    // contexts, and those deploys never reach the docker step anyway).
-    if (!existsSync(context)) continue;
-    // NOT the runtime location: the pod mounts a writable emptyDir over /app/.next/cache
-    // that shadows image content there; the pool server restores this seed at boot
-    // (pool-server/fetch-cache-seed.ts).
-    const dest = path.join(context, ".k8s-adapter", "fetch-cache-seed");
-    rmSync(dest, { recursive: true, force: true });
-    cpSync(src, dest, { recursive: true, dereference: true });
-    console.log(`    Re-staged build fetch-cache into ${path.relative(projectDir, context)}`);
-  }
-}
-
-export function buildDockerCommands(options: DockerCommandOptions): GcloudCommand[] {
-  const { pools, buildId, registry, outputDir, containerStrategy } = options;
-  const cli = options.containerCli ?? "docker";
-  // S24: pin the build architecture. Without it a host-native build on Apple Silicon
-  // produces arm64 images that fail with `exec format error` on GKE's x86 nodes — and only
-  // at rollout, not at build time. Never passed to `push`, which has no such flag.
-  const platformArg = `--platform=${parseTargetPlatform(
-    options.targetPlatform ?? targetPlatform(),
-    "Docker target platform",
-  )}`;
-  const commands: GcloudCommand[] = [];
-  const poolImageLayout = parsePoolImageLayout(
-    options.poolImageLayout,
-    "Docker command poolImageLayout",
-  );
-
-  // 0. Registry authentication — ONLY for Google registries.
-  //
-  // This used to run `gcloud auth configure-docker` for every registry host unconditionally, so
-  // a Harbor/ECR/ACR deploy with perfectly good credentials already configured died before it
-  // built anything, on a machine that has no reason to have gcloud installed. Registry auth is
-  // the registry's business: for anything non-Google we assume the operator's existing
-  // credential setup (docker login, ECR credential helper, az acr login, a pull secret) — the
-  // same assumption every other tool makes.
-  const registryHost = registry.split("/")[0]!;
-  const authentication = options.registryAuthentication;
-  const shouldConfigureGcloud = authentication
-    ? authentication.kind === "gcloud-docker-helper"
-    : registryHost.endsWith("-docker.pkg.dev") || /(^|\.)gcr\.io$/.test(registryHost);
-  if (
-    authentication?.kind === "gcloud-docker-helper" &&
-    authentication.registryHost !== registryHost
-  ) {
-    throw new Error(
-      `Composition plan registry authentication names host ` +
-        `${JSON.stringify(authentication.registryHost)}, but the image repository uses ` +
-        `${JSON.stringify(registryHost)}. Rebuild the target plan.`,
-    );
-  }
-  if (shouldConfigureGcloud) {
-    commands.push({
-      description: `Configure Docker authentication for ${registryHost}`,
-      command: "gcloud",
-      args: ["auth", "configure-docker", registryHost, "--quiet"],
-    });
-  }
-
-  if (containerStrategy === "shared-image") {
-    const tag = `${registry}/nextjs-app:${buildId}`;
-    commands.push({
-      description: `Build shared image`,
-      command: cli,
-      args: ["build", platformArg, "-t", tag, `${outputDir}/shared-context`],
-    });
-    commands.push({
-      description: `Push shared image`,
-      command: cli,
-      args: ["push", tag],
-    });
-  } else {
-    let poolBaseTag: string | undefined;
-    if (poolImageLayout === SHARED_POOL_IMAGE_LAYOUT) {
-      const localTag = createHash("sha256")
-        .update(`${registry}\0${buildId}`)
-        .digest("hex")
-        .slice(0, 24);
-      poolBaseTag = `localhost/adapter-k8s-pool-base:${localTag}`;
-      commands.push({
-        description: "Build shared pool base",
-        command: cli,
-        args: ["build", platformArg, "-t", poolBaseTag, `${outputDir}/pool-base`],
-      });
-      commands.push({
-        description: "Verify shared pool base is visible in the container CLI image store",
-        command: cli,
-        args: ["image", "inspect", poolBaseTag],
-      });
-    }
-    for (const pool of pools) {
-      const tag = `${registry}/nextjs-app-${pool}:${buildId}`;
-      commands.push({
-        description: `Build ${pool} image`,
-        command: cli,
-        args: [
-          "build",
-          platformArg,
-          ...(poolBaseTag ? ["--build-arg", `POOL_BASE_IMAGE=${poolBaseTag}`] : []),
-          "-t",
-          tag,
-          `${outputDir}/pools/${pool}`,
-        ],
-      });
-      commands.push({
-        description: `Push ${pool} image`,
-        command: cli,
-        args: ["push", tag],
-      });
-    }
-  }
-
-  if (options.includeRoutingService !== false) {
-    const routingTag = `${registry}/routing-service:${buildId}`;
-    commands.push({
-      description: "Build routing service image",
-      command: cli,
-      args: [
-        "build",
-        platformArg,
-        "-f",
-        `${outputDir}/routing-service/Dockerfile`,
-        "-t",
-        routingTag,
-        `${outputDir}/routing-service`,
-      ],
-    });
-    commands.push({
-      description: "Push routing service image",
-      command: cli,
-      args: ["push", routingTag],
-    });
-  }
-
-  return commands;
-}
-
-// L15: pool names are read from build-metadata.json and used in chart file paths and
-// docker build contexts — a malicious or corrupt name (e.g. "../x") could otherwise
-// escape the chart templates directory.
-export function assertSafePoolName(poolName: string): void {
-  // N61: delegate the CHARSET to the shared validator the templates use, so deploy and
-  // emit can never disagree. The local copy was `/^[a-z0-9-]+$/`, which admitted a
-  // leading/trailing hyphen (an invalid K8s label value) and the YAML-1.1 boolean names
-  // (`on`/`no`/`y`/`off`/`true`) the templates now reject.
-  try {
-    assertSafePoolNameCharset(poolName);
-  } catch (err) {
-    throw new Error(
-      `${err instanceof Error ? err.message : String(err)} (from build-metadata.json — ` +
-        `refusing to use it in file paths.)`,
-    );
-  }
-  // "routing-service" is the reserved routing-tier Deployment name (<release>-routing-service,
-  // updated in place per build, verified/reverted separately from pools). A pool with this
-  // name would collide with it: readiness checks, cleanup classification, and rollback's
-  // edge revert all key off that exact name.
-  if (poolName === "routing-service") {
-    throw new Error(
-      `Invalid pool name "routing-service" in build-metadata.json: reserved for the routing ` +
-        `tier (<release>-routing-service). Rename the pool (check the adapter's route ` +
-        `classification config) and rebuild.`,
-    );
-  }
-}
-
-/**
- * S23: pin every deployed image to an immutable digest, or refuse the deploy.
- *
- * Two sources, local first (fast, offline) then the registry (authoritative). If an image
- * still cannot be pinned this THROWS, because the alternative is deploying the mutable
- * `:${buildId}` tag on pods that receive the internal dispatch secret and the cache
- * credentials. A registry writer who retags that tag then changes the code running on the
- * next pod start or scale-up, which is exactly the escalation the split `<release>-cli`
- * identity exists to prevent (it is deliberately writer, not repoAdmin, for this reason).
- * Degrading to that silently on a `docker inspect` quirk gives the quirk the same effect
- * as the attack.
- *
- * S7 (SECURITY): the deploy identity's registry write access is assumable by anyone who can
- * create a Pod in the namespace (Workload Identity), while the pods themselves carry
- * INTERNAL_HEADER_SECRET and the cache credentials in env — so a retag of an already-deployed
- * build id turns pod-creation into dispatch-secret theft, and from there into a cluster-wide
- * middleware bypass. `docker inspect` reports RepoDigests only AFTER a successful push (the
- * digest is assigned by the registry), which is why this runs here and not at
- * chart-generation time.
- *
- * `--allow-mutable-tags` is the explicit opt-out, mirroring `--allow-no-network-policy`:
- * fail-closed by default, and an operator who really wants it has to say so.
- */
-export async function resolveDeployImageDigests(opts: {
-  refs: Array<[string, string]>;
-  projectId: string;
-  allowMutableTags?: boolean;
-  containerCli?: string;
-  targetPlatform?: TargetPlatform;
-  digestLookup?: RegistryDigestLookup;
-}): Promise<Record<string, string>> {
-  const digests: Record<string, string> = {};
-  const unresolved: string[] = [];
-  const cliLabel = opts.containerCli ?? "docker";
-  const platform = parseTargetPlatform(
-    opts.targetPlatform ?? targetPlatform(),
-    "image digest target platform",
-  );
-  for (const [key, ref] of opts.refs) {
-    // REGISTRY FIRST, on ANY registry (S25/S28). kubelet pulls from the registry, so only the
-    // registry's digest can actually be deployed; the local daemon merely usually agrees, and
-    // podman measurably does not. Artifact Registry is asked through gcloud (proven, and works
-    // with the credential helper); everything else through crane/skopeo/docker-manifest.
-    const cli = opts.containerCli ?? "docker";
-    // The local daemon is the LAST resort, and only for docker. MEASURED with podman 6.0.1:
-    // its RepoDigest matched the registry for one image and differed for another, because push
-    // can rewrite the manifest. An unreliable digest is worse than none — it deploys and then
-    // ImagePullBackOffs at rollout, after cutover has started, whereas refusing fails at deploy
-    // time with something actionable.
-    const artifactRegistryProject =
-      opts.digestLookup?.kind === "gcp-artifact-registry"
-        ? opts.digestLookup.projectId
-        : opts.digestLookup?.kind === "oci-distribution"
-          ? null
-          : opts.projectId;
-    // Single-flight for the crane/skopeo/docker-manifest chain: resolveRegistryDigest ends
-    // by running it, and the `??` fallback used to run the IDENTICAL chain a second time
-    // whenever the first came back null — doubled subprocess latency on exactly the slow
-    // path (no crane/skopeo installed). Memoizing keeps the gcloud-failed case (where the
-    // chain has NOT run yet) probing exactly once.
-    let anyProbePromise: Promise<string | null> | undefined;
-    const probeAny = () => (anyProbePromise ??= resolveRegistryDigestAny(ref, cli, platform));
-    const digest =
-      (artifactRegistryProject !== null
-        ? await resolveRegistryDigest(ref, artifactRegistryProject, platform, cli, probeAny)
-        : null) ??
-      (await probeAny()) ??
-      (cli === "docker" ? await resolveImageDigest(ref, cli, platform) : null);
-    if (digest) digests[key] = digest;
-    else unresolved.push(ref);
-  }
-  if (unresolved.length > 0) {
-    if (!opts.allowMutableTags) {
-      throw new Error(
-        `Could not resolve an immutable digest for: ${unresolved.join(", ")}. No registry probe ` +
-          `could pin these images, so deploying would run them by TAG — a retag would change ` +
-          `what runs on the next pod start, on pods that hold the internal dispatch secret and ` +
-          `cache credentials. Refusing to deploy without image integrity.\n` +
-          `Fix registry access for a platform-aware client (\`crane\`, \`skopeo\`, or ` +
-          `\`docker manifest inspect\`). An Artifact Registry summary digest alone is not ` +
-          `enough because it may name an index with no ${platform} child.\n` +
-          `Note: the local ${cliLabel} daemon is only trusted as a digest source for docker — ` +
-          `podman rewrites manifests on push, so its local digest can differ from the registry's ` +
-          `and deploying it fails at rollout. Pass --allow-mutable-tags to deploy anyway.`,
-      );
-    }
-    console.warn(
-      `\n  ! Could not resolve an immutable digest for: ${unresolved.join(", ")}.\n` +
-        `    Deploying these by TAG (--allow-mutable-tags), so a retag would change what runs ` +
-        `on the next pod start.`,
-    );
-  }
-  return digests;
-}
-
-const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
-
-/**
- * S28: resolve an image's digest from ANY registry — ECR, ACR, Harbor, Docker Hub, or a
- * self-hosted one.
- *
- * `resolveRegistryDigest` below speaks only to Artifact Registry via gcloud, so every non-GCP
- * registry fell through to the LOCAL daemon. That is the exact path podman gets wrong: its
- * `RepoDigest` describes the local copy, and podman rewrites the manifest on push, so deploying
- * that value yields ImagePullBackOff (measured: podman said e04a0a5b…, the registry held
- * 27fa476b…). Shipping EKS/AKS on the local-daemon fallback would inherit a known-broken path.
- *
- * Probe order, first platform-validated answer wins:
- *  1. `crane manifest/config/digest` — inspect the index or single-image config before digest.
- *  2. `skopeo inspect --override-*` — require its selected image to report the target platform.
- *  3. `docker manifest inspect -v` — needs NO extra tooling, and VERIFIED against Artifact
- *     Registry to report a digest byte-identical to `gcloud artifacts docker images describe`.
- *     Docker-only: nerdctl has no such subcommand, and podman's `manifest inspect` operates on
- *     manifest lists it manages locally rather than querying a remote registry.
- *
- * Returns null (never throws) so the caller owns the fail-closed decision.
- */
-export async function resolveRegistryDigestAny(
-  imageRef: string,
-  containerCli: string,
-  platform: TargetPlatform = targetPlatform(),
-): Promise<string | null> {
-  const safePlatform = parseTargetPlatform(platform, "registry digest target platform");
-  const [targetOs, targetArch, targetVariant] = safePlatform.split("/");
-  const matches = (candidate: {
-    os?: string | undefined;
-    architecture?: string | undefined;
-    variant?: string | undefined;
-  }) =>
-    candidate.os === targetOs &&
-    candidate.architecture === targetArch &&
-    (candidate.variant ?? undefined) === (targetVariant ?? undefined);
-
-  const craneManifest = await execCapture("crane", ["manifest", imageRef], {
-    timeoutMs: EXEC_TIMEOUTS.kubectl,
-  }).catch(() => null);
-  if (craneManifest?.exitCode === 0) {
-    try {
-      const manifest = JSON.parse(craneManifest.stdout) as {
-        manifests?: Array<{
-          digest?: string;
-          platform?: { os?: string; architecture?: string; variant?: string };
-        }>;
-      };
-      if (Array.isArray(manifest.manifests)) {
-        const child = manifest.manifests.find((entry) => entry.platform && matches(entry.platform));
-        return child?.digest && DIGEST_RE.test(child.digest) ? child.digest : null;
-      }
-
-      // A single-image manifest has no platform field. Its config is the authoritative OS/arch.
-      const config = await execCapture("crane", ["config", imageRef], {
-        timeoutMs: EXEC_TIMEOUTS.kubectl,
-      }).catch(() => null);
-      if (config?.exitCode !== 0) return null;
-      const imageConfig = JSON.parse(config.stdout) as {
-        os?: string;
-        architecture?: string;
-        variant?: string;
-      };
-      if (!matches(imageConfig)) return null;
-      const digest = await execCapture("crane", ["digest", imageRef], {
-        timeoutMs: EXEC_TIMEOUTS.kubectl,
-      }).catch(() => null);
-      const value = digest?.stdout.trim() ?? "";
-      return digest?.exitCode === 0 && DIGEST_RE.test(value) ? value : null;
-    } catch {
-      // Malformed output is not proof of a platform; try the next independent probe.
-    }
-  }
-
-  const skopeoArgs = [
-    "inspect",
-    "--override-os",
-    targetOs!,
-    "--override-arch",
-    targetArch!,
-    ...(targetVariant ? ["--override-variant", targetVariant] : []),
-    `docker://${imageRef}`,
-  ];
-  const skopeo = await execCapture("skopeo", skopeoArgs, {
-    timeoutMs: EXEC_TIMEOUTS.kubectl,
-  }).catch(() => null);
-  if (skopeo?.exitCode === 0) {
-    try {
-      const inspected = JSON.parse(skopeo.stdout) as {
-        Digest?: string;
-        Os?: string;
-        Architecture?: string;
-        Variant?: string;
-      };
-      if (
-        !matches({
-          os: inspected.Os,
-          architecture: inspected.Architecture,
-          variant: inspected.Variant,
-        })
-      ) {
-        return null;
-      }
-      return inspected.Digest && DIGEST_RE.test(inspected.Digest) ? inspected.Digest : null;
-    } catch {
-      // Try docker's registry view when skopeo did not return usable JSON.
-    }
-  }
-
-  if (containerCli === "docker") {
-    const res = await execCapture("docker", ["manifest", "inspect", "-v", imageRef], {
-      timeoutMs: EXEC_TIMEOUTS.kubectl,
-    }).catch(() => null);
-    if (res?.exitCode === 0) {
-      try {
-        const parsed: unknown = JSON.parse(res.stdout);
-        // A SINGLE manifest comes back as one object carrying Descriptor.digest — that is the
-        // digest to deploy, and it is the case verified against Artifact Registry.
-        //
-        // A manifest LIST (multi-arch) comes back as an ARRAY of per-platform entries. Taking
-        // element [0] is WRONG: the order is the registry's, so an ARM-first list would pin the
-        // arm64 child and the pods would die with `exec format error` on x86 nodes. The child's
-        // digest is also not the digest of the index the tag points at. Since the platform we
-        // deploy is fixed (see targetPlatform()), select the matching child explicitly and
-        // refuse rather than guess when it is absent.
-        if (Array.isArray(parsed)) {
-          const match = parsed.find((entry) => {
-            const p = (
-              entry as {
-                Descriptor?: {
-                  platform?: { os?: string; architecture?: string; variant?: string };
-                };
-              }
-            ).Descriptor?.platform;
-            return !!p && matches(p);
-          });
-          const d = (match as { Descriptor?: { digest?: string } } | undefined)?.Descriptor?.digest;
-          if (typeof d === "string" && DIGEST_RE.test(d)) return d;
-          // No child for the platform we deploy: fall through to null so the caller fails
-          // closed rather than pinning an image that cannot run.
-          return null;
-        }
-        const descriptor = (
-          parsed as {
-            Descriptor?: {
-              digest?: string;
-              platform?: { os?: string; architecture?: string; variant?: string };
-            };
-          }
-        )?.Descriptor;
-        if (
-          descriptor?.platform &&
-          matches(descriptor.platform) &&
-          typeof descriptor.digest === "string" &&
-          DIGEST_RE.test(descriptor.digest)
-        ) {
-          return descriptor.digest;
-        }
-      } catch {
-        // Unparseable output is not a digest; fall through to null.
-      }
-    }
-  }
-
-  return null;
-}
-
-/**
- * S23: resolve an image's digest from the REGISTRY, which is authoritative.
- *
- * `resolveImageDigest` below asks the local docker daemon, and that only knows a RepoDigest
- * when the push went through it — podman, buildx with certain drivers, or an image pushed by
- * something else all leave it empty. That used to degrade the deploy to a MUTABLE tag on pods
- * holding the internal dispatch secret, i.e. an ordinary tooling quirk quietly removed image
- * integrity. The image was just pushed, so ask the registry instead.
- *
- * VERIFIED live: `gcloud artifacts docker images describe` returned a byte-identical sha256 to
- * `docker inspect` for the same reference.
- *
- * Returns null (never throws) so the caller owns the fail-closed decision.
- */
-export async function resolveRegistryDigest(
-  imageRef: string,
-  projectId: string,
-  platform: TargetPlatform = targetPlatform(),
-  containerCli: string = "docker",
-  // Injectable so a caller that ALSO falls back to resolveRegistryDigestAny can share one
-  // memoized probe instead of running the whole crane/skopeo/docker chain twice.
-  probeAny: () => Promise<string | null> = () =>
-    resolveRegistryDigestAny(imageRef, containerCli, platform),
-): Promise<string | null> {
-  // Artifact Registry only. Without a GCP project there is nothing to ask. The summary is a
-  // useful authoritative existence/digest check, but it is never sufficient by itself because
-  // an index digest does not prove that the requested platform is present.
-  if (!projectId) return null;
-  const res = await execCapture(
-    "gcloud",
-    [
-      "artifacts",
-      "docker",
-      "images",
-      "describe",
-      imageRef,
-      "--format=value(image_summary.digest)",
-      `--project=${projectId}`,
-    ],
-    { timeoutMs: EXEC_TIMEOUTS.kubectl },
-  );
-  if (res.exitCode !== 0) return null;
-  const digest = res.stdout.trim();
-  // Validated at the point of consumption: this string reaches a helm --set and then the pod
-  // spec's image reference.
-  if (!DIGEST_RE.test(digest)) return null;
-  // Artifact Registry's summary digest can name an OCI INDEX and says nothing about which
-  // children it contains. Never return it directly: a requested arm64 deploy previously
-  // accepted an amd64-only index here before any platform-aware probe ran.
-  return probeAny();
-}
-
-export async function resolveImageDigest(
-  imageRef: string,
-  containerCli: string = "docker",
-  platform: TargetPlatform = targetPlatform(),
-): Promise<string | null> {
-  // ALL RepoDigests, not just index 0: they belong to the image ID, and one local image tagged
-  // and pushed to more than one repository carries an entry per repository. Taking the first and
-  // pairing its digest with THIS repository could reference a manifest that does not exist
-  // there, leaving the new pods in ImagePullBackOff. Select the entry whose repository matches.
-  // podman and nerdctl both implement `inspect --format` with the same Go template fields.
-  const safePlatform = parseTargetPlatform(platform, "local image target platform");
-  const res = await execCapture(
-    containerCli,
-    [
-      "inspect",
-      "--format",
-      "{{.Os}}/{{.Architecture}}\n{{range .RepoDigests}}{{println .}}{{end}}",
-      imageRef,
-    ],
-    { timeoutMs: EXEC_TIMEOUTS.kubectl },
-  );
-  if (res.exitCode !== 0) return null;
-  const [reportedPlatform, ...digestLines] = res.stdout.split("\n");
-  if (reportedPlatform?.trim() !== safePlatform) return null;
-  // The repository is the reference without its tag — `registry/host/repo:tag` → `…/repo`.
-  // (A digest never appears here: this is the tag we just pushed.)
-  const colon = imageRef.lastIndexOf(":");
-  const slash = imageRef.lastIndexOf("/");
-  const repository = colon > slash ? imageRef.slice(0, colon) : imageRef;
-  const entries = digestLines.map((l) => l.trim()).filter(Boolean);
-  for (const entry of entries) {
-    const at = entry.lastIndexOf("@");
-    if (at === -1) continue;
-    if (entry.slice(0, at) !== repository) continue;
-    const digest = entry.slice(at + 1);
-    if (DIGEST_RE.test(digest)) return digest;
-  }
-  return null;
 }
 
 export type HelmUpgradeMode = "client-side" | "server-side";
@@ -1648,68 +1055,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Which provider this build targets. Older metadata predates the field; default to gke,
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
-  // Native dependencies are staged during `next build`, so deploy must consume the artifact's
-  // platform instead of re-reading a possibly different environment. Older artifacts did not
-  // record it and always staged the amd64 Sharp pair, so they are amd64 artifacts regardless
-  // of a deploy-time override.
-  const builtTargetPlatform =
-    metadata.targetPlatform === undefined
-      ? DEFAULT_TARGET_PLATFORM
-      : parseTargetPlatform(metadata.targetPlatform, "build-metadata.json targetPlatform");
-  const requestedTargetPlatform = process.env.ADAPTER_K8S_TARGET_PLATFORM?.trim();
-  if (
-    requestedTargetPlatform &&
-    parseTargetPlatform(requestedTargetPlatform) !== builtTargetPlatform
-  ) {
-    throw new Error(
-      `The build output in .k8s-adapter/output targets "${builtTargetPlatform}", but this ` +
-        `deploy requested "${requestedTargetPlatform}" through ADAPTER_K8S_TARGET_PLATFORM. ` +
-        `Sharp's native packages and the chart's node selector are fixed at build time. Re-run ` +
-        `without --skip-build so every artifact targets the same platform.`,
-    );
-  }
-
-  // TARGET FINGERPRINT. The routing tier's image registry is baked into its Deployment template
-  // at BUILD time, so copied or pre-variant output can still belong to another target. MEASURED:
-  // a Scaleway deploy reused a GKE chart and its routing pods went ImagePullBackOff trying to pull
-  // `us-central1-docker.pkg.dev/...` with a 403, after helm had already applied.
-  //
-  // Refuse before helm instead. This compares what the chart was BUILT for against what we are
-  // deploying WITH; a mismatch always means the output on disk belongs to a different target.
-  const builtRegistry: string | undefined =
-    typeof metadata.containerRegistry === "string" ? metadata.containerRegistry : undefined;
-  if (builtRegistry !== undefined && builtRegistry !== infra.containerRegistry) {
-    throw new Error(
-      `The build output in ${outputDirRelative} was emitted for registry ` +
-        `"${builtRegistry}", but this deploy targets "${infra.containerRegistry}". The chart bakes ` +
-        `image references at build time, so deploying it would pull another target's images ` +
-        `(and fail to authenticate against a registry this cluster cannot reach).\n` +
-        `${process.env.ADAPTER_K8S_CONFIG ? `You are using ADAPTER_K8S_CONFIG=${process.env.ADAPTER_K8S_CONFIG}; the selected variant output does not match its infrastructure.\n` : ""}` +
-        `Re-run without --skip-build so the chart is emitted for this target.`,
-    );
-  }
-  // Build metadata predating namespace support has no field and therefore targets the
-  // historical default namespace.
-  const builtNamespace = resolveK8sNamespace(metadata.namespace);
-  if (builtNamespace !== namespace) {
-    throw new Error(
-      `The build output in ${outputDirRelative} was emitted for namespace ` +
-        `"${builtNamespace}", but this deploy targets "${namespace}". The ext_proc authority ` +
-        `is namespace-qualified at build time, so deploying this chart would make routing ` +
-        `callouts target the wrong Service. Re-run without --skip-build so the chart is ` +
-        `emitted for this target.`,
-    );
-  }
-
-  if (!Array.isArray(pools)) {
-    throw new Error(`build-metadata.json is missing a "pools" array. Did next build run?`);
-  }
-  for (const poolName of pools) assertSafePoolName(poolName);
-  if (!defaultPool || !pools.includes(defaultPool)) {
-    throw new Error(
-      `build-metadata.json defaultPool must name one of its pools; got ${JSON.stringify(defaultPool)}`,
-    );
-  }
+  // A2 (pipeline/fingerprints.ts): artifact platform, target fingerprint (registry +
+  // namespace), and pool-topology validation — identical in emit and deploy by construction.
+  const builtTargetPlatform = resolveBuiltTargetPlatform(metadata);
+  assertTargetFingerprint({
+    outputDirRelative,
+    metadata,
+    deployRegistry: infra.containerRegistry,
+    deployNamespace: namespace,
+  });
+  assertDeployablePoolTopology(pools, defaultPool);
 
   // 0. Ensure kubectl is pointing at the right cluster.
   //
@@ -1775,6 +1130,17 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             .map((entry) => `${entry.apiVersion}/${entry.resource}`)
             .join(", ")}`,
         );
+      }
+      // Soft Envoy Gateway compat information (live-verified controller range +
+      // the 1.8 ListenerSet CRD install-order trap). WARN-only by design: an
+      // out-of-range controller is unverified, not known-broken, so it must never
+      // block a deploy. Silent when the target doesn't use Envoy Gateway or the
+      // controller image is not detectable.
+      for (const check of await evaluateEnvoyGatewayPreflight(compositionSnapshot.plan)) {
+        if (check.status === "warn") {
+          console.warn(`  ! ${check.name}: ${check.message}`);
+          if (check.fix) console.warn(`    Fix: ${check.fix}`);
+        }
       }
     }
   } else {
@@ -2334,34 +1700,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
   // H2: previousBuildId is spliced into a helm --set assignment below.
   if (previousBuildId) assertSafeBuildId(previousBuildId);
-  // The build-time collision guard (adapter.ts) can't see deploy-time state: if any of
-  // this build's COMPOSED resource names sanitizes to the SAME K8s name as the
-  // currently-serving build's, the two builds' resources become indistinguishable —
-  // pods carry identical version labels (split-brain cutover), the keep transfer can target
-  // the wrong Deployment, and cleanup can delete the serving build.
-  // Comparing the bare sanitized build ids is NOT enough: names collide on the COMPOSED
-  // truncated form — a long `<release>-<pool>-` prefix can push the differing part of
-  // the build id past the 63-char boundary even when the ids differ well inside their
-  // own 63 chars. Compare exactly what the templates emit: the pool Deployment/Service
-  // name, its suffix-reserving -hpa/-hcp variants (their truncation boundary sits 4
-  // chars earlier), and the routing-manifest snapshot name. Refuse to deploy on any
-  // collision while the build ids differ.
-  // N14: an IDENTICAL build id is the `deploymentId` (skew-protection) signature — Next pins
-  // the build id to a constant when next.config sets it, so every deploy reuses the serving
-  // build's names and a cutover would adopt the running Deployment instead of standing up
-  // beside it. The composed-name guard below can't see this case (it requires differing ids),
-  // so name the cause here rather than letting helm silently upgrade in place.
-  if (previousBuildId && previousBuildId === buildId) {
-    throw new Error(
-      `Build id "${buildId}" is IDENTICAL to the currently-serving build, so blue/green ` +
-        `cutover is impossible — the new release would adopt the running Deployment in ` +
-        `place, and both builds would share the \`k8s:${buildId}:\` cache namespace. The ` +
-        `usual cause is \`deploymentId\` in next.config: Next then pins the build id to a ` +
-        `constant for every build. Remove it — skew protection is already active via the ` +
-        `per-build build id, and immutable assets already handle asset versioning — or set ` +
-        `a \`generateBuildId\` that changes per build.`,
-    );
-  }
+  // B2 (pipeline/fingerprints.ts): the deploy-time collision guards. N14 first — an
+  // IDENTICAL build id is the `deploymentId` (skew-protection) signature and the composed-
+  // name guard below can't see it (it requires differing ids).
+  assertBuildIdChangedSinceServing(buildId, previousBuildId);
 
   // N70: the outgoing build owns its own pool topology. The incoming build metadata cannot
   // describe pools that were removed or renamed: iterating `pools` here used to omit those
@@ -2403,43 +1745,18 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
   }
   if (previousBuildId && previousBuildId !== buildId) {
-    // Compare the exact resource pairs that coexist during this rollout. Projecting both
-    // build ids over the incoming pool list invents previous-build resources after a rename.
-    const collision = findBuildTopologyNameCollision(
+    assertNoCrossBuildNameCollision(
       releaseName,
       { buildId, pools },
       { buildId: previousBuildId, pools: previousPools },
     );
-    if (collision) {
-      throw new Error(
-        `Build id "${buildId}" collides with the currently-serving build "${previousBuildId}" ` +
-          `after Kubernetes name sanitization: the ${collision.kind} "${collision.name}" would ` +
-          `be named identically for BOTH builds (lowercasing/truncation to the 63-char name ` +
-          `limit erased the difference), so the cutover could not distinguish them. Choose a ` +
-          `build id that still differs within the truncated name (see generateBuildId in ` +
-          `next.config), or shorten the release/pool names.`,
-      );
-    }
   }
 
-  // N62: collisions WITHIN a single build — pools `api` + `api-v2` with buildId `v2` both
-  // emit a Deployment/Service named `<release>-api-v2` — must be caught on a FIRST deploy
-  // too, so this check is unconditional (the previous-build comparison above cannot see it:
-  // it needs two build ids). It runs AFTER that comparison deliberately: over the full
+  // N62: self-collisions must be caught on a FIRST deploy too, so this check is
+  // unconditional. It runs AFTER the cross-build comparison deliberately: over the full
   // emitted name set it ALSO fires on the truncation case, and running it first masked the
   // more specific "collides with the currently-serving build" diagnosis.
-  const selfCollision = findEmittedNameCollision(releaseName, pools, [buildId]);
-  if (selfCollision) {
-    throw new Error(
-      `Emitted resource names collide within build "${buildId}": the ${selfCollision.kind} ` +
-        `"${selfCollision.name}" would be applied TWICE. Either a pool is named ` +
-        `"<otherPool>-${buildId}" (making its stable name equal the other pool's versioned ` +
-        `name), or two names truncated to the same value at the 63-char limit. helm applies ` +
-        `both objects silently, last-writer-wins, so an HTTPRoute backendRef can resolve to ` +
-        `the wrong pool's pods and the cutover patches the wrong object's selector. Rename ` +
-        `the pool, or shorten the release/pool names.`,
-    );
-  }
+  assertNoSelfNameCollision(releaseName, pools, buildId);
 
   const overridesFile = path.join(projectDir, ".k8s-adapter", "helm", "values.override.yaml");
   const helmArgsBase = {

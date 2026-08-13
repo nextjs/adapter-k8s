@@ -12,6 +12,7 @@ export {
   gatewayApiExposure,
   gkeCluster,
   gkeNativeRouting,
+  httpRouteExposure,
   ingressExposure,
   kubernetesCluster,
   manualExposure,
@@ -73,6 +74,7 @@ export type {
   RoutingReadiness,
 } from "./composition-plan/index.js";
 export type {
+  CertManagerTlsOptions,
   ClusterBuildResult,
   ClusterComponent,
   CompiledKubernetesTarget,
@@ -84,6 +86,7 @@ export type {
   ExposureRequirement,
   GatewayApiExposureOptions,
   GkeClusterOptions,
+  HttpRouteExposureOptions,
   IngressExposureOptions,
   IngressSourceSet,
   KubernetesClusterOptions,

@@ -4,6 +4,7 @@ import {
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeBuildId,
+  renderImagePullSecrets,
 } from "./utils.js";
 
 // Single source of truth for the traffic-ext registration Job name. deploy.ts's
@@ -22,6 +23,7 @@ export function renderRouteExtUpdateJob({
   region,
   buildId,
   documentDigest,
+  pullSecrets,
 }: {
   releaseName: string;
   projectId: string;
@@ -34,6 +36,14 @@ export function renderRouteExtUpdateJob({
    * working Job — the field checks below remain as a floor.
    */
   documentDigest?: string;
+  /**
+   * `imagePullSecrets` names (config `imagePullSecrets`), stamped on this Job's pod spec
+   * like every other pod the chart creates. The cloud-sdk image itself is public gcr.io,
+   * but clusters that mirror it behind a private registry (or admission policies that
+   * require the field) need the reference here too — and one pod-creating template
+   * silently exempt from the config surface is exactly how gaps like this start.
+   */
+  pullSecrets?: string[];
 }): string {
   // These are spliced unescaped into a `/bin/sh -c` script that runs under a
   // privileged Workload-Identity service account. Validate against a safe charset
@@ -42,6 +52,8 @@ export function renderRouteExtUpdateJob({
   assertSafeProjectId(projectId);
   assertSafeRegion(region);
   assertSafeBuildId(buildId);
+  // Registry pull auth — "" when unconfigured, keeping existing charts byte-identical.
+  const pullSecretsBlock = renderImagePullSecrets(pullSecrets, "      ");
   // Include buildId in the Job name so each deploy creates a fresh Job
   // (K8s Jobs are immutable — can't update an existing one)
   return `apiVersion: batch/v1
@@ -61,7 +73,7 @@ spec:
   template:
     spec:
       serviceAccountName: ${releaseName}-deploy-sa
-      # This Job uses the same immutable multi-platform image index on amd64 and arm64. Keep
+${pullSecretsBlock}      # This Job uses the same immutable multi-platform image index on amd64 and arm64. Keep
       # it on the release's target architecture so registration follows the same scheduling
       # contract as the adapter-built workloads.
       nodeSelector:
