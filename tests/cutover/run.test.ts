@@ -40,6 +40,7 @@ import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
 import { loadDeployedCompositionPlan } from "../../src/cli/composition-plan.js";
 import { routeExtJobName } from "../../src/emit/templates/route-ext-update-job.js";
+import { emitMetadataConfigMapName } from "../../src/emit/templates/cutover-job.js";
 
 const RELEASE = "rel";
 const NS = "default";
@@ -94,6 +95,8 @@ interface ClusterOverrides {
   policyReadFails?: boolean;
   routeExtJobFails?: boolean;
   servicePatchFailsFor?: string;
+  /** Names the emit-metadata ConfigMap listing reports (job-mode GC sweep). */
+  emitMetaConfigMaps?: string[];
 }
 
 /** A scripted cluster for one release serving `buildm`, with `buildn` landing. */
@@ -186,6 +189,11 @@ function cluster(overrides: ClusterOverrides = {}) {
       const target = args.find((a) => a.startsWith("deployment/"));
       events.push(args.includes("--replicas=0") ? `park:${target}` : `scaleup:${target}`);
       return ok();
+    }
+    if (args[1] === "configmaps" && j.includes("component=emit-metadata")) {
+      return ok(
+        overrides.emitMetaConfigMaps?.length ? `${overrides.emitMetaConfigMaps.join("\n")}\n` : "",
+      );
     }
     if (args[0] === "exec") return ok('503 {"reason":"route module failed to load"}');
     if (args[0] === "logs") return ok("");
@@ -284,6 +292,30 @@ describe("runCutover — the happy path's ordering", () => {
     vi.mocked(writeState).mockClear();
     await runCutover(inputs(), deps);
     expect(vi.mocked(writeState).mock.calls[0]![4]).toEqual({ clusterOnly: false });
+  });
+
+  it("sweeps superseded emit-metadata ConfigMaps, keeping current and previous", async () => {
+    // Keep-at-birth makes these unpruneable by any reconciler (a forcePromotion re-run of
+    // the parked build mounts ITS ConfigMap), so the cutover owns their deletion — without
+    // this sweep they accumulate one per build forever.
+    const current = emitMetadataConfigMapName(RELEASE, BUILD);
+    const previous = emitMetadataConfigMapName(RELEASE, PREV);
+    const stale = emitMetadataConfigMapName(RELEASE, "buildk");
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ emitMetaConfigMaps: [current, previous, stale] }) as never,
+    );
+
+    await runCutover(inputs(), deps);
+
+    const deletes = vi
+      .mocked(execCapture)
+      .mock.calls.filter(
+        ([, a]) => (a as string[])[0] === "delete" && (a as string[])[1] === "configmap",
+      )
+      .map(([, a]) => (a as string[])[2]);
+    expect(deletes).toContain(stale);
+    expect(deletes).not.toContain(current);
+    expect(deletes).not.toContain(previous);
   });
 });
 

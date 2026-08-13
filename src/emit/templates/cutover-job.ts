@@ -26,6 +26,9 @@ import {
 /** Component label on the Job (and the pane the operator greps for). */
 export const CUTOVER_JOB_COMPONENT = "cutover-job";
 
+/** Component label on the per-build emit-metadata ConfigMap — the GC sweep keys on it. */
+export const EMIT_METADATA_COMPONENT = "emit-metadata";
+
 /**
  * Per-build cutover Job name: `<release>-cutover-<12 hex>` — the same 48-bit digest
  * suffix idiom as routeExtJobName, for the same two reasons: Jobs are immutable (each
@@ -319,7 +322,7 @@ metadata:
   name: ${emitMetadataConfigMapName(releaseName, buildId)}
   labels:
     app.kubernetes.io/name: "${releaseName}"
-    app.kubernetes.io/component: emit-metadata
+    app.kubernetes.io/component: ${EMIT_METADATA_COMPONENT}
     app.kubernetes.io/version: "${sanitizeK8sName(buildId)}"
   annotations:
 ${keepAtBirthAnnotationEntries("    ")}data:
