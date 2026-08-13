@@ -160,12 +160,18 @@ export async function jobMain(env: NodeJS.ProcessEnv = process.env): Promise<num
     );
   }
 
-  const compositionSnapshot = await loadDeployedCompositionPlan({
-    releaseName,
-    namespace,
-    buildId,
-  });
-  if (!compositionSnapshot) {
+  // Only composed-target bundles render a composition-plan ConfigMap (helm.ts gates it
+  // and origin-service.yaml on the same compiledTarget, which is what hasPortableOrigin
+  // records). For those, a missing plan is a hard refusal, not a silently skipped gate;
+  // provider-ingress bundles have no plan to load and promote on the base battery.
+  const compositionSnapshot = metadata.hasPortableOrigin
+    ? await loadDeployedCompositionPlan({
+        releaseName,
+        namespace,
+        buildId,
+      })
+    : null;
+  if (metadata.hasPortableOrigin && !compositionSnapshot) {
     throw new Error(
       `Composition plan ConfigMap is missing for build "${buildId}" in namespace ` +
         `"${namespace}". The Job cannot verify HTTPRoute, Certificate, or other ` +

@@ -625,8 +625,7 @@ describe("jobMain — the poison pill", () => {
     poolTopologies: { [PREV]: ["ssr"] },
   };
 
-  function mountMetadata(): void {
-    metadataDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-jobmain-"));
+  function writeMetadata(extra: Record<string, unknown> = {}): void {
     writeFileSync(
       path.join(metadataDir, "emit-metadata.json"),
       JSON.stringify({
@@ -643,8 +642,14 @@ describe("jobMain — the poison pill", () => {
         targetPlatforms: { [BUILD]: "linux/amd64" },
         secretsMode: "external",
         cutover: "job",
+        ...extra,
       }),
     );
+  }
+
+  function mountMetadata(): void {
+    metadataDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-jobmain-"));
+    writeMetadata();
   }
 
   const env = (extra: Record<string, string> = {}) => ({
@@ -731,11 +736,21 @@ describe("jobMain — the poison pill", () => {
     expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
   });
 
-  it("REFUSES to promote when the composition plan ConfigMap is missing", async () => {
+  it("REFUSES to promote a composed-target bundle whose composition plan ConfigMap is missing", async () => {
+    writeMetadata({ hasPortableOrigin: true });
     vi.mocked(loadDeployedCompositionPlan).mockResolvedValue(null);
     vi.mocked(execCapture).mockImplementation(cluster() as never);
     await expect(jobMain(env())).rejects.toThrow(/Composition plan ConfigMap is missing/);
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
+  });
+
+  it("promotes a provider-ingress bundle WITHOUT a composition plan (none is rendered)", async () => {
+    // helm.ts renders composition-plan.yaml only for compiledTarget bundles — an
+    // unconditional refusal here would brick job mode for every provider-ingress release.
+    vi.mocked(loadDeployedCompositionPlan).mockResolvedValue(null);
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+    expect(await jobMain(env())).toBe(0);
+    expect(vi.mocked(loadDeployedCompositionPlan)).not.toHaveBeenCalled();
   });
 
   // The cutover marker lifecycle: the bundle stamps the stable Services
