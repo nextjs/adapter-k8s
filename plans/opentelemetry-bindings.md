@@ -112,10 +112,92 @@ but it needs a separate proof: the routing context does not carry every app-serv
 instrumentation hook may reasonably assume the complete Next server image. Staging and running it
 without that proof turns observability into a routing-service CrashLoop risk.
 
+## Provider-contributed telemetry
+
+Telemetry is cross-cutting target composition, not an Envoy-only feature. Cluster, exposure,
+routing, and resource components already contribute Kubernetes objects, API requirements,
+readiness, cleanup, and diagnostics. They should also be able to contribute telemetry without the
+core compiler learning conditionals such as `if nginx` or `if envoy`.
+
+There are two separate extension planes:
+
+1. **Runtime signals.** Source code the adapter owns imports one fail-safe telemetry core and
+   creates its own scoped spans/instruments. A future Envoy binding, NGINX routing process, cache
+   provider, or image service can add signals next to the operation it owns. It must not import an
+   exporter or start an SDK. Common operations keep common names plus a bounded provider
+   attribute; genuinely provider-specific operations use a provider namespace.
+2. **Deployment and inventory.** Target components contribute a declarative description of signal
+   producers, propagation, activation, ownership, and expected signals. The compiler merges and
+   fingerprints it into the composition plan so deploy, rollback, doctor, describe, and generated
+   docs all see the same topology. Concrete components can also emit the Kubernetes resources they
+   own through the existing contribution mechanism.
+
+A conceptual plan contribution is:
+
+```ts
+interface TelemetryContribution {
+  id: string;
+  producer: {
+    kind: "adapter-runtime" | "data-plane" | "ingress-controller" | "managed-provider";
+    name: string;
+  };
+  owner: "adapter" | "application" | "operator" | "cloud-provider";
+  activation:
+    | { kind: "app-instrumentation-hook" }
+    | { kind: "otel-operator"; instrumentationRef: string }
+    | { kind: "preload"; module: string }
+    | { kind: "external-precondition"; diagnostic: string }
+    | { kind: "managed" };
+  propagation?: Array<"tracecontext" | "tracestate" | "baggage-pass-through">;
+  signals: {
+    spans?: string[];
+    metrics?: string[];
+    logs?: string[];
+    protocol?: "otel-api" | "otlp" | "prometheus" | "cloud-managed";
+  };
+  workloads?: Array<"pools" | "routing-service" | { objectRef: string }>;
+}
+```
+
+The final type should use structured signal descriptors rather than bare strings, but the important
+boundary is ownership. It is an inventory and activation contract, not serialized callbacks or
+arbitrary pod-template patches. Supported activation kinds are rendered and validated at their
+consumption points.
+
+Examples:
+
+- **Envoy Gateway:** the routing component contributes the adapter ext_proc runtime source and,
+  when it owns the relevant Envoy objects, an Envoy-native data-plane source. Both continue the
+  same trace but remain distinct producers.
+- **GKE traffic extensions:** the routing component contributes ext_proc signals plus declarations
+  for managed load-balancer metrics/correlation that the adapter cannot instrument directly.
+- **Future NGINX Ingress:** code shipped by this project can create
+  `adapter_k8s.provider.nginx_ingress.*` signals through the shared runtime core. If the target
+  creates a per-application NGINX workload, it can emit its activation objects too. If it points at
+  a shared operator-owned controller, the application chart records/verifies an external
+  precondition; it must not mutate a cluster-wide controller ConfigMap behind the operator's back.
+- **Manual/direct exposure:** contributes no ingress producer, while pool runtime signals still
+  work. Missing provider-level signals are an explicit capability result, not a fake zero-valued
+  metric.
+
+Provider support therefore does not mean every topology promises identical internals. It means
+each target declares which signal sources and propagation edges exist. `describe` can show the
+inventory, `doctor` can verify activation, and collector/dashboard generation can consume only the
+capabilities actually present.
+
+Once a second adapter-owned producer exists, `src/telemetry.ts` should grow a small validated scope
+factory for provider modules. The first request-boundary PR should not freeze that API before there
+is a real second consumer.
+
 ## Follow-up slices
 
 ### Provider injection and resources
 
+- Add `TelemetryContribution` (or its final structured equivalent) to every target component
+  result, merge it with duplicate-id/capability validation, include it in the target fingerprint,
+  and serialize it in the versioned composition plan.
+- Teach `describe` and `doctor` to report signal sources, missing activation, and broken collector
+  reachability without making telemetry a deploy-readiness dependency by default.
 - Give both pod templates a stable OTEL Operator/preload configuration surface.
 - Establish resource attributes for release, namespace, build ID, component, and pool without
   duplicating `service.name` across routing and pool processes.
