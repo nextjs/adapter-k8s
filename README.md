@@ -253,7 +253,7 @@ Commit the bundle; your reconciler applies it. Because a build's chart is an art
 
 > **Do not point an auto-syncing reconciler at a chart produced by `deploy`.** The chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto a build that has been scaled to zero. Measured against real Argo CD: reverted in ~2.4 minutes, with the Application still reporting Synced. `emit --cutover job` is the answer—the promotion runs in-cluster, gated by the same checks the CLI runs.
 
-Run `migrate` once on any release that was previously deployed imperatively: it applies the prune-protection annotations that keep a reconciler from deleting the rollback target. Full recipes, ignore rules, and the evidence behind all of this: [docs/gitops.md](./docs/gitops.md) and [plans/gitops-deployment-strategies.md](./plans/gitops-deployment-strategies.md).
+Run `migrate` once on any release that was previously deployed imperatively: it applies the prune-protection annotations that keep a reconciler from deleting the rollback target. The copy-ready Flux `GitRepository`/`HelmRelease` recipe, ignore rules, and the evidence behind all of this are in [docs/gitops.md](./docs/gitops.md) and [plans/gitops-deployment-strategies.md](./plans/gitops-deployment-strategies.md).
 
 ## Security
 
@@ -278,13 +278,13 @@ Defaults, in brief—the full model is in [SECURITY.md](./SECURITY.md):
 
 ## Agent skills
 
-The package ships [Agent Skills](https://agentskills.io) in [`skills/`](./skills) — the same convention Next.js and Vercel use to make their tools legible to coding agents. Once the package is installed, point your agent at them (tools following the [`skills/` in npm packages convention](https://github.com/antfu/skills-npm) discover `node_modules/@next-community/adapter-k8s/skills/*/SKILL.md` automatically):
+The package ships [Agent Skills](https://agentskills.io) in [`skills/`](./skills) — versioned with the CLI so agents use instructions that match the installed adapter. Skills inside `node_modules` are not activated automatically by most agents. After installing the package, either run [`npx skills-npm setup`](https://github.com/antfu/skills-npm) once to discover and symlink package skills, or explicitly tell the agent to read `node_modules/@next-community/adapter-k8s/skills/configure/SKILL.md` (then `deploy/SKILL.md` for the deployment step):
 
 - **configure** — inspects the cluster access you already have (kubeconfig context, GatewayClasses, IngressClasses, registry credentials) and writes a working `adapter.config.mjs`, asking only for what it cannot discover
 - **deploy** — walks a deploy end to end and interprets each blue/green readiness gate, with a failure playbook
 - **troubleshoot** — doctor-first symptom decision tree for a deployed release
 
-A prompt like "prepare this project to deploy to my cluster" is enough: the configure skill handles discovery, target selection, and validation.
+A deterministic first prompt is: "Read `node_modules/@next-community/adapter-k8s/skills/configure/SKILL.md`, inspect this project and my cluster read-only, and prepare an application-only PR without deploying." After that PR is reviewed, point the agent at `skills/deploy/SKILL.md`, name the cluster-repository and kubeconfig paths, and authorize a second cluster PR without authorizing merge or live mutation. See the [two-PR agent workflow](./docs/gitops.md#two-pr-agent-onboarding).
 
 ## Roadmap
 
