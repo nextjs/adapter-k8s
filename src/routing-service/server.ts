@@ -18,6 +18,17 @@ import type {
   HeaderValueOption as PlainHeaderValueOption,
   ProcessingResponse as PlainProcessingResponse,
 } from "./ext-proc-types.js";
+import {
+  injectTraceHeaders,
+  metricHttpMethod,
+  recordRoutingRequest,
+  recordSpanError,
+  requestParentContext,
+  setSpanAttributes,
+  setSpanHttpStatus,
+  withAdapterSpan,
+  type TraceHeaderCarrier,
+} from "../telemetry.js";
 
 export interface RoutingServerOptions {
   handler: (requestHeaders: HeaderValue[]) => Promise<PlainProcessingResponse>;
@@ -56,6 +67,69 @@ function requestHeadersToPlain(req: ProcessingRequest): HeaderValue[] | null {
     if (h.rawValue.length) out.rawValue = Buffer.from(h.rawValue);
     return out;
   });
+}
+
+function requestMetricHttpMethod(headers: HeaderValue[]): string {
+  const raw = headers.find((header) => header.key.toLowerCase() === ":method");
+  return metricHttpMethod(raw?.value ?? raw?.rawValue?.toString("utf-8"));
+}
+
+function requestTraceCarrier(headers: HeaderValue[]): TraceHeaderCarrier {
+  const carrier: TraceHeaderCarrier = {};
+  for (const header of headers) {
+    const key = header.key.toLowerCase();
+    if (key.startsWith(":")) continue;
+    const value = header.value ?? header.rawValue?.toString("utf-8");
+    if (value !== undefined) carrier[key] = value;
+  }
+  return carrier;
+}
+
+function plainResponseHeader(response: PlainProcessingResponse, name: string): string | undefined {
+  return response.requestHeaders?.response?.headerMutation?.setHeaders?.find(
+    (entry) => entry.header.key.toLowerCase() === name,
+  )?.header.value;
+}
+
+function setPlainRequestHeader(
+  response: PlainProcessingResponse,
+  key: "traceparent" | "tracestate",
+  value: string,
+): void {
+  const common = response.requestHeaders?.response;
+  if (!common) return; // immediate responses never reach a pool
+  common.headerMutation ??= {};
+  common.headerMutation.setHeaders ??= [];
+  const existing = common.headerMutation.setHeaders.find(
+    (entry) => entry.header.key.toLowerCase() === key,
+  );
+  if (existing) {
+    existing.header.value = value;
+    delete existing.header.rawValue;
+    existing.appendAction = "OVERWRITE_IF_EXISTS_OR_ADD";
+    return;
+  }
+  common.headerMutation.setHeaders.push({
+    header: { key, value },
+    appendAction: "OVERWRITE_IF_EXISTS_OR_ADD",
+  });
+}
+
+function routingResult(response: PlainProcessingResponse): {
+  result: "routed" | "continued" | "immediate_response";
+  pool?: string;
+  statusCode?: number;
+} {
+  if (response.immediateResponse) {
+    return {
+      result: "immediate_response",
+      ...(response.immediateResponse.status?.code !== undefined
+        ? { statusCode: response.immediateResponse.status.code }
+        : {}),
+    };
+  }
+  const pool = plainResponseHeader(response, "x-upstream-pool");
+  return { result: pool ? "routed" : "continued", ...(pool ? { pool } : {}) };
 }
 
 function mapAppendAction(
@@ -212,13 +286,52 @@ export function createProcessHandler(
         yield phaseEchoResponse(req);
         continue;
       }
-      try {
-        const result = await withTimeout(handler(requestHeaders), timeoutMs);
-        yield plainResponseToProto(result);
-      } catch (err) {
-        console.error("ext_proc handler error:", err);
-        yield failOpen ? continueResponse() : internalError500();
-      }
+      const startedAt = performance.now();
+      const method = requestMetricHttpMethod(requestHeaders);
+      const parentContext = requestParentContext(requestTraceCarrier(requestHeaders), false);
+      const response = await withAdapterSpan(
+        "adapter-k8s.routing.request",
+        parentContext,
+        {
+          "adapter_k8s.component": "routing-service",
+          "http.request.method": method,
+        },
+        async ({ span, spanContext }) => {
+          let metricAttributes = {
+            "adapter_k8s.component": "routing-service",
+            "http.request.method": method,
+            "adapter_k8s.routing.result": failOpen ? "fail_open" : "fail_closed",
+          };
+          try {
+            const result = await withTimeout(handler(requestHeaders), timeoutMs);
+            const outcome = routingResult(result);
+            metricAttributes = {
+              "adapter_k8s.component": "routing-service",
+              "http.request.method": method,
+              "adapter_k8s.routing.result": outcome.result,
+              ...(outcome.pool ? { "adapter_k8s.pool.name": outcome.pool } : {}),
+            };
+            setSpanAttributes(span, metricAttributes);
+            if (outcome.statusCode !== undefined) setSpanHttpStatus(span, outcome.statusCode);
+
+            // Propagate the routing span to the pool. The handler's header-budget guard keeps a
+            // 2 KiB reserve for post-ext_proc mutations; these bounded W3C fields fit inside it.
+            injectTraceHeaders(spanContext, (key, value) =>
+              setPlainRequestHeader(result, key, value),
+            );
+            return plainResponseToProto(result);
+          } catch (err) {
+            console.error("ext_proc handler error:", err);
+            recordSpanError(span, err);
+            setSpanAttributes(span, metricAttributes);
+            if (!failOpen) setSpanHttpStatus(span, 500);
+            return failOpen ? continueResponse() : internalError500();
+          } finally {
+            recordRoutingRequest(performance.now() - startedAt, metricAttributes);
+          }
+        },
+      );
+      yield response;
     }
   };
 }
