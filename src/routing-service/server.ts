@@ -24,6 +24,7 @@ import {
   recordRoutingRequest,
   recordSpanError,
   requestParentContext,
+  runtimeTelemetryAttributes,
   setSpanAttributes,
   setSpanHttpStatus,
   withAdapterSpan,
@@ -288,6 +289,7 @@ export function createProcessHandler(
       }
       const startedAt = performance.now();
       const method = requestMetricHttpMethod(requestHeaders);
+      const providerAttributes = runtimeTelemetryAttributes();
       const parentContext = requestParentContext(requestTraceCarrier(requestHeaders), false);
       const response = await withAdapterSpan(
         "adapter-k8s.routing.request",
@@ -295,12 +297,14 @@ export function createProcessHandler(
         {
           "adapter_k8s.component": "routing-service",
           "http.request.method": method,
+          ...providerAttributes,
         },
         async ({ span, spanContext }) => {
           let metricAttributes = {
             "adapter_k8s.component": "routing-service",
             "http.request.method": method,
             "adapter_k8s.routing.result": failOpen ? "fail_open" : "fail_closed",
+            ...providerAttributes,
           };
           try {
             const result = await withTimeout(handler(requestHeaders), timeoutMs);
@@ -309,6 +313,7 @@ export function createProcessHandler(
               "adapter_k8s.component": "routing-service",
               "http.request.method": method,
               "adapter_k8s.routing.result": outcome.result,
+              ...providerAttributes,
               ...(outcome.pool ? { "adapter_k8s.pool.name": outcome.pool } : {}),
             };
             setSpanAttributes(span, metricAttributes);

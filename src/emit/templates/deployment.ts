@@ -8,6 +8,7 @@ import {
   assertSafeProbePath,
   assertSafeQuantity,
   assertSafeReleaseName,
+  assertSafeTelemetryProviderName,
   assertSafeReplicaCount,
   escapeHelmActions,
   renderImagePullSecrets,
@@ -89,6 +90,7 @@ export function renderDeployment({
   env,
   envFrom,
   deploymentId,
+  providerName,
   nodeArchitecture = "amd64",
   pullSecrets,
 }: {
@@ -134,6 +136,8 @@ export function renderDeployment({
    * pod must carry the exact build-time value.
    */
   deploymentId?: string;
+  /** Routing target component stamped onto adapter-owned OTEL signals. */
+  providerName?: string;
   /** Literal architecture for this newly emitted build. */
   nodeArchitecture?: TargetArchitecture;
   /**
@@ -152,6 +156,7 @@ export function renderDeployment({
   if (image !== undefined) assertSafeImageReference(image);
   if (imageDigest !== undefined) assertSafeImageDigest(imageDigest);
   if (replicas !== undefined) assertSafeReplicaCount(replicas, "replicas");
+  if (providerName !== undefined) assertSafeTelemetryProviderName(providerName);
 
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
@@ -173,6 +178,9 @@ export function renderDeployment({
   // JSON + Helm-action escaping like every other user-shaped scalar in this template.
   const deploymentIdEnv = deploymentId
     ? `\n            - name: NEXT_DEPLOYMENT_ID\n              value: ${escapeHelmActions(JSON.stringify(deploymentId))}`
+    : "";
+  const providerNameEnv = providerName
+    ? `\n            - name: ADAPTER_K8S_PROVIDER_NAME\n              value: ${JSON.stringify(providerName)}`
     : "";
 
   // User-supplied runtime environment. Rendered AFTER the adapter's own entries: Kubernetes
@@ -356,7 +364,7 @@ ${pullSecretsBlock}${nodeSelector}      securityContext:
             # can't reach sibling pools in any release not named that.
             - name: RELEASE_NAME
               value: "${releaseName}"
-${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${userEnv}${userEnvFrom}
+${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             # readOnlyRootFilesystem makes / read-only; Next still needs a writable
             # scratch dir, so /tmp is an emptyDir. NOT in-memory: a bare \`emptyDir: {}\`

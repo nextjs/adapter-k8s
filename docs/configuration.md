@@ -50,7 +50,7 @@ Precedence matches Next: the pool server calls `loadEnvConfig`, which does not o
 
 **Not for `NEXT_PUBLIC_*`.** Those are inlined into client bundles at _build_ time; setting one as container environment produces a value the browser never sees. The build fails rather than let that pass silently — put them in `.env.production` or the build environment.
 
-Names the adapter emits itself (`NODE_ENV`, `NEXT_BUILD_ID`, `POOL_NAME`, `RELEASE_NAME`, `INTERNAL_HEADER_SECRET`, `VALKEY_URL`, `VALKEY_AUTH`, `VALKEY_CA_CERT`, `PORT`, `CONFIG_DIR`) are reserved and rejected — shadowing `NEXT_BUILD_ID` in particular would cross-wire two builds' cache namespaces.
+Names the adapter emits itself (`NODE_ENV`, `NEXT_BUILD_ID`, `POOL_NAME`, `RELEASE_NAME`, `ADAPTER_K8S_PROVIDER_NAME`, `INTERNAL_HEADER_SECRET`, `VALKEY_URL`, `VALKEY_AUTH`, `VALKEY_CA_CERT`, `PORT`, `CONFIG_DIR`) are reserved and rejected — shadowing `NEXT_BUILD_ID` in particular would cross-wire two builds' cache namespaces. `ADAPTER_K8S_PROVIDER_NAME` is the compiler-selected, bounded provider dimension on adapter-owned OpenTelemetry signals.
 
 ## Distributed cache (cache components & PPR)
 

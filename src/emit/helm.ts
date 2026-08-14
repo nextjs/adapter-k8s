@@ -264,6 +264,12 @@ export function generateHelmChart({
         }),
   });
 
+  const routingProviderName = compiledTarget
+    ? compiledTarget.routingProviderName
+    : provider!.extProcStrategy === "envoy-gateway"
+      ? "envoy-native"
+      : "gke-native";
+
   for (const poolName of pools.keys()) {
     // Per-pool env merges OVER the shared map, and per-pool envFrom is appended AFTER the
     // shared sources — both match Kubernetes' own "last one wins" semantics, so a pool
@@ -275,6 +281,7 @@ export function generateHelmChart({
       poolName,
       buildId,
       releaseName,
+      providerName: routingProviderName,
       nodeArchitecture: targetArchitecture(targetPlatform),
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
       ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
@@ -319,6 +326,7 @@ export function generateHelmChart({
     files["templates/routing-service-deployment.yaml"] = renderRoutingServiceDeployment({
       releaseName,
       buildId,
+      providerName: routingProviderName,
       imageRegistry,
       nodeArchitecture: targetArchitecture(targetPlatform),
       ...(rs?.resources ? { resources: rs.resources } : {}),

@@ -2,6 +2,7 @@ import type {
   KubernetesApiRequirement,
   KubernetesManifest,
   RoutingReadiness,
+  TelemetrySource,
 } from "../composition-plan/types.js";
 import { parseCompositionPlan } from "../composition-plan/parse.js";
 import { MINIMUM_KUBERNETES_VERSION } from "../composition-plan/types.js";
@@ -30,6 +31,7 @@ function contributionOf(
         "externalCleanup",
         "retained",
         "diagnostics",
+        "telemetry",
       ].includes(key),
   );
   if (unknown.length > 0) {
@@ -44,6 +46,7 @@ function contributionOf(
     externalCleanup: [...(contribution.externalCleanup ?? [])],
     retained: [...(contribution.retained ?? [])],
     diagnostics: [...(contribution.diagnostics ?? [])],
+    telemetry: [...(contribution.telemetry ?? [])],
   };
 }
 
@@ -69,6 +72,79 @@ function mergeRequirements(requirements: KubernetesApiRequirement[]): Kubernetes
   return [...merged.values()].sort((a, b) =>
     `${a.apiVersion}/${a.resource}`.localeCompare(`${b.apiVersion}/${b.resource}`),
   );
+}
+
+function adapterTelemetrySources(
+  context: TargetBuildContext,
+  routingProviderName: string,
+  routingTierEnabled: boolean,
+): TelemetrySource[] {
+  const providerAttribute = { "adapter_k8s.provider.name": routingProviderName };
+  const sources: TelemetrySource[] = [
+    {
+      id: "adapter.pool",
+      producer: { kind: "adapter-runtime", name: "pool-server" },
+      owner: "adapter",
+      activation: { kind: "app-instrumentation-hook" },
+      protocols: ["otel-api"],
+      propagation: ["tracecontext", "tracestate", "baggage-pass-through"],
+      signals: [
+        { kind: "span", name: "adapter-k8s.pool.request" },
+        {
+          kind: "metric",
+          name: "adapter_k8s.pool.request.count",
+          instrument: "counter",
+          unit: "{request}",
+        },
+        {
+          kind: "metric",
+          name: "adapter_k8s.pool.request.duration",
+          instrument: "histogram",
+          unit: "s",
+        },
+      ],
+      workloads: context.pools.map((pool) => ({ kind: "adapter-pool" as const, pool })),
+      attributes: {
+        "adapter_k8s.component": "pool-server",
+        ...providerAttribute,
+      },
+    },
+  ];
+  if (routingTierEnabled) {
+    sources.push({
+      id: `adapter.routing.${routingProviderName}`,
+      producer: { kind: "adapter-runtime", name: "routing-service" },
+      owner: "adapter",
+      activation: {
+        kind: "external-precondition",
+        description:
+          "Inject or preload an OpenTelemetry provider into the routing-service process before its first request",
+      },
+      protocols: ["otel-api"],
+      propagation: ["tracecontext", "tracestate", "baggage-pass-through"],
+      signals: [
+        { kind: "span", name: "adapter-k8s.routing.request" },
+        {
+          kind: "metric",
+          name: "adapter_k8s.routing.request.count",
+          instrument: "counter",
+          unit: "{request}",
+        },
+        {
+          kind: "metric",
+          name: "adapter_k8s.routing.request.duration",
+          instrument: "histogram",
+          unit: "s",
+        },
+      ],
+      workloads: [{ kind: "adapter-routing-service" }],
+      attributes: {
+        "adapter_k8s.component": "routing-service",
+        ...providerAttribute,
+      },
+    });
+  }
+  return sources;
 }
 
 export function compileTarget(
@@ -99,6 +175,7 @@ export function compileTarget(
         "externalCleanup",
         "retained",
         "diagnostics",
+        "telemetry",
       ].includes(key),
   );
   if (unknownClusterFields.length > 0) {
@@ -117,6 +194,7 @@ export function compileTarget(
         "diagnostics",
         "ingressSources",
         "capabilities",
+        "telemetry",
       ].includes(key),
   );
   if (unknownExposureFields.length > 0) {
@@ -145,6 +223,7 @@ export function compileTarget(
         "externalCleanup",
         "retained",
         "diagnostics",
+        "telemetry",
       ].includes(key),
   );
   if (unknownRoutingFields.length > 0) {
@@ -162,6 +241,7 @@ export function compileTarget(
         externalCleanup: exposure.externalCleanup ?? [],
         retained: exposure.retained ?? [],
         diagnostics: exposure.diagnostics ?? [],
+        telemetry: exposure.telemetry ?? [],
       },
       target.exposure.name,
     ),
@@ -173,6 +253,7 @@ export function compileTarget(
         externalCleanup: routing.externalCleanup ?? [],
         retained: routing.retained ?? [],
         diagnostics: routing.diagnostics ?? [],
+        telemetry: routing.telemetry ?? [],
       },
       target.routing.name,
     ),
@@ -220,6 +301,31 @@ export function compileTarget(
     ...(cluster.diagnostics ?? []),
     ...contributions.flatMap((entry) => entry.diagnostics),
   ];
+  const contributedTelemetry = [
+    ...(cluster.telemetry ?? []),
+    ...contributions.flatMap((entry) => entry.telemetry),
+  ];
+  for (const source of contributedTelemetry) {
+    if (typeof source?.id === "string" && source.id.startsWith("adapter.")) {
+      throw new Error(
+        `Target telemetry source id ${JSON.stringify(source.id)} uses the reserved "adapter." ` +
+          `prefix. Provider/component sources must use their own prefix (for example ` +
+          `"provider.nginx").`,
+      );
+    }
+  }
+  const telemetry = [
+    ...adapterTelemetrySources(context, target.routing.name, routing.routingTier.enabled),
+    ...contributedTelemetry,
+  ].sort((a, b) => String(a?.id ?? "").localeCompare(String(b?.id ?? "")));
+  const telemetryIds = new Set<string>();
+  for (const source of telemetry) {
+    if (typeof source?.id !== "string") continue;
+    if (telemetryIds.has(source.id)) {
+      throw new Error(`Target components emitted duplicate telemetry source id ${source.id}`);
+    }
+    telemetryIds.add(source.id);
+  }
   const requirements = mergeRequirements([
     { apiVersion: "v1", resource: "services", optional: false },
     { apiVersion: "apps/v1", resource: "deployments", optional: false },
@@ -254,6 +360,7 @@ export function compileTarget(
     externalCleanup,
     retained,
     diagnostics,
+    telemetry,
   });
   const plan = parseCompositionPlan({
     apiVersion: "adapter-k8s.nextjs.org/v1alpha1",
@@ -316,6 +423,7 @@ export function compileTarget(
           containers: "all",
         },
       ],
+      telemetry,
     },
   });
   return {
@@ -327,5 +435,6 @@ export function compileTarget(
     })),
     ingressSources: exposure.ingressSources,
     routingTier: routing.routingTier,
+    routingProviderName: target.routing.name,
   };
 }

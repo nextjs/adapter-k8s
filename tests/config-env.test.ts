@@ -70,6 +70,7 @@ describe("env config validation", () => {
     "NEXT_BUILD_ID",
     "POOL_NAME",
     "RELEASE_NAME",
+    "ADAPTER_K8S_PROVIDER_NAME",
     "INTERNAL_HEADER_SECRET",
     "VALKEY_URL",
   ])("rejects the reserved name %s", (name) => {

@@ -63,6 +63,15 @@ function getPoolRequestInstruments(): RequestMetricInstruments {
 export type TraceHeaderCarrier = Record<string, string | string[] | undefined>;
 
 const COMMON_HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);
+const PROVIDER_NAME_RE = /^[a-z][a-z0-9-]{0,62}$/;
+
+/** Provider identity emitted by the target compiler; ignore an invalid operator override. */
+export function runtimeTelemetryAttributes(): Attributes {
+  const providerName = process.env.ADAPTER_K8S_PROVIDER_NAME;
+  return providerName && PROVIDER_NAME_RE.test(providerName)
+    ? { "adapter_k8s.provider.name": providerName }
+    : {};
+}
 
 /** Bound the user-controlled HTTP method metric dimension. */
 export function metricHttpMethod(method: string | undefined): string {

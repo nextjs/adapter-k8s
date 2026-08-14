@@ -72,6 +72,14 @@ export type {
   RetainedExternalResource,
   RoutingPlan,
   RoutingReadiness,
+  TelemetryActivation,
+  TelemetryOwner,
+  TelemetryProducerKind,
+  TelemetryPropagation,
+  TelemetryProtocol,
+  TelemetrySignal,
+  TelemetrySource,
+  TelemetryWorkload,
 } from "./composition-plan/index.js";
 export type {
   CertManagerTlsOptions,

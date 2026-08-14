@@ -1,6 +1,7 @@
 # OpenTelemetry runtime bindings
 
-Status: first request-boundary slice implemented on `codex/otel-runtime-bindings`.
+Status: request-boundary bindings and provider-contributed telemetry inventory implemented on
+`codex/otel-runtime-bindings`.
 
 ## What exists today
 
@@ -29,8 +30,10 @@ provider-neutral:
 - the pool's adapter span becomes active around its request handler, so Next/application spans
   are children of it;
 - the ext_proc service extracts the configured trace context, creates a routing span, and mutates
-  `traceparent` / `tracestate` on pool-bound requests to continue that span; and
-- request counters and duration histograms use bounded attributes only.
+  `traceparent` / `tracestate` on pool-bound requests to continue that span;
+- request counters and duration histograms use bounded attributes only; and
+- the target compiler records adapter and provider-contributed telemetry sources in the authenticated
+  composition plan and fingerprints them as part of target compatibility.
 
 The pool can use the provider registered by the app's normal `instrumentation.ts`. The routing
 service does not currently execute that hook; it exports only when an SDK/provider is preloaded or
@@ -51,7 +54,8 @@ surface is deliberately a follow-up rather than smuggling an SDK policy into thi
 The metric method vocabulary is `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, and
 `_OTHER`. Paths, query strings, headers, hostnames, error messages, route params, and trace IDs are
 not metric attributes. Pool names are build-configured and bounded. Status codes are bounded by
-the HTTP vocabulary.
+the HTTP vocabulary. Every adapter-owned signal also carries the validated
+`adapter_k8s.provider.name` selected by the routing target component.
 
 Tracers, meters, and metric instruments are resolved lazily. This is a correctness requirement,
 not an optimization. The app can register through a different physical copy of
@@ -116,8 +120,8 @@ without that proof turns observability into a routing-service CrashLoop risk.
 
 Telemetry is cross-cutting target composition, not an Envoy-only feature. Cluster, exposure,
 routing, and resource components already contribute Kubernetes objects, API requirements,
-readiness, cleanup, and diagnostics. They should also be able to contribute telemetry without the
-core compiler learning conditionals such as `if nginx` or `if envoy`.
+readiness, cleanup, and diagnostics. They can now contribute telemetry without the core compiler
+learning conditionals such as `if nginx` or `if envoy`.
 
 There are two separate extension planes:
 
@@ -132,10 +136,12 @@ There are two separate extension planes:
    docs all see the same topology. Concrete components can also emit the Kubernetes resources they
    own through the existing contribution mechanism.
 
-A conceptual plan contribution is:
+A component returns `telemetry: TelemetrySource[]` alongside its existing operational
+contributions. `TelemetrySource` is exported from the package and serialized without executable
+callbacks:
 
 ```ts
-interface TelemetryContribution {
+interface TelemetrySource {
   id: string;
   producer: {
     kind: "adapter-runtime" | "data-plane" | "ingress-controller" | "managed-provider";
@@ -144,33 +150,30 @@ interface TelemetryContribution {
   owner: "adapter" | "application" | "operator" | "cloud-provider";
   activation:
     | { kind: "app-instrumentation-hook" }
-    | { kind: "otel-operator"; instrumentationRef: string }
-    | { kind: "preload"; module: string }
-    | { kind: "external-precondition"; diagnostic: string }
+    | { kind: "otel-operator"; instrumentation: KubernetesObjectRef }
+    | { kind: "external-precondition"; description: string }
     | { kind: "managed" };
-  propagation?: Array<"tracecontext" | "tracestate" | "baggage-pass-through">;
-  signals: {
-    spans?: string[];
-    metrics?: string[];
-    logs?: string[];
-    protocol?: "otel-api" | "otlp" | "prometheus" | "cloud-managed";
-  };
-  workloads?: Array<"pools" | "routing-service" | { objectRef: string }>;
+  protocols: Array<"otel-api" | "otlp" | "prometheus" | "cloud-managed">;
+  propagation: Array<"tracecontext" | "tracestate" | "baggage-pass-through">;
+  signals: TelemetrySignal[];
+  workloads: TelemetryWorkload[];
+  attributes: Record<string, string>;
 }
 ```
 
-The final type should use structured signal descriptors rather than bare strings, but the important
-boundary is ownership. It is an inventory and activation contract, not serialized callbacks or
-arbitrary pod-template patches. Supported activation kinds are rendered and validated at their
-consumption points.
+Signals and workloads are closed discriminated unions. The parser bounds collection sizes and
+attribute cardinality, validates names, rejects duplicate source IDs, and rejects provider sources
+using the adapter-reserved `adapter.*` prefix. The inventory is part of the target fingerprint, so
+rollback cannot silently combine a build with a different telemetry topology. Older authenticated
+v1alpha1 plans remain valid: the parser preserves an absent telemetry field rather than changing
+their digest.
 
 Examples:
 
-- **Envoy Gateway:** the routing component contributes the adapter ext_proc runtime source and,
-  when it owns the relevant Envoy objects, an Envoy-native data-plane source. Both continue the
-  same trace but remain distinct producers.
-- **GKE traffic extensions:** the routing component contributes ext_proc signals plus declarations
-  for managed load-balancer metrics/correlation that the adapter cannot instrument directly.
+- **Envoy Gateway / GKE traffic extensions:** the compiler records the adapter ext_proc runtime
+  source under the selected routing provider. A routing component can additionally declare native
+  Envoy or managed load-balancer sources when it actually owns or can verify them; none are implied
+  today.
 - **Future NGINX Ingress:** code shipped by this project can create
   `adapter_k8s.provider.nginx_ingress.*` signals through the shared runtime core. If the target
   creates a per-application NGINX workload, it can emit its activation objects too. If it points at
@@ -181,9 +184,9 @@ Examples:
   metric.
 
 Provider support therefore does not mean every topology promises identical internals. It means
-each target declares which signal sources and propagation edges exist. `describe` can show the
-inventory, `doctor` can verify activation, and collector/dashboard generation can consume only the
-capabilities actually present.
+each target declares which signal sources and propagation edges exist. `describe` and `doctor`
+show the inventory count today; richer activation verification and collector/dashboard generation
+can consume only the capabilities actually present.
 
 Once a second adapter-owned producer exists, `src/telemetry.ts` should grow a small validated scope
 factory for provider modules. The first request-boundary PR should not freeze that API before there
@@ -193,11 +196,8 @@ is a real second consumer.
 
 ### Provider injection and resources
 
-- Add `TelemetryContribution` (or its final structured equivalent) to every target component
-  result, merge it with duplicate-id/capability validation, include it in the target fingerprint,
-  and serialize it in the versioned composition plan.
-- Teach `describe` and `doctor` to report signal sources, missing activation, and broken collector
-  reachability without making telemetry a deploy-readiness dependency by default.
+- Teach `describe` and `doctor` to report per-source activation details, missing activation, and
+  broken collector reachability without making telemetry a deploy-readiness dependency by default.
 - Give both pod templates a stable OTEL Operator/preload configuration surface.
 - Establish resource attributes for release, namespace, build ID, component, and pool without
   duplicating `service.name` across routing and pool processes.

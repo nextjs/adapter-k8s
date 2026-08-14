@@ -12,6 +12,7 @@ import {
   recordPoolRequest,
   recordSpanError,
   requestParentContext,
+  runtimeTelemetryAttributes,
   setSpanAttributes,
   setSpanHttpStatus,
   withAdapterSpan,
@@ -260,6 +261,7 @@ export function createPoolServer(options: PoolServerOptions) {
 
     const start = performance.now();
     const method = metricHttpMethod(req.method);
+    const providerAttributes = runtimeTelemetryAttributes();
     const parentContext = requestParentContext(req.headers as TraceHeaderCarrier, true);
     await withAdapterSpan(
       "adapter-k8s.pool.request",
@@ -267,6 +269,7 @@ export function createPoolServer(options: PoolServerOptions) {
       {
         "adapter_k8s.component": "pool-server",
         "http.request.method": method,
+        ...providerAttributes,
         ...(poolName ? { "adapter_k8s.pool.name": poolName } : {}),
       },
       async ({ span }) => {
@@ -293,6 +296,7 @@ export function createPoolServer(options: PoolServerOptions) {
             "adapter_k8s.pool.result": result,
             "http.request.method": method,
             "http.response.status_code": res.statusCode,
+            ...providerAttributes,
             ...(poolName ? { "adapter_k8s.pool.name": poolName } : {}),
           };
           setSpanAttributes(span, {

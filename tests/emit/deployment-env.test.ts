@@ -16,6 +16,16 @@ const render = (
   } as Parameters<typeof renderDeployment>[0]);
 
 describe("renderDeployment env", () => {
+  it("stamps a validated telemetry provider identity", () => {
+    const yaml = render({ providerName: "nginx-ingress" });
+    expect(yaml).toContain(
+      '- name: ADAPTER_K8S_PROVIDER_NAME\n              value: "nginx-ingress"',
+    );
+    expect(() => render({ providerName: 'nginx"\n- name: INJECTED' })).toThrow(
+      /invalid telemetry provider name/i,
+    );
+  });
+
   it("renders nothing extra when no env is configured", () => {
     const yaml = render({});
     expect(yaml).toContain("name: NEXT_BUILD_ID");
@@ -107,6 +117,13 @@ describe("renderRoutingServiceDeployment env", () => {
     const yaml = renderRouting({ env: { MIDDLEWARE_VAR: "asdf2" } });
     expect(yaml).toContain('- name: MIDDLEWARE_VAR\n              value: "asdf2"');
     expect(yaml.indexOf("name: NEXT_BUILD_ID")).toBeLessThan(yaml.indexOf("name: MIDDLEWARE_VAR"));
+  });
+
+  it("stamps the same telemetry provider identity", () => {
+    const yaml = renderRouting({ providerName: "envoy-native" });
+    expect(yaml).toContain(
+      '- name: ADAPTER_K8S_PROVIDER_NAME\n              value: "envoy-native"',
+    );
   });
 
   it("renders secret refs and envFrom like the pool template", () => {

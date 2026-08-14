@@ -9,6 +9,7 @@ import {
   type KubernetesApiRequirement,
   type KubernetesObjectRef,
   type RoutingReadiness,
+  type TelemetrySource,
 } from "../composition-plan/index.js";
 import { compositionPlanConfigMapName } from "../emit/templates/composition-plan-configmap.js";
 import { outputDirName } from "./infrastructure-validation.js";
@@ -52,6 +53,7 @@ export interface CompositionPlanDescription {
     selector: string;
     containers: "all";
   }>;
+  telemetry: TelemetrySource[];
   cleanup: {
     kubernetes: CompositionPlan["operations"]["cleanup"]["kubernetes"]["contributedObjects"];
     external: CompositionPlan["operations"]["cleanup"]["external"];
@@ -1130,6 +1132,26 @@ export function describeCompositionPlan(plan: CompositionPlan): CompositionPlanD
       namespace: source.namespace,
       selector: `adapter-k8s.dev/release=${source.selector.releaseName}`,
       containers: source.containers,
+    })),
+    telemetry: (plan.operations.telemetry ?? []).map((source) => ({
+      ...source,
+      producer: { ...source.producer },
+      activation:
+        source.activation.kind === "otel-operator"
+          ? {
+              ...source.activation,
+              instrumentation: { ...source.activation.instrumentation },
+            }
+          : { ...source.activation },
+      protocols: [...source.protocols],
+      propagation: [...source.propagation],
+      signals: source.signals.map((signal) => ({ ...signal })),
+      workloads: source.workloads.map((workload) =>
+        workload.kind === "kubernetes-object"
+          ? { ...workload, object: { ...workload.object } }
+          : { ...workload },
+      ),
+      attributes: { ...source.attributes },
     })),
     cleanup: {
       kubernetes: plan.operations.cleanup.kubernetes.contributedObjects.map((entry) => ({

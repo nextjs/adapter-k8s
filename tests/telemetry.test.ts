@@ -55,8 +55,10 @@ cpSync(installedApiDir, copiedApiDir, { recursive: true });
 const appApi = createRequire(path.join(appApiRoot, "app.cjs"))(
   "@opentelemetry/api",
 ) as typeof import("@opentelemetry/api");
+const originalProviderName = process.env.ADAPTER_K8S_PROVIDER_NAME;
 
 beforeAll(() => {
+  process.env.ADAPTER_K8S_PROVIDER_NAME = "nginx-ingress";
   appApi.context.setGlobalContextManager(contextManager.enable());
   appApi.propagation.setGlobalPropagator(new W3CTraceContextPropagator());
   appApi.trace.setGlobalTracerProvider(tracerProvider);
@@ -70,6 +72,8 @@ afterAll(async () => {
   metrics.disable();
   propagation.disable();
   context.disable();
+  if (originalProviderName === undefined) delete process.env.ADAPTER_K8S_PROVIDER_NAME;
+  else process.env.ADAPTER_K8S_PROVIDER_NAME = originalProviderName;
   rmSync(appApiRoot, { recursive: true, force: true });
 });
 
@@ -182,11 +186,13 @@ describe("adapter-owned OpenTelemetry bindings", () => {
     expect(poolSpan?.parentSpanContext?.spanId).toBe(routingSpan?.spanContext().spanId);
     expect(appSpan?.parentSpanContext?.spanId).toBe(poolSpan?.spanContext().spanId);
     expect(routingSpan?.attributes).toMatchObject({
+      "adapter_k8s.provider.name": "nginx-ingress",
       "adapter_k8s.routing.result": "routed",
       "adapter_k8s.pool.name": "web",
       "http.request.method": "GET",
     });
     expect(poolSpan?.attributes).toMatchObject({
+      "adapter_k8s.provider.name": "nginx-ingress",
       "adapter_k8s.pool.name": "web",
       "adapter_k8s.pool.result": "ok",
       "http.response.status_code": 201,
