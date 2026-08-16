@@ -387,6 +387,34 @@ export function validateConfig(input: unknown, releaseName?: string): void {
         "cache.url must be a redis:// or rediss:// connection string (or omit it to provision managed Memorystore)",
       );
     }
+    // adapter.config.mjs is meant to be COMMITTED to the app repo — a literal credential in
+    // it has a far wider readership than the mode-0600 valkey-secret.yaml it renders into.
+    // The config is executable JS, so the safe pattern (process.env indirection) is always
+    // available. Warn loudly rather than reject: a plaintext-credential config is legal, it
+    // is just almost never what the operator meant to commit.
+    if (typeof config.cache.password === "string" && config.cache.password.length > 0) {
+      console.warn(
+        "[adapter-k8s] cache.password is a literal string in adapter.config, a file that is " +
+          "meant to be committed. Source the credential from the environment instead " +
+          "(e.g. `password: process.env.VALKEY_AUTH`) — the rendered chart still stores it in " +
+          "a mode-0600 Secret manifest.",
+      );
+    }
+    if (url) {
+      try {
+        const parsed = new URL(url);
+        if (parsed.username || parsed.password) {
+          console.warn(
+            "[adapter-k8s] cache.url embeds credentials (redis://:password@host) in " +
+              "adapter.config, a file that is meant to be committed. Drop the userinfo and " +
+              "pass the credential via cache.password sourced from the environment instead.",
+          );
+        }
+      } catch {
+        // A malformed URL is rejected downstream; the hygiene warning must not add a
+        // failure mode of its own.
+      }
+    }
   }
   if (config.imageOptimizer?.enabled) {
     throw new Error("imageOptimizer.enabled is not implemented yet");

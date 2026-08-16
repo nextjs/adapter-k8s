@@ -1,6 +1,23 @@
 // src/adapter.ts
-import { writeFile, mkdir, copyFile, cp, rm, realpath, readdir, lstat } from "node:fs/promises";
-import { constants, existsSync, readFileSync, statSync } from "node:fs";
+import {
+  writeFile,
+  mkdir,
+  copyFile,
+  cp,
+  rm,
+  realpath,
+  readdir,
+  lstat,
+  chmod,
+} from "node:fs/promises";
+import {
+  constants,
+  existsSync,
+  readFileSync,
+  statSync,
+  appendFileSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
@@ -1123,11 +1140,49 @@ function deriveReleaseName(projectDir: string): string {
 // from public inputs, because the key is operator-held:
 //   1. ADAPTER_K8S_INTERNAL_SECRET_KEY (CI: keep it in the CI secret store), else
 //   2. .k8s-adapter/internal-secret.key — created here on first build with 32 random bytes,
-//      mode 0600, in the already-gitignored state dir (same convention as the other
-//      secret-bearing files).
+//      mode 0600, in the state dir the build itself keeps gitignored
+//      (ensureStateDirGitignored — "already-gitignored" used to be an assumption, and it was
+//      false on the build-before-init GitOps flow).
 // A build cannot read the cluster (the other option the review floated), so the key file is
 // what makes the derivation stable across re-emits on the same machine/checkout.
-async function deriveInternalSecret(
+// M4b, enforced at BUILD time (init's step 6 is the other writer): `.k8s-adapter/` holds
+// generated secrets — the internal-secret HMAC key (deriveInternalSecret) and the rendered
+// `internal-secret.yaml` carrying the dispatch secret inline — and the documented GitOps
+// flow (docs/gitops.md) builds the application PR BEFORE `init` ever ran. Without this,
+// that first build's `git add -A` commits the operator key and every per-build secret
+// derivable from it (HMAC(key, "release\0buildId") is deterministic and documented in the
+// emitted bundle README). Idempotent and append-only; silent when the rule is present.
+export function ensureStateDirGitignored(projectDir: string): void {
+  const gitignorePath = path.join(projectDir, ".gitignore");
+  const ignoreLine = ".k8s-adapter/";
+  try {
+    const existing = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf-8") : null;
+    const alreadyIgnored =
+      existing !== null && existing.split("\n").some((l) => l.trim() === ignoreLine);
+    if (alreadyIgnored) return;
+    if (existing === null) {
+      writeFileSync(gitignorePath, `${ignoreLine}\n`);
+    } else {
+      const prefix = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+      appendFileSync(gitignorePath, `${prefix}${ignoreLine}\n`);
+    }
+    console.warn(
+      `[adapter-k8s] Added "${ignoreLine}" to .gitignore — the directory holds generated ` +
+        `secrets and deploy state and must never be committed.`,
+    );
+  } catch (err) {
+    // A hygiene guard must never break the build (read-only checkouts exist) — but a
+    // failure here means the secret-bearing directory CAN be committed, so say so loudly.
+    console.warn(
+      `[adapter-k8s] WARNING: could not add "${ignoreLine}" to .gitignore ` +
+        `(${err instanceof Error ? err.message : String(err)}). The directory holds ` +
+        `generated secrets — add the rule yourself before committing.`,
+    );
+  }
+}
+
+// Exported for unit tests (key-file mode discipline and derivation stability are pinned there).
+export async function deriveInternalSecret(
   projectDir: string,
   releaseName: string,
   buildId: string,
@@ -1144,6 +1199,12 @@ async function deriveInternalSecret(
       await mkdir(path.dirname(keyPath), { recursive: true });
       await writeFile(keyPath, key, { encoding: "utf-8", mode: 0o600 });
     }
+    // writeFile's mode applies at CREATION only — a pre-existing key file (restored from a
+    // loose backup, extracted from a tarball that dropped modes, hand-created empty) keeps
+    // its mode, and the key then sits readable by every local user for the lifetime of
+    // every deploy. Tighten unconditionally; deploy.ts's valkey-secret write pairs
+    // writeFileSync+chmodSync for the same reason.
+    await chmod(keyPath, 0o600);
   }
   return createHmac("sha256", key).update(`${releaseName}\0${buildId}`).digest("hex");
 }
@@ -1537,6 +1598,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // rest of the build); resolve them before any artifact is touched.
       const cfg = await ensureConfig(projectDir);
       const releaseName = deriveReleaseName(projectDir);
+
+      // This build is about to mint secret material under .k8s-adapter/ (the HMAC key and
+      // the rendered internal-secret.yaml) — make sure the directory can never be committed
+      // even when `init` has not run yet (the GitOps two-PR flow builds first).
+      ensureStateDirGitignored(projectDir);
 
       // Blue/green requires the new and current builds to have DISTINCT sanitized K8s
       // names: resource names, pod labels, and the active-Service selector all derive

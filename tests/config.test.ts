@@ -1,5 +1,5 @@
 // tests/config.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { validateConfig, applyDefaults } from "../src/config.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 
@@ -320,6 +320,38 @@ describe("cache config", () => {
     expect(() => validateConfig(withCache({ enabled: true, url: "http://cache:6379" }))).toThrow(
       /redis:\/\//,
     );
+  });
+
+  it("WARNS on a literal cache.password — adapter.config is meant to be committed", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      validateConfig(withCache({ enabled: true, password: "hunter2" }));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("cache.password"));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("process.env"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("WARNS on credentials embedded in cache.url userinfo", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      validateConfig(withCache({ enabled: true, url: "redis://:hunter2@cache:6379" }));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("cache.url embeds credentials"));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays quiet for an env-sourced credential and a userinfo-less url", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      validateConfig(withCache({ enabled: true, url: "rediss://cache:6380", password: undefined }));
+      validateConfig(withCache({ enabled: true, url: "redis://cache:6379" }));
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
