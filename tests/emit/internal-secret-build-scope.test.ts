@@ -26,7 +26,11 @@ import {
   INTERNAL_SECRET_KEY,
 } from "../../src/emit/templates/internal-secret.js";
 import { applyRequestTrustBoundary } from "../../src/pool-server/server.js";
-import { INTERNAL_SECRET_HEADER } from "../../src/routing-common.js";
+import {
+  computeDispatchProof,
+  INTERNAL_DISPATCH_PROOF_HEADER,
+  INTERNAL_SECRET_HEADER,
+} from "../../src/routing-common.js";
 import type { PoolDefinition, K8sAdapterConfig, RoutingManifest } from "../../src/types.js";
 
 const RELEASE = "nextjs";
@@ -158,17 +162,23 @@ function fakeReqRes(headers: Record<string, string>) {
 /**
  * Does a pool pod holding `podSecret` act on a dispatch verdict signed with `presented`?
  * Runs the REAL boundary (pool-server/server.ts), so this is the production decision, not a
- * restatement of it.
+ * restatement of it. `presented` is a secret VALUE: the wire credential is the per-request
+ * proof derived from it (the raw secret is never accepted anymore — the boundary must also
+ * delete it when a client presents it).
  */
 function trustsVerdict(podSecret: string | undefined, presented: string): boolean {
+  const covered = { "x-mw-evaluated": "1", "x-output-id": "/dashboard" };
   const { req, res } = fakeReqRes({
+    ...covered,
+    // A correctly-derived proof for the presented value…
+    [INTERNAL_DISPATCH_PROOF_HEADER]: computeDispatchProof(presented, "GET", "/", covered),
+    // …plus the raw value itself, to pin that v1's credential is dead at the boundary.
     [INTERNAL_SECRET_HEADER]: presented,
-    "x-mw-evaluated": "1",
-    "x-output-id": "/dashboard",
   });
   applyRequestTrustBoundary(req, res, { internalSecret: podSecret, trustInternalHeaders: false });
-  // The secret itself must never survive the boundary either way.
+  // Neither credential header may survive the boundary either way.
   expect(req.headers[INTERNAL_SECRET_HEADER]).toBeUndefined();
+  expect(req.headers[INTERNAL_DISPATCH_PROOF_HEADER]).toBeUndefined();
   return req.headers["x-mw-evaluated"] !== undefined;
 }
 

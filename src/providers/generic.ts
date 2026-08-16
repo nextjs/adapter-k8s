@@ -104,8 +104,9 @@ export const genericProvider: ProviderAdapter = {
   emitsHealthCheckPolicyCrd: false,
 
   // Envoy Gateway dials the ext_proc backend as plain h2c. Safe only because the emitted
-  // NetworkPolicy admits :8443 solely from this release's own proxy pods — the ext_proc reply
-  // carries INTERNAL_HEADER_SECRET, so reachability to this port IS the credential.
+  // NetworkPolicy admits :8443 solely from this release's own proxy pods — and since the
+  // dispatch-proof change (INTERNAL_DISPATCH_PROOF_HEADER), the ext_proc reply carries only
+  // a per-request HMAC proof, so reachability no longer yields a replayable credential.
   routingTransport: "h2c",
 
   // No Google CIDRs. The gateway runs IN the cluster, so the dataplane is reachable by workload
@@ -119,8 +120,11 @@ export const genericProvider: ProviderAdapter = {
   // have denied every real request while admitting the one workload that never sends any.
   //
   // Scoped to THIS release's Gateway by name, so a second release's proxies in the same
-  // cluster cannot reach this routing service — and reachability to :8443 IS the internal
-  // dispatch secret, since the ext_proc reply carries it.
+  // cluster cannot reach this routing service. Reachability matters less than it used to:
+  // the ext_proc reply carries only a per-request dispatch PROOF (HMAC over the request and
+  // the stamped headers), so there is no replayable credential to read off the port — this
+  // scoping stays as defense-in-depth and as the guard against unauthenticated ext_proc
+  // compute abuse.
   strictIngressSources({ releaseName, config }: ProviderChartContext) {
     const generic = genericConfigOf(config);
     return {

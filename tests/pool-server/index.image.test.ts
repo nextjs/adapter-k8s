@@ -15,6 +15,7 @@ import type { AddressInfo } from "node:net";
 
 import { request as httpRequest } from "node:http";
 import { cdnTagForBuildId } from "../../src/cdn-tags.js";
+import { signDispatch } from "../helpers/dispatch-proof.js";
 
 const REPO_ROOT = process.cwd();
 const BUILD_ID = "imgbuild1";
@@ -1101,13 +1102,15 @@ describe("image optimizer — middleware coverage must still win over the cachea
   return new Response("middleware ran twice", { status: 451 });
 }\n`,
       });
-      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+      const imageUrl = "/_next/image?url=/mislabeled.jpg&w=640&q=75";
+      const res = await fetch(`http://127.0.0.1:${p2}${imageUrl}`, {
         headers: {
           accept: "image/webp",
-          "x-internal-secret": "image-routing-secret",
-          "x-mw-evaluated": "ran",
-          "x-resolved-headers": JSON.stringify({ "x-image-upstream": "reused" }),
-          "x-mw-request-headers": JSON.stringify({ accept: "image/png" }),
+          ...signDispatch("image-routing-secret", "GET", imageUrl, {
+            "x-mw-evaluated": "ran",
+            "x-resolved-headers": JSON.stringify({ "x-image-upstream": "reused" }),
+            "x-mw-request-headers": JSON.stringify({ accept: "image/png" }),
+          }),
         },
       });
       expect(res.status).toBe(200);

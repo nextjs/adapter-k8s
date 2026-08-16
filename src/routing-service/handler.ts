@@ -27,7 +27,9 @@ import {
   rscCacheBustingUnvalidated,
   sanitizeRouteMatches,
   serializeHeaderMap,
+  computeDispatchProof,
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../routing-common.js";
@@ -196,10 +198,11 @@ export function createRequestHandler(
 
     // Ingress hygiene: a client can send any x-* header, and the egress mutations
     // below only overwrite the keys they set — so strip the whole internal dispatch
-    // vocabulary (plus the secret) BEFORE anything else sees it. Spoofed values must
+    // vocabulary (plus BOTH credential headers — the legacy raw secret and the dispatch
+    // proof) BEFORE anything else sees it. Spoofed values must
     // never reach resolveRoutes or middleware (an auth middleware reading a spoofed
     // x-output-id / x-mw-evaluated would be deciding on attacker input). The pool
-    // applies the same strip-unless-secret discipline server-side.
+    // applies the same strip-unless-proof discipline server-side.
     const headers = new Headers(
       requestHeaders
         .filter(
@@ -207,7 +210,8 @@ export function createRequestHandler(
             !h.key.startsWith(":") &&
             !(INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.key.toLowerCase()) &&
             !(UNTRUSTED_NEXT_REQUEST_HEADERS as readonly string[]).includes(h.key.toLowerCase()) &&
-            h.key.toLowerCase() !== INTERNAL_SECRET_HEADER,
+            h.key.toLowerCase() !== INTERNAL_SECRET_HEADER &&
+            h.key.toLowerCase() !== INTERNAL_DISPATCH_PROOF_HEADER,
         )
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
@@ -266,7 +270,12 @@ export function createRequestHandler(
     if (middlewareModule && method !== "GET" && method !== "HEAD") {
       return buildHeaderMutationResponse(
         [],
-        [...INTERNAL_DISPATCH_HEADERS, ...UNTRUSTED_NEXT_REQUEST_HEADERS, INTERNAL_SECRET_HEADER],
+        [
+          ...INTERNAL_DISPATCH_HEADERS,
+          ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+          INTERNAL_SECRET_HEADER,
+          INTERNAL_DISPATCH_PROOF_HEADER,
+        ],
       );
     }
 
@@ -694,7 +703,12 @@ export function createRequestHandler(
       // cost the body backstop pays, and it is the fail-safe direction.)
       return buildHeaderMutationResponse(
         [],
-        [...INTERNAL_DISPATCH_HEADERS, ...UNTRUSTED_NEXT_REQUEST_HEADERS, INTERNAL_SECRET_HEADER],
+        [
+          ...INTERNAL_DISPATCH_HEADERS,
+          ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+          INTERNAL_SECRET_HEADER,
+          INTERNAL_DISPATCH_PROOF_HEADER,
+        ],
       );
     }
 
@@ -724,6 +738,7 @@ export function createRequestHandler(
       ...INTERNAL_DISPATCH_HEADERS,
       ...UNTRUSTED_NEXT_REQUEST_HEADERS,
       INTERNAL_SECRET_HEADER,
+      INTERNAL_DISPATCH_PROOF_HEADER,
     ]);
     const setDispatch = (key: string, value: string) => {
       mutations.push({ key, value });
@@ -846,13 +861,28 @@ export function createRequestHandler(
       setDispatch("x-nextjs-ppr", "1");
     }
 
-    // Authenticate the dispatch headers to the pool. Only the trusted extension knows the
-    // secret; the pool ignores (strips) dispatch headers on any request whose secret doesn't
-    // match, so a spoofed x-output-id on a CEL-excluded path or during a fail-open outage is
-    // rejected. Absent in emulate/tests (no secret configured) — the pool re-resolves locally.
+    // Authenticate the dispatch headers to the pool with a PER-REQUEST PROOF, never the raw
+    // secret (INTERNAL_DISPATCH_PROOF_HEADER in routing-common.ts): HMAC over the method, the
+    // request target, and the complete dispatch set stamped above — the middleware verdict and
+    // its final request-header set included, so neither can be swapped onto another request
+    // or edited in transit. Anyone able to open an ext_proc stream to this service (a
+    // NetworkPolicy gap, a hostNetwork pod) used to read a replayable credential out of this
+    // mutation; they now get a proof that authenticates exactly one request — the one this
+    // tier actually resolved. Absent in emulate/tests (no secret configured) — the pool
+    // re-resolves locally. Computed BEFORE the header-budget projection below so the proof
+    // counts against it, and so the bail path (which clears the vocabulary and stamps
+    // nothing) stays consistent.
     if (internalSecret) {
-      mutations.push({ key: INTERNAL_SECRET_HEADER, value: internalSecret });
-      clear.delete(INTERNAL_SECRET_HEADER);
+      const covered: Record<string, string | undefined> = {};
+      for (const m of mutations) {
+        const key = m.key.toLowerCase();
+        if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(key)) covered[key] = m.value;
+      }
+      mutations.push({
+        key: INTERNAL_DISPATCH_PROOF_HEADER,
+        value: computeDispatchProof(internalSecret, method, rawPath, covered),
+      });
+      clear.delete(INTERNAL_DISPATCH_PROOF_HEADER);
     }
 
     // N40b (AVAILABILITY). The dispatch headers are ADDITIVE on the wire, and
@@ -897,7 +927,12 @@ export function createRequestHandler(
       );
       return buildHeaderMutationResponse(
         [],
-        [...INTERNAL_DISPATCH_HEADERS, ...UNTRUSTED_NEXT_REQUEST_HEADERS, INTERNAL_SECRET_HEADER],
+        [
+          ...INTERNAL_DISPATCH_HEADERS,
+          ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+          INTERNAL_SECRET_HEADER,
+          INTERNAL_DISPATCH_PROOF_HEADER,
+        ],
       );
     }
 

@@ -4,7 +4,7 @@
 // cjs-module-lexer can't statically resolve the named exports, so the import throws
 // "Named export 'detectDomainLocale' not found". Import the CJS default (module.exports)
 // and destructure; both bundle formats resolve the symbols this way.
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import NextRouting from "@next/routing";
 import type { ResolveRoutesParams } from "@next/routing";
 import { isSafePattern } from "redos-detector";
@@ -136,9 +136,103 @@ export function fitsPoolHeaderBudget(bytes: number): boolean {
 }
 
 // Header carrying the shared secret that authenticates the dispatch headers above.
-// Present only on responses from the trusted routing extension / cross-pool proxy.
+// LEGACY (v1): it is no longer stamped anywhere — see INTERNAL_DISPATCH_PROOF_HEADER. The
+// constant remains because every strip/clear list must keep naming it: a client (or an
+// old-build hop) presenting the raw secret must have it deleted, never honored.
 export const INTERNAL_SECRET_HEADER = "x-internal-secret";
 export const INTERNAL_EXECUTION_DEADLINE_HEADER = "x-adapter-k8s-execution-deadline";
+
+/**
+ * Header carrying the dispatch trust credential, v2: a PER-REQUEST HMAC proof, replacing
+ * the raw shared secret on the wire.
+ *
+ * v1 stamped the raw per-build secret (x-internal-secret) into every ext_proc response and
+ * every cross-pool hop. Anything able to open ONE ext_proc stream to the routing service —
+ * a NetworkPolicy miss, a hostNetwork pod (which bypasses NetworkPolicy entirely), a VPC
+ * peer, a non-enforcing CNI — could read the secret out of the header mutation and replay
+ * it against any pool with forged dispatch headers, minting trusted `x-mw-evaluated`
+ * verdicts for arbitrary routes: a release-wide middleware bypass. Reachability to :8443
+ * WAS the credential (2026-08-16 audit, issue #60).
+ *
+ * The proof binds the secret to the request AND to the complete stamped dispatch set:
+ * covered are the method, the request target, and every INTERNAL_DISPATCH_HEADERS value —
+ * which include the middleware verdict (`x-mw-evaluated`) and the middleware's final
+ * request-header set (`x-mw-request-headers`), so neither can be swapped onto a different
+ * request or edited in transit. A proof read out of one ext_proc response authenticates
+ * exactly the request the routing tier actually resolved — a caller can only ever obtain
+ * proofs for requests its own middleware verdicts authorize. The secret never crosses the
+ * wire, so reachability to :8443 no longer yields a replayable credential (NetworkPolicy
+ * drops to defense-in-depth).
+ *
+ * No legacy dual-accept on the pool: trusted pairings are ALWAYS same-build — the secret
+ * is HMAC(operatorKey, "release\0buildId") per build, and the edge's secretKeyRef moves
+ * with its image (N87) — so same build means same adapter code on both ends. Cross-build
+ * traffic already fails closed today (secret mismatch ⇒ strip ⇒ local re-resolution), so
+ * a proof-only pool and a raw-secret edge can never form a trusted pair.
+ */
+export const INTERNAL_DISPATCH_PROOF_HEADER = "x-internal-dispatch-proof";
+
+// Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
+// unequal-length buffers). Canonical home; pool-server/dispatch.ts re-exports it so the two
+// historical import sites can never drift apart.
+export function timingSafeStringEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Compute (and verify) the per-request dispatch proof. `target` is the origin-form request
+ * target (`:path` at the ext_proc tier, `req.url` at the pool) — both tiers see the same
+ * raw, un-normalized bytes. Covered headers contribute `name\nvalue`, sorted by name;
+ * non-string (multi-valued) entries are skipped symmetrically on both sides, which for the
+ * single-valued-by-construction dispatch vocabulary simply means "absent".
+ */
+export function computeDispatchProof(
+  secret: string,
+  method: string,
+  target: string,
+  headers: Record<string, string | undefined>,
+): string {
+  const hmac = createHmac("sha256", secret);
+  hmac.update("adapter-k8s-dispatch-v1\n");
+  hmac.update(method.toUpperCase());
+  hmac.update("\n");
+  hmac.update(target);
+  for (const name of [...INTERNAL_DISPATCH_HEADERS].sort()) {
+    const value = headers[name];
+    if (typeof value !== "string") continue;
+    hmac.update("\n");
+    hmac.update(name);
+    hmac.update("\n");
+    hmac.update(value);
+  }
+  return hmac.digest("hex");
+}
+
+/** Collect the proof-covered headers off a live request (string values only). */
+export function coveredDispatchHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): Record<string, string | undefined> {
+  const covered: Record<string, string | undefined> = {};
+  for (const name of INTERNAL_DISPATCH_HEADERS) {
+    const value = headers[name];
+    if (typeof value === "string") covered[name] = value;
+  }
+  return covered;
+}
+
+export function verifyDispatchProof(
+  secret: string,
+  method: string,
+  target: string,
+  headers: Record<string, string | string[] | undefined>,
+  presentedProof: string,
+): boolean {
+  const expected = computeDispatchProof(secret, method, target, coveredDispatchHeaders(headers));
+  return timingSafeStringEqual(presentedProof, expected);
+}
 
 // A compiled middleware matcher entry from middleware-manifest.json.
 export interface MiddlewareMatcher {

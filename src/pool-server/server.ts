@@ -2,11 +2,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   requestTargetPathname,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
+  verifyDispatchProof,
 } from "../routing-common.js";
-import { guardStreamErrors, timingSafeStringEqual } from "./dispatch.js";
+import { guardStreamErrors } from "./dispatch.js";
 
 /**
  * LIVENESS. "This process is answering HTTP." Nothing more — do NOT gate traffic on it.
@@ -54,14 +56,28 @@ export function applyRequestTrustBoundary(
   const { internalSecret, trustInternalHeaders = false } = options;
 
   // Establish whether the internal dispatch headers on this request can be trusted. With a
-  // secret configured (GKE), trust requires a matching x-internal-secret; without one
-  // (emulate/tests), fall back to the trustInternalHeaders flag. The secret itself must never
-  // reach the handler or leak upstream, so it is always deleted.
-  const presentedSecret = req.headers[INTERNAL_SECRET_HEADER];
+  // secret configured (GKE), trust requires a valid PER-REQUEST PROOF (HMAC over the method,
+  // the request target, and the complete dispatch header set — routing-common.ts
+  // INTERNAL_DISPATCH_PROOF_HEADER). The v1 raw-secret header is NEVER honored: it is no
+  // longer stamped by any producer, and accepting it would keep the "read one ext_proc
+  // response, replay forever" hole open. Trusted pairings are always same-build (per-build
+  // secret + N87's secretKeyRef-moves-with-image), so a legacy raw-secret producer and a
+  // proof-only pool can never share a credential anyway — cross-build mismatches fail closed
+  // to local resolution exactly as before. Without a secret (emulate/tests), fall back to
+  // the trustInternalHeaders flag. Both credential headers are always deleted.
+  const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
   const trusted = internalSecret
-    ? typeof presentedSecret === "string" && timingSafeStringEqual(presentedSecret, internalSecret)
+    ? typeof presentedProof === "string" &&
+      verifyDispatchProof(
+        internalSecret,
+        req.method ?? "GET",
+        req.url ?? "/",
+        req.headers,
+        presentedProof,
+      )
     : trustInternalHeaders;
   delete req.headers[INTERNAL_SECRET_HEADER];
+  delete req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
 
   // These are Next's private request controls, not trusted adapter dispatch headers. Keep the
   // list aligned with Next 16's server-ipc INTERNAL_HEADERS; legitimate values are synthesized
@@ -187,10 +203,13 @@ export interface PoolServerOptions {
   trustInternalHeaders?: boolean;
   /**
    * Shared secret proving a request's internal dispatch headers came from the routing
-   * extension / cross-pool proxy (they carry it in x-internal-secret). When set, dispatch
-   * headers are trusted ONLY if the secret matches — regardless of trustInternalHeaders — so a
-   * client that speaks the dispatch protocol on a CEL-excluded path or during a fail-open
-   * outage is still rejected. Absent in emulate/tests.
+   * extension / cross-pool proxy. Never carried on the wire itself: trusted requests carry
+   * a per-request HMAC proof in x-internal-dispatch-proof (routing-common.ts), verified
+   * against this value. When set, dispatch headers are trusted ONLY with a valid proof —
+   * regardless of trustInternalHeaders — so a client that speaks the dispatch protocol on
+   * a CEL-excluded path or during a fail-open outage is still rejected, and anyone able to
+   * observe a trusted exchange gains a credential valid for exactly that one request.
+   * Absent in emulate/tests.
    */
   internalSecret?: string | undefined;
   /**

@@ -2,7 +2,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { splitCookiesString } from "next/dist/server/web/utils.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -12,7 +12,11 @@ import type { StaticAssetEntry } from "../types.js";
 import {
   INTERNAL_EXECUTION_DEADLINE_HEADER,
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
+  computeDispatchProof,
+  coveredDispatchHeaders,
+  timingSafeStringEqual,
   localeAlignedRouteParamPathname,
   queryFromUrl,
   requestTargetPathname,
@@ -122,15 +126,10 @@ function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {
   }
 }
 
-// Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
-// unequal-length buffers). Canonical implementation — server.ts imports this one; keep a
-// single copy so the two secret checks can never drift.
-export function timingSafeStringEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return timingSafeEqual(ab, bb);
-}
+// Constant-time string compare. The canonical implementation lives in routing-common.ts
+// (it is also the proof verifier's compare); re-exported so the historical import sites
+// (server.ts, this file's preview check) can never drift apart.
+export { timingSafeStringEqual };
 
 // Extract one cookie's value from a Cookie header, percent-decoded the way Next's RequestCookies
 // does it (next/dist/compiled/@edge-runtime/cookies). Returns undefined when the cookie is absent.
@@ -3846,7 +3845,7 @@ const ASSERTED_BY_THIS_HOP: Record<string, true> = {
   "x-invoke-path": true,
   "x-invoke-query": true,
   [INTERNAL_EXECUTION_DEADLINE_HEADER]: true,
-  [INTERNAL_SECRET_HEADER]: true,
+  [INTERNAL_DISPATCH_PROOF_HEADER]: true,
 };
 
 function proxyToPool(
@@ -3889,18 +3888,36 @@ function proxyToPool(
       // middleware (which would double-apply cookies/redirects). Without this, the target's
       // x-mw-evaluated gate would fall through to a second evaluation.
       "x-mw-evaluated": "ran",
-      ...(internalSecret ? { [INTERNAL_SECRET_HEADER]: internalSecret } : {}),
     };
     // S15 (SECURITY). Drop any dispatch header this hop did not itself assert. `req.headers`
     // was replaced wholesale a few lines up with the middleware's FINAL request-header set,
-    // and the request below carries INTERNAL_SECRET_HEADER — so whatever survives the spread
+    // and the request below carries the dispatch proof — so whatever survives the spread
     // arrives at the sibling pool as TRUSTED input. The explicit assignments above cover only
     // six of the ten names: `x-resolved-headers` (which the receiving pool merges into the
     // RESPONSE), `x-upstream-pool`, `x-nextjs-ppr` and `x-mw-request-headers` used to ride
     // through unguarded. Deleted AFTER the assignments so this is an allowlist of exactly what
     // this hop asserts, not a filter that a new header can slip past.
-    for (const h of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) {
+    for (const h of [
+      ...INTERNAL_DISPATCH_HEADERS,
+      INTERNAL_SECRET_HEADER,
+      INTERNAL_DISPATCH_PROOF_HEADER,
+    ]) {
       if (!(h in ASSERTED_BY_THIS_HOP)) delete forwardHeaders[h];
+    }
+
+    // The trust credential is a per-request PROOF, never the raw secret (routing-common.ts
+    // INTERNAL_DISPATCH_PROOF_HEADER): computed over the exact dispatch set this hop asserts
+    // plus the forwarded method/URL, so a proof observed in transit authenticates only this
+    // request. The header list is fixed by the proof scheme — the cleanup above has already
+    // evicted every covered name this hop did not set, so `coveredDispatchHeaders` sees the
+    // final wire state.
+    if (internalSecret) {
+      forwardHeaders[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
+        internalSecret,
+        req.method ?? "GET",
+        req.url ?? "/",
+        coveredDispatchHeaders(forwardHeaders),
+      );
     }
 
     // Same forged-framing guard as the loopback invocation: the target pool would

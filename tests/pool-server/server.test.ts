@@ -1,6 +1,7 @@
 // tests/pool-server/server.test.ts
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createPoolServer, filterWriteHeadHeadersArg } from "../../src/pool-server/server.js";
+import { signDispatch } from "../helpers/dispatch-proof.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 describe("createPoolServer", () => {
@@ -231,8 +232,7 @@ describe("internal header security", () => {
       await fetch(`http://127.0.0.1:${port}/page`, {
         method: "POST",
         headers: {
-          "x-internal-secret": "the-secret",
-          "x-output-id": "/page",
+          ...signDispatch("the-secret", "POST", "/page", { "x-output-id": "/page" }),
           "next-resume": "1",
           "x-next-resume-state-length": "32",
           "x-now-route-matches": "spoofed",
@@ -281,8 +281,8 @@ describe("internal header security", () => {
     const DISPATCH_HEADERS = {
       "x-output-id": "/admin/action",
       "x-upstream-pool": "admin",
-      "x-internal-secret": "the-secret",
     };
+    const SIGNED = signDispatch("the-secret", "GET", "/page", DISPATCH_HEADERS);
 
     function seeingServer(seen: Record<string, string | undefined>) {
       return vi.fn((req: IncomingMessage, res: ServerResponse) => {
@@ -302,11 +302,74 @@ describe("internal header security", () => {
       });
       const { port } = await server.start();
 
-      await fetch(`http://127.0.0.1:${port}/page`, { headers: DISPATCH_HEADERS });
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: SIGNED });
 
       expect(seen["x-output-id"]).toBe("/admin/action");
-      // The secret itself must never reach the handler.
+      // The credential header itself must never reach the handler.
       expect(seen["x-internal-secret"]).toBeUndefined();
+      expect(seen["x-internal-dispatch-proof"]).toBeUndefined();
+    });
+
+    it("RED TEAM: the raw v1 secret is no longer a credential — a stolen secret signs nothing", async () => {
+      // The finding this protocol change closes: reading an ext_proc response (or a pool
+      // hop) used to hand over the replayable raw secret. A request presenting ONLY the raw
+      // secret is now exactly as untrusted as one presenting nothing.
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: { ...DISPATCH_HEADERS, "x-internal-secret": "the-secret" },
+      });
+
+      expect(seen["x-output-id"]).toBeUndefined();
+    });
+
+    it("RED TEAM: a valid proof for ANOTHER request does not authorize this one", async () => {
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      // A proof minted for GET /other with a different dispatch set…
+      const stolen = signDispatch("the-secret", "GET", "/other", { "x-output-id": "/other" });
+      // …replayed against /page with a forged dispatch target.
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: {
+          ...DISPATCH_HEADERS,
+          "x-internal-dispatch-proof": stolen["x-internal-dispatch-proof"]!,
+        },
+      });
+
+      expect(seen["x-output-id"]).toBeUndefined();
+    });
+
+    it("RED TEAM: a proof minted over a different dispatch set is rejected on edit", async () => {
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      // Sign a benign verdict, then edit x-output-id in transit — the proof must break.
+      const signed = signDispatch("the-secret", "GET", "/page", {
+        "x-output-id": "/about",
+        "x-mw-evaluated": "ran",
+      });
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: { ...signed, "x-output-id": "/admin/action" },
+      });
+
+      expect(seen["x-output-id"]).toBeUndefined();
     });
 
     it("RED TEAM: strips a spoofed x-output-id when no/invalid secret is presented (secret configured)", async () => {
@@ -318,9 +381,13 @@ describe("internal header security", () => {
       });
       const { port } = await server.start();
 
-      // Attacker knows the dispatch protocol but not the secret.
+      // Attacker knows the dispatch protocol but not the secret — a guessed proof fails the
+      // same way a guessed secret used to.
       await fetch(`http://127.0.0.1:${port}/page`, {
-        headers: { "x-output-id": "/admin/action", "x-internal-secret": "wrong-guess" },
+        headers: {
+          "x-output-id": "/admin/action",
+          "x-internal-dispatch-proof": "deadbeef".repeat(8),
+        },
       });
 
       // Dispatch header stripped → pool falls to Phase-1 resolution (runs middleware), not a
@@ -328,8 +395,8 @@ describe("internal header security", () => {
       expect(seen["x-output-id"]).toBeUndefined();
     });
 
-    it("RED TEAM: a matching secret alone does NOT let trustInternalHeaders be bypassed when unset", async () => {
-      // With a secret configured, trustInternalHeaders is irrelevant — trust is secret-only.
+    it("RED TEAM: a valid proof alone does NOT let trustInternalHeaders be bypassed when unset", async () => {
+      // With a secret configured, trustInternalHeaders is irrelevant — trust is proof-only.
       const seen: Record<string, string | undefined> = {};
       server = createPoolServer({
         onRequest: seeingServer(seen),
@@ -339,7 +406,7 @@ describe("internal header security", () => {
       });
       const { port } = await server.start();
 
-      await fetch(`http://127.0.0.1:${port}/page`, { headers: DISPATCH_HEADERS });
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: SIGNED });
       expect(seen["x-output-id"]).toBe("/admin/action");
     });
 

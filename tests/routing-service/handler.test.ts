@@ -11,8 +11,10 @@ import {
 import { mockRouting } from "../helpers/mock-outputs.js";
 import {
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
+  verifyDispatchProof,
 } from "../../src/routing-common.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
@@ -183,6 +185,7 @@ describe("createRequestHandler", () => {
         ...INTERNAL_DISPATCH_HEADERS,
         ...UNTRUSTED_NEXT_REQUEST_HEADERS,
         INTERNAL_SECRET_HEADER,
+        INTERNAL_DISPATCH_PROOF_HEADER,
       ]),
     );
   });
@@ -400,7 +403,7 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
     expect(parsed["set-cookie"]).toEqual(["a=1; Path=/", "b=2; Path=/"]);
   });
 
-  it("adds the internal secret when INTERNAL_HEADER_SECRET is set", async () => {
+  it("stamps a per-request dispatch PROOF when INTERNAL_HEADER_SECRET is set — never the raw secret", async () => {
     process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
@@ -410,12 +413,66 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
 
     const response = await handler(makeHeaders("/about"));
     const mutation = response.requestHeaders!.response!.headerMutation!;
-    const secret = mutation.setHeaders!.find((h) => h.header.key === "x-internal-secret");
-    expect(secret!.header.value).toBe("s3cr3t");
-    expect(mutation.removeHeaders).not.toContain("x-internal-secret");
+    // The raw secret must NEVER be on the wire (it is actively removed instead)…
+    expect(mutation.setHeaders!.find((h) => h.header.key === "x-internal-secret")).toBeUndefined();
+    expect(mutation.removeHeaders).toContain("x-internal-secret");
+    // …the proof is — and it verifies against the request and the stamped dispatch set.
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof");
+    expect(proof).toBeDefined();
+    expect(mutation.removeHeaders).not.toContain("x-internal-dispatch-proof");
+    const covered: Record<string, string> = {};
+    for (const h of mutation.setHeaders!) {
+      if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.header.key!)) {
+        covered[h.header.key!] = h.header.value!;
+      }
+    }
+    expect(verifyDispatchProof("s3cr3t", "GET", "/about", covered, proof!.header.value!)).toBe(
+      true,
+    );
+    // And it is genuinely per-request: another path yields a different proof.
+    const other = await handler(makeHeaders("/proxy"));
+    const otherProof = other.requestHeaders!.response!.headerMutation!.setHeaders!.find(
+      (h) => h.header.key === "x-internal-dispatch-proof",
+    );
+    expect(otherProof).toBeDefined();
+    expect(otherProof!.header.value).not.toBe(proof!.header.value);
   });
 
-  it("removes x-internal-secret when none is configured (client cannot spoof it)", async () => {
+  it("the proof rejects a single swapped or edited covered header (no transplant/replay)", async () => {
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    const response = await handler(makeHeaders("/about"));
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const covered: Record<string, string> = {};
+    for (const h of mutation.setHeaders!) {
+      if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.header.key!)) {
+        covered[h.header.key!] = h.header.value!;
+      }
+    }
+    // Swapping the dispatch target…
+    expect(
+      verifyDispatchProof(
+        "s3cr3t",
+        "GET",
+        "/about",
+        { ...covered, "x-output-id": "/admin" },
+        proof,
+      ),
+    ).toBe(false);
+    // …or replaying the proof onto a different path…
+    expect(verifyDispatchProof("s3cr3t", "GET", "/admin", covered, proof)).toBe(false);
+    // …or guessing from the wrong secret…
+    expect(verifyDispatchProof("wrong", "GET", "/about", covered, proof)).toBe(false);
+  });
+
+  it("removes x-internal-secret AND the proof when none is configured (client cannot spoof either)", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       resolvedPathname: "/about",
@@ -426,6 +483,10 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
     const mutation = response.requestHeaders!.response!.headerMutation!;
     expect(mutation.setHeaders!.find((h) => h.header.key === "x-internal-secret")).toBeUndefined();
     expect(mutation.removeHeaders).toContain("x-internal-secret");
+    expect(
+      mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof"),
+    ).toBeUndefined();
+    expect(mutation.removeHeaders).toContain("x-internal-dispatch-proof");
   });
 
   it("maps an RSC request to the .rsc output variant in x-output-id", async () => {
@@ -482,6 +543,7 @@ describe("createRequestHandler ingress hygiene", () => {
       { key: "x-mw-evaluated", value: "ran" },
       { key: "x-resolved-headers", value: "{}" },
       { key: "x-internal-secret", value: "guessed" },
+      { key: "x-internal-dispatch-proof", value: "guessed-proof" },
       { key: "x-upstream-pool", value: "api" },
       { key: "x-nextjs-ppr", value: "1" },
     ]);
@@ -494,6 +556,7 @@ describe("createRequestHandler ingress hygiene", () => {
       "x-mw-evaluated",
       "x-resolved-headers",
       "x-internal-secret",
+      "x-internal-dispatch-proof",
       "x-upstream-pool",
       "x-nextjs-ppr",
     ]) {
@@ -1750,6 +1813,7 @@ describe("N40b: pool header-budget guard", () => {
       ...INTERNAL_DISPATCH_HEADERS,
       ...UNTRUSTED_NEXT_REQUEST_HEADERS,
       INTERNAL_SECRET_HEADER,
+      INTERNAL_DISPATCH_PROOF_HEADER,
     ]) {
       expect(mutation.removeHeaders).toContain(name);
     }

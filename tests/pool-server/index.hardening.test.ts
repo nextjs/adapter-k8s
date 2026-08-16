@@ -35,6 +35,7 @@ delete process.env.NEXT_ENABLE_ADAPTER;
 process.env.NEXT_UNHANDLED_REJECTION_FILTER = "silent";
 
 const { startPoolServer } = await import("../../src/pool-server/index.js");
+const { signDispatch } = await import("../helpers/dispatch-proof.js");
 
 interface Staged {
   dir: string;
@@ -157,6 +158,7 @@ function writeStagedDir(options: StageOptions = {}): Staged {
          mwRequestHeaders: req.headers["x-mw-request-headers"] ?? null,
          resolvedHeaders: req.headers["x-resolved-headers"] ?? null,
          internalSecret: req.headers["x-internal-secret"] ?? null,
+         proof: req.headers["x-internal-dispatch-proof"] ?? null,
        }));
      }
     `,
@@ -700,15 +702,17 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
       mwRequestHeaders: string | null;
       resolvedHeaders: string | null;
       internalSecret: string | null;
+      proof: string | null;
     };
   }
 
   it("applies it as a REPLACEMENT for a trusted request: added header in, deleted header gone", async () => {
     const body = await echo({
-      "x-internal-secret": SECRET,
-      "x-output-id": "/echo-headers",
-      "x-mw-evaluated": "ran",
-      "x-mw-request-headers": MW_HEADERS,
+      ...signDispatch(SECRET, "GET", "/echo-public", {
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "ran",
+        "x-mw-request-headers": MW_HEADERS,
+      }),
       // The client's spoof, which the middleware deleted at the edge.
       "x-user-id": "spoofed-by-client",
     });
@@ -716,17 +720,19 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     expect(body.userId).toBeNull();
   });
 
-  it("never leaks the transport header (or the secret) to the handler", async () => {
+  it("never leaks the transport headers (or either credential) to the handler", async () => {
     const body = await echo({
-      "x-internal-secret": SECRET,
-      "x-output-id": "/echo-headers",
-      "x-mw-evaluated": "ran",
-      "x-mw-request-headers": MW_HEADERS,
-      "x-resolved-headers": JSON.stringify({ "x-from-headers-rule": "1" }),
+      ...signDispatch(SECRET, "GET", "/echo-public", {
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "ran",
+        "x-mw-request-headers": MW_HEADERS,
+        "x-resolved-headers": JSON.stringify({ "x-from-headers-rule": "1" }),
+      }),
     });
     expect(body.mwRequestHeaders).toBeNull();
     expect(body.resolvedHeaders).toBeNull();
     expect(body.internalSecret).toBeNull();
+    expect(body.proof).toBeNull();
   });
 
   it("RED TEAM: an UNTRUSTED request cannot install request headers with it", async () => {
@@ -752,20 +758,34 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     expect(body.mwRequestHeaders).toBeNull();
   });
 
-  it("RED TEAM: a WRONG secret of the same length is also refused", async () => {
-    const wrong = "x".repeat(SECRET.length);
-    expect(wrong.length).toBe(SECRET.length);
+  it("RED TEAM: a WRONG signing secret is also refused", async () => {
     const body = await echo(
-      {
-        "x-internal-secret": wrong,
+      signDispatch("wrong-secret", "GET", "/echo-headers", {
         "x-output-id": "/echo-headers",
         "x-mw-evaluated": "ran",
         "x-mw-request-headers": MW_HEADERS,
         "x-user-id": "spoofed-by-client",
-      },
+      }),
       "/echo-headers",
     );
     expect(body.authenticatedUser).toBeNull();
     expect(body.userId).toBe("spoofed-by-client");
+  });
+
+  it("RED TEAM: the raw v1 secret alone no longer buys trust", async () => {
+    // The 2026-08-16 audit finding: a leaked raw secret must be USELESS on its own.
+    const body = await echo(
+      {
+        "x-internal-secret": SECRET,
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "ran",
+        "x-mw-request-headers": JSON.stringify({
+          host: "localhost",
+          "x-authenticated-user": "attacker",
+        }),
+      },
+      "/echo-headers",
+    );
+    expect(body.authenticatedUser).toBeNull();
   });
 });

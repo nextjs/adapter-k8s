@@ -15,7 +15,7 @@ import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types
  * ALB nor Azure Application Gateway supports ext_proc at all, so EKS/AKS/generic all need an
  * in-cluster Envoy either way. MEASURED 2026-07-29 on k3s + Envoy Gateway v1.5.4 — an
  * `EnvoyExtensionPolicy` carries our full dispatch vocabulary (`x-output-id`,
- * `x-internal-secret`, `x-mw-evaluated: ran`) with the routing-service image unchanged, and
+ * `x-internal-dispatch-proof`, `x-mw-evaluated: ran`) with the routing-service image unchanged, and
  * `failOpen: false` fails closed. See the prototype section of the plan.
  */
 export type ExtProcStrategy = "gke-traffic-extension" | "envoy-gateway";

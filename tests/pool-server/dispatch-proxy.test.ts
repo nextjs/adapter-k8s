@@ -4,6 +4,7 @@
 // hop-by-hop stripping, and the x-resolved-headers protocol.
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createDispatcher } from "../../src/pool-server/dispatch.js";
+import { verifyDispatchProof } from "../../src/routing-common.js";
 import type { DispatcherOptions } from "../../src/pool-server/dispatch.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer, request as httpRequest, type Server } from "node:http";
@@ -971,10 +972,22 @@ describe("cross-pool proxy hardening", () => {
     expect(seen["x-upstream-pool"]).toBeUndefined();
     expect(seen["x-nextjs-ppr"]).toBeUndefined();
     expect(seen["x-mw-request-headers"]).toBeUndefined();
-    // …while what this hop genuinely asserts still goes, with the secret.
+    // …while what this hop genuinely asserts still goes — authenticated by a per-request
+    // PROOF, never the raw secret (which must not be on the wire at all anymore).
     expect(seen["x-output-id"]).toBe("/api/thing");
     expect(seen["x-mw-evaluated"]).toBe("ran");
-    expect(seen["x-internal-secret"]).toBe("shared-secret");
+    expect(seen["x-internal-secret"]).toBeUndefined();
+    const proof = seen["x-internal-dispatch-proof"];
+    expect(typeof proof).toBe("string");
+    expect(
+      verifyDispatchProof(
+        "shared-secret",
+        "GET",
+        "/api/thing",
+        seen as Record<string, string | undefined>,
+        proof as string,
+      ),
+    ).toBe(true);
   });
 });
 
