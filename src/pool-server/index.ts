@@ -2740,13 +2740,17 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Serve _next/static/* and _next/data/* directly from filesystem.
     // In production, CDN handles these. In standalone/emulate mode, the pool server must serve them.
     if (!middlewareMayCover && staticPathname.startsWith("/_next/static/")) {
-      const filePath = path.join(
-        process.cwd(),
-        ".next",
-        "static",
+      // S30, same containment as the public/data/image disk serves: the request path is
+      // percent-encoded (so `%2f` stays a literal character and the WHATWG parser has
+      // already folded dot segments — lexical traversal is not possible here), but a bare
+      // path.join FOLLOWS SYMLINKS, and an escaping symlink inside .next/static is
+      // reachable under emulate/local dev against a working tree (a malicious postinstall,
+      // a committed symlink). resolveWithinRoot's realpath re-check closes exactly that.
+      const filePath = resolveWithinRoot(
+        path.join(process.cwd(), ".next", "static"),
         staticPathname.slice("/_next/static/".length),
       );
-      if (existsSync(filePath)) {
+      if (filePath && existsSync(filePath)) {
         // N31: a build asset answers GET/HEAD only. `next start`'s router-server sets
         // `Allow: GET, HEAD` and 405s every other method BEFORE serveStatic (measured:
         // POST/PUT/DELETE on a chunk → 405; the adapter used to answer 200 with the full body
@@ -3657,6 +3661,21 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         ...(extDeadlineAt ? { executionDeadlineAt: extDeadlineAt } : {}),
       });
       return;
+    }
+
+    // The fall-through path: a secret-gated `x-output-id` was present but the middleware
+    // verdict was absent or untrusted, so Phase 1 re-derives EVERYTHING itself — the
+    // dispatch vocabulary is unusable here by construction. S22 deleted it only inside the
+    // trusted branch above; left in place on this path, `x-output-id`, `x-upstream-pool`,
+    // `x-route-matches`, `x-invoke-path`, `x-invoke-query`, `x-nextjs-ppr` and the execution
+    // deadline rode into resolveRoutes, the middleware invocation, the loopback handler
+    // request (dispatch.ts's toNodeHeaders copy) and EXTERNAL-REWRITE targets as ordinary
+    // request headers — leaking the internal routing state (rewrite destination included)
+    // to app code and off-cluster third parties. Strip both the live request and the
+    // `headers` snapshot taken at :2894 (resolve reads the snapshot, dispatch reads req).
+    for (const h of INTERNAL_DISPATCH_HEADERS) {
+      delete req.headers[h];
+      headers.delete(h);
     }
 
     // Phase 1: resolve route locally

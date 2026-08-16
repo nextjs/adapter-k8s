@@ -12,7 +12,7 @@
 // The staged dirs live UNDER THE REPO ROOT so createRequire(<staged>/package.json) can resolve
 // the repo's `next` (the pool requires several next/dist modules at boot).
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import net, { type AddressInfo } from "node:net";
 import path from "node:path";
 import { createServer } from "node:http";
@@ -146,7 +146,8 @@ function writeStagedDir(options: StageOptions = {}): Staged {
     `,
   );
   // Echoes exactly what the handler observes on req.headers — the only way to prove that
-  // middleware's final request-header set was installed as a REPLACEMENT (N40).
+  // middleware's final request-header set was installed as a REPLACEMENT (N40), and that the
+  // dispatch vocabulary never leaks into Phase 1 (the fall-through strip).
   writeFileSync(
     path.join(dir, "handlers", "echo-headers.mjs"),
     `export function handler(req, res) {
@@ -157,6 +158,9 @@ function writeStagedDir(options: StageOptions = {}): Staged {
          mwRequestHeaders: req.headers["x-mw-request-headers"] ?? null,
          resolvedHeaders: req.headers["x-resolved-headers"] ?? null,
          internalSecret: req.headers["x-internal-secret"] ?? null,
+         outputId: req.headers["x-output-id"] ?? null,
+         upstreamPool: req.headers["x-upstream-pool"] ?? null,
+         invokePath: req.headers["x-invoke-path"] ?? null,
        }));
      }
     `,
@@ -468,6 +472,18 @@ describe("pool-server request-boundary hardening", () => {
       const res = await fetch(url("/_next/static/chunks/nope.js"));
       expect(res.status).toBe(404);
     });
+
+    it("S30: never follows a symlink that escapes .next/static", async () => {
+      // The percent-encoded request path makes lexical traversal impossible, but a bare
+      // path.join follows SYMLINKS — and under emulate/local dev the server runs against a
+      // working tree where a malicious postinstall or a committed symlink can plant one.
+      // Target: the staged "compiled server bundle" carrying the planted secret.
+      const target = path.join(pool.staged.dir, ".next", "server", "pages", "_app.js");
+      symlinkSync(target, path.join(pool.staged.dir, ".next", "static", "leak.js"));
+      const res = await fetch(url("/_next/static/leak.js"));
+      expect(res.status).toBe(404);
+      expect(await res.text()).not.toContain(PLANTED_SECRET);
+    });
   });
 
   // ---- N35: one shared image byte cap ----
@@ -484,12 +500,17 @@ describe("pool-server request-boundary hardening", () => {
 
   // ---- N32: readiness ----
   describe("N32: /readyz on a healthy build", () => {
-    it("reports ready, and names what it verified", async () => {
+    it("reports ready — WITHOUT internal detail on the wire", async () => {
+      // The probe interception runs before any trust check and the Gateway catch-all
+      // forwards every path to this port, so the body is internet-visible. The reason
+      // string names internal route-output keys and startup state: it goes to the pod
+      // log, never the response body.
       const res = await fetch(url("/readyz"));
       expect(res.status).toBe(200);
-      const body = (await res.json()) as { status: string; reason: string };
+      const body = (await res.json()) as { status: string; reason?: string };
       expect(body.status).toBe("ok");
-      expect(body.reason).toContain("route module loaded");
+      expect(body.reason).toBeUndefined();
+      expect(Object.keys(body)).toEqual(["status"]);
       expect(res.headers.get("cache-control")).toBe("no-store");
     });
 
@@ -558,9 +579,9 @@ describe("N32: /readyz goes ready on a basePath build (manifest keys prefixed, N
     // gate timed every basePath rollout out — the full run's ~20-suite basePath cluster.
     const res = await fetch(`http://localhost:${pool.port}/readyz`);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { status: string; reason: string };
+    const body = (await res.json()) as { status: string; reason?: string };
     expect(body.status).toBe("ok");
-    expect(body.reason).toContain("route module loaded");
+    expect(body.reason).toBeUndefined();
   });
 });
 
@@ -580,12 +601,16 @@ describe("N32: /readyz withholds traffic from a build whose route module cannot 
     expect(await res.json()).toEqual({ status: "ok" });
   });
 
-  it("answers /readyz 503 with the reason", async () => {
+  it("answers /readyz 503 — the reason is logged, not served to the internet", async () => {
     const res = await fetch(`http://localhost:${pool.port}/readyz`);
     expect(res.status).toBe(503);
-    const body = (await res.json()) as { status: string; reason: string };
+    const body = (await res.json()) as { status: string; reason?: string };
     expect(body.status).toBe("unavailable");
-    expect(body.reason).toContain("failed to load");
+    // The failure detail ("route module X failed to load") names internal route-output
+    // keys: pod logs carry it (boot logs it at error level, and server.ts logs the /readyz
+    // transition), the internet-visible body must not.
+    expect(body.reason).toBeUndefined();
+    expect(Object.keys(body)).toEqual(["status"]);
   });
 
   it("and the app route it could not load does 500 — which is what the gate must catch", async () => {
@@ -700,6 +725,9 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
       mwRequestHeaders: string | null;
       resolvedHeaders: string | null;
       internalSecret: string | null;
+      outputId: string | null;
+      upstreamPool: string | null;
+      invokePath: string | null;
     };
   }
 
@@ -726,6 +754,42 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     });
     expect(body.mwRequestHeaders).toBeNull();
     expect(body.resolvedHeaders).toBeNull();
+    expect(body.internalSecret).toBeNull();
+  });
+
+  it("RED TEAM: valid secret + ABSENT mw verdict fails safe to Phase 1 — and leaks NO dispatch vocabulary", async () => {
+    // The fall-through case: `x-output-id` proved trust but nothing asserts the middleware
+    // stage ran (a broken/custom extension), so the pool re-resolves locally. The dispatch
+    // headers are transport, not request data — before the strip, they reached the handler
+    // (and middleware, and external-rewrite targets) as ordinary request headers.
+    const body = await echo(
+      {
+        "x-internal-secret": SECRET,
+        "x-output-id": "/echo-headers",
+        "x-upstream-pool": "main",
+        "x-invoke-path": "/echo-headers",
+        "x-route-matches": "{}",
+      },
+      "/echo-headers",
+    );
+    expect(body.outputId).toBeNull();
+    expect(body.upstreamPool).toBeNull();
+    expect(body.invokePath).toBeNull();
+    expect(body.internalSecret).toBeNull();
+  });
+
+  it("RED TEAM: an UNRECOGNIZED mw verdict gets the same treatment", async () => {
+    const body = await echo(
+      {
+        "x-internal-secret": SECRET,
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "trust-me-bro",
+        "x-upstream-pool": "main",
+      },
+      "/echo-headers",
+    );
+    expect(body.outputId).toBeNull();
+    expect(body.upstreamPool).toBeNull();
     expect(body.internalSecret).toBeNull();
   });
 

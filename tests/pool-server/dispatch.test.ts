@@ -80,6 +80,47 @@ describe("createDispatcher", () => {
     ).toEqual({ slug: ["company", "about-us"] });
   });
 
+  it("logs the 404-no-handler line with the PATHNAME only — never the raw query string", async () => {
+    // server.ts's request log is pathname-only because the raw query routinely carries
+    // tokens and signed parameters; dispatch's 404 line fired on attacker-inducible 404s
+    // and logged `req.url` verbatim. Reachable on builds whose loader has neither
+    // `/_not-found` nor `/404` (an app-wide getInitialProps exposes no standalone 404).
+    const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+    const handlerLoader = {
+      load: vi.fn(),
+      has: vi.fn().mockReturnValue(false),
+      get: vi.fn().mockReturnValue(undefined),
+    };
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoader as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      localHandlerInvoker,
+      revalidate: vi.fn(),
+    });
+    const logs: string[] = [];
+    const spy = vi
+      .spyOn(console, "log")
+      .mockImplementation((...args: unknown[]) => logs.push(args.map(String).join(" ")));
+    try {
+      await dispatcher.dispatch(mockReq("/definitely-missing?token=secret-token"), mockRes(), {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/definitely-missing",
+        routeMatches: null,
+        resolvedHeaders: undefined,
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    const line = logs.find((l) => l.includes("[dispatch] 404"));
+    expect(line, `expected a [dispatch] 404 line in: ${logs.join("\n")}`).toBeDefined();
+    expect(line).toContain("/definitely-missing");
+    expect(line).not.toContain("secret-token");
+    expect(line).not.toContain("?");
+  });
+
   it("dispatches route to handler", async () => {
     const handler = vi.fn();
     const revalidate = vi.fn().mockResolvedValue(undefined);

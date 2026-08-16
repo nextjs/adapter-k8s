@@ -2957,8 +2957,11 @@ export function createDispatcher(options: DispatcherOptions) {
           // If no handler exists for this output, fall through to 404
           if (!handlerLoader.has(handlerPathname)) {
             if (!handlerLoader.has("/_not-found") && !handlerLoader.has("/404")) {
+              // Pathname only, never req.url — the raw query string routinely carries
+              // tokens and signed parameters (server.ts's request log follows the same
+              // rule), and this line fires on attacker-inducible 404s.
               console.log(
-                `[dispatch] 404: no handler for matchedPathname="${handlerPathname}" url="${req.url}"`,
+                `[dispatch] 404: no handler for matchedPathname="${handlerPathname}" url="${requestTargetPathname(req.url ?? "/")}"`,
               );
             }
             const bufferedBody = bufferedActionBody(req);

@@ -219,6 +219,13 @@ export function createPoolServer(options: PoolServerOptions) {
     appOwnsProbePath,
   } = options;
 
+  // /readyz detail goes to the pod LOG, not the wire: the probe interception runs before any
+  // trust check and the Gateway catch-all HTTPRoute forwards every path to this port, so the
+  // body is internet-visible. The reason string names internal route-output keys ("route
+  // module loaded (/ssr)") and startup state — a free side-channel into the release for any
+  // client. Log it once per transition; the probe consumer (kubelet, HealthCheckPolicy,
+  // cutover gate) reads only the status code.
+  let lastLoggedNotReady: string | undefined;
   const server: Server = createServer(async (req, res) => {
     // Probes bypass all routing — unless the app itself owns the pathname (see appOwnsProbePath).
     // The pathname is parsed rather than compared to the raw target so `/healthz?x=1` is still a
@@ -234,12 +241,18 @@ export function createPoolServer(options: PoolServerOptions) {
         return;
       }
       const state = readiness?.() ?? { ready: false, reason: "readiness state not wired" };
+      if (!state.ready && state.reason !== lastLoggedNotReady) {
+        lastLoggedNotReady = state.reason;
+        console.warn(`[pool-server] /readyz unavailable: ${state.reason}`);
+      } else if (state.ready) {
+        lastLoggedNotReady = undefined;
+      }
       res.writeHead(state.ready ? 200 : 503, {
         "content-type": "application/json",
         // A 503 must never be cached by the LB/CDN or a proxy between it and the kubelet.
         "cache-control": "no-store",
       });
-      res.end(JSON.stringify({ status: state.ready ? "ok" : "unavailable", reason: state.reason }));
+      res.end(JSON.stringify({ status: state.ready ? "ok" : "unavailable" }));
       return;
     }
 
