@@ -2093,6 +2093,117 @@ describe("revertRoutingServiceToBuild — env stays truthful", () => {
   });
 });
 
+// SECURITY (audit): the revert's image reference is assembled from ConfigMap-sourced values
+// (the emit-metadata CM's `registry`, the state CM's `routingImageDigests`) — mutable by any
+// namespace actor with configmaps/update. Unvalidated, that pair is an arbitrary-image
+// injection into the routing Deployment, whose pod starts with the release's dispatch secret.
+describe("revertRoutingServiceToBuild — ConfigMap-sourced image coordinates are validated", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // The deployment read the function always performs; the revert target's snapshot/secret
+  // lookups return "present" so the flow reaches the patch when it should.
+  function mockServingCluster() {
+    vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
+      if (args[0] === "patch") return { exitCode: 0, stdout: "", stderr: "" };
+      if (args[0] === "get" && args[1] === "deployment") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            spec: {
+              template: {
+                spec: {
+                  containers: [
+                    {
+                      name: "routing-service",
+                      image: "gcr.io/p/routing-service:current",
+                      env: [{ name: "NEXT_BUILD_ID", value: "current" }],
+                    },
+                  ],
+                  volumes: [
+                    { name: "routing-manifest", configMap: { name: "rel-routing-manifest" } },
+                  ],
+                },
+              },
+            },
+          }),
+          stderr: "",
+        };
+      }
+      // snapshot configmap + secret lookups: present
+      return { exitCode: 0, stdout: "configmap/rel-rm-target", stderr: "" };
+    }) as never);
+  }
+
+  function patchBodies(): string[] {
+    return vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "patch")
+      .map(([, args]) => {
+        const i = args.findIndex((a) => a === "-p" || a === "--patch");
+        return args[i + 1]!;
+      });
+  }
+
+  it("refuses a targetBuildId outside the build-id charset before touching the cluster", async () => {
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: 'bad"\nbuild',
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/Invalid buildId/);
+    expect(execCapture).not.toHaveBeenCalled();
+  });
+
+  it("refuses a registry that is not a registry, and never patches", async () => {
+    mockServingCluster();
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target-build",
+        registry: "attacker.io/x\ninjected: yes",
+      }),
+    ).rejects.toThrow(/Invalid image registry/);
+    expect(patchBodies()).toHaveLength(0);
+  });
+
+  it("IGNORES a malformed recorded digest — the edge reverts by TAG, not by injection", async () => {
+    mockServingCluster();
+    const warnings: string[] = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    });
+    try {
+      await revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: "target-build",
+        registry: "gcr.io/p",
+        targetImageDigest: "attacker.io/pwn@latest",
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
+    const body = patchBodies().join("\n");
+    expect(body).toContain("routing-service:target-build");
+    expect(body).not.toContain("attacker.io/pwn");
+    expect(warnings.join("\n")).toMatch(/not sha256:<64 hex>/);
+  });
+
+  it("pins a WELL-FORMED recorded digest exactly as before", async () => {
+    mockServingCluster();
+    const digest = `sha256:${"c".repeat(64)}`;
+    await revertRoutingServiceToBuild({
+      releaseName: "rel",
+      targetBuildId: "target-build",
+      registry: "gcr.io/p",
+      targetImageDigest: digest,
+    });
+    expect(patchBodies().join("\n")).toContain(`routing-service@${digest}`);
+  });
+});
+
 // N87 (SECURITY). The internal dispatch secret is per BUILD, so the edge's secretKeyRef has to
 // move with the image for the same reason NEXT_BUILD_ID does: a reverted edge still presenting
 // the rolled-away-from build's secret is rejected by the rolled-back pools, which then re-resolve

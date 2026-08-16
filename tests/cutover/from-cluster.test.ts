@@ -194,6 +194,32 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
     );
     expect(readWithout("namespace")).toThrow(/Invalid namespace/);
   });
+
+  it("assertSafe*: registry, digests, pool names and projectId — the image-injection battery", () => {
+    // `registry` + a `digests` value combine into the routing image a `kubectl patch` puts
+    // on the routing Deployment (revertRoutingServiceToBuild): an unvalidated pair is an
+    // arbitrary-image injection into the pod that starts with the release's dispatch
+    // secret. The ConfigMap is operator-mutable, so the check runs HERE, on the read.
+    expect(() =>
+      readJobEmitMetadata(mount(metadataFixture({ registry: "Evil.Registry.io/x" }))),
+    ).toThrow(/Invalid image registry/);
+    expect(() =>
+      readJobEmitMetadata(mount(metadataFixture({ registry: "attacker.io/x\nfoo: bar" }))),
+    ).toThrow(/Invalid image registry/);
+    expect(() =>
+      readJobEmitMetadata(mount(metadataFixture({ digests: { routingService: "latest" } }))),
+    ).toThrow(/not sha256:<64 hex>/);
+    expect(() =>
+      readJobEmitMetadata(mount(metadataFixture({ poolTopology: ["ssr", "Bad Pool"] }))),
+    ).toThrow(/Invalid pool name/);
+    expect(() => readJobEmitMetadata(mount(metadataFixture({ defaultPool: "-ssr" })))).toThrow(
+      /Invalid pool name/,
+    );
+    // projectId reaches a gcloud argv in the CDN-invalidation step.
+    expect(() => readJobEmitMetadata(mount(metadataFixture({ projectId: "x&calc" })))).toThrow(
+      /Invalid projectId/,
+    );
+  });
 });
 
 describe("isAlreadyPromoted — the cheap-idempotent short-circuit (§4.3)", () => {

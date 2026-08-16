@@ -20,10 +20,14 @@ import { EXEC_TIMEOUTS, execCapture } from "../cli/exec.js";
 import { type AdapterState } from "../cli/state.js";
 import {
   assertSafeBuildId,
+  assertSafeImageRegistry,
   assertSafeNamespace,
+  assertSafePoolName,
+  assertSafeProjectId,
   assertSafeReleaseName,
   sanitizeK8sName,
 } from "../emit/templates/utils.js";
+import { DIGEST_RE } from "../pipeline/digests.js";
 import { parseTargetPlatform, type TargetPlatform } from "../target-platform.js";
 import type { EmitMetadata } from "../cli/emit.js";
 import type { CutoverInputs } from "./inputs.js";
@@ -89,12 +93,30 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
   if (typeof meta.registry !== "string" || !meta.registry) {
     throw new Error(`emit-metadata.json has no registry — the edge revert could not run.`);
   }
+  // The registry joins a digest below to form the routing image a `kubectl patch` puts on
+  // the routing Deployment — an unvalidated value is an arbitrary-image injection into the
+  // pod that holds the release's dispatch secret. Same for every other value that lands in
+  // a kubectl/gcloud argv or a label selector: the battery runs HERE, on the
+  // operator-mutable ConfigMap read, even though emit validated at write time.
+  assertSafeImageRegistry(meta.registry);
+  const digests = meta.digests ?? {};
+  for (const [key, digest] of Object.entries(digests)) {
+    if (typeof digest !== "string" || !DIGEST_RE.test(digest)) {
+      throw new Error(
+        `emit-metadata.json digest for "${key}" is not sha256:<64 hex> — refusing to ` +
+          `promote on an image reference emit did not produce.`,
+      );
+    }
+  }
   if (!Array.isArray(meta.poolTopology) || meta.poolTopology.length === 0) {
     throw new Error(`emit-metadata.json has no poolTopology — refusing to promote.`);
   }
+  for (const pool of meta.poolTopology) assertSafePoolName(pool);
   if (typeof meta.defaultPool !== "string" || !meta.defaultPool) {
     throw new Error(`emit-metadata.json has no defaultPool — refusing to promote.`);
   }
+  assertSafePoolName(meta.defaultPool);
+  if (meta.projectId != null) assertSafeProjectId(meta.projectId);
   const platformRaw = meta.targetPlatforms?.[meta.buildId];
   if (typeof platformRaw !== "string") {
     throw new Error(
@@ -108,7 +130,7 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
     releaseName: meta.releaseName,
     namespace: meta.namespace,
     registry: meta.registry,
-    digests: meta.digests ?? {},
+    digests,
     poolTopology: meta.poolTopology,
     defaultPool: meta.defaultPool,
     builtTargetPlatform: parseTargetPlatform(platformRaw, "emit-metadata targetPlatforms"),

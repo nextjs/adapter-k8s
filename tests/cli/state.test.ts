@@ -265,6 +265,42 @@ describe("readState — N20: unreadable cluster state is never 'no deploys yet'"
     await expect(readState(tmpDir)).rejects.toBeInstanceOf(StateUnavailableError);
   });
 
+  it("rejects a state whose routingImageDigests are not digests — the CM is operator-mutable", async () => {
+    // routingImageDigests flows into revertRoutingServiceToBuild's `kubectl patch` image
+    // reference. edge.ts validates at consumption; isAdapterState is the belt-and-braces
+    // read-side guard: a tampered blob is "unknown" (N20 fail-closed), never deployable truth.
+    vi.mocked(execCapture).mockResolvedValue(CLUSTER_ABSENT);
+    writeLocal(tmpDir, {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      routingImageDigests: { buildm: "attacker.io/x@latest" },
+    });
+    await expect(readState(tmpDir)).rejects.toBeInstanceOf(LocalStateReadError);
+    // A non-build-id key is rejected too (it would be spliced into log lines and patches).
+    writeLocal(tmpDir, {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      routingImageDigests: { 'bad"\nkey': `sha256:${"a".repeat(64)}` },
+    });
+    await expect(readState(tmpDir)).rejects.toBeInstanceOf(LocalStateReadError);
+    // A well-formed digest map reads fine.
+    writeLocal(tmpDir, {
+      buildId: "buildn",
+      previousBuildId: "buildm",
+      routingImageDigests: { buildm: `sha256:${"a".repeat(64)}` },
+    });
+    await expect(readState(tmpDir)).resolves.toMatchObject({ buildId: "buildn" });
+    // The cluster-CM read applies the same guard.
+    vi.mocked(execCapture).mockResolvedValue(
+      clusterGet({
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        routingImageDigests: { buildm: "not-a-digest" },
+      }),
+    );
+    await expect(readState(tmpDir, "rel")).rejects.toThrow(/routingImageDigests/);
+  });
+
   it("falls back to the local file when the ConfigMap is genuinely absent", async () => {
     vi.mocked(execCapture).mockResolvedValue(CLUSTER_ABSENT);
     writeLocal(tmpDir, { buildId: "local-only", previousBuildId: null });

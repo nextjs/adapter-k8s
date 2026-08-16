@@ -29,7 +29,7 @@
 import readline from "node:readline";
 import { existsSync, readFileSync } from "node:fs";
 import { EXEC_TIMEOUTS, execCapture, execOrThrow } from "./exec.js";
-import { infrastructurePath } from "./infrastructure-validation.js";
+import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { resolveK8sNamespace, assertSafeReleaseName } from "../emit/templates/utils.js";
 import { keepAtBirthAnnotationEntries } from "../emit/templates/utils.js";
@@ -140,6 +140,11 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
   const infra: Record<string, string | undefined> = existsSync(infraPath)
     ? JSON.parse(readFileSync(infraPath, "utf-8"))
     : {};
+  // S13 (SECURITY): the same idiom destroy/describe/doctor/tail/rollback already apply —
+  // infrastructure.json is operator-mutable (a poisoned checkout can carry one), and
+  // projectId/region below reach a `gcloud` argv. Validate at the point of read, before
+  // any subprocess is built from it.
+  assertSafeInfrastructure(infra);
   const namespace = resolveK8sNamespace(infra.namespace);
 
   // Invariant 6 / destroy's C1 guard, verbatim idiom: pin the kubectl context before any
