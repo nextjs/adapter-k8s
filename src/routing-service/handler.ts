@@ -27,10 +27,13 @@ import {
   rscCacheBustingUnvalidated,
   sanitizeRouteMatches,
   serializeHeaderMap,
+  coalesceWireHeader,
   computeDispatchProof,
+  buildProofHeaderNames,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
+  PROOF_COVERED_CONTEXT_HEADERS,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../routing-common.js";
 
@@ -59,6 +62,22 @@ function getHeader(headers: HeaderValue[], key: string): string | undefined {
   if (h.value) return h.value;
   if (h.rawValue) return h.rawValue.toString("utf-8");
   return undefined;
+}
+
+/**
+ * Read a real (non-pseudo) header the way the POOL will see it: case-insensitive on the name,
+ * and repeated entries coalesced with the delimiter the next hop uses (routing-common.ts
+ * `coalesceWireHeader`). Used for the proof's context and matcher inputs — those are signed as
+ * the bytes that will arrive at the pool, not as the ext_proc list happens to be shaped. Returns
+ * `undefined` for an absent header, which the proof covers distinctly from an empty value.
+ */
+function getWireHeader(headers: HeaderValue[], key: string): string | undefined {
+  const values: string[] = [];
+  for (const h of headers) {
+    if (h.key.toLowerCase() !== key) continue;
+    values.push(h.value || h.rawValue?.toString("utf-8") || "");
+  }
+  return coalesceWireHeader(key, values);
 }
 
 // The resolved response headers (next.config `headers()` + middleware response headers) and the
@@ -134,6 +153,13 @@ export function createRequestHandler(
   // (injected from a Secret); absent in emulate/tests, where the pool trusts nothing over the
   // wire and re-resolves locally. Read once — the deployment env is fixed for the process.
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
+  // The build-derived request headers the dispatch proof must bind (see buildProofHeaderNames):
+  // the middleware-matcher inputs, because `matchesMiddleware` below derives the `x-mw-evaluated`
+  // verdict from them (so a proof that left them unbound could be lifted from a `skip-nomatch`
+  // request onto one the matcher DOES cover), and the RSC negotiation headers, because they pick
+  // the `x-output-id` variant the pool dispatches. Derived once from the build's manifest — the
+  // pool derives the identical list from its copy of the same manifest.
+  const proofHeaderNames = buildProofHeaderNames(manifest);
   const rscConfig = getRscConfig(manifest);
   // Per-request budget mirrored from the server's withTimeout shed — when it fires,
   // this signal aborts so middleware awaiting a slow upstream is actually cancelled
@@ -172,7 +198,13 @@ export function createRequestHandler(
     const rawPath = getHeader(requestHeaders, ":path") ?? "/";
     const method = getHeader(requestHeaders, ":method") ?? "GET";
     const scheme = getHeader(requestHeaders, ":scheme") ?? "https";
-    const authority = getHeader(requestHeaders, ":authority") ?? "localhost";
+    // Raw authority, absence preserved: the dispatch proof covers it (the pool reads the same
+    // value as `Host`, which Envoy writes from `:authority`), and ABSENT is a distinct covered
+    // value from any present one. `:authority` is the HTTP/2-normalized form Envoy hands ext_proc;
+    // the `host` fallback is for a caller that only sets the HTTP/1.1 spelling.
+    const rawAuthority =
+      getHeader(requestHeaders, ":authority") ?? getWireHeader(requestHeaders, "host");
+    const authority = rawAuthority ?? "localhost";
     // N10/N40 (SECURITY). Both tiers parse the request target through the SHARED
     // parseRequestUrl: the authority comes from `:authority`/Host and NEVER from the target
     // (so `//evil.example/x` stays a PATH and the shared repeated-slash 308 normalizes it),
@@ -862,25 +894,46 @@ export function createRequestHandler(
     }
 
     // Authenticate the dispatch headers to the pool with a PER-REQUEST PROOF, never the raw
-    // secret (INTERNAL_DISPATCH_PROOF_HEADER in routing-common.ts): HMAC over the method, the
-    // request target, and the complete dispatch set stamped above — the middleware verdict and
-    // its final request-header set included, so neither can be swapped onto another request
-    // or edited in transit. Anyone able to open an ext_proc stream to this service (a
-    // NetworkPolicy gap, a hostNetwork pod) used to read a replayable credential out of this
-    // mutation; they now get a proof that authenticates exactly one request — the one this
-    // tier actually resolved. Absent in emulate/tests (no secret configured) — the pool
-    // re-resolves locally. Computed BEFORE the header-budget projection below so the proof
-    // counts against it, and so the bail path (which clears the vocabulary and stamps
-    // nothing) stays consistent.
+    // secret (INTERNAL_DISPATCH_PROOF_HEADER in routing-common.ts): HMAC over EVERY routing input
+    // the pool will trust — the method, the request target, the authority, the forwarding
+    // witnesses (`x-forwarded-proto`, which is the pool's only scheme witness, and
+    // `x-forwarded-host`), the complete dispatch set stamped above (the middleware verdict and its
+    // final request-header set included), and this build's derived inputs — the matcher headers
+    // that decided that verdict and the RSC negotiation headers that chose the output id. So no
+    // verdict can be swapped onto another request, host, scheme, matcher state or content
+    // negotiation, nor edited in transit.
+    //
+    // NOT a caller-authentication scheme: this service answers any peer that can open a stream to
+    // :8443 and will hand that peer a valid proof for a request of its own choosing. The emitted
+    // NetworkPolicy is therefore still REQUIRED, not defense-in-depth — see the residual-risk
+    // paragraph on INTERNAL_DISPATCH_PROOF_HEADER.
+    //
+    // Absent in emulate/tests (no secret configured) — the pool re-resolves locally. Computed
+    // BEFORE the header-budget projection below so the proof counts against it, and so the bail
+    // path (which clears the vocabulary and stamps nothing) stays consistent.
     if (internalSecret) {
       const covered: Record<string, string | undefined> = {};
       for (const m of mutations) {
         const key = m.key.toLowerCase();
         if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(key)) covered[key] = m.value;
       }
+      // Context and matcher inputs are signed as they sit ON THE WIRE, because this response
+      // neither sets nor clears them: the client's own bytes are what the pool will read back.
+      // (Names the egress `clear` set removes — the dispatch vocabulary and
+      // UNTRUSTED_NEXT_REQUEST_HEADERS — can never appear here: buildProofHeaderNames excludes
+      // them precisely because their wire value differs across the hop.)
+      for (const name of [...PROOF_COVERED_CONTEXT_HEADERS, ...proofHeaderNames]) {
+        covered[name] = getWireHeader(requestHeaders, name);
+      }
       mutations.push({
         key: INTERNAL_DISPATCH_PROOF_HEADER,
-        value: computeDispatchProof(internalSecret, method, rawPath, covered),
+        value: computeDispatchProof(internalSecret, {
+          method,
+          target: rawPath,
+          authority: rawAuthority,
+          headers: covered,
+          proofHeaderNames,
+        }),
       });
       clear.delete(INTERNAL_DISPATCH_PROOF_HEADER);
     }

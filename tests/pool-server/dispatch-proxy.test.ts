@@ -979,15 +979,27 @@ describe("cross-pool proxy hardening", () => {
     expect(seen["x-internal-secret"]).toBeUndefined();
     const proof = seen["x-internal-dispatch-proof"];
     expect(typeof proof).toBe("string");
+    // Verified over exactly what ARRIVED — method, target, the forwarded `Host` and forwarding
+    // witnesses included, which is what the receiving pool's trust boundary recomputes.
     expect(
       verifyDispatchProof(
         "shared-secret",
-        "GET",
-        "/api/thing",
-        seen as Record<string, string | undefined>,
+        { method: "GET", target: "/api/thing", headers: seen },
         proof as string,
       ),
     ).toBe(true);
+    // The authority is part of the transcript: the same proof does not verify for another host.
+    expect(
+      verifyDispatchProof(
+        "shared-secret",
+        {
+          method: "GET",
+          target: "/api/thing",
+          headers: { ...seen, host: "tenant-b.example.com" },
+        },
+        proof as string,
+      ),
+    ).toBe(false);
   });
 });
 

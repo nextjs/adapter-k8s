@@ -8,7 +8,7 @@ Please report suspected vulnerabilities privately via GitHub's [private vulnerab
 
 ## Threat model in one paragraph
 
-The sensitive asset is the **internal dispatch secret**. The routing service resolves each request (runs middleware, classifies the route) and communicates its verdict to the pool servers via headers authenticated with this secret. Anything that holds the secret can hand a pool a forged, pre-trusted verdict—including "middleware already ran"—and have middleware skipped for arbitrary requests. The design therefore reduces to two questions: _who can reach the routing service_, and _who can obtain the secret at rest_. Everything below serves one of those two.
+The sensitive asset is the **internal dispatch secret**. The routing service resolves each request (runs middleware, classifies the route) and communicates its verdict to the pool servers via headers authenticated with a per-request HMAC **proof** derived from this secret. Anything that holds the secret can hand a pool a forged, pre-trusted verdict—including "middleware already ran"—and have middleware skipped for arbitrary requests. The secret is never on the wire, so a proof observed in transit authorizes only the one request it was minted for; but the routing service authenticates no callers, so anything that can reach it can have a request of its own choosing resolved and signed. The design therefore reduces to two questions: _who can reach the routing service_, and _who can obtain the secret at rest_. Everything below serves one of those two.
 
 ## Workload hardening
 
@@ -23,7 +23,7 @@ Pool and routing-service containers run as `USER node` with:
 
 ### Why reachability is the boundary
 
-The ext_proc listener authenticates only the server (TLS with no client-certificate verification), and an ordinary `request_headers` call is answered with the dispatch secret in its header mutation—that is how the secret reaches the pools. So **anything that can reach the routing service on `:8443` can read the secret**, then replay a trusted verdict directly to a pool. Reachability to the routing service is equivalent to holding the credential. Network policy is therefore not defense-in-depth here; it is the primary control until caller authentication lands (see [Known limits](#known-limits-and-planned-work)).
+The ext_proc listener authenticates only the server (TLS with no client-certificate verification), and it answers an ordinary `request_headers` call from anyone who can open a stream. The reply carries a per-request dispatch **proof** rather than the secret itself, which bounds what an observer gets: a proof is bound to that request's method, target, authority, scheme witness, dispatch header set and middleware-matcher inputs, so it cannot be replayed against a different request, host, scheme or matcher state. It does **not** bound who may ask. **Anything that can reach the routing service on `:8443` can submit a request it composed and receive a pool-trusted verdict for it**—on any path, including ones the CDN-side match condition normally excludes from the callout—and can spend the middleware compute behind the callout unmetered. Network policy is therefore not defense-in-depth here; it is the primary control until caller authentication lands (see [Known limits](#known-limits-and-planned-work)).
 
 ### GKE: strict ingress allowlist
 
@@ -67,11 +67,15 @@ That is a tighter admission rule than IP ranges, but it rests on three precondit
 - **`hostNetwork` pods bypass NetworkPolicy** in every implementation. A tenant permitted `hostNetwork` anywhere in the cluster can reach `:8443`.
 - **The proxy namespace should be locked down**, since anything running there with matching labels is admitted.
 
-If those do not hold for your cluster, treat the dispatch secret as reachable.
+If those do not hold for your cluster, treat the routing tier as callable by anything in the cluster — and therefore willing to issue a trusted routing verdict for any request that reaches it.
 
 ## The internal dispatch secret
 
-- Delivered to pods only via a Kubernetes Secret (`INTERNAL_HEADER_SECRET`), compared in constant time; dispatch headers from any other source are stripped.
+**NetworkPolicy is a required part of this boundary, not a hardening extra.** The secret itself no longer travels on the wire: a trusted `ext_proc` reply (and each cross-pool hop) carries a per-request HMAC **proof** bound to the method, the request target, the authority, the forwarding witnesses that give the pool its scheme, the complete internal dispatch header set, and the request headers this build's middleware `matcher` conditions read. A proof observed in transit authenticates exactly the one request it was minted for, so reading one exchange no longer yields a credential that can be replayed against any pool.
+
+What the proof does **not** do is authenticate callers to the routing service. `:8443` answers any peer that can open a stream to it, so anything that reaches the port can submit a request of its own composing and be handed a valid proof for it — including for paths the CDN-side match condition would normally keep away from the callout — and can spend the middleware compute behind it unmetered. Caller authentication (mTLS) remains an open item; until it lands, network admission is the caller check.
+
+- Delivered to pods only via a Kubernetes Secret (`INTERNAL_HEADER_SECRET`), never on the wire; the proof derived from it is compared in constant time, and dispatch headers arriving without a valid proof are stripped.
 - Derived deterministically per build—`HMAC-SHA256(key, "<release>\0<buildId>")`—where the key comes from `ADAPTER_K8S_INTERNAL_SECRET_KEY` or a 32-byte `.k8s-adapter/internal-secret.key` created on first build (mode `0600`). Re-emitting a build is byte-identical, and a deploy never rotates the secret out from under pods currently serving.
 - Rotation (changing the key) is safe but not free: during the rollout window, old pods stop trusting dispatch headers and re-resolve locally, which runs middleware twice per request.
 
@@ -118,7 +122,7 @@ Two rules regardless of provider:
 
 ## Known limits and planned work
 
-- **No caller authentication on the ext_proc callout.** mTLS on the callout (via `BackendAuthenticationConfig` on GKE) would remove the dependency on network controls entirely and is the strongest planned fix. Until then, network reachability is the boundary.
+- **No caller authentication on the ext_proc callout.** The per-request dispatch proof removed the replayable, wire-readable credential, but the routing service will still resolve and sign a request for any caller that reaches it. mTLS on the callout (via `BackendAuthenticationConfig` on GKE) would remove the dependency on network controls entirely and is the strongest planned fix. Until then, network reachability is the boundary.
 - **Rollback's routing tier is tag-pinned.** A rolled-back routing tier reconstructs its image reference by tag (see [Image provenance](#image-provenance)); digest-pinned rollback is on the roadmap. This matters because the routing tier holds the dispatch secret.
 - **`hostNetwork` pods bypass NetworkPolicy** in both postures and on every CNI.
 - **Escape hatches disable guarantees.** `--allow-no-network-policy` and `--allow-mutable-tags` exist for constrained environments and turn off the controls described above; they are opt-in and loud.

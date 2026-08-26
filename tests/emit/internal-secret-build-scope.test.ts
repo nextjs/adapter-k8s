@@ -26,8 +26,8 @@ import {
   INTERNAL_SECRET_KEY,
 } from "../../src/emit/templates/internal-secret.js";
 import { applyRequestTrustBoundary } from "../../src/pool-server/server.js";
+import { signDispatch } from "../helpers/dispatch-proof.js";
 import {
-  computeDispatchProof,
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
 } from "../../src/routing-common.js";
@@ -169,9 +169,10 @@ function fakeReqRes(headers: Record<string, string>) {
 function trustsVerdict(podSecret: string | undefined, presented: string): boolean {
   const covered = { "x-mw-evaluated": "1", "x-output-id": "/dashboard" };
   const { req, res } = fakeReqRes({
-    ...covered,
-    // A correctly-derived proof for the presented value…
-    [INTERNAL_DISPATCH_PROOF_HEADER]: computeDispatchProof(presented, "GET", "/", covered),
+    // A correctly-derived proof for the presented value. The synthetic request carries no
+    // method, target or Host, so the proof is minted over the same defaults the boundary
+    // verifies with (GET, "/", no authority) — this test is about the SECRET, not the inputs.
+    ...signDispatch(presented, "GET", "/", covered),
     // …plus the raw value itself, to pin that v1's credential is dead at the boundary.
     [INTERNAL_SECRET_HEADER]: presented,
   });

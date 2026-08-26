@@ -51,28 +51,44 @@ export interface ReadinessState {
 export function applyRequestTrustBoundary(
   req: IncomingMessage,
   res: ServerResponse,
-  options: { internalSecret?: string | undefined; trustInternalHeaders?: boolean },
+  options: {
+    internalSecret?: string | undefined;
+    trustInternalHeaders?: boolean;
+    /**
+     * This build's proof-covered request headers — the middleware-matcher inputs and the RSC
+     * negotiation headers (routing-common.ts `buildProofHeaderNames`). Part of the proof's
+     * covered set, so the value MUST be the same list the signing tier used; both derive it from
+     * the one build's routing manifest.
+     */
+    proofHeaderNames?: readonly string[] | undefined;
+  },
 ): void {
-  const { internalSecret, trustInternalHeaders = false } = options;
+  const { internalSecret, trustInternalHeaders = false, proofHeaderNames } = options;
 
   // Establish whether the internal dispatch headers on this request can be trusted. With a
-  // secret configured (GKE), trust requires a valid PER-REQUEST PROOF (HMAC over the method,
-  // the request target, and the complete dispatch header set — routing-common.ts
-  // INTERNAL_DISPATCH_PROOF_HEADER). The v1 raw-secret header is NEVER honored: it is no
-  // longer stamped by any producer, and accepting it would keep the "read one ext_proc
-  // response, replay forever" hole open. Trusted pairings are always same-build (per-build
-  // secret + N87's secretKeyRef-moves-with-image), so a legacy raw-secret producer and a
-  // proof-only pool can never share a credential anyway — cross-build mismatches fail closed
-  // to local resolution exactly as before. Without a secret (emulate/tests), fall back to
-  // the trustInternalHeaders flag. Both credential headers are always deleted.
+  // secret configured (GKE), trust requires a valid PER-REQUEST PROOF over every routing input
+  // this pool is about to act on — the method, the request target, the authority, the forwarding
+  // witnesses, the complete dispatch header set, and this build's derived inputs — its
+  // middleware-matcher headers and its RSC negotiation headers
+  // (routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER / computeDispatchProof). Verified against
+  // the RAW wire headers, before the strips below rewrite any of them. The v1 raw-secret header
+  // is NEVER honored: it is no longer stamped by any producer, and accepting it would keep the
+  // "read one ext_proc response, replay forever" hole open. Trusted pairings are always
+  // same-build (per-build secret + N87's secretKeyRef-moves-with-image), so a legacy raw-secret
+  // producer and a proof-only pool can never share a credential anyway — cross-build mismatches
+  // fail closed to local resolution exactly as before. Without a secret (emulate/tests), fall
+  // back to the trustInternalHeaders flag. Both credential headers are always deleted.
   const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
   const trusted = internalSecret
     ? typeof presentedProof === "string" &&
       verifyDispatchProof(
         internalSecret,
-        req.method ?? "GET",
-        req.url ?? "/",
-        req.headers,
+        {
+          method: req.method,
+          target: req.url,
+          headers: req.headers,
+          proofHeaderNames,
+        },
         presentedProof,
       )
     : trustInternalHeaders;
@@ -213,6 +229,13 @@ export interface PoolServerOptions {
    */
   internalSecret?: string | undefined;
   /**
+   * This build's proof-covered request headers (routing-common.ts `buildProofHeaderNames`: the
+   * middleware-matcher inputs plus the RSC negotiation headers) — part of the dispatch proof's
+   * covered set, so the pool must verify with the SAME list the routing service and the
+   * cross-pool proxy sign with. Absent means "none", correct for a build with neither.
+   */
+  proofHeaderNames?: readonly string[] | undefined;
+  /**
    * Readiness verdict for `/readyz`. When ABSENT the endpoint answers 503
    * ("readiness not wired") — deliberately fail-safe: every real deployment goes through
    * startPoolServer, which supplies one, so an absent supplier means an embedding that has not
@@ -234,6 +257,7 @@ export function createPoolServer(options: PoolServerOptions) {
     port,
     trustInternalHeaders = false,
     internalSecret,
+    proofHeaderNames,
     readiness,
     appOwnsProbePath,
   } = options;
@@ -262,7 +286,11 @@ export function createPoolServer(options: PoolServerOptions) {
       return;
     }
 
-    applyRequestTrustBoundary(req, res, { internalSecret, trustInternalHeaders });
+    applyRequestTrustBoundary(req, res, {
+      internalSecret,
+      trustInternalHeaders,
+      proofHeaderNames,
+    });
 
     const start = Date.now();
     try {

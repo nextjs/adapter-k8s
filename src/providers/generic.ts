@@ -104,9 +104,11 @@ export const genericProvider: ProviderAdapter = {
   emitsHealthCheckPolicyCrd: false,
 
   // Envoy Gateway dials the ext_proc backend as plain h2c. Safe only because the emitted
-  // NetworkPolicy admits :8443 solely from this release's own proxy pods — and since the
-  // dispatch-proof change (INTERNAL_DISPATCH_PROOF_HEADER), the ext_proc reply carries only
-  // a per-request HMAC proof, so reachability no longer yields a replayable credential.
+  // NetworkPolicy admits :8443 solely from this release's own proxy pods. The dispatch-proof
+  // change (INTERNAL_DISPATCH_PROOF_HEADER) narrowed what a reader of that port GETS — the reply
+  // carries a per-request HMAC proof, not the replayable raw secret — but the routing service
+  // still authenticates no callers: whatever reaches :8443 can submit a request of its own and be
+  // handed a valid proof for it. The NetworkPolicy is therefore REQUIRED, not defense-in-depth.
   routingTransport: "h2c",
 
   // No Google CIDRs. The gateway runs IN the cluster, so the dataplane is reachable by workload
@@ -120,11 +122,16 @@ export const genericProvider: ProviderAdapter = {
   // have denied every real request while admitting the one workload that never sends any.
   //
   // Scoped to THIS release's Gateway by name, so a second release's proxies in the same
-  // cluster cannot reach this routing service. Reachability matters less than it used to:
-  // the ext_proc reply carries only a per-request dispatch PROOF (HMAC over the request and
-  // the stamped headers), so there is no replayable credential to read off the port — this
-  // scoping stays as defense-in-depth and as the guard against unauthenticated ext_proc
-  // compute abuse.
+  // cluster cannot reach this routing service. This scoping is a REQUIRED trust boundary, not a
+  // hardening extra. What the dispatch-proof change altered is only the WORST CASE of reaching
+  // the port: the ext_proc reply carries a per-request proof (HMAC over the request, the
+  // authority, the scheme witness, the stamped dispatch set and the matcher inputs) instead of
+  // the raw secret, so there is no longer a credential to read off the port and replay. But the
+  // service authenticates no callers — anything admitted here can ask it to resolve a request it
+  // crafted and receive a proof valid for that request, including on paths the CEL match
+  // condition normally keeps away from the callout, and can spend the middleware compute behind
+  // it unmetered. Caller authentication (mTLS) is the open item; until then, admission IS the
+  // caller check.
   strictIngressSources({ releaseName, config }: ProviderChartContext) {
     const generic = genericConfigOf(config);
     return {
@@ -139,8 +146,8 @@ export const genericProvider: ProviderAdapter = {
             // BOTH halves of the owning-gateway identity are required. With the name alone, a
             // Gateway of the SAME name in a different application namespace produces proxy pods
             // carrying matching labels in the shared proxy namespace — so another tenant's
-            // proxies would be admitted to this release's ext_proc port, and reachability to
-            // that port IS the internal dispatch secret. The value is resolved by helm because
+            // proxies would be admitted to this release's ext_proc port, which is still the
+            // boundary deciding who may obtain a dispatch proof at all. The value is resolved by helm because
             // only helm knows which namespace the release installs into.
             "gateway.envoyproxy.io/owning-gateway-namespace": RELEASE_NAMESPACE_EXPR,
           },
@@ -153,7 +160,7 @@ export const genericProvider: ProviderAdapter = {
           // connection (measured on k3d: pods Ready, Envoy connection-refused, fail-closed
           // 500s). TENANCY TRADE, stated plainly: the merged proxy serves every release on
           // the class, so admitting it admits the SHARED data plane to this release's
-          // ext_proc port — reachability-as-secret narrows to "the class's data plane".
+          // ext_proc port — the caller boundary widens to "the class's data plane".
           // That is inherent to choosing merged gateways; per-release proxy identity does
           // not exist there. Non-merged deployments are unaffected: peers are OR'd and their
           // proxies match the stricter peer above.

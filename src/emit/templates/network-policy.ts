@@ -106,10 +106,14 @@ import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./ut
 // S22 — NOW THE DEFAULT. `deploy` discovers the node range (discoverClusterNodeCidrs:
 // cluster subnetwork -> its primary range, VERIFIED live: nodes 10.128.15.x inside
 // 10.128.0.0/20), so the requirement below no longer costs the operator anything. The
-// broad posture never bounded the dispatch credential: it isolates in-cluster PODS only,
-// while any VPC peer could reach :8443. (v1 read a replayable x-internal-secret out of the
-// ext_proc header mutation; since the dispatch-proof change the reply carries only a
-// per-request HMAC proof, so this is defense-in-depth, not the trust boundary.) Kept below
+// broad posture never bounded who may talk to the routing tier: it isolates in-cluster PODS
+// only, while any VPC peer could reach :8443. That still matters after the dispatch-proof
+// change. What changed is the WORST CASE, not the requirement: v1 let a reader lift a
+// replayable `x-internal-secret` out of the ext_proc header mutation and forge dispatch headers
+// release-wide, whereas the reply now carries only a per-request HMAC proof bound to the request
+// that was resolved. The routing service still authenticates no callers, so reachability to
+// :8443 remains enough to have a CRAFTED request resolved and signed — which is why THIS
+// POLICY IS A REQUIRED TRUST BOUNDARY, not defense-in-depth. Kept below
 // for why nodeCidrs is REQUIRED whenever strict is on — the kubelet. `nodeCidrs` is REQUIRED when strict is on, and the
 // template `fail`s without it, because the broad posture is silently also allowing
 // something the LB ranges do not cover: kubelet's liveness/readiness probes
@@ -133,7 +137,10 @@ import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./ut
 //     policy entirely in either posture.
 //   - The fail-safe layering that makes the residual exposure survivable is unchanged:
 //     a request arriving without trusted dispatch headers gets full local resolution
-//     (middleware runs), and dispatch headers are honored only with the shared secret.
+//     (middleware runs), and dispatch headers are honored only with a valid per-request
+//     dispatch proof (routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER) over every routing
+//     input the pool acts on. A pod that CAN reach :8443 can still obtain such a proof for a
+//     request it composes itself, so the policy is what bounds who may ask.
 
 /**
  * GFE proxy source ranges for a global external Application Load Balancer whose

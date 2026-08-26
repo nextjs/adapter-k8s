@@ -36,6 +36,13 @@ process.env.NEXT_UNHANDLED_REJECTION_FILTER = "silent";
 
 const { startPoolServer } = await import("../../src/pool-server/index.js");
 const { signDispatch } = await import("../helpers/dispatch-proof.js");
+const { buildProofHeaderNames } = await import("../../src/routing-common.js");
+
+// The RSC config the staged builds below declare. The dispatch proof covers this build's RSC
+// negotiation header (it selects the dispatched output id), so a test that signs a trusted
+// request must use the same covered-name list the booted pool derives from its manifest.
+const STAGED_RSC = { header: "rsc", suffix: ".rsc" };
+const PROOF_HEADER_NAMES = buildProofHeaderNames({ routeGraph: { rsc: STAGED_RSC } });
 
 interface Staged {
   dir: string;
@@ -230,7 +237,7 @@ function writeStagedDir(options: StageOptions = {}): Staged {
         onMatch: [],
         fallback: [],
         shouldNormalizeNextData: true,
-        rsc: { header: "rsc", suffix: ".rsc" },
+        rsc: STAGED_RSC,
       },
       pathnames,
       i18n: null,
@@ -690,6 +697,14 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     "x-authenticated-user": "alice",
   });
 
+  // The proof covers the authority and this build's covered request headers, so it is minted for
+  // the Host `fetch` puts on the wire and with the list the booted pool verifies against.
+  const sign = (secret: string, method: string, target: string, headers: Record<string, string>) =>
+    signDispatch(secret, method, target, headers, {
+      authority: `localhost:${pool.port}`,
+      proofHeaderNames: PROOF_HEADER_NAMES,
+    });
+
   // The trusted cases use a PUBLIC url the dispatch headers redirect to `/echo-headers`; the
   // untrusted ones must request the route directly, because stripping `x-output-id` (correctly)
   // leaves Phase 1 to resolve the url itself.
@@ -708,7 +723,7 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
 
   it("applies it as a REPLACEMENT for a trusted request: added header in, deleted header gone", async () => {
     const body = await echo({
-      ...signDispatch(SECRET, "GET", "/echo-public", {
+      ...sign(SECRET, "GET", "/echo-public", {
         "x-output-id": "/echo-headers",
         "x-mw-evaluated": "ran",
         "x-mw-request-headers": MW_HEADERS,
@@ -722,7 +737,7 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
 
   it("never leaks the transport headers (or either credential) to the handler", async () => {
     const body = await echo({
-      ...signDispatch(SECRET, "GET", "/echo-public", {
+      ...sign(SECRET, "GET", "/echo-public", {
         "x-output-id": "/echo-headers",
         "x-mw-evaluated": "ran",
         "x-mw-request-headers": MW_HEADERS,
@@ -760,7 +775,7 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
 
   it("RED TEAM: a WRONG signing secret is also refused", async () => {
     const body = await echo(
-      signDispatch("wrong-secret", "GET", "/echo-headers", {
+      sign("wrong-secret", "GET", "/echo-headers", {
         "x-output-id": "/echo-headers",
         "x-mw-evaluated": "ran",
         "x-mw-request-headers": MW_HEADERS,

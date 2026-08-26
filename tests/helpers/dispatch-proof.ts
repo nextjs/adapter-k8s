@@ -3,21 +3,51 @@
 // Trusted dispatch requests in tests are signed exactly the way the routing service and the
 // cross-pool proxy sign them: a per-request HMAC proof (INTERNAL_DISPATCH_PROOF_HEADER),
 // never the raw secret. One helper, so tests can never drift from the wire scheme.
-import { computeDispatchProof, INTERNAL_DISPATCH_PROOF_HEADER } from "../../src/routing-common.js";
+import {
+  computeDispatchProof,
+  dispatchProofInputsFromRequest,
+  INTERNAL_DISPATCH_PROOF_HEADER,
+} from "../../src/routing-common.js";
+
+/** Everything the proof binds beyond the headers a test hands to its HTTP client. */
+export interface SignDispatchContext {
+  /**
+   * The `Host` the request will carry — for a `fetch` against a test server that is
+   * `` `127.0.0.1:${port}` `` or `` `localhost:${port}` ``, i.e. whatever the client puts on the
+   * wire, since the proof covers the authority. Omit only when the request genuinely has no Host
+   * (a synthetic req/res pair), which the proof covers as ABSENT on both sides.
+   */
+  authority?: string | undefined;
+  /** This build's proof-covered request headers (routing-common.ts buildProofHeaderNames). */
+  proofHeaderNames?: readonly string[] | undefined;
+}
 
 /**
- * Return `headers` plus a valid dispatch proof for (method, url). `headers` must contain
- * every covered dispatch header the request carries (x-output-id, x-mw-evaluated, …) — the
- * proof binds them, so anything added after signing invalidates it (which is the point).
+ * Return `headers` plus a valid dispatch proof for this request. `headers` must contain every
+ * covered value the request carries — the dispatch vocabulary (x-output-id, x-mw-evaluated, …),
+ * the forwarding witnesses (`x-forwarded-proto`/`x-forwarded-host`) and any matcher-input header —
+ * and `context.authority` must be the Host the client will send. The proof binds all of it, so
+ * anything added or changed after signing invalidates it (which is the point).
  */
 export function signDispatch(
   secret: string,
   method: string,
   url: string,
   headers: Record<string, string> = {},
+  context: SignDispatchContext = {},
 ): Record<string, string> {
+  const wire: Record<string, string> = { ...headers };
+  if (context.authority !== undefined) wire["host"] = context.authority;
   return {
     ...headers,
-    [INTERNAL_DISPATCH_PROOF_HEADER]: computeDispatchProof(secret, method, url, headers),
+    [INTERNAL_DISPATCH_PROOF_HEADER]: computeDispatchProof(
+      secret,
+      dispatchProofInputsFromRequest({
+        method,
+        target: url,
+        headers: wire,
+        proofHeaderNames: context.proofHeaderNames,
+      }),
+    ),
   };
 }

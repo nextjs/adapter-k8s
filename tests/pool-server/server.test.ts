@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createPoolServer, filterWriteHeadHeadersArg } from "../../src/pool-server/server.js";
 import { signDispatch } from "../helpers/dispatch-proof.js";
+import { matcherProofHeaderNames } from "../../src/routing-common.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 describe("createPoolServer", () => {
@@ -232,7 +233,13 @@ describe("internal header security", () => {
       await fetch(`http://127.0.0.1:${port}/page`, {
         method: "POST",
         headers: {
-          ...signDispatch("the-secret", "POST", "/page", { "x-output-id": "/page" }),
+          ...signDispatch(
+            "the-secret",
+            "POST",
+            "/page",
+            { "x-output-id": "/page" },
+            { authority: `127.0.0.1:${port}` },
+          ),
           "next-resume": "1",
           "x-next-resume-state-length": "32",
           "x-now-route-matches": "spoofed",
@@ -282,7 +289,22 @@ describe("internal header security", () => {
       "x-output-id": "/admin/action",
       "x-upstream-pool": "admin",
     };
-    const SIGNED = signDispatch("the-secret", "GET", "/page", DISPATCH_HEADERS);
+
+    // The proof covers the AUTHORITY, so a valid one can only be minted once the ephemeral port
+    // is known — `fetch` sends `Host: 127.0.0.1:<port>` and the boundary verifies against it.
+    function signFor(
+      port: number,
+      headers: Record<string, string> = DISPATCH_HEADERS,
+      opts: { secret?: string; method?: string; target?: string; host?: string } = {},
+    ) {
+      return signDispatch(
+        opts.secret ?? "the-secret",
+        opts.method ?? "GET",
+        opts.target ?? "/page",
+        headers,
+        { authority: opts.host ?? `127.0.0.1:${port}` },
+      );
+    }
 
     function seeingServer(seen: Record<string, string | undefined>) {
       return vi.fn((req: IncomingMessage, res: ServerResponse) => {
@@ -302,7 +324,7 @@ describe("internal header security", () => {
       });
       const { port } = await server.start();
 
-      await fetch(`http://127.0.0.1:${port}/page`, { headers: SIGNED });
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: signFor(port) });
 
       expect(seen["x-output-id"]).toBe("/admin/action");
       // The credential header itself must never reach the handler.
@@ -339,7 +361,7 @@ describe("internal header security", () => {
       const { port } = await server.start();
 
       // A proof minted for GET /other with a different dispatch set…
-      const stolen = signDispatch("the-secret", "GET", "/other", { "x-output-id": "/other" });
+      const stolen = signFor(port, { "x-output-id": "/other" }, { target: "/other" });
       // …replayed against /page with a forged dispatch target.
       await fetch(`http://127.0.0.1:${port}/page`, {
         headers: {
@@ -361,7 +383,7 @@ describe("internal header security", () => {
       const { port } = await server.start();
 
       // Sign a benign verdict, then edit x-output-id in transit — the proof must break.
-      const signed = signDispatch("the-secret", "GET", "/page", {
+      const signed = signFor(port, {
         "x-output-id": "/about",
         "x-mw-evaluated": "ran",
       });
@@ -406,8 +428,107 @@ describe("internal header security", () => {
       });
       const { port } = await server.start();
 
-      await fetch(`http://127.0.0.1:${port}/page`, { headers: SIGNED });
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: signFor(port) });
       expect(seen["x-output-id"]).toBe("/admin/action");
+    });
+
+    it("RED TEAM: a proof minted for another :authority does not verify here", async () => {
+      // REVIEW (PR #61): the first cut of the proof left the authority unbound, so one host's
+      // routing verdict — pool assignment, domain-locale mapping, a `has: {type:"host"}`
+      // matcher outcome — was liftable onto any other host served by the same build.
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      const otherHost = signFor(port, DISPATCH_HEADERS, { host: "tenant-b.example.com" });
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: otherHost });
+
+      expect(seen["x-output-id"]).toBeUndefined();
+    });
+
+    it("RED TEAM: a proof minted for another scheme witness does not verify here", async () => {
+      // `x-forwarded-proto` is the pool's ONLY witness of the client-facing scheme
+      // (dispatch.ts requestProtocol), so the proof binds it. A proof for the https request
+      // must not authorize the otherwise identical http one.
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      const httpsProof = signFor(port, { ...DISPATCH_HEADERS, "x-forwarded-proto": "https" });
+      // Same everything, downgraded scheme witness on the wire.
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: { ...httpsProof, "x-forwarded-proto": "http" },
+      });
+      expect(seen["x-output-id"]).toBeUndefined();
+
+      // And the matching request is still trusted, so the binding is not just "always reject".
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: httpsProof });
+      expect(seen["x-output-id"]).toBe("/admin/action");
+    });
+
+    it("RED TEAM: a skip-nomatch proof does not transfer across the matcher inputs", async () => {
+      // The middleware matcher `missing: [{type:"cookie", key:"session"}]` means an ANONYMOUS
+      // request legitimately earns the trusted `skip-nomatch` verdict. With the matcher inputs
+      // unbound, that proof could be replayed with the session cookie attached — telling the pool
+      // the middleware stage was settled for a request whose middleware never ran.
+      const proofHeaderNames = matcherProofHeaderNames([
+        { regexp: "^/page$", missing: [{ type: "cookie", key: "session" }] },
+      ]);
+      expect(proofHeaderNames).toEqual(["cookie"]);
+
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+        proofHeaderNames,
+      });
+      const { port } = await server.start();
+
+      const anonymous = signDispatch(
+        "the-secret",
+        "GET",
+        "/page",
+        { "x-output-id": "/admin/action", "x-mw-evaluated": "skip-nomatch" },
+        { authority: `127.0.0.1:${port}`, proofHeaderNames },
+      );
+
+      // Replayed WITH the cookie the matcher checks for: a different matcher verdict, so the
+      // proof must not verify.
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: { ...anonymous, cookie: "session=alice" },
+      });
+      expect(seen["x-output-id"]).toBeUndefined();
+
+      // The request it was actually minted for still passes.
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: anonymous });
+      expect(seen["x-output-id"]).toBe("/admin/action");
+    });
+
+    it("RED TEAM: an empty covered header is not interchangeable with an absent one", async () => {
+      // Delimiter-injection / canonicalization guard: v1 skipped absent covered headers entirely,
+      // so `x-route-matches: ""` and no `x-route-matches` at all signed the same bytes. The
+      // framing now covers ABSENT as its own symbol.
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+
+      const withEmpty = signFor(port, { ...DISPATCH_HEADERS, "x-route-matches": "" });
+      const { "x-route-matches": _dropped, ...withoutEmpty } = withEmpty;
+      await fetch(`http://127.0.0.1:${port}/page`, { headers: withoutEmpty });
+      expect(seen["x-output-id"]).toBeUndefined();
     });
 
     it("always strips x-internal-secret even in legacy trustInternalHeaders mode (no secret configured)", async () => {

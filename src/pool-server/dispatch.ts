@@ -15,7 +15,7 @@ import {
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   computeDispatchProof,
-  coveredDispatchHeaders,
+  dispatchProofInputsFromRequest,
   timingSafeStringEqual,
   localeAlignedRouteParamPathname,
   queryFromUrl,
@@ -1764,6 +1764,12 @@ export interface DispatcherOptions {
   poolResponseHeadTimeouts?: Record<string, number> | undefined;
   /** Shared secret used to authenticate cluster-internal cross-pool dispatch headers. */
   internalSecret?: string | undefined;
+  /**
+   * This build's proof-covered request headers (routing-common.ts `buildProofHeaderNames`) —
+   * covered by the dispatch proof, so a cross-pool hop must sign with the same list the receiving
+   * pool verifies with. Both come from the one build's manifest.
+   */
+  proofHeaderNames?: readonly string[] | undefined;
   /** True when a classic incremental `cacheHandler` is registered (via next.config.cacheHandler)
    * and therefore owns the PPR shell. When set, we DON'T inject the build-time postponed token —
    * the incremental cache serves + revalidates the shell instead. This must track the SAME build
@@ -1805,6 +1811,7 @@ export function createDispatcher(options: DispatcherOptions) {
     prerenderedPaths = new Set<string>(),
     buildIdForData = "",
     internalSecret,
+    proofHeaderNames,
     incrementalCacheShared = false,
     entrypointOwnsPprShell = false,
     emulatePlatformCache = false,
@@ -2950,6 +2957,7 @@ export function createDispatcher(options: DispatcherOptions) {
               internalSecret,
               requestHeadTimeoutMs,
               executionDeadlineAt,
+              proofHeaderNames,
             );
           }
 
@@ -3857,6 +3865,7 @@ function proxyToPool(
   internalSecret?: string,
   proxyTimeoutMs: number = PROXY_TIMEOUT_MS,
   executionDeadlineAt?: number,
+  proofHeaderNames?: readonly string[] | undefined,
 ): Promise<void> {
   return new Promise((resolve) => {
     let deadlineExceeded = false;
@@ -3906,17 +3915,21 @@ function proxyToPool(
     }
 
     // The trust credential is a per-request PROOF, never the raw secret (routing-common.ts
-    // INTERNAL_DISPATCH_PROOF_HEADER): computed over the exact dispatch set this hop asserts
-    // plus the forwarded method/URL, so a proof observed in transit authenticates only this
-    // request. The header list is fixed by the proof scheme — the cleanup above has already
-    // evicted every covered name this hop did not set, so `coveredDispatchHeaders` sees the
-    // final wire state.
+    // INTERNAL_DISPATCH_PROOF_HEADER): computed over the exact dispatch set this hop asserts plus
+    // the forwarded method/URL, authority, forwarding witnesses and matcher inputs, so a proof
+    // observed in transit authenticates only this request. Signed over `forwardHeaders` — the
+    // FINAL outbound state, after the eviction above and including the `host`/`x-forwarded-*`
+    // values this hop actually relays — so the sibling pool recomputes the identical transcript
+    // from what it receives.
     if (internalSecret) {
       forwardHeaders[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
         internalSecret,
-        req.method ?? "GET",
-        req.url ?? "/",
-        coveredDispatchHeaders(forwardHeaders),
+        dispatchProofInputsFromRequest({
+          method: req.method,
+          target: req.url,
+          headers: forwardHeaders,
+          proofHeaderNames,
+        }),
       );
     }
 
