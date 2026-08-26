@@ -36,6 +36,10 @@ import {
   type RetainedExternalResource,
   type RoutingPlan,
   type RoutingReadiness,
+  type TelemetryActivation,
+  type TelemetrySignal,
+  type TelemetrySource,
+  type TelemetryWorkload,
 } from "./types.js";
 
 type JsonObject = Record<string, unknown>;
@@ -47,6 +51,9 @@ const DNS_SUBDOMAIN_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
 const CIDR_RE = /^(?:[0-9a-fA-F:.]+)\/[0-9]{1,3}$/;
 const SERVICE_ACCOUNT_EMAIL_RE =
   /^[a-z][a-z0-9-]{0,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
+const TELEMETRY_ID_RE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/;
+const OTEL_METRIC_NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,254}$/;
+const OTEL_ATTRIBUTE_KEY_RE = /^[a-z][a-z0-9_.-]{0,254}$/;
 
 function fail(path: string, message: string): never {
   throw new Error(`Invalid composition plan at ${path}: ${message}`);
@@ -900,6 +907,189 @@ function parseStringMap(value: unknown, path: string): Record<string, string> {
   return result;
 }
 
+function telemetryId(value: unknown, path: string): string {
+  const parsed = safeText(value, path, 127);
+  if (!TELEMETRY_ID_RE.test(parsed)) {
+    fail(path, `expected a lowercase dotted identifier matching ${TELEMETRY_ID_RE}`);
+  }
+  return parsed;
+}
+
+function parseTelemetryActivation(value: unknown, path: string): TelemetryActivation {
+  const parsed = object(value, path);
+  const kind = string(parsed.kind, `${path}.kind`);
+  switch (kind) {
+    case "app-instrumentation-hook":
+    case "managed":
+      exactKeys(parsed, ["kind"], path);
+      return { kind };
+    case "otel-operator":
+      exactKeys(parsed, ["kind", "instrumentation"], path);
+      return {
+        kind,
+        instrumentation: parseKubernetesObjectRef(
+          parsed.instrumentation,
+          `${path}.instrumentation`,
+        ),
+      };
+    case "external-precondition":
+      exactKeys(parsed, ["kind", "description"], path);
+      return { kind, description: safeText(parsed.description, `${path}.description`, 512) };
+    default:
+      fail(`${path}.kind`, `unknown telemetry activation ${JSON.stringify(kind)}`);
+  }
+}
+
+function parseTelemetrySignal(value: unknown, path: string): TelemetrySignal {
+  const parsed = object(value, path);
+  const kind = oneOf(parsed.kind, ["span", "metric", "log"] as const, `${path}.kind`);
+  if (kind === "metric") {
+    exactKeys(parsed, ["kind", "name", "instrument", "unit"], path);
+    const name = safeText(parsed.name, `${path}.name`, 255);
+    if (!OTEL_METRIC_NAME_RE.test(name)) {
+      fail(`${path}.name`, "invalid OpenTelemetry metric name");
+    }
+    const unit = parsed.unit === undefined ? undefined : safeText(parsed.unit, `${path}.unit`, 63);
+    return {
+      kind,
+      name,
+      instrument: oneOf(
+        parsed.instrument,
+        ["counter", "histogram", "gauge", "up-down-counter"] as const,
+        `${path}.instrument`,
+      ),
+      ...(unit !== undefined ? { unit } : {}),
+    };
+  }
+  exactKeys(parsed, ["kind", "name"], path);
+  return { kind, name: safeText(parsed.name, `${path}.name`, 255) };
+}
+
+function parseTelemetryWorkload(value: unknown, path: string): TelemetryWorkload {
+  const parsed = object(value, path);
+  const kind = string(parsed.kind, `${path}.kind`);
+  switch (kind) {
+    case "adapter-pool":
+      exactKeys(parsed, ["kind", "pool"], path);
+      return { kind, pool: validated(parsed.pool, `${path}.pool`, assertSafePoolName) };
+    case "adapter-routing-service":
+      exactKeys(parsed, ["kind"], path);
+      return { kind };
+    case "kubernetes-object":
+      exactKeys(parsed, ["kind", "object"], path);
+      return { kind, object: parseKubernetesObjectRef(parsed.object, `${path}.object`) };
+    case "managed-service":
+      exactKeys(parsed, ["kind", "name"], path);
+      return { kind, name: telemetryId(parsed.name, `${path}.name`) };
+    default:
+      fail(`${path}.kind`, `unknown telemetry workload ${JSON.stringify(kind)}`);
+  }
+}
+
+function parseTelemetryAttributes(value: unknown, path: string): Record<string, string> {
+  const parsed = object(value, path);
+  const entries = Object.entries(parsed);
+  if (entries.length > 32) fail(path, "expected at most 32 static attributes");
+  const attributes: Record<string, string> = {};
+  for (const [key, value] of entries) {
+    if (!OTEL_ATTRIBUTE_KEY_RE.test(key)) {
+      fail(`${path}.${key}`, "invalid OpenTelemetry attribute key");
+    }
+    attributes[key] = safeText(value, `${path}.${key}`, 256);
+  }
+  return attributes;
+}
+
+function assertUniqueTelemetryEntries(
+  entries: readonly string[],
+  path: string,
+  description: string,
+): void {
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (seen.has(entry)) fail(path, `duplicate ${description} ${JSON.stringify(entry)}`);
+    seen.add(entry);
+  }
+}
+
+function parseTelemetrySource(value: unknown, path: string): TelemetrySource {
+  const parsed = object(value, path);
+  exactKeys(
+    parsed,
+    [
+      "id",
+      "producer",
+      "owner",
+      "activation",
+      "protocols",
+      "propagation",
+      "signals",
+      "workloads",
+      "attributes",
+    ],
+    path,
+  );
+  const producer = object(parsed.producer, `${path}.producer`);
+  exactKeys(producer, ["kind", "name"], `${path}.producer`);
+  const protocols = array(
+    parsed.protocols,
+    `${path}.protocols`,
+    (entry, entryPath) =>
+      oneOf(entry, ["otel-api", "otlp", "prometheus", "cloud-managed"] as const, entryPath),
+    8,
+  );
+  const propagation = array(
+    parsed.propagation,
+    `${path}.propagation`,
+    (entry, entryPath) =>
+      oneOf(entry, ["tracecontext", "tracestate", "baggage-pass-through"] as const, entryPath),
+    8,
+  );
+  const signals = array(parsed.signals, `${path}.signals`, parseTelemetrySignal, 128);
+  const workloads = array(parsed.workloads, `${path}.workloads`, parseTelemetryWorkload, 128);
+  if (signals.length === 0 && propagation.length === 0) {
+    fail(path, "a telemetry source must declare at least one signal or propagation format");
+  }
+  if (signals.length > 0 && protocols.length === 0) {
+    fail(`${path}.protocols`, "a telemetry source with signals must declare a protocol");
+  }
+  if (workloads.length === 0) fail(`${path}.workloads`, "expected at least one workload");
+  assertUniqueTelemetryEntries(protocols, `${path}.protocols`, "protocol");
+  assertUniqueTelemetryEntries(propagation, `${path}.propagation`, "propagation format");
+  assertUniqueTelemetryEntries(
+    signals.map((signal) => `${signal.kind}:${signal.name}`),
+    `${path}.signals`,
+    "signal",
+  );
+  assertUniqueTelemetryEntries(
+    workloads.map((workload) => JSON.stringify(workload)),
+    `${path}.workloads`,
+    "workload",
+  );
+  return {
+    id: telemetryId(parsed.id, `${path}.id`),
+    producer: {
+      kind: oneOf(
+        producer.kind,
+        ["adapter-runtime", "data-plane", "ingress-controller", "managed-provider"] as const,
+        `${path}.producer.kind`,
+      ),
+      name: telemetryId(producer.name, `${path}.producer.name`),
+    },
+    owner: oneOf(
+      parsed.owner,
+      ["adapter", "application", "operator", "cloud-provider"] as const,
+      `${path}.owner`,
+    ),
+    activation: parseTelemetryActivation(parsed.activation, `${path}.activation`),
+    protocols,
+    propagation,
+    signals,
+    workloads,
+    attributes: parseTelemetryAttributes(parsed.attributes, `${path}.attributes`),
+  };
+}
+
 function isSafeMapKey(value: string): boolean {
   return (
     value.length > 0 &&
@@ -1030,7 +1220,17 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
   const operations = object(parsed.operations, "$.operations");
   exactKeys(
     operations,
-    ["resources", "network", "cache", "cdn", "routing", "cleanup", "diagnostics", "logs"],
+    [
+      "resources",
+      "network",
+      "cache",
+      "cdn",
+      "routing",
+      "cleanup",
+      "diagnostics",
+      "logs",
+      "telemetry",
+    ],
     "$.operations",
   );
   const resourceOperations = object(operations.resources, "$.operations.resources");
@@ -1084,8 +1284,26 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
       cleanup: parseCleanup(operations.cleanup, "$.operations.cleanup"),
       diagnostics: array(operations.diagnostics, "$.operations.diagnostics", parseDiagnostic),
       logs: array(operations.logs, "$.operations.logs", parseLog),
+      // telemetry was added without changing the v1alpha1 envelope. Preserve absence when
+      // authenticating older plans, because materialising [] would change their signed digest.
+      ...(operations.telemetry !== undefined
+        ? {
+            telemetry: array(
+              operations.telemetry,
+              "$.operations.telemetry",
+              parseTelemetrySource,
+              256,
+            ),
+          }
+        : {}),
     },
   };
+
+  assertUniqueTelemetryEntries(
+    (plan.operations.telemetry ?? []).map((source) => source.id),
+    "$.operations.telemetry",
+    "source id",
+  );
 
   for (const [path, candidate] of [
     ["$.operations.logs", plan.operations.logs.map((source) => source.namespace)],

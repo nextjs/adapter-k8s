@@ -288,6 +288,54 @@ export interface LogSource {
   containers: "all";
 }
 
+export type TelemetryProducerKind =
+  | "adapter-runtime"
+  | "data-plane"
+  | "ingress-controller"
+  | "managed-provider";
+
+export type TelemetryOwner = "adapter" | "application" | "operator" | "cloud-provider";
+
+export type TelemetryActivation =
+  | { kind: "app-instrumentation-hook" }
+  | { kind: "otel-operator"; instrumentation: KubernetesObjectRef }
+  | { kind: "external-precondition"; description: string }
+  | { kind: "managed" };
+
+export type TelemetryProtocol = "otel-api" | "otlp" | "prometheus" | "cloud-managed";
+
+export type TelemetryPropagation = "tracecontext" | "tracestate" | "baggage-pass-through";
+
+export type TelemetrySignal =
+  | { kind: "span"; name: string }
+  | {
+      kind: "metric";
+      name: string;
+      instrument: "counter" | "histogram" | "gauge" | "up-down-counter";
+      unit?: string;
+    }
+  | { kind: "log"; name: string };
+
+export type TelemetryWorkload =
+  | { kind: "adapter-pool"; pool: string }
+  | { kind: "adapter-routing-service" }
+  | { kind: "kubernetes-object"; object: KubernetesObjectRef }
+  | { kind: "managed-service"; name: string };
+
+/** One independently-owned signal producer in the composed request topology. */
+export interface TelemetrySource {
+  id: string;
+  producer: { kind: TelemetryProducerKind; name: string };
+  owner: TelemetryOwner;
+  activation: TelemetryActivation;
+  protocols: TelemetryProtocol[];
+  propagation: TelemetryPropagation[];
+  signals: TelemetrySignal[];
+  workloads: TelemetryWorkload[];
+  /** Static, bounded dimensions a runtime/provider must attach to this source's signals. */
+  attributes: Record<string, string>;
+}
+
 export interface KubernetesApiRequirement {
   apiVersion: string;
   resource: string;
@@ -351,6 +399,12 @@ export interface CompositionPlanV1 {
     cleanup: CleanupPlan;
     diagnostics: DiagnosticSource[];
     logs: LogSource[];
+    /**
+     * Optional for backwards compatibility with retained v1alpha1 plans emitted before the
+     * telemetry inventory existed. New compilers always emit it; parsers preserve absence so an
+     * old plan's authenticated digest remains stable.
+     */
+    telemetry?: TelemetrySource[];
   };
 }
 

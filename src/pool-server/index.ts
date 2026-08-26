@@ -3731,6 +3731,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // Create and start server
   const server = createPoolServer({
     port,
+    poolName,
     trustInternalHeaders,
     internalSecret,
     onRequest: handleRequest,

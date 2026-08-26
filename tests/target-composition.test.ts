@@ -17,6 +17,7 @@ import {
 } from "../src/target/index.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 import type { TargetBuildContext } from "../src/target/types.js";
+import type { TelemetrySource } from "../src/composition-plan/index.js";
 
 const hosts = [{ hostname: "app.example.com", tls: { enabled: false } }];
 
@@ -30,6 +31,41 @@ function context(overrides: Partial<TargetBuildContext> = {}): TargetBuildContex
     defaultPool: "default",
     failurePolicy: "closed",
     ...overrides,
+  };
+}
+
+function nginxTelemetrySource(
+  id = "provider.nginx-ingress",
+  metricName = "nginx_ingress_controller_requests",
+): TelemetrySource {
+  return {
+    id,
+    producer: { kind: "ingress-controller", name: "nginx-ingress" },
+    owner: "operator",
+    activation: {
+      kind: "otel-operator",
+      instrumentation: {
+        apiVersion: "opentelemetry.io/v1alpha1",
+        resource: "instrumentations",
+        name: "nginx-ingress",
+        namespace: "apps",
+      },
+    },
+    protocols: ["prometheus"],
+    propagation: ["tracecontext"],
+    signals: [{ kind: "metric", name: metricName, instrument: "counter", unit: "{request}" }],
+    workloads: [
+      {
+        kind: "kubernetes-object",
+        object: {
+          apiVersion: "apps/v1",
+          resource: "deployments",
+          name: "ingress-nginx-controller",
+          namespace: "apps",
+        },
+      },
+    ],
+    attributes: { "adapter_k8s.provider.name": "nginx-ingress" },
   };
 }
 
@@ -62,6 +98,16 @@ describe("Kubernetes target composition", () => {
     expect(compiled.plan.operations.cleanup.external).toEqual([]);
     expect(compiled.plan.operations.cleanup.retained).toEqual([]);
     expect(compiled.plan.operations.diagnostics).toEqual([]);
+    expect(compiled.plan.operations.telemetry).toEqual([
+      expect.objectContaining({
+        id: "adapter.pool",
+        workloads: [
+          { kind: "adapter-pool", pool: "default" },
+          { kind: "adapter-pool", pool: "api" },
+        ],
+        attributes: expect.objectContaining({ "adapter_k8s.provider.name": "portable" }),
+      }),
+    ]);
     expect(JSON.stringify(compiled.plan)).not.toContain("envoy");
     expect(JSON.stringify(compiled.plan)).not.toContain("gcp-");
   });
@@ -396,6 +442,13 @@ describe("Kubernetes target composition", () => {
       expect.objectContaining({
         apiVersion: "gateway.envoyproxy.io/v1alpha1",
         kind: "EnvoyExtensionPolicy",
+      }),
+    );
+    expect(compiled.plan.operations.telemetry).toContainEqual(
+      expect.objectContaining({
+        id: "adapter.routing.envoy-native",
+        producer: { kind: "adapter-runtime", name: "routing-service" },
+        attributes: expect.objectContaining({ "adapter_k8s.provider.name": "envoy-native" }),
       }),
     );
     expect(compiled.plan.operations.resources.objects).toContainEqual(
@@ -928,6 +981,65 @@ describe("Kubernetes target composition", () => {
 });
 
 describe("open build-time hooks", () => {
+  it("lets an NGINX ingress component contribute telemetry and fingerprints the contract", () => {
+    const nginxExposure = (metricName: string) =>
+      defineExposureComponent({
+        name: "nginx-ingress",
+        hosts,
+        build(ctx) {
+          const exposure = ingressExposure({ className: "nginx", hosts }).build(ctx);
+          return {
+            ...exposure,
+            telemetry: [nginxTelemetrySource("provider.nginx-ingress", metricName)],
+          };
+        },
+      });
+    const compile = (metricName: string) =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: nginxExposure(metricName),
+        }),
+        context(),
+      );
+
+    const compiled = compile("nginx_ingress_controller_requests");
+    expect(compiled.plan.operations.telemetry).toContainEqual(nginxTelemetrySource());
+    expect(compiled.plan.target.fingerprint).not.toBe(
+      compile("nginx_ingress_controller_request_duration_seconds").plan.target.fingerprint,
+    );
+  });
+
+  it("rejects reserved and duplicate provider telemetry source ids", () => {
+    const resource = (name: string, source: TelemetrySource) =>
+      defineResourceComponent({ name, build: () => ({ telemetry: [source] }) });
+
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          resources: [resource("bad-telemetry", nginxTelemetrySource("adapter.injected"))],
+        }),
+        context(),
+      ),
+    ).toThrow(/reserved "adapter\." prefix/i);
+
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          resources: [
+            resource("telemetry-one", nginxTelemetrySource()),
+            resource("telemetry-two", nginxTelemetrySource()),
+          ],
+        }),
+        context(),
+      ),
+    ).toThrow(/duplicate telemetry source id/i);
+  });
+
   it("accepts a custom cluster without a provider key", () => {
     const cluster = defineClusterComponent({
       name: "home-cluster",

@@ -16,6 +16,7 @@ import type {
   RetainedExternalResource,
   RoutingPlan,
   RoutingReadiness,
+  TelemetrySource,
 } from "../composition-plan/types.js";
 
 export interface TargetBuildContext {
@@ -37,6 +38,8 @@ export interface OperationalContribution {
   externalCleanup?: ExternalCleanupOperation[];
   retained?: RetainedExternalResource[];
   diagnostics?: DiagnosticSource[];
+  /** Declarative OTEL/native signal sources contributed by this target component. */
+  telemetry?: TelemetrySource[];
 }
 
 export interface KubernetesContribution extends OperationalContribution {
@@ -140,6 +143,8 @@ export interface CompiledKubernetesTarget {
   hosts: HostConfig[];
   ingressSources: IngressSourceSet;
   routingTier: RoutingBuildResult["routingTier"];
+  /** Validated routing component name stamped onto adapter-owned runtime telemetry. */
+  routingProviderName: string;
 }
 
 export interface KubernetesClusterOptions {

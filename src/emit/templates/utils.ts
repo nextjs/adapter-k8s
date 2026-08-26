@@ -769,6 +769,16 @@ export function assertSafePoolName(poolName: string): void {
   }
 }
 
+/** Target component name emitted into pod env and bounded OTEL attributes. */
+export function assertSafeTelemetryProviderName(providerName: string): void {
+  if (!/^[a-z][a-z0-9-]{0,62}$/.test(providerName)) {
+    throw new Error(
+      `Invalid telemetry provider name ${JSON.stringify(providerName)}: expected a target ` +
+        `component name (lowercase letters, digits and hyphens, max 63 characters).`,
+    );
+  }
+}
+
 import type { EnvValue, EnvFromSource } from "../../types.js";
 
 /**

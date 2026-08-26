@@ -37,6 +37,7 @@ function plan(
     readiness?: CompositionPlan["operations"]["resources"]["readiness"];
     objects?: CompositionPlan["operations"]["resources"]["objects"];
     diagnostics?: CompositionPlan["operations"]["diagnostics"];
+    telemetry?: NonNullable<CompositionPlan["operations"]["telemetry"]>;
   } = {},
 ): CompositionPlan {
   return parseCompositionPlan({
@@ -107,6 +108,7 @@ function plan(
         retained: [],
       },
       diagnostics: overrides.diagnostics ?? [],
+      telemetry: overrides.telemetry ?? [],
       logs: [
         {
           kind: "kubernetes-pods",
@@ -660,6 +662,25 @@ describe("composition-plan readiness and descriptions", () => {
           body: { spec: { ingressClassName: "nginx" } },
         },
       ],
+      telemetry: [
+        {
+          id: "provider.nginx-ingress",
+          producer: { kind: "ingress-controller", name: "nginx-ingress" },
+          owner: "operator",
+          activation: { kind: "managed" },
+          protocols: ["prometheus"],
+          propagation: ["tracecontext"],
+          signals: [
+            {
+              kind: "metric",
+              name: "nginx_ingress_controller_requests",
+              instrument: "counter",
+            },
+          ],
+          workloads: [{ kind: "managed-service", name: "nginx-ingress" }],
+          attributes: { "adapter_k8s.provider.name": "nginx-ingress" },
+        },
+      ],
     });
     assertCompositionPlanInvocation(value, {
       releaseName: RELEASE,
@@ -685,6 +706,7 @@ describe("composition-plan readiness and descriptions", () => {
         containers: "all",
       },
     ]);
+    expect(description.telemetry).toEqual(value.operations.telemetry);
     expect(description.cleanup.kubernetes[0]?.ref.name).toBe("test-app-ingress");
   });
 });
