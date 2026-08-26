@@ -15,9 +15,13 @@
   },
   "files": [
     "dist",
+    "docker",
+    "docs",
     "integration",
+    "plans",
     "scripts",
-    "skills"
+    "skills",
+    "SECURITY.md"
   ],
   "type": "module",
   "main": "dist/index.js",

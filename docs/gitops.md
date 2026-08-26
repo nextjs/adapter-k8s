@@ -16,7 +16,7 @@
 
 When the config sets `imagePullSecrets` (private registries—see [configuration.md](./configuration.md#registry-pull-auth)), every pod spec in the bundle references those Secrets and the README lists them as an operator prerequisite: they must exist in the target namespace before the bundle is applied, delivered by your secrets flow—the bundle never carries them.
 
-Design and rationale: [plans/gitops-deployment-strategies.md](../plans/gitops-deployment-strategies.md). Two cutover models ship today: `cutover.mode: none` (the default—promotion stays out-of-band, below) and `--cutover job` (the [in-cluster cutover Job](#in-cluster-cutover---cutover-job), which promotes inside the target namespace after the same gate battery `deploy` runs). The Argo CD/Flux recipes are a later PR.
+Design and rationale: [plans/gitops-deployment-strategies.md](../plans/gitops-deployment-strategies.md). Two cutover models ship today: `cutover.mode: none` (the default—promotion stays out-of-band, below) and `--cutover job` (the [in-cluster cutover Job](#in-cluster-cutover---cutover-job), which promotes inside the target namespace after the same gate battery `deploy` runs). A copy-ready Flux recipe is included below; an equivalent generated Argo CD recipe remains future work.
 
 ## ⛔ The drift hazard, first
 
@@ -85,7 +85,7 @@ Operational notes:
 
 - **It is a plain `batch/v1` Job**—no Argo hook or sync-wave semantics required (Flux has none). Its per-build name is the idempotency key: a no-op re-sync finds the completed Job and does nothing, and a re-created pod for an already-promoted build logs "already promoted" and exits 0 without touching HPAs.
 - **A gate failure restores the edge first, then exits nonzero** (the reconciler reports a failed Job), and records the build in the state ConfigMap's `failedPromotions` — the **poison pill**. Reconciler retries then refuse cheaply (one short-lived pod, no HPA warm-up wobble) until you fix the build and emit a new one, or override deliberately with `cutover.forcePromotion: true` (which renders the Job under a `-force` name — Jobs are immutable, so the override could not otherwise re-run beside the original failed Job). The pill clears on the next successful promotion. Find the pods with `kubectl logs -l app.kubernetes.io/component=cutover-job -n <ns>`.
-- **`cutover.image` is required at emit time, by digest.** `emit --cutover job` refuses to render a bundle without a digest-pinned image (`--cutover-image <name@sha256:…>` or `ADAPTER_K8S_CUTOVER_IMAGE`)—the chart-default tag is neither published nor immutable. Build it from this repo's [docker/cutover-job.Dockerfile](../docker/cutover-job.Dockerfile) (`npm run build`, then `docker build -f docker/cutover-job.Dockerfile …`), push it to your registry, and pass the pushed digest; emit writes it into the bundle's values.
+- **`cutover.image` is required at emit time, by digest.** `emit --cutover job` refuses to render a bundle without a digest-pinned image (`--cutover-image <name@sha256:…>` or `ADAPTER_K8S_CUTOVER_IMAGE`)—the chart-default tag is neither published nor immutable. Build it from this repo's [docker/cutover-job.Dockerfile](../docker/cutover-job.Dockerfile) after `npm run build`. The Dockerfile deliberately requires `KUBECTL_VERSION`: choose a release within one minor of the target API server, and build for the cluster node architecture (not the workstation's). For an amd64 Kubernetes 1.35 cluster, for example: `docker build --platform=linux/amd64 --build-arg KUBECTL_VERSION=v1.35.7 -f docker/cutover-job.Dockerfile -t <registry>/adapter-k8s-cutover:<version> .`. Push it, resolve the registry digest, and pass that digest to emit. The same Dockerfile and built `dist/` are included in the npm package, so an installed copy can be used as the build context too.
 - **Prerequisite for existing releases:** run [`adapter-k8s migrate`](#-prune-deletes-your-rollback-target) once before pointing a pruning reconciler at a release with imperative deploy history.
 - **Selector ignore rules are still required** (see [the drift hazard](#-the-drift-hazard-first)): the bundle renders selectors at the previous build, so a self-healing reconciler reverts the Job's promotion exactly as it reverts an out-of-band one.
 - **Composed-target readiness is part of the gate battery.** For composed-target bundles the Job loads the per-build composition-plan ConfigMap and verifies HTTPRoute/Gateway/Ingress/Certificate readiness before promoting; a missing plan ConfigMap is a refusal, not a skip. (Provider-ingress bundles render no plan and promote on the base battery.)
@@ -127,19 +127,217 @@ When the app repo runs CI/`emit` and a separate cluster repo holds the committed
 
 The path may name the bundle directory or its `emit-metadata.json` directly (relative paths resolve against the project directory). The foreign bundle passes the **same** validation battery as a same-repo one—wrong release, wrong namespace, newer `emitVersion`, or corrupt JSON are refusals, and its `previousDefaultPool` is consumed identically on a re-emit of the same build. The flag is fail-closed in the direction that matters for CI: a wrong path (or a checkout step that silently didn't run) is a hard error, never silently treated as a first deploy. The genuine first deploy of a split-repo release uses `--first-deploy` with no `--previous-bundle`.
 
+## Two-PR agent onboarding
+
+For an existing application and a separately reconciled cluster repository, keep ownership and
+authorization visible as two PRs:
+
+1. **Application PR — prepare, do not deploy.** Add a reproducible adapter dependency and lockfile,
+   wire `adapterPath`, add `adapter.config.*`, and optionally add the app repo's public-recipient
+   `.sops.yaml` rule. Validate with `next build`. Keep `.k8s-adapter/` ignored and do not push
+   images or emit a cluster bundle from an unreviewed application diff. The PR description hands
+   off the non-secret release facts: release, namespace, registry, hostname, platform, and variant.
+2. **Cluster PR — build the reviewed commit, then integrate.** From the merged or explicitly named
+   application commit, inspect the supplied kubeconfig read-only, recreate the ignored
+   `infrastructure*.json`, build/push images, and run `emit`. Copy the bundle wholesale into a
+   clean cluster-repo branch, then add the environment-owned Flux/Argo, SOPS, pull-secret, DNS,
+   certificate/Gateway, and tunnel resources. Open the PR without applying or merging it; merge is
+   the reconciler's deployment trigger.
+
+The adapter package must be resolvable from a fresh application checkout. Never commit `npm link`,
+an absolute `file:/Users/...` dependency, or a tarball path that exists only on the present laptop.
+Until a registry release exists, use a stable reviewed package artifact URL; otherwise package
+distribution—not Kubernetes—is the honest blocker to a mergeable first PR.
+
+Prompt shape for PR 1:
+
+> Read the installed `skills/configure/SKILL.md`. Inspect this project and the named kubeconfig
+> read-only. Prepare and validate an application-only PR for adapter-k8s. Do not edit the cluster
+> repo, push deployment images, emit a bundle, or deploy.
+
+Prompt shape for PR 2:
+
+> Read the installed `skills/deploy/SKILL.md`. Use this exact reviewed application commit and the
+> cluster repo at `<path>` with kubeconfig `<path>`. You may edit the cluster repo and open a PR;
+> do not merge it or mutate the live cluster. Generate the digest-pinned SOPS bundle and include
+> every environment-owned DNS/Gateway/tunnel prerequisite discovered from existing apps.
+
+## Flux recipe: a chart committed in the cluster repository
+
+This is the portable split-repository shape for a Flux cluster whose existing `GitRepository`
+source is named `flux-system`. Replace every `<...>` placeholder and keep the emitted bundle
+whole—the chart, values, metadata, encrypted Secrets, and update-bot fence are one build artifact:
+
+```text
+kubernetes/apps/<namespace>/<release>/
+├── ks.yaml
+└── app/
+    ├── kustomization.yaml
+    ├── helmrelease.yaml
+    └── bundle/                 # wholesale copy of .k8s-adapter/gitops/
+        ├── chart/
+        ├── values/
+        ├── manifests/
+        ├── secrets/            # --secrets sops
+        ├── emit-metadata.json
+        ├── renovate.json5
+        └── README.md
+```
+
+Add `<release>/ks.yaml` to the namespace/category Kustomization that already discovers Flux
+objects in your cluster repository. In repositories where the top-level Flux `Kustomization`
+recursively discovers those objects, no additional parent entry is needed.
+
+SOPS encryption happens in the app checkout **before** the bundle is copied. The app repo's
+`.sops.yaml` must therefore match the emitted source path, even when the cluster repo has its own
+rule for `kubernetes/**`. An age recipient is public and can safely be shared between the two
+configs:
+
+```yaml
+# app-repo/.sops.yaml
+creation_rules:
+  - path_regex: ^\.k8s-adapter/gitops/secrets/.*\.sops\.ya?ml$
+    encrypted_regex: "^(data|stringData)$"
+    key_groups:
+      - age:
+          - age1replace_with_the_cluster_recipient
+```
+
+`--sops-config ../cluster-repo/.sops.yaml` selects that file but does not rewrite the secret's
+path for `creation_rules`; a cluster-only `path_regex: kubernetes/.*` still will not match the
+app repo's `.k8s-adapter/gitops/secrets/...` path.
+
+For SOPS mode, reconcile the encrypted Secrets separately and make the application wait for
+them. Pointing a Flux `Kustomization` directly at `bundle/secrets` is intentional: Flux generates
+the small Kustomize file for that directory, while `app/kustomization.yaml` prevents it from trying
+to parse the Helm chart and values as Kubernetes resources. The `sops-age` Secret must exist in
+the same namespace as the `<release>-secrets` Flux `Kustomization`; many cluster repositories copy
+it into each application namespace through a reusable component.
+
+The example keeps the shared `GitRepository` in `flux-system` while the two `Kustomization`
+objects and the `HelmRelease` live in the application namespace. It therefore requires both
+kustomize-controller and helm-controller to allow cross-namespace source references. Clusters that
+set `--no-cross-namespace-refs=true` must provide an equivalent `GitRepository` in the application
+namespace and remove `namespace: flux-system` from each `sourceRef` below.
+
+```yaml
+# kubernetes/apps/<namespace>/<release>/ks.yaml
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: <release>-secrets
+  namespace: <namespace>
+spec:
+  interval: 30m
+  retryInterval: 1m
+  path: ./kubernetes/apps/<namespace>/<release>/app/bundle/secrets
+  targetNamespace: <namespace>
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+    namespace: flux-system
+  decryption:
+    provider: sops
+    secretRef:
+      name: sops-age
+  wait: true
+  timeout: 5m
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: <release>
+  namespace: <namespace>
+spec:
+  interval: 30m
+  retryInterval: 1m
+  path: ./kubernetes/apps/<namespace>/<release>/app
+  targetNamespace: <namespace>
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+    namespace: flux-system
+  dependsOn:
+    - name: <release>-secrets
+  wait: true
+  timeout: 65m
+```
+
+If `--secrets external` is used instead, omit the Secrets `Kustomization` and `dependsOn`, and
+make sure the named `ExternalSecret` store and registry pull Secrets already exist.
+
+```yaml
+# kubernetes/apps/<namespace>/<release>/app/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ./helmrelease.yaml
+```
+
+```yaml
+# kubernetes/apps/<namespace>/<release>/app/helmrelease.yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: <release>
+  namespace: <namespace>
+spec:
+  interval: 30m
+  timeout: 60m
+  chart:
+    spec:
+      chart: ./kubernetes/apps/<namespace>/<release>/app/bundle/chart
+      sourceRef:
+        kind: GitRepository
+        name: flux-system
+        namespace: flux-system
+      valuesFiles:
+        - ./kubernetes/apps/<namespace>/<release>/app/bundle/values/values.yaml
+  driftDetection:
+    mode: enabled
+    ignore:
+      - target:
+          kind: Service
+        paths:
+          - /spec/selector
+```
+
+The kind-wide Service ignore is deliberate and is safer than enumerating pool names: a later
+bundle can add a pool without silently reintroducing selector drift. Do not set
+`install.disableWaitForJobs` or `upgrade.disableWaitForJobs`; Flux must wait for the cutover Job.
+Keep the chart's default `ChartVersion` reconciliation strategy. Every emitted build has a
+build-specific `Chart.yaml` version, so a new bundle triggers an upgrade while an unrelated commit
+elsewhere in the shared cluster repository does not. `Revision` is unsafe here: it turns every
+repository commit into a Helm upgrade, which can reapply the chart's pre-cutover Service selectors.
+The 60-minute timeout is a small-topology example. Keep the `HelmRelease` timeout larger than the
+emitted Job's sequential gate budget (each pool rollout and the routing rollout can wait up to ten
+minutes), and keep the parent Kustomization timeout larger than the HelmRelease timeout.
+
+For every subsequent build, the app pipeline checks out the cluster repository, passes the old
+`app/bundle` to `--previous-bundle`, replaces `app/bundle` wholesale, copies the emitted
+`renovate.json5` ignore path into the cluster repository's root Renovate config, and opens a PR.
+The PR is the review boundary; merging it is the deployment trigger. Never let Renovate or Flux
+image automation edit files inside `bundle/` independently.
+
 ## Secrets
 
 `--secrets external` (default): the bundle chart omits `internal-secret.yaml`/`valkey-secret.yaml` and emits `templates/external-secret.yaml`—ExternalSecrets gated on `externalSecrets.storeName` in values—plus a README table of the exact Secret names/keys the pods reference. Load the values into your store from the build output (the gitignored `chart/templates/internal-secret.yaml` holds the rendered dispatch secret).
 
 `--secrets sops`: the same secret objects inline mode ships in-chart—the per-build dispatch Secret and, when the cache is enabled, the Valkey connection Secret—are written as plain YAML and encrypted through the `sops` CLI into `secrets/<name>.sops.yaml`. The chart omits the secret templates (like external mode); the encrypted files are applied by your GitOps engine's SOPS integration. **Recipients come from the repo's own `.sops.yaml` creation rules**: emit walks up from the bundle directory for `.sops.yaml` and runs sops with its cwd at that directory, never passing recipients on argv—so the same rules that govern every other secret in the repo govern these (`--sops-config <path>` names a config explicitly). Fail-closed: a missing `sops` binary, no discoverable `.sops.yaml`, or a nonzero sops exit is a hard error—emit **never** falls back to writing plaintext.
 
-With Flux, decrypt via a Kustomization pointed at `secrets/`:
+With Flux, decrypt via a Kustomization pointed at `secrets/`. This same-repository example keeps
+the emitted path; for a split app/cluster repository, use the complete recipe above and point at
+the copied `app/bundle/secrets` directory instead:
 
 ```yaml
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 spec:
   path: ./.k8s-adapter/gitops/secrets
+  targetNamespace: <namespace>
   decryption:
     provider: sops
     secretRef:

@@ -1,57 +1,6 @@
 ---
 name: configure
-description: adapter.config.mjs authoring expert guidance for @next-community/adapter-k8s. Use when creating or editing adapter.config.mjs, picking a target composition (kubernetesCluster, gkeCluster, gatewayApiExposure, httpRouteExposure, ingressExposure, manualExposure, envoyNativeRouting), setting up pools, or preparing a project to run npx adapter-k8s deploy or emit.
-metadata:
-  priority: 8
-  docs:
-    - "https://github.com/nextjs/adapter-k8s#readme"
-  pathPatterns:
-    - "adapter.config.*"
-    - ".k8s-adapter/**"
-  bashPatterns:
-    - '\badapter-k8s\s+init\b'
-    - '\badapter-k8s\s+deploy\b'
-    - '\bnpx\s+adapter-k8s\b'
-    - '\bkubectl\s+get\s+gatewayclass'
-  importPatterns:
-    - "@next-community/adapter-k8s"
-  promptSignals:
-    phrases:
-      - "adapter.config"
-      - "deploy next.js to kubernetes"
-      - "adapter-k8s"
-      - "set up the adapter"
-    allOf:
-      - [next, kubernetes]
-      - [configure, adapter]
-    anyOf:
-      - "gatewayclass"
-      - "ingress"
-      - "gke"
-    noneOf:
-      - "terraform"
-      - "vercel deploy"
-    minScore: 6
-retrieval:
-  aliases:
-    - adapter config
-    - k8s adapter setup
-    - kubernetes target
-  intents:
-    - create adapter.config.mjs
-    - pick a target composition
-    - configure pools and scaling
-    - choose gateway or ingress exposure
-    - prepare a project for adapter-k8s deploy
-  entities:
-    - adapter.config.mjs
-    - defineTarget
-    - kubernetesCluster
-    - gatewayApiExposure
-    - httpRouteExposure
-    - envoyNativeRouting
-    - gkeCluster
-    - infrastructure.json
+description: adapter.config.mjs and application-PR authoring guidance for @next-community/adapter-k8s. Use when preparing a project for the adapter, opening a project-only setup PR, creating or editing adapter.config.mjs, picking a target composition (kubernetesCluster, gkeCluster, gatewayApiExposure, httpRouteExposure, ingressExposure, manualExposure, envoyNativeRouting), setting up pools, or preparing to run npx adapter-k8s deploy or emit.
 ---
 
 # Configure adapter-k8s
@@ -65,6 +14,7 @@ You are a configuration author for `@next-community/adapter-k8s`. Your job is to
 - **`envoyNativeRouting` only for Envoy-controlled classes.** A non-Envoy GatewayClass programs the Gateway and then silently never calls the routing service. When unsure, omit `routing` — the default `portableRouting()` works on any exposure.
 - **One of `target` or legacy `provider`, never both** — config validation rejects the pair.
 - Every key you write must exist in `K8sAdapterConfig` (shipped as `dist/types.d.ts` in the installed package) and every component in `dist/target/components.d.ts`. Do not invent options.
+- **Keep a project-PR request inside the project.** It may add the dependency, lockfile, adapter wiring, config, and non-secret SOPS recipient policy. It must not edit a cluster repository, push deployment images, run `emit`, apply Kubernetes resources, or merge either PR.
 
 ## Step 1 — Inspect what access exists
 
@@ -130,13 +80,33 @@ npx next build                    # validates config, compiles the target
 npx adapter-k8s deploy --dry-run  # prints the deploy plan; never builds or touches the cluster
 ```
 
-If validation fails, fix the exact reported key — the validators name the offending field. Then tell the user the next command is:
+If validation fails, fix the exact reported key — the validators name the offending field. For an
+imperatively managed cluster, tell the user the next command is:
 
 ```bash
 npx adapter-k8s deploy
 ```
 
-**If the cluster is reconciled by Argo CD or Flux**, `deploy` is the wrong verb — CI has no kubeconfig there and the reconciler owns apply. Point the user at `npx adapter-k8s emit` instead (renders a committable bundle, no cluster contact), and at `skills/deploy` plus `docs/gitops.md` for the flow. Two things to raise before they commit anything: run `npx adapter-k8s migrate` first on a release that was previously deployed imperatively, and use `--secrets sops` (or the default `external`) so the bundle never carries plaintext secrets.
+### Project-PR mode
+
+When the user asks to prepare the application as the first half of a two-PR GitOps onboarding:
+
+1. The adapter dependency must be reproducible on another checkout. Never commit `npm link`, an
+   absolute `file:/Users/...` dependency, or a tarball path that exists only on this machine. Use a
+   published/canary package or a stable package artifact URL. If none exists, validate locally but
+   report package distribution as the blocker to opening a mergeable PR.
+2. Commit only application-owned files: package manifest + lockfile, adapter wiring,
+   `adapter.config.*`, and an optional `.sops.yaml` rule containing public recipients. Keep
+   `.k8s-adapter/` ignored; it holds credentials, generated output, and local infrastructure state.
+3. Create the ignored `.k8s-adapter/infrastructure*.json` only for local validation. Put its
+   non-secret handoff facts in the PR description: release name, namespace, registry, hostname,
+   target platform, and config variant. Never print or commit the internal-secret key.
+4. Run `next build`, review the generated target/composition summary, and leave the tracked tree
+   containing only the intended project setup.
+5. Open the application PR and stop. The cluster PR is a later deploy-skill task against the exact
+   reviewed application commit; generating it early makes its image digests and bundle stale.
+
+**If the cluster is reconciled by Argo CD or Flux**, `deploy` is the wrong verb — CI has no kubeconfig there and the reconciler owns apply. Hand off to the packaged [deploy skill](../deploy/SKILL.md) and its [GitOps guide](../../docs/gitops.md), which use `npx adapter-k8s emit` to render a committable bundle without cluster contact. Two things to raise before they commit anything: run `npx adapter-k8s migrate` first on a release that was previously deployed imperatively, and use `--secrets sops` (or the default `external`) so the bundle never carries plaintext secrets.
 
 ## Gotchas
 
