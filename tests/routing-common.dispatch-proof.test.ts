@@ -225,6 +225,46 @@ describe("the build-derived covered names (matcherProofHeaderNames / buildProofH
       ]),
     ).toEqual(["x-real-one"]);
   });
+
+  it("excludes the W3C trace headers, which the routing tier overwrites AFTER minting the proof", () => {
+    // A5-X3. These are the one covered-set entry a matcher can pull in on its own — they are in
+    // neither INTERNAL_DISPATCH_HEADERS nor PROOF_COVERED_CONTEXT_HEADERS. An OTel-enabled
+    // routing tier injects them with OVERWRITE_IF_EXISTS_OR_ADD after handler() has already
+    // signed the request (routing-service/server.ts injectTraceHeaders), so binding them would
+    // compare the edge's pre-injection bytes against the pool's post-injection value and fail
+    // EVERY proof for that build — silently: trusted dispatch permanently off, middleware run
+    // twice per request, nothing logged.
+    expect(
+      matcherProofHeaderNames([
+        {
+          regexp: "^/a$",
+          has: [
+            { type: "header", key: "traceparent" },
+            { type: "header", key: "TraceState" },
+          ],
+        },
+      ]),
+    ).toEqual([]);
+    // Not a blanket ban on the surrounding matcher: real names alongside them still bind.
+    expect(
+      matcherProofHeaderNames([
+        {
+          regexp: "^/a$",
+          has: [
+            { type: "header", key: "traceparent" },
+            { type: "cookie", key: "session" },
+          ],
+        },
+      ]),
+    ).toEqual(["cookie"]);
+    expect(
+      buildProofHeaderNames({
+        middleware: {
+          matchers: [{ regexp: "^/a$", has: [{ type: "header", key: "tracestate" }] }],
+        },
+      }),
+    ).toEqual([]);
+  });
 });
 
 describe("dispatchProofInputsFromRequest / verifyDispatchProof", () => {

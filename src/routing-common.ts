@@ -236,12 +236,29 @@ export const PROOF_COVERED_CONTEXT_HEADERS = [
 // REWRITTEN between the two tiers (the edge sets/deletes `x-nextjs-data` for its own matcher
 // evaluation and clears the whole list on egress), so binding a wire value for them would compare
 // the edge's pre-strip bytes against the pool's post-clear absence and fail every proof.
+//
+// The W3C trace headers are excluded for that SAME rewritten-between-the-tiers reason, and are
+// worth naming explicitly because only a middleware `matcher` condition can pull them in (they
+// are in neither the dispatch vocabulary nor PROOF_COVERED_CONTEXT_HEADERS). An OTel-enabled
+// routing tier injects `traceparent`/`tracestate` with OVERWRITE_IF_EXISTS_OR_ADD *after*
+// handler() has already minted the proof (routing-service/server.ts injectTraceHeaders), so
+// binding them would compare the edge's pre-injection bytes against the pool's post-injection
+// value and fail EVERY proof for that build — silently and permanently: trusted dispatch off,
+// middleware run twice per request, `x-mw-request-headers` never applied, and nothing logged.
+//
+// ACCEPTED RESIDUAL: a matcher gating on a trace header is then an UNBOUND proof input. That
+// costs no integrity, because the value the pool sees is edge-controlled anyway — the routing
+// tier overwrites it unconditionally on every routed and continued response, so the client's own
+// bytes never reach the pool and there is nothing an attacker could swap that the edge has not
+// already replaced.
 const PROOF_EXCLUDED_MATCHER_HEADERS: ReadonlySet<string> = new Set<string>([
   ...INTERNAL_DISPATCH_HEADERS,
   ...UNTRUSTED_NEXT_REQUEST_HEADERS,
   INTERNAL_SECRET_HEADER,
   INTERNAL_DISPATCH_PROOF_HEADER,
   "host",
+  "traceparent",
+  "tracestate",
 ]);
 
 /**
@@ -257,7 +274,9 @@ const PROOF_EXCLUDED_MATCHER_HEADERS: ReadonlySet<string> = new Set<string>([
  * re-opened one header at a time.
  *
  * `query` and `host` conditions add no names: they read `url.searchParams` and `url.hostname`,
- * already bound by the request target and the authority.
+ * already bound by the request target and the authority. Names in
+ * PROOF_EXCLUDED_MATCHER_HEADERS add none either — see that set for why binding a value the two
+ * tiers do not see identically would fail every proof rather than bind anything.
  */
 export function matcherProofHeaderNames(matchers: MiddlewareMatcher[] | undefined): string[] {
   if (!matchers || matchers.length === 0) return [];

@@ -635,6 +635,59 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
     expect(verifyAsPool(proof, { target: "/about", headers: atPool })).toBe(false);
   });
 
+  it("signs the ORIGINAL wire target across the trailing-slash/i18n retry", async () => {
+    // N40c. The retry recurses into handleRequest with `:path` replaced by the retried,
+    // locale-prefixed URL so resolution runs against the real target — but the mutation response
+    // never mutates `:path` (the public target is preserved for the client; the rewrite rides in
+    // `x-invoke-path`), so Envoy forwards the ORIGINAL target upstream and the pool verifies with
+    // `req.url` = that original. Signing the recursion's own `:path` made EVERY retried request
+    // fail verification: the pool silently stripped the whole dispatch vocabulary and re-resolved
+    // locally, running middleware a SECOND time — the exact double execution the retry's
+    // `middlewareAlreadyRan` plumbing exists to prevent, on every i18n build in production.
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const manifest = makeManifest({
+      i18n: { locales: ["en"], defaultLocale: "en" } as any,
+      poolAssignments: { "/about": "ssr" },
+      pathnames: ["/about"],
+    });
+    const proofHeaderNames = buildProofHeaderNames(manifest);
+    let call = 0;
+    vi.mocked(resolveRoutes).mockImplementation(async () => {
+      call++;
+      if (call === 1) {
+        // Pure internal trailing-slash artifact: locale-stripped target == request path and
+        // status 308 → normalizeResolvedRedirect returns kind "retry".
+        return {
+          redirect: { url: new URL("https://app.example.com/en/about"), status: 308 },
+        } as any;
+      }
+      return {
+        resolvedPathname: "/en/about",
+        invocationTarget: { pathname: "/en/about", query: {} },
+      } as any;
+    });
+
+    const handler = createRequestHandler(manifest, null);
+    const response = await handler(makeHeaders("/about?x=1"));
+    // The retry really happened (two resolution passes) …
+    expect(call).toBe(2);
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    // … and no hop rewrote the public target, so the pool will read `/about?x=1` as `req.url`.
+    expect(mutation.setHeaders!.find((h) => h.header.key === ":path")).toBeUndefined();
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const atPool = poolViewOf(mutation);
+
+    expect(verifyAsPool(proof, { target: "/about?x=1", headers: atPool, proofHeaderNames })).toBe(
+      true,
+    );
+    // And NOT against the retried path, which never reaches the wire — the transcript that used
+    // to be signed here.
+    expect(
+      verifyAsPool(proof, { target: "/en/about?x=1", headers: atPool, proofHeaderNames }),
+    ).toBe(false);
+  });
+
   it("removes x-internal-secret AND the proof when none is configured (client cannot spoof either)", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({

@@ -193,9 +193,13 @@ export function renderNetworkPolicies({
    * README states plainly. A provider whose gateway runs IN the cluster supplies a podSelector
    * instead: real workload identity, scoped to that release's own proxies.
    *
-   * This matters more than it looks: the ext_proc reply carries INTERNAL_HEADER_SECRET, so
-   * whatever can reach :8443 can obtain the credential that makes a pool trust dispatch
-   * headers. Defaults to GKE's CIDRs so existing callers are unchanged.
+   * This matters more than it looks. The ext_proc reply no longer carries the raw secret — it
+   * carries a per-request HMAC proof bound to the request that was resolved
+   * (routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER), and the secret never crosses the wire.
+   * But the routing service authenticates no callers, so whatever can reach :8443 is handed a
+   * valid proof for a request of its OWN choosing: a signing oracle, not credential disclosure.
+   * Reachability is still what bounds who may ask for a routing verdict at all.
+   * Defaults to GKE's CIDRs so existing callers are unchanged.
    */
   ingressSources?: {
     cidrs: readonly string[];

@@ -193,9 +193,28 @@ export function createRequestHandler(
       middlewareAlreadyRan: true;
       mwEvaluated: MwEvaluated;
       middlewareRequestHeaders?: Headers | undefined;
+      // N40c (SECURITY/AVAILABILITY). The `:path` of the ORIGINAL request — the target the POOL
+      // will actually see. See `wireTarget` below: the retry recursion resolves against a
+      // REWRITTEN `:path`, but nothing ever mutates `:path` on the wire, so the dispatch proof
+      // must be signed with this value and not with the recursion's own view of the target.
+      wireTarget: string;
     },
   ): Promise<ProcessingResponse> {
     const rawPath = getHeader(requestHeaders, ":path") ?? "/";
+    // N40c (SECURITY/AVAILABILITY). The request target the POOL will read back as `req.url`, and
+    // therefore the only target the dispatch proof may be signed with.
+    //
+    // It is NOT always `rawPath`. The trailing-slash/i18n retry below recurses into this handler
+    // with a header list whose `:path` is replaced by the retried (locale-prefixed) URL, so the
+    // recursion resolves the real target — but the mutation response deliberately never mutates
+    // `:path` (the public target is preserved for the client; the rewrite travels in
+    // `x-invoke-path`), so Envoy forwards the ORIGINAL target upstream. Signing the recursion's
+    // own `rawPath` therefore produced a transcript the pool could never reproduce: EVERY retried
+    // request failed verification, the pool silently stripped the dispatch vocabulary and
+    // re-resolved locally, and middleware ran a second time — the exact double execution the
+    // retry's `middlewareAlreadyRan` plumbing (N40) exists to prevent, on every i18n build whose
+    // root resolves through the internal 308 artifact.
+    const wireTarget = retry?.wireTarget ?? rawPath;
     const method = getHeader(requestHeaders, ":method") ?? "GET";
     const scheme = getHeader(requestHeaders, ":scheme") ?? "https";
     // Raw authority, absence preserved: the dispatch proof covers it (the pool reads the same
@@ -654,10 +673,13 @@ export function createRequestHandler(
         // the retry does NOT run middleware a second time (see the `retry` parameter) —
         // TOGETHER WITH the request headers that pass mutated (N40b), or the retried response
         // pairs a trusted `x-mw-evaluated: ran` with the client's own headers.
+        // N40c: and carry the ORIGINAL wire target, which is what the pool will see as `req.url`
+        // — the recursion's own `:path` is the retried one and exists only to steer resolution.
         return handleRequest(retried, shedSignal, {
           middlewareAlreadyRan: true,
           mwEvaluated,
           middlewareRequestHeaders,
+          wireTarget,
         });
       }
       const responseHeaders: Record<string, string> = {};
@@ -929,7 +951,9 @@ export function createRequestHandler(
         key: INTERNAL_DISPATCH_PROOF_HEADER,
         value: computeDispatchProof(internalSecret, {
           method,
-          target: rawPath,
+          // N40c: the target the POOL will read back, not this pass's `:path` — they differ
+          // across the trailing-slash/i18n retry recursion (see `wireTarget`).
+          target: wireTarget,
           authority: rawAuthority,
           headers: covered,
           proofHeaderNames,

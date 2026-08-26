@@ -2345,9 +2345,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     };
   };
   // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch
-  // headers and authenticates them with a shared secret (INTERNAL_HEADER_SECRET, injected from
-  // a Secret). When the secret is set the pool trusts dispatch headers only if it matches;
-  // TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test paths).
+  // headers and authenticates them with a PER-REQUEST HMAC PROOF derived from the shared secret
+  // (INTERNAL_HEADER_SECRET, injected from a Secret; the secret itself never crosses the wire —
+  // routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER). When the secret is set the pool trusts
+  // dispatch headers only if the presented proof verifies over every routing input it is about to
+  // act on; TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test
+  // paths).
   // Declared here (rather than beside the server construction) because `revalidate` below is the
   // second entrance to the same trust boundary and must be configured identically.
   const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
