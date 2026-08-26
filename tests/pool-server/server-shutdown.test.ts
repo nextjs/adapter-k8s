@@ -10,7 +10,7 @@
 //     waited out `terminationGracePeriodSeconds` and died to SIGKILL.
 // `stop()` is the settle-always form the signal handler now uses. Real sockets throughout: the
 // bug only exists at the socket layer, so a mock could not have caught it.
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import net from "node:net";
 import { get as httpGet, type IncomingMessage, type ServerResponse } from "node:http";
 import { createPoolServer } from "../../src/pool-server/server.js";
@@ -23,7 +23,28 @@ afterEach(async () => {
     await pool.stop({ graceMs: 200 });
     pool = null;
   }
+  vi.restoreAllMocks();
 });
+
+/**
+ * The single "drain complete" line is the whole post-incident record of a rollout, so its counts
+ * are asserted as parsed numbers rather than as a substring match.
+ */
+function captureDrainLog(): () => Record<string, number> {
+  const lines: string[] = [];
+  vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  });
+  return () => {
+    const line = lines.find((value) => value.includes("drain complete"));
+    if (!line) throw new Error(`no drain-complete log line in: ${JSON.stringify(lines)}`);
+    const counts: Record<string, number> = {};
+    for (const [, key, value] of line.matchAll(/([A-Za-z]+)=(\d+)/g)) {
+      counts[key] = Number(value);
+    }
+    return counts;
+  };
+}
 
 describe("createPoolServer().stop()", () => {
   it("tracks upgraded sockets and closes them with WebSocket 1001 after the grace window", async () => {
@@ -272,6 +293,102 @@ describe("createPoolServer().stop()", () => {
     expect(received).toContain("503 Service Unavailable");
     expect(received.toLowerCase()).toContain("retry-after: 1");
     socket.destroy();
+    pool = null;
+  });
+
+  it("counts an SSE stream whose EOF never flushed once, not as both sseEnded and httpForced", async () => {
+    // A client that stops reading closes its TCP receive window, so the drain's res.end() sits in
+    // the socket buffer past the 250ms flush window and the response is still active when the
+    // final destroy loop runs. That loop used to credit the same stream to httpForced on top of
+    // the sseEnded it already had, so the categories summed to 2 for a single response.
+    // Tracked through the public writable contract rather than a sleep: `drain` firing would mean
+    // the buffers absorbed everything, and the wait below then fails loudly instead of asserting
+    // the fixed counts against a response that actually flushed.
+    let backpressured = false;
+    pool = createPoolServer({
+      onRequest: (_req: IncomingMessage, res: ServerResponse) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.flushHeaders();
+        res.on("drain", () => (backpressured = false));
+        // Enough volume that no loopback socket buffer can swallow the whole body — the writes
+        // that do not fit stay queued in userland for as long as the client refuses to read.
+        const chunk = `: ${"x".repeat(256 * 1024)}\n\n`;
+        for (let index = 0; index < 96; index += 1) {
+          if (!res.write(chunk)) backpressured = true;
+        }
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write("GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    // Never read: no 'data' listener and no resume(), so the receive window fills and stays shut.
+    socket.pause();
+    while (!backpressured) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+    const readDrainLog = captureDrainLog();
+    await pool.stop({ graceMs: 120 });
+    const counts = readDrainLog();
+
+    expect(counts.http).toBe(1);
+    expect(counts.sseForced).toBe(1);
+    expect(counts.sseEnded).toBe(0);
+    expect(counts.httpForced).toBe(0);
+    expect(
+      counts.completed +
+        counts.clientClosed +
+        counts.sseEnded +
+        counts.sseForced +
+        counts.httpForced,
+    ).toBe(counts.http);
+    socket.destroy();
+    pool = null;
+  });
+
+  it("does not report a server-rejected upgrade as a voluntary peer close", async () => {
+    let releaseUpgrade!: (disposition: "accepted" | "rejected") => void;
+    const disposition = new Promise<"accepted" | "rejected">((resolve) => {
+      releaseUpgrade = resolve;
+    });
+    let upgradeEntered!: () => void;
+    const entered = new Promise<void>((resolve) => (upgradeEntered = resolve));
+    pool = createPoolServer({
+      onRequest: () => undefined,
+      onUpgrade: () => {
+        upgradeEntered();
+        return disposition;
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    socket.on("data", () => undefined);
+    socket.on("error", () => undefined);
+    const clientClosed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write(
+      "GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n" +
+        "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+        "Sec-WebSocket-Version: 13\r\n\r\n",
+    );
+    await entered;
+
+    const readDrainLog = captureDrainLog();
+    const drain = pool.stop({ graceMs: 400 });
+    // Resolve the handshake DURING the drain wait loop: the rejection's socket.end() is the only
+    // server-initiated close that runs before the terminal WebSocket phase, and it used to leave
+    // serverSignalled false so the close listener booked it as peerClosed.
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    releaseUpgrade("rejected");
+    await clientClosed;
+    await drain;
+    const counts = readDrainLog();
+
+    expect(counts.webSockets).toBe(1);
+    expect(counts.peerClosed).toBe(0);
     pool = null;
   });
 

@@ -285,11 +285,19 @@ interface ActiveResponseState {
   terminalAction?: "end-sse" | "force-close";
 }
 
+/**
+ * One drain outcome per tracked response, and one per tracked socket. The HTTP categories
+ * (completed, clientClosed, sseEnded, sseForced, httpForceClosed) are mutually exclusive and never
+ * sum past httpAtStart — an operator reading the single "drain complete" line after an incident has
+ * to be able to add them up, so a response that receives an SSE EOF and is then destroyed because
+ * the EOF never flushed must land in exactly one of them (sseForced), not in two.
+ */
 interface DrainMetrics {
   httpAtStart: number;
   httpCompleted: number;
   httpClientClosed: number;
   sseEnded: number;
+  sseForced: number;
   httpForceClosed: number;
   webSocketsAtStart: number;
   webSocketsPeerClosed: number;
@@ -438,7 +446,16 @@ export function createPoolServer(options: PoolServerOptions) {
       if (responseState.settled) return;
       responseState.settled = true;
       activeResponses.delete(res);
-      if (!drainMetrics || responseState.terminalAction) return;
+      if (!drainMetrics) return;
+      // Adapter-initiated terminal actions are counted where they are initiated — except the SSE
+      // EOF, whose outcome is only known once the response settles. Counting it here keeps a
+      // stream that flushed (sseEnded) apart from one still queued when the flush window expired,
+      // which the terminal phase counts as sseForced after flipping terminalAction.
+      if (responseState.terminalAction === "end-sse") {
+        drainMetrics.sseEnded += 1;
+        return;
+      }
+      if (responseState.terminalAction) return;
       if (finished || res.writableFinished) drainMetrics.httpCompleted += 1;
       else drainMetrics.httpClientClosed += 1;
     };
@@ -535,6 +552,10 @@ export function createPoolServer(options: PoolServerOptions) {
           const state = upgradedSockets.get(socket);
           if (state && disposition === "accepted") state.accepted = true;
           if (disposition === "rejected" && !socket.destroyed && !socket.writableEnded) {
+            // The SERVER is ending this handshake. Without the flag a rejection that lands after
+            // drain begins is reported as webSocketsPeerClosed — a voluntary peer departure the
+            // peer never made — because the close listener treats every unsignalled close as one.
+            if (state) state.serverSignalled = true;
             socket.end();
           }
         })
@@ -619,6 +640,7 @@ export function createPoolServer(options: PoolServerOptions) {
           httpCompleted: 0,
           httpClientClosed: 0,
           sseEnded: 0,
+          sseForced: 0,
           httpForceClosed: 0,
           webSocketsAtStart: upgradedSockets.size,
           webSocketsPeerClosed: 0,
@@ -653,7 +675,9 @@ export function createPoolServer(options: PoolServerOptions) {
           if (res.writableEnded || res.destroyed) continue;
           if (state.eventStream) {
             state.terminalAction = "end-sse";
-            drainMetrics.sseEnded += 1;
+            // Counted on settle (sseEnded) or in the final destroy loop (sseForced), not here: a
+            // client that is not reading leaves this EOF queued past the flush window, and the
+            // same stream must not be reported as both cleanly ended and force-closed.
             // Do not invent an SSE data/control event: event IDs and replay semantics belong to
             // the application. A clean HTTP EOF is sufficient for EventSource to reconnect.
             res.end();
@@ -704,8 +728,13 @@ export function createPoolServer(options: PoolServerOptions) {
         for (const [res, state] of activeResponses) {
           if (!res.destroyed) {
             if (state.terminalAction !== "force-close") {
+              // An SSE EOF still queued here never reached the client, so it belongs in its own
+              // category rather than in httpForced on top of the sseEnded it would otherwise also
+              // be credited with. Flipping terminalAction first keeps settleResponse from
+              // counting the destroy that follows a second time.
+              if (state.terminalAction === "end-sse") drainMetrics.sseForced += 1;
+              else drainMetrics.httpForceClosed += 1;
               state.terminalAction = "force-close";
-              drainMetrics.httpForceClosed += 1;
             }
             res.destroy();
           }
@@ -720,7 +749,7 @@ export function createPoolServer(options: PoolServerOptions) {
           `[pool-server] drain complete in ${elapsedMs}ms: ` +
             `http=${drainMetrics.httpAtStart} completed=${drainMetrics.httpCompleted} ` +
             `clientClosed=${drainMetrics.httpClientClosed} sseEnded=${drainMetrics.sseEnded} ` +
-            `httpForced=${drainMetrics.httpForceClosed}; ` +
+            `sseForced=${drainMetrics.sseForced} httpForced=${drainMetrics.httpForceClosed}; ` +
             `webSockets=${drainMetrics.webSocketsAtStart} ` +
             `peerClosed=${drainMetrics.webSocketsPeerClosed} ` +
             `signalled=${drainMetrics.webSocketsSignalled} ` +
