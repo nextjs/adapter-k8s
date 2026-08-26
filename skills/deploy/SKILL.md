@@ -146,7 +146,12 @@ For Flux with a chart committed in the cluster repository, use the copy-ready
 The non-negotiable pieces are:
 
 - copy the emitted bundle wholesale; do not hand-edit image fields inside it;
-- use a Git-sourced `HelmRelease` with `reconcileStrategy: Revision` and the emitted values file;
+- use a Git-sourced `HelmRelease` with the default `ChartVersion` strategy and the emitted values
+  file; each emitted build bumps `Chart.yaml`, while an unrelated cluster-repository commit must
+  not trigger an upgrade that reapplies pre-cutover Service selectors;
+- when the Flux objects live in the app namespace but their `GitRepository` lives in
+  `flux-system`, confirm both controllers allow cross-namespace source references; otherwise use
+  an equivalent same-namespace source;
 - enable drift detection but ignore `/spec/selector` on `Service` resources, kind-wide;
 - reconcile `bundle/secrets` through a SOPS-enabled Flux `Kustomization` before the HelmRelease,
   and set its `spec.targetNamespace` to the app namespace (the Flux object's own namespace does

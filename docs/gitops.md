@@ -214,6 +214,12 @@ to parse the Helm chart and values as Kubernetes resources. The `sops-age` Secre
 the same namespace as the `<release>-secrets` Flux `Kustomization`; many cluster repositories copy
 it into each application namespace through a reusable component.
 
+The example keeps the shared `GitRepository` in `flux-system` while the two `Kustomization`
+objects and the `HelmRelease` live in the application namespace. It therefore requires both
+kustomize-controller and helm-controller to allow cross-namespace source references. Clusters that
+set `--no-cross-namespace-refs=true` must provide an equivalent `GitRepository` in the application
+namespace and remove `namespace: flux-system` from each `sourceRef` below.
+
 ```yaml
 # kubernetes/apps/<namespace>/<release>/ks.yaml
 ---
@@ -288,7 +294,6 @@ spec:
         kind: GitRepository
         name: flux-system
         namespace: flux-system
-      reconcileStrategy: Revision
       valuesFiles:
         - ./kubernetes/apps/<namespace>/<release>/app/bundle/values/values.yaml
   driftDetection:
@@ -303,6 +308,10 @@ spec:
 The kind-wide Service ignore is deliberate and is safer than enumerating pool names: a later
 bundle can add a pool without silently reintroducing selector drift. Do not set
 `install.disableWaitForJobs` or `upgrade.disableWaitForJobs`; Flux must wait for the cutover Job.
+Keep the chart's default `ChartVersion` reconciliation strategy. Every emitted build has a
+build-specific `Chart.yaml` version, so a new bundle triggers an upgrade while an unrelated commit
+elsewhere in the shared cluster repository does not. `Revision` is unsafe here: it turns every
+repository commit into a Helm upgrade, which can reapply the chart's pre-cutover Service selectors.
 The 60-minute timeout is a small-topology example. Keep the `HelmRelease` timeout larger than the
 emitted Job's sequential gate budget (each pool rollout and the routing rollout can wait up to ten
 minutes), and keep the parent Kustomization timeout larger than the HelmRelease timeout.

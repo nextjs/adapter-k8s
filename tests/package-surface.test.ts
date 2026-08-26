@@ -82,4 +82,12 @@ describe("published package consumer surface", () => {
     expect(gitops).toContain("path: ./kubernetes/apps/<namespace>/<release>/app/bundle/secrets");
     expect(gitops).toContain("targetNamespace: <namespace>");
   });
+
+  it("does not turn every Flux source revision into a Helm upgrade", () => {
+    for (const relative of ["docs/gitops.md", "skills/deploy/SKILL.md"]) {
+      const content = readFileSync(path.join(repoRoot, relative), "utf8");
+      expect(content, relative).not.toContain("reconcileStrategy: Revision");
+      expect(content, relative).toContain("ChartVersion");
+    }
+  });
 });
