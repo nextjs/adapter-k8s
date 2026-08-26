@@ -28,6 +28,10 @@ export default createK8sAdapter({
   // Shared cross-replica cache (ISR/PPR revalidation, fetch cache). Requires a Valkey
   // instance — provisioned automatically on GKE, or bring your own via cache.url:
   //   cache: { enabled: true, provider: 'valkey', url: 'redis://my-valkey.internal:6379' },
+  // If the cache needs AUTH, do not write the credential in this file — adapter.config
+  // is meant to be committed. Use an env indirection instead:
+  //   cache: { enabled: true, provider: 'valkey', url: 'rediss://my-valkey.internal:6379',
+  //            password: process.env.VALKEY_AUTH },
   // Not yet implemented (validates but throws at build time):
   //   skewProtection: { enabled: true, duration: '5m' },
 
