@@ -320,7 +320,9 @@ const IMAGE_REGISTRY_RE =
   /^[a-z0-9]+([._-][a-z0-9]+)*(:[0-9]{1,5})?(\/[a-z0-9]+([._-][a-z0-9]+)*)*$/;
 // Next.js build ids (default or from `generateBuildId()` — commonly a git ref in CI).
 // Excludes helm `--set` metacharacters (`,` `\`) and YAML/template breakouts (`"` `'` `{`).
-const BUILD_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+// Exported for non-throwing call sites (type guards such as cli/state.ts's isAdapterState)
+// that need the same charset without the assert's error path.
+export const BUILD_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // GCS bucket naming rules (https://cloud.google.com/storage/docs/buckets#naming).
 const BUCKET_RE = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;

@@ -258,6 +258,22 @@ describe("runMigrate — annotating the retained set", () => {
     expect(annotateCalls()).toHaveLength(0);
   });
 
+  it("S13: rejects a poisoned infrastructure.json BEFORE any gcloud/kubectl call", async () => {
+    // destroy/describe/doctor/tail/rollback all ran assertSafeInfrastructure on this read;
+    // migrate was the gap — projectId/region below reach a `gcloud get-credentials` argv.
+    writeInfra({ ...PINNED_INFRA, projectId: "x&calc" });
+    await expect(
+      runMigrate({ projectDir: tmpDir, releaseName: RELEASE, yes: true }),
+    ).rejects.toThrow(/Invalid projectId/);
+    expect(vi.mocked(execCapture)).not.toHaveBeenCalled();
+    expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
+    // And the region slot is covered by the same read-time battery.
+    writeInfra({ ...PINNED_INFRA, region: "us-central1;rm -rf /" });
+    await expect(
+      runMigrate({ projectDir: tmpDir, releaseName: RELEASE, yes: true }),
+    ).rejects.toThrow(/Invalid region/);
+  });
+
   it("FAILS CLOSED on an unreadable list — an unannotated set must never look migrated", async () => {
     // The N20 family: "could not list" is NOT "nothing to annotate". Exiting 0 here would
     // green-light enabling a pruning reconciler over an unprotected parked build.
