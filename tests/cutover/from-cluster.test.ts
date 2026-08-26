@@ -158,6 +158,12 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
     expect(readWithout("defaultPool")).toThrow(/no defaultPool — refusing to promote/);
   });
 
+  it("fail-closed: defaultPool is not a member of poolTopology", () => {
+    expect(() =>
+      readJobEmitMetadata(mount(metadataFixture({ poolTopology: ["ssr"], defaultPool: "worker" }))),
+    ).toThrow(/defaultPool must name one of its poolTopology entries/);
+  });
+
   it("fail-closed: no registry — the edge revert could not run", () => {
     expect(readWithout("registry")).toThrow(/no registry — the edge revert could not run/);
   });

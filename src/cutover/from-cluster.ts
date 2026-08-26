@@ -116,6 +116,12 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
     throw new Error(`emit-metadata.json has no defaultPool — refusing to promote.`);
   }
   assertSafePoolName(meta.defaultPool);
+  if (!meta.poolTopology.includes(meta.defaultPool)) {
+    throw new Error(
+      `emit-metadata.json defaultPool must name one of its poolTopology entries; got ` +
+        `${JSON.stringify(meta.defaultPool)} — refusing to promote.`,
+    );
+  }
   if (meta.projectId != null) assertSafeProjectId(meta.projectId);
   const platformRaw = meta.targetPlatforms?.[meta.buildId];
   if (typeof platformRaw !== "string") {
