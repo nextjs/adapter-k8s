@@ -2198,8 +2198,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const stageStaticRuntimeFiles = async (
         poolName: string,
         stageDirOverride?: string,
+        includeFilePath?: (filePath: string) => boolean,
       ): Promise<void> => {
         for (const asset of staticManifest) {
+          // A caller whose context already holds part of the corpus filters those entries out.
+          // stageFile does not dedupe against a bulk `cp`: stagedPaths only records its own
+          // copies, and its exists-check skips a destination only when the realpaths MATCH, so an
+          // already-present copy is overwritten rather than left alone.
+          if (includeFilePath && !includeFilePath(asset.filePath)) continue;
           const absPath = path.resolve(projectDir, asset.filePath);
           await stageFile(projectDir, absPath, asset.filePath, poolName, false, stageDirOverride);
           // Runtime sibling files the manifest doesn't carry (`.meta` — see
@@ -2282,7 +2288,25 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         );
 
         const sharpStaging = await stageCommonRuntimeFiles("shared", true);
-        await stageStaticRuntimeFiles("shared", path.join(projectDir, absSharedStageDir));
+        // Only the entries the wholesale distDir `cp` above did NOT place. That copy already put
+        // every distDir-resident manifest entry — `static/**`, and each prerender's `.html` /
+        // `.segments` / `.meta` — at exactly the destination stageFile computes, and stageFile
+        // overwrites a non-identical destination instead of skipping it, so staging them again
+        // copies the whole corpus twice. On the 94k-route builds this staging exists to make
+        // cheap, that is the hot path. `public/` (never inside distDir) and any out-of-dist entry
+        // still need staging; `<distDir>/cache` is excluded from the cp, so anything under it
+        // stays eligible here.
+        const distDirStagedPrefix = distDirRel + path.sep;
+        const distCacheStagedPrefix = path.join(distDirRel, "cache") + path.sep;
+        await stageStaticRuntimeFiles(
+          "shared",
+          path.join(projectDir, absSharedStageDir),
+          (filePath) => {
+            const normalized = path.normalize(filePath);
+            if (!normalized.startsWith(distDirStagedPrefix)) return true;
+            return normalized.startsWith(distCacheStagedPrefix);
+          },
+        );
         await pruneSharpContext(path.join(projectDir, absSharedStageDir));
 
         // Keep .env secrets out of the shared image (built from this context).
