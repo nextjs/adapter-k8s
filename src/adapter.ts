@@ -1171,12 +1171,14 @@ export function ensureStateDirGitignored(projectDir: string): void {
         `secrets and deploy state and must never be committed.`,
     );
   } catch (err) {
-    // A hygiene guard must never break the build (read-only checkouts exist) — but a
-    // failure here means the secret-bearing directory CAN be committed, so say so loudly.
-    console.warn(
-      `[adapter-k8s] WARNING: could not add "${ignoreLine}" to .gitignore ` +
-        `(${err instanceof Error ? err.message : String(err)}). The directory holds ` +
-        `generated secrets — add the rule yourself before committing.`,
+    // Fail before deriveInternalSecret or chart emission writes anything under the state
+    // directory. A warning is not enough here: a writable state directory beside an
+    // unwritable .gitignore is exactly the partial-permission state that lets `git add -A`
+    // commit both the operator key and the rendered Secret manifest.
+    throw new Error(
+      `[adapter-k8s] Could not add "${ignoreLine}" to .gitignore ` +
+        `(${err instanceof Error ? err.message : String(err)}). Refusing to generate secret ` +
+        `material until the directory is ignored.`,
     );
   }
 }

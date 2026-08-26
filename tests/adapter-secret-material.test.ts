@@ -54,11 +54,14 @@ describe("ensureStateDirGitignored", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("fails SOFT but loud when the checkout is unwritable", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    // A projectDir that does not exist: writeFileSync throws ENOENT.
-    ensureStateDirGitignored(path.join(tmpDir, "does-not-exist"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("could not add"));
+  it("fails closed when .gitignore cannot be updated but the state directory is writable", () => {
+    // A directory at this path makes readFileSync fail while leaving projectDir writable. This
+    // pins the partial-permission case that would otherwise mint committable secret material.
+    mkdirSync(path.join(tmpDir, ".gitignore"));
+    expect(() => ensureStateDirGitignored(tmpDir)).toThrow(
+      /Could not add.*Refusing to generate secret material/,
+    );
+    expect(() => mkdirSync(path.join(tmpDir, ".k8s-adapter"))).not.toThrow();
   });
 });
 

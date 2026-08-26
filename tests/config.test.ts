@@ -322,35 +322,27 @@ describe("cache config", () => {
     );
   });
 
-  it("WARNS on a literal cache.password — adapter.config is meant to be committed", () => {
+  it("does not guess whether evaluated cache credentials came from literals or the environment", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const previousAuth = process.env.VALKEY_AUTH;
+    const previousUrl = process.env.VALKEY_URL;
     try {
-      validateConfig(withCache({ enabled: true, password: "hunter2" }));
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("cache.password"));
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("process.env"));
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it("WARNS on credentials embedded in cache.url userinfo", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      validateConfig(withCache({ enabled: true, url: "redis://:hunter2@cache:6379" }));
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("cache.url embeds credentials"));
-    } finally {
-      warn.mockRestore();
-    }
-  });
-
-  it("stays quiet for an env-sourced credential and a userinfo-less url", () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      validateConfig(withCache({ enabled: true, url: "rediss://cache:6380", password: undefined }));
-      validateConfig(withCache({ enabled: true, url: "redis://cache:6379" }));
+      process.env.VALKEY_AUTH = "from-env";
+      process.env.VALKEY_URL = "redis://:from-env@cache:6379";
+      validateConfig(
+        withCache({
+          enabled: true,
+          password: process.env.VALKEY_AUTH,
+          url: process.env.VALKEY_URL,
+        }),
+      );
       expect(warn).not.toHaveBeenCalled();
     } finally {
       warn.mockRestore();
+      if (previousAuth === undefined) delete process.env.VALKEY_AUTH;
+      else process.env.VALKEY_AUTH = previousAuth;
+      if (previousUrl === undefined) delete process.env.VALKEY_URL;
+      else process.env.VALKEY_URL = previousUrl;
     }
   });
 });
