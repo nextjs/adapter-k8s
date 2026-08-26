@@ -89,18 +89,27 @@ function webHeadersToNodeHeaders(webHeaders: Headers): Record<string, string | s
 // attacker-chosen origin into the relative-vs-absolute Location comparison below.
 const FORWARDED_HOST_RE = /^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/;
 
-// Effective public scheme of a request that reached this pool. TLS terminates at the load
-// balancer (GXLB) which stamps x-forwarded-proto, so the pool's own socket is always plain
-// http — the forwarded value is the only witness of the client's real scheme. Only the two
-// real schemes are honored — a spoofed value (e.g. `javascript:`) becomes http.
-function requestProtocol(req: IncomingMessage): "http" | "https" {
+// The client's real scheme as witnessed by x-forwarded-proto, or undefined when the header is
+// absent or carries anything other than one of the two real schemes (e.g. a spoofed
+// `javascript:`). Exported so websocket-upgrade.ts derives the handshake's same-origin authority
+// from the same witness this file uses — an https site behind the TLS-terminating load balancer
+// must compare a browser's `Origin: https://…` against `https://…`, not against the plain-http
+// scheme of the pool's own socket.
+export function validatedForwardedProtocol(req: IncomingMessage): "http" | "https" | undefined {
   const forwardedProto = req.headers["x-forwarded-proto"];
   const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
     ?.split(",")[0]
     ?.trim();
   return forwardedProtoValue === "https" || forwardedProtoValue === "http"
     ? forwardedProtoValue
-    : "http";
+    : undefined;
+}
+
+// Effective public scheme of a request that reached this pool. TLS terminates at the load
+// balancer (GXLB) which stamps x-forwarded-proto, so the pool's own socket is always plain
+// http — the forwarded value is the only witness of the client's real scheme.
+function requestProtocol(req: IncomingMessage): "http" | "https" {
+  return validatedForwardedProtocol(req) ?? "http";
 }
 
 function middlewareRedirectLocation(req: IncomingMessage, target: URL): string {

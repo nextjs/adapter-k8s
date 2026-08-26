@@ -296,6 +296,55 @@ describe("handleWebSocketUpgrade", () => {
     acceptedSocket.socket.destroy();
   });
 
+  it("treats a wss handshake behind the TLS-terminating load balancer as same-origin", async () => {
+    // TLS terminates at the load balancer, so the pool's socket is plain http even though the
+    // browser dialled wss:// against an https site. The same-origin authority must come from the
+    // validated x-forwarded-proto witness — otherwise every https app would need to list itself
+    // in webSocketRouteHandlers.allowedOrigins.
+    const sameOrigin = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    const sameOriginReq = request(undefined, {
+      "x-forwarded-proto": "https",
+      origin: "https://example.com",
+    });
+    sameOriginReq.socket = { encrypted: false };
+    const sameOriginSocket = captureSocket();
+    await expect(
+      handleWebSocketUpgrade(
+        sameOrigin.deps,
+        sameOriginReq,
+        sameOriginSocket.socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("accepted");
+    expect(sameOrigin.deps.webSocketAllowedOrigins).toBeUndefined();
+    expect(sameOrigin.resolve).toHaveBeenCalledOnce();
+    sameOriginSocket.socket.destroy();
+
+    // The forwarded witness only fixes the scheme — a genuinely different origin is still denied.
+    const crossOrigin = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    const crossOriginReq = request(undefined, {
+      "x-forwarded-proto": "https",
+      origin: "https://attacker.example",
+    });
+    crossOriginReq.socket = { encrypted: false };
+    const crossOriginSocket = captureSocket();
+    await expect(
+      handleWebSocketUpgrade(
+        crossOrigin.deps,
+        crossOriginReq,
+        crossOriginSocket.socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("rejected");
+    expect(crossOriginSocket.text()).toContain("HTTP/1.1 403 Forbidden");
+    expect(crossOriginSocket.text()).toContain("WebSocket origin is not allowed.");
+    expect(crossOrigin.resolve).not.toHaveBeenCalled();
+  });
+
   it("preserves only framework-authored middleware cookies into the generated request", async () => {
     const middlewareRequestHeaders = new Headers({
       host: "example.com",

@@ -21,7 +21,11 @@ import {
   parseRequestUrl,
 } from "../routing-common.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
-import { applyMiddlewareRequestHeaders, extractRouteParams } from "./dispatch.js";
+import {
+  applyMiddlewareRequestHeaders,
+  extractRouteParams,
+  validatedForwardedProtocol,
+} from "./dispatch.js";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 
@@ -161,11 +165,18 @@ function exactHttpOrigin(value: string): URL | undefined {
   return undefined;
 }
 
+// Same-origin authority a browser's `Origin` is compared against. TLS terminates at the load
+// balancer, so the pool's own socket is plain http even for a wss:// handshake against an https
+// site — deriving the scheme from `socket.encrypted` computed `http://host` and 403'd every
+// legitimate same-origin `Origin: https://host`. The validated x-forwarded-proto witness is the
+// same signal the HTTP path uses (requestProtocol in dispatch.ts); socket.encrypted is only the
+// fallback for a direct connection that carries no witness at all.
 function webSocketRequestAuthority(req: IncomingMessage): URL | undefined {
   const hosts = rawHeaderValues(req, "host");
   if (hosts.length !== 1 || !hosts[0] || /\s|[\\/@?#,]/.test(hosts[0])) return undefined;
   const encrypted = Boolean((req.socket as { encrypted?: boolean } | undefined)?.encrypted);
-  return exactHttpOrigin(`${encrypted ? "https" : "http"}://${hosts[0]}`);
+  const scheme = validatedForwardedProtocol(req) ?? (encrypted ? "https" : "http");
+  return exactHttpOrigin(`${scheme}://${hosts[0]}`);
 }
 
 function validateWebSocketHandshake(
@@ -479,9 +490,8 @@ function trustedResolutionFromHeaders(req: IncomingMessage): ResolveResult | und
 
 function publicRequestUrl(req: IncomingMessage): URL {
   const url = parseRequestUrl(req.url ?? "/", req.headers.host);
-  const forwarded = req.headers["x-forwarded-proto"];
-  const protocol = (Array.isArray(forwarded) ? forwarded[0] : forwarded)?.split(",", 1)[0]?.trim();
-  if (protocol === "https" || protocol === "http") url.protocol = `${protocol}:`;
+  const protocol = validatedForwardedProtocol(req);
+  if (protocol) url.protocol = `${protocol}:`;
   return url;
 }
 
