@@ -134,6 +134,7 @@ export async function runDescribe(options: {
         compositionSummary =
           `\n${d}Plan:    ${snapshot.digest}  ${description.resources.length} resources, ` +
           `${description.logs.length} log sources, ` +
+          `${description.telemetry.length} telemetry sources, ` +
           `${description.cleanup.kubernetes.length + description.cleanup.external.length} cleanup operations${x}`;
       }
     } catch (error) {

@@ -7,7 +7,12 @@
 // re-exports them so its import surface (and the tests that mock it) are unchanged.
 import { EXEC_TIMEOUTS, execCapture, execCaptureStdin } from "../cli/exec.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
-import { resolveK8sNamespace } from "../emit/templates/utils.js";
+import {
+  assertSafeBuildId,
+  assertSafeImageRegistry,
+  resolveK8sNamespace,
+} from "../emit/templates/utils.js";
+import { DIGEST_RE } from "../pipeline/digests.js";
 import {
   ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
   ROUTING_MANIFEST_VOLUME_NAME,
@@ -421,8 +426,17 @@ export async function revertRoutingServiceToBuild(opts: {
   /** The target build's recorded platform. Unknown legacy builds leave the selector alone. */
   targetPlatform?: TargetPlatform | undefined;
 }): Promise<void> {
-  const { releaseName, targetBuildId, registry, targetImageDigest, targetPlatform } = opts;
+  const { releaseName, targetBuildId, registry, targetPlatform } = opts;
   const namespace = resolveK8sNamespace(opts.namespace);
+  // SECURITY: every input that forms the image reference below is ConfigMap-sourced on the
+  // GitOps path (the emit-metadata CM mounts `registry`; the state CM carries
+  // `routingImageDigests`) and is therefore mutable by any namespace actor with
+  // configmaps/update — the exact actor the S1/S9 digest-pin defenses exist against. An
+  // unvalidated registry/digest pair here is an arbitrary-image injection into the routing
+  // Deployment via `kubectl patch`, and the routing pod starts with the release's internal
+  // dispatch secret. Validate at the point of consumption (AGENTS.md), even though the
+  // writers validated at write time.
+  assertSafeBuildId(targetBuildId);
   const deployName = routingServiceDeploymentName(releaseName);
   // N68: same distinction as retention — a read failure here used to return silently, i.e.
   // report "this release has no routing tier" and let the caller believe the edge was
@@ -445,6 +459,30 @@ export async function revertRoutingServiceToBuild(opts: {
         `reference cannot be formed. Restore it (re-run \`npx adapter-k8s init\`) and ` +
         `re-run the rollback. Traffic was NOT switched.`,
     );
+  }
+  assertSafeImageRegistry(registry);
+
+  // Digest when the deploy that pushed this build recorded one; tag otherwise (a build from
+  // before digests were recorded, where the tag is all that identifies it). A recorded digest
+  // that is not sha256:<64 hex> came out of an operator-mutable ConfigMap and is NOT a
+  // digest — refuse to put it in an image reference and revert by tag instead, exactly like
+  // a pre-digest build (availability is preserved; the injection vector is not).
+  let targetImageDigest: string | undefined;
+  if (opts.targetImageDigest === undefined) {
+    console.warn(
+      `  ! No recorded routing-image digest for build ${targetBuildId} — reverting the edge by ` +
+        `TAG. A retag of that tag would change what the edge runs on its next restart; the ` +
+        `next deploy records a digest so a later rollback can pin it.`,
+    );
+  } else if (!DIGEST_RE.test(opts.targetImageDigest)) {
+    console.warn(
+      `  ! Ignoring the recorded routing-image digest for build ${targetBuildId}: ` +
+        `${JSON.stringify(opts.targetImageDigest)} is not sha256:<64 hex>. Deploy state is ` +
+        `operator-mutable, so a malformed digest never reaches an image reference. ` +
+        `Reverting by TAG.`,
+    );
+  } else {
+    targetImageDigest = opts.targetImageDigest;
   }
 
   // Exactly what the edge is serving BEFORE this function changes anything, so a failed
@@ -480,18 +518,9 @@ export async function revertRoutingServiceToBuild(opts: {
     );
   }
 
-  // Digest when the deploy that pushed this build recorded one; tag otherwise (a build from
-  // before digests were recorded, where the tag is all that identifies it).
   const image = targetImageDigest
     ? `${registry}/routing-service@${targetImageDigest}`
     : `${registry}/routing-service:${targetBuildId}`;
-  if (!targetImageDigest) {
-    console.warn(
-      `  ! No recorded routing-image digest for build ${targetBuildId} — reverting the edge by ` +
-        `TAG. A retag of that tag would change what the edge runs on its next restart; the ` +
-        `next deploy records a digest so a later rollback can pin it.`,
-    );
-  }
   if (!targetPlatform) {
     console.warn(
       `  ! No recorded target platform for build ${targetBuildId}. This build predates ` +

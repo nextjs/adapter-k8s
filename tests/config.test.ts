@@ -1,5 +1,5 @@
 // tests/config.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { validateConfig, applyDefaults } from "../src/config.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 
@@ -320,6 +320,30 @@ describe("cache config", () => {
     expect(() => validateConfig(withCache({ enabled: true, url: "http://cache:6379" }))).toThrow(
       /redis:\/\//,
     );
+  });
+
+  it("does not guess whether evaluated cache credentials came from literals or the environment", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const previousAuth = process.env.VALKEY_AUTH;
+    const previousUrl = process.env.VALKEY_URL;
+    try {
+      process.env.VALKEY_AUTH = "from-env";
+      process.env.VALKEY_URL = "redis://:from-env@cache:6379";
+      validateConfig(
+        withCache({
+          enabled: true,
+          password: process.env.VALKEY_AUTH,
+          url: process.env.VALKEY_URL,
+        }),
+      );
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      if (previousAuth === undefined) delete process.env.VALKEY_AUTH;
+      else process.env.VALKEY_AUTH = previousAuth;
+      if (previousUrl === undefined) delete process.env.VALKEY_URL;
+      else process.env.VALKEY_URL = previousUrl;
+    }
   });
 });
 

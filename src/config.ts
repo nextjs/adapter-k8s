@@ -67,6 +67,7 @@ const RESERVED_ENV_NAMES = new Set([
   "NEXT_BUILD_ID",
   "POOL_NAME",
   "RELEASE_NAME",
+  "ADAPTER_K8S_PROVIDER_NAME",
   "INTERNAL_HEADER_SECRET",
   "VALKEY_URL",
   "VALKEY_AUTH",
@@ -387,6 +388,9 @@ export function validateConfig(input: unknown, releaseName?: string): void {
         "cache.url must be a redis:// or rediss:// connection string (or omit it to provision managed Memorystore)",
       );
     }
+    // This function receives the evaluated config object, so a literal and
+    // `process.env.VALKEY_AUTH` are both plain strings here. Do not claim to know which source
+    // the operator used. The scaffold documents the environment-variable form instead.
   }
   if (config.imageOptimizer?.enabled) {
     throw new Error("imageOptimizer.enabled is not implemented yet");

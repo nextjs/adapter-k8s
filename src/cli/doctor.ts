@@ -511,6 +511,7 @@ export async function runDoctor(options: {
             status: "pass",
             message:
               `${snapshot.digest} (${description.resources.length} contributed resources, ` +
+              `${description.telemetry.length} telemetry sources, ` +
               `${description.cleanup.kubernetes.length + description.cleanup.external.length} cleanup operations)`,
           });
           try {

@@ -292,6 +292,8 @@ const cluster = defineClusterComponent({
 
 Custom exposure and resource components emit typed Kubernetes objects. They must declare their API requirements and readiness conditions; the adapter checks them before mutation and records their exact object identities for rollback and cleanup. Raw YAML and inferred cloud names are deliberately outside this boundary.
 
+Any cluster, exposure, routing, or resource component can also return `telemetry: TelemetrySource[]`. A source declaratively identifies its producer and owner, activation mechanism, protocols and propagation, structured signal names, affected workloads, and bounded static attributes. The compiler validates and merges the sources, rejects duplicate IDs and the adapter-reserved `adapter.*` prefix, includes them in the target fingerprint, and stores them in the composition plan consumed by `describe` and `doctor`. This is how a project-owned NGINX ingress component can declare Prometheus/OTLP signals or OpenTelemetry Operator activation without adding an `if nginx` branch to the compiler. The contribution is inventory—not an executable callback, exporter selection, or permission to mutate a shared controller.
+
 Set `managedCache: "none"` for custom clusters and configure an operator-managed Valkey/Redis endpoint through `cache.url`. Managed cache provisioning is currently supplied only by the GKE preset.
 
 ## Legacy provider configuration

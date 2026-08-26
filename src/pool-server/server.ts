@@ -9,6 +9,17 @@ import {
   verifyDispatchProof,
 } from "../routing-common.js";
 import { guardStreamErrors } from "./dispatch.js";
+import {
+  metricHttpMethod,
+  recordPoolRequest,
+  recordSpanError,
+  requestParentContext,
+  runtimeTelemetryAttributes,
+  setSpanAttributes,
+  setSpanHttpStatus,
+  withAdapterSpan,
+  type TraceHeaderCarrier,
+} from "../telemetry.js";
 
 /**
  * LIVENESS. "This process is answering HTTP." Nothing more — do NOT gate traffic on it.
@@ -249,6 +260,8 @@ export interface PoolServerOptions {
    * AND was defeated by a query string — so the shadowing was inconsistent as well as silent.
    */
   appOwnsProbePath?: (pathname: string) => boolean;
+  /** Validated build-time pool name, used only as a bounded telemetry attribute. */
+  poolName?: string;
 }
 
 export function createPoolServer(options: PoolServerOptions) {
@@ -260,8 +273,16 @@ export function createPoolServer(options: PoolServerOptions) {
     proofHeaderNames,
     readiness,
     appOwnsProbePath,
+    poolName,
   } = options;
 
+  // /readyz detail goes to the pod LOG, not the wire: the probe interception runs before any
+  // trust check and the Gateway catch-all HTTPRoute forwards every path to this port, so the
+  // body is internet-visible. The reason string names internal route-output keys ("route
+  // module loaded (/ssr)") and startup state — a free side-channel into the release for any
+  // client. Log it once per transition; the probe consumer (kubelet, HealthCheckPolicy,
+  // cutover gate) reads only the status code.
+  let lastLoggedNotReady: string | undefined;
   const server: Server = createServer(async (req, res) => {
     // Probes bypass all routing — unless the app itself owns the pathname (see appOwnsProbePath).
     // The pathname is parsed rather than compared to the raw target so `/healthz?x=1` is still a
@@ -277,12 +298,18 @@ export function createPoolServer(options: PoolServerOptions) {
         return;
       }
       const state = readiness?.() ?? { ready: false, reason: "readiness state not wired" };
+      if (!state.ready && state.reason !== lastLoggedNotReady) {
+        lastLoggedNotReady = state.reason;
+        console.warn(`[pool-server] /readyz unavailable: ${state.reason}`);
+      } else if (state.ready) {
+        lastLoggedNotReady = undefined;
+      }
       res.writeHead(state.ready ? 200 : 503, {
         "content-type": "application/json",
         // A 503 must never be cached by the LB/CDN or a proxy between it and the kubelet.
         "cache-control": "no-store",
       });
-      res.end(JSON.stringify({ status: state.ready ? "ok" : "unavailable", reason: state.reason }));
+      res.end(JSON.stringify({ status: state.ready ? "ok" : "unavailable" }));
       return;
     }
 
@@ -292,26 +319,60 @@ export function createPoolServer(options: PoolServerOptions) {
       proofHeaderNames,
     });
 
-    const start = Date.now();
-    try {
-      await onRequest(req, res);
-    } catch (err) {
-      // The full error stays in the server log — the client body must not leak internal
-      // error messages (stack fragments, paths, upstream hostnames).
-      console.error("Unhandled request error:", err);
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "text/plain" });
-        res.end("Internal Server Error");
-      } else if (!res.writableEnded) {
-        res.end();
-      }
-    } finally {
-      const ms = Date.now() - start;
-      // Log the pathname only — the raw query string routinely carries tokens and
-      // signed parameters (pre-signed URLs, session hints) that must not land in logs.
-      const logPath = req.url?.split("?", 1)[0] ?? "";
-      console.log(`${req.method} ${logPath} → ${res.statusCode} (${ms}ms)`);
-    }
+    const start = performance.now();
+    const method = metricHttpMethod(req.method);
+    const providerAttributes = runtimeTelemetryAttributes();
+    const parentContext = requestParentContext(req.headers as TraceHeaderCarrier, true);
+    await withAdapterSpan(
+      "adapter-k8s.pool.request",
+      parentContext,
+      {
+        "adapter_k8s.component": "pool-server",
+        "http.request.method": method,
+        ...providerAttributes,
+        ...(poolName ? { "adapter_k8s.pool.name": poolName } : {}),
+      },
+      async ({ span }) => {
+        let requestFailed = false;
+        try {
+          await onRequest(req, res);
+        } catch (err) {
+          requestFailed = true;
+          recordSpanError(span, err);
+          // The full error stays in the server log — the client body must not leak internal
+          // error messages (stack fragments, paths, upstream hostnames).
+          console.error("Unhandled request error:", err);
+          if (!res.headersSent) {
+            res.writeHead(500, { "content-type": "text/plain" });
+            res.end("Internal Server Error");
+          } else if (!res.writableEnded) {
+            res.end();
+          }
+        } finally {
+          const ms = performance.now() - start;
+          const result = requestFailed || res.statusCode >= 500 ? "error" : "ok";
+          const metricAttributes = {
+            "adapter_k8s.component": "pool-server",
+            "adapter_k8s.pool.result": result,
+            "http.request.method": method,
+            "http.response.status_code": res.statusCode,
+            ...providerAttributes,
+            ...(poolName ? { "adapter_k8s.pool.name": poolName } : {}),
+          };
+          setSpanAttributes(span, {
+            "adapter_k8s.pool.result": result,
+            ...(poolName ? { "adapter_k8s.pool.name": poolName } : {}),
+          });
+          setSpanHttpStatus(span, res.statusCode);
+          recordPoolRequest(ms, metricAttributes);
+
+          // Log the pathname only — the raw query string routinely carries tokens and
+          // signed parameters (pre-signed URLs, session hints) that must not land in logs.
+          const logPath = req.url?.split("?", 1)[0] ?? "";
+          console.log(`${req.method} ${logPath} → ${res.statusCode} (${Math.round(ms)}ms)`);
+        }
+      },
+    );
   });
 
   // Keep-alive must outlive the proxy tier's upstream idle timeout (Envoy in front of this

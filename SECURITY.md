@@ -4,7 +4,7 @@ This document describes the security model of the infrastructure the adapter gen
 
 ## Reporting a vulnerability
 
-Please report suspected vulnerabilities privately via GitHub's [private vulnerability reporting](../../security/advisories/new) on this repository rather than opening a public issue. We'll acknowledge within a few days. The project is experimental and pre-1.0; there is no bug bounty.
+Please report suspected vulnerabilities privately via GitHub's [private vulnerability reporting](https://github.com/nextjs/adapter-k8s/security/advisories/new) on this repository rather than opening a public issue. We'll acknowledge within a few days. The project is experimental and pre-1.0; there is no bug bounty.
 
 ## Threat model in one paragraph
 

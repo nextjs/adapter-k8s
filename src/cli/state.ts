@@ -3,7 +3,8 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "
 import path from "node:path";
 import { stateFileName } from "./infrastructure-validation.js";
 import { execCapture, execCaptureStdin } from "./exec.js";
-import { resolveK8sNamespace } from "../emit/templates/utils.js";
+import { BUILD_ID_RE, resolveK8sNamespace } from "../emit/templates/utils.js";
+import { DIGEST_RE } from "../pipeline/digests.js";
 import type { TargetPlatform } from "../target-platform.js";
 
 const STATE_DIR = ".k8s-adapter";
@@ -179,7 +180,22 @@ function isAdapterState(value: unknown): value is AdapterState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   if (typeof v.buildId !== "string" || v.buildId === "") return false;
-  return v.previousBuildId === null || typeof v.previousBuildId === "string";
+  if (!(v.previousBuildId === null || typeof v.previousBuildId === "string")) return false;
+  // The state ConfigMap is operator-mutable (any namespace actor with configmaps/update can
+  // rewrite it), and routingImageDigests flows — via revertRoutingServiceToBuild — into the
+  // image reference of a `kubectl patch` on the routing Deployment. edge.ts validates at the
+  // consumption point; this is the belt-and-braces half: a state blob whose digests are not
+  // sha256:<64 hex> (or whose keys are not build ids) reads as "unknown", never as deployable
+  // truth (N20: unknown must fail closed, not read as a first deploy).
+  if (v.routingImageDigests !== undefined) {
+    if (typeof v.routingImageDigests !== "object" || v.routingImageDigests === null) return false;
+    if (Array.isArray(v.routingImageDigests)) return false;
+    for (const [key, digest] of Object.entries(v.routingImageDigests)) {
+      if (!BUILD_ID_RE.test(key)) return false;
+      if (typeof digest !== "string" || !DIGEST_RE.test(digest)) return false;
+    }
+  }
+  return true;
 }
 
 function generationOf(state: AdapterState): number {
@@ -215,8 +231,9 @@ function readLocalState(projectDir: string): AdapterState | null {
   }
   if (!isAdapterState(parsed)) {
     throw new LocalStateReadError(
-      `Local deploy state ${filePath} is missing a string "buildId" / "previousBuildId" — ` +
-        `refusing to treat it as "no deploys yet". Fix or delete the file.`,
+      `Local deploy state ${filePath} is missing a string "buildId" / "previousBuildId", ` +
+        `or carries a malformed "routingImageDigests" — refusing to treat it as "no deploys ` +
+        `yet". Fix or delete the file.`,
     );
   }
   return parsed;
@@ -543,7 +560,9 @@ function parseStateConfigMap(
     return {
       state: null,
       resourceVersion,
-      error: `ConfigMap ${cmName}'s state.json is missing a string "buildId" / "previousBuildId"`,
+      error:
+        `ConfigMap ${cmName}'s state.json is missing a string "buildId" / "previousBuildId", ` +
+        `or carries a malformed "routingImageDigests"`,
     };
   }
   return { state, resourceVersion };

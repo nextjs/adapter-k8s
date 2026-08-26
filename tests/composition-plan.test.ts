@@ -6,6 +6,7 @@ import {
   parseAndFingerprintCompositionPlan,
   parseAndVerifyCompositionPlan,
   parseCompositionPlan,
+  type CompositionPlan,
 } from "../src/composition-plan/index.js";
 
 const TARGET_FINGERPRINT = `sha256:${"a".repeat(64)}`;
@@ -70,6 +71,45 @@ function basePlan(): Record<string, unknown> {
   };
 }
 
+function telemetrySource(id = "provider.nginx-ingress"): Record<string, unknown> {
+  return {
+    id,
+    producer: { kind: "ingress-controller", name: "nginx-ingress" },
+    owner: "operator",
+    activation: {
+      kind: "otel-operator",
+      instrumentation: {
+        apiVersion: "opentelemetry.io/v1alpha1",
+        resource: "instrumentations",
+        name: "nginx-ingress",
+        namespace: "test-app",
+      },
+    },
+    protocols: ["prometheus"],
+    propagation: ["tracecontext"],
+    signals: [
+      {
+        kind: "metric",
+        name: "nginx_ingress_controller_requests",
+        instrument: "counter",
+        unit: "{request}",
+      },
+    ],
+    workloads: [
+      {
+        kind: "kubernetes-object",
+        object: {
+          apiVersion: "apps/v1",
+          resource: "deployments",
+          name: "ingress-nginx-controller",
+          namespace: "test-app",
+        },
+      },
+    ],
+    attributes: { "adapter_k8s.provider.name": "nginx-ingress" },
+  };
+}
+
 function reverseKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(reverseKeys);
   if (value === null || typeof value !== "object") return value;
@@ -85,6 +125,35 @@ describe("composition plan schema", () => {
     const plan = parseCompositionPlan(basePlan());
     expect(plan.apiVersion).toBe("adapter-k8s.nextjs.org/v1alpha1");
     expect(plan.requirements.kubernetes.minimumVersion).toBe("1.33.0");
+  });
+
+  it("parses declarative provider telemetry without executing provider code", () => {
+    const raw = basePlan();
+    (raw.operations as Record<string, unknown>).telemetry = [telemetrySource()];
+    const parsed = parseCompositionPlan(raw);
+    expect(parsed.operations.telemetry).toEqual([telemetrySource()]);
+  });
+
+  it("keeps telemetry absent on older authenticated v1alpha1 plans", () => {
+    const legacy = basePlan() as unknown as CompositionPlan;
+    const legacyDigest = fingerprintCompositionPlan(legacy);
+    const parsed = parseAndVerifyCompositionPlan(legacy, legacyDigest);
+    expect(parsed.operations).not.toHaveProperty("telemetry");
+  });
+
+  it("rejects duplicate or malformed telemetry contributions", () => {
+    const duplicate = basePlan();
+    (duplicate.operations as Record<string, unknown>).telemetry = [
+      telemetrySource(),
+      telemetrySource(),
+    ];
+    expect(() => parseCompositionPlan(duplicate)).toThrow(/duplicate source id/i);
+
+    const malformed = basePlan();
+    const source = telemetrySource();
+    (source.signals as Array<Record<string, unknown>>)[0]!.name = "bad metric name";
+    (malformed.operations as Record<string, unknown>).telemetry = [source];
+    expect(() => parseCompositionPlan(malformed)).toThrow(/invalid OpenTelemetry metric name/i);
   });
 
   it("rejects unknown fields at every parsed boundary", () => {

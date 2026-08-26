@@ -4,6 +4,7 @@ import {
   assertSafeImageRegistry,
   assertSafeQuantity,
   assertSafeReleaseName,
+  assertSafeTelemetryProviderName,
   UNCONFIGURED_IMAGE_REGISTRY,
   routingManifestSnapshotName as routingManifestSnapshotNameFor,
   renderImagePullSecrets,
@@ -65,6 +66,7 @@ export function renderRoutingServiceDeployment({
   env,
   envFrom,
   deploymentId,
+  providerName,
   nodeArchitecture = "amd64",
   pullSecrets,
 }: {
@@ -90,6 +92,8 @@ export function renderRoutingServiceDeployment({
   envFrom?: EnvFromSource[];
   /** next.config `deploymentId` — see renderDeployment; node middleware runs here. */
   deploymentId?: string;
+  /** Routing target component stamped onto adapter-owned OTEL signals. */
+  providerName?: string;
   nodeArchitecture?: TargetArchitecture;
   /** `imagePullSecrets` names — see renderDeployment's `pullSecrets` (same pattern). */
   pullSecrets?: string[];
@@ -102,6 +106,7 @@ export function renderRoutingServiceDeployment({
   // deploy replaces via `--set`; exempted by identity so the guard stays strict otherwise.
   if (imageRegistry !== UNCONFIGURED_IMAGE_REGISTRY) assertSafeImageRegistry(imageRegistry);
   if (imageDigest !== undefined) assertSafeImageDigest(imageDigest);
+  if (providerName !== undefined) assertSafeTelemetryProviderName(providerName);
 
   const safeBuildId = sanitizeK8sName(buildId);
   const cpuReq = resources?.cpu ?? DEFAULT_ROUTING_RESOURCES.cpu;
@@ -147,6 +152,9 @@ export function renderRoutingServiceDeployment({
   const { userEnv, userEnvFrom } = renderUserEnvBlocks(env, envFrom);
   const deploymentIdEnv = deploymentId
     ? `\n            - name: NEXT_DEPLOYMENT_ID\n              value: ${escapeHelmActions(JSON.stringify(deploymentId))}`
+    : "";
+  const providerNameEnv = providerName
+    ? `\n            - name: ADAPTER_K8S_PROVIDER_NAME\n              value: ${JSON.stringify(providerName)}`
     : "";
   // Registry pull auth (config imagePullSecrets) — "" when unconfigured (byte-identical
   // charts for public registries). Same baked pattern as renderDeployment.
@@ -256,7 +264,7 @@ ${pullSecretsBlock}      nodeSelector:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-${internalSecretEnv}${deploymentIdEnv}${userEnv}${userEnvFrom}
+${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
           volumeMounts:
             - name: routing-manifest
               mountPath: /config

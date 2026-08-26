@@ -2284,32 +2284,43 @@ All components emit structured JSON logs to stdout (GKE's standard log collectio
 
 ### 16.2 Metrics (OpenTelemetry)
 
-The route extension and pool servers export OpenTelemetry metrics. On GKE, these flow to Cloud Monitoring via the OpenTelemetry Collector (deployed as a DaemonSet or sidecar).
+> **Implementation status:** the metric list below is the target-state inventory. Adapter-owned
+> request-boundary bindings are being introduced first; cache/PPR/revalidation instruments and a
+> routing-service provider-injection surface remain follow-up work. See
+> [OpenTelemetry runtime bindings](./opentelemetry-bindings.md) for the implemented contract and
+> rollout boundaries.
+
+The target is for the route extension and pool servers to export OpenTelemetry metrics. On GKE, these flow to Cloud Monitoring via an operator-managed OpenTelemetry Collector.
 
 **Route Extension metrics:**
 
-- `routing.request.duration` (histogram) — ext_proc processing time, labeled by `pool`, `has_middleware`, `result` (routed / redirect / immediate_response)
-- `routing.request.count` (counter) — request count by pool and result
-- `routing.middleware.duration` (histogram) — middleware execution time
-- `routing.cel.skip_rate` — not directly observable from the service, but can be calculated in Cloud Monitoring by correlating ALB request count (all requests) vs. route extension request count (ext_proc invocations). The difference is the CEL skip volume. Create a dashboard widget: `1 - (route_extension_requests / alb_total_requests)`.
+- `adapter_k8s.routing.request.duration` (histogram) — ext_proc processing time, labeled by pool and result
+- `adapter_k8s.routing.request.count` (counter) — request count by pool and result
+- `adapter_k8s.routing.middleware.duration` (histogram) — middleware execution time
+- `adapter_k8s.routing.cel.skip_rate` — not directly observable from the service, but can be calculated in Cloud Monitoring by correlating ALB request count (all requests) vs. route extension request count (ext_proc invocations). The difference is the CEL skip volume. Create a dashboard widget: `1 - (route_extension_requests / alb_total_requests)`.
 
 **Pool Server metrics:**
 
-- `pool.request.duration` (histogram) — total request handling time, labeled by `output_id`, `cache_state`
-- `pool.cache.operation` (counter) — Valkey operations by type (get/set/revalidate) and result (hit/miss/error)
-- `pool.handler.cold_start` (counter) — handler module loads (first request per output)
-- `pool.handler.duration` (histogram) — handler invocation time, labeled by `output_id`
-- `pool.ppr.preamble_duration` (histogram) — time to read preamble from Valkey
-- `pool.ppr.resume_duration` (histogram) — time for resume handler to complete
-- `pool.revalidation.background` (counter) — background revalidation triggers and outcomes
+- `adapter_k8s.pool.request.count` (counter) — total request count by pool and result
+- `adapter_k8s.pool.request.duration` (histogram) — total request handling time, labeled by pool and result
+- `adapter_k8s.pool.cache.operation` (counter) — Valkey operations by type (get/set/revalidate) and result (hit/miss/error)
+- `adapter_k8s.pool.handler.cold_start` (counter) — handler module loads (first request per output)
+- `adapter_k8s.pool.handler.duration` (histogram) — handler invocation time, labeled by output template
+- `adapter_k8s.pool.ppr.preamble_duration` (histogram) — time to read preamble from Valkey
+- `adapter_k8s.pool.ppr.resume_duration` (histogram) — time for resume handler to complete
+- `adapter_k8s.pool.revalidation.background` (counter) — background revalidation triggers and outcomes
 
 **Cache metrics:**
 
-- `cache.valkey.latency` (histogram) — Valkey operation latency
-- `cache.valkey.connection_errors` (counter) — connection failures
-- `cache.cdn.invalidation` (counter) — CDN invalidation requests by type (path/tag) and outcome
+- `adapter_k8s.cache.valkey.latency` (histogram) — Valkey operation latency
+- `adapter_k8s.cache.valkey.connection_errors` (counter) — connection failures
+- `adapter_k8s.cache.cdn.invalidation` (counter) — CDN invalidation requests by type (path/tag) and outcome
 
 ### 16.3 Distributed Tracing
+
+> **Implementation status:** request-boundary spans and trace-context handoff are the first slice.
+> The cache, PPR, handler, and revalidation child spans below remain target state; collector/SDK
+> policy stays operator-owned.
 
 Requests carry trace context through the full lifecycle:
 
@@ -2322,7 +2333,7 @@ Client → LB → Route Extension → LB → CDN → Pool Server → Handler
                                                     PPR)        RSC)
 ```
 
-The route extension propagates `traceparent` / `tracestate` headers. The pool server creates child spans for cache lookups, PPR preamble reads, handler invocations, and background revalidation. On GKE, traces flow to Cloud Trace via the OpenTelemetry Collector.
+The route extension propagates `traceparent` / `tracestate` headers. The pool server will add child spans for cache lookups, PPR preamble reads, handler invocations, and background revalidation. On GKE, traces can flow to Cloud Trace through an operator-managed OpenTelemetry Collector.
 
 ---
 

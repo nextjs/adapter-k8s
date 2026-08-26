@@ -583,6 +583,23 @@ export function parseChartValues(content: string): {
   };
 }
 
+/**
+ * Secret templates normally pass through Helm, but SOPS-mode Secrets are decrypted and
+ * applied as plain manifests. The generated dispatch Secret has one intentional Helm block:
+ * reconciler prune annotations that exist only for job-mode bundles. Resolve that known block
+ * here before rejecting every other Helm action (which could be an escaped credential value).
+ *
+ * Keep this deliberately narrow. Treating arbitrary Helm templates as plain YAML would make a
+ * Secret look valid while silently changing its value or metadata at apply time.
+ */
+function materializeSopsSecretTemplate(template: string, cutoverMode: "none" | "job"): string {
+  const jobModeBlock =
+    /^([ \t]*)\{\{- if and \.Values\.cutover \(eq \.Values\.cutover\.mode "job"\) \}\}\r?\n([\s\S]*?)^\1\{\{- end \}\}\r?\n/gm;
+  return template.replace(jobModeBlock, (_match, _indent: string, body: string) =>
+    cutoverMode === "job" ? body : "",
+  );
+}
+
 export async function runEmit(options: EmitOptions): Promise<void> {
   const {
     projectDir,
@@ -975,20 +992,23 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   let sopsFiles: string[] | undefined;
   if (secretsMode === "sops") {
     // The same secret OBJECTS inline mode ships in-chart, as plain YAML sources. The
-    // rendered templates are plain YAML UNLESS a secret value contained a literal "{{"
-    // — escapeHelmActions then wrote a Helm action ({{ "{{" }}) that only Helm would
-    // undo, and these files bypass Helm (the GitOps engine applies them decrypted, raw).
-    // The dispatch secret is HMAC hex so it never trips this; a Valkey URL/AUTH could.
-    // Refuse rather than deliver a mangled credential.
+    // Resolve the ONE Helm conditional the real internal-secret template carries (job-mode
+    // reconciler retention). Any remaining action can be an escaped literal "{{" in a secret
+    // value, which only Helm would undo; these files bypass Helm and are applied decrypted/raw.
+    // The dispatch secret is HMAC hex so it never trips this; a Valkey URL/AUTH could. Refuse
+    // rather than deliver a mangled credential.
     const sources = excluded.map((rel) => {
-      const plaintext = readFileSync(path.join(chartSrcDir, rel), "utf-8");
+      const plaintext = materializeSopsSecretTemplate(
+        readFileSync(path.join(chartSrcDir, rel), "utf-8"),
+        cutoverMode,
+      );
       if (plaintext.includes("{{")) {
         throw new Error(
-          `--secrets sops: ${rel} contains Helm template syntax ("{{" — a secret value ` +
-            `with a literal "{{" was Helm-escaped at render time), but sops-mode secrets ` +
-            `are applied WITHOUT Helm, so the escape would reach the cluster verbatim. ` +
-            `Remove the "{{" from the secret value (cache.url/cache.password), or use ` +
-            `--secrets external/inline.`,
+          `--secrets sops: ${rel} contains unsupported Helm template syntax ("{{" — ` +
+            `possibly a secret value with a literal "{{" that was Helm-escaped at render ` +
+            `time), but sops-mode secrets are applied WITHOUT Helm, so the action would ` +
+            `reach the cluster verbatim. Remove the "{{" from the secret value ` +
+            `(cache.url/cache.password), or use --secrets external/inline.`,
         );
       }
       return { fileName: path.basename(rel, ".yaml"), plaintext };
@@ -1359,6 +1379,7 @@ apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization
 spec:
   path: ./${bundleDirPosix}/secrets
+  targetNamespace: ${meta.namespace}
   decryption:
     provider: sops
     secretRef:

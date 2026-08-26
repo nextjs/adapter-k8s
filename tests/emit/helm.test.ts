@@ -162,6 +162,9 @@ describe("generateHelmChart", () => {
     ).toMatchObject({ activeDefaultPool: "ssr" });
     expect(Object.values(result).some((body) => body.includes('"kind": "Gateway"'))).toBe(true);
     expect(Object.values(result).some((body) => body.includes('"kind": "HTTPRoute"'))).toBe(true);
+    expect(result["templates/ssr-deployment.yaml"]).toContain(
+      '- name: ADAPTER_K8S_PROVIDER_NAME\n              value: "portable"',
+    );
     expect(result["templates/routing-service-deployment.yaml"]).toBeUndefined();
   });
 

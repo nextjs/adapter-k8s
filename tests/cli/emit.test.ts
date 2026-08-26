@@ -30,7 +30,10 @@ import {
   runEmit,
   type EmitMetadata,
 } from "../../src/cli/emit.js";
-import { internalSecretName } from "../../src/emit/templates/internal-secret.js";
+import {
+  internalSecretName,
+  renderInternalSecret,
+} from "../../src/emit/templates/internal-secret.js";
 import { cutoverJobName } from "../../src/emit/templates/cutover-job.js";
 
 const DIGEST_SSR = `sha256:${"a".repeat(64)}`;
@@ -878,6 +881,47 @@ describe("secret externalization: --secrets sops", () => {
     ]);
   });
 
+  it("materializes the real generated dispatch Secret before SOPS encrypts a mode-none bundle", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
+    writeFileSync(
+      path.join(projectDir, ".k8s-adapter", "output", "chart", "templates", "internal-secret.yaml"),
+      renderInternalSecret({ releaseName: RELEASE, buildId: BUILD, secret: "0".repeat(64) }),
+    );
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+
+    await runEmit(sopsOptions());
+
+    const encrypted = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    expect(encrypted).not.toContain("{{");
+    expect(encrypted).not.toContain("kustomize.toolkit.fluxcd.io/prune: disabled");
+  });
+
+  it("keeps the real dispatch Secret's reconciler retention annotations in SOPS job mode", async () => {
+    writeFixture({ nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
+    writeFileSync(
+      path.join(projectDir, ".k8s-adapter", "output", "chart", "templates", "internal-secret.yaml"),
+      renderInternalSecret({ releaseName: RELEASE, buildId: BUILD, secret: "0".repeat(64) }),
+    );
+    writeInternalSecretKey();
+    writeSopsRepoConfig();
+    mockSops();
+
+    await runEmit({ ...jobOptions(), secrets: "sops" });
+
+    const encrypted = readFileSync(
+      path.join(projectDir, ".k8s-adapter", "gitops", "secrets", "internal-secret.sops.yaml"),
+      "utf-8",
+    );
+    expect(encrypted).not.toContain("{{");
+    expect(encrypted).toContain("argocd.argoproj.io/sync-options: Prune=false");
+    expect(encrypted).toContain("kustomize.toolkit.fluxcd.io/prune: disabled");
+  });
+
   it("sops runs with cwd at the .sops.yaml directory and NO recipients on argv", async () => {
     writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
     writeInternalSecretKey();
@@ -1065,6 +1109,7 @@ describe("secret externalization: --secrets sops", () => {
     expect(readme).toContain("Secrets (SOPS-encrypted)");
     expect(readme).toContain("kustomize.toolkit.fluxcd.io");
     expect(readme).toContain("provider: sops");
+    expect(readme).toContain("targetNamespace: default");
     expect(readme).toContain("secrets/internal-secret.sops.yaml");
     // The determinism caveat: secrets/ is excluded from byte-determinism, and the
     // reuse rule that keeps re-emit diffs meaningful is stated.

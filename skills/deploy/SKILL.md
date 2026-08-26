@@ -1,60 +1,6 @@
 ---
 name: deploy
-description: adapter-k8s deploy expert guidance. Use when deploying a Next.js app to Kubernetes with @next-community/adapter-k8s, running next build with the adapter, reading blue/green cutover output, verifying a deploy with doctor/describe/tail, recovering from a failed readiness gate, or rendering a GitOps bundle with emit for an Argo CD / Flux cluster. Do not use for Vercel or generic Helm deployments.
-metadata:
-  priority: 8
-  docs:
-    - "https://www.npmjs.com/package/@next-community/adapter-k8s"
-  pathPatterns:
-    - "adapter.config.*"
-    - ".k8s-adapter/**"
-  importPatterns:
-    - "@next-community/adapter-k8s"
-  bashPatterns:
-    - '\badapter-k8s\s+(deploy|emit|migrate|rollback|doctor|describe|tail|init|emulate|destroy)\b'
-    - '^\s*npx\s+adapter-k8s(?:\s|$)'
-    - '\bNEXT_ADAPTER_PATH='
-    - '\bADAPTER_K8S_(CONFIG|CONTAINER_CLI|TARGET_PLATFORM)='
-  promptSignals:
-    phrases:
-      - "deploy to kubernetes"
-      - "adapter-k8s"
-      - "blue/green cutover"
-      - "readiness gate"
-      - "pods not ready"
-      - "gitops bundle"
-      - "argo cd"
-      - "flux"
-    allOf:
-      - [deploy, kubernetes]
-      - [next, k8s]
-    anyOf:
-      - "rollback"
-      - "cutover"
-      - "helm upgrade"
-    noneOf:
-      - "vercel deploy"
-      - "terraform"
-    minScore: 6
-retrieval:
-  aliases:
-    - kubernetes deploy
-    - blue/green deploy
-    - next.js k8s deploy
-    - helm deploy next
-  intents:
-    - deploy the app to the cluster
-    - run next build with the adapter
-    - verify a deploy
-    - roll back a bad build
-    - debug a failed readiness gate
-  entities:
-    - adapter-k8s
-    - NEXT_ADAPTER_PATH
-    - adapter.config.mjs
-    - .k8s-adapter/infrastructure.json
-    - /readyz
-    - helm upgrade
+description: adapter-k8s deploy and GitOps cluster-PR guidance. Use when deploying a Next.js app to Kubernetes with @next-community/adapter-k8s, preparing a second PR in a Flux or Argo CD repository from an adapter-ready project, inspecting a named kubeconfig/environment, rendering a GitOps bundle with emit, reading blue/green cutover output, verifying with doctor/describe/tail, or recovering from a failed readiness gate. Do not use for Vercel or generic Helm deployments.
 ---
 
 # Deploy
@@ -131,17 +77,98 @@ Confirm each checkpoint: doctor shows 0 failures; `describe` shows the new build
 
 If the cluster is reconciled by Argo CD or Flux, `deploy` is the wrong verb: CI has no kubeconfig, and pointing an auto-syncing reconciler at a chart produced by `deploy` causes an outage — the chart holds the traffic pointer at its pre-cutover value by design, so drift correction repoints traffic onto the build that was just scaled to zero (measured against real Argo CD: ~2.4 minutes, Application still reporting Synced).
 
+### Second PR: application commit → cluster repository
+
+For a two-PR onboarding, begin only after the application PR is merged or the user names an exact
+reviewed commit. The second agent needs the application checkout, cluster-repository path, and
+kubeconfig path. Then:
+
+1. Read the cluster repository's agent instructions and obtain any consent they require before
+   edits. Use a fresh clean branch/worktree; never build a demo PR on unrelated local changes.
+2. Point `KUBECONFIG` at the named environment and inspect it read-only: server version, node
+   architecture/CIDRs, Gateway/Ingress classes, existing shared Gateways, certificate issuers,
+   registry pull Secrets, DNS controller sources, and public tunnel/ingress conventions. GETs are
+   discovery, not authorization to apply.
+3. Recreate the ignored `.k8s-adapter/infrastructure*.json` from the application PR handoff and
+   verify release, namespace, registry, hostname, platform, and config variant match the reviewed
+   config. Obtain the internal-secret key through an environment/secret store; never log or commit
+   it.
+4. Build and push the application and cutover images, resolve immutable registry digests, and run
+   `emit` from the application checkout. `emit` itself makes no cluster contact.
+5. Replace the cluster repo's release bundle wholesale and add only cluster-owned integration:
+   Flux/Argo wrappers, SOPS decryption, namespace/pull-secret components, DNS, certificate/shared
+   Gateway references, and tunnel routes required by that environment.
+6. Validate the cluster-repository build locally, show the diff, open the cluster PR, and stop.
+   Do not merge it, run `kubectl apply`, or force a Flux reconcile unless the user separately
+   authorizes that live deployment action. The PR merge is the intended deployment trigger.
+
+Record the exact application commit and `emit-metadata.json` build ID in the cluster PR so reviewers
+can prove which source produced every digest in the bundle.
+
 ```bash
-npx adapter-k8s migrate                     # ONCE per release previously deployed imperatively:
-                                            # applies prune-protection to the retained rollback set
+# Existing imperative release only, once before its first reconciler sync:
+npx adapter-k8s migrate
+
+# First GitOps build for a genuinely new release:
 npx adapter-k8s emit --cutover job \
   --cutover-image ghcr.io/example/adapter-k8s-cutover@sha256:<digest> \
+  --secrets sops \
+  --first-deploy
 
-  --secrets sops                            # or the default --secrets external
-# commit .k8s-adapter/gitops/ ; the reconciler applies it
+# Later builds use this history flag instead of --first-deploy:
+npx adapter-k8s emit --cutover job \
+  --cutover-image ghcr.io/example/adapter-k8s-cutover@sha256:<digest> \
+  --secrets sops \
+  --previous-bundle ../cluster-repo/kubernetes/apps/<namespace>/<release>/app/bundle
 ```
 
-Under `--cutover job` the bundle's stable Services render at the PREVIOUS build (sync is not cutover) and an in-cluster Job runs the same gate battery this skill describes, then promotes. `--cutover-image` must be digest-pinned (`name@sha256:<64 hex>`); `:latest` is refused. Under the default `--cutover none` the bundle is inert: you cut over yourself per `docs/ci-cd.md`. Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy. Full recipes and the ignore rules a reconciler needs: `docs/gitops.md`.
+Under `--cutover job` the bundle's stable Services render at the PREVIOUS build (sync is not cutover) and an in-cluster Job runs the same gate battery this skill describes, then promotes. `--cutover-image` must be digest-pinned (`name@sha256:<64 hex>`); `:latest` is refused. Under the default `--cutover none` the bundle is inert: you cut over yourself per the [CI/CD guide](../../docs/ci-cd.md). Split repos (app repo emits, cluster repo holds bundles) need `--previous-bundle <path>` — emit refuses rather than guessing that a missing prior bundle means a first deploy.
+
+Build the cutover image before emit. Inspect the API server minor and node architecture; the
+Dockerfile intentionally has no kubectl default because Kubernetes supports kubectl only within
+one minor of the API server. Build for the node platform even when the workstation differs, push,
+then resolve and use the immutable registry digest:
+
+```bash
+# Example only: amd64 nodes and a Kubernetes 1.35 API server.
+npm run build
+docker build --platform=linux/amd64 --build-arg KUBECTL_VERSION=v1.35.7 \
+  -f docker/cutover-job.Dockerfile -t <registry>/adapter-k8s-cutover:<version> .
+docker push <registry>/adapter-k8s-cutover:<version>
+```
+
+When working from an installed package rather than this source repository, the same Dockerfile and
+built `dist/` are under `node_modules/@next-community/adapter-k8s`; use that package directory as
+the Docker build context.
+
+For Flux with a chart committed in the cluster repository, use the copy-ready
+[GitRepository/HelmRelease recipe](../../docs/gitops.md#flux-recipe-a-chart-committed-in-the-cluster-repository).
+The non-negotiable pieces are:
+
+- copy the emitted bundle wholesale; do not hand-edit image fields inside it;
+- use a Git-sourced `HelmRelease` with the default `ChartVersion` strategy and the emitted values
+  file; each emitted build bumps `Chart.yaml`, while an unrelated cluster-repository commit must
+  not trigger an upgrade that reapplies pre-cutover Service selectors;
+- when the Flux objects live in the app namespace but their `GitRepository` lives in
+  `flux-system`, confirm both controllers allow cross-namespace source references; otherwise use
+  an equivalent same-namespace source;
+- enable drift detection but ignore `/spec/selector` on `Service` resources, kind-wide;
+- reconcile `bundle/secrets` through a SOPS-enabled Flux `Kustomization` before the HelmRelease,
+  and set its `spec.targetNamespace` to the app namespace (the Flux object's own namespace does
+  not default namespace-less Secret manifests);
+- make the app repo's `.sops.yaml` creation rule cover `.k8s-adapter/gitops/secrets/*.sops.yaml`;
+- leave Job waiting enabled and give the HelmRelease enough timeout for the sequential cutover
+  gates (each pool rollout and the routing rollout can wait up to ten minutes);
+- inspect how existing apps make a hostname reachable and mirror every cluster-owned prerequisite
+  the adapter does not emit: DNS records/controllers, tunnel routes, certificate issuers, shared
+  Gateway parentRefs, registry pull Secrets, and SOPS keys. An accepted HTTPRoute alone does not
+  prove that public DNS or a tunnel reaches that Gateway;
+- merge the emitted Renovate ignore path into the cluster repository's root config;
+- for the next build, pass the committed prior `bundle` path to `--previous-bundle` and replace it wholesale.
+
+Respect the cluster repository's own agent instructions before creating files or opening a PR.
+For a repository that requires consent before GitOps changes, stop after showing the proposed diff
+until the user approves it.
 
 ## Failure Playbook
 
