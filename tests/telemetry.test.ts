@@ -4,7 +4,7 @@ import { cpSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { context, metrics, propagation, trace } from "@opentelemetry/api";
+import { context, metrics, propagation, SpanStatusCode, trace } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import {
@@ -238,5 +238,40 @@ describe("adapter-owned OpenTelemetry bindings", () => {
       .filter((span) => span.name === "adapter-k8s.routing.request")
       .at(-1);
     expect(routingSpan?.parentSpanContext).toBeUndefined();
+  });
+
+  it("continues the routing span to the pool after a fail-open error", async () => {
+    const clientTraceId = "1123456789abcdef0123456789abcdef";
+    const clientSpanId = "1123456789abcdef";
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const process = createProcessHandler(async () => {
+        throw new Error("routing failed");
+      }, true);
+      const [routingResponse] = await collect(
+        process(once(routingCallout(`00-${clientTraceId}-${clientSpanId}-01`))),
+      );
+
+      expect(routingResponse?.response.case).toBe("requestHeaders");
+      if (routingResponse?.response.case !== "requestHeaders") throw new Error("wrong response");
+      const mutations = routingResponse.response.value.response?.headerMutation?.setHeaders ?? [];
+      const propagated = Object.fromEntries(
+        mutations.map((entry) => [
+          entry.header?.key.toLowerCase(),
+          decoder.decode(entry.header?.rawValue),
+        ]),
+      );
+      expect(propagated.traceparent).toMatch(new RegExp(`^00-${clientTraceId}-[0-9a-f]{16}-01$`));
+
+      await tracerProvider.forceFlush();
+      const routingSpan = spanExporter
+        .getFinishedSpans()
+        .filter((span) => span.name === "adapter-k8s.routing.request")
+        .at(-1);
+      expect(propagated.traceparent).toContain(`-${routingSpan?.spanContext().spanId}-`);
+      expect(routingSpan?.status.code).toBe(SpanStatusCode.ERROR);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });

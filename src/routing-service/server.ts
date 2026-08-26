@@ -188,13 +188,8 @@ export function plainResponseToProto(plain: PlainProcessingResponse): Processing
   });
 }
 
-function continueResponse(): ProcessingResponse {
-  return create(ProcessingResponseSchema, {
-    response: {
-      case: "requestHeaders",
-      value: { response: { status: CommonResponse_ResponseStatus.CONTINUE } },
-    },
-  });
+function plainContinueResponse(): PlainProcessingResponse {
+  return { requestHeaders: { response: { status: "CONTINUE" } } };
 }
 
 // Answer an unexpected (non-request_headers) callout phase with the response case
@@ -330,7 +325,15 @@ export function createProcessHandler(
             recordSpanError(span, err);
             setSpanAttributes(span, metricAttributes);
             if (!failOpen) setSpanHttpStatus(span, 500);
-            return failOpen ? continueResponse() : internalError500();
+            if (!failOpen) return internalError500();
+
+            // The request still reaches a pool on fail-open. Propagate this failed routing span
+            // there too, or the pool becomes its sibling and the trace hides the routing failure.
+            const continued = plainContinueResponse();
+            injectTraceHeaders(spanContext, (key, value) =>
+              setPlainRequestHeader(continued, key, value),
+            );
+            return plainResponseToProto(continued);
           } finally {
             recordRoutingRequest(performance.now() - startedAt, metricAttributes);
           }
