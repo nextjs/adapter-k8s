@@ -3761,7 +3761,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
     // The fall-through path: a secret-gated `x-output-id` was present but the middleware
     // verdict was absent/untrusted or any dispatch metadata was malformed, so Phase 1
-    // re-derives EVERYTHING itself — the
+    // re-derives EVERYTHING itself. Revoke the values parsed before this decision as one unit:
+    // in particular, a valid x-resolved-headers beside a malformed query/deadline/route-match
+    // must not retain its Cache-Control slot while local resolution owns the response.
+    extResolvedHeaders = undefined;
+    extMwRequestHeaders = undefined;
+    appCacheControl = null;
+    // The
     // dispatch vocabulary is unusable here by construction. S22 deleted it only inside the
     // trusted branch above; left in place on this path, `x-output-id`, `x-upstream-pool`,
     // `x-route-matches`, `x-invoke-path`, `x-invoke-query`, `x-nextjs-ppr` and the execution
