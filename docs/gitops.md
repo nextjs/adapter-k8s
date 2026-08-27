@@ -263,7 +263,7 @@ spec:
   dependsOn:
     - name: <release>-secrets
   wait: true
-  timeout: 95m
+  timeout: 155m
 ```
 
 If `--secrets external` is used instead, omit the Secrets `Kustomization` and `dependsOn`, and
@@ -286,7 +286,7 @@ metadata:
   namespace: <namespace>
 spec:
   interval: 30m
-  timeout: 90m
+  timeout: 150m
   chart:
     spec:
       chart: ./kubernetes/apps/<namespace>/<release>/app/bundle/chart
@@ -312,7 +312,8 @@ Keep the chart's default `ChartVersion` reconciliation strategy. Every emitted b
 build-specific `Chart.yaml` version, so a new bundle triggers an upgrade while an unrelated commit
 elsewhere in the shared cluster repository does not. `Revision` is unsafe here: it turns every
 repository commit into a Helm upgrade, which can reapply the chart's pre-cutover Service selectors.
-The 90-minute timeout is a small-topology example, and it must be recomputed for yours: an
+The 150-minute timeout is a conservative small-topology example, and it must be recomputed for
+yours: an
 overrun is not a benign retry. When the `HelmRelease` timeout fires mid-cutover, Flux marks the
 release failed and — under the default `upgrade.remediation` — rolls it back, reapplying the
 chart's pre-cutover Service selectors, while the cutover Job (which has no
@@ -321,12 +322,21 @@ split-selector state is what the cutover design exists to avoid.
 
 Keep the `HelmRelease` timeout above the emitted Job's SEQUENTIAL gate budget:
 `pools x 10m` (pool rollouts, awaited one at a time) `+ 30m` (the routing rollout, at its
-ceiling) `+ 10m` (the ext_proc registration Job, GKE only) `+ 2m` (the readiness/capacity gate)
-— so ~72 minutes for three pools, ~52 for one. Two of those numbers are worst cases rather than
-typical ones: the routing gate derives its wait from that tier's live replica count (10 minutes
-at the default HPA floor of 2, rising to the 30-minute ceiling around 6 replicas), and a pool
-rollout only spends its full budget if pods are slow to boot. Budget the ceiling anyway — the
-failure mode above is worse than a long reconciliation. Keep the parent Kustomization timeout
+ceiling) `+ 10m` (the ext_proc registration Job, GKE only; allow 1m for the generic policy gate)
+`+ the composition-plan readiness budget` `+ 2m` (the readiness/capacity gate), then add at
+least 10m for the bounded kubectl reads and patches between waits. Do not omit the composition
+term: `waitForCompositionPlanReadiness` waits its distinct entries ONE AT A TIME, each with its
+own deadline. Read `.k8s-adapter/output/composition-plan.json` and sum the `timeoutSeconds` of
+the distinct entries in `operations.resources.readiness` and
+`operations.routing.dataplane.readiness`; count `kubernetes-service-endpoints` as 120s and
+`gcp-traffic-extension` as 600s because those two kinds carry fixed runtime defaults instead.
+Identical entries present in both arrays are waited once. For example, three pools, GKE
+registration, four distinct 10-minute composition checks, and the 10-minute command cushion need
+at least `30 + 30 + 10 + 40 + 2 + 10 = 122m`, not 72m. Two of those numbers are worst cases rather
+than typical ones: the routing gate derives its wait from that tier's live replica count (10
+minutes at the default HPA floor of 2, rising to the 30-minute ceiling around 6 replicas), and a
+pool rollout only spends its full budget if pods are slow to boot. Budget the ceiling anyway —
+the failure mode above is worse than a long reconciliation. Keep the parent Kustomization timeout
 larger than the HelmRelease timeout.
 
 For every subsequent build, the app pipeline checks out the cluster repository, passes the old

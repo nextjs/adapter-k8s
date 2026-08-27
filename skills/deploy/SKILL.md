@@ -169,9 +169,10 @@ The non-negotiable pieces are:
   not default namespace-less Secret manifests);
 - make the app repo's `.sops.yaml` creation rule cover `.k8s-adapter/gitops/secrets/*.sops.yaml`;
 - leave Job waiting enabled and give the HelmRelease enough timeout for the sequential cutover
-  gates — `pools x 10m + 30m + 10m + 2m` (see docs/gitops.md); a timeout that fires mid-cutover
-  makes Flux roll the release back onto the pre-cutover Service selectors while the Job patches
-  them forward;
+  gates. Budget pool rollouts, the routing rollout, provider registration, the sum of the
+  composition-plan readiness deadlines, the capacity gate, and command overhead (see
+  docs/gitops.md); a timeout that fires mid-cutover makes Flux roll the release back onto the
+  pre-cutover Service selectors while the Job patches them forward;
 - inspect how existing apps make a hostname reachable and mirror every cluster-owned prerequisite
   the adapter does not emit: DNS records/controllers, tunnel routes, certificate issuers, shared
   Gateway parentRefs, registry pull Secrets, and SOPS keys. An accepted HTTPRoute alone does not
