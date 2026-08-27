@@ -102,12 +102,25 @@ async function checkDomainForHost(opts: {
   // Wildcard domains: skip the DNS A record check (can't resolve *.example.com)
   // but still check CNAME auth and cert status.
   const isWildcard = host.includes("*");
+  const normalizedHost = host.toLowerCase().replace(/\.$/, "");
+  // RFC 6761 reserves localhost and every name below it for loopback resolution. DNS's
+  // authoritative resolve4() path intentionally bypasses the operating-system resolver,
+  // so it reports ENOTFOUND for names such as lane1.localhost even while browsers, curl,
+  // and Node's lookup() correctly reach the local Gateway. Portable local clusters use
+  // those names to keep parallel Host-routed releases isolated; they do not need an A record.
+  const isLoopbackHost = normalizedHost === "localhost" || normalizedHost.endsWith(".localhost");
   const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
 
   results.push({ name: `--- ${host}`, status: "pass", message: "---" });
 
   // A record (skip for wildcards — can't resolve *.example.com directly)
-  if (!isWildcard) {
+  if (isLoopbackHost) {
+    results.push({
+      name: `  A record`,
+      status: "pass",
+      message: `${host} is reserved for loopback`,
+    });
+  } else if (!isWildcard) {
     const resolvedIp = await resolve4(host)
       .then((ips) => ips[0] ?? null)
       .catch(() => null);

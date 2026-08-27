@@ -355,6 +355,17 @@ describe("runDoctor", () => {
     expect(out).toContain(`Add DNS: app.example.com A ${STATIC_IP}`);
   });
 
+  it("accepts localhost subdomains without querying authoritative DNS", async () => {
+    writeInfra(["lane1.localhost"]);
+    vi.mocked(resolve4).mockRejectedValue(new Error("ENOTFOUND") as never);
+    stubCluster({});
+
+    await runDoctor({ projectDir: tmpDir, releaseName: RELEASE });
+
+    expect(printed()).toContain("A record: lane1.localhost is reserved for loopback");
+    expect(resolve4).not.toHaveBeenCalled();
+  });
+
   it("traffic-ext coverage WARNs instead of vacuously passing when FR enumeration fails", async () => {
     // Regression: the old code read .stdout unconditionally — a failed list call
     // produced "covers 2/0 forwarding rules", a PASS that proved nothing.
