@@ -299,6 +299,8 @@ export interface RoutingManifest {
   /** ISO timestamp of when this manifest was generated (build time). */
   builtAt: string;
   basePath: string;
+  /** Project-relative Next build directory. Absent only on retained pre-contract manifests. */
+  distDir?: string;
   trailingSlash?: boolean;
   /** False only when the app set `logging: false`; absent preserves legacy request logging. */
   requestLogging?: false;

@@ -1718,6 +1718,7 @@ async function serveNotFound(
   bufferedBody: Buffer | undefined,
   basePath = "",
   notFoundIsPrerendered = false,
+  distDir = path.join(process.cwd(), ".next"),
 ): Promise<void> {
   // Deploy contract (upstream not-found-non-document, canary.97): for non-HTML subresource
   // requests (sec-fetch-dest: image/font/manifest/…) the deployed routing layer serves the
@@ -1740,7 +1741,7 @@ async function serveNotFound(
     );
     const candidates = [
       ...(prerenderedNotFound ? [path.resolve(process.cwd(), prerenderedNotFound.filePath)] : []),
-      path.join(process.cwd(), ".next", "server", "app", "_not-found.html"),
+      path.join(distDir, "server", "app", "_not-found.html"),
     ];
     for (const fullPath of candidates) {
       if (existsSync(fullPath) && !res.writableEnded) {
@@ -1977,6 +1978,8 @@ export interface DispatcherOptions {
   revalidate?: Revalidate;
   /** Configured public basePath. Output ids and static 404 assets may be basePath-prefixed. */
   basePath?: string;
+  /** Absolute validated Next build directory. */
+  distDir?: string;
   /** Configured Pages Router locales, used to keep locale protocol prefixes out of route params. */
   i18nLocales?: string[];
 }
@@ -2009,6 +2012,7 @@ export function createDispatcher(options: DispatcherOptions) {
     platformCache,
     revalidate,
     basePath = "",
+    distDir = path.join(process.cwd(), ".next"),
     i18nLocales = [],
     builtAt,
     proxyTimeoutMs = PROXY_TIMEOUT_MS,
@@ -2364,7 +2368,9 @@ export function createDispatcher(options: DispatcherOptions) {
       // into ANY response — static assets, handler responses, and 404s (middleware
       // next() headers must reach the response even when no route matches).
       if (
-        (resolution.kind === "route" || resolution.kind === "not-found") &&
+        (resolution.kind === "route" ||
+          resolution.kind === "not-found" ||
+          resolution.kind === "external-rewrite") &&
         resolution.resolvedHeaders
       ) {
         installResolvedResponseHeaders(res, resolution.resolvedHeaders);
@@ -2944,6 +2950,7 @@ export function createDispatcher(options: DispatcherOptions) {
 
         case "external-rewrite": {
           // Proxy the request to the external URL (middleware rewrite / next.config.js rewrite)
+          applyMiddlewareRequestHeaders(req, resolution.middlewareRequestHeaders);
           const target = resolution.url;
           const proxyMod =
             target.protocol === "https:" ? await import("node:https") : await import("node:http");
@@ -3058,6 +3065,7 @@ export function createDispatcher(options: DispatcherOptions) {
             bufferedBody,
             basePath,
             notFoundIsPrerendered,
+            distDir,
           );
           return;
         }
@@ -3117,6 +3125,7 @@ export function createDispatcher(options: DispatcherOptions) {
                 undefined,
                 basePath,
                 notFoundIsPrerendered,
+                distDir,
               );
               return;
             }
@@ -3169,6 +3178,7 @@ export function createDispatcher(options: DispatcherOptions) {
               bufferedBody,
               basePath,
               notFoundIsPrerendered,
+              distDir,
             );
             return;
           }

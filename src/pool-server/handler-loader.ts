@@ -51,8 +51,12 @@ export function resolveRouteHandlerExport(
   // App Router route modules compiled by Turbopack may export routeModule with a handle method
   if (module.routeModule && typeof module.routeModule === "object") {
     const rm = module.routeModule as Record<string, unknown>;
-    if (typeof rm.handle === "function") return rm.handle as ArtifactRouteHandler;
-    if (typeof rm.render === "function") return rm.render as ArtifactRouteHandler;
+    if (typeof rm.handle === "function") {
+      return (rm.handle as ArtifactRouteHandler).bind(module.routeModule);
+    }
+    if (typeof rm.render === "function") {
+      return (rm.render as ArtifactRouteHandler).bind(module.routeModule);
+    }
   }
 
   // Edge runtime modules compiled by Turbopack register in globalThis._ENTRIES.

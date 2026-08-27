@@ -415,15 +415,15 @@ describe("createLocalResolver", () => {
     // Direct handler: module has no default function and no default.default.
     // Falls through to path 3: handlerFn(request, { waitUntil }).
     let backgroundComplete = false;
+    let finishBackground!: () => void;
+    const background = new Promise<void>((resolve) => {
+      finishBackground = () => {
+        backgroundComplete = true;
+        resolve();
+      };
+    });
     const directHandler = vi.fn(async (_request: Request, ctx: { waitUntil: Function }) => {
-      ctx.waitUntil(
-        new Promise<void>((resolve) => {
-          setTimeout(() => {
-            backgroundComplete = true;
-            resolve();
-          }, 5);
-        }),
-      );
+      ctx.waitUntil(background);
       return new Response(null, {
         status: 200,
         headers: { "x-middleware-next": "1" },
@@ -450,12 +450,21 @@ describe("createLocalResolver", () => {
       middleware: directHandler,
     } as any);
 
-    await resolver.resolve(
+    const resolution = resolver.resolve(
       new URL("http://localhost/about"),
       new Headers(),
       "GET",
       new ReadableStream<Uint8Array>(),
     );
+    const first = await Promise.race([
+      resolution.then(() => "resolved" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 25)),
+    ]);
+    expect(first).toBe("resolved");
+    expect(backgroundComplete).toBe(false);
+    finishBackground();
+    await background;
+    await resolution;
 
     expect(directHandler).toHaveBeenCalledTimes(1);
     expect(directHandler).toHaveBeenCalledWith(
@@ -497,7 +506,10 @@ describe("createLocalResolver", () => {
       expect.any(Request),
       expect.objectContaining({
         waitUntil: expect.any(Function),
-        requestMeta: { relativeProjectDir: "." },
+        requestMeta: {
+          relativeProjectDir: ".",
+          distDir: expect.stringMatching(/\.next$/),
+        },
       }),
     );
     expect(compatibilityDefault).not.toHaveBeenCalled();

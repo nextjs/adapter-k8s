@@ -283,6 +283,7 @@ export function generateHelmChart({
       releaseName,
       providerName: routingProviderName,
       nodeArchitecture: targetArchitecture(targetPlatform),
+      ...(routingManifest.distDir !== undefined ? { distDir: routingManifest.distDir } : {}),
       ...(imageDigests?.[poolName] ? { imageDigest: imageDigests[poolName]! } : {}),
       ...(Object.keys(mergedEnv).length > 0 ? { env: mergedEnv } : {}),
       ...(mergedEnvFrom.length > 0 ? { envFrom: mergedEnvFrom } : {}),

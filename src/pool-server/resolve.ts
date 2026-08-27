@@ -5,6 +5,7 @@ import {
   hasCallableNodeMiddlewareEntrypoint,
   invokeNodeMiddleware,
 } from "../next-runtime/middleware-entrypoint.js";
+import { resolveNextDistDir } from "../next-runtime/dist-dir.js";
 import {
   applyRewriteSignalHeaders,
   computeRewriteInvocation,
@@ -50,7 +51,12 @@ export type ResolveResult =
   | { kind: "redirect"; url: URL; status: number; resolvedHeaders?: Headers | undefined }
   | { kind: "error"; status: number }
   | { kind: "middleware-response"; response: Response }
-  | { kind: "external-rewrite"; url: URL }
+  | {
+      kind: "external-rewrite";
+      url: URL;
+      resolvedHeaders?: Headers | undefined;
+      middlewareRequestHeaders?: Headers | undefined;
+    }
   | {
       kind: "not-found";
       resolvedHeaders?: Headers | undefined;
@@ -73,6 +79,7 @@ export function createLocalResolver(
   // runs when the request matches. Absent → run always.
   middlewareMatchers?: MiddlewareMatcher[] | undefined,
 ) {
+  const runtimeDistDir = resolveNextDistDir(process.cwd(), manifest.distDir).absolute;
   return {
     async resolve(
       url: URL,
@@ -179,6 +186,7 @@ export function createLocalResolver(
                       method,
                       requestBody: ctx.requestBody,
                       nextConfig: manifestNextConfig(manifest),
+                      distDir: runtimeDistDir,
                       getCloneableBody: getCloneableBody ?? null,
                       logBackgroundError(error) {
                         console.error("[pool-server] middleware background work failed:", error);
@@ -306,7 +314,12 @@ export function createLocalResolver(
             invocationQuery: mergeInvocationQuery(rewriteQuery, rewritten.invocationQuery),
           };
         }
-        return { kind: "external-rewrite", url: resolution.externalRewrite };
+        return {
+          kind: "external-rewrite",
+          url: resolution.externalRewrite,
+          resolvedHeaders: resolution.resolvedHeaders ?? undefined,
+          middlewareRequestHeaders: middlewareRequestHeaders ?? undefined,
+        };
       }
 
       // 4. Normal route resolution

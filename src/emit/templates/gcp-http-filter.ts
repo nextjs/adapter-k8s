@@ -64,6 +64,9 @@ export const NEVER_KEYED_DISPATCH_HEADERS: readonly string[] = [
   "x-mw-evaluated",
   "x-invoke-path",
   "x-invoke-query",
+  // Terminal target selected after cache lookup. The pre-cache request already carries the
+  // pathname/query that selected it; middleware-covered responses are forced no-cache.
+  "x-external-rewrite-url",
   // REQUEST-SCOPED and stamped only after cache lookup; keying it would guarantee misses.
   "x-adapter-k8s-execution-deadline",
 ];

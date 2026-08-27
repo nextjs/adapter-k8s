@@ -9,6 +9,7 @@ import NextRouting from "@next/routing";
 import type { ResolveRoutesParams } from "@next/routing";
 import { isSafePattern } from "redos-detector";
 import { grantsSharedCacheFreshness as grantsSharedCacheFreshnessFromCacheControl } from "./cache-control.js";
+import { normalizeNextDistDir } from "./next-runtime/dist-dir.js";
 const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
@@ -45,6 +46,9 @@ export const INTERNAL_DISPATCH_HEADERS = [
   // entirely (the handler would see only the client's original search params).
   "x-invoke-path",
   "x-invoke-query",
+  // Authenticated terminal produced when the routing tier already resolved an external rewrite.
+  // The pool performs only the proxy hop and must not re-run middleware or route resolution.
+  "x-external-rewrite-url",
   // Absolute time-to-response-head deadline propagated by a trusted cross-pool hop. Keeping one
   // build-derived deadline prevents the target pool from minting a fresh maxDuration budget.
   "x-adapter-k8s-execution-deadline",
@@ -864,7 +868,10 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
       actual = cond.key ? headers.get(cond.key) : undefined;
       break;
     case "query":
-      actual = cond.key ? url.searchParams.get(cond.key) : undefined;
+      if (cond.key) {
+        const values = url.searchParams.getAll(cond.key);
+        actual = values.length > 0 ? values[values.length - 1] : undefined;
+      }
       break;
     case "cookie": {
       const cookie = headers.get("cookie");
@@ -872,7 +879,13 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
         for (const part of cookie.split(";")) {
           const [k, ...v] = part.trim().split("=");
           if (k === cond.key) {
-            actual = v.join("=");
+            let value = v.join("=").trim();
+            if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+            try {
+              actual = decodeURIComponent(value);
+            } catch {
+              actual = value;
+            }
             break;
           }
         }
@@ -883,8 +896,10 @@ function conditionPresent(cond: RouteHasCondition, headers: Headers, url: URL): 
       actual = url.hostname;
       break;
   }
-  if (actual === null || actual === undefined) return false;
-  if (cond.value === undefined) return true; // presence-only
+  // Next's matchHas uses truthiness for both presence-only and valued conditions. In particular,
+  // an empty header/query/cookie value is absent, and an empty configured value means presence.
+  if (!actual) return false;
+  if (!cond.value) return true;
   // Anchored (^…$) on purpose: this evaluates MIDDLEWARE matcher has/missing,
   // which `next start` runs through matchHas (prepare-destination.js) — and
   // matchHas anchors (`new RegExp(`^${value}$`)`). @next/routing's own
@@ -1710,6 +1725,11 @@ export function assertValidRoutingManifest(parsed: unknown, source: string): voi
     fail("`buildId` must be a non-empty string");
   }
   if (typeof m.basePath !== "string") fail('`basePath` must be a string ("" when unset)');
+  try {
+    normalizeNextDistDir(m.distDir);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : "`distDir` is invalid");
+  }
   if (!Array.isArray(m.pathnames) || m.pathnames.some((p) => typeof p !== "string")) {
     fail("`pathnames` must be an array of strings");
   }

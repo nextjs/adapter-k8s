@@ -118,7 +118,7 @@ Two Next features the adapter turns on by default are still experimental upstrea
 
 | Variable                                    | Effect when set to `1`                                                                                                                                                                               |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS`      | Forces `experimental.supportsImmutableAssets: false` — asset URLs stay off `/_next/static/immutable/`. For checking whether the immutable-asset split regressed client bootstrap.                    |
+| `ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS`      | Forces `supportsImmutableAssets: false` — asset URLs stay off `/_next/static/immutable/`. For checking whether the immutable-asset split regressed client bootstrap.                                 |
 | `ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE` | Forces `experimental.turbopackFileSystemCacheForBuild: false` — a fully cold compile, ignoring `<distDir>/cache`. For a suspected upstream cache-invalidation bug (see [docs/ci-cd.md](./ci-cd.md)). |
 
 Each one wins over an explicit `true` in `next.config`, not just over the adapter's default: an app that has pinned the flag on is exactly the app that could not otherwise disable it without changing code.
