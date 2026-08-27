@@ -1,27 +1,20 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
-import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const projectDir = process.cwd();
-const scratchDir = mkdtempSync(path.join(projectDir, ".package-test-"));
+const scratchDir = mkdtempSync(path.join(tmpdir(), "adapter-k8s-package-test-"));
 
-function run(command, args, options = {}) {
+function run(command, args, { cwd = projectDir, env, ...options } = {}) {
   const result = spawnSync(command, args, {
-    cwd: projectDir,
+    cwd,
     encoding: "utf8",
     ...options,
+    env: { ...process.env, NEXT_TELEMETRY_DISABLED: "1", ...env },
   });
   if (result.status !== 0) {
     throw new Error(
@@ -91,7 +84,47 @@ try {
     );
   }
 
-  const packageModule = await import(pathToFileURL(path.join(packageDir, "dist/index.js")).href);
+  const consumerDir = path.join(scratchDir, "consumer");
+  mkdirSync(consumerDir);
+  writeFileSync(
+    path.join(consumerDir, "package.json"),
+    JSON.stringify({ name: "adapter-k8s-package-surface-consumer", private: true, type: "module" }),
+  );
+  const supportedNext = sourceManifest.dependencies["@next/routing"];
+  assert.match(supportedNext, /^\d+\.\d+\.\d+/, "@next/routing must pin a concrete Next line");
+  run(
+    "npm",
+    [
+      "install",
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+      "--package-lock=false",
+      tarball,
+      `next@${supportedNext}`,
+    ],
+    { cwd: consumerDir },
+  );
+
+  const consumerRequire = createRequire(path.join(consumerDir, "package.json"));
+  const imported = new Map();
+  for (const exportName of Object.keys(manifest.exports)) {
+    const specifier =
+      exportName === "."
+        ? manifest.name
+        : exportName === "./package.json"
+          ? `${manifest.name}/package.json`
+          : `${manifest.name}/${exportName.slice(2)}`;
+    const resolved = consumerRequire.resolve(specifier);
+    imported.set(
+      exportName,
+      exportName === "./package.json"
+        ? consumerRequire(resolved)
+        : await import(pathToFileURL(resolved).href),
+    );
+  }
+
+  const packageModule = imported.get(".");
   assert.equal(typeof packageModule.createK8sAdapter, "function");
   assert.equal(typeof packageModule.defineTarget, "function");
   assert.equal(
@@ -100,35 +133,22 @@ try {
     "unstable target compilation must not leak from the root export",
   );
 
-  const cli = run(process.execPath, [path.join(packageDir, "dist/cli.cjs"), "--help"], {
-    cwd: packageDir,
-  });
-  assert.match(cli.stdout, /adapter-k8s/);
-
-  const consumerDir = path.join(scratchDir, "consumer");
-  const scopeDir = path.join(consumerDir, "node_modules", "@next-community");
-  mkdirSync(scopeDir, { recursive: true });
-  writeFileSync(
-    path.join(consumerDir, "package.json"),
-    JSON.stringify({ name: "adapter-k8s-package-surface-consumer", private: true }),
-  );
-  symlinkSync(packageDir, path.join(scopeDir, "adapter-k8s"), "dir");
-  const consumerRequire = createRequire(path.join(consumerDir, "package.json"));
-  assert.equal(
-    realpathSync(consumerRequire.resolve("@next-community/adapter-k8s")),
-    realpathSync(path.join(packageDir, "dist/index.js")),
-    "createRequire.resolve must find adapterPath through the default export condition",
-  );
-
-  const internalPath = consumerRequire.resolve("@next-community/adapter-k8s/internal");
-  const internalModule = await import(pathToFileURL(internalPath).href);
+  const internalModule = imported.get("./internal");
   assert.equal(typeof internalModule.compileTarget, "function");
   assert.equal(typeof internalModule.parseAndVerifyCompositionPlan, "function");
 
-  const planPath = consumerRequire.resolve("@next-community/adapter-k8s/composition-plan");
-  const planModule = await import(pathToFileURL(planPath).href);
+  const planModule = imported.get("./composition-plan");
   assert.equal(planModule.COMPOSITION_PLAN_API_VERSION, "adapter-k8s.nextjs.org/v1alpha1");
   assert.deepEqual(Object.keys(planModule), ["COMPOSITION_PLAN_API_VERSION"]);
+
+  const installedManifest = imported.get("./package.json");
+  assert.equal(installedManifest.name, manifest.name);
+  assert.equal(installedManifest.version, manifest.version);
+
+  const cli = run(path.join(consumerDir, "node_modules", ".bin", "adapter-k8s"), ["--help"], {
+    cwd: consumerDir,
+  });
+  assert.match(cli.stdout, /adapter-k8s/);
 
   console.log(
     `Verified ${manifest.name}@${manifest.version}: ${packedPaths.size} files, ` +

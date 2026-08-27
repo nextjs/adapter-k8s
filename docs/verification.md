@@ -141,9 +141,10 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
-  when a maintainer launches it—hours, not minutes—so individual commits are gated by the
-  unit suite and a ~35-minute smoke subset (`scripts/e2e-smoke.sh`), with full runs between
-  batches.
+  when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
+  type, lint, build, package, and schema checks in CI. Maintainers run the ~35-minute smoke subset
+  (`scripts/e2e-smoke.sh`) for release-candidate batches and full runs when the routing or runtime
+  boundary changes; neither local suite is a per-commit GitHub check.
 - **27 upstream tests fail in the full topology** (0.6% of the suite; see the table in
   layer 2). About a third are intermittent timing races; the substantive remainder are the
   server-action harness conditions, the unimplemented `partialFallback` contract, and one

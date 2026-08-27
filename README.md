@@ -1,6 +1,6 @@
 # @next-community/adapter-k8s
 
-Build and deploy full-fidelity Next.js applications as independently scalable Kubernetes pools. The adapter uses Next.js 16.3's `adapterPath` API to generate Helm charts, Dockerfiles, and routing manifests from the build output.
+Build and deploy Next.js applications as independently scalable Kubernetes pools. The adapter uses Next.js 16.3's `adapterPath` API to generate Helm charts, Dockerfiles, and routing manifests from the build output.
 
 ```bash
 npx adapter-k8s deploy
@@ -21,7 +21,7 @@ Deployment targets are composed from independent cluster, exposure, and routing 
 
 Contributor guidance for a new controller or routing integration is in [CONTRIBUTING.md](./CONTRIBUTING.md) and [Writing a routing adapter](./docs/targets.md#writing-a-routing-adapter).
 
-With a shared cache configured, cache components, Partial Prerendering (PPR), and ISR work correctly across replicas: cached entries are shared, and `revalidateTag` / `revalidatePath` on one pod is seen by all. See [Distributed cache](./docs/configuration.md#distributed-cache-cache-components--ppr).
+With a shared cache configured, verified cache-component, PPR, and ISR paths share entries and propagate `revalidateTag` / `revalidatePath` across replicas. The upstream `partialFallback` contract and one PPR resume-data consistency case remain open; see [Distributed cache](./docs/configuration.md#distributed-cache-cache-components--ppr) and the exact [verification boundary](./docs/verification.md#known-coverage-gaps).
 
 CDN and middleware behavior are coordinated so cached responses can never bypass middleware-protected routes—see [Architecture](#architecture) for how.
 
@@ -339,13 +339,9 @@ Current boundaries are deliberate:
   balancer maintenance. Clients must reconnect, and should use a keepalive appropriate for their
   ingress/load-balancer timeout. State continuity needs an application cursor/session token and
   shared replay/pub-sub; a live connection cannot be transferred between pods.
-- During shutdown the pod stops accepting upgrades, gives established sockets the configured
-  bounded shutdown window, sends close code `1001` (going away), and then force-closes survivors. A
-  socket tunnelled to another pool is relayed byte-for-byte, so it gets the `1001` only when its
-  relayed frame stream is provably between frames at that instant; a socket caught mid-frame gets
-  no injected close frame (splicing one into a frame's payload would corrupt it) and ends in an
-  abnormal closure unless the peer pool happens to be draining too. The drain log's `tunnelled=`
-  counter is exactly that population.
+- During shutdown the pod gives established sockets a bounded drain window and normally sends
+  close code `1001` (going away). Cross-pool tunnels have a qualified mid-frame case documented in
+  the [deploy lifecycle](./docs/lifecycle.md#long-lived-requests-during-cutover).
 
 The same rollout contract covers finite response streams and SSE, including clean SSE EOF and
 `Last-Event-ID` replay guidance. See [deploy lifecycle](./docs/lifecycle.md#long-lived-requests-during-cutover).
