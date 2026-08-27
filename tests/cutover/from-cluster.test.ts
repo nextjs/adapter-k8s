@@ -49,6 +49,7 @@ function metadataFixture(overrides: Record<string, unknown> = {}): Record<string
     hasEnvoyExtensionPolicy: true,
     cdnEnabled: true,
     hasPortableOrigin: true,
+    hasRoutingTier: true,
     projectId: "my-project",
   };
   return { ...meta, ...overrides };
@@ -92,6 +93,7 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
       hasEnvoyExtensionPolicy: true,
       cdnEnabled: true,
       hasPortableOrigin: true,
+      hasRoutingTier: true,
       projectId: "my-project",
     });
   });
@@ -116,6 +118,7 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
     expect(meta.hasEnvoyExtensionPolicy).toBe(false);
     expect(meta.cdnEnabled).toBe(false);
     expect(meta.hasPortableOrigin).toBe(false);
+    expect(meta.hasRoutingTier).toBe(true);
     expect(meta.projectId).toBeUndefined();
     expect(meta.digests).toEqual({});
     expect(meta.previousBuildId).toBeNull();
@@ -123,6 +126,10 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
     expect(readJobEmitMetadata(mount(metadataFixture({ cdnEnabled: "true" }))).cdnEnabled).toBe(
       false,
     );
+  });
+
+  it("requires an explicit routing-tier declaration", () => {
+    expect(readWithout("hasRoutingTier")).toThrow(/no explicit hasRoutingTier declaration/i);
   });
 
   it("fail-closed: a MISSING mount names the path and the chart gate that renders it", () => {
@@ -365,6 +372,7 @@ describe("buildCutoverInputsFromCluster — assembling CutoverInputs from the th
     expect(inputs.hasRouteExtJob).toBe(true);
     expect(inputs.hasEnvoyExtensionPolicy).toBe(true);
     expect(inputs.cdnEnabled).toBe(true);
+    expect(inputs.hasRoutingTier).toBe(true);
   });
 
   it("passes a loaded composition snapshot through (the Job must not drop target readiness)", () => {

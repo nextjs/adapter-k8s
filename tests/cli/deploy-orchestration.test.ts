@@ -11,7 +11,14 @@ vi.mock("../../src/cli/state.js", async (importOriginal) => {
   return { ...actual, readState: vi.fn(), writeState: vi.fn() };
 });
 vi.mock("../../src/cli/cdn-invalidate.js");
-vi.mock("../../src/cli/rollback.js");
+vi.mock("../../src/cutover/edge.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cutover/edge.js")>();
+  return {
+    ...actual,
+    retainLiveRoutingManifest: vi.fn(),
+    revertRoutingServiceToBuild: vi.fn(),
+  };
+});
 vi.mock("../../src/cli/doctor.js");
 vi.mock("../../src/cli/provision-cache.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/cli/provision-cache.js")>();
@@ -28,7 +35,7 @@ import {
   StateDisagreementError,
 } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
-import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "../../src/cli/rollback.js";
+import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "../../src/cutover/edge.js";
 import { runDomainChecks } from "../../src/cli/doctor.js";
 import { provisionMemorystore } from "../../src/cli/provision-cache.js";
 import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
@@ -163,6 +170,7 @@ function setupFs({
   metadata = { buildId: "buildn", pools: ["ssr"], cacheEnabled: false },
   compositionPlan,
   cdn = true,
+  routing = true,
   outputName = "output",
   infrastructureName = "infrastructure.json",
 }: {
@@ -170,6 +178,7 @@ function setupFs({
   metadata?: Record<string, unknown>;
   compositionPlan?: CompositionPlan;
   cdn?: boolean;
+  routing?: boolean;
   outputName?: string;
   infrastructureName?: string;
 } = {}) {
@@ -196,12 +205,19 @@ function setupFs({
     "templates",
     "route-ext-update-job.yaml",
   );
+  const fixtureRoutingDeployment = path.join(
+    fixtureOutput,
+    "chart",
+    "templates",
+    "routing-service-deployment.yaml",
+  );
   vi.mocked(existsSync).mockImplementation(
     (p) =>
       p === fixtureInfraPath ||
       p === fixtureMetaPath ||
       (compositionPlan !== undefined && p === fixturePlanPath) ||
       (cdn && p === fixtureCdnFilter) ||
+      (routing && p === fixtureRoutingDeployment) ||
       p === fixtureRouteExtJobYaml,
   );
   vi.mocked(readFileSync).mockImplementation((p) => {
@@ -2001,6 +2017,67 @@ describe("runDeploy — guards and teardown", () => {
             args[2] === compositionPlanConfigMapName(RELEASE, "buildm"),
         ),
     ).toBe(true);
+  });
+
+  it("preserves local cache coordinates when the coordination claim cannot be deleted", async () => {
+    const outgoing = gkeCompositionPlan({
+      buildId: "buildm",
+      cache: {
+        kind: "managed",
+        region: "europe-west1",
+        sizeGb: 3,
+        tier: "BASIC",
+        auth: true,
+      },
+    });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "europe-west1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    const cluster = happyCompositionCluster(events, { buildm: outgoing });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "delete" &&
+        args[1] === "configmap" &&
+        args[2] === "rel-cache-identity"
+      ) {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const infrastructureWrites = vi
+      .mocked(writeFileSync)
+      .mock.calls.filter(([target]) => target === infraPath);
+    expect(infrastructureWrites).toHaveLength(0);
+    expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toMatch(
+      /cache was deleted.*coordination ConfigMap could not be removed.*coordinates were preserved/s,
+    );
   });
 
   it("defers composed cache cleanup when the outgoing plan cannot be authenticated", async () => {

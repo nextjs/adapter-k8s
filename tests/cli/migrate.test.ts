@@ -12,6 +12,11 @@ import path from "node:path";
 import os from "node:os";
 
 vi.mock("../../src/cli/exec.js");
+const composition = vi.hoisted(() => ({ value: null as any }));
+vi.mock("../../src/cli/composition-plan.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/composition-plan.js")>();
+  return { ...actual, loadProjectCompositionPlan: () => composition.value };
+});
 
 // Same prompt seam as destroy.test.ts (L12): control what the TTY confirmation "types".
 const mockAnswer = vi.hoisted(() => ({ value: "", queue: [] as string[] }));
@@ -124,6 +129,7 @@ function printed(): string {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  composition.value = null;
   mockAnswer.value = "";
   mockAnswer.queue = [];
   tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-migrate-"));
@@ -159,6 +165,75 @@ describe("keepAtBirthAnnotationArgs", () => {
 });
 
 describe("runMigrate — annotating the retained set", () => {
+  it("keeps dry-run cluster-free and prints selector-level sweeps", async () => {
+    composition.value = {
+      plan: {
+        metadata: { releaseName: RELEASE, namespace: "plan-namespace", buildId: "build-1" },
+        target: {
+          identity: { kind: "unverified", requireExplicitConfirmation: true },
+          access: { kind: "kubeconfig-context", context: "another-cluster" },
+        },
+      },
+    };
+
+    await runMigrate({ projectDir: tmpDir, releaseName: RELEASE, dryRun: true });
+
+    expect(execCapture).not.toHaveBeenCalled();
+    expect(execOrThrow).not.toHaveBeenCalled();
+    expect(printed()).toContain("selector sweep");
+    expect(printed()).toContain("does not contact the cluster");
+    expect(printed()).toContain("plan-namespace");
+  });
+
+  it("uses the composition plan's exact GKE access and namespace", async () => {
+    writeInfra({
+      projectId: "wrong-project",
+      region: "wrong-region",
+      namespace: "wrong-namespace",
+    });
+    composition.value = {
+      plan: {
+        metadata: { releaseName: RELEASE, namespace: "plan-namespace", buildId: "build-1" },
+        target: {
+          identity: {
+            kind: "gke-resource",
+            projectId: "plan-project",
+            clusterName: "shared-production",
+            location: { kind: "zone", name: "us-central1-a" },
+          },
+          access: {
+            kind: "gke-get-credentials",
+            projectId: "plan-project",
+            clusterName: "shared-production",
+            location: { kind: "zone", name: "us-central1-a" },
+          },
+        },
+      },
+    };
+    scriptCluster({ empty: true });
+
+    await runMigrate({ projectDir: tmpDir, releaseName: RELEASE });
+
+    expect(vi.mocked(execOrThrow)).toHaveBeenCalledWith(
+      "gcloud",
+      expect.arrayContaining([
+        "get-credentials",
+        "shared-production",
+        "--zone",
+        "us-central1-a",
+        "--project",
+        "plan-project",
+      ]),
+      expect.any(Object),
+    );
+    const listCalls = vi
+      .mocked(execCapture)
+      .mock.calls.map(([, args]) => args as string[])
+      .filter((args) => args[0] === "get");
+    expect(listCalls.length).toBeGreaterThan(0);
+    for (const args of listCalls) expect(args[args.indexOf("-n") + 1]).toBe("plan-namespace");
+  });
+
   it("annotates the FULL retained set the live Argo audit showed being pruned", async () => {
     writeInfra(PINNED_INFRA);
     scriptCluster();
@@ -302,10 +377,12 @@ describe("runMigrate — annotating the retained set", () => {
     await runMigrate({ projectDir: tmpDir, releaseName: RELEASE, dryRun: true });
 
     expect(annotateCalls()).toHaveLength(0);
+    expect(execCapture).not.toHaveBeenCalled();
     expect(vi.mocked(execOrThrow)).not.toHaveBeenCalled();
     const out = printed();
-    expect(out).toContain("[dry-run] kubectl annotate deployments my-app-ssr-buildm");
-    expect(out).toContain("12 object(s) would be annotated");
+    expect(out).toContain("selector sweep: kubectl annotate deployments");
+    expect(out).toContain("Planned 8 selector sweeps");
+    expect(out).toContain("does not contact the cluster");
   });
 
   it("pins the kubectl context to the release's own cluster when it can", async () => {

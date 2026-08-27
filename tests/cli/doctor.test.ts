@@ -6,6 +6,11 @@ import os from "node:os";
 
 vi.mock("../../src/cli/exec.js");
 vi.mock("../../src/cli/state.js");
+const composition = vi.hoisted(() => ({ value: null as any }));
+vi.mock("../../src/cli/composition-plan.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/cli/composition-plan.js")>();
+  return { ...actual, loadProjectCompositionPlan: () => composition.value };
+});
 vi.mock("node:dns/promises", () => ({
   resolve4: vi.fn(),
   resolveCname: vi.fn(),
@@ -127,6 +132,7 @@ describe("runDoctor", () => {
     tmpDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-doctor-test-"));
     writeInfra();
     vi.clearAllMocks();
+    composition.value = null;
     vi.mocked(readState).mockResolvedValue(null as never);
     vi.mocked(resolve4).mockResolvedValue([STATIC_IP] as never);
     vi.mocked(resolveCname).mockResolvedValue(["abc123."] as never);
@@ -135,6 +141,35 @@ describe("runDoctor", () => {
     vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
       throw new Error(`process.exit:${code}`);
     }) as never);
+  });
+
+  it("stops before ambient cluster reads when composition target verification fails", async () => {
+    composition.value = {
+      plan: {
+        metadata: { releaseName: RELEASE, namespace: "apps", buildId: "build-1" },
+        target: {
+          identity: { kind: "unverified", requireExplicitConfirmation: true },
+          access: { kind: "kubeconfig-context", context: "production-cluster" },
+        },
+      },
+    };
+    vi.mocked(execCapture).mockResolvedValue({
+      exitCode: 0,
+      stdout: "developer-cluster\n",
+      stderr: "",
+    } as never);
+
+    await expect(runDoctor({ projectDir: tmpDir, releaseName: RELEASE })).rejects.toThrow(
+      "process.exit:1",
+    );
+
+    expect(readState).not.toHaveBeenCalled();
+    expect(execCapture).toHaveBeenCalledTimes(1);
+    expect(execCapture).toHaveBeenCalledWith(
+      "kubectl",
+      ["config", "current-context"],
+      expect.any(Object),
+    );
   });
 
   afterEach(() => {

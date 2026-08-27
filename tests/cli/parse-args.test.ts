@@ -1,6 +1,6 @@
 // tests/cli/parse-args.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { parseArgs } from "../../src/cli/index.js";
+import { parseArgs, resolveCliReleaseName } from "../../src/cli/index.js";
 
 const argv = (...args: string[]) => ["node", "adapter-k8s", ...args];
 
@@ -160,5 +160,28 @@ describe("parseArgs", () => {
     expect(() => parseArgs(argv("emulate", "--port=0"))).toThrow(/between 1 and 65535/);
     expect(() => parseArgs(argv("emulate", "--port=70000"))).toThrow(/between 1 and 65535/);
     expect(parseArgs(argv("emulate", "--port", "8080")).flags["port"]).toBe("8080");
+  });
+});
+
+describe("resolveCliReleaseName", () => {
+  it("prefers the verified composition plan over stale infrastructure", () => {
+    expect(
+      resolveCliReleaseName({
+        composition: "portable-release",
+        infrastructure: "legacy-release",
+        directoryDefault: "checkout-name",
+      }),
+    ).toBe("portable-release");
+  });
+
+  it("keeps an explicit operator selection authoritative", () => {
+    expect(
+      resolveCliReleaseName({
+        explicit: "selected-release",
+        composition: "built-release",
+        infrastructure: "legacy-release",
+        directoryDefault: "checkout-name",
+      }),
+    ).toBe("selected-release");
   });
 });

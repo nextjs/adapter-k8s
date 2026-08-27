@@ -187,6 +187,8 @@ export interface EmitMetadata {
   cdnEnabled?: boolean;
   /** Chart renders origin-service.yaml (the portable origin Service). Job mode only. */
   hasPortableOrigin?: boolean;
+  /** Chart renders the stable ext_proc routing Deployment. Job mode only. */
+  hasRoutingTier?: boolean;
   /** infra.projectId — E4's gcloud CDN invalidation identity. Job mode only. */
   projectId?: string;
 }
@@ -1166,6 +1168,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
       hasEnvoyExtensionPolicy: chartFiles.includes("templates/envoy-extension-policy.yaml"),
       cdnEnabled: chartFiles.includes("templates/cdn-http-filter.yaml"),
       hasPortableOrigin: chartFiles.includes("templates/origin-service.yaml"),
+      hasRoutingTier: chartFiles.includes("templates/routing-service-deployment.yaml"),
       ...(infra.projectId ? { projectId: infra.projectId } : {}),
     };
     const templatesDir = path.join(bundleDir, "chart", "templates");
@@ -1271,6 +1274,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
           hasEnvoyExtensionPolicy: chartFiles.includes("templates/envoy-extension-policy.yaml"),
           cdnEnabled: chartFiles.includes("templates/cdn-http-filter.yaml"),
           hasPortableOrigin: chartFiles.includes("templates/origin-service.yaml"),
+          hasRoutingTier: chartFiles.includes("templates/routing-service-deployment.yaml"),
           ...(infra.projectId ? { projectId: infra.projectId } : {}),
         }
       : {}),

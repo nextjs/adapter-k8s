@@ -48,6 +48,7 @@ export interface JobEmitMetadata {
   hasEnvoyExtensionPolicy: boolean;
   cdnEnabled: boolean;
   hasPortableOrigin: boolean;
+  hasRoutingTier: boolean;
   projectId: string | undefined;
 }
 
@@ -130,6 +131,12 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
         `a failed rollout could not restore the edge's architecture selector.`,
     );
   }
+  if (typeof meta.hasRoutingTier !== "boolean") {
+    throw new Error(
+      `emit-metadata.json has no explicit hasRoutingTier declaration. The cutover Job cannot ` +
+        `distinguish an intentional pool-local target from a missing ext_proc Deployment.`,
+    );
+  }
   return {
     buildId: meta.buildId,
     previousBuildId: meta.previousBuildId ?? null,
@@ -144,6 +151,7 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
     hasEnvoyExtensionPolicy: meta.hasEnvoyExtensionPolicy === true,
     cdnEnabled: meta.cdnEnabled === true,
     hasPortableOrigin: meta.hasPortableOrigin === true,
+    hasRoutingTier: meta.hasRoutingTier,
     projectId: typeof meta.projectId === "string" && meta.projectId ? meta.projectId : undefined,
   };
 }
@@ -284,6 +292,7 @@ export function buildCutoverInputsFromCluster(opts: {
     previousPools,
     defaultPool: metadata.defaultPool,
     hasPortableOrigin: metadata.hasPortableOrigin,
+    hasRoutingTier: metadata.hasRoutingTier,
     previousReplicasByPool,
     state,
     compositionSnapshot,
