@@ -20,6 +20,42 @@ Each deploy creates a new versioned Deployment alongside the previous one. Traff
 
 `/readyz` is the pod's own verdict: it answers 503 until instrumentation registration has succeeded and at least one route module has imported. The selector value comes from the same sanitizer that stamps the pod label—a mismatch would drain the Service to zero endpoints, which is why both sides derive from one function.
 
+### Long-lived requests during cutover
+
+A cutover changes where **new** connections go; it cannot move a live TCP connection or an
+in-memory handler from one pod to another. Existing connections remain on the previous pod while,
+after the selector change has propagated through the data plane, new connections select the new
+build. The previous pod first receives Kubernetes' `preStop` window, then SIGTERM; on SIGTERM it
+stops readiness and new work, closes idle keep-alives, and gives active protocols a 60-second
+drain window. The pod's 210-second termination grace leaves a 30-second cushion after the
+120-second `preStop` and application drain phases.
+
+The terminal behavior is protocol-specific:
+
+- A finite HTTP/RSC stream may use the full application drain window. If it still has not
+  completed, the adapter resets it; ending it normally would make a truncated representation look
+  complete. The client must retry requests for which that is safe.
+- An SSE response may use the full window, then receives a clean EOF so `EventSource` can
+  reconnect. Durable continuity remains an application contract: send `id:` fields, resume from
+  `Last-Event-ID`, keep replayable events in shared storage, and emit comment heartbeats more
+  frequently than every proxy/CDN idle timeout. The adapter does not fabricate events or migrate
+  process memory.
+- An established WebSocket may use the full window, then receives close code `1001` (going away)
+  before bounded forced teardown. Clients should reconnect with jittered backoff and send an
+  application cursor/session token when missed state matters. Cross-pod topics and replay require
+  shared pub/sub or storage; socket state itself is not transferable.
+
+For the generic Envoy target, generated application rules disable Envoy's 15-second total route
+deadline with `timeouts.request: 0s`; the gateway's stream-idle timeout still detects a connection
+that stops making progress. Other exposure layers supplied by an operator need equivalent
+streaming and WebSocket behavior. Provider-specific GKE backend draining/timeout policy is not
+changed by this portable contract.
+
+This is graceful degradation, not an exactly-once guarantee. An involuntary node loss, process
+crash, exhausted grace period, or abrupt load-balancer reset can still break a connection without
+EOF/1001. Application-level IDs, idempotency, replay, and reconnect logic are what make those
+failures recoverable.
+
 ## Rollback
 
 `npx adapter-k8s rollback` returns to the previous build: pools scale back up, the routing tier reverts to that build's image and manifest snapshot, and the Service selectors patch back. It is symmetric—running it again rolls forward. Deploys resolve images by digest; the routing tier's rollback path currently reconstructs its image reference from the build tag (digest-pinned rollback is on the [roadmap](../README.md#roadmap)).

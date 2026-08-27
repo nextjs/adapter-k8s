@@ -285,9 +285,13 @@ Current boundaries are deliberate:
   pub/sub when messages must span pods.
 - Connections are not durable across deploys, rollbacks, HPA scale-down, node replacement, or load
   balancer maintenance. Clients must reconnect, and should use a keepalive appropriate for their
-  ingress/load-balancer timeout.
+  ingress/load-balancer timeout. State continuity needs an application cursor/session token and
+  shared replay/pub-sub; a live connection cannot be transferred between pods.
 - During shutdown the pod stops accepting upgrades, gives established sockets the configured
   bounded shutdown window, sends close code `1001` (going away), and then force-closes survivors.
+
+The same rollout contract covers finite response streams and SSE, including clean SSE EOF and
+`Last-Event-ID` replay guidance. See [deploy lifecycle](./docs/lifecycle.md#long-lived-requests-during-cutover).
 
 Treat this as an experimental compatibility surface until the Next.js API and its upstream e2e
 suite are published. Exposure components supplied by an operator must preserve HTTP/1.1 WebSocket

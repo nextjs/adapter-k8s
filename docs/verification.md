@@ -109,9 +109,16 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   remaining PPR resume-data consistency case.
 - **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to.
 - **The generic provider is younger** than the GKE one and has correspondingly less real-world exposure, though it passes the same unit suite and its live verification covered the full request path.
+- **Portable rollout continuity is data-plane tested, not yet cluster-rollout verified.** A
+  Docker-gated suite runs real Envoy in front of an old/new pool selector. It differentially
+  verifies disabled total route timeouts, an old-build finite stream completing through cutover,
+  SSE ending cleanly and resuming from `Last-Event-ID` on the new build, and WebSocket `1001`
+  followed by a new-build reconnect. It does not replace a live Kubernetes EndpointSlice,
+  controller, or involuntary node-loss test.
 - **WebSocket Route Handlers are transport-tested, not yet framework-e2e verified.** The pool has
   real-socket coverage for generated `upgradeHandler` dispatch, trusted and local routing,
-  cross-pool tunnelling, repeated handshake headers, and bounded shutdown. The public
+  cross-pool tunnelling, repeated handshake headers, bounded shutdown, and the portable rollout
+  path above. The public
   `NextResponse.upgrade()` API and its upstream e2e fixture are still experimental/unpublished;
   that suite must pass against the exact Next branch before this support is called framework
   verified.
