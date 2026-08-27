@@ -13,12 +13,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=./e2e-lock.sh
+source "${SCRIPT_DIR}/e2e-lock.sh"
+# shellcheck source=./e2e-next-checkout.sh
+source "${SCRIPT_DIR}/e2e-next-checkout.sh"
 # Keep the Next.js checkout outside the adapter repo so npm/package-lock.json
 # here cannot influence workspace or bundler root detection in the Next.js repo.
 WORKSPACE="${ADAPTER_DIR}/../.adapter-k8s-e2e"
 NEXTJS_DIR="${NEXTJS_DIR:-${WORKSPACE}/next.js}"
 TEST_PATTERN="${1:-}"
-NEXTJS_REF="${2:-canary}"
+NEXTJS_REF="${2:-v16.3.0-canary.97}"
 TEST_GROUP="${3:-1/1}"
 # Match upstream CI (.github/workflows/integration_tests_reusable.yml `num_retries: 2`) so
 # our pass/fail numbers are comparable to Next's own. This was 0 while the adapter still had
@@ -59,37 +63,18 @@ echo ""
 # pnpm's virtual store. Double-checked stamp + an atomic directory lock: the stamp records the prepped commit
 # for THIS ref, so post-prep lanes skip without touching the lock at all, and racers
 # serialize then re-check before doing any work.
-PREP_STAMP="${WORKSPACE}/.prep-done-${NEXTJS_REF}"
+PREP_REF_KEY="$(
+  node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(process.argv[1]).digest("hex").slice(0, 16))' \
+    "$NEXTJS_REF"
+)"
+PREP_STAMP="${WORKSPACE}/.prep-done-${PREP_REF_KEY}"
 PREP_LOCK_DIR="${WORKSPACE}/.prep.lock.d"
 prep_lock_acquired=0
 release_prep_lock() {
   if [ "$prep_lock_acquired" -eq 1 ]; then
-    rm -f "${PREP_LOCK_DIR}/owner"
-    rmdir "$PREP_LOCK_DIR" 2>/dev/null || true
+    e2e_lock_release "$PREP_LOCK_DIR"
     prep_lock_acquired=0
   fi
-}
-acquire_prep_lock() {
-  # A full Next checkout build can be slow on the first lane. Wait up to 30 minutes, reclaiming
-  # a lock only when its recorded local process no longer exists. mkdir is atomic on macOS and
-  # Linux, unlike `flock`, which is not installed on a stock macOS contributor machine.
-  for _attempt in $(seq 1 18000); do
-    if mkdir "$PREP_LOCK_DIR" 2>/dev/null; then
-      printf '%s\n' "$$" > "${PREP_LOCK_DIR}/owner"
-      prep_lock_acquired=1
-      return 0
-    fi
-    lock_owner="$(cat "${PREP_LOCK_DIR}/owner" 2>/dev/null || true)"
-    if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
-      stale_lock="${PREP_LOCK_DIR}.stale.$$.$_attempt"
-      if mv "$PREP_LOCK_DIR" "$stale_lock" 2>/dev/null; then
-        rm -rf "$stale_lock"
-      fi
-    fi
-    sleep 0.1
-  done
-  echo "Timed out waiting for Next.js preparation lock: ${PREP_LOCK_DIR}" >&2
-  return 1
 }
 prep_needed() {
   [ -f "$PREP_STAMP" ] || return 0
@@ -100,16 +85,13 @@ prep_needed() {
   return 1
 }
 run_prep() {
-  if [ -d "$NEXTJS_DIR/.git" ]; then
+  if [ -e "$NEXTJS_DIR/.git" ]; then
     echo "Fetching Next.js ref ${NEXTJS_REF}..."
-    cd "$NEXTJS_DIR"
-    git fetch origin "$NEXTJS_REF" --depth=25
-    git checkout FETCH_HEAD
   else
-    echo "Cloning Next.js..."
+    echo "Initializing Next.js checkout..."
     mkdir -p "$WORKSPACE"
-    git clone --depth=25 --branch "$NEXTJS_REF" https://github.com/vercel/next.js.git "$NEXTJS_DIR"
   fi
+  e2e_next_checkout_ref "$NEXTJS_DIR" https://github.com/vercel/next.js.git "$NEXTJS_REF" 25
 
   echo "Building Next.js..."
   cd "$NEXTJS_DIR"
@@ -121,13 +103,23 @@ run_prep() {
   pnpm install
 
   echo "Installing Playwright..."
-  pnpm playwright install chromium
+  if [ "${E2E_PLAYWRIGHT_WITH_DEPS:-0}" = "1" ]; then
+    pnpm playwright install --with-deps chromium
+  else
+    pnpm playwright install chromium
+  fi
 
   git -C "$NEXTJS_DIR" rev-parse HEAD > "$PREP_STAMP"
 }
 if prep_needed; then
   mkdir -p "$WORKSPACE"
-  acquire_prep_lock
+  # A full first checkout build can be slow. The shared helper recovers both dead-owner and
+  # interrupted ownerless locks without relying on Linux-only `stat` or `flock`.
+  if ! e2e_lock_acquire "$PREP_LOCK_DIR" 1800 60; then
+    echo "Timed out waiting for Next.js preparation lock: ${PREP_LOCK_DIR}" >&2
+    exit 1
+  fi
+  prep_lock_acquired=1
   trap release_prep_lock EXIT
   if prep_needed; then
     run_prep
@@ -184,11 +176,8 @@ export ADAPTER_DIR="$ADAPTER_DIR"
 export IS_TURBOPACK_TEST=1
 export NEXT_TEST_JOB=1
 export NEXT_TELEMETRY_DISABLED=1
-# Topology selection. These were assigned unconditionally, which silently defeated the
-# only mechanism callers had to pick a different one: `npm run test:integration` sets
-# NEXT_TEST_DEPLOY_SCRIPT_PATH=scripts/e2e-integration-deploy.sh and this line overwrote
-# it, so the "Phase 2 through Envoy" suite was in fact running the Phase 1 pool topology.
-# Defaulting instead of assigning keeps Phase 1 the default for a bare `test:e2e`.
+# Topology selection. Defaulting keeps the local pool server as the canonical bare run while
+# allowing the Kubernetes wrapper to select its deploy, logs, and cleanup scripts.
 export NEXT_TEST_DEPLOY_SCRIPT_PATH="${NEXT_TEST_DEPLOY_SCRIPT_PATH:-${ADAPTER_DIR}/scripts/e2e-deploy.sh}"
 export NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH="${NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH:-${ADAPTER_DIR}/scripts/e2e-logs.sh}"
 export NEXT_TEST_CLEANUP_SCRIPT_PATH="${NEXT_TEST_CLEANUP_SCRIPT_PATH:-${ADAPTER_DIR}/scripts/e2e-cleanup.sh}"

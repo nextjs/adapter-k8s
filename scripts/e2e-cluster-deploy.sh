@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Next.js Adapter E2E Deploy Script — PHASE 3 topology (REAL CLUSTER).
+# Next.js Adapter E2E Deploy Script — Kubernetes topology.
 #
-# Unlike the other two topologies, this one puts the upstream test app behind the
-# production request path: GXLB -> Cloud CDN -> ext_proc routing service -> pool.
-# That is the whole point — it is the only way to see CDN interaction, GCP-programmed
-# match conditions, and multi-replica cache state, none of which any local topology has.
-#
-#   scripts/e2e-deploy.sh              Phase 1: pool server only        (local)
-#   scripts/e2e-integration-deploy.sh  Phase 2: Envoy -> ext_proc -> pool (local)
-#   scripts/e2e-cluster-deploy.sh      Phase 3: real cluster             (this file)
+# This is shared by local k3d and configured external clusters. The selected target decides
+# the exposure and routing path; both exercise deployed routing, pools, and shared cache.
 #
 # STRICTLY SERIAL. Every suite deploys to the SAME release on the SAME hostname, so two
 # concurrent deploys would race the same blue/green cutover and each would serve the
@@ -33,6 +27,9 @@ ADAPTER_DIR="${ADAPTER_DIR:?ADAPTER_DIR must be set}"
 CLUSTER_STATE_DIR="${ADAPTER_K8S_E2E_CLUSTER_STATE:?ADAPTER_K8S_E2E_CLUSTER_STATE must be set (run via scripts/e2e-cluster.sh)}"
 CLUSTER_LOCK_DIR="${CLUSTER_STATE_DIR}/.deploy.lock"
 APP_DIR="$PWD"
+E2E_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./e2e-lock.sh
+source "${E2E_SCRIPT_DIR}/e2e-lock.sh"
 
 if [ ! -f "${CLUSTER_STATE_DIR}/adapter.config.mjs" ]; then
   echo "[adapter-k8s] Missing ${CLUSTER_STATE_DIR}/adapter.config.mjs" >&2
@@ -48,28 +45,15 @@ fi
 # state dir too. Waits up to 90 minutes because the queue is one full build+push+rollout
 # per waiting suite, and a slow suite ahead is normal rather than a hang.
 cluster_lock_acquired=0
-for _attempt in $(seq 1 54000); do
-  if mkdir "$CLUSTER_LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' "$$" > "${CLUSTER_LOCK_DIR}/owner"
-    cluster_lock_acquired=1
-    break
-  fi
-  lock_owner="$(cat "${CLUSTER_LOCK_DIR}/owner" 2>/dev/null || true)"
-  if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
-    stale="${CLUSTER_LOCK_DIR}.stale.$$.$_attempt"
-    if mv "$CLUSTER_LOCK_DIR" "$stale" 2>/dev/null; then rm -rf "$stale"; fi
-  fi
-  sleep 0.1
-done
-if [ "$cluster_lock_acquired" -ne 1 ]; then
+if ! e2e_lock_acquire "$CLUSTER_LOCK_DIR" 5400 60; then
   echo "[adapter-k8s] Timed out waiting for the cluster deploy lock: ${CLUSTER_LOCK_DIR}" >&2
   exit 1
 fi
+cluster_lock_acquired=1
 
 release_cluster_lock() {
   if [ "$cluster_lock_acquired" -eq 1 ]; then
-    rm -f "${CLUSTER_LOCK_DIR}/owner"
-    rmdir "$CLUSTER_LOCK_DIR" 2>/dev/null || true
+    e2e_lock_release "$CLUSTER_LOCK_DIR"
     cluster_lock_acquired=0
   fi
 }
@@ -165,14 +149,14 @@ if [ -f "${APP_DIR}/.k8s-adapter/internal-secret.key" ]; then
 fi
 
 # --- 5. Wait for the public path to actually serve this build ---
-# `deploy` returns when the rollout is complete in-cluster, which is upstream of the
-# GXLB/CDN. Polling the public host is what proves the request path is live; without it
-# the first assertions of the suite race the load balancer and fail as "adapter bugs".
+# `deploy` returns when the rollout is complete in-cluster, which can still be upstream of
+# the selected exposure's data plane or CDN. Polling the public host proves that path is live;
+# without it the first assertions race the edge and fail as "adapter bugs".
 HOST="$(node -e "
 const j = require('${APP_DIR}/.k8s-adapter/infrastructure.json');
 process.stdout.write(j.hosts[0]);
 ")"
-# Cloud targets serve on https://<host>; the LOCAL Phase-2 cluster serves on a mapped port
+# External targets serve on https://<host> by default; local k3d uses a mapped port
 # over plain HTTP (http://<host>.localhost:<port>). The wrapper that knows the topology
 # exports the base URL; the hostname-derived HTTPS form stays the default for cloud runs.
 URL="${ADAPTER_K8S_E2E_BASE_URL:-https://${HOST}}"

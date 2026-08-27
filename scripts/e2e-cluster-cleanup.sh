@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cleanup for the PHASE 3 (real cluster) topology.
+# Cleanup for the Kubernetes topology.
 #
 # Deliberately does NOT tear the release down. Every suite deploys to the same release,
 # and the next one's blue/green cutover replaces this build — destroying it here would

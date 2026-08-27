@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PHASE 2 bootstrap: a LOCAL Kubernetes cluster for running upstream Next.js e2e suites
+# Bootstrap a local Kubernetes cluster for running upstream Next.js e2e suites
 # through the REAL production topology — Envoy Gateway → ext_proc routing service → pools —
-# with the generic provider. This replaces the retired process-level Envoy emulation
-# (e2e-integration-deploy.sh), which drifted for months and never produced a completed run.
+# with the explicit portable target. This is the maintained full-topology local harness.
 #
 # Idempotent: safe to re-run; recreates nothing that exists.
 #
@@ -18,7 +17,7 @@ set -euo pipefail
 # ships a built-in kube-router-based netpol controller. Pilot 3 proved it the hard way:
 # the merged Envoy proxy (owned by the GatewayClass, so unmatched by the per-gateway
 # allowlist peer) was REFUSED by every pool and ext_proc port while the pods sat Ready.
-# So Phase 2 exercises the strict allowlist for real; the earlier "decorative netpol"
+# The local cluster therefore exercises the strict allowlist for real; the earlier "decorative netpol"
 # caveat here was wrong, in the good direction.
 
 CLUSTER_NAME="${E2E_K3D_CLUSTER:-adapter-e2e}"
@@ -27,14 +26,14 @@ REGISTRY_PORT="${E2E_K3D_REGISTRY_PORT:-5511}"
 HTTP_PORT="${E2E_K3D_HTTP_PORT:-8788}"
 ENVOY_GATEWAY_VERSION="${E2E_ENVOY_GATEWAY_VERSION:-v1.5.4}"
 
-echo "=== Phase 2 local cluster bootstrap ==="
+echo "=== Local cluster bootstrap ==="
 
 # DEDICATED kubeconfig — never the global one. A global `kubectl config use-context` here
 # while a cloud deploy is mid-flight elsewhere cross-wires that deploy's later kubectl calls
 # into this cluster. That is not hypothetical: it happened live on 2026-07-30 (attempt-5 of a
 # GKE restore ran its helm upgrade against this k3d cluster; helm failed wholesale before
 # creating anything, which is the only reason nothing leaked). Every kubectl in this script
-# and in the Phase-2 harness goes through this file.
+# and in the local-cluster harness goes through this file.
 export KUBECONFIG="${E2E_K3D_KUBECONFIG:-$HOME/.kube/k3d-adapter-e2e.yaml}"
 
 # --- 1. Registry ---
