@@ -19,10 +19,12 @@
 import { describe, it, expect } from "vitest";
 import {
   buildProofHeaderNames,
+  coalesceWireHeaderBytes,
   computeDispatchProof,
   dispatchProofInputsFromRequest,
   INTERNAL_DISPATCH_HEADERS,
   matcherProofHeaderNames,
+  NODE_SINGLETON_REQUEST_HEADERS,
   PROOF_COVERED_CONTEXT_HEADERS,
   proofCoveredHeaderNames,
   rscProofHeaderNames,
@@ -333,6 +335,73 @@ describe("dispatchProofInputsFromRequest / verifyDispatchProof", () => {
     expect(octets(inputs.headers["cookie"])).toBe("a=1; b=2");
     expect(octets(inputs.headers["x-forwarded-proto"])).toBe("https, http");
     expect(octets(inputs.headers["x-output-id"])).toBe("/about");
+  });
+
+  it("A0-DP-3: mirrors Node's SINGLETON headers — first value wins, no join", () => {
+    // The claim the ", " join rested on was that "one rule serves both sides". It does not: Node's
+    // parser keeps only the FIRST value for a fixed set of names, so the edge (which sees both
+    // Envoy entries) signed "A, B" while the pool read "A" and refused every such request.
+    // `matcherProofHeaderNames` admits any non-excluded name, so a matcher gating on `user-agent`
+    // or `authorization` plus a client sending it twice is all it takes.
+    for (const name of ["user-agent", "authorization", "referer", "content-type"]) {
+      expect(coalesceWireHeaderBytes(name, [Buffer.from("A"), Buffer.from("B")])).toEqual(
+        Buffer.from("A"),
+      );
+      expect(NODE_SINGLETON_REQUEST_HEADERS.has(name)).toBe(true);
+    }
+    // Case-insensitive on the name — the edge reads `User-Agent` off the wire as it was sent.
+    expect(coalesceWireHeaderBytes("User-Agent", [Buffer.from("A"), Buffer.from("B")])).toEqual(
+      Buffer.from("A"),
+    );
+    // Everything else keeps the delimiter Node actually uses.
+    expect(coalesceWireHeaderBytes("cookie", [Buffer.from("a=1"), Buffer.from("b=2")])).toEqual(
+      Buffer.from("a=1; b=2"),
+    );
+    expect(coalesceWireHeaderBytes("x-tenant", [Buffer.from("a"), Buffer.from("b")])).toEqual(
+      Buffer.from("a, b"),
+    );
+    // A single value is untouched whatever the name, and an empty list is ABSENT.
+    expect(coalesceWireHeaderBytes("user-agent", [Buffer.from("only")])).toEqual(
+      Buffer.from("only"),
+    );
+    expect(coalesceWireHeaderBytes("user-agent", [])).toBeUndefined();
+  });
+
+  it("A0-DP-3: a signer seeing both entries and a pool seeing one produce the same proof", () => {
+    // The two sides of the divergence, end to end: the edge's ext_proc list carries both field
+    // lines, while Node's `req.headers` carries only the first. Both must reach one transcript.
+    const proofHeaderNames = ["user-agent"];
+    const asEdge = computeDispatchProof(
+      SECRET,
+      baseInputs({
+        headers: {
+          ...baseInputs().headers,
+          "user-agent": coalesceWireHeaderBytes("user-agent", [
+            Buffer.from("first/1.0"),
+            Buffer.from("second/2.0"),
+          ]),
+        },
+        proofHeaderNames,
+      }),
+    );
+    const asPool = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest({
+        method: "GET",
+        target: "/about?x=1",
+        headers: {
+          host: "app.example.com",
+          "user-agent": "first/1.0",
+          "x-output-id": "/about",
+          "x-matched-pathname": "/about",
+          "x-mw-evaluated": "ran",
+          "x-upstream-pool": "ssr",
+          "x-forwarded-proto": "https",
+        },
+        proofHeaderNames,
+      }),
+    );
+    expect(asPool).toBe(asEdge);
   });
 
   it("defaults a missing method/target the same way the pool boundary does", () => {
