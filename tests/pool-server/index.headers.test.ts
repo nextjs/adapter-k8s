@@ -40,6 +40,7 @@ function writeStagedDir(): { dir: string; configDir: string } {
   writeFileSync(path.join(dir, "public", "header-priority.txt"), "priority body");
   writeFileSync(path.join(dir, "public", "probe.txt"), "probe body");
   writeFileSync(path.join(dir, "public", "mw-probe.txt"), "mw probe body");
+  writeFileSync(path.join(dir, "public", "mw-stale.txt"), "mw stale body");
   writeFileSync(path.join(dir, "public", "stale.txt"), "stale body");
 
   // Middleware-covered handler that claims a cacheable policy of its own — the forced
@@ -509,6 +510,27 @@ describe("pool-server response cache-control precedence", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { resolvedPathname: string | null };
     expect(body.resolvedPathname).toBe("/echo-target");
+  });
+
+  it("discards an upstream cache policy when malformed sibling metadata forces Phase 1", async () => {
+    // Middleware is lazy-loaded by the first locally resolved request. Prime it so this request
+    // exercises the middleware-covered cache wrapper regardless of test filtering/order.
+    await fetch(`http://127.0.0.1:${port}/mw-covered`);
+    const res = await fetch(`http://127.0.0.1:${port}/mw-stale.txt`, {
+      headers: {
+        "x-output-id": "/mw-stale.txt",
+        "x-mw-evaluated": "ran",
+        "x-resolved-headers": JSON.stringify({
+          "cache-control": "no-store",
+        }),
+        "x-invoke-query": "{not json",
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("mw stale body");
+    // Local resolution owns the whole verdict after any member is rejected. The stale upstream
+    // value must not displace the middleware-covered response's local no-cache policy.
+    expect(res.headers.get("cache-control")).toBe("no-cache");
   });
 
   it("re-resolves a trusted verdict whose route-matches payload has the wrong shape", async () => {
