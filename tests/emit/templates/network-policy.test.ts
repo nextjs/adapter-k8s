@@ -316,18 +316,21 @@ describe("renderNetworkPolicies — input validation", () => {
     ).toThrow(/Invalid releaseName/);
   });
 
-  it.each(["999.1.1.1/24", "10.0.0.0/33", "2001:db8::/129", "10.0.0.0/24\n- {}"])(
-    "rejects malformed ingress CIDR %s",
-    (cidr) => {
-      expect(() =>
-        renderNetworkPolicies({
-          releaseName: "my-app",
-          poolNames: ["ssr"],
-          ingressSources: { cidrs: [cidr], podSelectors: [] },
-        }),
-      ).toThrow(/CIDR/i);
-    },
-  );
+  it.each([
+    "999.1.1.1/24",
+    "10.0.0.0/33",
+    "2001:db8::/129",
+    "fe80::1%eth0/64",
+    "10.0.0.0/24\n- {}",
+  ])("rejects malformed ingress CIDR %s", (cidr) => {
+    expect(() =>
+      renderNetworkPolicies({
+        releaseName: "my-app",
+        poolNames: ["ssr"],
+        ingressSources: { cidrs: [cidr], podSelectors: [] },
+      }),
+    ).toThrow(/CIDR/i);
+  });
 
   it("quotes validated IPv4 and IPv6 ingress CIDRs", () => {
     const yaml = renderNetworkPolicies({

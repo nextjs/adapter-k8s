@@ -6,15 +6,10 @@
 // and destructure; both bundle formats resolve the symbols this way.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import NextRouting from "@next/routing";
-import type { ResolveRoutesParams, ResolveRoutesResult } from "@next/routing";
+import type { ResolveRoutesParams } from "@next/routing";
 import { isSafePattern } from "redos-detector";
 import { grantsSharedCacheFreshness as grantsSharedCacheFreshnessFromCacheControl } from "./cache-control.js";
-const {
-  detectLocale,
-  detectDomainLocale,
-  normalizeLocalePath,
-  resolveRoutes: resolveRoutesFromNext,
-} = NextRouting;
+const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
 // (routing-service/handler.ts, "Phase 2") and the pool's local resolver
@@ -1666,50 +1661,6 @@ export function manifestNextConfig(manifest: {
 
 export function getRscConfig(manifest: { routeGraph?: unknown }): RscConfig | undefined {
   return (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
-}
-
-/**
- * Run the official resolver while preserving the split case policy used by `next start`.
- *
- * `@next/routing` 16.3 applies `routes.caseSensitive` to custom routes and filesystem dynamic
- * routes alike. Next's production server does not: custom routes follow
- * `experimental.caseSensitiveRoutes` (false by default), while filesystem dynamic routes are
- * always matched by their flagless route regex. When the official resolver selects a dynamic
- * route by case only, remove every dynamic candidate that is invalid for that concrete rewritten
- * pathname and resolve again. The middleware verdict is memoized because this is one request and
- * middleware must never execute twice. All route ordering, rewrites, conditions, locales, and
- * result construction remain owned by `@next/routing`.
- */
-export async function resolveRoutesWithNextParity(
-  params: ResolveRoutesParams,
-): Promise<ResolveRoutesResult> {
-  if (params.routes.caseSensitive === true || params.routes.dynamicRoutes.length === 0) {
-    return resolveRoutesFromNext(params);
-  }
-
-  let middlewareVerdict: ReturnType<ResolveRoutesParams["invokeMiddleware"]> | undefined;
-  const invokeMiddlewareOnce: ResolveRoutesParams["invokeMiddleware"] = (context) => {
-    middlewareVerdict ??= params.invokeMiddleware(context);
-    return middlewareVerdict;
-  };
-  let dynamicRoutes = params.routes.dynamicRoutes;
-
-  while (true) {
-    const result = await resolveRoutesFromNext({
-      ...params,
-      routes: { ...params.routes, dynamicRoutes },
-      invokeMiddleware: invokeMiddlewareOnce,
-    });
-    const pathname = result.invocationTarget?.pathname;
-    if (pathname === undefined || result.routeMatches === undefined) return result;
-
-    const caseValidRoutes = dynamicRoutes.filter((route) => {
-      const matchedIgnoringCase = new RegExp(route.sourceRegex, "i").test(pathname);
-      return !matchedIgnoringCase || new RegExp(route.sourceRegex).test(pathname);
-    });
-    if (caseValidRoutes.length === dynamicRoutes.length) return result;
-    dynamicRoutes = caseValidRoutes;
-  }
 }
 
 /** The `routeGraph` buckets `@next/routing`'s matchRoute walks. Every entry in each of them

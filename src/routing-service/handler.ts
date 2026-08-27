@@ -1,4 +1,4 @@
-import { responseToMiddlewareResult } from "@next/routing";
+import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
 import { invokeNodeMiddleware } from "../next-runtime/middleware-entrypoint.js";
 import type { ProcessingResponse, HeaderValue } from "./ext-proc-types.js";
@@ -25,7 +25,6 @@ import {
   prepareRequest,
   resolveOutputPathname,
   resolveRscOutput,
-  resolveRoutesWithNextParity,
   rscCacheBustingUnvalidated,
   sanitizeRouteMatches,
   serializeHeaderMap,
@@ -377,7 +376,7 @@ export function createRequestHandler(
     // yet confirmed to have run (so the pool re-evaluates); `none` when there is no middleware.
     let mwEvaluated: MwEvaluated = retry?.mwEvaluated ?? (middlewareModule ? "error" : "none");
 
-    const resolution = await resolveRoutesWithNextParity({
+    const resolution = await resolveRoutes({
       url: resolveUrl,
       buildId: manifest.buildId,
       basePath: manifest.basePath,

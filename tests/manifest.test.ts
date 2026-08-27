@@ -283,7 +283,7 @@ describe("buildRoutingManifest", () => {
     expect(manifest.pathnames).toContain("/api/hello");
   });
 
-  it("passes raw route regexes and the default case policy to @next/routing", () => {
+  it("encodes the default insensitive policy only on custom route buckets", () => {
     const routing = mockRouting({
       beforeFiles: [
         { source: "/redir", sourceRegex: "^\\/redir(?:\\/)?$", destination: "/dest", status: 307 },
@@ -309,14 +309,10 @@ describe("buildRoutingManifest", () => {
       afterFiles: Array<{ sourceRegex: string }>;
       beforeFiles: Array<{ sourceRegex: string }>;
     };
-    expect(rg.caseSensitive).toBe(false);
-    expect(rg.afterFiles[0]!.sourceRegex).toBe("^\\/rewrite-1(?:\\/)?$");
-    expect(rg.beforeFiles[0]!.sourceRegex).toBe("^\\/redir(?:\\/)?$");
-    // This is the exact construction used by @next/routing 16.3. Keeping the policy separate
-    // avoids adapter-authored regex syntax and lets the upstream package own match semantics.
-    expect(
-      new RegExp(rg.afterFiles[0]!.sourceRegex, rg.caseSensitive ? "" : "i").test("/Rewrite-1"),
-    ).toBe(true);
+    expect(rg.caseSensitive).toBe(true);
+    expect(rg.afterFiles[0]!.sourceRegex).toBe("(?i:^\\/rewrite-1(?:\\/)?$)");
+    expect(rg.beforeFiles[0]!.sourceRegex).toBe("(?i:^\\/redir(?:\\/)?$)");
+    expect(new RegExp(rg.afterFiles[0]!.sourceRegex).test("/Rewrite-1")).toBe(true);
   });
 
   it("passes the case-sensitive Next config without rewriting any route bucket", () => {
@@ -366,8 +362,8 @@ describe("buildRoutingManifest", () => {
   });
 
   it("emits sourceRegexes that compile with new RegExp on the deploy runtime", () => {
-    // The adapter must ship Next-provided regex source, not synthesize runtime-specific syntax.
-    // @next/routing owns the case flag separately through routeGraph.caseSensitive.
+    // Default custom routes use Node 24 scoped modifiers because @next/routing has only one
+    // global case flag. Every emitted image pins that same runtime floor.
     const routing = mockRouting({
       beforeMiddleware: [{ source: "/bm", sourceRegex: "^\\/bm(?:\\/)?$", destination: "/d" }],
       beforeFiles: [{ source: "/bf", sourceRegex: "^\\/bf(?:\\/)?$", destination: "/d" }],

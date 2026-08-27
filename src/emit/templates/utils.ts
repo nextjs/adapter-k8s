@@ -438,7 +438,7 @@ export function assertSafeAnnotationName(name: unknown): asserts name is string 
 
 /** Parse an IPv4/IPv6 CIDR and enforce the address family's prefix bounds. */
 export function assertSafeCidr(cidr: unknown, where = "CIDR"): asserts cidr is string {
-  if (typeof cidr !== "string") {
+  if (typeof cidr !== "string" || cidr.includes("%")) {
     throw new Error(`Invalid ${where} ${JSON.stringify(cidr)}: expected an IPv4 or IPv6 CIDR.`);
   }
   const match = /^(.+)\/([0-9]{1,3})$/.exec(cidr);

@@ -86,6 +86,23 @@ export function collectOutputPathnames(outputs: AdapterOutputs): string[] {
   return [...pathnames].sort();
 }
 
+// @next/routing 16.3 exposes one caseSensitive flag for every route bucket, while `next start`
+// applies experimental.caseSensitiveRoutes to custom rules and always matches filesystem dynamic
+// routes with a flagless RegExp. Keep the resolver globally sensitive, and encode the default
+// insensitive policy only on custom-route sources. Node 24 is the emitted/runtime floor because
+// it is the first supported runtime with scoped regexp modifiers.
+function customRouteSources<T extends { sourceRegex: string }>(
+  routes: T[],
+  caseSensitive: boolean,
+): T[] {
+  if (caseSensitive) return routes;
+  return routes.map((route) =>
+    route.sourceRegex && !route.sourceRegex.startsWith("(?i")
+      ? { ...route, sourceRegex: `(?i:${route.sourceRegex})` }
+      : route,
+  );
+}
+
 // builtAt is embedded in the chart ConfigMap and every Docker build context, so a
 // wall-clock stamp makes two chart generations of the SAME build byte-different —
 // busting Docker layer caches and violating the clean chart-regeneration invariant
@@ -326,16 +343,15 @@ export function buildRoutingManifest({
   return {
     // rsc is inside routeGraph per design doc §5.3
     routeGraph: {
-      // Keep Next's route sources byte-for-byte and pass its policy separately. @next/routing
-      // 16.3 owns the RegExp flags for every bucket; wrapping sources here duplicated that
-      // logic, ignored experimental.caseSensitiveRoutes, and introduced Node-24-only syntax.
-      caseSensitive,
-      beforeMiddleware: routing.beforeMiddleware,
-      beforeFiles: routing.beforeFiles,
-      afterFiles: routing.afterFiles,
+      // See customRouteSources: @next/routing's one global flag cannot represent Next's split
+      // policy. Dynamic routes remain raw and sensitive at every ordered resolution stage.
+      caseSensitive: true,
+      beforeMiddleware: customRouteSources(routing.beforeMiddleware, caseSensitive),
+      beforeFiles: customRouteSources(routing.beforeFiles, caseSensitive),
+      afterFiles: customRouteSources(routing.afterFiles, caseSensitive),
       dynamicRoutes: routing.dynamicRoutes,
-      onMatch: routing.onMatch,
-      fallback: routing.fallback,
+      onMatch: customRouteSources(routing.onMatch, caseSensitive),
+      fallback: customRouteSources(routing.fallback, caseSensitive),
       shouldNormalizeNextData: routing.shouldNormalizeNextData,
       rsc: routing.rsc,
     },

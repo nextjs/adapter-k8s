@@ -1,8 +1,8 @@
 // src/emit/dockerfiles.ts
 import { DEFAULT_TARGET_PLATFORM, targetNodeCpu, type TargetPlatform } from "../target-platform.js";
 
-// Node 24 is the tested runtime and current default image. Route-regex compatibility does not
-// depend on it: the manifest preserves Next's regex sources and @next/routing owns the flags.
+// Node 24 is the tested runtime and required image: scoped regexp modifiers preserve Next's
+// split custom-route/filesystem-route case policy across @next/routing's single global flag.
 export const DEFAULT_EMITTED_NODE_VERSION = "24";
 
 /**

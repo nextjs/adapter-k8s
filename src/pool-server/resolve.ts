@@ -1,5 +1,5 @@
 // src/pool-server/resolve.ts
-import { responseToMiddlewareResult } from "@next/routing";
+import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
 import {
   hasCallableNodeMiddlewareEntrypoint,
@@ -21,7 +21,6 @@ import {
   queryFromUrl,
   resolveOutputPathname,
   resolveRscOutput,
-  resolveRoutesWithNextParity,
   sanitizeRouteMatches,
   type MiddlewareMatcher,
 } from "../routing-common.js";
@@ -129,7 +128,7 @@ export function createLocalResolver(
         return { kind: "error", status: 500 };
       }
 
-      const resolution = await resolveRoutesWithNextParity({
+      const resolution = await resolveRoutes({
         url,
         buildId: manifest.buildId,
         basePath: manifest.basePath,

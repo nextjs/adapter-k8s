@@ -1,6 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createLocalResolver } from "../../src/pool-server/resolve.js";
-import { resolveRoutesWithNextParity } from "../../src/routing-common.js";
 import type { RoutingManifest } from "../../src/types.js";
 
 const rsc = {
@@ -27,15 +26,15 @@ describe("createLocalResolver with real @next/routing", () => {
   ])("resolves an i18n index rewrite for %s", async (pathname, locale) => {
     const manifest: RoutingManifest = {
       routeGraph: {
-        caseSensitive: false,
+        caseSensitive: true,
         beforeMiddleware: [],
         beforeFiles: [],
         afterFiles: [
           {
             source: "/:nextInternalLocale(en|nl\\-NL)",
-            // Raw source emitted by Next. @next/routing applies the case-insensitive flag from
-            // routeGraph.caseSensitive; the adapter must not synthesize an inline modifier.
-            sourceRegex: "^(?:\\/(en|nl\\-NL))(?:\\/)?$",
+            // The adapter scopes case folding to custom routes so dynamic routes remain
+            // case-sensitive through every ordered @next/routing resolution stage.
+            sourceRegex: "(?i:^(?:\\/(en|nl\\-NL))(?:\\/)?$)",
             destination: "/$1/company/about-us?nextInternalLocale=$1",
           },
         ],
@@ -84,13 +83,13 @@ describe("createLocalResolver with real @next/routing", () => {
   it("keeps custom routes insensitive and filesystem dynamic routes sensitive by default", async () => {
     const manifest: RoutingManifest = {
       routeGraph: {
-        caseSensitive: false,
+        caseSensitive: true,
         beforeMiddleware: [],
         beforeFiles: [],
         afterFiles: [
           {
             source: "/rewrite",
-            sourceRegex: "^\\/rewrite(?:\\/)?$",
+            sourceRegex: "(?i:^\\/rewrite(?:\\/)?$)",
             destination: "/blog/rewritten",
           },
         ],
@@ -140,7 +139,16 @@ describe("createLocalResolver with real @next/routing", () => {
 
     const sensitiveResolver = createLocalResolver({
       ...manifest,
-      routeGraph: { ...manifest.routeGraph, caseSensitive: true },
+      routeGraph: {
+        ...manifest.routeGraph,
+        afterFiles: [
+          {
+            source: "/rewrite",
+            sourceRegex: "^\\/rewrite(?:\\/)?$",
+            destination: "/blog/rewritten",
+          },
+        ],
+      },
     });
     const sensitiveCustom = await sensitiveResolver.resolve(
       new URL("http://localhost/REWRITE"),
@@ -154,33 +162,47 @@ describe("createLocalResolver with real @next/routing", () => {
     }
   });
 
-  it("does not execute middleware twice when rejecting an insensitive dynamic match", async () => {
-    const invokeMiddleware = vi.fn(async () => ({}));
-    const result = await resolveRoutesWithNextParity({
-      url: new URL("http://localhost/BLOG/direct"),
-      buildId: "build-id",
-      basePath: "",
-      requestBody: new ReadableStream<Uint8Array>(),
-      headers: new Headers(),
-      pathnames: ["/blog/[slug]"],
-      routes: {
-        caseSensitive: false,
+  it("continues ordered rewrites before accepting a case-valid dynamic match", async () => {
+    const manifest: RoutingManifest = {
+      routeGraph: {
+        caseSensitive: true,
         beforeMiddleware: [],
         beforeFiles: [],
-        afterFiles: [],
+        afterFiles: [
+          { sourceRegex: "(?i:^/start$)", destination: "/BLOG/x" },
+          { sourceRegex: "(?i:^/BLOG/x$)", destination: "/blog/x" },
+        ],
         dynamicRoutes: [
           {
-            sourceRegex: "^\\/blog\\/([^/]+?)(?:\\/)?$",
+            sourceRegex: "^/blog/([^/]+?)$",
             destination: "/blog/[slug]?slug=$1",
           },
         ],
         onMatch: [],
         fallback: [],
+        shouldNormalizeNextData: false,
+        rsc,
       },
-      invokeMiddleware,
-    });
+      pathnames: ["/blog/[slug]"],
+      i18n: null,
+      buildId: "build-id",
+      basePath: "",
+      middleware: null,
+      poolAssignments: { "/blog/[slug]": "default" },
+      pprRoutes: {},
+      nextVersion: "16.3.0",
+    };
+    const result = await createLocalResolver(manifest).resolve(
+      new URL("http://localhost/start"),
+      new Headers(),
+      "GET",
+      new ReadableStream<Uint8Array>(),
+    );
 
-    expect(result.resolvedPathname).toBeUndefined();
-    expect(invokeMiddleware).toHaveBeenCalledOnce();
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.matchedPathname).toBe("/blog/[slug]");
+      expect(result.invokePath).toBe("/blog/x?slug=x");
+    }
   });
 });

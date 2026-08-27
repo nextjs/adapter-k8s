@@ -158,22 +158,11 @@ function validateEnvFrom(envFrom: unknown, where: string): void {
   }
 }
 
-/**
- * One IPv4 or IPv6 CIDR. Deliberately the same charset shape deploy.ts accepts for
- * `provider.generic.nodeCidrs` (`/^[0-9a-fA-F:.]+\/\d{1,3}$/`) — these values reach a helm
- * `--set` brace list on the deploy path and a JSON values array on the emit path, so the
- * charset is what keeps one list entry from splitting into several. Exported for the emit
- * verb, which consumes `networkPolicy.podCidrs`/`nodeCidrs` at values-write time
- * (sanitize-at-consumption, AGENTS.md).
- */
-export const CIDR_RE = /^[0-9a-fA-F:.]+\/\d{1,3}$/;
-
 export function assertSafeCidrList(cidrs: unknown, where: string): asserts cidrs is string[] {
   if (!Array.isArray(cidrs)) {
     throw new Error(`${where} must be an array of CIDR strings (e.g. ["10.0.0.0/16"])`);
   }
   const bad = cidrs.filter((cidr) => {
-    if (typeof cidr !== "string" || !CIDR_RE.test(cidr)) return true;
     try {
       assertSafeCidr(cidr, where);
       return false;

@@ -8,6 +8,7 @@ import {
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeReleaseName,
+  assertSafeServiceName,
 } from "../emit/templates/utils.js";
 import {
   COMPOSITION_PLAN_API_VERSION,
@@ -420,10 +421,8 @@ function parseKubernetesObjectRef(value: unknown, path: string): KubernetesObjec
 function parseKubernetesServiceRef(value: unknown, path: string): KubernetesServiceRef {
   const parsed = object(value, path);
   exactKeys(parsed, ["name", "namespace", "port"], path);
-  const name = string(parsed.name, `${path}.name`);
-  if (!DNS_SUBDOMAIN_RE.test(name)) fail(`${path}.name`, "invalid Kubernetes Service name");
   return {
-    name,
+    name: validated(parsed.name, `${path}.name`, assertSafeServiceName),
     namespace: validated(parsed.namespace, `${path}.namespace`, assertSafeNamespace),
     port: integer(parsed.port, `${path}.port`, 1, 65_535),
   };

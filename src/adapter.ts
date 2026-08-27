@@ -2365,8 +2365,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         await writeOutputFile(
           projectDir,
           "Dockerfile",
-          // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts), the
-          // runtime version exercised by this package's image and deployment verification.
+          // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts). Node 24
+          // is required by the manifest's scoped regexp compatibility modifiers.
           generateDockerfile({
             containerStrategy: "shared-image",
             buildId,

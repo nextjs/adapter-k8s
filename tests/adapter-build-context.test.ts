@@ -107,6 +107,7 @@ function ctxFor({
   handlerAssets = {},
   wasmAssets,
   middleware,
+  routing,
   config = {},
 }: {
   distDirName?: string;
@@ -114,6 +115,7 @@ function ctxFor({
   handlerAssets?: Record<string, string>;
   wasmAssets?: Record<string, string>;
   middleware?: Record<string, unknown>;
+  routing?: ReturnType<typeof mockRouting>;
   config?: Record<string, unknown>;
 } = {}) {
   const distDir = path.join(projectDir, distDirName);
@@ -125,7 +127,7 @@ function ctxFor({
   if (wasmAssets) (page as unknown as Record<string, unknown>).wasmAssets = wasmAssets;
   return {
     buildId,
-    routing: mockRouting(),
+    routing: routing ?? mockRouting(),
     outputs: mockOutputs({
       appPages: [page],
       ...(middleware ? { middleware: middleware as never } : {}),
@@ -200,10 +202,16 @@ describe("CEL public-file handling (N40, post-exclusion-removal)", () => {
 describe("pool build context staging", () => {
   it("carries Next case-sensitive routing policy into the staged manifest", async () => {
     seedProject();
-    await build({ config: { experimental: { caseSensitiveRoutes: true } } });
+    await build({
+      config: { experimental: { caseSensitiveRoutes: true } },
+      routing: mockRouting({
+        afterFiles: [{ source: "/exact", sourceRegex: "^/exact$", destination: "/destination" }],
+      }),
+    });
 
     const manifest = JSON.parse(outputFile("routing-manifest.json"));
     expect(manifest.routeGraph.caseSensitive).toBe(true);
+    expect(manifest.routeGraph.afterFiles[0].sourceRegex).toBe("^/exact$");
   });
 
   it("emits one shared runtime base and thin, disjoint deltas for multiple pools", async () => {
