@@ -219,6 +219,9 @@ describe("pool build context staging", () => {
     expect(
       existsSync(path.join(output, "pool-base/fetch-cache/.k8s-adapter/fetch-cache-seed/entry")),
     ).toBe(true);
+    expect(existsSync(path.join(output, "pool-base/content/public/logo.png"))).toBe(true);
+    expect(existsSync(path.join(output, "pools/web/context/public/logo.png"))).toBe(false);
+    expect(existsSync(path.join(output, "pools/api/context/public/logo.png"))).toBe(false);
     expect(existsSync(path.join(output, "pools/web/context/.next/server/app/page.js"))).toBe(true);
     expect(
       existsSync(path.join(output, "pools/api/context/.next/server/app/api/hello/route.js")),

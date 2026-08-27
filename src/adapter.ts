@@ -2133,14 +2133,6 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // `@next/routing` / sharp gaps were the same crash-at-runtime shapes the traced-assets
       // branch already guarded against.
       const stageCommonRuntimeFiles = async (poolName: string, isShared: boolean) => {
-        // public/ files (favicon, robots, arbitrary static assets). They are NOT in Next's
-        // staticFiles output, so nothing else stages them, and the pool's public-file fast
-        // path 404s without them. Enumerate with the same helper the router uses.
-        for (const publicPathname of collectPublicPathnames(projectDir)) {
-          const rel = `public${publicPathname}`; // publicPathname starts with "/"
-          await stageFile(projectDir, path.join(projectDir, rel), rel, poolName, isShared);
-        }
-
         // @next/routing (the pool server's local route resolution — the fail-safe path).
         // Resolve adapter-first (it is the adapter's own dependency); a silent skip ships an
         // image that crashes with "Cannot find module '@next/routing'".
@@ -2195,6 +2187,41 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           isShared,
           imageTargetPlatform,
         );
+      };
+
+      // Build-emitted static files and prerenders are route-independent content. They must be
+      // visible in every pool because a public/static pathname can arrive at any route owner,
+      // but copying a large corpus into every pool only to hash it back into the shared OCI base
+      // makes staging scale as `static files × pools`. Defer these files until the image-layout
+      // decision is known: compatible multi-pool builds stage them directly into the shared
+      // content layer once; standalone layouts retain the historical per-pool copies.
+      const stageStaticRuntimeFiles = async (
+        poolName: string,
+        stageDirOverride?: string,
+        includeFilePath?: (filePath: string) => boolean,
+      ): Promise<void> => {
+        for (const asset of staticManifest) {
+          // A caller whose context already holds part of the corpus filters those entries out.
+          // stageFile does not dedupe against a bulk `cp`: stagedPaths only records its own
+          // copies, and its exists-check skips a destination only when the realpaths MATCH, so an
+          // already-present copy is overwritten rather than left alone.
+          if (includeFilePath && !includeFilePath(asset.filePath)) continue;
+          const absPath = path.resolve(projectDir, asset.filePath);
+          await stageFile(projectDir, absPath, asset.filePath, poolName, false, stageDirOverride);
+          // Runtime sibling files the manifest doesn't carry (`.meta` — see
+          // prerenderSiblingFiles). stageFile skips missing sources, so a prerender without one
+          // costs nothing.
+          for (const sibling of prerenderSiblingFiles(asset)) {
+            await stageFile(
+              projectDir,
+              path.resolve(projectDir, sibling),
+              sibling,
+              poolName,
+              false,
+              stageDirOverride,
+            );
+          }
+        }
       };
 
       if (skipStaging) {
@@ -2261,6 +2288,25 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         );
 
         const sharpStaging = await stageCommonRuntimeFiles("shared", true);
+        // Only the entries the wholesale distDir `cp` above did NOT place. That copy already put
+        // every distDir-resident manifest entry — `static/**`, and each prerender's `.html` /
+        // `.segments` / `.meta` — at exactly the destination stageFile computes, and stageFile
+        // overwrites a non-identical destination instead of skipping it, so staging them again
+        // copies the whole corpus twice. On the 94k-route builds this staging exists to make
+        // cheap, that is the hot path. `public/` (never inside distDir) and any out-of-dist entry
+        // still need staging; `<distDir>/cache` is excluded from the cp, so anything under it
+        // stays eligible here.
+        const distDirStagedPrefix = distDirRel + path.sep;
+        const distCacheStagedPrefix = path.join(distDirRel, "cache") + path.sep;
+        await stageStaticRuntimeFiles(
+          "shared",
+          path.join(projectDir, absSharedStageDir),
+          (filePath) => {
+            const normalized = path.normalize(filePath);
+            if (!normalized.startsWith(distDirStagedPrefix)) return true;
+            return normalized.startsWith(distCacheStagedPrefix);
+          },
+        );
         await pruneSharpContext(path.join(projectDir, absSharedStageDir));
 
         // Keep .env secrets out of the shared image (built from this context).
@@ -2344,25 +2390,6 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               poolName,
               false,
             );
-          }
-
-          // Stage static/public/prerender files into EVERY pool image, not just
-          // the default one. static-assets.json is written to every pool's config
-          // (so every dispatcher knows these paths), and the gateway routes a
-          // shared URL prefix to whichever pool owns a route under it — which may
-          // be a non-default pool. If the files lived only in the default pool,
-          // a public asset under such a prefix would 404 on the pool that
-          // actually receives it. (Phase 4 CDN/GCS offload will move these off
-          // the pods entirely and make this staging unnecessary.)
-          for (const asset of staticManifest) {
-            const absPath = path.resolve(projectDir, asset.filePath);
-            await stageFile(projectDir, absPath, asset.filePath, poolName);
-            // Runtime sibling files the manifest doesn't carry (`.meta` — see
-            // prerenderSiblingFiles). stageFile skips missing sources, so a prerender
-            // without one costs nothing.
-            for (const sibling of prerenderSiblingFiles(asset)) {
-              await stageFile(projectDir, path.resolve(projectDir, sibling), sibling, poolName);
-            }
           }
 
           // The build's fetch-cache (`<distDir>/cache/fetch-cache`) — `next start`'s
@@ -2492,7 +2519,10 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           );
         }
 
-        if (pools.size > 1) {
+        if (pools.size === 1) {
+          const poolName = pools.keys().next().value as string;
+          await stageStaticRuntimeFiles(poolName);
+        } else if (pools.size > 1) {
           const sharpDecisions = new Set(
             poolSharpStaging.map((staging) =>
               staging.staged
@@ -2503,6 +2533,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             ),
           );
           if (sharpDecisions.size > 1) {
+            for (const poolName of pools.keys()) await stageStaticRuntimeFiles(poolName);
             console.warn(
               `[adapter-k8s] Pool staging produced different sharp requirements ` +
                 `(${[...sharpDecisions].join(", ")}); keeping standalone pool images so each ` +
@@ -2519,6 +2550,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
 
             const baseContext = path.join(projectDir, poolBaseDir);
             const shared = await factorSharedPoolFiles(poolContexts, baseContext);
+            const sharedContentContext = path.join(baseContext, "content");
+            await stageStaticRuntimeFiles("pool-base", sharedContentContext);
             await writeOutputFile(projectDir, ".dockerignore", generateDockerignore(), poolBaseDir);
             await writeOutputFile(
               projectDir,
