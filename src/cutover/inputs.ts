@@ -81,6 +81,8 @@ export interface CutoverInputs {
   previousPools: string[];
   defaultPool: string;
   hasPortableOrigin: boolean;
+  /** Build chart declares the stable ext_proc routing Deployment. */
+  hasRoutingTier: boolean;
   /**
    * N64: the LIVE replica count of the build being replaced, per pool — read from the
    * cluster before `helm upgrade` (the keep-transfer loop's fail-closed `spec.replicas`

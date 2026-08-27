@@ -1,5 +1,5 @@
 // src/cli/destroy.ts
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import readline from "node:readline";
 import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
@@ -17,7 +17,7 @@ import {
   stablePoolResourceNames,
 } from "../emit/templates/utils.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
-import { readState, StateUnavailableError } from "./state.js";
+import { readState, removeLocalState, StateUnavailableError } from "./state.js";
 import {
   compositionPlanNeedsExplicitConfirmation,
   loadDeployedCompositionPlan,
@@ -31,7 +31,10 @@ import type {
   RetainedExternalResource,
 } from "../composition-plan/index.js";
 import { buildDeleteMemorystoreCommand } from "./provision-cache.js";
-import { deleteManagedCacheIdentityArgs } from "./cache-identity.js";
+import { cleanupManagedCache } from "./managed-cache-cleanup.js";
+import { hasDeletionFailureMarker, isAlreadyGoneError } from "./deletion-outcome.js";
+
+export { isAlreadyGoneError } from "./deletion-outcome.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -52,37 +55,6 @@ export interface DestroyOptions {
 // are removed: a naked 404 with no other evidence is not proof of absence. Callers that CAN
 // key on a machine-readable signal must do so instead — deploy's retained-manifest probe now
 // uses `--ignore-not-found` (exit 0 + empty stdout).
-const NOT_GONE_MARKERS = [
-  "permission",
-  "forbidden",
-  "unauthorized",
-  "unauthenticated",
-  "credential",
-  "invalid_grant",
-  "dial tcp",
-  "no such host",
-  "connection refused",
-  "unable to connect",
-  "i/o timeout",
-  "timed out",
-  "quota",
-  "rate limit",
-  "service unavailable",
-];
-
-export function isAlreadyGoneError(stderr: string): boolean {
-  const s = stderr.toLowerCase();
-  if (NOT_GONE_MARKERS.some((m) => s.includes(m))) return false;
-  return (
-    s.includes("notfound") ||
-    s.includes("not_found") ||
-    s.includes("not found") ||
-    s.includes("does not exist") ||
-    s.includes("was not found") ||
-    s.includes("release: not found")
-  );
-}
-
 function parseKubernetesList(stdout: string, description: string): unknown[] {
   let parsed: unknown;
   try {
@@ -296,7 +268,7 @@ function parseStablePoolResourceNames(
 
 function isOptionalHealthCheckPolicyApiMissing(stderr: string): boolean {
   const s = stderr.toLowerCase();
-  if (NOT_GONE_MARKERS.some((marker) => s.includes(marker))) return false;
+  if (hasDeletionFailureMarker(s)) return false;
   return (
     s.includes('the server doesn\'t have a resource type "healthcheckpolicy"') ||
     s.includes('no matches for kind "healthcheckpolicy"') ||
@@ -599,10 +571,19 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         `coordinates and re-run destroy. No resources were deleted.`,
     );
   }
-  const namespace = resolveK8sNamespace(infra?.namespace);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
   const localComposition = loadProjectCompositionPlan(projectDir);
+  if (localComposition && localComposition.plan.metadata.releaseName !== releaseName) {
+    throw new Error(
+      `Composition-plan release mismatch: plan records ` +
+        `${JSON.stringify(localComposition.plan.metadata.releaseName)}, but destroy targets ` +
+        `${JSON.stringify(releaseName)}. No resources were deleted.`,
+    );
+  }
+  const namespace = localComposition
+    ? localComposition.plan.metadata.namespace
+    : resolveK8sNamespace(infra?.namespace);
 
   // L12: destroying is irreversible — gate it. --yes (or -y) skips the prompt and is
   // REQUIRED non-interactively; --dry-run never deletes and skips the gate entirely.
@@ -656,23 +637,25 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // Resources that failed for a reason OTHER than "already gone". These make the
   // destroy incomplete and cause a non-zero exit + preserved local state.
   const failures: string[] = [];
-  const clearManagedCacheIdentity = async (): Promise<void> => {
-    if (!infra || dryRun) return;
-    const identityDelete = await execCapture(
-      "kubectl",
-      deleteManagedCacheIdentityArgs(releaseName, namespace),
-      { timeoutMs: EXEC_TIMEOUTS.kubectl },
-    );
-    if (identityDelete.exitCode !== 0 && !isAlreadyGoneError(identityDelete.stderr)) {
-      console.warn(
-        `    WARNING: paid cache deletion succeeded, but the coordination ConfigMap could not ` +
-          `be removed: ${sanitizeForTerminal(identityDelete.stderr.trim()) || `exit ${identityDelete.exitCode}`}`,
-      );
+  const deleteOwnedKubernetes = async (options: {
+    args: string[];
+    description: string;
+    warning?: string;
+  }): Promise<boolean> => {
+    if (dryRun) {
+      console.log(`  [dry-run] kubectl ${options.args.join(" ")}`);
+      return true;
     }
-    delete infra.cacheRegion;
-    delete infra.cacheProjectId;
-    delete infra.cacheProvisioningPending;
-    writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+    const result = await execCapture("kubectl", options.args, {
+      timeoutMs: EXEC_TIMEOUTS.kubectl,
+    });
+    if (result.exitCode === 0 || isAlreadyGoneError(result.stderr)) return true;
+    const detail = sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`;
+    console.warn(
+      `    WARNING: ${options.warning ?? `could not delete ${options.description}`}: ${detail}.`,
+    );
+    failures.push(options.description);
+    return false;
   };
 
   // Pin kubectl at THIS release's cluster before any cluster mutation — helm uninstall
@@ -951,18 +934,10 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // foreign Helm resource can legitimately share app.kubernetes.io/name and managed-by values;
   // neither is deletion authority. The version requirement excludes the stable routing tier.
   for (const hpaName of exactOwnedHpas) {
-    const exactDelete = await execCapture(
-      "kubectl",
-      ["delete", "hpa", hpaName, "-n", namespace, "--ignore-not-found"],
-      { timeoutMs: EXEC_TIMEOUTS.kubectl },
-    );
-    if (exactDelete.exitCode !== 0 && !isAlreadyGoneError(exactDelete.stderr)) {
-      console.warn(
-        `    WARNING: could not delete retained HPA ${hpaName}: ` +
-          `${sanitizeForTerminal(exactDelete.stderr.trim()) || `exit ${exactDelete.exitCode}`}.`,
-      );
-      failures.push(`retained HPA "${hpaName}"`);
-    }
+    await deleteOwnedKubernetes({
+      args: ["delete", "hpa", hpaName, "-n", namespace, "--ignore-not-found"],
+      description: `retained HPA "${hpaName}"`,
+    });
   }
   for (const { kind, description } of [
     { kind: "deployment", description: "retained pool Deployments" },
@@ -977,19 +952,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       retainedRolloutSelector,
       "--ignore-not-found",
     ];
-    if (dryRun) {
-      console.log(`  [dry-run] kubectl ${deleteArgs.join(" ")}`);
-      continue;
-    }
-
-    const res = await execCapture("kubectl", deleteArgs, { timeoutMs: EXEC_TIMEOUTS.kubectl });
-    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
-      console.warn(
-        `    WARNING: could not delete ${description}: ` +
-          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}.`,
-      );
-      failures.push(description);
-    }
+    await deleteOwnedKubernetes({ args: deleteArgs, description });
   }
 
   // A topology-changing deploy can retain a removed pool's stable Service, PDB and (on GKE)
@@ -1051,18 +1014,10 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     }
 
     for (const name of names) {
-      const deleted = await execCapture(
-        "kubectl",
-        ["delete", kind, name, "-n", namespace, "--ignore-not-found"],
-        { timeoutMs: EXEC_TIMEOUTS.kubectl },
-      );
-      if (deleted.exitCode !== 0 && !isAlreadyGoneError(deleted.stderr)) {
-        console.warn(
-          `    WARNING: could not delete ${kind} ${name}: ` +
-            `${sanitizeForTerminal(deleted.stderr.trim()) || `exit ${deleted.exitCode}`}.`,
-        );
-        failures.push(`${description}: "${name}"`);
-      }
+      await deleteOwnedKubernetes({
+        args: ["delete", kind, name, "-n", namespace, "--ignore-not-found"],
+        description: `${description}: "${name}"`,
+      });
     }
   }
 
@@ -1087,7 +1042,8 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // ConfigMap (state.ts writes it via kubectl apply) and any retained routing-manifest
   // snapshot ConfigMaps (rollback/deploy retention). A stale state ConfigMap otherwise
   // survives destroy and resurrects the destroyed build as "previous" on the next
-  // deploy of this release name. Best-effort: warn, don't fail the destroy.
+  // deploy of this release name. This deletion is required: local state may be removed only after
+  // the cluster confirms its copy is gone.
   const cmDeleteArgs = [
     "delete",
     "configmap",
@@ -1097,19 +1053,14 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/managed-by=adapter-k8s`,
     "--ignore-not-found",
   ];
-  if (dryRun) {
-    console.log(`  [dry-run] kubectl ${cmDeleteArgs.join(" ")}`);
-  } else {
-    const res = await execCapture("kubectl", cmDeleteArgs, { timeoutMs: EXEC_TIMEOUTS.kubectl });
-    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
-      console.warn(
-        `    WARNING: could not delete adapter state ConfigMaps: ` +
-          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
-          `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
-          `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state.`,
-      );
-    }
-  }
+  const clusterStateDeleted = await deleteOwnedKubernetes({
+    args: cmDeleteArgs,
+    description: "adapter state ConfigMaps",
+    warning:
+      `could not delete adapter state ConfigMaps. Delete them manually ` +
+      `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
+      `app.kubernetes.io/managed-by=adapter-k8s) or the next deploy may see stale state`,
+  });
 
   // Helm-owned per-build routing snapshots carry resource-policy: keep so an outgoing
   // ReplicaSet and rollback target never lose the ConfigMap they mount. Helm uninstall
@@ -1123,21 +1074,14 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}`,
     "--ignore-not-found",
   ];
-  if (dryRun) {
-    console.log(`  [dry-run] kubectl ${snapshotDeleteArgs.join(" ")}`);
-  } else {
-    const res = await execCapture("kubectl", snapshotDeleteArgs, {
-      timeoutMs: EXEC_TIMEOUTS.kubectl,
-    });
-    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
-      console.warn(
-        `    WARNING: could not delete retained routing-manifest ConfigMaps: ` +
-          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them manually ` +
-          `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
-          `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT}).`,
-      );
-    }
-  }
+  await deleteOwnedKubernetes({
+    args: snapshotDeleteArgs,
+    description: "retained routing-manifest ConfigMaps",
+    warning:
+      `could not delete retained routing-manifest ConfigMaps. Delete them manually ` +
+      `(kubectl delete configmap -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
+      `app.kubernetes.io/component=${ROUTING_MANIFEST_SNAPSHOT_COMPONENT})`,
+  });
 
   const compositionDeleteArgs = [
     "delete",
@@ -1148,19 +1092,10 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${COMPOSITION_PLAN_COMPONENT}`,
     "--ignore-not-found",
   ];
-  if (dryRun) {
-    console.log(`  [dry-run] kubectl ${compositionDeleteArgs.join(" ")}`);
-  } else {
-    const res = await execCapture("kubectl", compositionDeleteArgs, {
-      timeoutMs: EXEC_TIMEOUTS.kubectl,
-    });
-    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
-      console.warn(
-        `    WARNING: could not delete retained composition-plan ConfigMaps: ` +
-          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}.`,
-      );
-    }
-  }
+  await deleteOwnedKubernetes({
+    args: compositionDeleteArgs,
+    description: "retained composition-plan ConfigMaps",
+  });
 
   // 1c. Delete the per-build internal-dispatch Secrets (N87). These carry
   // `helm.sh/resource-policy: keep` ON PURPOSE — a build's secret must outlive the upgrade that
@@ -1179,23 +1114,15 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     `app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}`,
     "--ignore-not-found",
   ];
-  if (dryRun) {
-    console.log(`  [dry-run] kubectl ${secretDeleteArgs.join(" ")}`);
-  } else {
-    const res = await execCapture("kubectl", secretDeleteArgs, {
-      timeoutMs: EXEC_TIMEOUTS.kubectl,
-    });
-    if (res.exitCode !== 0 && !isAlreadyGoneError(res.stderr)) {
-      console.warn(
-        `    WARNING: could not delete the internal-dispatch Secrets: ` +
-          `${sanitizeForTerminal(res.stderr.trim()) || `exit ${res.exitCode}`}. Delete them ` +
-          `manually (kubectl delete secret -n ${namespace} -l ` +
-          `app.kubernetes.io/name=${releaseName},` +
-          `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}); they are retained by ` +
-          `resource-policy and helm uninstall will not remove them.`,
-      );
-    }
-  }
+  await deleteOwnedKubernetes({
+    args: secretDeleteArgs,
+    description: "retained internal-dispatch Secrets",
+    warning:
+      `could not delete the internal-dispatch Secrets. Delete them manually ` +
+      `(kubectl delete secret -n ${namespace} -l app.kubernetes.io/name=${releaseName},` +
+      `app.kubernetes.io/component=${INTERNAL_SECRET_COMPONENT}); they are retained by ` +
+      `resource-policy and helm uninstall will not remove them`,
+  });
 
   const retainedResources = new Map<string, RetainedExternalResource>();
   for (const snapshot of plannedSnapshots) {
@@ -1235,6 +1162,25 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         continue;
       }
       console.log(`  → Deleting ${cleanup.desc}`);
+      if (operation.kind === "gcp-memorystore") {
+        const result = await cleanupManagedCache({
+          releaseName,
+          namespace,
+          deletion: cleanup,
+          ...(infra ? { infrastructure: infra, infrastructurePath: infraPath } : {}),
+        });
+        if (result.status === "cloud-delete-failed") {
+          console.warn(`    WARNING: deletion failed: ${result.detail}`);
+          failures.push(cleanup.desc);
+        } else if (result.status === "identity-delete-failed") {
+          console.warn(
+            `    WARNING: paid cache deletion succeeded, but the coordination ConfigMap could ` +
+              `not be removed: ${result.detail}. Local cache coordinates were preserved for retry.`,
+          );
+          failures.push(`managed-cache coordination ConfigMap "${releaseName}-cache-identity"`);
+        }
+        continue;
+      }
       const result = await execCapture(cleanup.command, cleanup.args, {
         timeoutMs: EXEC_TIMEOUTS.cloudOperation,
       });
@@ -1244,8 +1190,6 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
             `${sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`}`,
         );
         failures.push(cleanup.desc);
-      } else if (operation.kind === "gcp-memorystore") {
-        await clearManagedCacheIdentity();
       }
     }
     if (operations.size === 0) {
@@ -1326,17 +1270,22 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         console.log(`  [dry-run] ${cache.command} ${cache.args.join(" ")}`);
       } else {
         console.log(`  → Deleting ${cache.desc}`);
-        const result = await execCapture(cache.command, cache.args, {
-          timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        const result = await cleanupManagedCache({
+          releaseName,
+          namespace,
+          deletion: cache,
+          infrastructure: infra,
+          infrastructurePath: infraPath,
         });
-        if (result.exitCode === 0 || isAlreadyGoneError(result.stderr)) {
-          await clearManagedCacheIdentity();
-        } else {
-          console.warn(
-            `    WARNING: deletion failed: ` +
-              `${sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`}`,
-          );
+        if (result.status === "cloud-delete-failed") {
+          console.warn(`    WARNING: deletion failed: ${result.detail}`);
           failures.push(cache.desc);
+        } else if (result.status === "identity-delete-failed") {
+          console.warn(
+            `    WARNING: paid cache deletion succeeded, but the coordination ConfigMap could ` +
+              `not be removed: ${result.detail}. Local cache coordinates were preserved for retry.`,
+          );
+          failures.push(`managed-cache coordination ConfigMap "${releaseName}-cache-identity"`);
         }
       }
     }
@@ -1413,6 +1362,10 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     process.exit(1);
   }
 
+  // The cluster-side deletion above is the authority to retire local deploy state. Keep every
+  // other .k8s-adapter artifact, including infrastructure coordinates and composition output.
+  if (clusterStateDeleted) removeLocalState(projectDir);
+
   // 4. Report honestly what was removed vs what remains. destroy deliberately does NOT
   // auto-delete the GKE cluster or Artifact Registry: both are commonly SHARED across
   // releases and expensive/slow to recreate, so nuking them from a per-release `destroy` is
@@ -1446,8 +1399,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       `      authorizations named "${releaseName}-*" — list: gcloud certificate-manager maps list --project ${projectId}`,
     );
   }
-  // Preserve .k8s-adapter/infrastructure.json: legacy targets need it to find retained resources,
-  // and composed targets may still have a local build plan there. Cluster-only plans are removed
-  // with the release, so their exact manual commands are printed above before returning.
-  console.log(`\n  Local state (.k8s-adapter) preserved.\n`);
+  // Preserve infrastructure and build artifacts. Only the current variant's deploy-state file and
+  // interrupted-write temp file were retired after the cluster state deletion succeeded.
+  console.log(`\n  Local infrastructure and build artifacts (.k8s-adapter) preserved.\n`);
 }

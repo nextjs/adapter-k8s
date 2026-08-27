@@ -23,7 +23,7 @@ import { retainRemovedPoolResources } from "./stable-pool-resources.js";
 import { runCutover } from "../cutover/run.js";
 import { createEdgeRecovery } from "../cutover/edge.js";
 import { CutoverExitError } from "../cutover/inputs.js";
-import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "./rollback.js";
+import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "../cutover/edge.js";
 
 /**
  * The liveness path, used ONLY as the one-cycle fallback for the stable HealthCheckPolicy when
@@ -38,11 +38,10 @@ import {
   buildDeleteMemorystoreCommand,
   cacheInstanceName,
 } from "./provision-cache.js";
-import { isAlreadyGoneError } from "./destroy.js";
+import { cleanupManagedCache } from "./managed-cache-cleanup.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import {
   claimManagedCacheIdentity,
-  deleteManagedCacheIdentityArgs,
   readManagedCacheIdentity,
   type ManagedCacheIdentity,
 } from "./cache-identity.js";
@@ -87,20 +86,6 @@ import {
   resolveBuiltTargetPlatform,
 } from "../pipeline/fingerprints.js";
 
-// Moved to src/pipeline/ (GitOps PR1); re-exported here so the import surface of the CLI
-// module is unchanged for existing consumers and tests-through-runDeploy.
-export {
-  assertSafePoolName,
-  buildDockerCommands,
-  refreshFetchCacheStaging,
-  type DockerCommandOptions,
-} from "../pipeline/images.js";
-export {
-  resolveDeployImageDigests,
-  resolveImageDigest,
-  resolveRegistryDigest,
-  resolveRegistryDigestAny,
-} from "../pipeline/digests.js";
 import {
   assertCompositionPlanInvocation,
   compositionPlanNeedsExplicitConfirmation,
@@ -2373,6 +2358,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           previousPools,
           defaultPool,
           hasPortableOrigin,
+          hasRoutingTier: existsSync(
+            path.join(outputDir, "chart", "templates", "routing-service-deployment.yaml"),
+          ),
           previousReplicasByPool,
           state,
           compositionSnapshot,
@@ -2471,32 +2459,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `${metadata.cacheEnabled ? "switched to bring-your-own cache" : "cache is disabled"}...`,
       );
       const del = buildDeleteMemorystoreCommand(releaseName, cleanup.region, cleanup.projectId);
-      const res = await execCapture(del.command, del.args, {
-        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      const result = await cleanupManagedCache({
+        releaseName,
+        namespace,
+        deletion: del,
+        infrastructure: infra,
+        infrastructurePath: infraPath,
       });
-      if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
-        const identityDelete = await execCapture(
-          "kubectl",
-          deleteManagedCacheIdentityArgs(releaseName, namespace),
-          { timeoutMs: EXEC_TIMEOUTS.kubectl },
-        );
-        if (identityDelete.exitCode !== 0 && !isAlreadyGoneError(identityDelete.stderr)) {
-          console.warn(
-            `    Warning: the cache was deleted, but its coordination ConfigMap could not be ` +
-              `removed. Delete ${releaseName}-cache-identity before choosing a new cache ` +
-              `project or region.\n    ${sanitizeForTerminal(identityDelete.stderr.trim())}`,
-          );
-        }
-        delete infra.cacheRegion;
-        delete infra.cacheProjectId;
-        delete infra.cacheProvisioningPending;
-        writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+      if (result.status === "cleared") {
         console.log(`    ${del.desc} deleted`);
-      } else {
+      } else if (result.status === "cloud-delete-failed") {
         console.warn(
           `    Warning: could not delete ${del.desc} in ${cleanup.region} — it may still be ` +
             `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ` +
-            `${sanitizeForTerminal(res.stderr.trim())}`,
+            result.detail,
+        );
+      } else {
+        console.warn(
+          `    Warning: the cache was deleted, but its coordination ConfigMap could not be ` +
+            `removed. Local cache coordinates were preserved for retry. Delete ` +
+            `${releaseName}-cache-identity before choosing a new cache project or region.\n    ` +
+            result.detail,
         );
       }
     }

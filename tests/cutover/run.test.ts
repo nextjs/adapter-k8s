@@ -82,6 +82,7 @@ function inputs(overrides: Partial<CutoverInputs> = {}): CutoverInputs {
     previousPools: ["ssr"],
     defaultPool: "ssr",
     hasPortableOrigin: false,
+    hasRoutingTier: true,
     previousReplicasByPool: new Map([["ssr", 2]]),
     state: { buildId: PREV, previousBuildId: "buildm0", generation: 4 },
     compositionSnapshot: null,
@@ -114,6 +115,8 @@ interface ClusterOverrides {
   routingReplicas?: number | null;
   /** D2 probe reports the routing Deployment as absent (the gate then skips entirely). */
   routingDeploymentMissing?: boolean;
+  /** D2 probe cannot read the routing Deployment. */
+  routingDeploymentReadFails?: boolean;
   newBuildHpa?: { min: number; max: number };
   /** EnvoyExtensionPolicy `-o json` body. */
   policy?: unknown;
@@ -175,6 +178,9 @@ function cluster(overrides: ClusterOverrides = {}) {
     // D2 routing-tier existence probe, which now also carries THIS tier's replica count
     // (checked before the D6 probe below — they share a jsonpath shape).
     if (args[0] === "get" && args[1] === "deployment" && args[2] === `${RELEASE}-routing-service`) {
+      if (overrides.routingDeploymentReadFails) {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
       if (overrides.routingDeploymentMissing) return ok("");
       const replicas = overrides.routingReplicas === undefined ? 2 : overrides.routingReplicas;
       return ok(`${RELEASE}-routing-service|${replicas === null ? "" : replicas}`);
@@ -631,6 +637,43 @@ describe("runCutover — A2: the two rollout gates budget the shapes they actual
     );
   });
 
+  it("fails when the build declares a routing tier but its Deployment is absent", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster({ routingDeploymentMissing: true }) as never);
+
+    await expect(runCutover(inputs({ hasRoutingTier: true }), deps)).rejects.toThrow(
+      /expected routing service.*is absent/i,
+    );
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+
+  it("fails when the expected routing Deployment cannot be read", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ routingDeploymentReadFails: true }) as never,
+    );
+
+    await expect(runCutover(inputs({ hasRoutingTier: true }), deps)).rejects.toThrow(
+      /could not read expected routing service[^]*forbidden by RBAC/i,
+    );
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+
+  it("skips the routing Deployment probe when the build declares pool-local routing", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster({ routingDeploymentMissing: true }) as never);
+
+    await runCutover(inputs({ hasRoutingTier: false }), deps);
+
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(
+          ([, args]) =>
+            args[0] === "get" && args[1] === "deployment" && args[2] === "rel-routing-service",
+        ),
+    ).toBe(false);
+  });
+
   it("quotes the budget it actually used when the ROUTING rollout fails", async () => {
     // The abort message quoted a stale "120s" for two revisions; A2 then made it quote the
     // POOL gate's number on a routing failure. It must quote the wait this gate performed.
@@ -1048,6 +1091,7 @@ describe("jobMain — the poison pill", () => {
         targetPlatforms: { [BUILD]: "linux/amd64" },
         secretsMode: "external",
         cutover: "job",
+        hasRoutingTier: true,
         ...extra,
       }),
     );

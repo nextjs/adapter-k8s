@@ -1530,6 +1530,7 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
       registry: REGISTRY,
       cutover: "job",
       hasPortableOrigin: false,
+      hasRoutingTier: false,
       hasRouteExtJob: false,
       hasEnvoyExtensionPolicy: false,
       cdnEnabled: false,
@@ -1570,6 +1571,7 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
       hasEnvoyExtensionPolicy: false,
       cdnEnabled: false,
       hasPortableOrigin: false,
+      hasRoutingTier: false,
     });
   });
 
@@ -1584,6 +1586,7 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
       "envoy-extension-policy.yaml",
       "cdn-http-filter.yaml",
       "origin-service.yaml",
+      "routing-service-deployment.yaml",
     ]) {
       writeFileSync(path.join(chartDir, f), "apiVersion: v1\nkind: ConfigMap\n");
     }
@@ -1593,6 +1596,7 @@ describe("emit --cutover job (the in-cluster cutover Job's bundle)", () => {
       hasEnvoyExtensionPolicy: true,
       cdnEnabled: true,
       hasPortableOrigin: true,
+      hasRoutingTier: true,
     });
   });
 

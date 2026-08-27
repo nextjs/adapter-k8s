@@ -45,6 +45,13 @@ export async function runDescribe(options: {
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
   const localComposition = loadProjectCompositionPlan(projectDir);
+  if (localComposition && localComposition.plan.metadata.releaseName !== releaseName) {
+    throw new Error(
+      `Composition-plan release mismatch: plan records ` +
+        `${JSON.stringify(localComposition.plan.metadata.releaseName)}, but describe targets ` +
+        `${JSON.stringify(releaseName)}.`,
+    );
+  }
   const namespace =
     localComposition?.plan.metadata.namespace ?? resolveK8sNamespace(infra?.namespace);
 

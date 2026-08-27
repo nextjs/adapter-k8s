@@ -229,6 +229,14 @@ export async function runDoctor(options: {
   const results: CheckResult[] = [];
   let namespace = resolveK8sNamespace();
   const localComposition = loadProjectCompositionPlan(projectDir);
+  let compositionTargetFailed = false;
+  if (localComposition && localComposition.plan.metadata.releaseName !== releaseName) {
+    throw new Error(
+      `Composition-plan release mismatch: plan records ` +
+        `${JSON.stringify(localComposition.plan.metadata.releaseName)}, but doctor targets ` +
+        `${JSON.stringify(releaseName)}.`,
+    );
+  }
 
   // Ensure kubectl is pointing at the right cluster
   const infraPathForCtx = infrastructurePath(projectDir);
@@ -246,6 +254,7 @@ export async function runDoctor(options: {
         message: `${preflight.clusterIdentity}; Kubernetes ${preflight.serverVersion}`,
       });
     } catch (error) {
+      compositionTargetFailed = true;
       results.push({
         name: "Composition target",
         status: "fail",
@@ -292,6 +301,13 @@ export async function runDoctor(options: {
 
   console.log("\nRunning health checks...\n");
 
+  // Once target authentication fails, ambient kubectl data is untrusted. Stop before state or
+  // resource discovery so doctor cannot present another cluster's healthy objects as this release.
+  if (compositionTargetFailed) {
+    printCheckResults(results);
+    return;
+  }
+
   // --- Prerequisites ---
   if (!localComposition) results.push(await checkTool("gcloud", ["--version"]));
   results.push(await checkTool("kubectl", ["version", "--client", "-o", "yaml"]));
@@ -304,6 +320,13 @@ export async function runDoctor(options: {
   const infraPath = infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
     results.push({ name: "infrastructure.json", status: "pass", message: infraPath });
+  } else if (localComposition) {
+    results.push({
+      name: "infrastructure.json",
+      status: "warn",
+      message: "Not found; using the verified composition plan",
+      fix: "Cloud-account and hostname checks are unavailable without the local infrastructure handoff",
+    });
   } else {
     results.push({
       name: "infrastructure.json",
