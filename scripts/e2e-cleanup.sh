@@ -45,5 +45,7 @@ if [ -f ".adapter-server.log" ]; then
   echo "=== Final Server Log (last 20) ==="
   tail -20 .adapter-server.log
   echo "=== 404/500 Errors ==="
-  grep "404\|500\|Error\|dispatch" .adapter-server.log | tail -10
+  # A clean log has no matches. grep reports that as status 1, which must not make the custom
+  # cleanup hook fail under pipefail after the server was stopped and its log was persisted.
+  grep "404\|500\|Error\|dispatch" .adapter-server.log | tail -10 || true
 fi
