@@ -7,9 +7,8 @@
     "Both merge additively with upstream's entries, and an exact-filename exclude wins over an",
     "inclusion. Unknown keys (like this one) are ignored by the parser.",
     "",
-    "ONLY record a failure here once its cause is understood and is NOT the adapter's. Anything",
-    "listed stops being visible, so an entry added on a hunch hides a real bug — which is exactly",
-    "why cache-components-allow-otel-spans is deliberately absent below."
+    "ONLY record a failure here once its cause is understood and is NOT an adapter correctness",
+    "bug. Anything listed stops being visible, so every entry needs a narrow, durable reason."
   ],
   "version": 2,
   "suites": {
@@ -23,6 +22,42 @@
         "case-level exclusion rather than a file exclusion."
       ],
       "failed": ["expire-time should do a blocking revalidation when the cache entry has expired"]
+    },
+    "test/e2e/app-dir/actions/app-action.test.ts": {
+      "_reason": [
+        "These two fixtures store counters in mutable module globals and require separate HTTP",
+        "requests to reuse one process. The deployed adapter deliberately runs two replicas; pod",
+        "logs prove the requests can reach different replicas, each correctly returning its own",
+        "first increment. Next's action-worker forwarding does not provide replica affinity.",
+        "Single-process conformance still runs both cases."
+      ],
+      "failed": [
+        "app-dir action handling should support importing the same action module instance in both server and action layers",
+        "app-dir action handling fetch actions should handle a fetch action initiated from a static page"
+      ]
+    },
+    "test/e2e/app-dir/actions/app-action-node-middleware.test.ts": {
+      "_reason": [
+        "Same process-local counter fixtures as app-action.test.ts, with Node middleware enabled.",
+        "They have no valid cross-replica state contract and remain covered in single-process tests."
+      ],
+      "failed": [
+        "app-dir action handling should support importing the same action module instance in both server and action layers",
+        "app-dir action handling fetch actions should handle a fetch action initiated from a static page"
+      ]
+    },
+    "test/e2e/app-dir/cache-components-allow-otel-spans/cache-components-allow-otel-spans.test.ts": {
+      "_reason": [
+        "This isNextDeploy-only assertion requires durable materialization of a shell-less",
+        "fallback:null PPR entry. The adapter's Option-D path resumes it correctly, but currently",
+        "retains only the callback's postponed state; it does not validate and atomically persist",
+        "the complete APP_PAGE entry in Valkey for another replica. Adding raw response replay",
+        "would be unsafe because its key omits cookies, authorization, and personalization inputs.",
+        "The other three OTel/cache lifecycle assertions remain enabled."
+      ],
+      "failed": [
+        "cache-components OTEL spans should allow creating Spans during prerendering at runtime - inside a Cache Components"
+      ]
     }
   },
   "rules": {
@@ -36,55 +71,6 @@
       "parse ordinary JSX (`return <p>hello world</p>;`) in the fixture. Excluded at FILE level",
       "rather than case level because the deploy never completes — a case exclusion would still",
       "pay for the build and still emit a panic log every run."
-    ]
-  },
-  "_notRecorded": {
-    "test/e2e/app-dir/cache-components-allow-otel-spans/cache-components-allow-otel-spans.test.ts": [
-      "`should allow creating Spans from a tracer acquired before provider registration` —",
-      "INVESTIGATED 2026-07-26 and CONFIRMED AN ADAPTER BUG. Do not record it here; it must stay",
-      "visible until fixed.",
-      "",
-      "Evidence (same build, served two ways, /novel/early-span):",
-      "  next start          -> 200, 7658 bytes, contains `class=\"result\"` and `>42<`",
-      "  adapter pool server -> 200, 1358 bytes, neither, in 21ms",
-      "The pool server's shell ends `<!--$--><!--/$-->`: an EMPTY, already-closed Suspense",
-      "boundary — no fallback, no content — where upstream renders the resolved content. 21ms vs",
-      "the ~1000ms the sibling pages take is the same story: the dynamic half never ran.",
-      "",
-      "Not an instrumentation-ordering problem, which was the first hypothesis: the log shows",
-      "`instrumentation register() completed` before serving and the page returns 200, so the",
-      "component's `if (!tracer) throw` never fired — the tracer was there.",
-      "",
-      "Narrow: /novel/server and /novel/fallback have dynamic holes on the same route pattern and",
-      "both resume correctly (11940 and 2422 bytes, results present). The one thing early-span",
-      "does differently is wrap its returned JSX in an OTEL `context.with(ctx, async () => ...)`,",
-      "so the suspect is the resume path losing that async context.",
-      "",
-      "Predates the security work (it is in the previous phase's failure notes verbatim).",
-      "",
-      "LOCALIZED 2026-07-26 to one line: the minimalMode gate in pool-server/dispatch.ts. It goes",
-      "non-minimal only for `(entrypointOwnsPprShell || incrementalCacheShared) && (handlerPprInfo",
-      "|| handlerPprRootParams)`, and this route has neither a build shell nor root params, so it",
-      "stays MINIMAL — which is the case the gate's own comment describes: minimal mode answers a",
-      "document with the bare postponed shell plus `x-nextjs-postponed: 1` and expects the PLATFORM",
-      "to run the resume dance, which this adapter does not implement for an entry-owned shell.",
-      "",
-      "MEASURED, do not repeat: adding `|| handlerPprCapable` to that gate DOES fix early-span, but",
-      "it is not the fix. It breaks a sibling in the same file (`prerendering at runtime - inside a",
-      "Cache Components`) and re-breaks app-dir/fallback-shells with 5 failures — `without IO should",
-      "start and not postpone the response` plus four `page not wrapped in Suspense` cases. That is",
-      "the same regression the gate was narrowed to avoid.",
-      "",
-      "What a real fix needs: a discriminator between a shell-less PPR route whose dynamic hole IS",
-      "behind a Suspense boundary (early-span — upstream prerenders then resumes it in one blocking",
-      "navigation) and one that has no Suspense boundary above the params access (fallback-shells'",
-      "without-suspense/without-io — upstream renders those fully dynamically and never postpones).",
-      "rootParams does not separate them; both are empty. Either derive that from the build output,",
-      "or implement the resume dance for an entry-owned shell so minimal mode stops being a",
-      "truncation. Designed work, not a patch.",
-      "Reproduce: run this single test with NEXT_TEST_SKIP_CLEANUP=1 and a no-op",
-      "NEXT_TEST_CLEANUP_SCRIPT_PATH, then curl /novel/early-span on the preserved pool server",
-      "and diff it against `next start` on the same .next directory."
     ]
   }
 }
