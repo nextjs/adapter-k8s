@@ -41,6 +41,9 @@ interface FakeServer {
   commands: string[][];
   /** Total connections the server has accepted (used to observe reconnects). */
   connectionCount: () => number;
+  /** Connections that carried at least one complete RESP command. Ambient localhost probes may
+   * connect to a random test port, but they cannot manufacture the client's command stream. */
+  commandConnectionCount: () => number;
   close: () => Promise<void>;
 }
 
@@ -59,6 +62,7 @@ function startFakeValkey(
 ): Promise<FakeServer> {
   const commands: string[][] = [];
   const sockets = new Set<net.Socket>();
+  const commandSockets = new Set<net.Socket>();
   let connections = 0;
   const onConnection = (socket: net.Socket) => {
     connections++;
@@ -71,6 +75,7 @@ function startFakeValkey(
       for (;;) {
         const parsed = parseCommand(buf);
         if (!parsed) break;
+        commandSockets.add(socket);
         commands.push(parsed.args);
         buf = buf.subarray(parsed.consumed);
         const reply = respond(parsed.args, socket);
@@ -98,6 +103,7 @@ function startFakeValkey(
         port,
         commands,
         connectionCount: () => connections,
+        commandConnectionCount: () => commandSockets.size,
         close: () =>
           new Promise<void>((r) => {
             for (const s of sockets) s.destroy();
@@ -835,12 +841,12 @@ describe("L17: circuit breaker after a failure (fail fast, probe later)", () => 
     try {
       // Trip the breaker: the command times out and the connection is destroyed.
       await expect(client.get("hang")).rejects.toThrow(/timed out/);
-      const connsAfterTrip = server.connectionCount();
+      const connsAfterTrip = server.commandConnectionCount();
       // Within the window, commands reject with the breaker error and make NO reconnect attempt
       // (a reconnect would bump the server's accepted-connection count).
       await expect(client.get("k")).rejects.toThrow(/circuit breaker/);
       await expect(client.get("k")).rejects.toThrow(/circuit breaker/);
-      expect(server.connectionCount()).toBe(connsAfterTrip);
+      expect(server.commandConnectionCount()).toBe(connsAfterTrip);
     } finally {
       await client.quit();
       await server.close();
@@ -857,10 +863,10 @@ describe("L17: circuit breaker after a failure (fail fast, probe later)", () => 
     });
     try {
       await expect(client.get("hang")).rejects.toThrow(/timed out/);
-      const connsAfterTrip = server.connectionCount();
+      const connsAfterTrip = server.commandConnectionCount();
       await sleep(800);
       expect(await client.get("k")).toBe("v");
-      expect(server.connectionCount()).toBe(connsAfterTrip + 1);
+      expect(server.commandConnectionCount()).toBe(connsAfterTrip + 1);
     } finally {
       await client.quit();
       await server.close();
