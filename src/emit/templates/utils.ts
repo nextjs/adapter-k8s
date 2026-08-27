@@ -1,5 +1,6 @@
 // src/emit/templates/utils.ts
 import { createHash } from "node:crypto";
+import { isIP } from "node:net";
 
 /** Default release namespace when infrastructure.json does not declare one. */
 export const K8S_NAMESPACE = "default";
@@ -324,6 +325,8 @@ const IMAGE_REGISTRY_RE =
 // that need the same charset without the assert's error path.
 export const BUILD_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
 const NAMESPACE_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const DNS_1035_LABEL_RE = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
+const QUALIFIED_NAME_PART_RE = /^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
 // GCS bucket naming rules (https://cloud.google.com/storage/docs/buckets#naming).
 const BUCKET_RE = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;
 
@@ -397,6 +400,53 @@ export function assertSafeNamespace(namespace: unknown): asserts namespace is st
         `(lowercase letters, digits, and hyphens only, max 63 chars, and must start ` +
         `and end with a letter or digit).`,
     );
+  }
+}
+
+/** Kubernetes Service names remain DNS-1035 labels on the supported cluster floor. */
+export function assertSafeServiceName(name: unknown): asserts name is string {
+  if (typeof name !== "string" || !DNS_1035_LABEL_RE.test(name)) {
+    throw new Error(
+      `Invalid Service name ${JSON.stringify(name)}: must be a DNS-1035 label ` +
+        `(lowercase letter first, lowercase letters, digits, and hyphens only, max 63 chars).`,
+    );
+  }
+}
+
+/** Validate Kubernetes qualified names used as annotation keys. */
+export function assertSafeAnnotationName(name: unknown): asserts name is string {
+  if (typeof name !== "string") {
+    throw new Error(`Invalid annotation name ${JSON.stringify(name)}: expected a string.`);
+  }
+  const slash = name.indexOf("/");
+  if (slash !== name.lastIndexOf("/")) {
+    throw new Error(`Invalid annotation name ${JSON.stringify(name)}: too many "/" separators.`);
+  }
+  const prefix = slash === -1 ? undefined : name.slice(0, slash);
+  const part = slash === -1 ? name : name.slice(slash + 1);
+  const prefixValid =
+    prefix === undefined ||
+    (prefix.length <= 253 &&
+      prefix.length > 0 &&
+      prefix.split(".").every((label) => NAMESPACE_RE.test(label)));
+  if (!prefixValid || !QUALIFIED_NAME_PART_RE.test(part)) {
+    throw new Error(
+      `Invalid annotation name ${JSON.stringify(name)}: expected a Kubernetes qualified name.`,
+    );
+  }
+}
+
+/** Parse an IPv4/IPv6 CIDR and enforce the address family's prefix bounds. */
+export function assertSafeCidr(cidr: unknown, where = "CIDR"): asserts cidr is string {
+  if (typeof cidr !== "string") {
+    throw new Error(`Invalid ${where} ${JSON.stringify(cidr)}: expected an IPv4 or IPv6 CIDR.`);
+  }
+  const match = /^(.+)\/([0-9]{1,3})$/.exec(cidr);
+  const family = match ? isIP(match[1]!) : 0;
+  const prefix = match ? Number(match[2]) : -1;
+  const maxPrefix = family === 4 ? 32 : family === 6 ? 128 : -1;
+  if (family === 0 || !Number.isInteger(prefix) || prefix < 0 || prefix > maxPrefix) {
+    throw new Error(`Invalid ${where} ${JSON.stringify(cidr)}: expected an IPv4 or IPv6 CIDR.`);
   }
 }
 

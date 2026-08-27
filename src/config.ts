@@ -3,6 +3,7 @@ import type { K8sAdapterConfig, PoolConfig } from "./types.js";
 import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
 import { resolveConfiguredTarget } from "./target/legacy.js";
 import {
+  assertSafeCidr,
   assertSafeHostname,
   assertSafePoolName,
   assertSafeQuantity,
@@ -171,11 +172,19 @@ export function assertSafeCidrList(cidrs: unknown, where: string): asserts cidrs
   if (!Array.isArray(cidrs)) {
     throw new Error(`${where} must be an array of CIDR strings (e.g. ["10.0.0.0/16"])`);
   }
-  const bad = cidrs.filter((c) => typeof c !== "string" || !CIDR_RE.test(c));
+  const bad = cidrs.filter((cidr) => {
+    if (typeof cidr !== "string" || !CIDR_RE.test(cidr)) return true;
+    try {
+      assertSafeCidr(cidr, where);
+      return false;
+    } catch {
+      return true;
+    }
+  });
   if (bad.length > 0) {
     throw new Error(
       `${where} contains invalid CIDR(s): ${bad.map((c) => JSON.stringify(c)).join(", ")}. ` +
-        `Expected entries like "10.0.0.0/16" (matching ${CIDR_RE}).`,
+        `Expected valid entries like "10.0.0.0/16".`,
     );
   }
 }

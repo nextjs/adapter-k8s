@@ -315,6 +315,29 @@ describe("renderNetworkPolicies — input validation", () => {
       renderNetworkPolicies({ releaseName: 'foo";rm -rf /;"', poolNames: ["ssr"] }),
     ).toThrow(/Invalid releaseName/);
   });
+
+  it.each(["999.1.1.1/24", "10.0.0.0/33", "2001:db8::/129", "10.0.0.0/24\n- {}"])(
+    "rejects malformed ingress CIDR %s",
+    (cidr) => {
+      expect(() =>
+        renderNetworkPolicies({
+          releaseName: "my-app",
+          poolNames: ["ssr"],
+          ingressSources: { cidrs: [cidr], podSelectors: [] },
+        }),
+      ).toThrow(/CIDR/i);
+    },
+  );
+
+  it("quotes validated IPv4 and IPv6 ingress CIDRs", () => {
+    const yaml = renderNetworkPolicies({
+      releaseName: "my-app",
+      poolNames: ["ssr"],
+      ingressSources: { cidrs: ["10.0.0.0/24", "2001:db8::/64"], podSelectors: [] },
+    });
+    expect(yaml).toContain('cidr: "10.0.0.0/24"');
+    expect(yaml).toContain('cidr: "2001:db8::/64"');
+  });
 });
 
 // Renders the template with REAL helm when the binary is present (offline; `helm
@@ -391,7 +414,7 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
       .map((d) => d.trimEnd())
       .join("\n---\n");
     expect(docs).toBe(expected.trimEnd());
-    expect(docs).toContain("cidr: 35.191.0.0/16");
+    expect(docs).toContain('cidr: "35.191.0.0/16"');
     expect(docs).not.toContain("0.0.0.0/0");
   });
 

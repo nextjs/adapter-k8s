@@ -599,6 +599,12 @@ describe("networkPolicy CIDR config surface", () => {
     expect(() => validateConfig(withNetworkPolicy({ podCidrs: [42] }))).toThrow(
       /networkPolicy\.podCidrs contains invalid CIDR/,
     );
+    expect(() => validateConfig(withNetworkPolicy({ podCidrs: ["999.0.0.1/24"] }))).toThrow(
+      /networkPolicy\.podCidrs contains invalid CIDR/,
+    );
+    expect(() => validateConfig(withNetworkPolicy({ podCidrs: ["10.0.0.0/33"] }))).toThrow(
+      /networkPolicy\.podCidrs contains invalid CIDR/,
+    );
   });
 
   it("rejects a non-array CIDR list", () => {

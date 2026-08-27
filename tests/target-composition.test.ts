@@ -1135,6 +1135,96 @@ describe("open build-time hooks", () => {
     ).toThrow(/invalid-backend.*Service/i);
   });
 
+  it.each([
+    ["a dotted name", "app.origin", "apps"],
+    ["a digit-leading name", "1-origin", "apps"],
+    ["an overlong name", `a${"b".repeat(63)}`, "apps"],
+    ["a cross-namespace origin", "valid-origin", "other-apps"],
+  ])("rejects %s before built-in exposures consume it", (_label, name, namespace) => {
+    const invalid = defineRoutingComponent({
+      name: "invalid-origin",
+      origin: () => ({
+        kind: "kubernetes-service",
+        service: { name, namespace, port: 3000 },
+      }),
+      build: (ctx) => portableRouting().build(ctx),
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: gatewayApiExposure({ className: "envoy", hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/invalid-origin.*Service/i);
+  });
+
+  it("rejects a pool-local plan that describes a different Service than the exposure origin", () => {
+    const invalid = defineRoutingComponent({
+      name: "split-origin",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: { name: `${ctx.releaseName}-origin`, namespace: ctx.namespace, port: 3000 },
+      }),
+      build(ctx) {
+        const result = portableRouting().build(ctx);
+        return {
+          ...result,
+          plan: {
+            ...result.plan,
+            dataplane: {
+              ...result.plan.dataplane,
+              service: { name: "other-origin", namespace: ctx.namespace, port: 3000 },
+            },
+          },
+        };
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/split-origin.*same origin Service/i);
+  });
+
+  it.each([
+    ["non-boolean enabled", { enabled: 1, serviceAnnotations: {}, registration: "none" }],
+    ["unknown registration", { enabled: false, serviceAnnotations: {}, registration: "typo" }],
+    [
+      "non-string annotation",
+      { enabled: false, serviceAnnotations: { "example.com/count": 7 }, registration: "none" },
+    ],
+  ])("rejects JavaScript-shaped routing tiers with %s", (_label, routingTier) => {
+    const invalid = defineRoutingComponent({
+      name: "invalid-tier",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: { name: `${ctx.releaseName}-origin`, namespace: ctx.namespace, port: 3000 },
+      }),
+      build(ctx) {
+        const result = portableRouting().build(ctx);
+        return { ...result, routingTier } as never;
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/invalid-tier.*routingTier/i);
+  });
+
   it("lets an NGINX ingress component contribute telemetry and fingerprints the contract", () => {
     const nginxExposure = (metricName: string) =>
       defineExposureComponent({

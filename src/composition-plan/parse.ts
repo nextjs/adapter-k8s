@@ -1,6 +1,7 @@
 import {
   assertSafeBucketName,
   assertSafeBuildId,
+  assertSafeCidr,
   assertSafeImageRegistry,
   assertSafeNamespace,
   assertSafePoolName,
@@ -48,7 +49,6 @@ const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
 const API_VERSION_RE = /^(?:[a-z0-9]([-a-z0-9.]*[a-z0-9])?\/)?v[0-9][a-z0-9]*$/;
 const RESOURCE_RE = /^[a-z][a-z0-9-]{0,62}$/;
 const DNS_SUBDOMAIN_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
-const CIDR_RE = /^(?:[0-9a-fA-F:.]+)\/[0-9]{1,3}$/;
 const SERVICE_ACCOUNT_EMAIL_RE =
   /^[a-z][a-z0-9-]{0,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 const TELEMETRY_ID_RE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/;
@@ -283,7 +283,11 @@ function parseNetworkSource(value: unknown, path: string): NetworkCidrSource {
       exactKeys(parsed, ["kind", "cidrs"], path);
       const cidrs = array(parsed.cidrs, `${path}.cidrs`, (entry, entryPath) => {
         const cidr = string(entry, entryPath);
-        if (!CIDR_RE.test(cidr)) fail(entryPath, "expected an IPv4 or IPv6 CIDR");
+        try {
+          assertSafeCidr(cidr, entryPath);
+        } catch {
+          fail(entryPath, "expected an IPv4 or IPv6 CIDR");
+        }
         return cidr;
       });
       if (cidrs.length === 0) fail(`${path}.cidrs`, "expected at least one CIDR");

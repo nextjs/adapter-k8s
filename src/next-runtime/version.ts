@@ -1,4 +1,5 @@
 export const SUPPORTED_NEXT_RELEASE_LINE = ">=16.3.0 <16.4.0";
+export const NEXT_CANARY_CONFORMANCE_VERSION = "16.3.0-canary.97";
 
 export type NextVersionSupport =
   | { supported: true; prerelease: boolean }
@@ -7,8 +8,8 @@ export type NextVersionSupport =
 /**
  * The adapter and @next/routing are tested as one release-line contract. A 16.4 runtime may
  * change generated entrypoints or routing semantics, so it must be reviewed before widening this
- * bound. The pinned `16.3.0-canary.*` upstream conformance lane is accepted deliberately, but is
- * reported as a prerelease and is not part of the stable support promise.
+ * bound. The exact upstream conformance canary is accepted deliberately, but is reported as a
+ * prerelease and is not part of the stable support promise.
  */
 export function checkSupportedNextVersion(version: unknown): NextVersionSupport {
   if (typeof version !== "string") {
@@ -28,10 +29,10 @@ export function checkSupportedNextVersion(version: unknown): NextVersionSupport 
 
   const prerelease = match[4];
   if (prerelease !== undefined) {
-    if (Number(match[3]) !== 0 || !/^canary\.\d+$/.test(prerelease)) {
+    if (version !== NEXT_CANARY_CONFORMANCE_VERSION) {
       return {
         supported: false,
-        reason: "is not the pinned Next.js 16.3.0 canary conformance lane",
+        reason: `is not the pinned Next.js ${NEXT_CANARY_CONFORMANCE_VERSION} conformance lane`,
       };
     }
     return { supported: true, prerelease: true };

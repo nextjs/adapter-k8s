@@ -269,4 +269,30 @@ describe("renderRoutingServiceService — provider annotations", () => {
     expect(yaml).not.toContain("cloud.google.com/neg");
     expect(yaml).toContain("kind: Service");
   });
+
+  it("quotes annotation keys and opaque values without evaluating Helm actions", () => {
+    const yaml = renderRoutingServiceService({
+      releaseName: "my-app",
+      annotations: {
+        "example.com/note": "it's line one\n{{ mul 7 6 }}",
+      },
+    });
+    expect(yaml).toContain('"example.com/note": "it\'s line one\\n');
+    expect(yaml).toContain('{{ "{{" }} mul 7 6 }}');
+  });
+
+  it("rejects invalid annotation qualified names and non-string values", () => {
+    expect(() =>
+      renderRoutingServiceService({
+        releaseName: "my-app",
+        annotations: { "bad key": "value" },
+      }),
+    ).toThrow(/annotation name/i);
+    expect(() =>
+      renderRoutingServiceService({
+        releaseName: "my-app",
+        annotations: { "example.com/count": 7 } as never,
+      }),
+    ).toThrow(/annotation value/i);
+  });
 });
