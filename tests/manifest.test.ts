@@ -283,7 +283,7 @@ describe("buildRoutingManifest", () => {
     expect(manifest.pathnames).toContain("/api/hello");
   });
 
-  it("wraps rewrite/redirect sourceRegex case-insensitively (matches next start)", () => {
+  it("passes raw route regexes and the default case policy to @next/routing", () => {
     const routing = mockRouting({
       beforeFiles: [
         { source: "/redir", sourceRegex: "^\\/redir(?:\\/)?$", destination: "/dest", status: 307 },
@@ -299,27 +299,27 @@ describe("buildRoutingManifest", () => {
       buildId: "test123",
       basePath: "",
       i18n: null,
+      caseSensitive: false,
       nextVersion: "16.2.0",
       projectDir: "/app",
     });
 
     const rg = manifest.routeGraph as {
+      caseSensitive?: boolean;
       afterFiles: Array<{ sourceRegex: string }>;
       beforeFiles: Array<{ sourceRegex: string }>;
     };
-    expect(rg.afterFiles[0]!.sourceRegex).toBe("(?i:^\\/rewrite-1(?:\\/)?$)");
-    expect(rg.beforeFiles[0]!.sourceRegex).toBe("(?i:^\\/redir(?:\\/)?$)");
-    // the wrapped regex matches a differently-cased request path
-    expect(new RegExp(rg.afterFiles[0]!.sourceRegex).test("/Rewrite-1")).toBe(true);
-    // named groups + non-source rules are untouched (idempotent, no double-wrap)
-    expect(rg.afterFiles[0]!.sourceRegex.startsWith("(?i:(?i:")).toBe(false);
+    expect(rg.caseSensitive).toBe(false);
+    expect(rg.afterFiles[0]!.sourceRegex).toBe("^\\/rewrite-1(?:\\/)?$");
+    expect(rg.beforeFiles[0]!.sourceRegex).toBe("^\\/redir(?:\\/)?$");
+    // This is the exact construction used by @next/routing 16.3. Keeping the policy separate
+    // avoids adapter-authored regex syntax and lets the upstream package own match semantics.
+    expect(
+      new RegExp(rg.afterFiles[0]!.sourceRegex, rg.caseSensitive ? "" : "i").test("/Rewrite-1"),
+    ).toBe(true);
   });
 
-  it("wraps ALL custom-route buckets case-insensitively, but NOT dynamicRoutes", () => {
-    // Verified against upstream (see comment in manifest.ts): next start matches
-    // custom routes with path-to-regexp sensitive:false but dynamic page routes
-    // with a flagless RegExp (case-sensitive). @next/routing compiles everything
-    // flagless — so only the custom-route buckets get the (?i:…) wrap.
+  it("passes the case-sensitive Next config without rewriting any route bucket", () => {
     const routing = mockRouting({
       beforeMiddleware: [{ source: "/bm", sourceRegex: "^\\/bm(?:\\/)?$", destination: "/dest" }],
       beforeFiles: [{ source: "/bf", sourceRegex: "^\\/bf(?:\\/)?$", destination: "/dest" }],
@@ -335,37 +335,39 @@ describe("buildRoutingManifest", () => {
       buildId: "test123",
       basePath: "",
       i18n: null,
+      caseSensitive: true,
       nextVersion: "16.2.0",
       projectDir: "/app",
     });
 
-    const rg = manifest.routeGraph as Record<
-      "beforeMiddleware" | "beforeFiles" | "afterFiles" | "fallback" | "onMatch" | "dynamicRoutes",
-      Array<{ sourceRegex: string }>
-    >;
+    const rg = manifest.routeGraph as typeof manifest.routeGraph &
+      Record<
+        | "beforeMiddleware"
+        | "beforeFiles"
+        | "afterFiles"
+        | "fallback"
+        | "onMatch"
+        | "dynamicRoutes",
+        Array<{ sourceRegex: string }>
+      >;
+    expect(rg.caseSensitive).toBe(true);
     for (const bucket of [
       "beforeMiddleware",
       "beforeFiles",
       "afterFiles",
       "fallback",
       "onMatch",
+      "dynamicRoutes",
     ] as const) {
-      expect(rg[bucket][0]!.sourceRegex.startsWith("(?i:"), bucket).toBe(true);
+      expect(rg[bucket][0]!.sourceRegex.startsWith("(?i:"), bucket).toBe(false);
     }
-    expect(new RegExp(rg.beforeMiddleware[0]!.sourceRegex).test("/BM")).toBe(true);
-    expect(new RegExp(rg.fallback[0]!.sourceRegex).test("/Fb")).toBe(true);
-    expect(new RegExp(rg.onMatch[0]!.sourceRegex).test("/OM")).toBe(true);
-    // dynamicRoutes: untouched, matching upstream case-sensitive page matching
-    expect(rg.dynamicRoutes[0]!.sourceRegex).toBe("^\\/blog\\/([^/]+?)(?:\\/)?$");
+    expect(new RegExp(rg.beforeMiddleware[0]!.sourceRegex).test("/BM")).toBe(false);
     expect(new RegExp(rg.dynamicRoutes[0]!.sourceRegex).test("/BLOG/x")).toBe(false);
   });
 
   it("emits sourceRegexes that compile with new RegExp on the deploy runtime", () => {
-    // N24 REGRESSION PIN: the (?i:…) wraps are inline regexp modifiers, which V8 only
-    // accepts from Node 24 (the emitted containers' base image — dockerfiles.ts). Every
-    // regex the manifest ships must be constructible on the runtime this suite runs on
-    // (mise.toml pins Node 24); on Node 22 `new RegExp("(?i:/x)")` throws and the
-    // deployed pool/routing containers would 500 every request.
+    // The adapter must ship Next-provided regex source, not synthesize runtime-specific syntax.
+    // @next/routing owns the case flag separately through routeGraph.caseSensitive.
     const routing = mockRouting({
       beforeMiddleware: [{ source: "/bm", sourceRegex: "^\\/bm(?:\\/)?$", destination: "/d" }],
       beforeFiles: [{ source: "/bf", sourceRegex: "^\\/bf(?:\\/)?$", destination: "/d" }],

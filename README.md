@@ -42,7 +42,9 @@ Middleware, PPR, cache components, and ISR are verified through the upstream Nex
 - `kubectl` and Helm >= 3.2 in PATH, plus a container runtime—`docker`, `podman`, or `nerdctl`.
   Helm 3 uses its client-side upgrade path; Helm 4 uses server-side apply.
 
-Emitted container images run **Node 24** (the generated routing manifest requires it; the build fails on older bases rather than failing with a 500 at runtime).
+Emitted container images pin the tested **Node 24** runtime. Routing compatibility does not rely
+on Node-specific regex extensions: the adapter passes Next's route sources and case-sensitivity
+policy directly to `@next/routing`.
 
 ### Reserved paths
 

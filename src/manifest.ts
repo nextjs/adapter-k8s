@@ -86,18 +86,6 @@ export function collectOutputPathnames(outputs: AdapterOutputs): string[] {
   return [...pathnames].sort();
 }
 
-// Wrap each route's baked sourceRegex in an inline case-insensitive group so
-// @next/routing matches rewrite/redirect/header sources the way `next start`
-// does (path-to-regexp `sensitive: false`). The `(?i:…)` modifier keeps named
-// capture groups intact, so dynamic-param extraction is unaffected.
-function caseInsensitiveSources<T extends { sourceRegex: string }>(routes: T[]): T[] {
-  return routes.map((route) =>
-    route.sourceRegex && !route.sourceRegex.startsWith("(?i")
-      ? { ...route, sourceRegex: `(?i:${route.sourceRegex})` }
-      : route,
-  );
-}
-
 // builtAt is embedded in the chart ConfigMap and every Docker build context, so a
 // wall-clock stamp makes two chart generations of the SAME build byte-different —
 // busting Docker layer caches and violating the clean chart-regeneration invariant
@@ -161,6 +149,7 @@ export function buildRoutingManifest({
   basePath,
   i18n,
   trailingSlash,
+  caseSensitive = false,
   nextVersion,
   projectDir,
   distDir,
@@ -172,6 +161,7 @@ export function buildRoutingManifest({
   basePath: string;
   i18n: BuildCompleteContext["config"]["i18n"] | null;
   trailingSlash: boolean;
+  caseSensitive?: boolean;
   nextVersion: string;
   projectDir: string;
   /**
@@ -336,23 +326,16 @@ export function buildRoutingManifest({
   return {
     // rsc is inside routeGraph per design doc §5.3
     routeGraph: {
-      // Rewrites/redirects/headers/onMatch match case-insensitively in `next start`
-      // (path-to-regexp `sensitive: false` — filesystem.js buildCustomRoute passes
-      // experimental.caseSensitiveRoutes, default false), but @next/routing's
-      // matchRoute compiles the baked sourceRegex with no flags, so `/Rewrite-1`
-      // would miss `/rewrite-1`. Wrap each custom-route source in an inline
-      // case-insensitive group so both the pool and the ext_proc routing service
-      // match the way `next start` does. Named capture groups are preserved.
-      beforeMiddleware: caseInsensitiveSources(routing.beforeMiddleware),
-      beforeFiles: caseInsensitiveSources(routing.beforeFiles),
-      afterFiles: caseInsensitiveSources(routing.afterFiles),
-      // dynamicRoutes stay case-SENSITIVE: `next start` matches dynamic PAGE routes
-      // via getRouteRegex (route-regex.js) which compiles `new RegExp(...)` with no
-      // flags — verified: /BLOG/hello does not match /blog/[slug] upstream. Only
-      // custom routes are case-insensitive, so only they get the wrap.
+      // Keep Next's route sources byte-for-byte and pass its policy separately. @next/routing
+      // 16.3 owns the RegExp flags for every bucket; wrapping sources here duplicated that
+      // logic, ignored experimental.caseSensitiveRoutes, and introduced Node-24-only syntax.
+      caseSensitive,
+      beforeMiddleware: routing.beforeMiddleware,
+      beforeFiles: routing.beforeFiles,
+      afterFiles: routing.afterFiles,
       dynamicRoutes: routing.dynamicRoutes,
-      onMatch: caseInsensitiveSources(routing.onMatch),
-      fallback: caseInsensitiveSources(routing.fallback),
+      onMatch: routing.onMatch,
+      fallback: routing.fallback,
       shouldNormalizeNextData: routing.shouldNormalizeNextData,
       rsc: routing.rsc,
     },

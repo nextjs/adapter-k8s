@@ -1,17 +1,8 @@
 // src/emit/dockerfiles.ts
 import { DEFAULT_TARGET_PLATFORM, targetNodeCpu, type TargetPlatform } from "../target-platform.js";
 
-// N24: the emitted routing manifest wraps rewrite/redirect/header/fallback sources in
-// inline regexp modifiers — `(?i:…)` (manifest.ts caseInsensitiveSources) — so custom
-// routes match case-insensitively the way `next start` does. V8 only accepts inline
-// modifiers from 12.7 (Node 23+): on a node:22 base, `new RegExp("(?i:/foo)")` throws
-// at manifest load and the container 500s EVERY request for any app with redirects()/
-// headers()/rewrites(). This is a known incident class here (Node 22 routing container
-// vs Node 24-built `@next/routing` `(?i:)` regexes — all unmatched paths 500ed).
-// mise.toml pins the build toolchain to Node 24; the runtime base MUST stay in V8
-// parity. Do NOT downgrade below 24 — assertSupportedNodeVersion makes that fail the
-// build (and the dockerfiles test suite) loudly instead of 500ing in production.
-export const MIN_EMITTED_NODE_MAJOR = 24;
+// Node 24 is the tested runtime and current default image. Route-regex compatibility does not
+// depend on it: the manifest preserves Next's regex sources and @next/routing owns the flags.
 export const DEFAULT_EMITTED_NODE_VERSION = "24";
 
 /**
@@ -29,28 +20,16 @@ export const DEFAULT_EMITTED_NODE_VERSION = "24";
  */
 export const NODE_BASE_DIGEST_ENV = "ADAPTER_K8S_NODE_BASE_DIGEST";
 
-function baseImageRef(nodeVersion: string): string {
+function baseImageRef(): string {
   const digest = process.env[NODE_BASE_DIGEST_ENV];
-  if (!digest) return `node:${nodeVersion}-slim`;
+  if (!digest) return `node:${DEFAULT_EMITTED_NODE_VERSION}-slim`;
   if (!/^sha256:[a-f0-9]{64}$/.test(digest)) {
     throw new Error(
       `Invalid ${NODE_BASE_DIGEST_ENV}: ${JSON.stringify(digest)} — expected sha256:<64 hex>. ` +
         `It is interpolated into the emitted Dockerfile's FROM line.`,
     );
   }
-  return `node:${nodeVersion}-slim@${digest}`;
-}
-
-function assertSupportedNodeVersion(nodeVersion: string): void {
-  const major = Number.parseInt(nodeVersion, 10);
-  if (!Number.isInteger(major) || major < MIN_EMITTED_NODE_MAJOR) {
-    throw new Error(
-      `Unsupported emitted base image node:${nodeVersion}-slim: the routing manifest ` +
-        `embeds inline regexp modifiers ("(?i:…)") that V8 only accepts on Node ` +
-        `${MIN_EMITTED_NODE_MAJOR}+ — a node:${nodeVersion} container would throw at ` +
-        `manifest load and 500 every request. Use Node ${MIN_EMITTED_NODE_MAJOR} or newer.`,
-    );
-  }
+  return `node:${DEFAULT_EMITTED_NODE_VERSION}-slim@${digest}`;
 }
 
 // installSharpVersion lands inside a Dockerfile RUN instruction — validate at the
@@ -83,13 +62,11 @@ RUN npm install --prefix /tmp/adapter-k8s-sharp --no-save --no-audit --no-fund \
 
 export function generateDockerfile({
   containerStrategy: _containerStrategy,
-  nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
 }: {
   containerStrategy: "shared-image" | "traced-assets";
-  nodeVersion?: string;
   targetPlatform?: TargetPlatform;
   buildId: string;
   /**
@@ -100,12 +77,11 @@ export function generateDockerfile({
    */
   installSharpVersion?: string;
 }): string {
-  assertSupportedNodeVersion(nodeVersion);
   // `=== undefined` (not falsy): an EMPTY version string must reach the validator, which
   // rejects it, rather than silently skipping the install step.
   const sharpInstall =
     installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
-  return `FROM ${baseImageRef(nodeVersion)}
+  return `FROM ${baseImageRef()}
 WORKDIR /app
 COPY --chown=node:node . .
 ${sharpInstall}ENV NODE_ENV=production
@@ -119,13 +95,11 @@ CMD ["node", "pool-server.cjs"]
 
 export function generatePoolDockerfile({
   poolName,
-  nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
 }: {
   poolName: string;
-  nodeVersion?: string;
   targetPlatform?: TargetPlatform;
   buildId: string;
   /**
@@ -137,13 +111,12 @@ export function generatePoolDockerfile({
    */
   installSharpVersion?: string;
 }): string {
-  assertSupportedNodeVersion(nodeVersion);
   // `=== undefined` (not falsy): an EMPTY version string must reach the validator, which
   // rejects it, rather than silently skipping the install step.
   const sharpInstall =
     installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
   // context/ is prepared by the adapter with exactly what's needed.
-  return `FROM ${baseImageRef(nodeVersion)}
+  return `FROM ${baseImageRef()}
 WORKDIR /app
 COPY --chown=node:node context/ .
 ${sharpInstall}ENV NODE_ENV=production
@@ -158,20 +131,17 @@ CMD ["node", "pool-server.cjs"]
 
 /** Parent image for traced-assets builds with more than one pool. */
 export function generatePoolBaseDockerfile({
-  nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
 }: {
-  nodeVersion?: string;
   targetPlatform?: TargetPlatform;
   buildId: string;
   installSharpVersion?: string;
 }): string {
-  assertSupportedNodeVersion(nodeVersion);
   const sharpInstall =
     installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
-  return `FROM ${baseImageRef(nodeVersion)}
+  return `FROM ${baseImageRef()}
 WORKDIR /app
 COPY --chown=node:node dependencies/ .
 ${sharpInstall}COPY --chown=node:node content/ .
@@ -205,14 +175,7 @@ CMD ["node", "pool-server.cjs"]
 `;
 }
 
-export function generateRoutingServiceDockerfile({
-  nodeVersion = DEFAULT_EMITTED_NODE_VERSION,
-  buildId,
-}: {
-  nodeVersion?: string;
-  buildId: string;
-}): string {
-  assertSupportedNodeVersion(nodeVersion);
+export function generateRoutingServiceDockerfile({ buildId }: { buildId: string }): string {
   // GCP ext_proc callouts reach the routing service over HTTP/2 *with TLS* (a plaintext
   // gRPC health check still passes, which is why an h2c server looks healthy but the
   // callout silently fails). The cert is NOT baked into the image: the routing service
@@ -221,7 +184,7 @@ export function generateRoutingServiceDockerfile({
   // spec backs with an emptyDir (the root filesystem is read-only). openssl is kept
   // installed for that runtime generation. server.ts serves TLS when TLS_CERT_FILE/
   // TLS_KEY_FILE exist, and plaintext h2c otherwise (local emulate).
-  return `FROM ${baseImageRef(nodeVersion)}
+  return `FROM ${baseImageRef()}
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \\
  && rm -rf /var/lib/apt/lists/*

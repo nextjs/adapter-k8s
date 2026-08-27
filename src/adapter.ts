@@ -1786,6 +1786,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         basePath: nextConfig.basePath ?? "",
         i18n: nextConfig.i18n ?? null,
         trailingSlash: nextConfig.trailingSlash ?? false,
+        caseSensitive:
+          (nextConfig.experimental as { caseSensitiveRoutes?: boolean } | undefined)
+            ?.caseSensitiveRoutes ?? false,
         nextVersion,
         projectDir,
         distDir,

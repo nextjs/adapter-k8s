@@ -198,6 +198,14 @@ describe("CEL public-file handling (N40, post-exclusion-removal)", () => {
 });
 
 describe("pool build context staging", () => {
+  it("carries Next case-sensitive routing policy into the staged manifest", async () => {
+    seedProject();
+    await build({ config: { experimental: { caseSensitiveRoutes: true } } });
+
+    const manifest = JSON.parse(outputFile("routing-manifest.json"));
+    expect(manifest.routeGraph.caseSensitive).toBe(true);
+  });
+
   it("emits one shared runtime base and thin, disjoint deltas for multiple pools", async () => {
     seedProject();
     const route = writeFile(".next/server/app/api/hello/route.js", "module.exports={}");

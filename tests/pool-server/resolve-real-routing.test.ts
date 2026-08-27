@@ -12,12 +12,15 @@ describe("createLocalResolver with real @next/routing", () => {
   ])("resolves an i18n index rewrite for %s", async (pathname, locale) => {
     const manifest: RoutingManifest = {
       routeGraph: {
+        caseSensitive: false,
         beforeMiddleware: [],
         beforeFiles: [],
         afterFiles: [
           {
             source: "/:nextInternalLocale(en|nl\\-NL)",
-            sourceRegex: "(?i:^(?:\\/(en|nl\\-NL))(?:\\/)?$)",
+            // Raw source emitted by Next. @next/routing applies the case-insensitive flag from
+            // routeGraph.caseSensitive; the adapter must not synthesize an inline modifier.
+            sourceRegex: "^(?:\\/(en|nl\\-NL))(?:\\/)?$",
             destination: "/$1/company/about-us?nextInternalLocale=$1",
           },
         ],
