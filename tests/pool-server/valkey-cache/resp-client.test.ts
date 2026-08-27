@@ -39,8 +39,6 @@ interface FakeServer {
   port: number;
   /** Every command the server has parsed, in arrival order (decoded as strings). */
   commands: string[][];
-  /** Total connections the server has accepted (used to observe reconnects). */
-  connectionCount: () => number;
   /** Connections that carried at least one complete RESP command. Ambient localhost probes may
    * connect to a random test port, but they cannot manufacture the client's command stream. */
   commandConnectionCount: () => number;
@@ -63,9 +61,7 @@ function startFakeValkey(
   const commands: string[][] = [];
   const sockets = new Set<net.Socket>();
   const commandSockets = new Set<net.Socket>();
-  let connections = 0;
   const onConnection = (socket: net.Socket) => {
-    connections++;
     sockets.add(socket);
     socket.on("error", () => undefined);
     socket.on("close", () => sockets.delete(socket));
@@ -102,7 +98,6 @@ function startFakeValkey(
         url: `${tlsOpts ? "rediss" : "redis"}://${urlHost}:${port}`,
         port,
         commands,
-        connectionCount: () => connections,
         commandConnectionCount: () => commandSockets.size,
         close: () =>
           new Promise<void>((r) => {
@@ -326,7 +321,7 @@ describe("N71: an unsolicited reply frame is a protocol violation, never a queue
       await sleep(120); // let the unsolicited frame arrive and tear the connection down
       // The critical assertion: keyB gets KEY B's value, from a fresh connection.
       expect(await client.get("keyB")).toBe("BBBB-value");
-      expect(server.connectionCount()).toBe(2);
+      expect(server.commandConnectionCount()).toBe(2);
     } finally {
       await client.quit();
       await server.close();
@@ -345,7 +340,7 @@ describe("N71: an unsolicited reply frame is a protocol violation, never a queue
       expect(await client.get("keyA")).toBe("AAAA-value");
       await sleep(20);
       expect(await client.get("keyB")).toBe("BBBB-value");
-      expect(server.connectionCount()).toBe(2);
+      expect(server.commandConnectionCount()).toBe(2);
     } finally {
       await client.quit();
       await server.close();
@@ -915,7 +910,7 @@ describe("L17: circuit breaker after a failure (fail fast, probe later)", () => 
       // BEFORE the close lands would be a legitimately-failed in-flight command (breaker opens).
       await sleep(200);
       expect(await client.get("b")).toBe("v"); // transparent reconnect, no breaker error
-      expect(server.connectionCount()).toBe(2);
+      expect(server.commandConnectionCount()).toBe(2);
     } finally {
       await client.quit();
       await server.close();
@@ -1050,12 +1045,12 @@ describe("N76: a failure report is scoped to the connection that produced it", (
     });
     try {
       await expect(client.get("a")).rejects.toThrow();
-      const connsAfterFailure = server.connectionCount();
+      const connsAfterFailure = server.commandConnectionCount();
       expect(await client.get("b")).toBe("v");
-      expect(server.connectionCount()).toBe(connsAfterFailure + 1);
+      expect(server.commandConnectionCount()).toBe(connsAfterFailure + 1);
       // And the recovered connection is still usable — nothing tore it down behind our back.
       expect(await client.get("c")).toBe("v");
-      expect(server.connectionCount()).toBe(connsAfterFailure + 1);
+      expect(server.commandConnectionCount()).toBe(connsAfterFailure + 1);
     } finally {
       await client.quit();
       await server.close();
