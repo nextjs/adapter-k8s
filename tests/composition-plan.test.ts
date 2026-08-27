@@ -125,6 +125,23 @@ describe("composition plan schema", () => {
     const plan = parseCompositionPlan(basePlan());
     expect(plan.apiVersion).toBe("adapter-k8s.nextjs.org/v1alpha1");
     expect(plan.requirements.kubernetes.minimumVersion).toBe("1.33.0");
+    expect(plan.operations.routing).not.toHaveProperty("registration");
+  });
+
+  it("authenticates versioned routing registration operations", () => {
+    const raw = basePlan();
+    const routing = (raw.operations as Record<string, unknown>).routing as Record<string, unknown>;
+    (routing.dataplane as Record<string, unknown>).transport = "tls";
+    routing.registration = {
+      kind: "gcp-traffic-extension-v1",
+      projectId: "sample-project",
+      extensionName: "test-app-traffic-ext",
+      addressName: "test-app-ip",
+    };
+    expect(parseCompositionPlan(raw).operations.routing.registration).toEqual(routing.registration);
+
+    (routing.registration as Record<string, unknown>).kind = "exec-provider-plugin";
+    expect(() => parseCompositionPlan(raw)).toThrow(/unknown routing registration operation/i);
   });
 
   it("parses declarative provider telemetry without executing provider code", () => {

@@ -915,7 +915,13 @@ describe("Kubernetes target composition", () => {
       }),
       context({ infrastructure: { projectId: "sample-project", region: "us-central1" } }),
     );
-    expect(compiled.routingTier.registration).toBe("gke-traffic-extension");
+    expect(compiled.routingTier).not.toHaveProperty("registration");
+    expect(compiled.plan.operations.routing.registration).toEqual({
+      kind: "gcp-traffic-extension-v1",
+      projectId: "sample-project",
+      extensionName: "test-app-traffic-ext",
+      addressName: "test-app-ip",
+    });
     expect(compiled.plan.target.registry).toMatchObject({
       authentication: { kind: "ambient-credentials" },
       digestLookup: { kind: "oci-distribution" },
@@ -1111,7 +1117,6 @@ describe("open build-time hooks", () => {
             enabled: true,
             transport: "h2c",
             serviceAnnotations: {},
-            registration: "none",
           },
         } as never;
       },
@@ -1156,7 +1161,6 @@ describe("open build-time hooks", () => {
               transportSecurity: "none",
             },
             serviceAnnotations: {},
-            registration: "none",
           },
         } as never;
       },
@@ -1201,7 +1205,6 @@ describe("open build-time hooks", () => {
               transportSecurity: "none",
             },
             serviceAnnotations: {},
-            registration: "none",
           },
         };
       },

@@ -1971,7 +1971,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // balancer (the edge kept the previous build's chain) with a green deploy. Emit the
       // chain only when it can actually be registered, and say so loudly when it cannot.
       const needsGkeRegistration = compiledTarget
-        ? compiledTarget.routingTier.registration === "gke-traffic-extension"
+        ? compiledTarget.plan.operations.routing.registration?.kind === "gcp-traffic-extension-v1"
         : Boolean(gkeProvider);
       const canRegisterExtension = needsGkeRegistration && !!(infra.projectId && infra.region);
       const extensionChain = canRegisterExtension
