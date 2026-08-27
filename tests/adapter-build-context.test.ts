@@ -313,36 +313,45 @@ describe("pool build context staging", () => {
         api: { routes: ["appRoutes"] },
       },
     };
-    await createK8sAdapter(config).onBuildComplete!(ctx);
+    // try/finally, per this file's convention: vitest.config.ts sets neither `restoreMocks`
+    // nor `mockReset`, and there is no global restoreAllMocks, so a spy left installed
+    // silences console.warn for every test declared after this one — which swallows exactly
+    // the `[adapter-k8s] …` warnings (sharp pruning, cache handler, topology) that explain
+    // why a later staging test failed.
+    try {
+      await createK8sAdapter(config).onBuildComplete!(ctx);
 
-    // The branch under test was actually taken (both decisions occurred, in one build).
-    expect(warn.mock.calls.flat().join(" ")).toMatch(
-      /different sharp requirements .*staged.*install:0\.34\.2|different sharp requirements .*install:0\.34\.2.*staged/,
-    );
-    const output = path.join(projectDir, ".k8s-adapter/output");
-    // No shared layers at all — the standalone layout must not leave a half-factored base
-    // behind, or the pool Dockerfiles would reference an image nothing populated.
-    expect(existsSync(path.join(output, "pool-base"))).toBe(false);
-    expect(JSON.parse(outputFile("build-metadata.json")).poolImageLayout).not.toBe(
-      "shared-base-v1",
-    );
+      // The branch under test was actually taken (both decisions occurred, in one build).
+      expect(warn.mock.calls.flat().join(" ")).toMatch(
+        /different sharp requirements .*staged.*install:0\.34\.2|different sharp requirements .*install:0\.34\.2.*staged/,
+      );
+      const output = path.join(projectDir, ".k8s-adapter/output");
+      // No shared layers at all — the standalone layout must not leave a half-factored base
+      // behind, or the pool Dockerfiles would reference an image nothing populated.
+      expect(existsSync(path.join(output, "pool-base"))).toBe(false);
+      expect(JSON.parse(outputFile("build-metadata.json")).poolImageLayout).not.toBe(
+        "shared-base-v1",
+      );
 
-    for (const poolName of ["web", "api"]) {
-      const context = path.join(output, "pools", poolName, "context");
-      // static-assets.json in THIS context claims these pathnames; a request for one can
-      // arrive at either pool, so both must be able to serve it from its own image.
-      const manifest = JSON.parse(
-        readFileSync(path.join(context, "config/static-assets.json"), "utf-8"),
-      ) as Array<{ pathname: string; filePath: string }>;
-      expect(manifest.map((e) => e.pathname)).toContain("/logo.png");
-      expect(manifest.map((e) => e.pathname)).toContain("/blog/post");
-      expect(readFileSync(path.join(context, "public/logo.png"), "utf-8")).toBe("png-bytes");
-      expect(existsSync(path.join(context, ".next/server/app/blog/post.html"))).toBe(true);
-      expect(existsSync(path.join(context, ".next/server/app/blog/post.meta"))).toBe(true);
-      // Standalone images, not layered deltas.
-      expect(
-        readFileSync(path.join(output, "pools", poolName, "Dockerfile"), "utf8"),
-      ).not.toContain("FROM ${POOL_BASE_IMAGE}");
+      for (const poolName of ["web", "api"]) {
+        const context = path.join(output, "pools", poolName, "context");
+        // static-assets.json in THIS context claims these pathnames; a request for one can
+        // arrive at either pool, so both must be able to serve it from its own image.
+        const manifest = JSON.parse(
+          readFileSync(path.join(context, "config/static-assets.json"), "utf-8"),
+        ) as Array<{ pathname: string; filePath: string }>;
+        expect(manifest.map((e) => e.pathname)).toContain("/logo.png");
+        expect(manifest.map((e) => e.pathname)).toContain("/blog/post");
+        expect(readFileSync(path.join(context, "public/logo.png"), "utf-8")).toBe("png-bytes");
+        expect(existsSync(path.join(context, ".next/server/app/blog/post.html"))).toBe(true);
+        expect(existsSync(path.join(context, ".next/server/app/blog/post.meta"))).toBe(true);
+        // Standalone images, not layered deltas.
+        expect(
+          readFileSync(path.join(output, "pools", poolName, "Dockerfile"), "utf8"),
+        ).not.toContain("FROM ${POOL_BASE_IMAGE}");
+      }
+    } finally {
+      warn.mockRestore();
     }
   });
 
