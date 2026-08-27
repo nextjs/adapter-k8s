@@ -101,12 +101,12 @@ import {
 import { evaluateEnvoyGatewayPreflight } from "./envoy-gateway-preflight.js";
 
 // The rollout wait and its measured-on-a-real-cluster rationale moved to src/cutover/gates.ts
-// with the Phase D gate battery (GitOps PR2). A2: it is no longer a 600s constant — 600s is
-// only the FLOOR. runCutover derives the budget per deploy from the replica count times the
-// chart's own serial surge cost (ready + minReadySeconds + preStop + the pool's post-SIGTERM
-// drain), because the old pod's termination sits on the rollout's critical path under
-// `maxUnavailable: 0` and a large-replica rollout legitimately outlasts 600s while still
-// progressing. See deriveRolloutWaitBudget.
+// with the Phase D gate battery (GitOps PR2). A2: there are now TWO waits, because the two
+// gates await different shapes. D1's pool Deployments are created fresh per build, so their
+// pods come up in parallel and 600s stays a constant. D2's routing Deployment is patched in
+// place, so it walks one serial surge step per replica (ready + minReadySeconds + the
+// kubelet's termination grace) and its budget is derived per deploy from its OWN live replica
+// count, floored at 600s and capped at 1800s. See deriveRolloutWaitBudget.
 
 export interface DeployOptions {
   projectDir: string;

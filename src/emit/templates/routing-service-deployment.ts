@@ -181,9 +181,14 @@ spec:
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
-  # A2: shared with the pool template so the cutover's derived rollout wait (gates.ts
-  # deriveRolloutWaitBudget) covers THIS tier too — it is the one Deployment that rolls
-  # in place on every build, i.e. the one that actually pays the serial preStop cost.
+  # A2: shared with the pool template, and the cutover's derived rollout wait (gates.ts
+  # deriveRolloutWaitBudget) is derived from it — plus terminationGracePeriodSeconds below —
+  # per replica. This is the one Deployment helm patches IN PLACE on every build, so it is the
+  # only one that actually pays the serial preStop cost, and D2 (waitRoutingRollout) is the
+  # only consumer of that derivation. A2-repair: D2 reads THIS Deployment's own spec.replicas
+  # to feed it. It shipped fed from max(previousReplicasByPool), i.e. the POOL tier's count —
+  # this tier is scaled by its own HPA (routing-service-hpa.ts, min 2 / max 10 by default) and
+  # the two numbers are unrelated.
   minReadySeconds: ${MIN_READY_SECONDS}
   selector:
     matchLabels:

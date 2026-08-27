@@ -230,15 +230,17 @@ async function registerInstrumentationHook(): Promise<InstrumentationStatus> {
 }
 
 /**
- * Post-SIGTERM application drain budget (see the shutdown handler at the end of
- * startPoolServer). Exported because it is ROLLOUT arithmetic as much as runtime
- * arithmetic: a terminating pod spends this long after its 120 s preStop, and with
- * `maxUnavailable: 0` the next surge step cannot start until it is gone — so
- * src/cutover/gates.ts derives the `kubectl rollout status` budget from it via the
- * `POOL_SHUTDOWN_GRACE_SECONDS` mirror in src/emit/templates/deployment.ts (kept
- * dependency-free of this bundle, pinned by a test that imports both).
+ * Default post-SIGTERM application drain budget (see the shutdown handler at the end of
+ * startPoolServer), overridable per-pod via `ADAPTER_K8S_SHUTDOWN_GRACE_MS`.
+ *
+ * A2-repair: deliberately NOT exported, and deliberately not mirrored into the emit layer.
+ * A2 mirrored it as `POOL_SHUTDOWN_GRACE_SECONDS` so the cutover could add it to the surge
+ * step's old-pod occupancy term, but an env-overridable default is not a bound on anything —
+ * raising the knob would have made a surge step outlast the budget derived from it. The
+ * kubelet's `terminationGracePeriodSeconds` is the real ceiling on how long a terminating pod
+ * holds its slot, so that is what src/cutover/gates.ts derives from now.
  */
-export const DEFAULT_SHUTDOWN_GRACE_MS = 60_000;
+const DEFAULT_SHUTDOWN_GRACE_MS = 60_000;
 
 // DoS backstop: the pool buffers request/image bodies fully in memory (the
 // loopback handler needs a fixed-length body, and middleware may read it). Cap

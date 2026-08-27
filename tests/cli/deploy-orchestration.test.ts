@@ -264,6 +264,9 @@ function happyCluster(
     // N64: the new build's rendered replica count, and how many of its pods are Ready.
     newBuildReplicas?: number;
     newBuildReplicasProbeFails?: boolean;
+    // A2-repair: `.spec.replicas` the D2 probe reads off the ROUTING Deployment — its own
+    // HPA's number, which is what D2's rollout budget is derived from.
+    routingReplicas?: number;
     podReplicas?: number;
     readyPerPool?: Record<string, number>;
     // N67: the chart-rendered HPA the new build's Deployment is bound to. `null` simulates
@@ -438,6 +441,14 @@ function happyCluster(
         return { exitCode: 1, stdout: "", stderr: "deployment metadata patch denied" };
       }
       return ok();
+    }
+    // 7a-bis (D2) existence probe on the routing tier, which also carries that tier's OWN
+    // replica count — the number D2's rollout budget is derived from (A2-repair). 4 replicas
+    // is where its HPA sits under load; the pool tier's count is irrelevant to it. MUST come
+    // before the N64 branch below: the two probes read the same jsonpath and differ only in
+    // which Deployment they name.
+    if (args[0] === "get" && args[1] === "deployment" && args[2] === "rel-routing-service") {
+      return ok(`rel-routing-service|${overrides.routingReplicas ?? 4}`);
     }
     // N64: pre-cutover capacity probe on the NEW build's Deployment (short jsonpath).
     if (j.includes("jsonpath={.metadata.name}|{.spec.replicas}")) {
@@ -615,9 +626,6 @@ function happyCluster(
       if (j.includes("version=")) return ok("rel-ssr-buildn\nrel-routing-service\n");
       return ok("rel-ssr-buildn\nrel-ssr-buildm\nrel-routing-service\n");
     }
-    if (args.includes("deployment") && args.includes("rel-routing-service")) {
-      return ok("deployment.apps/rel-routing-service\n"); // 7a-bis existence probe
-    }
     if (args.includes("jobs")) return ok("");
     if (args.includes("exec")) return ok("200 OK");
     if (args.includes("logs")) return ok("");
@@ -778,6 +786,22 @@ describe("runDeploy — orchestration", () => {
     // The routing deployment was NOT rollout-waited by the POOL loop (exact-name exclusion):
     // it appears exactly once — from the dedicated 7a-bis check.
     expect(events.filter((e) => e === "rollout:deployment/rel-routing-service")).toHaveLength(1);
+    // A2-repair, through the CLI entrypoint: the two rollout gates carry DIFFERENT budgets.
+    // D1 awaits per-build Deployments that are being created, so its pods come up in parallel
+    // (600s, fixed); D2 awaits the one Deployment helm patches in place, so it surges serially
+    // and derives its wait from its own tier's live replica count (4 x 285s here). A2 shipped
+    // with one budget for both, taken from the POOL replica counts.
+    const rolloutWaits = Object.fromEntries(
+      vi
+        .mocked(execCapture)
+        .mock.calls.filter(([, a]) => a[0] === "rollout")
+        .map(([, a]) => [
+          a.find((x) => x.startsWith("deployment/"))!,
+          a.find((x) => x.startsWith("--timeout=")),
+        ]),
+    );
+    expect(rolloutWaits["deployment/rel-ssr-buildn"]).toBe("--timeout=600s");
+    expect(rolloutWaits["deployment/rel-routing-service"]).toBe("--timeout=1140s");
     // Cleanup never deletes the routing deployment.
     const deletes = vi
       .mocked(execCapture)
@@ -1278,9 +1302,10 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-      // A2: the quoted budget is the DERIVED one (600s at this fixture's replica count),
-      // not the "120s" the message hardcoded for two rollout-budget revisions after the
-      // wait itself stopped being 120s.
+      // A2: the message quotes the budget the gate actually waited, not the "120s" it
+      // hardcoded for two rollout-budget revisions after the wait stopped being 120s. This is
+      // the POOL gate (D1), whose Deployments are created fresh per build and whose pods
+      // therefore come up in parallel — 600s, not a per-replica derivation.
     ).rejects.toThrow(/did not finish rolling out within 600s/);
     // No selector patch, no state commit — the previous build keeps serving.
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);

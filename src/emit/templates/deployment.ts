@@ -44,24 +44,32 @@ export const TERMINATION_GRACE_SECONDS = 210;
 
 /**
  * A2. The rest of the rollout arithmetic, exported (and interpolated into the manifest
- * below) so the cutover's `kubectl rollout status` wait can be DERIVED from the chart's own
- * parameters instead of restating them as a hardcoded number that drifts every time one of
- * them moves — see `deriveRolloutWaitBudget` in src/cutover/gates.ts.
+ * below) so the cutover's `kubectl rollout status` waits can be DERIVED from the chart's own
+ * parameters instead of restating them as hardcoded numbers that drift every time one of
+ * them moves — see `deriveRolloutWaitBudget` (D2, an in-place rollout) and
+ * `ROLLOUT_TIMEOUT_FLOOR_SECONDS` (D1, a fresh create) in src/cutover/gates.ts.
  *
- * `MIN_READY_SECONDS` is the GFE health-check window (N63); the readiness probe values are
- * N71's explicit timings. `POOL_SHUTDOWN_GRACE_SECONDS` mirrors the pool server's own
- * post-SIGTERM budget (`SHUTDOWN_GRACE_MS` / `DEFAULT_SHUTDOWN_GRACE_MS` in
- * src/pool-server/index.ts, env-overridable via ADAPTER_K8S_SHUTDOWN_GRACE_MS) — the pool
- * deliberately holds SSE/WebSocket connections for the COMPLETE window, so it is real
- * wall-clock time a terminating pod spends after its 120 s preStop and BEFORE the next
- * surge step of a `maxUnavailable: 0` rollout can start. Duplicated rather than imported so
- * this template module stays dependency-free of the pool-server runtime (same rule as
- * `POOL_READINESS_PATH` below); pinned by a test that imports both.
+ * `MIN_READY_SECONDS` is the GFE health-check window (N63); the probe values are N71's
+ * explicit timings, and `STARTUP_PROBE_BUDGET_SECONDS` is its `periodSeconds ×
+ * failureThreshold` — the boot budget a pool pod gets before liveness can restart it, and
+ * therefore the bound on ONE pod becoming Ready.
+ *
+ * A2-repair: the old-pod occupancy term of a surge step is `TERMINATION_GRACE_SECONDS`
+ * above, not `PRESTOP_DRAIN_SECONDS` plus a mirror of the pool server's application drain.
+ * That mirror (`POOL_SHUTDOWN_GRACE_SECONDS`, 60 s) was described as "real wall-clock time"
+ * while being env-overridable via `ADAPTER_K8S_SHUTDOWN_GRACE_MS` in the same breath — both
+ * cannot be true of a constant, and an operator raising the knob would have made each surge
+ * step outlast what the cutover budgeted for it. The kubelet's grace period is the actual
+ * ceiling on slot occupancy (SIGKILL lands there regardless), cannot be moved from the pod's
+ * env, and covers the routing tier too — which has no such knob at all.
  */
 export const MIN_READY_SECONDS = 30;
 export const READINESS_PROBE_PERIOD_SECONDS = 5;
 export const READINESS_PROBE_FAILURE_THRESHOLD = 3;
-export const POOL_SHUTDOWN_GRACE_SECONDS = 60;
+export const STARTUP_PROBE_PERIOD_SECONDS = 5;
+export const STARTUP_PROBE_FAILURE_THRESHOLD = 30;
+export const STARTUP_PROBE_BUDGET_SECONDS =
+  STARTUP_PROBE_PERIOD_SECONDS * STARTUP_PROBE_FAILURE_THRESHOLD;
 
 /**
  * Ephemeral-storage sizing. `/app/.next/cache` is Next's FILESYSTEM incremental cache —
@@ -314,9 +322,13 @@ ${replicaLine}  # N63. The other half of the 502/503 fix: a pool Deployment DOES
   # minReadySeconds gives the GFE time to health-check each new pod into the NEG before the
   # next one is replaced — the same shape the routing tier already used.
   #
-  # A2: this shape is also what makes a rollout SERIAL, so the cutover's rollout wait is
-  # derived from these numbers (MIN_READY_SECONDS below + PRESTOP_DRAIN_SECONDS +
-  # POOL_SHUTDOWN_GRACE_SECONDS, times the replica count) rather than hardcoded.
+  # A2: this shape is also what makes an IN-PLACE rollout serial (MIN_READY_SECONDS below +
+  # TERMINATION_GRACE_SECONDS per surge step, times the replica count — see
+  # deriveRolloutWaitBudget). A2-repair: that derivation is NOT this template's rollout wait.
+  # A pool Deployment carries the build id in its name, and an identical build id is refused
+  # before helm runs (assertBuildIdChangedSinceServing), so the cutover only ever CREATES these
+  # objects: their pods come up in parallel and pay no preStop. The shape above still matters
+  # for the rollouts nothing here controls — an HPA resize, a node drain, a kubectl edit.
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -418,9 +430,9 @@ ${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${
             httpGet:
               path: /healthz
               port: 3000
-            periodSeconds: 5
+            periodSeconds: ${STARTUP_PROBE_PERIOD_SECONDS}
             timeoutSeconds: 3
-            failureThreshold: 30
+            failureThreshold: ${STARTUP_PROBE_FAILURE_THRESHOLD}
           readinessProbe:
             httpGet:
               path: ${readinessPath}
