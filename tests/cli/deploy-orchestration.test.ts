@@ -1168,13 +1168,13 @@ describe("runDeploy — orchestration", () => {
         ([, a]) => a.includes("patch") && a.includes("service") && a.includes("rel-ssr"),
       );
     expect(patchCalls).toHaveLength(2);
-    const forward = JSON.parse(patchCalls[0]![1].at(-1)!)[0].value;
+    const forward = JSON.parse(patchCalls[0]![1].at(-1)!)[1].value;
     expect(forward).toMatchObject({
       "app.kubernetes.io/component": "ssr",
       "app.kubernetes.io/version": "buildn",
       "example.com/custom": "kept",
     });
-    const restored = JSON.parse(patchCalls[1]![1].at(-1)!)[0].value;
+    const restored = JSON.parse(patchCalls[1]![1].at(-1)!)[1].value;
     expect(restored).toEqual({
       "app.kubernetes.io/name": "rel",
       "app.kubernetes.io/component": "legacy-fallback",
@@ -1216,7 +1216,7 @@ describe("runDeploy — orchestration", () => {
       .mock.calls.find(
         ([, args]) => args[0] === "patch" && args[1] === "service" && args[2] === "rel-api",
       );
-    const selector = JSON.parse(apiPatch![1].at(-1)!)[0].value;
+    const selector = JSON.parse(apiPatch![1].at(-1)!)[1].value;
     expect(selector).toEqual({
       "app.kubernetes.io/name": "rel",
       "app.kubernetes.io/component": "api",
@@ -2042,6 +2042,67 @@ describe("runDeploy — guards and teardown", () => {
     expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
     expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toMatch(
       /could not authenticate.*NOT deleted.*outgoing build artifact.*adapter-k8s destroy/s,
+    );
+  });
+
+  it("does not treat the cluster cache claim as cloud-deletion authority", async () => {
+    const outgoing = gkeCompositionPlan({
+      buildId: "buildm",
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    const cluster = happyCompositionCluster(events, { buildm: outgoing });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "get" &&
+        args[1] === "configmap" &&
+        args[2] === "rel-cache-identity"
+      ) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            metadata: {
+              labels: {
+                "app.kubernetes.io/name": RELEASE,
+                "app.kubernetes.io/component": "managed-cache-identity",
+                "adapter-k8s.dev/release": RELEASE,
+              },
+            },
+            data: { projectId: "my-project", region: "us-central1" },
+          }),
+          stderr: "",
+        };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toMatch(
+      /authenticated plan names my-project\/us-central1.*durable provisioning state records undefined\/undefined/s,
     );
   });
 

@@ -2435,11 +2435,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
                 JSON.stringify(expectedName),
             );
           }
+          // The cluster claim prevents concurrent creation, but a namespace actor can rewrite it
+          // together with retained plan/state ConfigMaps. Ambient GCP credentials may be spent
+          // only when operator-local infrastructure state independently names the same resource.
           const recordedIdentity: ManagedCacheIdentity | null =
-            clusterCacheIdentity ??
-            (infra.cacheProjectId && infra.cacheRegion
+            infra.cacheProjectId && infra.cacheRegion
               ? { projectId: infra.cacheProjectId, region: infra.cacheRegion }
-              : null);
+              : null;
           if (
             recordedIdentity?.projectId !== previousCache.projectId ||
             recordedIdentity?.region !== previousCache.region

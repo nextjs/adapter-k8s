@@ -1,4 +1,4 @@
-import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture, execCaptureStdin } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import {
   assertSafeNamespace,
@@ -115,18 +115,23 @@ export async function claimManagedCacheIdentity(
     return;
   }
 
-  const created = await execCapture(
+  const created = await execCaptureStdin(
     "kubectl",
-    [
-      "create",
-      "configmap",
-      name,
-      "-n",
-      namespace,
-      `--from-literal=projectId=${expected.projectId}`,
-      `--from-literal=region=${expected.region}`,
-      `--labels=app.kubernetes.io/name=${releaseName},app.kubernetes.io/component=${MANAGED_CACHE_IDENTITY_COMPONENT},adapter-k8s.dev/release=${releaseName}`,
-    ],
+    ["create", "-f", "-"],
+    JSON.stringify({
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: {
+        name,
+        namespace,
+        labels: {
+          "app.kubernetes.io/name": releaseName,
+          "app.kubernetes.io/component": MANAGED_CACHE_IDENTITY_COMPONENT,
+          "adapter-k8s.dev/release": releaseName,
+        },
+      },
+      data: { projectId: expected.projectId, region: expected.region },
+    }),
     { timeoutMs: EXEC_TIMEOUTS.kubectl },
   );
   if (created.exitCode === 0) return;

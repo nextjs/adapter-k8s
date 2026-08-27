@@ -44,6 +44,7 @@ export async function switchTrafficToNewBuild(opts: {
   const patchFailures: { pool: string; service: string; stderr: string }[] = [];
   const patchedServices: string[] = [];
   const originalServiceSelectors = new Map<string, Record<string, string>>();
+  const patchedServiceSelectors = new Map<string, Record<string, string>>();
 
   // A topology-changing rollback may have redirected a stable Service to a fallback pool.
   // Read every selector before changing any of them so cutover restores both component and
@@ -103,6 +104,11 @@ export async function switchTrafficToNewBuild(opts: {
     for (const { servicePool, targetPool } of serviceDestinations) {
       const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
       const originalSelector = originalServiceSelectors.get(activeServiceName)!;
+      const nextSelector = {
+        ...originalSelector,
+        "app.kubernetes.io/component": targetPool,
+        "app.kubernetes.io/version": safeBuildId,
+      };
       const patchResult = await execCapture(
         "kubectl",
         [
@@ -122,13 +128,14 @@ export async function switchTrafficToNewBuild(opts: {
           "-p",
           JSON.stringify([
             {
+              op: "test",
+              path: "/spec/selector",
+              value: originalSelector,
+            },
+            {
               op: "replace",
               path: "/spec/selector",
-              value: {
-                ...originalSelector,
-                "app.kubernetes.io/component": targetPool,
-                "app.kubernetes.io/version": safeBuildId,
-              },
+              value: nextSelector,
             },
           ]),
         ],
@@ -142,6 +149,7 @@ export async function switchTrafficToNewBuild(opts: {
         });
       } else {
         patchedServices.push(activeServiceName);
+        patchedServiceSelectors.set(activeServiceName, nextSelector);
       }
     }
   }
@@ -154,6 +162,7 @@ export async function switchTrafficToNewBuild(opts: {
     const revertFailures: string[] = [];
     for (const serviceName of patchedServices) {
       const originalSelector = originalServiceSelectors.get(serviceName)!;
+      const patchedSelector = patchedServiceSelectors.get(serviceName)!;
       const revertResult = await execCapture(
         "kubectl",
         [
@@ -166,6 +175,11 @@ export async function switchTrafficToNewBuild(opts: {
           "--field-manager=helm",
           "-p",
           JSON.stringify([
+            {
+              op: "test",
+              path: "/spec/selector",
+              value: patchedSelector,
+            },
             {
               op: "replace",
               path: "/spec/selector",

@@ -27,6 +27,7 @@ function identity(projectId = "project-one", region = "us-central1") {
 describe("managed cache identity coordination", () => {
   beforeEach(() => {
     vi.mocked(exec.execCapture).mockReset();
+    vi.mocked(exec.execCaptureStdin).mockReset();
   });
 
   it("uses a release-scoped Kubernetes name", () => {
@@ -35,19 +36,28 @@ describe("managed cache identity coordination", () => {
   });
 
   it("claims an absent identity with an atomic ConfigMap create", async () => {
-    vi.mocked(exec.execCapture)
-      .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce(ok("configmap/my-app-cache-identity\n"));
+    vi.mocked(exec.execCapture).mockResolvedValueOnce(ok());
+    vi.mocked(exec.execCaptureStdin).mockResolvedValueOnce(ok("configmap/my-app-cache-identity\n"));
 
     await claimManagedCacheIdentity("my-app", "apps", {
       projectId: "project-one",
       region: "us-central1",
     });
 
-    const create = vi.mocked(exec.execCapture).mock.calls[1]?.[1] ?? [];
-    expect(create.slice(0, 3)).toEqual(["create", "configmap", "my-app-cache-identity"]);
-    expect(create).toContain("--from-literal=projectId=project-one");
-    expect(create).toContain("--from-literal=region=us-central1");
+    const create = vi.mocked(exec.execCaptureStdin).mock.calls[0];
+    expect(create?.[1]).toEqual(["create", "-f", "-"]);
+    expect(JSON.parse(create?.[2] ?? "{}")).toMatchObject({
+      metadata: {
+        name: "my-app-cache-identity",
+        namespace: "apps",
+        labels: {
+          "app.kubernetes.io/name": "my-app",
+          "app.kubernetes.io/component": "managed-cache-identity",
+          "adapter-k8s.dev/release": "my-app",
+        },
+      },
+      data: { projectId: "project-one", region: "us-central1" },
+    });
   });
 
   it("accepts an existing identity only when coordinates and ownership match", async () => {
@@ -64,8 +74,12 @@ describe("managed cache identity coordination", () => {
   it("rejects a concurrent claim for different paid coordinates", async () => {
     vi.mocked(exec.execCapture)
       .mockResolvedValueOnce(ok())
-      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "AlreadyExists" })
       .mockResolvedValueOnce(ok(identity("project-two", "europe-west1")));
+    vi.mocked(exec.execCaptureStdin).mockResolvedValueOnce({
+      exitCode: 1,
+      stdout: "",
+      stderr: "AlreadyExists",
+    });
 
     await expect(
       claimManagedCacheIdentity("my-app", "default", {
