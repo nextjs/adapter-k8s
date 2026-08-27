@@ -100,7 +100,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
     const head = Buffer.from("early-frame");
 
-    await expect(handleWebSocketUpgrade(deps, req, socket, head)).resolves.toBe("accepted");
+    await expect(handleWebSocketUpgrade(deps, req, socket, head)).resolves.toBe("accepted-local");
 
     expect(upgradeHandler).toHaveBeenCalledOnce();
     const [context, transport] = upgradeHandler.mock.calls[0]!;
@@ -177,7 +177,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
-      "accepted",
+      "accepted-local",
     );
     expect(resolve).not.toHaveBeenCalled();
     expect(upgradeHandler).toHaveBeenCalledOnce();
@@ -210,7 +210,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
-      "accepted",
+      "accepted-local",
     );
     expect(resolve).toHaveBeenCalledOnce();
     expect(req.headers["x-mw-request-headers"]).toBeUndefined();
@@ -265,6 +265,59 @@ describe("handleWebSocketUpgrade", () => {
     }
   });
 
+  // N89. `next/dist/compiled/ws` exports only the transport classes, so `extension.parse` is
+  // undefined on every Next release the adapter has shipped against. Throwing then rejected the
+  // upgrade promise, whose handler in createPoolServer destroyed the socket without writing a
+  // byte — every browser handshake (they all offer permessage-deflate) died with no HTTP status.
+  it("completes a browser handshake when the pinned extension parser is unavailable", async () => {
+    const upgradeHandler = vi.fn(async () => ({ upgraded: true, statusCode: 101 }));
+    const { deps, resolve } = dependencies({ upgradeHandler });
+    deps.parseWebSocketExtensions = undefined;
+    const { socket, text } = captureSocket();
+
+    await expect(
+      handleWebSocketUpgrade(
+        deps,
+        request(undefined, {
+          "sec-websocket-extensions": "permessage-deflate; client_max_window_bits",
+        }),
+        socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("accepted-local");
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(upgradeHandler).toHaveBeenCalledOnce();
+    // Nothing is written by the adapter: the generated entrypoint owns the 101 and the extension
+    // negotiation, exactly as it does for a handshake with no extensions offered at all.
+    expect(text()).toBe("");
+    socket.destroy();
+  });
+
+  it("still uses the pinned parser to reject a malformed extension offer when it exists", async () => {
+    const parseWebSocketExtensions = vi.fn((value: string) => {
+      if (value === "permessage-deflate; =") throw new SyntaxError("invalid extension");
+      return {};
+    });
+    const { deps, resolve } = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    deps.parseWebSocketExtensions = parseWebSocketExtensions;
+    const { socket, text } = captureSocket();
+
+    await expect(
+      handleWebSocketUpgrade(
+        deps,
+        request(undefined, { "sec-websocket-extensions": "permessage-deflate; =" }),
+        socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("rejected");
+    expect(parseWebSocketExtensions).toHaveBeenCalledWith("permessage-deflate; =");
+    expect(text()).toContain("HTTP/1.1 400");
+    expect(text()).toContain("Invalid Sec-WebSocket-Extensions header.");
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("enforces same-origin and configured cross-origin policy before routing", async () => {
     const denied = dependencies({
       upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
@@ -292,7 +345,7 @@ describe("handleWebSocketUpgrade", () => {
         acceptedSocket.socket,
         Buffer.alloc(0),
       ),
-    ).resolves.toBe("accepted");
+    ).resolves.toBe("accepted-local");
     expect(accepted.resolve).toHaveBeenCalledOnce();
     acceptedSocket.socket.destroy();
   });
@@ -318,7 +371,7 @@ describe("handleWebSocketUpgrade", () => {
         sameOriginSocket.socket,
         Buffer.alloc(0),
       ),
-    ).resolves.toBe("accepted");
+    ).resolves.toBe("accepted-local");
     expect(sameOrigin.deps.webSocketAllowedOrigins).toBeUndefined();
     expect(sameOrigin.resolve).toHaveBeenCalledOnce();
     sameOriginSocket.socket.destroy();
@@ -345,6 +398,83 @@ describe("handleWebSocketUpgrade", () => {
     expect(crossOriginSocket.text()).toContain("WebSocket origin is not allowed.");
     expect(crossOrigin.resolve).not.toHaveBeenCalled();
   });
+
+  // S25. webSocketRequestAuthority derives the same-origin authority from the validated
+  // x-forwarded-proto witness, so which element of a multi-hop chain wins decides whether a
+  // browser's own `wss://` handshake is accepted, not just how a URL is spelled. Append
+  // conventions are client-first, so the leftmost element is the TLS-terminating outer hop's and
+  // the rightmost belongs to an inner hop that only saw the plaintext leg: reading the rightmost
+  // would 403 every wss handshake for an https app behind an appending intermediary. Nothing
+  // pinned that before.
+  it.each([
+    // [x-forwarded-proto, socket.encrypted, Origin, allowed, why]
+    [undefined, false, "http://example.com", true, "no witness, plain socket → http authority"],
+    [undefined, false, "https://example.com", false, "no witness cannot upgrade the authority"],
+    [undefined, true, "https://example.com", true, "direct TLS connection with no edge in front"],
+    ["https", false, "https://example.com", true, "TLS-terminating LB: the witness is the scheme"],
+    ["HTTPS", false, "https://example.com", true, "case-insensitive witness"],
+    ["http", false, "https://example.com", false, "edge witnessed plaintext"],
+    // The topology the ordering exists for: TLS-terminating outer LB plus an appending inner hop.
+    // The browser's own wss:// handshake must be accepted.
+    [
+      "https,http",
+      false,
+      "https://example.com",
+      true,
+      "leftmost hop (the TLS terminator) said https",
+    ],
+    [
+      ["https", "http"],
+      false,
+      "https://example.com",
+      true,
+      "repeated header instances are one chain, joined before the leftmost read",
+    ],
+    ["http,https", false, "https://example.com", false, "the client-facing leg was plaintext"],
+    ["javascript", false, "https://example.com", false, "garbage witness falls back to the socket"],
+    ["javascript", false, "http://example.com", true, "garbage witness falls back to the socket"],
+    [
+      "javascript,https",
+      false,
+      "https://example.com",
+      false,
+      "garbage leftmost element does not fall further right",
+    ],
+    [
+      "https,javascript",
+      false,
+      "https://example.com",
+      true,
+      "junk appended by an inner hop cannot demote the outer hop's witness",
+    ],
+  ] as const)(
+    "same-origin authority for x-forwarded-proto %j (encrypted=%s, Origin %s) allows=%s",
+    async (forwardedProto, encrypted, origin, allowed) => {
+      const { deps, resolve } = dependencies({
+        upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+      });
+      const req = request(undefined, { origin });
+      if (forwardedProto !== undefined) req.headers["x-forwarded-proto"] = forwardedProto;
+      req.rawHeaders = Object.entries(req.headers).flatMap(([name, value]) =>
+        Array.isArray(value) ? value.flatMap((entry) => [name, entry]) : [name, value],
+      );
+      req.socket = { encrypted };
+      const { socket, text } = captureSocket();
+
+      const disposition = await handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0));
+
+      if (allowed) {
+        expect(disposition).toBe("accepted-local");
+        expect(resolve).toHaveBeenCalledOnce();
+        socket.destroy();
+      } else {
+        expect(disposition).toBe("rejected");
+        expect(text()).toContain("HTTP/1.1 403 Forbidden");
+        expect(text()).toContain("WebSocket origin is not allowed.");
+        expect(resolve).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it("preserves only framework-authored middleware cookies into the generated request", async () => {
     const middlewareRequestHeaders = new Headers({
@@ -382,7 +512,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
-      "accepted",
+      "accepted-local",
     );
     expect(upgradeHandler).toHaveBeenCalledOnce();
     socket.destroy();
@@ -527,8 +657,10 @@ describe("handleWebSocketUpgrade", () => {
     });
 
     try {
+      // N90: a tunnel, not a locally owned socket — shutdown may only write into this relayed pipe
+      // where the N91 cursor proves it sits between frames.
       await expect(handleWebSocketUpgrade(deps, clientRequest, socket, earlyFrame)).resolves.toBe(
-        "accepted",
+        "accepted-tunnel",
       );
       expect(siblingHeaders?.["x-output-id"]).toBe("/rooms/[room]");
       expect(siblingHeaders?.["x-mw-evaluated"]).toBe("ran");

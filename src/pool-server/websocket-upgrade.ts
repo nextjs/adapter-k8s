@@ -31,8 +31,27 @@ import {
 } from "./dispatch.js";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
+import { trackTunnelFraming } from "./websocket-frame-cursor.js";
 
-export type UpgradeDisposition = "accepted" | "rejected";
+/**
+ * N90. Who owns FRAMING on an accepted socket, which is what shutdown needs to know before it
+ * writes anything into one (createPoolServer's drain, and the same union on its `onUpgrade`).
+ *
+ * - `accepted-local`: Next's generated ws stack owns this socket. It writes each frame
+ *   synchronously under cork, so a close frame injected between frames cannot interleave with a
+ *   partially written one — the drain path may stamp RFC 6455 code 1001 itself.
+ * - `accepted-tunnel`: the socket is one end of `proxyUpgradeToPool`'s byte pipe. Nothing here
+ *   owns its framing: a frame relayed from the sibling pool routinely spans several TCP chunks, so
+ *   at any instant the client may hold a partially relayed frame whose header already promised N
+ *   more payload bytes, and a close frame written there lands INSIDE that payload and corrupts the
+ *   stream. The drain path therefore asks websocket-frame-cursor.ts whether the client-bound relay
+ *   is provably between frames (N91) and injects only then; otherwise it injects nothing and
+ *   relays whatever close frame the peer pool's own drain emits.
+ *
+ * Deliberately not a boolean `accepted`: conflating the two ownership models is exactly what put
+ * a close frame into the middle of a relayed frame, so every accepting path must now say which.
+ */
+export type UpgradeDisposition = "accepted-local" | "accepted-tunnel" | "rejected";
 
 export interface WebSocketUpgradeDispatcher {
   resolve(
@@ -255,13 +274,29 @@ function validateWebSocketHandshake(
       seen.add(protocol);
     }
   }
+  // Sec-WebSocket-Extensions is validated ONLY when the app's pinned ws transport actually
+  // exports its parser — RFC 6455's extension grammar has enough edge cases that a hand-rolled
+  // approximation would drift from what the ws stack downstream accepts, and two disagreeing
+  // parsers on one handshake is worse than one.
+  //
+  // N89. The adapter must DEGRADE, not fail, when that parser is absent. `next/dist/compiled/ws`
+  // is an nccc bundle whose only public exports are the transport classes (CONNECTING…CLOSED,
+  // createWebSocketStream, Server, Receiver, Sender, WebSocket, WebSocketServer) — `extension` is
+  // internal to the bundle and is NOT exported as of Next 16.3.0. Throwing here therefore fired
+  // on every handshake carrying this header, i.e. every real browser (all of them offer
+  // permessage-deflate): the rejected promise landed in createPoolServer's upgrade `.catch`,
+  // which destroyed the socket after writing ZERO bytes, so the client saw a bare TCP close
+  // rather than any HTTP status and the pod logged one "Unhandled WebSocket upgrade error" per
+  // attempt. Skipping the check keeps browser WebSockets working and costs no trust boundary:
+  // nothing in this file reads the extensions header (unlike host/origin/key/version, which
+  // decide same-origin and handshake validity), it is relayed verbatim on a cross-pool hop, and
+  // the party that negotiates extensions is Next's generated ws stack — `WebSocketServer`
+  // parses this header itself and answers 400 when perMessageDeflate is enabled, and ignores it
+  // (negotiating nothing, so framing stays plain RFC 6455) when it is not. An unparseable value
+  // can therefore never reach frame decoding as an active extension.
   const extensions = rawHeaderValues(req, "sec-websocket-extensions");
-  if (extensions.length > 0) {
-    if (!parseWebSocketExtensions) {
-      throw new Error("The vendored WebSocket extension parser is unavailable.");
-    }
+  if (extensions.length > 0 && parseWebSocketExtensions) {
     try {
-      // RFC 6455 grammar has enough edge cases that a hand-rolled approximation will drift.
       // Use the exact parser pinned by the application's Next transport, as Next itself does.
       parseWebSocketExtensions(extensions.join(","));
     } catch {
@@ -426,7 +461,8 @@ function generatedUpgradeDisposition(outcome: unknown): UpgradeDisposition {
   ) {
     throw new TypeError("Next generated upgradeHandler returned an inconsistent upgrade outcome");
   }
-  return upgraded ? "accepted" : "rejected";
+  // Accepted here means the GENERATED entrypoint took the socket, so ws owns its framing.
+  return upgraded ? "accepted-local" : "rejected";
 }
 
 /** Read the proof-gated phase-two routing verdict, then erase the transport vocabulary. */
@@ -809,6 +845,11 @@ async function proxyUpgradeToPool(
         return;
       }
 
+      // Either end closing takes the other with it, so shutdown needs no separate handle on the
+      // upstream socket: when the drain path destroys the client socket after its bounded flush
+      // window, this teardown closes the sibling-pool connection in the same tick and the back
+      // pool's generated stack sees its peer leave. N90: the drain path may write into the client
+      // end ONLY at a frame boundary, which is what the N91 cursor below exists to establish.
       const teardown = () => {
         if (!socket.destroyed) socket.destroy();
         if (!proxySocket.destroyed) proxySocket.destroy();
@@ -819,7 +860,10 @@ async function proxyUpgradeToPool(
       proxySocket.on("close", teardown);
       socket.pipe(proxySocket);
       proxySocket.pipe(socket);
-      finish("accepted");
+      // N91. Track only the CLIENT-BOUND direction: it is the one shutdown may write into, and
+      // `proxyHead` is already part of that stream (it was written above, before the pipe existed).
+      trackTunnelFraming(socket, proxySocket, proxyHead);
+      finish("accepted-tunnel");
     });
 
     proxyReq.once("response", (proxyRes) => {

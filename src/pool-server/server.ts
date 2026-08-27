@@ -10,6 +10,9 @@ import {
   verifyDispatchProof,
 } from "../routing-common.js";
 import { guardStreamErrors } from "./dispatch.js";
+// A leaf: it knows about byte positions in a relayed frame stream and nothing about dispatch, so
+// importing it keeps the "no dependency on the dispatcher" property `onUpgrade` is spelled out for.
+import { injectTunnelCloseFrame } from "./websocket-frame-cursor.js";
 import {
   metricHttpMethod,
   recordPoolRequest,
@@ -228,14 +231,24 @@ export function filterWriteHeadHeadersArg(
 export interface PoolServerOptions {
   onRequest: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
   /**
-   * Node upgrade transport used by Next's generated App Route `upgradeHandler`. Returning
-   * `accepted` marks the still-open socket as an established WebSocket for graceful shutdown.
+   * Node upgrade transport used by Next's generated App Route `upgradeHandler`. An accepting
+   * disposition marks the still-open socket as an established WebSocket for graceful shutdown,
+   * and says who owns its FRAMING — `accepted-local` for a socket Next's ws stack writes frames
+   * into (shutdown may stamp RFC 6455 code 1001 itself), `accepted-tunnel` for one end of a
+   * cross-pool byte pipe whose framing nothing here owns (shutdown may stamp 1001 only where the
+   * N91 cursor proves the relayed stream sits between frames). N90 in
+   * websocket-upgrade.ts `UpgradeDisposition` carries the full derivation; the union is spelled
+   * out here rather than imported so this transport keeps no dependency on the dispatcher.
    */
   onUpgrade?: (
     req: IncomingMessage,
     socket: Duplex,
     head: Buffer,
-  ) => "accepted" | "rejected" | Promise<"accepted" | "rejected">;
+  ) =>
+    | "accepted-local"
+    | "accepted-tunnel"
+    | "rejected"
+    | Promise<"accepted-local" | "accepted-tunnel" | "rejected">;
   port: number;
   /** Explicit bind host. Production omits this so Kubernetes can reach the pod on every address. */
   host?: string | undefined;
@@ -288,11 +301,23 @@ interface ActiveResponseState {
 }
 
 /**
- * One drain outcome per tracked response, and one per tracked socket. The HTTP categories
- * (completed, clientClosed, sseEnded, sseForced, httpForceClosed) are mutually exclusive and never
- * sum past httpAtStart — an operator reading the single "drain complete" line after an incident has
- * to be able to add them up, so a response that receives an SSE EOF and is then destroyed because
- * the EOF never flushed must land in exactly one of them (sseForced), not in two.
+ * One drain outcome per tracked response, and one terminal SIGNAL per tracked socket. The HTTP
+ * categories (completed, clientClosed, sseEnded, sseForced, httpForceClosed) are mutually exclusive
+ * and never sum past httpAtStart — an operator reading the single "drain complete" line after an
+ * incident has to be able to add them up, so a response that receives an SSE EOF and is then
+ * destroyed because the EOF never flushed must land in exactly one of them (sseForced), not in two.
+ *
+ * The WebSocket counters partition differently, and deliberately: peerClosed, signalled and
+ * tunnelled are mutually exclusive and sum to webSocketsAtStart minus the handshakes still in
+ * flight, while wsForced counts the SEPARATE later act of destroying a socket that outlived the
+ * terminal flush window. A socket signalled with 1001 and then destroyed appears in both
+ * (signalled=1 wsForced=1) — the 1001 says what the peer was told, wsForced says how the socket
+ * ended. tunnelled is the N90/N91 split: a cross-pool tunnel that could NOT be given a 1001,
+ * because its client-bound relay was mid-frame at that instant or had already relayed the peer
+ * pool's own close frame. A tunnel that was between frames is counted in signalled with every
+ * other socket the client heard 1001 from — the counter is about what the peer was told, not about
+ * which code path told it — so a rising tunnelled is the population that ends abnormally (ws 1006)
+ * and is worth an operator's attention on its own.
  */
 interface DrainMetrics {
   httpAtStart: number;
@@ -304,6 +329,7 @@ interface DrainMetrics {
   webSocketsAtStart: number;
   webSocketsPeerClosed: number;
   webSocketsSignalled: number;
+  webSocketsTunnelled: number;
   webSocketsForceClosed: number;
 }
 
@@ -368,7 +394,13 @@ export function createPoolServer(options: PoolServerOptions) {
   // shutdown can let finite responses complete, end SSE with a reconnectable EOF, and close a
   // WebSocket with RFC 6455 code 1001 instead of applying one blunt socket operation to all three.
   const activeResponses = new Map<ServerResponse, ActiveResponseState>();
-  const upgradedSockets = new Map<Duplex, { accepted: boolean; serverSignalled: boolean }>();
+  // `ownership` starts as "handshake" — still an HTTP exchange, so it gets an HTTP close rather
+  // than a WebSocket frame — and becomes "local" or "tunnel" from the upgrade disposition. N90:
+  // only "local" sockets may be written into during drain.
+  const upgradedSockets = new Map<
+    Duplex,
+    { ownership: "handshake" | "local" | "tunnel"; serverSignalled: boolean }
+  >();
   let draining = false;
   let drainMetrics: DrainMetrics | undefined;
   let stopPromise: Promise<void> | undefined;
@@ -553,7 +585,8 @@ export function createPoolServer(options: PoolServerOptions) {
         trustInternalHeaders,
         proofHeaderNames,
       });
-      const socketState = { accepted: false, serverSignalled: false };
+      const socketState: { ownership: "handshake" | "local" | "tunnel"; serverSignalled: boolean } =
+        { ownership: "handshake", serverSignalled: false };
       upgradedSockets.set(socket, socketState);
       socket.once("close", () => {
         upgradedSockets.delete(socket);
@@ -568,7 +601,9 @@ export function createPoolServer(options: PoolServerOptions) {
       Promise.resolve(onUpgrade(req, socket, head))
         .then((disposition) => {
           const state = upgradedSockets.get(socket);
-          if (state && disposition === "accepted") state.accepted = true;
+          if (state && disposition !== "rejected") {
+            state.ownership = disposition === "accepted-tunnel" ? "tunnel" : "local";
+          }
           if (disposition === "rejected" && !socket.destroyed && !socket.writableEnded) {
             // The SERVER is ending this handshake. Without the flag a rejection that lands after
             // drain begins is reported as webSocketsPeerClosed — a voluntary peer departure the
@@ -643,8 +678,10 @@ export function createPoolServer(options: PoolServerOptions) {
      * This form always settles: stop accepting, drop idle keep-alive sockets immediately, let
      * active responses use the COMPLETE grace window, then close each surviving protocol
      * honestly. SSE receives a normal EOF (EventSource can reconnect); an incomplete finite body
-     * is reset rather than pretending truncated bytes are complete; established WebSockets get
-     * RFC 6455 code 1001 before forced teardown. Errors are swallowed — "already closing" and
+     * is reset rather than pretending truncated bytes are complete; an established WebSocket this
+     * pod OWNS gets RFC 6455 code 1001 before forced teardown, and a cross-pool tunnel gets one
+     * only where its relayed frame stream is provably between frames (N90/N91). Errors are
+     * swallowed — "already closing" and
      * "never started" are the only outcomes, and neither should stop a caller from exiting.
      */
     async stop(options: { graceMs?: number } = {}): Promise<void> {
@@ -665,6 +702,7 @@ export function createPoolServer(options: PoolServerOptions) {
           webSocketsAtStart: upgradedSockets.size,
           webSocketsPeerClosed: 0,
           webSocketsSignalled: 0,
+          webSocketsTunnelled: 0,
           webSocketsForceClosed: 0,
         };
 
@@ -718,9 +756,31 @@ export function createPoolServer(options: PoolServerOptions) {
             try {
               if (!socket.destroyed) {
                 state.serverSignalled = true;
-                if (state.accepted) {
+                if (state.ownership === "local") {
                   drainMetrics.webSocketsSignalled += 1;
                   socket.write(goingAway);
+                } else if (state.ownership === "tunnel") {
+                  // N90. A cross-pool tunnel (websocket-upgrade.ts proxyUpgradeToPool) is a byte
+                  // pipe whose framing nothing here owns: a frame relayed from the peer pool may
+                  // be only partly written into this socket right now, its header already having
+                  // promised N more payload bytes. Writing 1001 blindly puts close-frame bytes
+                  // INSIDE that payload and corrupts the stream — strictly worse than no close
+                  // frame at all.
+                  //
+                  // N91 (websocket-frame-cursor.ts) makes the position knowable, so ask instead of
+                  // assume. Between frames — the ordinary case for an idle tunnel, and the only
+                  // case for one that never carried a frame — the client gets a real 1001. Mid
+                  // frame, or once the peer's own close frame has already been relayed, nothing is
+                  // injected: the pipe stays open through the terminal flush window so a peer pool
+                  // that is draining too can emit its 1001 at a real boundary and have it relayed
+                  // intact. Either way the forced destroy that follows takes the upstream
+                  // connection with it through the tunnel's teardown pair, which is how the peer
+                  // pool learns the client is gone.
+                  if (injectTunnelCloseFrame(socket, goingAway)) {
+                    drainMetrics.webSocketsSignalled += 1;
+                  } else {
+                    drainMetrics.webSocketsTunnelled += 1;
+                  }
                 } else {
                   socket.end();
                 }
@@ -773,6 +833,7 @@ export function createPoolServer(options: PoolServerOptions) {
             `webSockets=${drainMetrics.webSocketsAtStart} ` +
             `peerClosed=${drainMetrics.webSocketsPeerClosed} ` +
             `signalled=${drainMetrics.webSocketsSignalled} ` +
+            `tunnelled=${drainMetrics.webSocketsTunnelled} ` +
             `wsForced=${drainMetrics.webSocketsForceClosed}`,
         );
       })();

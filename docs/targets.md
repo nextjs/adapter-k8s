@@ -55,6 +55,24 @@ export default createK8sAdapter({
 
 Use `gatewayApiExposure` instead for any conformant GatewayClass.
 
+**One requirement on whatever terminates TLS.** The pool's own socket is always plaintext, so
+`x-forwarded-proto` is its only witness of the client-facing scheme: it decides middleware's
+request URL, whether a middleware redirect `Location` is same-origin, and the origin a WebSocket
+handshake's `Origin` header is compared against. **It must reach the pool single-valued, written by
+the hop that terminated TLS.** Envoy — and Envoy Gateway, with the default zero trusted hops —
+overwrites it from the downstream connection's TLS state, so both emitted topologies satisfy this
+with no configuration. Two ways operator-supplied ingress can break it:
+
+- **Forwarding a client-supplied value unchanged.** Then an https app evaluates its own routing
+  against a scheme the client chose. Overwrite it at the edge.
+- **An appending intermediary between the TLS terminator and the pool.** Append conventions are
+  client-first (the `X-Forwarded-For` ordering, standardized in RFC 7239), so a second hop turns
+  the header into `https,http` — its own plaintext observation on the right. The adapter reads the
+  **leftmost** element, so it still derives `https`, but Next's own `x-forwarded-proto` handling
+  treats only the exact single value `https` as secure and will read `http` from that chain
+  regardless. Anything the app derives itself (absolute URLs, its own redirects) is then wrong even
+  though adapter-level routing is right. Configure the inner hop to overwrite, not append.
+
 ### TLS for dedicated exposures (cert-manager)
 
 A dedicated Gateway or Ingress terminates TLS from a Secret **in the app's namespace** — Gateway `certificateRefs` and Ingress `spec.tls` are namespace-local. Wildcard-cert fleets typically keep their certificate in the gateway owner's namespace (e.g. `network`), so no such Secret exists per app namespace. Both dedicated exposures accept `certManager` to emit a `cert-manager.io/v1` Certificate that issues it in place:
