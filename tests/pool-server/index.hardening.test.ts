@@ -11,11 +11,12 @@
 //
 // The staged dirs live UNDER THE REPO ROOT so createRequire(<staged>/package.json) can resolve
 // the repo's `next` (the pool requires several next/dist modules at boot).
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import net, { type AddressInfo } from "node:net";
 import path from "node:path";
 import { createServer } from "node:http";
+import dns from "node:dns";
 
 const REPO_ROOT = process.cwd();
 const BUILD_ID = "hardenbuild1";
@@ -36,7 +37,8 @@ process.env.NEXT_UNHANDLED_REJECTION_FILTER = "silent";
 
 const { startPoolServer } = await import("../../src/pool-server/index.js");
 const { signDispatch } = await import("../helpers/dispatch-proof.js");
-const { buildProofHeaderNames } = await import("../../src/routing-common.js");
+const { buildProofHeaderNames, dispatchBodyDigest, verifyDispatchProof } =
+  await import("../../src/routing-common.js");
 
 // The RSC config the staged builds below declare. The dispatch proof covers this build's RSC
 // negotiation header (it selects the dispatched output id), so a test that signs a trusted
@@ -70,6 +72,8 @@ type StageOptions = {
    * which an app-owned `cache-control` from the resolved routing verdict is load-bearing.
    */
   middlewareCoversEcho?: boolean;
+  /** Assign `/echo-headers` to a sibling pool so the real index-to-proxy body seam is exercised. */
+  crossPoolEcho?: boolean;
 };
 
 function writeStagedDir(options: StageOptions = {}): Staged {
@@ -264,7 +268,9 @@ function writeStagedDir(options: StageOptions = {}): Staged {
             matchers: [{ regexp: "^\\/echo-headers$" }],
           }
         : null,
-      poolAssignments: Object.fromEntries(pathnames.map((p) => [p, "main"])),
+      poolAssignments: Object.fromEntries(
+        pathnames.map((p) => [p, options.crossPoolEcho && p === "/echo-headers" ? "api" : "main"]),
+      ),
       // `fallbackFilePath` deliberately points at a file that does not exist: the resume-token
       // injection is then skipped (shellAvailable === false) and the handler answers normally,
       // which isolates the CACHE-POLICY behavior under test from the PPR resume machinery.
@@ -967,5 +973,89 @@ describe("A0-DP-5: revoking a body-bound proof also revokes what it already reso
     // `cache-control` here was still the revoked verdict's value.
     expect(res.headers.get("cache-control")).toBe("no-cache");
     expect(res.headers.get("x-from-resolved")).toBeNull();
+  });
+});
+
+describe("A0-DP-5: a cross-pool proof binds a known-empty body", () => {
+  it("does not weaken an empty POST body to the ABSENT digest symbol", async (ctx) => {
+    const secret = "an-internal-dispatch-secret";
+    let resolveVerdict!: (value: ReturnType<typeof verifyDispatchProof>) => void;
+    const receivedVerdict = new Promise<ReturnType<typeof verifyDispatchProof>>((resolve) => {
+      resolveVerdict = resolve;
+    });
+    const target = createServer((req, res) => {
+      const proof = req.headers["x-internal-dispatch-proof"];
+      resolveVerdict(
+        typeof proof === "string"
+          ? verifyDispatchProof(
+              secret,
+              {
+                method: req.method,
+                target: req.url,
+                headers: req.headers,
+                proofHeaderNames: PROOF_HEADER_NAMES,
+              },
+              proof,
+            )
+          : { trusted: false, reason: "malformed" },
+      );
+      req.resume();
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        target.once("error", reject);
+        target.listen(3000, "127.0.0.1", () => {
+          target.off("error", reject);
+          resolve();
+        });
+      });
+    } catch (error) {
+      // proxyToPool's production port is fixed. A developer service on :3000 should skip this
+      // socket test instead of making the suite fail for an unrelated local process.
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+        ctx.skip();
+        return;
+      }
+      throw error;
+    }
+
+    const lookup = vi.spyOn(dns, "lookup").mockImplementation(((
+      _hostname: string,
+      options: unknown,
+      cb?: unknown,
+    ) => {
+      const opts = typeof options === "object" ? (options as { all?: boolean }) : {};
+      const callback = (typeof options === "function" ? options : cb) as (
+        error: NodeJS.ErrnoException | null,
+        address: unknown,
+        family?: number,
+      ) => void;
+      queueMicrotask(() => {
+        if (opts.all) callback(null, [{ address: "127.0.0.1", family: 4 }]);
+        else callback(null, "127.0.0.1", 4);
+      });
+    }) as typeof dns.lookup);
+
+    let pool: Awaited<ReturnType<typeof boot>> | undefined;
+    try {
+      pool = await boot({ internalSecret: secret, crossPoolEcho: true });
+      const response = await fetch(`http://localhost:${pool.port}/echo-headers`, {
+        method: "POST",
+        body: "",
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+
+      const verdict = await receivedVerdict;
+      expect(verdict.trusted).toBe(true);
+      expect(verdict.trusted && verdict.bodyDigest).toEqual(dispatchBodyDigest(Buffer.alloc(0)));
+    } finally {
+      if (pool) await pool.stop();
+      lookup.mockRestore();
+      if (target.listening) await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
   });
 });

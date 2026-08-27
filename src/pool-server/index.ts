@@ -311,7 +311,7 @@ async function readRequestBody(
   req: NodeJS.ReadableStream,
   res: ServerResponse,
   maxBytes = MAX_BODY_BYTES,
-): Promise<Buffer | null> {
+): Promise<Buffer> {
   const stream = req as NodeJS.ReadableStream & {
     on: (event: string, cb: (...args: never[]) => void) => unknown;
     off: (event: string, cb: (...args: never[]) => void) => unknown;
@@ -374,7 +374,12 @@ async function readRequestBody(
     throw err;
   }
   releaseBodyBudgetWhenResponseCompletes(res, charged);
-  return chunks.length > 0 ? Buffer.concat(chunks) : null;
+  // An empty body is still a body value for a non-read method. Keep it as a zero-length Buffer
+  // rather than collapsing it to null: proxyToPool binds `actionBody` into the dispatch proof,
+  // and ABSENT means the signer could not observe the body at all. Treating a known-empty POST as
+  // ABSENT let its proof be replayed with attacker-controlled chunked bytes inside the freshness
+  // window while the receiving pool still honored `x-mw-evaluated: ran`.
+  return Buffer.concat(chunks, total);
 }
 
 function createBufferedStream(body: Buffer | null): ReadableStream<Uint8Array> {
@@ -2975,9 +2980,10 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       }
       throw err;
     }
-    if (bodyBuffer) {
+    if (bodyBuffer !== null) {
       // Next.js action-handler checks request meta first when the original
-      // Node stream has already been consumed upstream.
+      // Node stream has already been consumed upstream. Preserve Buffer.alloc(0): the cross-pool
+      // proof must bind a known-empty body instead of weakening it to ABSENT.
       addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
     }
 
