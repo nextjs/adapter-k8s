@@ -1,7 +1,7 @@
 // src/config.ts
 import type { K8sAdapterConfig, PoolConfig } from "./types.js";
 import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
-import { targetForConfig } from "./target/legacy.js";
+import { resolveConfiguredTarget } from "./target/legacy.js";
 import {
   assertSafeHostname,
   assertSafePoolName,
@@ -182,6 +182,15 @@ export function assertSafeCidrList(cidrs: unknown, where: string): asserts cidrs
 
 export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
+  const inputRecord = input as Record<string, unknown>;
+  for (const removed of ["imageOptimizer", "skewProtection", "routeExtension"] as const) {
+    if (Object.hasOwn(inputRecord, removed) && inputRecord[removed] !== undefined) {
+      throw new Error(
+        `${removed} is not a supported adapter config option. It was a placeholder and never ` +
+          `changed emitted workloads. Remove it from adapter.config.mjs.`,
+      );
+    }
+  }
   validateEnvMap(config.env, "adapter config");
   validateEnvFrom(config.envFrom, "adapter config");
   // Registry pull auth for private registries. Each name lands in `imagePullSecrets` on
@@ -326,7 +335,7 @@ export function validateConfig(input: unknown, releaseName?: string): void {
   validateResources(config.routingService?.resources, "routingService");
   validateScaling(config.routingService?.scaling, "routingService");
 
-  const target = targetForConfig(config);
+  const target = resolveConfiguredTarget(config).definition;
   const gatewayHosts = [...target.exposure.hosts];
   if (gatewayHosts.length === 0) {
     throw new Error("target exposure must contain at least one host");
@@ -393,15 +402,6 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // `process.env.VALKEY_AUTH` are both plain strings here. Do not claim to know which source
     // the operator used. The scaffold documents the environment-variable form instead.
   }
-  if (config.imageOptimizer?.enabled) {
-    throw new Error("imageOptimizer.enabled is not implemented yet");
-  }
-  if (config.skewProtection?.enabled) {
-    throw new Error("skewProtection.enabled is not implemented yet");
-  }
-  if (config.routeExtension?.mode === "wasm") {
-    throw new Error('routeExtension.mode "wasm" is not implemented; use "auto" or "extproc"');
-  }
 }
 
 export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
@@ -411,15 +411,6 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
       enabled: false,
       provider: "valkey",
       ...config.cache,
-    },
-    skewProtection: {
-      enabled: false,
-      duration: "1m",
-      ...config.skewProtection,
-    },
-    routeExtension: {
-      mode: "auto",
-      ...config.routeExtension,
     },
     containerStrategy: config.containerStrategy ?? "traced-assets",
     // CDN defaults are a GKE concept (Cloud CDN via GCPHTTPFilter). A target composition or

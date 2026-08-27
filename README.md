@@ -19,6 +19,8 @@ At deploy time, the CLI builds and pushes images, then runs `helm upgrade` with 
 
 Deployment targets are composed from independent cluster, exposure, and routing components—see [docs/targets.md](./docs/targets.md).
 
+Contributor guidance for a new controller or routing integration is in [CONTRIBUTING.md](./CONTRIBUTING.md) and [Writing a routing adapter](./docs/targets.md#writing-a-routing-adapter).
+
 With a shared cache configured, cache components, Partial Prerendering (PPR), and ISR work correctly across replicas: cached entries are shared, and `revalidateTag` / `revalidatePath` on one pod is seen by all. See [Distributed cache](./docs/configuration.md#distributed-cache-cache-components--ppr).
 
 CDN and middleware behavior are coordinated so cached responses can never bypass middleware-protected routes—see [Architecture](#architecture) for how.

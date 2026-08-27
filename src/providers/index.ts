@@ -14,12 +14,12 @@ export { gkeProvider } from "./gke.js";
 export { genericProvider } from "./generic.js";
 
 /**
- * Pick the provider for a config.
+ * Pick the legacy chart adapter for a deprecated provider config.
  *
  * `provider` is a one-key discriminated object (`{ gke: … }`), so resolution is a key check
  * rather than a name field — that shape predates this seam and keeps existing configs valid.
- * Phase 0 registers GKE only; eks/aks/generic land in later phases of
- * plans/multi-provider-aks-eks-generic.md.
+ * Do not register new platforms here. New integrations use target components and compile to a
+ * composition plan.
  *
  * Throws on an unknown provider rather than defaulting to GKE: silently emitting a Google
  * gateway for `provider: { eks: … }` would produce a chart that installs and then does nothing

@@ -129,7 +129,7 @@ describe("validateConfig", () => {
     ["image optimizer", { imageOptimizer: { enabled: true, mode: "sidecar" } }],
     ["skew protection", { skewProtection: { enabled: true, duration: "5m" } }],
     ["Wasm routing", { routeExtension: { mode: "wasm" } }],
-  ])("rejects the unimplemented %s option", (_name, extra) => {
+  ])("rejects the removed %s placeholder", (_name, extra) => {
     const config = {
       pools: { ssr: { routes: ["appPages"] } },
       provider: {
@@ -142,9 +142,9 @@ describe("validateConfig", () => {
         },
       },
       ...extra,
-    } as K8sAdapterConfig;
+    } as unknown as K8sAdapterConfig;
 
-    expect(() => validateConfig(config)).toThrow(/not implemented/);
+    expect(() => validateConfig(config)).toThrow(/not a supported adapter config option/i);
   });
 
   it("caps the pool count at 15 (HTTPRoute 16-rule budget)", () => {
@@ -365,8 +365,6 @@ describe("applyDefaults", () => {
     expect(result.containerStrategy).toBe("traced-assets");
     expect(result.provider.gke.cdn?.enabled).toBe(false);
     expect(result.cache?.enabled).toBe(false);
-    expect(result.skewProtection?.enabled).toBe(false);
-    expect(result.routeExtension?.mode).toBe("auto");
   });
 });
 

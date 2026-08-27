@@ -30,7 +30,8 @@ import type {
 } from "./types.js";
 import { genericConfigOf, gkeConfigOf, providerGatewayHosts } from "./types.js";
 import { resolveProvider } from "./providers/index.js";
-import { compileTarget, targetForConfig } from "./target/index.js";
+import { compileTarget } from "./target/index.js";
+import { resolveConfiguredTarget } from "./target/legacy.js";
 import { fingerprintCompositionPlan } from "./composition-plan/index.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 import { targetPlatform, type TargetPlatform } from "./target-platform.js";
@@ -1896,22 +1897,24 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       }
 
       const configuredDefaultPool = cfg.defaultPool ?? [...pools.keys()][0]!;
-      const compiledTarget = cfg.target
-        ? compileTarget(targetForConfig(cfg), {
-            releaseName,
-            namespace,
-            buildId,
-            imageRegistry,
-            pools: [...pools.keys()],
-            defaultPool: configuredDefaultPool,
-            failurePolicy: failureModeAllow ? "open" : "closed",
-            cache: cfg.cache?.enabled ? "external" : "none",
-            infrastructure: {
-              ...(infra.projectId ? { projectId: infra.projectId } : {}),
-              ...(infra.region ? { region: infra.region } : {}),
-            },
-          })
-        : undefined;
+      const resolvedTarget = resolveConfiguredTarget(cfg);
+      const compiledTarget =
+        resolvedTarget.source === "target"
+          ? compileTarget(resolvedTarget.definition, {
+              releaseName,
+              namespace,
+              buildId,
+              imageRegistry,
+              pools: [...pools.keys()],
+              defaultPool: configuredDefaultPool,
+              failurePolicy: failureModeAllow ? "open" : "closed",
+              cache: cfg.cache?.enabled ? "external" : "none",
+              infrastructure: {
+                ...(infra.projectId ? { projectId: infra.projectId } : {}),
+                ...(infra.region ? { region: infra.region } : {}),
+              },
+            })
+          : undefined;
 
       // The GXLB traffic extension can only be described (and registered) once init has
       // written projectId + region: the chain's `service` field is
