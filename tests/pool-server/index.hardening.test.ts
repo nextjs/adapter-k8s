@@ -565,8 +565,8 @@ describe("pool-server request-boundary hardening", () => {
     it("publishes the loopback origin for self-forwarded requests (Server Action forwarding)", async () => {
       // next start sets __NEXT_PRIVATE_ORIGIN to its own URL (start-server.js) and action
       // forwarding fetches `${origin}${workerPathname}` — without it the pool fell back to
-      // the request's PUBLIC origin and hairpinned action POSTs through the whole edge
-      // (full-run v4: app-action forwarding, both runtimes, "<null>" results).
+      // the request's PUBLIC origin and hairpinned action POSTs through the whole edge.
+      // Authority preservation for that private hop is covered at the dispatch boundary.
       expect(process.env.__NEXT_PRIVATE_ORIGIN).toBe(`http://127.0.0.1:${pool.port}`);
     });
 

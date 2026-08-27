@@ -58,6 +58,19 @@ function toNodeHeaders(req: IncomingMessage): Record<string, string | string[]> 
   return headers;
 }
 
+// Next's BaseServer preserves the public authority before a generated entrypoint can forward a
+// Server Action to another worker. The pool invokes entrypoints directly, so it must supply that
+// missing parity step itself. Node fetch replaces Host with __NEXT_PRIVATE_ORIGIN's loopback
+// authority on the worker hop; x-forwarded-host is the value Next's CSRF check deliberately keeps.
+// Missing-only matches upstream and preserves an ingress- or middleware-supplied public host.
+function preserveServerActionAuthority(req: IncomingMessage): void {
+  if (req.headers["next-action"] === undefined) return;
+  if (req.headers["x-forwarded-host"] !== undefined) return;
+  if (typeof req.headers.host === "string" && req.headers.host.length > 0) {
+    req.headers["x-forwarded-host"] = req.headers.host;
+  }
+}
+
 // Convert a web `Headers` to a Node headers object, preserving multiple Set-Cookie
 // values as an array. `Headers.entries()` collapses repeated Set-Cookie into a single
 // comma-joined string, which would drop all but the last cookie once written to a client.
@@ -3137,6 +3150,7 @@ export function createDispatcher(options: DispatcherOptions) {
           // The override list is authoritative: a listed header with no corresponding
           // x-middleware-request-* value means deletion. Merging would resurrect it.
           applyMiddlewareRequestHeaders(req, resolution.middlewareRequestHeaders);
+          preserveServerActionAuthority(req);
 
           // Pool ownership is authoritative. A broad local dynamic template can match the
           // same concrete pathname as an exact route assigned elsewhere (for example an App
