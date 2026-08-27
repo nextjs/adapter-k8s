@@ -255,13 +255,29 @@ function validateWebSocketHandshake(
       seen.add(protocol);
     }
   }
+  // Sec-WebSocket-Extensions is validated ONLY when the app's pinned ws transport actually
+  // exports its parser — RFC 6455's extension grammar has enough edge cases that a hand-rolled
+  // approximation would drift from what the ws stack downstream accepts, and two disagreeing
+  // parsers on one handshake is worse than one.
+  //
+  // N89. The adapter must DEGRADE, not fail, when that parser is absent. `next/dist/compiled/ws`
+  // is an nccc bundle whose only public exports are the transport classes (CONNECTING…CLOSED,
+  // createWebSocketStream, Server, Receiver, Sender, WebSocket, WebSocketServer) — `extension` is
+  // internal to the bundle and is NOT exported as of Next 16.3.0. Throwing here therefore fired
+  // on every handshake carrying this header, i.e. every real browser (all of them offer
+  // permessage-deflate): the rejected promise landed in createPoolServer's upgrade `.catch`,
+  // which destroyed the socket after writing ZERO bytes, so the client saw a bare TCP close
+  // rather than any HTTP status and the pod logged one "Unhandled WebSocket upgrade error" per
+  // attempt. Skipping the check keeps browser WebSockets working and costs no trust boundary:
+  // nothing in this file reads the extensions header (unlike host/origin/key/version, which
+  // decide same-origin and handshake validity), it is relayed verbatim on a cross-pool hop, and
+  // the party that negotiates extensions is Next's generated ws stack — `WebSocketServer`
+  // parses this header itself and answers 400 when perMessageDeflate is enabled, and ignores it
+  // (negotiating nothing, so framing stays plain RFC 6455) when it is not. An unparseable value
+  // can therefore never reach frame decoding as an active extension.
   const extensions = rawHeaderValues(req, "sec-websocket-extensions");
-  if (extensions.length > 0) {
-    if (!parseWebSocketExtensions) {
-      throw new Error("The vendored WebSocket extension parser is unavailable.");
-    }
+  if (extensions.length > 0 && parseWebSocketExtensions) {
     try {
-      // RFC 6455 grammar has enough edge cases that a hand-rolled approximation will drift.
       // Use the exact parser pinned by the application's Next transport, as Next itself does.
       parseWebSocketExtensions(extensions.join(","));
     } catch {

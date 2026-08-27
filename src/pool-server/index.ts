@@ -2349,7 +2349,17 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   const pinnedWebSocket = appRequire("next/dist/compiled/ws") as {
     extension?: { parse?: (value: string) => unknown };
   };
-  const parseWebSocketExtensions = pinnedWebSocket.extension?.parse;
+  // N89. Optional on purpose, and absent in practice: the compiled bundle exports only the ws
+  // transport classes, so `extension` is undefined for every Next release the adapter has seen
+  // (16.3.0 included). The handshake validator skips adapter-side Sec-WebSocket-Extensions
+  // validation when this is undefined instead of failing the handshake — Next's generated ws
+  // stack is what negotiates extensions, and it parses the header itself. The lookup stays so a
+  // future Next that does export the parser is used immediately, and the shape is checked because
+  // a non-callable `extension.parse` would otherwise throw inside the handshake path.
+  const parseWebSocketExtensions =
+    typeof pinnedWebSocket.extension?.parse === "function"
+      ? pinnedWebSocket.extension.parse
+      : undefined;
   const { createRequestResponseMocks } = appRequire("next/dist/server/lib/mock-request") as {
     createRequestResponseMocks(options: {
       url: string;

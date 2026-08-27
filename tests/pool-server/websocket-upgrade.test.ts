@@ -265,6 +265,59 @@ describe("handleWebSocketUpgrade", () => {
     }
   });
 
+  // N89. `next/dist/compiled/ws` exports only the transport classes, so `extension.parse` is
+  // undefined on every Next release the adapter has shipped against. Throwing then rejected the
+  // upgrade promise, whose handler in createPoolServer destroyed the socket without writing a
+  // byte — every browser handshake (they all offer permessage-deflate) died with no HTTP status.
+  it("completes a browser handshake when the pinned extension parser is unavailable", async () => {
+    const upgradeHandler = vi.fn(async () => ({ upgraded: true, statusCode: 101 }));
+    const { deps, resolve } = dependencies({ upgradeHandler });
+    deps.parseWebSocketExtensions = undefined;
+    const { socket, text } = captureSocket();
+
+    await expect(
+      handleWebSocketUpgrade(
+        deps,
+        request(undefined, {
+          "sec-websocket-extensions": "permessage-deflate; client_max_window_bits",
+        }),
+        socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("accepted");
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(upgradeHandler).toHaveBeenCalledOnce();
+    // Nothing is written by the adapter: the generated entrypoint owns the 101 and the extension
+    // negotiation, exactly as it does for a handshake with no extensions offered at all.
+    expect(text()).toBe("");
+    socket.destroy();
+  });
+
+  it("still uses the pinned parser to reject a malformed extension offer when it exists", async () => {
+    const parseWebSocketExtensions = vi.fn((value: string) => {
+      if (value === "permessage-deflate; =") throw new SyntaxError("invalid extension");
+      return {};
+    });
+    const { deps, resolve } = dependencies({
+      upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+    });
+    deps.parseWebSocketExtensions = parseWebSocketExtensions;
+    const { socket, text } = captureSocket();
+
+    await expect(
+      handleWebSocketUpgrade(
+        deps,
+        request(undefined, { "sec-websocket-extensions": "permessage-deflate; =" }),
+        socket,
+        Buffer.alloc(0),
+      ),
+    ).resolves.toBe("rejected");
+    expect(parseWebSocketExtensions).toHaveBeenCalledWith("permessage-deflate; =");
+    expect(text()).toContain("HTTP/1.1 400");
+    expect(text()).toContain("Invalid Sec-WebSocket-Extensions header.");
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
   it("enforces same-origin and configured cross-origin policy before routing", async () => {
     const denied = dependencies({
       upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
