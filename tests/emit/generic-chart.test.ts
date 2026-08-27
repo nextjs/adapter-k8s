@@ -128,6 +128,18 @@ describe("generic gateway listeners under merged gateways", () => {
 });
 
 describe("generic provider — complete chart", () => {
+  it("disables Envoy's whole-response timeout on every application rule", () => {
+    const route = genericChart()["templates/http-route.yaml"]!;
+    const ruleCount = (route.match(/- matches:/g) ?? []).length;
+    const disabledTimeoutCount = (route.match(/request: 0s/g) ?? []).length;
+
+    // Envoy's 15s route default waits for the COMPLETE response and therefore truncates SSE and
+    // other healthy streams. Each generated application rule must carry the override: omitting it
+    // on only the catch-all/header fast path makes behavior depend on which route won at the edge.
+    expect(ruleCount).toBeGreaterThan(0);
+    expect(disabledTimeoutCount).toBe(ruleCount);
+  });
+
   it("emits the ext_proc routing tier even with no GCP infrastructure", () => {
     // The routing tier IS the adapter's middleware story. Emitting a chart without it means
     // every request silently falls back to pool-local middleware — the app still serves, so

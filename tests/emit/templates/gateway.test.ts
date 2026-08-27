@@ -130,6 +130,20 @@ describe("renderHTTPRoute rule cap", () => {
 });
 
 describe("renderHTTPRoute CDN filter injection", () => {
+  it("leaves provider timeout behavior untouched unless explicitly disabled", () => {
+    const common = {
+      releaseName: "nextjs",
+      hosts,
+      pools: makePools(2),
+      routingManifest: makeManifest({ "/dashboard/page": "pool1" }),
+    };
+    expect(renderHTTPRoute(common)).not.toContain("request: 0s");
+
+    const portable = renderHTTPRoute({ ...common, disableRequestTimeout: true });
+    const ruleCount = (portable.match(/- matches:/g) ?? []).length;
+    expect((portable.match(/request: 0s/g) ?? []).length).toBe(ruleCount);
+  });
+
   it("attaches the ExtensionRef filter to every rule when cdnFilterName is set", () => {
     const pools = makePools(2);
     const yaml = renderHTTPRoute({

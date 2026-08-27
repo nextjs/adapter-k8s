@@ -65,6 +65,11 @@ export const genericProvider: ProviderAdapter = {
       hosts,
       pools,
       routingManifest,
+      // Envoy otherwise applies its 15s route timeout until the COMPLETE response arrives. That
+      // silently truncates SSE/RSC/Route Handler streams even though the pool correctly forwards
+      // response headers and chunks as they arrive. 0s disables only the total deadline; Envoy's
+      // stream-idle timeout and the pool's response-head/maxDuration budgets remain in force.
+      disableRequestTimeout: true,
     });
 
     return files;

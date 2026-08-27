@@ -108,6 +108,7 @@ export function renderHTTPRoute({
   pools,
   routingManifest,
   cdnFilterName,
+  disableRequestTimeout = false,
 }: {
   releaseName: string;
   hosts: HostConfig[];
@@ -115,6 +116,17 @@ export function renderHTTPRoute({
   routingManifest: RoutingManifest;
   /** Name of a GCPHTTPFilter to attach to every rule (enables Cloud CDN). */
   cdnFilterName?: string | undefined;
+  /**
+   * Disable the Gateway's whole-response deadline on application rules. Envoy's default route
+   * timeout is 15 seconds and remains armed until the COMPLETE response arrives, which truncates
+   * SSE, RSC and other streamed responses even while bytes are flowing. The pool independently
+   * bounds time-to-headers and route maxDuration; Envoy's stream-idle timeout remains the
+   * progress/dead-peer bound after this total deadline is disabled.
+   *
+   * Provider-specific on purpose: the generic Envoy provider opts in, while GKE keeps its
+   * provider-owned backend timeout behavior and does not receive an unsupported semantic change.
+   */
+  disableRequestTimeout?: boolean;
 }): string {
   assertSafeReleaseName(releaseName);
   for (const host of hosts) assertSafeHostname(host.hostname);
@@ -146,6 +158,16 @@ export function renderHTTPRoute({
     : "";
   const hostnames = hosts.map((h) => h.hostname);
   const defaultPoolName = [...pools.keys()][0] ?? "default";
+  // Gateway API defines 0s as "disabled". Keep this literal provider-owned rather than exposing
+  // an arbitrary Duration string that would need a second injection-sensitive config surface.
+  const requestTimeoutYaml = disableRequestTimeout
+    ? `
+      # Envoy defaults a route to a 15s WHOLE-response timeout. Next Route Handlers may return
+      # long-lived Response streams (notably text/event-stream), so keep only progress/idle and
+      # pool-owned execution bounds instead of truncating a healthy stream at a wall-clock limit.
+      timeouts:
+        request: 0s`
+    : "";
 
   // Phase 1: simple path-based routing.
   // We MUST stay under 16 rules for Gateway API.
@@ -246,7 +268,7 @@ export function renderHTTPRoute({
               # N61: QUOTED. An unquoted pool name like "on"/"no"/"y"/"off"/"true"/"123"
               # renders a YAML boolean/int here; "helm template" accepts it and the
               # apiserver then rejects the chart (HTTPHeaderMatch.value is a string).
-              value: "${poolName}"
+              value: "${poolName}"${requestTimeoutYaml}
       backendRefs:
         - name: ${backendName}
           port: 3000${filtersYaml}`;
@@ -267,6 +289,7 @@ export function renderHTTPRoute({
     const backendName = sanitizeK8sName(`${releaseName}-${rule.poolName}`);
     return `    - matches:
         - path: { type: ${rule.matchType}, value: "${encodeGatewayPath(rule.path)}" }
+${requestTimeoutYaml}
       backendRefs:
         - name: ${backendName}
           port: 3000${filtersYaml}`;
@@ -276,6 +299,7 @@ export function renderHTTPRoute({
     const backendName = sanitizeK8sName(`${releaseName}-${catchAllRule.poolName}`);
     return `    - matches:
         - path: { type: ${catchAllRule.matchType}, value: "${encodeGatewayPath(catchAllRule.path)}" }
+${requestTimeoutYaml}
       backendRefs:
         - name: ${backendName}
           port: 3000${filtersYaml}`;
