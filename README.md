@@ -236,6 +236,64 @@ pools: {
 },
 ```
 
+## Experimental WebSocket Route Handlers
+
+The pool runtime supports Next's generated Node.js `upgradeHandler` adapter contract—the same
+additive entrypoint consumed by adapter-vercel. This is transport support for the experimental
+Next.js WebSocket work; stable Next.js does not yet expose `NextResponse.upgrade()`.
+
+On a compatible Next.js branch, enable the experiment and keep the route dynamic:
+
+```js
+// next.config.js
+export default {
+  experimental: { webSocketRouteHandlers: true },
+};
+```
+
+```ts
+// app/ws/route.ts
+import { NextResponse } from "next/server";
+
+export const dynamic = "force-dynamic";
+
+export function GET() {
+  return NextResponse.upgrade({
+    open(peer) {
+      peer.send("connected");
+    },
+    message(peer, message) {
+      peer.send(message.rawData);
+    },
+  });
+}
+```
+
+Once a compatible Next build generates the entrypoint, an upgrade follows the ordinary routing
+path: trusted routing-extension results are reused, untrusted or incomplete results are resolved
+locally, middleware and rewrites apply exactly once, and a route assigned to another pool is
+tunnelled to its owning pool. A Route Handler can return an ordinary `Response` to reject the
+upgrade; missing, non-Node, non-App-Route, and HTTP-only outputs answer `404 Not Found`, matching
+Next's route-ownership contract. An ordinary HTTP request to a handler that returns
+`NextResponse.upgrade()` receives Next's sanitized `426 Upgrade Required` fallback.
+
+Current boundaries are deliberate:
+
+- Node.js App Route outputs only—Pages Router, Edge Runtime, and static export are unsupported.
+- External WebSocket rewrites are rejected instead of bypassing the HTTP proxy's SSRF protections.
+- Peers and topic subscriptions are process-local. Multiple replicas need application-level shared
+  pub/sub when messages must span pods.
+- Connections are not durable across deploys, rollbacks, HPA scale-down, node replacement, or load
+  balancer maintenance. Clients must reconnect, and should use a keepalive appropriate for their
+  ingress/load-balancer timeout.
+- During shutdown the pod stops accepting upgrades, gives established sockets the configured
+  bounded shutdown window, sends close code `1001` (going away), and then force-closes survivors.
+
+Treat this as an experimental compatibility surface until the Next.js API and its upstream e2e
+suite are published. Exposure components supplied by an operator must preserve HTTP/1.1 WebSocket
+upgrade semantics; the adapter cannot infer that property for an arbitrary GatewayClass or Ingress
+controller.
+
 ## CI/CD
 
 The CLI is a convenience wrapper—everything it does can be done with a container runtime, `helm`, and (on GKE) `gcloud`. The chart is self-contained, including the load-balancer extension registration. See [docs/ci-cd.md](./docs/ci-cd.md) for the pipeline shape, the blue/green cutover commands, and known runtime requirements—including why image digests must be resolved from the registry, not the local daemon.

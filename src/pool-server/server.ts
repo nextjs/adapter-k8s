@@ -1,5 +1,6 @@
 // src/pool-server/server.ts
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import {
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
@@ -46,34 +47,21 @@ export interface ReadinessState {
   reason: string;
 }
 
+export interface RequestTrustOptions {
+  internalSecret?: string | undefined;
+  trustInternalHeaders?: boolean;
+  /** Build-derived matcher and RSC headers covered by the per-request dispatch proof. */
+  proofHeaderNames?: readonly string[] | undefined;
+}
+
 /**
- * Establish the request trust boundary: decide whether this request's internal dispatch headers
- * are trustworthy, strip everything a client must not be able to assert, wrap `writeHead` so no
- * internal control header can leak back, and attach the socket-error guard.
- *
- * Exported because there are TWO doors into `handleRequest`: the HTTP server below and the
- * in-process `revalidate()` re-entry (Pages `res.revalidate()`), which called `handleRequest`
- * directly and therefore skipped all of this while `handleRequest` still read `x-output-id` /
- * `x-mw-evaluated` as trusted. Not exploitable today (Next builds those internal headers itself)
- * but it was a second, unguarded entrance to the same trust boundary; both callers now share
- * this one function. Idempotent — applying it twice strips the same headers and stacks a
- * harmless second wrapper.
+ * Request-only half of the pool trust boundary, shared by ordinary HTTP and Node's separate
+ * `upgrade` event. Returns whether proof-gated dispatch headers were accepted.
  */
-export function applyRequestTrustBoundary(
+export function applyIncomingRequestTrustBoundary(
   req: IncomingMessage,
-  res: ServerResponse,
-  options: {
-    internalSecret?: string | undefined;
-    trustInternalHeaders?: boolean;
-    /**
-     * This build's proof-covered request headers — the middleware-matcher inputs and the RSC
-     * negotiation headers (routing-common.ts `buildProofHeaderNames`). Part of the proof's
-     * covered set, so the value MUST be the same list the signing tier used; both derive it from
-     * the one build's routing manifest.
-     */
-    proofHeaderNames?: readonly string[] | undefined;
-  },
-): void {
+  options: RequestTrustOptions,
+): boolean {
   const { internalSecret, trustInternalHeaders = false, proofHeaderNames } = options;
 
   // Establish whether the internal dispatch headers on this request can be trusted. With a
@@ -129,6 +117,23 @@ export function applyRequestTrustBoundary(
       delete req.headers[h];
     }
   }
+
+  return trusted;
+}
+
+/**
+ * Full HTTP trust boundary: apply the shared incoming-request checks, prevent internal response
+ * headers from leaking, and guard client-disconnect errors.
+ *
+ * Exported because both the HTTP server below and Pages `res.revalidate()` re-entry call the same
+ * handler. Idempotent: applying it twice strips the same headers and stacks a harmless wrapper.
+ */
+export function applyRequestTrustBoundary(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: RequestTrustOptions,
+): void {
+  applyIncomingRequestTrustBoundary(req, options);
 
   // Wrap res.writeHead to strip internal headers from responses.
   // Real paths pass headers both ways: via the setHeader-map AND as the headers
@@ -222,6 +227,15 @@ export function filterWriteHeadHeadersArg(
 
 export interface PoolServerOptions {
   onRequest: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
+  /**
+   * Node upgrade transport used by Next's generated App Route `upgradeHandler`. Returning
+   * `accepted` marks the still-open socket as an established WebSocket for graceful shutdown.
+   */
+  onUpgrade?: (
+    req: IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+  ) => "accepted" | "rejected" | Promise<"accepted" | "rejected">;
   port: number;
   /**
    * When true, trust x-output-id etc. from the request WITHOUT a secret. Legacy fallback used
@@ -267,6 +281,7 @@ export interface PoolServerOptions {
 export function createPoolServer(options: PoolServerOptions) {
   const {
     onRequest,
+    onUpgrade,
     port,
     trustInternalHeaders = false,
     internalSecret,
@@ -375,6 +390,46 @@ export function createPoolServer(options: PoolServerOptions) {
     );
   });
 
+  // Node removes upgraded connections from ordinary HTTP connection management. Keep explicit
+  // ownership so a rollout has a bounded, protocol-aware shutdown instead of either leaking the
+  // process until SIGKILL or dropping every connection without a close frame.
+  const upgradedSockets = new Map<Duplex, { accepted: boolean }>();
+  let draining = false;
+  if (onUpgrade) {
+    server.on("upgrade", (req, socket, head) => {
+      if (draining) {
+        socket.end(
+          "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n" + "Content-Length: 0\r\n\r\n",
+        );
+        return;
+      }
+
+      applyIncomingRequestTrustBoundary(req, {
+        internalSecret,
+        trustInternalHeaders,
+        proofHeaderNames,
+      });
+      upgradedSockets.set(socket, { accepted: false });
+      socket.once("close", () => upgradedSockets.delete(socket));
+      // Client resets are normal for long-lived connections and must never become an uncaught
+      // EventEmitter error that terminates the whole pool.
+      socket.on("error", () => undefined);
+
+      Promise.resolve(onUpgrade(req, socket, head))
+        .then((disposition) => {
+          const state = upgradedSockets.get(socket);
+          if (state && disposition === "accepted") state.accepted = true;
+          if (disposition === "rejected" && !socket.destroyed && !socket.writableEnded) {
+            socket.end();
+          }
+        })
+        .catch((error) => {
+          console.error("Unhandled WebSocket upgrade error:", error);
+          if (!socket.destroyed) socket.destroy();
+        });
+    });
+  }
+
   // Keep-alive must outlive the proxy tier's upstream idle timeout (Envoy in front of this
   // pool, and Node's default is 5s): when the pool closes an idle socket the proxy just chose
   // for a new request, the client sees an intermittent 502 (and e2e runs see `socket hang up`).
@@ -436,18 +491,54 @@ export function createPoolServer(options: PoolServerOptions) {
      */
     async stop(options: { graceMs?: number } = {}): Promise<void> {
       const graceMs = Math.max(1, options.graceMs ?? 15_000);
+      draining = true;
       const closed = new Promise<void>((resolve) => server.close(() => resolve()));
       // An idle keep-alive socket alone is enough to keep close() pending forever.
       server.closeIdleConnections?.();
       const forceClose = setTimeout(() => server.closeAllConnections?.(), Math.floor(graceMs / 2));
       forceClose.unref?.();
-      // Last resort: even closeAllConnections can be defeated (an upgraded socket the HTTP
-      // server no longer tracks), so the wait itself is bounded.
-      const timedOut = new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, graceMs);
-        t.unref?.();
-      });
-      await Promise.race([closed, timedOut]);
+      const deadline = Date.now() + graceMs;
+      while (upgradedSockets.size > 0 && Date.now() < deadline) {
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now())));
+          t.unref?.();
+        });
+      }
+
+      if (upgradedSockets.size > 0) {
+        // RFC 6455 close code 1001: endpoint is going away (rollout, rollback, HPA scale-down).
+        // Pending handshakes are still HTTP, so only established sockets receive a WS frame.
+        const goingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+        for (const [socket, state] of upgradedSockets) {
+          try {
+            if (!socket.destroyed) {
+              if (state.accepted) socket.write(goingAway);
+              else socket.end();
+            }
+          } catch {
+            // The peer disappeared between the set iteration and the write.
+          }
+        }
+        // Give the close frame a short opportunity to flush, while remaining inside the caller's
+        // already-bounded signal path.
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, Math.min(250, Math.max(1, graceMs)));
+          t.unref?.();
+        });
+        for (const socket of upgradedSockets.keys()) {
+          if (!socket.destroyed) socket.destroy();
+        }
+      }
+
+      // Last resort for ordinary HTTP: even closeAllConnections can be defeated by platform/Node
+      // behavior, so never wait past the same bound after explicitly closing upgraded sockets.
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, Math.max(1, deadline - Date.now()));
+          t.unref?.();
+        }),
+      ]);
       clearTimeout(forceClose);
     },
 

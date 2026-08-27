@@ -2,8 +2,28 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   resolveRouteHandlerExport,
+  resolveUpgradeHandlerExport,
   createHandlerLoader,
 } from "../../src/pool-server/handler-loader.js";
+
+describe("resolveUpgradeHandlerExport", () => {
+  it("resolves Next's generated top-level entrypoint", () => {
+    const upgradeHandler = () => {};
+    expect(resolveUpgradeHandlerExport({ upgradeHandler })).toBe(upgradeHandler);
+  });
+
+  it("accepts the dynamic-import wrapper around CommonJS module.exports", () => {
+    const upgradeHandler = () => {};
+    expect(resolveUpgradeHandlerExport({ default: { upgradeHandler } })).toBe(upgradeHandler);
+  });
+
+  it("does not mistake a userland export for the generated adapter contract", () => {
+    const upgradeHandler = () => {};
+    expect(
+      resolveUpgradeHandlerExport({ routeModule: { userland: { upgradeHandler } } }),
+    ).toBeUndefined();
+  });
+});
 
 describe("resolveRouteHandlerExport", () => {
   it("resolves module.handler", () => {
@@ -153,6 +173,30 @@ describe("resolveRouteHandlerExport", () => {
 });
 
 describe("createHandlerLoader", () => {
+  it("imports one module for its HTTP and WebSocket entrypoints", async () => {
+    const handler = () => {};
+    const upgradeHandler = () => {};
+    const loadModule = vi.fn().mockResolvedValue({ handler, upgradeHandler });
+    const manifest = {
+      buildId: "test123",
+      poolName: "routes",
+      outputs: {
+        "/socket": {
+          id: "/socket",
+          filePath: "handlers/socket.js",
+          pathname: "/socket",
+          type: "APP_ROUTE",
+          runtime: "nodejs",
+        },
+      },
+    } as any;
+    const loader = createHandlerLoader(manifest, loadModule);
+
+    expect(await loader.load("/socket")).toBe(handler);
+    expect(await loader.loadUpgrade("/socket")).toBe(upgradeHandler);
+    expect(loadModule).toHaveBeenCalledOnce();
+  });
+
   it("loads and caches handler modules", async () => {
     const mockHandler = () => {};
     const loadModule = vi.fn().mockResolvedValue({ handler: mockHandler });
