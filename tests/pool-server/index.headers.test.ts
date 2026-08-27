@@ -504,6 +504,21 @@ describe("pool-server response cache-control precedence", () => {
     expect(body.query).toEqual({ item: ["one", "two"] });
   });
 
+  it("re-resolves a trusted verdict whose route-matches payload has the wrong shape", async () => {
+    const res = await fetch(`http://127.0.0.1:${port}/echo-target`, {
+      headers: {
+        // If this malformed verdict were trusted, the nonexistent output would answer 404.
+        // Re-resolution uses the public pathname and finds /echo-target instead.
+        "x-output-id": "/does-not-exist",
+        "x-mw-evaluated": "none",
+        "x-route-matches": JSON.stringify({ id: ["not", "strings-at-the-field"] }),
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { resolvedPathname: string | null };
+    expect(body.resolvedPathname).toBe("/echo-target");
+  });
+
   it("the PPR no-store verdict is never overridden by a resolved cache-control", async () => {
     const res = await fetch(`http://127.0.0.1:${port}/mw-covered`, {
       headers: {
