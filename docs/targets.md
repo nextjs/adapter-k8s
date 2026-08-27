@@ -353,13 +353,15 @@ That contract can later support a Vercel control plane or BYOC product without t
 runtime about a specific vendor. The discriminant is preparation for that work, not an implemented
 proxy.
 
-`compileTarget` enforces the contract before it emits YAML. It rejects invalid Service references, pool-local plans that enable a routing tier, ext_proc plans that omit one, transport disagreements, failure-policy disagreements, unknown fields, duplicate objects, unsafe ownership labels, and invalid composition-plan values. The TypeScript types reject the same plan and tier mismatches during development.
+The adapter's internal `compileTarget` enforces the contract before it emits YAML. It rejects invalid Service references, pool-local plans that enable a routing tier, ext_proc plans that omit one, transport disagreements, failure-policy disagreements, unknown fields, duplicate objects, unsafe ownership labels, and invalid composition-plan values. The TypeScript types reject the same plan and tier mismatches during development. Contributor tests may import it from `@next-community/adapter-k8s/internal`; that subpath deliberately has no compatibility guarantee.
 
 `registration: "gke-traffic-extension"` is the one remaining provider-specific field in this interface. Treat it as a built-in bridge, not an extension point. The chart has exactly one matching executor and it runs the GKE registration job. Before another external control plane is added, replace this field with a versioned apply operation and an executor selected by operation kind. Generalizing the string today would create an interface with one adapter and would let a custom target invoke the wrong cloud tool.
 
 Start a routing adapter test at the public interface:
 
 ```ts
+import { compileTarget } from "@next-community/adapter-k8s/internal";
+
 const compiled = compileTarget(
   defineTarget({
     cluster: kubernetesCluster(),

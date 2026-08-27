@@ -38,3 +38,5 @@ npm run lint
 Run `npm run build` when exports, generated bundles, package types, or protobuf consumers change. Do not run the live GKE suite casually. The local e2e harness takes about 16 to 17 minutes with its default concurrency and a pinned Next.js ref.
 
 Every new routing adapter needs compiler tests plus live controller evidence. Record the tested Kubernetes, controller, CRD, and CNI versions in [docs/verification.md](./docs/verification.md). Include failure-policy, request-body, streaming, readiness, cleanup, and middleware-bypass checks.
+
+Maintainer release steps are in [docs/releasing.md](./docs/releasing.md).

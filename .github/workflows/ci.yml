@@ -41,8 +41,14 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Verify packed package
+        run: node scripts/verify-package.mjs
+
       - name: Run unit tests
         run: npm test
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=low
 
   minimum-node-build:
     name: Build and CLI (Node 20.16 minimum host)
