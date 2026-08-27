@@ -214,6 +214,15 @@ describe("pool build context staging", () => {
     expect(manifest.routeGraph.afterFiles[0].sourceRegex).toBe("^/exact$");
   });
 
+  it("carries the top-level Next logging opt-out into the staged routing manifest", async () => {
+    seedProject();
+    await build({ config: { logging: false } });
+    expect(JSON.parse(outputFile("routing-manifest.json")).requestLogging).toBe(false);
+
+    await build({ config: { logging: { incomingRequests: false } } });
+    expect(JSON.parse(outputFile("routing-manifest.json")).requestLogging).toBeUndefined();
+  });
+
   it("emits one shared runtime base and thin, disjoint deltas for multiple pools", async () => {
     seedProject();
     const route = writeFile(".next/server/app/api/hello/route.js", "module.exports={}");

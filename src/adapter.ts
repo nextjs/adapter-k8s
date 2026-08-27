@@ -1819,6 +1819,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         caseSensitive:
           (nextConfig.experimental as { caseSensitiveRoutes?: boolean } | undefined)
             ?.caseSensitiveRoutes ?? false,
+        requestLogging: nextConfig.logging !== false,
         nextVersion,
         projectDir,
         distDir,

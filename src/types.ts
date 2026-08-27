@@ -300,6 +300,8 @@ export interface RoutingManifest {
   builtAt: string;
   basePath: string;
   trailingSlash?: boolean;
+  /** False only when the app set `logging: false`; absent preserves legacy request logging. */
+  requestLogging?: false;
   middleware: {
     filePath: string;
     runtime?: string;
