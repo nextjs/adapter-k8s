@@ -71,6 +71,45 @@ function basePlan(): Record<string, unknown> {
   };
 }
 
+function addGkeTrafficExtension(raw: Record<string, unknown>): {
+  routing: Record<string, unknown>;
+  registration: Record<string, unknown>;
+  readiness: Record<string, unknown>;
+  gatewayAddress: Record<string, unknown>;
+} {
+  const operations = raw.operations as Record<string, unknown>;
+  const routing = operations.routing as Record<string, unknown>;
+  const dataplane = routing.dataplane as Record<string, unknown>;
+  const registration = {
+    kind: "gcp-traffic-extension-v1",
+    projectId: "sample-project",
+    extensionName: "test-app-traffic-ext",
+    addressName: "test-app-ip",
+  };
+  const readiness = {
+    kind: "gcp-traffic-extension",
+    projectId: "sample-project",
+    extensionName: "test-app-traffic-ext",
+    addressName: "test-app-ip",
+    requireEveryForwardingRule: true,
+  };
+  const gatewayAddress = { type: "NamedAddress", value: "test-app-ip" };
+  dataplane.transport = "tls";
+  dataplane.readiness = [readiness];
+  routing.registration = registration;
+  const resources = operations.resources as Record<string, unknown>;
+  resources.objects = [
+    {
+      apiVersion: "gateway.networking.k8s.io/v1",
+      kind: "Gateway",
+      resource: "gateways",
+      metadata: { name: "test-app-gateway", namespace: "test-app" },
+      body: { spec: { addresses: [gatewayAddress] } },
+    },
+  ];
+  return { routing, registration, readiness, gatewayAddress };
+}
+
 function telemetrySource(id = "provider.nginx-ingress"): Record<string, unknown> {
   return {
     id,
@@ -130,18 +169,80 @@ describe("composition plan schema", () => {
 
   it("authenticates versioned routing registration operations", () => {
     const raw = basePlan();
-    const routing = (raw.operations as Record<string, unknown>).routing as Record<string, unknown>;
-    (routing.dataplane as Record<string, unknown>).transport = "tls";
-    routing.registration = {
-      kind: "gcp-traffic-extension-v1",
-      projectId: "sample-project",
-      extensionName: "test-app-traffic-ext",
-      addressName: "test-app-ip",
-    };
-    expect(parseCompositionPlan(raw).operations.routing.registration).toEqual(routing.registration);
+    const { registration } = addGkeTrafficExtension(raw);
+    expect(parseCompositionPlan(raw).operations.routing.registration).toEqual(registration);
 
-    (routing.registration as Record<string, unknown>).kind = "exec-provider-plugin";
+    registration.extensionName = "Not Valid";
+    expect(() => parseCompositionPlan(raw)).toThrow(/traffic extension name/i);
+    registration.extensionName = "test-app-traffic-ext";
+    registration.addressName = "9-invalid";
+    expect(() => parseCompositionPlan(raw)).toThrow(/global address name/i);
+    registration.addressName = "test-app-ip";
+
+    registration.kind = "exec-provider-plugin";
     expect(() => parseCompositionPlan(raw)).toThrow(/unknown routing registration operation/i);
+  });
+
+  it("revalidates GKE routing topology at the serialized-plan boundary", () => {
+    const readinessMismatch = basePlan();
+    const readiness = addGkeTrafficExtension(readinessMismatch).readiness;
+    readiness.extensionName = "different-traffic-ext";
+    expect(() => parseCompositionPlan(readinessMismatch)).toThrow(
+      /must declare readiness matching/i,
+    );
+
+    const crossProject = basePlan();
+    addGkeTrafficExtension(crossProject);
+    const target = crossProject.target as Record<string, unknown>;
+    target.identity = {
+      kind: "gke-resource",
+      projectId: "cluster-project",
+      clusterName: "test-app-cluster",
+      location: { kind: "region", name: "us-central1" },
+    };
+    expect(() => parseCompositionPlan(crossProject)).toThrow(
+      /cross-project GKE traffic-extension registration is not supported/i,
+    );
+
+    const disconnectedAddress = basePlan();
+    const gatewayAddress = addGkeTrafficExtension(disconnectedAddress).gatewayAddress;
+    gatewayAddress.value = "different-ip";
+    expect(() => parseCompositionPlan(disconnectedAddress)).toThrow(
+      /requires exactly one Gateway NamedAddress "test-app-ip"/i,
+    );
+  });
+
+  it("rejects unsafe GCP routing resource names throughout the plan", () => {
+    const raw = basePlan();
+    const operations = raw.operations as Record<string, unknown>;
+    operations.cdn = {
+      kind: "gcp-cloud-cdn",
+      projectId: "sample-project",
+      addressName: "--format=json",
+      invalidation: "recorded-cache-tag-or-full-path",
+      failurePolicy: "warn",
+    };
+    expect(() => parseCompositionPlan(raw)).toThrow(/global address name/i);
+
+    operations.cdn = { kind: "none" };
+    operations.diagnostics = [
+      {
+        kind: "gcp-traffic-extension",
+        projectId: "sample-project",
+        extensionName: "--format=json",
+        addressName: "test-app-ip",
+      },
+    ];
+    expect(() => parseCompositionPlan(raw)).toThrow(/traffic extension name/i);
+
+    operations.diagnostics = [
+      {
+        kind: "gcp-global-address",
+        projectId: "sample-project",
+        name: "9-invalid",
+      },
+    ];
+    expect(() => parseCompositionPlan(raw)).toThrow(/global address name/i);
   });
 
   it("parses declarative provider telemetry without executing provider code", () => {

@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
-import { assertSafeCelScalar, assertSafeReleaseName, assertSafeYamlScalar } from "./utils.js";
+import {
+  assertSafeCelScalar,
+  assertSafeGcpResourceName,
+  assertSafeReleaseName,
+  assertSafeYamlScalar,
+} from "./utils.js";
 
 /**
  * S9. The document body produced by the most recent renderRouteExtConfigMap call. The Job and
@@ -16,10 +21,12 @@ export function routeExtDocumentDigest(): string {
 
 export function renderRouteExtConfigMap({
   releaseName,
+  extensionName = `${releaseName}-traffic-ext`,
   extensionChainJson,
   forwardingRule,
 }: {
   releaseName: string;
+  extensionName?: string;
   extensionChainJson: string;
   forwardingRule?: string;
 }): string {
@@ -28,6 +35,7 @@ export function renderRouteExtConfigMap({
   // privileged Workload Identity, so it is one of the highest-value injection sinks in the
   // chart — and it had no releaseName guard at all.
   assertSafeReleaseName(releaseName);
+  assertSafeGcpResourceName(extensionName, "traffic extension name");
 
   const chains = JSON.parse(extensionChainJson);
 
@@ -105,7 +113,7 @@ export function renderRouteExtConfigMap({
   assertSafeYamlScalar(fwdRule, "forwardingRule");
 
   const routeExtYaml = [
-    `name: "${releaseName}-traffic-ext"`,
+    `name: "${extensionName}"`,
     `loadBalancingScheme: EXTERNAL_MANAGED`,
     `forwardingRules:`,
     `  - "${fwdRule}"`,

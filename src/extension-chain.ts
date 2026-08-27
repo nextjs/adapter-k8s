@@ -1,4 +1,9 @@
 import type { AdapterOutputs } from "./types.js";
+import {
+  assertSafeNamespace,
+  assertSafeProjectId,
+  assertSafeReleaseName,
+} from "./emit/templates/utils.js";
 
 export interface ExtensionChainOptions {
   celExpression: string;
@@ -22,6 +27,9 @@ export function determineFailureMode(
 
 export function generateExtensionChain(options: ExtensionChainOptions): string {
   const { celExpression, releaseName, namespace, projectId, timeout, failureModeAllow } = options;
+  assertSafeReleaseName(releaseName);
+  assertSafeNamespace(namespace);
+  assertSafeProjectId(projectId);
 
   const chain = [
     {

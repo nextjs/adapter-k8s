@@ -12,6 +12,8 @@ import {
   compileTarget,
   defineTarget,
   gatewayApiExposure,
+  gkeCluster,
+  gkeNativeRouting,
   httpRouteExposure,
   kubernetesCluster,
 } from "../../src/target/index.js";
@@ -120,6 +122,74 @@ describe("chart version is always valid SemVer (N50)", () => {
 });
 
 describe("generateHelmChart", () => {
+  it("executes custom GKE routing registration coordinates from the composition plan", () => {
+    const target = defineTarget({
+      cluster: gkeCluster({ projectId: "cluster-project", region: "us-central1" }),
+      exposure: gatewayApiExposure({
+        className: "gke-l7-global-external-managed",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+        addresses: [{ type: "NamedAddress", value: "custom-frontend-ip" }],
+      }),
+      routing: gkeNativeRouting({
+        projectId: "cluster-project",
+        extensionName: "custom-traffic-ext",
+        addressName: "custom-frontend-ip",
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const extensionChainJson = JSON.stringify([
+      {
+        name: "nextjs-routing",
+        matchCondition: { celExpression: "true" },
+        extensions: [
+          {
+            name: "routing-service",
+            authority: "site-routing-service.apps.svc.cluster.local",
+            service: "projects/cluster-project/global/backendServices/site-routing-service",
+            timeout: "5s",
+            supportedEvents: ["REQUEST_HEADERS"],
+            failOpen: false,
+          },
+        ],
+      },
+    ]);
+
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      extensionChainJson,
+      infrastructure: { projectId: "cluster-project", region: "us-central1" },
+      compiledTarget,
+    });
+
+    expect(result["templates/route-ext-config.yaml"]).toContain('name: "custom-traffic-ext"');
+    const job = result["templates/route-ext-update-job.yaml"];
+    expect(job).toContain("gcloud compute addresses describe custom-frontend-ip");
+    expect(job).toMatch(/lb-traffic-extensions import\s+custom-traffic-ext/);
+    expect(job).toContain("--project=cluster-project");
+    expect(result["templates/deploy-service-account.yaml"]).toContain(
+      "site-deploy@cluster-project.iam.gserviceaccount.com",
+    );
+    expect(Object.values(result).find((body) => body.includes('"kind": "Gateway"'))).toContain(
+      '"value": "custom-frontend-ip"',
+    );
+  });
+
   it("renders a composed target behind the stable portable origin", () => {
     const target = defineTarget({
       cluster: kubernetesCluster(),
@@ -547,11 +617,11 @@ describe("generateHelmChart", () => {
   });
 
   // N50 (review, Medium): the route-extension update Job and its ServiceAccount used to
-  // vanish with a bare `if (projectId && region)` and no else — the chart installed the
+  // vanish with a bare `if (projectId)` and no else — the chart installed the
   // routing service but NEVER registered the GXLB traffic extension, so the edge kept the
   // previous build's chain (or none) while the deploy reported success. Refuse to render a
   // chain that cannot be registered.
-  it("throws when an extension chain is requested without projectId/region", () => {
+  it("throws when an extension chain is requested without a projectId", () => {
     const args = {
       pools: minimalPools(),
       buildId: "abc123",
@@ -565,10 +635,10 @@ describe("generateHelmChart", () => {
       internalSecret: "deadbeef",
       extensionChainJson: MINIMAL_CHAIN_JSON,
     };
-    expect(() => generateHelmChart(args)).toThrow(/projectId.*region/s);
-    expect(() => generateHelmChart({ ...args, infrastructure: { projectId: "p-123456" } })).toThrow(
-      /region/,
-    );
+    expect(() => generateHelmChart(args)).toThrow(/projectId/);
+    expect(() =>
+      generateHelmChart({ ...args, infrastructure: { projectId: "p-123456" } }),
+    ).not.toThrow();
     expect(() => generateHelmChart({ ...args, infrastructure: { region: "us-central1" } })).toThrow(
       /projectId/,
     );

@@ -369,6 +369,11 @@ export function generateHelmChart({
       compiledTarget.plan.operations.routing.registration?.kind === "gcp-traffic-extension-v1"
     ) {
       const extProcEmitter = compiledTarget ? gkeProvider : provider!;
+      const registration = compiledTarget?.plan.operations.routing.registration;
+      const executorProjectId =
+        compiledTarget?.plan.target.identity.kind === "gke-resource"
+          ? compiledTarget.plan.target.identity.projectId
+          : infrastructure?.projectId;
       Object.assign(
         files,
         extProcEmitter.emitExtProcTemplates({
@@ -378,6 +383,8 @@ export function generateHelmChart({
           config,
           buildId,
           infrastructure,
+          ...(executorProjectId ? { executorProjectId } : {}),
+          ...(registration?.kind === "gcp-traffic-extension-v1" ? { registration } : {}),
           extensionChainJson,
           routeExtDocumentDigest,
           routingFailOpen,
