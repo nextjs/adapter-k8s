@@ -384,17 +384,21 @@ describe("createPoolServer().stop()", () => {
     pool = null;
   });
 
-  it("relays a tunnelled WebSocket's own close frame instead of injecting one mid-frame", async () => {
-    // N90. A cross-pool tunnel (websocket-upgrade.ts proxyUpgradeToPool) is a frame-BLIND byte
-    // pipe: a frame relayed from the sibling pool routinely spans several TCP chunks, so at drain
-    // time this pool's client can hold a partially relayed frame whose header already promised
-    // more payload. Writing the 1001 frame that a locally owned socket gets would put close-frame
-    // bytes inside that payload — the client reads a header promising N bytes and gets 0x88 …
-    // instead. Real sockets and a real sibling server throughout: the corruption only exists at
-    // the byte level, and a mock pipe could not have shown it.
-    const partialFrame = Buffer.from([0x81, 0x08, 0x61, 0x62]); // header claims 8 bytes, 2 sent
-    const restOfFrame = Buffer.from("cdefgh");
-    const siblingGoingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+  // N90/N91. A cross-pool tunnel (websocket-upgrade.ts proxyUpgradeToPool) is a byte pipe whose
+  // framing nothing in this pod owns: a frame relayed from the sibling pool routinely spans several
+  // TCP chunks, so at drain time this pool's client can hold a partially relayed frame whose header
+  // already promised more payload. Writing the 1001 frame a locally owned socket gets would put
+  // close-frame bytes inside that payload — the client reads a header promising N bytes and gets
+  // 0x88 … instead. Real sockets and a real sibling server throughout: the corruption only exists
+  // at the byte level, and a mock pipe could not have shown it.
+  //
+  // GRACE/TIMING NOTE, because it is what makes these tests able to fail: `stop()`'s poll loop
+  // cannot break early while a socket is still tracked, so with graceMs=200 it signals at ~200ms
+  // and then holds the terminal flush window (min(250, graceMs) = 200ms) until ~400ms. A sibling
+  // write BEFORE 200ms therefore tests "the frame was already complete when we signalled"; a write
+  // between 200ms and 400ms tests the actual mid-frame instant, where a regression splices its
+  // 1001 between the two halves rather than merely appending bytes at the end.
+  async function tunnelledPool(onSiblingUpgrade: (socket: Duplex) => void) {
     let siblingSocket: Duplex | undefined;
     const sibling = createServer();
     sibling.on("upgrade", (_req, socket) => {
@@ -403,7 +407,7 @@ describe("createPoolServer().stop()", () => {
       socket.write(
         "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
       );
-      socket.write(partialFrame);
+      onSiblingUpgrade(socket);
     });
     await new Promise<void>((resolve) => sibling.listen(0, "127.0.0.1", () => resolve()));
     const siblingAddress = sibling.address();
@@ -411,7 +415,7 @@ describe("createPoolServer().stop()", () => {
       throw new Error("missing sibling pool address");
     }
 
-    pool = createPoolServer({
+    const poolServer = createPoolServer({
       onRequest: () => undefined,
       onUpgrade: (req, socket, head) =>
         handleWebSocketUpgrade(
@@ -438,7 +442,8 @@ describe("createPoolServer().stop()", () => {
         ),
       port: 0,
     });
-    const { port } = await pool.start();
+    pool = poolServer;
+    const { port } = await poolServer.start();
     const socket = net.createConnection({ host: "127.0.0.1", port });
     const chunks: Buffer[] = [];
     socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
@@ -451,33 +456,102 @@ describe("createPoolServer().stop()", () => {
     );
     await new Promise<void>((resolve) => socket.once("data", () => resolve()));
 
+    return {
+      stop: poolServer.stop,
+      /** The relayed WebSocket byte stream, with the 101 head asserted and stripped. */
+      relayedBytes() {
+        const received = Buffer.concat(chunks);
+        const bodyAt = received.indexOf("\r\n\r\n") + 4;
+        expect(received.subarray(0, bodyAt).toString("latin1")).toContain(
+          "101 Switching Protocols",
+        );
+        return received.subarray(bodyAt);
+      },
+      sibling: () => siblingSocket,
+      async close() {
+        socket.destroy();
+        siblingSocket?.destroy();
+        await new Promise<void>((resolve) => sibling.close(() => resolve()));
+        pool = null;
+      },
+    };
+  }
+
+  it.each<[string, number, string]>([
+    // [name, sibling-write delay relative to a 200ms grace, why this timing matters]
+    [
+      "already complete when the drain signals",
+      40,
+      "the accounting case: the frame finished before the signalling loop ran",
+    ],
+    [
+      "still incomplete when the drain signals",
+      260,
+      "the corruption case: the signalling loop runs at ~200ms with two payload bytes owed",
+    ],
+  ])(
+    "relays a tunnelled WebSocket's own close frame, never splicing one into a frame %s",
+    async (_name, siblingWriteMs) => {
+      const partialFrame = Buffer.from([0x81, 0x08, 0x61, 0x62]); // header claims 8 bytes, 2 sent
+      const restOfFrame = Buffer.from("cdefgh");
+      const siblingGoingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+      const tunnel = await tunnelledPool((socket) => socket.write(partialFrame));
+
+      const readDrainLog = captureDrainLog();
+      const drain = tunnel.stop({ graceMs: 200 });
+      // The sibling pool drains too (a rollout SIGTERMs every pool of the build) and emits its own
+      // 1001 at a real frame boundary. The tunnel must still be open to relay it.
+      await new Promise<void>((resolve) => setTimeout(resolve, siblingWriteMs));
+      tunnel.sibling()?.write(Buffer.concat([restOfFrame, siblingGoingAway]));
+      await drain;
+
+      // Exactly the relayed byte stream: the completed frame, then the sibling's close frame. An
+      // injected 1001 appears appended after it (40ms) or spliced between `ab` and `cdefgh`
+      // (260ms) instead.
+      expect(tunnel.relayedBytes()).toEqual(
+        Buffer.concat([partialFrame, restOfFrame, siblingGoingAway]),
+      );
+
+      const counts = readDrainLog();
+      expect(counts.webSockets).toBe(1);
+      expect(counts.tunnelled).toBe(1);
+      expect(counts.signalled).toBe(0);
+      expect(counts.peerClosed).toBe(0);
+      expect(counts.wsForced).toBe(1);
+      await tunnel.close();
+    },
+  );
+
+  it.each<[string, Buffer | undefined]>([
+    // [name, bytes the sibling relays before the drain]
+    ["that never carried a frame", undefined],
+    ["sitting between frames", Buffer.from([0x81, 0x02, 0x68, 0x69])],
+  ])("injects 1001 into a tunnel %s when the peer pool is not draining", async (_name, relayed) => {
+    // N91. The peer pool is a separate Deployment with its own HPA, so the ORDINARY case (a
+    // front pool scaling down, one pod evicted, a rollout touching one Deployment) leaves it
+    // healthy and silent — no close frame ever arrives to relay. Refusing to inject at all
+    // would end these clients on ws 1006. The cursor makes the frame position knowable, so a
+    // tunnel that is provably between frames gets the same clean 1001 as a local socket.
+    const goingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+    const tunnel = await tunnelledPool((socket) => {
+      if (relayed) socket.write(relayed);
+    });
+    // Let the relayed frame arrive and be counted before the drain reads the cursor.
+    if (relayed) await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
     const readDrainLog = captureDrainLog();
-    const drain = pool.stop({ graceMs: 200 });
-    // The sibling pool drains too (a rollout SIGTERMs every pool of the build) and emits its own
-    // 1001 at a real frame boundary. The tunnel must still be open to relay it.
-    await new Promise<void>((resolve) => setTimeout(resolve, 40));
-    siblingSocket?.write(Buffer.concat([restOfFrame, siblingGoingAway]));
-    await drain;
+    await tunnel.stop({ graceMs: 100 });
 
-    const received = Buffer.concat(chunks);
-    const bodyAt = received.indexOf("\r\n\r\n") + 4;
-    expect(received.subarray(0, bodyAt).toString("latin1")).toContain("101 Switching Protocols");
-    // Exactly the relayed byte stream: the completed frame, then the sibling's close frame. An
-    // injected 1001 would appear between `ab` and `cdefgh` instead.
-    expect(received.subarray(bodyAt)).toEqual(
-      Buffer.concat([partialFrame, restOfFrame, siblingGoingAway]),
+    expect(tunnel.relayedBytes()).toEqual(
+      relayed ? Buffer.concat([relayed, goingAway]) : goingAway,
     );
-
     const counts = readDrainLog();
     expect(counts.webSockets).toBe(1);
-    expect(counts.tunnelled).toBe(1);
-    expect(counts.signalled).toBe(0);
+    expect(counts.signalled).toBe(1);
+    expect(counts.tunnelled).toBe(0);
     expect(counts.peerClosed).toBe(0);
     expect(counts.wsForced).toBe(1);
-    socket.destroy();
-    siblingSocket?.destroy();
-    await new Promise<void>((resolve) => sibling.close(() => resolve()));
-    pool = null;
+    await tunnel.close();
   });
 
   it("does not report a server-rejected upgrade as a voluntary peer close", async () => {

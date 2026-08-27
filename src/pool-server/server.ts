@@ -10,6 +10,9 @@ import {
   verifyDispatchProof,
 } from "../routing-common.js";
 import { guardStreamErrors } from "./dispatch.js";
+// A leaf: it knows about byte positions in a relayed frame stream and nothing about dispatch, so
+// importing it keeps the "no dependency on the dispatcher" property `onUpgrade` is spelled out for.
+import { injectTunnelCloseFrame } from "./websocket-frame-cursor.js";
 import {
   metricHttpMethod,
   recordPoolRequest,
@@ -232,7 +235,8 @@ export interface PoolServerOptions {
    * disposition marks the still-open socket as an established WebSocket for graceful shutdown,
    * and says who owns its FRAMING — `accepted-local` for a socket Next's ws stack writes frames
    * into (shutdown may stamp RFC 6455 code 1001 itself), `accepted-tunnel` for one end of a
-   * frame-blind cross-pool byte pipe (shutdown must inject nothing). N90 in
+   * cross-pool byte pipe whose framing nothing here owns (shutdown may stamp 1001 only where the
+   * N91 cursor proves the relayed stream sits between frames). N90 in
    * websocket-upgrade.ts `UpgradeDisposition` carries the full derivation; the union is spelled
    * out here rather than imported so this transport keeps no dependency on the dispatcher.
    */
@@ -306,7 +310,12 @@ interface ActiveResponseState {
  * flight, while wsForced counts the SEPARATE later act of destroying a socket that outlived the
  * terminal flush window. A socket signalled with 1001 and then destroyed appears in both
  * (signalled=1 wsForced=1) — the 1001 says what the peer was told, wsForced says how the socket
- * ended. tunnelled is the N90 split: a cross-pool tunnel that gets no injected frame at all.
+ * ended. tunnelled is the N90/N91 split: a cross-pool tunnel that could NOT be given a 1001,
+ * because its client-bound relay was mid-frame at that instant or had already relayed the peer
+ * pool's own close frame. A tunnel that was between frames is counted in signalled with every
+ * other socket the client heard 1001 from — the counter is about what the peer was told, not about
+ * which code path told it — so a rising tunnelled is the population that ends abnormally (ws 1006)
+ * and is worth an operator's attention on its own.
  */
 interface DrainMetrics {
   httpAtStart: number;
@@ -656,8 +665,9 @@ export function createPoolServer(options: PoolServerOptions) {
      * active responses use the COMPLETE grace window, then close each surviving protocol
      * honestly. SSE receives a normal EOF (EventSource can reconnect); an incomplete finite body
      * is reset rather than pretending truncated bytes are complete; an established WebSocket this
-     * pod OWNS gets RFC 6455 code 1001 before forced teardown, while a cross-pool tunnel is left
-     * un-injected and only relays the back pool's own close frame (N90). Errors are swallowed — "already closing" and
+     * pod OWNS gets RFC 6455 code 1001 before forced teardown, and a cross-pool tunnel gets one
+     * only where its relayed frame stream is provably between frames (N90/N91). Errors are
+     * swallowed — "already closing" and
      * "never started" are the only outcomes, and neither should stop a caller from exiting.
      */
     async stop(options: { graceMs?: number } = {}): Promise<void> {
@@ -736,18 +746,27 @@ export function createPoolServer(options: PoolServerOptions) {
                   drainMetrics.webSocketsSignalled += 1;
                   socket.write(goingAway);
                 } else if (state.ownership === "tunnel") {
-                  // N90. A cross-pool tunnel is a frame-blind byte pipe
-                  // (websocket-upgrade.ts proxyUpgradeToPool), so a frame relayed from the back
-                  // pool may be only partly written into this socket right now — its header has
-                  // already promised N more payload bytes. Writing 1001 here puts close-frame
-                  // bytes INSIDE that payload and corrupts the stream, which is strictly worse
-                  // than no close frame at all. Inject nothing: the pipe stays open through the
-                  // terminal flush window below, so the sibling pool's own drain (a rollout
-                  // SIGTERMs every pool of the build) can emit its 1001 to its client — this
-                  // socket — at a real frame boundary and have it relayed intact. The forced
-                  // destroy that follows takes the upstream connection with it through the
-                  // tunnel's teardown pair, which is how the back pool learns the peer is gone.
-                  drainMetrics.webSocketsTunnelled += 1;
+                  // N90. A cross-pool tunnel (websocket-upgrade.ts proxyUpgradeToPool) is a byte
+                  // pipe whose framing nothing here owns: a frame relayed from the peer pool may
+                  // be only partly written into this socket right now, its header already having
+                  // promised N more payload bytes. Writing 1001 blindly puts close-frame bytes
+                  // INSIDE that payload and corrupts the stream — strictly worse than no close
+                  // frame at all.
+                  //
+                  // N91 (websocket-frame-cursor.ts) makes the position knowable, so ask instead of
+                  // assume. Between frames — the ordinary case for an idle tunnel, and the only
+                  // case for one that never carried a frame — the client gets a real 1001. Mid
+                  // frame, or once the peer's own close frame has already been relayed, nothing is
+                  // injected: the pipe stays open through the terminal flush window so a peer pool
+                  // that is draining too can emit its 1001 at a real boundary and have it relayed
+                  // intact. Either way the forced destroy that follows takes the upstream
+                  // connection with it through the tunnel's teardown pair, which is how the peer
+                  // pool learns the client is gone.
+                  if (injectTunnelCloseFrame(socket, goingAway)) {
+                    drainMetrics.webSocketsSignalled += 1;
+                  } else {
+                    drainMetrics.webSocketsTunnelled += 1;
+                  }
                 } else {
                   socket.end();
                 }

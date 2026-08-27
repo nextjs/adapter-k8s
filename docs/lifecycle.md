@@ -44,13 +44,17 @@ The terminal behavior is protocol-specific:
   before bounded forced teardown. Clients should reconnect with jittered backoff and send an
   application cursor/session token when missed state matters. Cross-pod topics and replay require
   shared pub/sub or storage; socket state itself is not transferable.
-- A WebSocket **tunnelled to another pool** of the same build is the one exception: the pod
-  relaying it does not own its framing, so it injects no close frame — a relayed frame can be only
-  partly written at that instant, and a `1001` written there would land inside that frame's
-  payload. It relays the owning pool's own `1001` if that pool is draining too (a rollout drains
-  every pool of the build), then tears the tunnel down within the same bounded window. A client
-  whose tunnel is dropped without a close frame sees an abnormal closure and must reconnect, which
-  is what the reconnect guidance above already requires.
+- A WebSocket **tunnelled to another pool** of the same build is the one qualified case: the pod
+  relaying it does not own its framing, so it may only write a close frame where the relayed byte
+  stream sits between frames. It checks: an idle tunnel — the ordinary case, and the only one for a
+  tunnel that never carried a frame — gets the same clean `1001`. A tunnel caught mid-frame gets
+  nothing injected, because a `1001` written there would land inside the payload the frame's header
+  already promised. Such a client sees the owning pool's own `1001` relayed only if that pool is
+  draining at the same moment (a full-build rollout drains every pool, but a per-pool HPA
+  scale-down or single-pod eviction does not), and otherwise an abnormal closure — which is what
+  the reconnect guidance above already requires. `tunnelled=` on the drain-complete line counts the
+  tunnels that could not be given a `1001`; a persistent non-zero value under scale-down is the
+  signal that clients are ending on close code 1006.
 
 For the generic Envoy target, generated application rules disable Envoy's 15-second total route
 deadline with `timeouts.request: 0s`; the gateway's stream-idle timeout still detects a connection

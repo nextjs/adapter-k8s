@@ -31,6 +31,7 @@ import {
 } from "./dispatch.js";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
+import { trackTunnelFraming } from "./websocket-frame-cursor.js";
 
 /**
  * N90. Who owns FRAMING on an accepted socket, which is what shutdown needs to know before it
@@ -39,12 +40,13 @@ import type { ResolveResult } from "./resolve.js";
  * - `accepted-local`: Next's generated ws stack owns this socket. It writes each frame
  *   synchronously under cork, so a close frame injected between frames cannot interleave with a
  *   partially written one — the drain path may stamp RFC 6455 code 1001 itself.
- * - `accepted-tunnel`: the socket is one end of `proxyUpgradeToPool`'s frame-blind byte pipe. A
- *   frame relayed from the sibling pool routinely spans several TCP chunks, so at any instant the
- *   client may hold a partially relayed frame whose header already promised N more payload bytes.
- *   Injecting a close frame there lands close-frame bytes INSIDE that payload and corrupts the
- *   stream. The drain path relays whatever close frame the back pool's own drain emits (correctly
- *   framed, at a frame boundary) and then tears the tunnel down, injecting nothing.
+ * - `accepted-tunnel`: the socket is one end of `proxyUpgradeToPool`'s byte pipe. Nothing here
+ *   owns its framing: a frame relayed from the sibling pool routinely spans several TCP chunks, so
+ *   at any instant the client may hold a partially relayed frame whose header already promised N
+ *   more payload bytes, and a close frame written there lands INSIDE that payload and corrupts the
+ *   stream. The drain path therefore asks websocket-frame-cursor.ts whether the client-bound relay
+ *   is provably between frames (N91) and injects only then; otherwise it injects nothing and
+ *   relays whatever close frame the peer pool's own drain emits.
  *
  * Deliberately not a boolean `accepted`: conflating the two ownership models is exactly what put
  * a close frame into the middle of a relayed frame, so every accepting path must now say which.
@@ -846,8 +848,8 @@ async function proxyUpgradeToPool(
       // Either end closing takes the other with it, so shutdown needs no separate handle on the
       // upstream socket: when the drain path destroys the client socket after its bounded flush
       // window, this teardown closes the sibling-pool connection in the same tick and the back
-      // pool's generated stack sees its peer leave. N90: the drain path must NOT write into
-      // either end of this pipe — see UpgradeDisposition.
+      // pool's generated stack sees its peer leave. N90: the drain path may write into the client
+      // end ONLY at a frame boundary, which is what the N91 cursor below exists to establish.
       const teardown = () => {
         if (!socket.destroyed) socket.destroy();
         if (!proxySocket.destroyed) proxySocket.destroy();
@@ -858,6 +860,9 @@ async function proxyUpgradeToPool(
       proxySocket.on("close", teardown);
       socket.pipe(proxySocket);
       proxySocket.pipe(socket);
+      // N91. Track only the CLIENT-BOUND direction: it is the one shutdown may write into, and
+      // `proxyHead` is already part of that stream (it was written above, before the pipe existed).
+      trackTunnelFraming(socket, proxySocket, proxyHead);
       finish("accepted-tunnel");
     });
 
