@@ -112,7 +112,7 @@ function verifyAsPool(
       proofHeaderNames: request.proofHeaderNames ?? PROOF_NAMES,
     },
     proof,
-  );
+  ).trusted;
 }
 
 describe("createRequestHandler", () => {

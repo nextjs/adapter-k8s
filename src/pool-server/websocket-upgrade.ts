@@ -745,6 +745,9 @@ function forwardedUpgradeHeaders(
   if (deps.internalSecret) {
     headers[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
       deps.internalSecret,
+      // A0-DP-5: mint time bound, body ABSENT — a WebSocket upgrade is a GET and carries no
+      // request body, so there is nothing to bind (and the verifier refuses a declared digest on
+      // a read method, which is what makes ABSENT here unambiguous rather than merely absent).
       dispatchProofInputsFromRequest({
         method: req.method,
         target: req.url,

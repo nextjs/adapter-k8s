@@ -544,7 +544,7 @@ describe("handleWebSocketUpgrade", () => {
             headers: siblingHeaders ?? {},
           },
           proof as string,
-        ),
+        ).trusted,
       ).toBe(true);
       expect(siblingHeaders?.["x-authenticated-user"]).toBeUndefined();
       expect(siblingHeaders?.["x-mw-request-headers"]).toBe(

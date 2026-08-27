@@ -4057,21 +4057,37 @@ function proxyToPool(
     // FINAL outbound state, after the eviction above and including the `host`/`x-forwarded-*`
     // values this hop actually relays — so the sibling pool recomputes the identical transcript
     // from what it receives.
-    if (internalSecret) {
-      forwardHeaders[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
-        internalSecret,
-        dispatchProofInputsFromRequest({
-          method: req.method,
-          target: req.url,
-          headers: forwardHeaders,
-          proofHeaderNames,
-        }),
-      );
-    }
+    //
+    // A0-DP-5 (SECURITY). This is the one hop that CAN bind the body, and it must: the credential
+    // authenticated the header tuple only, so an observer of a POST hop could replay the proof with
+    // an arbitrary body and the sibling pool would honor `x-mw-evaluated: ran` for bytes middleware
+    // never saw. `bufferedActionBody` is populated for every non-GET/HEAD request on the serving
+    // path (index.ts buffers the body before routing), so this binds real bytes in practice; the
+    // streaming fallback below has no digest to offer and binds ABSENT. The mint time is bound too,
+    // which is what bounds a replay in time rather than merely per-tuple.
 
     // Same forged-framing guard as the loopback invocation: the target pool would
     // otherwise await body bytes that never arrive (hang until requestTimeout).
+    // BEFORE signing, deliberately: this rewrites `content-length`, which a middleware `matcher`
+    // can pull into the covered set, and the proof's contract is that it signs the FINAL outbound
+    // header state. Signing first left the client's declared length in the transcript and the
+    // restated one on the wire.
     restateFramingHeaders(forwardHeaders, bufferedBody, req.method, false);
+
+    if (internalSecret) {
+      forwardHeaders[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
+        internalSecret,
+        dispatchProofInputsFromRequest(
+          {
+            method: req.method,
+            target: req.url,
+            headers: forwardHeaders,
+            proofHeaderNames,
+          },
+          { body: bufferedBody },
+        ),
+      );
+    }
     // This pool's Phase-1 routing verdict (next.config headers() + middleware response
     // headers) is deliberately NOT forwarded in the x-resolved-headers slot: the
     // resolvedHeaders on this resolution already installed the writeHead merge wrapper

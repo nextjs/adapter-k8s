@@ -986,7 +986,7 @@ describe("cross-pool proxy hardening", () => {
         "shared-secret",
         { method: "GET", target: "/api/thing", headers: seen },
         proof as string,
-      ),
+      ).trusted,
     ).toBe(true);
     // The authority is part of the transcript: the same proof does not verify for another host.
     expect(
@@ -998,7 +998,7 @@ describe("cross-pool proxy hardening", () => {
           headers: { ...seen, host: "tenant-b.example.com" },
         },
         proof as string,
-      ),
+      ).trusted,
     ).toBe(false);
   });
 });
