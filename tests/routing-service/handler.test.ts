@@ -11,8 +11,11 @@ import {
 import { mockRouting } from "../helpers/mock-outputs.js";
 import {
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
+  buildProofHeaderNames,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
+  verifyDispatchProof,
 } from "../../src/routing-common.js";
 import type { RoutingManifest } from "../../src/types.js";
 import type { HeaderValue } from "../../src/routing-service/ext-proc-types.js";
@@ -64,6 +67,52 @@ function makeHeaders(path: string): HeaderValue[] {
     { key: ":authority", value: "app.example.com" },
     { key: "host", value: "app.example.com" },
   ];
+}
+
+/**
+ * The header set the POOL sees after Envoy applies this response's mutation: the stamped dispatch
+ * headers, `Host` written from `:authority`, plus whatever of the client's own request survived
+ * (the caller passes any context/matcher headers it put on the wire). This is the shape
+ * verifyDispatchProof is handed at the pool's trust boundary, so verifying it here checks the two
+ * tiers agree on the whole covered set rather than restating the signing side's own arithmetic.
+ */
+function poolViewOf(
+  mutation: { setHeaders?: { header: { key?: string; value?: string } }[] },
+  wireHeaders: Record<string, string> = {},
+): Record<string, string> {
+  const atPool: Record<string, string> = { host: "app.example.com", ...wireHeaders };
+  for (const h of mutation.setHeaders ?? []) {
+    if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(h.header.key!)) {
+      atPool[h.header.key!] = h.header.value!;
+    }
+  }
+  return atPool;
+}
+
+/** This build's covered request-header names, exactly as the pool would derive them. */
+const PROOF_NAMES = buildProofHeaderNames(makeManifest());
+
+/** Verify a stamped proof the way the pool's trust boundary does: over the arriving request. */
+function verifyAsPool(
+  proof: string,
+  request: {
+    method?: string;
+    target: string;
+    headers: Record<string, string | undefined>;
+    proofHeaderNames?: readonly string[];
+  },
+  secret = "s3cr3t",
+): boolean {
+  return verifyDispatchProof(
+    secret,
+    {
+      method: request.method ?? "GET",
+      target: request.target,
+      headers: request.headers,
+      proofHeaderNames: request.proofHeaderNames ?? PROOF_NAMES,
+    },
+    proof,
+  );
 }
 
 describe("createRequestHandler", () => {
@@ -183,6 +232,7 @@ describe("createRequestHandler", () => {
         ...INTERNAL_DISPATCH_HEADERS,
         ...UNTRUSTED_NEXT_REQUEST_HEADERS,
         INTERNAL_SECRET_HEADER,
+        INTERNAL_DISPATCH_PROOF_HEADER,
       ]),
     );
   });
@@ -400,7 +450,7 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
     expect(parsed["set-cookie"]).toEqual(["a=1; Path=/", "b=2; Path=/"]);
   });
 
-  it("adds the internal secret when INTERNAL_HEADER_SECRET is set", async () => {
+  it("stamps a per-request dispatch PROOF when INTERNAL_HEADER_SECRET is set — never the raw secret", async () => {
     process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
@@ -410,12 +460,235 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
 
     const response = await handler(makeHeaders("/about"));
     const mutation = response.requestHeaders!.response!.headerMutation!;
-    const secret = mutation.setHeaders!.find((h) => h.header.key === "x-internal-secret");
-    expect(secret!.header.value).toBe("s3cr3t");
-    expect(mutation.removeHeaders).not.toContain("x-internal-secret");
+    // The raw secret must NEVER be on the wire (it is actively removed instead)…
+    expect(mutation.setHeaders!.find((h) => h.header.key === "x-internal-secret")).toBeUndefined();
+    expect(mutation.removeHeaders).toContain("x-internal-secret");
+    // …the proof is — and it verifies against the request as the POOL will see it: the same
+    // method and target, `Host` carrying what arrived as `:authority`, plus the stamped set.
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof");
+    expect(proof).toBeDefined();
+    expect(mutation.removeHeaders).not.toContain("x-internal-dispatch-proof");
+    expect(
+      verifyAsPool(proof!.header.value!, { target: "/about", headers: poolViewOf(mutation) }),
+    ).toBe(true);
+    // And it is genuinely per-request: another path yields a different proof.
+    const other = await handler(makeHeaders("/proxy"));
+    const otherProof = other.requestHeaders!.response!.headerMutation!.setHeaders!.find(
+      (h) => h.header.key === "x-internal-dispatch-proof",
+    );
+    expect(otherProof).toBeDefined();
+    expect(otherProof!.header.value).not.toBe(proof!.header.value);
   });
 
-  it("removes x-internal-secret when none is configured (client cannot spoof it)", async () => {
+  it("the proof rejects a single swapped or edited covered header (no transplant/replay)", async () => {
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    const response = await handler(makeHeaders("/about"));
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const atPool = poolViewOf(mutation);
+    // Swapping the dispatch target…
+    expect(
+      verifyAsPool(proof, {
+        target: "/about",
+        headers: { ...atPool, "x-output-id": "/admin" },
+      }),
+    ).toBe(false);
+    // …or replaying the proof onto a different path…
+    expect(verifyAsPool(proof, { target: "/admin", headers: atPool })).toBe(false);
+    // …or onto a different method…
+    expect(verifyAsPool(proof, { method: "POST", target: "/about", headers: atPool })).toBe(false);
+    // …or guessing from the wrong secret…
+    expect(verifyAsPool(proof, { target: "/about", headers: atPool }, "wrong")).toBe(false);
+  });
+
+  it("binds :authority and the scheme witness — a proof for one host/scheme does not verify for another", async () => {
+    // REVIEW (PR #61): the first cut of the proof covered only (method, target, dispatch
+    // headers), so a verdict resolved for one host — or for the https request — verified for
+    // another. The authority is bound directly; the scheme is bound through the pool's only
+    // witness of it, `x-forwarded-proto` (TLS terminates at the LB, so the pool's own socket is
+    // always plain http).
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const handler = createRequestHandler(makeManifest(), null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    const response = await handler([
+      ...makeHeaders("/about"),
+      { key: "x-forwarded-proto", value: "https" },
+    ] as HeaderValue[]);
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const atPool = poolViewOf(mutation, { "x-forwarded-proto": "https" });
+
+    // The honest request verifies…
+    expect(verifyAsPool(proof, { target: "/about", headers: atPool })).toBe(true);
+    // …a different tenant host does not…
+    expect(
+      verifyAsPool(proof, {
+        target: "/about",
+        headers: { ...atPool, host: "tenant-b.example.com" },
+      }),
+    ).toBe(false);
+    // …nor the same request with the scheme witness downgraded…
+    expect(
+      verifyAsPool(proof, {
+        target: "/about",
+        headers: { ...atPool, "x-forwarded-proto": "http" },
+      }),
+    ).toBe(false);
+    // …nor with it stripped entirely: ABSENT is its own covered value, not "any value".
+    const { "x-forwarded-proto": _proto, ...withoutProto } = atPool;
+    expect(verifyAsPool(proof, { target: "/about", headers: withoutProto })).toBe(false);
+    // Host CASE is normalized, though — both tiers route on the lowercased hostname, so a case
+    // flip must not degrade a real deployment to untrusted.
+    expect(
+      verifyAsPool(proof, { target: "/about", headers: { ...atPool, host: "APP.example.com" } }),
+    ).toBe(true);
+  });
+
+  it("binds the RSC negotiation headers that choose the dispatched output id", async () => {
+    // `resolveRscOutput` reads the RSC header to pick `/about.rsc` over `/about`, and the pool
+    // dispatches that output id verbatim. Unbound, the flight request's proof would verify with
+    // the RSC header stripped: the pool serves a flight body while deriving its cache verdict for
+    // a document request.
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const manifest = makeManifest({
+      poolAssignments: { "/about": "ssr", "/about.rsc": "ssr" },
+      pathnames: ["/about"],
+    });
+    expect(buildProofHeaderNames(manifest)).toContain("rsc");
+    const handler = createRequestHandler(manifest, null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    const response = await handler([
+      ...makeHeaders("/about"),
+      { key: "rsc", value: "1" },
+    ] as HeaderValue[]);
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    expect(mutation.setHeaders!.find((h) => h.header.key === "x-output-id")!.header.value).toBe(
+      "/about.rsc",
+    );
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const atPool = poolViewOf(mutation, { rsc: "1" });
+
+    expect(verifyAsPool(proof, { target: "/about", headers: atPool })).toBe(true);
+    // Strip the header that made this a flight request: the `.rsc` dispatch is no longer trusted.
+    const { rsc: _rsc, ...asDocument } = atPool;
+    expect(verifyAsPool(proof, { target: "/about", headers: asDocument })).toBe(false);
+  });
+
+  it("binds the middleware-matcher inputs, so a skip-nomatch proof does not transfer", async () => {
+    // The matcher `missing: [{type:"cookie", key:"session"}]` makes the ANONYMOUS request the one
+    // that legitimately earns the trusted `skip-nomatch` verdict. Unbound, that proof would carry
+    // over to a request that DOES present the cookie — a middleware stage the pool then skips
+    // although middleware never ran for that request.
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const manifest = makeManifest({
+      middleware: {
+        filePath: "middleware.js",
+        matchers: [{ regexp: "^/about$", missing: [{ type: "cookie", key: "session" }] }],
+      } as RoutingManifest["middleware"],
+    });
+    const proofHeaderNames = buildProofHeaderNames(manifest);
+    // The matcher's cookie input alongside this build's RSC negotiation header.
+    expect(proofHeaderNames).toEqual(["cookie", "rsc"]);
+
+    // No middleware MODULE: the manifest's matchers still define the covered set, and a
+    // module-less build stamps `x-mw-evaluated: none`.
+    const handler = createRequestHandler(manifest, null);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as any);
+
+    const response = await handler(makeHeaders("/about"));
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const atPool = poolViewOf(mutation);
+
+    expect(verifyAsPool(proof, { target: "/about", headers: atPool, proofHeaderNames })).toBe(true);
+    // The same verdict presented WITH the cookie the matcher gates on: rejected.
+    expect(
+      verifyAsPool(proof, {
+        target: "/about",
+        headers: { ...atPool, cookie: "session=alice" },
+        proofHeaderNames,
+      }),
+    ).toBe(false);
+    // A pool verifying with the WRONG covered set (no matcher inputs) rejects it too — the
+    // covered-name count is signed, so two builds' transcripts cannot collide.
+    expect(verifyAsPool(proof, { target: "/about", headers: atPool })).toBe(false);
+  });
+
+  it("signs the ORIGINAL wire target across the trailing-slash/i18n retry", async () => {
+    // N40c. The retry recurses into handleRequest with `:path` replaced by the retried,
+    // locale-prefixed URL so resolution runs against the real target — but the mutation response
+    // never mutates `:path` (the public target is preserved for the client; the rewrite rides in
+    // `x-invoke-path`), so Envoy forwards the ORIGINAL target upstream and the pool verifies with
+    // `req.url` = that original. Signing the recursion's own `:path` made EVERY retried request
+    // fail verification: the pool silently stripped the whole dispatch vocabulary and re-resolved
+    // locally, running middleware a SECOND time — the exact double execution the retry's
+    // `middlewareAlreadyRan` plumbing exists to prevent, on every i18n build in production.
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
+    const manifest = makeManifest({
+      i18n: { locales: ["en"], defaultLocale: "en" } as any,
+      poolAssignments: { "/about": "ssr" },
+      pathnames: ["/about"],
+    });
+    const proofHeaderNames = buildProofHeaderNames(manifest);
+    let call = 0;
+    vi.mocked(resolveRoutes).mockImplementation(async () => {
+      call++;
+      if (call === 1) {
+        // Pure internal trailing-slash artifact: locale-stripped target == request path and
+        // status 308 → normalizeResolvedRedirect returns kind "retry".
+        return {
+          redirect: { url: new URL("https://app.example.com/en/about"), status: 308 },
+        } as any;
+      }
+      return {
+        resolvedPathname: "/en/about",
+        invocationTarget: { pathname: "/en/about", query: {} },
+      } as any;
+    });
+
+    const handler = createRequestHandler(manifest, null);
+    const response = await handler(makeHeaders("/about?x=1"));
+    // The retry really happened (two resolution passes) …
+    expect(call).toBe(2);
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    // … and no hop rewrote the public target, so the pool will read `/about?x=1` as `req.url`.
+    expect(mutation.setHeaders!.find((h) => h.header.key === ":path")).toBeUndefined();
+    const proof = mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof")!
+      .header.value!;
+    const atPool = poolViewOf(mutation);
+
+    expect(verifyAsPool(proof, { target: "/about?x=1", headers: atPool, proofHeaderNames })).toBe(
+      true,
+    );
+    // And NOT against the retried path, which never reaches the wire — the transcript that used
+    // to be signed here.
+    expect(
+      verifyAsPool(proof, { target: "/en/about?x=1", headers: atPool, proofHeaderNames }),
+    ).toBe(false);
+  });
+
+  it("removes x-internal-secret AND the proof when none is configured (client cannot spoof either)", async () => {
     const handler = createRequestHandler(makeManifest(), null);
     vi.mocked(resolveRoutes).mockResolvedValue({
       resolvedPathname: "/about",
@@ -426,6 +699,10 @@ describe("createRequestHandler internal-header hygiene & forwarding", () => {
     const mutation = response.requestHeaders!.response!.headerMutation!;
     expect(mutation.setHeaders!.find((h) => h.header.key === "x-internal-secret")).toBeUndefined();
     expect(mutation.removeHeaders).toContain("x-internal-secret");
+    expect(
+      mutation.setHeaders!.find((h) => h.header.key === "x-internal-dispatch-proof"),
+    ).toBeUndefined();
+    expect(mutation.removeHeaders).toContain("x-internal-dispatch-proof");
   });
 
   it("maps an RSC request to the .rsc output variant in x-output-id", async () => {
@@ -482,6 +759,7 @@ describe("createRequestHandler ingress hygiene", () => {
       { key: "x-mw-evaluated", value: "ran" },
       { key: "x-resolved-headers", value: "{}" },
       { key: "x-internal-secret", value: "guessed" },
+      { key: "x-internal-dispatch-proof", value: "guessed-proof" },
       { key: "x-upstream-pool", value: "api" },
       { key: "x-nextjs-ppr", value: "1" },
     ]);
@@ -494,6 +772,7 @@ describe("createRequestHandler ingress hygiene", () => {
       "x-mw-evaluated",
       "x-resolved-headers",
       "x-internal-secret",
+      "x-internal-dispatch-proof",
       "x-upstream-pool",
       "x-nextjs-ppr",
     ]) {
@@ -1750,6 +2029,7 @@ describe("N40b: pool header-budget guard", () => {
       ...INTERNAL_DISPATCH_HEADERS,
       ...UNTRUSTED_NEXT_REQUEST_HEADERS,
       INTERNAL_SECRET_HEADER,
+      INTERNAL_DISPATCH_PROOF_HEADER,
     ]) {
       expect(mutation.removeHeaders).toContain(name);
     }

@@ -15,8 +15,13 @@ import type { AddressInfo } from "node:net";
 
 import { request as httpRequest } from "node:http";
 import { cdnTagForBuildId } from "../../src/cdn-tags.js";
+import { buildProofHeaderNames } from "../../src/routing-common.js";
+import { signDispatch } from "../helpers/dispatch-proof.js";
 
 const REPO_ROOT = process.cwd();
+// The RSC config every staged manifest here declares. Its negotiation header is part of the
+// dispatch proof's covered set (routing-common.ts buildProofHeaderNames).
+const STAGED_RSC = { header: "rsc", suffix: ".rsc" };
 const BUILD_ID = "imgbuild1";
 const BUILD_TAG = cdnTagForBuildId(BUILD_ID);
 
@@ -185,7 +190,7 @@ function writeStagedDir(
         onMatch: [],
         fallback: [],
         shouldNormalizeNextData: true,
-        rsc: { header: "rsc", suffix: ".rsc" },
+        rsc: STAGED_RSC,
       },
       pathnames: options.pathnames ?? [],
       i18n: null,
@@ -1101,13 +1106,26 @@ describe("image optimizer — middleware coverage must still win over the cachea
   return new Response("middleware ran twice", { status: 451 });
 }\n`,
       });
-      const res = await fetch(`http://127.0.0.1:${p2}/_next/image?url=/mislabeled.jpg&w=640&q=75`, {
+      const imageUrl = "/_next/image?url=/mislabeled.jpg&w=640&q=75";
+      const res = await fetch(`http://127.0.0.1:${p2}${imageUrl}`, {
         headers: {
           accept: "image/webp",
-          "x-internal-secret": "image-routing-secret",
-          "x-mw-evaluated": "ran",
-          "x-resolved-headers": JSON.stringify({ "x-image-upstream": "reused" }),
-          "x-mw-request-headers": JSON.stringify({ accept: "image/png" }),
+          // The proof binds the authority too, so it is minted for the Host `fetch` will send.
+          ...signDispatch(
+            "image-routing-secret",
+            "GET",
+            imageUrl,
+            {
+              "x-mw-evaluated": "ran",
+              "x-resolved-headers": JSON.stringify({ "x-image-upstream": "reused" }),
+              "x-mw-request-headers": JSON.stringify({ accept: "image/png" }),
+            },
+            {
+              authority: `127.0.0.1:${p2}`,
+              // This staged build's RSC negotiation header is covered too.
+              proofHeaderNames: buildProofHeaderNames({ routeGraph: { rsc: STAGED_RSC } }),
+            },
+          ),
         },
       });
       expect(res.status).toBe(200);

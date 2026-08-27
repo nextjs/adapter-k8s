@@ -8,9 +8,11 @@
 //
 // PROVEN 2026-07-29 on k3s + Envoy Gateway v1.5.4, driving the UNMODIFIED routing-service image
 // this adapter already builds for GKE. The backend received the complete dispatch vocabulary —
-// `x-output-id`, `x-internal-secret`, `x-matched-pathname`, and `x-mw-evaluated: ran` (middleware
-// executed at the edge) — and with the routing service scaled to zero, requests returned 500
-// rather than being delivered with middleware skipped. Both halves of the contract hold.
+// `x-output-id`, the dispatch credential (now the per-request `x-internal-dispatch-proof`,
+// formerly the raw `x-internal-secret`), `x-matched-pathname`, and `x-mw-evaluated: ran`
+// (middleware executed at the edge) — and with the routing service scaled to zero, requests
+// returned 500 rather than being delivered with middleware skipped. Both halves of the
+// contract hold.
 //
 // It also DELETES the privileged registration Job: `route-ext-update-job.ts` exists only to call
 // gcloud with a Workload-Identity-bound ServiceAccount, and is the credential-bearing entrypoint

@@ -1,5 +1,9 @@
 // src/emit/templates/gcp-http-filter.ts
-import { INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER } from "../../routing-common.js";
+import {
+  INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
+  INTERNAL_SECRET_HEADER,
+} from "../../routing-common.js";
 import { sanitizeK8sName, assertSafeReleaseName } from "./utils.js";
 
 // Next.js App Router response `Vary` headers. Cloud CDN refuses to cache a response whose
@@ -148,8 +152,14 @@ export function renderCdnFilter({
     if (!HEADER_NAME_RE.test(header)) {
       throw new Error(`Invalid CDN cache-key header "${header}": must match ${HEADER_NAME_RE}.`);
     }
-    if (header.toLowerCase() === INTERNAL_SECRET_HEADER) {
-      throw new Error(`"${INTERNAL_SECRET_HEADER}" must never be part of the CDN cache key.`);
+    if (
+      header.toLowerCase() === INTERNAL_SECRET_HEADER ||
+      header.toLowerCase() === INTERNAL_DISPATCH_PROOF_HEADER
+    ) {
+      // The dispatch credentials must never be part of the CDN cache key: keying on a
+      // per-request proof would shard the cache into per-request entries (hit-rate
+      // destruction), and keying on the legacy secret would pin it into CDN logs/config.
+      throw new Error(`"${header}" must never be part of the CDN cache key.`);
     }
   }
 

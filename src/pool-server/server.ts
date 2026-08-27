@@ -2,11 +2,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   requestTargetPathname,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
+  verifyDispatchProof,
 } from "../routing-common.js";
-import { guardStreamErrors, timingSafeStringEqual } from "./dispatch.js";
+import { guardStreamErrors } from "./dispatch.js";
 import {
   metricHttpMethod,
   recordPoolRequest,
@@ -60,19 +62,49 @@ export interface ReadinessState {
 export function applyRequestTrustBoundary(
   req: IncomingMessage,
   res: ServerResponse,
-  options: { internalSecret?: string | undefined; trustInternalHeaders?: boolean },
+  options: {
+    internalSecret?: string | undefined;
+    trustInternalHeaders?: boolean;
+    /**
+     * This build's proof-covered request headers — the middleware-matcher inputs and the RSC
+     * negotiation headers (routing-common.ts `buildProofHeaderNames`). Part of the proof's
+     * covered set, so the value MUST be the same list the signing tier used; both derive it from
+     * the one build's routing manifest.
+     */
+    proofHeaderNames?: readonly string[] | undefined;
+  },
 ): void {
-  const { internalSecret, trustInternalHeaders = false } = options;
+  const { internalSecret, trustInternalHeaders = false, proofHeaderNames } = options;
 
   // Establish whether the internal dispatch headers on this request can be trusted. With a
-  // secret configured (GKE), trust requires a matching x-internal-secret; without one
-  // (emulate/tests), fall back to the trustInternalHeaders flag. The secret itself must never
-  // reach the handler or leak upstream, so it is always deleted.
-  const presentedSecret = req.headers[INTERNAL_SECRET_HEADER];
+  // secret configured (GKE), trust requires a valid PER-REQUEST PROOF over every routing input
+  // this pool is about to act on — the method, the request target, the authority, the forwarding
+  // witnesses, the complete dispatch header set, and this build's derived inputs — its
+  // middleware-matcher headers and its RSC negotiation headers
+  // (routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER / computeDispatchProof). Verified against
+  // the RAW wire headers, before the strips below rewrite any of them. The v1 raw-secret header
+  // is NEVER honored: it is no longer stamped by any producer, and accepting it would keep the
+  // "read one ext_proc response, replay forever" hole open. Trusted pairings are always
+  // same-build (per-build secret + N87's secretKeyRef-moves-with-image), so a legacy raw-secret
+  // producer and a proof-only pool can never share a credential anyway — cross-build mismatches
+  // fail closed to local resolution exactly as before. Without a secret (emulate/tests), fall
+  // back to the trustInternalHeaders flag. Both credential headers are always deleted.
+  const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
   const trusted = internalSecret
-    ? typeof presentedSecret === "string" && timingSafeStringEqual(presentedSecret, internalSecret)
+    ? typeof presentedProof === "string" &&
+      verifyDispatchProof(
+        internalSecret,
+        {
+          method: req.method,
+          target: req.url,
+          headers: req.headers,
+          proofHeaderNames,
+        },
+        presentedProof,
+      )
     : trustInternalHeaders;
   delete req.headers[INTERNAL_SECRET_HEADER];
+  delete req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
 
   // These are Next's private request controls, not trusted adapter dispatch headers. Keep the
   // list aligned with Next 16's server-ipc INTERNAL_HEADERS; legitimate values are synthesized
@@ -198,12 +230,22 @@ export interface PoolServerOptions {
   trustInternalHeaders?: boolean;
   /**
    * Shared secret proving a request's internal dispatch headers came from the routing
-   * extension / cross-pool proxy (they carry it in x-internal-secret). When set, dispatch
-   * headers are trusted ONLY if the secret matches — regardless of trustInternalHeaders — so a
-   * client that speaks the dispatch protocol on a CEL-excluded path or during a fail-open
-   * outage is still rejected. Absent in emulate/tests.
+   * extension / cross-pool proxy. Never carried on the wire itself: trusted requests carry
+   * a per-request HMAC proof in x-internal-dispatch-proof (routing-common.ts), verified
+   * against this value. When set, dispatch headers are trusted ONLY with a valid proof —
+   * regardless of trustInternalHeaders — so a client that speaks the dispatch protocol on
+   * a CEL-excluded path or during a fail-open outage is still rejected, and anyone able to
+   * observe a trusted exchange gains a credential valid for exactly that one request.
+   * Absent in emulate/tests.
    */
   internalSecret?: string | undefined;
+  /**
+   * This build's proof-covered request headers (routing-common.ts `buildProofHeaderNames`: the
+   * middleware-matcher inputs plus the RSC negotiation headers) — part of the dispatch proof's
+   * covered set, so the pool must verify with the SAME list the routing service and the
+   * cross-pool proxy sign with. Absent means "none", correct for a build with neither.
+   */
+  proofHeaderNames?: readonly string[] | undefined;
   /**
    * Readiness verdict for `/readyz`. When ABSENT the endpoint answers 503
    * ("readiness not wired") — deliberately fail-safe: every real deployment goes through
@@ -228,6 +270,7 @@ export function createPoolServer(options: PoolServerOptions) {
     port,
     trustInternalHeaders = false,
     internalSecret,
+    proofHeaderNames,
     readiness,
     appOwnsProbePath,
     poolName,
@@ -270,7 +313,11 @@ export function createPoolServer(options: PoolServerOptions) {
       return;
     }
 
-    applyRequestTrustBoundary(req, res, { internalSecret, trustInternalHeaders });
+    applyRequestTrustBoundary(req, res, {
+      internalSecret,
+      trustInternalHeaders,
+      proofHeaderNames,
+    });
 
     const start = performance.now();
     const method = metricHttpMethod(req.method);

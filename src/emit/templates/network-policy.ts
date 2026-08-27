@@ -106,10 +106,15 @@ import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./ut
 // S22 — NOW THE DEFAULT. `deploy` discovers the node range (discoverClusterNodeCidrs:
 // cluster subnetwork -> its primary range, VERIFIED live: nodes 10.128.15.x inside
 // 10.128.0.0/20), so the requirement below no longer costs the operator anything. The
-// broad posture never bounded the dispatch secret: it isolates in-cluster PODS only, while
-// any VPC peer could reach :8443, read x-internal-secret out of the ext_proc header
-// mutation, and replay trusted dispatch headers to a pool. Kept below for why nodeCidrs is
-// REQUIRED whenever strict is on — the kubelet. `nodeCidrs` is REQUIRED when strict is on, and the
+// broad posture never bounded who may talk to the routing tier: it isolates in-cluster PODS
+// only, while any VPC peer could reach :8443. That still matters after the dispatch-proof
+// change. What changed is the WORST CASE, not the requirement: v1 let a reader lift a
+// replayable `x-internal-secret` out of the ext_proc header mutation and forge dispatch headers
+// release-wide, whereas the reply now carries only a per-request HMAC proof bound to the request
+// that was resolved. The routing service still authenticates no callers, so reachability to
+// :8443 remains enough to have a CRAFTED request resolved and signed — which is why THIS
+// POLICY IS A REQUIRED TRUST BOUNDARY, not defense-in-depth. Kept below
+// for why nodeCidrs is REQUIRED whenever strict is on — the kubelet. `nodeCidrs` is REQUIRED when strict is on, and the
 // template `fail`s without it, because the broad posture is silently also allowing
 // something the LB ranges do not cover: kubelet's liveness/readiness probes
 // (deployment.ts probes :3000, routing-service-deployment.ts probes :8081) originate
@@ -132,7 +137,10 @@ import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./ut
 //     policy entirely in either posture.
 //   - The fail-safe layering that makes the residual exposure survivable is unchanged:
 //     a request arriving without trusted dispatch headers gets full local resolution
-//     (middleware runs), and dispatch headers are honored only with the shared secret.
+//     (middleware runs), and dispatch headers are honored only with a valid per-request
+//     dispatch proof (routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER) over every routing
+//     input the pool acts on. A pod that CAN reach :8443 can still obtain such a proof for a
+//     request it composes itself, so the policy is what bounds who may ask.
 
 /**
  * GFE proxy source ranges for a global external Application Load Balancer whose
@@ -185,9 +193,13 @@ export function renderNetworkPolicies({
    * README states plainly. A provider whose gateway runs IN the cluster supplies a podSelector
    * instead: real workload identity, scoped to that release's own proxies.
    *
-   * This matters more than it looks: the ext_proc reply carries INTERNAL_HEADER_SECRET, so
-   * whatever can reach :8443 can obtain the credential that makes a pool trust dispatch
-   * headers. Defaults to GKE's CIDRs so existing callers are unchanged.
+   * This matters more than it looks. The ext_proc reply no longer carries the raw secret — it
+   * carries a per-request HMAC proof bound to the request that was resolved
+   * (routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER), and the secret never crosses the wire.
+   * But the routing service authenticates no callers, so whatever can reach :8443 is handed a
+   * valid proof for a request of its OWN choosing: a signing oracle, not credential disclosure.
+   * Reachability is still what bounds who may ask for a routing verdict at all.
+   * Defaults to GKE's CIDRs so existing callers are unchanged.
    */
   ingressSources?: {
     cidrs: readonly string[];

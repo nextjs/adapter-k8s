@@ -35,6 +35,14 @@ delete process.env.NEXT_ENABLE_ADAPTER;
 process.env.NEXT_UNHANDLED_REJECTION_FILTER = "silent";
 
 const { startPoolServer } = await import("../../src/pool-server/index.js");
+const { signDispatch } = await import("../helpers/dispatch-proof.js");
+const { buildProofHeaderNames } = await import("../../src/routing-common.js");
+
+// The RSC config the staged builds below declare. The dispatch proof covers this build's RSC
+// negotiation header (it selects the dispatched output id), so a test that signs a trusted
+// request must use the same covered-name list the booted pool derives from its manifest.
+const STAGED_RSC = { header: "rsc", suffix: ".rsc" };
+const PROOF_HEADER_NAMES = buildProofHeaderNames({ routeGraph: { rsc: STAGED_RSC } });
 
 interface Staged {
   dir: string;
@@ -158,6 +166,7 @@ function writeStagedDir(options: StageOptions = {}): Staged {
          mwRequestHeaders: req.headers["x-mw-request-headers"] ?? null,
          resolvedHeaders: req.headers["x-resolved-headers"] ?? null,
          internalSecret: req.headers["x-internal-secret"] ?? null,
+         proof: req.headers["x-internal-dispatch-proof"] ?? null,
          outputId: req.headers["x-output-id"] ?? null,
          upstreamPool: req.headers["x-upstream-pool"] ?? null,
          invokePath: req.headers["x-invoke-path"] ?? null,
@@ -232,7 +241,7 @@ function writeStagedDir(options: StageOptions = {}): Staged {
         onMatch: [],
         fallback: [],
         shouldNormalizeNextData: true,
-        rsc: { header: "rsc", suffix: ".rsc" },
+        rsc: STAGED_RSC,
       },
       pathnames,
       i18n: null,
@@ -713,6 +722,14 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     "x-authenticated-user": "alice",
   });
 
+  // The proof covers the authority and this build's covered request headers, so it is minted for
+  // the Host `fetch` puts on the wire and with the list the booted pool verifies against.
+  const sign = (secret: string, method: string, target: string, headers: Record<string, string>) =>
+    signDispatch(secret, method, target, headers, {
+      authority: `localhost:${pool.port}`,
+      proofHeaderNames: PROOF_HEADER_NAMES,
+    });
+
   // The trusted cases use a PUBLIC url the dispatch headers redirect to `/echo-headers`; the
   // untrusted ones must request the route directly, because stripping `x-output-id` (correctly)
   // leaves Phase 1 to resolve the url itself.
@@ -725,6 +742,7 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
       mwRequestHeaders: string | null;
       resolvedHeaders: string | null;
       internalSecret: string | null;
+      proof: string | null;
       outputId: string | null;
       upstreamPool: string | null;
       invokePath: string | null;
@@ -733,10 +751,11 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
 
   it("applies it as a REPLACEMENT for a trusted request: added header in, deleted header gone", async () => {
     const body = await echo({
-      "x-internal-secret": SECRET,
-      "x-output-id": "/echo-headers",
-      "x-mw-evaluated": "ran",
-      "x-mw-request-headers": MW_HEADERS,
+      ...sign(SECRET, "GET", "/echo-public", {
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "ran",
+        "x-mw-request-headers": MW_HEADERS,
+      }),
       // The client's spoof, which the middleware deleted at the edge.
       "x-user-id": "spoofed-by-client",
     });
@@ -744,53 +763,57 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     expect(body.userId).toBeNull();
   });
 
-  it("never leaks the transport header (or the secret) to the handler", async () => {
+  it("never leaks the transport headers (or either credential) to the handler", async () => {
     const body = await echo({
-      "x-internal-secret": SECRET,
-      "x-output-id": "/echo-headers",
-      "x-mw-evaluated": "ran",
-      "x-mw-request-headers": MW_HEADERS,
-      "x-resolved-headers": JSON.stringify({ "x-from-headers-rule": "1" }),
+      ...sign(SECRET, "GET", "/echo-public", {
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "ran",
+        "x-mw-request-headers": MW_HEADERS,
+        "x-resolved-headers": JSON.stringify({ "x-from-headers-rule": "1" }),
+      }),
     });
     expect(body.mwRequestHeaders).toBeNull();
     expect(body.resolvedHeaders).toBeNull();
     expect(body.internalSecret).toBeNull();
+    expect(body.proof).toBeNull();
   });
 
-  it("RED TEAM: valid secret + ABSENT mw verdict fails safe to Phase 1 — and leaks NO dispatch vocabulary", async () => {
-    // The fall-through case: `x-output-id` proved trust but nothing asserts the middleware
+  it("RED TEAM: TRUSTED request + ABSENT mw verdict fails safe to Phase 1 — and leaks NO dispatch vocabulary", async () => {
+    // The fall-through case: a VALID PROOF established trust but nothing asserts the middleware
     // stage ran (a broken/custom extension), so the pool re-resolves locally. The dispatch
     // headers are transport, not request data — before the strip, they reached the handler
-    // (and middleware, and external-rewrite targets) as ordinary request headers.
+    // (and middleware, and external-rewrite targets) as ordinary request headers. Signed, so
+    // the request really does clear the trust boundary: an unsigned one would be stripped by
+    // the untrusted path instead and would never reach the fall-through strip under test.
     const body = await echo(
-      {
-        "x-internal-secret": SECRET,
+      sign(SECRET, "GET", "/echo-headers", {
         "x-output-id": "/echo-headers",
         "x-upstream-pool": "main",
         "x-invoke-path": "/echo-headers",
         "x-route-matches": "{}",
-      },
+      }),
       "/echo-headers",
     );
     expect(body.outputId).toBeNull();
     expect(body.upstreamPool).toBeNull();
     expect(body.invokePath).toBeNull();
     expect(body.internalSecret).toBeNull();
+    expect(body.proof).toBeNull();
   });
 
   it("RED TEAM: an UNRECOGNIZED mw verdict gets the same treatment", async () => {
     const body = await echo(
-      {
-        "x-internal-secret": SECRET,
+      sign(SECRET, "GET", "/echo-headers", {
         "x-output-id": "/echo-headers",
         "x-mw-evaluated": "trust-me-bro",
         "x-upstream-pool": "main",
-      },
+      }),
       "/echo-headers",
     );
     expect(body.outputId).toBeNull();
     expect(body.upstreamPool).toBeNull();
     expect(body.internalSecret).toBeNull();
+    expect(body.proof).toBeNull();
   });
 
   it("RED TEAM: an UNTRUSTED request cannot install request headers with it", async () => {
@@ -816,20 +839,34 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
     expect(body.mwRequestHeaders).toBeNull();
   });
 
-  it("RED TEAM: a WRONG secret of the same length is also refused", async () => {
-    const wrong = "x".repeat(SECRET.length);
-    expect(wrong.length).toBe(SECRET.length);
+  it("RED TEAM: a WRONG signing secret is also refused", async () => {
     const body = await echo(
-      {
-        "x-internal-secret": wrong,
+      sign("wrong-secret", "GET", "/echo-headers", {
         "x-output-id": "/echo-headers",
         "x-mw-evaluated": "ran",
         "x-mw-request-headers": MW_HEADERS,
         "x-user-id": "spoofed-by-client",
-      },
+      }),
       "/echo-headers",
     );
     expect(body.authenticatedUser).toBeNull();
     expect(body.userId).toBe("spoofed-by-client");
+  });
+
+  it("RED TEAM: the raw v1 secret alone no longer buys trust", async () => {
+    // The 2026-08-16 audit finding: a leaked raw secret must be USELESS on its own.
+    const body = await echo(
+      {
+        "x-internal-secret": SECRET,
+        "x-output-id": "/echo-headers",
+        "x-mw-evaluated": "ran",
+        "x-mw-request-headers": JSON.stringify({
+          host: "localhost",
+          "x-authenticated-user": "attacker",
+        }),
+      },
+      "/echo-headers",
+    );
+    expect(body.authenticatedUser).toBeNull();
   });
 });

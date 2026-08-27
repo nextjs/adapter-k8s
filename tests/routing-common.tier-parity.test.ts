@@ -33,6 +33,7 @@ import { createLocalResolver } from "../src/pool-server/resolve.js";
 import { createRequestHandler } from "../src/routing-service/handler.js";
 import {
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   parseRequestUrl,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
@@ -269,7 +270,11 @@ async function bothTiersWithMiddleware(args: {
   install();
   const m1 = args.makeModule();
   const p1Headers = new Headers({ host: "app.example.com", ...extra });
-  for (const name of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) {
+  for (const name of [
+    ...INTERNAL_DISPATCH_HEADERS,
+    INTERNAL_SECRET_HEADER,
+    INTERNAL_DISPATCH_PROOF_HEADER,
+  ]) {
     p1Headers.delete(name);
   }
   const p1 = await createLocalResolver(manifest, m1.module, null, null, undefined).resolve(
@@ -467,7 +472,12 @@ async function bothTiersThroughRetry(args: {
   const s1 = install();
   const m1 = args.makeModule();
   const p1Headers = new Headers({ host: "app.example.com", ...extra });
-  for (const name of [...INTERNAL_DISPATCH_HEADERS, INTERNAL_SECRET_HEADER]) p1Headers.delete(name);
+  for (const name of [
+    ...INTERNAL_DISPATCH_HEADERS,
+    INTERNAL_SECRET_HEADER,
+    INTERNAL_DISPATCH_PROOF_HEADER,
+  ])
+    p1Headers.delete(name);
   const p1 = await createLocalResolver(manifest, m1.module, null, null, undefined).resolve(
     new URL(`${ORIGIN}${target}`),
     p1Headers,
@@ -730,6 +740,7 @@ describe("Phase 1 / Phase 2 middleware response parity (N40 / findings #16, #35,
         ...INTERNAL_DISPATCH_HEADERS,
         ...UNTRUSTED_NEXT_REQUEST_HEADERS,
         INTERNAL_SECRET_HEADER,
+        INTERNAL_DISPATCH_PROOF_HEADER,
       ]),
     );
   });

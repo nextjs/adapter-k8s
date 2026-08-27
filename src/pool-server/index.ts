@@ -14,6 +14,7 @@ import {
   manifestNextConfig,
   middlewareMayCoverPath,
   INTERNAL_DISPATCH_HEADERS,
+  buildProofHeaderNames,
   MW_EVALUATED_TRUSTED,
   parseRequestUrl,
   rscCacheBustingUnvalidated,
@@ -2309,6 +2310,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // fail-broad-covered EVERY request (incl. `_next/static`) → every response forced `no-cache`
   // → the CDN cached nothing. The routing manifest carries matchers for both node and edge.
   const middlewareMatchers: MiddlewareMatcher[] | undefined = routingManifest.middleware?.matchers;
+  // The build-derived request headers the dispatch proof covers (routing-common.ts
+  // buildProofHeaderNames): the middleware-matcher inputs, because those matchers decide the
+  // `x-mw-evaluated` verdict and an unbound input would let a `skip-nomatch` proof verify for a
+  // request the matcher DOES cover, plus the RSC negotiation headers that pick the dispatched
+  // `x-output-id` variant. Derived HERE, from the same manifest, and handed to every party that
+  // signs or verifies: the trust boundary, its second entrance (`revalidate`), and the cross-pool
+  // proxy. The routing service derives the identical list from its copy of the manifest.
+  const proofHeaderNames = buildProofHeaderNames(routingManifest);
 
   const internalSecret = process.env.INTERNAL_HEADER_SECRET || undefined;
   routingManifest.pathnames = [
@@ -2336,9 +2345,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     };
   };
   // In GKE, the pool server is behind the ALB — the routing extension sets internal dispatch
-  // headers and authenticates them with a shared secret (INTERNAL_HEADER_SECRET, injected from
-  // a Secret). When the secret is set the pool trusts dispatch headers only if it matches;
-  // TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test paths).
+  // headers and authenticates them with a PER-REQUEST HMAC PROOF derived from the shared secret
+  // (INTERNAL_HEADER_SECRET, injected from a Secret; the secret itself never crosses the wire —
+  // routing-common.ts INTERNAL_DISPATCH_PROOF_HEADER). When the secret is set the pool trusts
+  // dispatch headers only if the presented proof verifies over every routing input it is about to
+  // act on; TRUST_INTERNAL_HEADERS is the legacy no-secret fallback (still used by some test
+  // paths).
   // Declared here (rather than beside the server construction) because `revalidate` below is the
   // second entrance to the same trust boundary and must be configured identically.
   const trustInternalHeaders = process.env.TRUST_INTERNAL_HEADERS === "1";
@@ -2367,7 +2379,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     applyRequestTrustBoundary(
       mocked.req as unknown as IncomingMessage,
       mocked.res as unknown as ServerResponse,
-      { internalSecret, trustInternalHeaders },
+      { internalSecret, trustInternalHeaders, proofHeaderNames },
     );
     await handleRequest(
       mocked.req as unknown as IncomingMessage,
@@ -2437,6 +2449,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // inlined, which under deploymentId mode is NOT the adapter's effective NEXT_BUILD_ID.
     buildIdForData: routingManifest.buildId ?? buildId,
     internalSecret,
+    // Same covered-input list the trust boundary verifies with — a cross-pool hop signs the
+    // proof for the sibling pool, which derives this list from its copy of the same manifest.
+    proofHeaderNames,
     basePath: routingManifest.basePath ?? "",
     i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
     // Build timestamp anchoring the ISR seed-freshness window. Newer adapters write it
@@ -3734,6 +3749,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     poolName,
     trustInternalHeaders,
     internalSecret,
+    proofHeaderNames,
     onRequest: handleRequest,
     readiness,
     // A probe path the APP owns must not be silently shadowed (it was: the old check also

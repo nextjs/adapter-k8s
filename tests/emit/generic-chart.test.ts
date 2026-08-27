@@ -209,9 +209,11 @@ describe("generic provider — complete chart", () => {
 
 describe("generic provider — NetworkPolicy", () => {
   it("admits the release's own Envoy proxies, not Google CIDRs", () => {
-    // The h2c hop is only safe because of this policy: the ext_proc reply carries
-    // INTERNAL_HEADER_SECRET, so anything that can reach :8443 can obtain the credential that
-    // makes a pool trust dispatch headers.
+    // The h2c hop is only safe because of this policy. The ext_proc reply no longer carries the
+    // raw secret — only a per-request HMAC proof bound to the request that was resolved — but the
+    // routing service authenticates no callers, so anything that can reach :8443 is handed a
+    // valid proof for a request of its OWN choosing (a signing oracle). Reachability still
+    // decides who may ask for a routing verdict at all.
     const np = genericChart()["templates/network-policy.yaml"]!;
     expect(np).not.toContain("35.191.0.0/16");
     expect(np).not.toContain("130.211.0.0/22");

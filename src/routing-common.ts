@@ -4,7 +4,7 @@
 // cjs-module-lexer can't statically resolve the named exports, so the import throws
 // "Named export 'detectDomainLocale' not found". Import the CJS default (module.exports)
 // and destructure; both bundle formats resolve the symbols this way.
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import NextRouting from "@next/routing";
 import type { ResolveRoutesParams } from "@next/routing";
 import { isSafePattern } from "redos-detector";
@@ -136,9 +136,342 @@ export function fitsPoolHeaderBudget(bytes: number): boolean {
 }
 
 // Header carrying the shared secret that authenticates the dispatch headers above.
-// Present only on responses from the trusted routing extension / cross-pool proxy.
+// LEGACY (v1): it is no longer stamped anywhere — see INTERNAL_DISPATCH_PROOF_HEADER. The
+// constant remains because every strip/clear list must keep naming it: a client (or an
+// old-build hop) presenting the raw secret must have it deleted, never honored.
 export const INTERNAL_SECRET_HEADER = "x-internal-secret";
 export const INTERNAL_EXECUTION_DEADLINE_HEADER = "x-adapter-k8s-execution-deadline";
+
+/**
+ * Header carrying the dispatch trust credential, v2: a PER-REQUEST HMAC proof, replacing
+ * the raw shared secret on the wire.
+ *
+ * v1 stamped the raw per-build secret (x-internal-secret) into every ext_proc response and
+ * every cross-pool hop. Anything able to open ONE ext_proc stream to the routing service —
+ * a NetworkPolicy miss, a hostNetwork pod (which bypasses NetworkPolicy entirely), a VPC
+ * peer, a non-enforcing CNI — could read the secret out of the header mutation and replay
+ * it against any pool with forged dispatch headers, minting trusted `x-mw-evaluated`
+ * verdicts for arbitrary routes: a release-wide middleware bypass. Reachability to :8443
+ * WAS the credential (2026-08-16 audit, issue #60).
+ *
+ * The proof binds the secret to EVERY routing input the pool trusts from the edge — see
+ * `computeDispatchProof` for the exact covered set: the method, the request target, the
+ * authority, the forwarding witnesses the pool's own derivations read, every
+ * INTERNAL_DISPATCH_HEADERS value (the middleware verdict `x-mw-evaluated` and the
+ * middleware's final request-header set `x-mw-request-headers` among them), and this build's
+ * derived inputs — the request headers its middleware `matcher` has/missing conditions consult
+ * and the RSC negotiation headers that choose the dispatched output id. So no verdict can be
+ * swapped onto a different request, host, scheme, matcher state or content negotiation, nor
+ * edited in transit, and the secret itself never crosses the wire.
+ *
+ * WHAT THIS DOES *NOT* DO — the NetworkPolicy is still a REQUIRED trust boundary. The proof
+ * removes the replayable, disclosable credential; it does NOT authenticate CALLERS to the
+ * ext_proc port. The routing service answers any peer that can open a stream to :8443, so
+ * anything that reaches that port can still submit a request of its own choosing and be handed
+ * a valid proof for it — a signing oracle for crafted requests, including requests on paths the
+ * CEL match condition normally excludes from the callout, and unmetered use of the middleware
+ * compute behind it. Reachability is therefore still the boundary that decides who may ask for
+ * a routing verdict at all; issue #60 is narrowed (no wire-readable, replayable secret), not
+ * closed. The emitted NetworkPolicy (emit/templates/network-policy.ts) and the strict ingress
+ * sources per provider stay REQUIRED, not defense-in-depth.
+ *
+ * No legacy dual-accept on the pool: trusted pairings are ALWAYS same-build — the secret
+ * is HMAC(operatorKey, "release\0buildId") per build, and the edge's secretKeyRef moves
+ * with its image (N87) — so same build means same adapter code on both ends. Cross-build
+ * traffic already fails closed today (secret mismatch ⇒ strip ⇒ local re-resolution), so
+ * a proof-only pool and a raw-secret edge can never form a trusted pair. The covered-input
+ * SET is part of that same-build contract: both tiers derive it from the one build's manifest,
+ * so it can be extended without a wire-compat shim.
+ */
+export const INTERNAL_DISPATCH_PROOF_HEADER = "x-internal-dispatch-proof";
+
+// Constant-time string compare, guarding the length side-channel (timingSafeEqual throws on
+// unequal-length buffers). Canonical home; pool-server/dispatch.ts re-exports it so the two
+// historical import sites can never drift apart.
+export function timingSafeStringEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+/**
+ * Request-context headers the proof covers ON TOP of the dispatch vocabulary, because the
+ * POOL's own routing derivations read them straight off the wire — so a proof that did not
+ * bind them would verify for a request whose effective scheme or origin is a different one.
+ *
+ * REVIEW (PR #61): the first cut of the proof covered only (method, target, dispatch headers),
+ * which left `:scheme` and `:authority` unbound. `:authority` is bound directly (see
+ * `DispatchProofInputs.authority`). `:scheme` is bound THROUGH `x-forwarded-proto`, which is the
+ * pool's only witness of the client-facing scheme — TLS terminates at the load balancer, so the
+ * pool's own socket is always plain http and `dispatch.ts requestProtocol()` has nothing else to
+ * read. Binding the raw wire value (rather than each tier's own interpretation of it) is what
+ * keeps the two sides byte-identical: Envoy sets `x-forwarded-proto` during header sanitization,
+ * BEFORE the ext_proc filter runs, and does not touch it again on the way upstream. When the
+ * header is absent it is covered as ABSENT at both tiers, and the pool's derived scheme is `http`
+ * no matter what the caller does — so the scheme is bound in that case too.
+ *
+ * OPERATIONAL NOTE. This binding assumes the value the CALLOUT tier sees is the value that
+ * reaches the pool. That holds for the in-cluster Envoy Gateway path (above). It is NOT verified
+ * for the GKE traffic-extension path, where the callout is made by the GXLB rather than by an
+ * Envoy in the request path: if that load balancer sets `x-forwarded-proto` only while forwarding
+ * to the backend — i.e. after the extension chain — the two tiers would sign different values.
+ * The failure is FAIL-SAFE, not a hole: the proof does not verify, the pool strips the dispatch
+ * headers and re-resolves the request locally (middleware runs), so correctness is preserved and
+ * the cost is a doubled middleware pass. The live e2e suites (`npm run test:e2e:live`) exercise a
+ * real GXLB deployment and would show it as trusted-dispatch never being taken; removing this one
+ * entry from the list is the one-line fallback if so.
+ */
+export const PROOF_COVERED_CONTEXT_HEADERS = [
+  // Effective client-facing scheme (pool-server/dispatch.ts requestProtocol).
+  "x-forwarded-proto",
+  // Honored by the pool when deciding whether a middleware redirect Location is same-origin
+  // (pool-server/dispatch.ts middlewareRedirectLocation), so it is a routing input as well.
+  "x-forwarded-host",
+] as const;
+
+// Names that must never enter the BUILD-DERIVED covered set (`buildProofHeaderNames` and the two
+// derivations behind it): the dispatch vocabulary and both credentials are already covered
+// explicitly, `host` is covered as the authority, and the UNTRUSTED_NEXT_REQUEST_HEADERS are
+// REWRITTEN between the two tiers (the edge sets/deletes `x-nextjs-data` for its own matcher
+// evaluation and clears the whole list on egress), so binding a wire value for them would compare
+// the edge's pre-strip bytes against the pool's post-clear absence and fail every proof.
+//
+// The W3C trace headers are excluded for that SAME rewritten-between-the-tiers reason, and are
+// worth naming explicitly because only a middleware `matcher` condition can pull them in (they
+// are in neither the dispatch vocabulary nor PROOF_COVERED_CONTEXT_HEADERS). An OTel-enabled
+// routing tier injects `traceparent`/`tracestate` with OVERWRITE_IF_EXISTS_OR_ADD *after*
+// handler() has already minted the proof (routing-service/server.ts injectTraceHeaders), so
+// binding them would compare the edge's pre-injection bytes against the pool's post-injection
+// value and fail EVERY proof for that build — silently and permanently: trusted dispatch off,
+// middleware run twice per request, `x-mw-request-headers` never applied, and nothing logged.
+//
+// ACCEPTED RESIDUAL: a matcher gating on a trace header is then an UNBOUND proof input. That
+// costs no integrity, because the value the pool sees is edge-controlled anyway — the routing
+// tier overwrites it unconditionally on every routed and continued response, so the client's own
+// bytes never reach the pool and there is nothing an attacker could swap that the edge has not
+// already replaced.
+const PROOF_EXCLUDED_MATCHER_HEADERS: ReadonlySet<string> = new Set<string>([
+  ...INTERNAL_DISPATCH_HEADERS,
+  ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+  INTERNAL_SECRET_HEADER,
+  INTERNAL_DISPATCH_PROOF_HEADER,
+  "host",
+  "traceparent",
+  "tracestate",
+]);
+
+/**
+ * Header names this build's middleware `matcher` has/missing conditions read — the "skip-nomatch
+ * inputs". Sorted and deduped so both tiers derive the same list from the same manifest.
+ *
+ * WHY THE PROOF MUST COVER THEM: `matchesMiddleware` decides the `x-mw-evaluated` verdict from
+ * the request's own headers and cookies. A matcher carrying `missing: [{type:"cookie",
+ * key:"session"}]` means an anonymous request legitimately yields the TRUSTED `skip-nomatch`
+ * verdict — and with those inputs unbound, that proof could be lifted onto a request that DOES
+ * carry the cookie, telling the pool the middleware stage was already settled for a request whose
+ * middleware never ran. That is the same middleware-bypass class `x-mw-evaluated` exists to close,
+ * re-opened one header at a time.
+ *
+ * `query` and `host` conditions add no names: they read `url.searchParams` and `url.hostname`,
+ * already bound by the request target and the authority. Names in
+ * PROOF_EXCLUDED_MATCHER_HEADERS add none either — see that set for why binding a value the two
+ * tiers do not see identically would fail every proof rather than bind anything.
+ */
+export function matcherProofHeaderNames(matchers: MiddlewareMatcher[] | undefined): string[] {
+  if (!matchers || matchers.length === 0) return [];
+  const names = new Set<string>();
+  for (const matcher of matchers) {
+    for (const cond of [...(matcher.has ?? []), ...(matcher.missing ?? [])]) {
+      // A cookie condition reads the whole `Cookie` header (conditionPresent parses it), so the
+      // header — not the cookie name — is the covered input.
+      if (cond.type === "cookie") names.add("cookie");
+      else if (cond.type === "header" && cond.key) names.add(cond.key.toLowerCase());
+    }
+  }
+  for (const excluded of PROOF_EXCLUDED_MATCHER_HEADERS) names.delete(excluded);
+  return [...names].sort();
+}
+
+/**
+ * Header names the RSC content negotiation reads — the other build-derived routing input. The
+ * edge picks `x-output-id` through `resolveRscOutput`, which reads `rsc.header` (whole-page
+ * flight) and `rsc.prefetchSegmentHeader` (partial-tree prefetch); the pool then dispatches that
+ * output id verbatim. Unbound, a proof for the flight request would verify with the RSC header
+ * stripped: the pool serves the `.rsc` output while deriving its cache verdict for a document
+ * request, which is a shared-cache confusion, not just a wrong content type.
+ */
+export function rscProofHeaderNames(rsc: RscConfig | undefined): string[] {
+  if (!rsc) return [];
+  const names = [rsc.header, rsc.prefetchSegmentHeader]
+    .filter((name): name is string => typeof name === "string" && name.length > 0)
+    .map((name) => name.toLowerCase())
+    .filter((name) => !PROOF_EXCLUDED_MATCHER_HEADERS.has(name));
+  return [...new Set(names)].sort();
+}
+
+/**
+ * The build-derived request-header names the proof covers on top of the fixed vocabulary: the
+ * middleware-matcher inputs and the RSC negotiation headers. ONE derivation, called by every
+ * party that signs (routing-service/handler.ts, pool-server/dispatch.ts's cross-pool hop) and by
+ * the verifier (pool-server/server.ts) — all three read the same build's routing manifest, and a
+ * trusted pairing is always same-build, so the lists cannot disagree in a live deployment.
+ */
+export function buildProofHeaderNames(manifest: {
+  middleware?: { matchers?: MiddlewareMatcher[] } | null | undefined;
+  routeGraph?: unknown;
+}): string[] {
+  return [
+    ...new Set<string>([
+      ...matcherProofHeaderNames(manifest.middleware?.matchers),
+      ...rscProofHeaderNames(getRscConfig(manifest)),
+    ]),
+  ].sort();
+}
+
+/** The complete covered header-name list for a build, sorted — the proof's canonical order. */
+export function proofCoveredHeaderNames(buildHeaderNames?: readonly string[]): string[] {
+  return [
+    ...new Set<string>([
+      ...INTERNAL_DISPATCH_HEADERS,
+      ...PROOF_COVERED_CONTEXT_HEADERS,
+      ...(buildHeaderNames ?? []),
+    ]),
+  ].sort();
+}
+
+/**
+ * Coalesce a repeated header into the single value the NEXT hop will see, so the two tiers
+ * canonicalize duplicates identically. Node's HTTP parser joins repeated `Cookie` fields with
+ * `"; "` and everything else with `", "`, and Envoy joins with the same delimiters when it writes
+ * an HTTP/1.1 upstream request — so one rule serves both sides. An empty list is ABSENT.
+ */
+export function coalesceWireHeader(name: string, values: readonly string[]): string | undefined {
+  if (values.length === 0) return undefined;
+  if (values.length === 1) return values[0];
+  return values.join(name.toLowerCase() === "cookie" ? "; " : ", ");
+}
+
+/** Read one header off a Node `req.headers`-shaped record, coalescing a repeated value. */
+function wireHeaderValue(name: string, value: string | string[] | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return typeof value === "string" ? value : coalesceWireHeader(name, value);
+}
+
+/** Every routing input the dispatch proof binds. Both tiers fill this in from what they see. */
+export interface DispatchProofInputs {
+  /** Request method; case-normalized by the proof. */
+  method: string;
+  /**
+   * Origin-form request target — `:path` at the ext_proc tier, `req.url` at the pool. Both tiers
+   * see the same raw, un-normalized bytes (query string included).
+   */
+  target: string;
+  /**
+   * `:authority` at the ext_proc tier, `Host` at the pool (Envoy writes the one from the other).
+   * `undefined` means the header was absent, which is covered distinctly from any present value.
+   */
+  authority?: string | undefined;
+  /**
+   * Covered header values keyed by LOWERCASE name — the dispatch vocabulary, the context
+   * witnesses, and this build's derived inputs. A missing key (or an explicit `undefined`) is
+   * covered as ABSENT, which the framing keeps distinct from a present empty value.
+   */
+  headers: Record<string, string | undefined>;
+  /** This build's derived covered header names (`buildProofHeaderNames`). */
+  proofHeaderNames?: readonly string[] | undefined;
+}
+
+/**
+ * Length-prefixed framing for one covered field. `+<byteLength>\n<bytes>` for a present value,
+ * `-\n` for an ABSENT one.
+ *
+ * The v1 construction joined fields with `\n`, which made distinct input tuples share a
+ * transcript: a covered header that was ABSENT was skipped entirely, so it signed the same bytes
+ * as one present with an empty value, and a value containing a newline could restate a following
+ * `name\nvalue` pair. Framing by byte length removes both — no covered value can impersonate the
+ * delimiter, and absence is its own symbol rather than the lack of one.
+ */
+function updateProofField(hmac: ReturnType<typeof createHmac>, value: string | undefined): void {
+  if (value === undefined) {
+    hmac.update("-\n");
+    return;
+  }
+  const bytes = Buffer.from(value, "utf8");
+  hmac.update(`+${bytes.length}\n`);
+  hmac.update(bytes);
+}
+
+/**
+ * Compute (and verify) the per-request dispatch proof over EVERY routing input the pool trusts
+ * from the edge, in one unambiguous transcript:
+ *
+ *   domain tag │ method │ target │ authority │ covered-name count │ (name │ value)*
+ *
+ * Covered names are the sorted union of INTERNAL_DISPATCH_HEADERS, PROOF_COVERED_CONTEXT_HEADERS
+ * and this build's `proofHeaderNames`; every field is length-prefixed (see updateProofField),
+ * and an absent header is signed as ABSENT rather than skipped. The name count is signed too, so
+ * one build's transcript can never be a prefix of another's.
+ *
+ * Both tiers MUST pass the same `proofHeaderNames` — they do, because both derive it from the
+ * one build's routing manifest and a trusted pairing is always same-build (see
+ * INTERNAL_DISPATCH_PROOF_HEADER). A mismatch fails closed: the pool strips the dispatch headers
+ * and re-resolves locally.
+ */
+export function computeDispatchProof(secret: string, inputs: DispatchProofInputs): string {
+  const names = proofCoveredHeaderNames(inputs.proofHeaderNames);
+  const hmac = createHmac("sha256", secret);
+  hmac.update("adapter-k8s-dispatch-v2\n");
+  updateProofField(hmac, inputs.method.toUpperCase());
+  updateProofField(hmac, inputs.target);
+  // Hostnames are case-insensitive and both tiers route on the lowercased form (URL parsing
+  // lowercases `hostname`), so lowercase here rather than letting a case flip fail the compare.
+  updateProofField(hmac, inputs.authority?.toLowerCase());
+  updateProofField(hmac, String(names.length));
+  for (const name of names) {
+    updateProofField(hmac, name);
+    updateProofField(hmac, inputs.headers[name]);
+  }
+  return hmac.digest("hex");
+}
+
+/**
+ * Collect the proof inputs off a live request (Node `req.headers` shape, or the cross-pool
+ * proxy's outbound header record). The authority comes from `Host`; every covered name is read
+ * verbatim off the wire, with a repeated value coalesced the way the next hop would see it.
+ */
+export function dispatchProofInputsFromRequest(request: {
+  method?: string | undefined;
+  target?: string | undefined;
+  headers: Record<string, string | string[] | undefined>;
+  proofHeaderNames?: readonly string[] | undefined;
+}): DispatchProofInputs {
+  const headers: Record<string, string | undefined> = {};
+  for (const name of proofCoveredHeaderNames(request.proofHeaderNames)) {
+    headers[name] = wireHeaderValue(name, request.headers[name]);
+  }
+  return {
+    method: request.method ?? "GET",
+    target: request.target ?? "/",
+    authority: wireHeaderValue("host", request.headers["host"]),
+    headers,
+    proofHeaderNames: request.proofHeaderNames,
+  };
+}
+
+export function verifyDispatchProof(
+  secret: string,
+  request: {
+    method?: string | undefined;
+    target?: string | undefined;
+    headers: Record<string, string | string[] | undefined>;
+    proofHeaderNames?: readonly string[] | undefined;
+  },
+  presentedProof: string,
+): boolean {
+  const expected = computeDispatchProof(secret, dispatchProofInputsFromRequest(request));
+  return timingSafeStringEqual(presentedProof, expected);
+}
 
 // A compiled middleware matcher entry from middleware-manifest.json.
 export interface MiddlewareMatcher {

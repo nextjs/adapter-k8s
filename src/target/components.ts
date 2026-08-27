@@ -724,8 +724,9 @@ export interface HttpRouteExposureOptions {
   /**
    * Strict-NetworkPolicy admitted sources. The shared gateway's proxy pods live in the
    * PARENT's namespace (e.g. envoy-gateway-system or network), so under
-   * networkPolicy.strict you MUST admit them here or every request fails closed —
-   * reachability to the routing tier's :8443 is the internal dispatch secret.
+   * networkPolicy.strict you MUST admit them here or every request fails closed. Keep the set as
+   * tight as the deployment allows: the routing tier authenticates no callers, so reachability to
+   * its :8443 is what decides who can obtain a pool-trusted routing verdict.
    */
   ingressSources?: IngressSourceSet;
 }

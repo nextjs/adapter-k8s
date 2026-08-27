@@ -34,22 +34,31 @@ describe("renderCdnFilter", () => {
     }
   });
 
-  it("omits the duplicate/per-user dispatch headers and never keys the secret", () => {
+  it("omits the duplicate/per-user dispatch headers and never keys either credential", () => {
     expect(yaml).not.toContain("x-matched-pathname");
     expect(yaml).not.toContain("x-internal-secret");
+    // The per-request proof would shard the cache into per-request entries if keyed.
+    expect(yaml).not.toContain("x-internal-dispatch-proof");
     // N40: x-mw-request-headers carries the middleware's whole final request-header set as
     // JSON, INCLUDING `cookie`. Keying on it would make the cache key per-user and shatter
     // the hit rate; it is safe to omit because the header only exists when middleware ran and
     // a middleware-covered response is forced `no-cache` by the pool (invariant 2).
     expect(yaml).not.toContain("x-mw-request-headers");
     expect(DEFAULT_CDN_CACHE_KEY_HEADERS).not.toContain("x-internal-secret");
+    expect(DEFAULT_CDN_CACHE_KEY_HEADERS).not.toContain("x-internal-dispatch-proof");
     expect(DEFAULT_CDN_CACHE_KEY_HEADERS).not.toContain("x-matched-pathname");
     expect(DEFAULT_CDN_CACHE_KEY_HEADERS).not.toContain("x-mw-request-headers");
   });
 
-  it("rejects a cache-key list containing the internal secret header", () => {
+  it("rejects a cache-key list containing either dispatch credential header", () => {
     expect(() =>
       renderCdnFilter({ releaseName: "nextjs", cacheKeyHeaders: ["RSC", "X-Internal-Secret"] }),
+    ).toThrow(/never be part of the CDN cache key/);
+    expect(() =>
+      renderCdnFilter({
+        releaseName: "nextjs",
+        cacheKeyHeaders: ["RSC", "x-internal-dispatch-proof"],
+      }),
     ).toThrow(/never be part of the CDN cache key/);
   });
 

@@ -109,9 +109,16 @@ export type RoutingTransport = "tls" | "h2c";
  *
  * So the transport is stated explicitly rather than inferred. `h2c` is a legitimate PRODUCTION
  * posture here, not a debug escape hatch, but it is only safe because the emitted NetworkPolicy
- * admits :8443 solely from the release's own Envoy proxy pods — the ext_proc reply carries
- * INTERNAL_HEADER_SECRET, so anything that can reach this port can obtain it. The two ship
- * together deliberately.
+ * admits :8443 solely from the release's own Envoy proxy pods — a REQUIRED trust boundary, and the
+ * reason the two ship together deliberately.
+ *
+ * The dispatch-proof change (INTERNAL_DISPATCH_PROOF_HEADER, routing-common.ts) narrowed the
+ * consequence of reaching this port without removing the requirement: the reply carries a
+ * per-request HMAC proof — valid for exactly the request that was resolved, over every routing
+ * input the pool acts on — instead of the raw, replayable secret. This service still
+ * authenticates NO callers, so anything that can open a stream here can have a request of its own
+ * choosing resolved and signed. Reachability is no longer a release-wide credential; it is still
+ * a signing oracle plus unmetered middleware compute.
  */
 export function routingTransport(): RoutingTransport {
   const declared = process.env.ROUTING_TRANSPORT?.trim();
