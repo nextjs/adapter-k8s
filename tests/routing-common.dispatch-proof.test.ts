@@ -21,10 +21,15 @@ import {
   buildProofHeaderNames,
   coalesceWireHeaderBytes,
   computeDispatchProof,
+  dispatchBodyDigest,
+  DISPATCH_PROOF_MAX_AGE_MS,
+  DISPATCH_PROOF_MAX_SKEW_MS,
+  dispatchProofBodyMatches,
   dispatchProofInputsFromRequest,
   INTERNAL_DISPATCH_HEADERS,
   matcherProofHeaderNames,
   NODE_SINGLETON_REQUEST_HEADERS,
+  parseDispatchProof,
   PROOF_COVERED_CONTEXT_HEADERS,
   proofCoveredHeaderNames,
   rscProofHeaderNames,
@@ -38,10 +43,14 @@ const SECRET = "an-internal-dispatch-secret";
 const octets = (value: Buffer | string | undefined): string | undefined =>
   value === undefined ? undefined : Buffer.isBuffer(value) ? value.toString("latin1") : value;
 
+/** A fixed mint time, so a transcript is reproducible (A0-DP-5 binds the issued-at). */
+const ISSUED_AT = 1_800_000_000_000;
+
 const baseInputs = (over: Partial<DispatchProofInputs> = {}): DispatchProofInputs => ({
   method: "GET",
   target: "/about?x=1",
   authority: "app.example.com",
+  issuedAtMs: ISSUED_AT,
   headers: {
     "x-output-id": "/about",
     "x-matched-pathname": "/about",
@@ -386,20 +395,23 @@ describe("dispatchProofInputsFromRequest / verifyDispatchProof", () => {
     );
     const asPool = computeDispatchProof(
       SECRET,
-      dispatchProofInputsFromRequest({
-        method: "GET",
-        target: "/about?x=1",
-        headers: {
-          host: "app.example.com",
-          "user-agent": "first/1.0",
-          "x-output-id": "/about",
-          "x-matched-pathname": "/about",
-          "x-mw-evaluated": "ran",
-          "x-upstream-pool": "ssr",
-          "x-forwarded-proto": "https",
+      dispatchProofInputsFromRequest(
+        {
+          method: "GET",
+          target: "/about?x=1",
+          headers: {
+            host: "app.example.com",
+            "user-agent": "first/1.0",
+            "x-output-id": "/about",
+            "x-matched-pathname": "/about",
+            "x-mw-evaluated": "ran",
+            "x-upstream-pool": "ssr",
+            "x-forwarded-proto": "https",
+          },
+          proofHeaderNames,
         },
-        proofHeaderNames,
-      }),
+        { issuedAtMs: ISSUED_AT },
+      ),
     );
     expect(asPool).toBe(asEdge);
   });
@@ -436,7 +448,7 @@ describe("dispatchProofInputsFromRequest / verifyDispatchProof", () => {
         { method: "GET", target: "/about", headers: wire, proofHeaderNames },
         proof,
       ),
-    ).toBe(true);
+    ).toEqual({ trusted: true, bodyDigest: undefined });
     // One matcher input changed ⇒ a different matcher verdict ⇒ no trust.
     expect(
       verifyDispatchProof(
@@ -449,23 +461,203 @@ describe("dispatchProofInputsFromRequest / verifyDispatchProof", () => {
         },
         proof,
       ),
-    ).toBe(false);
-    // A garbage proof of the same length is rejected without throwing (constant-time compare
-    // needs equal-length buffers).
+    ).toEqual({ trusted: false, reason: "mismatch" });
+    // A garbage credential of the same length is rejected without throwing (constant-time compare
+    // needs equal-length buffers) — as malformed, since it is not even the credential shape.
     expect(
       verifyDispatchProof(
         SECRET,
         { method: "GET", target: "/about", headers: wire, proofHeaderNames },
         "0".repeat(proof.length),
       ),
-    ).toBe(false);
-    // So is one of a different length.
+    ).toEqual({ trusted: false, reason: "malformed" });
+    // So is one of a different length, and the empty string.
     expect(
       verifyDispatchProof(
         SECRET,
         { method: "GET", target: "/about", headers: wire, proofHeaderNames },
         "",
       ),
+    ).toEqual({ trusted: false, reason: "malformed" });
+    // A well-formed credential whose MAC is wrong is a MISMATCH, not malformed — the reason is
+    // what an operator reads off the rejection metric, so the two must not blur.
+    const [, issuedAt, digest] = proof.split(".") as [string, string, string];
+    expect(
+      verifyDispatchProof(
+        SECRET,
+        { method: "GET", target: "/about", headers: wire, proofHeaderNames },
+        `v3.${issuedAt}.${digest}.${"0".repeat(64)}`,
+      ),
+    ).toEqual({ trusted: false, reason: "mismatch" });
+  });
+});
+
+describe("A0-DP-5 — a proof is bound to a transmission, not just to an input tuple", () => {
+  const wire = (): Record<string, string | string[] | undefined> => ({
+    host: "app.example.com",
+    "x-forwarded-proto": "https",
+    "x-output-id": "/api/submit",
+    "x-mw-evaluated": "ran",
+  });
+  const request = { method: "POST", target: "/api/submit", headers: wire() };
+
+  it("binds a SHA-256 of the body on a hop that has it, and refuses a swapped body", () => {
+    // The cross-pool hop's replay: the proof authenticated the header tuple only, so an observer
+    // of a POST hop could re-send it with arbitrary bytes and the sibling pool would honor
+    // `x-mw-evaluated: ran` for a body middleware never saw.
+    const body = Buffer.from("formData=honest");
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { body, issuedAtMs: ISSUED_AT }),
+    );
+    const verdict = verifyDispatchProof(SECRET, request, proof, { nowMs: ISSUED_AT });
+    expect(verdict.trusted).toBe(true);
+
+    // The MAC alone cannot see a swapped body — the digest travels in the credential — so the
+    // verdict carries the DECLARED digest and the caller checks the bytes it received.
+    expect(verdict.trusted && dispatchProofBodyMatches(verdict.bodyDigest, body)).toBe(true);
+    expect(
+      verdict.trusted &&
+        dispatchProofBodyMatches(verdict.bodyDigest, Buffer.from("formData=attacker")),
     ).toBe(false);
+    // …and one byte is enough.
+    expect(
+      verdict.trusted &&
+        dispatchProofBodyMatches(verdict.bodyDigest, Buffer.from("formData=hones")),
+    ).toBe(false);
+    // An empty body is a bound state of its own, not "no body".
+    expect(verdict.trusted && dispatchProofBodyMatches(verdict.bodyDigest, Buffer.alloc(0))).toBe(
+      false,
+    );
+  });
+
+  it("cannot have its declared digest rewritten to match a different body", () => {
+    // The digest is carried in the credential so the header-phase verifier can reproduce the
+    // transcript without the body — which only works because the digest is INSIDE the MAC.
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, {
+        body: Buffer.from("honest"),
+        issuedAtMs: ISSUED_AT,
+      }),
+    );
+    const parts = proof.split(".") as [string, string, string, string];
+    const attackerDigest = dispatchBodyDigest(Buffer.from("attacker")).toString("hex");
+    const swapped = `v3.${parts[1]}.${attackerDigest}.${parts[3]}`;
+    expect(verifyDispatchProof(SECRET, request, swapped, { nowMs: ISSUED_AT })).toEqual({
+      trusted: false,
+      reason: "mismatch",
+    });
+  });
+
+  it("keeps a bound body distinct from an ABSENT one, and ABSENT unconstrained", () => {
+    const bound = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { body: Buffer.alloc(0), issuedAtMs: ISSUED_AT }),
+    );
+    const absent = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
+    );
+    expect(bound).not.toBe(absent);
+    // ABSENT is what the ext_proc edge must bind (a header-phase callout has no body). It is an
+    // accepted residual, documented on verifyDispatchProof: no body constrains it.
+    const verdict = verifyDispatchProof(SECRET, request, absent, { nowMs: ISSUED_AT });
+    expect(verdict.trusted).toBe(true);
+    expect(verdict.trusted && verdict.bodyDigest).toBeUndefined();
+    expect(dispatchProofBodyMatches(undefined, Buffer.from("anything"))).toBe(true);
+  });
+
+  it("refuses a declared digest on a read method, which no signer produces", () => {
+    const readRequest = { method: "GET", target: "/about", headers: wire() };
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(readRequest, {
+        body: Buffer.from("x"),
+        issuedAtMs: ISSUED_AT,
+      }),
+    );
+    expect(verifyDispatchProof(SECRET, readRequest, proof, { nowMs: ISSUED_AT })).toEqual({
+      trusted: false,
+      reason: "body-unexpected",
+    });
+  });
+
+  it("expires: the same credential stops verifying once the freshness window closes", () => {
+    // Before this, the proof was a deterministic HMAC over the input tuple with no nonce,
+    // timestamp or body binding — so a captured trusted exchange replayed verbatim FOREVER.
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
+    );
+    expect(verifyDispatchProof(SECRET, request, proof, { nowMs: ISSUED_AT }).trusted).toBe(true);
+    // Inside the window (an in-flight request across one or two hops).
+    expect(
+      verifyDispatchProof(SECRET, request, proof, {
+        nowMs: ISSUED_AT + DISPATCH_PROOF_MAX_AGE_MS,
+      }).trusted,
+    ).toBe(true);
+    // Past it — refused, with the reason an operator will read off the metric.
+    expect(
+      verifyDispatchProof(SECRET, request, proof, {
+        nowMs: ISSUED_AT + DISPATCH_PROOF_MAX_AGE_MS + 1,
+      }),
+    ).toEqual({ trusted: false, reason: "stale" });
+    // A day later, which is the replay this closes.
+    expect(verifyDispatchProof(SECRET, request, proof, { nowMs: ISSUED_AT + 86_400_000 })).toEqual({
+      trusted: false,
+      reason: "stale",
+    });
+  });
+
+  it("tolerates bounded clock skew but refuses a far-future mint time", () => {
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
+    );
+    // The codebase already compares absolute epoch times across pods (the execution deadline
+    // header), so a one-sided skew allowance is the honest bound.
+    expect(
+      verifyDispatchProof(SECRET, request, proof, {
+        nowMs: ISSUED_AT - DISPATCH_PROOF_MAX_SKEW_MS,
+      }).trusted,
+    ).toBe(true);
+    expect(
+      verifyDispatchProof(SECRET, request, proof, {
+        nowMs: ISSUED_AT - DISPATCH_PROOF_MAX_SKEW_MS - 1,
+      }),
+    ).toEqual({ trusted: false, reason: "premature" });
+  });
+
+  it("binds the mint time itself, so it cannot be pushed forward to extend the window", () => {
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
+    );
+    const parts = proof.split(".") as [string, string, string, string];
+    const restamped = `v3.${ISSUED_AT + 86_400_000}.${parts[2]}.${parts[3]}`;
+    expect(
+      verifyDispatchProof(SECRET, request, restamped, { nowMs: ISSUED_AT + 86_400_000 }),
+    ).toEqual({ trusted: false, reason: "mismatch" });
+  });
+
+  it("parses only the credential shape it minted", () => {
+    const proof = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
+    );
+    expect(parseDispatchProof(proof)).toEqual({ issuedAtMs: ISSUED_AT, bodyDigest: undefined });
+    // A bare v2-shaped hex MAC, a wrong version tag, a non-numeric time, a short MAC and a
+    // malformed digest are all refused rather than coerced.
+    for (const bad of [
+      "0".repeat(64),
+      `v2.${ISSUED_AT}.-.${"a".repeat(64)}`,
+      `v3.later.-.${"a".repeat(64)}`,
+      `v3.${ISSUED_AT}.-.${"a".repeat(63)}`,
+      `v3.${ISSUED_AT}.zz.${"a".repeat(64)}`,
+      `v3.${ISSUED_AT}.-.${"a".repeat(64)}.extra`,
+    ]) {
+      expect(parseDispatchProof(bad)).toBeUndefined();
+    }
   });
 });

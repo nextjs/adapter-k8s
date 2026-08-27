@@ -477,6 +477,96 @@ export interface DispatchProofInputs {
   headers: Record<string, ProofFieldValue>;
   /** This build's derived covered header names (`buildProofHeaderNames`). */
   proofHeaderNames?: readonly string[] | undefined;
+  /**
+   * A0-DP-5. Mint time, ms since the epoch — bound into the transcript AND carried in the
+   * credential, so the verifier can bound a proof's useful life without a second time source.
+   * Required rather than defaulted: a signer must state when it signed, and every test that pins
+   * a transcript must pin this too.
+   */
+  issuedAtMs: number;
+  /**
+   * A0-DP-5. SHA-256 of the request body, when the signer HAS the body. `undefined` is the
+   * explicit ABSENT symbol — the transcript keeps it distinct from any digest, so a hop that
+   * bound a body and one that could not are never confusable.
+   */
+  bodyDigest?: Buffer | undefined;
+}
+
+/** SHA-256 over a request body, the form `DispatchProofInputs.bodyDigest` takes. */
+export function dispatchBodyDigest(body: Buffer): Buffer {
+  return createHash("sha256").update(body).digest();
+}
+
+/**
+ * A0-DP-5. How long a minted proof stays acceptable.
+ *
+ * The proof binds an input TUPLE, which made it good per-tuple rather than per-transmission: a
+ * captured trusted exchange replayed to a pool verbatim, forever. This bounds that to a window.
+ *
+ * Anchored on REQUEST_HEAD_TIMEOUT_MS (dispatch.ts), the 60s default time-to-response-head budget
+ * for one hop — a proof only has to survive the transit between the tier that minted it and the
+ * tier that verifies it, and verification happens at the HEADER boundary, so a slow body upload
+ * afterwards does not count against it. Two hops (edge → pool → pool) plus queueing gives 120s as
+ * a deliberately generous ceiling that is still finite.
+ *
+ * The future-dated allowance is separate and one-sided. The codebase ALREADY assumes pod clocks
+ * agree closely enough to compare absolute epoch times across pods — that is exactly what
+ * INTERNAL_EXECUTION_DEADLINE_HEADER does — so 30s of skew is well past anything that assumption
+ * survives, and a proof further ahead than that is rejected rather than silently trusted.
+ *
+ * Rejection is the SAME fail-safe as a mismatch: strip the dispatch headers, re-resolve locally.
+ * A cluster with clocks bad enough to trip this loses trusted dispatch (a doubled middleware pass)
+ * rather than correctness — and, unlike before A0-DP-2, says so through
+ * `adapter_k8s.pool.dispatch_proof.rejected{reason="stale"|"premature"}`.
+ */
+export const DISPATCH_PROOF_MAX_AGE_MS = 120_000;
+export const DISPATCH_PROOF_MAX_SKEW_MS = 30_000;
+
+/**
+ * The credential the proof header carries: `v3.<issuedAtMs>.<bodyDigestHex|-> .<macHex>`.
+ *
+ * The mint time and the body digest travel WITH the MAC because the verifier cannot reproduce
+ * either on its own — it has no clock reading of the signing moment, and at the header trust
+ * boundary it has not read the body yet. Both are bound INTO the transcript, so neither can be
+ * edited in transit: rewriting the declared digest to match a swapped body invalidates the MAC.
+ *
+ * A declared digest is therefore an assertion the verifier must still CHECK against the bytes it
+ * receives — see `dispatchProofBodyMatches` and the enforcement in pool-server/server.ts. The MAC
+ * check alone says "the signer declared this digest", not "the body matches it".
+ */
+const DISPATCH_PROOF_PREFIX = "v3";
+const ABSENT_BODY_DIGEST = "-";
+
+export interface ParsedDispatchProof {
+  issuedAtMs: number;
+  bodyDigest: Buffer | undefined;
+}
+
+export function parseDispatchProof(credential: string): ParsedDispatchProof | undefined {
+  const parts = credential.split(".");
+  if (parts.length !== 4) return undefined;
+  const [prefix, issuedAt, digest, mac] = parts as [string, string, string, string];
+  if (prefix !== DISPATCH_PROOF_PREFIX) return undefined;
+  if (!/^\d{1,15}$/.test(issuedAt)) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(mac)) return undefined;
+  if (digest !== ABSENT_BODY_DIGEST && !/^[0-9a-f]{64}$/.test(digest)) return undefined;
+  return {
+    issuedAtMs: Number(issuedAt),
+    bodyDigest: digest === ABSENT_BODY_DIGEST ? undefined : Buffer.from(digest, "hex"),
+  };
+}
+
+/**
+ * Does a body match the digest a verified proof declared? ABSENT means the signer bound no body,
+ * which any body satisfies — see the residual note on `verifyDispatchProof`.
+ */
+export function dispatchProofBodyMatches(
+  declared: Buffer | undefined,
+  body: Buffer | null | undefined,
+): boolean {
+  if (declared === undefined) return true;
+  const actual = dispatchBodyDigest(body ?? Buffer.alloc(0));
+  return declared.length === actual.length && timingSafeEqual(declared, actual);
 }
 
 /**
@@ -527,34 +617,48 @@ function asciiLowerBytes(value: ProofFieldValue): ProofFieldValue {
 }
 
 /**
- * Compute (and verify) the per-request dispatch proof over EVERY routing input the pool trusts
- * from the edge, in one unambiguous transcript:
+ * Compute (and verify) the per-request dispatch credential over EVERY routing input the pool
+ * trusts from the edge, in one unambiguous transcript:
  *
- *   domain tag │ method │ target │ authority │ covered-name count │ (name │ value)*
+ *   domain tag │ method │ target │ authority │ issued-at │ body digest │
+ *   covered-name count │ (name │ value)*
  *
  * Covered names are the sorted union of INTERNAL_DISPATCH_HEADERS, PROOF_COVERED_CONTEXT_HEADERS
  * and this build's `proofHeaderNames`; every field is length-prefixed (see updateProofField),
  * and an absent header is signed as ABSENT rather than skipped. The name count is signed too, so
  * one build's transcript can never be a prefix of another's.
  *
+ * A0-DP-5. The mint time and the body digest are part of the transcript, and the returned
+ * CREDENTIAL carries both alongside the MAC (see DISPATCH_PROOF_MAX_AGE_MS and the credential
+ * format above) — so the proof is bound to a transmission window and, on a hop that has the body,
+ * to those exact bytes, not just to the header tuple.
+ *
  * Both tiers MUST pass the same `proofHeaderNames` — they do, because both derive it from the
  * one build's routing manifest and a trusted pairing is always same-build (see
  * INTERNAL_DISPATCH_PROOF_HEADER). A mismatch fails closed: the pool strips the dispatch headers
  * and re-resolves locally.
+ *
+ * No interop window is needed for the v2 → v3 transcript change: the secret is per BUILD
+ * (emit/templates/internal-secret.ts), so a pool only ever verifies proofs minted by its own
+ * build's edge. Cross-build traffic already fails closed.
  */
 export function computeDispatchProof(secret: string, inputs: DispatchProofInputs): string {
   const names = proofCoveredHeaderNames(inputs.proofHeaderNames);
+  const issuedAt = String(Math.trunc(inputs.issuedAtMs));
+  const digest = inputs.bodyDigest ? inputs.bodyDigest.toString("hex") : ABSENT_BODY_DIGEST;
   const hmac = createHmac("sha256", secret);
-  hmac.update("adapter-k8s-dispatch-v2\n");
+  hmac.update("adapter-k8s-dispatch-v3\n");
   updateProofField(hmac, inputs.method.toUpperCase());
   updateProofField(hmac, inputs.target);
   updateProofField(hmac, asciiLowerBytes(inputs.authority));
+  updateProofField(hmac, issuedAt);
+  updateProofField(hmac, inputs.bodyDigest);
   updateProofField(hmac, String(names.length));
   for (const name of names) {
     updateProofField(hmac, name);
     updateProofField(hmac, inputs.headers[name]);
   }
-  return hmac.digest("hex");
+  return `${DISPATCH_PROOF_PREFIX}.${issuedAt}.${digest}.${hmac.digest("hex")}`;
 }
 
 /** A request as a NODE tier sees (or is about to emit) it — latin1-decoded strings throughout. */
@@ -579,6 +683,16 @@ export interface NodeDispatchProofRequest {
  */
 export function dispatchProofInputsFromRequest(
   request: NodeDispatchProofRequest,
+  options?: {
+    /** Mint time. Defaults to now, which is what a SIGNER wants; a verifier passes the parsed one. */
+    issuedAtMs?: number | undefined;
+    /**
+     * A0-DP-5. The request body, when this hop has it buffered — binds those exact bytes into the
+     * proof. Omit (or pass `undefined`) on a hop that has no body available; that binds the ABSENT
+     * symbol, which is a weaker but unambiguous statement.
+     */
+    body?: Buffer | undefined;
+  },
 ): DispatchProofInputs {
   const headers: Record<string, ProofFieldValue> = {};
   for (const name of proofCoveredHeaderNames(request.proofHeaderNames)) {
@@ -590,16 +704,74 @@ export function dispatchProofInputsFromRequest(
     authority: wireHeaderBytes("host", request.headers["host"]),
     headers,
     proofHeaderNames: request.proofHeaderNames,
+    issuedAtMs: options?.issuedAtMs ?? Date.now(),
+    ...(options?.body !== undefined ? { bodyDigest: dispatchBodyDigest(options.body) } : {}),
   };
 }
 
+/** Why a presented credential was refused — the `reason` on the rejection metric. */
+export type DispatchProofRejection =
+  | "malformed"
+  | "mismatch"
+  | "stale"
+  | "premature"
+  | "body-unexpected";
+
+export type DispatchProofVerdict =
+  | {
+      trusted: true;
+      /**
+       * The body digest the signer declared, or `undefined` for ABSENT. A declared digest is an
+       * ASSERTION: the caller must still check the body it receives against it once it has the
+       * bytes (`dispatchProofBodyMatches`).
+       */
+      bodyDigest: Buffer | undefined;
+    }
+  | { trusted: false; reason: DispatchProofRejection };
+
+/**
+ * Verify a presented dispatch credential against the request as this tier sees it.
+ *
+ * A0-DP-5. Beyond the MAC this now enforces FRESHNESS: a credential older than
+ * DISPATCH_PROOF_MAX_AGE_MS, or dated further ahead than DISPATCH_PROOF_MAX_SKEW_MS, is refused.
+ * Before this, the proof was deterministic over the input tuple with no nonce, timestamp or body
+ * binding, so a captured trusted exchange replayed to a pool verbatim forever — SECURITY.md's
+ * "authorizes only the one request it was minted for" was true per input-tuple, not per
+ * transmission.
+ *
+ * ACCEPTED RESIDUAL (documented, not overlooked): a credential whose body digest is ABSENT is
+ * still replayable with any body inside the freshness window. The ext_proc edge cannot do better —
+ * the header-phase callout never sees a body — but it also barely matters there: a build WITH
+ * middleware never mints an edge proof for a body-capable request at all (handler.ts clears the
+ * whole dispatch vocabulary for non-GET/HEAD when a middleware module exists, so the pool
+ * re-resolves with the real body), and a build WITHOUT middleware has no middleware verdict to
+ * steal. The cross-pool hop, which DOES have the body buffered, binds it.
+ */
 export function verifyDispatchProof(
   secret: string,
   request: NodeDispatchProofRequest,
   presentedProof: string,
-): boolean {
-  const expected = computeDispatchProof(secret, dispatchProofInputsFromRequest(request));
-  return timingSafeStringEqual(presentedProof, expected);
+  options?: { nowMs?: number | undefined },
+): DispatchProofVerdict {
+  const parsed = parseDispatchProof(presentedProof);
+  if (!parsed) return { trusted: false, reason: "malformed" };
+  // A signer only declares a digest when it HAS a body, which implies a body-capable method. The
+  // method is bound, so this cannot be reached by rewriting one — it means a malformed producer.
+  const method = (request.method ?? "GET").toUpperCase();
+  if (parsed.bodyDigest && (method === "GET" || method === "HEAD")) {
+    return { trusted: false, reason: "body-unexpected" };
+  }
+  const age = (options?.nowMs ?? Date.now()) - parsed.issuedAtMs;
+  if (age > DISPATCH_PROOF_MAX_AGE_MS) return { trusted: false, reason: "stale" };
+  if (age < -DISPATCH_PROOF_MAX_SKEW_MS) return { trusted: false, reason: "premature" };
+  const expected = computeDispatchProof(secret, {
+    ...dispatchProofInputsFromRequest(request, { issuedAtMs: parsed.issuedAtMs }),
+    bodyDigest: parsed.bodyDigest,
+  });
+  if (!timingSafeStringEqual(presentedProof, expected)) {
+    return { trusted: false, reason: "mismatch" };
+  }
+  return { trusted: true, bodyDigest: parsed.bodyDigest };
 }
 
 // A compiled middleware matcher entry from middleware-manifest.json.

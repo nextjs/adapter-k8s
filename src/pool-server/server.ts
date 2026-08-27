@@ -2,6 +2,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import {
+  dispatchProofBodyMatches,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
@@ -77,6 +78,47 @@ function reportDispatchProofRejected(reason: string): void {
   );
 }
 
+/**
+ * A0-DP-5. Where the trust boundary parks the body digest a verified proof DECLARED, for the one
+ * caller that later has the bytes to check it against.
+ *
+ * The trust decision has to be made synchronously, at the header boundary, before any body is
+ * read — so the MAC check (which covers the declared digest, making it untamperable in transit)
+ * happens here and the CONTENT check happens at the single point that buffers the body. Splitting
+ * it this way keeps the alternative from happening: deferring the whole trust decision would leave
+ * the dispatch vocabulary on `req.headers` for every unverified body request until the body
+ * arrived, and things between here and there already read `x-output-id`.
+ */
+const DISPATCH_BODY_DIGEST = Symbol.for("adapter-k8s.dispatchProofBodyDigest");
+type BodyBoundRequest = IncomingMessage & { [DISPATCH_BODY_DIGEST]?: Buffer | undefined };
+
+/**
+ * A0-DP-5. Enforce the body binding of an already-verified dispatch proof, once the body is known.
+ *
+ * Returns false — and revokes trust by stripping the dispatch vocabulary, exactly as an unverified
+ * request is treated — when the proof declared a digest the body does not match. That is the
+ * replay this closes: on the cross-pool hop the body was unbound, so an observed proof could be
+ * re-sent with arbitrary bytes on a POST and the receiving pool would honor `x-mw-evaluated: ran`
+ * for a body middleware never saw.
+ *
+ * A proof that bound no body (ABSENT — every ext_proc-minted one) imposes no constraint here; see
+ * the residual note on `verifyDispatchProof`. Idempotent, and a no-op for an untrusted request.
+ */
+export function enforceDispatchBodyBinding(
+  req: IncomingMessage,
+  body: Buffer | null | undefined,
+): boolean {
+  const declared = (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST];
+  if (declared === undefined) return true;
+  delete (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST];
+  if (dispatchProofBodyMatches(declared, body)) return true;
+  for (const h of INTERNAL_DISPATCH_HEADERS) {
+    delete req.headers[h];
+  }
+  reportDispatchProofRejected("body-mismatch");
+  return false;
+}
+
 export interface RequestTrustOptions {
   internalSecret?: string | undefined;
   trustInternalHeaders?: boolean;
@@ -110,9 +152,10 @@ export function applyIncomingRequestTrustBoundary(
   const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
   let trusted: boolean;
   if (internalSecret) {
-    trusted =
-      typeof presentedProof === "string" &&
-      verifyDispatchProof(
+    if (typeof presentedProof !== "string") {
+      trusted = false;
+    } else {
+      const verdict = verifyDispatchProof(
         internalSecret,
         {
           method: req.method,
@@ -122,11 +165,22 @@ export function applyIncomingRequestTrustBoundary(
         },
         presentedProof,
       );
-    // A0-DP-2. Report the rejection. Only when a proof was actually PRESENTED: no proof at all is
-    // the ordinary untrusted path (ext_proc fail-open, a CEL-excluded route, a body request, a
-    // client hitting the pool directly) and is not a signal. See telemetry.ts
-    // recordDispatchProofRejected for why this branch must never be silent again.
-    if (!trusted && typeof presentedProof === "string") reportDispatchProofRejected("mismatch");
+      trusted = verdict.trusted;
+      if (verdict.trusted) {
+        // A0-DP-5. A declared body digest is an ASSERTION, not yet a check: the body has not been
+        // read at this boundary. Park it so the caller that DOES read the body can enforce it
+        // (`enforceDispatchBodyBinding`, called from index.ts once readRequestBody returns).
+        // Always assigned — including `undefined` — so a second pass over the same request cannot
+        // inherit a stale digest from the first.
+        (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST] = verdict.bodyDigest;
+      } else {
+        // A0-DP-2. Report the rejection with its reason. Only when a proof was actually PRESENTED:
+        // no proof at all is the ordinary untrusted path (ext_proc fail-open, a CEL-excluded route,
+        // a body request, a client hitting the pool directly) and is not a signal. See telemetry.ts
+        // recordDispatchProofRejected for why this branch must never be silent again.
+        reportDispatchProofRejected(verdict.reason);
+      }
+    }
   } else {
     trusted = trustInternalHeaders;
   }

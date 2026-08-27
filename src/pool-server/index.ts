@@ -71,6 +71,7 @@ import {
 import {
   applyRequestTrustBoundary,
   createPoolServer,
+  enforceDispatchBodyBinding,
   filterWriteHeadHeadersArg,
   LIVENESS_PATH,
   READINESS_PATH,
@@ -2986,6 +2987,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // Node stream has already been consumed upstream.
       addRequestMeta(req as unknown as Record<PropertyKey, unknown>, "actionBody", bodyBuffer);
     }
+
+    // A0-DP-5 (SECURITY). The second half of the dispatch proof's body binding. The trust boundary
+    // verified the MAC (which covers the digest the signer DECLARED, so it cannot be edited in
+    // transit) but had no body to compare it against — the boundary runs at the header phase, by
+    // design. This is the single point on the serving path where the body becomes known, and it is
+    // before anything reads the trusted `x-mw-evaluated` / `x-output-id` verdict below, so a
+    // mismatch revokes trust in time: the dispatch vocabulary is stripped and this request
+    // re-resolves locally with its real body, exactly like an unproven one. Closes the cross-pool
+    // replay where an observed POST proof was re-sent with attacker-chosen bytes.
+    enforceDispatchBodyBinding(req, bodyBuffer);
 
     // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
     // bodies routinely carry credentials, tokens, and PII, and were previously written to

@@ -1,6 +1,6 @@
 // tests/dispatch-proof-wire-canonicalization.test.ts
 //
-// A0-DP-2 / A0-DP-3. The dispatch proof across the TIER BOUNDARY, over a real socket.
+// A0-DP-2 / A0-DP-3 / A0-DP-5. The dispatch proof across the TIER BOUNDARY, over a real socket.
 //
 // tests/routing-common.dispatch-proof.test.ts pins the transcript's construction; the two tier
 // test files pin each side's signing and verifying against synthetic requests. Neither could see
@@ -17,16 +17,24 @@
 // Every test here therefore drives the REAL edge handler, applies its mutation response the way
 // Envoy does, puts the result on a REAL socket, and verifies through the REAL pool trust boundary.
 // A canonicalization that is only self-consistent within one tier cannot pass.
+//
+// The A0-DP-5 block at the bottom uses the same shape for the two properties that are about a
+// TRANSMISSION rather than a tuple — the freshness window and the cross-pool body binding — since
+// both are only meaningful against a request that really crossed a socket.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createServer, request as httpRequest, type IncomingMessage } from "node:http";
 import { connect, createServer as createNetServer } from "node:net";
 import { once } from "node:events";
 import { createRequestHandler } from "../src/routing-service/handler.js";
-import { applyIncomingRequestTrustBoundary } from "../src/pool-server/server.js";
+import {
+  applyIncomingRequestTrustBoundary,
+  enforceDispatchBodyBinding,
+} from "../src/pool-server/server.js";
 import { mockRouting } from "./helpers/mock-outputs.js";
 import {
   buildProofHeaderNames,
   computeDispatchProof,
+  DISPATCH_PROOF_MAX_AGE_MS,
   dispatchProofInputsFromRequest,
   INTERNAL_DISPATCH_PROOF_HEADER,
 } from "../src/routing-common.js";
@@ -436,5 +444,139 @@ describe("A0-DP-2 — the cross-pool hop is self-consistent (pool → pool)", ()
       headers: { host: AUTHORITY, "x-invoke-query": authored },
     }).headers["x-invoke-query"];
     expect(Buffer.isBuffer(signed) && signed.equals(Buffer.from(authored, "latin1"))).toBe(true);
+  });
+});
+
+describe("A0-DP-5 — the pool enforces the body binding and the freshness window", () => {
+  /**
+   * A real cross-pool hop, end to end: sign a POST the way `proxyToPool` does, send it with Node's
+   * HTTP client, and run BOTH halves of the receiving pool's check — the header-phase trust
+   * boundary and, once the body has been read, `enforceDispatchBodyBinding` (which index.ts calls
+   * at its single body-buffering point). `sentBody` is what actually goes on the wire, so a test
+   * can sign one body and transmit another, which is the replay this closes.
+   */
+  async function crossPoolPost(args: {
+    signedBody: Buffer;
+    sentBody?: Buffer;
+    issuedAtMs?: number;
+  }): Promise<{ trusted: boolean; bodyBound: boolean; mwEvaluated: string | undefined }> {
+    const sentBody = args.sentBody ?? args.signedBody;
+    let result:
+      | { trusted: boolean; bodyBound: boolean; mwEvaluated: string | undefined }
+      | undefined;
+    const server = createServer((req, res) => {
+      const trusted = applyIncomingRequestTrustBoundary(req, { internalSecret: SECRET });
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const bodyBound = enforceDispatchBodyBinding(req, Buffer.concat(chunks));
+        result = {
+          trusted,
+          bodyBound,
+          mwEvaluated: req.headers["x-mw-evaluated"] as string | undefined,
+        };
+        res.writeHead(204).end();
+      });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const { port } = server.address() as { port: number };
+      const outbound: Record<string, string> = {
+        host: AUTHORITY,
+        "x-mw-evaluated": "ran",
+        "x-output-id": "/api/submit",
+        "content-length": String(sentBody.length),
+      };
+      outbound[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
+        SECRET,
+        dispatchProofInputsFromRequest(
+          { method: "POST", target: "/api/submit", headers: outbound },
+          { body: args.signedBody, ...(args.issuedAtMs ? { issuedAtMs: args.issuedAtMs } : {}) },
+        ),
+      );
+      const req = httpRequest({
+        host: "127.0.0.1",
+        port,
+        path: "/api/submit",
+        method: "POST",
+        headers: outbound,
+      });
+      req.end(sentBody);
+      await once(req, "response");
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+    if (!result) throw new Error("the receiving pool never completed a request");
+    return result;
+  }
+
+  it("accepts a body-bound cross-pool POST whose body is the one that was signed", async () => {
+    const body = Buffer.from("formData=honest");
+    const result = await crossPoolPost({ signedBody: body });
+    expect(result.trusted).toBe(true);
+    expect(result.bodyBound).toBe(true);
+    // Trust survives, so the sibling pool honors the upstream middleware verdict.
+    expect(result.mwEvaluated).toBe("ran");
+  });
+
+  it("revokes trust when the body does not match the one the proof bound", async () => {
+    // The replay: an observed proof re-sent with attacker-chosen bytes. The MAC still verifies —
+    // it covers headers and the DECLARED digest — so the header boundary cannot see it; the
+    // body check does, and strips the dispatch vocabulary so the request re-resolves locally
+    // (middleware runs against the real body).
+    const result = await crossPoolPost({
+      signedBody: Buffer.from("formData=honest"),
+      sentBody: Buffer.from("formData=attack"),
+    });
+    expect(result.trusted).toBe(true);
+    expect(result.bodyBound).toBe(false);
+    expect(result.mwEvaluated).toBeUndefined();
+  });
+
+  it("refuses a credential minted outside the freshness window", async () => {
+    const body = Buffer.from("formData=honest");
+    const result = await crossPoolPost({
+      signedBody: body,
+      issuedAtMs: Date.now() - DISPATCH_PROOF_MAX_AGE_MS - 60_000,
+    });
+    expect(result.trusted).toBe(false);
+    expect(result.mwEvaluated).toBeUndefined();
+  });
+
+  it("still accepts one minted a moment ago", async () => {
+    const body = Buffer.from("formData=honest");
+    const result = await crossPoolPost({ signedBody: body, issuedAtMs: Date.now() - 1_000 });
+    expect(result.trusted).toBe(true);
+    expect(result.bodyBound).toBe(true);
+  });
+
+  it("refuses a stale credential on the edge→pool path too", async () => {
+    // The edge binds ABSENT for the body, so the mint time is the ONLY thing bounding a captured
+    // ext_proc exchange — which is exactly the observer in the PR's threat model.
+    const manifest = makeManifest();
+    const proofHeaderNames = buildProofHeaderNames(manifest);
+    vi.mocked(resolveRoutes).mockResolvedValue({
+      resolvedPathname: "/about",
+      invocationTarget: { pathname: "/about", query: {} },
+    } as never);
+    const entries = extProcHeaders("/about");
+    const response = await createRequestHandler(manifest, null)(entries);
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    const raw = envoyUpstreamBytes(entries, mutation);
+    // Fresh, it verifies.
+    expect((await throughPoolBoundary(raw, proofHeaderNames)).trusted).toBe(true);
+    // Replayed a day later — the identical octets — it does not.
+    // Only Date is faked: the real socket/server below still needs real timers.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 86_400_000);
+      const replayed = await throughPoolBoundary(raw, proofHeaderNames);
+      expect(replayed.trusted).toBe(false);
+      expect(replayed.mwEvaluated).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

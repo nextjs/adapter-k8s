@@ -989,6 +989,12 @@ export function createRequestHandler(
           authority: rawAuthorityBytes,
           headers: covered,
           proofHeaderNames,
+          // A0-DP-5. Bind the mint time, so a captured exchange stops verifying once the window
+          // closes instead of replaying forever. No body digest: the header-phase ext_proc callout
+          // never has a body, so this tier binds the ABSENT symbol — and a build with middleware
+          // never reaches here for a body-capable request anyway (see the non-GET/HEAD bail
+          // above, which clears the whole vocabulary and stamps nothing).
+          issuedAtMs: Date.now(),
         }),
       });
       clear.delete(INTERNAL_DISPATCH_PROOF_HEADER);
