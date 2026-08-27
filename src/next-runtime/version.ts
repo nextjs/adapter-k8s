@@ -1,5 +1,5 @@
 export const SUPPORTED_NEXT_RELEASE_LINE = ">=16.3.0 <16.4.0";
-export const NEXT_CANARY_CONFORMANCE_VERSION = "16.3.0-canary.97";
+export const PINNED_NEXT_CANARY = "16.3.0-canary.97";
 
 export type NextVersionSupport =
   | { supported: true; prerelease: boolean }
@@ -29,10 +29,10 @@ export function checkSupportedNextVersion(version: unknown): NextVersionSupport 
 
   const prerelease = match[4];
   if (prerelease !== undefined) {
-    if (version !== NEXT_CANARY_CONFORMANCE_VERSION) {
+    if (version !== PINNED_NEXT_CANARY) {
       return {
         supported: false,
-        reason: `is not the pinned Next.js ${NEXT_CANARY_CONFORMANCE_VERSION} conformance lane`,
+        reason: `is not the pinned ${PINNED_NEXT_CANARY} canary conformance lane`,
       };
     }
     return { supported: true, prerelease: true };

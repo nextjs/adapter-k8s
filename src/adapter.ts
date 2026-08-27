@@ -33,6 +33,7 @@ import { resolveProvider } from "./providers/index.js";
 import { compileTarget } from "./target/index.js";
 import { resolveConfiguredTarget } from "./target/legacy.js";
 import { fingerprintCompositionPlan } from "./composition-plan/index.js";
+import { assertSupportedNextVersion } from "./next-runtime/version.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 import { targetPlatform, type TargetPlatform } from "./target-platform.js";
 import {
@@ -1321,6 +1322,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     async modifyConfig(nextConfig, _ctx) {
       // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
       // Use process.cwd() which is the project root during build.
+      if (_ctx.nextVersion !== undefined) {
+        assertSupportedNextVersion(_ctx.nextVersion, "Next.js build configuration");
+      }
       const cfg = await ensureConfig(process.cwd());
 
       // N14: `deploymentId` (Next's skew protection) makes Next return a CONSTANT build id
@@ -1601,6 +1605,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         buildId: ctxBuildId,
         nextVersion,
       } = ctx;
+      // Runtime startup repeats this check as a skew/tamper defense, but an unsupported build
+      // must fail before the adapter emits or stages any deployment artifact.
+      assertSupportedNextVersion(nextVersion, "Next.js build output");
       const deploymentId = (nextConfig as { deploymentId?: string }).deploymentId;
       // Substitute Next's pinned deploymentId-mode constant with a unique id — see
       // effectiveBuildId. Everything below (resource names, image tags, Valkey namespace,
