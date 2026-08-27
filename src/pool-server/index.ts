@@ -229,6 +229,17 @@ async function registerInstrumentationHook(): Promise<InstrumentationStatus> {
   }
 }
 
+/**
+ * Post-SIGTERM application drain budget (see the shutdown handler at the end of
+ * startPoolServer). Exported because it is ROLLOUT arithmetic as much as runtime
+ * arithmetic: a terminating pod spends this long after its 120 s preStop, and with
+ * `maxUnavailable: 0` the next surge step cannot start until it is gone — so
+ * src/cutover/gates.ts derives the `kubectl rollout status` budget from it via the
+ * `POOL_SHUTDOWN_GRACE_SECONDS` mirror in src/emit/templates/deployment.ts (kept
+ * dependency-free of this bundle, pinned by a test that imports both).
+ */
+export const DEFAULT_SHUTDOWN_GRACE_MS = 60_000;
+
 // DoS backstop: the pool buffers request/image bodies fully in memory (the
 // loopback handler needs a fixed-length body, and middleware may read it). Cap
 // the buffer well above any legitimate payload so app-level limits
@@ -3915,7 +3926,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Spend 60s on application work and retain 30s for close-frame flushing, runtime cleanup,
     // kubelet scheduling delay, and the hard-exit cushion. The old 15s budget then cut HTTP/SSE
     // streams at its halfway mark (7.5s), despite the pod already reserving far more time.
-    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || 60_000,
+    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || DEFAULT_SHUTDOWN_GRACE_MS,
   );
   const shutdown = async () => {
     if (shuttingDown) return;

@@ -43,6 +43,27 @@ export const PRESTOP_DRAIN_SECONDS = 120;
 export const TERMINATION_GRACE_SECONDS = 210;
 
 /**
+ * A2. The rest of the rollout arithmetic, exported (and interpolated into the manifest
+ * below) so the cutover's `kubectl rollout status` wait can be DERIVED from the chart's own
+ * parameters instead of restating them as a hardcoded number that drifts every time one of
+ * them moves — see `deriveRolloutWaitBudget` in src/cutover/gates.ts.
+ *
+ * `MIN_READY_SECONDS` is the GFE health-check window (N63); the readiness probe values are
+ * N71's explicit timings. `POOL_SHUTDOWN_GRACE_SECONDS` mirrors the pool server's own
+ * post-SIGTERM budget (`SHUTDOWN_GRACE_MS` / `DEFAULT_SHUTDOWN_GRACE_MS` in
+ * src/pool-server/index.ts, env-overridable via ADAPTER_K8S_SHUTDOWN_GRACE_MS) — the pool
+ * deliberately holds SSE/WebSocket connections for the COMPLETE window, so it is real
+ * wall-clock time a terminating pod spends after its 120 s preStop and BEFORE the next
+ * surge step of a `maxUnavailable: 0` rollout can start. Duplicated rather than imported so
+ * this template module stays dependency-free of the pool-server runtime (same rule as
+ * `POOL_READINESS_PATH` below); pinned by a test that imports both.
+ */
+export const MIN_READY_SECONDS = 30;
+export const READINESS_PROBE_PERIOD_SECONDS = 5;
+export const READINESS_PROBE_FAILURE_THRESHOLD = 3;
+export const POOL_SHUTDOWN_GRACE_SECONDS = 60;
+
+/**
  * Ephemeral-storage sizing. `/app/.next/cache` is Next's FILESYSTEM incremental cache —
  * the fallback whenever the shared Valkey handler isn't wired — and it grows without
  * bound. An `emptyDir` with no `sizeLimit` is charged against the pod's ephemeral-storage
@@ -292,12 +313,16 @@ ${replicaLine}  # N63. The other half of the 502/503 fix: a pool Deployment DOES
   # Service still selects it. maxUnavailable: 0 + maxSurge: 1 never dips, and
   # minReadySeconds gives the GFE time to health-check each new pod into the NEG before the
   # next one is replaced — the same shape the routing tier already used.
+  #
+  # A2: this shape is also what makes a rollout SERIAL, so the cutover's rollout wait is
+  # derived from these numbers (MIN_READY_SECONDS below + PRESTOP_DRAIN_SECONDS +
+  # POOL_SHUTDOWN_GRACE_SECONDS, times the replica count) rather than hardcoded.
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
-  minReadySeconds: 30
+  minReadySeconds: ${MIN_READY_SECONDS}
   selector:
     matchLabels:
       app.kubernetes.io/name: "${releaseName}"
@@ -400,9 +425,9 @@ ${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${
             httpGet:
               path: ${readinessPath}
               port: 3000
-            periodSeconds: 5
+            periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
             timeoutSeconds: 3
-            failureThreshold: 3
+            failureThreshold: ${READINESS_PROBE_FAILURE_THRESHOLD}
           livenessProbe:
             httpGet:
               path: /healthz

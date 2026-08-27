@@ -8,26 +8,111 @@ import { execCapture, EXEC_TIMEOUTS } from "../cli/exec.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
 import { poolResourceNames } from "../emit/templates/utils.js";
 import { routingServiceDeploymentName } from "../emit/templates/routing-manifest-configmap.js";
-import { POOL_READINESS_PATH } from "../emit/templates/deployment.js";
+import {
+  MIN_READY_SECONDS,
+  POOL_READINESS_PATH,
+  POOL_SHUTDOWN_GRACE_SECONDS,
+  PRESTOP_DRAIN_SECONDS,
+  READINESS_PROBE_FAILURE_THRESHOLD,
+  READINESS_PROBE_PERIOD_SECONDS,
+} from "../emit/templates/deployment.js";
 import { CutoverExitError, type CutoverDeps } from "./inputs.js";
 
 /**
- * How long to wait for a Deployment rollout.
+ * How long to wait for a Deployment rollout — DERIVED from the chart's own rollout
+ * parameters, per replica, instead of restated as a constant.
  *
- * 120s was arithmetically impossible against the chart's OWN rollout parameters and only ever
- * passed by luck. The emitted Deployments use `maxUnavailable: 0` with `minReadySeconds: 30` and a
- * `preStop: sleep 120` (N63, for load-balancer connection draining), so a 2-replica rollout is
- * strictly serial: each new pod takes ~10s to become ready, +30s before it counts as available,
- * and the old pod it replaces spends 120s in preStop before the next surge can start. That is
- * ~200-320s for two replicas — MEASURED on a 3-node arm64 cluster, where the routing tier
- * reliably tripped the 120s wait while `kubectl rollout status` reported success moments later.
- * GKE dodged it only because its routing Deployment spec is often unchanged between builds.
+ * 120s was arithmetically impossible against those parameters and only ever passed by luck. The
+ * emitted Deployments use `maxUnavailable: 0` with `minReadySeconds: 30` and a `preStop: sleep
+ * 120` (N63, for load-balancer connection draining), so a rollout is strictly serial: each new
+ * pod takes ~10s to become ready, +30s before it counts as available, and the old pod it replaces
+ * spends 120s in preStop before the next surge can start. That is ~200-320s for two replicas —
+ * MEASURED on a 3-node arm64 cluster, where the routing tier reliably tripped the 120s wait while
+ * `kubectl rollout status` reported success moments later. GKE dodged it only because its routing
+ * Deployment spec is often unchanged between builds.
  *
- * 600s matches the chart's `progressDeadlineSeconds`: that is Kubernetes' own verdict on a stalled
- * rollout, so waiting less rejects a rollout the cluster still considers healthy, and waiting
- * longer outlives the deadline that would mark it Failed.
+ * A2: the 600s that replaced it was still a CONSTANT, and the arithmetic above has since grown a
+ * term. PR #50 raised the pool's post-SIGTERM drain budget to 60s (POOL_SHUTDOWN_GRACE_SECONDS,
+ * mirroring `DEFAULT_SHUTDOWN_GRACE_MS` in src/pool-server/index.ts) and deliberately holds
+ * SSE/WebSocket connections for the COMPLETE window, so an old pod now occupies its surge slot
+ * for ~180s + the new pod's ready+available time. Serially, that exceeds 600s from four replicas
+ * up — and this gate would then fail a rollout that was still PROGRESSING, abort the cutover, and
+ * revert the edge, for no reason other than its own stale constant. `progressDeadlineSeconds` is
+ * not a rebuttal: the chart leaves it at the Kubernetes default of 600s, and that deadline is
+ * measured from the last observed PROGRESS, not from the start of the rollout. A rollout that
+ * surges one pod every ~225s therefore never trips it, however many replicas it has, while its
+ * TOTAL wall clock grows without bound in the replica count. So the total is what has to be
+ * derived; Kubernetes keeps the verdict on a rollout that has actually stalled.
  */
-export const KUBECTL_ROLLOUT_TIMEOUT = "--timeout=600s";
+export const ROLLOUT_TIMEOUT_FLOOR_SECONDS = 600;
+
+/**
+ * A2 ceiling. Bounded for two reasons: a CLI deploy must not hang for an unattended hour
+ * (the in-cluster cutover Job inherits the same budget through runCutover, and it holds the
+ * HPA warm-up bounds for the whole wait — N67), and past some point "not finished yet" stops
+ * being distinguishable from "stalled in a way `kubectl rollout status` will never resolve".
+ * 30 minutes covers ~7 serial replicas at the per-step cost below; a deployment large enough
+ * to need more should be looked at by a human rather than waited on by a gate.
+ */
+export const ROLLOUT_TIMEOUT_CEILING_SECONDS = 1800;
+
+/**
+ * Wall clock ONE surge step of a `maxUnavailable: 0` / `maxSurge: 1` rollout costs:
+ * the new pod becoming Ready, `minReadySeconds` before it counts as available, then the old
+ * pod's full 120s preStop plus the pool server's 60s application drain before the slot frees.
+ *
+ * The ready term is the readiness probe's own `periodSeconds × failureThreshold` (15s — the
+ * window in which the kubelet will notice a pod that needed one retry) plus 30s of
+ * scheduling/image-pull slack, i.e. ~3x the ~10s measured on the arm64 cluster. The
+ * startupProbe's 150s ceiling (N71) is deliberately NOT budgeted per replica: it bounds a
+ * PATHOLOGICAL boot, and multiplying it by the replica count would triple every deploy's
+ * wait to cover a case the floor already absorbs for small deployments and
+ * `progressDeadlineSeconds` catches for large ones.
+ */
+export const ROLLOUT_SURGE_STEP_SECONDS =
+  READINESS_PROBE_PERIOD_SECONDS * READINESS_PROBE_FAILURE_THRESHOLD +
+  30 +
+  MIN_READY_SECONDS +
+  PRESTOP_DRAIN_SECONDS +
+  POOL_SHUTDOWN_GRACE_SECONDS;
+
+/** The derived `kubectl rollout status` budget, plus the subprocess ceiling that must outlive it. */
+export interface RolloutWaitBudget {
+  /** `--timeout=<n>s`, passed to every `kubectl rollout status` in the battery. */
+  arg: string;
+  /** The same number, for the abort messages (which used to quote a stale "120s"). */
+  seconds: number;
+  /**
+   * execCapture ceiling. exec.ts's `rollout` tier exists to "give the child headroom past the
+   * flag so kubectl reports the failure, not us" — a derived budget above that tier would
+   * invert it and kill kubectl mid-wait, so carry the headroom with the budget.
+   */
+  execTimeoutMs: number;
+}
+
+/**
+ * A2. Derive the rollout wait from the replica count actually in play.
+ *
+ * `replicas` is the largest per-pool live replica count of the build being REPLACED
+ * (`CutoverInputs.previousReplicasByPool`, N64's fail-closed pre-`helm upgrade` read): it is
+ * the count the D6 warm-up scales the incoming build to, and the count the outgoing pods
+ * surge out of when a Deployment rolls in place (the routing tier every build, a pool
+ * whenever the pod template changes under an unchanged build id). Pools roll in parallel in
+ * the cluster even though this battery awaits them one at a time, so the budget is per
+ * Deployment, not summed across them.
+ */
+export function deriveRolloutWaitBudget(replicas: number): RolloutWaitBudget {
+  const safeReplicas = Number.isFinite(replicas) ? Math.max(1, Math.floor(replicas)) : 1;
+  const seconds = Math.min(
+    ROLLOUT_TIMEOUT_CEILING_SECONDS,
+    Math.max(ROLLOUT_TIMEOUT_FLOOR_SECONDS, safeReplicas * ROLLOUT_SURGE_STEP_SECONDS),
+  );
+  return {
+    arg: `--timeout=${seconds}s`,
+    seconds,
+    execTimeoutMs: Math.max(EXEC_TIMEOUTS.rollout, seconds * 1000 + 60_000),
+  };
+}
 
 /** Shared identifiers every gate needs — one object so the call sites stay short. */
 export interface GateContext {
@@ -40,6 +125,13 @@ export interface GateContext {
    */
   safeBuildId: string;
   previousBuildId: string | null;
+  /**
+   * A2: the derived rollout wait, computed ONCE by the orchestrator (runCutover) so every
+   * gate in the battery — and both entrypoints, CLI and in-cluster Job — waits the same
+   * budget. Carried on the context rather than recomputed per gate so a future gate cannot
+   * quietly reintroduce a constant.
+   */
+  rolloutWait: RolloutWaitBudget;
   deps: CutoverDeps;
 }
 
@@ -50,7 +142,7 @@ export interface GateContext {
 // build whose id shared that prefix could satisfy this readiness check; the cutover would then
 // patch Services to the full new label, match zero pods, drain the NEG, and 503 the origin.
 export async function waitPoolRollouts(ctx: GateContext): Promise<void> {
-  const { releaseName, namespace, safeBuildId, deps } = ctx;
+  const { releaseName, namespace, safeBuildId, rolloutWait, deps } = ctx;
   console.log(`\n  → Waiting for new pods to be ready...`);
   const newDeployResult = await execCapture(
     "kubectl",
@@ -78,8 +170,8 @@ export async function waitPoolRollouts(ctx: GateContext): Promise<void> {
     console.log(`    Waiting for ${deployName}...`);
     const rollout = await execCapture(
       "kubectl",
-      ["rollout", "status", `deployment/${deployName}`, "-n", namespace, KUBECTL_ROLLOUT_TIMEOUT],
-      { timeoutMs: EXEC_TIMEOUTS.rollout },
+      ["rollout", "status", `deployment/${deployName}`, "-n", namespace, rolloutWait.arg],
+      { timeoutMs: rolloutWait.execTimeoutMs },
     );
     // The pod-health gate below is the real readiness gate, but don't walk into it on
     // an already-failed rollout — the exit code was previously discarded, so a stuck
@@ -90,8 +182,9 @@ export async function waitPoolRollouts(ctx: GateContext): Promise<void> {
       const edge = await deps.restoreEdgeToPreviousBuild();
       throw new Error(
         [
-          `Deployment ${deployName} did not finish rolling out within 120s. Traffic was ` +
-            `NOT switched — the previous build's pools are still serving.`,
+          `Deployment ${deployName} did not finish rolling out within ` +
+            `${rolloutWait.seconds}s. Traffic was NOT switched — the previous build's pools ` +
+            `are still serving.`,
           // L14: kubectl rollout output carries controller/admission messages.
           `${sanitizeForTerminal((rollout.stderr || rollout.stdout).trim())}`,
           `Inspect: kubectl logs deployment/${deployName} -n ${namespace} --tail=40`,
@@ -108,7 +201,7 @@ export async function waitPoolRollouts(ctx: GateContext): Promise<void> {
 // the old ReplicaSet serving stale edge code and the deploy reported success. Verify it
 // actually rolls out; a stuck rollout is fatal.
 export async function waitRoutingRollout(ctx: GateContext): Promise<void> {
-  const { releaseName, namespace, deps } = ctx;
+  const { releaseName, namespace, rolloutWait, deps } = ctx;
   const routingDeploy = routingServiceDeploymentName(releaseName);
   const rsExists = await execCapture(
     "kubectl",
@@ -119,15 +212,8 @@ export async function waitRoutingRollout(ctx: GateContext): Promise<void> {
     console.log(`    Waiting for ${routingDeploy}...`);
     const rsRollout = await execCapture(
       "kubectl",
-      [
-        "rollout",
-        "status",
-        `deployment/${routingDeploy}`,
-        "-n",
-        namespace,
-        KUBECTL_ROLLOUT_TIMEOUT,
-      ],
-      { timeoutMs: EXEC_TIMEOUTS.rollout },
+      ["rollout", "status", `deployment/${routingDeploy}`, "-n", namespace, rolloutWait.arg],
+      { timeoutMs: rolloutWait.execTimeoutMs },
     );
     if (rsRollout.exitCode !== 0) {
       // The new routing pods can't roll — but the OLD routing pods already picked up the
@@ -136,8 +222,9 @@ export async function waitRoutingRollout(ctx: GateContext): Promise<void> {
       const edge = await deps.restoreEdgeToPreviousBuild();
       throw new Error(
         [
-          `Routing service (${routingDeploy}) did not become healthy. Traffic was NOT ` +
-            `switched — the previous build's pools are still serving.`,
+          `Routing service (${routingDeploy}) did not become healthy within ` +
+            `${rolloutWait.seconds}s. Traffic was NOT switched — the previous build's pools ` +
+            `are still serving.`,
           `${sanitizeForTerminal((rsRollout.stderr || rsRollout.stdout).trim())}`,
           `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${namespace} --tail=40`,
           ...deps.edgeStatusLines(edge),

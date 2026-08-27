@@ -17,8 +17,11 @@
 //      flap the HPA warm-up against a build that will never pass.
 //
 // PLAIN Job semantics (real-cluster gap #4): nothing here depends on Argo hook ordering.
-// The Job races the sync that applied it, and the FIRST gate (D1 exact-version rollout
-// wait, 600s budget) is exactly the wait a PostSync hook would have provided.
+// The Job races the sync that applied it, and the FIRST gate (D1 exact-version rollout wait —
+// A2: a budget DERIVED from the replica count, floored at the 600s this used to hardcode)
+// is exactly the wait a PostSync hook would have provided. The derivation lives in
+// runCutover, so the Job inherits it for free: readPreviousReplicas supplies the same
+// per-pool live counts the CLI reads before `helm upgrade`.
 import { runCutover } from "./run.js";
 import { createEdgeRecovery, revertRoutingServiceToBuild } from "./edge.js";
 import { CutoverExitError } from "./inputs.js";

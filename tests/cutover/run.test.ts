@@ -39,6 +39,17 @@ import { execCapture } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
 import { loadDeployedCompositionPlan } from "../../src/cli/composition-plan.js";
+import {
+  deriveRolloutWaitBudget,
+  ROLLOUT_SURGE_STEP_SECONDS,
+  ROLLOUT_TIMEOUT_CEILING_SECONDS,
+  ROLLOUT_TIMEOUT_FLOOR_SECONDS,
+} from "../../src/cutover/gates.js";
+import {
+  MIN_READY_SECONDS,
+  POOL_SHUTDOWN_GRACE_SECONDS,
+  PRESTOP_DRAIN_SECONDS,
+} from "../../src/emit/templates/deployment.js";
 import { routeExtJobName } from "../../src/emit/templates/route-ext-update-job.js";
 import { emitMetadataConfigMapName } from "../../src/emit/templates/cutover-job.js";
 
@@ -493,6 +504,74 @@ describe("runCutover — D1: the EXACT-version rollout wait (the 12-char-prefix 
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     // The edge has been on the new build since the sync overwrote the stable manifest CM.
     expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+});
+
+describe("runCutover — A2: the rollout wait is DERIVED from the termination budget", () => {
+  /** Every `--timeout=<n>s` this cutover passed to `kubectl rollout status`. */
+  function rolloutTimeoutArgs(): string[] {
+    return vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, a]) => a[0] === "rollout")
+      .map(([, a]) => a.find((x) => x.startsWith("--timeout="))!);
+  }
+
+  it("small deployment: keeps the 600s floor the constant used to hardcode", async () => {
+    // Two replicas cost ~2 x 225s serially, which is under the floor — so the budget that
+    // shipped before A2 is unchanged for the deployments it was actually adequate for.
+    vi.mocked(execCapture).mockImplementation(cluster({ readyPerPool: { ssr: 2 } }) as never);
+
+    await runCutover(inputs({ previousReplicasByPool: new Map([["ssr", 2]]) }), deps);
+
+    const args = rolloutTimeoutArgs();
+    expect(args.length).toBeGreaterThan(0);
+    expect(new Set(args)).toEqual(new Set([`--timeout=${ROLLOUT_TIMEOUT_FLOOR_SECONDS}s`]));
+    expect(deriveRolloutWaitBudget(2).seconds).toBe(600);
+  });
+
+  it("large-replica deployment: derives a LARGER budget so a progressing rollout is not failed", async () => {
+    // 8 replicas x (15+30 ready + 30 minReady + 120 preStop + 60 drain) = 1800s of serial
+    // surge steps. Under the old fixed 600s this gate aborted a cutover whose rollout was
+    // still making progress (and progressDeadlineSeconds, measured from the last progress,
+    // never marked it Failed).
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ readyPerPool: { ssr: 8 }, newBuildHpa: { min: 1, max: 8 } }) as never,
+    );
+
+    await runCutover(inputs({ previousReplicasByPool: new Map([["ssr", 8]]) }), deps);
+
+    const args = rolloutTimeoutArgs();
+    const derived = 8 * ROLLOUT_SURGE_STEP_SECONDS;
+    expect(derived).toBeGreaterThan(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+    expect(new Set(args)).toEqual(new Set([`--timeout=${Math.min(derived, 1800)}s`]));
+    // D2 (the routing tier, the one Deployment that rolls IN PLACE every build) waits the
+    // same derived budget as the pool gate — one budget, computed once by the orchestrator.
+    expect(args.length).toBeGreaterThan(1);
+  });
+
+  it("the subprocess ceiling always outlives the flag, and the ceiling caps the derivation", () => {
+    // exec.ts's rollout tier exists to let kubectl report the timeout rather than have the
+    // parent kill it; a derived budget above that tier must carry its own headroom.
+    for (const replicas of [1, 2, 8, 40, 10_000]) {
+      const b = deriveRolloutWaitBudget(replicas);
+      expect(b.seconds).toBeGreaterThanOrEqual(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+      expect(b.seconds).toBeLessThanOrEqual(ROLLOUT_TIMEOUT_CEILING_SECONDS);
+      expect(b.execTimeoutMs).toBeGreaterThan(b.seconds * 1000);
+      expect(b.arg).toBe(`--timeout=${b.seconds}s`);
+    }
+    // A missing/garbage live replica read degrades to the floor, never to zero.
+    expect(deriveRolloutWaitBudget(0).seconds).toBe(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+    expect(deriveRolloutWaitBudget(NaN).seconds).toBe(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+  });
+
+  it("keeps the chart's rollout arithmetic and the pool server's drain budget in agreement", async () => {
+    // The derivation restates numbers that live in two other modules. If either moves and
+    // this does not, the comment on deriveRolloutWaitBudget becomes a lie.
+    const { DEFAULT_SHUTDOWN_GRACE_MS } = await import("../../src/pool-server/index.js");
+    expect(POOL_SHUTDOWN_GRACE_SECONDS * 1000).toBe(DEFAULT_SHUTDOWN_GRACE_MS);
+    expect(ROLLOUT_SURGE_STEP_SECONDS).toBe(
+      15 + 30 + MIN_READY_SECONDS + PRESTOP_DRAIN_SECONDS + POOL_SHUTDOWN_GRACE_SECONDS,
+    );
   });
 });
 

@@ -18,6 +18,7 @@ import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 import type { TargetPlatform } from "../target-platform.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
 import {
+  deriveRolloutWaitBudget,
   waitPoolRollouts,
   waitRoutingRollout,
   waitRouteExtJob,
@@ -80,7 +81,21 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
   // build whose id shared that prefix could satisfy this readiness check; the cutover would then
   // patch Services to the full new label, match zero pods, drain the NEG, and 503 the origin.
   const safeBuildId = sanitizeK8sName(buildId);
-  const ctx: GateContext = { releaseName, namespace, buildId, safeBuildId, previousBuildId, deps };
+  // A2: derive the rollout wait from the budget the rollout will ACTUALLY spend — replica
+  // count x (ready + minReadySeconds + preStop + the pool's post-SIGTERM drain) — rather than
+  // the constant it replaced, which a large-replica deploy outgrew (see
+  // deriveRolloutWaitBudget). Computed once here so the CLI and the in-cluster cutover Job,
+  // which both enter through this function, cannot wait different budgets.
+  const rolloutWait = deriveRolloutWaitBudget(Math.max(1, ...previousReplicasByPool.values()));
+  const ctx: GateContext = {
+    releaseName,
+    namespace,
+    buildId,
+    safeBuildId,
+    previousBuildId,
+    rolloutWait,
+    deps,
+  };
 
   // D1. Wait for the new build's pool Deployments to be ready (7a).
   await waitPoolRollouts(ctx);

@@ -14,7 +14,10 @@ import {
 import type { EnvValue, EnvFromSource } from "../../types.js";
 import {
   assertSafeImageDigest,
+  MIN_READY_SECONDS,
   PRESTOP_DRAIN_SECONDS,
+  READINESS_PROBE_FAILURE_THRESHOLD,
+  READINESS_PROBE_PERIOD_SECONDS,
   TERMINATION_GRACE_SECONDS,
 } from "./deployment.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
@@ -178,7 +181,10 @@ spec:
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
-  minReadySeconds: 30
+  # A2: shared with the pool template so the cutover's derived rollout wait (gates.ts
+  # deriveRolloutWaitBudget) covers THIS tier too — it is the one Deployment that rolls
+  # in place on every build, i.e. the one that actually pays the serial preStop cost.
+  minReadySeconds: ${MIN_READY_SECONDS}
   selector:
     matchLabels:
       app.kubernetes.io/name: "${releaseName}"
@@ -281,9 +287,9 @@ ${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
               path: /healthz
               port: 8081
             initialDelaySeconds: 3
-            periodSeconds: 5
+            periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
             timeoutSeconds: 3
-            failureThreshold: 3
+            failureThreshold: ${READINESS_PROBE_FAILURE_THRESHOLD}
           livenessProbe:
             httpGet:
               path: /healthz

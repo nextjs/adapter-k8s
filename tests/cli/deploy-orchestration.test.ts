@@ -1278,7 +1278,10 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/did not finish rolling out within 120s/);
+      // A2: the quoted budget is the DERIVED one (600s at this fixture's replica count),
+      // not the "120s" the message hardcoded for two rollout-budget revisions after the
+      // wait itself stopped being 120s.
+    ).rejects.toThrow(/did not finish rolling out within 600s/);
     // No selector patch, no state commit — the previous build keeps serving.
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
