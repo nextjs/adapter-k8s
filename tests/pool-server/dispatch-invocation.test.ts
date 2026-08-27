@@ -781,6 +781,42 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
       expect(calls[0].minimalMode).toBe(true);
     });
 
+    it("persists fully keyed partial-prefetch entries through the shared cache", async () => {
+      async function dispatchWithAllowQuery(allowQuery: string[]) {
+        const { calls, invoker } = invokerCapture();
+        const dispatcher = createDispatcher({
+          handlerLoader: handlerLoaderFor("/x/[category]/[id]", vi.fn(), "APP_PAGE"),
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          pprRoutes: {},
+          pprCapableRoutes: {
+            "/x/[category]/[id]": { rootParams: [], allowQuery },
+          },
+          incrementalCacheShared: true,
+          partialPrefetching: true,
+          rscConfig,
+          localHandlerInvoker: invoker as any,
+        });
+        await dispatcher.dispatch(
+          mockReq("/x/shoes/1"),
+          mockRes(),
+          routeResolution({
+            matchedPathname: "/x/[category]/[id]",
+            routeMatches: { category: "shoes", id: "1" },
+          }),
+        );
+        return calls[0];
+      }
+
+      const fullyKeyed = await dispatchWithAllowQuery(["nxtPcategory", "nxtPid"]);
+      expect(fullyKeyed.minimalMode).toBe(false);
+      expect(fullyKeyed.responsePrefix).toBeUndefined();
+
+      const missingParam = await dispatchWithAllowQuery(["nxtPcategory"]);
+      expect(missingParam.minimalMode).toBe(true);
+    });
+
     it("stays minimal for a route absent from BOTH pprRoutes and pprCapableRoutes", async () => {
       const { calls, invoker } = invokerCapture();
       const dispatcher = createDispatcher({
