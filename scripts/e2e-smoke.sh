@@ -114,33 +114,7 @@ for pid in "${pids[@]}"; do
   wait "$pid" || FAILED=1
 done
 
-# Aggregate exactly like e2e-lanes.sh: per-suite results.json newer than .run-start.
-python3 - "$RUN_DIR" "$HOME/Code/nextjs/.adapter-k8s-e2e/next.js" <<'EOF'
-import glob, json, os, sys
-run_dir, root = sys.argv[1], sys.argv[2]
-start = os.path.getmtime(os.path.join(run_dir, ".run-start"))
-suites = tot = p = f = retried = 0
-failed = []
-for fn in glob.glob(os.path.join(root, "test/**/*.results.json"), recursive=True):
-    if os.path.getmtime(fn) < start:
-        continue
-    try:
-        d = json.load(open(fn))
-    except Exception:
-        continue
-    suites += 1
-    tot += d.get("numTotalTests", 0)
-    p += d.get("numPassedTests", 0)
-    nf = d.get("numFailedTests", 0)
-    f += nf
-    for tr in d.get("testResults", []):
-        for a in tr.get("assertionResults", []):
-            if a.get("status") == "passed" and a.get("invocations", 1) > 1:
-                retried += 1
-    if nf:
-        failed.append(f'{fn[len(root) + 6:-len(".results.json")]} ({nf}/{d.get("numTotalTests")})')
-print(f"suites={suites} tests={tot} passed={p} failed={f} passed_on_retry={retried}")
-for x in sorted(failed):
-    print("  FAIL:", x)
-EOF
+# Aggregate exactly like e2e-lanes.sh, deriving NEXTJS_DIR instead of assuming one
+# contributor's checkout path. A zero-file aggregate fails the run.
+node "${SCRIPT_DIR}/e2e-aggregate-results.mjs" "$RUN_DIR"
 exit "$FAILED"

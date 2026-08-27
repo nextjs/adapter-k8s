@@ -21,7 +21,9 @@ import {
   EMULATE_ENVOY_IMAGE,
   EMULATE_LISTEN_HOST,
   EMULATE_VALKEY_IMAGE,
+  assertEmulateNodeVersion,
   renderEnvoyConfigForPort,
+  resolveEmulateEnvoyConfig,
 } from "../../src/cli/emulate.js";
 
 const SOURCE = `static_resources:
@@ -109,6 +111,40 @@ describe("renderEnvoyConfigForPort", () => {
 });
 
 describe("emulation security defaults", () => {
+  it("rejects host runtimes that cannot compile scoped regexp modifiers", () => {
+    expect(() => assertEmulateNodeVersion("20.16.0")).toThrow(/Node\.js 24/);
+    expect(() => assertEmulateNodeVersion("22.3.0")).toThrow(/Node\.js 24/);
+    expect(() => assertEmulateNodeVersion("24.0.0")).not.toThrow();
+    expect(() => assertEmulateNodeVersion("26.1.0")).not.toThrow();
+  });
+
+  it("resolves the packaged Envoy config next to the CLI bundle", () => {
+    const installDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-installed-emulate-"));
+    try {
+      const distDir = path.join(installDir, "dist");
+      mkdirSync(distDir);
+      const packaged = path.join(distDir, "envoy.yaml");
+      writeFileSync(packaged, SOURCE);
+      expect(resolveEmulateEnvoyConfig(distDir)).toBe(packaged);
+    } finally {
+      rmSync(installDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the repository fixture from built dist and source execution", () => {
+    const projectDir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-source-emulate-"));
+    try {
+      const integrationDir = path.join(projectDir, "integration");
+      mkdirSync(integrationDir);
+      const fixture = path.join(integrationDir, "envoy.yaml");
+      writeFileSync(fixture, SOURCE);
+      expect(resolveEmulateEnvoyConfig(path.join(projectDir, "dist"))).toBe(fixture);
+      expect(resolveEmulateEnvoyConfig(path.join(projectDir, "src", "cli"))).toBe(fixture);
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("binds the checked-in Envoy listener to loopback", () => {
     const yaml = readFileSync(new URL("../../integration/envoy.yaml", import.meta.url), "utf8");
     expect(EMULATE_LISTEN_HOST).toBe("127.0.0.1");

@@ -20,7 +20,14 @@ describe("published package consumer surface", () => {
     };
 
     expect(packageJson.files).toEqual(
-      expect.arrayContaining(["dist", "docker", "docs", "plans", "skills", "SECURITY.md"]),
+      expect.arrayContaining([
+        "dist",
+        "docker",
+        "docs",
+        "plans/gitops-deployment-strategies.md",
+        "skills",
+        "SECURITY.md",
+      ]),
     );
   });
 
@@ -31,7 +38,7 @@ describe("published package consumer surface", () => {
       path.join(repoRoot, "README.md"),
       path.join(repoRoot, "SECURITY.md"),
       ...markdownFiles(path.join(repoRoot, "docs")),
-      ...markdownFiles(path.join(repoRoot, "plans")),
+      path.join(repoRoot, "plans", "gitops-deployment-strategies.md"),
       ...markdownFiles(path.join(repoRoot, "skills")),
     ];
     for (const file of publishedMarkdown) {

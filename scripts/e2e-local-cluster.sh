@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PHASE 2: run an upstream Next.js e2e suite against the LOCAL k3d cluster — the real
-# production topology (Envoy Gateway → ext_proc routing service → pools, generic provider)
+# Run an upstream Next.js e2e suite against the local k3d cluster — the deployed
+# production topology (Envoy Gateway → ext_proc routing service → pools, portable target)
 # with none of the cloud: local registry (image push is a disk copy), Host-routed hostnames
-# on a mapped port, in-cluster Valkey. This is the successor to the retired process-level
-# Envoy emulation; it reuses the ENTIRE cluster harness (e2e-cluster.sh and friends) and
-# differs only in target.
+# on a mapped port, in-cluster Valkey. It reuses the cluster harness (e2e-cluster.sh and
+# friends) and differs only in target.
 #
 # Usage:
 #   ./scripts/e2e-local-cluster.sh <test-pattern> [nextjs-ref]
@@ -63,9 +62,15 @@ if [ ! -f "${STATE_DIR}/adapter.config.mjs" ]; then
   echo "Seeding local-cluster deploy target at ${STATE_DIR}..."
   mkdir -p "${STATE_DIR}/.k8s-adapter"
   cat > "${STATE_DIR}/adapter.config.mjs" <<EOF
-import { createK8sAdapter } from "@next-community/adapter-k8s";
+import {
+  createK8sAdapter,
+  defineTarget,
+  envoyNativeRouting,
+  gatewayApiExposure,
+  kubernetesCluster,
+} from "@next-community/adapter-k8s";
 
-// PHASE 2 target: generic provider on the local k3d cluster (see e2e-k3d-bootstrap.sh).
+// Explicit portable target on the local k3d cluster (see e2e-k3d-bootstrap.sh).
 // Cache ENABLED via the in-cluster Valkey — the production cache lifecycle (seed fallback,
 // shared incremental cache, tag invalidation) is part of what this topology exists to test.
 export default createK8sAdapter({
@@ -77,14 +82,36 @@ export default createK8sAdapter({
   },
   cache: { enabled: true, url: "redis://e2e-valkey.default.svc.cluster.local:6379" },
   containerStrategy: "traced-assets",
-  provider: {
-    generic: {
-      gateway: {
-        className: "eg",
-        hosts: [{ hostname: "${HOSTNAME_LOCAL}", tls: { enabled: false } }],
+  target: defineTarget({
+    cluster: kubernetesCluster(),
+    exposure: gatewayApiExposure({
+      className: "eg",
+      hosts: [{ hostname: "${HOSTNAME_LOCAL}", tls: { enabled: false } }],
+      ingressSources: {
+        cidrs: [],
+        podSelectors: [
+          {
+            namespace: "envoy-gateway-system",
+            labels: {
+              "app.kubernetes.io/name": "envoy",
+              "gateway.envoyproxy.io/owning-gateway-name": "${RELEASE}-gateway",
+              "gateway.envoyproxy.io/owning-gateway-namespace": "default",
+            },
+          },
+          {
+            namespace: "envoy-gateway-system",
+            labels: {
+              "app.kubernetes.io/name": "envoy",
+              "gateway.envoyproxy.io/owning-gatewayclass": "eg",
+            },
+          },
+        ],
       },
-    },
-  },
+    }),
+    // The bootstrap owns escaped-slash policy at GatewayClass scope because its data plane
+    // merges lane Gateways. The target records that external ownership explicitly.
+    routing: envoyNativeRouting({ gatewayClassName: "eg", escapedSlashes: "external" }),
+  }),
 });
 EOF
   cat > "${STATE_DIR}/.k8s-adapter/infrastructure.json" <<EOF

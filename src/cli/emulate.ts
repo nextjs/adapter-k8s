@@ -31,6 +31,17 @@ export const EMULATE_ENVOY_IMAGE =
 export const EMULATE_VALKEY_IMAGE =
   "valkey/valkey@sha256:f0ba225266310efba5fb33383e21c64fbd07907304224786c780606e7ebd7327";
 
+export function assertEmulateNodeVersion(version = process.versions.node): void {
+  const major = Number.parseInt(version.split(".")[0] ?? "", 10);
+  if (!Number.isInteger(major) || major < 24) {
+    throw new Error(
+      `adapter-k8s emulate requires Node.js 24 or newer because generated route regexps use ` +
+        `scoped modifiers; current host is ${version}. Other CLI commands follow the package's ` +
+        `broader Node.js engines range.`,
+    );
+  }
+}
+
 /**
  * The checked-in Envoy config hardcodes the listener on 8080, so `--port N` used to change only
  * the readiness check and the banner — Envoy kept listening on 8080, the wait on N timed out
@@ -65,6 +76,16 @@ export function renderEnvoyConfigForPort(envoyYamlSource: string, port: number):
   return rendered;
 }
 
+/** Resolve the checked-in source fixture in tests and the copied runtime asset after packaging. */
+export function resolveEmulateEnvoyConfig(distDir: string): string {
+  const candidates = [
+    path.join(distDir, "envoy.yaml"),
+    path.resolve(distDir, "..", "integration", "envoy.yaml"),
+    path.resolve(distDir, "..", "..", "integration", "envoy.yaml"),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
+}
+
 interface EmulateOptions {
   projectDir: string;
   skipBuild?: boolean;
@@ -72,6 +93,7 @@ interface EmulateOptions {
 }
 
 export async function runEmulate(options: EmulateOptions): Promise<void> {
+  assertEmulateNodeVersion();
   const { projectDir, skipBuild, port = 8080 } = options;
   const children: ChildProcess[] = [];
   // S24: emulate only needs a runtime for the optional Valkey container. Resolve it once and
@@ -88,16 +110,16 @@ export async function runEmulate(options: EmulateOptions): Promise<void> {
 
   // Shared per-run secret, mirroring the K8s Secret production injects into both
   // tiers: the routing service stamps it on mutated request headers via ext_proc,
-  // and the pool trusts the internal dispatch vocabulary (Phase 2) only when it
-  // matches. Without it the pool re-resolves everything locally (Phase 1) and
-  // edge-only behavior is invisible in emulation.
+  // and the pool trusts the internal dispatch vocabulary only when it matches.
+  // Without it the pool re-resolves everything locally and edge-only behavior is
+  // invisible in emulation.
   const internalSecret = randomBytes(32).toString("hex");
 
   console.log(`
 ${BOLD}${CYAN}adapter-k8s emulate${RESET}
-${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESET}
+${DIM}Local Envoy → routing service → pool request path${RESET}
 
-  ${CYAN}Envoy${RESET}             :${port}  ${DIM}(ALB + ext_proc)${RESET}
+  ${CYAN}Envoy${RESET}             :${port}  ${DIM}(proxy + ext_proc)${RESET}
   ${CYAN}Routing Service${RESET}   :8443 ${DIM}(ext_proc gRPC — middleware + route resolution)${RESET}
   ${CYAN}Pool Server${RESET}       :3000 ${DIM}(handler invocation)${RESET}
 `);
@@ -315,11 +337,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
   });
 
   // --- 5. Start Envoy ---
-  const envoyConfig = path.resolve(__dirname, "..", "integration", "envoy.yaml");
-  // Try bundled config, fallback to adapter package
-  const envoyYamlSource = existsSync(envoyConfig)
-    ? envoyConfig
-    : path.join(distDir, "..", "integration", "envoy.yaml");
+  const envoyYamlSource = resolveEmulateEnvoyConfig(distDir);
 
   const envoyYaml = renderEnvoyConfigForPort(envoyYamlSource, port);
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# PHASE 2 lane driver: run timing-balanced groups of the upstream suite across N concurrent
+# Local-cluster lane driver: run timing-balanced groups of the upstream suite across N concurrent
 # lanes on the local k3d cluster. Each lane is an independent release (own hostname, own
 # state dir, own serial cutover lock); they share the merged Envoy data plane, the local
 # registry, and Valkey.
@@ -73,7 +73,7 @@ if [ -z "${ADAPTER_K8S_PREBUILT_TARBALL:-}" ]; then
   echo "→ Adapter tarball: ${ADAPTER_K8S_PREBUILT_TARBALL}"
 fi
 
-echo "=== Phase 2 lane run ==="
+echo "=== Local-cluster lane run ==="
 echo "lanes:   ${LANES}"
 echo "groups:  ${FIRST_GROUP}..${LAST_GROUP} of ${TOTAL_GROUPS}"
 echo "ref:     ${NEXTJS_REF}"
@@ -131,30 +131,7 @@ done
 
 echo ""
 echo "=== Lane run complete (failed=${FAILED}) ==="
-# Aggregate per-suite results from the shared checkout: every results.json newer than this
-# run's start belongs to it (lanes never run the same suite twice — groups are disjoint).
-python3 - "$RUN_DIR" <<'EOF'
-import glob, json, os, sys
-run_dir = sys.argv[1]
-start = os.path.getmtime(os.path.join(run_dir, ".run-start"))
-root = os.path.abspath(os.path.join(run_dir, "../../../..", ".adapter-k8s-e2e/next.js"))
-tot = p = f = suites = 0
-failed = []
-for fn in glob.glob(os.path.join(root, "test/**/*.results.json"), recursive=True):
-    if os.path.getmtime(fn) < start:
-        continue
-    try:
-        d = json.load(open(fn))
-    except Exception:
-        continue
-    suites += 1
-    tot += d.get("numTotalTests", 0)
-    p += d.get("numPassedTests", 0)
-    f += d.get("numFailedTests", 0)
-    if d.get("numFailedTests", 0):
-        failed.append(os.path.relpath(fn, root))
-print(f"suites={suites} tests={tot} passed={p} failed={f}")
-for x in sorted(failed):
-    print("  FAIL:", x)
-EOF
+# Aggregate per-suite results from the configured checkout. A zero-file aggregate is an
+# infrastructure failure, not a successful run with zero tests.
+node "${SCRIPT_DIR}/e2e-aggregate-results.mjs" "$RUN_DIR"
 exit "$FAILED"

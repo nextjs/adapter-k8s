@@ -64,25 +64,44 @@ try {
     "dist/internal.js",
     "dist/internal.d.ts",
     "dist/cli.cjs",
+    "dist/envoy.yaml",
     "dist/pool-server.cjs",
     "dist/routing-service.cjs",
     "dist/cache-handler.cjs",
     "dist/cutover-job.cjs",
     "docker/cutover-job.Dockerfile",
     "docs/targets.md",
+    "plans/gitops-deployment-strategies.md",
+    "skills/configure/SKILL.md",
+    "skills/configure/references/config-surface.md",
     "skills/deploy/SKILL.md",
+    "skills/deploy/references/failure-playbook.md",
+    "skills/troubleshoot/SKILL.md",
+    "skills/troubleshoot/references/symptoms.md",
   ];
   for (const file of required) {
     assert.ok(packedPaths.has(file), `published package is missing ${file}`);
   }
   for (const file of packedPaths) {
     assert.ok(
-      !["src/", "tests/", ".github/", ".claude/", ".k8s-adapter/"].some((prefix) =>
-        file.startsWith(prefix),
+      !["src/", "tests/", "scripts/", "integration/", ".github/", ".claude/", ".k8s-adapter/"].some(
+        (prefix) => file.startsWith(prefix),
       ),
       `private development path escaped into the package: ${file}`,
     );
+    if (file.startsWith("plans/")) {
+      assert.equal(
+        file,
+        "plans/gitops-deployment-strategies.md",
+        `internal design plan escaped into the package: ${file}`,
+      );
+    }
   }
+  assert.equal(
+    readFileSync(path.join(packageDir, "dist", "envoy.yaml"), "utf8"),
+    readFileSync(path.join(projectDir, "integration", "envoy.yaml"), "utf8"),
+    "packed emulate config must match the reviewed source fixture",
+  );
 
   const consumerDir = path.join(scratchDir, "consumer");
   mkdirSync(consumerDir);
@@ -149,6 +168,16 @@ try {
     cwd: consumerDir,
   });
   assert.match(cli.stdout, /adapter-k8s/);
+  const installedCli = path.join(
+    consumerDir,
+    "node_modules",
+    manifest.name,
+    manifest.bin["adapter-k8s"],
+  );
+  assert.ok(
+    existsSync(path.join(path.dirname(installedCli), "envoy.yaml")),
+    "installed emulate config must be next to the bundled CLI",
+  );
 
   console.log(
     `Verified ${manifest.name}@${manifest.version}: ${packedPaths.size} files, ` +

@@ -21,7 +21,8 @@ The gate requires, per pool, at least as many Ready pods as the OUTGOING build w
 - `Capacity gate: ... <pool>: 2/6 ready` — this is not "pods are broken", it is "not ENOUGH pods yet". Usually cluster capacity or slow image pulls; check `kubectl get events -n <ns>` for scheduling pressure.
 - Error lines grepped from pod logs.
 
-Then: `npx adapter-k8s doctor` and `npx adapter-k8s tail`.
+Then run `npx adapter-k8s doctor` and `npx adapter-k8s tail`. If portable target access uses an
+unpinned current context, check `kubectl config current-context` first and pass `--yes` to `tail`.
 
 Generic-target special case: pods that never become Ready on a node that joined the cluster AFTER the last deploy usually mean the strict NetworkPolicy's kubelet allowlist snapshot is stale — set `nodeCidrs` (the node subnet, e.g. `["10.0.0.0/16"]`) in the generic provider config and redeploy.
 
@@ -36,7 +37,9 @@ npx adapter-k8s rollback        # scales the previous build up, reverts the rout
 
 - It is symmetric: running it again rolls forward. The CLI prints `✓ Rollback complete. Now serving build: <id>`.
 - Do NOT rollback after a failed deploy — nothing was cut over; the previous build is already serving.
-- The routing tier's rollback image is reconstructed from the build tag (not digest-pinned yet); `deploy` records digests so later rollbacks can pin.
+- Rollback prefers the immutable routing image digest recorded for that build. State written by
+  older adapter versions has no digest, so rollback falls back to the build tag and prints a
+  warning.
 - If deploy warned `--allow-unretained-manifest` was used, rollback to that build is image-only (its routing manifest snapshot was not retained).
 
 ## Why Never `helm rollback`
@@ -56,7 +59,7 @@ Each trades a safety property for deployability. Use deliberately, never as a de
 | Flag                          | Skips                                                               | Cost                                                                                       |
 | ----------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | `--allow-no-network-policy`   | Abort when the cluster pod CIDR cannot be discovered                | Ships without the strict ingress NetworkPolicy posture                                     |
-| `--allow-mutable-tags`        | Abort when no registry digest can be resolved                       | Deploys by tag; NetworkPolicies skipped — routing service reachable from in-cluster pods   |
+| `--allow-mutable-tags`        | Abort when no registry digest can be resolved                       | Deploys unresolved images by mutable tag; a retag changes code on restart or scale-up      |
 | `--allow-unretained-manifest` | Abort when the outgoing build's routing manifest cannot be retained | Rollback to the outgoing build becomes image-only (recorded in state; `doctor` reports it) |
 | `--yes` / `-y`                | The unpinned-kubectl-context confirmation                           | You own verifying the context targets the intended cluster (CI)                            |
 
