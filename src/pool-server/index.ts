@@ -3770,6 +3770,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // Create and start server
   const server = createPoolServer({
     port,
+    host: process.env.ADAPTER_K8S_LISTEN_HOST,
     poolName,
     trustInternalHeaders,
     internalSecret,

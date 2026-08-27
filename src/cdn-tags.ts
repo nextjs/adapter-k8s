@@ -1,5 +1,9 @@
 // src/cdn-tags.ts
 import { createHash } from "node:crypto";
+import {
+  grantsSharedCacheFreshness,
+  hasUnqualifiedCacheControlDirective,
+} from "./cache-control.js";
 
 /**
  * A Cloud-CDN-safe cache tag for a build id. Cloud CDN reads `--tags` comma-delimited and caps
@@ -47,11 +51,9 @@ export function cdnCacheTag(
   buildId: string | undefined,
 ): Record<string, string> {
   if (!buildId) return {};
-  if (/\bimmutable\b/.test(cacheControl)) return {};
-  // Tag only what Cloud CDN can actually store: private/no-store/no-cache responses
-  // never enter the shared cache, so a tag on them is dead weight and misleading in
-  // header dumps. The CDN's freshness lifetime is s-maxage when present, else max-age.
-  if (/\b(?:private|no-store|no-cache)\b/i.test(cacheControl)) return {};
-  const shared = /\bs-maxage=(\d+)/i.exec(cacheControl) ?? /\bmax-age=(\d+)/i.exec(cacheControl);
-  return shared && parseInt(shared[1]!, 10) > 0 ? { "cache-tag": cdnTagForBuildId(buildId) } : {};
+  // Only the bare directive marks a versioned immutable asset. `x-immutable` is an extension,
+  // and `immutable="field"` is malformed for this purpose. Neither may hide a mutable response
+  // from the deploy invalidation tag.
+  if (hasUnqualifiedCacheControlDirective(cacheControl, "immutable")) return {};
+  return grantsSharedCacheFreshness(cacheControl) ? { "cache-tag": cdnTagForBuildId(buildId) } : {};
 }

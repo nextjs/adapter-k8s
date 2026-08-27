@@ -5,7 +5,11 @@
 // cannot know) and its post-swap scale-down.
 import { execCapture, execOrThrow, EXEC_TIMEOUTS } from "../cli/exec.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
-import { poolResourceNames, sanitizeK8sName } from "../emit/templates/utils.js";
+import {
+  ADAPTER_RELEASE_LABEL,
+  poolResourceNames,
+  sanitizeK8sName,
+} from "../emit/templates/utils.js";
 import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 import {
   ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
@@ -32,6 +36,114 @@ import {
   hasHealthCheckPolicyCrd,
 } from "../cli/stable-pool-resources.js";
 import type { PoolDeploy } from "./inputs.js";
+
+type VersionedCompanionKind = "service" | "healthcheckpolicy";
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/**
+ * Delete a versioned pool companion only after independently proving its identity. The
+ * Deployment is an ownership anchor, not authority over another same-named Kubernetes kind:
+ * an operator can replace its Service without changing the Deployment, and deleting that
+ * replacement would cross the release boundary that S30 is meant to enforce.
+ */
+async function deleteOwnedVersionedCompanion(options: {
+  kind: VersionedCompanionKind;
+  name: string;
+  namespace: string;
+  releaseName: string;
+  poolName: string;
+  buildId: string;
+  serviceName: string;
+}): Promise<void> {
+  const { kind, name, namespace, releaseName, poolName, buildId, serviceName } = options;
+  let read;
+  try {
+    read = await execCapture(
+      "kubectl",
+      ["get", kind, name, "-n", namespace, "--ignore-not-found", "-o", "json"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+  } catch (err) {
+    console.warn(
+      `  ! Conservative cleanup: keeping ${kind} "${name}" because its ownership ` +
+        `could not be read: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+  if (read.exitCode !== 0) {
+    console.warn(
+      `  ! Conservative cleanup: keeping ${kind} "${name}" because its ownership ` +
+        `could not be read: ${sanitizeForTerminal(read.stderr.trim()) || `kubectl exited ${read.exitCode}`}`,
+    );
+    return;
+  }
+  if (!read.stdout.trim()) return;
+
+  let object: Record<string, unknown> | null;
+  try {
+    object = objectRecord(JSON.parse(read.stdout));
+  } catch {
+    object = null;
+  }
+  const metadata = objectRecord(object?.metadata);
+  const labels = objectRecord(metadata?.labels);
+  const spec = objectRecord(object?.spec);
+  const commonIdentityMatches =
+    metadata?.name === name &&
+    labels?.[ADAPTER_RELEASE_LABEL] === releaseName &&
+    labels?.["app.kubernetes.io/name"] === releaseName &&
+    labels?.["app.kubernetes.io/component"] === poolName &&
+    labels?.["app.kubernetes.io/version"] === sanitizeK8sName(buildId);
+  const kindIdentityMatches =
+    kind === "service"
+      ? (() => {
+          const selector = objectRecord(spec?.selector);
+          return (
+            selector?.["app.kubernetes.io/name"] === releaseName &&
+            selector?.["app.kubernetes.io/component"] === poolName &&
+            selector?.["app.kubernetes.io/version"] === sanitizeK8sName(buildId)
+          );
+        })()
+      : (() => {
+          const targetRef = objectRecord(spec?.targetRef);
+          return (
+            targetRef?.group === "" &&
+            targetRef?.kind === "Service" &&
+            targetRef?.name === serviceName
+          );
+        })();
+  if (!commonIdentityMatches || !kindIdentityMatches) {
+    console.warn(
+      `  ! Conservative cleanup: keeping ambiguous ${kind} "${name}" because its ` +
+        `adapter ownership metadata is missing or inconsistent.`,
+    );
+    return;
+  }
+
+  try {
+    const deleted = await execCapture(
+      "kubectl",
+      ["delete", kind, name, "-n", namespace, "--ignore-not-found"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (deleted.exitCode !== 0) {
+      console.warn(
+        `  ! Could not delete old ${kind} ${name}: ` +
+          `${sanitizeForTerminal(deleted.stderr.trim()) || `kubectl exited ${deleted.exitCode}`}`,
+      );
+    }
+  } catch (err) {
+    console.warn(
+      `  ! Could not delete old ${kind} ${name}: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
 
 // 7f (E5). State is durable and traffic has switched, so it is now safe to scale the previous
 // build down to 0. It served through the rollout and remains as the rollback target.
@@ -135,12 +247,36 @@ export async function gcSupersededResources(opts: {
       "-l",
       `app.kubernetes.io/name=${releaseName}`,
       "-o",
-      'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+      "json",
     ],
     { timeoutMs: EXEC_TIMEOUTS.kubectl },
   );
-  if (allDeploys.exitCode === 0) {
-    for (const name of allDeploys.stdout.trim().split("\n")) {
+  if (allDeploys.exitCode === 0 && allDeploys.stdout.trim()) {
+    let deployments: Array<{
+      metadata?: { name?: string; labels?: Record<string, string> };
+      spec?: {
+        template?: {
+          spec?: {
+            containers?: Array<{
+              name?: string;
+              env?: Array<{ name?: string; value?: string }>;
+            }>;
+          };
+        };
+      };
+    }> = [];
+    try {
+      const parsed = JSON.parse(allDeploys.stdout) as { items?: typeof deployments };
+      deployments = Array.isArray(parsed.items) ? parsed.items : [];
+    } catch {
+      console.warn(
+        `  ! Could not parse the release Deployment list; skipping superseded Deployment ` +
+          `cleanup rather than deleting an object whose ownership cannot be proved.`,
+      );
+    }
+
+    for (const deployment of deployments) {
+      const name = deployment.metadata?.name;
       // The routing tier is a stable in-place Deployment — never a cleanup candidate.
       // EXACT name match: a substring match would also spare (or, elsewhere, drop) a
       // pool deployment that merely contains "routing-service" in its name.
@@ -162,27 +298,70 @@ export async function gcSupersededResources(opts: {
         );
         continue;
       }
-      // Delete everything else
+
+      // S30. A common app.kubernetes.io/name label is grouping metadata, not proof that this
+      // adapter owns an object. Before crossing the deletion boundary, require the dedicated
+      // release label and reconstruct the exact template identity from the pool container's
+      // immutable RELEASE_NAME / POOL_NAME / NEXT_BUILD_ID values. This also handles build ids
+      // whose sanitized version label cannot reconstruct the raw deployment name on its own.
+      const labels = deployment.metadata?.labels ?? {};
+      const poolContainer = deployment.spec?.template?.spec?.containers?.find(
+        (container) => container.name === "pool-server",
+      );
+      const envValue = (envName: string): string | undefined =>
+        poolContainer?.env?.find((entry) => entry.name === envName)?.value;
+      const rawBuildId = envValue("NEXT_BUILD_ID");
+      const poolName = envValue("POOL_NAME");
+      const templateRelease = envValue("RELEASE_NAME");
+      const owned =
+        labels[ADAPTER_RELEASE_LABEL] === releaseName &&
+        labels["app.kubernetes.io/name"] === releaseName &&
+        typeof rawBuildId === "string" &&
+        rawBuildId.length > 0 &&
+        typeof poolName === "string" &&
+        poolName.length > 0 &&
+        templateRelease === releaseName &&
+        labels["app.kubernetes.io/component"] === poolName &&
+        labels["app.kubernetes.io/version"] === sanitizeK8sName(rawBuildId);
+      if (!owned) {
+        console.warn(
+          `  ! Conservative cleanup: keeping ambiguous Deployment "${name}" because its ` +
+            `adapter ownership metadata is missing or inconsistent.`,
+        );
+        continue;
+      }
+      const expected = poolResourceNames(releaseName, poolName, rawBuildId);
+      if (expected.deployment !== name) {
+        console.warn(
+          `  ! Conservative cleanup: keeping ambiguous Deployment "${name}" because its ` +
+            `template identity does not match the object name.`,
+        );
+        continue;
+      }
+
+      // Delete only an object whose release ownership and template identity both agree.
       console.log(`  → Deleting old build: ${name}`);
       await execCapture("kubectl", ["delete", "deployment", name, "-n", namespace], {
         timeoutMs: EXEC_TIMEOUTS.kubectl,
       });
-      await execCapture("kubectl", ["delete", "service", name, "-n", namespace], {
-        timeoutMs: EXEC_TIMEOUTS.kubectl,
-      }).catch(() => {});
-      // This build's raw release/pool/buildId parts are unknowable here (`name` is a
-      // cluster-listed deployment of a build state no longer tracks), so the HCP name
-      // can't go through poolResourceNames. Re-sanitizing the deployment name with the
-      // "-hcp" suffix reproduces the template's name exactly: for a base past the
-      // 59-char boundary, re-truncating the 63-char deployment name to 59 yields the
-      // same prefix the template truncated to (any trailing hyphens the template's
-      // strip removed beyond 59 are re-stripped here). Bare `${name}-hcp` diverged
-      // there — and could exceed 63 chars, an invalid name kubectl rejects.
-      await execCapture(
-        "kubectl",
-        ["delete", "healthcheckpolicy", sanitizeK8sName(name, "-hcp"), "-n", namespace],
-        { timeoutMs: EXEC_TIMEOUTS.kubectl },
-      ).catch(() => {});
+      await deleteOwnedVersionedCompanion({
+        kind: "service",
+        name,
+        namespace,
+        releaseName,
+        poolName,
+        buildId: rawBuildId,
+        serviceName: name,
+      });
+      await deleteOwnedVersionedCompanion({
+        kind: "healthcheckpolicy",
+        name: expected.hcp,
+        namespace,
+        releaseName,
+        poolName,
+        buildId: rawBuildId,
+        serviceName: name,
+      });
     }
   }
 

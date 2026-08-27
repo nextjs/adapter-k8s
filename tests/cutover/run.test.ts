@@ -97,6 +97,10 @@ interface ClusterOverrides {
   servicePatchFailsFor?: string;
   /** Names the emit-metadata ConfigMap listing reports (job-mode GC sweep). */
   emitMetaConfigMaps?: string[];
+  /** Deployment objects returned to the post-cutover ownership-aware GC sweep. */
+  gcDeployments?: unknown[];
+  /** Exact versioned companion objects keyed by `kind/name`; null means absent. */
+  gcCompanions?: Record<string, unknown | null>;
 }
 
 /** A scripted cluster for one release serving `buildm`, with `buildn` landing. */
@@ -128,7 +132,20 @@ function cluster(overrides: ClusterOverrides = {}) {
       events.push(`list-versioned:${args[args.indexOf("-l") + 1]}`);
       return ok(`${(overrides.versionedDeployments ?? [`${RELEASE}-ssr-${BUILD}`]).join("\n")}\n`);
     }
-    if (args[1] === "deployments") return ok(""); // E6 sweep listing
+    if (args[1] === "deployments") {
+      return overrides.gcDeployments
+        ? ok(JSON.stringify({ items: overrides.gcDeployments }))
+        : ok("");
+    }
+    if (
+      args[0] === "get" &&
+      ["service", "healthcheckpolicy"].includes(args[1]!) &&
+      args.includes("--ignore-not-found")
+    ) {
+      const key = `${args[1]}/${args[2]}`;
+      const value = overrides.gcCompanions?.[key];
+      return value == null ? ok() : ok(JSON.stringify(value));
+    }
     // D2 routing-tier existence probe (`-o name`, exactly).
     if (args[1] === "deployment" && args[args.indexOf("-o") + 1] === "name") {
       return ok(`deployment.apps/${RELEASE}-routing-service\n`);
@@ -190,6 +207,10 @@ function cluster(overrides: ClusterOverrides = {}) {
       events.push(args.includes("--replicas=0") ? `park:${target}` : `scaleup:${target}`);
       return ok();
     }
+    if (args[0] === "delete" && ["deployment", "service", "healthcheckpolicy"].includes(args[1]!)) {
+      events.push(`delete:${args[1]}:${args[2]}`);
+      return ok();
+    }
     if (args[1] === "configmaps" && j.includes("component=emit-metadata")) {
       return ok(
         overrides.emitMetaConfigMaps?.length ? `${overrides.emitMetaConfigMaps.join("\n")}\n` : "",
@@ -213,6 +234,72 @@ const ACCEPTED_CURRENT = {
     ],
   },
 };
+
+function poolDeployment(name: string, pool: string, buildId: string, owned = true) {
+  return {
+    metadata: {
+      name,
+      labels: {
+        "app.kubernetes.io/name": RELEASE,
+        "app.kubernetes.io/component": pool,
+        "app.kubernetes.io/version": buildId,
+        ...(owned ? { "adapter-k8s.dev/release": RELEASE } : {}),
+      },
+    },
+    spec: {
+      template: {
+        spec: {
+          containers: [
+            {
+              name: "pool-server",
+              env: [
+                { name: "NEXT_BUILD_ID", value: buildId },
+                { name: "POOL_NAME", value: pool },
+                { name: "RELEASE_NAME", value: RELEASE },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+
+function poolService(name: string, pool: string, buildId: string, owned = true) {
+  return {
+    metadata: {
+      name,
+      labels: {
+        "app.kubernetes.io/name": RELEASE,
+        "app.kubernetes.io/component": pool,
+        "app.kubernetes.io/version": buildId,
+        ...(owned ? { "adapter-k8s.dev/release": RELEASE } : {}),
+      },
+    },
+    spec: {
+      selector: {
+        "app.kubernetes.io/name": RELEASE,
+        "app.kubernetes.io/component": pool,
+        "app.kubernetes.io/version": buildId,
+      },
+    },
+  };
+}
+
+function poolHealthCheckPolicy(name: string, serviceName: string, pool: string, buildId: string) {
+  return {
+    metadata: {
+      name,
+      labels: {
+        "adapter-k8s.dev/release": RELEASE,
+        "app.kubernetes.io/name": RELEASE,
+        "app.kubernetes.io/component": pool,
+        "app.kubernetes.io/version": buildId,
+      },
+    },
+    spec: { targetRef: { group: "", kind: "Service", name: serviceName } },
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -601,6 +688,83 @@ describe("runCutover — D4/D5: the generation-guarded Accepted poll (stale Acce
     expect(events).toContain(`wait:job/${routeExtJobName(RELEASE, BUILD)}`);
     expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
     expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+});
+
+describe("runCutover — E6: superseded deployment ownership", () => {
+  it("deletes a superseded adapter pool but leaves a same-label foreign workload untouched", async () => {
+    const oldAdapterName = `${RELEASE}-ssr-buildl`;
+    const foreignName = `${RELEASE}-foreign-buildl`;
+    vi.mocked(execCapture).mockImplementation(
+      cluster({
+        gcDeployments: [
+          poolDeployment(oldAdapterName, "ssr", "buildl"),
+          poolDeployment(foreignName, "foreign", "buildl", false),
+        ],
+        gcCompanions: {
+          [`service/${oldAdapterName}`]: poolService(oldAdapterName, "ssr", "buildl"),
+          [`healthcheckpolicy/${oldAdapterName}-hcp`]: poolHealthCheckPolicy(
+            `${oldAdapterName}-hcp`,
+            oldAdapterName,
+            "ssr",
+            "buildl",
+          ),
+        },
+      }) as never,
+    );
+
+    await runCutover(inputs(), deps);
+
+    expect(events).toContain(`delete:deployment:${oldAdapterName}`);
+    expect(events).toContain(`delete:service:${oldAdapterName}`);
+    expect(events).toContain(`delete:healthcheckpolicy:${oldAdapterName}-hcp`);
+    expect(events.some((event) => event.includes(foreignName))).toBe(false);
+    expect(
+      vi
+        .mocked(console.warn)
+        .mock.calls.map((call) => String(call[0]))
+        .join("\n"),
+    ).toContain(`keeping ambiguous Deployment "${foreignName}"`);
+  });
+
+  it("independently retains a foreign same-named Service beside an owned old Deployment", async () => {
+    const oldAdapterName = `${RELEASE}-ssr-buildl`;
+    vi.mocked(execCapture).mockImplementation(
+      cluster({
+        gcDeployments: [poolDeployment(oldAdapterName, "ssr", "buildl")],
+        gcCompanions: {
+          [`service/${oldAdapterName}`]: poolService(oldAdapterName, "ssr", "buildl", false),
+        },
+      }) as never,
+    );
+
+    await runCutover(inputs(), deps);
+
+    expect(events).toContain(`delete:deployment:${oldAdapterName}`);
+    expect(events).not.toContain(`delete:service:${oldAdapterName}`);
+    expect(
+      vi
+        .mocked(console.warn)
+        .mock.calls.map((call) => String(call[0]))
+        .join("\n"),
+    ).toContain(`keeping ambiguous service "${oldAdapterName}"`);
+  });
+
+  it("keeps an owned-looking deployment whose template identity disagrees with its name", async () => {
+    const mismatchedName = `${RELEASE}-api-buildl`;
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ gcDeployments: [poolDeployment(mismatchedName, "ssr", "buildl")] }) as never,
+    );
+
+    await runCutover(inputs(), deps);
+
+    expect(events.some((event) => event.includes(mismatchedName))).toBe(false);
+    expect(
+      vi
+        .mocked(console.warn)
+        .mock.calls.map((call) => String(call[0]))
+        .join("\n"),
+    ).toContain("template identity does not match");
   });
 });
 

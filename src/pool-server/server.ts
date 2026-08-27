@@ -237,6 +237,8 @@ export interface PoolServerOptions {
     head: Buffer,
   ) => "accepted" | "rejected" | Promise<"accepted" | "rejected">;
   port: number;
+  /** Explicit bind host. Production omits this so Kubernetes can reach the pod on every address. */
+  host?: string | undefined;
   /**
    * When true, trust x-output-id etc. from the request WITHOUT a secret. Legacy fallback used
    * only when no `internalSecret` is configured (e.g. tests). Ignored once a secret is set.
@@ -344,6 +346,7 @@ export function createPoolServer(options: PoolServerOptions) {
     onRequest,
     onUpgrade,
     port,
+    host,
     trustInternalHeaders = false,
     internalSecret,
     proofHeaderNames,
@@ -374,7 +377,16 @@ export function createPoolServer(options: PoolServerOptions) {
     // Probes bypass all routing — unless the app itself owns the pathname (see appOwnsProbePath).
     // The pathname is parsed rather than compared to the raw target so `/healthz?x=1` is still a
     // probe, and so a `//healthz` target cannot be mistaken for one.
-    const probePath = requestTargetPathname(req.url ?? "/");
+    let probePath: string;
+    try {
+      probePath = requestTargetPathname(req.url ?? "/");
+    } catch {
+      // Reject proxy-style absolute-form and other unsupported targets at the first HTTP
+      // boundary. They must not reach a caller that forgets to parse the target again.
+      res.writeHead(400, { "content-type": "text/plain; charset=utf-8" });
+      res.end("Bad Request");
+      return;
+    }
     if (
       (probePath === LIVENESS_PATH || probePath === READINESS_PATH) &&
       !appOwnsProbePath?.(probePath)
@@ -589,7 +601,7 @@ export function createPoolServer(options: PoolServerOptions) {
     start(): Promise<{ port: number }> {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
-        server.listen(port, () => {
+        const onListening = () => {
           const addr = server.address();
           if (!addr || typeof addr === "string") {
             reject(new Error("Failed to get server address"));
@@ -605,7 +617,9 @@ export function createPoolServer(options: PoolServerOptions) {
           }
           console.log(`Pool server listening on port ${addr.port}`);
           resolve({ port: addr.port });
-        });
+        };
+        if (host) server.listen(port, host, onListening);
+        else server.listen(port, onListening);
       });
     },
 

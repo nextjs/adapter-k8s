@@ -66,6 +66,7 @@ metadata:
   # GitOps PR2 keep-at-birth (§4.2): a PER-BUILD resource must protect itself from the
   # sync that applies the NEXT bundle — see renderKeepAtBirthAnnotations.
 ${renderKeepAtBirthAnnotations("  ")}  labels:
+    ${ADAPTER_RELEASE_LABEL}: "${releaseName}"
     app.kubernetes.io/name: "${releaseName}"
     # N61: QUOTED — an unquoted pool name like "on"/"no"/"true"/"123" renders a YAML
     # boolean/int that the apiserver refuses to unmarshal into map[string]string.

@@ -78,6 +78,13 @@ describe("createRoutingServer", () => {
     server = null;
   });
 
+  it("honors an explicit loopback bind for local emulation", async () => {
+    server = createRoutingServer({ handler: continueHandler(), port: 0, host: "127.0.0.1" });
+    await server.start();
+    const address = server.server.address();
+    expect(address).toMatchObject({ address: "127.0.0.1" });
+  });
+
   it("keeps the plaintext h2c path working for emulate (no TLS env)", async () => {
     server = createRoutingServer({ handler: continueHandler(), port: 0 });
     const { port } = await server.start();

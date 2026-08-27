@@ -38,6 +38,7 @@ import {
   normalizeLocationRedirect,
   normalizeMatchedPathname,
   normalizeResolvedRedirect,
+  parseRequestUrl,
   preferConcreteOutput,
   prefixRequestLocale,
   prepareRequest,
@@ -56,6 +57,21 @@ function url(path: string, base = "http://localhost:3000"): URL {
   // with leading "//" aren't mis-parsed as protocol-relative URLs.
   return new URL(base + path);
 }
+
+describe("parseRequestUrl", () => {
+  it("rejects absolute-form and asterisk-form targets instead of replacing Host authority", () => {
+    expect(() => parseRequestUrl("http://evil.example/path", "app.example.com")).toThrow(
+      /origin-form/,
+    );
+    expect(() => parseRequestUrl("*", "app.example.com")).toThrow(/origin-form/);
+  });
+
+  it("keeps protocol-relative-looking targets under the validated Host authority", () => {
+    const parsed = parseRequestUrl("//evil.example/path", "app.example.com");
+    expect(parsed.origin).toBe("http://app.example.com");
+    expect(parsed.pathname).toBe("//evil.example/path");
+  });
+});
 
 describe("prefixRequestLocale", () => {
   it("prefixes the root with the default locale", () => {

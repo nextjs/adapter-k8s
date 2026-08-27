@@ -69,6 +69,11 @@ describe("renderService (versioned)", () => {
     expect(yaml).toContain("kind: Service");
   });
 
+  it("carries the dedicated release ownership label used by post-cutover GC", () => {
+    const yaml = renderService({ poolName: "ssr", buildId: "b1", releaseName: "my-app" });
+    expect(yaml).toContain('adapter-k8s.dev/release: "my-app"');
+  });
+
   it("sanitizes releaseName / poolName / buildId at the consumption point", () => {
     expect(() => renderService({ poolName: "ssr", buildId: "b1", releaseName: "BAD" })).toThrow(
       /Invalid releaseName/,

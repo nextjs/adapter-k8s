@@ -1812,6 +1812,18 @@ describe("N40: edge-only defects the pool-only e2e harness could never see", () 
     expect(resolveRoutes).not.toHaveBeenCalled();
   });
 
+  it("rejects an absolute-form :path instead of adopting its authority", async () => {
+    const handler = createRequestHandler(makeManifest(), null);
+    const response = await handler([
+      { key: ":path", value: "http://evil.example/about" },
+      { key: ":method", value: "GET" },
+      { key: ":scheme", value: "https" },
+      { key: ":authority", value: "app.example.com" },
+    ]);
+    expect(response.immediateResponse!.status!.code).toBe(400);
+    expect(resolveRoutes).not.toHaveBeenCalled();
+  });
+
   it("keeps the middleware body's bytes and drops its content-length", async () => {
     // `await mwRes.text()` + server.ts's TextEncoder turned every byte >= 0x80 into U+FFFD
     // (3 bytes): an 8-byte PNG signature measured 10 bytes on the wire, against a forwarded
