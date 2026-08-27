@@ -3913,24 +3913,35 @@ export function createDispatcher(options: DispatcherOptions) {
             // filesystem cache, and cross-replica correct because revalidateTag writes
             // through the same registered handler.
             minimalMode: !(
-              // N16: a shell-bearing PPR template, or one the build left shell-less because
-              // root params were unresolved. Do not flip every shell-less route non-minimal:
-              // upstream dynamically renders the no-root-param flavour, and doing so regressed
-              // app-dir/fallback-shells. The capture-and-resume path below handles the subset
-              // that postpones at runtime without changing this gate.
-              // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
-              // mode, where the entrypoint's own filesystem cache holds the build shells
-              // and Next resumes internally. Under a SHARED cache the entrypoints are
-              // per-request render modules with no route-shell orchestration (measured:
-              // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
-              // take the same minimal+inject path as the no-classic-handler case below.
-              // Shell-LESS root-param templates still need non-minimal in both modes (N16).
-              // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
-              // next start serves these through the full server, so getStaticProps sees
-              // revalidateReason 'on-demand' and the fresh entry persists through the
-              // registered cache handler. The minimal rungs exist for platform-cache
-              // emulation, which must never intercept an authenticated revalidation.
+              // A partial-prefetch template with no shell or unresolved root params normally
+              // stays minimal (N16), but a fully keyed entry is a complete cache value: every
+              // route param participates in allowQuery. In production the process-local response
+              // store is disabled, so minimal mode would render it without ever calling the
+              // registered incremental cache handler. Let Next persist the structured APP_PAGE
+              // entry through shared Valkey; templates missing even one key param keep the
+              // minimal/platform-owned path.
               (
+                (partialPrefetching &&
+                  incrementalCacheShared &&
+                  handlerPprCapable &&
+                  platformFullyKeyed) ||
+                // N16: a shell-bearing PPR template, or one the build left shell-less because
+                // root params were unresolved. Do not flip every shell-less route non-minimal:
+                // upstream dynamically renders the no-root-param flavour, and doing so regressed
+                // app-dir/fallback-shells. The capture-and-resume path below handles the subset
+                // that postpones at runtime without changing this gate.
+                // Shell-bearing templates (handlerPprInfo) go non-minimal ONLY in emulate
+                // mode, where the entrypoint's own filesystem cache holds the build shells
+                // and Next resumes internally. Under a SHARED cache the entrypoints are
+                // per-request render modules with no route-shell orchestration (measured:
+                // k3d sub-shell-generation served "(runtime)" layouts), so those routes now
+                // take the same minimal+inject path as the no-classic-handler case below.
+                // Shell-LESS root-param templates still need non-minimal in both modes (N16).
+                // A VERIFIED preview / on-demand-revalidate request always runs NON-minimal:
+                // next start serves these through the full server, so getStaticProps sees
+                // revalidateReason 'on-demand' and the fresh entry persists through the
+                // registered cache handler. The minimal rungs exist for platform-cache
+                // emulation, which must never intercept an authenticated revalidation.
                 isVerifiedPreviewRequest(req) ||
                 ((entrypointOwnsPprShell ||
                   // partialPrefetching builds get NO injection (the partialFallback serving
