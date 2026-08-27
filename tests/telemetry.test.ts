@@ -19,6 +19,8 @@ import {
   SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import { createPoolServer } from "../src/pool-server/server.js";
+import { recordDispatchProofRejected } from "../src/telemetry.js";
+import type { DispatchProofRejectionReason } from "../src/routing-common.js";
 import { createProcessHandler } from "../src/routing-service/server.js";
 import {
   ProcessingRequestSchema,
@@ -199,6 +201,8 @@ describe("adapter-owned OpenTelemetry bindings", () => {
     });
   });
 
+  // Runs BEFORE the rejection-counter test below on purpose: that counter is created lazily, so
+  // a clean process exports exactly these four.
   it("exports the four bounded request metrics", async () => {
     await meterProvider.forceFlush();
     const names = metricExporter
@@ -214,6 +218,42 @@ describe("adapter-owned OpenTelemetry bindings", () => {
         "adapter_k8s.pool.request.duration",
       ]),
     );
+  });
+
+  it("exports the dispatch-proof rejection counter, keyed by every documented reason", async () => {
+    // A0-DP-2. The pool's proof-rejection branch used to be entirely silent, which is how a
+    // canonicalization bug could keep trusted dispatch permanently off (middleware running twice
+    // per request) with nothing to see in logs or metrics. Lazily created, so it appears only once
+    // a rejection has actually happened — which is also why the metric-set test below still lists
+    // four instruments for a clean process.
+    //
+    // The label's value set is pinned BY TYPE as well as by assertion: `Record<union, true>` fails
+    // to compile until a new DispatchProofRejectionReason member is listed here. `body-mismatch`
+    // is why that matters — it is raised after the body is read (enforceDispatchBodyBinding), not
+    // by the header verdict, so it drifted in as a sixth label value that the exported reason type
+    // did not list and a `reason: string` parameter could not catch. It is also the one value that
+    // means an active replay attempt rather than a configuration problem, so a dashboard built
+    // from the type silently omitted the alert worth having.
+    const REASONS: Record<DispatchProofRejectionReason, true> = {
+      malformed: true,
+      mismatch: true,
+      stale: true,
+      premature: true,
+      "body-unexpected": true,
+      "body-mismatch": true,
+    };
+    const reasons = Object.keys(REASONS) as DispatchProofRejectionReason[];
+    for (const reason of reasons) recordDispatchProofRejected(reason);
+    await meterProvider.forceFlush();
+    const counter = metricExporter
+      .getMetrics()
+      .flatMap((resource) => resource.scopeMetrics)
+      .flatMap((scope) => scope.metrics)
+      .find((metric) => metric.descriptor.name === "adapter_k8s.pool.dispatch_proof.rejected");
+    expect(counter).toBeDefined();
+    expect(
+      counter!.dataPoints.map((point) => point.attributes["adapter_k8s.dispatch_proof.reason"]),
+    ).toEqual(expect.arrayContaining(reasons));
   });
 
   it("does not parent independent headerless requests to a long-lived Connect span", async () => {

@@ -12,6 +12,13 @@ import {
 /** Everything the proof binds beyond the headers a test hands to its HTTP client. */
 export interface SignDispatchContext {
   /**
+   * A0-DP-5. The request body, when the test wants it BOUND (as the cross-pool hop binds it).
+   * Omit for the ext_proc-shaped case, which binds the ABSENT symbol.
+   */
+  body?: Buffer | undefined;
+  /** Mint time. Defaults to now; pass an old value to exercise the freshness window. */
+  issuedAtMs?: number | undefined;
+  /**
    * The `Host` the request will carry — for a `fetch` against a test server that is
    * `` `127.0.0.1:${port}` `` or `` `localhost:${port}` ``, i.e. whatever the client puts on the
    * wire, since the proof covers the authority. Omit only when the request genuinely has no Host
@@ -42,12 +49,15 @@ export function signDispatch(
     ...headers,
     [INTERNAL_DISPATCH_PROOF_HEADER]: computeDispatchProof(
       secret,
-      dispatchProofInputsFromRequest({
-        method,
-        target: url,
-        headers: wire,
-        proofHeaderNames: context.proofHeaderNames,
-      }),
+      dispatchProofInputsFromRequest(
+        {
+          method,
+          target: url,
+          headers: wire,
+          proofHeaderNames: context.proofHeaderNames,
+        },
+        { body: context.body, issuedAtMs: context.issuedAtMs },
+      ),
     ),
   };
 }

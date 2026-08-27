@@ -342,45 +342,277 @@ export function proofCoveredHeaderNames(buildHeaderNames?: readonly string[]): s
 }
 
 /**
- * Coalesce a repeated header into the single value the NEXT hop will see, so the two tiers
- * canonicalize duplicates identically. Node's HTTP parser joins repeated `Cookie` fields with
- * `"; "` and everything else with `", "`, and Envoy joins with the same delimiters when it writes
- * an HTTP/1.1 upstream request — so one rule serves both sides. An empty list is ABSENT.
+ * A0-DP-3. Header names Node's HTTP parser treats as SINGLETONS: a repeated field is not joined,
+ * the FIRST value is kept and every later one is discarded.
+ *
+ * SOURCE OF TRUTH: Node's `lib/_http_incoming.js` — `matchKnownFields()` returns a `*` flag for
+ * these names and `_addHeaderLine` then does `if (dest[field] === undefined) dest[field] = value`.
+ * MEASURED against the Node in this environment (v24) through a real socket, two field lines per
+ * name: every name below yielded `"A"` (`host` included — a repeated `Host` is not rejected, the
+ * second line is simply dropped), while `cookie` yielded `"A; B"` and everything else (including
+ * `x-custom`, `accept*`, `if-none-match`, `via`, `x-forwarded-*`) yielded `"A, B"`.
+ * `content-length` is on Node's list and kept here for fidelity to it, though llhttp normally
+ * rejects a conflicting duplicate before a handler sees the request at all.
+ *
+ * WHY THE PROOF CARES: this function's first cut joined every non-cookie name with `", "` on the
+ * claim that "one rule serves both sides". It does not — `matcherProofHeaderNames` admits
+ * ANY non-excluded header name, so a build whose middleware `matcher` gates on (say)
+ * `user-agent` or `authorization` plus a client that sends the field twice made the edge sign
+ * `"A, B"` (Envoy keeps both entries) while the pool read `"A"`: proof mismatch, dispatch headers
+ * stripped, middleware re-run for every such request. Mirroring Node here is what makes the edge
+ * sign the value the pool will actually materialize.
+ *
+ * `set-cookie` is deliberately NOT here: Node keeps it as an ARRAY (measured: `["a=1","b=2"]`)
+ * and never joins it, so there is no single "value the next hop sees" to mirror. The `", "` join
+ * below is then only a canonical form — both tiers reach it from the same list, which is all the
+ * proof needs — and a request-side `Set-Cookie` is not a routing input in any case.
  */
-export function coalesceWireHeader(name: string, values: readonly string[]): string | undefined {
+export const NODE_SINGLETON_REQUEST_HEADERS: ReadonlySet<string> = new Set<string>([
+  "age",
+  "authorization",
+  "content-length",
+  "content-type",
+  "etag",
+  "expires",
+  "from",
+  "host",
+  "if-modified-since",
+  "if-unmodified-since",
+  "last-modified",
+  "location",
+  "max-forwards",
+  "proxy-authorization",
+  "referer",
+  "retry-after",
+  "server",
+  "user-agent",
+]);
+
+/**
+ * Coalesce a repeated header into the single value the NEXT hop will see, at the BYTE level, so
+ * the two tiers canonicalize duplicates identically. Three rules, all of them Node's (see
+ * NODE_SINGLETON_REQUEST_HEADERS for the measurement): a singleton name keeps its FIRST value,
+ * `Cookie` joins with `"; "`, everything else joins with `", "`. Envoy joins with the same two
+ * delimiters when it writes an HTTP/1.1 upstream request, and it forwards a singleton's repeated
+ * entries unchanged — which is why the first-value rule has to be applied by the SIGNER.
+ * An empty list is ABSENT.
+ *
+ * Bytes, not strings (A0-DP-2): the two tiers decode the same wire octets into DIFFERENT JS
+ * strings (Envoy's ext_proc `raw_value` is UTF-8, Node's parser is latin1), so the join has to
+ * happen on the octets both of them agree about.
+ */
+export function coalesceWireHeaderBytes(
+  name: string,
+  values: readonly Buffer[],
+): Buffer | undefined {
   if (values.length === 0) return undefined;
-  if (values.length === 1) return values[0];
-  return values.join(name.toLowerCase() === "cookie" ? "; " : ", ");
+  const first = values[0]!;
+  if (values.length === 1) return first;
+  const lower = name.toLowerCase();
+  if (NODE_SINGLETON_REQUEST_HEADERS.has(lower)) return first;
+  const separator = Buffer.from(lower === "cookie" ? "; " : ", ", "latin1");
+  const joined: Buffer[] = [];
+  for (const value of values) {
+    if (joined.length > 0) joined.push(separator);
+    joined.push(value);
+  }
+  return Buffer.concat(joined);
 }
 
-/** Read one header off a Node `req.headers`-shaped record, coalescing a repeated value. */
-function wireHeaderValue(name: string, value: string | string[] | undefined): string | undefined {
+/**
+ * Read one header off a Node `req.headers`-shaped record as WIRE BYTES.
+ *
+ * A0-DP-2. Node's HTTP parser decodes header octets as LATIN1 (measured: wire bytes `c3 a9`
+ * arrive as the two-char string `"Ã©"`), and Node's HTTP *client* re-encodes an outgoing header
+ * value as latin1 (measured: the JS string `"é"` is written as the single octet `e9`). So latin1
+ * is the exact inverse of Node's own codec in BOTH directions across U+0000–U+00FF — a value the
+ * tier parsed off an incoming request AND a value it authored itself and is about to emit. That is
+ * what keeps the cross-pool hop self-consistent: `proxyToPool` signs latin1 octets, Node writes
+ * those same octets, and the receiving pool parses them back to the identical latin1 string.
+ *
+ * U+00FF is the whole range that matters, not a convenient subset: it is everything Node's HTTP
+ * client will EMIT. Node validates an outgoing value against it (measured on Node 24:
+ * `http.request` with a header value containing U+65E5 throws ERR_INVALID_CHAR synchronously, and
+ * a path containing it throws ERR_UNESCAPED_CHARACTERS). So above U+00FF this encoding is not
+ * "lossy" so much as unreachable: `Buffer.from("日", "latin1")` would truncate to the single
+ * octet `e5`, but the hop that would have carried those octets throws before anything reaches the
+ * wire — a 500 for that request, not a proof that silently fails to verify. That throw predates
+ * this construction and is a separate concern (a cross-pool hop on a percent-encoded CJK path
+ * cannot cross the hop at all); what matters here is that no VERIFYING tier can ever be handed
+ * octets a signer truncated.
+ */
+function wireHeaderBytes(name: string, value: string | string[] | undefined): Buffer | undefined {
   if (value === undefined) return undefined;
-  return typeof value === "string" ? value : coalesceWireHeader(name, value);
+  if (typeof value === "string") return Buffer.from(value, "latin1");
+  return coalesceWireHeaderBytes(
+    name,
+    value.map((entry) => Buffer.from(entry, "latin1")),
+  );
 }
+
+/**
+ * One covered field's value, as the WIRE OCTETS both tiers must agree on (A0-DP-2).
+ *
+ * A `Buffer` is the octets themselves, and is what every value READ OFF THE WIRE must be: the
+ * ext_proc tier passes Envoy's `raw_value` straight through, the pool passes its latin1-decoded
+ * `req.headers` string re-encoded as latin1. A `string` is shorthand for "these octets are this
+ * string's UTF-8 encoding", which is correct for a value a signer AUTHORS and hands to Envoy — an
+ * ext_proc `HeaderValue.value` is a proto3 `string`, so Envoy puts its UTF-8 encoding on the wire
+ * — and for an ASCII-only test fixture. It is NOT correct for anything a Node tier read or is
+ * about to write (that is latin1, see `wireHeaderBytes`), which is why
+ * `dispatchProofInputsFromRequest` never produces one.
+ */
+export type ProofFieldValue = Buffer | string | undefined;
 
 /** Every routing input the dispatch proof binds. Both tiers fill this in from what they see. */
 export interface DispatchProofInputs {
-  /** Request method; case-normalized by the proof. */
+  /** Request method; case-normalized by the proof. An HTTP method token is ASCII by definition. */
   method: string;
   /**
    * Origin-form request target — `:path` at the ext_proc tier, `req.url` at the pool. Both tiers
-   * see the same raw, un-normalized bytes (query string included).
+   * see the same raw, un-normalized octets (query string included) but decode them differently,
+   * so pass the octets (see ProofFieldValue).
    */
-  target: string;
+  target: ProofFieldValue;
   /**
    * `:authority` at the ext_proc tier, `Host` at the pool (Envoy writes the one from the other).
    * `undefined` means the header was absent, which is covered distinctly from any present value.
    */
-  authority?: string | undefined;
+  authority?: ProofFieldValue;
   /**
    * Covered header values keyed by LOWERCASE name — the dispatch vocabulary, the context
    * witnesses, and this build's derived inputs. A missing key (or an explicit `undefined`) is
    * covered as ABSENT, which the framing keeps distinct from a present empty value.
    */
-  headers: Record<string, string | undefined>;
+  headers: Record<string, ProofFieldValue>;
   /** This build's derived covered header names (`buildProofHeaderNames`). */
   proofHeaderNames?: readonly string[] | undefined;
+  /**
+   * A0-DP-5. Mint time, ms since the epoch — bound into the transcript AND carried in the
+   * credential, so the verifier can bound a proof's useful life without a second time source.
+   * Required rather than defaulted: a signer must state when it signed, and every test that pins
+   * a transcript must pin this too.
+   */
+  issuedAtMs: number;
+  /**
+   * A0-DP-5. SHA-256 of the request body, when the signer HAS the body. `undefined` is the
+   * explicit ABSENT symbol — the transcript keeps it distinct from any digest, so a hop that
+   * bound a body and one that could not are never confusable.
+   */
+  bodyDigest?: Buffer | undefined;
+}
+
+/** SHA-256 over a request body, the form `DispatchProofInputs.bodyDigest` takes. */
+export function dispatchBodyDigest(body: Buffer): Buffer {
+  return createHash("sha256").update(body).digest();
+}
+
+/** An operator override in ms; an unparseable or non-positive value falls back to the default. */
+function positiveEnvMs(name: string): number | undefined {
+  const parsed = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/**
+ * The per-hop time-to-response-head budget, mirroring dispatch.ts's REQUEST_HEAD_TIMEOUT_MS.
+ * Re-parsed rather than imported: this module is shared with the ext_proc edge bundle, which must
+ * not pull the pool's dispatch module in behind it.
+ */
+const HANDLER_HEAD_BUDGET_MS = positiveEnvMs("ADAPTER_K8S_HANDLER_TIMEOUT_MS") ?? 60_000;
+
+/**
+ * A0-DP-5. How long a minted proof stays acceptable — in both directions.
+ *
+ * The proof binds an input TUPLE, which made it good per-tuple rather than per-transmission: a
+ * captured trusted exchange replayed to a pool verbatim, forever. This bounds that to a window.
+ *
+ * WHAT HAS TO FIT INSIDE THE WINDOW is the mint-to-verify delay: the gap between the tier that
+ * signs (the ext_proc reply, or the cross-pool proxy) and the receiving pool's request callback.
+ * That gap is dominated by INGRESS QUEUEING, not by handler runtime — REQUEST_HEAD_TIMEOUT_MS
+ * bounds time-to-response-HEAD, which is measured entirely after this check has already passed. A
+ * burst that queues in Envoy's pending-request queue while an HPA scale-up brings new pods Ready
+ * can pend for as long as the stream-idle timeout (~300s by default), and the `generic` provider
+ * passes `disableRequestTimeout: true` (providers/generic.ts), which emits `timeouts: request: 0s`
+ * on every application rule and removes the whole-response route timeout altogether. So `stale`
+ * means "queued OR clock-skewed" — do NOT read it as "this cluster's clocks are broken" — and
+ * every request that trips it loses trusted dispatch and pays a SECOND middleware pass at the
+ * pool, i.e. extra CPU precisely when the cluster is already saturated. The default is therefore
+ * anchored on the one budget an operator already raises for a slow cluster (2x
+ * REQUEST_HEAD_TIMEOUT_MS, never below the original 120s), and
+ * ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS overrides it outright. Only the VERIFIER reads these, so
+ * the two tiers never have to agree on a value.
+ *
+ * THE FUTURE-DATED BOUND IS THE SAME WIDTH, deliberately: it is an availability trade with no
+ * integrity benefit. `issuedAtMs` is inside the transcript — re-stamping it yields `mismatch`, as
+ * its own test pins — so no attacker can produce a future-dated credential. The only party that
+ * can is a legitimate signer whose clock runs fast, and the extra validity such a signer's proofs
+ * enjoy is bounded by its own clock error whether or not this check exists. A tight bound here
+ * does not remove that residual; it converts a modest node clock offset (routine on the
+ * self-managed clusters the `generic` provider exists to support) into a total, silent outage of
+ * the trusted path. At 30s, a routing-service pod on a node 45s fast turned EVERY minted proof
+ * into `premature` — middleware running twice for every request in the release, for as long as
+ * the offset persisted, with no env knob to escape through. `premature` survives as a distinct
+ * REASON because it tells an operator something `stale` does not (clock offset rather than
+ * transit), not because it is a defence.
+ *
+ * Rejection is the SAME fail-safe as a mismatch: strip the dispatch headers, re-resolve locally.
+ * A cluster that trips either bound loses trusted dispatch (a doubled middleware pass) rather
+ * than correctness — and, unlike before A0-DP-2, says so through
+ * `adapter_k8s.pool.dispatch_proof.rejected{reason="stale"|"premature"}`.
+ */
+export const DISPATCH_PROOF_MAX_AGE_MS = Math.max(
+  1_000,
+  positiveEnvMs("ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS") ??
+    Math.max(120_000, 2 * HANDLER_HEAD_BUDGET_MS),
+);
+/** The future-dated allowance. Equal to the max age BY CONSTRUCTION — see above for why. */
+export const DISPATCH_PROOF_MAX_SKEW_MS = DISPATCH_PROOF_MAX_AGE_MS;
+
+/**
+ * The credential the proof header carries: `v3.<issuedAtMs>.<bodyDigestHex|-> .<macHex>`.
+ *
+ * The mint time and the body digest travel WITH the MAC because the verifier cannot reproduce
+ * either on its own — it has no clock reading of the signing moment, and at the header trust
+ * boundary it has not read the body yet. Both are bound INTO the transcript, so neither can be
+ * edited in transit: rewriting the declared digest to match a swapped body invalidates the MAC.
+ *
+ * A declared digest is therefore an assertion the verifier must still CHECK against the bytes it
+ * receives — see `dispatchProofBodyMatches` and the enforcement in pool-server/server.ts. The MAC
+ * check alone says "the signer declared this digest", not "the body matches it".
+ */
+const DISPATCH_PROOF_PREFIX = "v3";
+const ABSENT_BODY_DIGEST = "-";
+
+export interface ParsedDispatchProof {
+  issuedAtMs: number;
+  bodyDigest: Buffer | undefined;
+}
+
+export function parseDispatchProof(credential: string): ParsedDispatchProof | undefined {
+  const parts = credential.split(".");
+  if (parts.length !== 4) return undefined;
+  const [prefix, issuedAt, digest, mac] = parts as [string, string, string, string];
+  if (prefix !== DISPATCH_PROOF_PREFIX) return undefined;
+  if (!/^\d{1,15}$/.test(issuedAt)) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(mac)) return undefined;
+  if (digest !== ABSENT_BODY_DIGEST && !/^[0-9a-f]{64}$/.test(digest)) return undefined;
+  return {
+    issuedAtMs: Number(issuedAt),
+    bodyDigest: digest === ABSENT_BODY_DIGEST ? undefined : Buffer.from(digest, "hex"),
+  };
+}
+
+/**
+ * Does a body match the digest a verified proof declared? ABSENT means the signer bound no body,
+ * which any body satisfies — see the residual note on `verifyDispatchProof`.
+ */
+export function dispatchProofBodyMatches(
+  declared: Buffer | undefined,
+  body: Buffer | null | undefined,
+): boolean {
+  if (declared === undefined) return true;
+  const actual = dispatchBodyDigest(body ?? Buffer.alloc(0));
+  return declared.length === actual.length && timingSafeEqual(declared, actual);
 }
 
 /**
@@ -392,86 +624,224 @@ export interface DispatchProofInputs {
  * as one present with an empty value, and a value containing a newline could restate a following
  * `name\nvalue` pair. Framing by byte length removes both — no covered value can impersonate the
  * delimiter, and absence is its own symbol rather than the lack of one.
+ *
+ * A0-DP-2: the framed unit is OCTETS, not a JS string. v2 took `string` and encoded it as UTF-8
+ * at both tiers, which silently signed two different transcripts for one request: the edge
+ * materialized covered values by decoding Envoy's `raw_value` as UTF-8 while the pool read Node's
+ * latin1-decoded `req.headers`, so any covered value carrying a non-ASCII octet (a cookie a
+ * matcher gates on, an `x-invoke-query` holding a percent-decoded `/posts/café`, a middleware
+ * header in `x-mw-request-headers`) produced `"é"` → 2 bytes at the edge and `"Ã©"` → 4 bytes at
+ * the pool. The proof then NEVER verified for that request shape: dispatch headers stripped,
+ * middleware re-run at the pool, permanently and (before this change) without a single log line.
  */
-function updateProofField(hmac: ReturnType<typeof createHmac>, value: string | undefined): void {
+function updateProofField(hmac: ReturnType<typeof createHmac>, value: ProofFieldValue): void {
   if (value === undefined) {
     hmac.update("-\n");
     return;
   }
-  const bytes = Buffer.from(value, "utf8");
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
   hmac.update(`+${bytes.length}\n`);
   hmac.update(bytes);
 }
 
 /**
- * Compute (and verify) the per-request dispatch proof over EVERY routing input the pool trusts
- * from the edge, in one unambiguous transcript:
+ * ASCII-lowercase the authority's OCTETS. Hostnames are case-insensitive and both tiers route on
+ * the lowercased form (URL parsing lowercases `hostname`), so lowercasing here stops a case flip
+ * from failing the compare. Deliberately ASCII-only: a registrable hostname reaches this tier
+ * punycoded, `toLowerCase()` on decoded octets would be locale- and encoding-dependent (the two
+ * tiers hold different strings for the same octets — the whole A0-DP-2 problem), and a
+ * non-hostname authority must fail the compare rather than be normalized into one.
+ */
+function asciiLowerBytes(value: ProofFieldValue): ProofFieldValue {
+  if (value === undefined) return undefined;
+  const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(value, "utf8");
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = bytes[i]!;
+    if (byte >= 0x41 && byte <= 0x5a) bytes[i] = byte + 0x20;
+  }
+  return bytes;
+}
+
+/**
+ * Compute (and verify) the per-request dispatch credential over EVERY routing input the pool
+ * trusts from the edge, in one unambiguous transcript:
  *
- *   domain tag │ method │ target │ authority │ covered-name count │ (name │ value)*
+ *   domain tag │ method │ target │ authority │ issued-at │ body digest │
+ *   covered-name count │ (name │ value)*
  *
  * Covered names are the sorted union of INTERNAL_DISPATCH_HEADERS, PROOF_COVERED_CONTEXT_HEADERS
  * and this build's `proofHeaderNames`; every field is length-prefixed (see updateProofField),
  * and an absent header is signed as ABSENT rather than skipped. The name count is signed too, so
  * one build's transcript can never be a prefix of another's.
  *
+ * A0-DP-5. The mint time and the body digest are part of the transcript, and the returned
+ * CREDENTIAL carries both alongside the MAC (see DISPATCH_PROOF_MAX_AGE_MS and the credential
+ * format above) — so the proof is bound to a transmission window and, on a hop that has the body,
+ * to those exact bytes, not just to the header tuple.
+ *
  * Both tiers MUST pass the same `proofHeaderNames` — they do, because both derive it from the
  * one build's routing manifest and a trusted pairing is always same-build (see
  * INTERNAL_DISPATCH_PROOF_HEADER). A mismatch fails closed: the pool strips the dispatch headers
  * and re-resolves locally.
+ *
+ * No interop window is needed for the v2 → v3 transcript change: the secret is per BUILD
+ * (emit/templates/internal-secret.ts), so a pool only ever verifies proofs minted by its own
+ * build's edge. Cross-build traffic already fails closed.
  */
 export function computeDispatchProof(secret: string, inputs: DispatchProofInputs): string {
   const names = proofCoveredHeaderNames(inputs.proofHeaderNames);
+  const issuedAt = String(Math.trunc(inputs.issuedAtMs));
+  const digest = inputs.bodyDigest ? inputs.bodyDigest.toString("hex") : ABSENT_BODY_DIGEST;
   const hmac = createHmac("sha256", secret);
-  hmac.update("adapter-k8s-dispatch-v2\n");
+  hmac.update("adapter-k8s-dispatch-v3\n");
   updateProofField(hmac, inputs.method.toUpperCase());
   updateProofField(hmac, inputs.target);
-  // Hostnames are case-insensitive and both tiers route on the lowercased form (URL parsing
-  // lowercases `hostname`), so lowercase here rather than letting a case flip fail the compare.
-  updateProofField(hmac, inputs.authority?.toLowerCase());
+  updateProofField(hmac, asciiLowerBytes(inputs.authority));
+  updateProofField(hmac, issuedAt);
+  updateProofField(hmac, inputs.bodyDigest);
   updateProofField(hmac, String(names.length));
   for (const name of names) {
     updateProofField(hmac, name);
     updateProofField(hmac, inputs.headers[name]);
   }
-  return hmac.digest("hex");
+  return `${DISPATCH_PROOF_PREFIX}.${issuedAt}.${digest}.${hmac.digest("hex")}`;
 }
 
-/**
- * Collect the proof inputs off a live request (Node `req.headers` shape, or the cross-pool
- * proxy's outbound header record). The authority comes from `Host`; every covered name is read
- * verbatim off the wire, with a repeated value coalesced the way the next hop would see it.
- */
-export function dispatchProofInputsFromRequest(request: {
+/** A request as a NODE tier sees (or is about to emit) it — latin1-decoded strings throughout. */
+export interface NodeDispatchProofRequest {
   method?: string | undefined;
   target?: string | undefined;
   headers: Record<string, string | string[] | undefined>;
   proofHeaderNames?: readonly string[] | undefined;
-}): DispatchProofInputs {
-  const headers: Record<string, string | undefined> = {};
+}
+
+/**
+ * Collect the proof inputs off a live request as seen by a NODE tier (a pool's `req.headers`, or
+ * the cross-pool proxy's outbound header record). The authority comes from `Host`; every covered
+ * name is read verbatim off the wire, with a repeated value coalesced the way the next hop would
+ * see it.
+ *
+ * A0-DP-2: everything here is converted to wire OCTETS with `wireHeaderBytes`, i.e. latin1 — the
+ * exact inverse of Node's own header codec on both the read and the write side (measured; see
+ * that function). The target gets the same treatment for the same reason. This is the only place
+ * a Node-held header string is turned into proof octets, so the edge tier's UTF-8 rule and this
+ * tier's latin1 rule cannot be confused at a call site.
+ */
+export function dispatchProofInputsFromRequest(
+  request: NodeDispatchProofRequest,
+  options?: {
+    /** Mint time. Defaults to now, which is what a SIGNER wants; a verifier passes the parsed one. */
+    issuedAtMs?: number | undefined;
+    /**
+     * A0-DP-5. The request body, when this hop has it buffered — binds those exact bytes into the
+     * proof. Omit (or pass `undefined`) on a hop that has no body available; that binds the ABSENT
+     * symbol, which is a weaker but unambiguous statement.
+     */
+    body?: Buffer | undefined;
+  },
+): DispatchProofInputs {
+  const headers: Record<string, ProofFieldValue> = {};
   for (const name of proofCoveredHeaderNames(request.proofHeaderNames)) {
-    headers[name] = wireHeaderValue(name, request.headers[name]);
+    headers[name] = wireHeaderBytes(name, request.headers[name]);
   }
   return {
     method: request.method ?? "GET",
-    target: request.target ?? "/",
-    authority: wireHeaderValue("host", request.headers["host"]),
+    target: Buffer.from(request.target ?? "/", "latin1"),
+    authority: wireHeaderBytes("host", request.headers["host"]),
     headers,
     proofHeaderNames: request.proofHeaderNames,
+    issuedAtMs: options?.issuedAtMs ?? Date.now(),
+    ...(options?.body !== undefined ? { bodyDigest: dispatchBodyDigest(options.body) } : {}),
   };
 }
 
+/** Why `verifyDispatchProof` refused a presented credential at the header trust boundary. */
+export type DispatchProofRejection =
+  | "malformed"
+  | "mismatch"
+  | "stale"
+  | "premature"
+  | "body-unexpected";
+
+/**
+ * Every value the `adapter_k8s.dispatch_proof.reason` metric label can take.
+ *
+ * A superset of the verdict reasons above: `body-mismatch` is decided LATER, by
+ * `enforceDispatchBodyBinding` once the body has been read, so `verifyDispatchProof` cannot return
+ * it — but it IS a value an operator sees on the metric, and the only one that means an active
+ * replay attempt rather than a configuration problem. The reporting path is typed on this union
+ * (telemetry.ts `recordDispatchProofRejected`, pool-server/server.ts
+ * `reportDispatchProofRejected`) rather than on a bare `string`, so a future reason cannot reach
+ * the metric without landing here first — which is how the documented label set, SECURITY.md and
+ * any dashboard built off them stay in step.
+ */
+export type DispatchProofRejectionReason = DispatchProofRejection | "body-mismatch";
+
+export type DispatchProofVerdict =
+  | {
+      trusted: true;
+      /**
+       * The body digest the signer declared, or `undefined` for ABSENT. A declared digest is an
+       * ASSERTION: the caller must still check the body it receives against it once it has the
+       * bytes (`dispatchProofBodyMatches`).
+       */
+      bodyDigest: Buffer | undefined;
+    }
+  | { trusted: false; reason: DispatchProofRejection };
+
+/**
+ * Verify a presented dispatch credential against the request as this tier sees it.
+ *
+ * A0-DP-5. Beyond the MAC this now enforces FRESHNESS: a credential older than
+ * DISPATCH_PROOF_MAX_AGE_MS, or dated further ahead than DISPATCH_PROOF_MAX_SKEW_MS, is refused.
+ * Before this, the proof was deterministic over the input tuple with no nonce, timestamp or body
+ * binding, so a captured trusted exchange replayed to a pool verbatim forever — SECURITY.md's
+ * "authorizes only the one request it was minted for" was true per input-tuple, not per
+ * transmission.
+ *
+ * ACCEPTED RESIDUAL (documented, not overlooked): a credential whose body digest is ABSENT is
+ * still replayable with any body inside the freshness window. The ext_proc edge cannot do better —
+ * the header-phase callout never sees a body — but it also barely matters there: a build WITH
+ * middleware never mints an edge proof for a body-capable request at all (handler.ts clears the
+ * whole dispatch vocabulary for non-GET/HEAD when a middleware module exists, so the pool
+ * re-resolves with the real body), and a build WITHOUT middleware has no middleware verdict to
+ * steal. The cross-pool hop, which DOES have the body buffered, binds it.
+ */
 export function verifyDispatchProof(
   secret: string,
-  request: {
-    method?: string | undefined;
-    target?: string | undefined;
-    headers: Record<string, string | string[] | undefined>;
-    proofHeaderNames?: readonly string[] | undefined;
-  },
+  request: NodeDispatchProofRequest,
   presentedProof: string,
-): boolean {
-  const expected = computeDispatchProof(secret, dispatchProofInputsFromRequest(request));
-  return timingSafeStringEqual(presentedProof, expected);
+  options?: { nowMs?: number | undefined },
+): DispatchProofVerdict {
+  const parsed = parseDispatchProof(presentedProof);
+  if (!parsed) return { trusted: false, reason: "malformed" };
+  // The MAC is checked FIRST, ahead of every policy check, so that every reason an operator reads
+  // off `adapter_k8s.pool.dispatch_proof.rejected` other than `malformed`/`mismatch` is
+  // AUTHENTICATED — it can only have come from a peer holding this build's secret. Checking
+  // freshness and body shape first let any in-cluster peer that can reach a pool on :3000 LABEL
+  // the metric at will with no knowledge of the secret: `v3.<far-future>.-.<64 zeros>` in a loop
+  // reports `premature`, a past timestamp reports `stale`, a fabricated digest on a GET reports
+  // `body-unexpected`. That both fakes a clock-skew incident and buries the one reason that means
+  // this build's two tiers disagree (`mismatch`) in noise — including in the throttled warn line,
+  // whose first-occurrence-per-reason behaviour decides which message an operator sees first. The
+  // accept/reject SET is identical either way; the cost is one HMAC on a reject path.
+  const expected = computeDispatchProof(secret, {
+    ...dispatchProofInputsFromRequest(request, { issuedAtMs: parsed.issuedAtMs }),
+    bodyDigest: parsed.bodyDigest,
+  });
+  if (!timingSafeStringEqual(presentedProof, expected)) {
+    return { trusted: false, reason: "mismatch" };
+  }
+  // A signer only declares a digest when it HAS a body, which implies a body-capable method. The
+  // method is bound, so this cannot be reached by rewriting one — it means a malformed producer.
+  const method = (request.method ?? "GET").toUpperCase();
+  if (parsed.bodyDigest && (method === "GET" || method === "HEAD")) {
+    return { trusted: false, reason: "body-unexpected" };
+  }
+  const age = (options?.nowMs ?? Date.now()) - parsed.issuedAtMs;
+  if (age > DISPATCH_PROOF_MAX_AGE_MS) return { trusted: false, reason: "stale" };
+  if (age < -DISPATCH_PROOF_MAX_SKEW_MS) return { trusted: false, reason: "premature" };
+  return { trusted: true, bodyDigest: parsed.bodyDigest };
 }
 
 // A compiled middleware matcher entry from middleware-manifest.json.

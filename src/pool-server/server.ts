@@ -2,12 +2,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import {
+  dispatchProofBodyMatches,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   requestTargetPathname,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
   verifyDispatchProof,
+  type DispatchProofRejectionReason,
 } from "../routing-common.js";
 import { guardStreamErrors } from "./dispatch.js";
 // A leaf: it knows about byte positions in a relayed frame stream and nothing about dispatch, so
@@ -15,6 +17,7 @@ import { guardStreamErrors } from "./dispatch.js";
 import { injectTunnelCloseFrame } from "./websocket-frame-cursor.js";
 import {
   metricHttpMethod,
+  recordDispatchProofRejected,
   recordPoolRequest,
   recordSpanError,
   requestParentContext,
@@ -50,6 +53,81 @@ export interface ReadinessState {
   reason: string;
 }
 
+/**
+ * A0-DP-2. Log throttle for the proof-rejection branch.
+ *
+ * The branch is per-request and, when the two tiers disagree about canonicalization, it is taken
+ * on EVERY request — so an unthrottled `console.warn` would be one line per request forever. One
+ * line the first time each reason appears, then at most one per minute per reason: enough for an
+ * operator to see "this build's dispatch proofs are being refused" in the pod log without the
+ * volume that makes people filter it out. The counter (telemetry.ts) is the unthrottled signal.
+ */
+const DISPATCH_PROOF_LOG_INTERVAL_MS = 60_000;
+const dispatchProofLoggedAt = new Map<string, number>();
+
+function reportDispatchProofRejected(reason: DispatchProofRejectionReason): void {
+  recordDispatchProofRejected(reason);
+  const now = Date.now();
+  const last = dispatchProofLoggedAt.get(reason);
+  if (last !== undefined && now - last < DISPATCH_PROOF_LOG_INTERVAL_MS) return;
+  dispatchProofLoggedAt.set(reason, now);
+  // Every reason but `malformed`/`mismatch` is AUTHENTICATED (the MAC is checked first, see
+  // verifyDispatchProof), so the guidance below can be read at face value rather than as
+  // something any in-cluster peer could have staged.
+  console.warn(
+    `[pool-server] refusing a presented dispatch proof (${reason}); stripping the dispatch ` +
+      `headers and re-resolving this request locally. A reason of "mismatch" that persists ` +
+      `across every request means the edge and this pool are signing different transcripts, ` +
+      `not that a client is probing. "stale" means the request took longer than the freshness ` +
+      `window (ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS, default 2x ADAPTER_K8S_HANDLER_TIMEOUT_MS) ` +
+      `between being minted and arriving here — INGRESS QUEUEING, e.g. a burst pending while a ` +
+      `scale-up brings pods Ready, as often as clock skew; "premature" means this pod's clock is ` +
+      `behind the signer's by more than that window. "body-mismatch" is the only reason that ` +
+      `means an active replay rather than a configuration or capacity problem.`,
+  );
+}
+
+/**
+ * A0-DP-5. Where the trust boundary parks the body digest a verified proof DECLARED, for the one
+ * caller that later has the bytes to check it against.
+ *
+ * The trust decision has to be made synchronously, at the header boundary, before any body is
+ * read — so the MAC check (which covers the declared digest, making it untamperable in transit)
+ * happens here and the CONTENT check happens at the single point that buffers the body. Splitting
+ * it this way keeps the alternative from happening: deferring the whole trust decision would leave
+ * the dispatch vocabulary on `req.headers` for every unverified body request until the body
+ * arrived, and things between here and there already read `x-output-id`.
+ */
+const DISPATCH_BODY_DIGEST = Symbol.for("adapter-k8s.dispatchProofBodyDigest");
+type BodyBoundRequest = IncomingMessage & { [DISPATCH_BODY_DIGEST]?: Buffer | undefined };
+
+/**
+ * A0-DP-5. Enforce the body binding of an already-verified dispatch proof, once the body is known.
+ *
+ * Returns false — and revokes trust by stripping the dispatch vocabulary, exactly as an unverified
+ * request is treated — when the proof declared a digest the body does not match. That is the
+ * replay this closes: on the cross-pool hop the body was unbound, so an observed proof could be
+ * re-sent with arbitrary bytes on a POST and the receiving pool would honor `x-mw-evaluated: ran`
+ * for a body middleware never saw.
+ *
+ * A proof that bound no body (ABSENT — every ext_proc-minted one) imposes no constraint here; see
+ * the residual note on `verifyDispatchProof`. Idempotent, and a no-op for an untrusted request.
+ */
+export function enforceDispatchBodyBinding(
+  req: IncomingMessage,
+  body: Buffer | null | undefined,
+): boolean {
+  const declared = (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST];
+  if (declared === undefined) return true;
+  delete (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST];
+  if (dispatchProofBodyMatches(declared, body)) return true;
+  for (const h of INTERNAL_DISPATCH_HEADERS) {
+    delete req.headers[h];
+  }
+  reportDispatchProofRejected("body-mismatch");
+  return false;
+}
+
 export interface RequestTrustOptions {
   internalSecret?: string | undefined;
   trustInternalHeaders?: boolean;
@@ -81,9 +159,21 @@ export function applyIncomingRequestTrustBoundary(
   // fail closed to local resolution exactly as before. Without a secret (emulate/tests), fall
   // back to the trustInternalHeaders flag. Both credential headers are always deleted.
   const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
-  const trusted = internalSecret
-    ? typeof presentedProof === "string" &&
-      verifyDispatchProof(
+  // A0-DP-5. Clear any digest a PREVIOUS pass over this same request parked, before the block
+  // below can park a new one. This function advertises idempotency (see applyRequestTrustBoundary)
+  // and a second pass necessarily finds no proof header — the first pass deleted it — so parking
+  // the digest only inside the trusted branch left the first pass's digest in place for a second
+  // caller to enforce against a different body view, i.e. a spurious `body-mismatch` on the metric
+  // and in the log. Not reachable today (the only re-entrance, `res.revalidate()` in index.ts,
+  // builds a fresh mocked request), so this keeps a stated contract true rather than fixing a live
+  // bug.
+  delete (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST];
+  let trusted: boolean;
+  if (internalSecret) {
+    if (typeof presentedProof !== "string") {
+      trusted = false;
+    } else {
+      const verdict = verifyDispatchProof(
         internalSecret,
         {
           method: req.method,
@@ -92,8 +182,24 @@ export function applyIncomingRequestTrustBoundary(
           proofHeaderNames,
         },
         presentedProof,
-      )
-    : trustInternalHeaders;
+      );
+      trusted = verdict.trusted;
+      if (verdict.trusted) {
+        // A0-DP-5. A declared body digest is an ASSERTION, not yet a check: the body has not been
+        // read at this boundary. Park it so the caller that DOES read the body can enforce it
+        // (`enforceDispatchBodyBinding`, called from index.ts once readRequestBody returns).
+        (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST] = verdict.bodyDigest;
+      } else {
+        // A0-DP-2. Report the rejection with its reason. Only when a proof was actually PRESENTED:
+        // no proof at all is the ordinary untrusted path (ext_proc fail-open, a CEL-excluded route,
+        // a body request, a client hitting the pool directly) and is not a signal. See telemetry.ts
+        // recordDispatchProofRejected for why this branch must never be silent again.
+        reportDispatchProofRejected(verdict.reason);
+      }
+    }
+  } else {
+    trusted = trustInternalHeaders;
+  }
   delete req.headers[INTERNAL_SECRET_HEADER];
   delete req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
 

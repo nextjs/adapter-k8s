@@ -11,11 +11,12 @@
 //
 // The staged dirs live UNDER THE REPO ROOT so createRequire(<staged>/package.json) can resolve
 // the repo's `next` (the pool requires several next/dist modules at boot).
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import net, { type AddressInfo } from "node:net";
 import path from "node:path";
 import { createServer } from "node:http";
+import dns from "node:dns";
 
 const REPO_ROOT = process.cwd();
 const BUILD_ID = "hardenbuild1";
@@ -36,7 +37,8 @@ process.env.NEXT_UNHANDLED_REJECTION_FILTER = "silent";
 
 const { startPoolServer } = await import("../../src/pool-server/index.js");
 const { signDispatch } = await import("../helpers/dispatch-proof.js");
-const { buildProofHeaderNames } = await import("../../src/routing-common.js");
+const { buildProofHeaderNames, dispatchBodyDigest, verifyDispatchProof } =
+  await import("../../src/routing-common.js");
 
 // The RSC config the staged builds below declare. The dispatch proof covers this build's RSC
 // negotiation header (it selects the dispatched output id), so a test that signs a trusted
@@ -63,6 +65,15 @@ type StageOptions = {
    * forever (measured: the full-run basePath cluster, ~20 suites, all rollout timeouts).
    */
   basePathKeys?: boolean;
+  /**
+   * Declare Node middleware whose matcher covers `/echo-headers`, which is what installs the
+   * forced `no-cache` cache-policy wrapper for that route (`middlewareMayCover`). The module is a
+   * bare continue — the point is the COVERAGE, because a forced verdict is the only state in
+   * which an app-owned `cache-control` from the resolved routing verdict is load-bearing.
+   */
+  middlewareCoversEcho?: boolean;
+  /** Assign `/echo-headers` to a sibling pool so the real index-to-proxy body seam is exercised. */
+  crossPoolEcho?: boolean;
 };
 
 function writeStagedDir(options: StageOptions = {}): Staged {
@@ -250,8 +261,16 @@ function writeStagedDir(options: StageOptions = {}): Staged {
       // NO middleware — the review's "middleware-less app" case. Nothing stamps `x-nextjs-ppr`
       // in such a deployment (there is no traffic extension at all), and `middlewareCovers` is
       // false for every request, so the ONLY source of the PPR verdict is the local inventory.
-      middleware: null,
-      poolAssignments: Object.fromEntries(pathnames.map((p) => [p, "main"])),
+      middleware: options.middlewareCoversEcho
+        ? {
+            filePath: path.join(dir, "mw.mjs"),
+            runtime: "nodejs",
+            matchers: [{ regexp: "^\\/echo-headers$" }],
+          }
+        : null,
+      poolAssignments: Object.fromEntries(
+        pathnames.map((p) => [p, options.crossPoolEcho && p === "/echo-headers" ? "api" : "main"]),
+      ),
       // `fallbackFilePath` deliberately points at a file that does not exist: the resume-token
       // injection is then skipped (shellAvailable === false) and the handler answers normally,
       // which isolates the CACHE-POLICY behavior under test from the PPR resume machinery.
@@ -262,6 +281,11 @@ function writeStagedDir(options: StageOptions = {}): Staged {
       nextVersion: "16.2.10",
     }),
   );
+  if (options.middlewareCoversEcho) {
+    // A callable export that returns nothing, i.e. `next()`. Phase 1 does invoke it on a request
+    // that lost its trusted verdict — the documented fail-safe (middleware runs at the pool).
+    writeFileSync(path.join(dir, "mw.mjs"), "export function proxy(request) {}\n");
+  }
   writeFileSync(path.join(configDir, "static-assets.json"), JSON.stringify([]));
   return { dir, configDir };
 }
@@ -868,5 +892,170 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
       "/echo-headers",
     );
     expect(body.authenticatedUser).toBeNull();
+  });
+});
+
+// A0-DP-5 (SECURITY). `enforceDispatchBodyBinding` revokes trust when the body does not match the
+// digest the proof bound — but it can only run AFTER the body has been read, and three reads of
+// trusted headers happen before that point on the serving path: the `x-resolved-headers` parse,
+// the `x-mw-request-headers` parse, and the PPR `x-output-id` peek. Revocation strips HEADERS, so
+// it cannot undo a value already captured into a local — and `appCacheControl` was seeded from
+// `x-resolved-headers` unconditionally, then fed to the forced-cache-policy wrapper. So on the
+// exact replay this check exists to close (an observed POST proof re-sent with different bytes)
+// the response still carried the cache policy — and the CDN cache-tag derived from it — of the
+// exchange that was replayed. The revocation now clears those captures as well as the headers.
+//
+// The stolen value is MAC-bound (`x-resolved-headers` is covered), so a replay reuses the observed
+// policy rather than choosing one: the impact is bounded, and this is about a revoked verdict not
+// continuing to decide the response.
+//
+// The route is under MIDDLEWARE COVERAGE deliberately: `forcedCdnCacheControl` returns `no-cache`
+// for a middleware-covered request, and `no-cache` is the one forced verdict an explicit app-owned
+// cache-control may override (`explicitCacheControlWins`) — which is exactly the state in which
+// the captured value decides the response. Without coverage there is no forced verdict, the
+// capture is never read, and a test would pass either way.
+describe("A0-DP-5: revoking a body-bound proof also revokes what it already resolved", () => {
+  let pool: Awaited<ReturnType<typeof boot>>;
+  const SECRET = "an-internal-dispatch-secret";
+  // The cache policy the replayed exchange resolved, which its replay must not inherit. It grants
+  // a shared cache no unrevalidated freshness, which is the only kind of explicit value allowed to
+  // override the forced middleware `no-cache` (`explicitCacheControlWins` — a positive s-maxage
+  // would let a CDN hit bypass the middleware callout, so it is refused whatever its provenance).
+  const RESOLVED_CACHE_CONTROL = "private, max-age=0, must-revalidate";
+
+  beforeAll(async () => {
+    pool = await boot({ internalSecret: SECRET, middlewareCoversEcho: true });
+  }, 60_000);
+  afterAll(async () => {
+    await pool.stop();
+  });
+
+  /**
+   * POST /echo-headers with a body-bound proof, the way `proxyToPool` signs a cross-pool hop.
+   * `sentBody` is what actually goes on the wire, so a caller can sign one body and transmit
+   * another. Both bodies are the SAME LENGTH, so `content-length` matches either way and the
+   * failure under test is the body binding rather than a header the proof also covers.
+   */
+  async function post(signedBody: string, sentBody = signedBody) {
+    const headers = {
+      "x-output-id": "/echo-headers",
+      "x-mw-evaluated": "ran",
+      "x-resolved-headers": JSON.stringify({
+        "cache-control": RESOLVED_CACHE_CONTROL,
+        "x-from-resolved": "1",
+      }),
+    };
+    return fetch(`http://localhost:${pool.port}/echo-headers`, {
+      method: "POST",
+      body: sentBody,
+      headers: signDispatch(SECRET, "POST", "/echo-headers", headers, {
+        authority: `localhost:${pool.port}`,
+        proofHeaderNames: PROOF_HEADER_NAMES,
+        body: Buffer.from(signedBody),
+      }),
+    });
+  }
+
+  it("applies the resolved cache policy when the body IS the one that was signed", async () => {
+    const res = await post("formData=honest");
+    expect(res.status).toBe(200);
+    // The app-owned value beats the forced middleware `no-cache` — the baseline the revocation
+    // must undo, and the proof that the captured value really does decide this response.
+    expect(res.headers.get("cache-control")).toBe(RESOLVED_CACHE_CONTROL);
+    expect(res.headers.get("x-from-resolved")).toBe("1");
+  });
+
+  it("drops it when the body does not match the digest the proof bound", async () => {
+    const res = await post("formData=honest", "formData=attack");
+    expect(res.status).toBe(200);
+    // Back to the verdict an unproven request gets: the middleware-covered forced `no-cache`, and
+    // none of the resolved response headers. Before the revocation cleared the pre-body captures,
+    // `cache-control` here was still the revoked verdict's value.
+    expect(res.headers.get("cache-control")).toBe("no-cache");
+    expect(res.headers.get("x-from-resolved")).toBeNull();
+  });
+});
+
+describe("A0-DP-5: a cross-pool proof binds a known-empty body", () => {
+  it("does not weaken an empty POST body to the ABSENT digest symbol", async (ctx) => {
+    const secret = "an-internal-dispatch-secret";
+    let resolveVerdict!: (value: ReturnType<typeof verifyDispatchProof>) => void;
+    const receivedVerdict = new Promise<ReturnType<typeof verifyDispatchProof>>((resolve) => {
+      resolveVerdict = resolve;
+    });
+    const target = createServer((req, res) => {
+      const proof = req.headers["x-internal-dispatch-proof"];
+      resolveVerdict(
+        typeof proof === "string"
+          ? verifyDispatchProof(
+              secret,
+              {
+                method: req.method,
+                target: req.url,
+                headers: req.headers,
+                proofHeaderNames: PROOF_HEADER_NAMES,
+              },
+              proof,
+            )
+          : { trusted: false, reason: "malformed" },
+      );
+      req.resume();
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        target.once("error", reject);
+        target.listen(3000, "127.0.0.1", () => {
+          target.off("error", reject);
+          resolve();
+        });
+      });
+    } catch (error) {
+      // proxyToPool's production port is fixed. A developer service on :3000 should skip this
+      // socket test instead of making the suite fail for an unrelated local process.
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+        ctx.skip();
+        return;
+      }
+      throw error;
+    }
+
+    const lookup = vi.spyOn(dns, "lookup").mockImplementation(((
+      _hostname: string,
+      options: unknown,
+      cb?: unknown,
+    ) => {
+      const opts = typeof options === "object" ? (options as { all?: boolean }) : {};
+      const callback = (typeof options === "function" ? options : cb) as (
+        error: NodeJS.ErrnoException | null,
+        address: unknown,
+        family?: number,
+      ) => void;
+      queueMicrotask(() => {
+        if (opts.all) callback(null, [{ address: "127.0.0.1", family: 4 }]);
+        else callback(null, "127.0.0.1", 4);
+      });
+    }) as typeof dns.lookup);
+
+    let pool: Awaited<ReturnType<typeof boot>> | undefined;
+    try {
+      pool = await boot({ internalSecret: secret, crossPoolEcho: true });
+      const response = await fetch(`http://localhost:${pool.port}/echo-headers`, {
+        method: "POST",
+        body: "",
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+
+      const verdict = await receivedVerdict;
+      expect(verdict.trusted).toBe(true);
+      expect(verdict.trusted && verdict.bodyDigest).toEqual(dispatchBodyDigest(Buffer.alloc(0)));
+    } finally {
+      if (pool) await pool.stop();
+      lookup.mockRestore();
+      if (target.listening) await new Promise<void>((resolve) => target.close(() => resolve()));
+    }
   });
 });
