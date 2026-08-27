@@ -79,7 +79,9 @@ export function generateBuildMetadata({
    * still provisioned and still backs `use cache` (V2 handler, registered at runtime).
    */
   incrementalCacheHandler: boolean;
-  cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string } | undefined;
+  cacheMemorystore?:
+    | { region?: string; sizeGb?: number; tier?: string; auth?: boolean }
+    | undefined;
   /**
    * Which provider this build targets. The CLI is otherwise unable to tell: it infers "GCP"
    * from the presence of infrastructure.json fields, so a generic build looked to `deploy`

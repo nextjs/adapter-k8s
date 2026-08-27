@@ -1,5 +1,6 @@
 import type { HostConfig } from "../types.js";
 import type {
+  CacheProvisioning,
   ClusterAccess,
   ClusterIdentity,
   CompositionPlan,
@@ -19,6 +20,16 @@ import type {
   TelemetrySource,
 } from "../composition-plan/types.js";
 
+export interface ManagedCacheRequest {
+  kind: "managed";
+  /** Optional cache-region override; the cluster region is used when absent. */
+  region?: string;
+  sizeGb: number;
+  tier: "BASIC" | "STANDARD_HA";
+  /** False is an explicit plaintext opt-out; true requires AUTH and TLS. */
+  auth: boolean;
+}
+
 export interface TargetBuildContext {
   releaseName: string;
   namespace: string;
@@ -27,7 +38,7 @@ export interface TargetBuildContext {
   pools: readonly string[];
   defaultPool: string;
   failurePolicy: "open" | "closed";
-  cache?: "none" | "external";
+  cache?: "none" | "external" | ManagedCacheRequest;
   infrastructure?: {
     projectId?: string;
     region?: string;
@@ -66,6 +77,8 @@ export type ExposureCapability =
 export type ExposureRequirement = Extract<ExposureCapability, { kind: "gateway-api" }>;
 
 export interface ClusterBuildResult extends OperationalContribution {
+  /** Concrete provisioning operation contributed for a managed-cache request. */
+  cache?: CacheProvisioning;
   identity: ClusterIdentity;
   access: ClusterAccess;
   registry: RegistryPlan;
@@ -97,7 +110,16 @@ export interface ExposureComponent {
 export interface ResourceComponent {
   readonly componentType: "resource";
   readonly name: string;
-  build(context: TargetBuildContext): KubernetesContribution;
+  build(context: TargetBuildContext): ResourceBuildResult;
+}
+
+export interface ResourceBuildResult extends KubernetesContribution {
+  /**
+   * Concrete provisioning operation contributed when the build requests a managed cache.
+   * This is deliberately operation-shaped: future resource components can supply a supported
+   * CacheProvisioning without growing a provider-name switch in the target API.
+   */
+  cache?: CacheProvisioning;
 }
 
 export type DisabledRoutingTier = {

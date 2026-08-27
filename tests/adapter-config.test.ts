@@ -5,6 +5,7 @@ import path from "node:path";
 import { createK8sAdapter } from "../src/adapter.js";
 import { mockOutputs, mockAppPage, mockRouting } from "./helpers/mock-outputs.js";
 import type { K8sAdapterConfig } from "../src/types.js";
+import { defineTarget, gkeCluster, manualExposure } from "../src/target/index.js";
 
 const validConfig: K8sAdapterConfig = {
   pools: { ssr: { routes: ["appPages"] } },
@@ -506,6 +507,71 @@ describe("onBuildComplete build-time guards", () => {
         readFileSync(path.join(projectDir, ".k8s-adapter/output/build-metadata.json"), "utf-8"),
       ).namespace,
     ).toBe("prod");
+  });
+
+  it("records explicit gkeCluster managed-cache intent in the plan and build metadata", async () => {
+    writeInfra({
+      projectId: "my-project-1",
+      region: "us-central1",
+      containerRegistry: "us-central1-docker.pkg.dev/my-project-1/nextjs",
+    });
+    const bundleDir = mkdtempSync(path.join(os.tmpdir(), "adapter-bundles-"));
+    writeFileSync(path.join(bundleDir, "cache-handler.cjs"), "module.exports = class {};");
+    const savedBundleDir = process.env.ADAPTER_K8S_BUNDLE_DIR;
+    process.env.ADAPTER_K8S_BUNDLE_DIR = bundleDir;
+    try {
+      const adapter = createK8sAdapter({
+        pools: { ssr: { routes: ["appPages"] } },
+        target: defineTarget({
+          cluster: gkeCluster(),
+          exposure: manualExposure({
+            hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+          }),
+        }),
+        cache: {
+          enabled: true,
+          memorystore: {
+            region: "europe-west1",
+            sizeGb: 5,
+            tier: "STANDARD_HA",
+            auth: false,
+          },
+        },
+      });
+      const modified = (await adapter.modifyConfig!({} as any, {} as any)) as Record<
+        string,
+        unknown
+      >;
+      await expect(adapter.onBuildComplete!(ctx("b12345", modified))).resolves.toBeUndefined();
+
+      const outputDir = path.join(projectDir, ".k8s-adapter/output");
+      const plan = JSON.parse(readFileSync(path.join(outputDir, "composition-plan.json"), "utf8"));
+      const metadata = JSON.parse(
+        readFileSync(path.join(outputDir, "build-metadata.json"), "utf8"),
+      );
+      expect(plan.operations.cache).toMatchObject({
+        kind: "gcp-memorystore",
+        projectId: "my-project-1",
+        region: "europe-west1",
+        sizeGb: 5,
+        tier: "STANDARD_HA",
+        security: { kind: "legacy-plaintext-explicit-opt-out" },
+      });
+      expect(metadata).toMatchObject({
+        cacheEnabled: true,
+        cacheManaged: true,
+        cacheMemorystore: {
+          region: "europe-west1",
+          sizeGb: 5,
+          tier: "STANDARD_HA",
+          auth: false,
+        },
+      });
+    } finally {
+      if (savedBundleDir === undefined) delete process.env.ADAPTER_K8S_BUNDLE_DIR;
+      else process.env.ADAPTER_K8S_BUNDLE_DIR = savedBundleDir;
+      rmSync(bundleDir, { recursive: true, force: true });
+    }
   });
 
   it("qualifies the GKE extension-chain authority with the custom namespace", async () => {

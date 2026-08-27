@@ -4,6 +4,13 @@
 // injected into the pods via the `${releaseName}-valkey` Secret, which deploy renders into
 // the chart (Helm-owned) once provisioning reveals the private IP.
 import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
+import {
+  assertSafeProjectId,
+  assertSafeRegion,
+  assertSafeReleaseName,
+} from "../emit/templates/utils.js";
+
+const GCP_NETWORK_NAME_RE = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
 
 export interface ProvisionCacheOptions {
   projectId: string;
@@ -208,6 +215,23 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     dryRun,
     log = console.log,
   } = opts;
+  assertSafeProjectId(projectId);
+  assertSafeRegion(region);
+  assertSafeReleaseName(releaseName);
+  if (!GCP_NETWORK_NAME_RE.test(network)) {
+    throw new Error(
+      `Invalid Memorystore network ${JSON.stringify(network)}: expected a GCP network name`,
+    );
+  }
+  if (!Number.isInteger(sizeGb) || sizeGb < 1 || sizeGb > 300) {
+    throw new Error("Memorystore sizeGb must be an integer from 1 to 300");
+  }
+  if (tier !== undefined && tier !== "BASIC" && tier !== "STANDARD_HA") {
+    throw new Error('Memorystore tier must be "BASIC" or "STANDARD_HA"');
+  }
+  if (auth !== undefined && typeof auth !== "boolean") {
+    throw new Error("Memorystore auth must be a boolean");
+  }
   const name = cacheInstanceName(releaseName);
 
   // S8 (SECURITY). AUTH + in-transit encryption now default ON. Memorystore's own defaults are

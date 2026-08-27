@@ -75,6 +75,19 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     vi.mocked(exec.execCapture).mockReset();
   });
 
+  it("validates plan/config values again at the provisioning boundary", async () => {
+    await expect(
+      provisionMemorystore({ ...OPTS, network: "--impersonate-service-account" }),
+    ).rejects.toThrow(/Invalid Memorystore network/);
+    await expect(provisionMemorystore({ ...OPTS, sizeGb: 301 })).rejects.toThrow(
+      /sizeGb must be an integer from 1 to 300/,
+    );
+    await expect(provisionMemorystore({ ...OPTS, tier: "PREMIUM" })).rejects.toThrow(
+      /tier must be/,
+    );
+    expect(exec.execCapture).not.toHaveBeenCalled();
+  });
+
   it("creates the instance with AUTH + SERVER_AUTHENTICATION and returns authString + CA", async () => {
     // describeInstance is called twice with the same args: not-found first (create
     // path), then READY (waitForReady). Track calls to sequence the two answers.
