@@ -52,6 +52,15 @@ interface InstanceInfo {
   port: number;
 }
 
+interface InstanceConfiguration {
+  authEnabled: boolean;
+  transitEncryptionMode: string;
+  memorySizeGb: number;
+  tier: string;
+  authorizedNetwork: string;
+  connectMode: string;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 async function describeInstance(
@@ -98,13 +107,14 @@ async function waitForReady(
   throw new Error(`Memorystore ${name} did not reach READY in time`);
 }
 
-// Full instance details, needed when AUTH is requested: AUTH + in-transit encryption are
-// creation-only on Memorystore, so an existing instance must already have them enabled.
-async function describeInstanceAuth(
+// Existing instances are paid, stateful infrastructure. Reuse is safe only when every
+// plan-controlled setting agrees; silently accepting drift makes the signed composition plan a
+// description of intent instead of an authorization boundary.
+async function describeInstanceConfiguration(
   name: string,
   region: string,
   projectId: string,
-): Promise<{ authEnabled: boolean; transitEncryption: boolean } | null> {
+): Promise<InstanceConfiguration | null> {
   const res = await execCapture(
     "gcloud",
     [
@@ -116,7 +126,7 @@ async function describeInstanceAuth(
       region,
       "--project",
       projectId,
-      "--format=json(authEnabled,transitEncryptionMode)",
+      "--format=json(authEnabled,transitEncryptionMode,memorySizeGb,tier,authorizedNetwork,connectMode)",
     ],
     { timeoutMs: EXEC_TIMEOUTS.kubectl },
   );
@@ -125,10 +135,34 @@ async function describeInstanceAuth(
     const parsed = JSON.parse(res.stdout) as {
       authEnabled?: boolean;
       transitEncryptionMode?: string;
+      memorySizeGb?: number | string;
+      tier?: string;
+      authorizedNetwork?: string;
+      connectMode?: string;
     };
+    const memorySizeGb =
+      typeof parsed.memorySizeGb === "number"
+        ? parsed.memorySizeGb
+        : typeof parsed.memorySizeGb === "string" && /^\d+$/.test(parsed.memorySizeGb)
+          ? Number(parsed.memorySizeGb)
+          : Number.NaN;
+    if (
+      typeof parsed.authEnabled !== "boolean" ||
+      typeof parsed.transitEncryptionMode !== "string" ||
+      !Number.isInteger(memorySizeGb) ||
+      typeof parsed.tier !== "string" ||
+      typeof parsed.authorizedNetwork !== "string" ||
+      typeof parsed.connectMode !== "string"
+    ) {
+      return null;
+    }
     return {
-      authEnabled: parsed.authEnabled === true,
-      transitEncryption: parsed.transitEncryptionMode === "SERVER_AUTHENTICATION",
+      authEnabled: parsed.authEnabled,
+      transitEncryptionMode: parsed.transitEncryptionMode,
+      memorySizeGb,
+      tier: parsed.tier,
+      authorizedNetwork: parsed.authorizedNetwork,
+      connectMode: parsed.connectMode,
     };
   } catch {
     return null;
@@ -242,14 +276,9 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
   // overwrite cached HTML/RSC (content injection into the production site) or drop tags
   // wholesale. Only a `// Recommended` comment in types.ts documented the risk.
   //
-  // Three states, because AUTH is CREATION-ONLY and an existing instance cannot be retrofitted:
-  //  - explicit `true`  → require it; refuse to reuse an instance that lacks it (unchanged).
-  //  - unset (default)  → create WITH it, but tolerate a pre-existing instance that lacks it
-  //                       (loudly). Otherwise the new default would hard-fail every existing
-  //                       deployment on upgrade and demand a cache wipe, which is not a
-  //                       migration this change is entitled to force.
-  //  - explicit `false` → opt out, and say so on every deploy.
-  const authExplicit = auth === true;
+  // AUTH is creation-only. Unset means secure; explicit false is the only plaintext opt-out.
+  // Existing infrastructure must match exactly in either direction: returning a plaintext URL
+  // for an AUTH-only instance is just as broken as returning rediss:// for a plaintext one.
   const authOptedOut = auth === false;
   const wantAuthOnCreate = !authOptedOut;
   if (authOptedOut) {
@@ -288,58 +317,62 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     return { ...endpoint, authString, caCert };
   };
 
+  const expectedTier = tier ?? "BASIC";
+  const verifyExistingConfiguration = async (): Promise<boolean> => {
+    const details = await describeInstanceConfiguration(name, region, projectId);
+    if (!details) {
+      throw new Error(
+        `Could not verify the full configuration of the existing Memorystore instance ${name} ` +
+          `(gcloud describe failed or returned incomplete data). Refusing to reuse paid state ` +
+          `without proving it matches the authenticated cache plan.`,
+      );
+    }
+
+    const existingNetwork = details.authorizedNetwork.split("/").at(-1) ?? "";
+    const secured =
+      details.authEnabled && details.transitEncryptionMode === "SERVER_AUTHENTICATION";
+    const securityMatches = wantAuthOnCreate
+      ? secured
+      : !details.authEnabled && details.transitEncryptionMode === "DISABLED";
+    const mismatches: string[] = [];
+    if (details.memorySizeGb !== sizeGb) {
+      mismatches.push(`memorySizeGb expected ${sizeGb}, found ${details.memorySizeGb}`);
+    }
+    if (details.tier !== expectedTier) {
+      mismatches.push(`tier expected ${expectedTier}, found ${details.tier}`);
+    }
+    if (existingNetwork !== network) {
+      mismatches.push(`network expected ${network}, found ${details.authorizedNetwork}`);
+    }
+    if (details.connectMode !== "DIRECT_PEERING") {
+      mismatches.push(`connectMode expected DIRECT_PEERING, found ${details.connectMode}`);
+    }
+    if (!securityMatches) {
+      mismatches.push(
+        `security expected ${wantAuthOnCreate ? "AUTH + TLS" : "plaintext"}, found ` +
+          `authEnabled=${String(details.authEnabled)}, ` +
+          `transitEncryptionMode=${details.transitEncryptionMode}`,
+      );
+    }
+    if (mismatches.length > 0) {
+      throw new Error(
+        `Existing Memorystore instance ${name} is incompatible with the authenticated cache ` +
+          `plan: ${mismatches.join("; ")}. Recreate it intentionally or restore matching ` +
+          `configuration; refusing to reuse or mutate paid state.`,
+      );
+    }
+    return secured;
+  };
+
   const existing = await describeInstance(name, region, projectId);
   if (existing) {
-    // AUTH + in-transit encryption are creation-only: refuse to silently reuse an instance
-    // that doesn't enforce them (the pods would get a rediss:// endpoint they can't use, or
-    // worse, plaintext creds would be expected on a path the operator believes is secured).
-    if (wantAuthOnCreate) {
-      const details = await describeInstanceAuth(name, region, projectId);
-      // "Couldn't tell" is NOT "proceed": a null here means the describe failed (or
-      // returned nothing parseable), and reusing the instance blind could hand the pods a
-      // rediss:// endpoint on an instance that doesn't enforce AUTH. Abort with guidance.
-      if (!details) {
-        throw new Error(
-          `Could not verify the AUTH / in-transit-encryption posture of the existing ` +
-            `Memorystore instance ${name} (gcloud describe failed or returned nothing). ` +
-            `AUTH is creation-only, so refusing to guess. Check \`gcloud redis instances ` +
-            `describe ${name} --region ${region} --project ${projectId}\` and re-run the deploy.`,
-        );
-      }
-      const secured = details.authEnabled && details.transitEncryption;
-      if (!secured && authExplicit) {
-        throw new Error(
-          `Memorystore instance ${name} already exists WITHOUT AUTH / in-transit encryption, ` +
-            `but cache.memorystore.auth is enabled. AUTH can only be set at creation: either ` +
-            `delete the instance (\`adapter-k8s destroy\` removes it) and redeploy, or set ` +
-            `cache.memorystore.auth: false.`,
-        );
-      }
-      if (!secured) {
-        // S8: pre-existing instance from before AUTH became the default. Continue rather than
-        // demand a cache wipe, but never quietly — this is a live exposure, and the operator
-        // is the only one who can schedule the recreate that fixes it.
-        log(
-          `    ! Memorystore ${name} predates the AUTH default and has AUTH / in-transit ` +
-            `encryption DISABLED (creation-only, so it cannot be enabled in place). Any ` +
-            `workload that can reach it on the VPC can read and overwrite the shared cache. ` +
-            `To fix: \`adapter-k8s destroy\` the instance and redeploy, which recreates it ` +
-            `with AUTH. To silence this, set cache.memorystore.auth: false.`,
-        );
-      }
-      if (existing.state === "READY" && existing.host) {
-        log(`    Reusing Memorystore ${name} at ${existing.host}:${existing.port}`);
-        return withAuth({ host: existing.host, port: existing.port }, secured);
-      }
-      log(`    Memorystore ${name} exists (state=${existing.state}); waiting for READY…`);
-      return withAuth(await waitForReady(name, region, projectId, log), secured);
-    }
+    const secured = await verifyExistingConfiguration();
     if (existing.state === "READY" && existing.host) {
       log(`    Reusing Memorystore ${name} at ${existing.host}:${existing.port}`);
-      return withAuth({ host: existing.host, port: existing.port });
+      return withAuth({ host: existing.host, port: existing.port }, secured);
     }
     log(`    Memorystore ${name} exists (state=${existing.state}); waiting for READY…`);
-    return withAuth(await waitForReady(name, region, projectId, log));
+    return withAuth(await waitForReady(name, region, projectId, log), secured);
   }
 
   const gcpTier = (tier ?? "").toUpperCase() === "STANDARD_HA" ? "standard_ha" : "basic";
@@ -379,6 +412,11 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     // A concurrent run may have created it first ("already exists") — in that case fall through
     // to wait for READY rather than failing the deploy.
     throw new Error(`Failed to create Memorystore instance ${name}: ${create.stderr.trim()}`);
+  }
+  if (create.exitCode !== 0) {
+    // A concurrent creator may use a different plan. The name collision is not evidence that
+    // its paid instance is safe for this deployment.
+    await verifyExistingConfiguration();
   }
   const ready = await waitForReady(name, region, projectId, log);
   log(`    Memorystore ${name} ready at ${ready.host}:${ready.port}`);

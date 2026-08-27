@@ -1652,7 +1652,7 @@ describe("runDeploy — guards and teardown", () => {
     ).rejects.toThrow(new RegExp(`Failed to parse ${infraPath.replace(/[/.]/g, "\\$&")}`));
   });
 
-  it("managed→BYO: tears down the previously provisioned Memorystore and clears cacheRegion", async () => {
+  it("refuses a legacy managed→BYO transition before Kubernetes or GCP changes", async () => {
     setupFs({
       infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
@@ -1665,24 +1665,19 @@ describe("runDeploy — guards and teardown", () => {
       return cluster(cmd, args);
     }) as never);
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/legacy managed-cache.*bring-your-own.*composition plan/s);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
-    expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(true);
-    expect(events.indexOf("cache-delete")).toBeGreaterThan(events.indexOf("writeState"));
-    // The BYO Secret is helm-owned — the imperative secret delete must NOT run.
+    expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(false);
     expect(calls.some((a) => a.includes("delete secret"))).toBe(false);
-    // cacheRegion was cleared from infrastructure.json.
-    const infraWrites = vi
-      .mocked(writeFileSync)
-      .mock.calls.filter(([p]) => p === infraPath)
-      .map(([, content]) => String(content));
-    expect(infraWrites.length).toBeGreaterThan(0);
-    expect(infraWrites[infraWrites.length - 1]).not.toContain("cacheRegion");
+    expect(events).not.toContain("helm");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
   });
 
-  it("does not delete the outgoing managed cache when Helm fails before cutover", async () => {
+  it("rejects an unauthenticated legacy cache transition before Helm can fail", async () => {
     setupFs({
       infra: { ...BASE_INFRA, cacheRegion: "us-central1", cacheProjectId: "my-project" },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
@@ -1695,10 +1690,11 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/Helm upgrade failed/);
+    ).rejects.toThrow(/legacy managed-cache/);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
     expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(events).not.toContain("helm");
   });
 
   it("provisions the authenticated composition plan's managed Memorystore operation", async () => {
@@ -1750,6 +1746,46 @@ describe("runDeploy — guards and teardown", () => {
     expect(infraWrites.some((content) => content.includes('"cacheProjectId": "my-project"'))).toBe(
       true,
     );
+  });
+
+  it("refuses to orphan a managed cache when its project or region changes", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: {
+        kind: "managed",
+        region: "europe-west1",
+        sizeGb: 5,
+        tier: "STANDARD_HA",
+        auth: true,
+      },
+    });
+    setupFs({
+      compositionPlan,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+        cacheMemorystore: {
+          region: "europe-west1",
+          sizeGb: 5,
+          tier: "STANDARD_HA",
+          auth: true,
+        },
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Cannot replace the managed cache.*us-central1.*europe-west1/s);
+
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
   });
 
   it("cleans a composed managed cache only after cutover using the outgoing plan's state anchor", async () => {
@@ -1857,6 +1893,44 @@ describe("runDeploy — guards and teardown", () => {
     );
   });
 
+  it("ignores stale local cache markers when neither composed plan owns a managed cache", async () => {
+    const outgoing = gkeCompositionPlan({ buildId: "buildm", cache: "external" });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCompositionCluster(events, { buildm: outgoing }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
+  });
+
   it("aborts before Helm rather than adopting a foreign-owned non-cache Secret", async () => {
     setupFs({
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
@@ -1891,20 +1965,21 @@ describe("runDeploy — guards and teardown", () => {
     expect(valkeyPatches).toHaveLength(0);
   });
 
-  it("cache disabled: removes the Secret AND the managed instance (regression)", async () => {
+  it("refuses to disable a legacy managed cache before deleting its Secret or instance", async () => {
     setupFs({
       infra: { ...BASE_INFRA, cacheRegion: "us-east1" },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, cacheManaged: false },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/legacy managed-cache.*disabled caching/s);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
-    expect(calls.some((a) => a.includes("delete secret rel-valkey"))).toBe(true);
-    expect(
-      calls.some((a) => a.includes("redis instances delete rel-cache") && a.includes("us-east1")),
-    ).toBe(true);
+    expect(calls.some((a) => a.includes("delete secret rel-valkey"))).toBe(false);
+    expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(events).not.toContain("helm");
   });
 
   it("BYO from the start (no cacheRegion): no teardown of anything", async () => {

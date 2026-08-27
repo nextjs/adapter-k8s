@@ -31,6 +31,16 @@ function mockGcloud(responses: [match: string, result: exec.ExecCaptureResult][]
 
 const ok = (stdout = ""): exec.ExecCaptureResult => ({ exitCode: 0, stdout, stderr: "" });
 
+const existingConfig = (overrides: Record<string, unknown> = {}) => ({
+  authEnabled: true,
+  transitEncryptionMode: "SERVER_AUTHENTICATION",
+  memorySizeGb: 1,
+  tier: "BASIC",
+  authorizedNetwork: "projects/proj-12345/global/networks/default",
+  connectMode: "DIRECT_PEERING",
+  ...overrides,
+});
+
 describe("cacheInstanceName", () => {
   it("derives a deterministic per-release instance name", () => {
     expect(cacheInstanceName("test-app")).toBe("test-app-cache");
@@ -180,22 +190,20 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     expect(logs.join("\n")).toMatch(/UNAUTHENTICATED/);
   });
 
-  it("TOLERATES a pre-existing non-AUTH instance when auth is merely defaulted, loudly", async () => {
-    // AUTH is creation-only, so the new default must not hard-fail every existing deployment
-    // and demand a cache wipe — but the exposure has to be reported on every deploy.
-    const logs: string[] = [];
+  it("refuses a pre-existing non-AUTH instance when secure auth is defaulted", async () => {
     mockGcloud([
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
       [
-        "--format=json(authEnabled,transitEncryptionMode)",
-        ok(JSON.stringify({ authEnabled: false, transitEncryptionMode: "DISABLED" })),
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(
+          JSON.stringify(
+            existingConfig({ authEnabled: false, transitEncryptionMode: "DISABLED" }),
+          ),
+        ),
       ],
     ]);
-    const endpoint = await provisionMemorystore({ ...OPTS, log: (m: string) => logs.push(m) });
-    // Reused, and NOT handed credentials it cannot use.
-    expect(endpoint).toEqual({ host: "10.0.0.1", port: 6379 });
-    expect(logs.join("\n")).toMatch(/predates the AUTH default/);
+    await expect(provisionMemorystore(OPTS)).rejects.toThrow(/incompatible.*AUTH/i);
   });
 
   it("refuses to reuse an existing non-AUTH instance when auth is requested", async () => {
@@ -203,12 +211,16 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
       [
-        "--format=json(authEnabled,transitEncryptionMode)",
-        ok(JSON.stringify({ authEnabled: false, transitEncryptionMode: "DISABLED" })),
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(
+          JSON.stringify(
+            existingConfig({ authEnabled: false, transitEncryptionMode: "DISABLED" }),
+          ),
+        ),
       ],
     ]);
     await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
-      /already exists WITHOUT AUTH/,
+      /incompatible.*AUTH/i,
     );
   });
 
@@ -217,8 +229,8 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
       [
-        "--format=json(authEnabled,transitEncryptionMode)",
-        ok(JSON.stringify({ authEnabled: true, transitEncryptionMode: "SERVER_AUTHENTICATION" })),
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(JSON.stringify(existingConfig())),
       ],
       ["get-auth-string", ok("s3cr3t-auth\n")],
       ["--format=json(serverCaCerts)", ok(JSON.stringify({ serverCaCerts: [{ cert: "CA-PEM" }] }))],
@@ -228,18 +240,67 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     expect(endpoint.caCert).toBe("CA-PEM");
   });
 
-  it("ABORTS when the AUTH posture of an existing instance cannot be determined (null ≠ proceed)", async () => {
+  it.each([
+    ["size", { memorySizeGb: 2 }],
+    ["tier", { tier: "STANDARD_HA" }],
+    ["network", { authorizedNetwork: "projects/proj-12345/global/networks/other" }],
+    ["connect mode", { connectMode: "PRIVATE_SERVICE_ACCESS" }],
+  ])("refuses to reuse an existing instance with incompatible %s", async (_field, override) => {
     mockGcloud([
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
-      // describeInstanceAuth: gcloud itself fails → null → must not reuse the instance blind.
       [
-        "--format=json(authEnabled,transitEncryptionMode)",
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(JSON.stringify(existingConfig(override))),
+      ],
+      ["get-auth-string", ok("s3cr3t-auth\n")],
+      ["--format=json(serverCaCerts)", ok(JSON.stringify({ serverCaCerts: [{ cert: "CA" }] }))],
+    ]);
+    await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
+      /incompatible.*Memorystore|Memorystore.*incompatible/i,
+    );
+  });
+
+  it("refuses a plaintext plan for an existing AUTH/TLS-only instance", async () => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      [
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(JSON.stringify(existingConfig())),
+      ],
+    ]);
+    await expect(provisionMemorystore({ ...OPTS, auth: false })).rejects.toThrow(
+      /incompatible.*AUTH|AUTH.*incompatible/i,
+    );
+  });
+
+  it("refuses a plaintext plan for a partially secured instance", async () => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      [
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(JSON.stringify(existingConfig({ authEnabled: false }))),
+      ],
+    ]);
+    await expect(provisionMemorystore({ ...OPTS, auth: false })).rejects.toThrow(
+      /transitEncryptionMode=SERVER_AUTHENTICATION/,
+    );
+  });
+
+  it("aborts when an existing instance's full configuration cannot be determined", async () => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      // The full describe fails, so the instance must not be reused blind.
+      [
+        "--format=json(authEnabled,transitEncryptionMode",
         { exitCode: 1, stdout: "", stderr: "permission denied" },
       ],
     ]);
     await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
-      /Could not verify the AUTH \/ in-transit-encryption posture/,
+      /Could not verify the full configuration/,
     );
     // Never reached for a credential fetch or a create.
     const joined = vi.mocked(exec.execCapture).mock.calls.map(([, args]) => args.join(" "));
@@ -252,10 +313,34 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     mockGcloud([
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
-      ["--format=json(authEnabled,transitEncryptionMode)", ok("SET LEGACY\n")],
+      ["--format=json(authEnabled,transitEncryptionMode", ok("SET LEGACY\n")],
     ]);
     await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
-      /Could not verify the AUTH \/ in-transit-encryption posture/,
+      /Could not verify the full configuration/,
+    );
+  });
+
+  it("verifies a concurrently created instance before reusing it", async () => {
+    let describes = 0;
+    vi.mocked(exec.execCapture).mockImplementation(async (_cmd, args) => {
+      const joined = args.join(" ");
+      if (joined.includes("--format=value(state,host,port)")) {
+        describes += 1;
+        return describes === 1
+          ? { exitCode: 1, stdout: "", stderr: "not found" }
+          : ok("READY 10.0.0.1 6379");
+      }
+      if (joined.includes("instances create")) {
+        return { exitCode: 1, stdout: "", stderr: "already exists" };
+      }
+      if (joined.includes("--format=json(authEnabled,transitEncryptionMode")) {
+        return ok(JSON.stringify(existingConfig({ memorySizeGb: 2 })));
+      }
+      return ok();
+    });
+
+    await expect(provisionMemorystore({ ...OPTS, auth: true })).rejects.toThrow(
+      /memorySizeGb expected 1, found 2/,
     );
   });
 
