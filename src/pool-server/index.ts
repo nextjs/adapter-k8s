@@ -2607,7 +2607,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // proved trust). Parsed ONCE here — the forced cache-policy wrapper below must see an
     // explicit app-owned cache-control before any response is written, and the Phase-2
     // dispatch reuses the same parse. Deleted immediately so it can never leak to handlers.
-    const extResolvedHeaders = parseResolvedHeaders(
+    // `let`, not `const`: enforceDispatchBodyBinding below can REVOKE this request's trust after
+    // this parse has already happened, and the revocation has to reach the values it captured.
+    let extResolvedHeaders = parseResolvedHeaders(
       req.headers["x-resolved-headers"] as string | undefined,
     );
     delete req.headers["x-resolved-headers"];
@@ -2624,7 +2626,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // told this pool the middleware stage was already complete, so the client's spoofed header
     // reached the handler unmodified. Parsed with the SAME reader as `x-resolved-headers` (one
     // wire shape) and deleted immediately so it can never leak to a handler on either phase.
-    const extMwRequestHeaders = parseResolvedHeaders(
+    // `let` for the same reason as `extResolvedHeaders` above.
+    let extMwRequestHeaders = parseResolvedHeaders(
       req.headers["x-mw-request-headers"] as string | undefined,
     );
     delete req.headers["x-mw-request-headers"];
@@ -2981,12 +2984,33 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // A0-DP-5 (SECURITY). The second half of the dispatch proof's body binding. The trust boundary
     // verified the MAC (which covers the digest the signer DECLARED, so it cannot be edited in
     // transit) but had no body to compare it against — the boundary runs at the header phase, by
-    // design. This is the single point on the serving path where the body becomes known, and it is
-    // before anything reads the trusted `x-mw-evaluated` / `x-output-id` verdict below, so a
-    // mismatch revokes trust in time: the dispatch vocabulary is stripped and this request
-    // re-resolves locally with its real body, exactly like an unproven one. Closes the cross-pool
-    // replay where an observed POST proof was re-sent with attacker-chosen bytes.
-    enforceDispatchBodyBinding(req, bodyBuffer);
+    // design. This is the single point on the serving path where the body becomes known, so a
+    // mismatch revokes trust here: the dispatch vocabulary is stripped from `req.headers` and this
+    // request re-resolves locally with its real body, exactly like an unproven one. Closes the
+    // cross-pool replay where an observed POST proof was re-sent with attacker-chosen bytes.
+    //
+    // WHERE THIS SITS IN THE ORDER, precisely — the revocation strips HEADERS, and cannot undo a
+    // value already captured into a local:
+    //   • AFTER the `x-resolved-headers` parse, the `x-mw-request-headers` parse and the PPR
+    //     `x-output-id` peek above. Those three ran before the body existed, so the revocation has
+    //     to reach their captures explicitly; that is what the block below does.
+    //   • BEFORE every read of the trusted `x-mw-evaluated` / `x-output-id` dispatch verdict
+    //     (the Phase-2 branch, the image fast path). Those re-read `req.headers` after the strip,
+    //     so they see an untrusted request and fall through to local resolution on their own.
+    if (!enforceDispatchBodyBinding(req, bodyBuffer)) {
+      // Trust is revoked: drop what the pre-body captures took from the now-untrusted verdict.
+      // `appCacheControl` is the load-bearing one — it was seeded unconditionally from
+      // `x-resolved-headers`, and it feeds the forced-cache-policy wrapper (this request's
+      // Cache-Control and its derived CDN cache-tag), so leaving it would let the replayed proof
+      // still choose the response's cache policy. Nulling it hands the slot back to local
+      // resolution, which re-seeds it below exactly as it does for a request that never presented
+      // a proof. `isPprRoute` is deliberately NOT recomputed: its inputs only ever OR the verdict
+      // ON (`no-store`), so a forged `x-output-id` can only make the cache policy stricter, and
+      // the wrapper it feeds is already installed above.
+      extResolvedHeaders = undefined;
+      extMwRequestHeaders = undefined;
+      appCacheControl = null;
+    }
 
     // Opt-in diagnostic only. NEVER log request bodies or router state: Server Action
     // bodies routinely carry credentials, tokens, and PII, and were previously written to

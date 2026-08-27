@@ -63,6 +63,13 @@ type StageOptions = {
    * forever (measured: the full-run basePath cluster, ~20 suites, all rollout timeouts).
    */
   basePathKeys?: boolean;
+  /**
+   * Declare Node middleware whose matcher covers `/echo-headers`, which is what installs the
+   * forced `no-cache` cache-policy wrapper for that route (`middlewareMayCover`). The module is a
+   * bare continue — the point is the COVERAGE, because a forced verdict is the only state in
+   * which an app-owned `cache-control` from the resolved routing verdict is load-bearing.
+   */
+  middlewareCoversEcho?: boolean;
 };
 
 function writeStagedDir(options: StageOptions = {}): Staged {
@@ -250,7 +257,13 @@ function writeStagedDir(options: StageOptions = {}): Staged {
       // NO middleware — the review's "middleware-less app" case. Nothing stamps `x-nextjs-ppr`
       // in such a deployment (there is no traffic extension at all), and `middlewareCovers` is
       // false for every request, so the ONLY source of the PPR verdict is the local inventory.
-      middleware: null,
+      middleware: options.middlewareCoversEcho
+        ? {
+            filePath: path.join(dir, "mw.mjs"),
+            runtime: "nodejs",
+            matchers: [{ regexp: "^\\/echo-headers$" }],
+          }
+        : null,
       poolAssignments: Object.fromEntries(pathnames.map((p) => [p, "main"])),
       // `fallbackFilePath` deliberately points at a file that does not exist: the resume-token
       // injection is then skipped (shellAvailable === false) and the handler answers normally,
@@ -262,6 +275,11 @@ function writeStagedDir(options: StageOptions = {}): Staged {
       nextVersion: "16.2.10",
     }),
   );
+  if (options.middlewareCoversEcho) {
+    // A callable export that returns nothing, i.e. `next()`. Phase 1 does invoke it on a request
+    // that lost its trusted verdict — the documented fail-safe (middleware runs at the pool).
+    writeFileSync(path.join(dir, "mw.mjs"), "export function proxy(request) {}\n");
+  }
   writeFileSync(path.join(configDir, "static-assets.json"), JSON.stringify([]));
   return { dir, configDir };
 }
@@ -868,5 +886,86 @@ describe("N40: Phase 2 installs the middleware's final request-header set", () =
       "/echo-headers",
     );
     expect(body.authenticatedUser).toBeNull();
+  });
+});
+
+// A0-DP-5 (SECURITY). `enforceDispatchBodyBinding` revokes trust when the body does not match the
+// digest the proof bound — but it can only run AFTER the body has been read, and three reads of
+// trusted headers happen before that point on the serving path: the `x-resolved-headers` parse,
+// the `x-mw-request-headers` parse, and the PPR `x-output-id` peek. Revocation strips HEADERS, so
+// it cannot undo a value already captured into a local — and `appCacheControl` was seeded from
+// `x-resolved-headers` unconditionally, then fed to the forced-cache-policy wrapper. So on the
+// exact replay this check exists to close (an observed POST proof re-sent with different bytes)
+// the response still carried the cache policy — and the CDN cache-tag derived from it — of the
+// exchange that was replayed. The revocation now clears those captures as well as the headers.
+//
+// The stolen value is MAC-bound (`x-resolved-headers` is covered), so a replay reuses the observed
+// policy rather than choosing one: the impact is bounded, and this is about a revoked verdict not
+// continuing to decide the response.
+//
+// The route is under MIDDLEWARE COVERAGE deliberately: `forcedCdnCacheControl` returns `no-cache`
+// for a middleware-covered request, and `no-cache` is the one forced verdict an explicit app-owned
+// cache-control may override (`explicitCacheControlWins`) — which is exactly the state in which
+// the captured value decides the response. Without coverage there is no forced verdict, the
+// capture is never read, and a test would pass either way.
+describe("A0-DP-5: revoking a body-bound proof also revokes what it already resolved", () => {
+  let pool: Awaited<ReturnType<typeof boot>>;
+  const SECRET = "an-internal-dispatch-secret";
+  // The cache policy the replayed exchange resolved, which its replay must not inherit. It grants
+  // a shared cache no unrevalidated freshness, which is the only kind of explicit value allowed to
+  // override the forced middleware `no-cache` (`explicitCacheControlWins` — a positive s-maxage
+  // would let a CDN hit bypass the middleware callout, so it is refused whatever its provenance).
+  const RESOLVED_CACHE_CONTROL = "private, max-age=0, must-revalidate";
+
+  beforeAll(async () => {
+    pool = await boot({ internalSecret: SECRET, middlewareCoversEcho: true });
+  }, 60_000);
+  afterAll(async () => {
+    await pool.stop();
+  });
+
+  /**
+   * POST /echo-headers with a body-bound proof, the way `proxyToPool` signs a cross-pool hop.
+   * `sentBody` is what actually goes on the wire, so a caller can sign one body and transmit
+   * another. Both bodies are the SAME LENGTH, so `content-length` matches either way and the
+   * failure under test is the body binding rather than a header the proof also covers.
+   */
+  async function post(signedBody: string, sentBody = signedBody) {
+    const headers = {
+      "x-output-id": "/echo-headers",
+      "x-mw-evaluated": "ran",
+      "x-resolved-headers": JSON.stringify({
+        "cache-control": RESOLVED_CACHE_CONTROL,
+        "x-from-resolved": "1",
+      }),
+    };
+    return fetch(`http://localhost:${pool.port}/echo-headers`, {
+      method: "POST",
+      body: sentBody,
+      headers: signDispatch(SECRET, "POST", "/echo-headers", headers, {
+        authority: `localhost:${pool.port}`,
+        proofHeaderNames: PROOF_HEADER_NAMES,
+        body: Buffer.from(signedBody),
+      }),
+    });
+  }
+
+  it("applies the resolved cache policy when the body IS the one that was signed", async () => {
+    const res = await post("formData=honest");
+    expect(res.status).toBe(200);
+    // The app-owned value beats the forced middleware `no-cache` — the baseline the revocation
+    // must undo, and the proof that the captured value really does decide this response.
+    expect(res.headers.get("cache-control")).toBe(RESOLVED_CACHE_CONTROL);
+    expect(res.headers.get("x-from-resolved")).toBe("1");
+  });
+
+  it("drops it when the body does not match the digest the proof bound", async () => {
+    const res = await post("formData=honest", "formData=attack");
+    expect(res.status).toBe(200);
+    // Back to the verdict an unproven request gets: the middleware-covered forced `no-cache`, and
+    // none of the resolved response headers. Before the revocation cleared the pre-body captures,
+    // `cache-control` here was still the revoked verdict's value.
+    expect(res.headers.get("cache-control")).toBe("no-cache");
+    expect(res.headers.get("x-from-resolved")).toBeNull();
   });
 });

@@ -4065,6 +4065,13 @@ function proxyToPool(
     // path (index.ts buffers the body before routing), so this binds real bytes in practice; the
     // streaming fallback below has no digest to offer and binds ABSENT. The mint time is bound too,
     // which is what bounds a replay in time rather than merely per-tuple.
+    //
+    // A0-DP-2. The signed octets are latin1 (`wireHeaderBytes`), which is exactly what `httpRequest`
+    // below writes for every code point up to U+00FF — and U+00FF is the ceiling for BOTH: Node
+    // refuses to emit a header value above it (ERR_INVALID_CHAR) or a path containing one
+    // (ERR_UNESCAPED_CHARACTERS). So a forwarded value that latin1 would truncate never reaches
+    // the wire from here at all; the hop throws instead, and no sibling pool is handed truncated
+    // octets to verify. See the range note on `wireHeaderBytes`.
 
     // Same forged-framing guard as the loopback invocation: the target pool would
     // otherwise await body bytes that never arrive (hang until requestTimeout).
