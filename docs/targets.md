@@ -58,12 +58,20 @@ Use `gatewayApiExposure` instead for any conformant GatewayClass.
 **One requirement on whatever terminates TLS.** The pool's own socket is always plaintext, so
 `x-forwarded-proto` is its only witness of the client-facing scheme: it decides middleware's
 request URL, whether a middleware redirect `Location` is same-origin, and the origin a WebSocket
-handshake's `Origin` header is compared against. The adapter reads the **rightmost** element of
-that header's comma-joined chain, so the requirement is only that your ingress be the last hop to
-write it — overwriting (Envoy, and Envoy Gateway with the default zero trusted hops) and appending
-(the `X-Forwarded-For` convention) both satisfy it. An ingress that forwards a client-supplied
-`x-forwarded-proto` unchanged does not, and an https app behind it would evaluate its own routing
-against a scheme the client chose.
+handshake's `Origin` header is compared against. **It must reach the pool single-valued, written by
+the hop that terminated TLS.** Envoy — and Envoy Gateway, with the default zero trusted hops —
+overwrites it from the downstream connection's TLS state, so both emitted topologies satisfy this
+with no configuration. Two ways operator-supplied ingress can break it:
+
+- **Forwarding a client-supplied value unchanged.** Then an https app evaluates its own routing
+  against a scheme the client chose. Overwrite it at the edge.
+- **An appending intermediary between the TLS terminator and the pool.** Append conventions are
+  client-first (the `X-Forwarded-For` ordering, standardized in RFC 7239), so a second hop turns
+  the header into `https,http` — its own plaintext observation on the right. The adapter reads the
+  **leftmost** element, so it still derives `https`, but Next's own `x-forwarded-proto` handling
+  treats only the exact single value `https` as secure and will read `http` from that chain
+  regardless. Anything the app derives itself (absolute URLs, its own redirects) is then wrong even
+  though adapter-level routing is right. Configure the inner hop to overwrite, not append.
 
 ### TLS for dedicated exposures (cert-manager)
 

@@ -400,9 +400,12 @@ describe("handleWebSocketUpgrade", () => {
   });
 
   // S25. webSocketRequestAuthority derives the same-origin authority from the validated
-  // x-forwarded-proto witness, so which element of a multi-hop chain wins is now a security
-  // decision and not just a URL detail: the rightmost element is the one the trusted edge added,
-  // the leftmost is whatever the client sent. Nothing pinned that before.
+  // x-forwarded-proto witness, so which element of a multi-hop chain wins decides whether a
+  // browser's own `wss://` handshake is accepted, not just how a URL is spelled. Append
+  // conventions are client-first, so the leftmost element is the TLS-terminating outer hop's and
+  // the rightmost belongs to an inner hop that only saw the plaintext leg: reading the rightmost
+  // would 403 every wss handshake for an https app behind an appending intermediary. Nothing
+  // pinned that before.
   it.each([
     // [x-forwarded-proto, socket.encrypted, Origin, allowed, why]
     [undefined, false, "http://example.com", true, "no witness, plain socket → http authority"],
@@ -411,29 +414,38 @@ describe("handleWebSocketUpgrade", () => {
     ["https", false, "https://example.com", true, "TLS-terminating LB: the witness is the scheme"],
     ["HTTPS", false, "https://example.com", true, "case-insensitive witness"],
     ["http", false, "https://example.com", false, "edge witnessed plaintext"],
-    ["http,https", false, "https://example.com", true, "rightmost hop (the edge) said https"],
+    // The topology the ordering exists for: TLS-terminating outer LB plus an appending inner hop.
+    // The browser's own wss:// handshake must be accepted.
     [
       "https,http",
       false,
       "https://example.com",
-      false,
-      "client prepended https; the edge's own value still decides",
+      true,
+      "leftmost hop (the TLS terminator) said https",
     ],
     [
       ["https", "http"],
       false,
       "https://example.com",
-      false,
-      "repeated header instances are one chain, not an index-0 lookup",
+      true,
+      "repeated header instances are one chain, joined before the leftmost read",
     ],
+    ["http,https", false, "https://example.com", false, "the client-facing leg was plaintext"],
     ["javascript", false, "https://example.com", false, "garbage witness falls back to the socket"],
     ["javascript", false, "http://example.com", true, "garbage witness falls back to the socket"],
+    [
+      "javascript,https",
+      false,
+      "https://example.com",
+      false,
+      "garbage leftmost element does not fall further right",
+    ],
     [
       "https,javascript",
       false,
       "https://example.com",
-      false,
-      "garbage rightmost element does not fall further left",
+      true,
+      "junk appended by an inner hop cannot demote the outer hop's witness",
     ],
   ] as const)(
     "same-origin authority for x-forwarded-proto %j (encrypted=%s, Origin %s) allows=%s",

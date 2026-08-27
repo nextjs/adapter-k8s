@@ -96,45 +96,71 @@ const FORWARDED_HOST_RE = /^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/;
 // must compare a browser's `Origin: https://…` against `https://…`, not against the plain-http
 // scheme of the pool's own socket.
 //
-// S25. The RIGHTMOST value wins, and this is the whole reason the parse is centralized here.
-// X-Forwarded-* chains grow to the RIGHT: under append semantics the leftmost element is the one
-// the CLIENT supplied and the rightmost is the one added by the hop closest to this pool, i.e. the
-// trusted edge. Reading the leftmost element (as this did) means that in any topology whose edge
-// appends instead of overwriting, the pool derives its public scheme — and therefore the
-// WebSocket handshake's same-origin authority, middleware's request URL, and the
-// relative-vs-absolute middleware redirect decision — from a value the client chose.
+// S25. The LEFTMOST value wins, and pinning that down is the whole reason the parse is
+// centralized here. Both supported topologies OVERWRITE, so a single element is what actually
+// arrives and every reading of it is byte-identical; element order only decides what happens in a
+// topology that APPENDS, and there the leftmost element is the client-facing one:
+//   • RFC 7239 §4 — the standardized form of this field, and the equivalent MDN points at —
+//     orders its element list client-first, so the `proto` of the connection the client actually
+//     made is the FIRST element. De-facto `x-forwarded-proto` follows the `X-Forwarded-For`
+//     convention it was cloned from, which is client-first for the same reason: each proxy
+//     appends what it saw on the connection IT received. The hop that terminates TLS is the
+//     OUTERMOST one, so it contributes the LEFTMOST element, while an appending intermediary
+//     between it and this pool saw the already-decrypted plaintext leg and contributes the
+//     rightmost. "The last hop to write it" and "the trusted edge" are therefore opposite ends of
+//     an appended chain — reading the rightmost element derives `http` for an https site behind a
+//     TLS-terminating outer LB, which is a 403 on every browser `wss://` handshake against the
+//     app's own origin (webSocketRequestAuthority), an `http://` initURL, and a same-origin
+//     middleware redirect emitted absolute with the wrong scheme.
+//   • Leftmost is also what the ecosystem reads and what operators configure against: Express's
+//     `req.protocol` takes the substring before the first comma.
 //
-// Both supported topologies are believed to OVERWRITE, so a single value is what actually
-// arrives, and rightmost then reads identically to leftmost:
-//   • Generic provider (Envoy Gateway / the emitted Envoy in front of the pool): Envoy treats
-//     x-forwarded-proto as SINGLE-valued and sets it from the downstream connection's TLS state,
-//     honoring a downstream value only when `xff_num_trusted_hops` is non-zero — which nothing
-//     the adapter emits configures (see client-traffic-policy.ts: the only ClientTrafficPolicy
-//     knob emitted is escapedSlashesAction), so the default of zero trusted hops applies and
-//     Envoy never appends.
+// What a leftmost read gives up is a client PREPENDING an element of its own in an appending
+// topology (client sends `https`, a hop appends `http`, leftmost → https). That buys an attacker
+// nothing reachable. The value is load-bearing only for this request's own derived scheme, and
+// the single security decision it feeds — websocket-upgrade.ts's same-origin `Origin` check —
+// exists to stop a hostile WEB PAGE, which cannot put a request header on a WebSocket handshake
+// at all (the browser WebSocket API admits no custom headers) and cannot get one past CORS
+// preflight elsewhere. A non-browser client is not constrained by `Origin` in the first place, so
+// moving the scheme gains it nothing either. An unreachable spoof does not justify a permanent
+// 403 for a legitimate topology, so the fail-safe direction here is the ecosystem's ordering.
+//
+// Both EMITTED topologies overwrite, which is why any of this is only a requirement on
+// operator-supplied ingress (docs/targets.md):
+//   • Generic provider (Envoy Gateway / the emitted Envoy in front of the pool): Envoy's HCM
+//     documents that downstream `x-forwarded-proto` headers are trusted only when
+//     `xff_num_trusted_hops` is non-zero, and that when it is zero the downstream
+//     `x-forwarded-proto` and `:scheme` are SET from whether the downstream connection is TLS.
+//     Nothing the adapter emits configures that knob (see client-traffic-policy.ts: the only
+//     ClientTrafficPolicy knob emitted is escapedSlashesAction) and integration/envoy.yaml sets
+//     no XFF knob either, so the zero default applies and Envoy overwrites with a single value.
 //   • GKE / GXLB: the load-balancer header documentation is explicit that X-Forwarded-For is
 //     appended to and specifies X-Forwarded-Proto as a single `[http | https]` value, but it does
 //     NOT state overwrite-vs-append for it. That is the same gap routing-common.ts's
 //     PROOF_COVERED_CONTEXT_HEADERS operational note already records for this header.
-// Rightmost is therefore the fail-safe reading: identical under overwrite, correct under append,
-// and it cannot be turned into a downgrade by a client prepending values of its own.
 //
-// A garbage rightmost element yields undefined rather than falling further left, so a client
-// cannot promote its own value past a trusted one by appending junk. Empty elements are skipped
-// (a trusted edge never writes an empty scheme). Comparison is case-insensitive because URI
-// schemes are (RFC 3986 §3.1) and treating `HTTPS` as unknown silently downgrades the derived
-// scheme to http; it grants nothing extra, since a client that can write `HTTPS` can write
-// `https`. The proof binds the RAW wire bytes (routing-common.ts), so none of this parsing is
-// part of the covered value.
+// A garbage leftmost element yields undefined rather than falling further right: junk in the
+// client-facing position means there is no witness, and an https site must not be derived from a
+// hop that only ever saw the plaintext leg. Empty elements are skipped (no hop writes an empty
+// scheme). Comparison is case-insensitive because URI schemes are (RFC 3986 §3.1) and treating
+// `HTTPS` as unknown silently downgrades the derived scheme; it grants nothing extra, since a
+// client that can write `HTTPS` can write `https`. The proof binds the RAW wire bytes
+// (routing-common.ts), so none of this parsing is part of the covered value.
+//
+// One asymmetry no reading here can fix, which docs/targets.md states as the operator
+// requirement instead: Next's own base-server derives `isHttps` from
+// `xForwardedProto === "https"` — an EXACT single value (node_modules/next/dist/server/
+// base-server.js) — so on ANY comma-joined chain Next itself reads http regardless of which
+// element this picks. A multi-valued chain is a misconfigured ingress for the whole app, not
+// just for this witness.
 export function validatedForwardedProtocol(req: IncomingMessage): "http" | "https" | undefined {
   const forwardedProto = req.headers["x-forwarded-proto"];
   // Repeated header instances are semantically one comma-joined list (RFC 9110 §5.3). Node
   // already joins them for this field; joining an array shape too keeps both identical.
   const chain = Array.isArray(forwardedProto) ? forwardedProto.join(",") : forwardedProto;
   if (!chain) return undefined;
-  const elements = chain.split(",");
-  for (let index = elements.length - 1; index >= 0; index--) {
-    const value = elements[index]!.trim().toLowerCase();
+  for (const element of chain.split(",")) {
+    const value = element.trim().toLowerCase();
     if (!value) continue;
     return value === "https" || value === "http" ? value : undefined;
   }
