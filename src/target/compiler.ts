@@ -71,14 +71,7 @@ function validateRoutingContract(
     throw new Error(`Routing component "${componentName}" must return plan and routingTier`);
   }
   const tierUnknown = Object.keys(tier).filter(
-    (key) =>
-      ![
-        "enabled",
-        "transport",
-        "callerAuthentication",
-        "serviceAnnotations",
-        "registration",
-      ].includes(key),
+    (key) => !["enabled", "transport", "callerAuthentication", "serviceAnnotations"].includes(key),
   );
   if (tierUnknown.length > 0) {
     throw new Error(
@@ -99,11 +92,6 @@ function validateRoutingContract(
       `Routing component "${componentName}" returned invalid routingTier.enabled; expected a boolean`,
     );
   }
-  if (tier.registration !== "none" && tier.registration !== "gke-traffic-extension") {
-    throw new Error(
-      `Routing component "${componentName}" returned invalid routingTier.registration`,
-    );
-  }
   for (const [name, value] of Object.entries(tier.serviceAnnotations)) {
     try {
       assertSafeAnnotationName(name);
@@ -122,7 +110,6 @@ function validateRoutingContract(
   if (routing.plan.protocol === "pool-local-v1") {
     if (
       tier.enabled !== false ||
-      tier.registration !== "none" ||
       tier.transport !== undefined ||
       tier.callerAuthentication !== undefined
     ) {
@@ -197,10 +184,26 @@ function validateRoutingContract(
         `ext_proc plan declares ${routing.plan.dataplane.transport}`,
     );
   }
-  if (tier.registration === "gke-traffic-extension" && tier.transport !== "tls") {
+  const registration = routing.plan.registration;
+  if (registration?.kind === "gcp-traffic-extension-v1" && tier.transport !== "tls") {
     throw new Error(
-      `Routing component "${componentName}" must use tls transport for gke-traffic-extension registration`,
+      `Routing component "${componentName}" must use tls transport for gcp-traffic-extension-v1 registration`,
     );
+  }
+  if (registration?.kind === "gcp-traffic-extension-v1") {
+    const matchingReadiness = routing.plan.dataplane.readiness.some(
+      (entry) =>
+        entry.kind === "gcp-traffic-extension" &&
+        entry.projectId === registration.projectId &&
+        entry.extensionName === registration.extensionName &&
+        entry.addressName === registration.addressName,
+    );
+    if (!matchingReadiness) {
+      throw new Error(
+        `Routing component "${componentName}" must declare matching readiness for its ` +
+          `gcp-traffic-extension-v1 registration`,
+      );
+    }
   }
 }
 

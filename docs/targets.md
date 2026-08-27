@@ -355,7 +355,7 @@ proxy.
 
 The adapter's internal `compileTarget` enforces the contract before it emits YAML. It rejects invalid Service references, pool-local plans that enable a routing tier, ext_proc plans that omit one, transport disagreements, failure-policy disagreements, unknown fields, duplicate objects, unsafe ownership labels, and invalid composition-plan values. The TypeScript types reject the same plan and tier mismatches during development. Contributor tests may import it from `@next-community/adapter-k8s/internal`; that subpath deliberately has no compatibility guarantee.
 
-`registration: "gke-traffic-extension"` is the one remaining provider-specific field in this interface. Treat it as a built-in bridge, not an extension point. The chart has exactly one matching executor and it runs the GKE registration job. Before another external control plane is added, replace this field with a versioned apply operation and an executor selected by operation kind. Generalizing the string today would create an interface with one adapter and would let a custom target invoke the wrong cloud tool.
+External control-plane attachment is an authenticated composition-plan operation, separate from the routing-tier interface. The only executor today is `gcp-traffic-extension-v1`, which runs the GKE registration job; a future control plane must add its own versioned operation, parser, executor, readiness proof, and cleanup instead of adding a provider field to `RoutingBuildResult`. A third-party component cannot select an unknown executor or smuggle an arbitrary command through the plan.
 
 Start a routing adapter test at the public interface:
 

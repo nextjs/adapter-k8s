@@ -1042,7 +1042,6 @@ export function portableRouting(): RoutingComponent {
         routingTier: {
           enabled: false,
           serviceAnnotations: {},
-          registration: "none",
         },
       };
     },
@@ -1216,7 +1215,6 @@ export function envoyNativeRouting(
             transportSecurity: "none",
           },
           serviceAnnotations: {},
-          registration: "none",
         },
       };
     },
@@ -1259,6 +1257,12 @@ export function gkeNativeRouting(
         plan: {
           protocol: "envoy-ext-proc-v3",
           failurePolicy: context.failurePolicy,
+          registration: {
+            kind: "gcp-traffic-extension-v1",
+            projectId,
+            extensionName,
+            addressName,
+          },
           dataplane: { kind: "external-ext-proc", transport: "tls", readiness },
         },
         readiness,
@@ -1280,7 +1284,6 @@ export function gkeNativeRouting(
           serviceAnnotations: {
             "cloud.google.com/neg": `{"exposed_ports":{"8443":{"name":"${context.releaseName}-routing-neg"}}}`,
           },
-          registration: "gke-traffic-extension",
         },
         externalCleanup: [
           {

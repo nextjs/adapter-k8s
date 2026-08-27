@@ -37,6 +37,7 @@ import {
   type RegistryPlan,
   type RetainedExternalResource,
   type RoutingPlan,
+  type RoutingRegistration,
   type RoutingReadiness,
   type TelemetryActivation,
   type TelemetrySignal,
@@ -520,9 +521,29 @@ function parseRoutingReadiness(value: unknown, path: string): RoutingReadiness {
   }
 }
 
+function parseRoutingRegistration(value: unknown, path: string): RoutingRegistration {
+  const parsed = object(value, path);
+  const kind = string(parsed.kind, `${path}.kind`);
+  switch (kind) {
+    case "none":
+      exactKeys(parsed, ["kind"], path);
+      return { kind };
+    case "gcp-traffic-extension-v1":
+      exactKeys(parsed, ["kind", "projectId", "extensionName", "addressName"], path);
+      return {
+        kind,
+        projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
+        extensionName: safeText(parsed.extensionName, `${path}.extensionName`, 63),
+        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+      };
+    default:
+      fail(`${path}.kind`, `unknown routing registration operation ${JSON.stringify(kind)}`);
+  }
+}
+
 function parseRouting(value: unknown, path: string): RoutingPlan {
   const parsed = object(value, path);
-  exactKeys(parsed, ["protocol", "failurePolicy", "dataplane"], path);
+  exactKeys(parsed, ["protocol", "failurePolicy", "registration", "dataplane"], path);
   const protocol = oneOf(
     parsed.protocol,
     ["pool-local-v1", "envoy-ext-proc-v3"] as const,
@@ -532,7 +553,13 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
   const kind = string(dataplane.kind, `${path}.dataplane.kind`);
   const readiness = (raw: unknown) =>
     array(raw, `${path}.dataplane.readiness`, parseRoutingReadiness, 64);
+  const registration = Object.hasOwn(parsed, "registration")
+    ? parseRoutingRegistration(parsed.registration, `${path}.registration`)
+    : undefined;
   if (protocol === "pool-local-v1") {
+    if (registration && registration.kind !== "none") {
+      fail(`${path}.registration`, "pool-local-v1 cannot register an external routing tier");
+    }
     if (kind !== "portable-http-origin") {
       fail(`${path}.dataplane.kind`, 'pool-local-v1 requires "portable-http-origin"');
     }
@@ -540,6 +567,7 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
     return {
       protocol,
       failurePolicy: literal(parsed.failurePolicy, "closed", `${path}.failurePolicy`),
+      ...(registration ? { registration } : {}),
       dataplane: {
         kind,
         service: parseKubernetesServiceRef(dataplane.service, `${path}.dataplane.service`),
@@ -577,6 +605,15 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
     default:
       fail(`${path}.dataplane.kind`, `unknown routing dataplane operation ${JSON.stringify(kind)}`);
   }
+  if (
+    registration?.kind === "gcp-traffic-extension-v1" &&
+    (parsedDataplane.kind !== "external-ext-proc" || parsedDataplane.transport !== "tls")
+  ) {
+    fail(
+      `${path}.registration`,
+      "gcp-traffic-extension-v1 requires an external-ext-proc dataplane with tls transport",
+    );
+  }
   return {
     protocol,
     failurePolicy: oneOf(
@@ -584,6 +621,7 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
       ["open", "closed"] as const,
       `${path}.failurePolicy`,
     ),
+    ...(registration ? { registration } : {}),
     dataplane: parsedDataplane,
   };
 }

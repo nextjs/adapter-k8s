@@ -41,6 +41,7 @@ export type {
   RegistryPlan,
   RetainedExternalResource,
   RoutingPlan,
+  RoutingRegistration,
   RoutingReadiness,
   TelemetryActivation,
   TelemetryOwner,
