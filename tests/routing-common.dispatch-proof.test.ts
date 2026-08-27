@@ -16,7 +16,7 @@
 //   • absent covered headers were SKIPPED rather than signed, so `name: ""` and no `name` at all
 //     signed identical bytes, and a value containing a newline could restate the `\n`-joined
 //     `name\nvalue` framing of a following pair.
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   buildProofHeaderNames,
   coalesceWireHeaderBytes,
@@ -610,23 +610,137 @@ describe("A0-DP-5 — a proof is bound to a transmission, not just to an input t
     });
   });
 
-  it("tolerates bounded clock skew but refuses a far-future mint time", () => {
+  it("tolerates clock skew as wide as the max age, and still bounds it", () => {
     const proof = computeDispatchProof(
       SECRET,
       dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
     );
-    // The codebase already compares absolute epoch times across pods (the execution deadline
-    // header), so a one-sided skew allowance is the honest bound.
+    // The future bound is an AVAILABILITY trade, not a defence, so it is the same width as the
+    // max age. `issuedAtMs` is inside the transcript (the next test pins that re-stamping it
+    // yields `mismatch`), so no attacker can mint a future-dated credential — the only party that
+    // can is a legitimate signer whose clock runs fast, and the extra validity such a signer's
+    // proofs enjoy is bounded by its clock error whether or not this check exists. At the original
+    // 30s, a routing-service pod on a node 45s fast (routine on the self-managed clusters the
+    // `generic` provider supports) turned EVERY minted proof into `premature`: trusted dispatch
+    // off cluster-wide and middleware running twice per request, with no env knob to escape it.
+    expect(DISPATCH_PROOF_MAX_SKEW_MS).toBe(DISPATCH_PROOF_MAX_AGE_MS);
+    // A signer a minute ahead of this pool is still trusted, where before it was not.
+    expect(verifyDispatchProof(SECRET, request, proof, { nowMs: ISSUED_AT - 60_000 }).trusted).toBe(
+      true,
+    );
     expect(
       verifyDispatchProof(SECRET, request, proof, {
         nowMs: ISSUED_AT - DISPATCH_PROOF_MAX_SKEW_MS,
       }).trusted,
     ).toBe(true);
+    // Still finite: a proof dated past the window is refused, with the reason that tells an
+    // operator "clock offset" rather than "transit".
     expect(
       verifyDispatchProof(SECRET, request, proof, {
         nowMs: ISSUED_AT - DISPATCH_PROOF_MAX_SKEW_MS - 1,
       }),
     ).toEqual({ trusted: false, reason: "premature" });
+  });
+
+  it("reports `mismatch` for every rejection a peer WITHOUT the secret can construct", () => {
+    // The rejection metric and the throttled warn line are the signal that distinguishes "a
+    // client sent a bogus credential" from "this build's two tiers disagree". Checking freshness
+    // and body shape ahead of the MAC let any in-cluster peer that can reach a pool on :3000 pick
+    // the label with no knowledge of the secret — a loop of far-future credentials manufactures a
+    // `premature` clock-skew incident, and either shape buries a real `mismatch` in noise. The MAC
+    // now runs first, so every reason but `malformed`/`mismatch` is AUTHENTICATED.
+    const zeroMac = "0".repeat(64);
+    const getRequest = { method: "GET", target: "/about", headers: wire() };
+    const forgedDigest = dispatchBodyDigest(Buffer.from("anything")).toString("hex");
+    const forged = [
+      // Would have reported `premature`.
+      `v3.${ISSUED_AT + 86_400_000}.-.${zeroMac}`,
+      // Would have reported `stale`.
+      `v3.${ISSUED_AT - 86_400_000}.-.${zeroMac}`,
+      // Would have reported `body-unexpected` (a declared digest on a read method).
+      `v3.${ISSUED_AT}.${forgedDigest}.${zeroMac}`,
+    ];
+    for (const credential of forged) {
+      expect(verifyDispatchProof(SECRET, getRequest, credential, { nowMs: ISSUED_AT })).toEqual({
+        trusted: false,
+        reason: "mismatch",
+      });
+    }
+    // Same for a credential minted with the WRONG secret — a different build's edge, which the
+    // per-build secret makes the ordinary cross-build case — whatever its policy shape.
+    const wrongSecret = computeDispatchProof(
+      "not-this-builds-secret",
+      dispatchProofInputsFromRequest(getRequest, { issuedAtMs: ISSUED_AT + 86_400_000 }),
+    );
+    expect(verifyDispatchProof(SECRET, getRequest, wrongSecret, { nowMs: ISSUED_AT })).toEqual({
+      trusted: false,
+      reason: "mismatch",
+    });
+    // And the authenticated reasons still reach an operator: a credential this build's secret
+    // really did mint reports the policy reason, not `mismatch`.
+    const authentic = computeDispatchProof(
+      SECRET,
+      dispatchProofInputsFromRequest(request, { issuedAtMs: ISSUED_AT }),
+    );
+    expect(
+      verifyDispatchProof(SECRET, request, authentic, {
+        nowMs: ISSUED_AT + DISPATCH_PROOF_MAX_AGE_MS + 1,
+      }),
+    ).toEqual({ trusted: false, reason: "stale" });
+  });
+
+  it("anchors the freshness window on the operator-tunable per-hop budget", async () => {
+    // The window's job is to cover the MINT-TO-VERIFY delay, which ingress queueing dominates: a
+    // burst pending in Envoy while an HPA scale-up brings pods Ready, with the whole-response
+    // route timeout switched off entirely on the `generic` provider. A hardcoded 120s therefore
+    // pointed the wrong way — raising ADAPTER_K8S_HANDLER_TIMEOUT_MS to 600s left the proof
+    // window where it was, so every queued request arrived `stale`, lost trusted dispatch and
+    // paid a second middleware pass exactly when the cluster was already saturated.
+    //
+    // Both constants are read at module load (the dispatch.ts style for this kind of knob), so
+    // this re-imports the module under a stubbed env rather than mutating a live value.
+    const load = async (env: Record<string, string | undefined>) => {
+      vi.resetModules();
+      vi.stubEnv("ADAPTER_K8S_HANDLER_TIMEOUT_MS", env["ADAPTER_K8S_HANDLER_TIMEOUT_MS"]);
+      vi.stubEnv(
+        "ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS",
+        env["ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS"],
+      );
+      try {
+        const mod = await import("../src/routing-common.js");
+        return { age: mod.DISPATCH_PROOF_MAX_AGE_MS, skew: mod.DISPATCH_PROOF_MAX_SKEW_MS };
+      } finally {
+        vi.unstubAllEnvs();
+        vi.resetModules();
+      }
+    };
+    // Default: the original 120s, unchanged.
+    expect(await load({})).toEqual({ age: 120_000, skew: 120_000 });
+    // It moves with the handler budget an operator raises for a slow cluster…
+    expect(await load({ ADAPTER_K8S_HANDLER_TIMEOUT_MS: "600000" })).toEqual({
+      age: 1_200_000,
+      skew: 1_200_000,
+    });
+    // …but never shrinks below the 120s floor when that budget is lowered.
+    expect(await load({ ADAPTER_K8S_HANDLER_TIMEOUT_MS: "5000" })).toEqual({
+      age: 120_000,
+      skew: 120_000,
+    });
+    // An explicit override wins outright, in either direction — the escape hatch a cluster with a
+    // known clock offset or a known queueing profile needs.
+    expect(
+      await load({
+        ADAPTER_K8S_HANDLER_TIMEOUT_MS: "600000",
+        ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS: "30000",
+      }),
+    ).toEqual({ age: 30_000, skew: 30_000 });
+    // Garbage or a non-positive value falls back rather than disabling the window.
+    for (const bad of ["not-a-number", "0", "-1", ""]) {
+      expect(await load({ ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS: bad })).toEqual({
+        age: 120_000,
+        skew: 120_000,
+      });
+    }
   });
 
   it("binds the mint time itself, so it cannot be pushed forward to extend the window", () => {

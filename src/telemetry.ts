@@ -15,6 +15,9 @@ import {
   type TextMapGetter,
   type TextMapSetter,
 } from "@opentelemetry/api";
+// Type-only: erased at compile time, so this does not couple the telemetry module to the routing
+// module at runtime. The metric's label set is DEFINED there, next to the verdict it reports on.
+import type { DispatchProofRejectionReason } from "./routing-common.js";
 
 const INSTRUMENTATION_NAME = "@next-community/adapter-k8s";
 
@@ -88,8 +91,12 @@ function getDispatchProofRejectedCounter(): Counter {
  * Deliberately NOT recorded for a request that presents no proof at all: that is the ordinary
  * Phase-1 path (ext_proc fail-open, a CEL-excluded path, an app with no middleware, a body
  * request) and would swamp the signal.
+ *
+ * `reason` is typed on DispatchProofRejectionReason rather than `string` so the label's value set
+ * stays the documented one: `body-mismatch` (raised after the body is read, not by the header
+ * verdict) drifted in unnoticed exactly because a bare `string` caught nothing.
  */
-export function recordDispatchProofRejected(reason: string): void {
+export function recordDispatchProofRejected(reason: DispatchProofRejectionReason): void {
   try {
     getDispatchProofRejectedCounter().add(1, { "adapter_k8s.dispatch_proof.reason": reason });
   } catch {

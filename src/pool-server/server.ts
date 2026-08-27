@@ -9,6 +9,7 @@ import {
   requestTargetPathname,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
   verifyDispatchProof,
+  type DispatchProofRejectionReason,
 } from "../routing-common.js";
 import { guardStreamErrors } from "./dispatch.js";
 // A leaf: it knows about byte positions in a relayed frame stream and nothing about dispatch, so
@@ -64,17 +65,25 @@ export interface ReadinessState {
 const DISPATCH_PROOF_LOG_INTERVAL_MS = 60_000;
 const dispatchProofLoggedAt = new Map<string, number>();
 
-function reportDispatchProofRejected(reason: string): void {
+function reportDispatchProofRejected(reason: DispatchProofRejectionReason): void {
   recordDispatchProofRejected(reason);
   const now = Date.now();
   const last = dispatchProofLoggedAt.get(reason);
   if (last !== undefined && now - last < DISPATCH_PROOF_LOG_INTERVAL_MS) return;
   dispatchProofLoggedAt.set(reason, now);
+  // Every reason but `malformed`/`mismatch` is AUTHENTICATED (the MAC is checked first, see
+  // verifyDispatchProof), so the guidance below can be read at face value rather than as
+  // something any in-cluster peer could have staged.
   console.warn(
     `[pool-server] refusing a presented dispatch proof (${reason}); stripping the dispatch ` +
       `headers and re-resolving this request locally. A reason of "mismatch" that persists ` +
       `across every request means the edge and this pool are signing different transcripts, ` +
-      `not that a client is probing.`,
+      `not that a client is probing. "stale" means the request took longer than the freshness ` +
+      `window (ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS, default 2x ADAPTER_K8S_HANDLER_TIMEOUT_MS) ` +
+      `between being minted and arriving here — INGRESS QUEUEING, e.g. a burst pending while a ` +
+      `scale-up brings pods Ready, as often as clock skew; "premature" means this pod's clock is ` +
+      `behind the signer's by more than that window. "body-mismatch" is the only reason that ` +
+      `means an active replay rather than a configuration or capacity problem.`,
   );
 }
 
@@ -150,6 +159,15 @@ export function applyIncomingRequestTrustBoundary(
   // fail closed to local resolution exactly as before. Without a secret (emulate/tests), fall
   // back to the trustInternalHeaders flag. Both credential headers are always deleted.
   const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
+  // A0-DP-5. Clear any digest a PREVIOUS pass over this same request parked, before the block
+  // below can park a new one. This function advertises idempotency (see applyRequestTrustBoundary)
+  // and a second pass necessarily finds no proof header — the first pass deleted it — so parking
+  // the digest only inside the trusted branch left the first pass's digest in place for a second
+  // caller to enforce against a different body view, i.e. a spurious `body-mismatch` on the metric
+  // and in the log. Not reachable today (the only re-entrance, `res.revalidate()` in index.ts,
+  // builds a fresh mocked request), so this keeps a stated contract true rather than fixing a live
+  // bug.
+  delete (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST];
   let trusted: boolean;
   if (internalSecret) {
     if (typeof presentedProof !== "string") {
@@ -170,8 +188,6 @@ export function applyIncomingRequestTrustBoundary(
         // A0-DP-5. A declared body digest is an ASSERTION, not yet a check: the body has not been
         // read at this boundary. Park it so the caller that DOES read the body can enforce it
         // (`enforceDispatchBodyBinding`, called from index.ts once readRequestBody returns).
-        // Always assigned — including `undefined` — so a second pass over the same request cannot
-        // inherit a stale digest from the first.
         (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST] = verdict.bodyDigest;
       } else {
         // A0-DP-2. Report the rejection with its reason. Only when a proof was actually PRESENTED:

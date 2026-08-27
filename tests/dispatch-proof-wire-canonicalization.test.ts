@@ -459,6 +459,10 @@ describe("A0-DP-5 — the pool enforces the body binding and the freshness windo
     signedBody: Buffer;
     sentBody?: Buffer;
     issuedAtMs?: number;
+    /** Re-apply the trust boundary to the same request — the idempotency it advertises. */
+    secondBoundaryPass?: boolean;
+    /** The body view handed to the enforcement half; defaults to the bytes actually received. */
+    enforceAgainst?: Buffer | null;
   }): Promise<{ trusted: boolean; bodyBound: boolean; mwEvaluated: string | undefined }> {
     const sentBody = args.sentBody ?? args.signedBody;
     let result:
@@ -466,10 +470,17 @@ describe("A0-DP-5 — the pool enforces the body binding and the freshness windo
       | undefined;
     const server = createServer((req, res) => {
       const trusted = applyIncomingRequestTrustBoundary(req, { internalSecret: SECRET });
+      if (args.secondBoundaryPass) {
+        applyIncomingRequestTrustBoundary(req, { internalSecret: SECRET });
+      }
       const chunks: Buffer[] = [];
       req.on("data", (chunk: Buffer) => chunks.push(chunk));
       req.on("end", () => {
-        const bodyBound = enforceDispatchBodyBinding(req, Buffer.concat(chunks));
+        const received = Buffer.concat(chunks);
+        const bodyBound = enforceDispatchBodyBinding(
+          req,
+          args.enforceAgainst === undefined ? received : args.enforceAgainst,
+        );
         result = {
           trusted,
           bodyBound,
@@ -533,6 +544,28 @@ describe("A0-DP-5 — the pool enforces the body binding and the freshness windo
     expect(result.trusted).toBe(true);
     expect(result.bodyBound).toBe(false);
     expect(result.mwEvaluated).toBeUndefined();
+  });
+
+  it("does not let a second trust-boundary pass inherit the first pass's parked digest", async () => {
+    // `applyRequestTrustBoundary` advertises idempotency, and the parked digest broke it: the
+    // digest was written only on the branch that VERIFIED a proof, and a second pass necessarily
+    // finds no proof header (the first pass deleted it), so the first pass's digest stayed parked.
+    // A caller that re-applied the boundary and then enforced against a different body view got a
+    // `body-mismatch` — the label that means an active replay — for a request that replayed
+    // nothing. Not reachable today (the only re-entrance, `res.revalidate()`, builds a fresh
+    // mocked request), so this pins the stated contract rather than a live bug.
+    const body = Buffer.from("formData=honest");
+    // One pass: the digest IS parked and IS enforced, which is the behaviour that must not change.
+    const single = await crossPoolPost({ signedBody: body, enforceAgainst: null });
+    expect(single.trusted).toBe(true);
+    expect(single.bodyBound).toBe(false);
+    // Two passes: the second clears what the first parked, so there is nothing to mis-enforce.
+    const twice = await crossPoolPost({
+      signedBody: body,
+      secondBoundaryPass: true,
+      enforceAgainst: null,
+    });
+    expect(twice.bodyBound).toBe(true);
   });
 
   it("refuses a credential minted outside the freshness window", async () => {
