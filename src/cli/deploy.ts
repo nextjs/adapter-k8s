@@ -1385,6 +1385,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       );
     }
   }
+  if (!compositionSnapshot && !cacheManaged && infra.cacheRegion) {
+    throw new Error(
+      `Cannot transition this legacy managed-cache deployment to ` +
+        `${metadata.cacheEnabled ? "bring-your-own cache" : "disabled caching"} safely. The ` +
+        `outgoing rollback build still depends on the release cache, but its artifact has no ` +
+        `authenticated composition plan proving which paid instance may be deleted. Rebuild and ` +
+        `deploy once with managed cache still enabled, then make the cache-mode change from that ` +
+        `composed build. No Kubernetes or cloud resources were changed.`,
+    );
+  }
   if (cacheManaged && !dryRun) {
     // Fail loudly rather than silently shipping without a shared cache: managed provisioning
     // needs the project + region. (BYO cache sets cache.url and never reaches this branch.)
@@ -1396,7 +1406,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           "and region. Set cache.url for a bring-your-own instance, or re-run `adapter-k8s init`.",
       );
     }
-    console.log("\n  → Provisioning managed cache (Memorystore)...");
     const ms = (
       metadata as {
         cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string; auth?: boolean };
@@ -1429,6 +1438,20 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (auth !== undefined && typeof auth !== "boolean") {
       throw new Error("managed cache auth must be a boolean");
     }
+    if (infra.cacheRegion) {
+      const existingProjectId = infra.cacheProjectId ?? infra.projectId;
+      if (infra.cacheRegion !== cacheRegion || existingProjectId !== projectId) {
+        throw new Error(
+          `Cannot replace the managed cache for ${releaseName} from ` +
+            `${JSON.stringify(existingProjectId)}/${JSON.stringify(infra.cacheRegion)} to ` +
+            `${JSON.stringify(projectId)}/${JSON.stringify(cacheRegion)} during deploy. The ` +
+            `current lifecycle records only one paid instance, so provisioning the replacement ` +
+            `would orphan the old one. Restore the existing project/region or destroy and ` +
+            `recreate the cache intentionally. No Kubernetes or cloud resources were changed.`,
+        );
+      }
+    }
+    console.log("\n  → Provisioning managed cache (Memorystore)...");
     const endpoint = await provisionMemorystore({
       projectId,
       region: cacheRegion,
@@ -2274,9 +2297,9 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
   // A managed→BYO/disabled transition is cleanup, not rollout preparation. Deleting the
   // outgoing build's cache before Helm/readiness/cutover made a failed deploy disrupt the
-  // build still serving 100% of traffic. Resolve the old operation from its state-authenticated
-  // composition snapshot when available, and mutate it only after runCutover has committed the
-  // new build. Legacy artifacts fall back to the project/region persisted at provisioning time.
+  // build still serving 100% of traffic. Only its retained, state-authenticated composition
+  // plan can authorize the cloud mutation, and it happens after runCutover commits the new build.
+  // Legacy builds were rejected before Helm because their markers cannot prove ownership.
   if (!dryRun && !cacheManaged) {
     if (!metadata.cacheEnabled) {
       const secretDelete = await execCapture(
@@ -2290,7 +2313,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
 
     let cleanup: { projectId: string; region: string } | undefined;
-    let authenticatedLookupFailed = false;
     const previousPlanAnchor = previousBuildId
       ? state?.compositionPlans?.[previousBuildId]
       : undefined;
@@ -2327,24 +2349,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           cleanup = { projectId: previousCache.projectId, region: previousCache.region };
         }
       } catch (error) {
-        authenticatedLookupFailed = true;
         console.warn(
           `    Warning: could not authenticate the outgoing build's managed-cache operation, ` +
             `so it was NOT deleted and may still be billed. Delete it manually, or restore the ` +
             `outgoing build artifact and run \`adapter-k8s destroy\`.\n    ` +
             `${sanitizeForTerminal(error instanceof Error ? error.message : String(error))}`,
-        );
-      }
-    }
-    if (!cleanup && !authenticatedLookupFailed && infra.cacheRegion) {
-      const projectId = infra.cacheProjectId ?? infra.projectId;
-      if (projectId) {
-        cleanup = { projectId, region: infra.cacheRegion };
-      } else {
-        console.warn(
-          `    Warning: managed cache region ${infra.cacheRegion} is recorded, but its project ` +
-            `is unknown. It was NOT deleted and may still be billed. Run \`adapter-k8s destroy\` ` +
-            `after restoring cacheProjectId in infrastructure.json.`,
         );
       }
     }
