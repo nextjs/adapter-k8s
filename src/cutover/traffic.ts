@@ -23,13 +23,23 @@ export async function switchTrafficToNewBuild(opts: {
   releaseName: string;
   namespace: string;
   safeBuildId: string;
+  expectedCurrentBuildId: string | null;
   pools: string[];
   hasPortableOrigin: boolean;
   defaultPool: string;
   deps: CutoverDeps;
   restoreWarmedHpas: () => Promise<void>;
 }): Promise<void> {
-  const { releaseName, namespace, safeBuildId, pools, hasPortableOrigin, defaultPool, deps } = opts;
+  const {
+    releaseName,
+    namespace,
+    safeBuildId,
+    expectedCurrentBuildId,
+    pools,
+    hasPortableOrigin,
+    defaultPool,
+    deps,
+  } = opts;
   console.log(`  → Switching traffic to new build...`);
   const patchFailures: { pool: string; service: string; stderr: string }[] = [];
   const patchedServices: string[] = [];
@@ -73,6 +83,20 @@ export async function switchTrafficToNewBuild(opts: {
       continue;
     }
     originalServiceSelectors.set(activeServiceName, selector as Record<string, string>);
+    if (
+      expectedCurrentBuildId &&
+      (selector as Record<string, string>)["app.kubernetes.io/version"] !==
+        sanitizeK8sName(expectedCurrentBuildId)
+    ) {
+      patchFailures.push({
+        pool: servicePool,
+        service: activeServiceName,
+        stderr:
+          `selector changed concurrently: expected version ` +
+          `${sanitizeK8sName(expectedCurrentBuildId)}, found ` +
+          `${JSON.stringify((selector as Record<string, string>)["app.kubernetes.io/version"])}`,
+      });
+    }
   }
 
   if (patchFailures.length === 0) {

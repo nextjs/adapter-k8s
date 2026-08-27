@@ -1,5 +1,5 @@
 // src/cli/destroy.ts
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import { cliServiceAccountEmail, deployExtRoleId, deployServiceAccountEmail } from "./init.js";
@@ -30,6 +30,8 @@ import type {
   KubernetesOwnedObject,
   RetainedExternalResource,
 } from "../composition-plan/index.js";
+import { buildDeleteMemorystoreCommand } from "./provision-cache.js";
+import { deleteManagedCacheIdentityArgs } from "./cache-identity.js";
 
 export interface DestroyOptions {
   projectDir: string;
@@ -305,28 +307,8 @@ function isOptionalHealthCheckPolicyApiMissing(stderr: string): boolean {
 export function buildReleaseScopedGcpResources(
   releaseName: string,
   projectId: string,
-  region?: string,
-  cacheProjectId = projectId,
 ): { desc: string; args: string[] }[] {
   return [
-    // Managed cache (Memorystore) is release-scoped and ephemeral — remove it. No-ops when the
-    // instance was never provisioned (BYO cache) or is already gone. Requires the region.
-    ...(region
-      ? [
-          {
-            desc: `Memorystore instance "${releaseName}-cache"`,
-            args: [
-              "redis",
-              "instances",
-              "delete",
-              `${releaseName}-cache`,
-              `--region=${region}`,
-              `--project=${cacheProjectId}`,
-              "--quiet",
-            ],
-          },
-        ]
-      : []),
     {
       desc: `traffic extension "${releaseName}-traffic-ext"`,
       args: [
@@ -674,6 +656,24 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   // Resources that failed for a reason OTHER than "already gone". These make the
   // destroy incomplete and cause a non-zero exit + preserved local state.
   const failures: string[] = [];
+  const clearManagedCacheIdentity = async (): Promise<void> => {
+    if (!infra || dryRun) return;
+    const identityDelete = await execCapture(
+      "kubectl",
+      deleteManagedCacheIdentityArgs(releaseName, namespace),
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (identityDelete.exitCode !== 0 && !isAlreadyGoneError(identityDelete.stderr)) {
+      console.warn(
+        `    WARNING: paid cache deletion succeeded, but the coordination ConfigMap could not ` +
+          `be removed: ${sanitizeForTerminal(identityDelete.stderr.trim()) || `exit ${identityDelete.exitCode}`}`,
+      );
+    }
+    delete infra.cacheRegion;
+    delete infra.cacheProjectId;
+    delete infra.cacheProvisioningPending;
+    writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+  };
 
   // Pin kubectl at THIS release's cluster before any cluster mutation — helm uninstall
   // and the state-ConfigMap delete otherwise run against whatever context happens to be
@@ -1244,6 +1244,8 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
             `${sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`}`,
         );
         failures.push(cleanup.desc);
+      } else if (operation.kind === "gcp-memorystore") {
+        await clearManagedCacheIdentity();
       }
     }
     if (operations.size === 0) {
@@ -1314,20 +1316,37 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
       }
     }
 
+    // Memorystore has independent project/region coordinates. Delete it even when the cluster
+    // project is absent; coupling this to `projectId` leaked paid state from partial legacy files.
+    const cacheProjectId: string | undefined = infra.cacheProjectId ?? projectId;
+    const cacheRegion: string | undefined = infra.cacheRegion ?? region;
+    if (cacheProjectId && cacheRegion) {
+      const cache = buildDeleteMemorystoreCommand(releaseName, cacheRegion, cacheProjectId);
+      if (dryRun) {
+        console.log(`  [dry-run] ${cache.command} ${cache.args.join(" ")}`);
+      } else {
+        console.log(`  → Deleting ${cache.desc}`);
+        const result = await execCapture(cache.command, cache.args, {
+          timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+        });
+        if (result.exitCode === 0 || isAlreadyGoneError(result.stderr)) {
+          await clearManagedCacheIdentity();
+        } else {
+          console.warn(
+            `    WARNING: deletion failed: ` +
+              `${sanitizeForTerminal(result.stderr.trim()) || `exit ${result.exitCode}`}`,
+          );
+          failures.push(cache.desc);
+        }
+      }
+    }
+
     // Delete the release-scoped ext_proc resources (in dependency order: the traffic
     // extension references the backend, which references the health check). helm uninstall
     // removed the Gateway/Service, but these are provisioned outside the chart and would
     // otherwise be left billing/dangling — the exact "destroy silently leaves infra" gap.
     if (projectId) {
-      // The managed cache may live in a different region than the cluster when
-      // cache.memorystore.region overrides it — deploy persists that as infra.cacheRegion. Use it
-      // so destroy deletes the instance where it actually is, not the cluster region.
-      const extResources = buildReleaseScopedGcpResources(
-        releaseName,
-        projectId,
-        infra?.cacheRegion ?? infra?.region,
-        infra?.cacheProjectId ?? projectId,
-      );
+      const extResources = buildReleaseScopedGcpResources(releaseName, projectId);
       for (const { desc, args } of extResources) {
         if (dryRun) {
           console.log(`  [dry-run] gcloud ${args.join(" ")}`);

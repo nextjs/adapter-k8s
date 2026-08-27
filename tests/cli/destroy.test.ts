@@ -23,7 +23,7 @@ import {
   type RetainedExternalResource,
 } from "../../src/composition-plan/index.js";
 import { compositionPlanConfigMapName } from "../../src/emit/templates/composition-plan-configmap.js";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -92,21 +92,6 @@ describe("buildReleaseScopedGcpResources", () => {
       "--project=my-project",
       "--quiet",
     ]);
-  });
-
-  it("deletes a regional cache in its recorded project without moving other resources", () => {
-    const resources = buildReleaseScopedGcpResources(
-      "my-app",
-      "cluster-project",
-      "europe-west1",
-      "cache-project",
-    );
-    const cache = resources.find((resource) => resource.desc.includes("Memorystore"));
-    const extension = resources.find((resource) => resource.desc.includes("traffic extension"));
-
-    expect(cache?.args).toContain("--project=cache-project");
-    expect(cache?.args).toContain("--region=europe-west1");
-    expect(extension?.args).toContain("--project=cluster-project");
   });
 });
 
@@ -523,6 +508,46 @@ describe("runDestroy — confirmation gate (L12)", () => {
     ).rejects.toThrow(/incomplete managed-cache identity.*cacheProjectId=undefined/s);
 
     expect(vi.mocked(exec.execCapture)).not.toHaveBeenCalled();
+  });
+
+  it("deletes a fully identified cache even when the cluster project is absent", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ cacheProjectId: "cache-project", cacheRegion: "europe-west1" }),
+    );
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const cacheDelete = vi
+      .mocked(exec.execCapture)
+      .mock.calls.find(
+        ([cmd, args]) =>
+          cmd === "gcloud" && args.includes("delete") && args.includes("my-app-cache"),
+      );
+    expect(cacheDelete?.[1]).toEqual(
+      expect.arrayContaining(["--project", "cache-project", "--region", "europe-west1"]),
+    );
+  });
+
+  it("clears cache coordinates only after confirmed deletion", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({
+        ...INFRA,
+        cacheProjectId: "cache-project",
+        cacheRegion: "europe-west1",
+        cacheProvisioningPending: "true",
+      }),
+    );
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const persisted = JSON.parse(
+      readFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), "utf8"),
+    );
+    expect(persisted).not.toHaveProperty("cacheProjectId");
+    expect(persisted).not.toHaveProperty("cacheRegion");
+    expect(persisted).not.toHaveProperty("cacheProvisioningPending");
   });
 
   it("prompts for the release name on a TTY and proceeds on a match", async () => {
