@@ -657,8 +657,8 @@ describe("handleWebSocketUpgrade", () => {
     });
 
     try {
-      // N90: a tunnel, not a locally owned socket — shutdown must not inject a close frame into
-      // this frame-blind pipe.
+      // N90: a tunnel, not a locally owned socket — shutdown may only write into this relayed pipe
+      // where the N91 cursor proves it sits between frames.
       await expect(handleWebSocketUpgrade(deps, clientRequest, socket, earlyFrame)).resolves.toBe(
         "accepted-tunnel",
       );
