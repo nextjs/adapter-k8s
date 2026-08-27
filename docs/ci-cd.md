@@ -17,6 +17,13 @@ This is a compilation cache, not a cross-build prerender cache. Next still evalu
 should use a bounded prerender subset plus on-demand generation/ISR when rebuilding every route is
 not required.
 
+Set `ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE=1` in the build environment to force the cache off
+for one build without touching `next.config`. The feature is still experimental upstream, so this
+is the escape hatch for a suspected cache-invalidation bug: re-run the build with the variable set
+and compare. It overrides `experimental.turbopackFileSystemCacheForBuild: true` as well as the
+adapter's default, so an app that has pinned the flag on can still disable it from the pipeline.
+The next build with the variable unset re-enables the cache (and repopulates `<distDir>/cache`).
+
 ```yaml
 # GitHub Actions example
 jobs:

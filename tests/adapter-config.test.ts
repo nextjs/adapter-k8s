@@ -96,6 +96,43 @@ describe("Turbopack production filesystem cache", () => {
     expect(modified.experimental?.turbopackFileSystemCacheForBuild).toBe(false);
     expect(modified.experimental?.optimizePackageImports).toEqual(["example-package"]);
   });
+
+  // A3-F3. The comment above the default motivates an opt-out for "an app that encounters an
+  // upstream cache invalidation bug" — but a next.config edit is a code change, and during an
+  // incident (or while A/B-ing whether the cache is what produced a stale bundle) the operator
+  // needs the same no-code-change escape ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS already provides.
+  describe("ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE kill-switch", () => {
+    const cacheFlag = async (nextConfig: Record<string, unknown> = {}) => {
+      const adapter = createK8sAdapter(validConfig);
+      const modified = (await adapter.modifyConfig!(nextConfig as any, {} as any)) as {
+        experimental?: { turbopackFileSystemCacheForBuild?: boolean };
+      };
+      return modified.experimental?.turbopackFileSystemCacheForBuild;
+    };
+
+    afterEach(() => {
+      delete process.env.ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE;
+    });
+
+    it("forces the cache off against the adapter's own default", async () => {
+      process.env.ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE = "1";
+      expect(await cacheFlag()).toBe(false);
+    });
+
+    it("overrides an explicit `true` in next.config — the pinned app is the trapped one", async () => {
+      process.env.ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE = "1";
+      expect(await cacheFlag({ experimental: { turbopackFileSystemCacheForBuild: true } })).toBe(
+        false,
+      );
+    });
+
+    it("takes only the exact opt-in value, like its immutable-assets precedent", async () => {
+      for (const value of ["0", "", "true", "yes"]) {
+        process.env.ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE = value;
+        expect(await cacheFlag()).toBe(true);
+      }
+    });
+  });
 });
 
 // N50 (review #22): `nextConfig.generateBuildId ?? (() => …)` never fell through, because
