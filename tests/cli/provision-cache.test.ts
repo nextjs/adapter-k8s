@@ -197,9 +197,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
       [
         "--format=json(authEnabled,transitEncryptionMode",
         ok(
-          JSON.stringify(
-            existingConfig({ authEnabled: false, transitEncryptionMode: "DISABLED" }),
-          ),
+          JSON.stringify(existingConfig({ authEnabled: false, transitEncryptionMode: "DISABLED" })),
         ),
       ],
     ]);
@@ -213,9 +211,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
       [
         "--format=json(authEnabled,transitEncryptionMode",
         ok(
-          JSON.stringify(
-            existingConfig({ authEnabled: false, transitEncryptionMode: "DISABLED" }),
-          ),
+          JSON.stringify(existingConfig({ authEnabled: false, transitEncryptionMode: "DISABLED" })),
         ),
       ],
     ]);
@@ -228,10 +224,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     mockGcloud([
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
-      [
-        "--format=json(authEnabled,transitEncryptionMode",
-        ok(JSON.stringify(existingConfig())),
-      ],
+      ["--format=json(authEnabled,transitEncryptionMode", ok(JSON.stringify(existingConfig()))],
       ["get-auth-string", ok("s3cr3t-auth\n")],
       ["--format=json(serverCaCerts)", ok(JSON.stringify({ serverCaCerts: [{ cert: "CA-PEM" }] }))],
     ]);
@@ -265,10 +258,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     mockGcloud([
       ["services enable", ok()],
       ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
-      [
-        "--format=json(authEnabled,transitEncryptionMode",
-        ok(JSON.stringify(existingConfig())),
-      ],
+      ["--format=json(authEnabled,transitEncryptionMode", ok(JSON.stringify(existingConfig()))],
     ]);
     await expect(provisionMemorystore({ ...OPTS, auth: false })).rejects.toThrow(
       /incompatible.*AUTH|AUTH.*incompatible/i,
