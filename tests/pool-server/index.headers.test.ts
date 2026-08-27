@@ -488,20 +488,27 @@ describe("pool-server response cache-control precedence", () => {
     expect(body.query).toEqual({ item: ["one", "two"] });
   });
 
-  it("Phase 2: a malformed x-invoke-query is ignored, not a 500 (query recovered from x-invoke-path)", async () => {
-    const res = await fetch(`http://127.0.0.1:${port}/echo-public`, {
+  it.each([
+    ["invocation query", { "x-invoke-query": "{not json" }],
+    ["resolved headers", { "x-resolved-headers": JSON.stringify({ authorization: [123] }) }],
+    [
+      "middleware request headers",
+      { "x-mw-request-headers": JSON.stringify({ authorization: [123] }) },
+    ],
+    ["execution deadline", { "x-adapter-k8s-execution-deadline": "not-a-deadline" }],
+  ])("re-resolves a trusted verdict with a malformed %s payload", async (_name, malformed) => {
+    const res = await fetch(`http://127.0.0.1:${port}/echo-target`, {
       headers: {
-        "x-output-id": "/echo-target",
-        "x-mw-evaluated": "skip-nomatch",
-        "x-invoke-path": "/echo-target?item=one&item=two",
-        "x-invoke-query": "{not json",
+        // A partial phase-two fallback would dispatch this nonexistent output. The entire
+        // verdict must instead be discarded so middleware and routing run together locally.
+        "x-output-id": "/does-not-exist",
+        "x-mw-evaluated": "none",
+        ...malformed,
       },
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { rewrittenPathname: string | null; query: unknown };
-    expect(body.rewrittenPathname).toBe("/echo-target");
-    // The invoker falls back to the query parsed out of the invocation path itself.
-    expect(body.query).toEqual({ item: ["one", "two"] });
+    const body = (await res.json()) as { resolvedPathname: string | null };
+    expect(body.resolvedPathname).toBe("/echo-target");
   });
 
   it("re-resolves a trusted verdict whose route-matches payload has the wrong shape", async () => {
