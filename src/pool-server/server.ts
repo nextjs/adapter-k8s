@@ -278,6 +278,67 @@ export interface PoolServerOptions {
   poolName?: string;
 }
 
+interface ActiveResponseState {
+  settled: boolean;
+  eventStream: boolean;
+  /** Terminal action initiated by the adapter, rather than the handler or peer. */
+  terminalAction?: "end-sse" | "force-close";
+}
+
+/**
+ * One drain outcome per tracked response, and one per tracked socket. The HTTP categories
+ * (completed, clientClosed, sseEnded, sseForced, httpForceClosed) are mutually exclusive and never
+ * sum past httpAtStart — an operator reading the single "drain complete" line after an incident has
+ * to be able to add them up, so a response that receives an SSE EOF and is then destroyed because
+ * the EOF never flushed must land in exactly one of them (sseForced), not in two.
+ */
+interface DrainMetrics {
+  httpAtStart: number;
+  httpCompleted: number;
+  httpClientClosed: number;
+  sseEnded: number;
+  sseForced: number;
+  httpForceClosed: number;
+  webSocketsAtStart: number;
+  webSocketsPeerClosed: number;
+  webSocketsSignalled: number;
+  webSocketsForceClosed: number;
+}
+
+function isEventStreamContentType(value: unknown): boolean {
+  const contentType = Array.isArray(value) ? value.join(",") : String(value ?? "");
+  return /^\s*text\/event-stream(?:\s*;|\s*$)/i.test(contentType);
+}
+
+/** Read one header from any of Node's writeHead header argument shapes. */
+function writeHeadHeaderValue(args: unknown[], wantedName: string): unknown {
+  const headers = args[typeof args[0] === "string" ? 1 : 0];
+  if (Array.isArray(headers)) {
+    if (headers.length > 0 && Array.isArray(headers[0])) {
+      const tuple = (headers as Array<[unknown, unknown]>).find(
+        ([name]) => String(name).toLowerCase() === wantedName,
+      );
+      return tuple?.[1];
+    }
+    for (let index = 0; index + 1 < headers.length; index += 2) {
+      if (String(headers[index]).toLowerCase() === wantedName) return headers[index + 1];
+    }
+    return undefined;
+  }
+  if (headers && typeof headers === "object") {
+    const key = Object.keys(headers).find((name) => name.toLowerCase() === wantedName);
+    return key === undefined ? undefined : (headers as Record<string, unknown>)[key];
+  }
+  return undefined;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, Math.max(1, ms));
+    timer.unref?.();
+  });
+}
+
 export function createPoolServer(options: PoolServerOptions) {
   const {
     onRequest,
@@ -298,6 +359,17 @@ export function createPoolServer(options: PoolServerOptions) {
   // client. Log it once per transition; the probe consumer (kubelet, HealthCheckPolicy,
   // cutover gate) reads only the status code.
   let lastLoggedNotReady: string | undefined;
+
+  // N88. HTTP responses and protocol upgrades have different ownership in Node. Ordinary
+  // responses stay attached to the HTTP server; upgraded sockets do not. Track both explicitly so
+  // shutdown can let finite responses complete, end SSE with a reconnectable EOF, and close a
+  // WebSocket with RFC 6455 code 1001 instead of applying one blunt socket operation to all three.
+  const activeResponses = new Map<ServerResponse, ActiveResponseState>();
+  const upgradedSockets = new Map<Duplex, { accepted: boolean; serverSignalled: boolean }>();
+  let draining = false;
+  let drainMetrics: DrainMetrics | undefined;
+  let stopPromise: Promise<void> | undefined;
+
   const server: Server = createServer(async (req, res) => {
     // Probes bypass all routing — unless the app itself owns the pathname (see appOwnsProbePath).
     // The pathname is parsed rather than compared to the raw target so `/healthz?x=1` is still a
@@ -312,7 +384,9 @@ export function createPoolServer(options: PoolServerOptions) {
         res.end(JSON.stringify({ status: "ok" }));
         return;
       }
-      const state = readiness?.() ?? { ready: false, reason: "readiness state not wired" };
+      const state = draining
+        ? { ready: false, reason: "shutting down" }
+        : (readiness?.() ?? { ready: false, reason: "readiness state not wired" });
       if (!state.ready && state.reason !== lastLoggedNotReady) {
         lastLoggedNotReady = state.reason;
         console.warn(`[pool-server] /readyz unavailable: ${state.reason}`);
@@ -328,11 +402,65 @@ export function createPoolServer(options: PoolServerOptions) {
       return;
     }
 
+    // server.close() stops NEW TCP connections, but an already-established HTTP/1.1 connection
+    // can pipeline another request across the signal boundary. Refuse that new unit of work while
+    // allowing the response already in flight on the same connection to finish.
+    if (draining) {
+      res.writeHead(503, {
+        "content-type": "text/plain",
+        "cache-control": "no-store",
+        connection: "close",
+        "retry-after": "1",
+      });
+      res.end("Service Unavailable");
+      return;
+    }
+
     applyRequestTrustBoundary(req, res, {
       internalSecret,
       trustInternalHeaders,
       proofHeaderNames,
     });
+
+    const responseState: ActiveResponseState = { settled: false, eventStream: false };
+    activeResponses.set(res, responseState);
+    // ServerResponse.getHeader() no longer exposes committed headers on every supported Node
+    // version. Capture Content-Type at the public mutation boundary so the terminal drain phase
+    // does not need private `_header` parsing or unreliable heuristics based on the pathname.
+    const originalSetHeader = res.setHeader.bind(res);
+    res.setHeader = ((name: string, value: number | string | readonly string[]) => {
+      if (name.toLowerCase() === "content-type") {
+        responseState.eventStream = isEventStreamContentType(value);
+      }
+      return originalSetHeader(name, value);
+    }) as ServerResponse["setHeader"];
+    const originalTrackedWriteHead = res.writeHead.bind(res);
+    (res as any).writeHead = function (statusCode: number, ...args: unknown[]) {
+      const contentType = writeHeadHeaderValue(args, "content-type");
+      if (contentType !== undefined) {
+        responseState.eventStream = isEventStreamContentType(contentType);
+      }
+      return originalTrackedWriteHead(statusCode, ...(args as [never]));
+    };
+    const settleResponse = (finished: boolean) => {
+      if (responseState.settled) return;
+      responseState.settled = true;
+      activeResponses.delete(res);
+      if (!drainMetrics) return;
+      // Adapter-initiated terminal actions are counted where they are initiated — except the SSE
+      // EOF, whose outcome is only known once the response settles. Counting it here keeps a
+      // stream that flushed (sseEnded) apart from one still queued when the flush window expired,
+      // which the terminal phase counts as sseForced after flipping terminalAction.
+      if (responseState.terminalAction === "end-sse") {
+        drainMetrics.sseEnded += 1;
+        return;
+      }
+      if (responseState.terminalAction) return;
+      if (finished || res.writableFinished) drainMetrics.httpCompleted += 1;
+      else drainMetrics.httpClientClosed += 1;
+    };
+    res.once("finish", () => settleResponse(true));
+    res.once("close", () => settleResponse(false));
 
     const start = performance.now();
     const method = metricHttpMethod(req.method);
@@ -393,8 +521,6 @@ export function createPoolServer(options: PoolServerOptions) {
   // Node removes upgraded connections from ordinary HTTP connection management. Keep explicit
   // ownership so a rollout has a bounded, protocol-aware shutdown instead of either leaking the
   // process until SIGKILL or dropping every connection without a close frame.
-  const upgradedSockets = new Map<Duplex, { accepted: boolean }>();
-  let draining = false;
   if (onUpgrade) {
     server.on("upgrade", (req, socket, head) => {
       if (draining) {
@@ -409,8 +535,14 @@ export function createPoolServer(options: PoolServerOptions) {
         trustInternalHeaders,
         proofHeaderNames,
       });
-      upgradedSockets.set(socket, { accepted: false });
-      socket.once("close", () => upgradedSockets.delete(socket));
+      const socketState = { accepted: false, serverSignalled: false };
+      upgradedSockets.set(socket, socketState);
+      socket.once("close", () => {
+        upgradedSockets.delete(socket);
+        if (drainMetrics && !socketState.serverSignalled) {
+          drainMetrics.webSocketsPeerClosed += 1;
+        }
+      });
       // Client resets are normal for long-lived connections and must never become an uncaught
       // EventEmitter error that terminates the whole pool.
       socket.on("error", () => undefined);
@@ -420,6 +552,10 @@ export function createPoolServer(options: PoolServerOptions) {
           const state = upgradedSockets.get(socket);
           if (state && disposition === "accepted") state.accepted = true;
           if (disposition === "rejected" && !socket.destroyed && !socket.writableEnded) {
+            // The SERVER is ending this handshake. Without the flag a rejection that lands after
+            // drain begins is reported as webSocketsPeerClosed — a voluntary peer departure the
+            // peer never made — because the close listener treats every unsignalled close as one.
+            if (state) state.serverSignalled = true;
             socket.end();
           }
         })
@@ -484,62 +620,144 @@ export function createPoolServer(options: PoolServerOptions) {
      * client leaves". `process.exit(0)` after it was therefore unreachable, so every rollout
      * waited out `terminationGracePeriodSeconds` and died to SIGKILL instead.
      *
-     * This form always settles: stop accepting, drop idle keep-alive sockets immediately, and at
-     * the halfway mark tear down whatever is still streaming so `close()` can complete. Errors
-     * are swallowed — "already closing" and "never started" are the only outcomes, and neither
-     * should stop a caller from exiting.
+     * This form always settles: stop accepting, drop idle keep-alive sockets immediately, let
+     * active responses use the COMPLETE grace window, then close each surviving protocol
+     * honestly. SSE receives a normal EOF (EventSource can reconnect); an incomplete finite body
+     * is reset rather than pretending truncated bytes are complete; established WebSockets get
+     * RFC 6455 code 1001 before forced teardown. Errors are swallowed — "already closing" and
+     * "never started" are the only outcomes, and neither should stop a caller from exiting.
      */
     async stop(options: { graceMs?: number } = {}): Promise<void> {
-      const graceMs = Math.max(1, options.graceMs ?? 15_000);
-      draining = true;
-      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-      // An idle keep-alive socket alone is enough to keep close() pending forever.
-      server.closeIdleConnections?.();
-      const forceClose = setTimeout(() => server.closeAllConnections?.(), Math.floor(graceMs / 2));
-      forceClose.unref?.();
-      const deadline = Date.now() + graceMs;
-      while (upgradedSockets.size > 0 && Date.now() < deadline) {
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now())));
-          t.unref?.();
-        });
-      }
+      if (stopPromise) return stopPromise;
 
-      if (upgradedSockets.size > 0) {
-        // RFC 6455 close code 1001: endpoint is going away (rollout, rollback, HPA scale-down).
-        // Pending handshakes are still HTTP, so only established sockets receive a WS frame.
-        const goingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
-        for (const [socket, state] of upgradedSockets) {
-          try {
-            if (!socket.destroyed) {
-              if (state.accepted) socket.write(goingAway);
-              else socket.end();
-            }
-          } catch {
-            // The peer disappeared between the set iteration and the write.
+      stopPromise = (async () => {
+        const graceMs = Math.max(1, options.graceMs ?? 60_000);
+        const startedAt = Date.now();
+        const deadline = startedAt + graceMs;
+        draining = true;
+        drainMetrics = {
+          httpAtStart: activeResponses.size,
+          httpCompleted: 0,
+          httpClientClosed: 0,
+          sseEnded: 0,
+          sseForced: 0,
+          httpForceClosed: 0,
+          webSocketsAtStart: upgradedSockets.size,
+          webSocketsPeerClosed: 0,
+          webSocketsSignalled: 0,
+          webSocketsForceClosed: 0,
+        };
+
+        let serverClosed = false;
+        const closed = new Promise<void>((resolve) => {
+          // Ignore ERR_SERVER_NOT_RUNNING: stop() is deliberately settle-always and idempotent.
+          server.close(() => {
+            serverClosed = true;
+            resolve();
+          });
+        });
+        // An idle keep-alive socket alone is enough to keep close() pending forever, and carries no
+        // in-flight work worth preserving.
+        server.closeIdleConnections?.();
+
+        // Wait for every tracked protocol to leave voluntarily. Polling is deliberate and bounded:
+        // finish/close can race each other and Node offers no single event spanning HTTP responses,
+        // half-read requests, and upgraded sockets.
+        while (Date.now() < deadline) {
+          if (activeResponses.size === 0 && upgradedSockets.size === 0 && serverClosed) break;
+          await delay(Math.min(25, Math.max(1, deadline - Date.now())));
+        }
+
+        // The deadline belongs to application work, so no finite response is cut at an arbitrary
+        // halfway point. Only survivors reach this protocol-aware terminal phase.
+        let terminalFlushRequired = false;
+        for (const [res, state] of activeResponses) {
+          if (res.writableEnded || res.destroyed) continue;
+          if (state.eventStream) {
+            state.terminalAction = "end-sse";
+            // Counted on settle (sseEnded) or in the final destroy loop (sseForced), not here: a
+            // client that is not reading leaves this EOF queued past the flush window, and the
+            // same stream must not be reported as both cleanly ended and force-closed.
+            // Do not invent an SSE data/control event: event IDs and replay semantics belong to
+            // the application. A clean HTTP EOF is sufficient for EventSource to reconnect.
+            res.end();
+            terminalFlushRequired = true;
+          } else {
+            state.terminalAction = "force-close";
+            drainMetrics.httpForceClosed += 1;
+            // A normal end would falsely authenticate a partial finite body as complete.
+            res.destroy();
           }
         }
-        // Give the close frame a short opportunity to flush, while remaining inside the caller's
-        // already-bounded signal path.
-        await new Promise<void>((resolve) => {
-          const t = setTimeout(resolve, Math.min(250, Math.max(1, graceMs)));
-          t.unref?.();
-        });
-        for (const socket of upgradedSockets.keys()) {
-          if (!socket.destroyed) socket.destroy();
-        }
-      }
 
-      // Last resort for ordinary HTTP: even closeAllConnections can be defeated by platform/Node
-      // behavior, so never wait past the same bound after explicitly closing upgraded sockets.
-      await Promise.race([
-        closed,
-        new Promise<void>((resolve) => {
-          const t = setTimeout(resolve, Math.max(1, deadline - Date.now()));
-          t.unref?.();
-        }),
-      ]);
-      clearTimeout(forceClose);
+        if (upgradedSockets.size > 0) {
+          // RFC 6455 close code 1001: endpoint is going away (rollout, rollback, HPA scale-down).
+          // Pending handshakes are still HTTP, so only established sockets receive a WS frame.
+          const goingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+          for (const [socket, state] of upgradedSockets) {
+            try {
+              if (!socket.destroyed) {
+                state.serverSignalled = true;
+                if (state.accepted) {
+                  drainMetrics.webSocketsSignalled += 1;
+                  socket.write(goingAway);
+                } else {
+                  socket.end();
+                }
+                terminalFlushRequired = true;
+              }
+            } catch {
+              // The peer disappeared between the set iteration and the write.
+            }
+          }
+        }
+
+        // The process signal path has a one-second hard-exit cushion. Spend at most 250ms of it
+        // flushing SSE EOF / WebSocket close frames, then make termination deterministic.
+        // server.close() does not own upgraded sockets and may resolve while their close frames
+        // are still queued. Give terminal protocol bytes their own bounded flush window instead
+        // of racing that unrelated callback (a fast callback otherwise wins with a 0ms flush).
+        if (terminalFlushRequired) await delay(Math.min(250, graceMs));
+        for (const [socket, state] of upgradedSockets) {
+          if (!socket.destroyed) {
+            state.serverSignalled = true;
+            drainMetrics.webSocketsForceClosed += 1;
+            socket.destroy();
+          }
+        }
+        for (const [res, state] of activeResponses) {
+          if (!res.destroyed) {
+            if (state.terminalAction !== "force-close") {
+              // An SSE EOF still queued here never reached the client, so it belongs in its own
+              // category rather than in httpForced on top of the sseEnded it would otherwise also
+              // be credited with. Flipping terminalAction first keeps settleResponse from
+              // counting the destroy that follows a second time.
+              if (state.terminalAction === "end-sse") drainMetrics.sseForced += 1;
+              else drainMetrics.httpForceClosed += 1;
+              state.terminalAction = "force-close";
+            }
+            res.destroy();
+          }
+        }
+        // Catches a connection still receiving headers and therefore not yet represented by a
+        // ServerResponse. Node intentionally excludes upgraded sockets; those were handled above.
+        server.closeAllConnections?.();
+        await Promise.race([closed, delay(250)]);
+
+        const elapsedMs = Date.now() - startedAt;
+        console.log(
+          `[pool-server] drain complete in ${elapsedMs}ms: ` +
+            `http=${drainMetrics.httpAtStart} completed=${drainMetrics.httpCompleted} ` +
+            `clientClosed=${drainMetrics.httpClientClosed} sseEnded=${drainMetrics.sseEnded} ` +
+            `sseForced=${drainMetrics.sseForced} httpForced=${drainMetrics.httpForceClosed}; ` +
+            `webSockets=${drainMetrics.webSocketsAtStart} ` +
+            `peerClosed=${drainMetrics.webSocketsPeerClosed} ` +
+            `signalled=${drainMetrics.webSocketsSignalled} ` +
+            `wsForced=${drainMetrics.webSocketsForceClosed}`,
+        );
+      })();
+
+      return stopPromise;
     },
 
     get server() {
