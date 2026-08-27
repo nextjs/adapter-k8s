@@ -120,6 +120,7 @@ interface ClusterOverrides {
   policyReadFails?: boolean;
   routeExtJobFails?: boolean;
   servicePatchFailsFor?: string;
+  serviceVersion?: string;
   /** Names the emit-metadata ConfigMap listing reports (job-mode GC sweep). */
   emitMetaConfigMaps?: string[];
   /** Deployment objects returned to the post-cutover ownership-aware GC sweep. */
@@ -217,7 +218,7 @@ function cluster(overrides: ClusterOverrides = {}) {
             selector: {
               "app.kubernetes.io/name": RELEASE,
               "app.kubernetes.io/component": args[2]!.slice(`${RELEASE}-`.length),
-              "app.kubernetes.io/version": PREV,
+              "app.kubernetes.io/version": overrides.serviceVersion ?? PREV,
             },
           },
         }),
@@ -340,6 +341,11 @@ beforeEach(() => {
     })),
     edgeStatusLines: vi.fn(() => ["  The routing edge was reverted."]),
   };
+  vi.mocked(readState).mockResolvedValue({
+    buildId: PREV,
+    previousBuildId: "buildm0",
+    generation: 4,
+  });
   vi.mocked(writeState).mockResolvedValue(undefined);
   vi.mocked(invalidateCdnBuildTag).mockResolvedValue(undefined as never);
   vi.mocked(loadDeployedCompositionPlan).mockResolvedValue({
@@ -409,6 +415,23 @@ describe("runCutover — the happy path's ordering", () => {
     expect(vi.mocked(writeState).mock.calls[0]![4]).toEqual({ clusterOnly: false });
   });
 
+  it("revalidates committed state at the last read-only point before selector cutover", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "another-build",
+      previousBuildId: PREV,
+      generation: 5,
+    });
+
+    await expect(runCutover(inputs(), deps)).rejects.toThrow(
+      /state changed while build buildn was becoming ready/,
+    );
+
+    expect(events).not.toContain("patch:rel-ssr");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalledOnce();
+  });
+
   it("sweeps superseded emit-metadata ConfigMaps, keeping current and previous", async () => {
     // Keep-at-birth makes these unpruneable by any reconciler (a forcePromotion re-run of
     // the parked build mounts ITS ConfigMap), so the cutover owns their deletion — without
@@ -446,6 +469,7 @@ describe("runCutover — D1: the EXACT-version rollout wait (the 12-char-prefix 
       cluster({
         versionedDeployments: [`${RELEASE}-ssr-${newBuild}`],
         readyPerPool: { ssr: 2 },
+        serviceVersion: oldBuild,
       }) as never,
     );
 

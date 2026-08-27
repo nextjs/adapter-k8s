@@ -34,7 +34,7 @@ import { provisionMemorystore } from "../../src/cli/provision-cache.js";
 import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { routingManifestSnapshotName } from "../../src/emit/templates/routing-manifest-configmap.js";
 import { compositionPlanConfigMapName } from "../../src/emit/templates/composition-plan-configmap.js";
-import { poolResourceNames } from "../../src/emit/templates/utils.js";
+import { poolResourceNames, sanitizeK8sName } from "../../src/emit/templates/utils.js";
 import { renderHPA } from "../../src/emit/templates/hpa.js";
 import { cdnTagForBuildId } from "../../src/cdn-tags.js";
 import {
@@ -1610,7 +1610,17 @@ describe("runDeploy — guards and teardown", () => {
       previousBuildId: null,
       poolTopologies: { [prevBuild]: ["ssr"] },
     } as never);
-    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        activeSelectorByPool: {
+          [`${longRelease}-ssr`.slice(`${RELEASE}-`.length)]: {
+            "app.kubernetes.io/name": longRelease,
+            "app.kubernetes.io/component": "ssr",
+            "app.kubernetes.io/version": sanitizeK8sName(prevBuild),
+          },
+        },
+      }) as never,
+    );
 
     await runDeploy({ projectDir: PROJECT, releaseName: longRelease, skipBuild: true });
 
@@ -1659,7 +1669,11 @@ describe("runDeploy — guards and teardown", () => {
 
   it("refuses a legacy managed→BYO transition before Kubernetes or GCP changes", async () => {
     setupFs({
-      infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
     });
     const cluster = happyCluster(events);
@@ -1813,6 +1827,32 @@ describe("runDeploy — guards and teardown", () => {
     expect(events).not.toContain("helm");
   });
 
+  it("requires a managed retry while a paid cache operation is pending", async () => {
+    const compositionPlan = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+        cacheProvisioningPending: "true",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/managed-cache provision is pending.*Retry the same managed-cache plan/s);
+
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
+  });
+
   it("refuses to infer a legacy cache project from mutable cluster coordinates", async () => {
     const compositionPlan = gkeCompositionPlan({
       cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
@@ -1834,6 +1874,29 @@ describe("runDeploy — guards and teardown", () => {
     ).rejects.toThrow(/incomplete managed-cache identity.*cacheProjectId=undefined/s);
 
     expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
+  });
+
+  it("re-reads deploy state before Helm after paid-resource preparation", async () => {
+    setupFs();
+    vi.mocked(readState)
+      .mockResolvedValueOnce({
+        buildId: "buildm",
+        previousBuildId: null,
+        poolTopologies: { buildm: ["ssr"] },
+      } as never)
+      .mockResolvedValueOnce({
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        poolTopologies: { buildn: ["ssr"], buildm: ["ssr"] },
+      } as never);
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/state changed during release preparation.*stale state/s);
+
+    expect(vi.mocked(readState)).toHaveBeenCalledTimes(2);
     expect(events).not.toContain("helm");
   });
 
@@ -2056,7 +2119,11 @@ describe("runDeploy — guards and teardown", () => {
 
   it("refuses to disable a legacy managed cache before deleting its Secret or instance", async () => {
     setupFs({
-      infra: { ...BASE_INFRA, cacheRegion: "us-east1" },
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-east1",
+        cacheProjectId: "my-project",
+      },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, cacheManaged: false },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);

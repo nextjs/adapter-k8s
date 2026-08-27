@@ -104,7 +104,7 @@ State (current build, previous build) lives in two places, and the newer wins:
 
 Every successful write bumps a monotonic generation counter, and reads take the newer of the two copies. This ordering matters: unconditionally preferring the ConfigMap once turned a failed-write recovery into a second outage, because the re-run read stale state and patched the active Service selector onto a build already scaled to zero.
 
-State is committed only after cutover—an interrupted deploy leaves the previous build serving.
+State is committed only after cutover—an interrupted deploy leaves the previous build serving. Deploy re-reads the committed generation before Helm and again at the last read-only point before Service selectors change; a concurrent promotion aborts instead of moving traffic from stale state.
 
 ## See also
 
