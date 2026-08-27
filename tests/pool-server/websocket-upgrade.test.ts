@@ -399,6 +399,71 @@ describe("handleWebSocketUpgrade", () => {
     expect(crossOrigin.resolve).not.toHaveBeenCalled();
   });
 
+  // S25. webSocketRequestAuthority derives the same-origin authority from the validated
+  // x-forwarded-proto witness, so which element of a multi-hop chain wins is now a security
+  // decision and not just a URL detail: the rightmost element is the one the trusted edge added,
+  // the leftmost is whatever the client sent. Nothing pinned that before.
+  it.each([
+    // [x-forwarded-proto, socket.encrypted, Origin, allowed, why]
+    [undefined, false, "http://example.com", true, "no witness, plain socket → http authority"],
+    [undefined, false, "https://example.com", false, "no witness cannot upgrade the authority"],
+    [undefined, true, "https://example.com", true, "direct TLS connection with no edge in front"],
+    ["https", false, "https://example.com", true, "TLS-terminating LB: the witness is the scheme"],
+    ["HTTPS", false, "https://example.com", true, "case-insensitive witness"],
+    ["http", false, "https://example.com", false, "edge witnessed plaintext"],
+    ["http,https", false, "https://example.com", true, "rightmost hop (the edge) said https"],
+    [
+      "https,http",
+      false,
+      "https://example.com",
+      false,
+      "client prepended https; the edge's own value still decides",
+    ],
+    [
+      ["https", "http"],
+      false,
+      "https://example.com",
+      false,
+      "repeated header instances are one chain, not an index-0 lookup",
+    ],
+    ["javascript", false, "https://example.com", false, "garbage witness falls back to the socket"],
+    ["javascript", false, "http://example.com", true, "garbage witness falls back to the socket"],
+    [
+      "https,javascript",
+      false,
+      "https://example.com",
+      false,
+      "garbage rightmost element does not fall further left",
+    ],
+  ] as const)(
+    "same-origin authority for x-forwarded-proto %j (encrypted=%s, Origin %s) allows=%s",
+    async (forwardedProto, encrypted, origin, allowed) => {
+      const { deps, resolve } = dependencies({
+        upgradeHandler: async () => ({ upgraded: true, statusCode: 101 }),
+      });
+      const req = request(undefined, { origin });
+      if (forwardedProto !== undefined) req.headers["x-forwarded-proto"] = forwardedProto;
+      req.rawHeaders = Object.entries(req.headers).flatMap(([name, value]) =>
+        Array.isArray(value) ? value.flatMap((entry) => [name, entry]) : [name, value],
+      );
+      req.socket = { encrypted };
+      const { socket, text } = captureSocket();
+
+      const disposition = await handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0));
+
+      if (allowed) {
+        expect(disposition).toBe("accepted-local");
+        expect(resolve).toHaveBeenCalledOnce();
+        socket.destroy();
+      } else {
+        expect(disposition).toBe("rejected");
+        expect(text()).toContain("HTTP/1.1 403 Forbidden");
+        expect(text()).toContain("WebSocket origin is not allowed.");
+        expect(resolve).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("preserves only framework-authored middleware cookies into the generated request", async () => {
     const middlewareRequestHeaders = new Headers({
       host: "example.com",

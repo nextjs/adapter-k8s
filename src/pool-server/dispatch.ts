@@ -95,14 +95,50 @@ const FORWARDED_HOST_RE = /^[a-zA-Z0-9.-]+(:[0-9]{1,5})?$/;
 // from the same witness this file uses — an https site behind the TLS-terminating load balancer
 // must compare a browser's `Origin: https://…` against `https://…`, not against the plain-http
 // scheme of the pool's own socket.
+//
+// S25. The RIGHTMOST value wins, and this is the whole reason the parse is centralized here.
+// X-Forwarded-* chains grow to the RIGHT: under append semantics the leftmost element is the one
+// the CLIENT supplied and the rightmost is the one added by the hop closest to this pool, i.e. the
+// trusted edge. Reading the leftmost element (as this did) means that in any topology whose edge
+// appends instead of overwriting, the pool derives its public scheme — and therefore the
+// WebSocket handshake's same-origin authority, middleware's request URL, and the
+// relative-vs-absolute middleware redirect decision — from a value the client chose.
+//
+// Both supported topologies are believed to OVERWRITE, so a single value is what actually
+// arrives, and rightmost then reads identically to leftmost:
+//   • Generic provider (Envoy Gateway / the emitted Envoy in front of the pool): Envoy treats
+//     x-forwarded-proto as SINGLE-valued and sets it from the downstream connection's TLS state,
+//     honoring a downstream value only when `xff_num_trusted_hops` is non-zero — which nothing
+//     the adapter emits configures (see client-traffic-policy.ts: the only ClientTrafficPolicy
+//     knob emitted is escapedSlashesAction), so the default of zero trusted hops applies and
+//     Envoy never appends.
+//   • GKE / GXLB: the load-balancer header documentation is explicit that X-Forwarded-For is
+//     appended to and specifies X-Forwarded-Proto as a single `[http | https]` value, but it does
+//     NOT state overwrite-vs-append for it. That is the same gap routing-common.ts's
+//     PROOF_COVERED_CONTEXT_HEADERS operational note already records for this header.
+// Rightmost is therefore the fail-safe reading: identical under overwrite, correct under append,
+// and it cannot be turned into a downgrade by a client prepending values of its own.
+//
+// A garbage rightmost element yields undefined rather than falling further left, so a client
+// cannot promote its own value past a trusted one by appending junk. Empty elements are skipped
+// (a trusted edge never writes an empty scheme). Comparison is case-insensitive because URI
+// schemes are (RFC 3986 §3.1) and treating `HTTPS` as unknown silently downgrades the derived
+// scheme to http; it grants nothing extra, since a client that can write `HTTPS` can write
+// `https`. The proof binds the RAW wire bytes (routing-common.ts), so none of this parsing is
+// part of the covered value.
 export function validatedForwardedProtocol(req: IncomingMessage): "http" | "https" | undefined {
   const forwardedProto = req.headers["x-forwarded-proto"];
-  const forwardedProtoValue = (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto)
-    ?.split(",")[0]
-    ?.trim();
-  return forwardedProtoValue === "https" || forwardedProtoValue === "http"
-    ? forwardedProtoValue
-    : undefined;
+  // Repeated header instances are semantically one comma-joined list (RFC 9110 §5.3). Node
+  // already joins them for this field; joining an array shape too keeps both identical.
+  const chain = Array.isArray(forwardedProto) ? forwardedProto.join(",") : forwardedProto;
+  if (!chain) return undefined;
+  const elements = chain.split(",");
+  for (let index = elements.length - 1; index >= 0; index--) {
+    const value = elements[index]!.trim().toLowerCase();
+    if (!value) continue;
+    return value === "https" || value === "http" ? value : undefined;
+  }
+  return undefined;
 }
 
 // Effective public scheme of a request that reached this pool. TLS terminates at the load

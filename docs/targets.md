@@ -55,6 +55,16 @@ export default createK8sAdapter({
 
 Use `gatewayApiExposure` instead for any conformant GatewayClass.
 
+**One requirement on whatever terminates TLS.** The pool's own socket is always plaintext, so
+`x-forwarded-proto` is its only witness of the client-facing scheme: it decides middleware's
+request URL, whether a middleware redirect `Location` is same-origin, and the origin a WebSocket
+handshake's `Origin` header is compared against. The adapter reads the **rightmost** element of
+that header's comma-joined chain, so the requirement is only that your ingress be the last hop to
+write it — overwriting (Envoy, and Envoy Gateway with the default zero trusted hops) and appending
+(the `X-Forwarded-For` convention) both satisfy it. An ingress that forwards a client-supplied
+`x-forwarded-proto` unchanged does not, and an https app behind it would evaluate its own routing
+against a scheme the client chose.
+
 ### TLS for dedicated exposures (cert-manager)
 
 A dedicated Gateway or Ingress terminates TLS from a Secret **in the app's namespace** — Gateway `certificateRefs` and Ingress `spec.tls` are namespace-local. Wildcard-cert fleets typically keep their certificate in the gateway owner's namespace (e.g. `network`), so no such Secret exists per app namespace. Both dedicated exposures accept `certManager` to emit a `cert-manager.io/v1` Certificate that issues it in place:
