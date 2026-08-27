@@ -710,6 +710,51 @@ describe("createDispatcher", () => {
     expect(backgroundComplete).toBe(true);
   });
 
+  it("preserves the public Host for Edge Server Action forwarding", async () => {
+    const edgeRouteRunner = vi.fn().mockResolvedValue({
+      response: new Response("ok"),
+      waitUntil: Promise.resolve(),
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: "edge",
+          type: "APP_PAGE",
+          filePath: "/app/.next/server/edge/page.js",
+        }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      edgeRouteRunner,
+    });
+    const req = mockReq("/edge-action", {
+      host: "public.example:8443",
+      "next-action": "action-id",
+    });
+    req.method = "POST";
+
+    await dispatcher.dispatch(req, mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/edge-action",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+
+    expect(edgeRouteRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          headers: expect.objectContaining({
+            "x-forwarded-host": "public.example:8443",
+          }),
+        }),
+      }),
+    );
+  });
+
   it("recovers Edge App catch-all params from the concrete pathname", async () => {
     const edgeRouteRunner = vi.fn().mockResolvedValue({
       response: new Response("ok"),

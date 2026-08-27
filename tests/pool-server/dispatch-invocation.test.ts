@@ -181,6 +181,36 @@ describe("requestMeta.initURL public scheme", () => {
   });
 });
 
+describe("Server Action forwarded authority", () => {
+  async function invokeAction(headers: Record<string, string>) {
+    let innerHeaders: IncomingMessage["headers"] | undefined;
+    const handler: NodeHandler = (req, res) => {
+      innerHeaders = req.headers;
+      res.end("ok");
+    };
+    const dispatcher = makeDispatcher(handler);
+    await dispatcher.dispatch(
+      mockReq("/api/echo", { "next-action": "action-id", ...headers }, "POST"),
+      mockRes(),
+      routeResolution(),
+    );
+    return innerHeaders;
+  }
+
+  it("copies the public Host when x-forwarded-host is absent", async () => {
+    const headers = await invokeAction({ host: "public.example:8443" });
+    expect(headers?.["x-forwarded-host"]).toBe("public.example:8443");
+  });
+
+  it("preserves an existing x-forwarded-host", async () => {
+    const headers = await invokeAction({
+      host: "internal.example:3000",
+      "x-forwarded-host": "public.example:8443",
+    });
+    expect(headers?.["x-forwarded-host"]).toBe("public.example:8443");
+  });
+});
+
 describe("public request URL vs rewrite invocation target", () => {
   // Empirically pinned against `next start` (Next 16.2.10) on the upstream fixtures:
   //   /blog-post-2 -> /blog/post-2?hello=world   req.url + asPath = "/blog-post-2",
