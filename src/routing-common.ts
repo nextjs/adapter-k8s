@@ -6,10 +6,15 @@
 // and destructure; both bundle formats resolve the symbols this way.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import NextRouting from "@next/routing";
-import type { ResolveRoutesParams } from "@next/routing";
+import type { ResolveRoutesParams, ResolveRoutesResult } from "@next/routing";
 import { isSafePattern } from "redos-detector";
 import { grantsSharedCacheFreshness as grantsSharedCacheFreshnessFromCacheControl } from "./cache-control.js";
-const { detectLocale, detectDomainLocale, normalizeLocalePath } = NextRouting;
+const {
+  detectLocale,
+  detectDomainLocale,
+  normalizeLocalePath,
+  resolveRoutes: resolveRoutesFromNext,
+} = NextRouting;
 
 // Shared routing helpers used by BOTH resolvers — the ext_proc edge
 // (routing-service/handler.ts, "Phase 2") and the pool's local resolver
@@ -1663,8 +1668,53 @@ export function getRscConfig(manifest: { routeGraph?: unknown }): RscConfig | un
   return (manifest.routeGraph as { rsc?: RscConfig } | undefined)?.rsc;
 }
 
+/**
+ * Run the official resolver while preserving the split case policy used by `next start`.
+ *
+ * `@next/routing` 16.3 applies `routes.caseSensitive` to custom routes and filesystem dynamic
+ * routes alike. Next's production server does not: custom routes follow
+ * `experimental.caseSensitiveRoutes` (false by default), while filesystem dynamic routes are
+ * always matched by their flagless route regex. When the official resolver selects a dynamic
+ * route by case only, remove every dynamic candidate that is invalid for that concrete rewritten
+ * pathname and resolve again. The middleware verdict is memoized because this is one request and
+ * middleware must never execute twice. All route ordering, rewrites, conditions, locales, and
+ * result construction remain owned by `@next/routing`.
+ */
+export async function resolveRoutesWithNextParity(
+  params: ResolveRoutesParams,
+): Promise<ResolveRoutesResult> {
+  if (params.routes.caseSensitive === true || params.routes.dynamicRoutes.length === 0) {
+    return resolveRoutesFromNext(params);
+  }
+
+  let middlewareVerdict: ReturnType<ResolveRoutesParams["invokeMiddleware"]> | undefined;
+  const invokeMiddlewareOnce: ResolveRoutesParams["invokeMiddleware"] = (context) => {
+    middlewareVerdict ??= params.invokeMiddleware(context);
+    return middlewareVerdict;
+  };
+  let dynamicRoutes = params.routes.dynamicRoutes;
+
+  while (true) {
+    const result = await resolveRoutesFromNext({
+      ...params,
+      routes: { ...params.routes, dynamicRoutes },
+      invokeMiddleware: invokeMiddlewareOnce,
+    });
+    const pathname = result.invocationTarget?.pathname;
+    if (pathname === undefined || result.routeMatches === undefined) return result;
+
+    const caseValidRoutes = dynamicRoutes.filter((route) => {
+      const matchedIgnoringCase = new RegExp(route.sourceRegex, "i").test(pathname);
+      return !matchedIgnoringCase || new RegExp(route.sourceRegex).test(pathname);
+    });
+    if (caseValidRoutes.length === dynamicRoutes.length) return result;
+    dynamicRoutes = caseValidRoutes;
+  }
+}
+
 /** The `routeGraph` buckets `@next/routing`'s matchRoute walks. Every entry in each of them
- * carries a `sourceRegex` that gets `new RegExp()`'d PER REQUEST with no try/catch. */
+ * carries a `sourceRegex` that gets compiled PER REQUEST with the graph's case policy and no
+ * try/catch. */
 const ROUTE_GRAPH_BUCKETS = [
   "beforeMiddleware",
   "beforeFiles",
@@ -1683,12 +1733,12 @@ const ROUTE_GRAPH_BUCKETS = [
  *  1. A structurally wrong manifest (an empty file, a half-written mount, a hand-edited
  *     ConfigMap) was consumed by a bare `JSON.parse` and only failed later, deep inside
  *     resolveRoutes, on the first request.
- *  2. A route `sourceRegex` the SERVING V8 rejects. `@next/routing`'s matchRoute does
- *     `new RegExp(entry.sourceRegex)` with NO try/catch — unlike compileMatcherRegex above,
- *     which has an explicit fail-safe for exactly this build-machine/serving-runtime skew
- *     (the `(?i:)`-on-older-Node incident). One such route therefore throws on EVERY request
- *     inside resolveRoutes → the routing service's catch → `failOpen === false` whenever the
- *     app has middleware → 500 on everything, while `/healthz` keeps answering 200.
+ *  2. A route `sourceRegex` the SERVING V8 rejects. `@next/routing`'s matchRoute compiles it
+ *     with `new RegExp(entry.sourceRegex, caseSensitive ? "" : "i")` and NO try/catch — unlike
+ *     compileMatcherRegex above, which has an explicit fail-safe for build-machine/serving-
+ *     runtime skew. One such route therefore throws on EVERY request inside resolveRoutes →
+ *     the routing service's catch → `failOpen === false` whenever the app has middleware →
+ *     500 on everything, while `/healthz` keeps answering 200.
  *
  * Throwing here puts the failure where the startup path already puts a missing TLS identity
  * and a missing middleware module: at deploy time, in front of the readiness gate.
@@ -1723,6 +1773,10 @@ export function assertValidRoutingManifest(parsed: unknown, source: string): voi
     fail("`routeGraph` must be an object");
   }
   const graph = routeGraph as Record<string, unknown>;
+  if (graph.caseSensitive !== undefined && typeof graph.caseSensitive !== "boolean") {
+    fail("`routeGraph.caseSensitive` must be a boolean when present");
+  }
+  const routeFlags = graph.caseSensitive === true ? "" : "i";
   for (const bucket of ROUTE_GRAPH_BUCKETS) {
     const entries = graph[bucket];
     if (entries === undefined) fail(`\`routeGraph.${bucket}\` is missing`);
@@ -1733,15 +1787,15 @@ export function assertValidRoutingManifest(parsed: unknown, source: string): voi
       const sourceRegex = (entry as Record<string, unknown>).sourceRegex;
       if (typeof sourceRegex !== "string") fail(`\`${at}.sourceRegex\` must be a string`);
       try {
-        new RegExp(sourceRegex as string);
+        new RegExp(sourceRegex as string, routeFlags);
       } catch (err) {
         fail(
           `\`${at}.sourceRegex\` does not compile in this runtime: ` +
             `${JSON.stringify(sourceRegex)} — ` +
             `${err instanceof Error ? err.message : String(err)}. This usually means the ` +
             `build machine's Node/V8 accepts syntax the serving runtime does not (e.g. ` +
-            `inline-flag groups like "(?i:)" on an older Node). @next/routing's matchRoute ` +
-            `compiles this per request with no try/catch`,
+            `inline-flag groups like "(?i:)" on an older Node). @next/routing compiles this ` +
+            `per request with the route graph's case-sensitivity flag and no try/catch`,
         );
       }
     });
