@@ -748,7 +748,7 @@ describe("buildRoutingManifest", () => {
       writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
       const manifest = build([template("/x/[id]", 1), rscSibling("/x/[id]", 1, undefined)]);
       expect(manifest.pprCapableRoutes).toEqual({
-        "/x/[id]": { rootParams: [], wouldPostpone: false },
+        "/x/[id]": { rootParams: [] },
       });
       expect(manifest.pprRoutes["/x/[id]"]).toBeUndefined();
     });
@@ -765,7 +765,7 @@ describe("buildRoutingManifest", () => {
         rscSibling("/[lang]/x/[id]", 1, undefined),
       ]);
       expect(manifest.pprCapableRoutes).toEqual({
-        "/[lang]/x/[id]": { rootParams: ["lang"], wouldPostpone: false },
+        "/[lang]/x/[id]": { rootParams: ["lang"] },
       });
     });
 
@@ -818,7 +818,7 @@ describe("buildRoutingManifest", () => {
         }),
       ]);
       expect(manifest.pprCapableRoutes).toEqual({
-        "/x/[id]": { rootParams: [], wouldPostpone: false },
+        "/x/[id]": { rootParams: [] },
       });
     });
 
@@ -835,189 +835,6 @@ describe("buildRoutingManifest", () => {
     it("is empty when the prerender manifest is absent", () => {
       const manifest = build([template("/x/[id]", 1)]);
       expect(manifest.pprCapableRoutes).toEqual({});
-    });
-
-    // N16b. `rootParams: []` conflated two behaviours that need OPPOSITE handling. The bit that
-    // separates them is the same-groupId `.rsc` sibling's postponedState: the build suppressed
-    // the shell of `/novel/early-span` only because it would have been EMPTY, yet the render DID
-    // postpone — served minimal, that route returned 1,358 bytes with an empty closed
-    // `<!--$--><!--/$-->` boundary where `next start` returns 7,658 bytes of resolved content.
-    describe("wouldPostpone (N16b)", () => {
-      it("is true when the same-groupId .rsc sibling carries a postponed state", () => {
-        writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
-        const manifest = build([template("/x/[id]", 7), rscSibling("/x/[id]", 7, "postponed-abc")]);
-        expect(manifest.pprCapableRoutes).toEqual({
-          "/x/[id]": { rootParams: [], wouldPostpone: true },
-        });
-        // Still DISJOINT from pprRoutes: there is no shell file to prepend, so nothing may be
-        // injected — the whole point is that Next owns the shell lifecycle for these.
-        expect(manifest.pprRoutes["/x/[id]"]).toBeUndefined();
-      });
-
-      it("is false when the sibling exists but carries no postponed state", () => {
-        writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
-        const manifest = build([template("/x/[id]", 7), rscSibling("/x/[id]", 7, undefined)]);
-        expect(manifest.pprCapableRoutes).toEqual({
-          "/x/[id]": { rootParams: [], wouldPostpone: false },
-        });
-      });
-
-      // The `without-io` flavour as the build really emits it: the template KEEPS its shell file
-      // (so `fallback` is not null) but nothing in its group ever postponed. Measured on a probe
-      // app: `/i/[slug]` fallback file present + postponedState absent, sibling postponedState
-      // absent. This must stay minimal (app-dir/fallback-shells).
-      it("is false for a shell-bearing-but-never-postponing template (without-io shape)", () => {
-        writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
-        const manifest = build([
-          template("/x/[id]", 7, {
-            fallback: { filePath: "/app/dist/x.html", postponedState: undefined } as any,
-          }),
-          rscSibling("/x/[id]", 7, undefined),
-        ]);
-        expect(manifest.pprCapableRoutes).toEqual({
-          "/x/[id]": { rootParams: [], wouldPostpone: false },
-        });
-      });
-
-      // The join must be on groupId, never on suffix arithmetic: a postponed state belonging to a
-      // DIFFERENT group — here a concrete generateStaticParams instance whose id happens to sit
-      // under the same route prefix — must not answer for the template.
-      it("ignores a postponed state from a different group", () => {
-        writePrerenderManifest({
-          dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } },
-          routes: { "/x/foo": {} },
-        });
-        const manifest = build([
-          template("/x/[id]", 7),
-          rscSibling("/x/[id]", 7, undefined),
-          mockPrerender({
-            pathname: "/x/foo",
-            sourcePage: "/x/[id]",
-            // @ts-ignore - mock property
-            groupId: 8,
-            fallback: { filePath: "/app/dist/x/foo.html", postponedState: "concrete" },
-            config: { renderingMode: "PARTIALLY_STATIC" as any },
-          }),
-          rscSibling("/x/foo", 8, "concrete"),
-        ]);
-        expect(manifest.pprCapableRoutes).toEqual({
-          "/x/[id]": { rootParams: [], wouldPostpone: false },
-        });
-      });
-
-      // Prerequisite-2 finding, pinned: two CONCRETE params of one template can disagree about
-      // postponing (measured on a probe app — `/h/dyn` postponed, `/h/stat` did not). That does
-      // NOT make the per-template flag wrong, because each concrete param sits in its own group
-      // and is answered by its own artifact; the template's flag describes only the template
-      // render, which is the only evidence available for a param with no build artifact.
-      it("is unaffected by concrete params that disagree about postponing", () => {
-        writePrerenderManifest({
-          dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } },
-          routes: { "/x/dyn": {}, "/x/stat": {} },
-        });
-        const manifest = build([
-          template("/x/[id]", 7),
-          rscSibling("/x/[id]", 7, "template-postponed"),
-          mockPrerender({
-            pathname: "/x/dyn",
-            sourcePage: "/x/[id]",
-            // @ts-ignore - mock property
-            groupId: 8,
-            fallback: { filePath: "/app/dist/x/dyn.html", postponedState: "dyn-postponed" },
-            config: { renderingMode: "PARTIALLY_STATIC" as any },
-          }),
-          rscSibling("/x/dyn", 8, "dyn-postponed"),
-          mockPrerender({
-            pathname: "/x/stat",
-            sourcePage: "/x/[id]",
-            // @ts-ignore - mock property
-            groupId: 9,
-            fallback: { filePath: "/app/dist/x/stat.html", postponedState: undefined } as any,
-            config: { renderingMode: "PARTIALLY_STATIC" as any },
-          }),
-          rscSibling("/x/stat", 9, undefined),
-        ]);
-        // Only the template is keyed; both concrete params keep their own artifacts.
-        expect(manifest.pprCapableRoutes).toEqual({
-          "/x/[id]": { rootParams: [], wouldPostpone: true },
-        });
-        expect(manifest.pprRoutes["/x/dyn"]).toBeDefined();
-        expect(manifest.pprRoutes["/x/stat"]).toBeUndefined();
-      });
-
-      // The build-time assertion. Losing the sibling upstream would silently reclassify every
-      // shell-less PPR template as "never postpones" and bring the truncation back, so it must be
-      // a loud build failure instead.
-      // N16c: this used to THROW, to protect the `wouldPostpone` signal. The signal turned out
-      // not to discriminate (see the N16c notes in manifest.ts and the minimalMode gate), so
-      // nothing load-bearing consumes it and a hard throw could only fail builds for no benefit.
-      // A missing sibling now classifies as "does not postpone" and the build proceeds.
-      it("does NOT throw when a PARTIALLY_STATIC template has no same-groupId .rsc sibling", () => {
-        writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
-        const manifest = build([template("/x/[id]", 7)]);
-        expect(manifest.pprCapableRoutes?.["/x/[id]"]?.wouldPostpone).toBe(false);
-      });
-
-      // A same-group member that is NOT the sibling does not satisfy the assertion: segment
-      // prerenders share the groupId but carry their own fallback FILE and hardcode
-      // `postponedState: undefined` (build-complete.js:634).
-      // N16c: both of these used to THROW for the same reason as above, and no longer do.
-      // Kept as regression cover that a missing/segment-only sibling is CLASSIFIED (as
-      // not-postponing) rather than fatal.
-      it("classifies rather than throws when the only same-group members are segment prerenders", () => {
-        writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
-        const manifest = build([
-          template("/x/[id]", 7),
-          mockPrerender({
-            pathname: "/x/[id].segments/_tree.segment.rsc",
-            sourcePage: "/x/[id]",
-            // @ts-ignore - mock property
-            groupId: 7,
-            fallback: { filePath: "/app/dist/x/_tree.segment.rsc", postponedState: undefined },
-            config: { renderingMode: "PARTIALLY_STATIC" as any },
-          }),
-        ]);
-        expect(manifest.pprCapableRoutes?.["/x/[id]"]?.wouldPostpone).toBe(false);
-      });
-
-      it("does not throw for a shell-bearing PARTIALLY_STATIC template with no sibling", () => {
-        writePrerenderManifest({ dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } } });
-        expect(() =>
-          build([
-            template("/x/[id]", 7, {
-              fallback: { filePath: "/app/dist/x.html", postponedState: "abc" },
-            }),
-          ]),
-        ).not.toThrow();
-      });
-
-      // The assertion covers the shell-BEARING flavour too: it is the same upstream contract, and
-      // a break there is the earliest signal that the discriminator is gone.
-      // Concrete instances and `.segments/` variants are NOT prerender-manifest `dynamicRoutes`
-      // members, so the assertion must not fire for them — they legitimately have no sibling of
-      // their own in some builds, and an over-broad assertion would break every build.
-      it("does not assert on outputs that are not route templates", () => {
-        writePrerenderManifest({
-          dynamicRoutes: { "/x/[id]": { fallbackRootParams: [] } },
-          routes: { "/x/foo": {} },
-        });
-        const manifest = build([
-          template("/x/[id]", 7),
-          rscSibling("/x/[id]", 7, undefined),
-          mockPrerender({
-            pathname: "/x/foo",
-            sourcePage: "/x/[id]",
-            // @ts-ignore - mock property
-            groupId: 8,
-            // @ts-ignore - mock property
-            fallback: null,
-            config: { renderingMode: "PARTIALLY_STATIC" as any },
-          }),
-        ]);
-        expect(manifest.pprCapableRoutes).toEqual({
-          "/x/[id]": { rootParams: [], wouldPostpone: false },
-        });
-      });
     });
   });
 
@@ -1040,82 +857,6 @@ describe("buildRoutingManifest", () => {
     expect(manifest.routeGraph.rsc).toBeDefined();
     expect(manifest.routeGraph.rsc.header).toBe("RSC");
     expect((manifest as any).rsc).toBeUndefined();
-  });
-});
-
-// Survey Tier 2 #7 (plans/lessons-from-sibling-adapters.md): the build emits PARTIALLY_STATIC
-// PRERENDER outputs whose fallback carries a postponedState but NO filePath — the shell-less
-// `.rsc` postponed-state siblings (dynamic-RSC prefetch responses for PPR routes,
-// build-complete.js:986-991). `pprRoutes` deliberately requires a shell and `pprCapableRoutes`
-// only admits route TEMPLATES (prerender-manifest dynamicRoutes members), so these outputs were
-// dropped from the manifest entirely — the resume implementation cannot see them. The Vercel
-// adapter registers them gated on `allowQuery.length === 0` (outputs.ts:652-673): with no
-// route-param variance the postponed state is shareable across requests; with params it is not
-// and must cold-render.
-describe("pprStatePrerenders (survey Tier 2 #7)", () => {
-  function manifestWith(prerender: Record<string, unknown>) {
-    const outputs = mockOutputs({
-      appPages: [mockAppPage({ pathname: "/novel" })],
-      prerenders: [mockPrerender(prerender as any)],
-    });
-    const pools = new Map<string, PoolDefinition>([
-      ["ssr", { name: "ssr", outputs: [outputs.appPages[0]!], config: { routes: ["appPages"] } }],
-    ]);
-    return buildRoutingManifest({
-      routing: mockRouting(),
-      outputs,
-      pools,
-      buildId: "test123",
-      basePath: "",
-      i18n: null,
-      nextVersion: "16.2.0",
-      projectDir: "/app",
-    });
-  }
-
-  it("registers a filePath-less postponed-state prerender when allowQuery is empty", () => {
-    const manifest = manifestWith({
-      pathname: "/novel.rsc",
-      groupId: 7,
-      fallback: { postponedState: "ppr-state-bytes" },
-      config: { renderingMode: "PARTIALLY_STATIC" as any, allowQuery: [] },
-    });
-    expect((manifest as any).pprStatePrerenders).toEqual({
-      "/novel.rsc": { postponedState: "ppr-state-bytes" },
-    });
-    // Disjoint from the shell-bearing map — nothing here has a shell to serve.
-    expect(manifest.pprRoutes["/novel.rsc"]).toBeUndefined();
-  });
-
-  it("refuses one whose allowQuery names route params (state is param-dependent, must cold-render)", () => {
-    const manifest = manifestWith({
-      pathname: "/novel/[id].rsc",
-      groupId: 8,
-      fallback: { postponedState: "param-dependent-state" },
-      config: { renderingMode: "PARTIALLY_STATIC" as any, allowQuery: ["id"] },
-    });
-    expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
-  });
-
-  it("refuses one with no allowQuery at all (variance unknown — conservative)", () => {
-    const manifest = manifestWith({
-      pathname: "/novel.rsc",
-      groupId: 9,
-      fallback: { postponedState: "state" },
-      config: { renderingMode: "PARTIALLY_STATIC" as any },
-    });
-    expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
-  });
-
-  it("leaves shell-bearing prerenders in pprRoutes only", () => {
-    const manifest = manifestWith({
-      pathname: "/dashboard",
-      groupId: 10,
-      fallback: { filePath: "/app/dist/dashboard.html", postponedState: "abc" },
-      config: { renderingMode: "PARTIALLY_STATIC" as any, allowQuery: [] },
-    });
-    expect(manifest.pprRoutes["/dashboard"]).toBeDefined();
-    expect((manifest as any).pprStatePrerenders ?? {}).toEqual({});
   });
 });
 

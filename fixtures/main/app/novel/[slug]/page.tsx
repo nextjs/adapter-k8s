@@ -1,5 +1,4 @@
-// Shell-less PPR probe (spec rev-4 "Option D" — docs/superpowers/specs/
-// 2026-07-26-ppr-resume-shell-less-templates.md). Mirrors the structure of upstream's
+// Shell-less PPR probe for "Option D". Mirrors the structure of upstream's
 // cache-components-allow-otel-spans `[slug]/early-span`: a PARTIALLY_STATIC dynamic template
 // whose non-prerendered params render async work with NO Suspense boundary above it, so the
 // build's static shell is empty and demoted (`fallback: null`) while the template lands in
