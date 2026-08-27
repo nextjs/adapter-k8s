@@ -4,18 +4,19 @@ The package is unpublished and experimental. The ledger below is the release cla
 the named profile and version were exercised, not that every conformant controller or managed
 Kubernetes product inherits the result.
 
-| Status                  | Profile or capability                           | Evidence                                                                                                       | Boundary                                                                                                                         |
-| ----------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Historical partial pass | Next.js pool runtime                            | 2026-07-29, adapter `db4bd0c`, upstream `v16.3.0-canary.97`: 3,439 passed / 2 failed                           | The two recorded failures reproduce against `next start`; this is still a dated ref, not a blanket claim for other Next versions |
-| Historical partial pass | Full k3d legacy-provider topology               | 2026-08-04, upstream `v16.3.0-canary.97`: about 4,438 passed / 27 failed                                       | Adapter commit was not recorded; this predates direct target-composition coverage and retains the other gaps below               |
-| Historical live receipt | GKE traffic-extension deployment                | Recorded 2026-07-29: 26-check deploy → rollback → roll-forward with CDN, cache, routing, and multiple replicas | Tested artifact SHA and cluster/GKE versions were not recorded; this is not a per-commit release gate                            |
-| Historical live receipt | Generic Envoy Gateway                           | Recorded 2026-07-29: k3s 1.30.6 and Scaleway Kubernetes 1.36.1, arm64, Cilium, Envoy Gateway 1.5.4             | Tested artifact SHA was not recorded; does not imply another Gateway controller supports native ext_proc routing                 |
-| Schema-tested           | Portable Ingress, generic Envoy, and GKE charts | 2026-08-27: `npm run test:schema` with pinned Helm, kubeconform, and Kubernetes schemas                        | Gateway API, Envoy, and GKE CRDs are named explicit skips; their controllers/live API servers remain the authority               |
-| Untested                | ingress-nginx controller matrix                 | The portable `Ingress` object is schema-tested                                                                 | Supported as exposure plus pool-local routing, not as a native routing adapter                                                   |
-| Transport-tested        | Experimental WebSocket `upgradeHandler`         | Real-socket unit and Docker-gated rollout coverage                                                             | No stable public Next API or upstream framework fixture yet                                                                      |
-| Deferred                | AWS/EKS components                              | Provider-neutral cluster, registry, exposure, routing, and resource seams exist                                | No AWS provisioning, IAM, load-balancer, registry, or live-cluster support is shipped or claimed                                 |
-| Deferred                | Vercel/BYOC proxy origin                        | `RoutingOrigin` is discriminated for a future non-Service origin                                               | 0.1 accepts Kubernetes Service origins only; no incremental-migration proxy is implemented                                       |
-| Unverified              | Performance and broad cluster compatibility     | None                                                                                                           | No published load tests, benchmarks, or “all Kubernetes” claim                                                                   |
+| Status                  | Profile or capability                           | Evidence                                                                                                       | Boundary                                                                                                                      |
+| ----------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Release-candidate pass  | Next.js pool runtime                            | 2026-08-27, adapter `70a1c94`, upstream `v16.3.0-canary.97`: 3,441 passed / 0 failed across 1,082 suites       | Pool-local routing only; one suite redeployed after a transient host-port collision; this does not prove the cluster topology |
+| Release-candidate pass  | Unit, schema, audit, build, and packed package  | 2026-08-27, adapter `70a1c94`: `npm run release:check` passed; 3,241 unit tests passed / 8 skipped             | Docker-gated skips do not replace live controller or cluster verification                                                     |
+| Historical partial pass | Full k3d legacy-provider topology               | 2026-08-04, upstream `v16.3.0-canary.97`: about 4,438 passed / 27 failed                                       | Adapter commit was not recorded; this predates direct target-composition coverage and retains the other gaps below            |
+| Historical live receipt | GKE traffic-extension deployment                | Recorded 2026-07-29: 26-check deploy → rollback → roll-forward with CDN, cache, routing, and multiple replicas | Tested artifact SHA and cluster/GKE versions were not recorded; this is not a per-commit release gate                         |
+| Historical live receipt | Generic Envoy Gateway                           | Recorded 2026-07-29: k3s 1.30.6 and Scaleway Kubernetes 1.36.1, arm64, Cilium, Envoy Gateway 1.5.4             | Tested artifact SHA was not recorded; does not imply another Gateway controller supports native ext_proc routing              |
+| Schema-tested           | Portable Ingress, generic Envoy, and GKE charts | 2026-08-27: `npm run test:schema` with pinned Helm, kubeconform, and Kubernetes schemas                        | Gateway API, Envoy, and GKE CRDs are named explicit skips; their controllers/live API servers remain the authority            |
+| Untested                | ingress-nginx controller matrix                 | The portable `Ingress` object is schema-tested                                                                 | Supported as exposure plus pool-local routing, not as a native routing adapter                                                |
+| Transport-tested        | Experimental WebSocket `upgradeHandler`         | Real-socket unit and Docker-gated rollout coverage                                                             | No stable public Next API or upstream framework fixture yet                                                                   |
+| Deferred                | AWS/EKS components                              | Provider-neutral cluster, registry, exposure, routing, and resource seams exist                                | No AWS provisioning, IAM, load-balancer, registry, or live-cluster support is shipped or claimed                              |
+| Deferred                | Vercel/BYOC proxy origin                        | `RoutingOrigin` is discriminated for a future non-Service origin                                               | 0.1 accepts Kubernetes Service origins only; no incremental-migration proxy is implemented                                    |
+| Unverified              | Performance and broad cluster compatibility     | None                                                                                                           | No published load tests, benchmarks, or “all Kubernetes” claim                                                                |
 
 Node support has two distinct gates: Node 20.16 is the minimum build/CLI host because the cache
 bundle uses `process.getBuiltinModule`; Node 24 is the pool/routing runtime floor because the
@@ -62,16 +63,15 @@ framework's surface area:
 
 ```text
 Next.js:        v16.3.0-canary.97 (367e5215)
-adapter-k8s:    db4bd0c
-run date:       2026-07-29
-result:         3,439 passed / 2 failed / 1,082 suites
-reproduce:      NEXT_TEST_CONCURRENCY=4 bash scripts/e2e-local.sh "" v16.3.0-canary.97
+adapter-k8s:    70a1c94b60c39931213afab33d2b811a3661e673
+run date:       2026-08-27
+result:         3,441 passed / 0 failed / 1,018 pending / 6 todo / 1,082 suites
+reproduce:      NEXT_TEST_CONCURRENCY=4 npm run test:e2e -- "" v16.3.0-canary.97
 ```
 
-The two pool-topology failures are client-side navigation timing races
-(`i18n-support-same-page-hash-change`, `rewrites-manual-href-as`) whose assertions read DOM
-state after a client transition with no request reaching the pool; both reproduce at similar
-rates against vanilla `next start`.
+One suite redeployed after a concurrent host-port collision (`EADDRINUSE`) and then passed; no
+assertion needed a retry. The two client-navigation timing races in the July receipt
+(`i18n-support-same-page-hash-change`, `rewrites-manual-href-as`) both passed on their first attempt.
 
 **Full cluster topology** — the same suite through the production request path: Envoy
 Gateway → ext_proc routing service → pool, with a shared Valkey incremental cache, deployed
