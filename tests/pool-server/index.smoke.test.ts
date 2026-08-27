@@ -47,6 +47,7 @@ interface StagedDir {
 function writeStagedDir(
   withMiddleware: boolean,
   middlewareRuntime: "nodejs" | "edge" = "nodejs",
+  nextVersion = "16.3.0",
 ): StagedDir {
   const dir = mkdtempSync(path.join(REPO_ROOT, ".smoke-stage-"));
   const configDir = path.join(dir, "config");
@@ -169,7 +170,7 @@ function writeStagedDir(
         "/upstream-jp2": "main",
       },
       pprRoutes: {},
-      nextVersion: "16.2.10",
+      nextVersion,
     }),
   );
   if (withMiddleware) {
@@ -423,6 +424,18 @@ describe("pool-server startup smoke test", () => {
     process.env.CONFIG_DIR = stagedB.configDir;
     try {
       await expect(startPoolServer()).rejects.toThrow(/no callable export/);
+    } finally {
+      process.env.CONFIG_DIR = previousConfigDir;
+      rmSync(stagedB.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to start an artifact from an unreviewed Next.js release line", async () => {
+    const stagedB = writeStagedDir(false, "nodejs", "16.4.0");
+    const previousConfigDir = process.env.CONFIG_DIR;
+    process.env.CONFIG_DIR = stagedB.configDir;
+    try {
+      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.0 <16\.4\.0/);
     } finally {
       process.env.CONFIG_DIR = previousConfigDir;
       rmSync(stagedB.dir, { recursive: true, force: true });

@@ -1,5 +1,6 @@
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
+import { invokeNodeMiddleware } from "../next-runtime/middleware-entrypoint.js";
 import type { ProcessingResponse, HeaderValue } from "./ext-proc-types.js";
 import {
   buildImmediateResponse,
@@ -388,36 +389,9 @@ export function createRequestHandler(
       pathnames: manifest.pathnames,
       i18n: (manifest.i18n || undefined) as any,
       routes: manifest.routeGraph,
-      // Next.js middleware modules have multiple shapes depending on compilation target. The
-      // ladder here MUST match pool-server/resolve.ts, which runs:
-      //
-      //   0. edge sandbox        — pool only (this tier runs Node middleware only)
-      //   G. generated handler   — handler(Request, ctx)
-      //   1. web adapter         — default({ handler, request, page })
-      //   2. legacy              — default.default({ request })
-      //   3. direct handler      — handler(request, { waitUntil })
-      //
-      // The three invocation paths must stay SEPARATE and in this order — invoking a
-      // compatibility wrapper with the wrong shape silently returns next() and bypasses the
-      // user's proxy.
-      //
-      // COMMENT CORRECTIONS (N40), both verified by measurement:
-      //  - this used to claim the ordering "MUST match pool-server/resolve.ts (paths 1/2/3)"
-      //    while OMITTING the generated-handler path the pool tries FIRST. The real Next 16.2
-      //    artifact is `{ default: { default: adapterWrapper, handler } }`, so
-      //    `middlewareModule.default` is an OBJECT: `adapterFn` is null, path 1 (the only
-      //    Phase-2 path that passed `manifestNextConfig`) was UNREACHABLE, and every request
-      //    fell to path 2 with no `nextConfig` at all. Measured on the real artifact for
-      //    `basePath: '/docs'` + i18n: middleware saw `nextUrl.pathname = '/docs/about'`,
-      //    `locale = ''` at the edge versus `/about` / `en` in the pool and under
-      //    `next start` — so a `pathname === '/admin'` gate silently failed to fire in
-      //    production only.
-      //  - it also claimed "the legacy path strips control headers from the response, which
-      //    makes responseToMiddlewareResult misinterpret it". MEASURED FALSE on 16.2.10: for
-      //    the same request the legacy path and the generated handler return byte-identical
-      //    control headers (`x-middleware-next: 1`, `x-middleware-override-headers`, every
-      //    `x-middleware-request-*`). The order is justified by the nextUrl normalization
-      //    above, not by header stripping.
+      // The shared Node runtime seam owns shape discrimination and the measured load-bearing
+      // invocation order. The pool's edge sandbox remains separate because this service only
+      // executes Node middleware.
       invokeMiddleware: middlewareModule
         ? async (ctx) => {
             try {
@@ -433,225 +407,49 @@ export function createRequestHandler(
                 return {};
               }
 
-              let response: Response | null = null;
+              const invoked = await invokeNodeMiddleware(middlewareModule, {
+                url: ctx.url,
+                headers: ctx.headers,
+                method,
+                requestBody: ctx.requestBody,
+                // The same shed signal reaches generated/direct Request.signal and the request
+                // object consumed by web-adapter/legacy wrappers. A fresh never-aborted signal
+                // here previously let timed-out middleware keep running detached.
+                signal: shedSignal ?? null,
+                nextConfig: manifestNextConfig(manifest),
+                logBackgroundError(error) {
+                  console.error("[routing-service] middleware background work failed:", error);
+                },
+              });
 
-              const nestedDefault =
-                middlewareModule.default && typeof middlewareModule.default === "object"
-                  ? (middlewareModule.default as Record<string, unknown>)
-                  : null;
-              const generatedHandler =
-                typeof middlewareModule.handler === "function"
-                  ? (middlewareModule.handler as (...args: unknown[]) => unknown)
-                  : typeof nestedDefault?.handler === "function"
-                    ? (nestedDefault.handler as (...args: unknown[]) => unknown)
-                    : null;
+              // Preserve the existing fail-safe for an unknown module shape: `mwEvaluated`
+              // remains its pessimistic `error` value, which is not a trusted skip verdict, so
+              // the pool discards the edge dispatch and runs full local resolution.
+              if (invoked.kind === "unsupported") return {};
+              // A recognized callable with an unrecognized result is not a successful
+              // middleware evaluation. Throw into the existing genuine-error policy; never stamp
+              // it as `ran` and never fall through to a second callable.
+              if (invoked.kind === "invalid-result") throw invoked.error;
 
-              const adapterFn =
-                typeof middlewareModule.default === "function"
-                  ? (middlewareModule.default as (...args: unknown[]) => unknown)
-                  : null;
-
-              const exportedHandler =
-                (middlewareModule as Record<string, unknown>).proxy ??
-                (middlewareModule as Record<string, unknown>).middleware;
-              const handlerFn =
-                typeof exportedHandler === "function"
-                  ? (exportedHandler as (...args: unknown[]) => unknown)
-                  : typeof middlewareModule === "function"
-                    ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
-                    : null;
-
-              const legacyMiddlewareFn =
-                typeof (middlewareModule.default as Record<string, unknown> | undefined)
-                  ?.default === "function"
-                  ? ((middlewareModule.default as Record<string, unknown>).default as (
-                      ...args: unknown[]
-                    ) => unknown)
-                  : null;
-              const adapterHandler = handlerFn ?? (adapterFn ? middlewareModule : null);
-
-              // Manifest declares middleware but no callable export was found — this is the
-              // exact silent-bypass state. Leave `mwEvaluated = "error"` so the pool does NOT
-              // trust the skip and re-runs middleware itself. `generatedHandler` counts: this
-              // tier can now invoke a `handler`-only module, which it previously recognized
-              // (pool-server/resolve.ts hasCallableMiddlewareExport) but could not run.
-              if (!generatedHandler && !adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
-              // A callable was found and is about to run — the middleware stage is genuinely
-              // evaluated for this request.
               mwEvaluated = "ran";
-
-              const pendingWaitUntil: Promise<void>[] = [];
-              const waitUntil = (waitable: Promise<unknown>) => {
-                pendingWaitUntil.push(
-                  Promise.resolve(waitable)
-                    .then(() => undefined)
-                    .catch((error) => {
-                      console.error("[routing-service] middleware background work failed:", error);
-                    }),
-                );
-              };
-
-              // Path G: the generated handler — `handler(Request, ctx)`. This is the
-              // DOCUMENTED Node middleware entrypoint of a real 16.2 build, and its wrapper
-              // bakes the build's own basePath/i18n into `request.nextUrl`, so middleware sees
-              // the same normalized URL it sees under `next start`. Tried FIRST, exactly as
-              // pool-server/resolve.ts does: for the real artifact shape
-              // (`{ default: { default, handler } }`) every path below either can't fire
-              // (path 1 needs a callable `default`) or normalizes worse.
-              if (generatedHandler) {
-                const requestInit: RequestInit & { duplex?: "half" } = {
-                  method,
-                  headers: new Headers(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                  ),
-                  // Shed budget must abort the generated handler too — the Request ctor adopts
-                  // this signal as request.signal for the middleware to observe.
-                  signal: shedSignal ?? null,
-                  duplex: "half",
-                };
-                if (method !== "GET" && method !== "HEAD") {
-                  requestInit.body = ctx.requestBody;
-                }
-                const result = await (generatedHandler as any)(
-                  new Request(ctx.url.toString(), requestInit),
-                  {
-                    waitUntil,
-                    // The generated wrapper resolves the app's own instrumentation/config
-                    // relative to this. Same value the pool passes.
-                    requestMeta: { relativeProjectDir: "." },
-                  },
-                );
-                response =
-                  result instanceof Response
-                    ? result
-                    : result?.response instanceof Response
-                      ? result.response
-                      : null;
-              }
-
-              // Path 1: Web adapter (default({ handler, request, page }))
-              if (!response && adapterFn && adapterHandler) {
-                const requestHeaders = Object.fromEntries(
-                  [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                );
-                const result = await (adapterFn as any)({
-                  handler: adapterHandler,
-                  request: {
-                    url: ctx.url.toString(),
-                    method,
-                    headers: requestHeaders,
-                    body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                    // Wired to the request-time shed budget — a previously
-                    // never-aborted controller meant the timeout shed rejected the
-                    // response but the middleware kept running detached.
-                    signal: shedSignal ?? new AbortController().signal,
-                    nextConfig: manifestNextConfig(manifest),
-                    waitUntil,
-                  },
-                  page: "middleware",
-                });
-
-                response =
-                  result?.response instanceof Response
-                    ? result.response
-                    : result instanceof Response
-                      ? result
-                      : null;
-              }
-
-              // Path 2: Legacy middleware (default.default)
-              if (!response && legacyMiddlewareFn) {
-                const requestHeaders = Object.fromEntries(
-                  [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                );
-                const result = await (legacyMiddlewareFn as any)({
-                  request: {
-                    url: ctx.url.toString(),
-                    method,
-                    headers: requestHeaders,
-                    body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                    // Next's legacy adapter (next/dist/server/web/adapter.js) forwards
-                    // params.request.signal into the NextRequest init, so the shed
-                    // budget reaches legacy middleware through the same field Path 1
-                    // uses — without it, legacy middleware keeps running detached
-                    // after the server-side timeout shed rejects the response.
-                    signal: shedSignal ?? new AbortController().signal,
-                    // N40: the legacy adapter builds request.nextUrl from this too. MEASURED
-                    // on the real 16.2.10 artifact: without it a `basePath: '/docs'` + i18n
-                    // app's middleware sees `nextUrl.pathname = '/docs/about'`, `locale = ''`,
-                    // `basePath = ''`; with it, `/about` / `en` / `/docs` — byte-identical to
-                    // the generated handler above and to `next start`. This path was the ONLY
-                    // reachable one at the edge for the real artifact shape, and it passed no
-                    // config at all.
-                    nextConfig: manifestNextConfig(manifest),
-                    destination: "document",
-                    credentials: "same-origin",
-                    bodyUsed: false,
-                    mode: "navigate",
-                    redirect: "follow",
-                  },
-                });
-
-                if (result?.waitUntil) {
-                  await result.waitUntil;
-                }
-
-                response =
-                  result?.response instanceof Response
-                    ? result.response
-                    : result instanceof Response
-                      ? result
-                      : null;
-              }
-
-              // Path 3: Direct handler invocation
-              if (!response && typeof handlerFn === "function") {
-                const requestInit: RequestInit & { duplex?: "half" } = {
-                  method,
-                  headers: new Headers(
-                    [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                  ),
-                  // Shed budget must abort Path 3 middleware too — the Request ctor
-                  // adopts this signal as request.signal for the handler to observe.
-                  signal: shedSignal ?? null,
-                  duplex: "half",
-                };
-                if (method !== "GET" && method !== "HEAD") {
-                  requestInit.body = ctx.requestBody;
-                }
-                const middlewareRequest = new Request(ctx.url.toString(), requestInit);
-                const result = await (handlerFn as any)(middlewareRequest, { waitUntil });
-
-                response =
-                  result instanceof Response
-                    ? result
-                    : result?.response instanceof Response
-                      ? result.response
-                      : null;
-              }
-
-              // ext_proc is the platform invocation for Node middleware. Keep it alive until
-              // registered after()/cache work completes so cutover or request teardown cannot
-              // discard side effects; shared cache state itself remains in Valkey.
-              await Promise.all(pendingWaitUntil);
-
-              if (response) {
-                middlewareResponse = response;
-                // N40 (SECURITY). responseToMiddlewareResult MUTATES the Headers it is handed
-                // into the middleware's FINAL request-header set (applying
-                // x-middleware-override-headers / x-middleware-request-* /
-                // x-middleware-set-cookie). This tier used to construct that object inline and
-                // throw it away, so `NextResponse.next({ request: { headers } })` was a total
-                // no-op at the edge — and because we still stamp `x-mw-evaluated: ran`, the
-                // pool skipped its own middleware and the client's spoofed header reached the
-                // handler unmodified. Capture it and transport it below (x-mw-request-headers),
-                // exactly as pool-server/resolve.ts does for Phase 1.
-                const reqHeaders = new Headers(ctx.headers);
-                const mwResult = responseToMiddlewareResult(response.clone(), reqHeaders, ctx.url);
-                middlewareRequestHeaders = reqHeaders;
-                return mwResult;
-              }
-              return {};
+              middlewareResponse = invoked.response;
+              // N40 (SECURITY). responseToMiddlewareResult MUTATES the Headers it is handed
+              // into the middleware's FINAL request-header set (applying
+              // x-middleware-override-headers / x-middleware-request-* /
+              // x-middleware-set-cookie). This tier used to construct that object inline and
+              // throw it away, so `NextResponse.next({ request: { headers } })` was a total
+              // no-op at the edge — and because we still stamp `x-mw-evaluated: ran`, the
+              // pool skipped its own middleware and the client's spoofed header reached the
+              // handler unmodified. Capture it and transport it below (x-mw-request-headers),
+              // exactly as pool-server/resolve.ts does for Phase 1.
+              const reqHeaders = new Headers(ctx.headers);
+              const mwResult = responseToMiddlewareResult(
+                invoked.response.clone(),
+                reqHeaders,
+                ctx.url,
+              );
+              middlewareRequestHeaders = reqHeaders;
+              return mwResult;
             } catch (err) {
               // Shed-abort ≠ middleware crash. When the per-request budget expires,
               // the shed signal aborts signal-aware middleware and the rejection must

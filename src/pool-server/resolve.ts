@@ -2,6 +2,10 @@
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
 import {
+  hasCallableNodeMiddlewareEntrypoint,
+  invokeNodeMiddleware,
+} from "../next-runtime/middleware-entrypoint.js";
+import {
   applyRewriteSignalHeaders,
   computeRewriteInvocation,
   computeRewriteSignalHeaders,
@@ -24,13 +28,7 @@ import {
 type LoadedModule = Record<string, unknown>;
 
 export function hasCallableMiddlewareExport(module: LoadedModule | null | undefined): boolean {
-  if (!module) return false;
-  if (typeof module === "function") return true;
-  if (typeof module.handler === "function") return true;
-  if (typeof module.default === "function") return true;
-  if (typeof module.proxy === "function" || typeof module.middleware === "function") return true;
-  const nested = module.default as Record<string, unknown> | undefined;
-  return typeof nested?.handler === "function" || typeof nested?.default === "function";
+  return hasCallableNodeMiddlewareEntrypoint(module);
 }
 
 export type ResolveResult =
@@ -144,34 +142,9 @@ export function createLocalResolver(
         invokeMiddleware:
           middlewareModule || edgeMiddlewareRunner
             ? async (ctx) => {
-                // Next.js middleware modules have multiple shapes depending on
-                // compilation target. We try invocation paths in order:
-                //
-                // 0. Edge sandbox: use Next.js's built-in edge runtime sandbox
-                //    (for middleware compiled with edge runtime target).
-                // G. Generated handler: handler(Request, ctx) — the DOCUMENTED Node
-                //    middleware entrypoint of a real 16.2 artifact
-                //    (`{ default: { default: adapterWrapper, handler } }`), whose wrapper
-                //    bakes the build's own basePath/i18n into request.nextUrl.
-                // 1. Web adapter: default({ handler, request, page }) — Node middleware
-                //    Returns raw NextResponse with x-middleware-* headers intact.
-                // 2. Legacy: default.default({ request }) — older Next.js Edge output.
-                // 3. Direct handler: handler(request, { waitUntil }) — raw handler fn
-                //
-                // ORDER IS LOAD-BEARING and the three invocation paths must stay SEPARATE:
-                // invoking a compatibility wrapper with the wrong shape silently returns
-                // next() and bypasses the user's proxy. routing-service/handler.ts carries
-                // the same ladder minus path 0 (it runs Node middleware only).
-                //
-                // COMMENT CORRECTION (N40): this used to justify the order with "the legacy
-                // path strips control headers from the response, causing
-                // responseToMiddlewareResult to misinterpret the result (sets
-                // bodySent=true incorrectly)". MEASURED FALSE on 16.2.10: for the same
-                // request, path 2 and the generated handler return byte-identical control
-                // headers (`x-middleware-next: 1`, `x-middleware-override-headers`, every
-                // `x-middleware-request-*`). The real reason to prefer the earlier paths is
-                // the nextUrl normalization above — path 2 only sees basePath/i18n if the
-                // caller hands it `nextConfig`.
+                // Edge sandbox invocation stays here because it is a different runtime. Node
+                // shape discrimination and the measured load-bearing order live in the shared
+                // next-runtime/middleware-entrypoint module used by both Node tiers.
 
                 try {
                   // A same-origin middleware rewrite continues route resolution internally. It
@@ -200,187 +173,26 @@ export function createLocalResolver(
 
                   // Node middleware paths (only if no edge runner or edge didn't produce a response)
                   if (!response && middlewareModule) {
-                    const nestedDefault =
-                      middlewareModule.default && typeof middlewareModule.default === "object"
-                        ? (middlewareModule.default as Record<string, unknown>)
-                        : null;
-                    const generatedHandler =
-                      typeof middlewareModule.handler === "function"
-                        ? (middlewareModule.handler as (...args: unknown[]) => unknown)
-                        : typeof nestedDefault?.handler === "function"
-                          ? (nestedDefault.handler as (...args: unknown[]) => unknown)
-                          : null;
-                    const adapterFn =
-                      typeof middlewareModule.default === "function"
-                        ? (middlewareModule.default as (...args: unknown[]) => unknown)
-                        : null;
-
-                    const exportedHandler =
-                      (middlewareModule as Record<string, unknown>).proxy ??
-                      (middlewareModule as Record<string, unknown>).middleware;
-                    const handlerFn =
-                      typeof exportedHandler === "function"
-                        ? (exportedHandler as (...args: unknown[]) => unknown)
-                        : typeof middlewareModule === "function"
-                          ? (middlewareModule as unknown as (...args: unknown[]) => unknown)
-                          : null;
-
-                    const legacyMiddlewareFn =
-                      typeof (middlewareModule.default as Record<string, unknown> | undefined)
-                        ?.default === "function"
-                        ? ((middlewareModule.default as Record<string, unknown>).default as (
-                            ...args: unknown[]
-                          ) => unknown)
-                        : null;
-                    const adapterHandler = handlerFn ?? (adapterFn ? middlewareModule : null);
-
-                    if (!adapterFn && !handlerFn && !legacyMiddlewareFn) return {};
-
-                    const pendingWaitUntil: Promise<void>[] = [];
-                    const waitUntil = (waitable: Promise<unknown>) => {
-                      pendingWaitUntil.push(
-                        Promise.resolve(waitable)
-                          .then(() => undefined)
-                          .catch((error) => {
-                            console.error(
-                              "[pool-server] middleware background work failed:",
-                              error,
-                            );
-                          }),
-                      );
-                    };
-
-                    // Modern adapter builds expose the documented middleware entrypoint as
-                    // `handler(Request, ctx)`. Prefer it over compatibility `default` wrappers;
-                    // invoking a wrapper with the wrong legacy shape silently returns next()
-                    // and bypasses the user's Node proxy.
-                    if (generatedHandler) {
-                      const requestInit: RequestInit & { duplex?: "half" } = {
-                        method,
-                        headers: new Headers(
-                          [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                        ),
-                        duplex: "half",
-                      };
-                      if (method !== "GET" && method !== "HEAD") {
-                        requestInit.body = ctx.requestBody;
-                      }
-                      const result = await (generatedHandler as any)(
-                        new Request(ctx.url.toString(), requestInit),
-                        {
-                          waitUntil,
-                          requestMeta: { relativeProjectDir: "." },
-                        },
-                      );
-                      response = result instanceof Response ? result : null;
+                    const invoked = await invokeNodeMiddleware(middlewareModule, {
+                      url: ctx.url,
+                      headers: ctx.headers,
+                      method,
+                      requestBody: ctx.requestBody,
+                      nextConfig: manifestNextConfig(manifest),
+                      getCloneableBody: getCloneableBody ?? null,
+                      logBackgroundError(error) {
+                        console.error("[pool-server] middleware background work failed:", error);
+                      },
+                    });
+                    // The startup guard above normally makes this unreachable. Keep it explicit:
+                    // a declared policy never degrades into an implicit next().
+                    if (invoked.kind === "unsupported") {
+                      throw invoked.error;
                     }
-
-                    // Path 1: Web adapter (default({ handler, request, page }))
-                    if (!response && adapterFn && adapterHandler) {
-                      const requestHeaders = Object.fromEntries(
-                        [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                      );
-                      // Node middleware wants request.body as a CloneableBody
-                      // (has .cloneBodyStream()); wrap the buffered body in a
-                      // Node Readable. GET/HEAD carry no body.
-                      let mwBody: unknown;
-                      if (method !== "GET" && method !== "HEAD") {
-                        if (getCloneableBody) {
-                          const { Readable } = await import("node:stream");
-                          mwBody = getCloneableBody(Readable.fromWeb(ctx.requestBody as any));
-                        } else {
-                          mwBody = ctx.requestBody;
-                        }
-                      }
-                      const result = await (adapterFn as any)({
-                        handler: adapterHandler,
-                        request: {
-                          url: ctx.url.toString(),
-                          method,
-                          headers: requestHeaders,
-                          body: mwBody,
-                          signal: new AbortController().signal,
-                          nextConfig: manifestNextConfig(manifest),
-                          waitUntil,
-                        },
-                        page: "middleware",
-                      });
-
-                      response =
-                        result?.response instanceof Response
-                          ? result.response
-                          : result instanceof Response
-                            ? result
-                            : null;
+                    if (invoked.kind === "invalid-result") {
+                      throw invoked.error;
                     }
-
-                    // Path 2: Legacy middleware (default.default)
-                    if (!response && legacyMiddlewareFn) {
-                      const requestHeaders = Object.fromEntries(
-                        [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                      );
-                      const result = await (legacyMiddlewareFn as any)({
-                        request: {
-                          url: ctx.url.toString(),
-                          method,
-                          headers: requestHeaders,
-                          body: method !== "GET" && method !== "HEAD" ? ctx.requestBody : undefined,
-                          // N40: the legacy adapter builds request.nextUrl from this too
-                          // (MEASURED on 16.2.10: without it a basePath+i18n app's middleware
-                          // sees `/docs/about` instead of `/about`, locale "" instead of "en").
-                          // Path 1 already passed it; path 2 did not, so a build that only
-                          // exposes `default.default` got an un-normalized nextUrl on BOTH
-                          // tiers. Same value, same helper, all three paths.
-                          nextConfig: manifestNextConfig(manifest),
-                          destination: "document",
-                          credentials: "same-origin",
-                          bodyUsed: false,
-                          mode: "navigate",
-                          redirect: "follow",
-                        },
-                      });
-
-                      if (result?.waitUntil) {
-                        await result.waitUntil;
-                      }
-
-                      response =
-                        result?.response instanceof Response
-                          ? result.response
-                          : result instanceof Response
-                            ? result
-                            : null;
-                    }
-
-                    // Path 3: Direct handler invocation
-                    if (!response && typeof handlerFn === "function") {
-                      const requestInit: RequestInit & { duplex?: "half" } = {
-                        method,
-                        headers: new Headers(
-                          [...ctx.headers.entries()].filter(([k]) => !k.startsWith(":")),
-                        ),
-                        duplex: "half",
-                      };
-                      if (method !== "GET" && method !== "HEAD") {
-                        requestInit.body = ctx.requestBody;
-                      }
-                      const middlewareRequest = new Request(ctx.url.toString(), requestInit);
-                      const result = await (handlerFn as any)(middlewareRequest, {
-                        waitUntil,
-                      });
-
-                      response =
-                        result instanceof Response
-                          ? result
-                          : result?.response instanceof Response
-                            ? result.response
-                            : null;
-                    }
-
-                    // The response verdict is ready, but the middleware invocation is not done
-                    // until its registered after()/cache work settles. Keep the platform request
-                    // alive; this does not move cache state into process memory.
-                    await Promise.all(pendingWaitUntil);
+                    response = invoked.response;
                   } // end if (!response && middlewareModule)
 
                   if (response) {

@@ -57,7 +57,7 @@ describe("createLocalResolver with real @next/routing", () => {
         "/nl-NL/company/about-us": "default",
       },
       pprRoutes: {},
-      nextVersion: "16.2.10",
+      nextVersion: "16.3.0",
     };
 
     const result = await createLocalResolver(manifest).resolve(

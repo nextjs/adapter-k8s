@@ -103,7 +103,7 @@ function writeStagedDir(): { dir: string; configDir: string } {
       middleware: null,
       poolAssignments: { "/hello": "main", "/foo": "main" },
       pprRoutes: {},
-      nextVersion: "16.2.10",
+      nextVersion: "16.3.0",
     }),
   );
   return { dir, configDir };
