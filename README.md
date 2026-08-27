@@ -288,7 +288,9 @@ Current boundaries are deliberate:
   ingress/load-balancer timeout. State continuity needs an application cursor/session token and
   shared replay/pub-sub; a live connection cannot be transferred between pods.
 - During shutdown the pod stops accepting upgrades, gives established sockets the configured
-  bounded shutdown window, sends close code `1001` (going away), and then force-closes survivors.
+  bounded shutdown window, sends close code `1001` (going away) on the sockets it owns, and then
+  force-closes survivors. A socket tunnelled to another pool gets no injected frame — that pipe is
+  frame-blind, so the owning pool's own close frame is relayed instead.
 
 The same rollout contract covers finite response streams and SSE, including clean SSE EOF and
 `Last-Event-ID` replay guidance. See [deploy lifecycle](./docs/lifecycle.md#long-lived-requests-during-cutover).

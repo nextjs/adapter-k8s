@@ -44,6 +44,13 @@ The terminal behavior is protocol-specific:
   before bounded forced teardown. Clients should reconnect with jittered backoff and send an
   application cursor/session token when missed state matters. Cross-pod topics and replay require
   shared pub/sub or storage; socket state itself is not transferable.
+- A WebSocket **tunnelled to another pool** of the same build is the one exception: the pod
+  relaying it does not own its framing, so it injects no close frame — a relayed frame can be only
+  partly written at that instant, and a `1001` written there would land inside that frame's
+  payload. It relays the owning pool's own `1001` if that pool is draining too (a rollout drains
+  every pool of the build), then tears the tunnel down within the same bounded window. A client
+  whose tunnel is dropped without a close frame sees an abnormal closure and must reconnect, which
+  is what the reconnect guidance above already requires.
 
 For the generic Envoy target, generated application rules disable Envoy's 15-second total route
 deadline with `timeouts.request: 0s`; the gateway's stream-idle timeout still detects a connection

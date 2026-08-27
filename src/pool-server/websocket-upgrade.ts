@@ -32,7 +32,24 @@ import {
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 
-export type UpgradeDisposition = "accepted" | "rejected";
+/**
+ * N90. Who owns FRAMING on an accepted socket, which is what shutdown needs to know before it
+ * writes anything into one (createPoolServer's drain, and the same union on its `onUpgrade`).
+ *
+ * - `accepted-local`: Next's generated ws stack owns this socket. It writes each frame
+ *   synchronously under cork, so a close frame injected between frames cannot interleave with a
+ *   partially written one — the drain path may stamp RFC 6455 code 1001 itself.
+ * - `accepted-tunnel`: the socket is one end of `proxyUpgradeToPool`'s frame-blind byte pipe. A
+ *   frame relayed from the sibling pool routinely spans several TCP chunks, so at any instant the
+ *   client may hold a partially relayed frame whose header already promised N more payload bytes.
+ *   Injecting a close frame there lands close-frame bytes INSIDE that payload and corrupts the
+ *   stream. The drain path relays whatever close frame the back pool's own drain emits (correctly
+ *   framed, at a frame boundary) and then tears the tunnel down, injecting nothing.
+ *
+ * Deliberately not a boolean `accepted`: conflating the two ownership models is exactly what put
+ * a close frame into the middle of a relayed frame, so every accepting path must now say which.
+ */
+export type UpgradeDisposition = "accepted-local" | "accepted-tunnel" | "rejected";
 
 export interface WebSocketUpgradeDispatcher {
   resolve(
@@ -442,7 +459,8 @@ function generatedUpgradeDisposition(outcome: unknown): UpgradeDisposition {
   ) {
     throw new TypeError("Next generated upgradeHandler returned an inconsistent upgrade outcome");
   }
-  return upgraded ? "accepted" : "rejected";
+  // Accepted here means the GENERATED entrypoint took the socket, so ws owns its framing.
+  return upgraded ? "accepted-local" : "rejected";
 }
 
 /** Read the proof-gated phase-two routing verdict, then erase the transport vocabulary. */
@@ -825,6 +843,11 @@ async function proxyUpgradeToPool(
         return;
       }
 
+      // Either end closing takes the other with it, so shutdown needs no separate handle on the
+      // upstream socket: when the drain path destroys the client socket after its bounded flush
+      // window, this teardown closes the sibling-pool connection in the same tick and the back
+      // pool's generated stack sees its peer leave. N90: the drain path must NOT write into
+      // either end of this pipe — see UpgradeDisposition.
       const teardown = () => {
         if (!socket.destroyed) socket.destroy();
         if (!proxySocket.destroyed) proxySocket.destroy();
@@ -835,7 +858,7 @@ async function proxyUpgradeToPool(
       proxySocket.on("close", teardown);
       socket.pipe(proxySocket);
       proxySocket.pipe(socket);
-      finish("accepted");
+      finish("accepted-tunnel");
     });
 
     proxyReq.once("response", (proxyRes) => {

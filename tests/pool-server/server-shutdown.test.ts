@@ -12,8 +12,10 @@
 // bug only exists at the socket layer, so a mock could not have caught it.
 import { describe, it, expect, afterEach, vi } from "vitest";
 import net from "node:net";
-import { get as httpGet, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Duplex } from "node:stream";
 import { createPoolServer } from "../../src/pool-server/server.js";
+import { handleWebSocketUpgrade } from "../../src/pool-server/websocket-upgrade.js";
 import { INTERNAL_DISPATCH_PROOF_HEADER } from "../../src/routing-common.js";
 import { signDispatch } from "../helpers/dispatch-proof.js";
 
@@ -55,7 +57,7 @@ describe("createPoolServer().stop()", () => {
           "HTTP/1.1 101 Switching Protocols\r\n" +
             "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
         );
-        return "accepted";
+        return "accepted-local";
       },
       port: 0,
     });
@@ -382,9 +384,105 @@ describe("createPoolServer().stop()", () => {
     pool = null;
   });
 
+  it("relays a tunnelled WebSocket's own close frame instead of injecting one mid-frame", async () => {
+    // N90. A cross-pool tunnel (websocket-upgrade.ts proxyUpgradeToPool) is a frame-BLIND byte
+    // pipe: a frame relayed from the sibling pool routinely spans several TCP chunks, so at drain
+    // time this pool's client can hold a partially relayed frame whose header already promised
+    // more payload. Writing the 1001 frame that a locally owned socket gets would put close-frame
+    // bytes inside that payload — the client reads a header promising N bytes and gets 0x88 …
+    // instead. Real sockets and a real sibling server throughout: the corruption only exists at
+    // the byte level, and a mock pipe could not have shown it.
+    const partialFrame = Buffer.from([0x81, 0x08, 0x61, 0x62]); // header claims 8 bytes, 2 sent
+    const restOfFrame = Buffer.from("cdefgh");
+    const siblingGoingAway = Buffer.from([0x88, 0x02, 0x03, 0xe9]);
+    let siblingSocket: Duplex | undefined;
+    const sibling = createServer();
+    sibling.on("upgrade", (_req, socket) => {
+      siblingSocket = socket;
+      socket.on("error", () => undefined);
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+      );
+      socket.write(partialFrame);
+    });
+    await new Promise<void>((resolve) => sibling.listen(0, "127.0.0.1", () => resolve()));
+    const siblingAddress = sibling.address();
+    if (!siblingAddress || typeof siblingAddress === "string") {
+      throw new Error("missing sibling pool address");
+    }
+
+    pool = createPoolServer({
+      onRequest: () => undefined,
+      onUpgrade: (req, socket, head) =>
+        handleWebSocketUpgrade(
+          {
+            resolve: async () =>
+              ({ kind: "route", pool: "chat", matchedPathname: "/socket" }) as never,
+            handlerLoader: {
+              has: () => true,
+              get: () => ({ runtime: "nodejs", type: "APP_ROUTE" }),
+              loadUpgrade: async () => undefined,
+            } as never,
+            poolName: "default",
+            releaseName: "app",
+            buildId: "b1",
+            webSocketRegistryScope: {},
+            resolvePoolEndpoint: () => ({
+              hostname: "127.0.0.1",
+              port: siblingAddress.port,
+            }),
+          },
+          req,
+          socket,
+          head,
+        ),
+      port: 0,
+    });
+    const { port } = await pool.start();
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+    socket.on("error", () => undefined);
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    socket.write(
+      "GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n" +
+        "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+        "Sec-WebSocket-Version: 13\r\n\r\n",
+    );
+    await new Promise<void>((resolve) => socket.once("data", () => resolve()));
+
+    const readDrainLog = captureDrainLog();
+    const drain = pool.stop({ graceMs: 200 });
+    // The sibling pool drains too (a rollout SIGTERMs every pool of the build) and emits its own
+    // 1001 at a real frame boundary. The tunnel must still be open to relay it.
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    siblingSocket?.write(Buffer.concat([restOfFrame, siblingGoingAway]));
+    await drain;
+
+    const received = Buffer.concat(chunks);
+    const bodyAt = received.indexOf("\r\n\r\n") + 4;
+    expect(received.subarray(0, bodyAt).toString("latin1")).toContain("101 Switching Protocols");
+    // Exactly the relayed byte stream: the completed frame, then the sibling's close frame. An
+    // injected 1001 would appear between `ab` and `cdefgh` instead.
+    expect(received.subarray(bodyAt)).toEqual(
+      Buffer.concat([partialFrame, restOfFrame, siblingGoingAway]),
+    );
+
+    const counts = readDrainLog();
+    expect(counts.webSockets).toBe(1);
+    expect(counts.tunnelled).toBe(1);
+    expect(counts.signalled).toBe(0);
+    expect(counts.peerClosed).toBe(0);
+    expect(counts.wsForced).toBe(1);
+    socket.destroy();
+    siblingSocket?.destroy();
+    await new Promise<void>((resolve) => sibling.close(() => resolve()));
+    pool = null;
+  });
+
   it("does not report a server-rejected upgrade as a voluntary peer close", async () => {
-    let releaseUpgrade!: (disposition: "accepted" | "rejected") => void;
-    const disposition = new Promise<"accepted" | "rejected">((resolve) => {
+    let releaseUpgrade!: (disposition: "accepted-local" | "rejected") => void;
+    const disposition = new Promise<"accepted-local" | "rejected">((resolve) => {
       releaseUpgrade = resolve;
     });
     let upgradeEntered!: () => void;

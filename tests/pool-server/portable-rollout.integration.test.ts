@@ -56,7 +56,7 @@ function websocketHandler(build: string) {
         `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
     );
     socket.write(websocketFrame(build));
-    return "accepted" as const;
+    return "accepted-local" as const;
   };
 }
 

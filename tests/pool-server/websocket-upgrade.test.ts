@@ -100,7 +100,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
     const head = Buffer.from("early-frame");
 
-    await expect(handleWebSocketUpgrade(deps, req, socket, head)).resolves.toBe("accepted");
+    await expect(handleWebSocketUpgrade(deps, req, socket, head)).resolves.toBe("accepted-local");
 
     expect(upgradeHandler).toHaveBeenCalledOnce();
     const [context, transport] = upgradeHandler.mock.calls[0]!;
@@ -177,7 +177,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
-      "accepted",
+      "accepted-local",
     );
     expect(resolve).not.toHaveBeenCalled();
     expect(upgradeHandler).toHaveBeenCalledOnce();
@@ -210,7 +210,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
-      "accepted",
+      "accepted-local",
     );
     expect(resolve).toHaveBeenCalledOnce();
     expect(req.headers["x-mw-request-headers"]).toBeUndefined();
@@ -284,7 +284,7 @@ describe("handleWebSocketUpgrade", () => {
         socket,
         Buffer.alloc(0),
       ),
-    ).resolves.toBe("accepted");
+    ).resolves.toBe("accepted-local");
     expect(resolve).toHaveBeenCalledOnce();
     expect(upgradeHandler).toHaveBeenCalledOnce();
     // Nothing is written by the adapter: the generated entrypoint owns the 101 and the extension
@@ -345,7 +345,7 @@ describe("handleWebSocketUpgrade", () => {
         acceptedSocket.socket,
         Buffer.alloc(0),
       ),
-    ).resolves.toBe("accepted");
+    ).resolves.toBe("accepted-local");
     expect(accepted.resolve).toHaveBeenCalledOnce();
     acceptedSocket.socket.destroy();
   });
@@ -371,7 +371,7 @@ describe("handleWebSocketUpgrade", () => {
         sameOriginSocket.socket,
         Buffer.alloc(0),
       ),
-    ).resolves.toBe("accepted");
+    ).resolves.toBe("accepted-local");
     expect(sameOrigin.deps.webSocketAllowedOrigins).toBeUndefined();
     expect(sameOrigin.resolve).toHaveBeenCalledOnce();
     sameOriginSocket.socket.destroy();
@@ -435,7 +435,7 @@ describe("handleWebSocketUpgrade", () => {
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
-      "accepted",
+      "accepted-local",
     );
     expect(upgradeHandler).toHaveBeenCalledOnce();
     socket.destroy();
@@ -580,8 +580,10 @@ describe("handleWebSocketUpgrade", () => {
     });
 
     try {
+      // N90: a tunnel, not a locally owned socket — shutdown must not inject a close frame into
+      // this frame-blind pipe.
       await expect(handleWebSocketUpgrade(deps, clientRequest, socket, earlyFrame)).resolves.toBe(
-        "accepted",
+        "accepted-tunnel",
       );
       expect(siblingHeaders?.["x-output-id"]).toBe("/rooms/[room]");
       expect(siblingHeaders?.["x-mw-evaluated"]).toBe("ran");

@@ -228,14 +228,23 @@ export function filterWriteHeadHeadersArg(
 export interface PoolServerOptions {
   onRequest: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
   /**
-   * Node upgrade transport used by Next's generated App Route `upgradeHandler`. Returning
-   * `accepted` marks the still-open socket as an established WebSocket for graceful shutdown.
+   * Node upgrade transport used by Next's generated App Route `upgradeHandler`. An accepting
+   * disposition marks the still-open socket as an established WebSocket for graceful shutdown,
+   * and says who owns its FRAMING — `accepted-local` for a socket Next's ws stack writes frames
+   * into (shutdown may stamp RFC 6455 code 1001 itself), `accepted-tunnel` for one end of a
+   * frame-blind cross-pool byte pipe (shutdown must inject nothing). N90 in
+   * websocket-upgrade.ts `UpgradeDisposition` carries the full derivation; the union is spelled
+   * out here rather than imported so this transport keeps no dependency on the dispatcher.
    */
   onUpgrade?: (
     req: IncomingMessage,
     socket: Duplex,
     head: Buffer,
-  ) => "accepted" | "rejected" | Promise<"accepted" | "rejected">;
+  ) =>
+    | "accepted-local"
+    | "accepted-tunnel"
+    | "rejected"
+    | Promise<"accepted-local" | "accepted-tunnel" | "rejected">;
   port: number;
   /**
    * When true, trust x-output-id etc. from the request WITHOUT a secret. Legacy fallback used
@@ -286,11 +295,18 @@ interface ActiveResponseState {
 }
 
 /**
- * One drain outcome per tracked response, and one per tracked socket. The HTTP categories
- * (completed, clientClosed, sseEnded, sseForced, httpForceClosed) are mutually exclusive and never
- * sum past httpAtStart — an operator reading the single "drain complete" line after an incident has
- * to be able to add them up, so a response that receives an SSE EOF and is then destroyed because
- * the EOF never flushed must land in exactly one of them (sseForced), not in two.
+ * One drain outcome per tracked response, and one terminal SIGNAL per tracked socket. The HTTP
+ * categories (completed, clientClosed, sseEnded, sseForced, httpForceClosed) are mutually exclusive
+ * and never sum past httpAtStart — an operator reading the single "drain complete" line after an
+ * incident has to be able to add them up, so a response that receives an SSE EOF and is then
+ * destroyed because the EOF never flushed must land in exactly one of them (sseForced), not in two.
+ *
+ * The WebSocket counters partition differently, and deliberately: peerClosed, signalled and
+ * tunnelled are mutually exclusive and sum to webSocketsAtStart minus the handshakes still in
+ * flight, while wsForced counts the SEPARATE later act of destroying a socket that outlived the
+ * terminal flush window. A socket signalled with 1001 and then destroyed appears in both
+ * (signalled=1 wsForced=1) — the 1001 says what the peer was told, wsForced says how the socket
+ * ended. tunnelled is the N90 split: a cross-pool tunnel that gets no injected frame at all.
  */
 interface DrainMetrics {
   httpAtStart: number;
@@ -302,6 +318,7 @@ interface DrainMetrics {
   webSocketsAtStart: number;
   webSocketsPeerClosed: number;
   webSocketsSignalled: number;
+  webSocketsTunnelled: number;
   webSocketsForceClosed: number;
 }
 
@@ -365,7 +382,13 @@ export function createPoolServer(options: PoolServerOptions) {
   // shutdown can let finite responses complete, end SSE with a reconnectable EOF, and close a
   // WebSocket with RFC 6455 code 1001 instead of applying one blunt socket operation to all three.
   const activeResponses = new Map<ServerResponse, ActiveResponseState>();
-  const upgradedSockets = new Map<Duplex, { accepted: boolean; serverSignalled: boolean }>();
+  // `ownership` starts as "handshake" — still an HTTP exchange, so it gets an HTTP close rather
+  // than a WebSocket frame — and becomes "local" or "tunnel" from the upgrade disposition. N90:
+  // only "local" sockets may be written into during drain.
+  const upgradedSockets = new Map<
+    Duplex,
+    { ownership: "handshake" | "local" | "tunnel"; serverSignalled: boolean }
+  >();
   let draining = false;
   let drainMetrics: DrainMetrics | undefined;
   let stopPromise: Promise<void> | undefined;
@@ -541,7 +564,8 @@ export function createPoolServer(options: PoolServerOptions) {
         trustInternalHeaders,
         proofHeaderNames,
       });
-      const socketState = { accepted: false, serverSignalled: false };
+      const socketState: { ownership: "handshake" | "local" | "tunnel"; serverSignalled: boolean } =
+        { ownership: "handshake", serverSignalled: false };
       upgradedSockets.set(socket, socketState);
       socket.once("close", () => {
         upgradedSockets.delete(socket);
@@ -556,7 +580,9 @@ export function createPoolServer(options: PoolServerOptions) {
       Promise.resolve(onUpgrade(req, socket, head))
         .then((disposition) => {
           const state = upgradedSockets.get(socket);
-          if (state && disposition === "accepted") state.accepted = true;
+          if (state && disposition !== "rejected") {
+            state.ownership = disposition === "accepted-tunnel" ? "tunnel" : "local";
+          }
           if (disposition === "rejected" && !socket.destroyed && !socket.writableEnded) {
             // The SERVER is ending this handshake. Without the flag a rejection that lands after
             // drain begins is reported as webSocketsPeerClosed — a voluntary peer departure the
@@ -629,8 +655,9 @@ export function createPoolServer(options: PoolServerOptions) {
      * This form always settles: stop accepting, drop idle keep-alive sockets immediately, let
      * active responses use the COMPLETE grace window, then close each surviving protocol
      * honestly. SSE receives a normal EOF (EventSource can reconnect); an incomplete finite body
-     * is reset rather than pretending truncated bytes are complete; established WebSockets get
-     * RFC 6455 code 1001 before forced teardown. Errors are swallowed — "already closing" and
+     * is reset rather than pretending truncated bytes are complete; an established WebSocket this
+     * pod OWNS gets RFC 6455 code 1001 before forced teardown, while a cross-pool tunnel is left
+     * un-injected and only relays the back pool's own close frame (N90). Errors are swallowed — "already closing" and
      * "never started" are the only outcomes, and neither should stop a caller from exiting.
      */
     async stop(options: { graceMs?: number } = {}): Promise<void> {
@@ -651,6 +678,7 @@ export function createPoolServer(options: PoolServerOptions) {
           webSocketsAtStart: upgradedSockets.size,
           webSocketsPeerClosed: 0,
           webSocketsSignalled: 0,
+          webSocketsTunnelled: 0,
           webSocketsForceClosed: 0,
         };
 
@@ -704,9 +732,22 @@ export function createPoolServer(options: PoolServerOptions) {
             try {
               if (!socket.destroyed) {
                 state.serverSignalled = true;
-                if (state.accepted) {
+                if (state.ownership === "local") {
                   drainMetrics.webSocketsSignalled += 1;
                   socket.write(goingAway);
+                } else if (state.ownership === "tunnel") {
+                  // N90. A cross-pool tunnel is a frame-blind byte pipe
+                  // (websocket-upgrade.ts proxyUpgradeToPool), so a frame relayed from the back
+                  // pool may be only partly written into this socket right now — its header has
+                  // already promised N more payload bytes. Writing 1001 here puts close-frame
+                  // bytes INSIDE that payload and corrupts the stream, which is strictly worse
+                  // than no close frame at all. Inject nothing: the pipe stays open through the
+                  // terminal flush window below, so the sibling pool's own drain (a rollout
+                  // SIGTERMs every pool of the build) can emit its 1001 to its client — this
+                  // socket — at a real frame boundary and have it relayed intact. The forced
+                  // destroy that follows takes the upstream connection with it through the
+                  // tunnel's teardown pair, which is how the back pool learns the peer is gone.
+                  drainMetrics.webSocketsTunnelled += 1;
                 } else {
                   socket.end();
                 }
@@ -759,6 +800,7 @@ export function createPoolServer(options: PoolServerOptions) {
             `webSockets=${drainMetrics.webSocketsAtStart} ` +
             `peerClosed=${drainMetrics.webSocketsPeerClosed} ` +
             `signalled=${drainMetrics.webSocketsSignalled} ` +
+            `tunnelled=${drainMetrics.webSocketsTunnelled} ` +
             `wsForced=${drainMetrics.webSocketsForceClosed}`,
         );
       })();
