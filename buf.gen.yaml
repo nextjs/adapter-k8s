@@ -1,16 +1,16 @@
 # Learn more: https://buf.build/docs/configuration/v2/buf-gen-yaml
 version: v2
 inputs:
-  - module: buf.build/envoyproxy/envoy:main
+  - module: buf.build/envoyproxy/envoy:d939ad7a9f30490c81fafe49844c4007
     types:
       - "envoy.service.ext_proc.v3.ExternalProcessor"
-  - module: buf.build/cncf/xds:main
+  - module: buf.build/cncf/xds:2456e1dfc0664e7596d7f3b20f4b62d0
     types:
       - "udpa.annotations.VersioningAnnotation"
       - "udpa.annotations.FileMigrateAnnotation"
       - "udpa.annotations.StatusAnnotation"
       - "xds.annotations.v3.StatusAnnotation"
-  - module: buf.build/envoyproxy/protoc-gen-validate:main
+  - module: buf.build/envoyproxy/protoc-gen-validate:daf171c6cdb54629b5f51e345a79e4dd
     paths:
       - "validate/validate.proto"
 plugins:

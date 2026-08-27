@@ -28,11 +28,14 @@ set -euo pipefail
 # shellcheck source=./e2e-setup-common.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e-setup-common.sh"
 
+# Same reviewed multi-platform Envoy v1.32 image index used by `adapter-k8s emulate`.
+ENVOY_IMAGE="envoyproxy/envoy@sha256:6bf0d37dd5e8eac4b37effe89a1aec4760f7f2ce860d1fd6af22147eb87a5058"
+
 # --- 5. Start pool server (:3000 — the port integration/envoy.yaml routes to) ---
 {
   export CONFIG_DIR="${PWD}/config"
   export POOL_NAME=default NEXT_BUILD_ID="${BUILD_ID}" NODE_ENV=production
-  export PORT=3000
+  export PORT=3000 ADAPTER_K8S_LISTEN_HOST=127.0.0.1
   echo "[adapter-k8s] Starting pool server on :3000..."
   node "${POOL_SERVER_CJS_LOCAL}" >> .adapter-server.log 2>&1 &
   POOL_PID=$!
@@ -41,7 +44,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e-setup-common.sh"
 
 # --- 4. Start Routing Service ---
 {
-  export PORT=8443
+  export PORT=8443 ADAPTER_K8S_LISTEN_HOST=127.0.0.1
   # Same CONFIG_DIR the pool uses — the routing tier reads the routing manifest from it.
   export CONFIG_DIR="${PWD}/config"
   # The routing service refuses to start plaintext by default: GCP ext_proc callouts need
@@ -67,8 +70,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e-setup-common.sh"
   if envoy --version 2>&1 | grep -q "version:"; then
     ENVOY_CMD="envoy"
     ENVOY_CONFIG_ARG="${ENVOY_CONFIG_HOST}"
-  elif docker image inspect envoyproxy/envoy:v1.32-latest &>/dev/null 2>&1 || docker pull envoyproxy/envoy:v1.32-latest >&2 2>&1; then
-    ENVOY_CMD="docker run --rm --network host -v ${ENVOY_CONFIG_HOST}:/etc/envoy/envoy.yaml:ro envoyproxy/envoy:v1.32-latest"
+  elif docker image inspect "${ENVOY_IMAGE}" &>/dev/null 2>&1 || docker pull "${ENVOY_IMAGE}" >&2 2>&1; then
+    ENVOY_CMD="docker run --rm --network host -v ${ENVOY_CONFIG_HOST}:/etc/envoy/envoy.yaml:ro ${ENVOY_IMAGE}"
     ENVOY_CONFIG_ARG="/etc/envoy/envoy.yaml"
   else
     echo "[adapter-k8s] ERROR: Neither envoy nor docker available. Cannot run integration tests."
@@ -84,7 +87,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e-setup-common.sh"
   # If docker, get the container ID
   if [[ "$ENVOY_CMD" == docker* ]]; then
     sleep 1
-    ENVOY_CONTAINER=$(docker ps -q --filter "ancestor=envoyproxy/envoy:v1.32-latest" | head -1)
+    ENVOY_CONTAINER=$(docker ps -q --filter "ancestor=${ENVOY_IMAGE}" | head -1)
     echo "${ENVOY_CONTAINER}" > .adapter-envoy-container
   fi
 } >&2

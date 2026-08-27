@@ -19,7 +19,9 @@ static_resources:
     - name: listener_0
       address:
         socket_address:
-          address: 0.0.0.0
+          # Local emulation is advertised on localhost. Do not expose the app or its unauthenticated
+          # ext_proc path to the developer's LAN by binding the front door more broadly.
+          address: 127.0.0.1
           port_value: 8080
       filter_chains:
         - filters:

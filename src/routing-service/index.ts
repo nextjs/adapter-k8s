@@ -274,13 +274,14 @@ async function main() {
   // Per-request budget: shed slow requests before the ext_proc deadline (default 4s,
   // under GCP's 5s callout timeout). Set 0 to disable.
   const timeoutMs = parseInt(process.env.ROUTING_REQUEST_TIMEOUT_MS ?? "4000", 10);
+  const listenHost = process.env.ADAPTER_K8S_LISTEN_HOST;
 
   // Create handler and server. Mint the TLS identity first so createRoutingServer sees the
   // cert files (or their deliberate absence, after a generation failure) when it picks its
   // transport.
   const handler = createRequestHandler(manifest, middlewareModule, { timeoutMs });
   ensureTlsIdentity();
-  const server = createRoutingServer({ handler, port, failOpen, timeoutMs });
+  const server = createRoutingServer({ handler, port, host: listenHost, failOpen, timeoutMs });
 
   await server.start();
 
@@ -288,7 +289,7 @@ async function main() {
   // probe would leave in the NEG. Ready only once the ext_proc server is listening.
   let ready = true;
   const healthPort = parseInt(process.env.HEALTH_PORT ?? "8081", 10);
-  const health = startHealthServer(healthPort, () => ready);
+  const health = startHealthServer(healthPort, () => ready, listenHost);
 
   // Graceful shutdown
   const shutdown = async () => {

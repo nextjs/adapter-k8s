@@ -36,6 +36,23 @@ describe("cdnCacheTag", () => {
     expect(cdnCacheTag("public, max-age=3600", "")).toEqual({});
   });
 
+  it("uses the shared Cache-Control parser for every shared-cache freshness form", () => {
+    const tag = { "cache-tag": cdnTagForBuildId("b123") };
+    expect(cdnCacheTag('public, max-age="3600"', "b123")).toEqual(tag);
+    expect(cdnCacheTag("max-age=0, stale-while-revalidate=600", "b123")).toEqual(tag);
+    expect(cdnCacheTag("max-age=0, stale-if-error=600", "b123")).toEqual(tag);
+    expect(cdnCacheTag('private="set-cookie", s-maxage=600', "b123")).toEqual(tag);
+    expect(cdnCacheTag("x-no-store, s-maxage=600", "b123")).toEqual(tag);
+  });
+
+  it("matches immutable and storage vetoes by exact unqualified directive name", () => {
+    const tag = { "cache-tag": cdnTagForBuildId("b123") };
+    expect(cdnCacheTag("x-immutable, max-age=3600", "b123")).toEqual(tag);
+    expect(cdnCacheTag('immutable="field", max-age=3600', "b123")).toEqual(tag);
+    expect(cdnCacheTag('no-cache="set-cookie", max-age=3600', "b123")).toEqual(tag);
+    expect(cdnCacheTag("no-cache, max-age=3600", "b123")).toEqual({});
+  });
+
   it("INVARIANT: handler/PPR responses are non-cacheable → never tagged", () => {
     // `writeInnerResponse` forces exactly this cache-control on x-nextjs-cache responses
     // (dispatch.ts), so PPR/handler output is never CDN-cached and correctly carries no tag.

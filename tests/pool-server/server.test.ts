@@ -27,6 +27,34 @@ describe("createPoolServer", () => {
     expect(onRequest).not.toHaveBeenCalled();
   });
 
+  it("honors an explicit loopback bind for local emulation", async () => {
+    server = createPoolServer({ onRequest: vi.fn(), port: 0, host: "127.0.0.1" });
+    await server.start();
+    const address = server.server.address();
+    expect(address).toMatchObject({ address: "127.0.0.1" });
+  });
+
+  it("rejects absolute-form request targets before the application handler", async () => {
+    const onRequest = vi.fn();
+    server = createPoolServer({ onRequest, port: 0, host: "127.0.0.1" });
+    const { port } = await server.start();
+    const net = await import("node:net");
+    const response = await new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
+        socket.write(
+          "GET http://evil.example/path HTTP/1.1\r\n" +
+            `Host: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+        );
+      });
+      socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      socket.once("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      socket.once("error", reject);
+    });
+    expect(response).toContain("400 Bad Request");
+    expect(onRequest).not.toHaveBeenCalled();
+  });
+
   it("delegates non-health requests to onRequest", async () => {
     const onRequest = vi.fn((req: IncomingMessage, res: ServerResponse) => {
       res.writeHead(200);

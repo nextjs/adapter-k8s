@@ -34,6 +34,8 @@ import {
 export interface RoutingServerOptions {
   handler: (requestHeaders: HeaderValue[]) => Promise<PlainProcessingResponse>;
   port: number;
+  /** Explicit bind host. Production defaults to every pod interface. */
+  host?: string | undefined;
   // When a handler throws, fail-open (CONTINUE, let the request through) if true,
   // else fail-closed with an immediate 500. Defaults to true to preserve the
   // historical behavior. See ROUTING_FAIL_OPEN wiring in index.ts.
@@ -348,7 +350,11 @@ export function createProcessHandler(
 // at the socket layer even when the event loop is wedged; an httpGet probe must be
 // *processed* by the loop, so a blocked/broken service fails it and gets evicted —
 // which is the failure the ext_proc callout would otherwise hit silently.
-export function startHealthServer(port: number, isReady: () => boolean): HealthServer {
+export function startHealthServer(
+  port: number,
+  isReady: () => boolean,
+  host = "0.0.0.0",
+): HealthServer {
   const srv = createHttpServer((req, res) => {
     if (req.url === "/healthz" || req.url === "/readyz") {
       const ready = isReady();
@@ -359,7 +365,7 @@ export function startHealthServer(port: number, isReady: () => boolean): HealthS
       res.end();
     }
   });
-  srv.listen(port, "0.0.0.0", () => console.log(`Routing health server on port ${port}`));
+  srv.listen(port, host, () => console.log(`Routing health server on port ${port}`));
   return { close: () => new Promise<void>((r) => srv.close(() => r())) };
 }
 interface HealthServer {
@@ -367,7 +373,7 @@ interface HealthServer {
 }
 
 export function createRoutingServer(options: RoutingServerOptions) {
-  const { handler, port, failOpen = true, timeoutMs = 0 } = options;
+  const { handler, port, host = "0.0.0.0", failOpen = true, timeoutMs = 0 } = options;
 
   const processImpl = createProcessHandler(handler, failOpen, timeoutMs);
   const routes = (router: ConnectRouter) =>
@@ -402,7 +408,7 @@ export function createRoutingServer(options: RoutingServerOptions) {
     start(): Promise<{ port: number }> {
       return new Promise((resolve, reject) => {
         server.once("error", reject);
-        server.listen(port, "0.0.0.0", () => {
+        server.listen(port, host, () => {
           const address = server.address();
           const boundPort = typeof address === "object" && address ? address.port : port;
           console.log(`Routing service listening on port ${boundPort}`);

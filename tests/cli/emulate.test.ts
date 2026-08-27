@@ -17,7 +17,12 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { renderEnvoyConfigForPort } from "../../src/cli/emulate.js";
+import {
+  EMULATE_ENVOY_IMAGE,
+  EMULATE_LISTEN_HOST,
+  EMULATE_VALKEY_IMAGE,
+  renderEnvoyConfigForPort,
+} from "../../src/cli/emulate.js";
 
 const SOURCE = `static_resources:
   listeners:
@@ -101,4 +106,20 @@ describe("renderEnvoyConfigForPort", () => {
     mkdirSync(path.dirname(missing), { recursive: true });
     expect(renderEnvoyConfigForPort(missing, 9000)).toBe(missing);
   });
+});
+
+describe("emulation security defaults", () => {
+  it("binds the checked-in Envoy listener to loopback", () => {
+    const yaml = readFileSync(new URL("../../integration/envoy.yaml", import.meta.url), "utf8");
+    expect(EMULATE_LISTEN_HOST).toBe("127.0.0.1");
+    expect(yaml).toContain(`address: ${EMULATE_LISTEN_HOST}`);
+    expect(yaml).not.toContain("address: 0.0.0.0");
+  });
+
+  it.each([EMULATE_ENVOY_IMAGE, EMULATE_VALKEY_IMAGE])(
+    "pins emulation image %s to an immutable digest",
+    (image) => {
+      expect(image).toMatch(/^[^@]+@sha256:[0-9a-f]{64}$/);
+    },
+  );
 });

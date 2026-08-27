@@ -23,6 +23,14 @@ const RED = "\x1b[31m";
 const CYAN = "\x1b[36m";
 const RESET = "\x1b[0m";
 
+export const EMULATE_LISTEN_HOST = "127.0.0.1";
+// Multi-platform index digests resolved from the prior Envoy v1.32-latest and Valkey 8 tags on
+// 2026-08-26. Keep the readable version in this comment when refreshing the reviewed digests.
+export const EMULATE_ENVOY_IMAGE =
+  "envoyproxy/envoy@sha256:6bf0d37dd5e8eac4b37effe89a1aec4760f7f2ce860d1fd6af22147eb87a5058";
+export const EMULATE_VALKEY_IMAGE =
+  "valkey/valkey@sha256:f0ba225266310efba5fb33383e21c64fbd07907304224786c780606e7ebd7327";
+
 /**
  * The checked-in Envoy config hardcodes the listener on 8080, so `--port N` used to change only
  * the readiness check and the banner — Envoy kept listening on 8080, the wait on N timed out
@@ -144,7 +152,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
         valkeyContainerName,
         "-p",
         `127.0.0.1:${valkeyPort}:6379`,
-        "valkey/valkey:8",
+        EMULATE_VALKEY_IMAGE,
       ]);
       if (run.exitCode === 0) {
         // Readiness: PING until PONG (image pull + boot can take a few seconds).
@@ -221,6 +229,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     env: {
       ...process.env,
       PORT: "3000",
+      ADAPTER_K8S_LISTEN_HOST: EMULATE_LISTEN_HOST,
       POOL_NAME: "default",
       NEXT_BUILD_ID: buildId,
       CONFIG_DIR: configDir,
@@ -266,6 +275,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
     env: {
       ...process.env,
       PORT: "8443",
+      ADAPTER_K8S_LISTEN_HOST: EMULATE_LISTEN_HOST,
       NEXT_BUILD_ID: buildId,
       CONFIG_DIR: configDir,
       NODE_ENV: "production",
@@ -351,7 +361,7 @@ ${DIM}Local infrastructure emulation — replicates GKE deployment locally${RESE
           envoyContainerName,
           "-v",
           `${envoyYaml}:/etc/envoy/envoy.yaml:ro`,
-          "envoyproxy/envoy:v1.32-latest",
+          EMULATE_ENVOY_IMAGE,
           "--log-level",
           "warn",
         ],
