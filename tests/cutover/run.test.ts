@@ -498,7 +498,19 @@ describe("runCutover — D1: the EXACT-version rollout wait (the 12-char-prefix 
     const patch = vi
       .mocked(execCapture)
       .mock.calls.find(([, a]) => a[0] === "patch" && a[1] === "service")!;
-    expect(patch[1][patch[1].length - 1]).toContain(`"app.kubernetes.io/version":"${newBuild}"`);
+    const operations = JSON.parse(patch[1][patch[1].length - 1]!);
+    expect(operations).toEqual([
+      {
+        op: "test",
+        path: "/spec/selector",
+        value: expect.objectContaining({ "app.kubernetes.io/version": oldBuild }),
+      },
+      {
+        op: "replace",
+        path: "/spec/selector",
+        value: expect.objectContaining({ "app.kubernetes.io/version": newBuild }),
+      },
+    ]);
   });
 
   it("excludes the routing tier by EXACT name — a pool named routing-service-extra still waits", async () => {
@@ -987,7 +999,17 @@ describe("runCutover — E1: a failed selector patch never records the new build
       .mocked(execCapture)
       .mock.calls.filter(([, a]) => a[0] === "patch" && a[2] === "rel-ssr")
       .at(-1)!;
-    expect(restore[1][restore[1].length - 1]).toContain(`"app.kubernetes.io/version":"${PREV}"`);
+    const restoreOperations = JSON.parse(restore[1][restore[1].length - 1]!);
+    expect(restoreOperations[0]).toEqual({
+      op: "test",
+      path: "/spec/selector",
+      value: expect.objectContaining({ "app.kubernetes.io/version": BUILD }),
+    });
+    expect(restoreOperations[1]).toEqual({
+      op: "replace",
+      path: "/spec/selector",
+      value: expect.objectContaining({ "app.kubernetes.io/version": PREV }),
+    });
     // N67: the abandoned build must not keep the raised replica floor.
     expect(events).toContain("hpa-bounds:rel-ssr-buildn-hpa:1:3");
   });
