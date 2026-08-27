@@ -1,6 +1,6 @@
 # @next-community/adapter-k8s
 
-Deploy full-fidelity Next.js—middleware, Partial Prerendering, cache components, ISR—to Kubernetes with a single command. The adapter plugs into Next.js 16.3's `adapterPath` API and generates Helm charts, Dockerfiles, and routing manifests from your build output.
+Build and deploy full-fidelity Next.js applications as independently scalable Kubernetes pools. The adapter uses Next.js 16.3's `adapterPath` API to generate Helm charts, Dockerfiles, and routing manifests from the build output.
 
 ```bash
 npx adapter-k8s deploy
@@ -27,9 +27,33 @@ CDN and middleware behavior are coordinated so cached responses can never bypass
 
 ## Status
 
-Framework compatibility is verified against the upstream Next.js e2e suite; operational hardening remains.
+This package is **not published to npm** and remains **experimental**. APIs and generated infrastructure may change before the first release. Claims are scoped to recorded evidence:
 
-Middleware, PPR, cache components, and ISR are verified through the upstream Next.js e2e suite, local full-path emulation, and live multi-replica deployments on GKE and generic clusters—see [docs/verification.md](./docs/verification.md) for what each layer covers and what it can't. The aim is a reference implementation for running full-fidelity Next.js on Kubernetes; remaining work centers on load testing, throughput tuning, skew protection, and published benchmarks. Expect APIs and generated infrastructure to change as that work lands. Issues and contributions welcome.
+| Profile                         | Current evidence                                                                  | Boundary                                                                                                                          |
+| ------------------------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Pool runtime                    | Upstream Next.js e2e suite on the recorded Next ref                               | Known failures and the exact ref are listed in [verification](./docs/verification.md)                                             |
+| GKE traffic extension           | Live multi-replica deploy, rollback, roll-forward, CDN, cache, and routing checks | GKE is the only provisioned cloud profile today                                                                                   |
+| Generic Envoy Gateway           | Live k3s and Scaleway/Cilium deployments at the recorded versions                 | Other Gateway controllers are not implied                                                                                         |
+| Portable Gateway API or Ingress | Unit tests and strict schema validation of native Kubernetes resources            | ingress-nginx is an exposure option with pool-local routing, not a native routing adapter; its live controller matrix is untested |
+
+AWS components are intentionally deferred. The target contract keeps cluster access, registry, exposure, routing, and managed resources separate so an eventual EKS integration can be added without changing the pool runtime; that seam is not an AWS support claim. Performance, load behavior, and published benchmarks remain unverified.
+
+### Why not `output: "standalone"` and three replicas?
+
+That remains the simpler choice for a single process when per-route scaling, shared revalidation,
+or adapter-managed rollout semantics are unnecessary. This adapter exists for a different contract:
+
+- Route classes can run in independently scaled pools while `@next/routing` preserves Next's
+  middleware, rewrite, redirect, and invocation decisions.
+- Shared Valkey state coordinates cache entries and tag/path revalidation across replicas;
+  middleware-covered responses are kept out of an upstream CDN cache so a cache hit cannot skip
+  the middleware boundary.
+- Cutover verifies every new pool and the routing tier before changing stable Service selectors.
+  Rollback restores pool capacity, routing image/manifest state, and the traffic pointer; the
+  GitOps path retains those rollback objects instead of letting Helm or a reconciler prune them.
+
+Those are the measured differences. Merely scaling the standalone server to three replicas is
+ordinary process redundancy, not the same cache, routing, and release protocol.
 
 ## Requirements
 
@@ -37,7 +61,9 @@ Middleware, PPR, cache components, and ISR are verified through the upstream Nex
 - Next.js >= 16.3.0 and < 16.4.0. Each Next.js release line is reviewed before this bound widens;
   the runtime rejects artifacts built outside it. The pinned 16.3 canary used by upstream
   conformance is an explicitly experimental verification lane, not part of the stable promise.
-- Kubernetes >= 1.33 with the APIs required by the selected target components
+- Kubernetes >= 1.33 with the APIs required by the selected target components. This is the
+  adapter's schema compatibility floor, not an upstream security-support promise; use a currently
+  maintained Kubernetes minor for production.
 - [Envoy Gateway](https://gateway.envoyproxy.io/) only when using `envoyNativeRouting`; `gcloud` only for GKE components
 - `kubectl` and Helm >= 3.2 in PATH, plus a container runtime—`docker`, `podman`, or `nerdctl`.
   Helm 3 uses its client-side upgrade path; Helm 4 uses server-side apply.
@@ -53,7 +79,7 @@ the generated manifest uses Node 24 scoped regex modifiers to preserve that spli
 
 ## Quick start: an existing Kubernetes cluster
 
-This is the portable path: any conformant cluster, any Gateway API or Ingress controller, no cloud-specific APIs. Next.js routing executes in the application origin, so no Envoy CRD is emitted.
+This portable shape uses standard Kubernetes plus the exposure API selected in the target; it emits no cloud-specific API. Next.js routing executes in the application origin, so no Envoy CRD is emitted. The operator is still responsible for validating the chosen GatewayClass or Ingress controller, CNI enforcement, TLS, and streaming behavior.
 
 ### 1. Install
 
@@ -73,11 +99,30 @@ npm install @next-community/adapter-k8s
 
 ### 2. Configure the adapter
 
-Set the adapter via environment variable (no `next.config.ts` change needed). It must be exported in the environment where the build runs—your shell, or the CI job env:
+Next.js 16.2 promoted adapters to the top-level `adapterPath` option. Configure that official
+surface directly:
+
+```js
+// next.config.mjs
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+
+export default {
+  adapterPath: require.resolve("@next-community/adapter-k8s"),
+};
+```
+
+Or use Next's official zero-config deployment-platform environment variable. It must be exported
+where the build runs—your shell or CI job:
 
 ```bash
 export NEXT_ADAPTER_PATH=@next-community/adapter-k8s
 ```
+
+The configuration hook is top-level, not `experimental.adapterPath`. The adapter still depends on
+experimental `@next/routing`, which is one reason this package remains experimental. See the
+[Next.js adapter configuration](https://nextjs.org/docs/app/api-reference/adapters/configuration)
+and [`@next/routing` status](https://nextjs.org/docs/app/api-reference/adapters/routing-with-next-routing).
 
 Then create `adapter.config.mjs`:
 
@@ -177,7 +222,7 @@ For GKE, `init` provisions everything and scaffolds the config:
 npx adapter-k8s init --project-id my-project --host app.example.com
 ```
 
-This idempotently provisions the cluster, static IP, Artifact Registry repo, GCS bucket, IAM service accounts, and managed TLS certificate. The GKE journey adds Cloud CDN with a Next.js-aware cache key and managed Memorystore-for-Valkey provisioning for the distributed cache (managed cache provisioning currently requires the `provider.gke` config shape that `init` scaffolds—see [configuration](./docs/configuration.md#distributed-cache-cache-components--ppr)). Full journey: [docs/targets.md](./docs/targets.md#managed-gke).
+This idempotently provisions the cluster, static IP, Artifact Registry repo, GCS bucket, IAM service accounts, and managed TLS certificate. The GKE journey adds Cloud CDN with a Next.js-aware cache key and managed Memorystore-for-Valkey provisioning for the distributed cache. `gkeCluster()` supplies the same managed-cache operation to composed targets; `init` still scaffolds the legacy `provider.gke` shape because Cloud CDN has not moved to the composition contract yet. See [configuration](./docs/configuration.md#distributed-cache-cache-components--ppr) and the full [GKE journey](./docs/targets.md#managed-gke).
 
 ## CLI commands
 
@@ -229,7 +274,7 @@ Run `adapter-k8s --help` for the full flag list. Deploy, rollback, destroy, doct
 2. On a miss, the routing service runs `@next/routing`—middleware, rewrites, redirects—and sets `x-upstream-pool`. Static assets and middleware-free `public/` files skip the callout entirely.
 3. The HTTPRoute routes to the matching pool, whose server invokes the handler directly.
 
-With the default portable routing there is no callout tier: Next.js routing executes in the application origin. With `envoyNativeRouting` the callout is hosted by an in-cluster Envoy gateway; on GKE it is hosted by the Google load balancer as a traffic extension—the routing service itself is byte-identical across both. The difference that matters is trust: GXLB authenticates the callout by arriving from Google's frontend over TLS, whereas an in-cluster Envoy gateway dials plain h2c and is bounded by NetworkPolicy instead. Per-target diagrams: [docs/targets.md](./docs/targets.md).
+With the default portable routing there is no callout tier: Next.js routing executes in the application origin. With `envoyNativeRouting` the callout is hosted by an in-cluster Envoy gateway; on GKE it is hosted by the Google load balancer as a traffic extension—the routing service itself is byte-identical across both. Envoy dials plain h2c; GKE uses server-authenticated TLS. Neither transport authenticates the caller to the routing service, so both profiles retain a required NetworkPolicy boundary. Per-target diagrams: [docs/targets.md](./docs/targets.md).
 
 ## Configuration
 
@@ -308,7 +353,7 @@ The same rollout contract covers finite response streams and SSE, including clea
 Treat this as an experimental compatibility surface until the Next.js API and its upstream e2e
 suite are published. Exposure components supplied by an operator must preserve HTTP/1.1 WebSocket
 upgrade semantics; the adapter cannot infer that property for an arbitrary GatewayClass or Ingress
-controller.
+controller. See the exact [verification boundary](./docs/verification.md#known-coverage-gaps).
 
 ## CI/CD
 
@@ -337,7 +382,7 @@ Defaults, in brief—the full model is in [SECURITY.md](./SECURITY.md):
 - NetworkPolicies apply a strict ingress allowlist (load-balancer ranges, kubelet probes, sibling pools) discovered at deploy time; a deploy that can't establish isolation aborts rather than shipping without it.
 - Internal dispatch headers between the routing tier and pools are authenticated with a per-request HMAC proof derived from a per-build shared secret that is delivered only via Kubernetes Secrets and never sent on the wire; the proof binds the method, target, authority, scheme witness, dispatch header set and middleware-matcher inputs, and dispatch headers without a valid proof are stripped.
 - **Known limit:** the routing-service callout still authenticates no callers, so NetworkPolicy remains a **required** part of the boundary—anything that can reach the routing tier can have a request of its own choosing resolved and signed, even though it can no longer read a replayable credential off the port. mTLS caller authentication is planned. Read the [threat model](./SECURITY.md#threat-model-in-one-paragraph) before using in-cluster native routing in a shared or hostile cluster.
-- New deployments are pinned to immutable image digests (rollback's routing tier is currently tag-reconstructed—see [SECURITY.md](./SECURITY.md#image-provenance)); secrets never touch command lines, logs, or git.
+- New deployments and modern rollback state pin the routing tier to immutable image digests. State written before digest recording falls back to the build tag with a warning—see [SECURITY.md](./SECURITY.md#image-provenance). Secrets never touch command lines, logs, or git.
 - Cloud IAM is split into a minimally-scoped in-cluster identity and a push-capable CLI identity that no pod can assume.
 
 ## Documentation
@@ -364,8 +409,7 @@ A deterministic first prompt is: "Read `node_modules/@next-community/adapter-k8s
 
 - Skew protection (versioned routing for zero-mismatch deploys)
 - mTLS caller authentication on the routing callout
-- Digest-pinned rollback for the routing tier
-- Additional exposure/routing presets
+- Additional exposure/routing presets; AWS components are deferred until after the first release
 - Operational hardening: connection pooling, routing-service tuning, published benchmarks
 
 ## License
