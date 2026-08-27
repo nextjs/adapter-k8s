@@ -27,8 +27,9 @@ import {
   rscCacheBustingUnvalidated,
   sanitizeRouteMatches,
   serializeHeaderMap,
-  coalesceWireHeader,
+  coalesceWireHeaderBytes,
   computeDispatchProof,
+  type ProofFieldValue,
   buildProofHeaderNames,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
@@ -65,19 +66,39 @@ function getHeader(headers: HeaderValue[], key: string): string | undefined {
 }
 
 /**
- * Read a real (non-pseudo) header the way the POOL will see it: case-insensitive on the name,
- * and repeated entries coalesced with the delimiter the next hop uses (routing-common.ts
- * `coalesceWireHeader`). Used for the proof's context and matcher inputs — those are signed as
- * the bytes that will arrive at the pool, not as the ext_proc list happens to be shaped. Returns
- * `undefined` for an absent header, which the proof covers distinctly from an empty value.
+ * One header entry's WIRE OCTETS.
+ *
+ * A0-DP-2. Envoy's ext_proc `HeaderValue` carries a value-vs-raw_value duality: `raw_value` is
+ * `bytes` and preserves the field's octets exactly, while `value` is a proto3 `string` and can
+ * therefore only ever hold a valid-UTF-8 value (obs-text and other non-UTF-8 octets are delivered
+ * in `raw_value` only). So `raw_value` is passed through UNTOUCHED — a `toString("utf-8")`
+ * round-trip here is what made the edge sign a different byte string than the pool for every
+ * non-ASCII covered value — and an entry that carries only `value` is encoded back to the UTF-8
+ * octets Envoy itself put on the wire.
  */
-function getWireHeader(headers: HeaderValue[], key: string): string | undefined {
-  const values: string[] = [];
+function getRawHeader(headers: HeaderValue[], key: string): Buffer | undefined {
+  const h = headers.find((h) => h.key === key);
+  if (!h) return undefined;
+  if (h.rawValue) return h.rawValue;
+  if (h.value) return Buffer.from(h.value, "utf8");
+  return undefined;
+}
+
+/**
+ * Read a real (non-pseudo) header the way the POOL will see it, as OCTETS: case-insensitive on
+ * the name, and repeated entries coalesced with the rule the next hop applies (routing-common.ts
+ * `coalesceWireHeaderBytes`). Used for the proof's context and matcher inputs — those are signed
+ * as the bytes that will arrive at the pool, not as the ext_proc list happens to be shaped.
+ * Returns `undefined` for an absent header, which the proof covers distinctly from an empty value.
+ */
+function getWireHeaderBytes(headers: HeaderValue[], key: string): Buffer | undefined {
+  const values: Buffer[] = [];
   for (const h of headers) {
     if (h.key.toLowerCase() !== key) continue;
-    values.push(h.value || h.rawValue?.toString("utf-8") || "");
+    // An entry with neither field is an empty value, not an absent header.
+    values.push(h.rawValue ?? (h.value ? Buffer.from(h.value, "utf8") : Buffer.alloc(0)));
   }
-  return coalesceWireHeader(key, values);
+  return coalesceWireHeaderBytes(key, values);
 }
 
 // The resolved response headers (next.config `headers()` + middleware response headers) and the
@@ -197,7 +218,9 @@ export function createRequestHandler(
       // will actually see. See `wireTarget` below: the retry recursion resolves against a
       // REWRITTEN `:path`, but nothing ever mutates `:path` on the wire, so the dispatch proof
       // must be signed with this value and not with the recursion's own view of the target.
-      wireTarget: string;
+      // OCTETS, not a string (A0-DP-2): this is a proof input, and the two tiers decode the
+      // target's bytes differently (Envoy raw_value is UTF-8, the pool's `req.url` is latin1).
+      wireTarget: Buffer;
     },
   ): Promise<ProcessingResponse> {
     const rawPath = getHeader(requestHeaders, ":path") ?? "/";
@@ -214,15 +237,18 @@ export function createRequestHandler(
     // re-resolved locally, and middleware ran a second time — the exact double execution the
     // retry's `middlewareAlreadyRan` plumbing (N40) exists to prevent, on every i18n build whose
     // root resolves through the internal 308 artifact.
-    const wireTarget = retry?.wireTarget ?? rawPath;
+    const wireTarget =
+      retry?.wireTarget ?? getRawHeader(requestHeaders, ":path") ?? Buffer.from("/", "latin1");
     const method = getHeader(requestHeaders, ":method") ?? "GET";
     const scheme = getHeader(requestHeaders, ":scheme") ?? "https";
     // Raw authority, absence preserved: the dispatch proof covers it (the pool reads the same
     // value as `Host`, which Envoy writes from `:authority`), and ABSENT is a distinct covered
     // value from any present one. `:authority` is the HTTP/2-normalized form Envoy hands ext_proc;
-    // the `host` fallback is for a caller that only sets the HTTP/1.1 spelling.
-    const rawAuthority =
-      getHeader(requestHeaders, ":authority") ?? getWireHeader(requestHeaders, "host");
+    // the `host` fallback is for a caller that only sets the HTTP/1.1 spelling. The proof is
+    // signed from the OCTETS (A0-DP-2); the decoded string below is what routing parses.
+    const rawAuthorityBytes =
+      getRawHeader(requestHeaders, ":authority") ?? getWireHeaderBytes(requestHeaders, "host");
+    const rawAuthority = rawAuthorityBytes?.toString("utf-8");
     const authority = rawAuthority ?? "localhost";
     // N10/N40 (SECURITY). Both tiers parse the request target through the SHARED
     // parseRequestUrl: the authority comes from `:authority`/Host and NEVER from the target
@@ -934,9 +960,15 @@ export function createRequestHandler(
     // BEFORE the header-budget projection below so the proof counts against it, and so the bail
     // path (which clears the vocabulary and stamps nothing) stays consistent.
     if (internalSecret) {
-      const covered: Record<string, string | undefined> = {};
+      const covered: Record<string, ProofFieldValue> = {};
       for (const m of mutations) {
         const key = m.key.toLowerCase();
+        // A0-DP-2: a mutation value is a JS string this tier authored, and Envoy carries it in
+        // the proto3 `string` field of HeaderValue — so the octets that reach the pool are its
+        // UTF-8 encoding, which is exactly what a `string` ProofFieldValue means. (These are the
+        // values that made the divergence reachable with ordinary traffic: `x-invoke-query`
+        // carries percent-DECODED query values and `x-mw-request-headers` carries whatever
+        // middleware set, both via plain JSON.stringify, which does not \u-escape non-ASCII.)
         if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(key)) covered[key] = m.value;
       }
       // Context and matcher inputs are signed as they sit ON THE WIRE, because this response
@@ -945,7 +977,7 @@ export function createRequestHandler(
       // UNTRUSTED_NEXT_REQUEST_HEADERS — can never appear here: buildProofHeaderNames excludes
       // them precisely because their wire value differs across the hop.)
       for (const name of [...PROOF_COVERED_CONTEXT_HEADERS, ...proofHeaderNames]) {
-        covered[name] = getWireHeader(requestHeaders, name);
+        covered[name] = getWireHeaderBytes(requestHeaders, name);
       }
       mutations.push({
         key: INTERNAL_DISPATCH_PROOF_HEADER,
@@ -954,7 +986,7 @@ export function createRequestHandler(
           // N40c: the target the POOL will read back, not this pass's `:path` — they differ
           // across the trailing-slash/i18n retry recursion (see `wireTarget`).
           target: wireTarget,
-          authority: rawAuthority,
+          authority: rawAuthorityBytes,
           headers: covered,
           proofHeaderNames,
         }),

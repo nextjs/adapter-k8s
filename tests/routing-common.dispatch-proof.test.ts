@@ -32,6 +32,10 @@ import {
 
 const SECRET = "an-internal-dispatch-secret";
 
+/** A wire-octet proof field as a readable latin1 string (Buffer in, `undefined` preserved). */
+const octets = (value: Buffer | string | undefined): string | undefined =>
+  value === undefined ? undefined : Buffer.isBuffer(value) ? value.toString("latin1") : value;
+
 const baseInputs = (over: Partial<DispatchProofInputs> = {}): DispatchProofInputs => ({
   method: "GET",
   target: "/about?x=1",
@@ -142,6 +146,48 @@ describe("dispatch proof — canonicalization has no ambiguity", () => {
   it("cannot be confused by a value that spans the method/target/authority boundary", () => {
     expect(proofOf({ method: "GET", target: "/a", authority: "b" })).not.toBe(
       proofOf({ method: "GET", target: "/ab", authority: undefined }),
+    );
+  });
+
+  it("A0-DP-2: canonicalizes WIRE OCTETS, so the two tiers' JS strings converge", () => {
+    // The defect: `updateProofField` took a `string` and UTF-8-encoded it at both tiers, but the
+    // tiers hold DIFFERENT strings for one request's octets — the edge decoded Envoy's raw_value
+    // as UTF-8, the pool reads Node's latin1-decoded req.headers. For the two octets `c3 a9` that
+    // is "é" at the edge and "Ã©" at the pool, and the old rule signed 2 bytes against 4.
+    const wire = Buffer.from([0xc3, 0xa9]);
+    const edgeView = wire.toString("utf-8"); // "é"      — what the ext_proc tier held
+    const poolView = wire.toString("latin1"); // "Ã©"     — what Node's parser hands the pool
+    expect(edgeView).not.toBe(poolView);
+
+    const withCookie = (value: Buffer) =>
+      computeDispatchProof(
+        SECRET,
+        baseInputs({
+          headers: { ...baseInputs().headers, cookie: value },
+          proofHeaderNames: ["cookie"],
+        }),
+      );
+    // Both tiers reach the same octets from their own representation, so the same transcript.
+    expect(withCookie(Buffer.from(edgeView, "utf8"))).toBe(
+      withCookie(Buffer.from(poolView, "latin1")),
+    );
+    // …and the octets are still what is signed: a different value is still a different proof.
+    expect(withCookie(Buffer.from([0xc3, 0xa8]))).not.toBe(withCookie(wire));
+  });
+
+  it("A0-DP-2: applies the same rule to the target and the authority", () => {
+    const targetOctets = Buffer.from("/posts/cafÃ©", "latin1");
+    expect(proofOf({ target: targetOctets })).toBe(
+      proofOf({ target: Buffer.from("/posts/café", "utf8") }),
+    );
+    const authorityOctets = Buffer.from("cafÃ©.example.com", "latin1");
+    expect(proofOf({ authority: authorityOctets })).toBe(
+      proofOf({ authority: Buffer.from("café.example.com", "utf8") }),
+    );
+    // The authority is still ASCII-case-folded (both tiers route on the lowercased hostname), and
+    // ONLY ASCII: a high octet is not touched, so it cannot be normalized into a different host.
+    expect(proofOf({ authority: Buffer.from("APP.Example.com", "latin1") })).toBe(
+      proofOf({ authority: "app.example.com" }),
     );
   });
 
@@ -280,17 +326,19 @@ describe("dispatchProofInputsFromRequest / verifyDispatchProof", () => {
       },
       proofHeaderNames: ["cookie"],
     });
-    expect(inputs.authority).toBe("app.example.com");
+    // A0-DP-2: a Node tier's inputs are WIRE OCTETS, produced with latin1 — the exact inverse of
+    // Node's own header codec on both the read and the write side.
+    expect(octets(inputs.authority)).toBe("app.example.com");
     // Node's parser and Envoy both join repeated Cookie with "; " and everything else with ", ".
-    expect(inputs.headers["cookie"]).toBe("a=1; b=2");
-    expect(inputs.headers["x-forwarded-proto"]).toBe("https, http");
-    expect(inputs.headers["x-output-id"]).toBe("/about");
+    expect(octets(inputs.headers["cookie"])).toBe("a=1; b=2");
+    expect(octets(inputs.headers["x-forwarded-proto"])).toBe("https, http");
+    expect(octets(inputs.headers["x-output-id"])).toBe("/about");
   });
 
   it("defaults a missing method/target the same way the pool boundary does", () => {
     const inputs = dispatchProofInputsFromRequest({ headers: {} });
     expect(inputs.method).toBe("GET");
-    expect(inputs.target).toBe("/");
+    expect(octets(inputs.target)).toBe("/");
     expect(inputs.authority).toBeUndefined();
   });
 

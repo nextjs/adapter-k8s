@@ -15,6 +15,7 @@ import { guardStreamErrors } from "./dispatch.js";
 import { injectTunnelCloseFrame } from "./websocket-frame-cursor.js";
 import {
   metricHttpMethod,
+  recordDispatchProofRejected,
   recordPoolRequest,
   recordSpanError,
   requestParentContext,
@@ -50,6 +51,32 @@ export interface ReadinessState {
   reason: string;
 }
 
+/**
+ * A0-DP-2. Log throttle for the proof-rejection branch.
+ *
+ * The branch is per-request and, when the two tiers disagree about canonicalization, it is taken
+ * on EVERY request — so an unthrottled `console.warn` would be one line per request forever. One
+ * line the first time each reason appears, then at most one per minute per reason: enough for an
+ * operator to see "this build's dispatch proofs are being refused" in the pod log without the
+ * volume that makes people filter it out. The counter (telemetry.ts) is the unthrottled signal.
+ */
+const DISPATCH_PROOF_LOG_INTERVAL_MS = 60_000;
+const dispatchProofLoggedAt = new Map<string, number>();
+
+function reportDispatchProofRejected(reason: string): void {
+  recordDispatchProofRejected(reason);
+  const now = Date.now();
+  const last = dispatchProofLoggedAt.get(reason);
+  if (last !== undefined && now - last < DISPATCH_PROOF_LOG_INTERVAL_MS) return;
+  dispatchProofLoggedAt.set(reason, now);
+  console.warn(
+    `[pool-server] refusing a presented dispatch proof (${reason}); stripping the dispatch ` +
+      `headers and re-resolving this request locally. A reason of "mismatch" that persists ` +
+      `across every request means the edge and this pool are signing different transcripts, ` +
+      `not that a client is probing.`,
+  );
+}
+
 export interface RequestTrustOptions {
   internalSecret?: string | undefined;
   trustInternalHeaders?: boolean;
@@ -81,8 +108,10 @@ export function applyIncomingRequestTrustBoundary(
   // fail closed to local resolution exactly as before. Without a secret (emulate/tests), fall
   // back to the trustInternalHeaders flag. Both credential headers are always deleted.
   const presentedProof = req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
-  const trusted = internalSecret
-    ? typeof presentedProof === "string" &&
+  let trusted: boolean;
+  if (internalSecret) {
+    trusted =
+      typeof presentedProof === "string" &&
       verifyDispatchProof(
         internalSecret,
         {
@@ -92,8 +121,15 @@ export function applyIncomingRequestTrustBoundary(
           proofHeaderNames,
         },
         presentedProof,
-      )
-    : trustInternalHeaders;
+      );
+    // A0-DP-2. Report the rejection. Only when a proof was actually PRESENTED: no proof at all is
+    // the ordinary untrusted path (ext_proc fail-open, a CEL-excluded route, a body request, a
+    // client hitting the pool directly) and is not a signal. See telemetry.ts
+    // recordDispatchProofRejected for why this branch must never be silent again.
+    if (!trusted && typeof presentedProof === "string") reportDispatchProofRejected("mismatch");
+  } else {
+    trusted = trustInternalHeaders;
+  }
   delete req.headers[INTERNAL_SECRET_HEADER];
   delete req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
 

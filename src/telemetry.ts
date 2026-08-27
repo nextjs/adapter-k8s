@@ -60,6 +60,43 @@ function getPoolRequestInstruments(): RequestMetricInstruments {
   });
 }
 
+let dispatchProofRejectedCounter: Counter | undefined;
+
+function getDispatchProofRejectedCounter(): Counter {
+  const meter = metrics.getMeter(INSTRUMENTATION_NAME);
+  return (dispatchProofRejectedCounter ??= meter.createCounter(
+    "adapter_k8s.pool.dispatch_proof.rejected",
+    {
+      description:
+        "Requests that presented a dispatch proof the pool refused, by reason — the pool then " +
+        "strips the dispatch headers and re-resolves the request locally (middleware runs again)",
+      unit: "{request}",
+    },
+  ));
+}
+
+/**
+ * A0-DP-2. The pool's proof-rejection branch, made OBSERVABLE.
+ *
+ * Rejection is fail-SAFE, never fail-visible: the pool strips the dispatch vocabulary and
+ * re-resolves the request locally, so responses stay correct and nothing errors. That is exactly
+ * what let a canonicalization bug (the two tiers signing different octets for the same wire bytes)
+ * run permanently with trusted dispatch off, middleware executing twice per request, and NOT ONE
+ * log line or metric anywhere to say so. A counter keyed by reason is the cheapest signal that
+ * distinguishes "a client sent a bogus credential" from "this build's two tiers disagree".
+ *
+ * Deliberately NOT recorded for a request that presents no proof at all: that is the ordinary
+ * Phase-1 path (ext_proc fail-open, a CEL-excluded path, an app with no middleware, a body
+ * request) and would swamp the signal.
+ */
+export function recordDispatchProofRejected(reason: string): void {
+  try {
+    getDispatchProofRejectedCounter().add(1, { "adapter_k8s.dispatch_proof.reason": reason });
+  } catch {
+    // A custom meter provider/exporter must never participate in request correctness.
+  }
+}
+
 export type TraceHeaderCarrier = Record<string, string | string[] | undefined>;
 
 const COMMON_HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]);

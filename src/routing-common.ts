@@ -342,43 +342,88 @@ export function proofCoveredHeaderNames(buildHeaderNames?: readonly string[]): s
 }
 
 /**
- * Coalesce a repeated header into the single value the NEXT hop will see, so the two tiers
- * canonicalize duplicates identically. Node's HTTP parser joins repeated `Cookie` fields with
- * `"; "` and everything else with `", "`, and Envoy joins with the same delimiters when it writes
- * an HTTP/1.1 upstream request — so one rule serves both sides. An empty list is ABSENT.
+ * Coalesce a repeated header into the single value the NEXT hop will see, at the BYTE level, so
+ * the two tiers canonicalize duplicates identically. Node's HTTP parser joins repeated `Cookie`
+ * fields with `"; "` and everything else with `", "`, and Envoy joins with the same delimiters
+ * when it writes an HTTP/1.1 upstream request. An empty list is ABSENT.
+ *
+ * Bytes, not strings (A0-DP-2): the two tiers decode the same wire octets into DIFFERENT JS
+ * strings (Envoy's ext_proc `raw_value` is UTF-8, Node's parser is latin1), so the join has to
+ * happen on the octets both of them agree about.
  */
-export function coalesceWireHeader(name: string, values: readonly string[]): string | undefined {
+export function coalesceWireHeaderBytes(
+  name: string,
+  values: readonly Buffer[],
+): Buffer | undefined {
   if (values.length === 0) return undefined;
-  if (values.length === 1) return values[0];
-  return values.join(name.toLowerCase() === "cookie" ? "; " : ", ");
+  const first = values[0]!;
+  if (values.length === 1) return first;
+  const lower = name.toLowerCase();
+  const separator = Buffer.from(lower === "cookie" ? "; " : ", ", "latin1");
+  const joined: Buffer[] = [];
+  for (const value of values) {
+    if (joined.length > 0) joined.push(separator);
+    joined.push(value);
+  }
+  return Buffer.concat(joined);
 }
 
-/** Read one header off a Node `req.headers`-shaped record, coalescing a repeated value. */
-function wireHeaderValue(name: string, value: string | string[] | undefined): string | undefined {
+/**
+ * Read one header off a Node `req.headers`-shaped record as WIRE BYTES.
+ *
+ * A0-DP-2. Node's HTTP parser decodes header octets as LATIN1 (measured: wire bytes `c3 a9`
+ * arrive as the two-char string `"Ã©"`), and Node's HTTP *client* re-encodes an outgoing header
+ * value as latin1 (measured: the JS string `"é"` is written as the single octet `e9`). So latin1
+ * is the exact inverse of Node's own codec in BOTH directions, which makes it the one encoding
+ * that reproduces the wire octets from anything a Node tier holds — a value it parsed off an
+ * incoming request AND a value it authored itself and is about to emit. That is what keeps the
+ * cross-pool hop self-consistent: `proxyToPool` signs latin1 octets, Node writes those same
+ * octets, and the receiving pool parses them back to the identical latin1 string.
+ */
+function wireHeaderBytes(name: string, value: string | string[] | undefined): Buffer | undefined {
   if (value === undefined) return undefined;
-  return typeof value === "string" ? value : coalesceWireHeader(name, value);
+  if (typeof value === "string") return Buffer.from(value, "latin1");
+  return coalesceWireHeaderBytes(
+    name,
+    value.map((entry) => Buffer.from(entry, "latin1")),
+  );
 }
+
+/**
+ * One covered field's value, as the WIRE OCTETS both tiers must agree on (A0-DP-2).
+ *
+ * A `Buffer` is the octets themselves, and is what every value READ OFF THE WIRE must be: the
+ * ext_proc tier passes Envoy's `raw_value` straight through, the pool passes its latin1-decoded
+ * `req.headers` string re-encoded as latin1. A `string` is shorthand for "these octets are this
+ * string's UTF-8 encoding", which is correct for a value a signer AUTHORS and hands to Envoy — an
+ * ext_proc `HeaderValue.value` is a proto3 `string`, so Envoy puts its UTF-8 encoding on the wire
+ * — and for an ASCII-only test fixture. It is NOT correct for anything a Node tier read or is
+ * about to write (that is latin1, see `wireHeaderBytes`), which is why
+ * `dispatchProofInputsFromRequest` never produces one.
+ */
+export type ProofFieldValue = Buffer | string | undefined;
 
 /** Every routing input the dispatch proof binds. Both tiers fill this in from what they see. */
 export interface DispatchProofInputs {
-  /** Request method; case-normalized by the proof. */
+  /** Request method; case-normalized by the proof. An HTTP method token is ASCII by definition. */
   method: string;
   /**
    * Origin-form request target — `:path` at the ext_proc tier, `req.url` at the pool. Both tiers
-   * see the same raw, un-normalized bytes (query string included).
+   * see the same raw, un-normalized octets (query string included) but decode them differently,
+   * so pass the octets (see ProofFieldValue).
    */
-  target: string;
+  target: ProofFieldValue;
   /**
    * `:authority` at the ext_proc tier, `Host` at the pool (Envoy writes the one from the other).
    * `undefined` means the header was absent, which is covered distinctly from any present value.
    */
-  authority?: string | undefined;
+  authority?: ProofFieldValue;
   /**
    * Covered header values keyed by LOWERCASE name — the dispatch vocabulary, the context
    * witnesses, and this build's derived inputs. A missing key (or an explicit `undefined`) is
    * covered as ABSENT, which the framing keeps distinct from a present empty value.
    */
-  headers: Record<string, string | undefined>;
+  headers: Record<string, ProofFieldValue>;
   /** This build's derived covered header names (`buildProofHeaderNames`). */
   proofHeaderNames?: readonly string[] | undefined;
 }
@@ -392,15 +437,42 @@ export interface DispatchProofInputs {
  * as one present with an empty value, and a value containing a newline could restate a following
  * `name\nvalue` pair. Framing by byte length removes both — no covered value can impersonate the
  * delimiter, and absence is its own symbol rather than the lack of one.
+ *
+ * A0-DP-2: the framed unit is OCTETS, not a JS string. v2 took `string` and encoded it as UTF-8
+ * at both tiers, which silently signed two different transcripts for one request: the edge
+ * materialized covered values by decoding Envoy's `raw_value` as UTF-8 while the pool read Node's
+ * latin1-decoded `req.headers`, so any covered value carrying a non-ASCII octet (a cookie a
+ * matcher gates on, an `x-invoke-query` holding a percent-decoded `/posts/café`, a middleware
+ * header in `x-mw-request-headers`) produced `"é"` → 2 bytes at the edge and `"Ã©"` → 4 bytes at
+ * the pool. The proof then NEVER verified for that request shape: dispatch headers stripped,
+ * middleware re-run at the pool, permanently and (before this change) without a single log line.
  */
-function updateProofField(hmac: ReturnType<typeof createHmac>, value: string | undefined): void {
+function updateProofField(hmac: ReturnType<typeof createHmac>, value: ProofFieldValue): void {
   if (value === undefined) {
     hmac.update("-\n");
     return;
   }
-  const bytes = Buffer.from(value, "utf8");
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
   hmac.update(`+${bytes.length}\n`);
   hmac.update(bytes);
+}
+
+/**
+ * ASCII-lowercase the authority's OCTETS. Hostnames are case-insensitive and both tiers route on
+ * the lowercased form (URL parsing lowercases `hostname`), so lowercasing here stops a case flip
+ * from failing the compare. Deliberately ASCII-only: a registrable hostname reaches this tier
+ * punycoded, `toLowerCase()` on decoded octets would be locale- and encoding-dependent (the two
+ * tiers hold different strings for the same octets — the whole A0-DP-2 problem), and a
+ * non-hostname authority must fail the compare rather than be normalized into one.
+ */
+function asciiLowerBytes(value: ProofFieldValue): ProofFieldValue {
+  if (value === undefined) return undefined;
+  const bytes = Buffer.isBuffer(value) ? Buffer.from(value) : Buffer.from(value, "utf8");
+  for (let i = 0; i < bytes.length; i++) {
+    const byte = bytes[i]!;
+    if (byte >= 0x41 && byte <= 0x5a) bytes[i] = byte + 0x20;
+  }
+  return bytes;
 }
 
 /**
@@ -425,9 +497,7 @@ export function computeDispatchProof(secret: string, inputs: DispatchProofInputs
   hmac.update("adapter-k8s-dispatch-v2\n");
   updateProofField(hmac, inputs.method.toUpperCase());
   updateProofField(hmac, inputs.target);
-  // Hostnames are case-insensitive and both tiers route on the lowercased form (URL parsing
-  // lowercases `hostname`), so lowercase here rather than letting a case flip fail the compare.
-  updateProofField(hmac, inputs.authority?.toLowerCase());
+  updateProofField(hmac, asciiLowerBytes(inputs.authority));
   updateProofField(hmac, String(names.length));
   for (const name of names) {
     updateProofField(hmac, name);
@@ -436,25 +506,37 @@ export function computeDispatchProof(secret: string, inputs: DispatchProofInputs
   return hmac.digest("hex");
 }
 
-/**
- * Collect the proof inputs off a live request (Node `req.headers` shape, or the cross-pool
- * proxy's outbound header record). The authority comes from `Host`; every covered name is read
- * verbatim off the wire, with a repeated value coalesced the way the next hop would see it.
- */
-export function dispatchProofInputsFromRequest(request: {
+/** A request as a NODE tier sees (or is about to emit) it — latin1-decoded strings throughout. */
+export interface NodeDispatchProofRequest {
   method?: string | undefined;
   target?: string | undefined;
   headers: Record<string, string | string[] | undefined>;
   proofHeaderNames?: readonly string[] | undefined;
-}): DispatchProofInputs {
-  const headers: Record<string, string | undefined> = {};
+}
+
+/**
+ * Collect the proof inputs off a live request as seen by a NODE tier (a pool's `req.headers`, or
+ * the cross-pool proxy's outbound header record). The authority comes from `Host`; every covered
+ * name is read verbatim off the wire, with a repeated value coalesced the way the next hop would
+ * see it.
+ *
+ * A0-DP-2: everything here is converted to wire OCTETS with `wireHeaderBytes`, i.e. latin1 — the
+ * exact inverse of Node's own header codec on both the read and the write side (measured; see
+ * that function). The target gets the same treatment for the same reason. This is the only place
+ * a Node-held header string is turned into proof octets, so the edge tier's UTF-8 rule and this
+ * tier's latin1 rule cannot be confused at a call site.
+ */
+export function dispatchProofInputsFromRequest(
+  request: NodeDispatchProofRequest,
+): DispatchProofInputs {
+  const headers: Record<string, ProofFieldValue> = {};
   for (const name of proofCoveredHeaderNames(request.proofHeaderNames)) {
-    headers[name] = wireHeaderValue(name, request.headers[name]);
+    headers[name] = wireHeaderBytes(name, request.headers[name]);
   }
   return {
     method: request.method ?? "GET",
-    target: request.target ?? "/",
-    authority: wireHeaderValue("host", request.headers["host"]),
+    target: Buffer.from(request.target ?? "/", "latin1"),
+    authority: wireHeaderBytes("host", request.headers["host"]),
     headers,
     proofHeaderNames: request.proofHeaderNames,
   };
@@ -462,12 +544,7 @@ export function dispatchProofInputsFromRequest(request: {
 
 export function verifyDispatchProof(
   secret: string,
-  request: {
-    method?: string | undefined;
-    target?: string | undefined;
-    headers: Record<string, string | string[] | undefined>;
-    proofHeaderNames?: readonly string[] | undefined;
-  },
+  request: NodeDispatchProofRequest,
   presentedProof: string,
 ): boolean {
   const expected = computeDispatchProof(secret, dispatchProofInputsFromRequest(request));
