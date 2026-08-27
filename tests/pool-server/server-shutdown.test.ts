@@ -255,6 +255,41 @@ describe("createPoolServer().stop()", () => {
     pool = null;
   });
 
+  it("resets a finite body when an earlier SSE content type was removed", async () => {
+    pool = createPoolServer({
+      onRequest: (_req: IncomingMessage, res: ServerResponse) => {
+        res.setHeader("content-type", "text/event-stream");
+        res.removeHeader("content-type");
+        res.write("partial-body");
+        // Never finishes. The final response is no longer SSE, so shutdown must reset it rather
+        // than turn the partial chunked body into a cleanly terminated representation.
+      },
+      port: 0,
+    });
+    const { port } = await pool.start();
+
+    let responseStarted!: () => void;
+    const started = new Promise<void>((resolve) => (responseStarted = resolve));
+    const aborted = new Promise<boolean>((resolve, reject) => {
+      httpGet({ host: "127.0.0.1", port, path: "/finite-after-sse" }, (res) => {
+        responseStarted();
+        res.on("data", () => undefined);
+        res.on("aborted", () => resolve(true));
+        res.on("end", () => resolve(false));
+        res.on("error", (error) => {
+          if ((error as NodeJS.ErrnoException).code === "ECONNRESET") resolve(true);
+          else reject(error);
+        });
+      }).on("error", reject);
+    });
+    await started;
+
+    const drain = pool.stop({ graceMs: 180 });
+    await expect(aborted).resolves.toBe(true);
+    await drain;
+    pool = null;
+  });
+
   it("rejects pipelined work that arrives on an existing connection after drain starts", async () => {
     let firstResponse!: ServerResponse;
     let firstStarted!: () => void;

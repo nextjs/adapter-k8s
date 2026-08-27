@@ -434,6 +434,12 @@ export function createPoolServer(options: PoolServerOptions) {
       }
       return originalSetHeader(name, value);
     }) as ServerResponse["setHeader"];
+    const originalRemoveHeader = res.removeHeader.bind(res);
+    res.removeHeader = ((name: string) => {
+      const result = originalRemoveHeader(name);
+      if (name.toLowerCase() === "content-type") responseState.eventStream = false;
+      return result;
+    }) as ServerResponse["removeHeader"];
     const originalTrackedWriteHead = res.writeHead.bind(res);
     (res as any).writeHead = function (statusCode: number, ...args: unknown[]) {
       const contentType = writeHeadHeaderValue(args, "content-type");
