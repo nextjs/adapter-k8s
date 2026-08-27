@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  NEXT_CANARY_CONFORMANCE_VERSION,
+  PINNED_NEXT_CANARY,
   SUPPORTED_NEXT_RELEASE_LINE,
   assertSupportedNextVersion,
   checkSupportedNextVersion,
@@ -15,7 +15,7 @@ describe("supported Next.js runtime release line", () => {
   });
 
   it("accepts the pinned 16.3 canary conformance lane deliberately", () => {
-    expect(checkSupportedNextVersion(NEXT_CANARY_CONFORMANCE_VERSION)).toEqual({
+    expect(checkSupportedNextVersion(PINNED_NEXT_CANARY)).toEqual({
       supported: true,
       prerelease: true,
     });
