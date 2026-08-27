@@ -306,6 +306,7 @@ export function buildReleaseScopedGcpResources(
   releaseName: string,
   projectId: string,
   region?: string,
+  cacheProjectId = projectId,
 ): { desc: string; args: string[] }[] {
   return [
     // Managed cache (Memorystore) is release-scoped and ephemeral — remove it. No-ops when the
@@ -320,7 +321,7 @@ export function buildReleaseScopedGcpResources(
               "delete",
               `${releaseName}-cache`,
               `--region=${region}`,
-              `--project=${projectId}`,
+              `--project=${cacheProjectId}`,
               "--quiet",
             ],
           },
@@ -607,6 +608,15 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before any of these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
+  if (Boolean(infra?.cacheRegion) !== Boolean(infra?.cacheProjectId)) {
+    throw new Error(
+      `infrastructure.json has an incomplete managed-cache identity: cacheRegion=${JSON.stringify(
+        infra?.cacheRegion,
+      )}, cacheProjectId=${JSON.stringify(infra?.cacheProjectId)}. Refusing to infer a paid ` +
+        `instance's project or region from mutable cluster settings. Restore both original ` +
+        `coordinates and re-run destroy. No resources were deleted.`,
+    );
+  }
   const namespace = resolveK8sNamespace(infra?.namespace);
   const projectId: string | undefined = infra?.projectId;
   const region: string | undefined = infra?.region;
@@ -1316,6 +1326,7 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
         releaseName,
         projectId,
         infra?.cacheRegion ?? infra?.region,
+        infra?.cacheProjectId ?? projectId,
       );
       for (const { desc, args } of extResources) {
         if (dryRun) {

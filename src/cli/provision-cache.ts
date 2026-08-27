@@ -328,7 +328,10 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
       );
     }
 
-    const existingNetwork = details.authorizedNetwork.split("/").at(-1) ?? "";
+    const expectedNetwork = `projects/${projectId}/global/networks/${network}`;
+    const existingNetwork = details.authorizedNetwork
+      .replace(/^https?:\/\/[^/]+\/compute\/v1\//, "")
+      .replace(/^\/+/, "");
     const secured =
       details.authEnabled && details.transitEncryptionMode === "SERVER_AUTHENTICATION";
     const securityMatches = wantAuthOnCreate
@@ -341,8 +344,8 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     if (details.tier !== expectedTier) {
       mismatches.push(`tier expected ${expectedTier}, found ${details.tier}`);
     }
-    if (existingNetwork !== network) {
-      mismatches.push(`network expected ${network}, found ${details.authorizedNetwork}`);
+    if (existingNetwork !== expectedNetwork) {
+      mismatches.push(`network expected ${expectedNetwork}, found ${details.authorizedNetwork}`);
     }
     if (details.connectMode !== "DIRECT_PEERING") {
       mismatches.push(`connectMode expected DIRECT_PEERING, found ${details.connectMode}`);

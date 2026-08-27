@@ -1362,6 +1362,37 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
 
   console.log(`  Pools: ${pools.join(", ")}`);
 
+  // Read committed state before provisioning paid resources. Besides driving Helm retention,
+  // this tells cache transitions whether the outgoing rollback build has an authenticated plan.
+  // A mixed legacy/composed transition must stop before either cloud or Kubernetes is mutated.
+  let state: AdapterState | null = null;
+  let stateUnavailable: string | null = null;
+  if (dryRun) {
+    state = await readState(projectDir).catch(() => null);
+  } else {
+    try {
+      state = await readState(projectDir, releaseName, { namespace });
+    } catch (err) {
+      if (!(err instanceof StateUnavailableError)) throw err;
+      stateUnavailable = err.message;
+    }
+  }
+  let previousBuildId = state?.buildId ?? null;
+  if (stateUnavailable) {
+    console.warn(
+      `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
+    );
+    previousBuildId = await discoverServingBuildId(releaseName, namespace);
+    console.warn(
+      `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
+        `Service selector. Proceeding with it as the previous build — its recorded CDN tag ` +
+        `is unknown, so cutover invalidation falls back to a full purge (M13). Fix deploy ` +
+        `state after this deploy.`,
+    );
+  }
+  if (previousBuildId) assertSafeBuildId(previousBuildId);
+  assertBuildIdChangedSinceServing(buildId, previousBuildId);
+
   // Managed cache: provision Memorystore and inject its discovered endpoint into the Helm chart.
   // This keeps the Valkey Secret Helm-owned in both managed and BYO modes, so switching modes
   // updates one resource instead of crossing the kubectl/Helm ownership boundary.
@@ -1385,11 +1416,19 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       );
     }
   }
-  if (!compositionSnapshot && !cacheManaged && infra.cacheRegion) {
+  const previousPlanAnchor = previousBuildId
+    ? state?.compositionPlans?.[previousBuildId]
+    : undefined;
+  if (
+    !cacheManaged &&
+    previousBuildId &&
+    !previousPlanAnchor &&
+    (Boolean(compositionSnapshot) || Boolean(infra.cacheRegion))
+  ) {
     throw new Error(
-      `Cannot transition this legacy managed-cache deployment to ` +
+      `Cannot transition cache mode for the outgoing legacy build ${previousBuildId} to ` +
         `${metadata.cacheEnabled ? "bring-your-own cache" : "disabled caching"} safely. The ` +
-        `outgoing rollback build still depends on the release cache, but its artifact has no ` +
+        `rollback build's cache contract is unknown, and deploy state has no ` +
         `authenticated composition plan proving which paid instance may be deleted. Rebuild and ` +
         `deploy once with managed cache still enabled, then make the cache-mode change from that ` +
         `composed build. No Kubernetes or cloud resources were changed.`,
@@ -1438,8 +1477,17 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     if (auth !== undefined && typeof auth !== "boolean") {
       throw new Error("managed cache auth must be a boolean");
     }
+    if (Boolean(infra.cacheRegion) !== Boolean(infra.cacheProjectId)) {
+      throw new Error(
+        `infrastructure.json has an incomplete managed-cache identity: cacheRegion=${JSON.stringify(
+          infra.cacheRegion,
+        )}, cacheProjectId=${JSON.stringify(infra.cacheProjectId)}. Refusing to infer the ` +
+          `missing coordinate from mutable cluster settings because that could orphan a paid ` +
+          `instance. Restore the original cache project and region explicitly before deploying.`,
+      );
+    }
     if (infra.cacheRegion) {
-      const existingProjectId = infra.cacheProjectId ?? infra.projectId;
+      const existingProjectId = infra.cacheProjectId!;
       if (infra.cacheRegion !== cacheRegion || existingProjectId !== projectId) {
         throw new Error(
           `Cannot replace the managed cache for ${releaseName} from ` +
@@ -1452,6 +1500,16 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       }
     }
     console.log("\n  → Provisioning managed cache (Memorystore)...");
+    if (!infra.cacheRegion) {
+      // Record intent before the cloud call. Instance creation is asynchronous: the command may
+      // time out while GCP finishes successfully, and credential/CA retrieval happens after the
+      // instance is already billable. Leaving this pending marker makes retry and destroy target
+      // the only coordinates this deploy was authorized to create.
+      infra.cacheRegion = cacheRegion;
+      infra.cacheProjectId = projectId;
+      infra.cacheProvisioningPending = "true";
+      writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+    }
     const endpoint = await provisionMemorystore({
       projectId,
       region: cacheRegion,
@@ -1464,12 +1522,11 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       ...(auth === undefined ? {} : { auth }),
       log: (m: string) => console.log(m),
     });
-    // Persist the actual region immediately after provisioning. Any later failure (writing the
-    // chart, Helm connectivity, rollout) must still leave destroy enough state to find the paid
-    // instance, especially when cache.memorystore.region differs from the cluster region.
-    if (infra.cacheRegion !== cacheRegion || infra.cacheProjectId !== projectId) {
-      infra.cacheRegion = cacheRegion;
-      infra.cacheProjectId = projectId;
+    // Successful endpoint and credential verification promotes the pending identity to the
+    // durable managed-cache record. Later chart/Helm failures still leave destroy enough state
+    // to find the paid instance.
+    if (infra.cacheProvisioningPending) {
+      delete infra.cacheProvisioningPending;
       writeFileSync(infraPath, JSON.stringify(infra, null, 2));
     }
 
@@ -1665,46 +1722,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 6. Helm upgrade
-  // L13: dry-run must not touch the cluster — skip the cluster ConfigMap read and use
-  // local state only (best-effort).
-  let state: AdapterState | null = null;
-  // N20: "state is unknown" and "there is no state (first deploy)" MUST stay distinct.
-  let stateUnavailable: string | null = null;
-  if (dryRun) {
-    state = await readState(projectDir).catch(() => null);
-  } else {
-    try {
-      state = await readState(projectDir, releaseName, { namespace });
-    } catch (err) {
-      if (!(err instanceof StateUnavailableError)) throw err;
-      stateUnavailable = err.message;
-    }
-  }
-  let previousBuildId = state?.buildId ?? null;
-  if (stateUnavailable) {
-    // Recover the live build from the cluster instead of proceeding as a first deploy
-    // (which skips the retained-manifest injection below, so `helm upgrade` deletes the
-    // Deployment currently serving traffic, and sets activeBuildId to a build with zero
-    // ready pods). discoverServingBuildId throws with a repair message when the live
-    // build can't be established — deploy must never guess here.
-    // L14: the message wraps cluster-sourced read errors.
-    console.warn(
-      `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
-    );
-    previousBuildId = await discoverServingBuildId(releaseName, namespace);
-    console.warn(
-      `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
-        `Service selector. Proceeding with it as the previous build — its recorded CDN tag ` +
-        `is unknown, so cutover invalidation falls back to a full purge (M13). Fix deploy ` +
-        `state after this deploy.`,
-    );
-  }
-  // H2: previousBuildId is spliced into a helm --set assignment below.
-  if (previousBuildId) assertSafeBuildId(previousBuildId);
-  // B2 (pipeline/fingerprints.ts): the deploy-time collision guards. N14 first — an
-  // IDENTICAL build id is the `deploymentId` (skew-protection) signature and the composed-
-  // name guard below can't see it (it requires differing ids).
-  assertBuildIdChangedSinceServing(buildId, previousBuildId);
+  // B2 (pipeline/fingerprints.ts): the remaining deploy-time collision guards. The identical
+  // build-id guard ran before paid-resource provisioning above.
 
   // N70: the outgoing build owns its own pool topology. The incoming build metadata cannot
   // describe pools that were removed or renamed: iterating `pools` here used to omit those
@@ -2313,9 +2332,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     }
 
     let cleanup: { projectId: string; region: string } | undefined;
-    const previousPlanAnchor = previousBuildId
-      ? state?.compositionPlans?.[previousBuildId]
-      : undefined;
     if (previousBuildId && previousPlanAnchor) {
       try {
         const previousPlan = await loadDeployedCompositionPlan({

@@ -93,6 +93,21 @@ describe("buildReleaseScopedGcpResources", () => {
       "--quiet",
     ]);
   });
+
+  it("deletes a regional cache in its recorded project without moving other resources", () => {
+    const resources = buildReleaseScopedGcpResources(
+      "my-app",
+      "cluster-project",
+      "europe-west1",
+      "cache-project",
+    );
+    const cache = resources.find((resource) => resource.desc.includes("Memorystore"));
+    const extension = resources.find((resource) => resource.desc.includes("traffic extension"));
+
+    expect(cache?.args).toContain("--project=cache-project");
+    expect(cache?.args).toContain("--region=europe-west1");
+    expect(extension?.args).toContain("--project=cluster-project");
+  });
 });
 
 describe("composition-plan cleanup", () => {
@@ -495,6 +510,19 @@ describe("runDestroy — confirmation gate (L12)", () => {
     expect(calls.some(([cmd, args]) => cmd === "helm" && args.includes("uninstall"))).toBe(true);
     // custom role delete included
     expect(calls.some(([, args]) => args.join(" ").includes("iam roles delete"))).toBe(true);
+  });
+
+  it("refuses incomplete cache coordinates before deleting any resource", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ ...INFRA, cacheRegion: "europe-west1" }),
+    );
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow(/incomplete managed-cache identity.*cacheProjectId=undefined/s);
+
+    expect(vi.mocked(exec.execCapture)).not.toHaveBeenCalled();
   });
 
   it("prompts for the release name on a TTY and proceeds on a match", async () => {
