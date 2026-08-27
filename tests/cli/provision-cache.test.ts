@@ -237,6 +237,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     ["size", { memorySizeGb: 2 }],
     ["tier", { tier: "STANDARD_HA" }],
     ["network", { authorizedNetwork: "projects/proj-12345/global/networks/other" }],
+    ["network project", { authorizedNetwork: "projects/other-project/global/networks/default" }],
     ["connect mode", { connectMode: "PRIVATE_SERVICE_ACCESS" }],
   ])("refuses to reuse an existing instance with incompatible %s", async (_field, override) => {
     mockGcloud([

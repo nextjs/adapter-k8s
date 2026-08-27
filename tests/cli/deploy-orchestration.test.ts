@@ -143,6 +143,7 @@ interface InfraFixture {
   containerRegistry?: string;
   cacheRegion?: string;
   cacheProjectId?: string;
+  cacheProvisioningPending?: string;
   namespace?: string;
 }
 
@@ -1374,7 +1375,11 @@ describe("runDeploy — guards and teardown", () => {
     // Regression: metadata from an older adapter version carries cacheEnabled but no
     // cacheManaged flag; the teardown branch then deleted a LIVE managed Memorystore.
     setupFs({
-      infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
@@ -1667,7 +1672,7 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/legacy managed-cache.*bring-your-own.*composition plan/s);
+    ).rejects.toThrow(/outgoing legacy build.*bring-your-own.*composition plan/s);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
     expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(false);
@@ -1690,11 +1695,37 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/legacy managed-cache/);
+    ).rejects.toThrow(/outgoing legacy build/);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
     expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
     expect(events).not.toContain("helm");
+  });
+
+  it("refuses a composed transition when the outgoing managed build has no plan anchor", async () => {
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing legacy build buildm.*bring-your-own/s);
+
+    expect(events).not.toContain("helm");
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(([, args]) => args.includes("delete") && args.includes("rel-cache")),
+    ).toBe(false);
   });
 
   it("provisions the authenticated composition plan's managed Memorystore operation", async () => {
@@ -1746,6 +1777,64 @@ describe("runDeploy — guards and teardown", () => {
     expect(infraWrites.some((content) => content.includes('"cacheProjectId": "my-project"'))).toBe(
       true,
     );
+    expect(
+      infraWrites.some((content) => content.includes('"cacheProvisioningPending": "true"')),
+    ).toBe(true);
+    expect(infraWrites.at(-1)).not.toContain("cacheProvisioningPending");
+  });
+
+  it("records pending cache coordinates before provisioning can fail", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    setupFs({
+      compositionPlan,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+    vi.mocked(provisionMemorystore).mockRejectedValueOnce(new Error("AUTH string unavailable"));
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/AUTH string unavailable/);
+
+    const infraWrites = vi
+      .mocked(writeFileSync)
+      .mock.calls.filter(([p]) => p === infraPath)
+      .map(([, content]) => String(content));
+    expect(infraWrites.at(-1)).toContain('"cacheRegion": "us-central1"');
+    expect(infraWrites.at(-1)).toContain('"cacheProjectId": "my-project"');
+    expect(infraWrites.at(-1)).toContain('"cacheProvisioningPending": "true"');
+    expect(events).not.toContain("helm");
+  });
+
+  it("refuses to infer a legacy cache project from mutable cluster coordinates", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    setupFs({
+      compositionPlan,
+      infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/incomplete managed-cache identity.*cacheProjectId=undefined/s);
+
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
   });
 
   it("refuses to orphan a managed cache when its project or region changes", async () => {
@@ -1974,7 +2063,7 @@ describe("runDeploy — guards and teardown", () => {
 
     await expect(
       runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
-    ).rejects.toThrow(/legacy managed-cache.*disabled caching/s);
+    ).rejects.toThrow(/outgoing legacy build.*disabled caching/s);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
     expect(calls.some((a) => a.includes("delete secret rel-valkey"))).toBe(false);
