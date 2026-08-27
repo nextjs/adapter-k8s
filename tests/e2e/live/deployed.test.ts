@@ -283,6 +283,43 @@ describe("middleware at the ext_proc edge (traffic extension, after the CDN cach
     expect(Number(r.headers.get("x-mw-executed"))).toBeGreaterThan(0);
   });
 
+  // A4. Everything above is satisfied by middleware running ANYWHERE. That is the gap: the pool
+  // trust boundary (pool-server/server.ts applyIncomingRequestTrustBoundary) fails SAFE — a
+  // dispatch proof that does not verify makes the pool strip the dispatch headers and re-resolve
+  // the request locally, running middleware a second time in the pool process. The behaviour is
+  // correct, but it is also silent, so a deployment whose entire edge tier is being discarded
+  // (say a forwarding witness the two tiers do not see identically — PR #61 binds
+  // x-forwarded-proto, which Google's external ALB sets on the target proxy and the
+  // traffic-extension callout sees, so this is expected to hold) passes every other assertion in
+  // this file while the edge does nothing but add a hop.
+  //
+  // So assert the POSITIVE: the middleware that produced these headers ran in the ext_proc tier,
+  // which is only possible if the pool verified the proof and reused the edge's verdict instead
+  // of re-resolving (see the x-mw-tier note in fixtures/main/proxy.ts).
+  //
+  // Opt-in, like every other gate in this config, and for a concrete reason: x-mw-tier comes
+  // from the FIXTURE, so a deployment built before it exists would fail here for a reason that
+  // has nothing to do with dispatch. Set it once the target has been redeployed:
+  //   E2E_BASE_URL=https://… E2E_ASSERT_EDGE_DISPATCH=1 npm run test:e2e:live
+  describe.skipIf(process.env.E2E_ASSERT_EDGE_DISPATCH !== "1")("trusted dispatch is taken", () => {
+    it("verified the dispatch proof: middleware ran at the EDGE, not re-resolved in the pool", async () => {
+      const r = await req("/");
+      expect(r.headers.get("x-mw-marker")).toBe("adapter-k8s-e2e");
+      // Not `toBeTruthy()`: a pool name here is the failure this test exists to catch, and an
+      // absent header means the deployment predates the fixture marker (see the gate above).
+      expect(r.headers.get("x-mw-tier")).toBe("edge");
+    });
+
+    it("uses the edge's REWRITE verdict rather than recomputing it in the pool", async () => {
+      // The strongest form: the pool acted on a trusted x-output-id + rewrite target, so the
+      // rewritten body and the edge-authored headers arrive together from one middleware run.
+      const r = await req("/from-mw");
+      expect(r.status).toBe(200);
+      expect(r.body).toContain("Rewritten by middleware");
+      expect(r.headers.get("x-mw-tier")).toBe("edge");
+    });
+  });
+
   it("forces even an explicitly cacheable middleware-matched route to revalidate", async () => {
     const r = await req("/middleware-cache-probe.txt");
     expect(r.status).toBe(200);

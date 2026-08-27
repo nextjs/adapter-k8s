@@ -46,6 +46,15 @@ export function proxy(request: NextRequest) {
   // Number(x-mw-executed) > 0), not an ISO string.
   response.headers.set("x-mw-marker", "adapter-k8s-e2e");
   response.headers.set("x-mw-executed", Date.now().toString());
+  // A4: WHICH TIER executed this pass. The marker above proves middleware ran somewhere, which
+  // is exactly the ambiguity that let the edge tier fail silently: if the pool rejects the
+  // dispatch proof it strips the headers and re-resolves locally — running this middleware in
+  // the POOL process — and every existing assertion still passes. The routing-service
+  // (ext_proc) container has no POOL_NAME; a pool pod always does (emit/templates/
+  // deployment.ts stamps it, and POOL_NAME is a reserved env name so an app cannot set it).
+  // So "edge" on the response is positive evidence that the pool VERIFIED the proof and reused
+  // the edge's verdict, and a pool name is positive evidence that it did not.
+  response.headers.set("x-mw-tier", process.env.POOL_NAME ?? "edge");
   return response;
 }
 
