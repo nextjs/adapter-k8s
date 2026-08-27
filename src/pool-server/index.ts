@@ -3687,6 +3687,26 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // were stripped), so they can be trusted here.
     const extOutputId = req.headers["x-output-id"] as string | undefined;
     const extMwEvaluated = req.headers["x-mw-evaluated"] as string | undefined;
+    const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
+    let routeMatches: Record<string, string> | null = null;
+    let routeMatchesValid = true;
+    if (routeMatchesRaw) {
+      try {
+        const parsed: unknown = JSON.parse(routeMatchesRaw);
+        if (
+          !parsed ||
+          typeof parsed !== "object" ||
+          Array.isArray(parsed) ||
+          Object.values(parsed).some((value) => typeof value !== "string")
+        ) {
+          routeMatchesValid = false;
+        } else {
+          routeMatches = parsed as Record<string, string>;
+        }
+      } catch {
+        routeMatchesValid = false;
+      }
+    }
     delete req.headers["x-mw-evaluated"];
     // Skip the pool's own middleware ONLY when the trusted upstream POSITIVELY asserts it
     // evaluated the middleware stage (x-mw-evaluated ∈ ran/skip-nomatch/none). x-output-id
@@ -3694,18 +3714,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // without having run middleware. Absent / `error` / unrecognized ⇒ fall through to
     // Phase 1 below so the pool evaluates middleware itself. Both headers are secret-gated
     // (untrusted ones were already stripped in server.ts), so this can't be forged.
-    if (extOutputId && extMwEvaluated && MW_EVALUATED_TRUSTED.has(extMwEvaluated)) {
-      const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
-      // Secret-gated (trusted) input, but a malformed value from an extension bug should not
-      // 500 the request — fall back to no route params rather than throwing.
-      let routeMatches: Record<string, string> | null = null;
-      if (routeMatchesRaw) {
-        try {
-          routeMatches = JSON.parse(routeMatchesRaw);
-        } catch {
-          routeMatches = null;
-        }
-      }
+    if (
+      extOutputId &&
+      extMwEvaluated &&
+      MW_EVALUATED_TRUSTED.has(extMwEvaluated) &&
+      routeMatchesValid
+    ) {
       const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
 
       // Public files flow through dispatch via the static manifest (which merges
@@ -3776,7 +3790,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     }
 
     // The fall-through path: a secret-gated `x-output-id` was present but the middleware
-    // verdict was absent or untrusted, so Phase 1 re-derives EVERYTHING itself — the
+    // verdict was absent/untrusted or its route-match payload was malformed, so Phase 1
+    // re-derives EVERYTHING itself — the
     // dispatch vocabulary is unusable here by construction. S22 deleted it only inside the
     // trusted branch above; left in place on this path, `x-output-id`, `x-upstream-pool`,
     // `x-route-matches`, `x-invoke-path`, `x-invoke-query`, `x-nextjs-ppr` and the execution
