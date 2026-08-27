@@ -1,14 +1,55 @@
 # What is verified, and how
 
-The README's status claim—framework compatibility verified, hardening pending—rests on the verification described here. It is organized by layer; each layer states what it covers and what it structurally _cannot_.
+The package is unpublished and experimental. The ledger below is the release claim: “tested” means
+the named profile and version were exercised, not that every conformant controller or managed
+Kubernetes product inherits the result.
+
+| Status                  | Profile or capability                           | Evidence                                                                                                       | Boundary                                                                                                                                 |
+| ----------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Historical partial pass | Next.js pool runtime                            | 2026-07-29, adapter `db4bd0c`, upstream `v16.3.0-canary.97`: 3,439 passed / 2 failed                           | The two recorded failures reproduce against `next start`; this is still a dated ref, not a blanket claim for other Next versions         |
+| Historical partial pass | Full k3d topology                               | 2026-08-04, upstream `v16.3.0-canary.97`: about 4,438 passed / 27 failed                                       | Adapter commit was not recorded; `partialFallback`, resume-data consistency, server-action harness, and other failures below remain open |
+| Historical live receipt | GKE traffic-extension deployment                | Recorded 2026-07-29: 26-check deploy → rollback → roll-forward with CDN, cache, routing, and multiple replicas | Tested artifact SHA and cluster/GKE versions were not recorded; this is not a per-commit release gate                                    |
+| Historical live receipt | Generic Envoy Gateway                           | Recorded 2026-07-29: k3s 1.30.6 and Scaleway Kubernetes 1.36.1, arm64, Cilium, Envoy Gateway 1.5.4             | Tested artifact SHA was not recorded; does not imply another Gateway controller supports native ext_proc routing                         |
+| Schema-tested           | Portable Ingress, generic Envoy, and GKE charts | 2026-08-27: `npm run test:schema` with pinned Helm, kubeconform, and Kubernetes schemas                        | Gateway API, Envoy, and GKE CRDs are named explicit skips; their controllers/live API servers remain the authority                       |
+| Untested                | ingress-nginx controller matrix                 | The portable `Ingress` object is schema-tested                                                                 | Supported as exposure plus pool-local routing, not as a native routing adapter                                                           |
+| Transport-tested        | Experimental WebSocket `upgradeHandler`         | Real-socket unit and Docker-gated rollout coverage                                                             | No stable public Next API or upstream framework fixture yet                                                                              |
+| Deferred                | AWS/EKS components                              | Provider-neutral cluster, registry, exposure, routing, and resource seams exist                                | No AWS provisioning, IAM, load-balancer, registry, or live-cluster support is shipped or claimed                                         |
+| Deferred                | Vercel/BYOC proxy origin                        | `RoutingOrigin` is discriminated for a future non-Service origin                                               | 0.1 accepts Kubernetes Service origins only; no incremental-migration proxy is implemented                                               |
+| Unverified              | Performance and broad cluster compatibility     | None                                                                                                           | No published load tests, benchmarks, or “all Kubernetes” claim                                                                           |
+
+Node support has two distinct gates: Node 20.16 is the minimum build/CLI host because the cache
+bundle uses `process.getBuiltinModule`; Node 24 is the pool/routing runtime floor because the
+generated manifest uses inline regular-expression modifier groups. CI typechecks, builds, and
+loads the CLI on 20.16, while the complete runtime unit suite stays on Node 24. Emitted images pin
+Node 24.
+
+The remaining sections preserve the exact run receipts and explain what each layer cannot observe.
+Kubernetes 1.33 is a technical schema floor, not a security-lifecycle claim: upstream ended support
+for 1.33 on 2026-06-28. The k3s 1.30.6 deployment below is useful historical evidence, but it
+predates the current versioned composition-plan gate and sits outside the release promise. The
+schema gate therefore targets 1.33, and production guidance remains to use an upstream-supported
+minor.
 
 ## The layers
 
-### 1. Unit suite—2,620 tests
+### 1. Unit and schema suites
 
-Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted templates. Several template tests render through **real `helm`**, because the question being asked is what helm does with the file, not what the file contains.
+Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted
+templates. Several template tests render through real Helm. The separate schema gate renders
+portable Ingress, generic Envoy, and GKE profiles with pinned Helm 3.18.6, then uses pinned
+kubeconform 0.7.0 in strict mode against the minimum supported Kubernetes 1.33 schemas pinned at
+`yannh/kubernetes-json-schema@5a69f83`. It skips only the named external
+CRD kinds (`Gateway`, `HTTPRoute`, `ClientTrafficPolicy`, `EnvoyExtensionPolicy`,
+`HealthCheckPolicy`, and `GCPHTTPFilter`); native Deployments, Services, HPAs, policies, RBAC, Jobs,
+Secrets, ConfigMaps, and Ingresses must validate.
 
-**Cannot see:** anything about a live cluster, load balancer, or CDN. Template tests prove the chart renders and carries the intended values; they cannot prove GKE programs it.
+The 2026-08-27 receipt is: portable Ingress 13 valid / 0 skipped; generic Envoy 14 valid /
+5 external-CRD objects skipped; GKE 17 valid / 5 external-CRD objects skipped. All three report
+0 invalid and 0 errors, and the command prints these counts on every run.
+
+**Cannot see:** anything about a live cluster, load balancer, CDN, or CRD controller. Schema tests
+prove the chart renders and its native resources match the pinned Kubernetes schemas; they cannot
+prove a controller accepts or programs an external CRD.
 
 ### 2. Upstream Next.js e2e suite—two topologies
 
@@ -126,6 +167,7 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 ## Reproducing
 
 - Unit suite: `npm test`
+- Native Kubernetes chart schemas: `npm run test:schema`
 - Upstream Next.js e2e (pool topology): `NEXT_TEST_CONCURRENCY=4 bash scripts/e2e-local.sh "" v16.3.0-canary.97`—expect ~17 minutes
 - Upstream Next.js e2e (full cluster topology): `bash scripts/e2e-k3d-bootstrap.sh` once, then `bash scripts/e2e-lanes.sh 6 24`—expect 3–4.5 hours; `bash scripts/e2e-smoke.sh` runs the ~32-suite sensitive subset in ~35 minutes
 - ext_proc path locally: `npx adapter-k8s emulate` in `fixtures/main`

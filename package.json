@@ -37,6 +37,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:schema": "bash scripts/verify-chart-schema.sh",
     "test:watch": "vitest",
     "test:e2e": "bash scripts/e2e-local.sh",
     "test:e2e:live": "vitest run --config vitest.e2e-live.config.ts",
