@@ -135,6 +135,32 @@ describe("Turbopack production filesystem cache", () => {
   });
 });
 
+describe("Next output mode", () => {
+  it("removes redundant standalone output before Next finalizes the adapter build", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = createK8sAdapter(validConfig);
+      const modified = (await adapter.modifyConfig!(
+        { output: "standalone", poweredByHeader: false } as any,
+        {} as any,
+      )) as { output?: string; poweredByHeader?: boolean };
+
+      expect(modified).not.toHaveProperty("output");
+      expect(modified.poweredByHeader).toBe(false);
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/output.*standalone.*adapter-owned/s);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("rejects static export because it emits no deployable route entrypoints", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    await expect(adapter.modifyConfig!({ output: "export" } as any, {} as any)).rejects.toThrow(
+      /output.*export.*static files.*Kubernetes runtime/i,
+    );
+  });
+});
+
 // N50 (review #22): `nextConfig.generateBuildId ?? (() => …)` never fell through, because
 // Next's DEFAULT config value for generateBuildId is a FUNCTION — `() => null`
 // (next/dist/server/config-shared.js). So the adapter's "K8s-friendly" generator had never
