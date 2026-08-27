@@ -1941,7 +1941,19 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               pools: [...pools.keys()],
               defaultPool: configuredDefaultPool,
               failurePolicy: failureModeAllow ? "open" : "closed",
-              cache: cfg.cache?.enabled ? "external" : "none",
+              cache: !cfg.cache?.enabled
+                ? "none"
+                : cfg.cache.url
+                  ? "external"
+                  : {
+                      kind: "managed",
+                      ...(cfg.cache.memorystore?.region
+                        ? { region: cfg.cache.memorystore.region }
+                        : {}),
+                      sizeGb: cfg.cache.memorystore?.sizeGb ?? 1,
+                      tier: cfg.cache.memorystore?.tier ?? "BASIC",
+                      auth: cfg.cache.memorystore?.auth ?? true,
+                    },
               infrastructure: {
                 ...(infra.projectId ? { projectId: infra.projectId } : {}),
                 ...(infra.region ? { region: infra.region } : {}),
@@ -2916,7 +2928,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           hasMiddleware: !!outputs.middleware,
           failureModeAllow,
           cacheEnabled: cfg.cache?.enabled ?? false,
-          cacheManaged: !cfg.target && !!cfg.cache?.enabled && !cfg.cache.url,
+          cacheManaged: compiledTarget
+            ? compiledTarget.plan.operations.cache.kind === "gcp-memorystore"
+            : !!cfg.cache?.enabled && !cfg.cache.url,
           // Deliberately NOT folded into cacheEnabled: the review suggested reporting
           // cacheEnabled:false when this handler is skipped, but deploy.ts:383/:442 use
           // cacheEnabled/cacheManaged to PROVISION and TEAR DOWN the managed Memorystore, and
@@ -2924,7 +2938,18 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // that instance regardless of this flag. Reporting false would delete a cache that
           // is in use. This field records the actual gap instead, and the build logs it.
           incrementalCacheHandler,
-          ...(cfg.cache?.memorystore ? { cacheMemorystore: cfg.cache.memorystore } : {}),
+          ...(compiledTarget?.plan.operations.cache.kind === "gcp-memorystore"
+            ? {
+                cacheMemorystore: {
+                  region: compiledTarget.plan.operations.cache.region,
+                  sizeGb: compiledTarget.plan.operations.cache.sizeGb,
+                  tier: compiledTarget.plan.operations.cache.tier,
+                  auth: compiledTarget.plan.operations.cache.security.kind === "auth-tls-required",
+                },
+              }
+            : cfg.cache?.memorystore
+              ? { cacheMemorystore: cfg.cache.memorystore }
+              : {}),
         }),
       );
 

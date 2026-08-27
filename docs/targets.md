@@ -183,7 +183,7 @@ Notes on this journey:
 - **Registry.** The CLI reads `containerRegistry` from `.k8s-adapter/infrastructure.json`—create it by hand for an existing cluster (see the README quick start). Digest lookup uses the OCI distribution API by default; authentication uses your ambient credentials.
 - **TLS** terminates from a Kubernetes Secret; `tls.enabled` without a TLS source (`tlsSecretName` or [`certManager`](#tls-for-dedicated-exposures-cert-manager)) is a config error.
 - **CDN**: put any CDN in front of the exposure. The routing tier always runs post-cache (see the architecture note in the README).
-- **Cache**: bring your own Valkey/Redis via `cache.url`. Disabling the cache makes ISR/PPR revalidation per-replica. Cache provisioning does not belong to a cluster component. See [configuration](./configuration.md#distributed-cache-cache-components--ppr).
+- **Cache**: bring your own Valkey/Redis via `cache.url`. Enabling the cache without a URL is a managed-cache request and fails unless a target component contributes a concrete provisioning operation. `kubernetesCluster()` deliberately contributes none. Disabling the cache makes ISR/PPR revalidation per-replica. See [configuration](./configuration.md#distributed-cache-cache-components--ppr).
 
 ## Envoy Gateway native routing
 
@@ -275,7 +275,7 @@ The GKE target composes `gkeCluster()` + `gatewayApiExposure` (controller-manage
 The callout arrives from Google's frontend over TLS—a stronger trust story than the in-cluster h2c path. GKE-specific features on this journey:
 
 - **Cloud CDN** with a Next.js-aware cache key and per-build cache-tag purge on cutover—see [configuration](./configuration.md#cloud-cdn-gke).
-- **Managed Memorystore-for-Valkey** provisioning for the distributed cache, created with AUTH + TLS by default—see [configuration](./configuration.md#distributed-cache-cache-components--ppr) and [SECURITY.md](../SECURITY.md#cache-security). Managed cache provisioning currently requires the legacy `provider.gke` config shape (which is what `init` scaffolds); a hand-written `target: defineTarget(...)` composition—including `gkeCluster()`—must set `cache.url` when the cache is enabled.
+- **Managed Memorystore-for-Valkey** provisioning for the distributed cache, created with AUTH + TLS by default—see [configuration](./configuration.md#distributed-cache-cache-components--ppr) and [SECURITY.md](../SECURITY.md#cache-security). Both the legacy GKE preset and an explicit target using `gkeCluster()` compile an enabled cache without `cache.url` into the same verified `gcp-memorystore` operation and deployment path.
 - **Split cloud IAM**: a minimally-scoped in-cluster identity and a push-capable CLI identity no pod can assume—see [SECURITY.md](../SECURITY.md#cloud-iam-two-identities-split-by-pod-assumability).
 
 ## Custom cluster components
@@ -316,9 +316,11 @@ const cluster = defineClusterComponent({
 
 Custom exposure and resource components emit typed Kubernetes objects. They must declare their API requirements and readiness conditions; the adapter checks them before mutation and records their exact object identities for rollback and cleanup. Raw YAML and inferred cloud names are deliberately outside this boundary.
 
+Cluster or resource components may also return `cache: CacheProvisioning` when the build context requests a managed cache. The compiler accepts exactly one contribution, fingerprints it, validates the operation through the composition-plan parser, and derives its cleanup operation. Do not branch on provider names: a target that cannot provision the requested cache should contribute nothing, which produces an actionable build error. External `cache.url` and disabled-cache builds remain operator-managed and `none` respectively.
+
 Any cluster, exposure, routing, or resource component can also return `telemetry: TelemetrySource[]`. A source identifies its producer and owner, activation mechanism, protocols, propagation, signal names, workloads, and static attributes. The compiler merges the sources, rejects duplicate IDs and the adapter-reserved `adapter.*` prefix, includes them in the target fingerprint, and stores them for `describe` and `doctor`. A project-owned NGINX ingress component can declare Prometheus or OTLP signals without adding an `if nginx` branch to the compiler. This is inventory. It cannot run callbacks, choose exporters, or mutate a shared controller.
 
-Configure an operator-managed Valkey or Redis endpoint through `cache.url`. Cache provisioning is not part of the cluster component interface. The existing managed Memorystore workflow belongs to the legacy GKE preset until it becomes an independent resource component.
+Configure an operator-managed Valkey or Redis endpoint through `cache.url`. `gkeCluster()` is the only built-in managed-cache contributor today; other cluster types intentionally make no cloud assumption. This keeps a future managed-cache component additive without coupling Kubernetes access, registry, exposure, or routing to a provider enum.
 
 ## Writing a routing adapter
 
@@ -373,7 +375,7 @@ Record the controller name, controller version, Kubernetes version, CRD versions
 
 ## Legacy provider configuration
 
-`provider.gke` and `provider.generic` remain accepted through the 0.x release line and are planned for removal in 1.0. One internal translator maps them to built-in target definitions. The old chart emitter remains isolated for the GKE CDN and managed-cache behavior that composition does not represent yet. New integrations must use `target: defineTarget(...)`. Do not extend the provider union. Configuring both `target` and `provider` is an error because they can select different clusters and routing paths.
+`provider.gke` and `provider.generic` remain accepted through the 0.x release line and are planned for removal in 1.0. One internal translator maps them to built-in target definitions. Managed cache no longer depends on this compatibility layer. It remains because `init` still scaffolds `provider.gke`, Cloud CDN has no composed target operation/emitter yet, and the legacy GKE route-extension timeout still lives under `provider.gke.serviceExtensions`. New integrations must use `target: defineTarget(...)`. Do not extend the provider union. Configuring both `target` and `provider` is an error because they can select different clusters and routing paths.
 
 ### `provider.generic`
 

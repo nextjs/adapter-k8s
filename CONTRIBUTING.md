@@ -17,6 +17,8 @@ Use the existing target seams for Kubernetes integrations:
 
 Do not add another `provider` value. `provider.gke` and `provider.generic` are legacy inputs supported through 0.x. New cluster support must remain independent from registry, exposure, routing, and managed-resource choices. That is why adding AWS support later should not imply ECR, ALB, Route 53, or ElastiCache today.
 
+Managed cache support uses the existing `CacheProvisioning` operation. A cluster or resource component may contribute one concrete `cache` operation when `ctx.cache.kind === "managed"`; the compiler rejects missing or conflicting contributions and derives cleanup from the operation. Do not add `managedCache` to `ClusterBuildResult` or a cloud/provider enum to this seam.
+
 ## Routing integrations
 
 Read [Writing a routing adapter](./docs/targets.md#writing-a-routing-adapter) before adding controller-specific code. Ingress support and native routing are different jobs. For example, ingress-nginx works today as `ingressExposure({ className: "nginx" })` with portable routing. It should only gain a native routing component if the controller has a real pre-origin hook that can preserve the adapter's dispatch and failure contracts.
