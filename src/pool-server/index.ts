@@ -229,6 +229,19 @@ async function registerInstrumentationHook(): Promise<InstrumentationStatus> {
   }
 }
 
+/**
+ * Default post-SIGTERM application drain budget (see the shutdown handler at the end of
+ * startPoolServer), overridable per-pod via `ADAPTER_K8S_SHUTDOWN_GRACE_MS`.
+ *
+ * A2-repair: deliberately NOT exported, and deliberately not mirrored into the emit layer.
+ * A2 mirrored it as `POOL_SHUTDOWN_GRACE_SECONDS` so the cutover could add it to the surge
+ * step's old-pod occupancy term, but an env-overridable default is not a bound on anything —
+ * raising the knob would have made a surge step outlast the budget derived from it. The
+ * kubelet's `terminationGracePeriodSeconds` is the real ceiling on how long a terminating pod
+ * holds its slot, so that is what src/cutover/gates.ts derives from now.
+ */
+const DEFAULT_SHUTDOWN_GRACE_MS = 60_000;
+
 // DoS backstop: the pool buffers request/image bodies fully in memory (the
 // loopback handler needs a fixed-length body, and middleware may read it). Cap
 // the buffer well above any legitimate payload so app-level limits
@@ -3915,7 +3928,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Spend 60s on application work and retain 30s for close-frame flushing, runtime cleanup,
     // kubelet scheduling delay, and the hard-exit cushion. The old 15s budget then cut HTTP/SSE
     // streams at its halfway mark (7.5s), despite the pod already reserving far more time.
-    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || 60_000,
+    parseInt(process.env.ADAPTER_K8S_SHUTDOWN_GRACE_MS ?? "", 10) || DEFAULT_SHUTDOWN_GRACE_MS,
   );
   const shutdown = async () => {
     if (shuttingDown) return;

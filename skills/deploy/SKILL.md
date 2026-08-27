@@ -54,7 +54,7 @@ npx adapter-k8s tail              # color-coded logs from all workloads
 
 1. `→ Running next build...` then image build/push — images are pinned to registry `@sha256:` digests (registry-first; local podman digests are untrusted).
 2. `→ Running helm upgrade...` — from here the ext_proc edge MAY run the new build; pools still serve the old one.
-3. Readiness gates, in order: pool Deployment rollouts (`kubectl rollout status`, 600s budget each — matching the chart's `progressDeadlineSeconds`; the printed failure message still says "120s") → routing-service rollout → ext_proc registration Job complete (GKE) or `EnvoyExtensionPolicy accepted ✓` (generic) → composition-plan readiness → capacity warm-up (`→ Warming <hpa>...` temporarily lifts HPA bounds to match outgoing replicas) → `→ Verifying new pods are serving...` (per-pool ready count must match the outgoing build's live count, probed via `/readyz`, 2-minute budget).
+3. Readiness gates, in order: pool Deployment rollouts (`kubectl rollout status`, 600s each — these Deployments are created fresh per build, so their pods come up in parallel) → routing-service rollout (the one Deployment patched IN PLACE per build, so it surges serially: budget DERIVED per deploy from that tier's own live replica count x the chart's 285s surge cost — 600s floor, 1800s cap, and the failure message quotes the budget it used) → ext_proc registration Job complete (GKE) or `EnvoyExtensionPolicy accepted ✓` (generic) → composition-plan readiness → capacity warm-up (`→ Warming <hpa>...` temporarily lifts HPA bounds to match outgoing replicas) → `→ Verifying new pods are serving...` (per-pool ready count must match the outgoing build's live count, probed via `/readyz`, 2-minute budget).
 4. `→ Switching traffic to new build...` — the actual cutover: stable Service selectors patched to the new version label.
 5. Cleanup: `→ Previous build scaled to 0 (kept for rollback)`, old builds deleted, CDN invalidated.
 6. `✓ Deploy complete (build: <id>)`.
@@ -169,7 +169,10 @@ The non-negotiable pieces are:
   not default namespace-less Secret manifests);
 - make the app repo's `.sops.yaml` creation rule cover `.k8s-adapter/gitops/secrets/*.sops.yaml`;
 - leave Job waiting enabled and give the HelmRelease enough timeout for the sequential cutover
-  gates (each pool rollout and the routing rollout can wait up to ten minutes);
+  gates. Budget pool rollouts, the routing rollout, provider registration, the sum of the
+  composition-plan readiness deadlines, the capacity gate, and command overhead (see
+  docs/gitops.md); a timeout that fires mid-cutover makes Flux roll the release back onto the
+  pre-cutover Service selectors while the Job patches them forward;
 - inspect how existing apps make a hostname reachable and mirror every cluster-owned prerequisite
   the adapter does not emit: DNS records/controllers, tunnel routes, certificate issuers, shared
   Gateway parentRefs, registry pull Secrets, and SOPS keys. An accepted HTTPRoute alone does not

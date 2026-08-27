@@ -39,6 +39,23 @@ import { execCapture } from "../../src/cli/exec.js";
 import { readState, writeState } from "../../src/cli/state.js";
 import { invalidateCdnBuildTag } from "../../src/cli/cdn-invalidate.js";
 import { loadDeployedCompositionPlan } from "../../src/cli/composition-plan.js";
+import {
+  deriveRolloutWaitBudget,
+  poolRolloutWaitBudget,
+  POOL_POD_AVAILABLE_BUDGET_SECONDS,
+  ROLLOUT_SURGE_STEP_SECONDS,
+  ROLLOUT_TIMEOUT_CEILING_SECONDS,
+  ROLLOUT_TIMEOUT_FLOOR_SECONDS,
+} from "../../src/cutover/gates.js";
+import {
+  MIN_READY_SECONDS,
+  PRESTOP_DRAIN_SECONDS,
+  READINESS_PROBE_FAILURE_THRESHOLD,
+  READINESS_PROBE_PERIOD_SECONDS,
+  STARTUP_PROBE_BUDGET_SECONDS,
+  STARTUP_PROBE_FAILURE_THRESHOLD,
+  TERMINATION_GRACE_SECONDS,
+} from "../../src/emit/templates/deployment.js";
 import { routeExtJobName } from "../../src/emit/templates/route-ext-update-job.js";
 import { emitMetadataConfigMapName } from "../../src/emit/templates/cutover-job.js";
 
@@ -89,6 +106,14 @@ interface ClusterOverrides {
   rolloutFailsFor?: string;
   /** New build's rendered replica count before the D6 scale-up. */
   newBuildReplicas?: number;
+  /**
+   * `.spec.replicas` the D2 existence probe reads back off the routing Deployment — the count
+   * its own HPA has it at, which is what D2's budget is derived from. `null` renders the field
+   * as absent (an unreadable count must degrade to the floor, not to zero).
+   */
+  routingReplicas?: number | null;
+  /** D2 probe reports the routing Deployment as absent (the gate then skips entirely). */
+  routingDeploymentMissing?: boolean;
   newBuildHpa?: { min: number; max: number };
   /** EnvoyExtensionPolicy `-o json` body. */
   policy?: unknown;
@@ -146,9 +171,12 @@ function cluster(overrides: ClusterOverrides = {}) {
       const value = overrides.gcCompanions?.[key];
       return value == null ? ok() : ok(JSON.stringify(value));
     }
-    // D2 routing-tier existence probe (`-o name`, exactly).
-    if (args[1] === "deployment" && args[args.indexOf("-o") + 1] === "name") {
-      return ok(`deployment.apps/${RELEASE}-routing-service\n`);
+    // D2 routing-tier existence probe, which now also carries THIS tier's replica count
+    // (checked before the D6 probe below — they share a jsonpath shape).
+    if (args[0] === "get" && args[1] === "deployment" && args[2] === `${RELEASE}-routing-service`) {
+      if (overrides.routingDeploymentMissing) return ok("");
+      const replicas = overrides.routingReplicas === undefined ? 2 : overrides.routingReplicas;
+      return ok(`${RELEASE}-routing-service|${replicas === null ? "" : replicas}`);
     }
     // D6 pre-scale probe on the NEW build's Deployment.
     if (j.includes("{.metadata.name}|{.spec.replicas}")) {
@@ -493,6 +521,142 @@ describe("runCutover — D1: the EXACT-version rollout wait (the 12-char-prefix 
     expect(vi.mocked(writeState)).not.toHaveBeenCalled();
     // The edge has been on the new build since the sync overwrote the stable manifest CM.
     expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+});
+
+describe("runCutover — A2: the two rollout gates budget the shapes they actually await", () => {
+  /** `--timeout=<n>s` per awaited Deployment, keyed by the Deployment the gate waited on. */
+  function rolloutTimeoutsByDeployment(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [, a] of vi.mocked(execCapture).mock.calls) {
+      if (a[0] !== "rollout") continue;
+      const target = a.find((x) => x.startsWith("deployment/"))!.slice("deployment/".length);
+      out[target] = a.find((x) => x.startsWith("--timeout="))!;
+    }
+    return out;
+  }
+
+  it("D1 waits the fixed parallel-create budget; D2 derives its own from the ROUTING tier", async () => {
+    // A2-repair, the whole point: these two numbers are independent. The pools sit at 2 live
+    // replicas while the routing HPA has that tier at 4 under traffic — plausible, since the
+    // tier is single-threaded at 500m with a 70% CPU target. A2 shipped handing BOTH gates
+    // max(previousReplicasByPool) = 2, i.e. the 600s floor, against ~1140s of real serial
+    // routing cost; D2 then aborted a cutover whose rollout was still progressing.
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ readyPerPool: { ssr: 2 }, routingReplicas: 4 }) as never,
+    );
+
+    await runCutover(inputs({ previousReplicasByPool: new Map([["ssr", 2]]) }), deps);
+
+    const waits = rolloutTimeoutsByDeployment();
+    // D1: created-from-nothing Deployments, pods in parallel — the constant, regardless of any
+    // replica count anywhere.
+    expect(waits[`${RELEASE}-ssr-${BUILD}`]).toBe(`--timeout=${ROLLOUT_TIMEOUT_FLOOR_SECONDS}s`);
+    // D2: patched in place, one serial surge step per ROUTING replica. 4 x 285s = 1140s, inside
+    // the band where the derivation — not the floor, not the ceiling — governs the answer.
+    expect(waits[`${RELEASE}-routing-service`]).toBe(`--timeout=1140s`);
+    expect(4 * ROLLOUT_SURGE_STEP_SECONDS).toBe(1140);
+  });
+
+  it("D2's budget tracks the routing replica count and nothing else", async () => {
+    // Same pool topology in every case; only the routing tier's own `.spec.replicas` moves. A
+    // budget derived from previousReplicasByPool instead would be constant across this table,
+    // and one landing on the ceiling could not tell the derivation from a hardcoded 1800.
+    for (const [routingReplicas, expected] of [
+      [2, `--timeout=${ROLLOUT_TIMEOUT_FLOOR_SECONDS}s`], // 570s of surge, under the floor
+      [3, "--timeout=855s"],
+      [4, "--timeout=1140s"],
+      [6, "--timeout=1710s"],
+      [12, `--timeout=${ROLLOUT_TIMEOUT_CEILING_SECONDS}s`], // 3420s, clamped
+    ] as const) {
+      vi.clearAllMocks();
+      vi.mocked(writeState).mockResolvedValue(undefined);
+      vi.mocked(execCapture).mockImplementation(cluster({ routingReplicas }) as never);
+
+      await runCutover(inputs(), deps);
+
+      const waits = rolloutTimeoutsByDeployment();
+      expect(waits[`${RELEASE}-routing-service`]).toBe(expected);
+      // And the pool gate never moves with it.
+      expect(waits[`${RELEASE}-ssr-${BUILD}`]).toBe(`--timeout=${ROLLOUT_TIMEOUT_FLOOR_SECONDS}s`);
+    }
+  });
+
+  it("an unreadable routing replica count degrades D2 to the floor, never to zero", async () => {
+    // The routing template omits `.spec.replicas` (its HPA owns the field), so a tier the HPA
+    // has not adopted yet reads back empty. A short wait is the dangerous direction: it aborts
+    // a healthy cutover and reverts the edge.
+    vi.mocked(execCapture).mockImplementation(cluster({ routingReplicas: null }) as never);
+
+    await runCutover(inputs(), deps);
+
+    expect(rolloutTimeoutsByDeployment()[`${RELEASE}-routing-service`]).toBe(
+      `--timeout=${ROLLOUT_TIMEOUT_FLOOR_SECONDS}s`,
+    );
+  });
+
+  it("quotes the budget it actually used when the ROUTING rollout fails", async () => {
+    // The abort message quoted a stale "120s" for two revisions; A2 then made it quote the
+    // POOL gate's number on a routing failure. It must quote the wait this gate performed.
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ routingReplicas: 4, rolloutFailsFor: `${RELEASE}-routing-service` }) as never,
+    );
+
+    await expect(runCutover(inputs(), deps)).rejects.toThrow(
+      /Routing service \(.*\) did not become healthy within 1140s/,
+    );
+    expect(events.some((e) => e.startsWith("patch:"))).toBe(false);
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+
+  it("the subprocess ceiling always outlives the flag, and the ceiling caps the derivation", () => {
+    // exec.ts's rollout tier exists to let kubectl report the timeout rather than have the
+    // parent kill it; a derived budget above that tier must carry its own headroom.
+    for (const replicas of [1, 2, 4, 8, 40, 10_000]) {
+      const b = deriveRolloutWaitBudget(replicas);
+      expect(b.seconds).toBeGreaterThanOrEqual(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+      expect(b.seconds).toBeLessThanOrEqual(ROLLOUT_TIMEOUT_CEILING_SECONDS);
+      expect(b.execTimeoutMs).toBeGreaterThan(b.seconds * 1000);
+      expect(b.arg).toBe(`--timeout=${b.seconds}s`);
+    }
+    // A missing/garbage live replica read degrades to the floor, never to zero.
+    expect(deriveRolloutWaitBudget(0).seconds).toBe(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+    expect(deriveRolloutWaitBudget(NaN).seconds).toBe(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+    // The pool budget is not a degenerate case of the derivation — it is its own constant.
+    expect(poolRolloutWaitBudget().seconds).toBe(ROLLOUT_TIMEOUT_FLOOR_SECONDS);
+  });
+
+  it("keeps both budgets pinned to the chart parameters they claim to be derived from", async () => {
+    // Both budgets restate numbers that live in the emit templates. If one moves and this does
+    // not, the comments in gates.ts become lies.
+    expect(ROLLOUT_SURGE_STEP_SECONDS).toBe(
+      READINESS_PROBE_PERIOD_SECONDS * READINESS_PROBE_FAILURE_THRESHOLD +
+        30 +
+        MIN_READY_SECONDS +
+        TERMINATION_GRACE_SECONDS,
+    );
+    // The occupancy term must be the KUBELET's ceiling, not preStop + the pool server's
+    // application drain: that sum is both smaller and not a bound at all, since
+    // ADAPTER_K8S_SHUTDOWN_GRACE_MS is a documented operator knob.
+    expect(TERMINATION_GRACE_SECONDS).toBeGreaterThan(PRESTOP_DRAIN_SECONDS);
+    const { renderDeployment } = await import("../../src/emit/templates/deployment.js");
+    const manifest = renderDeployment({
+      poolName: "ssr",
+      buildId: BUILD,
+      releaseName: RELEASE,
+      internalSecretRef: "rel-internal-secret",
+    });
+    expect(manifest).toContain(`terminationGracePeriodSeconds: ${TERMINATION_GRACE_SECONDS}`);
+    expect(manifest).toContain(`minReadySeconds: ${MIN_READY_SECONDS}`);
+    expect(manifest).toContain(`failureThreshold: ${STARTUP_PROBE_FAILURE_THRESHOLD}`);
+    // D1's constant must stay above what ONE pod of a freshly created Deployment can cost, or
+    // that gate is back to being arithmetically impossible (the 120s it replaced).
+    expect(POOL_POD_AVAILABLE_BUDGET_SECONDS).toBe(
+      STARTUP_PROBE_BUDGET_SECONDS +
+        READINESS_PROBE_PERIOD_SECONDS * READINESS_PROBE_FAILURE_THRESHOLD +
+        MIN_READY_SECONDS,
+    );
+    expect(ROLLOUT_TIMEOUT_FLOOR_SECONDS).toBeGreaterThan(POOL_POD_AVAILABLE_BUDGET_SECONDS * 2);
   });
 });
 

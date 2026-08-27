@@ -106,6 +106,17 @@ Sharp is the only native dependency the adapter retargets itself; staged foreign
 
 Runtime-specific requirements (nerdctl's buildkit socket, podman's digest rewriting) are in [docs/ci-cd.md](./ci-cd.md#container-runtimes).
 
+## Build-time kill-switches
+
+Two Next features the adapter turns on by default are still experimental upstream. Both have an environment escape so an app can A/B them, or turn one off during an incident, without a `next.config` edit and a review cycle. Set them in the environment that runs `next build` (or `adapter-k8s deploy`), and read them as "off for this build only" — the next build without the variable is back on the default.
+
+| Variable                                    | Effect when set to `1`                                                                                                                                                                               |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS`      | Forces `experimental.supportsImmutableAssets: false` — asset URLs stay off `/_next/static/immutable/`. For checking whether the immutable-asset split regressed client bootstrap.                    |
+| `ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE` | Forces `experimental.turbopackFileSystemCacheForBuild: false` — a fully cold compile, ignoring `<distDir>/cache`. For a suspected upstream cache-invalidation bug (see [docs/ci-cd.md](./ci-cd.md)). |
+
+Each one wins over an explicit `true` in `next.config`, not just over the adapter's default: an app that has pinned the flag on is exactly the app that could not otherwise disable it without changing code.
+
 ## Registry pull auth
 
 **Node-level credentials.** On clusters where the nodes themselves can authenticate to the registry—GKE nodes pulling from Artifact Registry in the same project, EKS with an ECR instance role, or any cluster whose kubelets carry a machine-level `config.json`—no adapter config is needed: the kubelet authenticates every pull and the chart's image references just work. This is the default assumption, and it is why the emitted pod specs carried no `imagePullSecrets` at all before this key existed.

@@ -14,7 +14,10 @@ import {
 import type { EnvValue, EnvFromSource } from "../../types.js";
 import {
   assertSafeImageDigest,
+  MIN_READY_SECONDS,
   PRESTOP_DRAIN_SECONDS,
+  READINESS_PROBE_FAILURE_THRESHOLD,
+  READINESS_PROBE_PERIOD_SECONDS,
   TERMINATION_GRACE_SECONDS,
 } from "./deployment.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
@@ -178,7 +181,15 @@ spec:
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: 1
-  minReadySeconds: 30
+  # A2: shared with the pool template, and the cutover's derived rollout wait (gates.ts
+  # deriveRolloutWaitBudget) is derived from it — plus terminationGracePeriodSeconds below —
+  # per replica. This is the one Deployment helm patches IN PLACE on every build, so it is the
+  # only one that actually pays the serial preStop cost, and D2 (waitRoutingRollout) is the
+  # only consumer of that derivation. A2-repair: D2 reads THIS Deployment's own spec.replicas
+  # to feed it. It shipped fed from max(previousReplicasByPool), i.e. the POOL tier's count —
+  # this tier is scaled by its own HPA (routing-service-hpa.ts, min 2 / max 10 by default) and
+  # the two numbers are unrelated.
+  minReadySeconds: ${MIN_READY_SECONDS}
   selector:
     matchLabels:
       app.kubernetes.io/name: "${releaseName}"
@@ -281,9 +292,9 @@ ${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
               path: /healthz
               port: 8081
             initialDelaySeconds: 3
-            periodSeconds: 5
+            periodSeconds: ${READINESS_PROBE_PERIOD_SECONDS}
             timeoutSeconds: 3
-            failureThreshold: 3
+            failureThreshold: ${READINESS_PROBE_FAILURE_THRESHOLD}
           livenessProbe:
             httpGet:
               path: /healthz

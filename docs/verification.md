@@ -130,6 +130,7 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 - Upstream Next.js e2e (full cluster topology): `bash scripts/e2e-k3d-bootstrap.sh` once, then `bash scripts/e2e-lanes.sh 6 24`—expect 3–4.5 hours; `bash scripts/e2e-smoke.sh` runs the ~32-suite sensitive subset in ~35 minutes
 - ext_proc path locally: `npx adapter-k8s emulate` in `fixtures/main`
 - Live suite: `E2E_BASE_URL=https://<host> npm run test:e2e:live` against a deployed release
+- Edge tier actually in use: add `E2E_ASSERT_EDGE_DISPATCH=1` to the live suite. It asserts the middleware that produced a response ran in the ext_proc tier — i.e. the pool VERIFIED the per-request dispatch proof rather than failing safe to local re-resolution, which is correct but silent and would otherwise leave the edge tier doing nothing but adding a hop. Requires a deployment built from the current `fixtures/main`
 
 ## See also
 

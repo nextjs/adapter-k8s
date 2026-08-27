@@ -100,8 +100,13 @@ import {
 } from "./composition-plan.js";
 import { evaluateEnvoyGatewayPreflight } from "./envoy-gateway-preflight.js";
 
-// The 600s rollout wait (KUBECTL_ROLLOUT_TIMEOUT) and its measured-on-a-real-cluster
-// rationale moved to src/cutover/gates.ts with the Phase D gate battery (GitOps PR2).
+// The rollout wait and its measured-on-a-real-cluster rationale moved to src/cutover/gates.ts
+// with the Phase D gate battery (GitOps PR2). A2: there are now TWO waits, because the two
+// gates await different shapes. D1's pool Deployments are created fresh per build, so their
+// pods come up in parallel and 600s stays a constant. D2's routing Deployment is patched in
+// place, so it walks one serial surge step per replica (ready + minReadySeconds + the
+// kubelet's termination grace) and its budget is derived per deploy from its OWN live replica
+// count, floored at 600s and capped at 1800s. See deriveRolloutWaitBudget.
 
 export interface DeployOptions {
   projectDir: string;

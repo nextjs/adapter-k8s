@@ -15,7 +15,13 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync
 import os from "node:os";
 import path from "node:path";
 import { createK8sAdapter } from "../src/adapter.js";
-import { mockOutputs, mockAppPage, mockAppRoute, mockRouting } from "./helpers/mock-outputs.js";
+import {
+  mockOutputs,
+  mockAppPage,
+  mockAppRoute,
+  mockPrerender,
+  mockRouting,
+} from "./helpers/mock-outputs.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 
 const validConfig: K8sAdapterConfig = {
@@ -237,6 +243,116 @@ describe("pool build context staging", () => {
       "COPY --chown=node:node dependencies/ .",
     );
     expect(JSON.parse(outputFile("build-metadata.json")).poolImageLayout).toBe("shared-base-v1");
+  });
+
+  // A3-F2. The factoring above only happens when every pool reached the SAME sharp staging
+  // decision. When they disagree, the build keeps standalone pool images — and that branch is
+  // now the ONLY thing that puts `public/` and the prerender corpus into each pool's own
+  // context. It is therefore exactly where the regression #54 was written against (a public
+  // asset 404ing on the pool that receives the request, because the pathname is served from
+  // the manifest by whichever pool the router picks) would come back, and the case the test
+  // above cannot reach.
+  //
+  // Decisions can only diverge if the resolver's answer CHANGES between two pools of one
+  // build — sharp's platform packages disappearing mid-build (a concurrent install, a
+  // workspace/optional-dependency prune, an editor sync). That is the situation the branch
+  // exists for, so it is what this reproduces: the `api` pool's asset staging removes the
+  // @img packages, after the `web` pool has already staged them.
+  it("divergent sharp decisions keep public/ and the prerender pair in EVERY pool context", async () => {
+    seedProject();
+    const sharpVersion = "0.34.2";
+    writeFile(
+      "node_modules/sharp/package.json",
+      JSON.stringify({ name: "sharp", version: sharpVersion }),
+    );
+    for (const pkg of ["@img/sharp-linux-x64", "@img/sharp-libvips-linux-x64"]) {
+      writeFile(
+        `node_modules/${pkg}/package.json`,
+        JSON.stringify({ name: pkg, version: "1.0.0" }),
+      );
+      writeFile(`node_modules/${pkg}/lib/sharp.node`, "linux-binary");
+    }
+    // A prerendered document plus the `.meta` sibling the manifest does not carry — the PPR
+    // fs-mirror seed reads it, so "the .html shipped" is not enough (prerenderSiblingFiles).
+    const prerenderHtml = writeFile(".next/server/app/blog/post.html", "<html>post</html>");
+    writeFile(".next/server/app/blog/post.meta", '{"postponed":null}');
+
+    const route = writeFile(".next/server/app/api/hello/route.js", "module.exports={}");
+    const ctx = ctxFor() as any;
+    const apiRoute = mockAppRoute({ pathname: "/api/hello", filePath: route, assets: {} });
+    // The mid-build disappearance, self-sequenced: it fires the first time the `api` pool's
+    // assets are read AFTER the `web` pool staged its own copy, so the two pools genuinely
+    // reach different decisions ("staged" vs "install:<version>") within one build.
+    Object.defineProperty(apiRoute, "assets", {
+      get() {
+        const webStaged = path.join(
+          projectDir,
+          ".k8s-adapter/output/pools/web/context/node_modules/@img/sharp-linux-x64",
+        );
+        if (existsSync(webStaged)) {
+          rmSync(path.join(projectDir, "node_modules/@img"), { recursive: true, force: true });
+        }
+        return {};
+      },
+    });
+    ctx.outputs.appRoutes = [apiRoute];
+    ctx.outputs.prerenders = [
+      mockPrerender({
+        pathname: "/blog/post",
+        sourcePage: "/",
+        parentOutputId: ctx.outputs.appPages[0].id,
+        fallback: { filePath: prerenderHtml } as never,
+      }),
+    ];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const config: K8sAdapterConfig = {
+      ...structuredClone(validConfig),
+      pools: {
+        web: { routes: ["appPages"] },
+        api: { routes: ["appRoutes"] },
+      },
+    };
+    // try/finally, per this file's convention: vitest.config.ts sets neither `restoreMocks`
+    // nor `mockReset`, and there is no global restoreAllMocks, so a spy left installed
+    // silences console.warn for every test declared after this one — which swallows exactly
+    // the `[adapter-k8s] …` warnings (sharp pruning, cache handler, topology) that explain
+    // why a later staging test failed.
+    try {
+      await createK8sAdapter(config).onBuildComplete!(ctx);
+
+      // The branch under test was actually taken (both decisions occurred, in one build).
+      expect(warn.mock.calls.flat().join(" ")).toMatch(
+        /different sharp requirements .*staged.*install:0\.34\.2|different sharp requirements .*install:0\.34\.2.*staged/,
+      );
+      const output = path.join(projectDir, ".k8s-adapter/output");
+      // No shared layers at all — the standalone layout must not leave a half-factored base
+      // behind, or the pool Dockerfiles would reference an image nothing populated.
+      expect(existsSync(path.join(output, "pool-base"))).toBe(false);
+      expect(JSON.parse(outputFile("build-metadata.json")).poolImageLayout).not.toBe(
+        "shared-base-v1",
+      );
+
+      for (const poolName of ["web", "api"]) {
+        const context = path.join(output, "pools", poolName, "context");
+        // static-assets.json in THIS context claims these pathnames; a request for one can
+        // arrive at either pool, so both must be able to serve it from its own image.
+        const manifest = JSON.parse(
+          readFileSync(path.join(context, "config/static-assets.json"), "utf-8"),
+        ) as Array<{ pathname: string; filePath: string }>;
+        expect(manifest.map((e) => e.pathname)).toContain("/logo.png");
+        expect(manifest.map((e) => e.pathname)).toContain("/blog/post");
+        expect(readFileSync(path.join(context, "public/logo.png"), "utf-8")).toBe("png-bytes");
+        expect(existsSync(path.join(context, ".next/server/app/blog/post.html"))).toBe(true);
+        expect(existsSync(path.join(context, ".next/server/app/blog/post.meta"))).toBe(true);
+        // Standalone images, not layered deltas.
+        expect(
+          readFileSync(path.join(output, "pools", poolName, "Dockerfile"), "utf8"),
+        ).not.toContain("FROM ${POOL_BASE_IMAGE}");
+      }
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("stages handler, traced assets, chunks, public files, next and @next/routing", async () => {

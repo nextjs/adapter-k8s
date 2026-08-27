@@ -18,6 +18,7 @@ import { routeExtJobName } from "../emit/templates/route-ext-update-job.js";
 import type { TargetPlatform } from "../target-platform.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
 import {
+  poolRolloutWaitBudget,
   waitPoolRollouts,
   waitRoutingRollout,
   waitRouteExtJob,
@@ -80,7 +81,22 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
   // build whose id shared that prefix could satisfy this readiness check; the cutover would then
   // patch Services to the full new label, match zero pods, drain the NEG, and 503 the origin.
   const safeBuildId = sanitizeK8sName(buildId);
-  const ctx: GateContext = { releaseName, namespace, buildId, safeBuildId, previousBuildId, deps };
+  // A2: the POOL gate's budget (D1), computed once here so the CLI and the in-cluster cutover
+  // Job — which both enter through this function — cannot wait different budgets. It is a
+  // constant, not a derivation: the Deployments D1 awaits are created fresh per build (a build
+  // id identical to the serving one is refused outright by assertBuildIdChangedSinceServing),
+  // so their pods come up in parallel with no preStop on the critical path. The serial
+  // per-replica derivation belongs to D2 alone, which reads the routing tier's own replica
+  // count — see poolRolloutWaitBudget / deriveRolloutWaitBudget.
+  const ctx: GateContext = {
+    releaseName,
+    namespace,
+    buildId,
+    safeBuildId,
+    previousBuildId,
+    poolRolloutWait: poolRolloutWaitBudget(),
+    deps,
+  };
 
   // D1. Wait for the new build's pool Deployments to be ready (7a).
   await waitPoolRollouts(ctx);

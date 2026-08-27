@@ -1430,13 +1430,23 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // Keep an explicit app choice authoritative. This matters while the Next feature remains
       // experimental: an app that encounters an upstream cache invalidation bug must be able to
       // turn it off without replacing the adapter.
+      //
+      // A3-F3: "without replacing the adapter" was still "with a next.config edit", i.e. a code
+      // change, a review and a rebuild — which is not what an incident has time for, and not how
+      // you A/B whether the cache is the thing producing a stale bundle. ADAPTER_K8S_DISABLE_
+      // TURBOPACK_BUILD_CACHE=1 forces it off exactly like ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS=1
+      // does for the immutable-asset split above: the env var wins over an explicit `true` in
+      // next.config as well as over this default, because the operator holding the incident is
+      // the one who needs the last word (and an app that has pinned `true` is precisely the app
+      // that cannot disable it any other way without a code change).
       {
         const userBuildCache = (
           nextConfig.experimental as { turbopackFileSystemCacheForBuild?: boolean } | undefined
         )?.turbopackFileSystemCacheForBuild;
+        const disabled = process.env.ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE === "1";
         modified.experimental = {
           ...(modified.experimental as Record<string, unknown> | undefined),
-          turbopackFileSystemCacheForBuild: userBuildCache ?? true,
+          turbopackFileSystemCacheForBuild: disabled ? false : (userBuildCache ?? true),
         };
       }
 
