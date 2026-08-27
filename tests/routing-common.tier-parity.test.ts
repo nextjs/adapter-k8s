@@ -36,7 +36,6 @@ import {
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
   parseRequestUrl,
-  UNTRUSTED_NEXT_REQUEST_HEADERS,
 } from "../src/routing-common.js";
 
 const ORIGIN = "http://app.example.com";
@@ -736,16 +735,16 @@ describe("Phase 1 / Phase 2 middleware response parity (N40 / findings #16, #35,
     expect(r.phase1.result.kind).toBe("external-rewrite");
     // The edge must NOT author a response the pool would have proxied …
     expect(r.phase2.response.immediateResponse).toBeUndefined();
-    // … and must clear the WHOLE vocabulary (plus the secret) so the pool re-resolves untrusted.
-    expect(r.phase2.dispatch("x-mw-evaluated")).toBeUndefined();
-    expect(new Set(r.phase2.removeHeaders)).toEqual(
-      new Set([
-        ...INTERNAL_DISPATCH_HEADERS,
-        ...UNTRUSTED_NEXT_REQUEST_HEADERS,
-        INTERNAL_SECRET_HEADER,
-        INTERNAL_DISPATCH_PROOF_HEADER,
-      ]),
-    );
+    // … and must hand the terminal target and middleware verdict to the pool. In production
+    // these fields share the normal per-request dispatch proof, so the pool can proxy without
+    // running middleware a second time. This parity harness deliberately has no secret; its pool
+    // boundary would strip these unauthenticated fields and fall back to local resolution.
+    expect(r.phase2.dispatch("x-external-rewrite-url")).toBe("https://example.com/probe");
+    expect(r.phase2.dispatch("x-mw-evaluated")).toBe("ran");
+    expect(r.phase2.dispatch("x-output-id")).toBeUndefined();
+    expect(r.phase2.removeHeaders).not.toContain("x-external-rewrite-url");
+    expect(r.phase2.removeHeaders).toContain("x-output-id");
+    expect(r.phase2.removeHeaders).toContain(INTERNAL_DISPATCH_PROOF_HEADER);
   });
 
   it("keeps a binary middleware-authored body byte-exact on both tiers", async () => {

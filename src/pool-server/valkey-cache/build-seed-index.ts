@@ -11,7 +11,7 @@
 // The index is built once per process from the SAME static-assets manifest the pool server
 // serves from (CONFIG_DIR/static-assets.json, present in the pool image). PPR artifacts are
 // excluded from THAT source (an html-only seed is half-usable) — they are covered by the
-// filesystem-mirror layer below, which reads `.next/server/app/<key>` exactly the way
+// filesystem-mirror layer below, which reads `<distDir>/server/app/<key>` exactly the way
 // next start's FileSystemCache does (html + .meta postponed state + .segments), so
 // route-keyed fallback-shell lookups behave like a warm fs cache. Without it, every PPR
 // shell lookup missed under the production config and the route rendered fully dynamically
@@ -126,13 +126,13 @@ export interface SeedLookupCtx {
 
 /**
  * Next's fetch-cache keys are hex digests (`incremental-cache/index.ts` generateCacheKey);
- * validate at the point of consumption — the key becomes a filename under `.next/cache`, so
+ * validate at the point of consumption — the key becomes a filename under `<distDir>/cache`, so
  * separators and dots are refused outright rather than path-normalized.
  */
 const SAFE_FETCH_CACHE_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
- * Fetch-cache mirror seed: read `<appRoot>/.next/cache/fetch-cache/<key>` the way
+ * Fetch-cache mirror seed: read `<appRoot>/<distDir>/cache/fetch-cache/<key>` the way
  * FileSystemCache.get does for kind FETCH (file-system-cache.ts:146-188 — one JSON file,
  * the CachedFetchValue stored verbatim, lastModified from the file mtime). The BUILD's
  * fetch entries are `next start`'s warm-start content, and their absence is not a mere
@@ -143,11 +143,11 @@ const SAFE_FETCH_CACHE_KEY = /^[A-Za-z0-9_-]{1,128}$/;
  * loses that race and dies with "uncached or runtime data during prerendering", so the
  * page serves stale forever (both rdc consistency tests, traced live 2026-08-04).
  */
-function fetchCacheSeed(appRoot: string, cacheKey: string): SeedEntry | null {
+function fetchCacheSeed(appRoot: string, distDir: string, cacheKey: string): SeedEntry | null {
   if (!SAFE_FETCH_CACHE_KEY.test(cacheKey)) return null;
   const fs = builtin<typeof import("node:fs")>("node:fs");
   const path = builtin<typeof import("node:path")>("node:path");
-  const abs = path.join(appRoot, ".next", "cache", "fetch-cache", cacheKey);
+  const abs = path.resolve(appRoot, distDir, "cache", "fetch-cache", cacheKey);
   if (!fs.existsSync(abs)) return null;
   const stat = fs.statSync(abs);
   let parsed: unknown;
@@ -168,18 +168,23 @@ function fetchCacheSeed(appRoot: string, cacheKey: string): SeedEntry | null {
 }
 
 /**
- * Filesystem-mirror seed: read `.next/server/app/<key>` the way FileSystemCache.get does
+ * Filesystem-mirror seed: read `<distDir>/server/app/<key>` the way FileSystemCache.get does
  * (file-system-cache.js:138-181 in the installed next) — html, `.meta` (postponed / headers /
  * status / segmentPaths), rscData only when there is NO postponed state, segment files from
  * `<key>.segments/`. Returns null (miss) when the html is absent or the entry would be
  * half-usable.
  */
-function fsMirrorSeed(appRoot: string, cacheKey: string, _ctx?: SeedLookupCtx): SeedEntry | null {
+function fsMirrorSeed(
+  appRoot: string,
+  distDir: string,
+  cacheKey: string,
+  _ctx?: SeedLookupCtx,
+): SeedEntry | null {
   const fs = builtin<typeof import("node:fs")>("node:fs");
   const path = builtin<typeof import("node:path")>("node:path");
-  const base = path.join(appRoot, ".next", "server", "app", ...cacheKey.split("/").filter(Boolean));
-  const htmlAbs =
-    cacheKey === "/" ? path.join(appRoot, ".next", "server", "app", "index.html") : `${base}.html`;
+  const appServerDir = path.resolve(appRoot, distDir, "server", "app");
+  const base = path.join(appServerDir, ...cacheKey.split("/").filter(Boolean));
+  const htmlAbs = cacheKey === "/" ? path.join(appServerDir, "index.html") : `${base}.html`;
   if (!fs.existsSync(htmlAbs)) return null;
   const stat = fs.statSync(htmlAbs);
   const html = fs.readFileSync(htmlAbs, "utf8");
@@ -245,6 +250,7 @@ function fsMirrorSeed(appRoot: string, cacheKey: string, _ctx?: SeedLookupCtx): 
 export function createBuildSeedLookup(options?: {
   configDir?: string;
   appRoot?: string;
+  distDir?: string;
 }): (cacheKey: string, ctx?: SeedLookupCtx) => Promise<SeedEntry | null> {
   let sources: Map<string, SeedSource> | null | undefined;
 
@@ -271,7 +277,11 @@ export function createBuildSeedLookup(options?: {
     // the page fs-mirror — they are answered from the staged build fetch-cache or not at all.
     if (ctx?.kind === "FETCH") {
       try {
-        return fetchCacheSeed(options?.appRoot ?? cwd(), cacheKey);
+        return fetchCacheSeed(
+          options?.appRoot ?? cwd(),
+          options?.distDir ?? process.env.ADAPTER_K8S_DIST_DIR ?? ".next",
+          cacheKey,
+        );
       } catch {
         return null;
       }
@@ -285,7 +295,12 @@ export function createBuildSeedLookup(options?: {
       if (ctx?.kind !== undefined && ctx.kind !== "APP_PAGE") return null;
       try {
         const appRoot = options?.appRoot ?? cwd();
-        return fsMirrorSeed(appRoot, cacheKey, ctx);
+        return fsMirrorSeed(
+          appRoot,
+          options?.distDir ?? process.env.ADAPTER_K8S_DIST_DIR ?? ".next",
+          cacheKey,
+          ctx,
+        );
       } catch {
         return null;
       }

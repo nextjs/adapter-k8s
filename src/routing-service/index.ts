@@ -268,7 +268,12 @@ async function main() {
   // configured-but-missing middleware must fail closed, not warn-and-continue, for the
   // same reason: running ext_proc without the middleware it exists to enforce is a bypass.
   let middlewareModule = null;
-  if (manifest.middleware) {
+  if (manifest.middleware?.runtime === "edge") {
+    console.log(
+      "Edge middleware will be evaluated by the pool sandbox; the routing service delegates " +
+        "those requests without a trusted dispatch verdict",
+    );
+  } else if (manifest.middleware) {
     const mwPath = path.resolve(process.cwd(), manifest.middleware.filePath);
     if (!existsSync(mwPath)) {
       throw new Error(

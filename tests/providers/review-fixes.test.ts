@@ -3,7 +3,7 @@
 import { describe, it, expect } from "vitest";
 import { resolveProvider } from "../../src/providers/index.js";
 import { renderNetworkPolicies } from "../../src/emit/templates/network-policy.js";
-import { buildDockerCommands } from "../../src/cli/deploy.js";
+import { buildDockerCommands } from "../../src/pipeline/images.js";
 import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../../src/types.js";
 
 const pools = new Map<string, PoolDefinition>([

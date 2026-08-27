@@ -10,6 +10,7 @@ const request = () => ({
   method: "GET",
   requestBody: new ReadableStream<Uint8Array>(),
   nextConfig: { basePath: "/docs" },
+  distDir: "/app/.next",
   logBackgroundError: vi.fn(),
 });
 

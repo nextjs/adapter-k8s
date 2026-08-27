@@ -1,4 +1,5 @@
 // src/emit/templates/deployment.ts
+import path from "node:path";
 import {
   ADAPTER_RELEASE_LABEL,
   sanitizeK8sName,
@@ -19,6 +20,7 @@ import type { EnvValue, EnvFromSource } from "../../types.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
 import { renderValkeyEnv } from "./valkey-secret.js";
 import type { TargetArchitecture } from "../../target-platform.js";
+import { normalizeNextDistDir } from "../../next-runtime/dist-dir.js";
 
 /**
  * N63. Pod-termination timings for a NEG-backed pod, from Google's own guidance —
@@ -72,7 +74,7 @@ export const STARTUP_PROBE_BUDGET_SECONDS =
   STARTUP_PROBE_PERIOD_SECONDS * STARTUP_PROBE_FAILURE_THRESHOLD;
 
 /**
- * Ephemeral-storage sizing. `/app/.next/cache` is Next's FILESYSTEM incremental cache —
+ * Ephemeral-storage sizing. `/app/<distDir>/cache` is Next's FILESYSTEM incremental cache —
  * the fallback whenever the shared Valkey handler isn't wired — and it grows without
  * bound. An `emptyDir` with no `sizeLimit` is charged against the pod's ephemeral-storage
  * allowance, so on Autopilot the pod is evicted once the (defaulted) request is exceeded,
@@ -122,6 +124,7 @@ export function renderDeployment({
   providerName,
   nodeArchitecture = "amd64",
   pullSecrets,
+  distDir = ".next",
 }: {
   poolName: string;
   buildId: string;
@@ -175,6 +178,8 @@ export function renderDeployment({
    * knowable at render time), not values-driven like the digest (which is not).
    */
   pullSecrets?: string[];
+  /** Project-relative Next build directory carried by the routing manifest. */
+  distDir?: string;
 }): string {
   // Sanitize at the point of consumption (AGENTS.md). These three land in resource names,
   // label values, label SELECTORS, and `value: "…"` env scalars; none of them was checked
@@ -186,6 +191,8 @@ export function renderDeployment({
   if (imageDigest !== undefined) assertSafeImageDigest(imageDigest);
   if (replicas !== undefined) assertSafeReplicaCount(replicas, "replicas");
   if (providerName !== undefined) assertSafeTelemetryProviderName(providerName);
+  const normalizedDistDir = normalizeNextDistDir(distDir);
+  const cacheMountPath = path.posix.join("/app", normalizedDistDir, "cache");
 
   const name = sanitizeK8sName(`${releaseName}-${poolName}-${buildId}`);
   const safeBuildId = sanitizeK8sName(buildId);
@@ -413,11 +420,11 @@ ${internalSecretEnv}${valkeyEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${
               mountPath: /tmp
             # Without the shared Valkey incremental handler wired (cache disabled, or an
             # edge-middleware app), Next falls back to its FILESYSTEM incremental cache at
-            # .next/cache — which must exist writable or renders fail with EROFS. Per-pod
+            # <distDir>/cache — which must exist writable or renders fail with EROFS. Per-pod
             # and ephemeral: correct (if unshared) degradation, never durable state. It
             # grows without bound in that fallback, hence the sizeLimit below.
             - name: next-cache
-              mountPath: /app/.next/cache
+              mountPath: ${JSON.stringify(cacheMountPath)}
           # N71. Probe timings are explicit, not inherited. The HTTP listener only comes up
           # at the END of startPoolServer (after .env loading and awaited instrumentation
           # registration), so everything before listen() is connection-refused: with the

@@ -46,11 +46,29 @@ describe("matchesMiddleware", () => {
     expect(matchesMiddleware(ms, url("/p"), h())).toBe(false);
   });
 
+  it("matches Next's truthy presence semantics for empty values", () => {
+    const header = [M("/p", { has: [{ type: "header", key: "x-present" }] })];
+    const query = [M("/p", { has: [{ type: "query", key: "present" }] })];
+    expect(matchesMiddleware(header, url("/p"), h({ "x-present": "" }))).toBe(false);
+    expect(matchesMiddleware(query, url("/p?present="), h())).toBe(false);
+  });
+
   it("has: cookie with a value regex", () => {
     const ms = [M("/p", { has: [{ type: "cookie", key: "loggedIn", value: "(?<x>true)" }] })];
     expect(matchesMiddleware(ms, url("/p"), h({ cookie: "loggedIn=true; other=1" }))).toBe(true);
     expect(matchesMiddleware(ms, url("/p"), h({ cookie: "loggedIn=false" }))).toBe(false);
     expect(matchesMiddleware(ms, url("/p"), h())).toBe(false);
+  });
+
+  it("decodes cookie values the way Next's getCookieParser does", () => {
+    const ms = [M("/p", { has: [{ type: "cookie", key: "role", value: "admin user" }] })];
+    expect(matchesMiddleware(ms, url("/p"), h({ cookie: "role=admin%20user" }))).toBe(true);
+  });
+
+  it("matches the last repeated query value like Next's parsed query arrays", () => {
+    const ms = [M("/p", { has: [{ type: "query", key: "mode", value: "final" }] })];
+    expect(matchesMiddleware(ms, url("/p?mode=first&mode=final"), h())).toBe(true);
+    expect(matchesMiddleware(ms, url("/p?mode=final&mode=first"), h())).toBe(false);
   });
 
   it("has: host", () => {

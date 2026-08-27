@@ -56,6 +56,17 @@ describe("resolveRouteHandlerExport", () => {
     expect(handler).toBe(fn);
   });
 
+  it("preserves the routeModule receiver for instance handlers", () => {
+    const routeModule = {
+      marker: "bound",
+      handle(this: { marker: string }) {
+        return this.marker;
+      },
+    };
+    const handler = resolveRouteHandlerExport({ routeModule });
+    expect(handler()).toBe("bound");
+  });
+
   it("throws when no handler found", () => {
     expect(() => resolveRouteHandlerExport({ foo: "bar" })).toThrow(/handler/i);
   });

@@ -82,290 +82,6 @@ function resolveDepDir(
   return undefined;
 }
 
-// Whether the app defines EDGE middleware. HISTORY: Turbopack bundles
-// `next.config.cacheHandler` into the edge middleware compilation, and a statically
-// resolvable `node:net`/`node:tls` specifier (or a literal `process.cwd()`) there fails the
-// BUILD — so registration used to be skipped for edge-middleware apps, silently costing
-// them all cross-replica ISR/PPR materialization (Phase-0 measured:
-// sub-shell-generation-middleware wrote zero Valkey entries, MISS forever). As of
-// 2026-08-02 the bundled handler is edge-COMPILE-safe (process.getBuiltinModule + hidden
-// cwd; see resp-client.ts/build-seed-index.ts) and registration no longer consults this.
-// The detector remains exported for tests and diagnostics.
-//
-// N50 (review #34): this used to be a pure FILENAME test — any `middleware.ts` counted as
-// edge. Next 16 decides by the file's declared runtime, not its name:
-// `hasNodeMiddleware = staticInfo.runtime === 'nodejs' || isProxyFile(page)`
-// (next/src/build/index.ts, ~:2656). So `middleware.ts` with `export const runtime =
-// 'nodejs'` is NODE middleware and there is no edge bundle to poison — yet the old check
-// skipped the cacheHandler anyway. Consequence for such an app with `cache.enabled`:
-// ISR/PPR-shell revalidation silently stopped being cross-replica, nothing was logged, and
-// build-metadata.json still said `cacheEnabled: true`, so deploy provisioned a Memorystore
-// instance the incremental cache never used.
-//
-// modifyConfig runs BEFORE the build, so `functions-config-manifest.json` does not exist
-// yet (and a previous build's copy may be stale) — read the runtime the same way the build
-// does, from the source file's segment config. onBuildComplete re-derives this
-// authoritatively from `outputs.middleware.runtime` and reports any disagreement.
-// `proxy.ts` (always Node, `isProxyFile`) is not in the candidate list at all.
-// Exported (with the staging helpers below) for hermetic unit tests — see
-// tests/adapter-staging.test.ts.
-const MIDDLEWARE_FILENAMES = [
-  "middleware.ts",
-  "middleware.js",
-  "middleware.tsx",
-  "middleware.jsx",
-  "middleware.mjs",
-] as const;
-
-// `export const runtime = "nodejs"` / `export const runtime = 'edge'`, allowing `let`/`var`
-// and an optional `as const`/type annotation. Matches how Next's static analysis reads the
-// segment config; a value it cannot resolve statically is a build error upstream, so a
-// source that does not match here has no explicit runtime and therefore uses the default
-// (edge, for `middleware.*`).
-//
-// N50 (review follow-up): this pattern used to be run over RAW SOURCE, so a COMMENTED-OUT or
-// quoted declaration read as active. That runs the wrong way for safety: default-edge middleware
-// with `// export const runtime = "nodejs"` in it was reported as Node, so with `cache.enabled`
-// the Node Valkey cache handler was registered into an EDGE build, where `node:net`/`node:tls`
-// cannot resolve. So the scan runs over `scanSource()` output instead: comments blanked, and every
-// string/template literal replaced by a `\uE000<index>\uE000` sentinel whose value is looked
-// up separately — a declaration that only exists inside a literal is a single sentinel token and
-// can no longer produce a match, while a real declaration's value is still read.
-const RUNTIME_EXPORT_RE = /export\s+(?:const|let|var)\s+runtime\s*(?::[^=]*)?=\s*\uE000(\d+)\uE000/;
-
-// U+E000 is a private-use codepoint: it has no meaning in JS source, and any occurrence in
-// the input is neutralized below so it cannot forge a sentinel.
-const LITERAL_SENTINEL = "\uE000";
-
-/**
- * Keywords after which a `/` starts a REGEX literal rather than being a division operator. Needed
- * because the disambiguation rule is "previous significant token is not an operand", and a keyword
- * ends in identifier characters just like an operand does (`return /x/` vs `a /x/`).
- */
-const REGEX_PRECEDING_KEYWORDS = new Set([
-  "return",
-  "typeof",
-  "instanceof",
-  "in",
-  "of",
-  "new",
-  "delete",
-  "void",
-  "throw",
-  "case",
-  "do",
-  "else",
-  "yield",
-  "await",
-]);
-
-interface ScannedSource {
-  /** Comments blanked, each string/template literal replaced by `\uE000<index>\uE000`. */
-  code: string;
-  /** Literal values, indexed by the number inside the sentinel. */
-  literals: string[];
-}
-
-/**
- * Blank comments and lift string/template literals out of a JS/TS source, so a textual scan of
- * the result cannot be fooled by code that is commented out or quoted. A full parse is overkill
- * for one segment-config lookup; what matters is that the stripper itself cannot be fooled, so it
- * is a character scanner (not a chain of regex replaces): a `//` inside a string, a `/*` inside a
- * template literal, a quote inside a regex literal, `${}` substitutions containing any of those,
- * and backslash escapes are all handled by the state machine rather than by pattern matching.
- *
- * Regex literals are recognized with the standard "previous significant token" heuristic (plus the
- * keyword set above) because distinguishing `/` as division from `/` as a regex needs parse
- * context. Same for JSX text in a `middleware.tsx` (an apostrophe in `<p>don't</p>` is not a
- * string quote). A misjudgement can only OVER-consume, so a swallowed declaration reads as "no
- * explicit runtime", which lands on the conservative EDGE answer — the safe direction for the
- * caller (edge means the Node cache handler is left out, which merely costs cross-replica ISR).
- */
-function scanSource(raw: string): ScannedSource {
-  // A literal sentinel codepoint in the source would forge a lifted literal; there is no legal
-  // reason for one in JS source, so neutralize any before scanning.
-  const src = raw.includes(LITERAL_SENTINEL) ? raw.split(LITERAL_SENTINEL).join(" ") : raw;
-  const n = src.length;
-  const literals: string[] = [];
-  let code = "";
-  let i = 0;
-
-  const isIdentChar = (ch: string) => /[A-Za-z0-9_$]/.test(ch);
-
-  const pushLiteral = (value: string) => {
-    code += `${LITERAL_SENTINEL}${literals.length}${LITERAL_SENTINEL}`;
-    literals.push(value);
-  };
-
-  /** Cursor is on the opening quote; consumes through the closing quote. */
-  const scanQuoted = (quote: string): string => {
-    let value = "";
-    i++;
-    while (i < n) {
-      const ch = src[i]!;
-      if (ch === "\\") {
-        value += src[i + 1] ?? "";
-        i += 2;
-        continue;
-      }
-      if (ch === quote) {
-        i++;
-        break;
-      }
-      // Unterminated string: a syntax error the build will report. Stop at the newline rather
-      // than swallowing the rest of the file.
-      if (ch === "\n") break;
-      value += ch;
-      i++;
-    }
-    return value;
-  };
-
-  /** Cursor is on the opening backtick; consumes through the closing backtick. */
-  const scanTemplate = (): string => {
-    let value = "";
-    i++;
-    while (i < n) {
-      const ch = src[i]!;
-      if (ch === "\\") {
-        value += src[i + 1] ?? "";
-        i += 2;
-        continue;
-      }
-      if (ch === "`") {
-        i++;
-        break;
-      }
-      if (ch === "$" && src[i + 1] === "{") {
-        i += 2;
-        // Keep the marker in the value: a substituted template is not a statically resolvable
-        // segment config, and `"${…}"` can never equal `"nodejs"`.
-        value += "${}";
-        skipBracedExpression();
-        continue;
-      }
-      value += ch;
-      i++;
-    }
-    return value;
-  };
-
-  /** Cursor is just past a `${`; consumes through the matching `}`. */
-  const skipBracedExpression = (): void => {
-    let depth = 1;
-    while (i < n) {
-      const ch = src[i]!;
-      const next = src[i + 1];
-      if (ch === "{") {
-        depth++;
-        i++;
-      } else if (ch === "}") {
-        i++;
-        if (--depth === 0) return;
-      } else if (ch === "/" && next === "/") {
-        while (i < n && src[i] !== "\n") i++;
-      } else if (ch === "/" && next === "*") {
-        i += 2;
-        while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++;
-        i += 2;
-      } else if (ch === '"' || ch === "'") {
-        scanQuoted(ch);
-      } else if (ch === "`") {
-        scanTemplate();
-      } else {
-        i++;
-      }
-    }
-  };
-
-  /** Cursor is on the leading `/` of a regex literal; consumes through the closing `/` + flags. */
-  const skipRegex = (): void => {
-    i++;
-    let inClass = false;
-    while (i < n) {
-      const ch = src[i]!;
-      if (ch === "\\") {
-        i += 2;
-        continue;
-      }
-      if (ch === "\n") return; // unterminated — not actually a regex; let the build complain
-      if (ch === "[") inClass = true;
-      else if (ch === "]") inClass = false;
-      else if (ch === "/" && !inClass) {
-        i++;
-        while (i < n && isIdentChar(src[i]!)) i++; // flags
-        return;
-      }
-      i++;
-    }
-  };
-
-  /** True when a `/` at the cursor starts a regex literal rather than being division. */
-  const regexCanStartHere = (): boolean => {
-    const trimmed = code.trimEnd();
-    if (trimmed.length === 0) return true;
-    const prev = trimmed[trimmed.length - 1]!;
-    if (prev === ")" || prev === "]" || prev === LITERAL_SENTINEL) return false;
-    if (!isIdentChar(prev)) return true; // `=`, `(`, `,`, `:`, `{`, `}`, `;`, an operator, …
-    const word = /[A-Za-z_$][A-Za-z0-9_$]*$/.exec(trimmed)?.[0] ?? "";
-    return REGEX_PRECEDING_KEYWORDS.has(word);
-  };
-
-  while (i < n) {
-    const ch = src[i]!;
-    const next = src[i + 1];
-    if (ch === "/" && next === "/") {
-      while (i < n && src[i] !== "\n") i++;
-      code += " ";
-    } else if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < n && !(src[i] === "*" && src[i + 1] === "/")) i++;
-      i += 2;
-      code += " "; // a space, not nothing: `export/**/const` must not become `exportconst`
-    } else if (ch === '"' || ch === "'") {
-      pushLiteral(scanQuoted(ch));
-    } else if (ch === "`") {
-      pushLiteral(scanTemplate());
-    } else if (ch === "/" && regexCanStartHere()) {
-      skipRegex();
-      code += " 0"; // an operand, so a following `/` reads as division
-    } else {
-      code += ch;
-      i++;
-    }
-  }
-  return { code, literals };
-}
-
-function findMiddlewareSource(projectDir: string): string | undefined {
-  for (const dir of [projectDir, path.join(projectDir, "src")]) {
-    for (const name of MIDDLEWARE_FILENAMES) {
-      const candidate = path.join(dir, name);
-      if (existsSync(candidate)) return candidate;
-    }
-  }
-  return undefined;
-}
-
-export function hasEdgeMiddleware(projectDir: string): boolean {
-  const source = findMiddlewareSource(projectDir);
-  if (!source) return false;
-  let contents = "";
-  try {
-    contents = readFileSync(source, "utf-8");
-  } catch {
-    // Unreadable middleware source: fall back to the conservative answer (treat as edge,
-    // i.e. skip the handler) — the build itself will fail on the same file momentarily.
-    return true;
-  }
-  const { code, literals } = scanSource(contents);
-  const match = RUNTIME_EXPORT_RE.exec(code);
-  // Only a string/template LITERAL is a statically resolvable runtime (`runtime = RUNTIME_CONST`
-  // is a build error upstream), so a non-match means "no explicit runtime" → the default, edge.
-  const declared = match ? literals[Number(match[1])] : undefined;
-  return declared !== "nodejs";
-}
-
 import { validateConfig, applyDefaults } from "./config.js";
 import { classifyIntoPools } from "./classify.js";
 import { buildRoutingManifest } from "./manifest.js";
@@ -1299,10 +1015,6 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     return config;
   }
 
-  interface ExperimentalWithServerActions {
-    serverActions?: { allowedOrigins?: string[] };
-  }
-
   // A user may paste a URL ("https://App.Example.com/path") where a hostname is expected;
   // Next's allowedOrigins matches host[:port] values (globs allowed — gateway wildcards like
   // `*.example.com` pass through). Scheme and path are stripped, the host lowercased.
@@ -1319,13 +1031,15 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
   const adapter: NextAdapter = {
     name: "k8s",
 
-    async modifyConfig(nextConfig, _ctx) {
-      // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
-      // Use process.cwd() which is the project root during build.
-      if (_ctx.nextVersion !== undefined) {
-        assertSupportedNextVersion(_ctx.nextVersion, "Next.js build configuration");
+    async modifyConfig(nextConfig, ctx) {
+      if (ctx.nextVersion !== undefined) {
+        assertSupportedNextVersion(ctx.nextVersion, "Next.js build configuration");
       }
-      const cfg = await ensureConfig(process.cwd());
+      // Next can invoke `next build apps/site` from a workspace root. The adapter contract's
+      // projectDir is the application root; cwd belongs to the caller and may be another package.
+      // The fallback keeps direct unit harnesses written against the early canary API working.
+      const projectDir = ctx.projectDir ?? process.cwd();
+      const cfg = await ensureConfig(projectDir);
 
       // N14: `deploymentId` (Next's skew protection) makes Next return a CONSTANT build id
       // — literally `build-TfctsWXpff2fKS` for every build, forever (see getBuildId in
@@ -1353,14 +1067,17 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         );
       }
 
-      const modified: Record<string, unknown> = {
+      type MutableNextConfig = Omit<typeof nextConfig, "output"> & {
+        output?: typeof nextConfig.output;
+      };
+      const modified: MutableNextConfig = {
         ...nextConfig,
         compress: false,
         // Set turbopack root to the project directory to avoid workspace detection issues
         // when the adapter is loaded from outside the project tree (e.g., e2e tests)
         turbopack: {
-          ...(nextConfig as any).turbopack,
-          root: (nextConfig as any).turbopack?.root ?? process.cwd(),
+          ...nextConfig.turbopack,
+          root: nextConfig.turbopack?.root ?? projectDir,
         },
         // Generate K8s-friendly build ids: `b` + base36 timestamp + base36 random, i.e.
         // lowercase alphanumeric only — safe as a Docker tag, a DNS-1123 name fragment, and
@@ -1419,10 +1136,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // Respect an explicit user opt-out.
       //
       // DELIBERATELY FORWARD-LOOKING, and a silent no-op below Next 16.3.
-      // `experimental.supportsImmutableAssets` is the 16.3 key; it does not exist in 16.2.10's config
-      // schema, where the equivalent knob is `experimental.immutableAssetToken` — a string that
-      // SUPPLIES a `?dpl=` token, i.e. the INVERSE intent, and which 16.3.0-canary removes again.
-      // So we set the 16.3 key unconditionally and do NOT backport the 16.2 one:
+      // `supportsImmutableAssets` is the 16.3 adapter capability. Next temporarily mirrors the
+      // deprecated experimental spelling for compatibility, but adapters should return the
+      // top-level field consumed by build-complete and runtime configuration. The 16.2 equivalent,
+      // `experimental.immutableAssetToken`, SUPPLIES a `?dpl=` token — the inverse intent — so do
+      // not backport to it:
       //   * on 16.3 this is correct (content-addressed assets, `?dpl=` suppressed);
       //   * on 16.2 Next ignores the unknown key without warning and emits no
       //     `/_next/static/immutable/` directory — harmless, because with no `deploymentId`
@@ -1434,18 +1152,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // Turbopack's content-derived chunk naming (measured: a one-line client-component change moved
       // `07-7zvnown312.js` → `3v9mo0_pueesb.js`), which is also why no `?dpl=` token is needed.
       // See docs/superpowers/specs/2026-07-26-phase7-skew-protection.md (version-support policy).
-      {
-        const userImmutable = (
-          nextConfig.experimental as { supportsImmutableAssets?: boolean } | undefined
-        )?.supportsImmutableAssets;
-        // ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS=1 forces it off — used to A/B whether the immutable
-        // asset split regresses client bootstrap (asset URLs move under /_next/static/immutable/).
-        const disabled = process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS === "1";
-        modified.experimental = {
-          ...(modified.experimental as Record<string, unknown> | undefined),
-          supportsImmutableAssets: disabled ? false : (userImmutable ?? true),
-        };
-      }
+      // ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS=1 forces it off — used to A/B whether the immutable
+      // asset split regresses client bootstrap (asset URLs move under /_next/static/immutable/).
+      const immutableAssetsDisabled = process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS === "1";
+      modified.supportsImmutableAssets = immutableAssetsDisabled
+        ? false
+        : (nextConfig.supportsImmutableAssets ?? true);
 
       // Turbopack's production filesystem cache is still opt-in in Next 16. The adapter runs
       // after Next has loaded next.config but before compilation, so this is the only adapter
@@ -1473,7 +1185,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         )?.turbopackFileSystemCacheForBuild;
         const disabled = process.env.ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE === "1";
         modified.experimental = {
-          ...(modified.experimental as Record<string, unknown> | undefined),
+          ...modified.experimental,
           turbopackFileSystemCacheForBuild: disabled ? false : (userBuildCache ?? true),
         };
       }
@@ -1483,7 +1195,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       const buildCpus = parseInt(process.env.ADAPTER_K8S_BUILD_CPUS ?? "", 10);
       if (buildCpus > 0) {
         modified.experimental = {
-          ...(modified.experimental as Record<string, unknown> | undefined),
+          ...modified.experimental,
           cpus: buildCpus,
           memoryBasedWorkersCount: false,
           parallelServerCompiles: false,
@@ -1503,8 +1215,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // (a CDN domain, a tunnel) without a config edit.
       {
         const allowedOrigins = new Set<string>(
-          ((nextConfig.experimental as ExperimentalWithServerActions | undefined)?.serverActions
-            ?.allowedOrigins ?? []) as string[],
+          nextConfig.experimental?.serverActions?.allowedOrigins ?? [],
         );
         // Server Actions compare Origin vs Host, and every provider serves the app on its
         // gateway hosts — so this is provider-independent, not a GKE detail.
@@ -1514,9 +1225,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
         const envHost = normalizeDeploymentHost(process.env.ADAPTER_K8S_DEPLOYMENT_HOST);
         if (envHost) allowedOrigins.add(envHost);
-        const existingServerActions = ((
-          nextConfig.experimental as ExperimentalWithServerActions | undefined
-        )?.serverActions ?? {}) as Record<string, unknown>;
+        const existingServerActions = nextConfig.experimental?.serverActions ?? {};
         // Deliberately NOT experimental.trustHostHeader, though the aws reference adapter sets
         // it: it is baked into the build via define-env.ts, so its blast radius is the whole
         // compiled output. The res.revalidate() invariant it exists for is already satisfied
@@ -1524,7 +1233,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // 3,342/0 without it (2026-07-28). Absent a measured need, a build-wide define stays
         // out; if it is ever reconsidered, land it alone and re-run the full suite.
         modified.experimental = {
-          ...(modified.experimental as Record<string, unknown> | undefined),
+          ...modified.experimental,
           ...(allowedOrigins.size > 0
             ? {
                 serverActions: {
@@ -1553,9 +1262,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         // are mutually exclusive (a custom handler owns the incremental cache, so the adapter's
         // shared store can't also own it). Warn and keep theirs; the V2 `use cache` handler still
         // registers at runtime, but cross-replica ISR/PPR-shell sharing needs the adapter's handler.
-        const existingHandler =
-          (modified as { cacheHandler?: unknown }).cacheHandler ??
-          (nextConfig as { cacheHandler?: unknown }).cacheHandler;
+        const existingHandler = modified.cacheHandler ?? nextConfig.cacheHandler;
         if (existingHandler) {
           console.warn(
             "[adapter-k8s] cache.enabled but next.config already sets `cacheHandler` — keeping " +
@@ -1568,7 +1275,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // no log line while build-metadata still advertised the cache. adapterBundlePath
           // throws with the path and the fix.
           const src = adapterBundlePath("cache-handler.cjs");
-          const destDir = path.join(process.cwd(), ".k8s-adapter");
+          const destDir = path.join(projectDir, ".k8s-adapter");
           await mkdir(destDir, { recursive: true });
           const dest = path.join(destDir, "cache-handler.cjs");
           await copyFile(src, dest, constants.COPYFILE_FICLONE);
@@ -1593,6 +1300,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         }
       }
 
+      // SAFETY: Next's normalized config type marks `output` required even though the runtime
+      // contract treats an absent value as the default server output. Clearing `standalone` is
+      // intentional because the adapter owns packaging; every other field retains its input type.
       return modified as typeof nextConfig;
     },
 
@@ -1634,9 +1344,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // silently ships without the build output, and — worse — the external-resolution path
       // does a recursive `rm(dest)` before copying, so the recursive delete lands outside the
       // tree too. Reject at the source, where the message can name the config that caused it.
-      if (distDirRel.startsWith("..") || path.isAbsolute(distDirRel)) {
+      if (distDirRel === "" || distDirRel.startsWith("..") || path.isAbsolute(distDirRel)) {
         throw new Error(
-          `[adapter-k8s] next.config \`distDir\` must resolve INSIDE the project directory. ` +
+          `[adapter-k8s] next.config \`distDir\` must resolve to a child directory INSIDE the ` +
+            `project directory. A project-root distDir would recursively copy the project into ` +
+            `its own .k8s-adapter output. ` +
             `Got ${JSON.stringify(distDir)}, which is ${JSON.stringify(distDirRel)} relative to ` +
             `${projectDir}. Staging paths are built from that relative form, so an external ` +
             `distDir would place (and recursively delete) files outside the Docker build ` +
