@@ -10,6 +10,7 @@ import type {
 } from "../composition-plan/types.js";
 import { parseCompositionPlan } from "../composition-plan/parse.js";
 import { MINIMUM_KUBERNETES_VERSION } from "../composition-plan/types.js";
+import { assertGcpTrafficExtensionTopology } from "../composition-plan/routing-invariants.js";
 import {
   ADAPTER_RELEASE_LABEL,
   assertSafeAnnotationName,
@@ -189,21 +190,6 @@ function validateRoutingContract(
     throw new Error(
       `Routing component "${componentName}" must use tls transport for gcp-traffic-extension-v1 registration`,
     );
-  }
-  if (registration?.kind === "gcp-traffic-extension-v1") {
-    const matchingReadiness = routing.plan.dataplane.readiness.some(
-      (entry) =>
-        entry.kind === "gcp-traffic-extension" &&
-        entry.projectId === registration.projectId &&
-        entry.extensionName === registration.extensionName &&
-        entry.addressName === registration.addressName,
-    );
-    if (!matchingReadiness) {
-      throw new Error(
-        `Routing component "${componentName}" must declare matching readiness for its ` +
-          `gcp-traffic-extension-v1 registration`,
-      );
-    }
   }
 }
 
@@ -493,6 +479,12 @@ export function compileTarget(
     );
   }
   validateRoutingContract(target.routing.name, context, routing, routingOrigin.service);
+  assertGcpTrafficExtensionTopology({
+    identity: cluster.identity,
+    routing: routing.plan,
+    objects: exposure.objects ?? [],
+    subject: `Routing component "${target.routing.name}"`,
+  });
 
   const contributions = [
     contributionOf(

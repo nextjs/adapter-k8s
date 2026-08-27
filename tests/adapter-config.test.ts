@@ -5,7 +5,13 @@ import path from "node:path";
 import { createK8sAdapter } from "../src/adapter.js";
 import { mockOutputs, mockAppPage, mockRouting } from "./helpers/mock-outputs.js";
 import type { K8sAdapterConfig } from "../src/types.js";
-import { defineTarget, gkeCluster, manualExposure } from "../src/target/index.js";
+import {
+  defineTarget,
+  gatewayApiExposure,
+  gkeCluster,
+  gkeNativeRouting,
+  manualExposure,
+} from "../src/target/index.js";
 
 const validConfig: K8sAdapterConfig = {
   pools: { ssr: { routes: ["appPages"] } },
@@ -582,6 +588,45 @@ describe("onBuildComplete build-time guards", () => {
     expect(
       readFileSync(path.join(projectDir, ".k8s-adapter/output/extension-chains.json"), "utf-8"),
     ).toContain("-routing-service.prod.svc.cluster.local");
+  });
+
+  it("uses the composed routing operation's project and resource names in emitted artifacts", async () => {
+    writeInfra({
+      namespace: "prod",
+      containerRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+    });
+    const adapter = createK8sAdapter({
+      pools: { ssr: { routes: ["appPages"] } },
+      target: defineTarget({
+        cluster: gkeCluster({ projectId: "cluster-project", region: "us-central1" }),
+        exposure: gatewayApiExposure({
+          className: "gke-l7-global-external-managed",
+          hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+          addresses: [{ type: "NamedAddress", value: "custom-frontend-ip" }],
+        }),
+        routing: gkeNativeRouting({
+          projectId: "cluster-project",
+          extensionName: "custom-traffic-ext",
+          addressName: "custom-frontend-ip",
+        }),
+      }),
+    });
+    await adapter.modifyConfig!({} as any, {} as any);
+    await expect(adapter.onBuildComplete!(ctx("b12345"))).resolves.toBeUndefined();
+
+    const output = path.join(projectDir, ".k8s-adapter/output");
+    expect(readFileSync(path.join(output, "extension-chains.json"), "utf8")).toContain(
+      "projects/cluster-project/global/backendServices",
+    );
+    expect(
+      readFileSync(path.join(output, "chart/templates/route-ext-config.yaml"), "utf8"),
+    ).toContain('name: "custom-traffic-ext"');
+    const job = readFileSync(
+      path.join(output, "chart/templates/route-ext-update-job.yaml"),
+      "utf8",
+    );
+    expect(job).toContain("gcloud compute addresses describe custom-frontend-ip");
+    expect(job).toContain("--project=cluster-project");
   });
 
   it('accepts an explicit namespace of "default" (and none at all)', async () => {

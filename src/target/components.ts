@@ -8,6 +8,7 @@ import type {
 } from "../composition-plan/types.js";
 import {
   assertSafeHostname,
+  assertSafeGcpResourceName,
   assertSafeNamespace,
   assertSafeProjectId,
   assertSafeRegion,
@@ -1244,6 +1245,8 @@ export function gkeNativeRouting(
       assertSafeProjectId(projectId);
       const extensionName = options.extensionName ?? `${context.releaseName}-traffic-ext`;
       const addressName = options.addressName ?? `${context.releaseName}-ip`;
+      assertSafeGcpResourceName(extensionName, "traffic extension name");
+      assertSafeGcpResourceName(addressName, "global address name");
       const readiness: RoutingReadiness[] = [
         {
           kind: "gcp-traffic-extension",

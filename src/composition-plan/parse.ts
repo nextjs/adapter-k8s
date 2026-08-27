@@ -2,6 +2,7 @@ import {
   assertSafeBucketName,
   assertSafeBuildId,
   assertSafeCidr,
+  assertSafeGcpResourceName,
   assertSafeImageRegistry,
   assertSafeNamespace,
   assertSafePoolName,
@@ -10,6 +11,7 @@ import {
   assertSafeReleaseName,
   assertSafeServiceName,
 } from "../emit/templates/utils.js";
+import { assertGcpTrafficExtensionTopology } from "./routing-invariants.js";
 import {
   COMPOSITION_PLAN_API_VERSION,
   COMPOSITION_PLAN_KIND,
@@ -393,7 +395,9 @@ function parseCdn(value: unknown, path: string): CdnInvalidation {
       return {
         kind,
         projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
         invalidation: literal(
           parsed.invalidation,
           "recorded-cache-tag-or-full-path",
@@ -508,8 +512,12 @@ function parseRoutingReadiness(value: unknown, path: string): RoutingReadiness {
       return {
         kind,
         projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
-        extensionName: safeText(parsed.extensionName, `${path}.extensionName`, 63),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        extensionName: validated(parsed.extensionName, `${path}.extensionName`, (name) =>
+          assertSafeGcpResourceName(name, "traffic extension name"),
+        ),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
         requireEveryForwardingRule: literal(
           parsed.requireEveryForwardingRule,
           true,
@@ -533,8 +541,12 @@ function parseRoutingRegistration(value: unknown, path: string): RoutingRegistra
       return {
         kind,
         projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
-        extensionName: safeText(parsed.extensionName, `${path}.extensionName`, 63),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        extensionName: validated(parsed.extensionName, `${path}.extensionName`, (name) =>
+          assertSafeGcpResourceName(name, "traffic extension name"),
+        ),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
       };
     default:
       fail(`${path}.kind`, `unknown routing registration operation ${JSON.stringify(kind)}`);
@@ -726,7 +738,13 @@ function parseExternalCleanup(value: unknown, path: string): ExternalCleanupOper
       };
     case "gcp-global-address":
       exactKeys(parsed, ["kind", "projectId", "name"], path);
-      return { kind, projectId: projectId(), name: safeText(parsed.name, `${path}.name`, 63) };
+      return {
+        kind,
+        projectId: projectId(),
+        name: validated(parsed.name, `${path}.name`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
+      };
     case "gcp-custom-iam-role":
       exactKeys(parsed, ["kind", "projectId", "roleId"], path);
       return {
@@ -815,7 +833,13 @@ function parseDiagnostic(value: unknown, path: string): DiagnosticSource {
       return { kind, projectId: projectId() };
     case "gcp-global-address":
       exactKeys(parsed, ["kind", "projectId", "name"], path);
-      return { kind, projectId: projectId(), name: safeText(parsed.name, `${path}.name`, 63) };
+      return {
+        kind,
+        projectId: projectId(),
+        name: validated(parsed.name, `${path}.name`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
+      };
     case "gcp-storage-bucket":
       exactKeys(parsed, ["kind", "projectId", "bucket"], path);
       return {
@@ -847,8 +871,12 @@ function parseDiagnostic(value: unknown, path: string): DiagnosticSource {
       return {
         kind,
         projectId: projectId(),
-        extensionName: safeText(parsed.extensionName, `${path}.extensionName`, 63),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        extensionName: validated(parsed.extensionName, `${path}.extensionName`, (name) =>
+          assertSafeGcpResourceName(name, "traffic extension name"),
+        ),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
       };
     case "gcp-backend-service-shape":
       exactKeys(
@@ -1428,6 +1456,13 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
       );
     }
   }
+
+  assertGcpTrafficExtensionTopology({
+    identity: plan.target.identity,
+    routing: plan.operations.routing,
+    objects: plan.operations.resources.objects,
+    subject: "$.operations.routing",
+  });
 
   return plan;
 }

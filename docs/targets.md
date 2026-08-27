@@ -248,6 +248,12 @@ npx adapter-k8s init --project-id my-project --host app.example.com
 
 The GKE target composes `gkeCluster()` + `gatewayApiExposure` (controller-managed TLS via Certificate Manager) + `gkeNativeRouting()`, which hosts the ext_proc callout on the Google load balancer as a traffic extension:
 
+When composing this target by hand, give `gatewayApiExposure` exactly one
+`{ type: "NamedAddress", value: addressName }` entry matching `gkeNativeRouting({ addressName })`.
+The routing project must match the `gkeCluster` project because the GKE controller owns the
+Gateway forwarding rules and standalone NEG there. `init` emits this matching topology
+automatically; cross-project traffic-extension registration is not supported today.
+
 ```
                  GCP Global External Application Load Balancer
 +---------------------------------------------------------------------+
