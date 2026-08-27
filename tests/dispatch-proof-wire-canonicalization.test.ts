@@ -295,6 +295,37 @@ describe("A0-DP-2 — the two tiers canonicalize the same wire octets (edge → 
   });
 });
 
+describe("A0-DP-3 — repeated covered headers coalesce the way Node really does", () => {
+  it("verifies when a client sends a covered SINGLETON header twice", async () => {
+    // Envoy forwards both field lines upstream; Node's parser keeps only the FIRST and discards
+    // the rest. The `", "` join therefore made the edge sign "first/1.0, second/2.0" against the
+    // pool's "first/1.0" — no verification, for any build whose matcher gates on such a name.
+    const result = await edgeToPool({
+      target: "/about",
+      matchers: [{ regexp: "^/.*$", has: [{ type: "header", key: "user-agent" }] }],
+      wireHeaders: [
+        ["user-agent", "first/1.0"],
+        ["user-agent", "second/2.0"],
+      ],
+    });
+    expect(result.trusted).toBe(true);
+    expect(result.mwEvaluated).toBeDefined();
+  });
+
+  it("verifies when a client sends a covered JOINED header twice", async () => {
+    // The other half of the rule, unchanged: `cookie` really is joined, with "; ".
+    const result = await edgeToPool({
+      target: "/about",
+      matchers: COOKIE_MATCHER,
+      wireHeaders: [
+        ["cookie", "a=1"],
+        ["cookie", "session=b"],
+      ],
+    });
+    expect(result.trusted).toBe(true);
+  });
+});
+
 describe("A0-DP-2 — the cross-pool hop is self-consistent (pool → pool)", () => {
   /**
    * The hop `proxyToPool` / the WS tunnel make: a pool signs over the outbound header record it is

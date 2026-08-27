@@ -341,10 +341,60 @@ export function proofCoveredHeaderNames(buildHeaderNames?: readonly string[]): s
 }
 
 /**
+ * A0-DP-3. Header names Node's HTTP parser treats as SINGLETONS: a repeated field is not joined,
+ * the FIRST value is kept and every later one is discarded.
+ *
+ * SOURCE OF TRUTH: Node's `lib/_http_incoming.js` — `matchKnownFields()` returns a `*` flag for
+ * these names and `_addHeaderLine` then does `if (dest[field] === undefined) dest[field] = value`.
+ * MEASURED against the Node in this environment (v24) through a real socket, two field lines per
+ * name: every name below yielded `"A"` (`host` included — a repeated `Host` is not rejected, the
+ * second line is simply dropped), while `cookie` yielded `"A; B"` and everything else (including
+ * `x-custom`, `accept*`, `if-none-match`, `via`, `x-forwarded-*`) yielded `"A, B"`.
+ * `content-length` is on Node's list and kept here for fidelity to it, though llhttp normally
+ * rejects a conflicting duplicate before a handler sees the request at all.
+ *
+ * WHY THE PROOF CARES: this function's first cut joined every non-cookie name with `", "` on the
+ * claim that "one rule serves both sides". It does not — `matcherProofHeaderNames` admits
+ * ANY non-excluded header name, so a build whose middleware `matcher` gates on (say)
+ * `user-agent` or `authorization` plus a client that sends the field twice made the edge sign
+ * `"A, B"` (Envoy keeps both entries) while the pool read `"A"`: proof mismatch, dispatch headers
+ * stripped, middleware re-run for every such request. Mirroring Node here is what makes the edge
+ * sign the value the pool will actually materialize.
+ *
+ * `set-cookie` is deliberately NOT here: Node keeps it as an ARRAY (measured: `["a=1","b=2"]`)
+ * and never joins it, so there is no single "value the next hop sees" to mirror. The `", "` join
+ * below is then only a canonical form — both tiers reach it from the same list, which is all the
+ * proof needs — and a request-side `Set-Cookie` is not a routing input in any case.
+ */
+export const NODE_SINGLETON_REQUEST_HEADERS: ReadonlySet<string> = new Set<string>([
+  "age",
+  "authorization",
+  "content-length",
+  "content-type",
+  "etag",
+  "expires",
+  "from",
+  "host",
+  "if-modified-since",
+  "if-unmodified-since",
+  "last-modified",
+  "location",
+  "max-forwards",
+  "proxy-authorization",
+  "referer",
+  "retry-after",
+  "server",
+  "user-agent",
+]);
+
+/**
  * Coalesce a repeated header into the single value the NEXT hop will see, at the BYTE level, so
- * the two tiers canonicalize duplicates identically. Node's HTTP parser joins repeated `Cookie`
- * fields with `"; "` and everything else with `", "`, and Envoy joins with the same delimiters
- * when it writes an HTTP/1.1 upstream request. An empty list is ABSENT.
+ * the two tiers canonicalize duplicates identically. Three rules, all of them Node's (see
+ * NODE_SINGLETON_REQUEST_HEADERS for the measurement): a singleton name keeps its FIRST value,
+ * `Cookie` joins with `"; "`, everything else joins with `", "`. Envoy joins with the same two
+ * delimiters when it writes an HTTP/1.1 upstream request, and it forwards a singleton's repeated
+ * entries unchanged — which is why the first-value rule has to be applied by the SIGNER.
+ * An empty list is ABSENT.
  *
  * Bytes, not strings (A0-DP-2): the two tiers decode the same wire octets into DIFFERENT JS
  * strings (Envoy's ext_proc `raw_value` is UTF-8, Node's parser is latin1), so the join has to
@@ -358,6 +408,7 @@ export function coalesceWireHeaderBytes(
   const first = values[0]!;
   if (values.length === 1) return first;
   const lower = name.toLowerCase();
+  if (NODE_SINGLETON_REQUEST_HEADERS.has(lower)) return first;
   const separator = Buffer.from(lower === "cookie" ? "; " : ", ", "latin1");
   const joined: Buffer[] = [];
   for (const value of values) {
