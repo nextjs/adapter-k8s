@@ -14,6 +14,8 @@ import { describe, it, expect, afterEach } from "vitest";
 import net from "node:net";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createPoolServer } from "../../src/pool-server/server.js";
+import { INTERNAL_DISPATCH_PROOF_HEADER } from "../../src/routing-common.js";
+import { signDispatch } from "../helpers/dispatch-proof.js";
 
 let pool: ReturnType<typeof createPoolServer> | null = null;
 afterEach(async () => {
@@ -56,7 +58,7 @@ describe("createPoolServer().stop()", () => {
     pool = null;
   });
 
-  it("applies the same secret-gated request boundary to upgrade traffic", async () => {
+  it("applies the same proof-gated request boundary to upgrade traffic", async () => {
     const seen: Array<Record<string, string | string[] | undefined>> = [];
     pool = createPoolServer({
       onRequest: () => undefined,
@@ -70,14 +72,14 @@ describe("createPoolServer().stop()", () => {
     });
     const { port } = await pool.start();
 
-    const send = (secret: string) =>
+    const send = (proof: string) =>
       new Promise<void>((resolve, reject) => {
         const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
           socket.write(
             "GET /socket HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n" +
               "Upgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
               "Sec-WebSocket-Version: 13\r\nX-Output-Id: /admin\r\n" +
-              `X-Internal-Secret: ${secret}\r\n\r\n`,
+              `X-Internal-Dispatch-Proof: ${proof}\r\n\r\n`,
           );
         });
         socket.on("data", () => undefined);
@@ -85,12 +87,19 @@ describe("createPoolServer().stop()", () => {
         socket.once("error", reject);
       });
 
-    await send("wrong-secret");
-    await send("correct-secret");
+    const signed = signDispatch(
+      "correct-secret",
+      "GET",
+      "/socket",
+      { "x-output-id": "/admin" },
+      { authority: "localhost" },
+    );
+    await send("invalid-proof");
+    await send(signed[INTERNAL_DISPATCH_PROOF_HEADER]!);
     expect(seen[0]?.["x-output-id"]).toBeUndefined();
     expect(seen[1]?.["x-output-id"]).toBe("/admin");
-    expect(seen[0]?.["x-internal-secret"]).toBeUndefined();
-    expect(seen[1]?.["x-internal-secret"]).toBeUndefined();
+    expect(seen[0]?.[INTERNAL_DISPATCH_PROOF_HEADER]).toBeUndefined();
+    expect(seen[1]?.[INTERNAL_DISPATCH_PROOF_HEADER]).toBeUndefined();
   });
 
   it("settles with an idle keep-alive connection open (close() alone would not)", async () => {

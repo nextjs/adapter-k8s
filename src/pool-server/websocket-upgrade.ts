@@ -13,7 +13,10 @@ import {
 } from "node:http";
 import type { Duplex } from "node:stream";
 import {
+  computeDispatchProof,
+  dispatchProofInputsFromRequest,
   INTERNAL_DISPATCH_HEADERS,
+  INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_EXECUTION_DEADLINE_HEADER,
   INTERNAL_SECRET_HEADER,
   MW_EVALUATED_TRUSTED,
@@ -43,6 +46,8 @@ export interface WebSocketUpgradeDispatcher {
   releaseName: string;
   buildId: string;
   internalSecret?: string | undefined;
+  /** Build-derived matcher and RSC headers covered by the cross-pool dispatch proof. */
+  proofHeaderNames?: readonly string[] | undefined;
   /** Stable server-owned scope required by Next's generated connection registry. */
   webSocketRegistryScope: object;
   /** Exact cross-origin values accepted by experimental.webSocketRouteHandlers. */
@@ -112,6 +117,7 @@ function isPrivateResponseHeader(name: string): boolean {
   return (
     lower === "x-next-cache-tags" ||
     lower === INTERNAL_SECRET_HEADER ||
+    lower === INTERNAL_DISPATCH_PROOF_HEADER ||
     (INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(lower) ||
     lower.startsWith("x-middleware-")
   );
@@ -286,6 +292,7 @@ function validateWebSocketOrigin(
 function removePrivateRawRequestHeaders(req: IncomingMessage): void {
   const privateNames = new Set<string>([
     INTERNAL_SECRET_HEADER,
+    INTERNAL_DISPATCH_PROOF_HEADER,
     ...INTERNAL_DISPATCH_HEADERS,
     ...UNTRUSTED_NEXT_REQUEST_HEADERS,
   ]);
@@ -422,7 +429,7 @@ function generatedUpgradeDisposition(outcome: unknown): UpgradeDisposition {
   return upgraded ? "accepted" : "rejected";
 }
 
-/** Read the secret-gated phase-two routing verdict, then erase the transport vocabulary. */
+/** Read the proof-gated phase-two routing verdict, then erase the transport vocabulary. */
 function trustedResolutionFromHeaders(req: IncomingMessage): ResolveResult | undefined {
   const discardDispatch = () => {
     for (const header of INTERNAL_DISPATCH_HEADERS) delete req.headers[header];
@@ -706,6 +713,7 @@ function forwardedUpgradeHeaders(
     const lower = name.toLowerCase();
     if (
       lower === INTERNAL_SECRET_HEADER ||
+      lower === INTERNAL_DISPATCH_PROOF_HEADER ||
       (INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(lower) ||
       HOP_BY_HOP_REQUEST_HEADERS.has(lower) ||
       nominated.has(lower)
@@ -734,7 +742,17 @@ function forwardedUpgradeHeaders(
     headers["x-invoke-query"] = JSON.stringify(resolution.invocationQuery);
   }
   headers[INTERNAL_EXECUTION_DEADLINE_HEADER] = String(executionDeadlineAt);
-  if (deps.internalSecret) headers[INTERNAL_SECRET_HEADER] = deps.internalSecret;
+  if (deps.internalSecret) {
+    headers[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
+      deps.internalSecret,
+      dispatchProofInputsFromRequest({
+        method: req.method,
+        target: req.url,
+        headers,
+        proofHeaderNames: deps.proofHeaderNames,
+      }),
+    );
+  }
   return headers;
 }
 

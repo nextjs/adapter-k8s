@@ -3786,6 +3786,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           releaseName,
           buildId,
           internalSecret,
+          proofHeaderNames,
           webSocketRegistryScope,
           webSocketAllowedOrigins,
           parseWebSocketExtensions,

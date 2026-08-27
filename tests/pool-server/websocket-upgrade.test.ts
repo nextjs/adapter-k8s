@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { Duplex, PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { handleWebSocketUpgrade } from "../../src/pool-server/websocket-upgrade.js";
+import { INTERNAL_DISPATCH_PROOF_HEADER, verifyDispatchProof } from "../../src/routing-common.js";
 
 function captureSocket() {
   const socket = new PassThrough();
@@ -357,10 +358,11 @@ describe("handleWebSocketUpgrade", () => {
     const upgradeHandler = vi.fn(async (_context, { node }) => {
       expect(node.req.headers["x-middleware-set-cookie"]).toBe("proxy-cookie=present; Path=/");
       expect(node.req.headers["x-nextjs-data"]).toBeUndefined();
+      expect(node.req.headers[INTERNAL_DISPATCH_PROOF_HEADER]).toBeUndefined();
       expect((node.req as any)[Symbol.for("next.websocket.upgrade-headers-filtered")]).toBe(true);
-      expect(node.req.rawHeaders.map((value: string) => value.toLowerCase())).not.toContain(
-        "x-middleware-set-cookie",
-      );
+      const rawNames = node.req.rawHeaders.map((value: string) => value.toLowerCase());
+      expect(rawNames).not.toContain("x-middleware-set-cookie");
+      expect(rawNames).not.toContain(INTERNAL_DISPATCH_PROOF_HEADER);
       return { upgraded: true, statusCode: 101 };
     });
     const { deps } = dependencies({
@@ -370,11 +372,13 @@ describe("handleWebSocketUpgrade", () => {
     const req = request(undefined, {
       "x-middleware-set-cookie": "forged=attacker; Path=/",
       "x-nextjs-data": "forged",
+      [INTERNAL_DISPATCH_PROOF_HEADER]: "forged",
     });
     // createPoolServer's shared trust boundary performs this normalized-header deletion before
     // handing the request to handleWebSocketUpgrade; keep the direct unit invocation faithful.
     delete req.headers["x-middleware-set-cookie"];
     delete req.headers["x-nextjs-data"];
+    delete req.headers[INTERNAL_DISPATCH_PROOF_HEADER];
     const { socket } = captureSocket();
 
     await expect(handleWebSocketUpgrade(deps, req, socket, Buffer.alloc(0))).resolves.toBe(
@@ -528,7 +532,20 @@ describe("handleWebSocketUpgrade", () => {
       );
       expect(siblingHeaders?.["x-output-id"]).toBe("/rooms/[room]");
       expect(siblingHeaders?.["x-mw-evaluated"]).toBe("ran");
-      expect(siblingHeaders?.["x-internal-secret"]).toBe("internal-secret");
+      expect(siblingHeaders?.["x-internal-secret"]).toBeUndefined();
+      const proof = siblingHeaders?.[INTERNAL_DISPATCH_PROOF_HEADER];
+      expect(typeof proof).toBe("string");
+      expect(
+        verifyDispatchProof(
+          "internal-secret",
+          {
+            method: clientRequest.method,
+            target: clientRequest.url,
+            headers: siblingHeaders ?? {},
+          },
+          proof as string,
+        ),
+      ).toBe(true);
       expect(siblingHeaders?.["x-authenticated-user"]).toBeUndefined();
       expect(siblingHeaders?.["x-mw-request-headers"]).toBe(
         JSON.stringify(Object.fromEntries(middlewareHeaders.entries())),
