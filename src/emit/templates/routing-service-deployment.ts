@@ -18,6 +18,8 @@ import {
   PRESTOP_DRAIN_SECONDS,
   READINESS_PROBE_FAILURE_THRESHOLD,
   READINESS_PROBE_PERIOD_SECONDS,
+  STARTUP_PROBE_FAILURE_THRESHOLD,
+  STARTUP_PROBE_PERIOD_SECONDS,
   TERMINATION_GRACE_SECONDS,
 } from "./deployment.js";
 import { renderInternalSecretEnv } from "./internal-secret.js";
@@ -80,9 +82,8 @@ export function renderRoutingServiceDeployment({
   /**
    * S26. ext_proc listener transport. GKE's callout arrives from Google's frontend over TLS;
    * an in-cluster Envoy Gateway dials plain h2c unless a BackendTLSPolicy says otherwise.
-   * Stated explicitly because the image BAKES TLS_CERT_FILE/TLS_KEY_FILE, so a Deployment can
-   * override those values but never unset them — and a mismatch is invisible: the health
-   * server stays green on :8081 while every callout fails.
+   * Stated explicitly because a mismatch is invisible: the health server stays green on :8081
+   * while every callout fails. TLS file paths are configured only for TLS transport.
    */
   transport?: "tls" | "h2c";
   /** GCP callout-failure policy mirrored to the server: false = fail-closed (500). */
@@ -159,6 +160,10 @@ export function renderRoutingServiceDeployment({
   const providerNameEnv = providerName
     ? `\n            - name: ADAPTER_K8S_PROVIDER_NAME\n              value: ${JSON.stringify(providerName)}`
     : "";
+  const tlsIdentityEnv =
+    transport === "tls"
+      ? `\n            - name: TLS_CERT_FILE\n              value: /tmp/tls/tls-cert.pem\n            - name: TLS_KEY_FILE\n              value: /tmp/tls/tls-key.pem`
+      : "";
   // Registry pull auth (config imagePullSecrets) — "" when unconfigured (byte-identical
   // charts for public registries). Same baked pattern as renderDeployment.
   const pullSecretsBlock = renderImagePullSecrets(pullSecrets, "      ");
@@ -260,7 +265,7 @@ ${pullSecretsBlock}      nodeSelector:
             - name: HEALTH_PORT
               value: "8081"
             - name: ROUTING_TRANSPORT
-              value: "${transport}"
+              value: "${transport}"${tlsIdentityEnv}
             - name: ROUTING_FAIL_OPEN
               value: "${failOpen === false ? "false" : "true"}"
             - name: ROUTING_REQUEST_TIMEOUT_MS
@@ -287,6 +292,13 @@ ${internalSecretEnv}${deploymentIdEnv}${providerNameEnv}${userEnv}${userEnvFrom}
           # httpGet, not a socket check: a wedged event loop still accepts a TCP
           # connection but fails to *serve* /healthz, so a broken-but-listening pod
           # gets evicted from the NEG instead of silently failing callouts.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            periodSeconds: ${STARTUP_PROBE_PERIOD_SECONDS}
+            timeoutSeconds: 3
+            failureThreshold: ${STARTUP_PROBE_FAILURE_THRESHOLD}
           readinessProbe:
             httpGet:
               path: /healthz

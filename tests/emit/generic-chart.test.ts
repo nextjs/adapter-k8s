@@ -269,12 +269,14 @@ describe("generic provider — callout policy matches the server's", () => {
   });
 
   it("declares h2c transport on the routing Deployment", () => {
-    // The image bakes TLS_CERT_FILE/TLS_KEY_FILE, so without an explicit transport the service
-    // self-signs and serves h2 TLS while Envoy Gateway dials h2c — health stays green on :8081
-    // while every callout fails.
+    // Envoy Gateway dials h2c, so the generic Deployment must state that transport and omit the
+    // TLS identity paths that make the GKE routing tier self-sign.
     expect(genericChart()["templates/routing-service-deployment.yaml"]).toContain(
       "name: ROUTING_TRANSPORT",
     );
     expect(genericChart()["templates/routing-service-deployment.yaml"]).toContain('value: "h2c"');
+    expect(genericChart()["templates/routing-service-deployment.yaml"]).not.toContain(
+      "TLS_KEY_FILE",
+    );
   });
 });

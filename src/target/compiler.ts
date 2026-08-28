@@ -14,6 +14,7 @@ import { assertGcpTrafficExtensionTopology } from "../composition-plan/routing-i
 import {
   ADAPTER_RELEASE_LABEL,
   assertSafeAnnotationName,
+  assertSafeKubernetesObjectName,
   assertSafeNamespace,
   assertSafeServiceName,
 } from "../emit/templates/utils.js";
@@ -25,6 +26,17 @@ import type {
   TargetBuildContext,
 } from "./types.js";
 import { targetFingerprint, validateTargetContext } from "./components.js";
+import { normalizeIngressSources } from "./ingress-sources.js";
+
+function assertSafeLabelValue(value: unknown, field: string): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.length > 63 ||
+    (value.length > 0 && !/^[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$/.test(value))
+  ) {
+    throw new Error(`Invalid ${field}: expected a Kubernetes label value`);
+  }
+}
 
 function validateRoutingOrigin(
   componentName: string,
@@ -452,6 +464,48 @@ export function compileTarget(
   if (!Array.isArray(exposure.capabilities)) {
     throw new Error(`Target component "${target.exposure.name}" must return capabilities`);
   }
+  const ingressSources = normalizeIngressSources(exposure.ingressSources);
+  const exposesTraffic = exposure.capabilities.some(
+    (capability) => capability.kind === "gateway-api" || capability.kind === "ingress",
+  );
+  if (
+    exposesTraffic &&
+    ingressSources.cidrs.length === 0 &&
+    ingressSources.podSelectors.length === 0
+  ) {
+    throw new Error(
+      `Target component "${target.exposure.name}" exposes external traffic but returned empty ` +
+        `ingressSources`,
+    );
+  }
+  const backendHealthCapabilities = exposure.capabilities.filter(
+    (capability): capability is Extract<typeof capability, { kind: "backend-health" }> =>
+      capability.kind === "backend-health",
+  );
+  if (backendHealthCapabilities.length > 1) {
+    throw new Error(
+      `Target component "${target.exposure.name}" returned more than one backend-health capability`,
+    );
+  }
+  const backendHealthCapability = backendHealthCapabilities[0];
+  if (backendHealthCapability) {
+    if (backendHealthCapability.policy.kind !== "gke-health-check-policy") {
+      throw new Error(
+        `Target component "${target.exposure.name}" returned an unsupported backend-health policy`,
+      );
+    }
+    const service = backendHealthCapability.service;
+    if (
+      service.name !== routingOrigin.service.name ||
+      service.namespace !== routingOrigin.service.namespace ||
+      service.port !== routingOrigin.service.port
+    ) {
+      throw new Error(
+        `Target component "${target.exposure.name}" backend-health capability must target the ` +
+          `routing origin Service`,
+      );
+    }
+  }
   const routing = target.routing.build({
     ...context,
     exposureCapabilities: exposure.capabilities,
@@ -516,6 +570,26 @@ export function compileTarget(
   const objects = contributions
     .flatMap((entry) => entry.objects)
     .map((manifest) => {
+      if (manifest.apiVersion === "v1" && manifest.kind === "Service") {
+        assertSafeServiceName(manifest.metadata.name);
+      } else if (manifest.apiVersion === "v1" && manifest.kind === "Namespace") {
+        assertSafeNamespace(manifest.metadata.name);
+      } else {
+        assertSafeKubernetesObjectName(manifest.metadata.name);
+      }
+      if (manifest.metadata.namespace !== undefined) {
+        assertSafeNamespace(manifest.metadata.namespace);
+      }
+      for (const [name, value] of Object.entries(manifest.metadata.labels ?? {})) {
+        assertSafeAnnotationName(name);
+        assertSafeLabelValue(value, `label ${JSON.stringify(name)}`);
+      }
+      for (const [name, value] of Object.entries(manifest.metadata.annotations ?? {})) {
+        assertSafeAnnotationName(name);
+        if (typeof value !== "string") {
+          throw new Error(`Invalid annotation ${JSON.stringify(name)}: expected a string value`);
+        }
+      }
       const configuredRelease = manifest.metadata.labels?.[ADAPTER_RELEASE_LABEL];
       if (configuredRelease !== undefined && configuredRelease !== context.releaseName) {
         throw new Error(
@@ -591,6 +665,15 @@ export function compileTarget(
     { apiVersion: "autoscaling/v2", resource: "horizontalpodautoscalers", optional: false },
     { apiVersion: "policy/v1", resource: "poddisruptionbudgets", optional: false },
     { apiVersion: "networking.k8s.io/v1", resource: "networkpolicies", optional: false },
+    ...(backendHealthCapability
+      ? [
+          {
+            apiVersion: "networking.gke.io/v1",
+            resource: "healthcheckpolicies",
+            optional: false,
+          },
+        ]
+      : []),
     ...contributions.flatMap((entry) => entry.requirements),
   ]);
   // This is the compatibility identity for lifecycle commands, not merely a cluster locator.
@@ -604,7 +687,8 @@ export function compileTarget(
       network: cluster.network,
     },
     defaultPool: context.defaultPool,
-    ingressSources: exposure.ingressSources,
+    ingressSources,
+    backendHealth: backendHealthCapability?.policy ?? null,
     objects,
     requirements,
     readiness,
@@ -688,7 +772,8 @@ export function compileTarget(
       hostname: host.hostname,
       tls: { ...host.tls },
     })),
-    ingressSources: exposure.ingressSources,
+    ingressSources,
+    backendHealth: backendHealthCapability?.policy ?? null,
     routingTier: routing.routingTier,
     routingProviderName: target.routing.name,
   };

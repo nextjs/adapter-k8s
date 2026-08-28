@@ -189,6 +189,8 @@ export interface EmitMetadata {
   hasPortableOrigin?: boolean;
   /** Chart renders the stable ext_proc routing Deployment. Job mode only. */
   hasRoutingTier?: boolean;
+  /** Chart owns GKE HealthCheckPolicy objects. Job mode only. */
+  hasHealthCheckPolicy?: boolean;
   /** infra.projectId — E4's gcloud CDN invalidation identity. Job mode only. */
   projectId?: string;
 }
@@ -980,6 +982,9 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   // (§3 item 3: committing chart/ commits credentials, and the 0600 mode does not survive
   // Git; under sops the same objects ship ENCRYPTED under secrets/ instead).
   const chartFiles = listFilesRecursive(chartSrcDir);
+  const hasHealthCheckPolicy = chartFiles.some((relativePath) =>
+    readFileSync(path.join(chartSrcDir, relativePath), "utf8").includes("kind: HealthCheckPolicy"),
+  );
   const excluded: string[] = [];
   for (const rel of chartFiles) {
     if (secretsMode !== "inline" && SECRET_CHART_FILES.has(rel)) {
@@ -1169,6 +1174,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
       cdnEnabled: chartFiles.includes("templates/cdn-http-filter.yaml"),
       hasPortableOrigin: chartFiles.includes("templates/origin-service.yaml"),
       hasRoutingTier: chartFiles.includes("templates/routing-service-deployment.yaml"),
+      hasHealthCheckPolicy,
       ...(infra.projectId ? { projectId: infra.projectId } : {}),
     };
     const templatesDir = path.join(bundleDir, "chart", "templates");
@@ -1180,7 +1186,16 @@ export async function runEmit(options: EmitOptions): Promise<void> {
         ...(imagePullSecrets.length > 0 ? { pullSecrets: imagePullSecrets } : {}),
       }),
     );
-    writeFileSync(path.join(templatesDir, "cutover-rbac.yaml"), renderCutoverRbac({ releaseName }));
+    writeFileSync(
+      path.join(templatesDir, "cutover-rbac.yaml"),
+      renderCutoverRbac({
+        releaseName,
+        namespace,
+        readiness: compositionSnapshot?.plan.operations.resources.readiness ?? [],
+        hasEnvoyExtensionPolicy: jobMetadata.hasEnvoyExtensionPolicy === true,
+        hasHealthCheckPolicy,
+      }),
+    );
     writeFileSync(
       path.join(templatesDir, "emit-metadata-configmap.yaml"),
       renderEmitMetadataConfigMap({
@@ -1275,6 +1290,7 @@ export async function runEmit(options: EmitOptions): Promise<void> {
           cdnEnabled: chartFiles.includes("templates/cdn-http-filter.yaml"),
           hasPortableOrigin: chartFiles.includes("templates/origin-service.yaml"),
           hasRoutingTier: chartFiles.includes("templates/routing-service-deployment.yaml"),
+          hasHealthCheckPolicy,
           ...(infra.projectId ? { projectId: infra.projectId } : {}),
         }
       : {}),

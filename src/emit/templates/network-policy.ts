@@ -5,21 +5,23 @@ import {
   assertSafeReleaseName,
   sanitizeK8sName,
 } from "./utils.js";
+import { GKE_GFE_PROXY_CIDRS, GKE_HEALTH_CHECK_PROBE_CIDRS } from "../../target/ingress-sources.js";
 
 // Default-deny-by-allowlist NetworkPolicies for the two workload tiers, gated on the
 // deploy CLI discovering the cluster's pod CIDRs (`--set global.networkPolicy.podCidrs=
 // {...}`). The whole file is wrapped in a helm `if` so an empty list renders nothing
 // (no policies) rather than a broken document.
 //
-// TWO POSTURES, selected by `global.networkPolicy.strict` (default: false = the broad
-// posture below, unchanged):
+// TWO POSTURES, selected by `global.networkPolicy.strict` (default: true):
 //
-// BROAD (default). Both tiers allow ingress from 0.0.0.0/0 EXCEPT the pod CIDRs: the
+// BROAD (explicit opt-out). Both tiers allow ingress from 0.0.0.0/0 EXCEPT the pod CIDRs: the
 // external LB and Google health-check probes arrive with non-pod source IPs, while
 // in-cluster pods are blocked from talking to these ports directly. That
-// `ipBlock.cidr: 0.0.0.0/0` + `except: <pod CIDR>` shape is Google's own documented
-// recipe for "broad range without Pod traffic" under **Calico** — with Calico, ipBlock
-// rules DO cover pod traffic, so the pod range must be subtracted explicitly. Under
+// family-matched `ipBlock.cidr: <family /0>` + `except: <same-family pod CIDR>` shape is
+// Google's documented recipe for "broad range without Pod traffic" under **Calico** —
+// with Calico, ipBlock rules DO cover pod traffic, so the pod range must be subtracted
+// explicitly. IPv4 and IPv6 must be separate peers: Kubernetes rejects an except CIDR
+// outside its parent block. Under
 // GKE Dataplane V2 (Autopilot's default) the subtraction is a no-op: "Pod traffic is
 // never covered by an ipBlock rule … even if you define a broad rule such as
 // cidr: '0.0.0.0/0'". Keeping the `except` therefore costs nothing on Dataplane V2 and
@@ -27,9 +29,8 @@ import {
 //   https://docs.cloud.google.com/kubernetes-engine/docs/how-to/network-policy
 //     (#ipblock_behavior_in_calico / #ipblock_behavior_in_gke_dataplane_v2)
 //
-// STRICT (opt-in). Replaces the 0.0.0.0/0 denylist with a positive allowlist of the
-// Google-owned load-balancer ranges — see N19 below for the grounding, the residual
-// risk, and why it is not the default.
+// STRICT (default). Replaces the 0.0.0.0/0 denylist with a positive allowlist supplied by
+// the exposure: Google frontend/probe CIDRs, or exact in-cluster controller pod selectors.
 //
 // Pool pods additionally allow ingress from SIBLING POOL pods only — cross-pool proxy
 // traffic (pool-server/dispatch.ts proxyToPool) is pool-to-pool; the routing service
@@ -49,7 +50,8 @@ import {
 // N19 (SECURITY). Grounding for the strict allowlist. The security review that flagged
 // "ingress from 0.0.0.0/0 is too permissive" was deferred with the reason "no grounding
 // for the exact GFE ranges"; this is that grounding, from Google's docs plus the live
-// topology. The strict posture is opt-in, not default — see WHY NOT DEFAULT.
+// topology. The strict posture is the default; the historical rationale below records why
+// the Google preset contains these exact ranges.
 //
 // TOPOLOGY THIS ADAPTER EMITS. A GKE Gateway of class `gke-l7-global-external-managed`
 // (gateway.ts) — i.e. a **global external Application Load Balancer**, GFE-based, not
@@ -119,7 +121,8 @@ import {
 // that was resolved. The routing service still authenticates no callers, so reachability to
 // :8443 remains enough to have a CRAFTED request resolved and signed — which is why THIS
 // POLICY IS A REQUIRED TRUST BOUNDARY, not defense-in-depth. Kept below
-// for why nodeCidrs is REQUIRED whenever strict is on — the kubelet. `nodeCidrs` is REQUIRED when strict is on, and the
+// for why nodeCidrs is REQUIRED whenever strict is on — the kubelet. `nodeCidrs` is
+// REQUIRED when strict is on, and the
 // template `fail`s without it, because the broad posture is silently also allowing
 // something the LB ranges do not cover: kubelet's liveness/readiness probes
 // (deployment.ts probes :3000, routing-service-deployment.ts probes :8081) originate
@@ -152,14 +155,14 @@ import {
  * backends are zonal NEGs (`GCE_VM_IP_PORT`) — i.e. every backend this chart creates.
  * Pinned by tests; widening this list is a security change (see N19).
  */
-export const GFE_PROXY_CIDRS = ["35.191.0.0/16", "130.211.0.0/22", "2600:2d00:1:1::/64"] as const;
+export const GFE_PROXY_CIDRS = GKE_GFE_PROXY_CIDRS;
 
 /**
  * Health-check prober source ranges for GFE-based load balancers with zonal NEG
  * backends (both the Gateway's pool health checks and the `<release>-routing-hc` TCP
  * check on :8443 that init.ts creates). Pinned by tests (see N19).
  */
-export const HEALTH_CHECK_PROBE_CIDRS = ["35.191.0.0/16", "2600:2d00:1:b029::/64"] as const;
+export const HEALTH_CHECK_PROBE_CIDRS = GKE_HEALTH_CHECK_PROBE_CIDRS;
 
 /**
  * The union actually emitted in the strict posture, de-duplicated and in a stable order:
@@ -204,7 +207,8 @@ export function renderNetworkPolicies({
    * But the routing service authenticates no callers, so whatever can reach :8443 is handed a
    * valid proof for a request of its OWN choosing: a signing oracle, not credential disclosure.
    * Reachability is still what bounds who may ask for a routing verdict at all.
-   * Defaults to GKE's CIDRs so existing callers are unchanged.
+   * No implicit source is safe across cluster types. An omitted set denies routing traffic
+   * under strict mode; public exposure constructors require an explicit non-empty set.
    */
   ingressSources?: {
     cidrs: readonly string[];
@@ -221,14 +225,28 @@ export function renderNetworkPolicies({
   // the `range` at column 0 so the rendered `- "cidr"` lines indent under `except:`.
   const broadFrom = `        - ipBlock:
             cidr: 0.0.0.0/0
+{{- if regexMatch "(^|,)[^,:]+/[0-9]+(,|$)" (join "," .Values.global.networkPolicy.podCidrs) }}
             except:
 {{- range .Values.global.networkPolicy.podCidrs }}
+{{- if not (contains ":" .) }}
               - {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+        - ipBlock:
+            cidr: "::/0"
+{{- if contains ":" (join "," .Values.global.networkPolicy.podCidrs) }}
+            except:
+{{- range .Values.global.networkPolicy.podCidrs }}
+{{- if contains ":" . }}
+              - {{ . | quote }}
+{{- end }}
+{{- end }}
 {{- end }}`;
 
   // Literal, doc-grounded constants (N19) — not helm values, so no deploy-time knob can
   // widen them; they change only with a code review of this file.
-  const sources = ingressSources ?? { cidrs: STRICT_INGRESS_CIDRS, podSelectors: [] };
+  const sources = ingressSources ?? { cidrs: [], podSelectors: [] };
   for (const cidr of sources.cidrs) assertSafeCidr(cidr, "ingress source CIDR");
   // Charset-check anything reaching a selector: these become label keys/values and a
   // namespace name in rendered YAML.
@@ -273,7 +291,14 @@ ${labels}${ns}`;
     })
     .join("\n");
   // Both lists render; an empty one contributes nothing.
-  const googleLbFrom = [cidrFrom, podSelectorFrom].filter(Boolean).join("\n");
+  const strictIngressFrom = [cidrFrom, podSelectorFrom].filter(Boolean).join("\n");
+  const routingDataIngress = strictIngressFrom
+    ? `    - from:
+${strictIngressFrom}
+      ports:
+        - protocol: TCP
+          port: 8443`
+    : "";
 
   // Operator-supplied node/subnet range(s): kubelet probe traffic (N19). Required
   // whenever strict is on — the guard below refuses to render without it.
@@ -298,11 +323,7 @@ spec:
     - Ingress
   ingress:
 {{- if .Values.global.networkPolicy.strict }}
-    - from:
-${googleLbFrom}
-      ports:
-        - protocol: TCP
-          port: 8443
+${routingDataIngress}
     - from:
 ${nodeFrom}
       ports:
@@ -354,7 +375,7 @@ spec:
   ingress:
     - from:
 {{- if .Values.global.networkPolicy.strict }}
-${googleLbFrom}
+${strictIngressFrom}
 ${nodeFrom}
 {{- else }}
 ${broadFrom}

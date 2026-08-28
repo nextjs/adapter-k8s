@@ -50,6 +50,7 @@ function metadataFixture(overrides: Record<string, unknown> = {}): Record<string
     cdnEnabled: true,
     hasPortableOrigin: true,
     hasRoutingTier: true,
+    hasHealthCheckPolicy: true,
     projectId: "my-project",
   };
   return { ...meta, ...overrides };
@@ -94,6 +95,7 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
       cdnEnabled: true,
       hasPortableOrigin: true,
       hasRoutingTier: true,
+      hasHealthCheckPolicy: true,
       projectId: "my-project",
     });
   });
@@ -130,6 +132,12 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
 
   it("requires an explicit routing-tier declaration", () => {
     expect(readWithout("hasRoutingTier")).toThrow(/no explicit hasRoutingTier declaration/i);
+  });
+
+  it("requires an explicit HealthCheckPolicy capability declaration", () => {
+    expect(readWithout("hasHealthCheckPolicy")).toThrow(
+      /no explicit hasHealthCheckPolicy declaration/i,
+    );
   });
 
   it("fail-closed: a MISSING mount names the path and the chart gate that renders it", () => {
