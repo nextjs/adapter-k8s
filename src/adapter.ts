@@ -1819,6 +1819,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         caseSensitive:
           (nextConfig.experimental as { caseSensitiveRoutes?: boolean } | undefined)
             ?.caseSensitiveRoutes ?? false,
+        requestLogging: nextConfig.logging !== false,
         nextVersion,
         projectDir,
         distDir,
@@ -1970,16 +1971,21 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       // so the chart installed the ext_proc tier and NOTHING ever attached it to the load
       // balancer (the edge kept the previous build's chain) with a green deploy. Emit the
       // chain only when it can actually be registered, and say so loudly when it cannot.
+      const routingRegistration = compiledTarget?.plan.operations.routing.registration;
       const needsGkeRegistration = compiledTarget
-        ? compiledTarget.routingTier.registration === "gke-traffic-extension"
+        ? routingRegistration?.kind === "gcp-traffic-extension-v1"
         : Boolean(gkeProvider);
-      const canRegisterExtension = needsGkeRegistration && !!(infra.projectId && infra.region);
+      const registrationProjectId =
+        routingRegistration?.kind === "gcp-traffic-extension-v1"
+          ? routingRegistration.projectId
+          : infra.projectId;
+      const canRegisterExtension = needsGkeRegistration && !!registrationProjectId;
       const extensionChain = canRegisterExtension
         ? generateExtensionChain({
             celExpression,
             releaseName,
             namespace,
-            projectId: infra.projectId!,
+            projectId: registrationProjectId!,
             timeout: gkeProvider?.serviceExtensions?.routeExtension?.timeout
               ? `${gkeProvider.serviceExtensions.routeExtension.timeout}s`
               : `${Math.max(1, Math.ceil((cfg.routingService?.requestTimeoutMs ?? 4000) / 1000))}s`,
@@ -1988,9 +1994,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         : undefined;
       if (needsGkeRegistration && !canRegisterExtension) {
         console.warn(
-          `[adapter-k8s] .k8s-adapter/infrastructure.json has no ${
-            infra.projectId ? "region" : infra.region ? "projectId" : "projectId/region"
-          } — emitting a chart WITHOUT the ext_proc routing tier and without the GXLB ` +
+          `[adapter-k8s] .k8s-adapter/infrastructure.json has no projectId — emitting a chart ` +
+            `WITHOUT the ext_proc routing tier and without the GXLB ` +
             `traffic-extension registration. Middleware/rewrites/redirects will run in the ` +
             `pools (the fail-safe path), not at the edge. Run \`npx adapter-k8s init\` to ` +
             `provision infrastructure and regenerate infrastructure.json before deploying.`,

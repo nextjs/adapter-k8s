@@ -148,7 +148,7 @@ export function generateHelmChart({
   // that only some pods can pull from is ImagePullBackOff on the rest.
   const pullSecrets = config.imagePullSecrets;
   const emitsHealthCheckPolicy = compiledTarget
-    ? compiledTarget.routingTier.registration === "gke-traffic-extension"
+    ? compiledTarget.plan.operations.routing.registration?.kind === "gcp-traffic-extension-v1"
     : provider!.emitsHealthCheckPolicyCrd;
   const secret = internalSecret;
   // N87: per-BUILD Secret name (and therefore one Secret per live build, annotated
@@ -364,8 +364,16 @@ export function generateHelmChart({
     // Second seam: HOW the ext_proc callout attaches to the data plane. GKE emits a
     // privileged gcloud registration Job; envoy-gateway providers emit an
     // EnvoyExtensionPolicy and need no cloud IAM at all.
-    if (!compiledTarget || compiledTarget.routingTier.registration === "gke-traffic-extension") {
+    if (
+      !compiledTarget ||
+      compiledTarget.plan.operations.routing.registration?.kind === "gcp-traffic-extension-v1"
+    ) {
       const extProcEmitter = compiledTarget ? gkeProvider : provider!;
+      const registration = compiledTarget?.plan.operations.routing.registration;
+      const executorProjectId =
+        compiledTarget?.plan.target.identity.kind === "gke-resource"
+          ? compiledTarget.plan.target.identity.projectId
+          : infrastructure?.projectId;
       Object.assign(
         files,
         extProcEmitter.emitExtProcTemplates({
@@ -375,6 +383,8 @@ export function generateHelmChart({
           config,
           buildId,
           infrastructure,
+          ...(executorProjectId ? { executorProjectId } : {}),
+          ...(registration?.kind === "gcp-traffic-extension-v1" ? { registration } : {}),
           extensionChainJson,
           routeExtDocumentDigest,
           routingFailOpen,

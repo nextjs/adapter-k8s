@@ -8,6 +8,7 @@ import type {
 } from "../composition-plan/types.js";
 import {
   assertSafeHostname,
+  assertSafeGcpResourceName,
   assertSafeNamespace,
   assertSafeProjectId,
   assertSafeRegion,
@@ -1042,7 +1043,6 @@ export function portableRouting(): RoutingComponent {
         routingTier: {
           enabled: false,
           serviceAnnotations: {},
-          registration: "none",
         },
       };
     },
@@ -1216,7 +1216,6 @@ export function envoyNativeRouting(
             transportSecurity: "none",
           },
           serviceAnnotations: {},
-          registration: "none",
         },
       };
     },
@@ -1246,6 +1245,8 @@ export function gkeNativeRouting(
       assertSafeProjectId(projectId);
       const extensionName = options.extensionName ?? `${context.releaseName}-traffic-ext`;
       const addressName = options.addressName ?? `${context.releaseName}-ip`;
+      assertSafeGcpResourceName(extensionName, "traffic extension name");
+      assertSafeGcpResourceName(addressName, "global address name");
       const readiness: RoutingReadiness[] = [
         {
           kind: "gcp-traffic-extension",
@@ -1259,6 +1260,12 @@ export function gkeNativeRouting(
         plan: {
           protocol: "envoy-ext-proc-v3",
           failurePolicy: context.failurePolicy,
+          registration: {
+            kind: "gcp-traffic-extension-v1",
+            projectId,
+            extensionName,
+            addressName,
+          },
           dataplane: { kind: "external-ext-proc", transport: "tls", readiness },
         },
         readiness,
@@ -1280,7 +1287,6 @@ export function gkeNativeRouting(
           serviceAnnotations: {
             "cloud.google.com/neg": `{"exposed_ports":{"8443":{"name":"${context.releaseName}-routing-neg"}}}`,
           },
-          registration: "gke-traffic-extension",
         },
         externalCleanup: [
           {

@@ -155,10 +155,26 @@ export type RoutingReadiness =
       requireEveryForwardingRule: true;
     };
 
+/**
+ * Adapter-owned work that attaches the routing service to an external data plane. This belongs
+ * to the authenticated operation plan, not the contributor-facing routing-tier shape: adding a
+ * future executor extends this operation union without adding a provider field to every adapter.
+ */
+export type RoutingRegistration =
+  | { kind: "none" }
+  | {
+      kind: "gcp-traffic-extension-v1";
+      projectId: string;
+      extensionName: string;
+      addressName: string;
+    };
+
 export type RoutingPlan =
   | {
       protocol: "pool-local-v1";
       failurePolicy: "closed";
+      /** Absent on retained plans emitted before registration became an authenticated operation. */
+      registration?: RoutingRegistration;
       dataplane: {
         kind: "portable-http-origin";
         service: KubernetesServiceRef;
@@ -169,6 +185,8 @@ export type RoutingPlan =
   | {
       protocol: "envoy-ext-proc-v3";
       failurePolicy: "open" | "closed";
+      /** Absent on retained plans emitted before registration became an authenticated operation. */
+      registration?: RoutingRegistration;
       dataplane:
         | {
             kind: "external-ext-proc";

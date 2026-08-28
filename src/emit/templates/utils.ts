@@ -306,6 +306,7 @@ export function findBuildIdNameCollision(
 // quotes it too, which is the fix that also covers names added later.
 const RELEASE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$/;
 const PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,28}[a-z0-9]$/;
+const GCP_RESOURCE_NAME_RE = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
 const REGION_RE = /^[a-z0-9-]+$/;
 // DNS-1123 hostname, optionally with a single left-most wildcard label (`*.example.com`).
 // Lowercase only, no whitespace/quotes — safe to embed in a quoted YAML scalar.
@@ -659,6 +660,19 @@ export function assertSafeProjectId(projectId: string): void {
     throw new Error(
       `Invalid projectId "${projectId}": must be a valid GCP project id ` +
         `(${PROJECT_ID_RE}: 6-30 chars, starts with a letter, lowercase letters/digits/hyphens).`,
+    );
+  }
+}
+
+/** RFC-1035 resource id used by Compute global addresses and Service Extensions. */
+export function assertSafeGcpResourceName(
+  name: unknown,
+  field = "GCP resource name",
+): asserts name is string {
+  if (typeof name !== "string" || !GCP_RESOURCE_NAME_RE.test(name)) {
+    throw new Error(
+      `Invalid ${field} ${JSON.stringify(name)}: expected 1-63 lowercase letters, digits, or ` +
+        `hyphens, starting with a letter and ending with a letter or digit.`,
     );
   }
 }

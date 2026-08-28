@@ -72,6 +72,62 @@ function nginxTelemetrySource(
 }
 
 describe("Kubernetes target composition", () => {
+  it("rejects invalid GCP routing registration resource names at build time", () => {
+    const target = defineTarget({
+      cluster: gkeCluster({ projectId: "sample-project", region: "us-central1" }),
+      exposure: gatewayApiExposure({ className: "gke-l7-global-external-managed", hosts }),
+      routing: gkeNativeRouting({ extensionName: "Not Valid", addressName: "9-invalid" }),
+    });
+
+    const gkeContext = context({
+      infrastructure: { projectId: "sample-project", region: "us-central1" },
+    });
+    expect(() => compileTarget(target, gkeContext)).toThrow(/traffic extension name/i);
+
+    const invalidAddress = defineTarget({
+      cluster: gkeCluster({ projectId: "sample-project", region: "us-central1" }),
+      exposure: gatewayApiExposure({ className: "gke-l7-global-external-managed", hosts }),
+      routing: gkeNativeRouting({ addressName: "9-invalid" }),
+    });
+    expect(() => compileTarget(invalidAddress, gkeContext)).toThrow(/global address name/i);
+  });
+
+  it("rejects GKE routing coordinates disconnected from controller-owned resources", () => {
+    const gkeContext = context({
+      infrastructure: { projectId: "cluster-project", region: "us-central1" },
+    });
+    const crossProject = defineTarget({
+      cluster: gkeCluster({ projectId: "cluster-project", region: "us-central1" }),
+      exposure: gatewayApiExposure({
+        className: "gke-l7-global-external-managed",
+        hosts,
+        addresses: [{ type: "NamedAddress", value: "custom-frontend-ip" }],
+      }),
+      routing: gkeNativeRouting({
+        projectId: "routing-project",
+        addressName: "custom-frontend-ip",
+      }),
+    });
+    expect(() => compileTarget(crossProject, gkeContext)).toThrow(
+      /cross-project GKE traffic-extension registration is not supported/i,
+    );
+
+    const missingAddress = defineTarget({
+      cluster: gkeCluster({ projectId: "cluster-project", region: "us-central1" }),
+      exposure: gatewayApiExposure({
+        className: "gke-l7-global-external-managed",
+        hosts,
+      }),
+      routing: gkeNativeRouting({
+        projectId: "cluster-project",
+        addressName: "custom-frontend-ip",
+      }),
+    });
+    expect(() => compileTarget(missingAddress, gkeContext)).toThrow(
+      /requires exactly one Gateway NamedAddress "custom-frontend-ip"/i,
+    );
+  });
+
   it("defaults to portable pool-local routing and a stable origin backend", () => {
     const target = defineTarget({
       cluster: kubernetesCluster(),
@@ -915,7 +971,13 @@ describe("Kubernetes target composition", () => {
       }),
       context({ infrastructure: { projectId: "sample-project", region: "us-central1" } }),
     );
-    expect(compiled.routingTier.registration).toBe("gke-traffic-extension");
+    expect(compiled.routingTier).not.toHaveProperty("registration");
+    expect(compiled.plan.operations.routing.registration).toEqual({
+      kind: "gcp-traffic-extension-v1",
+      projectId: "sample-project",
+      extensionName: "test-app-traffic-ext",
+      addressName: "test-app-ip",
+    });
     expect(compiled.plan.target.registry).toMatchObject({
       authentication: { kind: "ambient-credentials" },
       digestLookup: { kind: "oci-distribution" },
@@ -1111,7 +1173,6 @@ describe("open build-time hooks", () => {
             enabled: true,
             transport: "h2c",
             serviceAnnotations: {},
-            registration: "none",
           },
         } as never;
       },
@@ -1156,7 +1217,6 @@ describe("open build-time hooks", () => {
               transportSecurity: "none",
             },
             serviceAnnotations: {},
-            registration: "none",
           },
         } as never;
       },
@@ -1201,7 +1261,6 @@ describe("open build-time hooks", () => {
               transportSecurity: "none",
             },
             serviceAnnotations: {},
-            registration: "none",
           },
         };
       },

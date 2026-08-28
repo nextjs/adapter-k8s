@@ -39,6 +39,28 @@ describe("collectOutputPathnames", () => {
 });
 
 describe("buildRoutingManifest", () => {
+  it("records only the non-default request logging state", () => {
+    const page = mockAppPage({ pathname: "/" });
+    const common = {
+      routing: mockRouting(),
+      outputs: mockOutputs({ appPages: [page] }),
+      pools: new Map<string, PoolDefinition>([
+        ["ssr", { name: "ssr", outputs: [page], config: { routes: ["appPages"] } }],
+      ]),
+      buildId: "b",
+      basePath: "",
+      i18n: null,
+      trailingSlash: false,
+      nextVersion: "16.3.0",
+      projectDir: "/app",
+    };
+
+    expect(buildRoutingManifest({ ...common, requestLogging: false }).requestLogging).toBe(false);
+    expect(
+      buildRoutingManifest({ ...common, requestLogging: true }).requestLogging,
+    ).toBeUndefined();
+  });
+
   it("records route maxDuration and pool response-head deadlines", () => {
     const page = mockAppPage({
       pathname: "/reports/[id]",

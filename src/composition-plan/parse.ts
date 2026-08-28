@@ -2,6 +2,7 @@ import {
   assertSafeBucketName,
   assertSafeBuildId,
   assertSafeCidr,
+  assertSafeGcpResourceName,
   assertSafeImageRegistry,
   assertSafeNamespace,
   assertSafePoolName,
@@ -10,6 +11,7 @@ import {
   assertSafeReleaseName,
   assertSafeServiceName,
 } from "../emit/templates/utils.js";
+import { assertGcpTrafficExtensionTopology } from "./routing-invariants.js";
 import {
   COMPOSITION_PLAN_API_VERSION,
   COMPOSITION_PLAN_KIND,
@@ -37,6 +39,7 @@ import {
   type RegistryPlan,
   type RetainedExternalResource,
   type RoutingPlan,
+  type RoutingRegistration,
   type RoutingReadiness,
   type TelemetryActivation,
   type TelemetrySignal,
@@ -392,7 +395,9 @@ function parseCdn(value: unknown, path: string): CdnInvalidation {
       return {
         kind,
         projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
         invalidation: literal(
           parsed.invalidation,
           "recorded-cache-tag-or-full-path",
@@ -507,8 +512,12 @@ function parseRoutingReadiness(value: unknown, path: string): RoutingReadiness {
       return {
         kind,
         projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
-        extensionName: safeText(parsed.extensionName, `${path}.extensionName`, 63),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        extensionName: validated(parsed.extensionName, `${path}.extensionName`, (name) =>
+          assertSafeGcpResourceName(name, "traffic extension name"),
+        ),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
         requireEveryForwardingRule: literal(
           parsed.requireEveryForwardingRule,
           true,
@@ -520,9 +529,33 @@ function parseRoutingReadiness(value: unknown, path: string): RoutingReadiness {
   }
 }
 
+function parseRoutingRegistration(value: unknown, path: string): RoutingRegistration {
+  const parsed = object(value, path);
+  const kind = string(parsed.kind, `${path}.kind`);
+  switch (kind) {
+    case "none":
+      exactKeys(parsed, ["kind"], path);
+      return { kind };
+    case "gcp-traffic-extension-v1":
+      exactKeys(parsed, ["kind", "projectId", "extensionName", "addressName"], path);
+      return {
+        kind,
+        projectId: validated(parsed.projectId, `${path}.projectId`, assertSafeProjectId),
+        extensionName: validated(parsed.extensionName, `${path}.extensionName`, (name) =>
+          assertSafeGcpResourceName(name, "traffic extension name"),
+        ),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
+      };
+    default:
+      fail(`${path}.kind`, `unknown routing registration operation ${JSON.stringify(kind)}`);
+  }
+}
+
 function parseRouting(value: unknown, path: string): RoutingPlan {
   const parsed = object(value, path);
-  exactKeys(parsed, ["protocol", "failurePolicy", "dataplane"], path);
+  exactKeys(parsed, ["protocol", "failurePolicy", "registration", "dataplane"], path);
   const protocol = oneOf(
     parsed.protocol,
     ["pool-local-v1", "envoy-ext-proc-v3"] as const,
@@ -532,7 +565,13 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
   const kind = string(dataplane.kind, `${path}.dataplane.kind`);
   const readiness = (raw: unknown) =>
     array(raw, `${path}.dataplane.readiness`, parseRoutingReadiness, 64);
+  const registration = Object.hasOwn(parsed, "registration")
+    ? parseRoutingRegistration(parsed.registration, `${path}.registration`)
+    : undefined;
   if (protocol === "pool-local-v1") {
+    if (registration && registration.kind !== "none") {
+      fail(`${path}.registration`, "pool-local-v1 cannot register an external routing tier");
+    }
     if (kind !== "portable-http-origin") {
       fail(`${path}.dataplane.kind`, 'pool-local-v1 requires "portable-http-origin"');
     }
@@ -540,6 +579,7 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
     return {
       protocol,
       failurePolicy: literal(parsed.failurePolicy, "closed", `${path}.failurePolicy`),
+      ...(registration ? { registration } : {}),
       dataplane: {
         kind,
         service: parseKubernetesServiceRef(dataplane.service, `${path}.dataplane.service`),
@@ -577,6 +617,15 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
     default:
       fail(`${path}.dataplane.kind`, `unknown routing dataplane operation ${JSON.stringify(kind)}`);
   }
+  if (
+    registration?.kind === "gcp-traffic-extension-v1" &&
+    (parsedDataplane.kind !== "external-ext-proc" || parsedDataplane.transport !== "tls")
+  ) {
+    fail(
+      `${path}.registration`,
+      "gcp-traffic-extension-v1 requires an external-ext-proc dataplane with tls transport",
+    );
+  }
   return {
     protocol,
     failurePolicy: oneOf(
@@ -584,6 +633,7 @@ function parseRouting(value: unknown, path: string): RoutingPlan {
       ["open", "closed"] as const,
       `${path}.failurePolicy`,
     ),
+    ...(registration ? { registration } : {}),
     dataplane: parsedDataplane,
   };
 }
@@ -688,7 +738,13 @@ function parseExternalCleanup(value: unknown, path: string): ExternalCleanupOper
       };
     case "gcp-global-address":
       exactKeys(parsed, ["kind", "projectId", "name"], path);
-      return { kind, projectId: projectId(), name: safeText(parsed.name, `${path}.name`, 63) };
+      return {
+        kind,
+        projectId: projectId(),
+        name: validated(parsed.name, `${path}.name`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
+      };
     case "gcp-custom-iam-role":
       exactKeys(parsed, ["kind", "projectId", "roleId"], path);
       return {
@@ -777,7 +833,13 @@ function parseDiagnostic(value: unknown, path: string): DiagnosticSource {
       return { kind, projectId: projectId() };
     case "gcp-global-address":
       exactKeys(parsed, ["kind", "projectId", "name"], path);
-      return { kind, projectId: projectId(), name: safeText(parsed.name, `${path}.name`, 63) };
+      return {
+        kind,
+        projectId: projectId(),
+        name: validated(parsed.name, `${path}.name`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
+      };
     case "gcp-storage-bucket":
       exactKeys(parsed, ["kind", "projectId", "bucket"], path);
       return {
@@ -809,8 +871,12 @@ function parseDiagnostic(value: unknown, path: string): DiagnosticSource {
       return {
         kind,
         projectId: projectId(),
-        extensionName: safeText(parsed.extensionName, `${path}.extensionName`, 63),
-        addressName: safeText(parsed.addressName, `${path}.addressName`, 63),
+        extensionName: validated(parsed.extensionName, `${path}.extensionName`, (name) =>
+          assertSafeGcpResourceName(name, "traffic extension name"),
+        ),
+        addressName: validated(parsed.addressName, `${path}.addressName`, (name) =>
+          assertSafeGcpResourceName(name, "global address name"),
+        ),
       };
     case "gcp-backend-service-shape":
       exactKeys(
@@ -1390,6 +1456,13 @@ export function parseCompositionPlan(value: unknown): CompositionPlan {
       );
     }
   }
+
+  assertGcpTrafficExtensionTopology({
+    identity: plan.target.identity,
+    routing: plan.operations.routing,
+    objects: plan.operations.resources.objects,
+    subject: "$.operations.routing",
+  });
 
   return plan;
 }

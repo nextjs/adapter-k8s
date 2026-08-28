@@ -62,4 +62,24 @@ describe("generateExtensionChain", () => {
     const parsed = JSON.parse(chain);
     expect(parsed[0].extensions[0].failOpen).toBe(true);
   });
+
+  it("validates identifiers at the resource-path interpolation boundary", () => {
+    const options = {
+      celExpression: "true",
+      releaseName: "my-app",
+      namespace: "default",
+      projectId: "my-project",
+      timeout: "5s",
+      failureModeAllow: false,
+    };
+    expect(() => generateExtensionChain({ ...options, projectId: "--project=other" })).toThrow(
+      /Invalid projectId/,
+    );
+    expect(() => generateExtensionChain({ ...options, releaseName: "Bad App" })).toThrow(
+      /Invalid releaseName/,
+    );
+    expect(() => generateExtensionChain({ ...options, namespace: "Bad Namespace" })).toThrow(
+      /Invalid namespace/,
+    );
+  });
 });

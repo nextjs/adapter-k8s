@@ -56,10 +56,41 @@ echo ""
 # The checkout is SHARED MUTABLE STATE across concurrent lanes. The lane driver staggers
 # lane 1, but then releases the remaining lanes simultaneously — and five concurrent preps
 # race git (`shallow.lock`: mass-failed 16 of 24 groups in the first full 6-lane run) and
-# pnpm's virtual store. Double-checked stamp + flock: the stamp records the prepped commit
+# pnpm's virtual store. Double-checked stamp + an atomic directory lock: the stamp records the prepped commit
 # for THIS ref, so post-prep lanes skip without touching the lock at all, and racers
 # serialize then re-check before doing any work.
 PREP_STAMP="${WORKSPACE}/.prep-done-${NEXTJS_REF}"
+PREP_LOCK_DIR="${WORKSPACE}/.prep.lock.d"
+prep_lock_acquired=0
+release_prep_lock() {
+  if [ "$prep_lock_acquired" -eq 1 ]; then
+    rm -f "${PREP_LOCK_DIR}/owner"
+    rmdir "$PREP_LOCK_DIR" 2>/dev/null || true
+    prep_lock_acquired=0
+  fi
+}
+acquire_prep_lock() {
+  # A full Next checkout build can be slow on the first lane. Wait up to 30 minutes, reclaiming
+  # a lock only when its recorded local process no longer exists. mkdir is atomic on macOS and
+  # Linux, unlike `flock`, which is not installed on a stock macOS contributor machine.
+  for _attempt in $(seq 1 18000); do
+    if mkdir "$PREP_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" > "${PREP_LOCK_DIR}/owner"
+      prep_lock_acquired=1
+      return 0
+    fi
+    lock_owner="$(cat "${PREP_LOCK_DIR}/owner" 2>/dev/null || true)"
+    if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+      stale_lock="${PREP_LOCK_DIR}.stale.$$.$_attempt"
+      if mv "$PREP_LOCK_DIR" "$stale_lock" 2>/dev/null; then
+        rm -rf "$stale_lock"
+      fi
+    fi
+    sleep 0.1
+  done
+  echo "Timed out waiting for Next.js preparation lock: ${PREP_LOCK_DIR}" >&2
+  return 1
+}
 prep_needed() {
   [ -f "$PREP_STAMP" ] || return 0
   [ -d "$NEXTJS_DIR/.git" ] || return 0
@@ -96,14 +127,15 @@ run_prep() {
 }
 if prep_needed; then
   mkdir -p "$WORKSPACE"
-  exec 9>"${WORKSPACE}/.prep.lock"
-  flock 9
+  acquire_prep_lock
+  trap release_prep_lock EXIT
   if prep_needed; then
     run_prep
   else
     echo "Next.js checkout already prepared (another lane finished it while we waited)"
   fi
-  exec 9>&-
+  release_prep_lock
+  trap - EXIT
 else
   echo "Next.js checkout already prepared for ${NEXTJS_REF} — skipping fetch/build"
 fi
