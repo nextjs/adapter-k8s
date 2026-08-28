@@ -1,6 +1,6 @@
 {
   "name": "@next-community/adapter-k8s",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "homepage": "https://github.com/nextjs/adapter-k8s#readme",
   "bugs": {
     "url": "https://github.com/nextjs/adapter-k8s/issues"
@@ -31,12 +31,29 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.js"
+      "default": "./dist/index.js"
+    },
+    "./composition-plan": {
+      "types": "./dist/composition-plan.d.ts",
+      "import": "./dist/composition-plan.js",
+      "default": "./dist/composition-plan.js"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.js",
+      "default": "./dist/internal.js"
     },
     "./package.json": "./package.json"
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "test": "vitest run",
+    "test:package": "npm run build && node scripts/verify-package.mjs",
+    "test:schema": "bash scripts/verify-chart-schema.sh",
     "test:watch": "vitest",
     "test:e2e": "bash scripts/e2e-local.sh",
     "test:e2e:live": "vitest run --config vitest.e2e-live.config.ts",
@@ -50,13 +67,17 @@
     "build:clean": "rm -rf dist",
     "build:types": "tsc --emitDeclarationOnly --declaration --declarationDir dist",
     "build:adapter": "esbuild ./src/index.ts --bundle --format=esm --platform=node --outfile=./dist/index.js --external:next --external:@next/routing",
+    "build:public-subpaths": "esbuild ./src/internal.ts ./src/composition-plan.ts --bundle --format=esm --platform=node --outdir=./dist --external:next --external:@next/routing",
     "build:pool-server": "esbuild ./src/pool-server/index.ts --bundle --format=cjs --platform=node --outfile=./dist/pool-server.cjs --external:@next/routing --external:sharp",
     "build:cache-handler": "esbuild ./src/pool-server/valkey-cache/cache-handler-entry.ts --bundle --format=cjs --platform=node --outfile=./dist/cache-handler.cjs --external:next",
     "build:protos": "buf generate && node ./clean_protos.cjs",
     "build:routing-service": "esbuild ./src/routing-service/index.ts --bundle --format=cjs --platform=node --outfile=./dist/routing-service.cjs --external:@next/routing",
     "build:cli": "esbuild ./src/cli/index.ts --bundle --format=cjs --platform=node --outfile=./dist/cli.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cli.cjs",
     "build:cutover-job": "esbuild ./src/cutover/job-main.ts --bundle --format=cjs --platform=node --outfile=./dist/cutover-job.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cutover-job.cjs",
-    "build": "npm run build:clean && npm run build:types && npm run build:adapter && npm run build:pool-server && npm run build:cache-handler && npm run build:protos && npm run build:routing-service && npm run build:cli && npm run build:cutover-job",
+    "build": "npm run build:clean && npm run build:types && npm run build:adapter && npm run build:public-subpaths && npm run build:pool-server && npm run build:cache-handler && npm run build:protos && npm run build:routing-service && npm run build:cli && npm run build:cutover-job",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run release:check",
+    "release:check": "npm run fmt:check && npm run lint && npm run typecheck && npm test && npm run test:schema && npm run test:package",
     "fmt": "oxfmt",
     "fmt:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",

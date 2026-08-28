@@ -552,6 +552,46 @@ export async function runDoctor(options: {
         });
       }
     }
+
+    // CPU HPAs need the resource-metrics API. Kubernetes accepts an HPA object even when
+    // metrics-server (or an equivalent metrics.k8s.io adapter) is absent; the release then looks
+    // healthy but never scales above its current/minimum replica count. Probe the API only when
+    // this release actually has an HPA, so fixed-replica clusters do not acquire a dependency
+    // they did not ask for.
+    const hpaResult = await execCapture(
+      "kubectl",
+      ["get", "hpa", "-n", namespace, "-l", `app.kubernetes.io/name=${releaseName}`, "-o", "name"],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
+    if (hpaResult.exitCode !== 0) {
+      results.push({
+        name: "Autoscaling metrics",
+        status: "warn",
+        message: "Could not discover whether this release has HPAs",
+        fix: `kubectl get hpa -n ${namespace} -l app.kubernetes.io/name=${releaseName}`,
+      });
+    } else if (hpaResult.stdout.trim()) {
+      const metricsResult = await execCapture(
+        "kubectl",
+        ["get", "--raw=/apis/metrics.k8s.io/v1beta1"],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
+      results.push(
+        metricsResult.exitCode === 0 && metricsResult.stdout.trim()
+          ? {
+              name: "Autoscaling metrics",
+              status: "pass",
+              message: "metrics.k8s.io/v1beta1 is available for the release's HPAs",
+            }
+          : {
+              name: "Autoscaling metrics",
+              status: "warn",
+              message:
+                "Release HPAs exist, but metrics.k8s.io/v1beta1 is unavailable; CPU autoscaling will not work",
+              fix: "Install Metrics Server or another metrics.k8s.io resource-metrics adapter",
+            },
+      );
+    }
     if (localComposition) {
       printCheckResults(results);
       return;

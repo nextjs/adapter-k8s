@@ -92,7 +92,10 @@ What the proof does **not** do is authenticate callers to the routing service. `
 
 The **base** image is tracked by tag (`node:24-slim`) so upstream security patches keep flowing. For reproducible builds, pin it with `ADAPTER_K8S_NODE_BASE_DIGEST=sha256:…`—which you then own updating.
 
-One asymmetry worth knowing: a **rolled-back** routing tier is pinned by tag rather than digest, because the revert reconstructs the reference from the target build id. A rolled-back edge is one step less immutable than a freshly deployed one.
+Current deploy state records the routing image digest, and rollback uses that immutable reference.
+Deploy state written before digest recording cannot recover a digest retroactively; rollback falls
+back to the build tag for those legacy targets and prints a warning. Treat that fallback like
+`--allow-mutable-tags`: verify the tag has not moved before using it.
 
 ## Cache security
 
@@ -130,7 +133,7 @@ Two rules regardless of provider:
 ## Known limits and planned work
 
 - **No caller authentication on the ext_proc callout.** The per-request dispatch proof removed the replayable, wire-readable credential, but the routing service will still resolve and sign a request for any caller that reaches it. mTLS on the callout (via `BackendAuthenticationConfig` on GKE) would remove the dependency on network controls entirely and is the strongest planned fix. Until then, network reachability is the boundary.
-- **Rollback's routing tier is tag-pinned.** A rolled-back routing tier reconstructs its image reference by tag (see [Image provenance](#image-provenance)); digest-pinned rollback is on the roadmap. This matters because the routing tier holds the dispatch secret.
+- **Legacy rollback state can be tag-pinned.** Modern state records and reuses the routing digest. A state entry that predates that field falls back to its build tag with a warning; verify the tag before rollback because the routing tier holds the dispatch secret.
 - **`hostNetwork` pods bypass NetworkPolicy** in both postures and on every CNI.
 - **Escape hatches disable guarantees.** `--allow-no-network-policy` and `--allow-mutable-tags` exist for constrained environments and turn off the controls described above; they are opt-in and loud.
 - **Namespace isolation.** Moving the registration Job's work into the CLI—removing the in-cluster identity altogether—is the preferred fix for the shared-namespace residual, ahead of per-release namespaces plus an admission policy.

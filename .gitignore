@@ -38,3 +38,4 @@ fixtures/*/config/
 .image-admit-stage-*/
 .instr-stage-*/
 .draft-stage-*/
+.package-test-*/
