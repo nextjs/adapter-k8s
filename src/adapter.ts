@@ -30,7 +30,8 @@ import type {
 } from "./types.js";
 import { genericConfigOf, gkeConfigOf, providerGatewayHosts } from "./types.js";
 import { resolveProvider } from "./providers/index.js";
-import { compileTarget, targetForConfig } from "./target/index.js";
+import { compileTarget } from "./target/index.js";
+import { resolveConfiguredTarget } from "./target/legacy.js";
 import { fingerprintCompositionPlan } from "./composition-plan/index.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 import { targetPlatform, type TargetPlatform } from "./target-platform.js";
@@ -1785,6 +1786,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         basePath: nextConfig.basePath ?? "",
         i18n: nextConfig.i18n ?? null,
         trailingSlash: nextConfig.trailingSlash ?? false,
+        caseSensitive:
+          (nextConfig.experimental as { caseSensitiveRoutes?: boolean } | undefined)
+            ?.caseSensitiveRoutes ?? false,
         nextVersion,
         projectDir,
         distDir,
@@ -1896,22 +1900,24 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       }
 
       const configuredDefaultPool = cfg.defaultPool ?? [...pools.keys()][0]!;
-      const compiledTarget = cfg.target
-        ? compileTarget(targetForConfig(cfg), {
-            releaseName,
-            namespace,
-            buildId,
-            imageRegistry,
-            pools: [...pools.keys()],
-            defaultPool: configuredDefaultPool,
-            failurePolicy: failureModeAllow ? "open" : "closed",
-            cache: cfg.cache?.enabled ? "external" : "none",
-            infrastructure: {
-              ...(infra.projectId ? { projectId: infra.projectId } : {}),
-              ...(infra.region ? { region: infra.region } : {}),
-            },
-          })
-        : undefined;
+      const resolvedTarget = resolveConfiguredTarget(cfg);
+      const compiledTarget =
+        resolvedTarget.source === "target"
+          ? compileTarget(resolvedTarget.definition, {
+              releaseName,
+              namespace,
+              buildId,
+              imageRegistry,
+              pools: [...pools.keys()],
+              defaultPool: configuredDefaultPool,
+              failurePolicy: failureModeAllow ? "open" : "closed",
+              cache: cfg.cache?.enabled ? "external" : "none",
+              infrastructure: {
+                ...(infra.projectId ? { projectId: infra.projectId } : {}),
+                ...(infra.region ? { region: infra.region } : {}),
+              },
+            })
+          : undefined;
 
       // The GXLB traffic extension can only be described (and registered) once init has
       // written projectId + region: the chain's `service` field is
@@ -2359,8 +2365,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         await writeOutputFile(
           projectDir,
           "Dockerfile",
-          // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts)
-          // — Node >= 24 is required for the manifest's inline (?i:) regexes (N24).
+          // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts). Node 24
+          // is required by the manifest's scoped regexp compatibility modifiers.
           generateDockerfile({
             containerStrategy: "shared-image",
             buildId,

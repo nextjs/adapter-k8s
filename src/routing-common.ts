@@ -1664,7 +1664,8 @@ export function getRscConfig(manifest: { routeGraph?: unknown }): RscConfig | un
 }
 
 /** The `routeGraph` buckets `@next/routing`'s matchRoute walks. Every entry in each of them
- * carries a `sourceRegex` that gets `new RegExp()`'d PER REQUEST with no try/catch. */
+ * carries a `sourceRegex` that gets compiled PER REQUEST with the graph's case policy and no
+ * try/catch. */
 const ROUTE_GRAPH_BUCKETS = [
   "beforeMiddleware",
   "beforeFiles",
@@ -1683,12 +1684,12 @@ const ROUTE_GRAPH_BUCKETS = [
  *  1. A structurally wrong manifest (an empty file, a half-written mount, a hand-edited
  *     ConfigMap) was consumed by a bare `JSON.parse` and only failed later, deep inside
  *     resolveRoutes, on the first request.
- *  2. A route `sourceRegex` the SERVING V8 rejects. `@next/routing`'s matchRoute does
- *     `new RegExp(entry.sourceRegex)` with NO try/catch — unlike compileMatcherRegex above,
- *     which has an explicit fail-safe for exactly this build-machine/serving-runtime skew
- *     (the `(?i:)`-on-older-Node incident). One such route therefore throws on EVERY request
- *     inside resolveRoutes → the routing service's catch → `failOpen === false` whenever the
- *     app has middleware → 500 on everything, while `/healthz` keeps answering 200.
+ *  2. A route `sourceRegex` the SERVING V8 rejects. `@next/routing`'s matchRoute compiles it
+ *     with `new RegExp(entry.sourceRegex, caseSensitive ? "" : "i")` and NO try/catch — unlike
+ *     compileMatcherRegex above, which has an explicit fail-safe for build-machine/serving-
+ *     runtime skew. One such route therefore throws on EVERY request inside resolveRoutes →
+ *     the routing service's catch → `failOpen === false` whenever the app has middleware →
+ *     500 on everything, while `/healthz` keeps answering 200.
  *
  * Throwing here puts the failure where the startup path already puts a missing TLS identity
  * and a missing middleware module: at deploy time, in front of the readiness gate.
@@ -1723,6 +1724,10 @@ export function assertValidRoutingManifest(parsed: unknown, source: string): voi
     fail("`routeGraph` must be an object");
   }
   const graph = routeGraph as Record<string, unknown>;
+  if (graph.caseSensitive !== undefined && typeof graph.caseSensitive !== "boolean") {
+    fail("`routeGraph.caseSensitive` must be a boolean when present");
+  }
+  const routeFlags = graph.caseSensitive === true ? "" : "i";
   for (const bucket of ROUTE_GRAPH_BUCKETS) {
     const entries = graph[bucket];
     if (entries === undefined) fail(`\`routeGraph.${bucket}\` is missing`);
@@ -1733,15 +1738,15 @@ export function assertValidRoutingManifest(parsed: unknown, source: string): voi
       const sourceRegex = (entry as Record<string, unknown>).sourceRegex;
       if (typeof sourceRegex !== "string") fail(`\`${at}.sourceRegex\` must be a string`);
       try {
-        new RegExp(sourceRegex as string);
+        new RegExp(sourceRegex as string, routeFlags);
       } catch (err) {
         fail(
           `\`${at}.sourceRegex\` does not compile in this runtime: ` +
             `${JSON.stringify(sourceRegex)} — ` +
             `${err instanceof Error ? err.message : String(err)}. This usually means the ` +
             `build machine's Node/V8 accepts syntax the serving runtime does not (e.g. ` +
-            `inline-flag groups like "(?i:)" on an older Node). @next/routing's matchRoute ` +
-            `compiles this per request with no try/catch`,
+            `inline-flag groups like "(?i:)" on an older Node). @next/routing compiles this ` +
+            `per request with the route graph's case-sensitivity flag and no try/catch`,
         );
       }
     });

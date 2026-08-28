@@ -190,7 +190,7 @@ A requested variant must provide its own `infrastructure.<variant>.json`—there
 
 ## Not yet implemented
 
-`imageOptimizer` and `skewProtection` validate but throw at build time when enabled; skew protection is on the [roadmap](../README.md#roadmap).
+The old `imageOptimizer`, `skewProtection`, and top-level `routeExtension` keys were placeholders. They never changed emitted workloads and are no longer part of `K8sAdapterConfig`. Validation rejects them with a removal message instead of silently ignoring stale configuration. The implemented GKE routing timeout remains at `provider.gke.serviceExtensions.routeExtension.timeout` during the legacy migration window.
 
 ## See also
 

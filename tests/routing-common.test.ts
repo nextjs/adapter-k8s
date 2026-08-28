@@ -949,6 +949,27 @@ describe("assertValidRoutingManifest", () => {
     expect(() => assertValidRoutingManifest(valid(), "m.json")).not.toThrow();
   });
 
+  it("accepts an absent or boolean route case policy and rejects truthy lookalikes", () => {
+    expect(() =>
+      assertValidRoutingManifest(
+        { ...valid(), routeGraph: { ...graph(), caseSensitive: false } },
+        "m.json",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertValidRoutingManifest(
+        { ...valid(), routeGraph: { ...graph(), caseSensitive: true } },
+        "m.json",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertValidRoutingManifest(
+        { ...valid(), routeGraph: { ...graph(), caseSensitive: "false" } },
+        "m.json",
+      ),
+    ).toThrow(/routeGraph\.caseSensitive` must be a boolean/);
+  });
+
   for (const [name, mutate] of [
     ["not an object", () => "nope"],
     ["an array", () => []],
@@ -981,8 +1002,8 @@ describe("assertValidRoutingManifest", () => {
   }
 
   it("throws for a sourceRegex this runtime cannot compile (N40)", () => {
-    // THE BUG THIS PINS: @next/routing's matchRoute does `new RegExp(entry.sourceRegex)` with
-    // NO try/catch (unlike compileMatcherRegex's documented fail-safe for middleware matchers).
+    // THE BUG THIS PINS: @next/routing's matchRoute compiles sourceRegex with the graph's case
+    // flag and NO try/catch (unlike compileMatcherRegex's fail-safe for middleware matchers).
     // One uncompilable route therefore threw inside resolveRoutes on EVERY request →
     // createProcessHandler's catch → `failOpen === false` whenever the app has middleware →
     // 500 on everything, while /healthz kept answering 200 so nothing evicted the pod.

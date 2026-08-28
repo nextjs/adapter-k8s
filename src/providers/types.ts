@@ -1,11 +1,8 @@
 // src/providers/types.ts
 //
-// The provider seam. `provider: { gke: … }` was the only shape this adapter emitted for, and
-// every cloud-specific decision was inlined at its use site. AKS/EKS/generic need those same
-// decisions answered differently, so they move behind an interface here.
-//
-// Phase 0 of plans/multi-provider-aks-eks-generic.md is a REFACTOR: the emitted chart must stay
-// byte-identical. Nothing in this file may change what GKE renders.
+// Legacy provider chart compatibility. New cluster, registry, exposure, routing, and resource
+// adapters belong under src/target. This module remains only so provider.gke and provider.generic
+// keep their existing chart output through the documented 0.x migration window.
 import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types.js";
 
 /**
@@ -20,7 +17,7 @@ import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types
  */
 export type ExtProcStrategy = "gke-traffic-extension" | "envoy-gateway";
 
-export type ProviderName = "gke" | "eks" | "aks" | "generic";
+export type ProviderName = "gke" | "generic";
 
 /** Everything a provider needs to emit its ingress-tier templates. */
 export interface ProviderChartContext {

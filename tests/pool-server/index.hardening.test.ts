@@ -278,7 +278,7 @@ function writeStagedDir(options: StageOptions = {}): Staged {
         "/ssr": { postponedState: "state", fallbackFilePath: ".next/missing-shell.html" },
       },
       pprCapableRoutes: {},
-      nextVersion: "16.2.10",
+      nextVersion: "16.3.0",
     }),
   );
   if (options.middlewareCoversEcho) {

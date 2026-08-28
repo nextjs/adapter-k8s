@@ -1,5 +1,10 @@
 // src/emit/templates/network-policy.ts
-import { assertSafePoolName, assertSafeReleaseName, sanitizeK8sName } from "./utils.js";
+import {
+  assertSafeCidr,
+  assertSafePoolName,
+  assertSafeReleaseName,
+  sanitizeK8sName,
+} from "./utils.js";
 
 // Default-deny-by-allowlist NetworkPolicies for the two workload tiers, gated on the
 // deploy CLI discovering the cluster's pod CIDRs (`--set global.networkPolicy.podCidrs=
@@ -224,6 +229,7 @@ export function renderNetworkPolicies({
   // Literal, doc-grounded constants (N19) — not helm values, so no deploy-time knob can
   // widen them; they change only with a code review of this file.
   const sources = ingressSources ?? { cidrs: STRICT_INGRESS_CIDRS, podSelectors: [] };
+  for (const cidr of sources.cidrs) assertSafeCidr(cidr, "ingress source CIDR");
   // Charset-check anything reaching a selector: these become label keys/values and a
   // namespace name in rendered YAML.
   for (const sel of sources.podSelectors) {
@@ -247,7 +253,7 @@ export function renderNetworkPolicies({
   const cidrFrom = sources.cidrs
     .map(
       (cidr) => `        - ipBlock:
-            cidr: ${cidr}`,
+            cidr: ${JSON.stringify(cidr)}`,
     )
     .join("\n");
   const podSelectorFrom = sources.podSelectors

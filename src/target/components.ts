@@ -68,11 +68,17 @@ function copyIngressSources(sources?: IngressSourceSet): IngressSourceSet {
   };
 }
 
-function backend(context: TargetBuildContext): KubernetesServiceRef {
+function origin(context: TargetBuildContext): {
+  kind: "kubernetes-service";
+  service: KubernetesServiceRef;
+} {
   return {
-    name: sanitizeK8sName(`${context.releaseName}-origin`),
-    namespace: context.namespace,
-    port: 3000,
+    kind: "kubernetes-service",
+    service: {
+      name: sanitizeK8sName(`${context.releaseName}-origin`),
+      namespace: context.namespace,
+      port: 3000,
+    },
   };
 }
 
@@ -158,7 +164,6 @@ export function kubernetesCluster(options: KubernetesClusterOptions = {}): Clust
           digestLookup: options.registry?.digestLookup ?? { kind: "oci-distribution" },
         },
         network: options.network ?? DEFAULT_NETWORK,
-        managedCache: "none",
       };
     },
   });
@@ -220,7 +225,6 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
           },
           missingSourcePolicy: "fail",
         },
-        managedCache: "gcp-memorystore",
         retained: [
           {
             kind: "gke-cluster",
@@ -296,13 +300,13 @@ export function defineResourceComponent(options: {
 
 export function defineRoutingComponent(options: {
   name: string;
-  backend(context: TargetBuildContext): KubernetesServiceRef;
+  origin(context: TargetBuildContext): import("./types.js").RoutingOrigin;
   build(context: RoutingBuildContext): RoutingBuildResult;
 }): RoutingComponent {
   return {
     componentType: "routing",
     name: safeComponentName(options.name),
-    backend: options.backend,
+    origin: options.origin,
     build: options.build,
   };
 }
@@ -576,7 +580,9 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             rules: [
               {
                 matches: [{ path: { type: "PathPrefix", value: "/" } }],
-                backendRefs: [{ name: context.backend.name, port: context.backend.port }],
+                backendRefs: [
+                  { name: context.origin.service.name, port: context.origin.service.port },
+                ],
               },
             ],
           },
@@ -794,7 +800,9 @@ export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureCo
             rules: [
               {
                 matches: [{ path: { type: "PathPrefix", value: "/" } }],
-                backendRefs: [{ name: context.backend.name, port: context.backend.port }],
+                backendRefs: [
+                  { name: context.origin.service.name, port: context.origin.service.port },
+                ],
               },
             ],
           },
@@ -945,8 +953,8 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
                         pathType: "Prefix",
                         backend: {
                           service: {
-                            name: context.backend.name,
-                            port: { number: context.backend.port },
+                            name: context.origin.service.name,
+                            port: { number: context.origin.service.port },
                           },
                         },
                       },
@@ -978,9 +986,9 @@ export function portableRouting(): RoutingComponent {
   return {
     componentType: "routing",
     name: "portable",
-    backend,
+    origin,
     build(context): RoutingBuildResult {
-      const service = backend(context);
+      const service = origin(context).service;
       const readiness: RoutingReadiness[] = [
         { kind: "kubernetes-service-endpoints", service, minimumReady: 1 },
       ];
@@ -1016,7 +1024,7 @@ export function envoyNativeRouting(
   return {
     componentType: "routing",
     name: "envoy-native",
-    backend,
+    origin,
     build(context): RoutingBuildResult {
       const className = options.gatewayClassName ?? "eg";
       const exposure = gatewayCapability(context, "envoy-native", className);
@@ -1167,6 +1175,11 @@ export function envoyNativeRouting(
         routingTier: {
           enabled: true,
           transport: "h2c",
+          callerAuthentication: {
+            kind: "none",
+            networkPolicy: "required",
+            transportSecurity: "none",
+          },
           serviceAnnotations: {},
           registration: "none",
         },
@@ -1186,7 +1199,7 @@ export function gkeNativeRouting(
   return {
     componentType: "routing",
     name: "gke-native",
-    backend,
+    origin,
     build(context): RoutingBuildResult {
       gatewayCapability(
         context,
@@ -1224,6 +1237,11 @@ export function gkeNativeRouting(
         routingTier: {
           enabled: true,
           transport: "tls",
+          callerAuthentication: {
+            kind: "none",
+            networkPolicy: "required",
+            transportSecurity: "server-tls",
+          },
           serviceAnnotations: {
             "cloud.google.com/neg": `{"exposed_ports":{"8443":{"name":"${context.releaseName}-routing-neg"}}}`,
           },
@@ -1299,8 +1317,8 @@ export function defineTarget(options: DefineTargetOptions): KubernetesTargetDefi
   if (routing.componentType !== "routing") {
     throw new Error("defineTarget.routing must be a routing component");
   }
-  if (typeof routing.backend !== "function" || typeof routing.build !== "function") {
-    throw new Error("defineTarget.routing must implement backend() and build()");
+  if (typeof routing.origin !== "function" || typeof routing.build !== "function") {
+    throw new Error("defineTarget.routing must implement origin() and build()");
   }
   const resources = [...(options.resources ?? [])];
   for (const resource of resources) {

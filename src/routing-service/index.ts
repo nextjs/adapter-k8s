@@ -5,6 +5,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { RoutingManifest } from "../types.js";
 import { assertValidRoutingManifest } from "../routing-common.js";
+import {
+  assertSupportedNextVersion,
+  SUPPORTED_NEXT_RELEASE_LINE,
+} from "../next-runtime/version.js";
 import { createRequestHandler } from "./handler.js";
 import { createRoutingServer, startHealthServer } from "./server.js";
 
@@ -244,6 +248,16 @@ async function main() {
   assertValidRoutingManifest(parsedManifest, manifestPath);
   assertManifestMatchesImage(manifestPath);
   const manifest: RoutingManifest = parsedManifest as RoutingManifest;
+  const nextSupport = assertSupportedNextVersion(
+    manifest.nextVersion,
+    `Routing manifest at ${manifestPath}`,
+  );
+  if (nextSupport.prerelease) {
+    console.warn(
+      `[routing-service] Next.js ${manifest.nextVersion} is accepted for the pinned upstream ` +
+        `conformance lane; stable releases support ${SUPPORTED_NEXT_RELEASE_LINE}.`,
+    );
+  }
 
   // Load middleware module (if present). This MUST mirror the pool's top-level-await
   // unwrap (pool-server resolveMiddlewareModule): Next compiles TLA middleware as

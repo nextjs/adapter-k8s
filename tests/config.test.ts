@@ -129,7 +129,7 @@ describe("validateConfig", () => {
     ["image optimizer", { imageOptimizer: { enabled: true, mode: "sidecar" } }],
     ["skew protection", { skewProtection: { enabled: true, duration: "5m" } }],
     ["Wasm routing", { routeExtension: { mode: "wasm" } }],
-  ])("rejects the unimplemented %s option", (_name, extra) => {
+  ])("rejects the removed %s placeholder", (_name, extra) => {
     const config = {
       pools: { ssr: { routes: ["appPages"] } },
       provider: {
@@ -142,9 +142,9 @@ describe("validateConfig", () => {
         },
       },
       ...extra,
-    } as K8sAdapterConfig;
+    } as unknown as K8sAdapterConfig;
 
-    expect(() => validateConfig(config)).toThrow(/not implemented/);
+    expect(() => validateConfig(config)).toThrow(/not a supported adapter config option/i);
   });
 
   it("caps the pool count at 15 (HTTPRoute 16-rule budget)", () => {
@@ -365,8 +365,6 @@ describe("applyDefaults", () => {
     expect(result.containerStrategy).toBe("traced-assets");
     expect(result.provider.gke.cdn?.enabled).toBe(false);
     expect(result.cache?.enabled).toBe(false);
-    expect(result.skewProtection?.enabled).toBe(false);
-    expect(result.routeExtension?.mode).toBe("auto");
   });
 });
 
@@ -599,6 +597,15 @@ describe("networkPolicy CIDR config surface", () => {
       validateConfig(withNetworkPolicy({ podCidrs: ['10.0.0.0/16",\n  injected: true'] })),
     ).toThrow(/networkPolicy\.podCidrs contains invalid CIDR/);
     expect(() => validateConfig(withNetworkPolicy({ podCidrs: [42] }))).toThrow(
+      /networkPolicy\.podCidrs contains invalid CIDR/,
+    );
+    expect(() => validateConfig(withNetworkPolicy({ podCidrs: ["999.0.0.1/24"] }))).toThrow(
+      /networkPolicy\.podCidrs contains invalid CIDR/,
+    );
+    expect(() => validateConfig(withNetworkPolicy({ podCidrs: ["10.0.0.0/33"] }))).toThrow(
+      /networkPolicy\.podCidrs contains invalid CIDR/,
+    );
+    expect(() => validateConfig(withNetworkPolicy({ podCidrs: ["fe80::1%eth0/64"] }))).toThrow(
       /networkPolicy\.podCidrs contains invalid CIDR/,
     );
   });

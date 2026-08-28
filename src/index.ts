@@ -17,21 +17,7 @@ export {
   kubernetesCluster,
   manualExposure,
   portableRouting,
-  targetForConfig,
 } from "./target/index.js";
-export {
-  COMPOSITION_PLAN_API_VERSION,
-  COMPOSITION_PLAN_KIND,
-  MINIMUM_KUBERNETES_VERSION,
-  assertKubernetesMinimumVersion,
-  assertKubernetesServerVersion,
-  canonicalCompositionPlanJson,
-  fingerprintCompositionPlan,
-  parseAndFingerprintCompositionPlan,
-  parseAndVerifyCompositionPlan,
-  parseCompositionPlan,
-} from "./composition-plan/index.js";
-
 // Default instance for zero-config use via adapterPath: '@next-community/adapter-k8s'
 // It will attempt to load adapter.config.ts from the project root.
 const defaultAdapter = createK8sAdapter();
@@ -45,14 +31,9 @@ export type {
   PoolManifest,
 } from "./types.js";
 export type {
-  CacheProvisioning,
-  CdnInvalidation,
-  CleanupPlan,
   ClusterAccess,
   ClusterIdentity,
   CompositionPlan,
-  CompositionPlanDigest,
-  CompositionPlanV1,
   DiagnosticSource,
   ExternalCleanupOperation,
   GcpLocation,
@@ -60,10 +41,7 @@ export type {
   KubernetesJsonValue,
   KubernetesManifest,
   KubernetesObjectRef,
-  KubernetesOwnedObject,
-  KubernetesResourcePlan,
   KubernetesServiceRef,
-  LogSource,
   NetworkCidrSource,
   NetworkPlan,
   RegistryAuthentication,
@@ -103,6 +81,9 @@ export type {
   ResourceComponent,
   RoutingBuildResult,
   RoutingBuildContext,
+  RoutingCallerAuthentication,
   RoutingComponent,
+  RoutingOrigin,
+  RoutingTier,
   TargetBuildContext,
 } from "./target/index.js";

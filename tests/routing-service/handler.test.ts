@@ -13,6 +13,7 @@ import {
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_SECRET_HEADER,
+  MW_EVALUATED_TRUSTED,
   buildProofHeaderNames,
   UNTRUSTED_NEXT_REQUEST_HEADERS,
   verifyDispatchProof,
@@ -54,7 +55,7 @@ function makeManifest(overrides: Partial<RoutingManifest> = {}): RoutingManifest
     middleware: null,
     poolAssignments: { "/": "ssr", "/about": "ssr", "/api/hello": "api" },
     pprRoutes: {},
-    nextVersion: "16.2.0",
+    nextVersion: "16.3.0",
     ...overrides,
   };
 }
@@ -328,6 +329,40 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
     const mw = setHeaders.find((h) => h.header.key === "x-mw-evaluated");
 
     expect(mw?.header.value).toBe("error");
+    expect(MW_EVALUATED_TRUSTED.has(mw!.header.value!)).toBe(false);
+  });
+
+  it("fails closed when the selected callable returns an unknown result", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const generated = vi.fn(async () => undefined);
+      const compatibilityDefault = vi.fn(async () => ({
+        response: new Response(null, { headers: { "x-middleware-next": "1" } }),
+      }));
+      const middlewareModule = {
+        default: { handler: generated, default: compatibilityDefault },
+      };
+      vi.mocked(resolveRoutes).mockImplementation(async (params: any) => {
+        const result = await params.invokeMiddleware({
+          url: params.url,
+          headers: params.headers,
+          requestBody: params.requestBody,
+        });
+        expect(result).toEqual({ bodySent: true });
+        return { middlewareResponded: true } as any;
+      });
+
+      const response = await createRequestHandler(
+        makeManifest(),
+        middlewareModule,
+      )(makeHeaders("/about"));
+
+      expect(response.immediateResponse?.status?.code).toBe(500);
+      expect(generated).toHaveBeenCalledTimes(1);
+      expect(compatibilityDefault).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
   });
 });
 

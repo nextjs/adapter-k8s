@@ -62,7 +62,7 @@ function makeManifest(overrides: Partial<RoutingManifest> = {}): RoutingManifest
     middleware: null,
     poolAssignments: { "/": "ssr", "/about": "ssr", "/api/hello": "api" },
     pprRoutes: {},
-    nextVersion: "16.2.0",
+    nextVersion: "16.3.0",
     ...overrides,
   } as RoutingManifest;
 }
@@ -586,11 +586,12 @@ describe("Phase 1 / Phase 2 middleware invocation-path parity (N40 / finding #6)
       poolAssignments: { "/docs/about": "ssr", "/docs/en/about": "ssr" },
     });
 
-  it("invokes the GENERATED HANDLER on both tiers for the real 16.2 artifact shape", async () => {
+  it("invokes the GENERATED HANDLER on both tiers for the real 16.3 artifact shape", async () => {
     // THE BUG THIS PINS: for `{ default: { default, handler } }`, `middlewareModule.default` is
     // an object, so Phase 2's path 1 — the only one that passed `manifestNextConfig` — was
     // UNREACHABLE and every request fell to the legacy path with NO config at all. Measured on
-    // a real built fixture with `basePath: '/docs'` + i18n: middleware saw
+    // a real built fixture (the shape remains current in installed Next 16.3) with
+    // `basePath: '/docs'` + i18n: middleware saw
     // `nextUrl.pathname = '/docs/about'`, `locale = ''` at the edge versus `/about` / `en` in
     // the pool and under `next start`, so a `pathname === '/admin'` gate silently failed to
     // fire in production only.
@@ -637,26 +638,28 @@ describe("Phase 1 / Phase 2 middleware invocation-path parity (N40 / finding #6)
     expect(r.phase2.calls[0]!.nextConfig).toEqual(expected);
   });
 
-  it("keeps the three invocation paths separate and ordered (hard invariant)", () => {
-    // A behavioral test can only catch the shapes its fixtures cover. This one catches the ACT
-    // of collapsing the ladder, which is the change that has repeatedly broken middleware
-    // invocation: each tier must still name every path.
+  it("keeps one shared, explicitly ordered Node invocation seam (hard invariant)", () => {
+    // A behavioral test can only catch the shapes its fixtures cover. Pin the architectural
+    // invariant too: both Node tiers must call the same discriminator, while the pool keeps the
+    // edge sandbox as its separate path 0.
     const read = (rel: string) =>
       readFileSync(fileURLToPath(new URL(`../src/${rel}`, import.meta.url)), "utf8");
-    for (const tier of ["pool-server/resolve.ts", "routing-service/handler.ts"]) {
-      const src = read(tier);
-      for (const marker of [
-        "generatedHandler",
-        "adapterFn",
-        "legacyMiddlewareFn",
-        "handlerFn",
-        "Path 1",
-        "Path 2",
-        "Path 3",
-      ]) {
-        expect(src, `${tier} lost ${marker}`).toContain(marker);
-      }
+    const seam = read("next-runtime/middleware-entrypoint.ts");
+    for (const marker of [
+      'kind: "generated"',
+      'kind: "web-adapter"',
+      'kind: "legacy"',
+      'kind: "direct"',
+    ]) {
+      expect(seam, `shared seam lost ${marker}`).toContain(marker);
     }
+    expect(seam.indexOf('kind: "generated"')).toBeLessThan(seam.indexOf('kind: "web-adapter"'));
+    expect(seam.indexOf('kind: "web-adapter"')).toBeLessThan(seam.indexOf('kind: "legacy"'));
+    expect(seam.indexOf('kind: "legacy"')).toBeLessThan(seam.indexOf('kind: "direct"'));
+    for (const tier of ["pool-server/resolve.ts", "routing-service/handler.ts"]) {
+      expect(read(tier), `${tier} bypassed the shared seam`).toContain("invokeNodeMiddleware");
+    }
+    expect(read("pool-server/resolve.ts")).toContain("edgeMiddlewareRunner");
   });
 });
 

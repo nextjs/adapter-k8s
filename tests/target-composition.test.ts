@@ -4,6 +4,7 @@ import {
   defineClusterComponent,
   defineExposureComponent,
   defineResourceComponent,
+  defineRoutingComponent,
   defineTarget,
   envoyNativeRouting,
   gatewayApiExposure,
@@ -13,8 +14,9 @@ import {
   ingressExposure,
   kubernetesCluster,
   manualExposure,
-  targetForConfig,
+  portableRouting,
 } from "../src/target/index.js";
+import { resolveConfiguredTarget } from "../src/target/legacy.js";
 import type { K8sAdapterConfig } from "../src/types.js";
 import type { TargetBuildContext } from "../src/target/types.js";
 import type { TelemetrySource } from "../src/composition-plan/index.js";
@@ -981,6 +983,248 @@ describe("Kubernetes target composition", () => {
 });
 
 describe("open build-time hooks", () => {
+  it("rejects a native routing adapter that does not declare caller authentication", () => {
+    const invalid = defineRoutingComponent({
+      name: "unspecified-trust",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: {
+          name: `${ctx.releaseName}-origin`,
+          namespace: ctx.namespace,
+          port: 3000,
+        },
+      }),
+      build(ctx) {
+        return {
+          plan: {
+            protocol: "envoy-ext-proc-v3",
+            failurePolicy: ctx.failurePolicy,
+            dataplane: { kind: "external-ext-proc", transport: "h2c", readiness: [] },
+          },
+          routingTier: {
+            enabled: true,
+            transport: "h2c",
+            serviceAnnotations: {},
+            registration: "none",
+          },
+        } as never;
+      },
+    });
+
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/caller authentication/i);
+  });
+
+  it("rejects routing adapters whose tier disagrees with their plan", () => {
+    const invalid = defineRoutingComponent({
+      name: "invalid-native",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: {
+          name: `${ctx.releaseName}-origin`,
+          namespace: ctx.namespace,
+          port: 3000,
+        },
+      }),
+      build(ctx) {
+        return {
+          plan: {
+            protocol: "envoy-ext-proc-v3",
+            failurePolicy: ctx.failurePolicy,
+            dataplane: { kind: "external-ext-proc", transport: "tls", readiness: [] },
+          },
+          routingTier: {
+            enabled: true,
+            transport: "h2c",
+            callerAuthentication: {
+              kind: "none",
+              networkPolicy: "required",
+              transportSecurity: "none",
+            },
+            serviceAnnotations: {},
+            registration: "none",
+          },
+        } as never;
+      },
+    });
+
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/h2c transport.*declares tls/i);
+  });
+
+  it("rejects routing adapters whose failure policy disagrees with the build", () => {
+    const invalid = defineRoutingComponent({
+      name: "unsafe-open",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: {
+          name: `${ctx.releaseName}-origin`,
+          namespace: ctx.namespace,
+          port: 3000,
+        },
+      }),
+      build() {
+        return {
+          plan: {
+            protocol: "envoy-ext-proc-v3",
+            failurePolicy: "open",
+            dataplane: { kind: "external-ext-proc", transport: "h2c", readiness: [] },
+          },
+          routingTier: {
+            enabled: true,
+            transport: "h2c",
+            callerAuthentication: {
+              kind: "none",
+              networkPolicy: "required",
+              transportSecurity: "none",
+            },
+            serviceAnnotations: {},
+            registration: "none",
+          },
+        };
+      },
+    });
+
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context({ failurePolicy: "closed" }),
+      ),
+    ).toThrow(/failure policy.*open.*closed/i);
+  });
+
+  it("rejects invalid origin Service references before an exposure can embed them", () => {
+    const invalid = defineRoutingComponent({
+      name: "invalid-backend",
+      origin: () => ({
+        kind: "kubernetes-service",
+        service: { name: "UPPER CASE", namespace: "apps", port: 70_000 },
+      }),
+      build: (ctx) => portableRouting().build(ctx),
+    });
+
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/invalid-backend.*Service/i);
+  });
+
+  it.each([
+    ["a dotted name", "app.origin", "apps"],
+    ["a digit-leading name", "1-origin", "apps"],
+    ["an overlong name", `a${"b".repeat(63)}`, "apps"],
+    ["a cross-namespace origin", "valid-origin", "other-apps"],
+  ])("rejects %s before built-in exposures consume it", (_label, name, namespace) => {
+    const invalid = defineRoutingComponent({
+      name: "invalid-origin",
+      origin: () => ({
+        kind: "kubernetes-service",
+        service: { name, namespace, port: 3000 },
+      }),
+      build: (ctx) => portableRouting().build(ctx),
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: gatewayApiExposure({ className: "envoy", hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/invalid-origin.*Service/i);
+  });
+
+  it("rejects a pool-local plan that describes a different Service than the exposure origin", () => {
+    const invalid = defineRoutingComponent({
+      name: "split-origin",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: { name: `${ctx.releaseName}-origin`, namespace: ctx.namespace, port: 3000 },
+      }),
+      build(ctx) {
+        const result = portableRouting().build(ctx);
+        return {
+          ...result,
+          plan: {
+            ...result.plan,
+            dataplane: {
+              ...result.plan.dataplane,
+              service: { name: "other-origin", namespace: ctx.namespace, port: 3000 },
+            },
+          },
+        };
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/split-origin.*same origin Service/i);
+  });
+
+  it.each([
+    ["non-boolean enabled", { enabled: 1, serviceAnnotations: {}, registration: "none" }],
+    ["unknown registration", { enabled: false, serviceAnnotations: {}, registration: "typo" }],
+    [
+      "non-string annotation",
+      { enabled: false, serviceAnnotations: { "example.com/count": 7 }, registration: "none" },
+    ],
+  ])("rejects JavaScript-shaped routing tiers with %s", (_label, routingTier) => {
+    const invalid = defineRoutingComponent({
+      name: "invalid-tier",
+      origin: (ctx) => ({
+        kind: "kubernetes-service",
+        service: { name: `${ctx.releaseName}-origin`, namespace: ctx.namespace, port: 3000 },
+      }),
+      build(ctx) {
+        const result = portableRouting().build(ctx);
+        return { ...result, routingTier } as never;
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          routing: invalid,
+        }),
+        context(),
+      ),
+    ).toThrow(/invalid-tier.*routingTier/i);
+  });
+
   it("lets an NGINX ingress component contribute telemetry and fingerprints the contract", () => {
     const nginxExposure = (metricName: string) =>
       defineExposureComponent({
@@ -1064,7 +1308,6 @@ describe("open build-time hooks", () => {
             },
             missingSourcePolicy: "fail",
           },
-          managedCache: "none",
         };
       },
     });
@@ -1337,7 +1580,7 @@ describe("legacy provider translation", () => {
   const base = { pools: { default: { routes: ["appPages"] } } };
 
   it("translates generic and GKE blocks without a provider registry", () => {
-    const generic = targetForConfig({
+    const generic = resolveConfiguredTarget({
       ...base,
       provider: {
         generic: {
@@ -1345,9 +1588,13 @@ describe("legacy provider translation", () => {
         },
       },
     } as K8sAdapterConfig);
-    expect(generic.routing.name).toBe("envoy-native");
+    expect(generic).toMatchObject({
+      source: "legacy-provider",
+      providerName: "generic",
+      definition: { routing: { name: "envoy-native" } },
+    });
 
-    const gke = targetForConfig({
+    const gke = resolveConfiguredTarget({
       ...base,
       provider: {
         gke: {
@@ -1359,7 +1606,11 @@ describe("legacy provider translation", () => {
         },
       },
     } as K8sAdapterConfig);
-    expect(gke.routing.name).toBe("gke-native");
+    expect(gke).toMatchObject({
+      source: "legacy-provider",
+      providerName: "gke",
+      definition: { routing: { name: "gke-native" } },
+    });
   });
 
   it("rejects target/provider conflicts and unknown legacy providers", () => {
@@ -1368,10 +1619,13 @@ describe("legacy provider translation", () => {
       exposure: manualExposure({ hosts }),
     });
     expect(() =>
-      targetForConfig({ ...base, target, provider: { generic: {} } } as K8sAdapterConfig),
+      resolveConfiguredTarget({ ...base, target, provider: { generic: {} } } as K8sAdapterConfig),
     ).toThrow(/target or legacy provider, not both/i);
     expect(() =>
-      targetForConfig({ ...base, provider: { traefik: {} } } as unknown as K8sAdapterConfig),
+      resolveConfiguredTarget({
+        ...base,
+        provider: { traefik: {} },
+      } as unknown as K8sAdapterConfig),
     ).toThrow(/unknown legacy provider/i);
   });
 });
