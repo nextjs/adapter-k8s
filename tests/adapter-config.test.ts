@@ -20,6 +20,20 @@ const validConfig: K8sAdapterConfig = {
 };
 
 describe("createK8sAdapter config normalization", () => {
+  it("rejects an unreviewed Next.js release before modifying the build config", async () => {
+    const adapter = createK8sAdapter(validConfig);
+
+    await expect(
+      adapter.modifyConfig!(
+        {} as any,
+        {
+          phase: "phase-production-build",
+          nextVersion: "16.4.0",
+        } as any,
+      ),
+    ).rejects.toThrow(/outside the supported Next\.js release line.*>=16\.3\.0 <16\.4\.0/s);
+  });
+
   it("validates a directly supplied config", async () => {
     const adapter = createK8sAdapter({
       ...validConfig,
@@ -132,6 +146,32 @@ describe("Turbopack production filesystem cache", () => {
         expect(await cacheFlag()).toBe(true);
       }
     });
+  });
+});
+
+describe("Next output mode", () => {
+  it("removes redundant standalone output before Next finalizes the adapter build", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const adapter = createK8sAdapter(validConfig);
+      const modified = (await adapter.modifyConfig!(
+        { output: "standalone", poweredByHeader: false } as any,
+        {} as any,
+      )) as { output?: string; poweredByHeader?: boolean };
+
+      expect(modified).not.toHaveProperty("output");
+      expect(modified.poweredByHeader).toBe(false);
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/output.*standalone.*adapter-owned/s);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("rejects static export because it emits no deployable route entrypoints", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    await expect(adapter.modifyConfig!({ output: "export" } as any, {} as any)).rejects.toThrow(
+      /output.*export.*static files.*Kubernetes runtime/i,
+    );
   });
 });
 
@@ -253,7 +293,7 @@ describe("buildId validation at build time (H2)", () => {
         outputs: {},
         projectDir: "/nonexistent",
         config: {},
-        nextVersion: "16.2.0",
+        nextVersion: "16.3.0",
       } as any),
     ).rejects.toThrow(/Invalid buildId/);
   });
@@ -272,7 +312,7 @@ describe("buildId validation at build time (H2)", () => {
           outputs: {},
           projectDir: "/nonexistent",
           config: {},
-          nextVersion: "16.2.0",
+          nextVersion: "16.3.0",
         } as any),
       ).rejects.toThrow(/cannot be used as a Docker image tag/);
     },
@@ -287,7 +327,7 @@ describe("buildId validation at build time (H2)", () => {
         outputs: {},
         projectDir: "/nonexistent",
         config: {},
-        nextVersion: "16.2.0",
+        nextVersion: "16.3.0",
       } as any),
     ).rejects.toThrow(/generateBuildId/);
   });
@@ -320,7 +360,7 @@ describe("onBuildComplete build-time guards", () => {
       outputs: mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] }),
       projectDir,
       config,
-      nextVersion: "16.2.0",
+      nextVersion: "16.3.0",
     }) as any;
 
   const writeInfra = (infra: Record<string, unknown>) => {
@@ -506,7 +546,7 @@ describe("onBuildComplete build-time guards", () => {
         outputs: mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] }),
         projectDir: symbolDir,
         config: {},
-        nextVersion: "16.2.0",
+        nextVersion: "16.3.0",
       } as any),
     ).resolves.toBeUndefined();
     const gateway = readFileSync(
@@ -530,7 +570,7 @@ describe("onBuildComplete build-time guards", () => {
         outputs: mockOutputs({ appPages: [mockAppPage({ pathname: "/" })] }),
         projectDir: longDir,
         config: {},
-        nextVersion: "16.2.0",
+        nextVersion: "16.3.0",
       } as any),
     ).resolves.toBeUndefined();
     const gateway = readFileSync(

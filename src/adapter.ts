@@ -33,6 +33,7 @@ import { resolveProvider } from "./providers/index.js";
 import { compileTarget } from "./target/index.js";
 import { resolveConfiguredTarget } from "./target/legacy.js";
 import { fingerprintCompositionPlan } from "./composition-plan/index.js";
+import { assertSupportedNextVersion } from "./next-runtime/version.js";
 import { infrastructurePath, outputDirName } from "./cli/infrastructure-validation.js";
 import { targetPlatform, type TargetPlatform } from "./target-platform.js";
 import {
@@ -1321,6 +1322,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
     async modifyConfig(nextConfig, _ctx) {
       // The stable adapter API ctx has { phase, nextVersion } — no projectDir.
       // Use process.cwd() which is the project root during build.
+      if (_ctx.nextVersion !== undefined) {
+        assertSupportedNextVersion(_ctx.nextVersion, "Next.js build configuration");
+      }
       const cfg = await ensureConfig(process.cwd());
 
       // N14: `deploymentId` (Next's skew protection) makes Next return a CONSTANT build id
@@ -1385,6 +1389,29 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           return `b${timestamp}${random}`;
         },
       };
+
+      // A deployment adapter and Next's standalone server are two competing packagers for the
+      // same build. This adapter traces each route into pool-specific Docker contexts and never
+      // consumes `.next/standalone`; keeping the flag only asks Next to run its standalone
+      // finalizer after `onBuildComplete`. Next 16.3 can then fail looking for root trace files it
+      // deliberately omits when an adapter is active. Normalize the redundant setting here so
+      // existing self-hosting configs work when the adapter is enabled conditionally.
+      if (nextConfig.output === "standalone") {
+        delete modified.output;
+        console.warn(
+          '[adapter-k8s] Ignoring next.config output: "standalone": adapter-k8s emits its own ' +
+            "traced, adapter-owned Docker contexts and Kubernetes runtime.",
+        );
+      } else if (nextConfig.output === "export") {
+        // Per the adapter API, static export reports only staticFiles. There are no App/Pages
+        // entrypoints for the pool server to invoke, so accepting this would generate an empty
+        // runtime deployment that looks healthy but cannot serve the application.
+        throw new Error(
+          '[adapter-k8s] next.config output: "export" emits static files only and cannot be ' +
+            'deployed as an adapter-k8s Kubernetes runtime. Remove output: "export", or deploy ' +
+            "the exported directory as a static site without this adapter.",
+        );
+      }
 
       // Opt into immutable static assets (Turbopack-only). Next then content-addresses immutable
       // assets and drops the `?dpl` skew token from their URLs (mutable assets like service workers
@@ -1578,6 +1605,9 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         buildId: ctxBuildId,
         nextVersion,
       } = ctx;
+      // Runtime startup repeats this check as a skew/tamper defense, but an unsupported build
+      // must fail before the adapter emits or stages any deployment artifact.
+      assertSupportedNextVersion(nextVersion, "Next.js build output");
       const deploymentId = (nextConfig as { deploymentId?: string }).deploymentId;
       // Substitute Next's pinned deploymentId-mode constant with a unique id — see
       // effectiveBuildId. Everything below (resource names, image tags, Valkey namespace,

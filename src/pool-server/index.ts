@@ -47,6 +47,12 @@ import {
   mergeResolvedHeadersIntoHeadersArg,
   REQUEST_HEAD_TIMEOUT_MS,
 } from "./dispatch.js";
+import {
+  parseDispatchDeadline,
+  parseDispatchHeaderMap,
+  parseDispatchInvocationQuery,
+  parseDispatchRouteMatches,
+} from "./dispatch-metadata.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
 import {
   ifNoneMatchMatches,
@@ -417,28 +423,6 @@ function requestHeaders(req: IncomingMessage): Headers {
     else if (Array.isArray(value)) value.forEach((entry) => headers.append(key, entry));
   }
   return headers;
-}
-
-// Reconstruct a Headers from the routing extension's serialized x-resolved-headers (JSON of
-// next.config headers() + middleware response headers). Set-Cookie arrives as an array so each
-// cookie is re-appended intact. Malformed JSON is ignored (returns undefined) rather than
-// failing the request.
-function parseResolvedHeaders(raw: string | undefined): Headers | undefined {
-  if (!raw) return undefined;
-  try {
-    const obj = JSON.parse(raw) as Record<string, string | string[]>;
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(obj)) {
-      if (Array.isArray(value)) {
-        for (const v of value) headers.append(key, v);
-      } else {
-        headers.set(key, value);
-      }
-    }
-    return headers;
-  } catch {
-    return undefined;
-  }
 }
 
 // Every cache-control observable on the response at writeHead time: from the headers
@@ -2651,9 +2635,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // dispatch reuses the same parse. Deleted immediately so it can never leak to handlers.
     // `let`, not `const`: enforceDispatchBodyBinding below can REVOKE this request's trust after
     // this parse has already happened, and the revocation has to reach the values it captured.
-    let extResolvedHeaders = parseResolvedHeaders(
-      req.headers["x-resolved-headers"] as string | undefined,
-    );
+    const extResolvedHeadersField = parseDispatchHeaderMap(req.headers["x-resolved-headers"]);
+    let extResolvedHeaders = extResolvedHeadersField.ok ? extResolvedHeadersField.value : undefined;
     delete req.headers["x-resolved-headers"];
     // N40 (SECURITY). The middleware's FINAL request-header set, stamped by the routing
     // extension (routing-service/handler.ts) and secret-gated exactly like
@@ -2669,10 +2652,20 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // reached the handler unmodified. Parsed with the SAME reader as `x-resolved-headers` (one
     // wire shape) and deleted immediately so it can never leak to a handler on either phase.
     // `let` for the same reason as `extResolvedHeaders` above.
-    let extMwRequestHeaders = parseResolvedHeaders(
-      req.headers["x-mw-request-headers"] as string | undefined,
-    );
+    const extMwRequestHeadersField = parseDispatchHeaderMap(req.headers["x-mw-request-headers"]);
+    let extMwRequestHeaders = extMwRequestHeadersField.ok
+      ? extMwRequestHeadersField.value
+      : undefined;
     delete req.headers["x-mw-request-headers"];
+    const extRouteMatchesField = parseDispatchRouteMatches(req.headers["x-route-matches"]);
+    const extInvocationQueryField = parseDispatchInvocationQuery(req.headers["x-invoke-query"]);
+    const extDeadlineField = parseDispatchDeadline(req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER]);
+    const extDispatchMetadataValid =
+      extResolvedHeadersField.ok &&
+      extMwRequestHeadersField.ok &&
+      extRouteMatchesField.ok &&
+      extInvocationQueryField.ok &&
+      extDeadlineField.ok;
 
     // The explicit app-owned cache-control for this request, if any: from the routing
     // extension's resolved verdict (Phase 2, above) or from local resolution (Phase 1
@@ -3087,7 +3080,8 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     const upstreamMiddlewareVerdict = req.headers["x-mw-evaluated"];
     const upstreamAlreadyResolved =
       typeof upstreamMiddlewareVerdict === "string" &&
-      MW_EVALUATED_TRUSTED.has(upstreamMiddlewareVerdict);
+      MW_EVALUATED_TRUSTED.has(upstreamMiddlewareVerdict) &&
+      extDispatchMetadataValid;
     const upstreamInvokePath = req.headers["x-invoke-path"];
     const upstreamRewrotePlatform =
       upstreamAlreadyResolved &&
@@ -3105,6 +3099,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       applyMiddlewareRequestHeaders(req, extMwRequestHeaders);
       installResolvedResponseHeaders(res, extResolvedHeaders);
     } else if (shouldHandleImage) {
+      // A corrupt phase-two verdict is indivisible: do not expose the surviving transport
+      // fields to image-route middleware while locally rebuilding the decision.
+      for (const header of INTERNAL_DISPATCH_HEADERS) {
+        delete req.headers[header];
+        headers.delete(header);
+      }
       const resolution = await resolvePlatformRequest(
         resolver,
         url,
@@ -3687,6 +3687,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // were stripped), so they can be trusted here.
     const extOutputId = req.headers["x-output-id"] as string | undefined;
     const extMwEvaluated = req.headers["x-mw-evaluated"] as string | undefined;
+    const routeMatches = extRouteMatchesField.ok ? (extRouteMatchesField.value ?? null) : null;
     delete req.headers["x-mw-evaluated"];
     // Skip the pool's own middleware ONLY when the trusted upstream POSITIVELY asserts it
     // evaluated the middleware stage (x-mw-evaluated ∈ ran/skip-nomatch/none). x-output-id
@@ -3694,18 +3695,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // without having run middleware. Absent / `error` / unrecognized ⇒ fall through to
     // Phase 1 below so the pool evaluates middleware itself. Both headers are secret-gated
     // (untrusted ones were already stripped in server.ts), so this can't be forged.
-    if (extOutputId && extMwEvaluated && MW_EVALUATED_TRUSTED.has(extMwEvaluated)) {
-      const routeMatchesRaw = req.headers["x-route-matches"] as string | undefined;
-      // Secret-gated (trusted) input, but a malformed value from an extension bug should not
-      // 500 the request — fall back to no route params rather than throwing.
-      let routeMatches: Record<string, string> | null = null;
-      if (routeMatchesRaw) {
-        try {
-          routeMatches = JSON.parse(routeMatchesRaw);
-        } catch {
-          routeMatches = null;
-        }
-      }
+    if (
+      extOutputId &&
+      extMwEvaluated &&
+      MW_EVALUATED_TRUSTED.has(extMwEvaluated) &&
+      extDispatchMetadataValid
+    ) {
       const pool = (req.headers["x-upstream-pool"] as string) ?? poolName;
 
       // Public files flow through dispatch via the static manifest (which merges
@@ -3727,25 +3722,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // entrypoint as requestMeta (query / params / resolvedPathname) — the loopback
       // request URL itself stays the PUBLIC one, mirroring Next's base-server, because
       // req.url is what feeds req.url / router.asPath / usePathname. See
-      // dispatch.ts invokeLocalHandlerOverHttp. Trusted input, but a malformed query
-      // from an extension bug must not 500 the request — the invoker recovers the
-      // query from the invocation path itself.
+      // dispatch.ts invokeLocalHandlerOverHttp. The JSON metadata was validated as one
+      // indivisible verdict above; a skewed or corrupt routing tier falls through to local
+      // resolution instead of mixing phase-one and phase-two state.
       const extInvokePath = req.headers["x-invoke-path"] as string | undefined;
-      const extDeadlineRaw = req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER] as string | undefined;
-      const extDeadlineParsed = extDeadlineRaw === undefined ? Number.NaN : Number(extDeadlineRaw);
-      const extDeadlineAt =
-        Number.isSafeInteger(extDeadlineParsed) && extDeadlineParsed > 0
-          ? extDeadlineParsed
-          : undefined;
-      let extInvocationQuery: Record<string, string | string[]> | undefined;
-      const extInvokeQueryRaw = req.headers["x-invoke-query"] as string | undefined;
-      if (extInvokeQueryRaw) {
-        try {
-          extInvocationQuery = JSON.parse(extInvokeQueryRaw);
-        } catch {
-          extInvocationQuery = undefined;
-        }
-      }
+      const extDeadlineAt = extDeadlineField.ok ? extDeadlineField.value : undefined;
+      const extInvocationQuery = extInvocationQueryField.ok
+        ? extInvocationQueryField.value
+        : undefined;
 
       // S22. Every dispatch header has now been READ into a local — delete the whole
       // vocabulary before anything downstream sees it. Only `x-mw-evaluated` (and the two
@@ -3776,7 +3760,14 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     }
 
     // The fall-through path: a secret-gated `x-output-id` was present but the middleware
-    // verdict was absent or untrusted, so Phase 1 re-derives EVERYTHING itself — the
+    // verdict was absent/untrusted or any dispatch metadata was malformed, so Phase 1
+    // re-derives EVERYTHING itself. Revoke the values parsed before this decision as one unit:
+    // in particular, a valid x-resolved-headers beside a malformed query/deadline/route-match
+    // must not retain its Cache-Control slot while local resolution owns the response.
+    extResolvedHeaders = undefined;
+    extMwRequestHeaders = undefined;
+    appCacheControl = null;
+    // The
     // dispatch vocabulary is unusable here by construction. S22 deleted it only inside the
     // trusted branch above; left in place on this path, `x-output-id`, `x-upstream-pool`,
     // `x-route-matches`, `x-invoke-path`, `x-invoke-query`, `x-nextjs-ppr` and the execution
