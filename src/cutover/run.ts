@@ -5,7 +5,7 @@
 // and warmed HPAs are restored, and the callers (runDeploy/runRollback today, the in-cluster
 // cutover Job's main next phase) map it to an exit code.
 import { execCapture, execOrThrow, EXEC_TIMEOUTS } from "../cli/exec.js";
-import { writeState, type AdapterState } from "../cli/state.js";
+import { readState, StateUnavailableError, writeState, type AdapterState } from "../cli/state.js";
 import { invalidateCdnBuildTag } from "../cli/cdn-invalidate.js";
 import { cdnTagForBuildId } from "../cdn-tags.js";
 import { waitForCompositionPlanReadiness } from "../cli/composition-plan.js";
@@ -144,11 +144,60 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
   // D7 (7b). Per-pool /readyz capacity gate with failure diagnostics.
   await waitReadyCapacity(ctx, capacityTargets, restoreWarmedHpas);
 
+  // The readiness gates can take minutes. A second deploy may have committed during that window,
+  // making this function's `previousBuildId` and state generation stale even when deploy re-read
+  // them immediately before Helm. Check again at the last read-only point before selector
+  // mutation; otherwise the later CAS failure reports an error only after traffic has already
+  // moved to an unrecorded build.
+  try {
+    const latestState = await readState(projectDir, releaseName, {
+      namespace,
+      clusterOnly: stateStore === "cluster-only",
+    });
+    const changed = state
+      ? !latestState ||
+        latestState.buildId !== state.buildId ||
+        (latestState.generation ?? 0) !== (state.generation ?? 0)
+      : latestState !== null;
+    if (changed) {
+      throw new Error(
+        `deploy state changed while build ${buildId} was becoming ready ` +
+          `(expected ${state?.buildId ?? "no committed build"} generation ${state?.generation ?? 0}, ` +
+          `found ${latestState?.buildId ?? "no committed build"} generation ` +
+          `${latestState?.generation ?? 0})`,
+      );
+    }
+  } catch (error) {
+    if (!state && previousBuildId && error instanceof StateUnavailableError) {
+      // Deploy recovered `previousBuildId` from the live Service selectors because committed
+      // state was unavailable. Requiring that same unavailable store here would make repair
+      // impossible. E1 reads every selector again and now verifies it still names this recovered
+      // build before applying any patch, which is the authoritative concurrency check on this
+      // recovery path.
+      console.warn(
+        `  ! Deploy state remains unavailable immediately before cutover; verifying the ` +
+          `recovered build against every live Service selector instead.`,
+      );
+    } else {
+      const edge = await deps.restoreEdgeToPreviousBuild();
+      await restoreWarmedHpas();
+      throw new Error(
+        [
+          `Committed deploy state could not be revalidated immediately before traffic cutover; ` +
+            `refusing to patch Service selectors: ` +
+            `${error instanceof Error ? error.message : String(error)}`,
+          ...deps.edgeStatusLines(edge),
+        ].join("\n"),
+      );
+    }
+  }
+
   // E1 (7c). Cut traffic over: patch each active Service selector to the new build.
   await switchTrafficToNewBuild({
     releaseName,
     namespace,
     safeBuildId,
+    expectedCurrentBuildId: previousBuildId,
     pools,
     hasPortableOrigin,
     defaultPool,

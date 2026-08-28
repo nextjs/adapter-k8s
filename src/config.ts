@@ -7,6 +7,7 @@ import {
   assertSafeHostname,
   assertSafePoolName,
   assertSafeQuantity,
+  assertSafeRegion,
   assertSafeReplicaCount,
   assertSafeSecretName,
   assertSafeTargetCPU,
@@ -339,12 +340,6 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     throw new Error("target exposure must contain at least one host");
   }
 
-  if (config.target && config.cache?.enabled && !config.cache.url) {
-    throw new Error(
-      "target compositions require cache.url when cache.enabled is true; managed cache provisioning must be declared explicitly by a future target resource",
-    );
-  }
-
   for (const hostConfig of gatewayHosts) {
     if (!hostConfig.hostname) {
       throw new Error("each host in provider.gke.gateway.hosts must have a hostname");
@@ -395,6 +390,24 @@ export function validateConfig(input: unknown, releaseName?: string): void {
       throw new Error(
         "cache.url must be a redis:// or rediss:// connection string (or omit it to provision managed Memorystore)",
       );
+    }
+    const memorystore = config.cache.memorystore;
+    if (memorystore?.region !== undefined) assertSafeRegion(memorystore.region);
+    if (
+      memorystore?.sizeGb !== undefined &&
+      (!Number.isInteger(memorystore.sizeGb) || memorystore.sizeGb < 1 || memorystore.sizeGb > 300)
+    ) {
+      throw new Error("cache.memorystore.sizeGb must be an integer from 1 to 300");
+    }
+    if (
+      memorystore?.tier !== undefined &&
+      memorystore.tier !== "BASIC" &&
+      memorystore.tier !== "STANDARD_HA"
+    ) {
+      throw new Error('cache.memorystore.tier must be "BASIC" or "STANDARD_HA"');
+    }
+    if (memorystore?.auth !== undefined && typeof memorystore.auth !== "boolean") {
+      throw new Error("cache.memorystore.auth must be a boolean");
     }
     // This function receives the evaluated config object, so a literal and
     // `process.env.VALKEY_AUTH` are both plain strings here. Do not claim to know which source

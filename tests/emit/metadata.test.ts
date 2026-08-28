@@ -69,9 +69,18 @@ describe("generateBuildMetadata", () => {
   it("omits cacheMemorystore when absent and includes it when supplied", () => {
     expect(JSON.parse(generateBuildMetadata(base)).cacheMemorystore).toBeUndefined();
     expect(
-      JSON.parse(generateBuildMetadata({ ...base, cacheMemorystore: { region: "us-central1" } }))
-        .cacheMemorystore,
-    ).toEqual({ region: "us-central1" });
+      JSON.parse(
+        generateBuildMetadata({
+          ...base,
+          cacheMemorystore: {
+            region: "us-central1",
+            sizeGb: 5,
+            tier: "STANDARD_HA",
+            auth: false,
+          },
+        }),
+      ).cacheMemorystore,
+    ).toEqual({ region: "us-central1", sizeGb: 5, tier: "STANDARD_HA", auth: false });
   });
 
   it("records the shared pool image layout only when the build emitted it", () => {

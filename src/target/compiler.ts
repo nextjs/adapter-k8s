@@ -1,6 +1,10 @@
 import type {
+  CacheProvisioning,
+  DiagnosticSource,
+  ExternalCleanupOperation,
   KubernetesApiRequirement,
   KubernetesManifest,
+  RetainedExternalResource,
   RoutingReadiness,
   TelemetrySource,
 } from "../composition-plan/types.js";
@@ -16,6 +20,7 @@ import type {
   CompiledKubernetesTarget,
   KubernetesContribution,
   KubernetesTargetDefinition,
+  ResourceBuildResult,
   TargetBuildContext,
 } from "./types.js";
 import { targetFingerprint, validateTargetContext } from "./components.js";
@@ -199,10 +204,21 @@ function validateRoutingContract(
   }
 }
 
+interface NormalizedContribution {
+  objects: KubernetesManifest[];
+  requirements: KubernetesApiRequirement[];
+  readiness: RoutingReadiness[];
+  cache?: CacheProvisioning;
+  externalCleanup: ExternalCleanupOperation[];
+  retained: RetainedExternalResource[];
+  diagnostics: DiagnosticSource[];
+  telemetry: TelemetrySource[];
+}
+
 function contributionOf(
-  contribution: KubernetesContribution,
+  contribution: KubernetesContribution & Pick<ResourceBuildResult, "cache">,
   componentName: string,
-): Required<KubernetesContribution> {
+): NormalizedContribution {
   if (contribution === null || typeof contribution !== "object" || Array.isArray(contribution)) {
     throw new Error(`Target component "${componentName}" returned a non-object contribution`);
   }
@@ -212,6 +228,7 @@ function contributionOf(
         "objects",
         "requirements",
         "readiness",
+        "cache",
         "externalCleanup",
         "retained",
         "diagnostics",
@@ -227,11 +244,67 @@ function contributionOf(
     objects: [...(contribution.objects ?? [])],
     requirements: [...(contribution.requirements ?? [])],
     readiness: [...(contribution.readiness ?? [])],
+    ...(contribution.cache ? { cache: contribution.cache } : {}),
     externalCleanup: [...(contribution.externalCleanup ?? [])],
     retained: [...(contribution.retained ?? [])],
     diagnostics: [...(contribution.diagnostics ?? [])],
     telemetry: [...(contribution.telemetry ?? [])],
   };
+}
+
+function resolveCacheProvisioning(
+  context: TargetBuildContext,
+  targetName: string,
+  contributions: readonly (CacheProvisioning | undefined)[],
+): CacheProvisioning {
+  const declared = contributions.filter((entry): entry is CacheProvisioning => entry !== undefined);
+  if (declared.length > 1) {
+    throw new Error(`Target "${targetName}" has multiple cache provisioning contributions`);
+  }
+
+  if (context.cache === "external") {
+    if (declared.length > 0 && declared[0]!.kind !== "external") {
+      throw new Error(
+        `Target "${targetName}" declares managed cache provisioning even though cache.url is configured`,
+      );
+    }
+    return { kind: "external", lifecycle: "operator-managed" };
+  }
+  if (context.cache === undefined || context.cache === "none") {
+    if (declared.length > 0 && declared[0]!.kind !== "none") {
+      throw new Error(
+        `Target "${targetName}" declares cache provisioning even though the cache is disabled`,
+      );
+    }
+    return { kind: "none" };
+  }
+
+  const provisioning = declared[0];
+  if (!provisioning || provisioning.kind === "none" || provisioning.kind === "external") {
+    throw new Error(
+      `Target "${targetName}" does not provide managed cache provisioning. Set cache.url to ` +
+        `an operator-managed Valkey/Redis endpoint, disable the cache, or use a target component ` +
+        `that contributes a managed CacheProvisioning operation.`,
+    );
+  }
+  return provisioning;
+}
+
+function cacheCleanup(cache: CacheProvisioning): ExternalCleanupOperation[] {
+  switch (cache.kind) {
+    case "gcp-memorystore":
+      return [
+        {
+          kind: "gcp-memorystore",
+          projectId: cache.projectId,
+          region: cache.region,
+          name: cache.name,
+        },
+      ];
+    case "none":
+    case "external":
+      return [];
+  }
 }
 
 function objectIdentity(object: KubernetesManifest): string {
@@ -356,6 +429,7 @@ export function compileTarget(
         "access",
         "registry",
         "network",
+        "cache",
         "externalCleanup",
         "retained",
         "diagnostics",
@@ -474,9 +548,14 @@ export function compileTarget(
     identities.add(identity);
   }
   const readiness: RoutingReadiness[] = contributions.flatMap((entry) => entry.readiness);
+  const cache = resolveCacheProvisioning(context, target.cluster.name, [
+    cluster.cache,
+    ...contributions.map((entry) => entry.cache),
+  ]);
   const externalCleanup = [
     ...(cluster.externalCleanup ?? []),
     ...contributions.flatMap((entry) => entry.externalCleanup),
+    ...cacheCleanup(cache),
   ];
   const retained = [
     ...(cluster.retained ?? []),
@@ -519,10 +598,6 @@ export function compileTarget(
     { apiVersion: "networking.k8s.io/v1", resource: "networkpolicies", optional: false },
     ...contributions.flatMap((entry) => entry.requirements),
   ]);
-  const cache =
-    context.cache === "external"
-      ? ({ kind: "external", lifecycle: "operator-managed" } as const)
-      : ({ kind: "none" } as const);
   // This is the compatibility identity for lifecycle commands, not merely a cluster locator.
   // A rollback cannot safely keep the current Helm release while claiming to restore a build
   // whose exposure, routing policies, contributed objects or default origin pool differ.

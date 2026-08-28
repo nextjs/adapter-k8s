@@ -16,6 +16,7 @@ export interface InfrastructureArgvFields {
   containerRegistry?: string | undefined;
   gcsBucket?: string | undefined;
   cacheRegion?: string | undefined;
+  cacheProjectId?: string | undefined;
   clusterName?: string | undefined;
 }
 
@@ -24,7 +25,8 @@ export interface InfrastructureArgvFields {
  * `helm` argv, at the point it is read.
  *
  * `deploy` and `init` already did this; `destroy`, `describe`, `doctor`, `tail` and `rollback`
- * spliced `projectId`, `region`, `gcsBucket`, `containerRegistry` and `cacheRegion` straight
+ * spliced `projectId`, `region`, `gcsBucket`, `containerRegistry`, `cacheProjectId` and
+ * `cacheRegion` straight
  * into argv with no checks at all. On POSIX that is inert — everything goes through execFile
  * with `shell: false`, so a metacharacter is one literal argv token. On WINDOWS it is not:
  * `gcloud` resolves to `gcloud.cmd` and a `.cmd` shim can re-parse metacharacters out of its
@@ -42,6 +44,7 @@ export function assertSafeInfrastructure(infra: InfrastructureArgvFields | null 
   if (infra.region) assertSafeRegion(infra.region);
   if (infra.namespace !== undefined) assertSafeNamespace(infra.namespace);
   if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
+  if (infra.cacheProjectId) assertSafeProjectId(infra.cacheProjectId);
   // A region-shaped value; same charset as `region` (lowercase alnum + hyphen).
   if (infra.cacheRegion) assertSafeRegion(infra.cacheRegion);
   // GCS bucket and GKE cluster names: DNS-ish labels. Reject anything that could be argv

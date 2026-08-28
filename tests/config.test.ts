@@ -322,6 +322,24 @@ describe("cache config", () => {
     );
   });
 
+  it.each([0, 301, 1.5])("rejects invalid managed cache size %s", (sizeGb) => {
+    expect(() => validateConfig(withCache({ enabled: true, memorystore: { sizeGb } }))).toThrow(
+      /sizeGb must be an integer from 1 to 300/,
+    );
+  });
+
+  it("rejects invalid managed cache region, tier, and auth values", () => {
+    expect(() =>
+      validateConfig(withCache({ enabled: true, memorystore: { region: "BAD region" } })),
+    ).toThrow(/Invalid region/);
+    expect(() =>
+      validateConfig(withCache({ enabled: true, memorystore: { tier: "PREMIUM" as never } })),
+    ).toThrow(/tier must be/);
+    expect(() =>
+      validateConfig(withCache({ enabled: true, memorystore: { auth: "yes" as never } })),
+    ).toThrow(/auth must be a boolean/);
+  });
+
   it("does not guess whether evaluated cache credentials came from literals or the environment", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const previousAuth = process.env.VALKEY_AUTH;

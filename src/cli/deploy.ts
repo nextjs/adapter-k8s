@@ -33,9 +33,19 @@ import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "./rollba
 const LIVENESS_PATH_FOR_MIGRATION = "/healthz";
 import { renderService } from "../emit/templates/service.js";
 import { renderValkeySecret, VALKEY_SECRET_NAME } from "../emit/templates/valkey-secret.js";
-import { provisionMemorystore, buildDeleteMemorystoreCommand } from "./provision-cache.js";
+import {
+  provisionMemorystore,
+  buildDeleteMemorystoreCommand,
+  cacheInstanceName,
+} from "./provision-cache.js";
 import { isAlreadyGoneError } from "./destroy.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
+import {
+  claimManagedCacheIdentity,
+  deleteManagedCacheIdentityArgs,
+  readManagedCacheIdentity,
+  type ManagedCacheIdentity,
+} from "./cache-identity.js";
 // N87: internal dispatch Secrets are per BUILD and annotated `helm.sh/resource-policy: keep`.
 // Deploy owns the keep-at-upgrade half of their lifecycle (migrating the legacy stable-named
 // one past `helm upgrade`); the pruning half moved to src/cutover/gc.ts with step 7g.
@@ -95,6 +105,7 @@ import {
   assertCompositionPlanInvocation,
   compositionPlanNeedsExplicitConfirmation,
   currentKubeContext,
+  loadDeployedCompositionPlan,
   loadLocalCompositionPlan,
   preflightCompositionPlan,
 } from "./composition-plan.js";
@@ -963,6 +974,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // (projectId/region), extension-chain authority/YAML (namespace), and helm --set
   // assignments / docker tags (containerRegistry) — validate before any use.
   if (infra.projectId) assertSafeProjectId(infra.projectId);
+  if (infra.cacheProjectId) assertSafeProjectId(infra.cacheProjectId);
   if (infra.region) assertSafeRegion(infra.region);
   const namespace = resolveK8sNamespace(infra.namespace);
   if (infra.containerRegistry) assertSafeImageRegistry(infra.containerRegistry);
@@ -1362,42 +1374,222 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   //
   // Pre-`cacheManaged` build artifacts (older adapter versions) carry cacheEnabled but no
   // cacheManaged flag at all. A `--skip-build` deploy over such an artifact must treat
-  // enabled-with-unknown-mode as MANAGED: falling into the teardown branch below would
-  // delete a live managed Memorystore out from under the serving build. (Provisioning is
-  // idempotent, so re-running the managed branch against an existing instance is safe.)
-  const cacheManaged: boolean = metadata.cacheManaged ?? metadata.cacheEnabled === true;
+  // enabled-with-unknown-mode as MANAGED: treating it as BYO would schedule the paid instance
+  // for post-cutover cleanup. Provisioning is idempotent, so re-running the managed branch
+  // against an existing instance is the safe compatibility direction.
+  const plannedCache = compositionSnapshot?.plan.operations.cache;
+  const plannedMemorystore = plannedCache?.kind === "gcp-memorystore" ? plannedCache : undefined;
+  const cacheManaged: boolean = plannedCache
+    ? plannedCache.kind === "gcp-memorystore"
+    : (metadata.cacheManaged ?? metadata.cacheEnabled === true);
+  if (plannedCache) {
+    const planCacheEnabled = plannedCache.kind !== "none";
+    if (metadata.cacheEnabled !== planCacheEnabled || metadata.cacheManaged !== cacheManaged) {
+      throw new Error(
+        `Build metadata cache flags do not match the authenticated composition plan. Rebuild ` +
+          `the adapter output before deploying.`,
+      );
+    }
+  }
+  if (Boolean(infra.cacheRegion) !== Boolean(infra.cacheProjectId)) {
+    throw new Error(
+      `infrastructure.json has an incomplete managed-cache identity: cacheRegion=${JSON.stringify(
+        infra.cacheRegion,
+      )}, cacheProjectId=${JSON.stringify(infra.cacheProjectId)}. Refusing to infer the ` +
+        `missing coordinate from mutable cluster settings because that could orphan a paid ` +
+        `instance. Restore the original cache project and region explicitly before deploying.`,
+    );
+  }
+  if (infra.cacheProvisioningPending !== undefined && infra.cacheProvisioningPending !== "true") {
+    throw new Error(
+      `infrastructure.json cacheProvisioningPending must be "true" when present; found ` +
+        JSON.stringify(infra.cacheProvisioningPending),
+    );
+  }
+  if (infra.cacheProvisioningPending && !cacheManaged) {
+    throw new Error(
+      `A managed-cache provision is pending for ${infra.cacheProjectId}/${infra.cacheRegion}. ` +
+        `Retry the same managed-cache plan until the instance is verified, or run ` +
+        `\`adapter-k8s destroy\`; refusing to switch cache mode while a paid cloud operation ` +
+        `may still complete.`,
+    );
+  }
+
+  const readServingState = async (): Promise<{
+    state: AdapterState | null;
+    previousBuildId: string | null;
+  }> => {
+    let state: AdapterState | null = null;
+    let stateUnavailable: string | null = null;
+    if (dryRun) {
+      state = await readState(projectDir).catch(() => null);
+    } else {
+      try {
+        state = await readState(projectDir, releaseName, { namespace });
+      } catch (err) {
+        if (!(err instanceof StateUnavailableError)) throw err;
+        stateUnavailable = err.message;
+      }
+    }
+    let previousBuildId = state?.buildId ?? null;
+    if (stateUnavailable) {
+      console.warn(
+        `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
+      );
+      previousBuildId = await discoverServingBuildId(releaseName, namespace);
+      console.warn(
+        `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
+          `Service selector. Proceeding with it as the previous build — its recorded CDN tag ` +
+          `is unknown, so cutover invalidation falls back to a full purge (M13). Fix deploy ` +
+          `state after this deploy.`,
+      );
+    }
+    if (previousBuildId) assertSafeBuildId(previousBuildId);
+    return { state, previousBuildId };
+  };
+
+  const clusterCacheIdentity = dryRun
+    ? null
+    : await readManagedCacheIdentity(releaseName, namespace);
+  if (
+    clusterCacheIdentity &&
+    infra.cacheRegion &&
+    (clusterCacheIdentity.projectId !== infra.cacheProjectId ||
+      clusterCacheIdentity.region !== infra.cacheRegion)
+  ) {
+    throw new Error(
+      `Managed-cache identity disagrees between the cluster ` +
+        `(${clusterCacheIdentity.projectId}/${clusterCacheIdentity.region}) and ` +
+        `infrastructure.json (${infra.cacheProjectId}/${infra.cacheRegion}). Refusing to guess ` +
+        `which paid instance belongs to this release.`,
+    );
+  }
+  const assertCacheTransitionAuthorized = (
+    candidateState: AdapterState | null,
+    candidatePreviousBuildId: string | null,
+  ): void => {
+    if (cacheManaged) return;
+    const anchor = candidatePreviousBuildId
+      ? candidateState?.compositionPlans?.[candidatePreviousBuildId]
+      : undefined;
+    const hasManagedIdentity = Boolean(clusterCacheIdentity || infra.cacheRegion);
+    if (!candidatePreviousBuildId && hasManagedIdentity) {
+      throw new Error(
+        `A managed-cache identity exists without a committed serving build. A previous cloud ` +
+          `operation may still have created billable state; retry the same managed-cache plan ` +
+          `or run \`adapter-k8s destroy\` before selecting a different cache mode.`,
+      );
+    }
+    if (
+      !anchor &&
+      (hasManagedIdentity || (Boolean(compositionSnapshot) && Boolean(candidatePreviousBuildId)))
+    ) {
+      throw new Error(
+        `Cannot transition cache mode for the outgoing legacy build ` +
+          `${candidatePreviousBuildId ?? "(unknown)"} to ` +
+          `${metadata.cacheEnabled ? "bring-your-own cache" : "disabled caching"} safely. The ` +
+          `rollback build's cache contract is unknown, and deploy state has no authenticated ` +
+          `composition plan proving which paid instance may be deleted. Rebuild and deploy ` +
+          `once with managed cache still enabled, then make the cache-mode change from that ` +
+          `composed build. No Kubernetes or cloud resources were changed.`,
+      );
+    }
+  };
+
+  // Read state before a paid mutation, then read it again immediately before Helm. The second
+  // snapshot prevents a concurrent cutover during image build/push from becoming stale rollout
+  // input; the first protects legacy cache transitions and duplicate build ids before GCP work.
+  const cacheStateSnapshot = await readServingState();
+  assertBuildIdChangedSinceServing(buildId, cacheStateSnapshot.previousBuildId);
+  assertCacheTransitionAuthorized(cacheStateSnapshot.state, cacheStateSnapshot.previousBuildId);
   if (cacheManaged && !dryRun) {
     // Fail loudly rather than silently shipping without a shared cache: managed provisioning
     // needs the project + region. (BYO cache sets cache.url and never reaches this branch.)
-    if (!infra.projectId || !infra.region) {
+    const projectId = plannedMemorystore?.projectId ?? infra.projectId;
+    const defaultRegion = plannedMemorystore?.region ?? infra.region;
+    if (!projectId || !defaultRegion) {
       throw new Error(
         "cache.enabled with managed Memorystore requires infrastructure.json to have projectId " +
           "and region. Set cache.url for a bring-your-own instance, or re-run `adapter-k8s init`.",
       );
     }
-    console.log("\n  → Provisioning managed cache (Memorystore)...");
     const ms = (
       metadata as {
         cacheMemorystore?: { region?: string; sizeGb?: number; tier?: string; auth?: boolean };
       }
     ).cacheMemorystore;
-    const cacheRegion = ms?.region ?? infra.region;
+    const cacheRegion = plannedMemorystore?.region ?? ms?.region ?? defaultRegion;
+    const sizeGb = plannedMemorystore?.sizeGb ?? ms?.sizeGb;
+    const tier = plannedMemorystore?.tier ?? ms?.tier;
+    const auth = plannedMemorystore
+      ? plannedMemorystore.security.kind === "auth-tls-required"
+      : ms?.auth;
+    const network = plannedMemorystore?.network;
+    assertSafeProjectId(projectId);
+    assertSafeRegion(cacheRegion);
+    if (plannedMemorystore?.name !== undefined) {
+      const expectedName = cacheInstanceName(releaseName);
+      if (plannedMemorystore.name !== expectedName) {
+        throw new Error(
+          `Composition plan Memorystore name ${JSON.stringify(plannedMemorystore.name)} does ` +
+            `not match the release-scoped name ${JSON.stringify(expectedName)}`,
+        );
+      }
+    }
+    if (sizeGb !== undefined && (!Number.isInteger(sizeGb) || sizeGb < 1 || sizeGb > 300)) {
+      throw new Error("managed cache sizeGb must be an integer from 1 to 300");
+    }
+    if (tier !== undefined && tier !== "BASIC" && tier !== "STANDARD_HA") {
+      throw new Error('managed cache tier must be "BASIC" or "STANDARD_HA"');
+    }
+    if (auth !== undefined && typeof auth !== "boolean") {
+      throw new Error("managed cache auth must be a boolean");
+    }
+    if (infra.cacheRegion) {
+      const existingProjectId = infra.cacheProjectId!;
+      if (infra.cacheRegion !== cacheRegion || existingProjectId !== projectId) {
+        throw new Error(
+          `Cannot replace the managed cache for ${releaseName} from ` +
+            `${JSON.stringify(existingProjectId)}/${JSON.stringify(infra.cacheRegion)} to ` +
+            `${JSON.stringify(projectId)}/${JSON.stringify(cacheRegion)} during deploy. The ` +
+            `current lifecycle records only one paid instance, so provisioning the replacement ` +
+            `would orphan the old one. Restore the existing project/region or destroy and ` +
+            `recreate the cache intentionally. No Kubernetes or cloud resources were changed.`,
+        );
+      }
+    }
+    await claimManagedCacheIdentity(releaseName, namespace, {
+      projectId,
+      region: cacheRegion,
+    });
+    console.log("\n  → Provisioning managed cache (Memorystore)...");
+    if (!infra.cacheRegion) {
+      // Record intent before the cloud call. Instance creation is asynchronous: the command may
+      // time out while GCP finishes successfully, and credential/CA retrieval happens after the
+      // instance is already billable. Leaving this pending marker makes retry and destroy target
+      // the only coordinates this deploy was authorized to create.
+      infra.cacheRegion = cacheRegion;
+      infra.cacheProjectId = projectId;
+      infra.cacheProvisioningPending = "true";
+      writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+    }
     const endpoint = await provisionMemorystore({
-      projectId: infra.projectId,
+      projectId,
       region: cacheRegion,
       releaseName,
-      ...(ms?.sizeGb ? { sizeGb: ms.sizeGb } : {}),
-      ...(ms?.tier ? { tier: ms.tier } : {}),
+      ...(network ? { network } : {}),
+      ...(sizeGb ? { sizeGb } : {}),
+      ...(tier ? { tier } : {}),
       // S8: AUTH/TLS default ON — only an explicit `false` opts out (provisionMemorystore
       // distinguishes explicit-true from defaulted-true so an existing instance is tolerated).
-      ...(ms?.auth === undefined ? {} : { auth: ms.auth }),
+      ...(auth === undefined ? {} : { auth }),
       log: (m: string) => console.log(m),
     });
-    // Persist the actual region immediately after provisioning. Any later failure (writing the
-    // chart, Helm connectivity, rollout) must still leave destroy enough state to find the paid
-    // instance, especially when cache.memorystore.region differs from the cluster region.
-    if (infra.cacheRegion !== cacheRegion) {
-      infra.cacheRegion = cacheRegion;
+    // Successful endpoint and credential verification promotes the pending identity to the
+    // durable managed-cache record. Later chart/Helm failures still leave destroy enough state
+    // to find the paid instance.
+    if (infra.cacheProvisioningPending) {
+      delete infra.cacheProvisioningPending;
       writeFileSync(infraPath, JSON.stringify(infra, null, 2));
     }
 
@@ -1419,52 +1611,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     // its old mode, so a previously world-readable secret file would stay that way.
     chmodSync(secretPath, 0o600);
     console.log(`    Cache Secret ${releaseName}-valkey staged for Helm → ${url}`);
-  } else if (!compositionSnapshot && !cacheManaged && !dryRun) {
-    // The current build is NOT using the managed cache (disabled entirely, or BYO via
-    // cache.url). If a managed Memorystore was previously provisioned for this release
-    // (infra.cacheRegion persisted at provision time), tear it down — otherwise the
-    // managed→BYO switch silently leaks the paid instance (the teardown used to fire
-    // only when the cache was fully disabled). BYO-from-the-start never sets
-    // infra.cacheRegion, so this stays a no-op there.
-    if (!metadata.cacheEnabled) {
-      // Cache fully disabled: also remove the Secret so new pods stop receiving
-      // VALKEY_URL (the pod template always mounts the optional Secret). Not done for
-      // BYO: the chart then carries its own Helm-owned valkey-secret.yaml instead.
-      const secretDelete = await execCapture(
-        "kubectl",
-        ["delete", "secret", `${releaseName}-valkey`, "-n", namespace, "--ignore-not-found"],
-        { timeoutMs: EXEC_TIMEOUTS.kubectl },
-      );
-      if (secretDelete.stdout.trim())
-        console.log(`\n  → Removed cache Secret ${releaseName}-valkey`);
-    }
-    if (infra.cacheRegion) {
-      console.log(
-        `  → Deleting managed cache (Memorystore) — ${metadata.cacheEnabled ? "switched to bring-your-own cache" : "cache is disabled"}...`,
-      );
-      // projectId is only absent when infrastructure.json is hand-broken; the delete then
-      // fails gcloud-side and lands in the warn path below (the instance stays billed).
-      const del = buildDeleteMemorystoreCommand(
-        releaseName,
-        infra.cacheRegion,
-        infra.projectId ?? "",
-      );
-      const res = await execCapture(del.command, del.args, {
-        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
-      });
-      if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
-        delete infra.cacheRegion;
-        writeFileSync(infraPath, JSON.stringify(infra, null, 2));
-        console.log(`    ${del.desc} deleted`);
-      } else {
-        console.warn(
-          `    Warning: could not delete ${del.desc} in ${infra.cacheRegion} — it may still be ` +
-            `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ` +
-            // L14: gcloud stderr is externally influenced.
-            `${sanitizeForTerminal(res.stderr.trim())}`,
-        );
-      }
-    }
   }
 
   // 3. Read adapter config to determine container strategy
@@ -1639,46 +1785,28 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   }
 
   // 6. Helm upgrade
-  // L13: dry-run must not touch the cluster — skip the cluster ConfigMap read and use
-  // local state only (best-effort).
-  let state: AdapterState | null = null;
-  // N20: "state is unknown" and "there is no state (first deploy)" MUST stay distinct.
-  let stateUnavailable: string | null = null;
-  if (dryRun) {
-    state = await readState(projectDir).catch(() => null);
-  } else {
-    try {
-      state = await readState(projectDir, releaseName, { namespace });
-    } catch (err) {
-      if (!(err instanceof StateUnavailableError)) throw err;
-      stateUnavailable = err.message;
-    }
-  }
-  let previousBuildId = state?.buildId ?? null;
-  if (stateUnavailable) {
-    // Recover the live build from the cluster instead of proceeding as a first deploy
-    // (which skips the retained-manifest injection below, so `helm upgrade` deletes the
-    // Deployment currently serving traffic, and sets activeBuildId to a build with zero
-    // ready pods). discoverServingBuildId throws with a repair message when the live
-    // build can't be established — deploy must never guess here.
-    // L14: the message wraps cluster-sourced read errors.
-    console.warn(
-      `\n  ! Committed deploy state could not be determined:\n    ${sanitizeForTerminal(stateUnavailable)}`,
-    );
-    previousBuildId = await discoverServingBuildId(releaseName, namespace);
-    console.warn(
-      `  ! Recovered the currently-serving build "${previousBuildId}" from the active ` +
-        `Service selector. Proceeding with it as the previous build — its recorded CDN tag ` +
-        `is unknown, so cutover invalidation falls back to a full purge (M13). Fix deploy ` +
-        `state after this deploy.`,
+  const latestStateSnapshot = await readServingState();
+  const state = latestStateSnapshot.state;
+  const previousBuildId = latestStateSnapshot.previousBuildId;
+  if (
+    cacheStateSnapshot.previousBuildId !== previousBuildId ||
+    (cacheStateSnapshot.state?.generation ?? 0) !== (state?.generation ?? 0)
+  ) {
+    throw new Error(
+      `Committed deploy state changed during release preparation ` +
+        `(from ${cacheStateSnapshot.previousBuildId ?? "no build"} generation ` +
+        `${cacheStateSnapshot.state?.generation ?? 0} to ${previousBuildId ?? "no build"} ` +
+        `generation ${state?.generation ?? 0}). Refusing to run Helm with cache/image ` +
+        `preparation based on stale state; re-run the deploy against the new current build.`,
     );
   }
-  // H2: previousBuildId is spliced into a helm --set assignment below.
-  if (previousBuildId) assertSafeBuildId(previousBuildId);
-  // B2 (pipeline/fingerprints.ts): the deploy-time collision guards. N14 first — an
-  // IDENTICAL build id is the `deploymentId` (skew-protection) signature and the composed-
-  // name guard below can't see it (it requires differing ids).
   assertBuildIdChangedSinceServing(buildId, previousBuildId);
+  assertCacheTransitionAuthorized(state, previousBuildId);
+  const previousPlanAnchor = previousBuildId
+    ? state?.compositionPlans?.[previousBuildId]
+    : undefined;
+
+  // B2 (pipeline/fingerprints.ts): the remaining deploy-time collision guards.
 
   // N70: the outgoing build owns its own pool topology. The incoming build metadata cannot
   // describe pools that were removed or renamed: iterating `pools` here used to omit those
@@ -2266,6 +2394,111 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     } catch (err) {
       if (err instanceof CutoverExitError) process.exit(err.code);
       throw err;
+    }
+  }
+
+  // A managed→BYO/disabled transition is cleanup, not rollout preparation. Deleting the
+  // outgoing build's cache before Helm/readiness/cutover made a failed deploy disrupt the
+  // build still serving 100% of traffic. Only its retained, state-authenticated composition
+  // plan can authorize the cloud mutation, and it happens after runCutover commits the new build.
+  // Legacy builds were rejected before Helm because their markers cannot prove ownership.
+  if (!dryRun && !cacheManaged) {
+    if (!metadata.cacheEnabled) {
+      const secretDelete = await execCapture(
+        "kubectl",
+        ["delete", "secret", `${releaseName}-valkey`, "-n", namespace, "--ignore-not-found"],
+        { timeoutMs: EXEC_TIMEOUTS.kubectl },
+      );
+      if (secretDelete.stdout.trim()) {
+        console.log(`\n  → Removed cache Secret ${releaseName}-valkey`);
+      }
+    }
+
+    let cleanup: { projectId: string; region: string } | undefined;
+    if (previousBuildId && previousPlanAnchor) {
+      try {
+        const previousPlan = await loadDeployedCompositionPlan({
+          releaseName,
+          namespace,
+          buildId: previousBuildId,
+          expected: previousPlanAnchor,
+        });
+        if (!previousPlan) {
+          throw new Error(`retained composition plan for build ${previousBuildId} is missing`);
+        }
+        const previousCache = previousPlan.plan.operations.cache;
+        if (previousCache?.kind === "gcp-memorystore") {
+          const expectedName = cacheInstanceName(releaseName);
+          if (previousCache.name !== expectedName) {
+            throw new Error(
+              `previous composition plan names ${JSON.stringify(previousCache.name)} instead of ` +
+                JSON.stringify(expectedName),
+            );
+          }
+          // The cluster claim prevents concurrent creation, but a namespace actor can rewrite it
+          // together with retained plan/state ConfigMaps. Ambient GCP credentials may be spent
+          // only when operator-local infrastructure state independently names the same resource.
+          const recordedIdentity: ManagedCacheIdentity | null =
+            infra.cacheProjectId && infra.cacheRegion
+              ? { projectId: infra.cacheProjectId, region: infra.cacheRegion }
+              : null;
+          if (
+            recordedIdentity?.projectId !== previousCache.projectId ||
+            recordedIdentity?.region !== previousCache.region
+          ) {
+            throw new Error(
+              `the authenticated plan names ${previousCache.projectId}/${previousCache.region}, ` +
+                `but durable provisioning state records ` +
+                `${JSON.stringify(recordedIdentity?.projectId)}/${JSON.stringify(recordedIdentity?.region)}`,
+            );
+          }
+          cleanup = { projectId: previousCache.projectId, region: previousCache.region };
+        }
+      } catch (error) {
+        console.warn(
+          `    Warning: could not authenticate the outgoing build's managed-cache operation, ` +
+            `so it was NOT deleted and may still be billed. Delete it manually, or restore the ` +
+            `outgoing build artifact and run \`adapter-k8s destroy\`.\n    ` +
+            `${sanitizeForTerminal(error instanceof Error ? error.message : String(error))}`,
+        );
+      }
+    }
+    if (cleanup) {
+      assertSafeProjectId(cleanup.projectId);
+      assertSafeRegion(cleanup.region);
+      console.log(
+        `  → Deleting managed cache (Memorystore) after cutover — ` +
+          `${metadata.cacheEnabled ? "switched to bring-your-own cache" : "cache is disabled"}...`,
+      );
+      const del = buildDeleteMemorystoreCommand(releaseName, cleanup.region, cleanup.projectId);
+      const res = await execCapture(del.command, del.args, {
+        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      });
+      if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
+        const identityDelete = await execCapture(
+          "kubectl",
+          deleteManagedCacheIdentityArgs(releaseName, namespace),
+          { timeoutMs: EXEC_TIMEOUTS.kubectl },
+        );
+        if (identityDelete.exitCode !== 0 && !isAlreadyGoneError(identityDelete.stderr)) {
+          console.warn(
+            `    Warning: the cache was deleted, but its coordination ConfigMap could not be ` +
+              `removed. Delete ${releaseName}-cache-identity before choosing a new cache ` +
+              `project or region.\n    ${sanitizeForTerminal(identityDelete.stderr.trim())}`,
+          );
+        }
+        delete infra.cacheRegion;
+        delete infra.cacheProjectId;
+        delete infra.cacheProvisioningPending;
+        writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+        console.log(`    ${del.desc} deleted`);
+      } else {
+        console.warn(
+          `    Warning: could not delete ${del.desc} in ${cleanup.region} — it may still be ` +
+            `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ` +
+            `${sanitizeForTerminal(res.stderr.trim())}`,
+        );
+      }
     }
   }
 

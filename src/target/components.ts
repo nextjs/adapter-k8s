@@ -25,9 +25,9 @@ import type {
   GkeClusterOptions,
   IngressSourceSet,
   KubernetesClusterOptions,
-  KubernetesContribution,
   KubernetesTargetDefinition,
   ResourceComponent,
+  ResourceBuildResult,
   RoutingBuildResult,
   RoutingBuildContext,
   RoutingComponent,
@@ -180,6 +180,23 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
       }
       assertSafeProjectId(projectId);
       assertSafeRegion(region);
+      const managedCache = typeof context.cache === "object" ? context.cache : undefined;
+      if (managedCache) {
+        if (
+          !Number.isInteger(managedCache.sizeGb) ||
+          managedCache.sizeGb < 1 ||
+          managedCache.sizeGb > 300
+        ) {
+          throw new Error("managed cache sizeGb must be an integer from 1 to 300");
+        }
+        if (managedCache.tier !== "BASIC" && managedCache.tier !== "STANDARD_HA") {
+          throw new Error('managed cache tier must be "BASIC" or "STANDARD_HA"');
+        }
+        if (typeof managedCache.auth !== "boolean") {
+          throw new Error("managed cache auth must be a boolean");
+        }
+        if (managedCache.region !== undefined) assertSafeRegion(managedCache.region);
+      }
       const clusterName = options.clusterName ?? `${context.releaseName}-cluster`;
       const registryHost = context.imageRegistry.split("/")[0]!;
       const usesArtifactRegistry = registryHost.endsWith(".pkg.dev");
@@ -225,6 +242,24 @@ export function gkeCluster(options: GkeClusterOptions = {}): ClusterComponent {
           },
           missingSourcePolicy: "fail",
         },
+        ...(managedCache
+          ? {
+              cache: {
+                kind: "gcp-memorystore" as const,
+                projectId,
+                region: managedCache.region ?? region,
+                name: `${context.releaseName}-cache`,
+                network: "default",
+                sizeGb: managedCache.sizeGb,
+                tier: managedCache.tier,
+                security: {
+                  kind: managedCache.auth
+                    ? ("auth-tls-required" as const)
+                    : ("legacy-plaintext-explicit-opt-out" as const),
+                },
+              },
+            }
+          : {}),
         retained: [
           {
             kind: "gke-cluster",
@@ -289,7 +324,7 @@ export function defineExposureComponent(options: {
 
 export function defineResourceComponent(options: {
   name: string;
-  build(context: TargetBuildContext): KubernetesContribution;
+  build(context: TargetBuildContext): ResourceBuildResult;
 }): ResourceComponent {
   return {
     componentType: "resource",

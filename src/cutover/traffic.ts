@@ -23,17 +23,28 @@ export async function switchTrafficToNewBuild(opts: {
   releaseName: string;
   namespace: string;
   safeBuildId: string;
+  expectedCurrentBuildId: string | null;
   pools: string[];
   hasPortableOrigin: boolean;
   defaultPool: string;
   deps: CutoverDeps;
   restoreWarmedHpas: () => Promise<void>;
 }): Promise<void> {
-  const { releaseName, namespace, safeBuildId, pools, hasPortableOrigin, defaultPool, deps } = opts;
+  const {
+    releaseName,
+    namespace,
+    safeBuildId,
+    expectedCurrentBuildId,
+    pools,
+    hasPortableOrigin,
+    defaultPool,
+    deps,
+  } = opts;
   console.log(`  → Switching traffic to new build...`);
   const patchFailures: { pool: string; service: string; stderr: string }[] = [];
   const patchedServices: string[] = [];
   const originalServiceSelectors = new Map<string, Record<string, string>>();
+  const patchedServiceSelectors = new Map<string, Record<string, string>>();
 
   // A topology-changing rollback may have redirected a stable Service to a fallback pool.
   // Read every selector before changing any of them so cutover restores both component and
@@ -73,12 +84,31 @@ export async function switchTrafficToNewBuild(opts: {
       continue;
     }
     originalServiceSelectors.set(activeServiceName, selector as Record<string, string>);
+    if (
+      expectedCurrentBuildId &&
+      (selector as Record<string, string>)["app.kubernetes.io/version"] !==
+        sanitizeK8sName(expectedCurrentBuildId)
+    ) {
+      patchFailures.push({
+        pool: servicePool,
+        service: activeServiceName,
+        stderr:
+          `selector changed concurrently: expected version ` +
+          `${sanitizeK8sName(expectedCurrentBuildId)}, found ` +
+          `${JSON.stringify((selector as Record<string, string>)["app.kubernetes.io/version"])}`,
+      });
+    }
   }
 
   if (patchFailures.length === 0) {
     for (const { servicePool, targetPool } of serviceDestinations) {
       const activeServiceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
       const originalSelector = originalServiceSelectors.get(activeServiceName)!;
+      const nextSelector = {
+        ...originalSelector,
+        "app.kubernetes.io/component": targetPool,
+        "app.kubernetes.io/version": safeBuildId,
+      };
       const patchResult = await execCapture(
         "kubectl",
         [
@@ -98,13 +128,14 @@ export async function switchTrafficToNewBuild(opts: {
           "-p",
           JSON.stringify([
             {
+              op: "test",
+              path: "/spec/selector",
+              value: originalSelector,
+            },
+            {
               op: "replace",
               path: "/spec/selector",
-              value: {
-                ...originalSelector,
-                "app.kubernetes.io/component": targetPool,
-                "app.kubernetes.io/version": safeBuildId,
-              },
+              value: nextSelector,
             },
           ]),
         ],
@@ -118,6 +149,7 @@ export async function switchTrafficToNewBuild(opts: {
         });
       } else {
         patchedServices.push(activeServiceName);
+        patchedServiceSelectors.set(activeServiceName, nextSelector);
       }
     }
   }
@@ -130,6 +162,7 @@ export async function switchTrafficToNewBuild(opts: {
     const revertFailures: string[] = [];
     for (const serviceName of patchedServices) {
       const originalSelector = originalServiceSelectors.get(serviceName)!;
+      const patchedSelector = patchedServiceSelectors.get(serviceName)!;
       const revertResult = await execCapture(
         "kubectl",
         [
@@ -142,6 +175,11 @@ export async function switchTrafficToNewBuild(opts: {
           "--field-manager=helm",
           "-p",
           JSON.stringify([
+            {
+              op: "test",
+              path: "/spec/selector",
+              value: patchedSelector,
+            },
             {
               op: "replace",
               path: "/spec/selector",
