@@ -29,6 +29,7 @@ NEXTJS_REF="${5:-v16.3.0-canary.97}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADAPTER_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "${SCRIPT_DIR}/e2e-run-tmpdir.sh"
 RUN_DIR="${ADAPTER_DIR}/.k8s-adapter/lane-runs/$(date +%Y%m%dT%H%M%S)"
 mkdir -p "$RUN_DIR"
 # Fixed start marker for the end-of-run aggregation. The dir's own mtime is useless as a
@@ -39,8 +40,27 @@ touch "${RUN_DIR}/.run-start"
 # DEDICATED TMPDIR on the real disk — never tmpfs. The harness creates one full Next app
 # (node_modules included, ~150k inodes) per in-flight suite under os.tmpdir(); two lanes on
 # the default 1M-inode /tmp tmpfs exhausted it mid-pilot (measured: 16 clean deploys, then
-# ENOSPC mass-failed every suite after). The dir is exclusively ours, so wipe it at run
-# start rather than trusting per-suite cleanup to never leak.
+# ENOSPC mass-failed every suite after). Each run gets one child beneath the caller-selected
+# parent. The exit trap removes only that validated child, leaving the parent and other runs alone.
+TMP_ROOT="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
+RUN_TMPDIR="$(create_e2e_run_tmpdir "$TMP_ROOT")"
+TMP_ROOT="$(dirname "$RUN_TMPDIR")"
+cleanup_run_tmpdir() {
+  cleanup_e2e_run_tmpdir "$TMP_ROOT" "$RUN_TMPDIR" "$ADAPTER_DIR" || true
+}
+E2E_RUN_PIDS=()
+stop_run() {
+  local exit_code="$1"
+  trap - INT TERM HUP
+  stop_e2e_children "${E2E_RUN_PIDS[@]}"
+  exit "$exit_code"
+}
+trap 'stop_run 130' INT
+trap 'stop_run 143' TERM
+trap 'stop_run 129' HUP
+trap cleanup_run_tmpdir EXIT
+export TMPDIR="$RUN_TMPDIR"
+export E2E_LANES_TMPDIR="$RUN_TMPDIR"
 
 # DISK GUARD (2026-08-03): ~1,100 suite deploys accumulate ~1.8TB of docker build cache and
 # ~14k images; at 96% host disk the k3d node hit DiskPressure, kubelet EVICTED the Envoy
@@ -48,13 +68,6 @@ touch "${RUN_DIR}/.run-start"
 # infra). Cap the cache and drop this run's superseded e2e images up front.
 docker builder prune -f --keep-storage 100gb >/dev/null 2>&1 || true
 docker image prune -f >/dev/null 2>&1 || true
-
-export TMPDIR="${E2E_LANES_TMPDIR:-$HOME/.cache/adapter-k8s-e2e-tmp}"
-# Best-effort wipe: a previous run's straggler can still be writing here, and rm -rf races
-# concurrent writes into ENOTEMPTY — which under `set -e` killed the whole run at launch.
-# Stale files only cost disk; a failed wipe must never cost the run.
-rm -rf "$TMPDIR" 2>/dev/null || true
-mkdir -p "$TMPDIR"
 
 # Build + pack the adapter ONCE for every lane. Each lane's e2e-local.sh honors
 # ADAPTER_K8S_PREBUILT_TARBALL and skips its own build — without this, six concurrent
@@ -106,26 +119,25 @@ run_lane() {
   return "$rc"
 }
 
-PIDS=()
 for ((lane = 1; lane <= LANES; lane++)); do
   # shellcheck disable=SC2086
   groups=(${LANE_GROUPS[$((lane - 1))]:-})
   [ "${#groups[@]}" -eq 0 ] && continue
   run_lane "$lane" "${groups[@]}" &
-  PIDS+=($!)
+  E2E_RUN_PIDS+=($!)
   if [ "$lane" -eq 1 ]; then
     # Stagger: wait for lane 1 to finish the shared checkout prep before the rest start.
     first_log="${RUN_DIR}/lane1-group${groups[0]}of${TOTAL_GROUPS}.log"
     for _i in $(seq 1 600); do
       grep -q "Running tests\.\.\." "$first_log" 2>/dev/null && break
-      kill -0 "${PIDS[0]}" 2>/dev/null || break
+      kill -0 "${E2E_RUN_PIDS[0]}" 2>/dev/null || break
       sleep 2
     done
   fi
 done
 
 FAILED=0
-for pid in "${PIDS[@]}"; do
+for pid in "${E2E_RUN_PIDS[@]}"; do
   wait "$pid" || FAILED=1
 done
 
