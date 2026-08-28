@@ -1,14 +1,54 @@
 import type { HostConfig, K8sAdapterConfig } from "../types.js";
-import { STRICT_INGRESS_CIDRS } from "../emit/templates/network-policy.js";
 import {
   defineTarget,
   envoyNativeRouting,
   gatewayApiExposure,
   gkeCluster,
+  gkeHealthCheckPolicy,
   gkeNativeRouting,
   kubernetesCluster,
 } from "./components.js";
-import type { KubernetesTargetDefinition } from "./types.js";
+import { envoyGatewayIngressSources, gkeIngressSources } from "./ingress-sources.js";
+import type { ExposureComponent, KubernetesTargetDefinition } from "./types.js";
+import { sanitizeK8sName } from "../emit/templates/utils.js";
+
+function legacyEnvoyExposure(options: {
+  className: string;
+  hosts: readonly HostConfig[];
+  tlsSecretName?: string;
+  proxyNamespace: string;
+}): ExposureComponent {
+  // gatewayApiExposure validates the public options immediately. Its build result is then
+  // narrowed with the context-known Gateway identity, matching the legacy chart provider's
+  // ordinary per-Gateway peer plus its merged-GatewayClass fallback.
+  const exposure = gatewayApiExposure({
+    className: options.className,
+    hosts: options.hosts,
+    ...(options.tlsSecretName ? { tlsSecretName: options.tlsSecretName } : {}),
+    ingressSources: envoyGatewayIngressSources({
+      namespace: options.proxyNamespace,
+      gatewayClasses: [options.className],
+    }),
+  });
+  return {
+    ...exposure,
+    build(context) {
+      return {
+        ...exposure.build(context),
+        ingressSources: envoyGatewayIngressSources({
+          namespace: options.proxyNamespace,
+          gateways: [
+            {
+              name: sanitizeK8sName(`${context.releaseName}-gateway`),
+              namespace: context.namespace,
+            },
+          ],
+          gatewayClasses: [options.className],
+        }),
+      };
+    },
+  };
+}
 
 /**
  * The only seam where the deprecated provider shape enters target composition. Downstream
@@ -75,24 +115,13 @@ export function resolveConfiguredTarget(config: K8sAdapterConfig): ResolvedConfi
               }
             : {},
         ),
-        exposure: gatewayApiExposure({
+        exposure: legacyEnvoyExposure({
           className,
           hosts,
           ...(generic?.gateway?.tlsSecretName
             ? { tlsSecretName: generic.gateway.tlsSecretName }
             : {}),
-          ingressSources: {
-            cidrs: [],
-            podSelectors: [
-              {
-                namespace: generic?.gatewayNamespace ?? "envoy-gateway-system",
-                labels: {
-                  "app.kubernetes.io/name": "envoy",
-                  "gateway.envoyproxy.io/owning-gatewayclass": className,
-                },
-              },
-            ],
-          },
+          proxyNamespace: generic?.gatewayNamespace ?? "envoy-gateway-system",
         }),
         routing: envoyNativeRouting({
           gatewayClassName: className,
@@ -127,7 +156,8 @@ export function resolveConfiguredTarget(config: K8sAdapterConfig): ResolvedConfi
             nameSuffix: "-certmap",
           },
           releaseAddresses: [{ type: "NamedAddress", nameSuffix: "-ip" }],
-          ingressSources: { cidrs: [...STRICT_INGRESS_CIDRS], podSelectors: [] },
+          ingressSources: gkeIngressSources(),
+          backendHealth: gkeHealthCheckPolicy(),
         }),
         routing: gkeNativeRouting({
           gatewayClassName: gke?.gateway?.className ?? "gke-l7-global-external-managed",

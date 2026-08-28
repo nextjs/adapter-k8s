@@ -543,7 +543,7 @@ describe("imagePullSecrets config surface", () => {
 
   it("accepts well-formed Secret names, and an absent key", () => {
     expect(() => validateConfig(withPullSecrets(["docker-regcred"]))).not.toThrow();
-    expect(() => validateConfig(withPullSecrets(["a", "gh-cred-2"]))).not.toThrow();
+    expect(() => validateConfig(withPullSecrets(["a", "gh-cred-2", "reg.cred"]))).not.toThrow();
     expect(() => validateConfig(withPullSecrets(undefined))).not.toThrow();
     expect(() => validateConfig(withPullSecrets([]))).not.toThrow();
   });
@@ -555,14 +555,16 @@ describe("imagePullSecrets config surface", () => {
   });
 
   it("rejects names outside the K8s Secret-name charset — these land in every rendered pod spec", () => {
-    // Uppercase, underscore, edge hyphens, dots (adapter names never carry them), and a
-    // YAML-breakout payload all refuse.
+    // Uppercase, underscore, empty/invalid subdomain labels, edge hyphens, overlong labels, and
+    // a YAML-breakout payload all refuse. Dots are valid separators in Secret names.
     for (const bad of [
       "Docker-Regcred",
       "reg_cred",
       "-regcred",
       "regcred-",
-      "reg.cred",
+      "reg..cred",
+      "reg.-cred",
+      `${"a".repeat(64)}.cred`,
       'regcred"\n      hostNetwork: true',
       "",
       42,

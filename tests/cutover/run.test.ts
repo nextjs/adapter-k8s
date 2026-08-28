@@ -83,6 +83,7 @@ function inputs(overrides: Partial<CutoverInputs> = {}): CutoverInputs {
     defaultPool: "ssr",
     hasPortableOrigin: false,
     hasRoutingTier: true,
+    hasHealthCheckPolicy: true,
     previousReplicasByPool: new Map([["ssr", 2]]),
     state: { buildId: PREV, previousBuildId: "buildm0", generation: 4 },
     compositionSnapshot: null,
@@ -130,6 +131,8 @@ interface ClusterOverrides {
   gcDeployments?: unknown[];
   /** Exact versioned companion objects keyed by `kind/name`; null means absent. */
   gcCompanions?: Record<string, unknown | null>;
+  /** Whether the GKE HealthCheckPolicy CRD exists. */
+  healthCheckPolicyCrd?: boolean;
 }
 
 /** A scripted cluster for one release serving `buildm`, with `buildn` landing. */
@@ -155,6 +158,13 @@ function cluster(overrides: ClusterOverrides = {}) {
       events.push("policy-read");
       if (overrides.policyReadFails) return { exitCode: 1, stdout: "", stderr: "forbidden" };
       return ok(JSON.stringify(overrides.policy ?? ACCEPTED_CURRENT));
+    }
+    if (args[0] === "get" && args[1] === "crd") {
+      return ok(
+        overrides.healthCheckPolicyCrd
+          ? "customresourcedefinition.apiextensions.k8s.io/healthcheckpolicies.networking.gke.io"
+          : "",
+      );
     }
     // D1 listing: deployments by the EXACT version label.
     if (args[1] === "deployments" && j.includes("app.kubernetes.io/version=")) {
@@ -940,6 +950,7 @@ describe("runCutover — E6: superseded deployment ownership", () => {
     const foreignName = `${RELEASE}-foreign-buildl`;
     vi.mocked(execCapture).mockImplementation(
       cluster({
+        healthCheckPolicyCrd: true,
         gcDeployments: [
           poolDeployment(oldAdapterName, "ssr", "buildl"),
           poolDeployment(foreignName, "foreign", "buildl", false),
@@ -961,6 +972,9 @@ describe("runCutover — E6: superseded deployment ownership", () => {
     expect(events).toContain(`delete:deployment:${oldAdapterName}`);
     expect(events).toContain(`delete:service:${oldAdapterName}`);
     expect(events).toContain(`delete:healthcheckpolicy:${oldAdapterName}-hcp`);
+    expect(
+      vi.mocked(execCapture).mock.calls.some(([, args]) => args[0] === "get" && args[1] === "crd"),
+    ).toBe(false);
     expect(events.some((event) => event.includes(foreignName))).toBe(false);
     expect(
       vi
@@ -968,6 +982,25 @@ describe("runCutover — E6: superseded deployment ownership", () => {
         .mock.calls.map((call) => String(call[0]))
         .join("\n"),
     ).toContain(`keeping ambiguous Deployment "${foreignName}"`);
+  });
+
+  it("does not probe a GKE companion when the bundle declares no HealthCheckPolicy", async () => {
+    const oldAdapterName = `${RELEASE}-ssr-buildl`;
+    vi.mocked(execCapture).mockImplementation(
+      cluster({
+        gcDeployments: [poolDeployment(oldAdapterName, "ssr", "buildl")],
+        gcCompanions: {
+          [`service/${oldAdapterName}`]: poolService(oldAdapterName, "ssr", "buildl"),
+        },
+      }) as never,
+    );
+
+    await runCutover(inputs({ hasHealthCheckPolicy: false }), deps);
+
+    expect(events).toContain(`delete:service:${oldAdapterName}`);
+    expect(
+      vi.mocked(execCapture).mock.calls.some(([, args]) => args[1] === "healthcheckpolicy"),
+    ).toBe(false);
   });
 
   it("independently retains a foreign same-named Service beside an owned old Deployment", async () => {
@@ -1092,6 +1125,7 @@ describe("jobMain — the poison pill", () => {
         secretsMode: "external",
         cutover: "job",
         hasRoutingTier: true,
+        hasHealthCheckPolicy: true,
         ...extra,
       }),
     );

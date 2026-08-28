@@ -376,6 +376,94 @@ describe("composition plan schema", () => {
     ];
     expect(() => parseCompositionPlan(plan)).toThrow(/invalid Service name/i);
   });
+
+  it("applies the Service DNS-label rule to emitted manifests", () => {
+    const plan = basePlan();
+    const resources = (plan.operations as Record<string, unknown>).resources as Record<
+      string,
+      unknown
+    >;
+    resources.objects = [
+      {
+        apiVersion: "v1",
+        kind: "Service",
+        resource: "services",
+        metadata: { name: "1service", namespace: "test-app" },
+        body: { spec: { ports: [{ port: 3000 }] } },
+      },
+    ];
+    expect(() => parseCompositionPlan(plan)).toThrow(/invalid Service name/i);
+  });
+
+  it.each([
+    [{ "bad key": "value" }, /qualified name/i],
+    [{ "example.com/component": "bad/value" }, /label value/i],
+  ] as const)("rejects invalid Kubernetes metadata", (labels, message) => {
+    const plan = basePlan();
+    const resources = (plan.operations as Record<string, unknown>).resources as Record<
+      string,
+      unknown
+    >;
+    resources.objects = [
+      {
+        apiVersion: "v1",
+        kind: "ConfigMap",
+        resource: "configmaps",
+        metadata: { name: "settings", namespace: "test-app", labels },
+        body: { data: { enabled: "true" } },
+      },
+    ];
+    expect(() => parseCompositionPlan(plan)).toThrow(message);
+  });
+
+  it("accepts empty label and annotation values", () => {
+    const plan = basePlan();
+    const resources = (plan.operations as Record<string, unknown>).resources as Record<
+      string,
+      unknown
+    >;
+    resources.objects = [
+      {
+        apiVersion: "v1",
+        kind: "ConfigMap",
+        resource: "configmaps",
+        metadata: {
+          name: "settings.example.com",
+          namespace: "test-app",
+          labels: { "example.com/optional": "" },
+          annotations: { "example.com/note": "" },
+        },
+        body: { data: { enabled: "true" } },
+      },
+    ];
+    expect(parseCompositionPlan(plan).operations.resources.objects[0]?.metadata).toMatchObject({
+      labels: { "example.com/optional": "" },
+      annotations: { "example.com/note": "" },
+    });
+  });
+
+  it.each(["bad..name", "bad.-name", `${"a".repeat(64)}.example`])(
+    "rejects invalid DNS-subdomain object name %s",
+    (name) => {
+      const plan = basePlan();
+      addGkeTrafficExtension(plan);
+      const resources = (plan.operations as Record<string, unknown>).resources as Record<
+        string,
+        unknown
+      >;
+      const [object] = resources.objects as Array<Record<string, unknown>>;
+      (object!.metadata as Record<string, unknown>).name = name;
+      expect(() => parseCompositionPlan(plan)).toThrow(/Kubernetes object name/i);
+    },
+  );
+
+  it("rejects malformed DNS-subdomain API groups", () => {
+    const plan = basePlan();
+    const requirements = plan.requirements as Record<string, unknown>;
+    const kubernetes = requirements.kubernetes as Record<string, unknown>;
+    kubernetes.resources = [{ apiVersion: "bad..group/v1", resource: "widgets", optional: false }];
+    expect(() => parseCompositionPlan(plan)).toThrow(/Kubernetes API group/i);
+  });
 });
 
 describe("composition plan fingerprints", () => {

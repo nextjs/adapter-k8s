@@ -14,14 +14,137 @@
 // PostSync hook annotations are OPTIONAL sugar for the PR3 recipes, never required for
 // correctness, and are deliberately absent here.
 import { createHash } from "node:crypto";
+import type { RoutingReadiness } from "../../composition-plan/index.js";
 import {
   assertSafeBuildId,
+  assertSafeNamespace,
   assertSafeReleaseName,
   escapeHelmActions,
   keepAtBirthAnnotationEntries,
   renderImagePullSecrets,
   sanitizeK8sName,
 } from "./utils.js";
+
+interface CutoverRbacRule {
+  apiGroup: string;
+  resource: string;
+  verbs: Set<string>;
+}
+
+export interface CutoverRbacOptions {
+  releaseName: string;
+  /** Namespace containing both the Role and every readiness object it may observe. */
+  namespace: string;
+  readiness?: readonly RoutingReadiness[];
+  hasEnvoyExtensionPolicy?: boolean;
+  hasHealthCheckPolicy?: boolean;
+}
+
+const BASE_RBAC_KEYS = new Set([
+  "/services",
+  "apps/deployments",
+  "apps/deployments/scale",
+  "autoscaling/horizontalpodautoscalers",
+  "/pods",
+  "/pods/exec",
+  "/pods/log",
+  "batch/jobs",
+  "/configmaps",
+  "/secrets",
+  "policy/poddisruptionbudgets",
+]);
+
+function apiGroup(apiVersion: string): string {
+  const separator = apiVersion.indexOf("/");
+  return separator === -1 ? "" : apiVersion.slice(0, separator);
+}
+
+function readinessAccess(
+  namespace: string,
+  readiness: readonly RoutingReadiness[],
+): CutoverRbacRule[] {
+  const rules = new Map<string, CutoverRbacRule>();
+  const add = (group: string, resource: string, verb: "get" | "list") => {
+    const key = `${group}/${resource}`;
+    if (BASE_RBAC_KEYS.has(key)) return;
+    const rule = rules.get(key) ?? { apiGroup: group, resource, verbs: new Set<string>() };
+    rule.verbs.add(verb);
+    rules.set(key, rule);
+  };
+  const requireLocal = (objectNamespace: string | undefined, label: string) => {
+    if (objectNamespace === undefined) {
+      throw new Error(
+        `Cutover Job readiness ${label} has no namespace. A namespace-scoped Role cannot ` +
+          `safely infer whether that resource is namespaced or cluster-scoped.`,
+      );
+    }
+    if (objectNamespace !== namespace) {
+      throw new Error(
+        `Cutover Job readiness ${label} is in namespace ${JSON.stringify(objectNamespace)}, ` +
+          `outside the Job namespace ${JSON.stringify(namespace)}. Cross-namespace readiness ` +
+          `requires an explicit external gate; emit will not widen the Job to a ClusterRole.`,
+      );
+    }
+  };
+
+  for (const check of readiness) {
+    switch (check.kind) {
+      case "gcp-traffic-extension":
+        break;
+      case "kubernetes-service-endpoints":
+        requireLocal(check.service.namespace, `for Service ${check.service.name}`);
+        add("discovery.k8s.io", "endpointslices", "list");
+        break;
+      case "kubernetes-condition":
+      case "kubernetes-job-complete":
+      case "kubernetes-deployment-available":
+        requireLocal(check.object.namespace, `for ${check.object.resource}/${check.object.name}`);
+        add(apiGroup(check.object.apiVersion), check.object.resource, "get");
+        break;
+    }
+  }
+  return [...rules.values()].sort((a, b) =>
+    `${a.apiGroup}/${a.resource}`.localeCompare(`${b.apiGroup}/${b.resource}`),
+  );
+}
+
+function renderAdditionalRbacRules(options: CutoverRbacOptions): string {
+  const rules = new Map<string, CutoverRbacRule>();
+  const merge = (rule: CutoverRbacRule) => {
+    const key = `${rule.apiGroup}/${rule.resource}`;
+    const existing = rules.get(key) ?? {
+      apiGroup: rule.apiGroup,
+      resource: rule.resource,
+      verbs: new Set<string>(),
+    };
+    for (const verb of rule.verbs) existing.verbs.add(verb);
+    rules.set(key, existing);
+  };
+  for (const rule of readinessAccess(options.namespace, options.readiness ?? [])) merge(rule);
+  if (options.hasEnvoyExtensionPolicy) {
+    merge({
+      apiGroup: "gateway.envoyproxy.io",
+      resource: "envoyextensionpolicies",
+      verbs: new Set(["get"]),
+    });
+  }
+  if (options.hasHealthCheckPolicy) {
+    merge({
+      apiGroup: "networking.gke.io",
+      resource: "healthcheckpolicies",
+      verbs: new Set(["get", "list", "delete"]),
+    });
+  }
+  const order = ["get", "list", "watch", "create", "update", "patch", "delete"];
+  return [...rules.values()]
+    .sort((a, b) => `${a.apiGroup}/${a.resource}`.localeCompare(`${b.apiGroup}/${b.resource}`))
+    .map(
+      (rule) => `  - apiGroups: ${JSON.stringify([rule.apiGroup])}
+    resources: ${JSON.stringify([rule.resource])}
+    verbs: ${JSON.stringify([...rule.verbs].sort((a, b) => order.indexOf(a) - order.indexOf(b)))}`,
+    )
+    .join("\n");
+}
 
 /** Component label on the Job (and the pane the operator greps for). */
 export const CUTOVER_JOB_COMPONENT = "cutover-job";
@@ -175,14 +298,16 @@ ${pullSecretsBlock}      securityContext:
 /**
  * The Job's namespace-scoped RBAC: ServiceAccount + Role + RoleBinding, verbs enumerated
  * from what the cutover module actually executes (each rule names its consumer). No
- * cluster-scoped permissions: the CRD existence probe in gc.ts degrades with a warning
- * when it cannot read CRDs, and GKE HealthCheckPolicy cleanup is a best-effort no-op on
- * the clusters this mode targets.
+ * cluster-scoped permissions. The bundle records whether it owns GKE HealthCheckPolicies,
+ * and cleanup uses the namespaced API directly.
  */
-export function renderCutoverRbac({ releaseName }: { releaseName: string }): string {
+export function renderCutoverRbac(options: CutoverRbacOptions): string {
+  const { releaseName, namespace } = options;
   assertSafeReleaseName(releaseName);
+  assertSafeNamespace(namespace);
   const sa = cutoverServiceAccountName(releaseName);
   const role = cutoverRoleName(releaseName);
+  const additionalRules = renderAdditionalRbacRules(options);
   return `{{- if eq .Values.cutover.mode "job" }}
 apiVersion: v1
 kind: ServiceAccount
@@ -250,32 +375,12 @@ rules:
   # to confirm it selects the pool it claims to, and deletes the obsolete ones. Without
   # this rule the sweep is forbidden — non-fatal (it runs after the state commit and is
   # best-effort), but every Job logs the failure and removed pools' PDBs are never GC'd.
-  # HealthCheckPolicies need no rule: the cluster-scoped CRD probe fails first under the
-  # Job's namespaced Role and drops that kind from the sweep entirely.
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "delete"]
-  # D4/D5 generation-guarded Accepted gate — read-only.
-  - apiGroups: ["gateway.envoyproxy.io"]
-    resources: ["envoyextensionpolicies"]
-    verbs: ["get"]
-  # Composition-plan readiness (waitForCompositionPlanReadiness): HTTPRoute
-  # Accepted/ResolvedRefs, Gateway address, Ingress, cert-manager Certificate Ready,
-  # and EndpointSlice capacity. Read-only — the Job refuses promotion until they are
-  # ready; it never repairs them. Cross-namespace parent Gateways are not readable
-  # from this namespaced Role; HTTPRoute status in this namespace is the gate.
-  - apiGroups: ["gateway.networking.k8s.io"]
-    resources: ["httproutes", "gateways"]
-    verbs: ["get", "list"]
-  - apiGroups: ["cert-manager.io"]
-    resources: ["certificates"]
-    verbs: ["get", "list"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
-    verbs: ["get", "list"]
+  # Read-only composition readiness and optional controller cleanup permissions are
+  # projected from this bundle's plan/capabilities. No unrelated CRD receives access.
+${additionalRules}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

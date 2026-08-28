@@ -9,6 +9,7 @@ import {
   defineTarget,
   gatewayApiExposure,
   gkeCluster,
+  gkeIngressSources,
   gkeNativeRouting,
   manualExposure,
 } from "../src/target/index.js";
@@ -668,6 +669,7 @@ describe("onBuildComplete build-time guards", () => {
           className: "gke-l7-global-external-managed",
           hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
           addresses: [{ type: "NamedAddress", value: "custom-frontend-ip" }],
+          ingressSources: gkeIngressSources(),
         }),
         routing: gkeNativeRouting({
           projectId: "cluster-project",

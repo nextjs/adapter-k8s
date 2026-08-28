@@ -31,10 +31,7 @@ import {
   INTERNAL_SECRET_COMPONENT,
   internalSecretName,
 } from "../emit/templates/internal-secret.js";
-import {
-  cleanupRetainedStablePoolResources,
-  hasHealthCheckPolicyCrd,
-} from "../cli/stable-pool-resources.js";
+import { cleanupRetainedStablePoolResources } from "../cli/stable-pool-resources.js";
 import type { PoolDeploy } from "./inputs.js";
 
 type VersionedCompanionKind = "service" | "healthcheckpolicy";
@@ -226,6 +223,7 @@ export async function gcSupersededResources(opts: {
   pools: string[];
   previousPools: string[];
   hasPortableOrigin: boolean;
+  hasHealthCheckPolicy: boolean;
 }): Promise<void> {
   const { releaseName, namespace, buildId, previousBuildId, pools, previousPools } = opts;
   const routingDeploy = routingServiceDeploymentName(releaseName);
@@ -236,6 +234,9 @@ export async function gcSupersededResources(opts: {
   const previousDeployNames = previousBuildId
     ? new Set(previousPools.map((p) => sanitizeK8sName(`${releaseName}-${p}-${previousBuildId}`)))
     : undefined;
+  // The bundle records whether this release owns GKE HealthCheckPolicies. Do not discover
+  // that fact by reading cluster-scoped CRDs from a namespaced cutover ServiceAccount.
+  const healthCheckPolicyCrd = opts.hasHealthCheckPolicy;
 
   const allDeploys = await execCapture(
     "kubectl",
@@ -353,15 +354,17 @@ export async function gcSupersededResources(opts: {
         buildId: rawBuildId,
         serviceName: name,
       });
-      await deleteOwnedVersionedCompanion({
-        kind: "healthcheckpolicy",
-        name: expected.hcp,
-        namespace,
-        releaseName,
-        poolName,
-        buildId: rawBuildId,
-        serviceName: name,
-      });
+      if (healthCheckPolicyCrd) {
+        await deleteOwnedVersionedCompanion({
+          kind: "healthcheckpolicy",
+          name: expected.hcp,
+          namespace,
+          releaseName,
+          poolName,
+          buildId: rawBuildId,
+          serviceName: name,
+        });
+      }
     }
   }
 
@@ -373,18 +376,6 @@ export async function gcSupersededResources(opts: {
   // serving cutover. The helper validates ownership, labels, names, and selectors before any
   // deletion and keeps the Service as a retry anchor when a companion delete fails.
   try {
-    let healthCheckPolicyCrd = false;
-    try {
-      healthCheckPolicyCrd = await hasHealthCheckPolicyCrd();
-    } catch (err) {
-      // Post-commit cleanup can still safely classify Service/PDB without cluster-wide CRD
-      // permission. Preserve a truthful warning that HCP cleanup was skipped.
-      console.warn(
-        `  ! Could not classify retained HealthCheckPolicy objects: ` +
-          `${err instanceof Error ? err.message : String(err)}. Service/PDB cleanup will ` +
-          `continue; any retained HCP was left in place.`,
-      );
-    }
     const stableCleanup = await cleanupRetainedStablePoolResources({
       releaseName,
       namespace,

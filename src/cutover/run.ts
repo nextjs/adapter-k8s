@@ -67,6 +67,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     previousPools,
     defaultPool,
     hasPortableOrigin,
+    hasHealthCheckPolicy,
     previousReplicasByPool,
     state,
     compositionSnapshot,
@@ -373,6 +374,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     pools,
     previousPools,
     hasPortableOrigin,
+    hasHealthCheckPolicy,
   });
 }
 

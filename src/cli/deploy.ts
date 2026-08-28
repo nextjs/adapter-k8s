@@ -632,7 +632,7 @@ export function buildHelmUpgradeArgs(options: {
  * Discover the cluster's pod CIDR for the chart-rendered NetworkPolicies. FAIL-CLOSED:
  * the helm `podCidrs` guard renders NO policy when the value is absent, so a failed or
  * malformed lookup throws (the NetworkPolicies are what close in-cluster access to the
- * routing service's dispatch secret, H1) — unless the operator explicitly opts out with
+ * routing service's unauthenticated dispatch-proof endpoint, H1) — unless the operator opts out with
  * `--allow-no-network-policy`, in which case this warns loudly and returns null.
  */
 export async function discoverClusterPodCidr({
@@ -689,13 +689,14 @@ const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d
  * `discoverClusterNodeCidrs` below asks gcloud for the cluster's subnetwork, which a K3s,
  * kind or on-prem cluster does not have — so the strict NetworkPolicy posture was simply
  * unavailable there and the dataplane stayed on the broad `0.0.0.0/0 except pods` denylist.
- * That matters because the routing tier's ext_proc reply carries the internal dispatch secret.
+ * That matters because any caller reaching the routing tier can obtain a request-bound dispatch
+ * proof for a request it composed, even though the underlying secret never crosses the wire.
  *
  * Node addresses are exact (`/32`) rather than a subnet: the API reports the addresses the
  * kubelets actually have, which is tighter than the enclosing range and needs no cloud
  * metadata. The trade is that adding a node requires a redeploy to admit it — acceptable, and
  * failing CLOSED (a new node's probes are denied until then) is the right direction for a
- * control whose job is to bound who can reach the dispatch secret.
+ * control whose job is to bound who can ask the routing service for a trusted verdict.
  *
  * Returns null on any failure so the caller owns the fail-closed decision.
  */
@@ -1027,6 +1028,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Which provider this build targets. Older metadata predates the field; default to gke,
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
+  const hasHealthCheckPolicy = compositionSnapshot
+    ? compositionSnapshot.plan.requirements.kubernetes.resources.some(
+        (requirement) =>
+          requirement.apiVersion === "networking.gke.io/v1" &&
+          requirement.resource === "healthcheckpolicies",
+      )
+    : buildProvider === "gke";
   // A2 (pipeline/fingerprints.ts): artifact platform, target fingerprint (registry +
   // namespace), and pool-topology validation — identical in emit and deploy by construction.
   const builtTargetPlatform = resolveBuiltTargetPlatform(metadata);
@@ -1344,8 +1352,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       `Cannot determine the NetworkPolicy source ranges: .k8s-adapter/infrastructure.json is ` +
         `missing ${missing.join(" and ")}. Without ${missing.join(" and ")} neither the pod CIDR ` +
         `nor the node range can be discovered, and the chart would render NO NetworkPolicies — ` +
-        `leaving the routing tier's ext_proc port reachable, which is what makes the internal ` +
-        `dispatch secret obtainable. Run \`npx adapter-k8s init\` to regenerate ` +
+        `leaving the routing tier's ext_proc port reachable as a signing oracle for pool-trusted ` +
+        `dispatch verdicts. Run \`npx adapter-k8s init\` to regenerate ` +
         `infrastructure.json, or pass --allow-no-network-policy to deploy without isolation ` +
         `deliberately.`,
     );
@@ -2361,6 +2369,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           hasRoutingTier: existsSync(
             path.join(outputDir, "chart", "templates", "routing-service-deployment.yaml"),
           ),
+          hasHealthCheckPolicy,
           previousReplicasByPool,
           state,
           compositionSnapshot,

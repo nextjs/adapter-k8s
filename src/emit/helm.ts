@@ -147,9 +147,13 @@ export function generateHelmChart({
   // routing tier, and the registration Job via the provider seam) — a private registry
   // that only some pods can pull from is ImagePullBackOff on the rest.
   const pullSecrets = config.imagePullSecrets;
-  const emitsHealthCheckPolicy = compiledTarget
-    ? compiledTarget.plan.operations.routing.registration?.kind === "gcp-traffic-extension-v1"
-    : provider!.emitsHealthCheckPolicyCrd;
+  // Backend health belongs to the exposure's origin, not to routing registration. A GKE
+  // traffic extension can be paired with a different exposure, and portable routing can
+  // still sit behind a GKE Gateway. Only the explicit exposure capability selects the CRD.
+  const emitsOriginHealthCheckPolicy = compiledTarget
+    ? compiledTarget.backendHealth?.kind === "gke-health-check-policy"
+    : false;
+  const emitsLegacyPoolHealthCheckPolicies = !compiledTarget && provider!.emitsHealthCheckPolicyCrd;
   const secret = internalSecret;
   // N87: per-BUILD Secret name (and therefore one Secret per live build, annotated
   // `helm.sh/resource-policy: keep`). The FILENAME stays `templates/internal-secret.yaml`
@@ -228,7 +232,7 @@ export function generateHelmChart({
     files["templates/origin-service.yaml"] = renderOriginService({
       releaseName,
       poolName: defaultPool,
-      emitHealthCheckPolicy: emitsHealthCheckPolicy,
+      emitHealthCheckPolicy: emitsOriginHealthCheckPolicy,
     });
     files["templates/composition-plan.yaml"] = renderCompositionPlanConfigMap(compiledTarget.plan);
     Object.assign(files, renderComposedResources(compiledTarget.plan.operations.resources.objects));
@@ -250,10 +254,9 @@ export function generateHelmChart({
   files["templates/network-policy.yaml"] = renderNetworkPolicies({
     releaseName,
     poolNames: [...pools.keys()],
-    // The STRICT posture's admitted sources come from the provider: Google CIDRs on GKE, the
-    // release's own Envoy proxy pods on an in-cluster gateway. Reachability to the routing
-    // tier's :8443 IS the internal dispatch secret, so this is the control that makes the
-    // in-cluster h2c hop safe.
+    // The strict posture admits only the explicitly selected data-plane sources. The routing
+    // service does not reveal its secret, but it will sign a verdict for any caller that can
+    // reach :8443, so this allowlist remains a required authorization boundary.
     ingressSources: compiledTarget
       ? compiledTarget.ingressSources
       : provider!.strictIngressSources({
@@ -299,7 +302,7 @@ export function generateHelmChart({
     files[`templates/${poolName}-active-service.yaml`] = renderActiveService({
       poolName,
       releaseName,
-      emitHealthCheckPolicy: emitsHealthCheckPolicy,
+      emitHealthCheckPolicy: emitsLegacyPoolHealthCheckPolicies,
     });
     files[`templates/${poolName}-hpa.yaml`] = renderHPA({
       poolName,
