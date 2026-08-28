@@ -88,6 +88,7 @@ describe("harnessInjectedEnv", () => {
         TEST_FILE_PATH: "/tmp/t.ts",
         HEADLESS: "true",
         TRACE_PLAYWRIGHT: "1",
+        IS_RETRY: "1",
         RUST_MIN_STACK: "8388608",
         UPSTASH_DISABLE_TELEMETRY: "1",
         _: "/usr/bin/node",

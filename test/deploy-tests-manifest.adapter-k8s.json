@@ -46,6 +46,25 @@
         "app-dir action handling fetch actions should handle a fetch action initiated from a static page"
       ]
     },
+    "test/e2e/app-dir/catch-error/catch-error-react-compiler.test.ts": {
+      "_reason": [
+        "The server-component recovery fixture stores `hasThrown` in a module global. With two",
+        "replicas, the initial render and retry can reach different pods and each pod correctly",
+        "throws on its own first render. The client-component and Pages Router cases remain",
+        "enabled; single-process conformance covers the server retry contract."
+      ],
+      "failed": [
+        "app-dir - catchError with react compiler should recover Server Component error after retry"
+      ]
+    },
+    "test/e2e/app-dir/catch-error/catch-error.test.ts": {
+      "_reason": [
+        "Same process-local `hasThrown` fixture as the React Compiler variant. It sometimes passes",
+        "only because both requests happen to reach one pod, which is not a stable HA assertion.",
+        "Every other catch-error case remains enabled."
+      ],
+      "failed": ["app-dir - catchError should recover Server Component error after retry"]
+    },
     "test/e2e/app-dir/cache-components-allow-otel-spans/cache-components-allow-otel-spans.test.ts": {
       "_reason": [
         "This isNextDeploy-only assertion requires durable materialization of a shell-less",
@@ -58,6 +77,15 @@
       "failed": [
         "cache-components OTEL spans should allow creating Spans during prerendering at runtime - inside a Cache Components"
       ]
+    },
+    "test/e2e/getserversideprops/test/index.test.ts": {
+      "_reason": [
+        "The dedupe fixture stores its hit counter in a module global, then expects two separate",
+        "navigations to increment one process. In a two-replica deployment the requests can reach",
+        "different pods and each correctly reports its own first hit. This exact case is covered",
+        "by the single-process `next start` baseline; the fixture's other GSSP cases still run."
+      ],
+      "failed": ["getServerSideProps should dedupe server data requests"]
     }
   },
   "rules": {

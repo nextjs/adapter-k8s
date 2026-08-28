@@ -4,19 +4,20 @@ The package is unpublished and experimental. The ledger below is the release cla
 the named profile and version were exercised, not that every conformant controller or managed
 Kubernetes product inherits the result.
 
-| Status                  | Profile or capability                           | Evidence                                                                                                       | Boundary                                                                                                                      |
-| ----------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Release-candidate pass  | Next.js pool runtime                            | 2026-08-27, adapter `70a1c94`, upstream `v16.3.0-canary.97`: 3,441 passed / 0 failed across 1,082 suites       | Pool-local routing only; one suite redeployed after a transient host-port collision; this does not prove the cluster topology |
-| Release-candidate pass  | Unit, schema, audit, build, and packed package  | 2026-08-27, adapter `70a1c94`: `npm run release:check` passed; 3,241 unit tests passed / 8 skipped             | Docker-gated skips do not replace live controller or cluster verification                                                     |
-| Historical partial pass | Full k3d legacy-provider topology               | 2026-08-04, upstream `v16.3.0-canary.97`: about 4,438 passed / 27 failed                                       | Adapter commit was not recorded; this predates direct target-composition coverage and retains the other gaps below            |
-| Historical live receipt | GKE traffic-extension deployment                | Recorded 2026-07-29: 26-check deploy → rollback → roll-forward with CDN, cache, routing, and multiple replicas | Tested artifact SHA and cluster/GKE versions were not recorded; this is not a per-commit release gate                         |
-| Historical live receipt | Generic Envoy Gateway                           | Recorded 2026-07-29: k3s 1.30.6 and Scaleway Kubernetes 1.36.1, arm64, Cilium, Envoy Gateway 1.5.4             | Tested artifact SHA was not recorded; does not imply another Gateway controller supports native ext_proc routing              |
-| Schema-tested           | Portable Ingress, generic Envoy, and GKE charts | 2026-08-27: `npm run test:schema` with pinned Helm, kubeconform, and Kubernetes schemas                        | Gateway API, Envoy, and GKE CRDs are named explicit skips; their controllers/live API servers remain the authority            |
-| Untested                | ingress-nginx controller matrix                 | The portable `Ingress` object is schema-tested                                                                 | Supported as exposure plus pool-local routing, not as a native routing adapter                                                |
-| Transport-tested        | Experimental WebSocket `upgradeHandler`         | Real-socket unit and Docker-gated rollout coverage                                                             | No stable public Next API or upstream framework fixture yet                                                                   |
-| Deferred                | AWS/EKS components                              | Provider-neutral cluster, registry, exposure, routing, and resource seams exist                                | No AWS provisioning, IAM, load-balancer, registry, or live-cluster support is shipped or claimed                              |
-| Deferred                | Vercel/BYOC proxy origin                        | `RoutingOrigin` is discriminated for a future non-Service origin                                               | 0.1 accepts Kubernetes Service origins only; no incremental-migration proxy is implemented                                    |
-| Unverified              | Performance and broad cluster compatibility     | None                                                                                                           | No published load tests, benchmarks, or “all Kubernetes” claim                                                                |
+| Status                  | Profile or capability                           | Evidence                                                                                                           | Boundary                                                                                                                      |
+| ----------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| Release-candidate pass  | Next.js pool runtime                            | 2026-08-27, adapter `70a1c94`, upstream `v16.3.0-canary.97`: 3,441 passed / 0 failed across 1,082 suites           | Pool-local routing only; one suite redeployed after a transient host-port collision; this does not prove the cluster topology |
+| Release-candidate pass  | Unit, schema, audit, build, and packed package  | 2026-08-27, adapter `70a1c94`: `npm run release:check` passed; 3,241 unit tests passed / 8 skipped                 | Docker-gated skips do not replace live controller or cluster verification                                                     |
+| Release-candidate pass  | Two-replica k3d release smoke                   | 2026-08-28, upstream `v16.3.0-canary.97`: the cache/PPR/routing smoke described below passed its substantive cases | A selected release smoke, not the complete 1,082-suite cluster run                                                            |
+| Historical partial pass | Full k3d legacy-provider topology               | 2026-08-04, upstream `v16.3.0-canary.97`: about 4,438 passed / 27 failed                                           | Adapter commit was not recorded; this predates direct target-composition coverage and retains the other gaps below            |
+| Historical live receipt | GKE traffic-extension deployment                | Recorded 2026-07-29: 26-check deploy → rollback → roll-forward with CDN, cache, routing, and multiple replicas     | Tested artifact SHA and cluster/GKE versions were not recorded; this is not a per-commit release gate                         |
+| Historical live receipt | Generic Envoy Gateway                           | Recorded 2026-07-29: k3s 1.30.6 and Scaleway Kubernetes 1.36.1, arm64, Cilium, Envoy Gateway 1.5.4                 | Tested artifact SHA was not recorded; does not imply another Gateway controller supports native ext_proc routing              |
+| Schema-tested           | Portable Ingress, generic Envoy, and GKE charts | 2026-08-27: `npm run test:schema` with pinned Helm, kubeconform, and Kubernetes schemas                            | Gateway API, Envoy, and GKE CRDs are named explicit skips; their controllers/live API servers remain the authority            |
+| Untested                | ingress-nginx controller matrix                 | The portable `Ingress` object is schema-tested                                                                     | Supported as exposure plus pool-local routing, not as a native routing adapter                                                |
+| Transport-tested        | Experimental WebSocket `upgradeHandler`         | Real-socket unit and Docker-gated rollout coverage                                                                 | No stable public Next API or upstream framework fixture yet                                                                   |
+| Deferred                | AWS/EKS components                              | Provider-neutral cluster, registry, exposure, routing, and resource seams exist                                    | No AWS provisioning, IAM, load-balancer, registry, or live-cluster support is shipped or claimed                              |
+| Deferred                | Vercel/BYOC proxy origin                        | `RoutingOrigin` is discriminated for a future non-Service origin                                                   | 0.1 accepts Kubernetes Service origins only; no incremental-migration proxy is implemented                                    |
+| Unverified              | Performance and broad cluster compatibility     | None                                                                                                               | No published load tests, benchmarks, or “all Kubernetes” claim                                                                |
 
 Node support has two distinct gates: Node 20.16 is the minimum build/CLI host because the cache
 bundle uses `process.getBuiltinModule`; Node 24 is the pool/routing runtime floor because the
@@ -91,17 +92,45 @@ is from the recorded run.
 
 **The 27 failures:**
 
-| Group                                                                                                                                          | Count | Status                                                                                                                                               |
-| ---------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Server-action suites (`app-action` 5, `app-action-node-middleware` 5, `action-forward-loop` 1)                                                 | 11    | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
-| Timing races (`cached-navigations` 2, `prerender` 2, `vary-params-base-dynamic`, `catch-error`, `catch-error-react-compiler`, `client-params`) | 8     | Client-navigation waits that reproduce intermittently; rates and membership vary with host load                                                      |
-| PPR resume-data consistency (`resume-data-cache`)                                                                                              | 1     | After a tag revalidation, a regenerated page can retain the previous fetch-cache value in its resume data; under investigation                       |
-| `cache-components-prerender-matrix`                                                                                                            | 3     | The `partialFallback` on-demand shell-specialization contract, which this adapter deliberately does not yet implement                                |
-| Singletons (`metadata-navigation`, `no-duplicate-headers-middleware`, `non-ascii-cache-tags`, `cache-components-allow-otel-spans`)             | 4     | One test each; `no-duplicate-headers-middleware` is a documented, deliberate divergence                                                              |
+| Group                                                                                                                                                      | Count | Status                                                                                                                                               |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Server-action suites (`app-action` 5, `app-action-node-middleware` 5, `action-forward-loop` 1)                                                             | 11    | The action machinery itself is verified live (browser and curl); these failures are tied to deploy-harness conditions and remain under investigation |
+| Timing and fixture cases (`cached-navigations` 2, `prerender` 2, `vary-params-base-dynamic`, `catch-error`, `catch-error-react-compiler`, `client-params`) | 8     | Cached navigation, prerender, and segment-prefetch handling are resolved; exact replica-local exclusions are documented below                        |
+| PPR resume-data consistency (`resume-data-cache`)                                                                                                          | 1     | Resolved after this receipt; the release candidate passed 5/5 on k3d with two replicas and retry 0 on 2026-08-28                                     |
+| `cache-components-prerender-matrix`                                                                                                                        | 3     | Resolved after this receipt; the 2026-08-28 two-replica smoke passed the complete 60-case matrix on retry 0                                          |
+| Singletons (`metadata-navigation`, `no-duplicate-headers-middleware`, `non-ascii-cache-tags`, `cache-components-allow-otel-spans`)                         | 4     | `non-ascii-cache-tags` is resolved (6/6, two replicas, retry 0 on 2026-08-28); `no-duplicate-headers-middleware` is a documented divergence          |
 
 **Cannot see:** the real load balancer, CEL match-condition evaluation as GCP performs it,
 Cloud CDN interaction, or behaviour under load—both topologies are functional suites, not
 load tests.
+
+**2026-08-28 release smoke.** A fresh packed adapter was deployed through Envoy Gateway,
+ext_proc, two pool replicas, and in-cluster Valkey on k3s `v1.35.5+k3s1` with Envoy Gateway
+1.5.4. It closed the substantive failures represented in the historical table rather than
+relabeling that old full run:
+
+- `cache-components-prerender-matrix`: 60/60, retry 0
+- `partial-fallback-shell-upgrade`: passed, retry 0
+- `resume-data-cache`: 5/5, retry 0
+- `non-ascii-cache-tags`: 6/6, retry 0
+- `prerender`: 63/63 after restoring the missing deploy cache policy, retry 0
+- `cached-navigations`: 14/14 after moving Valkey invalidation I/O outside Next's staged-render
+  boundary, retry 0
+- `vary-params-base-dynamic`: 15/15 after restoring `x-nextjs-postponed: 2` on materialized
+  segment-prefetch responses, retry 0
+- both middleware-general files, fallback-shells, sub-shell generation, actions, interception,
+  not-found, metadata, prefetch, rewrite, basePath, and i18n selections passed
+
+The focused follow-up ran on Node 24 with `ADAPTER_K8S_TARGET_PLATFORM=linux/arm64` and passed
+31/31 at retry 0: `cached-navigations` 14/14, `vary-params-base-dynamic` 15/15, and the two
+one-case cached-navigation runtime-prefetch variants.
+
+Three additional replica-local case exclusions are explicit in
+`test/deploy-tests-manifest.adapter-k8s.json`: one
+GSSP deduplication assertion and the normal/compiler catch-error retry assertions store state in
+module globals, so a retry routed to another replica correctly observes that replica's first call.
+All three pass under the fixture's intended single-process `next start` baseline. The unfiltered
+upstream baselines also passed `cached-navigations` 14/14 and `prerender` 63/63.
 
 ### 3. `adapter-k8s emulate`—the ext_proc path locally
 
@@ -119,7 +148,7 @@ The layer that finds what the others structurally cannot.
 
 - **GKE**: the current live suite contains 29 tests: 27 run by default and two stronger edge-dispatch assertions require `E2E_ASSERT_EDGE_DISPATCH=1`. The dated 2026-07-29 receipt above covered 26 checks; it is not evidence for tests added afterwards. This layer exercises deploy → rollback → roll-forward across the full request path, CDN behavior, and cutover mechanics. Illustrative of why it exists: a run caught a rollback that named a manifest snapshot after the wrong build—surfaced only because the routing pod refuses to start on a manifest that does not match its own image. No lower layer runs a real rollback against a real routing rollout.
 - **Generic provider**: the historical live receipts used the legacy `provider.generic` spelling, which compiled through the same target components but did not directly prove a user-authored `defineTarget(...)` contract. They covered k3s (k3d, k3s v1.30.6) and a Scaleway managed cluster—3× **arm64** nodes, **Cilium**, Kubernetes v1.36.1, Envoy Gateway v1.5.4—using the routing-service image unchanged from the GKE build. On both, the public request path returned `200 / 200 / 200 / 404` for `/`, `/ssr`, `/api/hello`, `/nope` with `x-mw-executed` present, proving middleware ran **at the edge** through `EnvoyExtensionPolicy` rather than in the pool. Two properties can only be checked here:
-  - **NetworkPolicy is enforced, not merely accepted.** A pool pod attempting `routing-service:8443`—the port whose ext_proc reply carries the internal dispatch secret—was refused on both clusters (`ECONNREFUSED` on k3s, timeout on Cilium). Some CNIs accept policy objects and ignore them, which would make the whole in-cluster h2c posture decorative.
+  - **NetworkPolicy is enforced, not merely accepted.** A pool pod attempting `routing-service:8443`—the unauthenticated routing endpoint that can issue a valid dispatch proof for a caller-chosen request—was refused on both clusters (`ECONNREFUSED` on k3s, timeout on Cilium). Some CNIs accept policy objects and ignore them, which would make the whole in-cluster h2c posture decorative.
   - **Fail-closed is real.** With the routing service scaled to zero, requests returned 500 rather than being delivered with middleware silently skipped.
 - **Cross-platform builds**: the Scaleway nodes are arm64 while the build host is x86, so that deployment also exercises `ADAPTER_K8S_TARGET_PLATFORM`, arm64 native-package staging, and digest pinning of the single-platform image. The adapter does not publish a multi-architecture image index.
 - **Container runtimes**: docker, podman, and nerdctl are each validated by deploying the repo's e2e fixture to a live GKE cluster, not just by unit tests. This layer is why the digest resolution is registry-first: podman rewrites manifests on push, so its _local_ digest can differ from what the registry stored, and deploying that value yields `ImagePullBackOff`.
@@ -145,10 +174,11 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   type, lint, build, package, and schema checks in CI. Maintainers run the ~35-minute smoke subset
   (`scripts/e2e-smoke.sh`) for release-candidate batches and full runs when the routing or runtime
   boundary changes; neither local suite is a per-commit GitHub check.
-- **27 upstream tests fail in the full topology** (0.6% of the suite; see the table in
-  layer 2). About a third are intermittent timing races; the substantive remainder are the
-  server-action harness conditions, the unimplemented `partialFallback` contract, and one
-  remaining PPR resume-data consistency case.
+- **The dated full-topology receipt had 27 failures** (0.6% of the suite; see the table in
+  layer 2). The 2026-08-28 release smoke closed the cache, PPR, prerender, and cached-navigation
+  failures it re-ran, including the 60-case partial-fallback matrix. The replica-local fixture
+  assertions are documented above. The old table remains a historical receipt until another
+  complete 1,082-suite cluster run replaces it.
 - **Performance is unverified.** No load testing, no throughput tuning, no published benchmarks. This is the "operational hardening" the README's status refers to.
 - **The generic provider is younger** than the GKE one and has correspondingly less real-world exposure, though it passes the same unit suite and its live verification covered the full request path.
 - **Portable rollout continuity is data-plane tested, not yet cluster-rollout verified.** A
