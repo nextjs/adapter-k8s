@@ -1,4 +1,5 @@
 // src/pool-server/server.ts
+import { isUtf8 } from "node:buffer";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import {
@@ -82,7 +83,8 @@ function reportDispatchProofRejected(reason: DispatchProofRejectionReason): void
       `window (ADAPTER_K8S_DISPATCH_PROOF_MAX_AGE_MS, default 2x ADAPTER_K8S_HANDLER_TIMEOUT_MS) ` +
       `between being minted and arriving here — INGRESS QUEUEING, e.g. a burst pending while a ` +
       `scale-up brings pods Ready, as often as clock skew; "premature" means this pod's clock is ` +
-      `behind the signer's by more than that window. "body-mismatch" is the only reason that ` +
+      `behind the signer's by more than that window. "invalid-utf8" means an authenticated ` +
+      `producer emitted malformed dispatch bytes. "body-mismatch" is the only reason that ` +
       `means an active replay rather than a configuration or capacity problem.`,
   );
 }
@@ -100,6 +102,32 @@ function reportDispatchProofRejected(reason: DispatchProofRejectionReason): void
  */
 const DISPATCH_BODY_DIGEST = Symbol.for("adapter-k8s.dispatchProofBodyDigest");
 type BodyBoundRequest = IncomingMessage & { [DISPATCH_BODY_DIGEST]?: Buffer | undefined };
+
+/**
+ * Decode the routing tier's authenticated dispatch vocabulary after proof verification.
+ *
+ * Envoy carries ext_proc mutations as UTF-8 `raw_value` bytes. Node's HTTP parser exposes those
+ * same bytes as a latin1 string, so a concrete non-ASCII output such as `/🎉` otherwise arrives as
+ * `/ð\u009f\u008e\u0089`: the proof still verifies byte-for-byte, but manifest lookup and JSON
+ * metadata consume mojibake. Decode only proof-authenticated headers; legacy in-process tests and
+ * local resolution already hold ordinary JavaScript strings. Invalid UTF-8 fails closed to local
+ * resolution instead of letting a malformed trusted verdict reach dispatch.
+ */
+function decodeAuthenticatedDispatchHeaders(req: IncomingMessage): boolean {
+  for (const name of INTERNAL_DISPATCH_HEADERS) {
+    const value = req.headers[name];
+    if (value === undefined) continue;
+    const values = Array.isArray(value) ? value : [value];
+    const decoded: string[] = [];
+    for (const item of values) {
+      const bytes = Buffer.from(item, "latin1");
+      if (!isUtf8(bytes)) return false;
+      decoded.push(bytes.toString("utf8"));
+    }
+    req.headers[name] = Array.isArray(value) ? decoded : decoded[0];
+  }
+  return true;
+}
 
 /**
  * A0-DP-5. Enforce the body binding of an already-verified dispatch proof, once the body is known.
@@ -183,13 +211,18 @@ export function applyIncomingRequestTrustBoundary(
         },
         presentedProof,
       );
-      trusted = verdict.trusted;
       if (verdict.trusted) {
-        // A0-DP-5. A declared body digest is an ASSERTION, not yet a check: the body has not been
-        // read at this boundary. Park it so the caller that DOES read the body can enforce it
-        // (`enforceDispatchBodyBinding`, called from index.ts once readRequestBody returns).
-        (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST] = verdict.bodyDigest;
+        trusted = decodeAuthenticatedDispatchHeaders(req);
+        if (trusted) {
+          // A0-DP-5. A declared body digest is an ASSERTION, not yet a check: the body has not been
+          // read at this boundary. Park it so the caller that DOES read the body can enforce it
+          // (`enforceDispatchBodyBinding`, called from index.ts once readRequestBody returns).
+          (req as BodyBoundRequest)[DISPATCH_BODY_DIGEST] = verdict.bodyDigest;
+        } else {
+          reportDispatchProofRejected("invalid-utf8");
+        }
       } else {
+        trusted = false;
         // A0-DP-2. Report the rejection with its reason. Only when a proof was actually PRESENTED:
         // no proof at all is the ordinary untrusted path (ext_proc fail-open, a CEL-excluded route,
         // a body request, a client hitting the pool directly) and is not a signal. See telemetry.ts
@@ -765,6 +798,10 @@ export function createPoolServer(options: PoolServerOptions) {
           resolve({ port: addr.port });
         };
         if (host) server.listen(port, host, onListening);
+        // Port zero is a local/test allocation, never a chart-emitted serving port. Bind it to
+        // loopback so the OS cannot choose an IPv6 wildcard socket whose ephemeral port is already
+        // occupied by an IPv4 SSH forward (macOS permits both, then 127.0.0.1 reaches the forward).
+        else if (port === 0) server.listen(port, "127.0.0.1", onListening);
         else server.listen(port, onListening);
       });
     },

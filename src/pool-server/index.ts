@@ -418,9 +418,14 @@ function createBufferedStream(body: Buffer | null): ReadableStream<Uint8Array> {
   });
 }
 
-function requestHeaders(req: IncomingMessage): Headers {
+export function requestHeaders(req: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
+    // The authenticated dispatch vocabulary is parsed directly from req.headers before this
+    // point. It is private control metadata, not part of the application request. In particular,
+    // decoded UTF-8 output ids may contain code points that Web Headers correctly rejects when it
+    // is asked to reinterpret Node's request-header ByteStrings.
+    if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(key)) continue;
     if (typeof value === "string") headers.set(key, value);
     else if (Array.isArray(value)) value.forEach((entry) => headers.append(key, entry));
   }
@@ -1983,12 +1988,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // Non-fatal — draft mode just won't work
     }
   }
-  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
-    console.log(
-      `[cache-trace] ${JSON.stringify({ op: "startup", runtimeStaticTemplates: [...runtimeStaticTemplates] })}`,
-    );
-  }
-
   // Load the middleware manifest — contains edge function names, files, and assets.
   // This is used by the edge sandbox to find the right _ENTRIES key.
   const middlewareManifestPath = path.join(distDir, "server", "middleware-manifest.json");
@@ -2331,7 +2330,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     );
   }
 
-  const handlerLoader = createHandlerLoader(poolManifest);
+  const poolRscConfig = getRscConfig(routingManifest);
+  const handlerLoader = createHandlerLoader(
+    poolManifest,
+    undefined,
+    poolRscConfig ? { rscHeader: poolRscConfig.header } : undefined,
+  );
   // Middleware matchers (source regexp + has/missing) gate whether middleware runs — and,
   // downstream, whether a route is forced `no-cache` for the CDN. Read them from the ADAPTER's
   // routing manifest (built from the build's `outputs.middleware.config.matchers`), NOT Next's
@@ -2465,7 +2469,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // Build-pinned RSC negotiation config (header name + output suffixes). Hoisted so the N18
   // `_rsc` validation below reads the SAME header names the dispatcher negotiates on — an app
   // with a custom RSC header must not silently skip the check.
-  const poolRscConfig = getRscConfig(routingManifest);
   // N30 (SECURITY/CACHE): the pool's OWN PPR inventory, so the `no-store` verdict survives every
   // path that never sees the ext_proc tier's `x-nextjs-ppr` header. See createPprRouteMatcher.
   const isLocallyKnownPprRoute = createPprRouteMatcher({
@@ -2526,15 +2529,13 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     partialPrefetching: partialPrefetchingEnabled(distDir),
     ...(valkeyHandler
       ? {
-          checkShellStale: (tags: string[]) =>
-            valkeyHandler!.getExpiration(tags).then((e) => e > 0),
+          prepareUseCache: () => valkeyHandler.prepareForInvocation(),
+          checkShellStale: (tags: string[]) => valkeyHandler.hasTagUpdates(tags),
         }
       : {}),
-    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's own READ-ONLY view of
-    // the shared incremental cache. Reads go through the classic Valkey handler (get() owns
-    // tag staleness and falls back to the build seed via the SAME fs-mirror the registered
-    // in-app handler uses). Nothing writes through this interface — regeneration re-enters
-    // Next via the registered `revalidate()` and Next's own handler persists the entry.
+    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's read view of the shared
+    // incremental cache. Reads own tag staleness and fall back to the build seed through the
+    // same fs-mirror as Next; ResponseCache writes through the registered handler.
     // Regeneration fires whenever the build has a preview identity (__NEXT_PREVIEW_MODE_ID,
     // loaded unconditionally from the prerender manifest at startup) — it is always-on, not
     // flag-gated.
@@ -2548,7 +2549,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // registered cacheHandler may spend the lock.
             read: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.getPeek(key, ctx ?? {}),
-            readStored: (key: string, ctx?: { kind?: string }) =>
+            readStored: (key: string, ctx?: { kind?: string; softTags?: string[] }) =>
               platformCacheHandler!.getStored(key, ctx ?? {}),
             readSeed: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.getSeed(key, ctx ?? {}),
@@ -3880,6 +3881,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           webSocketRegistryScope,
           webSocketAllowedOrigins,
           parseWebSocketExtensions,
+          ...(valkeyHandler ? { prepareUseCache: () => valkeyHandler.prepareForInvocation() } : {}),
           handshakeTimeoutMs: REQUEST_HEAD_TIMEOUT_MS,
         },
         req,

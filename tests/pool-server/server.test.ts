@@ -390,6 +390,63 @@ describe("internal header security", () => {
       expect(seen["x-internal-dispatch-proof"]).toBeUndefined();
     });
 
+    it("decodes authenticated UTF-8 dispatch values from Node's latin1 header view", async () => {
+      const seen: Record<string, string | undefined> = {};
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+      // Envoy writes UTF-8 raw_value bytes; Node presents those octets as latin1 characters.
+      const wireOutputId = Buffer.from("/🎉", "utf8").toString("latin1");
+
+      await fetch(`http://127.0.0.1:${port}/page`, {
+        headers: signFor(port, { "x-output-id": wireOutputId }),
+      });
+
+      expect(seen["x-output-id"]).toBe("/🎉");
+    });
+
+    it("strips authenticated dispatch metadata whose wire bytes are not valid UTF-8", async () => {
+      const seen: Record<string, string | undefined> = {};
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      server = createPoolServer({
+        onRequest: seeingServer(seen),
+        port: 0,
+        internalSecret: "the-secret",
+      });
+      const { port } = await server.start();
+      const invalidOutput = `/\xff`;
+      const signed = signFor(port, { "x-output-id": invalidOutput });
+      const net = await import("node:net");
+      const response = await new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        const socket = net.createConnection({ host: "127.0.0.1", port }, () => {
+          socket.write(
+            Buffer.concat([
+              Buffer.from(
+                `GET /page HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nx-output-id: /`,
+                "ascii",
+              ),
+              Buffer.from([0xff]),
+              Buffer.from(
+                `\r\nx-internal-dispatch-proof: ${signed["x-internal-dispatch-proof"]}\r\nConnection: close\r\n\r\n`,
+                "ascii",
+              ),
+            ]),
+          );
+        });
+        socket.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        socket.once("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        socket.once("error", reject);
+      });
+
+      expect(response).toContain("200 OK");
+      expect(seen["x-output-id"]).toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("(invalid-utf8)"));
+    });
+
     it("RED TEAM: the raw v1 secret is no longer a credential — a stolen secret signs nothing", async () => {
       // The finding this protocol change closes: reading an ext_proc response (or a pool
       // hop) used to hand over the replayable raw secret. A request presenting ONLY the raw

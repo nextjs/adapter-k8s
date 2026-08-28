@@ -427,23 +427,11 @@ export function coalesceWireHeaderBytes(
  * Read one header off a Node `req.headers`-shaped record as WIRE BYTES.
  *
  * A0-DP-2. Node's HTTP parser decodes header octets as LATIN1 (measured: wire bytes `c3 a9`
- * arrive as the two-char string `"Ã©"`), and Node's HTTP *client* re-encodes an outgoing header
- * value as latin1 (measured: the JS string `"é"` is written as the single octet `e9`). So latin1
- * is the exact inverse of Node's own codec in BOTH directions across U+0000–U+00FF — a value the
- * tier parsed off an incoming request AND a value it authored itself and is about to emit. That is
- * what keeps the cross-pool hop self-consistent: `proxyToPool` signs latin1 octets, Node writes
- * those same octets, and the receiving pool parses them back to the identical latin1 string.
- *
- * U+00FF is the whole range that matters, not a convenient subset: it is everything Node's HTTP
- * client will EMIT. Node validates an outgoing value against it (measured on Node 24:
- * `http.request` with a header value containing U+65E5 throws ERR_INVALID_CHAR synchronously, and
- * a path containing it throws ERR_UNESCAPED_CHARACTERS). So above U+00FF this encoding is not
- * "lossy" so much as unreachable: `Buffer.from("日", "latin1")` would truncate to the single
- * octet `e5`, but the hop that would have carried those octets throws before anything reaches the
- * wire — a 500 for that request, not a proof that silently fails to verify. That throw predates
- * this construction and is a separate concern (a cross-pool hop on a percent-encoded CJK path
- * cannot cross the hop at all); what matters here is that no VERIFYING tier can ever be handed
- * octets a signer truncated.
+ * arrive as the two-char string `"Ã©"`), and its client writes latin1 code units byte-for-byte.
+ * Re-encoding a parsed value as latin1 therefore recovers the wire bytes. Authored dispatch
+ * values take a separate step first: `encodeNodeOutgoingDispatchHeaders` exposes their UTF-8
+ * bytes through a latin1 string, which lets semantic Unicode cross Node's HTTP/1 client intact.
+ * This function reads the final Node-shaped record after that conversion.
  */
 function wireHeaderBytes(name: string, value: string | string[] | undefined): Buffer | undefined {
   if (value === undefined) return undefined;
@@ -452,6 +440,33 @@ function wireHeaderBytes(name: string, value: string | string[] | undefined): Bu
     name,
     value.map((entry) => Buffer.from(entry, "latin1")),
   );
+}
+
+/**
+ * Encode a semantic dispatch-header value for Node's HTTP client.
+ *
+ * Envoy writes ext_proc string mutations as UTF-8 bytes. Node's HTTP client instead accepts only
+ * latin1 code units and writes each one as its matching byte. A pool-to-pool hop therefore has to
+ * present the UTF-8 bytes through Node's latin1 string view before it signs and sends the request.
+ * The receiving pool verifies those raw bytes first, then decodes the authenticated value back to
+ * Unicode. ASCII values are unchanged.
+ */
+export function encodeNodeOutgoingDispatchHeader(value: string): string {
+  return Buffer.from(value, "utf8").toString("latin1");
+}
+
+/** Encode every authored dispatch field in a Node outgoing-header record in place. */
+export function encodeNodeOutgoingDispatchHeaders(
+  headers: Record<string, string | string[] | undefined>,
+): void {
+  for (const header of INTERNAL_DISPATCH_HEADERS) {
+    const value = headers[header];
+    if (typeof value === "string") {
+      headers[header] = encodeNodeOutgoingDispatchHeader(value);
+    } else if (Array.isArray(value)) {
+      headers[header] = value.map(encodeNodeOutgoingDispatchHeader);
+    }
+  }
 }
 
 /**
@@ -770,16 +785,20 @@ export type DispatchProofRejection =
 /**
  * Every value the `adapter_k8s.dispatch_proof.reason` metric label can take.
  *
- * A superset of the verdict reasons above: `body-mismatch` is decided LATER, by
- * `enforceDispatchBodyBinding` once the body has been read, so `verifyDispatchProof` cannot return
- * it — but it IS a value an operator sees on the metric, and the only one that means an active
- * replay attempt rather than a configuration problem. The reporting path is typed on this union
- * (telemetry.ts `recordDispatchProofRejected`, pool-server/server.ts
+ * A superset of the verdict reasons above. `invalid-utf8` is decided after a proof verifies, when
+ * the pool decodes its authenticated dispatch values. `body-mismatch` is decided later still, by
+ * `enforceDispatchBodyBinding` once the body has been read. Neither can be returned by
+ * `verifyDispatchProof`, but both appear in the rejection metric. `body-mismatch` is the only one
+ * that means an active replay attempt rather than a configuration problem. The reporting path is
+ * typed on this union (telemetry.ts `recordDispatchProofRejected`, pool-server/server.ts
  * `reportDispatchProofRejected`) rather than on a bare `string`, so a future reason cannot reach
  * the metric without landing here first — which is how the documented label set, SECURITY.md and
  * any dashboard built off them stay in step.
  */
-export type DispatchProofRejectionReason = DispatchProofRejection | "body-mismatch";
+export type DispatchProofRejectionReason =
+  | DispatchProofRejection
+  | "invalid-utf8"
+  | "body-mismatch";
 
 export type DispatchProofVerdict =
   | {

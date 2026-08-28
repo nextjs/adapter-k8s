@@ -237,6 +237,31 @@ describe("createHandlerLoader", () => {
     expect(loadModule).toHaveBeenCalledTimes(1);
   });
 
+  it("does not load private ResponseCache code for a module without the route-module seam", async () => {
+    const responseCacheCtor = vi.fn(() => {
+      throw new Error("private ResponseCache should not be required");
+    });
+    const loader = createHandlerLoader(
+      {
+        buildId: "test123",
+        poolName: "routes",
+        outputs: {
+          route: {
+            id: "route",
+            filePath: "route.js",
+            pathname: "/route",
+            type: "APP_ROUTE",
+          },
+        },
+      } as any,
+      vi.fn().mockResolvedValue({ handler: () => "ok" }),
+      { responseCacheCtor: responseCacheCtor as any },
+    );
+
+    expect((await loader.load("route"))()).toBe("ok");
+    expect(responseCacheCtor).not.toHaveBeenCalled();
+  });
+
   it("un-latches ResponseCache: per-request minimalMode, one instance per mode", async () => {
     // route-module.ts:1101 lazily constructs `new ResponseCache(minimalMode)` ONCE per
     // route-module instance — latching the FIRST request's mode for the process lifetime
@@ -250,6 +275,10 @@ describe("createHandlerLoader", () => {
     class FakeResponseCache {
       constructor(minimal: boolean) {
         ctorCalls.push(minimal);
+      }
+
+      async handleRevalidate() {
+        return null;
       }
     }
     const routeModule = {
@@ -279,6 +308,217 @@ describe("createHandlerLoader", () => {
     expect(a).not.toBe(b);
     expect(a2).toBe(a); // batcher dedupe preserved within a mode
     expect(ctorCalls).toEqual([true, false]);
+  });
+
+  it("forces stale non-minimal PPR regeneration to ignore the old page's RDC", async () => {
+    class FakeResponseCache {
+      async handleRevalidate(
+        _key: string,
+        _incrementalCache: unknown,
+        _isRoutePPREnabled: boolean,
+        _isFallback: boolean,
+        generator: (context: Record<string, unknown>) => unknown,
+      ) {
+        return generator({ forceStaticRender: false });
+      }
+    }
+    const routeModule = { getResponseCache: () => undefined };
+    const loader = createHandlerLoader(
+      {
+        buildId: "test123",
+        poolName: "ssr",
+        outputs: {
+          "/page": {
+            id: "/app/page",
+            filePath: "x.js",
+            pathname: "/page",
+            type: "APP_PAGE",
+          },
+        },
+      } as any,
+      vi.fn().mockResolvedValue({ handler: () => {}, routeModule }),
+      { responseCacheCtor: FakeResponseCache as any, rscHeader: "rsc" },
+    );
+    await loader.load("/page");
+
+    const META = Symbol.for("NextInternalRequestMeta");
+    const responseCache = routeModule.getResponseCache({
+      [META]: { minimalMode: false },
+    } as any) as any;
+    const generator = vi.fn((context) => ({
+      cacheControl: { revalidate: 900 },
+      value: { kind: "APP_PAGE", context },
+    }));
+
+    await responseCache.handleRevalidate(
+      "/page",
+      { requestHeaders: { rsc: "1" } },
+      true,
+      false,
+      generator,
+      { isStale: true, value: { kind: "APP_PAGE" } },
+      true,
+    );
+    expect(generator).toHaveBeenCalledWith(expect.objectContaining({ forceStaticRender: true }));
+
+    generator.mockClear();
+    await responseCache.handleRevalidate(
+      "/page",
+      { requestHeaders: {} },
+      true,
+      false,
+      generator,
+      { isStale: true, value: { kind: "APP_PAGE" } },
+      true,
+    );
+    expect(generator).toHaveBeenCalledWith(expect.objectContaining({ forceStaticRender: false }));
+
+    generator.mockClear();
+    await responseCache.handleRevalidate(
+      "/page",
+      { requestHeaders: { rsc: "1" } },
+      true,
+      false,
+      generator,
+      { value: { kind: "APP_PAGE" } },
+      false,
+    );
+    expect(generator).toHaveBeenCalledWith(expect.objectContaining({ forceStaticRender: false }));
+  });
+
+  it("refuses a ResponseCache runtime without the required revalidation seam", async () => {
+    class IncompatibleResponseCache {}
+    const routeModule = { getResponseCache: () => undefined };
+    const loader = createHandlerLoader(
+      {
+        buildId: "test123",
+        poolName: "ssr",
+        outputs: {
+          "/page": { id: "/app/page", filePath: "x.js", pathname: "/page", type: "APP_PAGE" },
+        },
+      } as any,
+      vi.fn().mockResolvedValue({ handler: () => {}, routeModule }),
+      { responseCacheCtor: IncompatibleResponseCache as any },
+    );
+    await loader.load("/page");
+
+    expect(() => routeModule.getResponseCache({})).toThrow(/unsupported.*handleRevalidate/i);
+  });
+
+  it("imports and patches one route module shared by multiple output IDs once", async () => {
+    class FakeResponseCache {
+      async handleRevalidate() {
+        return null;
+      }
+    }
+    const routeModule = { getResponseCache: () => undefined };
+    const handler = () => undefined;
+    const loadModule = vi.fn().mockResolvedValue({ handler, routeModule });
+    const loader = createHandlerLoader(
+      {
+        buildId: "test123",
+        poolName: "ssr",
+        outputs: {
+          page: { id: "page", filePath: "shared.js", pathname: "/page", type: "APP_PAGE" },
+          rsc: { id: "rsc", filePath: "shared.js", pathname: "/page.rsc", type: "APP_PAGE" },
+        },
+      } as any,
+      loadModule,
+      { responseCacheCtor: FakeResponseCache as any },
+    );
+
+    expect(await loader.load("page")).toBe(handler);
+    expect(await loader.load("rsc")).toBe(handler);
+    expect(loadModule).toHaveBeenCalledOnce();
+  });
+
+  it("persists normal and prefetch PPR misses through Next's real minimal ResponseCache", async () => {
+    const routeModule = {
+      getResponseCache: () => {
+        throw new Error("original latch should have been replaced");
+      },
+    };
+    const loader = createHandlerLoader(
+      {
+        buildId: "test123",
+        poolName: "ssr",
+        outputs: {
+          "/page": {
+            id: "/app/page",
+            filePath: "x.js",
+            pathname: "/page",
+            type: "APP_PAGE",
+          },
+        },
+      } as any,
+      vi.fn().mockResolvedValue({ handler: () => {}, routeModule }),
+    );
+    await loader.load("/page");
+
+    const META = Symbol.for("NextInternalRequestMeta");
+    const responseCache = routeModule.getResponseCache({
+      [META]: { minimalMode: true },
+    } as any) as any;
+    const set = vi.fn().mockResolvedValue(undefined);
+    const incrementalCache = { get: vi.fn(), set };
+    const generated = (pathname: string) => {
+      return {
+        cacheControl: { revalidate: 900, expire: 31_536_000 },
+        value: {
+          kind: "APP_PAGE",
+          html: {
+            toUnchunkedString: vi.fn().mockResolvedValue(`<html>${pathname}</html>`),
+          },
+          postponed: "fresh-token",
+        },
+      };
+    };
+    const get = (pathname: string, isPrefetch = false) =>
+      responseCache.get(
+        pathname,
+        vi.fn().mockImplementation(async () => generated(pathname)),
+        {
+          routeKind: "APP_PAGE",
+          incrementalCache,
+          isRoutePPREnabled: true,
+          isFallback: false,
+          isPrefetch,
+          invocationID: pathname,
+        },
+      );
+
+    await Promise.all([get("/page"), get("/page")]);
+    // In Next 16.3 a prefetch miss bypasses revalidate() and calls handleRevalidate()
+    // directly. This is the path the old fake proof could not exercise.
+    await get("/prefetch", true);
+
+    expect(set).toHaveBeenCalledTimes(2);
+    expect(set).toHaveBeenCalledWith(
+      "/page",
+      expect.objectContaining({
+        kind: "APP_PAGE",
+        html: "<html>/page</html>",
+      }),
+      {
+        cacheControl: { revalidate: 900, expire: 31_536_000 },
+        isFallback: false,
+        isRoutePPREnabled: true,
+      },
+    );
+    expect(set).toHaveBeenCalledWith(
+      "/prefetch",
+      expect.objectContaining({ kind: "APP_PAGE", html: "<html>/prefetch</html>" }),
+      expect.objectContaining({ isRoutePPREnabled: true }),
+    );
+
+    const writeError = new Error("Valkey unavailable");
+    set.mockRejectedValueOnce(writeError);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(get("/write-failure")).resolves.toBeTruthy();
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[pool-server] minimal PPR cache write failed:",
+      writeError,
+    );
   });
 
   it("throws for unknown output ID", async () => {

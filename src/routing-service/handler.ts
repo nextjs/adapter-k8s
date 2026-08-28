@@ -51,12 +51,12 @@ type MwEvaluated = "ran" | "skip-nomatch" | "none" | "error";
 // yields "AbortError", and middleware (e.g. a fetch wrapper) may re-wrap either —
 // so also check `cause` one level deep for the same shapes.
 function isAbortError(err: unknown): boolean {
-  const shaped = (e: unknown): boolean =>
+  const hasAbortName = (e: unknown): boolean =>
     typeof e === "object" &&
     e !== null &&
     ((e as { name?: unknown }).name === "AbortError" ||
       (e instanceof DOMException && e.name === "TimeoutError"));
-  return shaped(err) || shaped((err as { cause?: unknown } | null | undefined)?.cause);
+  return hasAbortName(err) || hasAbortName((err as { cause?: unknown } | null | undefined)?.cause);
 }
 
 function getHeader(headers: HeaderValue[], key: string): string | undefined {
