@@ -18,11 +18,10 @@
 //  4. `x-nextjs-prerender`-marked responses must get the adapter's CDN cache policy —
 //     an s-maxage=31536000 leak was stored untagged by Cloud CDN for a year and
 //     tag-based cutover invalidation could never purge it (M13, stamping side).
-//  5. PPR routes with a registered classic cacheHandler (incrementalCacheShared)
-//     must run NON-minimal so Next itself joins shell + resume via the shared
-//     cache — minimal mode served bare postponed shells that nothing resumed.
+//  5. PPR ownership must distinguish injected shells, runtime capture, unresolved root
+//     params, and requests that cannot be resumed at the adapter boundary.
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { createDispatcher } from "../../src/pool-server/dispatch.js";
+import { createDispatcher, invokeLocalHandlerOverHttp } from "../../src/pool-server/dispatch.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
 
@@ -179,6 +178,206 @@ describe("requestMeta.initURL public scheme", () => {
     );
     expect(initURL).toBe("http://app.example.com/api/echo");
   });
+});
+
+describe("shared use-cache preparation", () => {
+  it("refreshes shared invalidation state before entering the Next handler", async () => {
+    const order: string[] = [];
+    const prepareUseCache = vi.fn(async () => {
+      order.push("prepare");
+    });
+    const localHandlerInvoker = vi.fn(async () => {
+      order.push("invoke");
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/api/echo", vi.fn()),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      prepareUseCache,
+      localHandlerInvoker: localHandlerInvoker as any,
+    });
+
+    await dispatcher.dispatch(mockReq("/api/echo"), mockRes(), routeResolution());
+
+    expect(prepareUseCache).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["prepare", "invoke"]);
+  });
+
+  it("runs module loading and invocation inside the prepared request scope", async () => {
+    const order: string[] = [];
+    let scopeDepth = 0;
+    const prepareUseCache = vi.fn(async () => <T>(callback: () => T): T => {
+      order.push("scope-enter");
+      scopeDepth++;
+      try {
+        const result = callback();
+        if (result instanceof Promise) {
+          return result.finally(() => {
+            scopeDepth--;
+            order.push("scope-exit");
+          }) as T;
+        }
+        scopeDepth--;
+        order.push("scope-exit");
+        return result;
+      } catch (error) {
+        scopeDepth--;
+        order.push("scope-exit");
+        throw error;
+      }
+    });
+    const handlerLoader = handlerLoaderFor("/api/echo", vi.fn());
+    handlerLoader.load.mockImplementation(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      order.push("load");
+      return vi.fn();
+    });
+    const localHandlerInvoker = vi.fn(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      order.push("invoke");
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      prepareUseCache,
+      localHandlerInvoker: localHandlerInvoker as any,
+    });
+
+    await dispatcher.dispatch(mockReq("/api/echo"), mockRes(), routeResolution());
+
+    expect(prepareUseCache).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["scope-enter", "load", "invoke", "scope-exit"]);
+  });
+
+  it("runs a not-found entrypoint inside the prepared request scope", async () => {
+    let scopeDepth = 0;
+    const prepareUseCache = vi.fn(async () => <T>(callback: () => T): T => {
+      scopeDepth++;
+      const result = callback();
+      if (result instanceof Promise) {
+        return result.finally(() => {
+          scopeDepth--;
+        }) as T;
+      }
+      scopeDepth--;
+      return result;
+    });
+    const handlerLoader = handlerLoaderFor("/_not-found", vi.fn());
+    handlerLoader.load.mockImplementation(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      return vi.fn();
+    });
+    const localHandlerInvoker = vi.fn(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      prepareUseCache,
+      localHandlerInvoker: localHandlerInvoker as any,
+    });
+
+    await dispatcher.dispatch(mockReq("/missing"), mockRes(), { kind: "not-found" });
+
+    expect(prepareUseCache).toHaveBeenCalledTimes(1);
+    expect(localHandlerInvoker).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes before a tagged prerender seed can return", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-use-cache-seed-"));
+    const seedFile = path.join(dir, "seed.html");
+    writeFileSync(seedFile, "<html>seed</html>");
+    try {
+      const order: string[] = [];
+      const prepareUseCache = vi.fn(async () => {
+        order.push("prepare");
+      });
+      const checkShellStale = vi.fn(async () => {
+        order.push("stale-check");
+        return false;
+      });
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/seed", vi.fn(), "APP_PAGE"),
+        poolName: "ssr",
+        buildId: "test123",
+        staticAssets: [
+          {
+            pathname: "/seed",
+            filePath: seedFile,
+            cacheControl: "public, max-age=0, must-revalidate",
+            headers: { "x-next-cache-tags": "seed-tag" },
+            prerender: true,
+            revalidate: false,
+          },
+        ],
+        prepareUseCache,
+        checkShellStale,
+      });
+      const res = mockRes();
+
+      await dispatcher.dispatch(
+        mockReq("/seed"),
+        res,
+        routeResolution({ matchedPathname: "/seed" }),
+      );
+
+      expect(res._body).toContain("seed");
+      expect(prepareUseCache).toHaveBeenCalledTimes(1);
+      expect(order).toEqual(["prepare", "stale-check"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("requestMeta path encoding", () => {
+  it.each([undefined, "/%F0%9F%8E%89"])(
+    "keeps the public URL encoded but gives Next a decoded concrete pathname (%s)",
+    async (invocationPath) => {
+      let seen:
+        | {
+            innerUrl: string | undefined;
+            params: unknown;
+            resolvedPathname: unknown;
+            rewrittenPathname: unknown;
+          }
+        | undefined;
+      const handler: NodeHandler = (req, res, ctx) => {
+        seen = {
+          innerUrl: req.url,
+          params: ctx.requestMeta.params,
+          resolvedPathname: ctx.requestMeta.resolvedPathname,
+          rewrittenPathname: ctx.requestMeta.rewrittenPathname,
+        };
+        res.writeHead(200);
+        res.end("ok");
+      };
+
+      await invokeLocalHandlerOverHttp({
+        handler: handler as never,
+        req: mockReq("/%F0%9F%8E%89"),
+        res: mockRes(),
+        matchedPathname: "/[slug]",
+        routeMatches: { nxtPslug: "%F0%9F%8E%89" },
+        routeParamPathname: "/🎉",
+        ...(invocationPath ? { invocationPath } : {}),
+        bufferedBody: undefined,
+      });
+
+      expect(seen?.innerUrl).toBe("/%F0%9F%8E%89");
+      expect(seen?.params).toEqual({ slug: "🎉" });
+      expect(seen?.resolvedPathname).toBe("/🎉");
+      expect(seen?.rewrittenPathname).toBe(invocationPath ? "/🎉" : undefined);
+    },
+  );
 });
 
 describe("Server Action forwarded authority", () => {
@@ -657,11 +856,10 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     }
   });
 
-  it("falls back to NON-minimal when the shell is tag-stale (vary-params tag flows)", async () => {
-    // A withheld shell + minimal render is a truncated document (bare postponed shell that
-    // nothing resumes). When checkShellStale reports the baked tags revalidated, the route
-    // must take the non-minimal path: Next renders the complete document dynamically —
-    // exactly the pre-injection behavior these suites were green under.
+  it("captures a fresh runtime shell when the build shell is tag-stale", async () => {
+    // A stale build token cannot be injected. The minimal invocation captures the fresh
+    // postponed state and the adapter immediately resumes it, keeping the encoded routing key
+    // while avoiding a truncated document.
     const { calls, invoker } = invokerCapture();
     const dispatcher = createDispatcher({
       handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
@@ -682,13 +880,170 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
     const req = mockReq("/ppr-page");
     await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
     expect(calls).toHaveLength(1);
-    expect(calls[0].minimalMode).toBe(false);
+    expect(calls[0].minimalMode).toBe(true);
+    expect(calls[0].capturePostponedState).toBe(true);
     const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
     expect(meta?.postponed).toBeUndefined();
     expect(calls[0].responsePrefix).toBeUndefined();
   });
 
-  it("falls back to NON-minimal when the shell's time-based revalidate window expired", async () => {
+  it("refreshes once before checking a PPR shell and entering the handler", async () => {
+    const order: string[] = [];
+    let scopeDepth = 0;
+    const prepareUseCache = vi.fn(async () => {
+      order.push("prepare");
+      return <T>(callback: () => T): T => {
+        order.push("scope-enter");
+        scopeDepth++;
+        const result = callback();
+        if (result instanceof Promise) {
+          return result.finally(() => {
+            scopeDepth--;
+            order.push("scope-exit");
+          }) as T;
+        }
+        scopeDepth--;
+        order.push("scope-exit");
+        return result;
+      };
+    });
+    const checkShellStale = vi.fn(async () => {
+      order.push("stale-check");
+      return true;
+    });
+    const localHandlerInvoker = vi.fn(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      order.push("invoke");
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/ppr-page", vi.fn()),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      pprRoutes: {
+        "/ppr-page": {
+          postponedState: "token",
+          fallbackFilePath: ".next/server/app/ppr-page.html",
+          tags: ["ppr-tag"],
+        },
+      },
+      incrementalCacheShared: true,
+      prepareUseCache,
+      checkShellStale,
+      localHandlerInvoker: localHandlerInvoker as any,
+    });
+
+    await dispatcher.dispatch(
+      mockReq("/ppr-page"),
+      mockRes(),
+      routeResolution({ matchedPathname: "/ppr-page" }),
+    );
+
+    expect(prepareUseCache).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["prepare", "stale-check", "scope-enter", "invoke", "scope-exit"]);
+  });
+
+  it("matches a decoded concrete PPR shell for an encoded request pathname", async () => {
+    const { calls, invoker } = invokerCapture();
+    const checkShellStale = vi.fn().mockResolvedValue(true);
+    const readStored = vi.fn().mockResolvedValue(null);
+    const dispatcher = createDispatcher({
+      handlerLoader: handlerLoaderFor("/[slug]", vi.fn()),
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      outputIds: ["/[slug]"],
+      pprRoutes: {
+        "/🎉": {
+          postponedState: "token",
+          fallbackFilePath: ".next/server/app/🎉.html",
+          tags: ["%F0%9F%8C%AE"],
+        },
+      },
+      pprCapableRoutes: {
+        "/[slug]": { rootParams: [], allowQuery: ["nxtPslug"] },
+      },
+      incrementalCacheShared: true,
+      checkShellStale,
+      platformCache: {
+        read: vi.fn().mockResolvedValue(null),
+        readStored,
+      },
+      localHandlerInvoker: invoker as any,
+    });
+    const req = mockReq("/%F0%9F%8E%89");
+    await dispatcher.dispatch(
+      req,
+      mockRes(),
+      routeResolution({
+        matchedPathname: "/%F0%9F%8E%89",
+        routeMatches: { slug: "%F0%9F%8E%89" },
+      }),
+    );
+
+    expect(checkShellStale).toHaveBeenCalledWith(["%F0%9F%8C%AE"]);
+    expect(readStored).toHaveBeenCalledWith("/🎉", {
+      kind: "APP_PAGE",
+      softTags: ["%F0%9F%8C%AE"],
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].minimalMode).toBe(true);
+    expect(calls[0].capturePostponedState).toBe(true);
+    expect(calls[0].responsePrefix).toBeUndefined();
+  });
+
+  it("does not inject a generic PPR shell over an encoded concrete non-PPR prerender", async () => {
+    const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "adapter-k8s-unicode-shell-"));
+    const shellFile = path.join(dir, "generic.html");
+    writeFileSync(shellFile, "<html>generic shell</html>");
+    try {
+      const { calls, invoker } = invokerCapture();
+      const dispatcher = createDispatcher({
+        handlerLoader: handlerLoaderFor("/[slug]", vi.fn(), "APP_PAGE"),
+        poolName: "ssr",
+        buildId: "test123",
+        outputIds: ["/[slug]"],
+        staticAssets: [
+          {
+            pathname: "/🎉",
+            filePath: path.join(dir, "concrete.html"),
+            cacheControl: "public, max-age=0, must-revalidate",
+            prerender: true,
+            ppr: false,
+          },
+        ],
+        pprRoutes: {
+          "/[slug]": { postponedState: "generic-token", fallbackFilePath: shellFile },
+        },
+        pprCapableRoutes: {
+          "/[slug]": { rootParams: [], allowQuery: ["nxtPslug"] },
+        },
+        incrementalCacheShared: true,
+        emulatePlatformCache: true,
+        localHandlerInvoker: invoker as any,
+      });
+      const req = mockReq("/%F0%9F%8E%89");
+      await dispatcher.dispatch(
+        req,
+        mockRes(),
+        routeResolution({
+          matchedPathname: "/%F0%9F%8E%89",
+          routeMatches: { slug: "%F0%9F%8E%89" },
+        }),
+      );
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].responsePrefix).toBeUndefined();
+      expect((req as any)[Symbol.for("NextInternalRequestMeta")]?.postponed).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("captures a fresh runtime shell when the build shell's revalidate window expired", async () => {
     // pprRoutes[].revalidate was latent — a shell with `revalidate: 1` (vary-params) must
     // stop being injected after its window, like the concrete-seed path already does.
     const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
@@ -718,7 +1073,8 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
       const req = mockReq("/ppr-page");
       await dispatcher.dispatch(req, mockRes(), routeResolution({ matchedPathname: "/ppr-page" }));
       expect(calls).toHaveLength(1);
-      expect(calls[0].minimalMode).toBe(false);
+      expect(calls[0].minimalMode).toBe(true);
+      expect(calls[0].capturePostponedState).toBe(true);
       const meta = (req as any)[Symbol.for("NextInternalRequestMeta")];
       expect(meta?.postponed).toBeUndefined();
     } finally {
@@ -917,14 +1273,10 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
         [false, false, true, true], // early-span: STILL minimal — the rung was measured out (above)
         [false, true, false, false], // unresolved root params (the live shell-less reason)
         [false, true, true, false], // …and wouldPostpone does not subtract from it
-        // Shell-bearing rows: minimal EXACTLY when the shell is usable and injected. In
-        // this table the fallbackFilePath does not exist on disk, so injection declines and
-        // the route takes the non-minimal complete-render path — the degradation rule that
-        // keeps a withheld shell from producing a truncated minimal document (measured:
-        // vary-params-base-dynamic 15/15 when the first cut ignored it). The usable-shell
-        // minimal+inject case is pinned by the dedicated injection tests above.
-        [true, false, false, false], // shell unusable (missing file) → non-minimal
-        [true, false, true, false],
+        // A missing build shell with no root params uses minimal runtime capture. Root params
+        // still require Next to own shell selection and therefore remain non-minimal.
+        [true, false, false, true],
+        [true, false, true, true],
         [true, true, false, false], // root params always win
         [true, true, true, false],
       ];
@@ -964,11 +1316,10 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
         });
       }
 
-      // The `.rsc` flight path is pinned for the root-param rung at line 404 above. Here it pins
-      // the N16c *negative*: the parent-recovery ladder does find the base route, and its
-      // `wouldPostpone` bit still does not flip the flight request non-minimal. Kept explicitly so
-      // a future re-attempt at the rung has to change this test and read the measurement above.
-      it("stays minimal for a .rsc flight output whose BASE route wouldPostpone", async () => {
+      // A shell-less runtime-capture route cannot resume a dynamic RSC request at the adapter
+      // boundary. The parent-recovery ladder must find the base route and hand that request to
+      // Next non-minimally; otherwise the entrypoint returns an incomplete runtime stage.
+      it("runs non-minimal for a .rsc flight output whose base route needs runtime capture", async () => {
         const { calls, invoker } = invokerCapture();
         const dispatcher = createDispatcher({
           handlerLoader: handlerLoaderFor("/x/[id]", vi.fn(), "APP_PAGE"),
@@ -987,7 +1338,7 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
           routeResolution({ matchedPathname: "/x/[id].rsc" }),
         );
         expect(calls).toHaveLength(1);
-        expect(calls[0].minimalMode).toBe(true);
+        expect(calls[0].minimalMode).toBe(false);
       });
 
       // The gate is still conditioned on someone owning the shell cache. With no resume owner

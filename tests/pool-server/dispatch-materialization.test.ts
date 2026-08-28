@@ -364,6 +364,87 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(invoker).not.toHaveBeenCalled();
     expect(res._body).toBe("segment-flight-bytes");
     expect(res._status).toBe(200);
+    expect(res._headers["x-nextjs-postponed"]).toBe("2");
+  });
+
+  it("never serves cached document HTML when a segment prefetch entry lacks that segment", async () => {
+    const calls: any[] = [];
+    const dispatcher = createDispatcher(
+      baseOptions({
+        localHandlerInvoker: (async (args: any) => {
+          calls.push(args);
+        }) as any,
+        platformCache: {
+          read: async () => ({
+            lastModified: Date.now(),
+            value: {
+              kind: "APP_PAGE",
+              html: "<html>complete document</html>",
+              headers: {},
+              status: 200,
+              segmentData: new Map([["/other", Buffer.from("other-segment")]]),
+            },
+          }),
+          write: async () => {},
+        },
+      }),
+    );
+    const res = mockRes();
+
+    await dispatcher.dispatch(
+      mockReq("/ppr-page", { "next-router-segment-prefetch": "/__PAGE__" }),
+      res,
+      route,
+    );
+
+    expect(res._body).not.toContain("complete document");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].responsePrefix).toBeUndefined();
+  });
+
+  it("serves stale segment data without consuming the regeneration path", async () => {
+    const invoker = vi.fn();
+    const revalidate = vi.fn().mockResolvedValue(undefined);
+    process.env.__NEXT_PREVIEW_MODE_ID = "pmid-segment";
+    try {
+      const dispatcher = createDispatcher(
+        baseOptions({
+          localHandlerInvoker: invoker as any,
+          revalidate,
+          platformCache: {
+            read: async () => null,
+            readStored: async () => ({
+              lastModified: Date.now(),
+              isStale: true,
+              value: {
+                kind: "APP_PAGE",
+                html: "<html>stale</html>",
+                postponed: "stale-token",
+                headers: {},
+                status: 200,
+                segmentData: new Map([["/__PAGE__", Buffer.from("stale-segment")]]),
+              },
+            }),
+          },
+        }),
+      );
+      const res = mockRes();
+      await dispatcher.dispatch(
+        mockReq("/ppr-page", {
+          rsc: "1",
+          "next-router-prefetch": "1",
+          "next-router-segment-prefetch": "/__PAGE__",
+        }),
+        res,
+        route,
+      );
+
+      expect(res._body).toBe("stale-segment");
+      expect(invoker).not.toHaveBeenCalled();
+      expect(revalidate).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.__NEXT_PREVIEW_MODE_ID;
+    }
   });
 
   it("derives the concrete read key from the REWRITE destination, not the public URL", async () => {
@@ -578,6 +659,7 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(invoker).not.toHaveBeenCalled();
     expect(res._body).toContain("materialized first");
     expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+    expect(res._headers["cache-control"]).toBe("public, max-age=0, must-revalidate");
   });
 
   it("serves a STORED (revalidated) entry in preference to the build seed for a non-PPR prerender", async () => {
@@ -628,6 +710,7 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(res._status).toBe(200);
     // The direct serve bypasses the loopback pipe's stripping — it must sanitize itself.
     expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+    expect(res._headers["cache-control"]).toBe("public, max-age=0, must-revalidate");
   });
 
   it("serves a STORED regenerated entry when the build seed is tag-stale (post-revalidation SWR)", async () => {
@@ -636,6 +719,7 @@ describe("PPR serve ladder reads the platform cache", () => {
     // forever — getStored applies the handler's own tag staleness, so a stale stored entry
     // still degrades to the live path.
     const calls: any[] = [];
+    const readContexts: unknown[] = [];
     const dispatcher = createDispatcher(
       baseOptions({
         localHandlerInvoker: (async (a: any) => {
@@ -651,16 +735,19 @@ describe("PPR serve ladder reads the platform cache", () => {
         },
         platformCache: {
           read: async () => null,
-          readStored: async () => ({
-            lastModified: Date.now(),
-            value: {
-              kind: "APP_PAGE",
-              html: "<html>regenerated shell</html>",
-              postponed: "regen-token",
-              headers: {},
-              status: 200,
-            },
-          }),
+          readStored: async (_key: string, ctx: unknown) => {
+            readContexts.push(ctx);
+            return {
+              lastModified: Date.now(),
+              value: {
+                kind: "APP_PAGE",
+                html: "<html>regenerated shell</html>",
+                postponed: "regen-token",
+                headers: {},
+                status: 200,
+              },
+            };
+          },
           write: async () => {},
         },
       }),
@@ -672,6 +759,7 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(meta?.postponed).toBe("regen-token");
     expect(calls[0].minimalMode).toBe(true);
     expect(calls[0].responsePrefix?.content?.toString()).toContain("regenerated shell");
+    expect(readContexts).toContainEqual({ kind: "APP_PAGE", softTags: ["t1"] });
   });
 
   it("reads the CONCRETE key first, then falls back to the ROUTE-TEMPLATE key", async () => {
@@ -728,18 +816,23 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(meta?.postponed).toBe("template-token");
   });
 
-  it("serves a STALE stored entry WITHOUT self-regenerating (entrypoint owns PPR regen)", async () => {
+  it("hands a soft-stale stored document to Next's non-minimal ResponseCache", async () => {
     // The x-prerender-revalidate re-entry hard-errors for cache-components routes
     // ("uncached or runtime data during prerendering") and its failed render holds the
     // single-flight lock to TTL — starving the entrypoint's own WORKING revalidation
-    // (forceStaticRender). Dispatch serves the stale entry and leaves regeneration to the
-    // next non-minimal dynamic-RSC/action request's entrypoint read.
+    // (forceStaticRender). Directly replaying the stale document is also wrong: a client
+    // making document requests only would never trigger the dynamic-RSC path. The generated
+    // adapter entrypoint also treats an encoded Unicode cache MISS as a fallback in non-minimal
+    // mode, but this branch has a real stored APP_PAGE. Keep it non-minimal so the ResponseCache
+    // wrapper can force a static regeneration: a minimal resume replays the entry's stale fetch
+    // Resume Data Cache before the shared fetch handler gets a chance to refresh it.
     process.env.__NEXT_PREVIEW_MODE_ID = "pmid-xyz";
     try {
       const revalidations: any[] = [];
+      const invoker = vi.fn();
       const dispatcher = createDispatcher(
         baseOptions({
-          localHandlerInvoker: vi.fn() as any,
+          localHandlerInvoker: invoker as any,
           revalidate: (cfg: any) => {
             revalidations.push(cfg);
             return Promise.resolve();
@@ -761,7 +854,10 @@ describe("PPR serve ladder reads the platform cache", () => {
       );
       const res = mockRes();
       await dispatcher.dispatch(mockReq("/ppr-page"), res, route);
-      expect(res._body).toContain("stale but served");
+      expect(invoker).toHaveBeenCalledOnce();
+      expect(invoker.mock.calls[0]?.[0]?.minimalMode).toBe(false);
+      expect(invoker.mock.calls[0]?.[0]?.capturePostponedState).toBe(false);
+      expect(res._body).not.toContain("stale but served");
       expect(revalidations).toHaveLength(0);
     } finally {
       delete process.env.__NEXT_PREVIEW_MODE_ID;
@@ -809,19 +905,14 @@ describe("PPR serve ladder reads the platform cache", () => {
     }
   });
 
-  it("on a STALE shell falls to the live render AND schedules ONE regeneration via revalidate()", async () => {
-    // The regeneration rides the pool's own res.revalidate() re-entry (N33 boundary):
-    // a mocked-request loopback carrying x-prerender-revalidate, which dispatch verifies
-    // and runs NON-minimal as an on-demand revalidation — Next itself persists the fresh
-    // entry through the registered cache handler, like next start's response cache.
+  it("regenerates a STALE shared document through minimal capture-and-resume", async () => {
+    // Starting an x-prerender-revalidate request races the working path with an on-demand render;
+    // Cache Components then skips nested cache reads and `connection()` aborts. The foreground
+    // minimal render owns the fresh shell and the adapter completes its postponed response.
     process.env.__NEXT_PREVIEW_MODE_ID = "pmid-xyz";
     try {
       const calls: any[] = [];
       const revalidations: any[] = [];
-      let resolveRegen: () => void;
-      const regenerated = new Promise<void>((r) => (resolveRegen = r));
-      let releaseRegen: () => void;
-      const holdRegen = new Promise<void>((r) => (releaseRegen = r));
       const dispatcher = createDispatcher(
         baseOptions({
           localHandlerInvoker: (async (a: any) => {
@@ -837,26 +928,21 @@ describe("PPR serve ladder reads the platform cache", () => {
           },
           revalidate: (cfg: any) => {
             revalidations.push(cfg);
-            resolveRegen();
-            // Stay in-flight until released — the dedupe is per-key WHILE pending.
-            return holdRegen;
+            return Promise.resolve();
           },
           platformCache: { read: async () => null, write: async () => {} },
         }),
       );
       await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
-      await dispatcher.dispatch(mockReq("/ppr-page"), mockRes(), route);
-      await regenerated;
 
-      // Both foreground invocations are the non-minimal live render (unusable shell path).
-      expect(calls).toHaveLength(2);
-      for (const c of calls) expect(c.minimalMode).toBe(false);
+      // The foreground invocation is the minimal platform render (unusable shell path).
+      expect(calls).toHaveLength(1);
+      for (const c of calls) {
+        expect(c.minimalMode).toBe(true);
+        expect(c.capturePostponedState).toBe(true);
+      }
 
-      // Exactly one regeneration, deduped in flight, canonical header shape.
-      expect(revalidations).toHaveLength(1);
-      expect(revalidations[0].urlPath).toBe("/ppr-page");
-      expect(revalidations[0].headers["x-prerender-revalidate"]).toBe("pmid-xyz");
-      releaseRegen!();
+      expect(revalidations).toHaveLength(0);
     } finally {
       delete process.env.__NEXT_PREVIEW_MODE_ID;
     }

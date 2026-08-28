@@ -8,10 +8,15 @@ import {
 } from "../../../src/pool-server/valkey-cache/stream-codec.js";
 import {
   MAX_CLOCK_SKEW_MS,
+  TAG_MANIFEST_EPOCH_FIELD,
   TAG_MANIFEST_TTL_SECONDS,
 } from "../../../src/pool-server/valkey-cache/tag-manifest.js";
 import type { CacheEntry } from "../../../src/pool-server/valkey-cache/types.js";
-import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
+import {
+  STORE_USE_CACHE_ENTRY_SCRIPT,
+  ValkeyCacheHandler,
+} from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
+import { READ_VALKEY_TIME_SCRIPT } from "../../../src/pool-server/valkey-cache/valkey-clock.js";
 
 // Unit tests for the V2 `use cache` handler's defensive write/read paths (no Docker needed):
 // an in-memory fake ValkeyClient records writes and can be scripted to fail.
@@ -26,6 +31,8 @@ class FakeValkeyClient implements ValkeyClient {
   readonly multiExpireArgs: number[] = [];
   /** The manifest TTL from each updateTags eval call (the script EXPIREs the key per write). */
   readonly manifestExpireCalls: number[] = [];
+  readonly hmgetCalls: string[][] = [];
+  manifestEpoch = 0;
   multiCount = 0;
   /** When set, `multi().exec()` reports it as a per-command failure inside the EXEC reply. */
   execFailure: RespError | null = null;
@@ -41,7 +48,10 @@ class FakeValkeyClient implements ValkeyClient {
   async get(key: string): Promise<string | null> {
     return this.strings.get(key) ?? null;
   }
-  async set(key: string, value: string | Buffer): Promise<string | null> {
+  async set(key: string, value: string | Buffer, ...args: Arg[]): Promise<string | null> {
+    if (args.some((arg) => String(arg).toUpperCase() === "NX") && this.strings.has(key)) {
+      return null;
+    }
     this.strings.set(key, String(value));
     return "OK";
   }
@@ -62,6 +72,30 @@ class FakeValkeyClient implements ValkeyClient {
   }
   async eval(...args: Arg[]): Promise<unknown> {
     if (this.evalError) throw this.evalError;
+    const serverNow = () => (this.serverNowFn ? this.serverNowFn() : this.serverNow || Date.now());
+    if (String(args[0]) === READ_VALKEY_TIME_SCRIPT) return serverNow();
+    if (String(args[0]) === STORE_USE_CACHE_ENTRY_SCRIPT) {
+      this.multiCount++;
+      const key = String(args[2]);
+      const meta = JSON.parse(String(args[3])) as Record<string, unknown>;
+      const entryTimestamp = Number(args[6]);
+      const clientNow = Number(args[7]);
+      const sharedNow = serverNow();
+      meta.timestamp = sharedNow + entryTimestamp - clientNow;
+      await this.hset(key, "m", JSON.stringify(meta), "v", args[4]!);
+      this.multiExpireArgs.push(Number(args[5]));
+      if (this.execFailure) throw this.execFailure;
+      return Math.abs(sharedNow - clientNow) > MAX_CLOCK_SKEW_MS ? 1 : 0;
+    }
+    if (args.length === 4) {
+      const key = String(args[2]);
+      const token = String(args[3]);
+      if (this.strings.get(key) === token) {
+        this.strings.delete(key);
+        return 1;
+      }
+      return 0;
+    }
     // Emulates UPDATE_TAGS_SCRIPT — keep in sync with the real script (the Docker integration
     // tests verify it against actual Valkey): args are
     // [script, numkeys, key, field, json, field, json, ..., ttlSeconds]; each event wins when
@@ -71,7 +105,7 @@ class FakeValkeyClient implements ValkeyClient {
     // manifest key's expiry on every write (M11). Returns the skew count.
     this.manifestExpireCalls.push(Number(args[args.length - 1]));
     const pairEnd = args.length - 1;
-    const now = this.serverNowFn ? this.serverNowFn() : this.serverNow || Date.now();
+    const now = serverNow();
     let clamped = 0;
     for (let i = 3; i < pairEnd; i += 2) {
       const field = String(args[i]);
@@ -91,11 +125,19 @@ class FakeValkeyClient implements ValkeyClient {
       if (expired !== undefined) merged.expired = expired;
       this.tagFields.set(field, JSON.stringify(merged));
     }
+    this.manifestEpoch++;
     return clamped;
   }
   async hmget(_key: string, ...fields: string[]): Promise<(string | null)[]> {
     if (this.hmgetError) throw this.hmgetError;
-    return fields.map((field) => this.tagFields.get(field) ?? null);
+    this.hmgetCalls.push(fields);
+    return fields.map((field) =>
+      field === TAG_MANIFEST_EPOCH_FIELD
+        ? this.manifestEpoch === 0
+          ? null
+          : String(this.manifestEpoch)
+        : (this.tagFields.get(field) ?? null),
+    );
   }
   async hset(key: string, ...args: Arg[]): Promise<number> {
     const hash = this.hashes.get(key) ?? Object.create(null);
@@ -108,6 +150,11 @@ class FakeValkeyClient implements ValkeyClient {
   }
   async hgetallBuffer(key: string): Promise<Record<string, Buffer>> {
     if (this.hgetallError) throw this.hgetallError;
+    if (key.endsWith(":tags")) {
+      const fields: Record<string, Buffer> = Object.create(null);
+      for (const [tag, state] of this.tagFields) fields[tag] = Buffer.from(state);
+      return fields;
+    }
     return this.hashes.get(key) ?? Object.create(null);
   }
   multi(): ValkeyMulti {
@@ -173,6 +220,20 @@ async function readStream(s: ReadableStream<Uint8Array>): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+async function preparedGet(
+  handler: ValkeyCacheHandler,
+  cacheKey: string,
+  softTags: string[],
+): Promise<CacheEntry | undefined> {
+  const run = await handler.prepareForInvocation();
+  return run(() => handler.get(cacheKey, softTags));
+}
+
+async function preparedExpiration(handler: ValkeyCacheHandler, tags: string[]): Promise<number> {
+  const run = await handler.prepareForInvocation();
+  return run(() => handler.getExpiration(tags));
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const validMeta = (overrides: Record<string, unknown> = {}) =>
@@ -208,6 +269,270 @@ describe("set/get round-trip (fake client)", () => {
     expect(got).toBeDefined();
     expect(await readStream(got!.value)).toBe("hello");
   });
+
+  it("evaluates request soft tags inside the shared clock domain", async () => {
+    const client = new FakeValkeyClient();
+    const clock = { t: 10_000 };
+    client.serverNowFn = () => clock.t;
+    const h = new ValkeyCacheHandler({ client, buildId: "soft-tag", now: () => clock.t });
+    await h.set("k", Promise.resolve(makeEntry("hello", { timestamp: clock.t })));
+    clock.t += 1;
+    await h.updateTags(["_N_T_/route"]);
+    clock.t += 1;
+
+    expect(await h.get("k", ["_N_T_/route"])).toBeUndefined();
+    expect(await h.get("k", [])).toBeDefined();
+  });
+
+  it("signals tag staleness to every replica during page regeneration", async () => {
+    const client = new FakeValkeyClient();
+    let now = 1_000;
+    client.serverNowFn = () => now;
+    const options = {
+      client,
+      buildId: "atomic-tag",
+      now: () => now,
+    };
+    const winnerHandler = new ValkeyCacheHandler(options);
+    const loserHandler = new ValkeyCacheHandler(options);
+    await winnerHandler.set(
+      "shared",
+      Promise.resolve(
+        makeEntry("old", {
+          tags: ["shared"],
+          timestamp: now,
+          revalidate: 3600,
+          expire: 7200,
+        }),
+      ),
+    );
+    now = 1_001;
+    await winnerHandler.updateTags(["shared"], { expire: 3600 });
+
+    const [winner, loser] = await Promise.all([
+      winnerHandler.get("shared", []),
+      loserHandler.get("shared", []),
+    ]);
+    // Duplicate regeneration is acceptable. Suppressing a reader could leave every request stale
+    // when the nominated owner never reaches the write path.
+    expect(winner?.revalidate).toBe(-1);
+    expect(loser?.revalidate).toBe(-1);
+    expect(await readStream(loser!.value)).toBe("old");
+  });
+
+  it("treats an age-stale entry as a synchronous miss like Next production", async () => {
+    const client = new FakeValkeyClient();
+    let now = 1_000;
+    client.serverNowFn = () => now;
+    const handler = new ValkeyCacheHandler({ client, buildId: "age-miss", now: () => now });
+    await handler.set(
+      "shared",
+      Promise.resolve(makeEntry("old", { timestamp: now, revalidate: 1, expire: 60 })),
+    );
+
+    now = 2_001;
+    expect(await handler.get("shared", [])).toBeUndefined();
+    // A read miss does not delete blindly; the bounded key remains available for a writer to
+    // replace without racing an eager cleanup.
+    expect(client.hashes.has("k8s:age-miss:entry:shared")).toBe(true);
+  });
+});
+
+describe("staged-render safe reads", () => {
+  it("turns a cold Valkey hit into an immediate miss, then warms the local front", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    client.hashes.set("k8s:stage-safe:entry:k", {
+      m: Buffer.from(validMeta({ timestamp: 1000, revalidate: 60, expire: 300 })),
+      v: Buffer.from("shared"),
+    });
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-safe", now: () => 1000 });
+
+    const run = await h.prepareForInvocation();
+    expect(client.hmgetCalls).toEqual([[TAG_MANIFEST_EPOCH_FIELD]]);
+
+    // A network-backed hit cannot resolve inside Cache Components' static stage. The current
+    // request recomputes instead; the backing read only warms the process for a later request.
+    expect(await run(() => h.get("k", []))).toBeUndefined();
+
+    await vi.waitFor(async () => {
+      const warmed = await preparedGet(h, "k", []);
+      expect(warmed).toBeDefined();
+      expect(await readStream(warmed!.value)).toBe("shared");
+    });
+  });
+
+  it("never scans the high-cardinality tag manifest during request preflight", async () => {
+    const client = new FakeValkeyClient();
+    for (let i = 0; i < 10_000; i++) {
+      client.tagFields.set(`tag-${i}`, JSON.stringify({ expired: i, at: i }));
+    }
+    const hgetall = vi.spyOn(client, "hgetallBuffer");
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-bounded", now: () => 10_000 });
+
+    const run = await h.prepareForInvocation();
+
+    expect(client.hmgetCalls).toEqual([[TAG_MANIFEST_EPOCH_FIELD]]);
+    expect(hgetall).not.toHaveBeenCalled();
+    expect(await run(() => h.getExpiration(["tag-9999"]))).toBe(Number.POSITIVE_INFINITY);
+  });
+
+  it("does not reuse one implicit-tag verdict for another tag set", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    client.hashes.set("k8s:stage-soft-tags:entry:k", {
+      m: Buffer.from(validMeta({ timestamp: 1000, revalidate: 60, expire: 300 })),
+      v: Buffer.from("shared"),
+    });
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-soft-tags", now: () => 1000 });
+
+    expect(await preparedGet(h, "k", ["_N_T_/one"])).toBeUndefined();
+    await vi.waitFor(async () => {
+      expect(await preparedGet(h, "k", ["_N_T_/one"])).toBeDefined();
+    });
+    expect(await preparedGet(h, "k", ["_N_T_/two"])).toBeUndefined();
+  });
+
+  it("does not admit a background warm after a newer epoch was prepared", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    const stored = {
+      m: Buffer.from(validMeta({ timestamp: 1000, revalidate: 60, expire: 300 })),
+      v: Buffer.from("old"),
+    };
+    client.hashes.set("k8s:stage-warm-race:entry:k", stored);
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-warm-race", now: () => 1000 });
+    const peer = new ValkeyCacheHandler({ client, buildId: "stage-warm-race", now: () => 1000 });
+    const firstRun = await h.prepareForInvocation();
+
+    let releaseRead!: () => void;
+    const blockedRead = new Promise<Record<string, Buffer>>((resolve) => {
+      releaseRead = () => resolve(stored);
+    });
+    vi.spyOn(client, "hgetallBuffer").mockImplementationOnce(() => blockedRead);
+    expect(await firstRun(() => h.get("k", []))).toBeUndefined();
+
+    await peer.updateTags(["peer-update"]);
+    await h.prepareForInvocation();
+    releaseRead();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The old read completed after the epoch changed, so it cannot repopulate the cleared front.
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+  });
+
+  it("does not let an older backing warm cross a newer local write", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    const oldStored = {
+      m: Buffer.from(validMeta({ timestamp: 900, revalidate: 60, expire: 300 })),
+      v: Buffer.from("old"),
+    };
+    client.hashes.set("k8s:stage-write-race:entry:k", oldStored);
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-write-race", now: () => 1000 });
+
+    let releaseRead!: () => void;
+    const blockedRead = new Promise<Record<string, Buffer>>((resolve) => {
+      releaseRead = () => resolve(oldStored);
+    });
+    vi.spyOn(client, "hgetallBuffer").mockImplementationOnce(() => blockedRead);
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+
+    await h.set("k", Promise.resolve(makeEntry("new", { timestamp: 1000 })));
+    releaseRead();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Neither the generated write nor the older in-flight read is trusted without a fresh,
+    // exact backing read at the prepared epoch.
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+    await vi.waitFor(async () => {
+      const warmed = await preparedGet(h, "k", []);
+      expect(await readStream(warmed!.value)).toBe("new");
+    });
+  });
+
+  it("does not start a backing warm while a same-key write is pending", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    client.hashes.set("k8s:stage-pending-write:entry:k", {
+      m: Buffer.from(validMeta({ timestamp: 900, revalidate: 60, expire: 300 })),
+      v: Buffer.from("old"),
+    });
+    const hgetall = vi.spyOn(client, "hgetallBuffer");
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-pending-write", now: () => 1000 });
+    let resolveEntry!: (entry: CacheEntry) => void;
+    const pendingEntry = new Promise<CacheEntry>((resolve) => {
+      resolveEntry = resolve;
+    });
+    const set = h.set("k", pendingEntry);
+
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+    expect(hgetall).not.toHaveBeenCalled();
+
+    resolveEntry(makeEntry("new", { timestamp: 1000 }));
+    await set;
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+    await vi.waitFor(async () => {
+      const warmed = await preparedGet(h, "k", []);
+      expect(await readStream(warmed!.value)).toBe("new");
+    });
+  });
+
+  it("bounds concurrent backing warms under a high-cardinality miss burst", async () => {
+    const client = new FakeValkeyClient();
+    const blockedRead = new Promise<Record<string, Buffer>>(() => undefined);
+    const hgetall = vi.spyOn(client, "hgetallBuffer").mockImplementation(() => blockedRead);
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-warm-bound", now: () => 1000 });
+    const run = await h.prepareForInvocation();
+
+    for (let i = 0; i < 65; i++) {
+      expect(await run(() => h.get(`key-${i}`, []))).toBeUndefined();
+    }
+
+    expect(hgetall).toHaveBeenCalledTimes(64);
+  });
+
+  it("drops locally warmed entries after another replica updates the shared tag manifest", async () => {
+    const client = new FakeValkeyClient();
+    let now = 1000;
+    client.serverNowFn = () => now;
+    const first = new ValkeyCacheHandler({ client, buildId: "stage-tags", now: () => now });
+    const peer = new ValkeyCacheHandler({ client, buildId: "stage-tags", now: () => now });
+
+    await first.set(
+      "k",
+      Promise.resolve(
+        makeEntry("local", { tags: ["shared"], timestamp: now, revalidate: 60, expire: 300 }),
+      ),
+    );
+    // A generated value is not admitted until the same persisted entry and its implicit tags
+    // have been checked outside Next's render boundary.
+    expect(await preparedGet(first, "k", [])).toBeUndefined();
+    await vi.waitFor(async () => {
+      expect(await preparedGet(first, "k", [])).toBeDefined();
+    });
+
+    now += 1;
+    await peer.updateTags(["shared"]);
+    now += 1;
+    expect(await preparedGet(first, "k", [])).toBeUndefined();
+  });
+
+  it("keeps prepared mode scoped to one invocation", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    client.hashes.set("k8s:stage-scope:entry:k", {
+      m: Buffer.from(validMeta({ timestamp: 1000, revalidate: 60, expire: 300 })),
+      v: Buffer.from("shared"),
+    });
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-scope", now: () => 1000 });
+
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+    // A direct consumer after unrelated prepared traffic retains the original live-read contract.
+    expect(await readStream((await h.get("k", []))!.value)).toBe("shared");
+    expect(await h.getExpiration(["never"])).toBe(0);
+    expect(await preparedExpiration(h, ["never"])).toBe(Number.POSITIVE_INFINITY);
+  });
 });
 
 describe("H4: non-finite lifetimes are refused, EXEC failures are detected", () => {
@@ -236,17 +561,17 @@ describe("H4: non-finite lifetimes are refused, EXEC failures are detected", () 
     expect(await h.get("k", [])).toBeUndefined();
   });
 
-  it("treats a per-command EXEC failure as a failed write and DELs the partial entry", async () => {
+  it("does not delete a possibly committed entry after an ambiguous script failure", async () => {
     const client = new FakeValkeyClient();
     client.execFailure = new RespError("ERR invalid expire time in 'expire' command");
     const h = new ValkeyCacheHandler({ client, buildId: "h4c", now: () => 1000 });
 
     // set() must not reject (a cache write failure never breaks the response)...
     await expect(h.set("k", Promise.resolve(makeEntry("v")))).resolves.toBeUndefined();
-    // ...but the partially-applied HSET (no TTL) must be cleaned up.
-    expect(client.delCalls).toEqual([["k8s:h4c:entry:k"]]);
-    expect(client.hashes.size).toBe(0);
-    expect(await h.get("k", [])).toBeUndefined();
+    // Lua is atomic. A transport error can arrive after Valkey committed the script, so cleanup
+    // must not race a later writer and delete its value.
+    expect(client.delCalls).toEqual([]);
+    expect(client.hashes.size).toBe(1);
   });
 
   it("does NOT DEL a previously cached entry when the entry promise itself rejects", async () => {
@@ -258,6 +583,19 @@ describe("H4: non-finite lifetimes are refused, EXEC failures are detected", () 
     // The write was never dispatched, so no cleanup DEL may remove the old entry.
     expect(client.delCalls).toEqual([]);
     expect(await h.get("k", [])).toBeDefined();
+  });
+
+  it("does not eagerly delete an expired entry that a concurrent writer may replace", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyCacheHandler({ client, buildId: "keep-expired", now: () => 2000 });
+    client.hashes.set("k8s:keep-expired:entry:k", {
+      m: Buffer.from(validMeta({ timestamp: 1000, expire: 1 })),
+      v: Buffer.from("old"),
+    });
+
+    expect(await h.get("k", [])).toBeUndefined();
+    expect(client.delCalls).toEqual([]);
+    expect(client.hashes.has("k8s:keep-expired:entry:k")).toBe(true);
   });
 });
 
@@ -338,7 +676,7 @@ describe("L3: getExpiration fails STALE (not fresh) on error", () => {
 
     expect(await h.getExpiration(["a"])).toBe(777_000);
     expect(await h.getExpiration(["a"])).toBe(777_000);
-    expect(error).toHaveBeenCalledTimes(1); // rate-limited, not per-call
+    expect(error).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -365,6 +703,25 @@ describe("tag state reads", () => {
     expect(await h.getExpiration(["t"])).toBe(0);
     await h.set("k", Promise.resolve(makeEntry("v", { tags: ["t"] })));
     expect(await h.get("k", [])).toBeDefined();
+  });
+
+  it("detects profiled updates even when they carry no expired watermark", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyCacheHandler({ client, buildId: "shell-tags", now: () => 1000 });
+    expect(await h.hasTagUpdates(["shell"])).toBe(false);
+
+    await h.updateTags(["shell"], {});
+
+    expect(await h.hasTagUpdates(["shell"])).toBe(true);
+  });
+
+  it("withholds a build artifact when the tag check fails", async () => {
+    const client = new FakeValkeyClient();
+    client.hmgetError = new Error("valkey down");
+    const h = new ValkeyCacheHandler({ client, buildId: "shell-tags-fail", now: () => 1000 });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    expect(await h.hasTagUpdates(["shell"])).toBe(true);
   });
 });
 
@@ -496,8 +853,8 @@ describe("N5/N79: the stored tag list is bounded exactly like the incremental ha
 });
 
 describe("N84: `revalidate <= 0` is storable (only a non-finite/`expire<=0` entry is not)", () => {
-  // `get` returns `revalidate: -1` for a stale entry (matching Next's default handler), the
-  // `use cache` wrapper propagates the MINIMUM revalidate into the ENCLOSING cache's store, and the
+  // A tag-stale `get` returns `revalidate: -1`, the `use cache` wrapper propagates the MINIMUM
+  // revalidate into the ENCLOSING cache's store, and the
   // old H4 guard then refused to store that outer entry — so nested caches stopped caching for as
   // long as any inner entry was stale, and `cacheLife({ revalidate: 0 })` was never cached at all.
   // Measured pre-fix: `stored entry with revalidate=-1? false`, `revalidate=0? false`.
@@ -507,12 +864,10 @@ describe("N84: `revalidate <= 0` is storable (only a non-finite/`expire<=0` entr
     const h = new ValkeyCacheHandler({ client, buildId: "n84a", now: () => 1000 });
     await h.set("k", Promise.resolve(makeEntry("outer", { revalidate: -1, expire: 300 })));
     expect(client.multiCount).toBe(1);
-    const got = await h.get("k", []);
-    expect(got).toBeDefined();
-    expect(await readStream(got!.value)).toBe("outer");
-    // Its own freshness is "stale immediately", which is the correct reading of revalidate <= 0:
-    // serve it and revalidate behind the request.
-    expect(got!.revalidate).toBe(-1);
+    expect(client.hashes.has("k8s:n84a:entry:k")).toBe(true);
+    // It is stored because an enclosing cache may receive the propagated lifetime, but a later
+    // production read treats the already-due time boundary as a synchronous miss.
+    expect(await h.get("k", [])).toBeUndefined();
     // The TTL argument is still valid (the arithmetic floors at 1s + the retention margin).
     expect(client.multiExpireArgs).toEqual([360]);
   });
@@ -663,5 +1018,95 @@ describe("N78: watermarks are rebased onto the Valkey server clock", () => {
     const state = JSON.parse(client.tagFields.get("t")!) as { stale: number; expired: number };
     expect(state.stale).toBe(server.t); // base pinned to the SERVER clock
     expect(state.expired - state.stale).toBe(300_000); // duration preserved bit-for-bit
+  });
+
+  it("stores computation start in the server domain and preserves age for skewed readers", async () => {
+    const client = new FakeValkeyClient();
+    const server = { t: 5_000_000 };
+    client.serverNowFn = () => server.t;
+    const writerNow = server.t - 300_000;
+    const writer = new ValkeyCacheHandler({
+      client,
+      buildId: "clock-entry",
+      now: () => writerNow,
+    });
+    await writer.set(
+      "k",
+      Promise.resolve(
+        makeEntry("v", {
+          timestamp: writerNow - 90_000,
+          revalidate: 120,
+          expire: 600,
+        }),
+      ),
+    );
+    const meta = JSON.parse(client.hashes.get("k8s:clock-entry:entry:k")!.m.toString("utf8")) as {
+      timestamp: number;
+    };
+    expect(meta.timestamp).toBe(server.t - 90_000);
+
+    server.t += 10_000;
+    const fastNow = server.t + 300_000;
+    const slowNow = server.t - 300_000;
+    const fast = new ValkeyCacheHandler({
+      client,
+      buildId: "clock-entry",
+      now: () => fastNow,
+    });
+    const slow = new ValkeyCacheHandler({
+      client,
+      buildId: "clock-entry",
+      now: () => slowNow,
+    });
+    const fastEntry = await fast.get("k", []);
+    const slowEntry = await slow.get("k", []);
+    expect(fastNow - fastEntry!.timestamp).toBe(100_000);
+    expect(slowNow - slowEntry!.timestamp).toBe(100_000);
+    expect(fastEntry!.revalidate).toBe(120);
+    expect(slowEntry!.revalidate).toBe(120);
+  });
+
+  it("keeps an invalidation that arrives while a value is computing", async () => {
+    const client = new FakeValkeyClient();
+    const server = { t: 8_000_000 };
+    client.serverNowFn = () => server.t;
+    const local = { t: server.t - 300_000 };
+    const handler = new ValkeyCacheHandler({
+      client,
+      buildId: "compute-race",
+      now: () => local.t,
+    });
+    const computationStarted = local.t;
+    server.t += 10_000;
+    local.t += 10_000;
+    await handler.updateTags(["t"]);
+    server.t += 10_000;
+    local.t += 10_000;
+    await handler.set(
+      "k",
+      Promise.resolve(makeEntry("late", { tags: ["t"], timestamp: computationStarted })),
+    );
+
+    expect(await handler.get("k", [])).toBeUndefined();
+  });
+
+  it("returns tag expirations in the requesting replica's local clock domain", async () => {
+    const client = new FakeValkeyClient();
+    const server = { t: 9_000_000 };
+    client.serverNowFn = () => server.t;
+    const writer = new ValkeyCacheHandler({
+      client,
+      buildId: "expiration-offset",
+      now: () => server.t,
+    });
+    await writer.updateTags(["t"]);
+
+    const readerNow = server.t + 300_000;
+    const reader = new ValkeyCacheHandler({
+      client,
+      buildId: "expiration-offset",
+      now: () => readerNow,
+    });
+    expect(await reader.getExpiration(["t"])).toBe(readerNow);
   });
 });

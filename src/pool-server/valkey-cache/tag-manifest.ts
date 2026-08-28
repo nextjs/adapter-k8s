@@ -1,6 +1,6 @@
 // Pure tag-staleness logic for the Valkey-backed V2 `use cache` CacheHandler.
 //
-// This mirrors Next 16.2's reference implementation exactly:
+// This mirrors Next 16.3's reference implementation exactly:
 //   - `areTagsExpired` / `areTagsStale` from
 //     next/dist/server/lib/incremental-cache/tags-manifest.external.js
 //   - `updateTags` / `getExpiration` from
@@ -9,8 +9,8 @@
 // The ONLY difference from Next's in-process handler is where the manifest lives: ours is
 // backed by Valkey so revalidation propagates across every replica (Next's default keeps it
 // in a per-process Map, which is why `refreshTags` is a no-op there and cross-replica
-// invalidation is impossible). The predicates below operate on an in-memory snapshot that
-// `refreshTags()` pulls from Valkey at the start of each request.
+// invalidation is impossible). Unprepared reads fetch only their relevant fields. Pool requests
+// first read the fixed-size epoch field, then keep Cache Components callbacks network-free.
 //
 // Watermarks are absolute milliseconds since the epoch, matching Next.
 
@@ -23,6 +23,14 @@ import { warnOnce } from "./stream-codec.js";
  * were TTL-bounded but manifests were not, so the keyspace grew without bound across deploys.
  */
 export const TAG_MANIFEST_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
+/**
+ * Reserved hash field incremented atomically with every tag-manifest update. A pool request reads
+ * only this scalar before entering Next's staged render; reading the complete, high-cardinality
+ * manifest on every request would make tag count an unbounded dataplane cost. The control-byte
+ * prefix is outside Next's generated tag namespace, and filterManifestTags rejects it explicitly.
+ */
+export const TAG_MANIFEST_EPOCH_FIELD = "\u001fadapter-k8s-epoch";
 
 /**
  * How far a replica's clock may differ from the Valkey SERVER clock before the skew is reported
@@ -83,6 +91,7 @@ export function filterManifestTags(tags: readonly string[]): string[] {
   const out: string[] = [];
   for (const tag of tags) {
     if (typeof tag !== "string" || tag.length === 0) continue;
+    if (tag === TAG_MANIFEST_EPOCH_FIELD) continue;
     if (tag.length > maxTagLength(tag)) continue;
     out.push(tag);
   }
@@ -135,18 +144,6 @@ export function chunkManifestTags(tags: readonly string[]): string[][] {
  * TIME" for the two shapes that matter: a hard event carries `expired == at`, so it lands on the
  * server's now; a profiled event carries `stale == at` and `expired == at + expire*1000`, so its
  * base lands on the server's now and the intended duration is preserved bit-for-bit.
- *
- * RESIDUAL, deliberately not "fixed" here: watermarks are now server-clocked, but entry
- * `timestamp`/`lastModified` values are still stamped by the WRITING replica's clock, so an entry
- * written by a pod whose clock runs ahead can still read as newer than a watermark and survive a
- * hard `revalidateTag`. The obvious patch — comparing with a tolerance
- * (`expiredAt > entryTimestamp - MAX_CLOCK_SKEW_MS`) — is worse than the bug: after ANY hard
- * revalidation, the entry that Next regenerates lands inside the tolerance window too, so it is
- * immediately invalidated again, and the route re-renders on every request for a full
- * MAX_CLOCK_SKEW_MS. Distinguishing "written 30s after the event" from "written by a 30s-fast
- * clock" is not possible without a clock the two share; closing it properly means stamping entry
- * timestamps from Valkey's `TIME` too (a per-process learned offset), which is a design change,
- * not a bug fix. The skew warning below is what makes the precondition visible meanwhile.
  *
  * The winning event is merged into the stored state PER DIMENSION (M12), not written over it:
  * an event only replaces the watermarks it SETS, preserving stored ones it didn't — exactly
@@ -210,6 +207,10 @@ while i <= pairCount do
   if write then redis.call('HSET', KEYS[1], field, incoming) end
   i = i + 2
 end
+-- The fixed-size epoch lets pool requests notice any peer invalidation without HGETALL-ing an
+-- unbounded manifest inside the request path. It shares this script's atomic boundary: a reader
+-- can observe either the old fields+epoch or the new fields+epoch, never a torn update.
+redis.call('HINCRBY', KEYS[1], '${TAG_MANIFEST_EPOCH_FIELD}', 1)
 -- M11: bound the manifest's own lifetime, refreshed on each write (entry keys are TTL-bounded;
 -- the manifest must be too, or every deploy leaks a build-namespaced hash forever).
 if ttlSeconds and ttlSeconds > 0 then redis.call('EXPIRE', KEYS[1], ttlSeconds) end
@@ -217,19 +218,16 @@ return clamped
 `;
 
 /**
- * Surface the skew count returned by `UPDATE_TAGS_SCRIPT`: when it is > 0, some replica's clock
- * differed from the Valkey server's by more than `MAX_CLOCK_SKEW_MS` (in EITHER direction — N78
- * rebases behind clocks as well as ahead ones) and its watermarks were rebased server-side. The
- * rebasing keeps the invalidation correct; the warning makes the broken clock observable, which
- * matters because entry timestamps are NOT rebased (see the script's RESIDUAL note). Once per
- * process — a skewed replica would otherwise log on every revalidation.
+ * Surface the skew flag/count returned by the server-clocked cache scripts. Entries and tag
+ * watermarks remain correct because they are stored in Valkey's domain; the warning identifies a
+ * broken pod clock. Once per process avoids one line per cache operation.
  */
 export function warnOnClockSkewClamp(clamped: unknown): void {
   if (typeof clamped === "number" && clamped > 0) {
     warnOnce(
       "clock-skew-clamp",
       `[valkey-cache] a replica clock differs from the Valkey server clock by more than ${MAX_CLOCK_SKEW_MS}ms; ` +
-        "tag-invalidation watermarks were rebased server-side — check pod clock sync (ntp/chrony)",
+        "cache timestamps were translated to the shared server clock — check pod clock sync (ntp/chrony)",
     );
   }
 }
@@ -365,12 +363,10 @@ export type Freshness =
   | { state: "fresh"; revalidate: number };
 
 /**
- * The freshness decision used by the handler's `get`. Unlike Next's in-memory default
- * handler — which evicts at `revalidate` because memory is short-lived — a persistent
- * (Valkey) cache keeps an entry up to the longer `expire` window and serves it stale
- * (`revalidate: -1`) in between, which is the intended stale-while-revalidate behavior
- * (the interface documents `expire` as "how long the entry is allowed to be used",
- * `revalidate` as "how long until the entry should be revalidated").
+ * The freshness decision used by the handler's `get`. Production Next treats the time-based
+ * `revalidate` boundary as a miss so the request regenerates synchronously; `expire` remains the
+ * hard retention boundary and controls profiled tag invalidations. Only a tag profile with a
+ * future expire watermark is stale-while-revalidate.
  */
 export function evaluateEntry(
   entry: { timestamp: number; revalidate: number; expire: number; tags: readonly string[] },
@@ -379,7 +375,7 @@ export function evaluateEntry(
 ): Freshness {
   if (now > entry.timestamp + entry.expire * 1000) return { state: "expired" };
   if (areTagsExpired(entry.tags, entry.timestamp, manifest, now)) return { state: "expired" };
-  if (now > entry.timestamp + entry.revalidate * 1000) return { state: "stale" };
+  if (now > entry.timestamp + entry.revalidate * 1000) return { state: "expired" };
   if (areTagsStale(entry.tags, entry.timestamp, manifest)) return { state: "stale" };
   return { state: "fresh", revalidate: entry.revalidate };
 }

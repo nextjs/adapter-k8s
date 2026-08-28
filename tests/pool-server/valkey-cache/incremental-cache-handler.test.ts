@@ -3,9 +3,13 @@ import type {
   ValkeyClient,
   ValkeyMulti,
 } from "../../../src/pool-server/valkey-cache/resp-client.js";
-import { ValkeyIncrementalCacheHandler } from "../../../src/pool-server/valkey-cache/incremental-cache-handler.js";
+import {
+  STORE_INCREMENTAL_ENTRY_SCRIPT,
+  ValkeyIncrementalCacheHandler,
+} from "../../../src/pool-server/valkey-cache/incremental-cache-handler.js";
 import { resetLogSuppressionForTests } from "../../../src/pool-server/valkey-cache/stream-codec.js";
 import { TAG_MANIFEST_TTL_SECONDS } from "../../../src/pool-server/valkey-cache/tag-manifest.js";
+import { READ_VALKEY_TIME_SCRIPT } from "../../../src/pool-server/valkey-cache/valkey-clock.js";
 
 // Unit tests for the classic incremental handler's tag caps (L9), size cap (M6), malformed-entry
 // handling (L5) and observable invalidation failures (M1) — no Docker needed.
@@ -22,6 +26,9 @@ class FakeValkeyClient implements ValkeyClient {
   /** When set, every `get`/`set` rejects with it (a permanently dead cache — N81). */
   getError: Error | null = null;
   setError: Error | null = null;
+  /** Server time used by atomic entry writes. Zero lets the write use the handler's test clock. */
+  serverNow = 0;
+  private observedServerNow = 0;
 
   async get(key: string): Promise<string | null> {
     if (this.getError) throw this.getError;
@@ -50,11 +57,38 @@ class FakeValkeyClient implements ValkeyClient {
   }
   async eval(...args: Arg[]): Promise<unknown> {
     if (this.evalError) throw this.evalError;
+    if (String(args[0]) === READ_VALKEY_TIME_SCRIPT) {
+      return this.serverNow || this.observedServerNow;
+    }
+    if (String(args[0]) === STORE_INCREMENTAL_ENTRY_SCRIPT) {
+      if (this.setError) throw this.setError;
+      const key = String(args[2]);
+      const entry = JSON.parse(String(args[3])) as Record<string, unknown>;
+      const clientNow = Number(args[5]);
+      const serverNow = this.serverNow || clientNow;
+      this.observedServerNow = serverNow;
+      entry.lastModified = serverNow;
+      const value = JSON.stringify(entry);
+      this.strings.set(key, value);
+      this.setArgs.push({ key, value, args: ["EX", Number(args[4])] });
+      return Math.abs(serverNow - clientNow) > 60_000 ? 1 : 0;
+    }
+    if (args.length === 4) {
+      const key = String(args[2]);
+      const token = String(args[3]);
+      if (this.strings.get(key) === token) {
+        this.strings.delete(key);
+        return 1;
+      }
+      return 0;
+    }
     // args: [script, numkeys, key, field, json, field, json, ..., ttlSeconds] — the trailing
     // ttl refreshes the manifest key's expiry (M11); the naive store skips the merge (the
     // Docker integration tests cover the real script's semantics).
     this.manifestExpireCalls.push(Number(args[args.length - 1]));
     for (let i = 3; i + 1 < args.length - 1; i += 2) {
+      const state = JSON.parse(String(args[i + 1])) as { at?: number };
+      if (!this.serverNow && typeof state.at === "number") this.observedServerNow = state.at;
       this.tagFields.set(String(args[i]), String(args[i + 1]));
     }
     return 0;
@@ -480,66 +514,10 @@ describe("N6: non-finite lifetimes are refused (never reach Valkey)", () => {
   });
 });
 
-// Survey Tier 3 #16: `set(key, null)` is a REAL cached value (Next stores null for
-// not-found responses). It must round-trip as a hit carrying `value: null` — collapsing it
-// into a miss makes Next re-render the known-empty result on every request, forever.
-describe("cache trace (ADAPTER_K8S_CACHE_TRACE=1 — PPR materialization diagnosis)", () => {
-  // One JSON line per set()/get() so a deployed pool's writes can be diffed against
-  // `next start`'s filesystem materialization (which keys, which kinds, postponed/rscData
-  // presence). Off by default; costs nothing when unset.
-  it("logs a structured line for set() and get() when enabled", async () => {
-    process.env.ADAPTER_K8S_CACHE_TRACE = "1";
-    const lines: string[] = [];
-    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
-      lines.push(a.join(" "));
-    });
-    try {
-      const client = new FakeValkeyClient();
-      const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tr1", now: () => 1000 });
-      await h.set("/traced", appPageEntry("T"), {
-        tags: ["t1"],
-        cacheControl: { revalidate: 60, expire: 600 },
-      });
-      await h.get("/traced", { kind: "APP_PAGE" });
-      const traceLines = lines.filter((l) => l.includes("[cache-trace]"));
-      expect(traceLines.length).toBe(2);
-      const setLine = JSON.parse(traceLines[0]!.slice(traceLines[0]!.indexOf("{")));
-      expect(setLine.op).toBe("set");
-      expect(setLine.key).toBe("/traced");
-      expect(setLine.kind).toBe("APP_PAGE");
-      expect(setLine).toHaveProperty("postponedBytes");
-      expect(setLine).toHaveProperty("htmlBytes");
-      expect(setLine.tags).toEqual(["t1"]);
-      const getLine = JSON.parse(traceLines[1]!.slice(traceLines[1]!.indexOf("{")));
-      expect(getLine.op).toBe("get");
-      expect(getLine.hit).toBe(true);
-    } finally {
-      spy.mockRestore();
-      delete process.env.ADAPTER_K8S_CACHE_TRACE;
-    }
-  });
-
-  it("logs nothing when disabled", async () => {
-    const lines: string[] = [];
-    const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
-      lines.push(a.join(" "));
-    });
-    try {
-      const client = new FakeValkeyClient();
-      const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tr2", now: () => 1000 });
-      await h.set("/quiet", appPageEntry("Q"), {});
-      await h.get("/quiet", {});
-      expect(lines.filter((l) => l.includes("[cache-trace]"))).toHaveLength(0);
-    } finally {
-      spy.mockRestore();
-    }
-  });
-});
-
 describe("getStored staleness signal (SWR must not become stale-forever)", () => {
   // Dispatch consumes getStored DIRECTLY — no Next incremental-cache layer above it to
   // compute age staleness from lastModified. getStored therefore surfaces `isStale`
-  // itself (tag- OR age-stale, single-flight lock-gated); dispatch serves the stale
+  // itself (tag- or age-stale); dispatch serves the stale
   // entry and schedules one canonical regeneration behind it.
   it("marks an AGE-stale stored entry isStale", async () => {
     const client = new FakeValkeyClient();
@@ -547,6 +525,7 @@ describe("getStored staleness signal (SWR must not become stale-forever)", () =>
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx1", now: () => clock.t });
     await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
     clock.t += 120_000; // past the 60s revalidate window, inside expire
+    client.serverNow = clock.t;
     const got = await h.getStored("/p", {});
     expect(got).not.toBeNull();
     expect((got as { isStale?: boolean }).isStale).toBe(true);
@@ -558,43 +537,40 @@ describe("getStored staleness signal (SWR must not become stale-forever)", () =>
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx2", now: () => clock.t });
     await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
     clock.t += 1_000;
+    client.serverNow = clock.t;
     const got = await h.getStored("/p", {});
     expect(got).not.toBeNull();
     expect((got as { isStale?: boolean }).isStale).toBeFalsy();
   });
 
   it("staleness is a NON-CONSUMING peek: every getStored reader is told stale", async () => {
-    // The single-flight NX revalidate lock nearly killed resume-data-cache: dispatch's
-    // ladder read consumed it (its own regen path 500s for cache-components AND holds the
-    // lock to TTL on failure), so the ENTRYPOINT — the only actor whose revalidation works
-    // — was told FRESH and never regenerated (stale >12s on cold pods, traced). getStored
-    // now reports staleness without touching the lock; the app-path get() keeps lock
-    // semantics for Next's own SWR signalling.
+    // Dispatch must not change what the entrypoint sees. Each serving read reports the same
+    // staleness state independently.
     const client = new FakeValkeyClient();
     const clock = { t: 1_000_000 };
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx3", now: () => clock.t });
     await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
     clock.t += 120_000;
+    client.serverNow = clock.t;
     const first = await h.getStored("/p", {});
     const second = await h.getStored("/p", {});
     expect((first as { isStale?: boolean }).isStale).toBe(true);
     expect((second as { isStale?: boolean }).isStale).toBe(true);
-    // And the lock was NOT consumed: the app path's tag-stale signalling still wins it.
   });
 
-  it("does not surface isStale (or take the regen lock for age) on the app-path get()", async () => {
+  it("does not surface isStale for age on the app-path get()", async () => {
     // Next's own incremental-cache layer sits above get() and computes age staleness from
-    // lastModified — the handler adding its own signal there would double-signal and take
-    // locks the app path never needed. Age staleness is a getStored-only contract.
+    // lastModified. Age staleness is a getStored-only contract.
     const client = new FakeValkeyClient();
     const clock = { t: 1_000_000 };
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "cx4", now: () => clock.t });
     await h.set("/p", appPageEntry("P"), { cacheControl: { revalidate: 60, expire: 6000 } });
     clock.t += 120_000;
+    client.serverNow = clock.t;
     const got = await h.get("/p", {});
     expect(got).not.toBeNull();
     expect((got as { isStale?: boolean }).isStale).toBeUndefined();
-    // The lock was not consumed — a getStored after the app-path get still wins it.
+    // A later dispatch read still reports age staleness.
     const stored = await h.getStored("/p", {});
     expect((stored as { isStale?: boolean }).isStale).toBe(true);
   });
@@ -612,12 +588,7 @@ describe("negative caching (survey Tier 3 #16)", () => {
   });
 });
 
-// Survey Tier 1 #5: single-flight revalidation. When a profiled (SWR) tag revalidation marks
-// an entry stale, EVERY replica that reads it gets the stale-signalling lastModified and every
-// one of them triggers a background re-render — N pods, N renders, one Valkey. The first
-// reader must take a short-TTL NX lock and be the only one told "stale"; concurrent readers
-// are told "fresh" and keep serving the stale-but-valid value while the winner revalidates.
-describe("single-flight revalidation lock (survey Tier 1 #5)", () => {
+describe("cross-replica stale signalling", () => {
   async function staleEntry(client: FakeValkeyClient) {
     const h = new ValkeyIncrementalCacheHandler({ client, buildId: "sf1", now: () => 1_000_000 });
     await h.set("/page", appPageEntry("P", "tag-a"), {
@@ -635,33 +606,84 @@ describe("single-flight revalidation lock (survey Tier 1 #5)", () => {
     return new ValkeyIncrementalCacheHandler({ client, buildId: "sf1", now: () => 2_000_000 });
   }
 
-  it("signals stale to exactly one REPLICA; other replicas see the entry as fresh", async () => {
-    // Single-flight is per-REPLICA, not per-get (2026-08-04): one render reads the same
-    // key several times (ResponseCache pipeline first, then the entrypoint's RDC branch,
-    // which is the only reader that schedules the working revalidation), so the winning
-    // process must keep the signal for the lock window. In-process repetition is deduped
-    // by Next's own revalidateBatcher; the lock exists to stop CROSS-replica stampedes.
+  it("signals stale to every replica until a fresh value is stored", async () => {
     const client = new FakeValkeyClient();
     const h = await staleEntry(client);
     const first = await h.get("/page");
     const second = await h.get("/page");
     expect(first).not.toBeNull();
     expect(second).not.toBeNull();
-    // The winner gets the shifted lastModified (one second past the route's 60s revalidate
+    // Every reader gets the shifted lastModified (one second past the route's 60s revalidate
     // window at now=2,000,000 — see staleByTagLastModified): Next computes "past revalidate
-    // window" from it and revalidates behind the request — on EVERY read in this process
-    // while the window lasts.
+    // window" from it and revalidates behind the request.
     expect(first!.lastModified).toBe(2_000_000 - 60_000 - 1_000);
     expect(second!.lastModified).toBe(2_000_000 - 60_000 - 1_000);
-    // Another replica (fresh handler instance, same shared store) loses the NX acquire and
-    // sees the entry's own lastModified — fresh, no cross-replica duplicate revalidation.
+    // A second replica must not be told the stale value is fresh. Next deduplicates within one
+    // process; duplicate work across replicas is the correctness-first fallback.
     const other = new ValkeyIncrementalCacheHandler({
       client,
       buildId: "sf1",
       now: () => 2_000_000,
     });
     const cross = await other.get("/page");
-    expect(cross!.lastModified).toBe(1_000_000);
+    expect(cross!.lastModified).toBe(2_000_000 - 60_000 - 1_000);
+  });
+});
+
+describe("shared-clock regeneration ordering", () => {
+  it("keeps a regeneration written after a hard invalidation when the writer clock is behind", async () => {
+    const client = new FakeValkeyClient();
+    client.tagFields.set("_N_T_/page", JSON.stringify({ expired: 2_000, at: 2_000 }));
+    client.serverNow = 2_001;
+
+    // The pod clock is behind the shared Valkey clock. A client-stamped write at 1,000 would be
+    // classified as older than the already-consumed hard invalidation and deleted on its first
+    // read, even though the SET reached Valkey afterwards.
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "server-order",
+      now: () => 1_000,
+    });
+    await h.set("/page", appPageEntry("fresh", "_N_T_/page"), {});
+
+    const raw = client.strings.get("k8s:server-order:inc:/page");
+    expect(raw).toBeDefined();
+    expect(raw).toMatch(/^\{"lastModified":/);
+    expect((JSON.parse(raw!) as { lastModified: number }).lastModified).toBe(2_001);
+    expect(await h.get("/page", {})).not.toBeNull();
+  });
+
+  it("preserves one server-measured age for fast and slow readers", async () => {
+    const client = new FakeValkeyClient();
+    const server = { t: 5_000_000 };
+    client.serverNow = server.t;
+    const writer = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "reader-offsets",
+      now: () => server.t - 300_000,
+    });
+    await writer.set("/page", appPageEntry("fresh"), {
+      cacheControl: { revalidate: 60, expire: 600 },
+    });
+
+    server.t += 30_000;
+    client.serverNow = server.t;
+    const fastNow = server.t + 300_000;
+    const slowNow = server.t - 300_000;
+    const fast = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "reader-offsets",
+      now: () => fastNow,
+    });
+    const slow = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "reader-offsets",
+      now: () => slowNow,
+    });
+    const fastEntry = await fast.get("/page");
+    const slowEntry = await slow.get("/page");
+    expect(fastNow - fastEntry!.lastModified!).toBe(30_000);
+    expect(slowNow - slowEntry!.lastModified!).toBe(30_000);
   });
 });
 
@@ -722,6 +744,61 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     expect((got?.value as { html?: string })?.html).toContain("built at build time");
   });
 
+  it("unifies encoded Unicode page keys with the decoded build manifest key", async () => {
+    const client = new FakeValkeyClient();
+    const seedLookup = vi
+      .fn()
+      .mockImplementation(async (key: string) => (key === "/🎉" ? seed : null));
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "seed-unicode",
+      now: () => 1000,
+      seedLookup,
+    });
+
+    const seeded = await h.get("/%F0%9F%8E%89", { kind: "APP_PAGE" });
+    expect(seeded?.value).toEqual(seed.value);
+    expect(seedLookup).toHaveBeenCalledWith("/🎉", expect.any(Object));
+
+    await h.set(
+      "/%F0%9F%8E%89",
+      { kind: "APP_PAGE", html: "<html>regenerated</html>", headers: {} } as never,
+      { revalidate: 60 },
+    );
+    const stored = await h.getStored("/🎉", { kind: "APP_PAGE" });
+    expect((stored?.value as { html?: string })?.html).toContain("regenerated");
+  });
+
+  it("preserves an encoded slash while canonicalizing pathname cache keys", async () => {
+    const seedLookup = vi.fn().mockResolvedValue(null);
+    const h = new ValkeyIncrementalCacheHandler({
+      client: new FakeValkeyClient(),
+      buildId: "seed-delimiter",
+      now: () => 1000,
+      seedLookup,
+    });
+
+    await h.get("/a%2Fb", { kind: "APP_PAGE" });
+    expect(seedLookup).toHaveBeenCalledWith("/a%2Fb", expect.any(Object));
+  });
+
+  it("keeps encoded and double-encoded delimiters in separate cache entries", async () => {
+    const client = new FakeValkeyClient();
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "delimiter-identity",
+      now: () => 1000,
+    });
+
+    await h.set("/a/%2F", appPageEntry("encoded slash") as never, {});
+    await h.set("/a/%252F", appPageEntry("literal percent spelling") as never, {});
+
+    expect((await h.getStored("/a/%2F"))?.value).toEqual(appPageEntry("encoded slash"));
+    expect((await h.getStored("/a/%252F"))?.value).toEqual(
+      appPageEntry("literal percent spelling"),
+    );
+  });
+
   it("prefers a stored Valkey entry over the seed", async () => {
     const client = new FakeValkeyClient();
     const h0 = new ValkeyIncrementalCacheHandler({ client, buildId: "seed2", now: () => 1000 });
@@ -762,11 +839,9 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     expect(await h.get("/blog/tim")).toBeNull();
   });
 
-  // FETCH-kind seeds (the staged build fetch-cache): the contract that closes the rdc
-  // stale-forever loop. After a PROFILED revalidateTag, the read must be a stale HIT —
-  // upstream patch-fetch foreground-refetches a stale FETCH entry with the prerender's
-  // abort signal DETACHED (patch-fetch.ts:1073-1104), while a MISS re-fetches signal-
-  // attached and loses the abort race under load, killing the background revalidation.
+  // FETCH-kind seeds (the staged build fetch-cache): a profiled revalidateTag must remain a
+  // stale hit. During static generation patch-fetch turns that signal into doOriginalFetch(true),
+  // which detaches the prerender abort signal before refreshing.
   const fetchSeed = {
     lastModified: 500,
     tags: ["test"],
@@ -791,7 +866,7 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     expect((got?.value as { kind?: string })?.kind).toBe("FETCH");
   });
 
-  it("signals a profiled-stale FETCH seed as stale (lastModified -1), never a miss", async () => {
+  it("signals a profiled-stale FETCH seed to every replica", async () => {
     const client = new FakeValkeyClient();
     const h = new ValkeyIncrementalCacheHandler({
       client,
@@ -800,23 +875,136 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
       seedLookup: vi.fn().mockResolvedValue(fetchSeed),
     });
     await h.revalidateTag("test", { expire: 3600 }); // profiled: stale now, hard-expire in 1h
-    const got = await h.get("0123abcdef", { kind: "FETCH", tags: ["test"] });
-    // The whole point: a MISS would re-fetch under the prerender's abort signal. The seed
-    // has no revalidate window of its own, so the stale signal degrades to -1 — for FETCH
-    // entries upstream derives isStale from age, and -1 makes the age astronomical.
-    expect(got).not.toBeNull();
-    expect(got?.lastModified).toBe(-1);
-    expect((got?.value as { kind?: string })?.kind).toBe("FETCH");
+    const winner = await h.get("0123abcdef", { kind: "FETCH", tags: ["test"] });
+    expect(winner).not.toBeNull();
+    expect((5000 - winner!.lastModified!) / 1000).toBeGreaterThan(31_536_000);
+    expect((winner?.value as { kind?: string })?.kind).toBe("FETCH");
+
+    const other = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "fetchseed2",
+      now: () => 5000,
+      seedLookup: vi.fn().mockResolvedValue(fetchSeed),
+    });
+    const stale = await other.get("0123abcdef", { kind: "FETCH", tags: ["test"] });
+    expect((5000 - stale!.lastModified!) / 1000).toBeGreaterThan(31_536_000);
+    expect((stale?.value as { kind?: string })?.kind).toBe("FETCH");
   });
 
-  // Dispatch's own serving reads must never spend the single-flight revalidate lock: the
-  // lock exists so exactly ONE of Next's own readers is told "stale" and revalidates.
-  // Dispatch reads entries only to SERVE them (document injection, template shells) and
-  // never revalidates from those paths — measured 2026-08-04 (rdc, run 6): document
-  // injection reads consumed the lock on every tag-stale seed read, so the entrypoint's
-  // dynamic-RSC read milliseconds later was told FRESH and its background revalidation
-  // never scheduled — zero errors, zero regenerations, stale forever.
-  it("getPeek reports the stale entry WITHOUT consuming the single-flight lock", async () => {
+  it("uses the current FETCH read lifetime when signalling a stale build seed", async () => {
+    const client = new FakeValkeyClient();
+    const now = 1_800_000_000_000;
+    const currentRevalidate = 4_294_967_294;
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "fetch-current-seed",
+      now: () => now,
+      seedLookup: vi.fn().mockResolvedValue(seed),
+    });
+    await h.revalidateTag("test", { expire: 3600 });
+
+    const got = await h.get("0123abcdef", {
+      kind: "FETCH",
+      tags: ["test"],
+      revalidate: currentRevalidate,
+    });
+    expect(got).not.toBeNull();
+    expect((now - got!.lastModified!) / 1000).toBeGreaterThan(currentRevalidate);
+  });
+
+  it("keeps SWR for a stored stale FETCH whose lifetime fits before the current epoch", async () => {
+    const client = new FakeValkeyClient();
+    let now = 1_787_916_225_000;
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "fetchstoredfit1",
+      now: () => now,
+    });
+    await h.set(
+      "ordinary-fetch",
+      {
+        kind: "FETCH",
+        data: { body: "stale", headers: {}, status: 200 },
+        revalidate: 31_536_000,
+      },
+      { tags: ["test"] },
+    );
+    now += 1;
+    await h.revalidateTag("test", { expire: 3600 });
+
+    const winner = await h.get("ordinary-fetch", { kind: "FETCH", tags: ["test"] });
+    expect(winner).not.toBeNull();
+    expect(winner?.lastModified).toBe(now - 31_536_000 * 1000 - 1000);
+    expect((winner?.value as { kind?: string })?.kind).toBe("FETCH");
+  });
+
+  it("uses the current FETCH read lifetime when signalling a stale stored entry", async () => {
+    const client = new FakeValkeyClient();
+    let now = 1_800_000_000_000;
+    const currentRevalidate = 4_294_967_294;
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "fetch-current-stored",
+      now: () => now,
+    });
+    await h.set(
+      "ordinary-fetch",
+      {
+        kind: "FETCH",
+        data: { body: "stale", headers: {}, status: 200 },
+        revalidate: 31_536_000,
+      },
+      { tags: ["test"] },
+    );
+    now += 1;
+    await h.revalidateTag("test", { expire: 3600 });
+
+    const got = await h.get("ordinary-fetch", {
+      kind: "FETCH",
+      tags: ["test"],
+      revalidate: currentRevalidate,
+    });
+    expect(got).not.toBeNull();
+    expect((now - got!.lastModified!) / 1000).toBeGreaterThan(currentRevalidate);
+  });
+
+  it.each(["tag", "age"] as const)(
+    "signals every cross-replica %s-stale FETCH read",
+    async (staleBy) => {
+      const client = new FakeValkeyClient();
+      let now = 1_000;
+      const options = {
+        client,
+        buildId: `atomic-${staleBy}`,
+        now: () => now,
+      };
+      const winnerHandler = new ValkeyIncrementalCacheHandler(options);
+      const loserHandler = new ValkeyIncrementalCacheHandler(options);
+      await winnerHandler.set(
+        "shared-fetch",
+        {
+          kind: "FETCH",
+          data: { body: "old", headers: {}, status: 200 },
+          revalidate: staleBy === "age" ? 1 : 3600,
+        },
+        { tags: ["shared"] },
+      );
+      now = staleBy === "age" ? 2_001 : 1_001;
+      client.serverNow = now;
+      if (staleBy === "tag") await winnerHandler.revalidateTag("shared", { expire: 3600 });
+
+      const [winner, loser] = await Promise.all([
+        winnerHandler.get("shared-fetch", { kind: "FETCH", tags: ["shared"] }),
+        loserHandler.get("shared-fetch", { kind: "FETCH", tags: ["shared"] }),
+      ]);
+      expect(winner).not.toBeNull();
+      expect(loser).not.toBeNull();
+      expect(winner?.lastModified).toBe(loser?.lastModified);
+      expect(winner?.lastModified).not.toBe(now);
+    },
+  );
+
+  it("getPeek reports staleness without changing the app-path signal", async () => {
     const client = new FakeValkeyClient();
     const h = new ValkeyIncrementalCacheHandler({
       client,
@@ -830,21 +1018,12 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     expect(peeked?.isStale).toBe(true);
     expect(peeked?.lastModified).toBe(500); // untouched — no SWR shifting for dispatch
 
-    // The lock is still free: Next's own read (app-path get) must still win it and get
-    // the stale-signalling lastModified.
+    // Next's own read still gets the stale-signalling lastModified.
     const got = await h.get("/blog/tim");
     expect(got?.lastModified).toBe(-1);
   });
 
-  // One render performs SEVERAL app-path gets for the same key (Next's ResponseCache
-  // pipeline reads first, then the entrypoint's RDC branch — the only caller that
-  // schedules the WORKING forceStaticRender revalidation). With a strictly one-shot lock,
-  // the pipeline read won it and the RDC branch was told FRESH — so nothing ever
-  // scheduled: rdc run 9, zero revalidate calls with the handler provably signalling -1.
-  // next start has no such lock (per-process manifest, every reader sees stale), so the
-  // pod that WINS the lock must keep signalling stale to its own subsequent reads for the
-  // lock window; other pods still read fresh (cross-replica single-flight preserved).
-  it("the lock-winning process keeps seeing the stale signal on subsequent gets", async () => {
+  it("every process keeps seeing the stale seed until regeneration stores a replacement", async () => {
     const client = new FakeValkeyClient();
     const h = new ValkeyIncrementalCacheHandler({
       client,
@@ -854,11 +1033,11 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     });
     await h.revalidateTag("_N_T_/blog/tim", { expire: 3600 });
     const first = await h.get("/blog/tim");
-    expect(first?.lastModified).toBe(-1); // won the lock
+    expect(first?.lastModified).toBe(-1);
     const second = await h.get("/blog/tim");
-    expect(second?.lastModified).toBe(-1); // same process: still the revalidation owner
+    expect(second?.lastModified).toBe(-1);
 
-    // Another replica (fresh handler, same shared store) is told fresh — single-flight.
+    // Another replica is also told stale; hiding the signal could lose regeneration entirely.
     const other = new ValkeyIncrementalCacheHandler({
       client,
       buildId: "lockwin1",
@@ -866,7 +1045,7 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
       seedLookup: vi.fn().mockResolvedValue(seed),
     });
     const cross = await other.get("/blog/tim");
-    expect(cross?.lastModified).toBe(500);
+    expect(cross?.lastModified).toBe(-1);
   });
 
   it("a completed set() ends the local stale-signal window", async () => {
@@ -889,7 +1068,7 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     expect(after?.lastModified).toBe(5000); // stored entry, served fresh — no lingering -1
   });
 
-  it("getSeed never consumes the lock either (dispatch's template-shell rung)", async () => {
+  it("getSeed does not change the app-path stale signal", async () => {
     const client = new FakeValkeyClient();
     const h = new ValkeyIncrementalCacheHandler({
       client,
@@ -901,20 +1080,16 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     const seeded = await h.getSeed("/blog/tim");
     expect(seeded).not.toBeNull();
     const got = await h.get("/blog/tim");
-    expect(got?.lastModified).toBe(-1); // lock was still available to the real reader
+    expect(got?.lastModified).toBe(-1);
   });
 
-  // Upstream fs-cache parity (file-system-cache.ts:167-187): pages can share one fetch
-  // cache key (same URL+init) while declaring DIFFERENT tags, and the stored entry only
-  // carries the LAST writer's list — so revalidateTag on the other page's tag no longer
-  // stales the shared entry. FileSystemCache re-sets the entry with the requesting page's
-  // tags on read ("update stored tags if a new one is being added"); mirror it, keeping
-  // the stored lastModified so tag watermarks keep their meaning (rdc fetch-cache
-  // variant, 2026-08-04: the / page's 'test' tag was clobbered by
-  // /revalidate-fetch-action's write and the entry never went stale again).
-  it("FETCH get merges missing request tags into the stored entry (fs-cache parity)", async () => {
+  // Pages and cache-components renders can share one FETCH key while declaring different tags.
+  // FileSystemCache updates the FETCH value's tag metadata on read. Rewriting our whole entry to
+  // do that would let a late read resurrect a concurrent regeneration's old body and timestamp.
+  it("persists current FETCH tags in companion metadata without rewriting the entry", async () => {
     const client = new FakeValkeyClient();
-    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tagmerge1", now: () => 1000 });
+    let now = 1000;
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "tagmerge1", now: () => now });
     await h.set(
       "sharedfetchkey",
       {
@@ -925,22 +1100,62 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
       { tags: ["other-page-tag"] },
     );
 
-    await h.get("sharedfetchkey", { kind: "FETCH", tags: ["test"] });
-    expect(storedTags(client, "k8s:tagmerge1:inc:sharedfetchkey").sort()).toEqual(
-      ["other-page-tag", "test"].sort(),
-    );
+    now = 1001;
+    client.serverNow = now;
+    await h.revalidateTag("other-page-tag");
+    const entryKey = "k8s:tagmerge1:inc:sharedfetchkey";
+    const primaryBefore = client.strings.get(entryKey);
+    const current = await h.get("sharedfetchkey", { kind: "FETCH", tags: ["test"] });
+    // FileSystemCache checks current request tags for FETCH freshness. A tag belonging to a prior
+    // consumer of the same fetch key must not expire this request.
+    expect(current).not.toBeNull();
+    expect((current!.value as { tags?: string[] }).tags).toEqual(["test"]);
+    expect(client.strings.get(entryKey)).toBe(primaryBefore);
+    expect(storedTags(client, "k8s:tagmerge1:inc:sharedfetchkey")).toEqual(["other-page-tag"]);
+    expect(JSON.parse(client.strings.get("k8s:tagmerge1:inc-fetch-tags:sharedfetchkey")!)).toEqual([
+      "test",
+    ]);
 
-    // The merged tag is now a real staleness input: a profiled revalidateTag on it makes
-    // the shared entry stale for the next reader.
+    // A later request sees FileSystemCache-compatible value metadata even without adding a tag.
+    const nextRequest = await h.get("sharedfetchkey", { kind: "FETCH" });
+    expect(nextRequest).not.toBeNull();
+    expect((nextRequest!.value as { tags?: string[] }).tags).toEqual(["test"]);
+
+    // The request tag is still a real staleness input on every matching read.
+    const revalidateNow = 1_787_916_225_000;
     const later = new ValkeyIncrementalCacheHandler({
       client,
       buildId: "tagmerge1",
-      now: () => 5000,
+      now: () => revalidateNow,
     });
     await later.revalidateTag("test", { expire: 3600 });
-    const got = await later.get("sharedfetchkey", { kind: "FETCH", tags: ["test"] });
-    expect(got).not.toBeNull();
-    expect(got!.lastModified).not.toBe(1000); // stale-signalled (shifted), not fresh
+    const winner = await later.get("sharedfetchkey", { kind: "FETCH", tags: ["test"] });
+    expect(winner).not.toBeNull();
+    expect(winner?.lastModified).not.toBe(1000);
+
+    const other = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "tagmerge1",
+      now: () => revalidateNow,
+    });
+    const stale = await other.get("sharedfetchkey", { kind: "FETCH", tags: ["test"] });
+    expect(stale?.lastModified).toBe(winner?.lastModified);
+  });
+
+  it("does not delete an old hard-expired entry after a concurrent writer could replace it", async () => {
+    const client = new FakeValkeyClient();
+    let now = 1000;
+    const h = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "keep-expired",
+      now: () => now,
+    });
+    await h.set("shared", appPageEntry("old", "tag"), {});
+    now = 1001;
+    await h.revalidateTag("tag");
+
+    expect(await h.get("shared", { kind: "APP_PAGE" })).toBeNull();
+    expect(client.strings.has("k8s:keep-expired:inc:shared")).toBe(true);
   });
 
   it("keeps working when the seed lookup itself throws", async () => {
