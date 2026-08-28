@@ -182,8 +182,8 @@ export function generateRoutingServiceDockerfile({ buildId }: { buildId: string 
   // generates a per-replica self-signed cert at container start (GCP does not validate
   // the backend certificate for callouts) and writes it under /tmp/tls, which the pod
   // spec backs with an emptyDir (the root filesystem is read-only). openssl is kept
-  // installed for that runtime generation. server.ts serves TLS when TLS_CERT_FILE/
-  // TLS_KEY_FILE exist, and plaintext h2c otherwise (local emulate).
+  // installed for that runtime generation. The Deployment supplies the TLS file paths for
+  // TLS transport; h2c deployments omit them.
   return `FROM ${baseImageRef()}
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends openssl \\
@@ -203,8 +203,6 @@ ENV CONFIG_DIR=/app/config
 # match the image it shipped with. Rollback reverts the routing IMAGE alongside the
 # snapshot ConfigMap, so the pair always matches for a legitimate revert.
 ENV BAKED_CONFIG_DIR=/app/config
-ENV TLS_CERT_FILE=/tmp/tls/tls-cert.pem
-ENV TLS_KEY_FILE=/tmp/tls/tls-key.pem
 EXPOSE 8443
 USER node
 CMD ["node", "routing-service.cjs"]

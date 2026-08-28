@@ -15,6 +15,7 @@ import type { Duplex } from "node:stream";
 import {
   computeDispatchProof,
   dispatchProofInputsFromRequest,
+  encodeNodeOutgoingDispatchHeaders,
   INTERNAL_DISPATCH_HEADERS,
   INTERNAL_DISPATCH_PROOF_HEADER,
   INTERNAL_EXECUTION_DEADLINE_HEADER,
@@ -28,6 +29,8 @@ import {
   applyMiddlewareRequestHeaders,
   extractRouteParams,
   validatedForwardedProtocol,
+  type PrepareUseCache,
+  type PreparedUseCacheRunner,
 } from "./dispatch.js";
 import {
   parseDispatchDeadline,
@@ -75,6 +78,8 @@ export interface WebSocketUpgradeDispatcher {
   proofHeaderNames?: readonly string[] | undefined;
   /** Stable server-owned scope required by Next's generated connection registry. */
   webSocketRegistryScope: object;
+  /** Refresh shared `use cache` invalidation state before loading a local generated handler. */
+  prepareUseCache?: PrepareUseCache | undefined;
   /** Exact cross-origin values accepted by experimental.webSocketRouteHandlers. */
   webSocketAllowedOrigins?: readonly string[];
   /** Parser from the app's pinned `next/dist/compiled/ws` transport. */
@@ -93,11 +98,14 @@ const BODY_FRAMING_HEADERS = ["content-length", "transfer-encoding", "expect", "
 const BODY_FRAMING_ERROR = "WebSocket upgrade requests cannot include HTTP body framing.";
 const RAW_HTTP_ERROR_CACHE_CONTROL = "private, no-cache, no-store, max-age=0, must-revalidate";
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const RUN_WITHOUT_USE_CACHE_SCOPE: PreparedUseCacheRunner = <T>(callback: () => T): T => callback();
 
 interface GeneratedUpgradeOutcome {
   statusCode?: number;
   upgraded: boolean;
 }
+
+type WebSocketRegistryScope = WebSocketUpgradeDispatcher["webSocketRegistryScope"];
 
 interface WebSocketHandshakeError {
   status: number;
@@ -378,7 +386,7 @@ function responseHeadersRecord(
   return record;
 }
 
-function installWebSocketRegistryScope(req: IncomingMessage, scope: object): void {
+function installWebSocketRegistryScope(req: IncomingMessage, scope: WebSocketRegistryScope): void {
   // The generated entrypoint deliberately refuses a lifecycle scope supplied through ctx: that
   // object can cross an Adapter boundary. Next's own router stamps the server-owned object on the
   // raw request before calling the same entrypoint. The pool owns the raw socket, so mirror that
@@ -713,6 +721,7 @@ function forwardedUpgradeHeaders(
     headers["x-invoke-query"] = JSON.stringify(resolution.invocationQuery);
   }
   headers[INTERNAL_EXECUTION_DEADLINE_HEADER] = String(executionDeadlineAt);
+  encodeNodeOutgoingDispatchHeaders(headers);
   if (deps.internalSecret) {
     headers[INTERNAL_DISPATCH_PROOF_HEADER] = computeDispatchProof(
       deps.internalSecret,
@@ -897,6 +906,14 @@ export async function handleWebSocketUpgrade(
 ): Promise<UpgradeDisposition> {
   const timeoutMs = Math.max(1, deps.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
   const localDeadlineAt = Date.now() + timeoutMs;
+  let useCachePreparation: Promise<PreparedUseCacheRunner> | undefined;
+  const prepareUseCacheOnce = (): Promise<PreparedUseCacheRunner> => {
+    if (!deps.prepareUseCache) return Promise.resolve(RUN_WITHOUT_USE_CACHE_SCOPE);
+    useCachePreparation ??= Promise.resolve()
+      .then(deps.prepareUseCache)
+      .then((runner) => (typeof runner === "function" ? runner : RUN_WITHOUT_USE_CACHE_SCOPE));
+    return useCachePreparation;
+  };
   if (
     !rawHeaderValues(req, "upgrade").some((value) =>
       value.split(",").some((protocol) => protocol.trim().toLowerCase() === "websocket"),
@@ -1012,15 +1029,15 @@ export async function handleWebSocketUpgrade(
     return rejectUpgradeWithMessage(socket, { status: 404, message: "Not Found" }, deadlineAt);
   }
 
-  let upgradeHandler;
+  let runPreparedUseCache: PreparedUseCacheRunner;
   try {
-    upgradeHandler = await beforeDeadline(
-      deps.handlerLoader.loadUpgrade(resolution.matchedPathname),
+    runPreparedUseCache = await beforeDeadline(
+      prepareUseCacheOnce(),
       deadlineAt,
-      "route module load",
+      "use-cache preparation",
     );
   } catch (error) {
-    console.error("[pool-server] WebSocket route module load failed:", error);
+    console.error("[pool-server] WebSocket use-cache preparation failed:", error);
     return rejectUpgrade(
       socket,
       error instanceof HandshakeDeadlineError ? 504 : 500,
@@ -1029,17 +1046,37 @@ export async function handleWebSocketUpgrade(
       resolution.resolvedHeaders,
     );
   }
-  if (!upgradeHandler) {
-    return rejectUpgradeWithMessage(socket, { status: 404, message: "Not Found" }, deadlineAt);
-  }
 
-  const context = handlerContext(req, resolution);
-  (req as IncomingMessage & Record<symbol, unknown>)[NEXT_WEBSOCKET_HEADERS_FILTERED] = true;
-  installWebSocketRegistryScope(req, deps.webSocketRegistryScope);
-  const outcome = await beforeDeadline(
-    Promise.resolve(upgradeHandler(context, { node: { req, socket, head } })),
-    deadlineAt,
-    "generated handler",
-  );
-  return generatedUpgradeDisposition(outcome);
+  return runPreparedUseCache(async () => {
+    let upgradeHandler;
+    try {
+      upgradeHandler = await beforeDeadline(
+        deps.handlerLoader.loadUpgrade(resolution.matchedPathname),
+        deadlineAt,
+        "route module load",
+      );
+    } catch (error) {
+      console.error("[pool-server] WebSocket route module load failed:", error);
+      return rejectUpgrade(
+        socket,
+        error instanceof HandshakeDeadlineError ? 504 : 500,
+        deadlineAt,
+        undefined,
+        resolution.resolvedHeaders,
+      );
+    }
+    if (!upgradeHandler) {
+      return rejectUpgradeWithMessage(socket, { status: 404, message: "Not Found" }, deadlineAt);
+    }
+
+    const context = handlerContext(req, resolution);
+    (req as IncomingMessage & Record<symbol, unknown>)[NEXT_WEBSOCKET_HEADERS_FILTERED] = true;
+    installWebSocketRegistryScope(req, deps.webSocketRegistryScope);
+    const outcome = await beforeDeadline(
+      Promise.resolve(upgradeHandler(context, { node: { req, socket, head } })),
+      deadlineAt,
+      "generated handler",
+    );
+    return generatedUpgradeDisposition(outcome);
+  });
 }

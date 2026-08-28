@@ -105,9 +105,9 @@ export type RoutingTransport = "tls" | "h2c";
  * S26. Which transport the ext_proc listener serves.
  *
  * GKE's callout arrives from Google's frontend and REQUIRES HTTP/2 over TLS. An in-cluster
- * Envoy Gateway dials the backend as plain h2c unless a BackendTLSPolicy says otherwise — and
- * the emitted image bakes TLS_CERT_FILE/TLS_KEY_FILE, so the previous logic (honour the
- * plaintext opt-in only when BOTH are unset) could never take effect there. MEASURED: the
+ * Envoy Gateway dials the backend as plain h2c unless a BackendTLSPolicy says otherwise. The
+ * previous image-level TLS defaults meant the plaintext opt-in could never take effect there.
+ * MEASURED: the
  * service self-signed, served h2 TLS, and every callout failed while the :8081 health server
  * stayed green — a deployment that looks healthy and routes nothing.
  *
@@ -136,8 +136,7 @@ export function routingTransport(): RoutingTransport {
 }
 
 export function ensureTlsIdentity(): void {
-  // Checked FIRST: an explicit h2c transport wins over whatever the image baked in, which is
-  // the whole point — the generic Deployment cannot unset an image ENV, only override it.
+  // Checked FIRST: h2c does not require or accept a generated TLS identity.
   if (routingTransport() === "h2c") return;
   const certFile = process.env.TLS_CERT_FILE;
   const keyFile = process.env.TLS_KEY_FILE;
@@ -268,7 +267,12 @@ async function main() {
   // configured-but-missing middleware must fail closed, not warn-and-continue, for the
   // same reason: running ext_proc without the middleware it exists to enforce is a bypass.
   let middlewareModule = null;
-  if (manifest.middleware) {
+  if (manifest.middleware?.runtime === "edge") {
+    console.log(
+      "Edge middleware will be evaluated by the pool sandbox; the routing service delegates " +
+        "those requests without a trusted dispatch verdict",
+    );
+  } else if (manifest.middleware) {
     const mwPath = path.resolve(process.cwd(), manifest.middleware.filePath);
     if (!existsSync(mwPath)) {
       throw new Error(

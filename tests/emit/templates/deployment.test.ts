@@ -79,8 +79,29 @@ describe("renderDeployment", () => {
     expect(yaml).toMatch(/volumes:[\s\S]*?name: tmp\n\s+emptyDir:\n\s+sizeLimit: 256Mi/);
     // .next/cache stays writable for Next's filesystem-cache fallback when no shared
     // Valkey handler is wired (otherwise renders fail with EROFS).
-    expect(yaml).toMatch(/name: next-cache\n\s+mountPath: \/app\/\.next\/cache/);
+    expect(yaml).toMatch(/name: next-cache\n\s+mountPath: "\/app\/\.next\/cache"/);
     expect(yaml).toMatch(/name: next-cache\n\s+emptyDir:\n\s+sizeLimit: 1Gi/);
+  });
+
+  it("mounts the writable cache under a custom Next distDir", () => {
+    const yaml = renderDeployment({
+      poolName: "ssr",
+      buildId: "b1",
+      releaseName: "my-app",
+      distDir: "build/output",
+    });
+    expect(yaml).toMatch(/name: next-cache\n\s+mountPath: "\/app\/build\/output\/cache"/);
+  });
+
+  it("refuses a distDir that escapes the application root", () => {
+    expect(() =>
+      renderDeployment({
+        poolName: "ssr",
+        buildId: "b1",
+        releaseName: "my-app",
+        distDir: "../escape",
+      }),
+    ).toThrow(/distDir/);
   });
 
   it("does NOT set TRUST_INTERNAL_HEADERS — the legacy bypass must not ship in the chart", () => {

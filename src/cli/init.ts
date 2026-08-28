@@ -554,7 +554,10 @@ export function buildInitGcloudCommands(options: {
 // service, which the traffic extension rejects — and re-running init won't fix them
 // (they already exist). Detect the stale shape and print exact migration commands rather
 // than silently leaving middleware unwired.
-async function checkRoutingResourceShape(releaseName: string, projectId: string): Promise<void> {
+async function checkRoutingResourceCompatibility(
+  releaseName: string,
+  projectId: string,
+): Promise<void> {
   const hc = `${releaseName}-routing-hc`;
   const bs = `${releaseName}-routing-service`;
   const hcType = (
@@ -838,7 +841,7 @@ export async function runInit(options: InitOptions): Promise<void> {
 
   // 2a-pre. Surface pre-traffic-extension routing resources that init can't fix in place.
   if (!dryRun) {
-    await checkRoutingResourceShape(releaseName, projectId);
+    await checkRoutingResourceCompatibility(releaseName, projectId);
   }
 
   // 2a. Cloud CDN (GCPHTTPFilter) needs GKE >= MIN_GKE_VERSION_FOR_CDN, and the scaffolded

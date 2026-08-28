@@ -13,7 +13,9 @@
 // `revalidateTag` is honored consistently by both. Like the V2 handler, it owns its own staleness:
 // `get` returns null when the entry's tags have been revalidated since it was stored (Next then
 // regenerates), so the per-process `tags-manifest.external` check Next also runs is irrelevant here.
+import { decodeNextPathname } from "../../next-runtime/pathname.js";
 import type { ValkeyClient } from "./client.js";
+import { sampleValkeyClock } from "./valkey-clock.js";
 import { logErrorRateLimited, maxCacheEntryBytes, wallClockNow, warnOnce } from "./stream-codec.js";
 import {
   areTagsExpired,
@@ -23,6 +25,7 @@ import {
   filterManifestTags,
   isRootParamTag,
   maxTagLength,
+  MAX_CLOCK_SKEW_MS,
   parseTagState,
   TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
@@ -31,6 +34,36 @@ import {
 } from "./tag-manifest.js";
 
 const NEXT_CACHE_TAGS_HEADER = "x-next-cache-tags";
+const SERVER_LAST_MODIFIED_MARKER = "__adapter_k8s_valkey_time__";
+
+/**
+ * Store a classic incremental-cache entry and stamp its creation time from Valkey's clock in the
+ * same atomic operation. Tag invalidations are ordered by that clock too. Using the pod clock here
+ * made a regeneration written by a slow-clock replica look older than the invalidation it had just
+ * consumed, so the first read deleted the fresh entry and every subsequent request failed to find
+ * either it or the now-invalid build seed.
+ *
+ * The payload stays byte-for-byte JSON produced by Node except for one private marker. Decoding and
+ * re-encoding it through Lua cjson is unsafe: cjson cannot distinguish an empty JSON array from an
+ * empty object, and an empty tag list or headers object would change shape. The exact marker occurs
+ * only in the top-level field we create below; strings inside the cached value are JSON-escaped.
+ * ARGV is `[payload, ttlSeconds, clientNow]`. The return value is a clock-skew flag for the existing
+ * warning path.
+ */
+export const STORE_INCREMENTAL_ENTRY_SCRIPT = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+local payload = ARGV[1]
+local marker = '{"lastModified":"${SERVER_LAST_MODIFIED_MARKER}"'
+if string.sub(payload, 1, string.len(marker)) ~= marker then
+  return redis.error_reply('incremental entry timestamp marker missing')
+end
+local stamped = '{"lastModified":' .. now .. string.sub(payload, string.len(marker) + 1)
+redis.call('SET', KEYS[1], stamped, 'EX', ARGV[2])
+local clientNow = tonumber(ARGV[3])
+if clientNow and math.abs(now - clientNow) > ${MAX_CLOCK_SKEW_MS} then return 1 end
+return 0
+`;
 const RETENTION_MARGIN_SECONDS = 60;
 // Retention for entries with no time-based lifetime (`revalidate: false` / static / PPR shells that
 // never time-revalidate). Next's semantics are "cache until a tag revalidates it", so these must NOT
@@ -39,11 +72,6 @@ const RETENTION_MARGIN_SECONDS = 60;
 // living past this simply re-renders the entry once, then re-caches it. Exported: the V2 `use cache`
 // handler caps its key TTL at the same bound (M7).
 export const DURABLE_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
-
-// Single-flight revalidation lock lifetime. Long enough to cover any sane background
-// re-render; short enough that a crashed winner only delays the NEXT revalidation attempt,
-// never the serving of the (stale-but-valid) entry. Mirrors adapter-aws's 30s default.
-const REVALIDATE_LOCK_TTL_SECONDS = 30;
 
 /**
  * Total budget for one entry's stored tag list (N79). A byte budget, not a count: the point of the
@@ -189,23 +217,17 @@ export function assertSafeBuildId(buildId: string): void {
 // Minimal structural mirror of Next's classic CacheHandler contract (avoids a compile-time
 // dependency on Next internals). `value` is an `IncrementalCacheValue`; we serialize its binary
 // members (Buffers, the segmentData Map) to base64 for JSON storage.
-/** Trace-only size probe: bytes for Buffer/string values, 0 for anything else. */
-function byteLen(v: unknown): number {
-  if (Buffer.isBuffer(v)) return v.length;
-  if (typeof v === "string") return Buffer.byteLength(v);
-  return 0;
-}
-
 interface CacheHandlerValue {
   lastModified?: number;
   value: unknown | null;
-  /** getStored()-only: the entry is soft-stale (tag- or age-, single-flight lock-gated) —
+  /** getStored()-only: the entry is soft-stale by tag or age —
    * serve it AND regenerate behind it. Never set on the app-path get(): Next's own
    * incremental-cache layer computes age staleness from lastModified there. */
   isStale?: boolean;
 }
 interface GetCtx {
   kind?: string;
+  revalidate?: number | false;
   softTags?: string[];
   tags?: string[];
   /** Threaded to the seed lookup — the fs-mirror layer needs the fs-cache read semantics. */
@@ -232,6 +254,18 @@ interface StoredEntry {
   expireSeconds?: number;
 }
 
+/** Next's generated adapter entrypoint can key a page by its encoded wire pathname even when
+ * requestMeta.resolvedPathname is decoded (observed on 16.3.0-canary.97: `/🎉` became
+ * `/%F0%9F%8E%89`). Build seeds and revalidatePath use manifest pathnames, so the two spellings
+ * otherwise become disjoint cache entries. `decodeNextPathname` mirrors Next's segment decoder:
+ * it exposes UTF-8 text without collapsing encoded and double-encoded path delimiters into one
+ * identity. Only pathname-like keys participate; FETCH/image keys are opaque hashes and never
+ * start with `/`. */
+function canonicalPathCacheKey(cacheKey: string): string {
+  if (!cacheKey.startsWith("/")) return cacheKey;
+  return decodeNextPathname(cacheKey);
+}
+
 /**
  * N80: the `lastModified` to report for an entry that a PROFILED (soft) tag revalidation marked
  * stale. This must not be `-1`.
@@ -253,14 +287,23 @@ interface StoredEntry {
  * false`, so nothing but `-1` can force a revalidation, and an `expire` window too short to hold
  * the shift genuinely IS past expiry.
  */
-function staleByTagLastModified(entry: StoredEntry, now: number): number {
-  const revalidate = entry.revalidateSeconds;
+function staleByTagLastModified(
+  entry: StoredEntry,
+  now: number,
+  currentRevalidate?: number | false,
+  allowNegative = false,
+): number {
+  const revalidate =
+    typeof currentRevalidate === "number" ? currentRevalidate : entry.revalidateSeconds;
   if (typeof revalidate !== "number") return -1;
   // One second past the revalidate boundary: `revalidateAfter` lands at `now - 1000 < now`.
   const shifted = now - revalidate * 1000 - 1000;
-  if (shifted <= 0) return -1;
+  // FETCH has no `lastModified === -1` special case in Next's IncrementalCache. A
+  // `revalidate:false` read uses INFINITE_CACHE, whose window is longer than the current epoch;
+  // preserve the negative timestamp so Next's ordinary age calculation still sees it as stale.
+  if (shifted <= 0 && !allowNegative) return -1;
   const expire = entry.expireSeconds;
-  if (typeof expire === "number" && expire * 1000 + shifted < now) return -1;
+  if (!allowNegative && typeof expire === "number" && expire * 1000 + shifted < now) return -1;
   return shifted;
 }
 
@@ -371,6 +414,14 @@ function decodeValue(value: unknown): unknown {
   return out;
 }
 
+function tagsFromFetchValue(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const tags = (value as { tags?: unknown }).tags;
+  return Array.isArray(tags)
+    ? capTags(tags.filter((tag): tag is string => typeof tag === "string"))
+    : [];
+}
+
 function extractTags(value: Record<string, unknown> | null, ctx: SetCtx): string[] {
   let raw: string[];
   if (ctx.tags && ctx.tags.length) {
@@ -407,20 +458,6 @@ export class ValkeyIncrementalCacheHandler {
   private readonly prefix: string;
   private readonly tagsKey: string;
   private readonly seedLookup: ValkeyIncrementalCacheOptions["seedLookup"];
-  /**
-   * Cache keys whose single-flight revalidate lock THIS process recently won, with the
-   * win time. One render performs SEVERAL app-path gets for the same key (Next's
-   * ResponseCache pipeline reads first, then the entrypoint's RDC branch — the only
-   * caller that schedules the WORKING forceStaticRender revalidation), and with a
-   * strictly one-shot lock the pipeline read spent it, so the RDC branch was told FRESH
-   * and nothing ever revalidated (rdc stale-forever, traced to zero revalidate() calls
-   * 2026-08-04). `next start` has no such lock — every reader in the process sees stale —
-   * so the winning POD keeps signalling stale to its own reads for the lock window,
-   * while other pods still read fresh (cross-replica single-flight preserved). A
-   * completed set() ends the window (as it releases the shared lock). Bounded: entries
-   * older than the lock TTL are pruned on touch.
-   */
-  private readonly recentLockWins = new Map<string, number>();
 
   constructor(options: ValkeyIncrementalCacheOptions) {
     this.client = options.client;
@@ -438,43 +475,69 @@ export class ValkeyIncrementalCacheHandler {
     return `${this.prefix}inc:${cacheKey}`;
   }
 
-  private revalidateLockKey(cacheKey: string): string {
-    return `${this.prefix}inc-revalidate-lock:${cacheKey}`;
+  private fetchTagsKey(cacheKey: string): string {
+    return `${this.prefix}inc-fetch-tags:${cacheKey}`;
   }
 
   /**
-   * Acquire (or re-assert) the stale-signal for `cacheKey`: true when THIS process owns
-   * the revalidation window — either it just won the shared NX lock or it won it within
-   * the lock TTL. A lock-acquire FAILURE fails open to the stale signal (at worst the old
-   * stampede, never a lost revalidation).
+   * FileSystemCache keeps a FETCH value's `tags` field aligned with the current read context.
+   * Rewriting our serialized entry from `get()` would be unsafe: a late read could overwrite a
+   * concurrent regeneration's value and timestamp. Keep that mutable metadata in a companion key
+   * instead. Its last-writer-wins behavior matches FileSystemCache while the cached body remains
+   * untouched.
    */
-  private async ownsStaleSignal(cacheKey: string, now: number): Promise<boolean> {
-    const win = this.recentLockWins.get(cacheKey);
-    if (win !== undefined) {
-      if (now - win < REVALIDATE_LOCK_TTL_SECONDS * 1000) return true;
-      this.recentLockWins.delete(cacheKey); // expired with the shared lock
-    }
+  private async reconcileFetchTags(
+    cacheKey: string,
+    value: unknown,
+    fallbackTags: string[],
+    requestTags: string[] | undefined,
+    ttlSeconds: number,
+  ): Promise<unknown> {
+    if (!value || typeof value !== "object") return value;
+    let storedTags = tagsFromFetchValue(value);
+    if (storedTags.length === 0) storedTags = fallbackTags;
+
     try {
-      const acquired = await this.client.set(
-        this.revalidateLockKey(cacheKey),
-        "1",
-        "NX",
-        "EX",
-        REVALIDATE_LOCK_TTL_SECONDS,
-      );
-      if (acquired !== null) {
-        // Bounded: prune the oldest entry past a generous cap (insertion order).
-        if (this.recentLockWins.size >= 4096) {
-          const oldest = this.recentLockWins.keys().next().value;
-          if (oldest !== undefined) this.recentLockWins.delete(oldest);
+      const raw = await this.client.get(this.fetchTagsKey(cacheKey));
+      if (raw) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = undefined;
         }
-        this.recentLockWins.set(cacheKey, now);
-        return true;
+        if (Array.isArray(parsed) && parsed.every((tag) => typeof tag === "string"))
+          storedTags = capTags(parsed);
       }
-      return false;
-    } catch {
-      return true;
+    } catch (error) {
+      logErrorRateLimited(
+        "fetch-tag-metadata-read",
+        "[valkey-cache] FETCH tag metadata could not be read; using the cached value's existing tags",
+        error,
+      );
     }
+
+    const currentTags = requestTags === undefined ? undefined : capTags(requestTags);
+    if (currentTags && !currentTags.every((tag) => storedTags.includes(tag))) {
+      storedTags = currentTags;
+      try {
+        await this.client.set(
+          this.fetchTagsKey(cacheKey),
+          JSON.stringify(storedTags),
+          "EX",
+          Math.max(1, Math.ceil(ttlSeconds)),
+        );
+      } catch (error) {
+        // The current request still receives correct metadata. Only persistence is lost.
+        logErrorRateLimited(
+          "fetch-tag-metadata-write",
+          "[valkey-cache] FETCH tag metadata could not be persisted; the cached body remains usable",
+          error,
+        );
+      }
+    }
+
+    return { ...(value as Record<string, unknown>), tags: storedTags };
   }
 
   /**
@@ -489,7 +552,7 @@ export class ValkeyIncrementalCacheHandler {
   private async seedFallback(
     cacheKey: string,
     ctx: GetCtx,
-    consumeLock: boolean,
+    peek: boolean,
   ): Promise<CacheHandlerValue | null> {
     if (!this.seedLookup) return null;
     try {
@@ -501,28 +564,63 @@ export class ValkeyIncrementalCacheHandler {
           : {}),
       });
       if (!seed) return null;
-      const softTags = ctx.softTags ?? ctx.tags ?? [];
-      const tags = [...seed.tags, ...softTags];
+      const value =
+        ctx.kind === "FETCH"
+          ? await this.reconcileFetchTags(
+              cacheKey,
+              seed.value,
+              seed.tags,
+              ctx.tags,
+              DURABLE_TTL_SECONDS,
+            )
+          : seed.value;
+      const tags =
+        ctx.kind === "FETCH"
+          ? [...capTags(ctx.tags ?? []), ...capTags(ctx.softTags ?? [])]
+          : [...seed.tags, ...(ctx.softTags ?? ctx.tags ?? [])];
       const manifest = await this.tagStates(tags);
-      const now = this.now();
-      if (areTagsExpired(tags, seed.lastModified, manifest, now)) return null;
-      const staleByTag = areTagsStale(tags, seed.lastModified, manifest);
-      // Dispatch reads (getSeed/getPeek): report staleness, never spend the lock — the
-      // same starvation rule as the stored-entry branch in getImpl.
-      if (!consumeLock) {
+      const clock = await sampleValkeyClock(this.client, this.now);
+      // A build seed necessarily predates every event in this build-namespaced runtime manifest.
+      // Its filesystem mtime belongs to the build host's clock, so compare runtime events against
+      // zero instead of mixing that third clock domain with Valkey's timestamps.
+      if (areTagsExpired(tags, 0, manifest, clock.serverNow)) return null;
+      const staleByTag = areTagsStale(tags, 0, manifest);
+      const seedRevalidate =
+        ctx.kind === "FETCH" && typeof seed.value.revalidate === "number"
+          ? seed.value.revalidate
+          : undefined;
+      const effectiveFetchRevalidate =
+        ctx.kind === "FETCH" && typeof ctx.revalidate === "number"
+          ? ctx.revalidate
+          : seedRevalidate;
+      const staleByAge =
+        effectiveFetchRevalidate !== undefined &&
+        clock.localNow >= seed.lastModified + effectiveFetchRevalidate * 1000;
+      // Dispatch reads report staleness separately because no Next incremental-cache layer sits
+      // above them to interpret an adjusted lastModified timestamp.
+      if (peek) {
         return {
           lastModified: seed.lastModified,
-          value: seed.value as CacheHandlerValue["value"],
-          ...(staleByTag ? { isStale: true } : {}),
+          value: value as CacheHandlerValue["value"],
+          ...(staleByTag || staleByAge ? { isStale: true } : {}),
         };
       }
-      const signalStale = staleByTag && (await this.ownsStaleSignal(cacheKey, now));
-      return {
+      const signalStale = staleByTag || (ctx.kind === "FETCH" && staleByAge);
+      const result = {
         lastModified: signalStale
-          ? staleByTagLastModified({ lastModified: seed.lastModified } as StoredEntry, now)
+          ? staleByTagLastModified(
+              {
+                lastModified: seed.lastModified,
+                ...(seedRevalidate !== undefined ? { revalidateSeconds: seedRevalidate } : {}),
+              } as StoredEntry,
+              clock.localNow,
+              ctx.revalidate,
+              ctx.kind === "FETCH",
+            )
           : seed.lastModified,
-        value: seed.value as CacheHandlerValue["value"],
+        value: value as CacheHandlerValue["value"],
       };
+      return result;
     } catch (error) {
       logErrorRateLimited(
         "cache-seed",
@@ -533,149 +631,98 @@ export class ValkeyIncrementalCacheHandler {
     }
   }
 
-  /**
-   * PPR-materialization diagnosis channel (ADAPTER_K8S_CACHE_TRACE=1): one JSON line per
-   * cache operation, so a deployed pool's write pattern can be diffed against `next
-   * start`'s filesystem materialization. Off by default and costs one env check.
-   */
-  private trace(op: string, key: string, detail: Record<string, unknown>): void {
-    if (process.env.ADAPTER_K8S_CACHE_TRACE !== "1") return;
-    console.log(`[cache-trace] ${JSON.stringify({ op, key, ...detail })}`);
-  }
-
   /** get() without the seed fallback: STORED entries only (a post-deploy write or null). */
   async getStored(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    const r = await this.getImpl(cacheKey, ctx, { skipSeed: true, consumeLock: false });
-    this.trace("getStored", cacheKey, {
-      kind: ctx.kind,
-      hit: r !== null,
-      ...(r?.isStale !== undefined ? { isStale: r.isStale } : {}),
-    });
-    return r;
+    cacheKey = canonicalPathCacheKey(cacheKey);
+    return this.getImpl(cacheKey, ctx, { skipSeed: true, peek: true });
   }
 
   /** The complement of getStored(): SEED entries only (build artifacts), never a stored
    * write. The dispatch template-shell rung reads through this — a stored entry answering
    * a TEMPLATE key would share one sibling's materialized page across the whole route.
-   * NON-consuming like every dispatch read (see getPeek). */
+   * Serving-only like every dispatch read (see getPeek). */
   async getSeed(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    return this.seedFallback(cacheKey, ctx, false);
+    cacheKey = canonicalPathCacheKey(cacheKey);
+    return this.seedFallback(cacheKey, ctx, true);
   }
 
-  /**
-   * get() with the single-flight revalidate lock left UNTOUCHED — dispatch's serving
-   * reads. The lock exists so exactly ONE of Next's own readers is told "stale" (adjusted
-   * lastModified) and revalidates behind the request; dispatch reads entries only to SERVE
-   * them (document shell injection, segment data) and never revalidates from those paths.
-   * Measured 2026-08-04 (rdc): document-injection reads spent the lock on every tag-stale
-   * seed read, so the ENTRYPOINT's dynamic-RSC read milliseconds later was told FRESH and
-   * its background revalidation never scheduled — zero errors, zero writes, stale forever.
-   * Staleness is still REPORTED (isStale, like getStored) with the true lastModified.
-   */
+  /** Dispatch serving read. Staleness is reported through `isStale` with the true timestamp. */
   async getPeek(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    const r = await this.getImpl(cacheKey, ctx, { skipSeed: false, consumeLock: false });
-    this.trace("getPeek", cacheKey, {
-      kind: ctx.kind,
-      hit: r !== null,
-      ...(r?.isStale !== undefined ? { isStale: r.isStale } : {}),
-    });
-    return r;
+    cacheKey = canonicalPathCacheKey(cacheKey);
+    return this.getImpl(cacheKey, ctx, { skipSeed: false, peek: true });
   }
 
   async get(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    const r = await this.getImpl(cacheKey, ctx, { skipSeed: false, consumeLock: true });
-    // lm: the lastModified handed to Next's layer. A shifted/-1 value means this get() won
-    // the single-flight lock and is the one reader expected to revalidate — distinguishing
-    // "who got the stale signal" among a render's several gets is what cracked the
-    // multi-get-per-render lock-starvation chain (rdc, 2026-08-04).
-    this.trace("get", cacheKey, {
-      kind: ctx.kind,
-      hit: r !== null,
-      ...(r !== null && r.lastModified !== undefined ? { lm: r.lastModified } : {}),
-    });
-    return r;
+    cacheKey = canonicalPathCacheKey(cacheKey);
+    return this.getImpl(cacheKey, ctx, { skipSeed: false, peek: false });
   }
 
   private async getImpl(
     cacheKey: string,
     ctx: GetCtx,
-    { skipSeed, consumeLock }: { skipSeed: boolean; consumeLock: boolean },
+    { skipSeed, peek }: { skipSeed: boolean; peek: boolean },
   ): Promise<CacheHandlerValue | null> {
     try {
       const raw = await this.client.get(this.entryKey(cacheKey));
-      if (!raw) return skipSeed ? null : this.seedFallback(cacheKey, ctx, consumeLock);
+      if (!raw) return skipSeed ? null : this.seedFallback(cacheKey, ctx, peek);
       const entry = parseStoredEntry(raw);
-      if (!entry) return skipSeed ? null : this.seedFallback(cacheKey, ctx, consumeLock); // corrupt entry → seed, else miss (L5)
-      const now = this.now();
+      if (!entry) return skipSeed ? null : this.seedFallback(cacheKey, ctx, peek); // corrupt entry → seed, else miss (L5)
 
-      // Upstream fs-cache parity (file-system-cache.ts:167-187): pages can share one FETCH
-      // cache key (same URL+init) while declaring DIFFERENT tags, and the stored entry only
-      // carries the LAST writer's list — revalidateTag on the other page's tag then never
-      // stales the shared entry (rdc fetch-cache variant, 2026-08-04). FileSystemCache
-      // re-sets the entry with the requesting page's tags on read; merge here the same way,
-      // preserving lastModified/ttl so the tag watermarks keep their meaning. Best-effort:
-      // the CURRENT read already evaluates the merged list below either way.
-      if (ctx.kind === "FETCH" && ctx.tags?.length) {
-        const missing = ctx.tags.filter((tag) => !entry.tags.includes(tag));
-        if (missing.length > 0) {
-          entry.tags = capTags([...entry.tags, ...missing]);
-          this.client
-            .set(this.entryKey(cacheKey), JSON.stringify(entry), "EX", entry.ttlSeconds)
-            .catch(() => undefined);
-        }
+      let value = decodeValue(entry.value);
+      if (ctx.kind === "FETCH") {
+        value = await this.reconcileFetchTags(
+          cacheKey,
+          value,
+          entry.tags,
+          ctx.tags,
+          entry.ttlSeconds,
+        );
       }
-      // Own the staleness check against the SHARED manifest (the tags-manifest.external check Next
-      // also runs is per-process and irrelevant for a custom handler). Combine the entry's own
-      // tags with any request soft tags.
-      const softTags = ctx.softTags ?? ctx.tags ?? [];
-      const tags = [...entry.tags, ...softTags];
+      // FETCH freshness follows FileSystemCache: current hard + soft request tags are the source
+      // of truth. Other entry kinds own their tags in the stored response metadata.
+      const tags =
+        ctx.kind === "FETCH"
+          ? [...capTags(ctx.tags ?? []), ...capTags(ctx.softTags ?? [])]
+          : [...entry.tags, ...(ctx.softTags ?? ctx.tags ?? [])];
       const manifest = await this.tagStates(tags);
-      if (areTagsExpired(tags, entry.lastModified, manifest, now)) {
-        this.client.del(this.entryKey(cacheKey)).catch(() => undefined);
+      const clock = await sampleValkeyClock(this.client, this.now);
+      if (areTagsExpired(tags, entry.lastModified, manifest, clock.serverNow)) {
+        // Leave the expired value for its bounded TTL. A blind DEL after this read can race a
+        // concurrent regeneration and delete the fresh replacement.
         return null; // hard-revalidated → miss → Next regenerates + calls set
       }
       // A stale (SWR) tag must make Next serve this value and revalidate BEHIND the request —
       // never block on a fresh render (N80, see `staleByTagLastModified`).
       //
-      // Single-flight (survey Tier 1 #5, plans/lessons-from-sibling-adapters.md): without a
-      // lock, EVERY replica that reads a tag-stale entry gets the stale-signalling
-      // lastModified and every one of them re-renders — N pods, N renders, one shared store
-      // (adapter-aws locks the same way before enqueueing, router.ts:772-805; adapter-bun
-      // built the lock table and forgot to call it). Only the reader that wins a short-TTL
-      // NX lock is told "stale"; the rest see the entry as fresh and keep serving it while
-      // the winner revalidates (its `set` releases the lock early; the TTL bounds a crashed
-      // winner). A lock-acquire FAILURE fails open to the stale signal — at worst the old
-      // stampede, never a lost revalidation.
       const staleByTag = areTagsStale(tags, entry.lastModified, manifest);
-      if (!consumeLock) {
-        // Dispatch's reads (getStored/getPeek): staleness is a NON-CONSUMING PEEK.
-        // The single-flight NX revalidate lock must NOT be spent here — dispatch cannot
-        // regenerate cache-components routes (the on-demand render mode hard-errors and a
-        // failed re-entry held the lock to TTL), so a consumed lock starved the
-        // ENTRYPOINT's own working revalidation: it read "fresh" and never regenerated
-        // (resume-data-cache stale >12s on cold pods, traced 2026-08-03; the same
-        // starvation via document-injection reads, traced 2026-08-04). Age staleness is
-        // computed here because no Next incremental-cache layer sits above these callers.
-        const staleByAge =
-          typeof entry.revalidateSeconds === "number" &&
-          now >= entry.lastModified + entry.revalidateSeconds * 1000;
+      const effectiveFetchRevalidate =
+        ctx.kind === "FETCH" && typeof ctx.revalidate === "number"
+          ? ctx.revalidate
+          : entry.revalidateSeconds;
+      const staleByAge =
+        typeof effectiveFetchRevalidate === "number" &&
+        clock.serverNow >= entry.lastModified + effectiveFetchRevalidate * 1000;
+      const localLastModified = clock.toLocal(entry.lastModified);
+      if (peek) {
+        // Age staleness is computed here because no Next incremental-cache layer sits above
+        // dispatch's serving-only callers.
         return {
-          lastModified: entry.lastModified,
-          value: decodeValue(entry.value),
+          lastModified: localLastModified,
+          value,
           ...(staleByTag || staleByAge ? { isStale: true } : {}),
         };
       }
-      // App-path get(): the lock-gated stale signal is Next's own SWR contract — exactly
-      // ONE replica is told stale (adjusted lastModified) and revalidates; its set()
-      // releases the lock early, and the TTL bounds a crashed winner. Within the winning
-      // replica, EVERY get keeps the signal for the lock window (ownsStaleSignal) — one
-      // render reads the same key several times and the reader that schedules the
-      // revalidation is not the first.
-      const signalStale = staleByTag && (await this.ownsStaleSignal(cacheKey, now));
-      return {
-        lastModified: signalStale ? staleByTagLastModified(entry, now) : entry.lastModified,
-        value: decodeValue(entry.value),
+      // Every stale reader gets the signal. Next's ResponseCache batcher still deduplicates work
+      // within a process; duplicate cross-replica regeneration is safer than suppressing the only
+      // reader that can schedule it.
+      const signalStale = staleByTag || (ctx.kind === "FETCH" && staleByAge);
+      const result = {
+        lastModified: signalStale
+          ? staleByTagLastModified(entry, clock.localNow, ctx.revalidate, ctx.kind === "FETCH")
+          : localLastModified,
+        value,
       };
+      return result;
     } catch (error) {
       // N81: fail open to a miss (Next regenerates) — but SAY SO. This catch was bare, so a
       // PERMANENT read failure (NOAUTH, WRONGTYPE, a cluster -MOVED, an exhausted breaker, an
@@ -696,6 +743,7 @@ export class ValkeyIncrementalCacheHandler {
     data: Record<string, unknown> | null,
     ctx: SetCtx = {},
   ): Promise<void> {
+    cacheKey = canonicalPathCacheKey(cacheKey);
     try {
       // `null` is a real cached value (Next stores it for not-found / 404 responses) — keep it as an
       // entry so the negative result is shared across replicas, don't delete.
@@ -732,10 +780,13 @@ export class ValkeyIncrementalCacheHandler {
         );
         return;
       }
-      const entry: StoredEntry = {
+      const clientNow = this.now();
+      const entry = {
+        // Keep the marker FIRST: the Lua write asserts and replaces the exact JSON prefix, so
+        // application data carrying an identical nested field can never be mistaken for it.
+        lastModified: SERVER_LAST_MODIFIED_MARKER,
         value: encodeValue(data),
         tags,
-        lastModified: this.now(),
         ttlSeconds: Math.ceil(ttlSeconds),
         // N80: remember the route's own cache-control window so a stale-by-tag read can express
         // stale-while-revalidate instead of forcing a blocking render.
@@ -743,7 +794,7 @@ export class ValkeyIncrementalCacheHandler {
         ...(typeof ctx.cacheControl?.expire === "number"
           ? { expireSeconds: ctx.cacheControl.expire }
           : {}),
-      };
+      } satisfies Omit<StoredEntry, "lastModified"> & { lastModified: string };
       const serialized = JSON.stringify(entry);
       // M6: skip (and log once) when the serialized entry exceeds the configured cap — an
       // oversized page/shell must not be pushed through the socket into Valkey unboundedly.
@@ -754,23 +805,36 @@ export class ValkeyIncrementalCacheHandler {
         );
         return;
       }
-      this.trace("set", cacheKey, {
-        kind: (data as { kind?: string } | null)?.kind,
-        htmlBytes: byteLen((data as { html?: unknown } | null)?.html),
-        postponedBytes: byteLen((data as { postponed?: unknown } | null)?.postponed),
-        rscDataBytes: byteLen((data as { rscData?: unknown } | null)?.rscData),
-        segmentCount:
-          (data as { segmentData?: Map<unknown, unknown> } | null)?.segmentData?.size ?? 0,
-        tags,
-        revalidate,
-        ttlSeconds: entry.ttlSeconds,
-      });
-      await this.client.set(this.entryKey(cacheKey), serialized, "EX", entry.ttlSeconds);
-      // A completed re-render releases the single-flight revalidation lock early (see `get`)
-      // and ends this process's stale-signal window; best-effort — the lock's own TTL is
-      // the backstop.
-      this.recentLockWins.delete(cacheKey);
-      this.client.del(this.revalidateLockKey(cacheKey)).catch(() => undefined);
+      const clamped = await this.client.eval(
+        STORE_INCREMENTAL_ENTRY_SCRIPT,
+        1,
+        this.entryKey(cacheKey),
+        serialized,
+        String(entry.ttlSeconds),
+        String(clientNow),
+      );
+      warnOnClockSkewClamp(clamped);
+      if (data?.kind === "FETCH") {
+        const valueTags = tagsFromFetchValue(data);
+        const fetchTags =
+          ctx.tags !== undefined ? capTags(ctx.tags) : valueTags.length > 0 ? valueTags : tags;
+        try {
+          await this.client.set(
+            this.fetchTagsKey(cacheKey),
+            JSON.stringify(fetchTags),
+            "EX",
+            entry.ttlSeconds,
+          );
+        } catch (error) {
+          // The primary entry is already committed atomically. Losing companion metadata must not
+          // misreport that body write as failed or delete it.
+          logErrorRateLimited(
+            "fetch-tag-metadata-write",
+            "[valkey-cache] FETCH tag metadata could not be persisted; the cached body remains usable",
+            error,
+          );
+        }
+      }
     } catch (error) {
       // Cache write failure must not break the response — but it must be observable (N81, see
       // the matching comment in `get`).

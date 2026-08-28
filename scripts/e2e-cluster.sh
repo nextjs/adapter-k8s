@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run an upstream Next.js e2e suite against a REAL CLUSTER (Phase 3 topology).
+# Run an upstream Next.js e2e suite against a Kubernetes cluster.
 #
 # Usage:
 #   ./scripts/e2e-cluster.sh <test-pattern> [nextjs-ref]
@@ -11,9 +11,8 @@ set -euo pipefail
 #   ./scripts/e2e-cluster.sh "middleware-general" v16.3.0-canary.97
 #
 # A test pattern is REQUIRED. There is no "just run everything" form on purpose: every
-# suite here is a full build + image push + blue/green rollout against shared cloud
-# infrastructure, so an accidental bare invocation is expensive in both money and time.
-# The large run gets its own deliberate driver.
+# suite here is a full build + image push + blue/green rollout against shared cluster
+# state, so an accidental bare invocation is expensive. Large runs use a deliberate driver.
 #
 # WHAT THIS CLOBBERS: the target release currently serves the repo's resident fixture
 # app. Each suite replaces it. Restore afterwards by deploying fixtures/main again:

@@ -34,17 +34,6 @@ import {
 import { runRevert } from "../cutover/run.js";
 import { CutoverExitError } from "../cutover/inputs.js";
 
-// Moved to src/cutover/ (GitOps PR2); re-exported here so the import surface of the CLI
-// module is unchanged for existing consumers (deploy.ts) and tests.
-export {
-  SNAPSHOT_BUILD_ID_ANNOTATION,
-  readRoutingServingConfig,
-  retainLiveRoutingManifest,
-  revertRoutingServiceToBuild,
-  type RetainManifestResult,
-} from "../cutover/edge.js";
-export { ROLLBACK_MIN_REPLICAS, planRollbackCapacity, type LiveCapacity } from "../cutover/gc.js";
-
 type RollbackCompositionRole = "current" | "target";
 
 /**
@@ -98,11 +87,6 @@ export function classifyLocalRollbackComposition(options: {
   return role;
 }
 
-// The edge-revert primitives (readRoutingServingConfig, retainLiveRoutingManifest,
-// revertRoutingServiceToBuild, restoreRoutingSpec — N68/N30/N25/N87 lineage) and the N26
-// capacity planning (planRollbackCapacity, readLiveCapacity) moved verbatim to
-// src/cutover/edge.ts and src/cutover/gc.ts (GitOps PR2); see the re-exports above.
-
 export async function runRollback(options: {
   projectDir: string;
   releaseName: string;
@@ -115,8 +99,17 @@ export async function runRollback(options: {
   const infra = existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : undefined;
   // S13: validate before these reach a gcloud/kubectl argv.
   assertSafeInfrastructure(infra);
-  const namespace = resolveK8sNamespace(infra?.namespace);
   const localComposition = loadProjectCompositionPlan(projectDir);
+  if (localComposition && localComposition.plan.metadata.releaseName !== releaseName) {
+    throw new Error(
+      `Composition-plan release mismatch: plan records ` +
+        `${JSON.stringify(localComposition.plan.metadata.releaseName)}, but rollback targets ` +
+        `${JSON.stringify(releaseName)}.`,
+    );
+  }
+  const namespace = localComposition
+    ? localComposition.plan.metadata.namespace
+    : resolveK8sNamespace(infra?.namespace);
 
   // Pin kubectl at THIS release's cluster BEFORE any cluster read — otherwise the state
   // ConfigMap read below runs against whatever context happens to be current, and a

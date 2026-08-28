@@ -23,7 +23,7 @@ import {
   type RetainedExternalResource,
 } from "../../src/composition-plan/index.js";
 import { compositionPlanConfigMapName } from "../../src/emit/templates/composition-plan-configmap.js";
-import { mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -175,6 +175,8 @@ describe("runDestroy — composition-plan trust boundary", () => {
     objectName?: string;
     externalAddress?: string;
     retained?: RetainedExternalResource[];
+    releaseName?: string;
+    namespace?: string;
   }): CompositionPlan {
     const lifecycle = defineResourceComponent({
       name: `lifecycle-${options.buildId}`,
@@ -217,8 +219,8 @@ describe("runDestroy — composition-plan trust boundary", () => {
         resources: [lifecycle],
       }),
       {
-        releaseName: "my-app",
-        namespace: "default",
+        releaseName: options.releaseName ?? "my-app",
+        namespace: options.namespace ?? "default",
         buildId: options.buildId,
         imageRegistry: "ghcr.io/example/my-app",
         pools: ["default"],
@@ -351,6 +353,35 @@ describe("runDestroy — composition-plan trust boundary", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("uses the verified plan namespace instead of stale infrastructure", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({ releaseName: "my-app", namespace: "wrong-namespace" }),
+    );
+    const value = plan({ buildId: "build-2", namespace: "apps" });
+    authorizeExternalCleanupLocally(value);
+
+    await destroyFromClusterPlans([value]);
+
+    const kubectlArgs = vi
+      .mocked(exec.execCapture)
+      .mock.calls.filter(([command]) => command === "kubectl")
+      .map(([, args]) => args);
+    expect(kubectlArgs.some((args) => args.includes("wrong-namespace"))).toBe(false);
+    expect(kubectlArgs.some((args) => args.includes("apps"))).toBe(true);
+  });
+
+  it("rejects a local plan for another release before any subprocess", async () => {
+    authorizeExternalCleanupLocally(
+      plan({ buildId: "build-2", releaseName: "another-app", namespace: "apps" }),
+    );
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow(/Composition-plan release mismatch/);
+    expect(exec.execCapture).not.toHaveBeenCalled();
   });
 
   it("never executes cluster-only external operations but preserves owned Kubernetes cleanup", async () => {
@@ -548,6 +579,70 @@ describe("runDestroy — confirmation gate (L12)", () => {
     expect(persisted).not.toHaveProperty("cacheProjectId");
     expect(persisted).not.toHaveProperty("cacheRegion");
     expect(persisted).not.toHaveProperty("cacheProvisioningPending");
+  });
+
+  it("preserves cache coordinates and fails when the coordination claim cannot be deleted", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({
+        ...INFRA,
+        cacheProjectId: "cache-project",
+        cacheRegion: "europe-west1",
+        cacheProvisioningPending: "true",
+      }),
+    );
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "delete" &&
+        args[1] === "configmap" &&
+        args[2] === "my-app-cache-identity"
+      ) {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
+      return successfulDestroyCommand(args);
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow("process.exit(1)");
+
+    const persisted = JSON.parse(
+      readFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), "utf8"),
+    );
+    expect(persisted).toMatchObject({
+      cacheProjectId: "cache-project",
+      cacheRegion: "europe-west1",
+      cacheProvisioningPending: "true",
+    });
+  });
+
+  it("finishes cache cleanup when a retry finds the cloud instance already absent", async () => {
+    writeFileSync(
+      path.join(tmpDir, ".k8s-adapter", "infrastructure.json"),
+      JSON.stringify({
+        ...INFRA,
+        cacheProjectId: "cache-project",
+        cacheRegion: "europe-west1",
+      }),
+    );
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "gcloud" && args.includes("delete") && args.includes("my-app-cache")) {
+        return { exitCode: 1, stdout: "", stderr: "NOT_FOUND: instance was not found" };
+      }
+      return successfulDestroyCommand(args);
+    });
+
+    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+
+    const persisted = JSON.parse(
+      readFileSync(path.join(tmpDir, ".k8s-adapter", "infrastructure.json"), "utf8"),
+    );
+    expect(persisted).not.toHaveProperty("cacheProjectId");
+    expect(persisted).not.toHaveProperty("cacheRegion");
   });
 
   it("prompts for the release name on a TTY and proceeds on a match", async () => {
@@ -817,22 +912,83 @@ describe("runDestroy — adapter state ConfigMap cleanup", () => {
     expect(calls.indexOf(cmDelete!)).toBeGreaterThan(helmIdx);
   });
 
-  it("tolerates a ConfigMap-delete failure (warns, destroy still succeeds)", async () => {
+  it("counts an adapter state ConfigMap delete failure and preserves local state", async () => {
+    const localState = path.join(tmpDir, ".k8s-adapter", "state.json");
+    writeFileSync(localState, JSON.stringify({ buildId: "old", previousBuildId: null }));
     vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
-      if (cmd === "kubectl" && args.includes("delete") && args.includes("configmap")) {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "delete" &&
+        args[1] === "configmap" &&
+        args.includes("app.kubernetes.io/name=my-app,app.kubernetes.io/managed-by=adapter-k8s")
+      ) {
         return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
       }
       return successfulDestroyCommand(args);
     });
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
 
     await expect(
       runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow("process.exit(1)");
     expect(
       warnSpy.mock.calls.some((c) =>
         String(c[0]).includes("could not delete adapter state ConfigMaps"),
       ),
     ).toBe(true);
+    expect(existsSync(localState)).toBe(true);
+  });
+
+  it.each([
+    ["routing-manifest ConfigMaps", "app.kubernetes.io/component=routing-manifest-snapshot"],
+    ["composition-plan ConfigMaps", "app.kubernetes.io/component=composition-plan"],
+    ["internal-dispatch Secrets", "app.kubernetes.io/component=internal-secret"],
+  ])("counts a retained %s delete failure", async (_description, selector) => {
+    const localState = path.join(tmpDir, ".k8s-adapter", "state.json");
+    writeFileSync(localState, JSON.stringify({ buildId: "old", previousBuildId: null }));
+    vi.mocked(exec.execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "delete" && args.some((arg) => arg.includes(selector))) {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
+      return successfulDestroyCommand(args);
+    });
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow("process.exit(1)");
+    expect(existsSync(localState)).toBe(true);
+  });
+
+  it("removes only the current variant state and temp files after complete cluster cleanup", async () => {
+    const stateDir = path.join(tmpDir, ".k8s-adapter");
+    const currentState = path.join(stateDir, "state.production.json");
+    const currentTemp = path.join(stateDir, "state.production.json.tmp");
+    const defaultState = path.join(stateDir, "state.json");
+    const otherVariant = path.join(stateDir, "state.staging.json");
+    writeFileSync(currentState, "{}");
+    writeFileSync(currentTemp, "{}");
+    writeFileSync(defaultState, "{}");
+    writeFileSync(otherVariant, "{}");
+    writeFileSync(path.join(stateDir, "infrastructure.production.json"), JSON.stringify(INFRA));
+    process.env.ADAPTER_K8S_CONFIG = "production";
+
+    try {
+      await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    } finally {
+      delete process.env.ADAPTER_K8S_CONFIG;
+    }
+
+    expect(existsSync(currentState)).toBe(false);
+    expect(existsSync(currentTemp)).toBe(false);
+    expect(existsSync(defaultState)).toBe(true);
+    expect(existsSync(otherVariant)).toBe(true);
+    expect(existsSync(path.join(stateDir, "infrastructure.json"))).toBe(true);
+    expect(existsSync(path.join(stateDir, "infrastructure.production.json"))).toBe(true);
   });
 
   it("dry-run prints the ConfigMap delete without executing it", async () => {
@@ -1021,7 +1177,7 @@ describe("destroy: retained internal-dispatch Secrets", () => {
     expect(del).toContain("--ignore-not-found");
   });
 
-  it("warns rather than failing the destroy when the sweep cannot run", async () => {
+  it("fails the destroy when the retained Secret sweep cannot run", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.mocked(exec.execCapture).mockImplementation((async (_c: string, args: string[]) => {
       if (args[0] === "delete" && args[1] === "secret") {
@@ -1029,8 +1185,13 @@ describe("destroy: retained internal-dispatch Secrets", () => {
       }
       return successfulDestroyCommand(args);
     }) as never);
+    vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
 
-    await runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true });
+    await expect(
+      runDestroy({ projectDir: tmpDir, releaseName: "my-app", yes: true }),
+    ).rejects.toThrow("process.exit(1)");
     expect(warn).toHaveBeenCalledWith(
       expect.stringMatching(/could not delete the internal-dispatch Secrets/),
     );

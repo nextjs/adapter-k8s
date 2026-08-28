@@ -11,12 +11,35 @@ import type { PoolDefinition, K8sAdapterConfig, RoutingManifest } from "../../sr
 import {
   compileTarget,
   defineTarget,
-  gatewayApiExposure,
+  envoyGatewayIngressSources,
+  gatewayApiExposure as buildGatewayApiExposure,
   gkeCluster,
+  gkeHealthCheckPolicy,
+  gkeIngressSources,
   gkeNativeRouting,
-  httpRouteExposure,
+  httpRouteExposure as buildHttpRouteExposure,
   kubernetesCluster,
 } from "../../src/target/index.js";
+
+function gatewayApiExposure(
+  options: Omit<Parameters<typeof buildGatewayApiExposure>[0], "ingressSources"> &
+    Partial<Pick<Parameters<typeof buildGatewayApiExposure>[0], "ingressSources">>,
+) {
+  return buildGatewayApiExposure({ ingressSources: gkeIngressSources(), ...options });
+}
+
+function httpRouteExposure(
+  options: Omit<Parameters<typeof buildHttpRouteExposure>[0], "ingressSources"> &
+    Partial<Pick<Parameters<typeof buildHttpRouteExposure>[0], "ingressSources">>,
+) {
+  return buildHttpRouteExposure({
+    ingressSources: envoyGatewayIngressSources({
+      namespace: "envoy-gateway-system",
+      gatewayClasses: ["eg"],
+    }),
+    ...options,
+  });
+}
 
 const mockManifest: RoutingManifest = {
   routeGraph: { rsc: {} } as any,
@@ -236,6 +259,49 @@ describe("generateHelmChart", () => {
       '- name: ADAPTER_K8S_PROVIDER_NAME\n              value: "portable"',
     );
     expect(result["templates/routing-service-deployment.yaml"]).toBeUndefined();
+  });
+
+  it("emits an exposure-selected GKE HealthCheckPolicy only for the origin Service", () => {
+    const target = defineTarget({
+      cluster: gkeCluster({ projectId: "cluster-project", region: "us-central1" }),
+      exposure: gatewayApiExposure({
+        className: "gke-l7-global-external-managed",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+        backendHealth: gkeHealthCheckPolicy(),
+      }),
+    });
+    const config = { pools: { ssr: { routes: ["appPages"] } }, target } as K8sAdapterConfig;
+    const compiledTarget = compileTarget(target, {
+      releaseName: "site",
+      namespace: "apps",
+      buildId: "abc123",
+      imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+    });
+    const result = generateHelmChart({
+      pools: minimalPools(),
+      buildId: "abc123",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "us-central1-docker.pkg.dev/cluster-project/nextjs",
+      routingManifest: mockManifest,
+      releaseName: "site",
+      internalSecret: "deadbeef",
+      infrastructure: { projectId: "cluster-project", region: "us-central1" },
+      compiledTarget,
+    });
+
+    const healthPolicyTemplates = Object.entries(result).filter(([, body]) =>
+      body.includes("kind: HealthCheckPolicy"),
+    );
+    expect(healthPolicyTemplates).toHaveLength(1);
+    expect(healthPolicyTemplates[0]?.[0]).toBe("templates/origin-service.yaml");
+    expect(healthPolicyTemplates[0]?.[1]).toMatch(
+      /targetRef:\n\s+group: ""\n\s+kind: Service\n\s+name: site-origin/,
+    );
+    expect(result["templates/ssr-service.yaml"]).not.toContain("HealthCheckPolicy");
   });
 
   it("renders an httpRouteExposure target with an HTTPRoute and no Gateway anywhere", () => {
@@ -851,11 +917,10 @@ describe("generateHelmChart", () => {
     // `nodeCidrs` had to be hand-supplied; deploy now discovers that range
     // (discoverClusterNodeCidrs), so the broad posture costs nothing to leave behind.
     //
-    // Why it matters: the broad posture is `0.0.0.0/0 except <pod CIDR>`, which admits every
-    // VPC peer, VM and hostNetwork pod to routing-service:8443. That service answers an
-    // ordinary ext_proc call with the internal dispatch secret in its header mutation, so a
-    // VPC-reachable caller can read the secret and replay trusted dispatch headers to a pool
-    // to skip middleware. Pod-level isolation alone never closed that.
+    // Why it matters: the broad posture admits every VPC peer, VM and hostNetwork pod to
+    // routing-service:8443. The raw secret stays off the wire, but the reachable service is a
+    // signing oracle: it returns a pool-trusted proof for a request of the caller's choosing.
+    // Pod-level isolation alone never closed that trust boundary.
     const values = JSON.parse(result["values.yaml"].slice(result["values.yaml"].indexOf("{")));
     expect(values.global.networkPolicy).toEqual({ podCidrs: [], nodeCidrs: [], strict: true });
   });

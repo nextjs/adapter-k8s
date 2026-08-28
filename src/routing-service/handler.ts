@@ -1,6 +1,7 @@
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import type { RoutingManifest } from "../types.js";
 import { invokeNodeMiddleware } from "../next-runtime/middleware-entrypoint.js";
+import { resolveNextDistDir } from "../next-runtime/dist-dir.js";
 import type { ProcessingResponse, HeaderValue } from "./ext-proc-types.js";
 import {
   buildImmediateResponse,
@@ -50,12 +51,12 @@ type MwEvaluated = "ran" | "skip-nomatch" | "none" | "error";
 // yields "AbortError", and middleware (e.g. a fetch wrapper) may re-wrap either —
 // so also check `cause` one level deep for the same shapes.
 function isAbortError(err: unknown): boolean {
-  const shaped = (e: unknown): boolean =>
+  const hasAbortName = (e: unknown): boolean =>
     typeof e === "object" &&
     e !== null &&
     ((e as { name?: unknown }).name === "AbortError" ||
       (e instanceof DOMException && e.name === "TimeoutError"));
-  return shaped(err) || shaped((err as { cause?: unknown } | null | undefined)?.cause);
+  return hasAbortName(err) || hasAbortName((err as { cause?: unknown } | null | undefined)?.cause);
 }
 
 function getHeader(headers: HeaderValue[], key: string): string | undefined {
@@ -183,6 +184,8 @@ export function createRequestHandler(
   // pool derives the identical list from its copy of the same manifest.
   const proofHeaderNames = buildProofHeaderNames(manifest);
   const rscConfig = getRscConfig(manifest);
+  const runtimeDistDir = resolveNextDistDir(process.cwd(), manifest.distDir).absolute;
+  const poolOnlyEdgeMiddleware = manifest.middleware?.runtime === "edge";
   // Per-request budget mirrored from the server's withTimeout shed — when it fires,
   // this signal aborts so middleware awaiting a slow upstream is actually cancelled
   // instead of racing a shed response it can no longer influence. 0 disables.
@@ -294,6 +297,21 @@ export function createRequestHandler(
         .map((h) => [h.key, h.value ?? h.rawValue?.toString("utf-8") ?? ""] as [string, string]),
     );
 
+    // Edge middleware requires Next's sandbox, which only the pool runtime owns today. Do not
+    // import the edge bundle as a Node module and do not stamp `none`: clear the whole internal
+    // vocabulary and let the pool perform the complete resolution with its sandbox.
+    if (poolOnlyEdgeMiddleware) {
+      return buildHeaderMutationResponse(
+        [],
+        [
+          ...INTERNAL_DISPATCH_HEADERS,
+          ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+          INTERNAL_SECRET_HEADER,
+          INTERNAL_DISPATCH_PROOF_HEADER,
+        ],
+      );
+    }
+
     // N18 (SECURITY): does this request's `_rsc` authenticate its RSC headers? Read off the
     // ORIGINAL public URL and the client's own headers, before prepareRequest can rewrite either.
     // Only consulted for the immediate responses this tier authors itself (see
@@ -374,7 +392,7 @@ export function createRequestHandler(
     // so the pool can trust the skip instead of inferring "middleware ran" from the presence
     // of routing headers. Pessimistic default `error` while middleware is configured but not
     // yet confirmed to have run (so the pool re-evaluates); `none` when there is no middleware.
-    let mwEvaluated: MwEvaluated = retry?.mwEvaluated ?? (middlewareModule ? "error" : "none");
+    let mwEvaluated: MwEvaluated = retry?.mwEvaluated ?? (manifest.middleware ? "error" : "none");
 
     const resolution = await resolveRoutes({
       url: resolveUrl,
@@ -417,6 +435,7 @@ export function createRequestHandler(
                 // here previously let timed-out middleware keep running detached.
                 signal: shedSignal ?? null,
                 nextConfig: manifestNextConfig(manifest),
+                distDir: runtimeDistDir,
                 logBackgroundError(error) {
                   console.error("[routing-service] middleware background work failed:", error);
                 },
@@ -568,27 +587,7 @@ export function createRequestHandler(
       );
     }
 
-    if (resolution.externalRewrite) {
-      // N40. NEVER author a status the other tier doesn't. Phase 1 returns
-      // `external-rewrite` and pool-server/dispatch.ts PROXIES it, matching `next start`;
-      // this tier used to answer 502 ("not supported in adapter-k8s v1"). Because the CEL
-      // match condition is `!(…)` — i.e. approximately everything — whenever the app has
-      // middleware, a next.config external rewrite worked in the e2e harness (pool only) and
-      // 502'd in production. Hand it to the pool exactly as the body-request backstop above
-      // does: CONTINUE with the whole internal dispatch vocabulary CLEARED and no secret
-      // added, so the pool treats the request as untrusted, re-resolves locally, and owns the
-      // proxy hop. (Middleware runs again in the pool for this request — that is the same
-      // cost the body backstop pays, and it is the fail-safe direction.)
-      return buildHeaderMutationResponse(
-        [],
-        [
-          ...INTERNAL_DISPATCH_HEADERS,
-          ...UNTRUSTED_NEXT_REQUEST_HEADERS,
-          INTERNAL_SECRET_HEADER,
-          INTERNAL_DISPATCH_PROOF_HEADER,
-        ],
-      );
-    }
+    const externalRewrite = resolution.externalRewrite;
 
     // Pool ownership is looked up on the BASE pathname (RSC variants live in the same pool as
     // their page). The output id, however, must be the RSC-mapped variant so the handler
@@ -600,13 +599,17 @@ export function createRequestHandler(
     // INVOCATION TARGET, so a rewrite whose destination also matched a dynamic route
     // (`/rewrite-1` → `/gssp`, resolvedPathname `/[slug]`) dispatched the `[slug]` template at
     // the edge while the pool's Phase-1 resolver dispatched `/gssp`.
-    const basePathname = resolveOutputPathname({
-      requestPathname: resolveUrl.pathname,
-      resolvedPathname: resolution.resolvedPathname,
-      invocationTargetPathname: resolution.invocationTarget?.pathname,
-      poolAssignments: manifest.poolAssignments,
-    });
-    const outputId = resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
+    const basePathname = externalRewrite
+      ? fallbackPathname
+      : resolveOutputPathname({
+          requestPathname: resolveUrl.pathname,
+          resolvedPathname: resolution.resolvedPathname,
+          invocationTargetPathname: resolution.invocationTarget?.pathname,
+          poolAssignments: manifest.poolAssignments,
+        });
+    const outputId = externalRewrite
+      ? undefined
+      : resolveRscOutput(basePathname, headers, rscConfig, manifest.poolAssignments);
 
     const mutations: HeaderMutationEntry[] = [];
     // Every internal dispatch header the extension does NOT set this response must be actively
@@ -630,16 +633,18 @@ export function createRequestHandler(
     // (e.g. a destination's repeated `?item=one&item=two`) is silently dropped. Same
     // derivation as pool-server/resolve.ts (shared computeRewriteInvocation).
     const rscRequest = isRscRequest(headers, rscConfig);
-    const invocation = computeRewriteInvocation({
-      originalUrl: prep.originalUrl,
-      addedLocale: prep.addedLocale,
-      isRscRequest: rscRequest,
-      isDataRequest: prep.isDataRequest,
-      routes: manifest.routeGraph,
-      resolvedQuery: resolution.resolvedQuery,
-      invocationTarget: resolution.invocationTarget,
-      resolvedPathname: resolution.resolvedPathname,
-    });
+    const invocation: ReturnType<typeof computeRewriteInvocation> = externalRewrite
+      ? { invokePath: undefined, invocationQuery: undefined }
+      : computeRewriteInvocation({
+          originalUrl: prep.originalUrl,
+          addedLocale: prep.addedLocale,
+          isRscRequest: rscRequest,
+          isDataRequest: prep.isDataRequest,
+          routes: manifest.routeGraph,
+          resolvedQuery: resolution.resolvedQuery,
+          invocationTarget: resolution.invocationTarget,
+          resolvedPathname: resolution.resolvedPathname,
+        });
 
     // N19. next.config headers() + middleware response headers → carried as one JSON header
     // and applied to the RESPONSE by the pool (NOT emitted as request-header mutations).
@@ -660,13 +665,15 @@ export function createRequestHandler(
     // `next start` (`/rewrite-query-array` → p=/api/rewrite-query-array q=item=one&item=two on
     // `next start` and Phase 1, but nothing at all through Envoy+ext_proc). The pool's Phase-1
     // resolver emitted it, so the whole e2e harness — which starts only the pool — was blind.
-    const signal = computeRewriteSignalHeaders({
-      originalUrl: prep.originalUrl,
-      addedLocale: prep.addedLocale,
-      isRscRequest: rscRequest,
-      invocationTarget: resolution.invocationTarget,
-      invocationQuery: invocation.invocationQuery,
-    });
+    const signal: ReturnType<typeof computeRewriteSignalHeaders> = externalRewrite
+      ? {}
+      : computeRewriteSignalHeaders({
+          originalUrl: prep.originalUrl,
+          addedLocale: prep.addedLocale,
+          isRscRequest: rscRequest,
+          invocationTarget: resolution.invocationTarget,
+          invocationQuery: invocation.invocationQuery,
+        });
     const hasSignal = signal.rewrittenPath !== undefined || signal.rewrittenQuery !== undefined;
     if (resolution.resolvedHeaders || hasSignal) {
       // Overwrite rather than defer to whatever middleware already set, so both tiers land on
@@ -717,12 +724,18 @@ export function createRequestHandler(
 
     // x-output-id tells the pool server which handler to invoke directly,
     // bypassing local resolveRoutes() (avoids double resolution + middleware)
-    setDispatch("x-output-id", outputId);
-    setDispatch("x-matched-pathname", outputId);
+    if (externalRewrite) {
+      setDispatch("x-external-rewrite-url", externalRewrite.toString());
+    } else {
+      setDispatch("x-output-id", outputId!);
+      setDispatch("x-matched-pathname", outputId!);
+    }
     // Sanitized with the SHARED helper, exactly as Phase 1 does before it attaches
     // routeMatches to a local resolution: the edge must not be the tier that ships the
     // unresolved-dynamic sentinel over the wire and leaves the pool to catch it.
-    const sanitizedRouteMatches = sanitizeRouteMatches(resolution.routeMatches);
+    const sanitizedRouteMatches = externalRewrite
+      ? null
+      : sanitizeRouteMatches(resolution.routeMatches);
     if (sanitizedRouteMatches) {
       setDispatch("x-route-matches", JSON.stringify(sanitizedRouteMatches));
     }
@@ -735,7 +748,7 @@ export function createRequestHandler(
       setDispatch("x-invoke-query", JSON.stringify(invocation.invocationQuery));
     }
 
-    if (basePathname in manifest.pprRoutes) {
+    if (!externalRewrite && basePathname in manifest.pprRoutes) {
       setDispatch("x-nextjs-ppr", "1");
     }
 
@@ -808,7 +821,7 @@ export function createRequestHandler(
     // Node answers that 431 from the parser (HPE_HEADER_OVERFLOW), so the pool never gets the
     // chance to read the transport header — the request simply stops working.
     //
-    // The fix is the SAME fail-safe the body-request and external-rewrite backstops above use:
+    // The fix is the SAME fail-safe the body-request backstop above uses:
     // clear the whole dispatch vocabulary, add no secret, and let the pool treat the request as
     // untrusted and re-resolve it locally (Phase 1 — which re-runs middleware and re-derives the
     // header mutations in-process, where no wire budget applies). That is strictly better than

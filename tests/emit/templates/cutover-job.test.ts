@@ -23,7 +23,63 @@ import { sanitizeK8sName } from "../../../src/emit/templates/utils.js";
 
 const RELEASE = "my-app";
 const BUILD = "buildn";
+const NAMESPACE = "default";
 const VALUES_GATE = '{{- if eq .Values.cutover.mode "job" }}';
+const READINESS = [
+  {
+    kind: "kubernetes-condition" as const,
+    object: {
+      apiVersion: "gateway.networking.k8s.io/v1",
+      resource: "httproutes",
+      name: "my-app-routes",
+      namespace: NAMESPACE,
+    },
+    conditionsAt: { kind: "parents" as const },
+    condition: {
+      type: "Accepted",
+      status: "True" as const,
+      observedGeneration: "must-equal-metadata-generation" as const,
+    },
+    timeoutSeconds: 600,
+  },
+  {
+    kind: "kubernetes-condition" as const,
+    object: {
+      apiVersion: "gateway.networking.k8s.io/v1",
+      resource: "gateways",
+      name: "my-app-gateway",
+      namespace: NAMESPACE,
+    },
+    conditionsAt: { kind: "object" as const },
+    condition: {
+      type: "Programmed",
+      status: "True" as const,
+      observedGeneration: "must-equal-metadata-generation" as const,
+    },
+    timeoutSeconds: 600,
+  },
+  {
+    kind: "kubernetes-condition" as const,
+    object: {
+      apiVersion: "cert-manager.io/v1",
+      resource: "certificates",
+      name: "my-app-tls",
+      namespace: NAMESPACE,
+    },
+    conditionsAt: { kind: "object" as const },
+    condition: {
+      type: "Ready",
+      status: "True" as const,
+      observedGeneration: "must-equal-metadata-generation" as const,
+    },
+    timeoutSeconds: 600,
+  },
+  {
+    kind: "kubernetes-service-endpoints" as const,
+    service: { name: "my-app-origin", namespace: NAMESPACE, port: 3000 },
+    minimumReady: 1,
+  },
+];
 
 /** Every annotation any engine could read as "run me as a hook / sweep me". */
 const HOOK_MARKERS = [
@@ -207,16 +263,21 @@ function roleRules(yaml: string): Map<string, string[]> {
 }
 
 describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
-  const out = renderCutoverRbac({ releaseName: RELEASE });
+  const out = renderCutoverRbac({
+    releaseName: RELEASE,
+    namespace: NAMESPACE,
+    readiness: READINESS,
+    hasEnvoyExtensionPolicy: true,
+    hasHealthCheckPolicy: true,
+  });
 
   it("emits ServiceAccount + Role + RoleBinding behind the values gate, and NOTHING cluster-scoped", () => {
     expect(out.startsWith(VALUES_GATE)).toBe(true);
     expect(out).toContain("kind: ServiceAccount");
     expect(out).toContain("kind: Role\n");
     expect(out).toContain("kind: RoleBinding");
-    // A cluster-scoped grant is the thing an operator reviewing this bundle would refuse:
-    // the CRD probe in gc.ts degrades with a warning instead, and GKE HealthCheckPolicy
-    // cleanup is a best-effort no-op on the clusters this mode targets.
+    // HealthCheckPolicy cleanup uses a namespaced rule and the bundle's explicit capability.
+    // It never needs cluster-scoped CRD discovery.
     expect(out).not.toContain("ClusterRole");
     expect(out).not.toContain("ClusterRoleBinding");
     expect(out).not.toContain("customresourcedefinitions");
@@ -251,14 +312,14 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
       // E6's retained stable-resource sweep lists PDBs by label, reads each to confirm it
       // selects the pool it claims to, and deletes the obsolete ones.
       "policy/poddisruptionbudgets": ["get", "list", "delete"],
+      "networking.gke.io/healthcheckpolicies": ["get", "list", "delete"],
       // D4/D5 generation-guarded Accepted gate — read-only.
       "gateway.envoyproxy.io/envoyextensionpolicies": ["get"],
-      // Composition-plan readiness — HTTPRoute/Gateway/Certificate/Ingress/EndpointSlice.
-      "gateway.networking.k8s.io/httproutes": ["get", "list"],
-      "gateway.networking.k8s.io/gateways": ["get", "list"],
-      "cert-manager.io/certificates": ["get", "list"],
-      "discovery.k8s.io/endpointslices": ["get", "list"],
-      "networking.k8s.io/ingresses": ["get", "list"],
+      // Composition-plan readiness — HTTPRoute/Gateway/Certificate/EndpointSlice.
+      "gateway.networking.k8s.io/httproutes": ["get"],
+      "gateway.networking.k8s.io/gateways": ["get"],
+      "cert-manager.io/certificates": ["get"],
+      "discovery.k8s.io/endpointslices": ["list"],
     });
     for (const verbs of rules.values()) expect(verbs).not.toContain("*");
     expect(out).not.toContain('resources: ["*"]');
@@ -268,8 +329,8 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
     const rules = roleRules(out);
     // The policy gate is a poll, never a repair.
     expect(rules.get("gateway.envoyproxy.io/envoyextensionpolicies")).toEqual(["get"]);
-    expect(rules.get("gateway.networking.k8s.io/httproutes")).toEqual(["get", "list"]);
-    expect(rules.get("cert-manager.io/certificates")).toEqual(["get", "list"]);
+    expect(rules.get("gateway.networking.k8s.io/httproutes")).toEqual(["get"]);
+    expect(rules.get("cert-manager.io/certificates")).toEqual(["get"]);
     // Dispatch Secrets are probed and pruned — never created or mutated (their material
     // is the chart's/the external store's business).
     expect(rules.get("secrets")).not.toContain("create");
@@ -279,21 +340,85 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
     expect(rules.get("pods")).toEqual(["get", "list"]);
   });
 
-  it("grants E6's retained stable-PDB sweep exactly what it executes", () => {
+  it("grants E6's retained stable-resource sweep exactly what it executes", () => {
     // gcSupersededResources → cleanupRetainedStablePoolResources lists retained
     // `poddisruptionbudget` objects by label, reads each to verify it selects the pool it
     // claims to, and deletes the obsolete ones. The sweep is post-state-commit and
     // best-effort, so a missing rule did not fail promotions — it just logged "Retained
     // stable-resource cleanup incomplete" on every Job and leaked PDBs from removed pools.
-    const rules = roleRules(renderCutoverRbac({ releaseName: RELEASE }));
+    const rules = roleRules(
+      renderCutoverRbac({
+        releaseName: RELEASE,
+        namespace: NAMESPACE,
+        hasHealthCheckPolicy: true,
+      }),
+    );
     expect(rules.get("policy/poddisruptionbudgets")).toEqual(["get", "list", "delete"]);
-    // HealthCheckPolicy is the deliberately-degraded case: without the cluster-scoped CRD
-    // probe the sweep never classifies HCPs at all, so no rule is needed.
+    expect(rules.get("networking.gke.io/healthcheckpolicies")).toEqual(["get", "list", "delete"]);
+  });
+
+  it("omits controller APIs the bundle does not use", () => {
+    const rules = roleRules(renderCutoverRbac({ releaseName: RELEASE, namespace: NAMESPACE }));
     expect(rules.has("networking.gke.io/healthcheckpolicies")).toBe(false);
+    expect(rules.has("gateway.envoyproxy.io/envoyextensionpolicies")).toBe(false);
+    expect(rules.has("gateway.networking.k8s.io/httproutes")).toBe(false);
+    expect(rules.has("cert-manager.io/certificates")).toBe(false);
+    expect(rules.has("discovery.k8s.io/endpointslices")).toBe(false);
+  });
+
+  it("derives read-only access for a custom namespaced readiness API", () => {
+    const rules = roleRules(
+      renderCutoverRbac({
+        releaseName: RELEASE,
+        namespace: NAMESPACE,
+        readiness: [
+          {
+            kind: "kubernetes-condition",
+            object: {
+              apiVersion: "routing.example.io/v1",
+              resource: "routingpolicies",
+              name: "my-app-routing",
+              namespace: NAMESPACE,
+            },
+            conditionsAt: { kind: "object" },
+            condition: {
+              type: "Ready",
+              status: "True",
+              observedGeneration: "must-equal-metadata-generation",
+            },
+            timeoutSeconds: 600,
+          },
+        ],
+      }),
+    );
+    expect(rules.get("routing.example.io/routingpolicies")).toEqual(["get"]);
+  });
+
+  it("rejects readiness outside the namespace-scoped Job's authority", () => {
+    const condition = READINESS[0]!;
+    expect(() =>
+      renderCutoverRbac({
+        releaseName: RELEASE,
+        namespace: NAMESPACE,
+        readiness: [{ ...condition, object: { ...condition.object, namespace: "network" } }],
+      }),
+    ).toThrow(/Cross-namespace readiness.*ClusterRole/i);
+    expect(() =>
+      renderCutoverRbac({
+        releaseName: RELEASE,
+        namespace: NAMESPACE,
+        readiness: [{ ...condition, object: { ...condition.object, namespace: undefined } }],
+      }),
+    ).toThrow(/has no namespace.*cluster-scoped/i);
   });
 
   it("validates the release name at the template boundary", () => {
-    expect(() => renderCutoverRbac({ releaseName: "Bad_Release" })).toThrow(/Invalid releaseName/);
+    expect(() => renderCutoverRbac({ releaseName: "Bad_Release", namespace: NAMESPACE })).toThrow(
+      /Invalid releaseName/,
+    );
+    expect(() => renderCutoverRbac({ releaseName: RELEASE, namespace: "Bad_NS" })).toThrow(
+      /Invalid namespace/,
+    );
   });
 });
 

@@ -1,6 +1,7 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { ValkeyClient } from "./client.js";
 import { assertSafeBuildId, capTags, DURABLE_TTL_SECONDS } from "./incremental-cache-handler.js";
-import { RespError } from "./resp-client.js";
+import { sampleValkeyClock } from "./valkey-clock.js";
 import {
   bufferToStream,
   drainEntryValue,
@@ -15,12 +16,15 @@ import {
   chunkManifestTags,
   filterManifestTags,
   maxExpiration,
+  MAX_CLOCK_SKEW_MS,
   parseTagState,
+  TAG_MANIFEST_EPOCH_FIELD,
   TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
   warnOnClockSkewClamp,
   type TagManifest,
   type TagState,
+  type Freshness,
 } from "./tag-manifest.js";
 import type { CacheEntry, CacheHandler, Timestamp } from "./types.js";
 
@@ -33,8 +37,67 @@ interface StoredMeta {
   revalidate: number;
 }
 
+interface StoredRead {
+  meta: StoredMeta;
+  localTimestamp: number;
+  value: Buffer;
+  freshness: Freshness;
+}
+
+interface LocalEntry {
+  tags: string[];
+  /** Implicit tags whose shared manifest state was checked before this backing entry was warmed. */
+  verifiedSoftTags: string[];
+  stale: number;
+  timestamp: number;
+  expire: number;
+  revalidate: number;
+  value: Buffer;
+}
+
+const SERVER_TIMESTAMP_MARKER = "__adapter_k8s_valkey_time__";
+
+/**
+ * Store a V2 entry with its computation-start timestamp translated into Valkey's clock domain.
+ * The translation must preserve the elapsed render time: stamping completion time would let an
+ * invalidation that arrived during a long computation lose to the completed write.
+ *
+ * ARGV is `[meta, value, ttlSeconds, entryTimestamp, clientNow]`. Meta keeps the marker first so
+ * the exact-prefix replacement cannot collide with application tags or future fields.
+ */
+export const STORE_USE_CACHE_ENTRY_SCRIPT = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+local payload = ARGV[1]
+local marker = '{"timestamp":"${SERVER_TIMESTAMP_MARKER}"'
+if string.sub(payload, 1, string.len(marker)) ~= marker then
+  return redis.error_reply('use-cache entry timestamp marker missing')
+end
+local clientNow = tonumber(ARGV[5])
+local entryTimestamp = tonumber(ARGV[4])
+if not clientNow or not entryTimestamp then
+  return redis.error_reply('use-cache entry timestamp arguments invalid')
+end
+local storedTimestamp = now + entryTimestamp - clientNow
+local stamped = '{"timestamp":' .. storedTimestamp .. string.sub(payload, string.len(marker) + 1)
+redis.call('HSET', KEYS[1], 'm', stamped, 'v', ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+if math.abs(now - clientNow) > ${MAX_CLOCK_SKEW_MS} then return 1 end
+return 0
+`;
+
 /** Extra seconds of Valkey key retention beyond the entry's own `expire` window. */
 const RETENTION_MARGIN_SECONDS = 60;
+
+/** Same default bound as Next's built-in `use cache` handler. This is a staging front, not a
+ * second durable cache: Valkey remains the backing store and shared invalidation authority. */
+const LOCAL_FRONT_MAX_BYTES = 50 * 1024 * 1024;
+/** Metadata-heavy/empty entries still consume Map/object memory even when their body is tiny. */
+const LOCAL_FRONT_MAX_ENTRIES = 10_000;
+/** A cache-key burst must not turn a miss into an unbounded fan-out of Valkey commands. */
+const LOCAL_FRONT_MAX_CONCURRENT_WARMS = 64;
+/** Conservative fixed allowance for the Map slot, object, arrays, and Buffer wrapper. */
+const LOCAL_ENTRY_OVERHEAD_BYTES = 256;
 
 /**
  * Bound on how long `get` waits for an in-flight same-key `set` before proceeding as a miss
@@ -45,6 +108,13 @@ const RETENTION_MARGIN_SECONDS = 60;
 const PENDING_SET_WAIT_MS = 5_000;
 
 const EMPTY_MANIFEST: TagManifest = new Map();
+
+interface PreparedInvocation {
+  epoch: string | undefined;
+}
+
+/** Closure returned by preflight and used to scope only the matching Next invocation. */
+export type PreparedUseCacheRunner = <T>(callback: () => T) => T;
 
 /**
  * Parse and validate the stored meta field (L5). A corrupt meta — wrong JSON, non-finite
@@ -83,13 +153,13 @@ export interface ValkeyCacheHandlerOptions {
 }
 
 /**
- * Valkey-backed implementation of Next 16.2's `use cache` V2 `CacheHandler`.
+ * Valkey-backed implementation of Next 16.3's `use cache` V2 `CacheHandler`.
  *
- * Behaviourally identical to Next's in-process default handler (`default.js`) — same tag
- * predicates, same stale/expire semantics — except the entry store AND the tag manifest live
- * in Valkey, shared across every pool replica. That sharing is the whole point: `updateTags`
- * on one replica invalidates `get` on all the others, which a per-process manifest (and
- * therefore Bun's no-op `refreshTags`) can never do.
+ * Behaviourally identical to Next's production default handler (`default.js`) — time-based
+ * revalidation is a synchronous miss, while a profiled tag invalidation can return a stale entry
+ * for background revalidation — except the entry store and tag manifest live in Valkey, shared
+ * across every pool replica. That sharing is the whole point: `updateTags` on one replica
+ * invalidates `get` on all the others, which a per-process manifest cannot do.
  *
  * All Valkey I/O is defensive: a connection failure degrades to a cache miss / no-op so a
  * cache outage never breaks rendering.
@@ -102,6 +172,19 @@ export class ValkeyCacheHandler implements CacheHandler {
   private readonly pendingSetWaitMs: number;
   /** In-process gate so a concurrent `get` waits for an in-flight `set` (interface contract). */
   private readonly pendingSets = new Map<string, Promise<void>>();
+  /** Cache Components decides whether work belongs to the static or runtime stage at an async-I/O
+   * boundary. A Valkey round trip inside `get` therefore changes rendered output even on a HIT.
+   * The bounded local front keeps reads microtask-fast after the pool has refreshed the shared tag
+   * manifest outside Next's render. A cold front deliberately reports a miss and warms in the
+   * background; recomputing once is correct, while moving static content into the runtime stage is
+   * not (cached-navigation fallback params then leak across client segment-cache entries). */
+  private readonly localEntries = new Map<string, LocalEntry>();
+  private localBytes = 0;
+  private manifestEpoch: string | undefined;
+  private backingAvailable = true;
+  private readonly warming = new Set<string>();
+  private writeGeneration = 0;
+  private readonly preparedInvocations = new AsyncLocalStorage<PreparedInvocation>();
 
   constructor(options: ValkeyCacheHandlerOptions) {
     this.client = options.client;
@@ -118,7 +201,214 @@ export class ValkeyCacheHandler implements CacheHandler {
     return `${this.prefix}entry:${cacheKey}`;
   }
 
-  async get(cacheKey: string, _softTags: string[]): Promise<CacheEntry | undefined> {
+  private clearLocalEntries(): void {
+    this.localEntries.clear();
+    this.localBytes = 0;
+  }
+
+  private localEntrySize(cacheKey: string, entry: LocalEntry): number {
+    let size = LOCAL_ENTRY_OVERHEAD_BYTES + Buffer.byteLength(cacheKey) + entry.value.byteLength;
+    for (const tag of entry.tags) size += Buffer.byteLength(tag) + 8;
+    for (const tag of entry.verifiedSoftTags) size += Buffer.byteLength(tag) + 8;
+    return size;
+  }
+
+  private removeLocalEntry(cacheKey: string): void {
+    const current = this.localEntries.get(cacheKey);
+    if (!current) return;
+    this.localEntries.delete(cacheKey);
+    this.localBytes -= this.localEntrySize(cacheKey, current);
+  }
+
+  private putLocalEntry(cacheKey: string, entry: LocalEntry): void {
+    const current = this.localEntries.get(cacheKey);
+    if (current && current.timestamp > entry.timestamp) return;
+    this.removeLocalEntry(cacheKey);
+    const entrySize = this.localEntrySize(cacheKey, entry);
+    if (entrySize > LOCAL_FRONT_MAX_BYTES) return;
+    this.localEntries.set(cacheKey, entry);
+    this.localBytes += entrySize;
+    while (
+      this.localBytes > LOCAL_FRONT_MAX_BYTES ||
+      this.localEntries.size > LOCAL_FRONT_MAX_ENTRIES
+    ) {
+      const oldest = this.localEntries.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.removeLocalEntry(oldest);
+    }
+  }
+
+  private readLocalEntry(cacheKey: string, softTags: string[]): CacheEntry | undefined {
+    const entry = this.localEntries.get(cacheKey);
+    if (!entry) return undefined;
+    // A cache key can be reused with different implicit path tags. Never transfer one backing
+    // read's tag verdict to another set: the new combination takes one safe miss and warms itself.
+    if (softTags.some((tag) => !entry.verifiedSoftTags.includes(tag))) return undefined;
+    // Tag freshness was checked when the entry was produced/warmed, and any later tag update
+    // changes the global epoch and clears the whole front before this callback runs. Only the
+    // entry's time lifetime remains to evaluate here.
+    const freshness = evaluateEntry({ ...entry, tags: [] }, EMPTY_MANIFEST, this.now());
+    if (freshness.state === "expired") {
+      this.removeLocalEntry(cacheKey);
+      return undefined;
+    }
+    // Map insertion order is the eviction order; refresh it on every hit.
+    this.localEntries.delete(cacheKey);
+    this.localEntries.set(cacheKey, entry);
+    return {
+      value: bufferToStream(entry.value),
+      tags: entry.tags,
+      stale: entry.stale,
+      timestamp: entry.timestamp,
+      expire: entry.expire,
+      revalidate: freshness.state === "fresh" ? freshness.revalidate : -1,
+    };
+  }
+
+  private warmLocalEntry(cacheKey: string, softTags: string[]): void {
+    const invocation = this.preparedInvocations.getStore();
+    if (
+      !invocation ||
+      invocation.epoch !== this.manifestEpoch ||
+      !this.backingAvailable ||
+      this.pendingSets.has(cacheKey) ||
+      this.warming.has(cacheKey) ||
+      this.warming.size >= LOCAL_FRONT_MAX_CONCURRENT_WARMS
+    ) {
+      return;
+    }
+    const epoch = invocation.epoch;
+    const writeGeneration = this.writeGeneration;
+    this.warming.add(cacheKey);
+    void this.readStored(cacheKey, softTags)
+      .then((read) => {
+        // A stale backing entry is useful to unprepared callers for SWR, but the staged front must
+        // not turn it fresh by dropping the per-tag manifest. The current request is already a
+        // miss and will regenerate it.
+        if (
+          !read ||
+          read.freshness.state !== "fresh" ||
+          this.manifestEpoch !== epoch ||
+          this.writeGeneration !== writeGeneration
+        ) {
+          return;
+        }
+        this.putLocalEntry(cacheKey, {
+          tags: read.meta.tags,
+          verifiedSoftTags: capTags(softTags),
+          stale: read.meta.stale,
+          timestamp: read.localTimestamp,
+          expire: read.meta.expire,
+          revalidate: read.freshness.revalidate,
+          value: read.value,
+        });
+      })
+      .catch((error) => {
+        logErrorRateLimited(
+          "use-cache-warm",
+          "[valkey-cache] `use cache` background warm failed; the current request already recomputed the entry",
+          error,
+        );
+      })
+      .finally(() => {
+        this.warming.delete(cacheKey);
+      });
+  }
+
+  /**
+   * Refresh the shared tag manifest before entering Next's render boundary.
+   *
+   * Next invokes `CacheHandler.get()` while deciding staged-render ownership. Even a successful
+   * network-backed read resolves too late and turns a static Cache Component into runtime data.
+   * The pool awaits this method before any cache-dependent fast path. It reads only the manifest's
+   * fixed-size epoch; `get` can then make the current request's decision from local state without
+   * I/O. Any tag update evicts the whole bounded front. The subsequent backing warm checks only
+   * the requested entry's explicit and implicit tags before admitting it to that front.
+   */
+  async prepareForInvocation(): Promise<PreparedUseCacheRunner> {
+    let preparedEpoch: string | undefined;
+    try {
+      const [rawEpoch] = await this.client.hmget(this.tagsKey, TAG_MANIFEST_EPOCH_FIELD);
+      const epoch = rawEpoch ?? "0";
+      if (!/^(?:0|[1-9]\d*)$/.test(epoch)) {
+        throw new Error("invalid Valkey tag-manifest epoch");
+      }
+      if (this.manifestEpoch !== undefined && epoch !== this.manifestEpoch) {
+        this.clearLocalEntries();
+      }
+      this.manifestEpoch = epoch;
+      preparedEpoch = epoch;
+      this.backingAvailable = true;
+    } catch (error) {
+      // Fail stale, not fresh: if the invalidation authority cannot be read, discard every local
+      // value and let this request recompute. The render still stays staged correctly because its
+      // subsequent `get` is an immediate local miss.
+      this.clearLocalEntries();
+      this.manifestEpoch = undefined;
+      this.backingAvailable = false;
+      logErrorRateLimited(
+        "use-cache-prepare",
+        "[valkey-cache] shared tag refresh failed before handler invocation; discarding local `use cache` entries",
+        error,
+      );
+    }
+    const invocation: PreparedInvocation = { epoch: preparedEpoch };
+    return <T>(callback: () => T): T => this.preparedInvocations.run(invocation, callback);
+  }
+
+  private async readStored(
+    cacheKey: string,
+    softTags: string[] = [],
+  ): Promise<StoredRead | undefined> {
+    const key = this.entryKey(cacheKey);
+    const data = await this.client.hgetallBuffer(key);
+    const metaBuf = data?.m;
+    if (!metaBuf) return undefined;
+    const value = data.v;
+    if (!value) return undefined;
+    const meta = parseStoredMeta(metaBuf.toString("utf8"));
+    if (!meta) return undefined;
+    const tags = [...meta.tags, ...softTags];
+    const manifest = await this.tagStates(tags);
+    const clock = await sampleValkeyClock(this.client, this.now);
+    const freshness = evaluateEntry({ ...meta, tags }, manifest, clock.serverNow);
+    if (freshness.state === "expired") {
+      // Keep the expired value until its bounded TTL or a writer replaces it. A blind DEL here
+      // can land after a concurrent HSET and remove the fresh replacement.
+      return undefined;
+    }
+    return {
+      meta,
+      localTimestamp: clock.toLocal(meta.timestamp),
+      value,
+      freshness,
+    };
+  }
+
+  private cacheEntry(read: StoredRead): CacheEntry {
+    return {
+      value: bufferToStream(read.value),
+      tags: read.meta.tags,
+      stale: read.meta.stale,
+      timestamp: read.localTimestamp,
+      expire: read.meta.expire,
+      revalidate: read.freshness.state === "fresh" ? read.freshness.revalidate : -1,
+    };
+  }
+
+  async get(cacheKey: string, softTags: string[]): Promise<CacheEntry | undefined> {
+    const invocation = this.preparedInvocations.getStore();
+    if (invocation) {
+      if (invocation.epoch !== this.manifestEpoch) return undefined;
+      const local = this.readLocalEntry(cacheKey, softTags);
+      if (local) return local;
+      // Do not await the backing store here. Cache Components observes that I/O boundary and
+      // moves an otherwise-static component into the runtime stage. The current request safely
+      // recomputes; the read warms a later request (and a concurrent `set` wins by timestamp).
+      this.warmLocalEntry(cacheKey, softTags);
+      return undefined;
+    }
+
     // Contract: if a `set` for this key is in flight on this replica, wait for it — but only
     // up to a bound (L10): a hung `set` must not block this render forever; the read simply
     // proceeds and misses, and Next regenerates.
@@ -136,33 +426,9 @@ export class ValkeyCacheHandler implements CacheHandler {
     }
 
     try {
-      const key = this.entryKey(cacheKey);
-      const data = await this.client.hgetallBuffer(key);
-      const metaBuf = data?.m;
-      if (!metaBuf) return undefined;
-      // A meta field without its value field is a corrupt/partially-written entry — treat it as
-      // a miss (L5). The old code synthesized an EMPTY body and served it as a valid fresh entry.
-      const valueBuf = data.v;
-      if (!valueBuf) return undefined;
-      const meta = parseStoredMeta(metaBuf.toString("utf8"));
-      if (!meta) return undefined; // corrupt meta → miss, never a fabricated entry (L5)
-
-      const now = this.now();
-      const manifest = await this.tagStates(meta.tags);
-      const freshness = evaluateEntry(meta, manifest, now);
-      if (freshness.state === "expired") {
-        this.client.del(key).catch(() => undefined);
-        return undefined;
-      }
-      const revalidate = freshness.state === "stale" ? -1 : freshness.revalidate;
-      return {
-        value: bufferToStream(valueBuf),
-        tags: meta.tags,
-        stale: meta.stale,
-        timestamp: meta.timestamp,
-        expire: meta.expire,
-        revalidate,
-      };
+      const read = await this.readStored(cacheKey, softTags);
+      if (!read) return undefined;
+      return this.cacheEntry(read);
     } catch (error) {
       // N81: fail open to a miss — but SAY SO. This catch was bare, so a PERMANENT read failure
       // (NOAUTH, WRONGTYPE, a cluster -MOVED, an exhausted breaker, an invalid URL) produced ZERO
@@ -178,16 +444,16 @@ export class ValkeyCacheHandler implements CacheHandler {
   }
 
   async set(cacheKey: string, pendingEntry: Promise<CacheEntry>): Promise<void> {
+    // A writer supersedes any local value and every in-flight backing warm. One coarse generation
+    // keeps that race bounded without retaining a per-key version map for attacker-chosen keys.
+    this.writeGeneration++;
+    this.removeLocalEntry(cacheKey);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
     this.pendingSets.set(cacheKey, gate);
     const key = this.entryKey(cacheKey);
-    // Tracks whether the MULTI/EXEC was dispatched: only then can a partially-applied write
-    // exist, and only then is the cleanup DEL warranted (a rejected entry promise must not
-    // delete a still-valid previously cached entry).
-    let writeAttempted = false;
     try {
       const entry = await pendingEntry;
       // H4: a NON-FINITE lifetime would produce a NaN/Infinity EXPIRE argument, which Valkey
@@ -215,15 +481,15 @@ export class ValkeyCacheHandler implements CacheHandler {
       if (entry.expire <= 0) return;
       const buf = await drainEntryValue(entry, maxCacheEntryBytes());
       if (buf === null) return; // partial/errored/over-cap stream → miss, don't cache
-      const meta: StoredMeta = {
+      const meta = {
+        timestamp: SERVER_TIMESTAMP_MARKER,
         // N5: cap the stored tag list like the incremental handler does — `entry.tags` was
         // stored verbatim, so an over-limit list bloated every entry meta and freshness HMGET.
         tags: capTags(entry.tags),
         stale: entry.stale,
-        timestamp: entry.timestamp,
         expire: entry.expire,
         revalidate: entry.revalidate,
-      };
+      } satisfies Omit<StoredMeta, "timestamp"> & { timestamp: string };
       // M7: Next hands INFINITE_CACHE-scale expires (~136 years) to this handler; cap the key
       // TTL at the same durable bound the incremental handler uses. A cold key is just a miss +
       // recompute — freshness logic is TTL-independent.
@@ -231,23 +497,21 @@ export class ValkeyCacheHandler implements CacheHandler {
         Math.max(entry.expire, entry.revalidate, 1) + RETENTION_MARGIN_SECONDS,
         DURABLE_TTL_SECONDS,
       );
-      writeAttempted = true;
-      const results = await this.client
-        .multi()
-        .hset(key, "m", JSON.stringify(meta), "v", buf)
-        .expire(key, Math.ceil(ttl))
-        .exec();
-      // H4: MULTI/EXEC is NOT all-or-nothing — a rejected command leaves the others applied
-      // (e.g. HSET succeeds, EXPIRE fails → a TTL-less key cached forever). The EXEC reply
-      // carries per-command errors as elements; inspect them and treat any failure as a failed
-      // write instead of assuming success.
-      const failure = results.find((result): result is RespError => result instanceof RespError);
-      if (failure) throw failure;
+      const clientNow = this.now();
+      const clamped = await this.client.eval(
+        STORE_USE_CACHE_ENTRY_SCRIPT,
+        1,
+        key,
+        JSON.stringify(meta),
+        buf,
+        String(Math.ceil(ttl)),
+        String(entry.timestamp),
+        String(clientNow),
+      );
+      warnOnClockSkewClamp(clamped);
     } catch (error) {
-      // A cache write failure must not break the response. If the write may have partially
-      // applied, best-effort DEL the key so a TTL-less partial entry can't live forever (the DEL
-      // itself may fail during an outage — bounded by the build-namespaced keyspace's lifetime).
-      if (writeAttempted) this.client.del(key).catch(() => undefined);
+      // The store script is atomic. A transport failure can be ambiguous after commit, so never
+      // issue a cleanup DEL that could race a later writer and remove its successful value.
       // N81: and it must be observable (see the matching comment in `get`). A rejected entry
       // promise (a failed render) lands here too, which is why this is rate-limited rather than
       // per-occurrence.
@@ -265,28 +529,29 @@ export class ValkeyCacheHandler implements CacheHandler {
   }
 
   async refreshTags(): Promise<void> {
-    // No-op: we read the shared tag manifest LIVE from Valkey on every `get`/`getExpiration`
-    // (below), so there is no per-process snapshot to refresh. This is deliberate — an earlier
-    // snapshot design let a replica that didn't handle a `revalidateTag` keep serving a stale
-    // in-process `use cache` memo, because its snapshot never saw the peer's invalidation
-    // (observed live: two pods diverged, one never picking up a revalidation). Reading live
-    // makes cross-replica revalidation immediate on every replica. A snapshot cache can return
-    // later as a "make it fast" optimization, but it must refresh from Valkey each request.
+    // Next calls this inside the render lifecycle, where Valkey I/O would change staged-render
+    // ownership. The pool performs the real refresh in `prepareForInvocation` before it enters
+    // Next. Direct consumers that do not use that preflight still read the manifest live in
+    // `get`/`getExpiration`, preserving the original fail-safe behavior.
   }
 
   async getExpiration(tags: string[]): Promise<Timestamp> {
+    // Next defines Infinity as "this handler already checked the implicit tags passed to get".
+    // That keeps the staged callback synchronous without weakening invalidation: a local entry is
+    // admitted only after those exact soft tags were checked, and every update bumps the epoch.
+    if (this.preparedInvocations.getStore()) return Number.POSITIVE_INFINITY;
     try {
       const manifest = await this.tagStates(tags);
-      return maxExpiration(tags, manifest);
+      const expiration = maxExpiration(tags, manifest);
+      if (expiration === 0) return 0;
+      const clock = await sampleValkeyClock(this.client, this.now);
+      return clock.toLocal(expiration);
     } catch (error) {
-      // L3: fail STALE, not fresh. Returning 0 ("never invalidated") would let revalidated
-      // entries keep serving during a transient manifest outage; returning the current time
-      // (`this.now()` — `Date.now` by default) makes Next treat affected entries as invalidated
-      // and regenerate, the same safe direction as `get` degrading to a miss. Logged
-      // (rate-limited) so the outage is observable without per-request log spam.
+      // Fail stale, not fresh: Next compares this local-domain value with locally returned entry
+      // timestamps. A manifest/clock outage therefore regenerates instead of serving invalid data.
       logErrorRateLimited(
         "getExpiration",
-        "[valkey-cache] getExpiration failed to read the tag manifest; treating entries as stale",
+        "[valkey-cache] getExpiration failed to read the shared clock/tag manifest; treating entries as stale",
         error,
       );
       return this.now();
@@ -298,6 +563,11 @@ export class ValkeyCacheHandler implements CacheHandler {
     // a real manifest field, and the EVAL argv must be bounded.
     const filtered = filterManifestTags(tags);
     if (filtered.length === 0) return;
+    // The cache-handler interface does not expose which implicit soft tags belong to a stored
+    // entry. Evicting the bounded front is the only sound immediate local invalidation; peers do
+    // the same on their next pre-invocation manifest refresh.
+    this.clearLocalEntries();
+    this.manifestEpoch = undefined;
     try {
       const now = this.now();
       // Apply each tag's new state atomically with LAST-EVENT-WINS semantics: the server-side
@@ -339,9 +609,30 @@ export class ValkeyCacheHandler implements CacheHandler {
   }
 
   /**
-   * Tag states for the given tags, read LIVE from the shared Valkey manifest (one `HMGET`).
-   * Reading live — rather than from a per-process snapshot — is what makes a `revalidateTag`
-   * on one replica immediately visible to every other replica's `get`/`getExpiration`.
+   * Whether any requested tag has shared invalidation state. This is called by the dispatcher's
+   * build-seed/PPR-shell gate before Next starts rendering, so a bounded per-request HMGET is safe.
+   * A read failure withholds the build artifact rather than serving a potentially stale shell.
+   */
+  async hasTagUpdates(tags: string[]): Promise<boolean> {
+    try {
+      const filtered = filterManifestTags(tags);
+      if (filtered.length === 0) return false;
+      const manifest = await this.tagStates(filtered);
+      return manifest.size > 0;
+    } catch (error) {
+      logErrorRateLimited(
+        "use-cache-shell-tags",
+        "[valkey-cache] failed to check build artifact tags; treating the seed or shell as stale",
+        error,
+      );
+      return true;
+    }
+  }
+
+  /**
+   * Tag states for an unprepared consumer, read live from the shared Valkey manifest.
+   * Production requests instead refresh the full manifest in `prepareForInvocation`, before
+   * entering Next's staged render, so their cache-handler callbacks never perform network I/O.
    */
   private async tagStates(tags: string[]): Promise<TagManifest> {
     if (tags.length === 0) return EMPTY_MANIFEST;

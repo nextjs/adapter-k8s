@@ -74,6 +74,8 @@ type StageOptions = {
   middlewareCoversEcho?: boolean;
   /** Assign `/echo-headers` to a sibling pool so the real index-to-proxy body seam is exercised. */
   crossPoolEcho?: boolean;
+  /** Declare only an edge output, without a middleware-manifest mapping for it. */
+  edgeOnlyWithoutMapping?: boolean;
 };
 
 function writeStagedDir(options: StageOptions = {}): Staged {
@@ -205,7 +207,7 @@ function writeStagedDir(options: StageOptions = {}): Staged {
   // The production basePath shape prefixes the manifest KEY and `pathname` but keeps Next's
   // unprefixed output id — see StageOptions.basePathKeys.
   const keyPrefix = options.basePathKeys ? "/base" : "";
-  const outputs: Record<string, unknown> = {
+  let outputs: Record<string, unknown> = {
     [`${keyPrefix}/ssr`]: {
       id: "/ssr",
       filePath: "handlers/ssr.mjs",
@@ -226,7 +228,19 @@ function writeStagedDir(options: StageOptions = {}): Staged {
       type: "PAGES_API",
     },
   };
-  const pathnames = ["/ssr", "/slow", "/big-image", "/echo-headers"];
+  let pathnames = ["/ssr", "/slow", "/big-image", "/echo-headers"];
+  if (options.edgeOnlyWithoutMapping) {
+    outputs = {
+      "/edge": {
+        id: "/edge",
+        filePath: "handlers/ssr.mjs",
+        pathname: "/edge",
+        type: "APP_ROUTE",
+        runtime: "edge",
+      },
+    };
+    pathnames = ["/edge"];
+  }
   if (options.appOwnsHealthz) {
     outputs["/healthz"] = {
       id: "/healthz",
@@ -307,6 +321,7 @@ const ENV_KEYS = [
   "RELEASE_NAME",
   "TRUST_INTERNAL_HEADERS",
   "INTERNAL_HEADER_SECRET",
+  "ADAPTER_K8S_DIST_DIR",
 ];
 
 /** Boot the real pool server against a staged dir; returns a teardown that fully undoes it. */
@@ -550,8 +565,8 @@ describe("pool-server request-boundary hardening", () => {
     it("publishes the loopback origin for self-forwarded requests (Server Action forwarding)", async () => {
       // next start sets __NEXT_PRIVATE_ORIGIN to its own URL (start-server.js) and action
       // forwarding fetches `${origin}${workerPathname}` — without it the pool fell back to
-      // the request's PUBLIC origin and hairpinned action POSTs through the whole edge
-      // (full-run v4: app-action forwarding, both runtimes, "<null>" results).
+      // the request's PUBLIC origin and hairpinned action POSTs through the whole edge.
+      // Authority preservation for that private hop is covered at the dispatch boundary.
       expect(process.env.__NEXT_PRIVATE_ORIGIN).toBe(`http://127.0.0.1:${pool.port}`);
     });
 
@@ -649,6 +664,22 @@ describe("N32: /readyz withholds traffic from a build whose route module cannot 
   it("and the app route it could not load does 500 — which is what the gate must catch", async () => {
     const res = await fetch(`http://localhost:${pool.port}/ssr`);
     expect(res.status).toBe(500);
+  });
+});
+
+describe("N32: /readyz withholds traffic from an unmapped edge-only build", () => {
+  let pool: Awaited<ReturnType<typeof boot>>;
+
+  beforeAll(async () => {
+    pool = await boot({ edgeOnlyWithoutMapping: true });
+  }, 60_000);
+  afterAll(async () => {
+    await pool.stop();
+  });
+
+  it("does not call manifest parsing sufficient proof that an edge route can execute", async () => {
+    expect((await fetch(`http://localhost:${pool.port}/healthz`)).status).toBe(200);
+    expect((await fetch(`http://localhost:${pool.port}/readyz`)).status).toBe(503);
   });
 });
 

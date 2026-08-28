@@ -166,7 +166,7 @@ import {
 export default createK8sAdapter({
   pools: {
     default: {
-      routes: ["appPages", "appRoutes", "pagesApi"],
+      routes: ["appPages", "appRoutes", "pagesApi", "pages"],
       scaling: { min: 2, max: 10, targetCPU: 70 },
     },
   },
@@ -180,6 +180,14 @@ export default createK8sAdapter({
       ingressSources: {
         cidrs: [],
         podSelectors: [
+          {
+            namespace: "envoy-gateway-system",
+            labels: {
+              "app.kubernetes.io/name": "envoy",
+              "gateway.envoyproxy.io/owning-gateway-name": "my-app-gateway",
+              "gateway.envoyproxy.io/owning-gateway-namespace": "default",
+            },
+          },
           {
             namespace: "envoy-gateway-system",
             labels: {
@@ -206,4 +214,4 @@ export default createK8sAdapter({
 }
 ```
 
-`containerRegistry` is mandatory for `deploy` (image tags cannot be formed without it). `projectId`/`region`/`gcsBucket` are GKE-only fields. The persisted `releaseName` is what read-only commands (doctor/describe/rollback/tail/destroy) target — keep it in sync with what was deployed.
+`containerRegistry` is mandatory for `deploy` (image tags cannot be formed without it). `projectId`/`region`/`gcsBucket` are GKE-only fields. Commands resolve the release from an explicit `--release-name`, then a digest-verified local composition plan, then this file, then the directory name. Keep the persisted value in sync with what was deployed.

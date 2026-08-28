@@ -27,7 +27,9 @@ import {
   templateOutputCandidates,
   trailingSlashVariants,
   type MiddlewareMatcher,
+  assertValidRoutingManifest,
 } from "../routing-common.js";
+import { resolveNextDistDir } from "../next-runtime/dist-dir.js";
 import { createHandlerLoader } from "./handler-loader.js";
 import { collectPublicPathnames } from "./public-files.js";
 import { restoreFetchCacheSeed } from "./fetch-cache-seed.js";
@@ -49,6 +51,7 @@ import {
 } from "./dispatch.js";
 import {
   parseDispatchDeadline,
+  parseDispatchExternalRewrite,
   parseDispatchHeaderMap,
   parseDispatchInvocationQuery,
   parseDispatchRouteMatches,
@@ -181,11 +184,10 @@ async function ensureNextNodeEnvironment(): Promise<void> {
 // states; only "failed" is not.
 type InstrumentationStatus = "ok" | "absent" | "registrar-missing" | "failed";
 
-async function registerInstrumentationHook(): Promise<InstrumentationStatus> {
-  // distDir is `.next` everywhere in the pool (staging, manifests, the edge sandbox);
-  // upstream passes a project-relative distDir here too.
-  const distDir = ".next";
-  const cwd = process.cwd();
+async function registerInstrumentationHook(
+  cwd: string,
+  distDir: string,
+): Promise<InstrumentationStatus> {
   // `ensureInstrumentationRegistered` already tolerates a missing hook, but checking first
   // keeps the "no instrumentation" case from depending on error-code sniffing at all.
   if (!existsSync(path.join(cwd, distDir, "server", "instrumentation.js"))) return "absent";
@@ -416,9 +418,14 @@ function createBufferedStream(body: Buffer | null): ReadableStream<Uint8Array> {
   });
 }
 
-function requestHeaders(req: IncomingMessage): Headers {
+export function requestHeaders(req: IncomingMessage): Headers {
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
+    // The authenticated dispatch vocabulary is parsed directly from req.headers before this
+    // point. It is private control metadata, not part of the application request. In particular,
+    // decoded UTF-8 output ids may contain code points that Web Headers correctly rejects when it
+    // is asked to reinterpret Node's request-header ByteStrings.
+    if ((INTERNAL_DISPATCH_HEADERS as readonly string[]).includes(key)) continue;
     if (typeof value === "string") headers.set(key, value);
     else if (Array.isArray(value)) value.forEach((entry) => headers.append(key, entry));
   }
@@ -708,7 +715,7 @@ function toAllowedSizes(values: unknown[]): number[] {
 // Read the app's image config (external-host allowlist + allowed sizes) from the build
 // output. Next.js writes the resolved config to .next/required-server-files.json. When it's
 // unavailable, external image fetches are denied by default and sizes fall back to defaults.
-function loadImageConfig(cwd: string): ImageConfig {
+function loadImageConfig(distDir: string): ImageConfig {
   const config: ImageConfig = {
     remotePatterns: [],
     domains: [],
@@ -723,7 +730,7 @@ function loadImageConfig(cwd: string): ImageConfig {
     minimumCacheTTL: DEFAULT_MINIMUM_CACHE_TTL,
   };
   try {
-    const rsfPath = path.join(cwd, ".next", "required-server-files.json");
+    const rsfPath = path.join(distDir, "required-server-files.json");
     if (existsSync(rsfPath)) {
       const rsf = JSON.parse(readFileSync(rsfPath, "utf-8"));
       const images = rsf?.config?.images ?? {};
@@ -1128,9 +1135,9 @@ function sendImageResponse(
 //     `next start`'s text/plain answer for subresources.
 // `next.config.partialPrefetching` from the resolved build config — see the dispatcher
 // option of the same name.
-function partialPrefetchingEnabled(cwd: string): boolean {
+function partialPrefetchingEnabled(distDir: string): boolean {
   try {
-    const rsfPath = path.join(cwd, ".next", "required-server-files.json");
+    const rsfPath = path.join(distDir, "required-server-files.json");
     if (!existsSync(rsfPath)) return false;
     const rsf = JSON.parse(readFileSync(rsfPath, "utf-8")) as {
       config?: { partialPrefetching?: boolean };
@@ -1141,9 +1148,9 @@ function partialPrefetchingEnabled(cwd: string): boolean {
   }
 }
 
-function notFoundIsPrerenderedBuild(cwd: string): boolean {
+function notFoundIsPrerenderedBuild(distDir: string): boolean {
   try {
-    const manifestPath = path.join(cwd, ".next", "prerender-manifest.json");
+    const manifestPath = path.join(distDir, "prerender-manifest.json");
     if (!existsSync(manifestPath)) return false;
     const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as {
       routes?: Record<string, unknown>;
@@ -1154,9 +1161,9 @@ function notFoundIsPrerenderedBuild(cwd: string): boolean {
   }
 }
 
-function hasRegisteredCacheHandler(cwd: string): boolean {
+function hasRegisteredCacheHandler(distDir: string): boolean {
   try {
-    const rsfPath = path.join(cwd, ".next", "required-server-files.json");
+    const rsfPath = path.join(distDir, "required-server-files.json");
     if (!existsSync(rsfPath)) return false;
     const rsf = JSON.parse(readFileSync(rsfPath, "utf-8"));
     return Boolean(rsf?.config?.cacheHandler);
@@ -1837,16 +1844,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     }
   }
 
-  const instrumentationStatus = await registerInstrumentationHook();
-
   const port = parseInt(process.env.PORT ?? "3000", 10);
   const releaseName = process.env.RELEASE_NAME ?? "nextjs";
   const configDir = process.env.CONFIG_DIR ?? "/config";
-
-  // The writable emptyDir at /app/.next/cache shadows anything the image ships there, so
-  // the build's fetch-cache rides at .k8s-adapter/fetch-cache-seed and is restored into
-  // the runtime location before anything can read it (see fetch-cache-seed.ts).
-  restoreFetchCacheSeed(process.cwd());
 
   // Load pool manifest (mounted as ConfigMap or baked into container)
   const poolManifestPath = path.join(configDir, `pool-manifest-${poolName}.json`);
@@ -1861,6 +1861,18 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     throw new Error(`Routing manifest not found: ${routingManifestPath}`);
   }
   const routingManifest: RoutingManifest = JSON.parse(readFileSync(routingManifestPath, "utf-8"));
+  assertValidRoutingManifest(routingManifest, routingManifestPath);
+  const runtimeDistDir = resolveNextDistDir(process.cwd(), routingManifest.distDir);
+  const distDir = runtimeDistDir.absolute;
+  // The bundled cache handler is constructed lazily after app modules load. Publish the validated
+  // relative directory before that happens so its build-seed lookup follows the same artifact.
+  process.env.ADAPTER_K8S_DIST_DIR = runtimeDistDir.relative;
+  // The writable cache emptyDir shadows the image's build seed at its runtime location.
+  restoreFetchCacheSeed(process.cwd(), distDir);
+  const instrumentationStatus = await registerInstrumentationHook(
+    process.cwd(),
+    runtimeDistDir.relative,
+  );
   const nextSupport = assertSupportedNextVersion(
     routingManifest.nextVersion,
     `Routing manifest at ${routingManifestPath}`,
@@ -1892,7 +1904,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     );
 
   // Allowlist for external /_next/image sources (SSRF guard).
-  const imageConfig = loadImageConfig(process.cwd());
+  const imageConfig = loadImageConfig(distDir);
 
   // A path-based assetPrefix (e.g. "/assets") prefixes `_next/static` URLs; strip it so those
   // requests are served/404'd like un-prefixed ones. (URL assetPrefixes point at a separate host,
@@ -1900,9 +1912,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   let assetPrefix = "";
   let webSocketAllowedOrigins: string[] = [];
   try {
-    const rsf = JSON.parse(
-      readFileSync(path.join(process.cwd(), ".next", "required-server-files.json"), "utf-8"),
-    );
+    const rsf = JSON.parse(readFileSync(path.join(distDir, "required-server-files.json"), "utf-8"));
     const ap = String(rsf?.config?.assetPrefix ?? "");
     if (ap.startsWith("/")) assetPrefix = ap.replace(/\/$/, "");
     const webSocketConfig = rsf?.config?.experimental?.webSocketRouteHandlers;
@@ -1928,7 +1938,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // a request matching such a route's regex but NOT in the prerendered set must
   // 404, mirroring `next start` — our loopback handler invocation doesn't
   // reproduce that check on its own.
-  const prerenderManifestPath = path.join(process.cwd(), ".next", "prerender-manifest.json");
+  const prerenderManifestPath = path.join(distDir, "prerender-manifest.json");
   const strictDynamicRoutes: { pageRegex: RegExp }[] = [];
   const runtimeStaticTemplates = new Set<string>();
   const prerenderedPaths = new Set<string>();
@@ -1978,20 +1988,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // Non-fatal — draft mode just won't work
     }
   }
-  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
-    console.log(
-      `[cache-trace] ${JSON.stringify({ op: "startup", runtimeStaticTemplates: [...runtimeStaticTemplates] })}`,
-    );
-  }
-
   // Load the middleware manifest — contains edge function names, files, and assets.
   // This is used by the edge sandbox to find the right _ENTRIES key.
-  const middlewareManifestPath = path.join(
-    process.cwd(),
-    ".next",
-    "server",
-    "middleware-manifest.json",
-  );
+  const middlewareManifestPath = path.join(distDir, "server", "middleware-manifest.json");
   const middlewareManifest: {
     middleware: Record<
       string,
@@ -2013,7 +2012,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
     | null = null;
   let edgeSandboxLoadError: Error | undefined;
-  const distDir = path.join(process.cwd(), ".next");
   try {
     const { createRequire: cr } = await import("node:module");
     const appReq = cr(path.join(process.cwd(), "package.json"));
@@ -2243,11 +2241,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           },
           edgeFunctionEntry: resolveEdgeEntryAssets(mwManifestEntry),
         });
-        // Keep the middleware invocation alive through after()/cache side effects. The routing
-        // verdict is already available, but returning before this promise settles lets a platform
-        // terminate the request context and lose the work. This is lifecycle ownership, not cache
-        // storage: Valkey remains the shared middle cache in production.
-        await result.waitUntil?.catch((error) => {
+        // The pod process, unlike a per-request isolate, outlives this response. Observe rejection
+        // without delaying the routing verdict, matching next start's middleware lifecycle.
+        void result.waitUntil?.catch((error) => {
           console.error("[pool-server] edge middleware background work failed:", error);
         });
         return result.response;
@@ -2290,25 +2286,26 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   let edgeRouteRunner:
     | ((params: any) => Promise<{ response: Response; waitUntil: Promise<void> }>)
     | null = null;
+  const lookupEdgeFunction = createEdgeFunctionLookup(middlewareManifest.functions);
+  const edgeFunctionForOutput = (name: string) => {
+    for (const candidate of [name, ...rscParentCandidates(name, getRscConfig(routingManifest))]) {
+      const base = candidate === "/" ? "" : candidate;
+      const entry =
+        lookupEdgeFunction(candidate) ??
+        lookupEdgeFunction(`${base}/page`) ??
+        lookupEdgeFunction(`${base}/route`);
+      if (entry) return entry;
+    }
+    return undefined;
+  };
   if (edgeSandboxRun && Object.keys(middlewareManifest.functions).length > 0) {
-    const lookupEdgeFunction = createEdgeFunctionLookup(middlewareManifest.functions);
-
     edgeRouteRunner = (params) => {
       // Look up the edge function in the manifest by pathname. Pages-router
       // entries are keyed by the bare pathname; app-router pages/route handlers
       // are keyed "<pathname>/page" / "<pathname>/route". RSC output ids
       // (.rsc / segment payloads) map to their parent page's edge function —
       // the rsc request headers drive flight-payload negotiation.
-      const rsc = getRscConfig(routingManifest);
-      let fnEntry;
-      for (const name of [params.name, ...rscParentCandidates(params.name, rsc)]) {
-        const base = name === "/" ? "" : name;
-        fnEntry =
-          lookupEdgeFunction(name) ??
-          lookupEdgeFunction(`${base}/page`) ??
-          lookupEdgeFunction(`${base}/route`);
-        if (fnEntry) break;
-      }
+      const fnEntry = edgeFunctionForOutput(params.name);
       if (!fnEntry) {
         throw new Error(`Edge function not found in middleware-manifest.json: ${params.name}`);
       }
@@ -2333,7 +2330,12 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     );
   }
 
-  const handlerLoader = createHandlerLoader(poolManifest);
+  const poolRscConfig = getRscConfig(routingManifest);
+  const handlerLoader = createHandlerLoader(
+    poolManifest,
+    undefined,
+    poolRscConfig ? { rscHeader: poolRscConfig.header } : undefined,
+  );
   // Middleware matchers (source regexp + has/missing) gate whether middleware runs — and,
   // downstream, whether a route is forced `no-cache` for the CDN. Read them from the ADAPTER's
   // routing manifest (built from the build's `outputs.middleware.config.matchers`), NOT Next's
@@ -2467,7 +2469,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // Build-pinned RSC negotiation config (header name + output suffixes). Hoisted so the N18
   // `_rsc` validation below reads the SAME header names the dispatcher negotiates on — an app
   // with a custom RSC header must not silently skip the check.
-  const poolRscConfig = getRscConfig(routingManifest);
   // N30 (SECURITY/CACHE): the pool's OWN PPR inventory, so the `no-store` verdict survives every
   // path that never sees the ext_proc tier's `x-nextjs-ppr` header. See createPprRouteMatcher.
   const isLocallyKnownPprRoute = createPprRouteMatcher({
@@ -2499,6 +2500,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // proof for the sibling pool, which derives this list from its copy of the same manifest.
     proofHeaderNames,
     basePath: routingManifest.basePath ?? "",
+    distDir,
     i18nLocales: (routingManifest.i18n as { locales?: string[] } | null)?.locales ?? [],
     // Build timestamp anchoring the ISR seed-freshness window. Newer adapters write it
     // into the routing manifest; read defensively — older manifests (and any build
@@ -2507,7 +2509,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     routeExecutionTimeouts: routingManifest.routeExecutionTimeouts,
     poolResponseHeadTimeouts: routingManifest.poolResponseHeadTimeouts,
     revalidate,
-    incrementalCacheShared: hasRegisteredCacheHandler(process.cwd()),
+    incrementalCacheShared: hasRegisteredCacheHandler(distDir),
     // NEXT_ENABLE_ADAPTER is set by Next's local deploy-test harness. That harness has neither
     // Cloud CDN nor Valkey, so let Next's built-in filesystem incremental cache stand in for the
     // platform PPR-shell cache and exercise shell upgrades/RDC end to end. Production deliberately
@@ -2523,19 +2525,17 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Cache-components builds prerender /_not-found; the deployed contract then serves that
     // prerender for subresource requests (not-found-non-document), while a dynamic app keeps
     // next start's text/plain (not-found-non-document-dynamic).
-    notFoundIsPrerendered: notFoundIsPrerenderedBuild(process.cwd()),
-    partialPrefetching: partialPrefetchingEnabled(process.cwd()),
+    notFoundIsPrerendered: notFoundIsPrerenderedBuild(distDir),
+    partialPrefetching: partialPrefetchingEnabled(distDir),
     ...(valkeyHandler
       ? {
-          checkShellStale: (tags: string[]) =>
-            valkeyHandler!.getExpiration(tags).then((e) => e > 0),
+          prepareUseCache: () => valkeyHandler.prepareForInvocation(),
+          checkShellStale: (tags: string[]) => valkeyHandler.hasTagUpdates(tags),
         }
       : {}),
-    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's own READ-ONLY view of
-    // the shared incremental cache. Reads go through the classic Valkey handler (get() owns
-    // tag staleness and falls back to the build seed via the SAME fs-mirror the registered
-    // in-app handler uses). Nothing writes through this interface — regeneration re-enters
-    // Next via the registered `revalidate()` and Next's own handler persists the entry.
+    // PPR MATERIALIZATION (see dispatch.ts platformCache): the pool's read view of the shared
+    // incremental cache. Reads own tag staleness and fall back to the build seed through the
+    // same fs-mirror as Next; ResponseCache writes through the registered handler.
     // Regeneration fires whenever the build has a preview identity (__NEXT_PREVIEW_MODE_ID,
     // loaded unconditionally from the prerender manifest at startup) — it is always-on, not
     // flag-gated.
@@ -2549,7 +2549,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // registered cacheHandler may spend the lock.
             read: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.getPeek(key, ctx ?? {}),
-            readStored: (key: string, ctx?: { kind?: string }) =>
+            readStored: (key: string, ctx?: { kind?: string; softTags?: string[] }) =>
               platformCacheHandler!.getStored(key, ctx ?? {}),
             readSeed: (key: string, ctx?: { kind?: string }) =>
               platformCacheHandler!.getSeed(key, ctx ?? {}),
@@ -2660,12 +2660,18 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     const extRouteMatchesField = parseDispatchRouteMatches(req.headers["x-route-matches"]);
     const extInvocationQueryField = parseDispatchInvocationQuery(req.headers["x-invoke-query"]);
     const extDeadlineField = parseDispatchDeadline(req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER]);
+    const extExternalRewriteField = parseDispatchExternalRewrite(
+      req.headers["x-external-rewrite-url"],
+    );
+    let extExternalRewrite = extExternalRewriteField.ok ? extExternalRewriteField.value : undefined;
+    delete req.headers["x-external-rewrite-url"];
     const extDispatchMetadataValid =
       extResolvedHeadersField.ok &&
       extMwRequestHeadersField.ok &&
       extRouteMatchesField.ok &&
       extInvocationQueryField.ok &&
-      extDeadlineField.ok;
+      extDeadlineField.ok &&
+      extExternalRewriteField.ok;
 
     // The explicit app-owned cache-control for this request, if any: from the routing
     // extension's resolved verdict (Phase 2, above) or from local resolution (Phase 1
@@ -2820,7 +2826,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // reachable under emulate/local dev against a working tree (a malicious postinstall,
       // a committed symlink). resolveWithinRoot's realpath re-check closes exactly that.
       const filePath = resolveWithinRoot(
-        path.join(process.cwd(), ".next", "static"),
+        path.join(distDir, "static"),
         staticPathname.slice("/_next/static/".length),
       );
       if (filePath && existsSync(filePath)) {
@@ -2925,7 +2931,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // Containment is re-asserted at the point of consumption even though WHATWG URL
         // normalization already collapses `..`/`%2e%2e` and never decodes `%2f`.
         const filePath = dataPath.endsWith(".json")
-          ? resolveWithinRoot(path.join(process.cwd(), ".next", "server", "pages"), dataPath)
+          ? resolveWithinRoot(path.join(distDir, "server", "pages"), dataPath)
           : null;
         // Draft mode bypasses the static serve (survey Tier 1 #2): an AUTHENTICATED
         // `__prerender_bypass` cookie (validated constant-time against the build's
@@ -3045,6 +3051,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // the wrapper it feeds is already installed above.
       extResolvedHeaders = undefined;
       extMwRequestHeaders = undefined;
+      extExternalRewrite = undefined;
       appCacheControl = null;
     }
 
@@ -3085,8 +3092,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     const upstreamInvokePath = req.headers["x-invoke-path"];
     const upstreamRewrotePlatform =
       upstreamAlreadyResolved &&
-      typeof upstreamInvokePath === "string" &&
-      !targetsSamePlatformUrl(upstreamInvokePath, url);
+      (extExternalRewrite !== undefined ||
+        (typeof upstreamInvokePath === "string" &&
+          !targetsSamePlatformUrl(upstreamInvokePath, url)));
     const shouldHandleImage = isImageRequest && !upstreamRewrotePlatform;
 
     // Next routing runs before the optimizer for every method. Redirects, middleware-authored
@@ -3212,7 +3220,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
               ? `${basePath}${decodedImagePath}`
               : decodedImagePath;
           const publicRoot = path.join(process.cwd(), "public");
-          const staticRoot = path.join(process.cwd(), ".next", "static");
+          const staticRoot = path.join(distDir, "static");
           const publicFile = resolveWithinRoot(publicRoot, filesystemImagePath);
           const staticFile = filesystemImagePath.startsWith("/_next/static/")
             ? resolveWithinRoot(staticRoot, filesystemImagePath.slice("/_next/static/".length))
@@ -3696,7 +3704,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Phase 1 below so the pool evaluates middleware itself. Both headers are secret-gated
     // (untrusted ones were already stripped in server.ts), so this can't be forged.
     if (
-      extOutputId &&
+      (extOutputId || extExternalRewrite) &&
       extMwEvaluated &&
       MW_EVALUATED_TRUSTED.has(extMwEvaluated) &&
       extDispatchMetadataValid
@@ -3709,6 +3717,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // static-assets.json would turn the file into a 404 (dispatch has already written
       // its verdict by the time it misses, so this check must come first).
       if (
+        extOutputId &&
         !handlerLoader.has(extOutputId) &&
         !staticManifestCovers(extOutputId) &&
         servePublicFileFromDisk(req, res, extOutputId, extResolvedHeaders, buildId)
@@ -3741,10 +3750,20 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // the pool passes what handlers need through requestMeta instead.
       for (const h of INTERNAL_DISPATCH_HEADERS) delete req.headers[h];
 
+      if (extExternalRewrite) {
+        await dispatcher.dispatch(req, res, {
+          kind: "external-rewrite",
+          url: extExternalRewrite,
+          resolvedHeaders: extResolvedHeaders,
+          middlewareRequestHeaders: extMwRequestHeaders,
+        });
+        return;
+      }
+
       await dispatcher.dispatch(req, res, {
         kind: "route",
         pool,
-        matchedPathname: extOutputId, // Use outputId/pathname from header
+        matchedPathname: extOutputId!, // guarded above; external rewrites returned separately
         routeMatches,
         resolvedHeaders: extResolvedHeaders,
         // N40: the same field Phase 1 populates, so dispatch.ts's existing "apply middleware's
@@ -3766,6 +3785,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // must not retain its Cache-Control slot while local resolution owns the response.
     extResolvedHeaders = undefined;
     extMwRequestHeaders = undefined;
+    extExternalRewrite = undefined;
     appCacheControl = null;
     // The
     // dispatch vocabulary is unusable here by construction. S22 deleted it only inside the
@@ -3861,6 +3881,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           webSocketRegistryScope,
           webSocketAllowedOrigins,
           parseWebSocketExtensions,
+          ...(valkeyHandler ? { prepareUseCache: () => valkeyHandler.prepareForInvocation() } : {}),
           handshakeTimeoutMs: REQUEST_HEAD_TIMEOUT_MS,
         },
         req,
@@ -3878,45 +3899,53 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
 
   await server.start();
 
-  // Verify a route module loads. Deliberately AFTER listen: the pod must answer /healthz (so the
-  // kubelet's liveness probe does not restart it mid-verification) while /readyz withholds
-  // traffic. Only NODE outputs are candidates — an edge output's module registers itself in the
-  // process-global `_ENTRIES`, and loading one at boot would change which entry the
-  // handler-loader's single-entry fallback resolves. The load is cached, so the first real
-  // request reuses it.
+  // Verify the executable path after listen. The pod answers liveness during this work while
+  // readiness withholds traffic. Node imports are cached. Edge modules must not be imported into
+  // the Node graph, but every edge output must map to staged files in a live sandbox.
   // Entries, not values: the handler-loader keys strictly on the MANIFEST KEY, and under a
   // basePath the key ("/base/ssr") differs from Next's output id ("/ssr"). Probing by `.id`
   // meant NO basePath build could ever load its probe ("Unknown output ID"), /readyz sat 503,
   // and the blue/green gate timed out every basePath rollout — the full run's entire
   // ~20-suite basePath cluster was this one lookup.
-  const verifiableOutputs = Object.entries(poolManifest.outputs).filter(
+  const nodeOutputs = Object.entries(poolManifest.outputs).filter(
     ([, output]) => output.runtime !== "edge",
+  );
+  const edgeOutputs = Object.entries(poolManifest.outputs).filter(
+    ([, output]) => output.runtime === "edge",
   );
   if (instrumentationStatus === "failed") {
     console.error(
       "[pool-server] NOT READY: instrumentation register() failed — /readyz will report 503 " +
         "so the blue/green gate cannot promote this build (app routes would 500)",
     );
-  } else if (verifiableOutputs.length === 0) {
-    // A pool with no Node outputs (pure static, or edge-only) has no module to prove; the
-    // manifests loaded and the handler loader is initialised, which is all "serving" can mean.
-    routeModulesVerified = true;
-    readinessReason = "no node route modules to verify (manifests loaded)";
-    console.log(`[pool-server] READY: ${readinessReason}`);
   } else {
-    const [probeKey] = verifiableOutputs[0]!;
     try {
-      await handlerLoader.load(probeKey);
+      const [nodeProbe] = nodeOutputs[0] ?? [];
+      if (nodeProbe) await handlerLoader.load(nodeProbe);
+      if (edgeOutputs.length > 0 && !edgeSandboxRun) {
+        throw new Error(
+          `edge sandbox unavailable${edgeSandboxLoadError ? `: ${edgeSandboxLoadError.message}` : ""}`,
+        );
+      }
+      for (const [key, output] of edgeOutputs) {
+        const candidates = [...new Set([key, output.id, output.pathname])];
+        const entry = candidates.map(edgeFunctionForOutput).find(Boolean);
+        if (!entry) throw new Error(`no middleware-manifest function maps edge output ${key}`);
+        const missingFile = entry.files.find((file) => !existsSync(path.resolve(distDir, file)));
+        if (missingFile) {
+          throw new Error(`edge output ${key} is missing staged file ${missingFile}`);
+        }
+      }
       routeModulesVerified = true;
-      readinessReason = `route module loaded (${probeKey})`;
+      readinessReason = nodeProbe
+        ? `route module loaded (${nodeProbe}); ${edgeOutputs.length} edge output(s) mapped`
+        : edgeOutputs.length > 0
+          ? `${edgeOutputs.length} edge output(s) mapped to the sandbox`
+          : "no executable route modules to verify (static-only pool)";
       console.log(`[pool-server] READY: ${readinessReason}`);
     } catch (err) {
-      readinessReason = `route module ${probeKey} failed to load`;
-      console.error(
-        `[pool-server] NOT READY: ${readinessReason} — /readyz will report 503. ` +
-          `Every request for this pool's routes would 500:`,
-        err,
-      );
+      readinessReason = "serving output verification failed";
+      console.error(`[pool-server] NOT READY: ${readinessReason} — /readyz will report 503:`, err);
     }
   }
 

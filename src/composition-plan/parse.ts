@@ -1,9 +1,11 @@
 import {
+  assertSafeAnnotationName,
   assertSafeBucketName,
   assertSafeBuildId,
   assertSafeCidr,
   assertSafeGcpResourceName,
   assertSafeImageRegistry,
+  assertSafeKubernetesObjectName,
   assertSafeNamespace,
   assertSafePoolName,
   assertSafeProjectId,
@@ -50,9 +52,8 @@ import {
 type JsonObject = Record<string, unknown>;
 
 const DIGEST_RE = /^sha256:[a-f0-9]{64}$/;
-const API_VERSION_RE = /^(?:[a-z0-9]([-a-z0-9.]*[a-z0-9])?\/)?v[0-9][a-z0-9]*$/;
+const KUBERNETES_VERSION_RE = /^v[0-9][a-z0-9]*$/;
 const RESOURCE_RE = /^[a-z][a-z0-9-]{0,62}$/;
-const DNS_SUBDOMAIN_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
 const SERVICE_ACCOUNT_EMAIL_RE =
   /^[a-z][a-z0-9-]{0,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/;
 const TELEMETRY_ID_RE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/;
@@ -137,6 +138,18 @@ function validated(value: unknown, path: string, check: (candidate: string) => v
     fail(path, error instanceof Error ? error.message : String(error));
   }
   return parsed;
+}
+
+function assertSafeApiVersion(apiVersion: string): void {
+  const parts = apiVersion.split("/");
+  if (parts.length === 2) {
+    assertSafeKubernetesObjectName(parts[0], "Kubernetes API group");
+  } else if (parts.length !== 1) {
+    throw new Error("invalid Kubernetes apiVersion");
+  }
+  if (!KUBERNETES_VERSION_RE.test(parts.at(-1)!)) {
+    throw new Error("invalid Kubernetes apiVersion");
+  }
 }
 
 function optionalString(
@@ -413,12 +426,14 @@ function parseCdn(value: unknown, path: string): CdnInvalidation {
 function parseKubernetesObjectRef(value: unknown, path: string): KubernetesObjectRef {
   const parsed = object(value, path);
   exactKeys(parsed, ["apiVersion", "resource", "name", "namespace"], path);
-  const apiVersion = string(parsed.apiVersion, `${path}.apiVersion`);
-  if (!API_VERSION_RE.test(apiVersion)) fail(`${path}.apiVersion`, "invalid Kubernetes apiVersion");
+  const apiVersion = validated(parsed.apiVersion, `${path}.apiVersion`, assertSafeApiVersion);
   const resource = string(parsed.resource, `${path}.resource`);
   if (!RESOURCE_RE.test(resource)) fail(`${path}.resource`, "invalid Kubernetes resource name");
-  const name = string(parsed.name, `${path}.name`);
-  if (!DNS_SUBDOMAIN_RE.test(name)) fail(`${path}.name`, "invalid Kubernetes object name");
+  const name = validated(parsed.name, `${path}.name`, (candidate) => {
+    if (apiVersion === "v1" && resource === "services") assertSafeServiceName(candidate);
+    else if (apiVersion === "v1" && resource === "namespaces") assertSafeNamespace(candidate);
+    else assertSafeKubernetesObjectName(candidate);
+  });
   const namespace = optionalString(parsed, "namespace", path, assertSafeNamespace);
   return { apiVersion, resource, name, ...(namespace ? { namespace } : {}) };
 }
@@ -937,8 +952,7 @@ function parseLog(value: unknown, path: string): LogSource {
 function parseKubernetesRequirement(value: unknown, path: string): KubernetesApiRequirement {
   const parsed = object(value, path);
   exactKeys(parsed, ["apiVersion", "resource", "optional"], path);
-  const apiVersion = string(parsed.apiVersion, `${path}.apiVersion`);
-  if (!API_VERSION_RE.test(apiVersion)) fail(`${path}.apiVersion`, "invalid Kubernetes apiVersion");
+  const apiVersion = validated(parsed.apiVersion, `${path}.apiVersion`, assertSafeApiVersion);
   const resource = string(parsed.resource, `${path}.resource`);
   if (!RESOURCE_RE.test(resource)) fail(`${path}.resource`, "invalid Kubernetes resource name");
   if (typeof parsed.optional !== "boolean") fail(`${path}.optional`, "expected a boolean");
@@ -964,14 +978,40 @@ function parseKubernetesJson(value: unknown, path: string, depth = 0): Kubernete
   return result;
 }
 
-function parseStringMap(value: unknown, path: string): Record<string, string> {
+function parseKubernetesMetadataMap(
+  value: unknown,
+  path: string,
+  kind: "labels" | "annotations",
+): Record<string, string> {
   const parsed = object(value, path);
   const result: Record<string, string> = {};
   for (const [key, entry] of Object.entries(parsed)) {
-    if (!isSafeMapKey(key) || typeof entry !== "string") {
-      fail(path, "expected printable string keys and string values");
+    try {
+      assertSafeAnnotationName(key);
+    } catch (error) {
+      fail(`${path}.${key}`, error instanceof Error ? error.message : String(error));
     }
-    result[key] = safeText(entry, `${path}.${key}`, 4096);
+    if (typeof entry !== "string") {
+      fail(`${path}.${key}`, "expected a string value");
+    }
+    if (
+      kind === "labels" &&
+      (entry.length > 63 ||
+        (entry.length > 0 && !/^[A-Za-z0-9](?:[-A-Za-z0-9_.]*[A-Za-z0-9])?$/.test(entry)))
+    ) {
+      fail(`${path}.${key}`, "expected a Kubernetes label value");
+    }
+    if (
+      kind === "annotations" &&
+      (entry.length > 4096 ||
+        [...entry].some((character) => {
+          const codePoint = character.codePointAt(0)!;
+          return codePoint <= 0x1f || codePoint === 0x7f;
+        }))
+    ) {
+      fail(`${path}.${key}`, "expected at most 4096 printable characters");
+    }
+    result[key] = entry;
   }
   return result;
 }
@@ -1159,22 +1199,10 @@ function parseTelemetrySource(value: unknown, path: string): TelemetrySource {
   };
 }
 
-function isSafeMapKey(value: string): boolean {
-  return (
-    value.length > 0 &&
-    value.length <= 253 &&
-    ![...value].some((character) => {
-      const codePoint = character.codePointAt(0)!;
-      return codePoint <= 0x1f || codePoint === 0x7f;
-    })
-  );
-}
-
 function parseKubernetesManifest(value: unknown, path: string): KubernetesManifest {
   const parsed = object(value, path);
   exactKeys(parsed, ["apiVersion", "kind", "resource", "metadata", "body"], path);
-  const apiVersion = string(parsed.apiVersion, `${path}.apiVersion`);
-  if (!API_VERSION_RE.test(apiVersion)) fail(`${path}.apiVersion`, "invalid Kubernetes apiVersion");
+  const apiVersion = validated(parsed.apiVersion, `${path}.apiVersion`, assertSafeApiVersion);
   const kind = safeText(parsed.kind, `${path}.kind`, 63);
   if (!/^[A-Z][A-Za-z0-9]*$/.test(kind)) fail(`${path}.kind`, "invalid Kubernetes kind");
   if (kind === "Secret") {
@@ -1184,14 +1212,21 @@ function parseKubernetesManifest(value: unknown, path: string): KubernetesManife
   if (!RESOURCE_RE.test(resource)) fail(`${path}.resource`, "invalid Kubernetes resource name");
   const metadata = object(parsed.metadata, `${path}.metadata`);
   exactKeys(metadata, ["name", "namespace", "labels", "annotations"], `${path}.metadata`);
-  const name = string(metadata.name, `${path}.metadata.name`);
-  if (!DNS_SUBDOMAIN_RE.test(name)) fail(`${path}.metadata.name`, "invalid Kubernetes object name");
+  const name = validated(metadata.name, `${path}.metadata.name`, (candidate) => {
+    if (apiVersion === "v1" && kind === "Service") assertSafeServiceName(candidate);
+    else if (apiVersion === "v1" && kind === "Namespace") assertSafeNamespace(candidate);
+    else assertSafeKubernetesObjectName(candidate);
+  });
   const namespace = optionalString(metadata, "namespace", `${path}.metadata`, assertSafeNamespace);
   const labels = Object.hasOwn(metadata, "labels")
-    ? parseStringMap(metadata.labels, `${path}.metadata.labels`)
+    ? parseKubernetesMetadataMap(metadata.labels, `${path}.metadata.labels`, "labels")
     : undefined;
   const annotations = Object.hasOwn(metadata, "annotations")
-    ? parseStringMap(metadata.annotations, `${path}.metadata.annotations`)
+    ? parseKubernetesMetadataMap(
+        metadata.annotations,
+        `${path}.metadata.annotations`,
+        "annotations",
+      )
     : undefined;
   const body = Object.hasOwn(parsed, "body")
     ? (parseKubernetesJson(parsed.body, `${path}.body`) as Record<string, KubernetesJsonValue>)

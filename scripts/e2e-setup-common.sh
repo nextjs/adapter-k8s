@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# SHARED E2E deploy SETUP — sourced by both topologies:
-#   scripts/e2e-deploy.sh              Phase 1: pool server only
-#   scripts/e2e-integration-deploy.sh  Phase 2: Envoy -> ext_proc -> pool
+# SHARED E2E deploy SETUP — sourced by both active deploy topologies:
+#   scripts/e2e-deploy.sh          local pool-server topology
+#   scripts/e2e-cluster-deploy.sh  Kubernetes topology (local k3d or configured cluster)
 #
 # Everything up to "start the tiers" lives here: packing the adapter once,
 # normalizing the temp app's package manager, installing, building, and staging
-# the pool config. The two scripts then start their own tiers and print the URL.
+# the pool config. The callers then start or deploy their own tiers and print the URL.
 #
-# WHY SHARED: these were copies, and the integration copy rotted. It never gained
-# the ADAPTER_K8S_PREBUILT_TARBALL fast path (so it re-packed the adapter on EVERY
-# deploy behind a serializing lock) nor the e2e-package-manager prep (so `npm install`
-# in a pnpm fixture left `next` unresolvable and EVERY suite failed at setup with
-# "We couldn't find the Next.js package"). Measured 2026-07-28: 85/85 suites failed
-# before running a single assertion. One copy of this logic, so Phase 2 cannot
-# silently drift behind Phase 1 again.
+# WHY SHARED: copied setup logic had drifted before, including missing the prebuilt-tarball
+# fast path and package-manager normalization. One implementation keeps local and cluster
+# deploys on the same package, install, and build contract.
 #
 # Contract (from nextjs.org/docs/.../adapterPath#testing-adapters):
 # - cwd is set to the isolated test app by the harness
@@ -25,10 +21,12 @@ set -euo pipefail
 
 ADAPTER_DIR="${ADAPTER_DIR:?ADAPTER_DIR must be set}"
 ADAPTER_DIR="$(cd "$ADAPTER_DIR" && pwd -P)"
+E2E_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./e2e-lock.sh
+source "${E2E_SCRIPT_DIR}/e2e-lock.sh"
 TEST_DIR="$PWD"
 ADAPTER_DIST_INDEX="${ADAPTER_DIR}/dist/index.js"
 ADAPTER_PACK_LOCK_DIR="${ADAPTER_DIR}/.e2e-deploy-pack.lock"
-ADAPTER_PACK_LOCK_OWNER="${ADAPTER_PACK_LOCK_DIR}/owner"
 ADAPTER_PACKAGE_NAME="@next-community/adapter-k8s"
 ADAPTER_PACK_DIR=""
 BUILD_CPUS="${ADAPTER_K8S_BUILD_CPUS:-4}"
@@ -39,8 +37,7 @@ DEPLOY_LOG=".adapter-deploy.log"
 
 cleanup_adapter_pack_lock() {
   if [ "$adapter_pack_lock_acquired" -eq 1 ]; then
-    rm -f "$ADAPTER_PACK_LOCK_OWNER"
-    rmdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || true
+    e2e_lock_release "$ADAPTER_PACK_LOCK_DIR"
     adapter_pack_lock_acquired=0
   fi
 }
@@ -96,43 +93,13 @@ if [ -n "${ADAPTER_K8S_PREBUILT_TARBALL:-}" ]; then
 else
   # Slow path: build + pack per deploy. Multiple deploy tests can share the same
   # adapter checkout. Serialize build + pack access so tarball creation sees a
-  # consistent dist/ tree. Record the lock owner so an interrupted full-suite run
-  # cannot poison every later deployment. A legitimate adapter build can take
-  # longer than 30 seconds under c=4, so wait up to ten minutes for a live owner.
-  for _attempt in $(seq 1 6000); do
-    if mkdir "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null; then
-      printf '%s\n' "$$" > "$ADAPTER_PACK_LOCK_OWNER"
-      adapter_pack_lock_acquired=1
-      break
-    fi
-
-    lock_owner="$(cat "$ADAPTER_PACK_LOCK_OWNER" 2>/dev/null || true)"
-    if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
-      # Rename first: only one waiter can claim and remove this abandoned lock,
-      # and no waiter can delete a newly acquired lock by mistake.
-      stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
-      if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
-        rm -rf "$stale_lock"
-      fi
-    elif [ -z "$lock_owner" ]; then
-      # Older harness versions created ownerless locks. Only reclaim one after it
-      # has remained untouched long enough that its creator cannot still be in
-      # the mkdir-to-owner-file window.
-      lock_age="$(( $(date +%s) - $(stat -c %Y "$ADAPTER_PACK_LOCK_DIR" 2>/dev/null || date +%s) ))"
-      if [ "$lock_age" -ge 60 ]; then
-        stale_lock="${ADAPTER_PACK_LOCK_DIR}.stale.$$.$_attempt"
-        if mv "$ADAPTER_PACK_LOCK_DIR" "$stale_lock" 2>/dev/null; then
-          rm -rf "$stale_lock"
-        fi
-      fi
-    fi
-    sleep 0.1
-  done
-
-  if [ "$adapter_pack_lock_acquired" -ne 1 ]; then
+  # consistent dist/ tree. A legitimate adapter build can take longer than 30 seconds
+  # under c=4, so wait up to ten minutes for a live owner.
+  if ! e2e_lock_acquire "$ADAPTER_PACK_LOCK_DIR" 600 60; then
     echo "Timed out waiting for adapter pack lock: ${ADAPTER_PACK_LOCK_DIR}" >&2
     exit 1
   fi
+  adapter_pack_lock_acquired=1
 
   echo "[adapter-k8s] Building adapter package..." >&2
   (
@@ -231,7 +198,7 @@ fi
 ADAPTER_INSTALL_DIR="${PWD}/node_modules/@next-community/adapter-k8s"
 NEXT_ADAPTER_PATH_LOCAL="${ADAPTER_INSTALL_DIR}/dist/index.js"
 POOL_SERVER_CJS_LOCAL="${ADAPTER_INSTALL_DIR}/dist/pool-server.cjs"
-# Phase 2 runs this tier too; both come from the INSTALLED package so the suite exercises
+# Cluster deploys run this tier too; both come from the INSTALLED package so the suite exercises
 # the packed artifact rather than the working-tree dist.
 ROUTING_SERVICE_CJS_LOCAL="${ADAPTER_INSTALL_DIR}/dist/routing-service.cjs"
 

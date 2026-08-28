@@ -22,6 +22,8 @@ export interface NodeMiddlewareInvocationOptions {
   method: string;
   requestBody: ReadableStream<Uint8Array>;
   nextConfig: Record<string, unknown>;
+  /** Absolute Next build directory for generated middleware instrumentation registration. */
+  distDir: string;
   signal?: AbortSignal | null;
   getCloneableBody?: ((readable: unknown) => unknown) | null;
   logBackgroundError(error: unknown): void;
@@ -132,13 +134,14 @@ export async function invokeNodeMiddleware(
   const entrypoint = detectNodeMiddlewareEntrypoint(module);
   if (entrypoint.kind === "unsupported") return entrypoint;
 
-  const pendingWaitUntil: Promise<void>[] = [];
+  const observedWaitUntil = new Set<PromiseLike<unknown>>();
+  const observeWaitUntil = (waitable: PromiseLike<unknown>) => {
+    if (observedWaitUntil.has(waitable)) return;
+    observedWaitUntil.add(waitable);
+    void Promise.resolve(waitable).catch(options.logBackgroundError);
+  };
   const waitUntil = (waitable: Promise<unknown>) => {
-    pendingWaitUntil.push(
-      Promise.resolve(waitable)
-        .then(() => undefined)
-        .catch(options.logBackgroundError),
-    );
+    observeWaitUntil(waitable);
   };
 
   let result: unknown;
@@ -146,7 +149,7 @@ export async function invokeNodeMiddleware(
     case "generated":
       result = await entrypoint.invoke(new Request(options.url, requestInit(options)), {
         waitUntil,
-        requestMeta: { relativeProjectDir: "." },
+        requestMeta: { relativeProjectDir: ".", distDir: options.distDir },
         ...(options.signal ? { signal: options.signal } : {}),
       });
       break;
@@ -205,8 +208,7 @@ export async function invokeNodeMiddleware(
   }
 
   const returnedWaitUntil = waitUntilFrom(result);
-  if (returnedWaitUntil) await returnedWaitUntil;
-  await Promise.all(pendingWaitUntil);
+  if (returnedWaitUntil) observeWaitUntil(returnedWaitUntil);
 
   // A direct raw userland proxy may return undefined to mean `NextResponse.next()`. The generated
   // and adapter wrappers normalize that into an x-middleware-next Response themselves; this

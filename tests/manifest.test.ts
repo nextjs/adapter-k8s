@@ -502,6 +502,7 @@ describe("buildRoutingManifest", () => {
           distDir,
         });
         expect(manifest.builtAt).toBe(past.toISOString());
+        expect(manifest.distDir).toBe("build");
       } finally {
         rmSync(projectDir, { recursive: true, force: true });
       }

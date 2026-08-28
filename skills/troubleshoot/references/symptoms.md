@@ -18,7 +18,7 @@ kubectl logs <pod> -n <ns> --tail=50
 
 ## Image pull and platform
 
-**ImagePullBackOff — digest not in registry.** Digest resolution is registry-first because podman rewrites manifests on push: the local digest can differ from what the registry stored, and deploying the local value yields ImagePullBackOff (observed live: podman said `e04a0a5b…`, the registry held `27fa476b…`). Deploy resolves from the registry; `--allow-mutable-tags` deploys by tag instead and is not recommended (it also skips NetworkPolicies).
+**ImagePullBackOff — digest not in registry.** Digest resolution is registry-first because podman rewrites manifests on push: the local digest can differ from what the registry stored, and deploying the local value yields ImagePullBackOff (observed live: podman said `e04a0a5b…`, the registry held `27fa476b…`). Deploy resolves from the registry; `--allow-mutable-tags` deploys unresolved images by tag instead and is not recommended.
 
 **ImagePullBackOff — 403 against Artifact Registry.** Two known causes:
 
@@ -61,7 +61,7 @@ Common causes, verbatim from the deploy error: the GatewayClass controller is no
 
 **Fail-closed is expected.** With the routing service scaled to zero, requests return 500 rather than serving with middleware skipped (`routingService.failureMode: "auto"` fails closed whenever the app has middleware). A wall of 500s with healthy pools means the routing tier is down, not the app.
 
-**Every request 500s (`ext_proc_error_gRPC_error_14`) after overriding `ingressSources`.** Observed live on Envoy Gateway 1.8.3: a hand-written `ingressSources` podSelector admitted only the `gateway.envoyproxy.io/owning-gatewayclass` label. Non-merged Envoy proxy pods carry the `owning-gateway-name`/`owning-gateway-namespace` pair and **not** the class label (identical in Envoy Gateway 1.5.5 and 1.8.3 — the class label is applied only under `mergeGateways`), so strict NetworkPolicy blocked Envoy→ext_proc — fail-closed 500 on every request, plus 503 on Envoy→pool. The adapter's default emits BOTH selector sets; an explicit `ingressSources` override replaces that default entirely. Fix: add the per-gateway labels (`owning-gateway-name: <release>-gateway`, `owning-gateway-namespace: <ns>`) to the override, or delete the override to restore the default.
+**Every request 500s (`ext_proc_error_gRPC_error_14`) with incomplete `ingressSources`.** Observed live on Envoy Gateway 1.8.3: a hand-written podSelector admitted only the `gateway.envoyproxy.io/owning-gatewayclass` label. Non-merged Envoy proxy pods carry the `owning-gateway-name`/`owning-gateway-namespace` pair and **not** the class label (identical in Envoy Gateway 1.5.5 and 1.8.3 — the class label is applied only under `mergeGateways`), so strict NetworkPolicy blocked Envoy→ext_proc — fail-closed 500 on every request, plus 503 on Envoy→pool. Legacy `provider.generic` config emits both selector sets by default. A composed `gatewayApiExposure` needs them in its explicit `ingressSources`. Add the per-gateway pair (`owning-gateway-name: <release>-gateway`, `owning-gateway-namespace: <ns>`) alongside the merged GatewayClass selector; legacy-provider users can instead delete their override to restore its default.
 
 ```bash
 kubectl get pods -n envoy-gateway-system --show-labels | grep owning-gateway
@@ -114,4 +114,4 @@ kubectl exec -n <ns> deploy/<pool-deployment> -- node -e \
 # Expected: ECONNREFUSED (k3s) or a timeout (Cilium). "REACHABLE" = your CNI does not enforce policy.
 ```
 
-If unenforced: install/enable a policy-enforcing CNI (Cilium, Calico; GKE Standard needs `--enable-network-policy` — Autopilot enforces by default). Also note the deploy-time degradations that skip policies entirely: `--allow-no-network-policy` and `--allow-mutable-tags` both leave the routing service reachable from any in-cluster pod, and deploy records/warns accordingly. On the generic provider, nodes added after deploy are missing from the kubelet allowlist (discovery snapshots node addresses at deploy time) — pods scheduled there never become ready until you set `nodeCidrs` in the generic provider config and redeploy.
+If unenforced: install/enable a policy-enforcing CNI (Cilium, Calico; GKE Standard needs `--enable-network-policy` — Autopilot enforces by default). `--allow-no-network-policy` is the deploy-time opt-out that can leave the routing service reachable from any in-cluster pod; deploy records and warns about it. On the generic provider, nodes added after deploy are missing from the kubelet allowlist (discovery snapshots node addresses at deploy time) — pods scheduled there never become ready until you set `nodeCidrs` in the generic provider config and redeploy.

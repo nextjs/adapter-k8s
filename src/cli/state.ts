@@ -1,5 +1,5 @@
 // src/cli/state.ts
-import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { stateFileName } from "./infrastructure-validation.js";
 import { execCapture, execCaptureStdin } from "./exec.js";
@@ -174,6 +174,13 @@ export class StateDisagreementError extends StateUnavailableError {}
 
 function stateFilePath(projectDir: string): string {
   return path.join(projectDir, STATE_DIR, STATE_FILE());
+}
+
+/** Remove only this target variant's local deploy-state record and interrupted-write temp file. */
+export function removeLocalState(projectDir: string): void {
+  const target = stateFilePath(projectDir);
+  rmSync(target, { force: true });
+  rmSync(`${target}.tmp`, { force: true });
 }
 
 function isAdapterState(value: unknown): value is AdapterState {

@@ -13,6 +13,7 @@ import {
   maxExpiration,
   maxTagLength,
   parseTagState,
+  TAG_MANIFEST_EPOCH_FIELD,
   TAG_MANIFEST_TTL_SECONDS,
   UPDATE_TAGS_SCRIPT,
   warnOnClockSkewClamp,
@@ -125,6 +126,14 @@ describe("UPDATE_TAGS_SCRIPT (M11: the manifest key itself is TTL-bounded)", () 
     expect(UPDATE_TAGS_SCRIPT).toContain("while i <= pairCount");
     // 30 days, mirroring DURABLE_TTL_SECONDS for entry keys.
     expect(TAG_MANIFEST_TTL_SECONDS).toBe(30 * 24 * 60 * 60);
+  });
+});
+
+describe("UPDATE_TAGS_SCRIPT request preflight epoch", () => {
+  it("increments one reserved scalar in the same atomic manifest update", () => {
+    expect(UPDATE_TAGS_SCRIPT).toContain("redis.call('HINCRBY', KEYS[1]");
+    expect(UPDATE_TAGS_SCRIPT).toContain(TAG_MANIFEST_EPOCH_FIELD);
+    expect(filterManifestTags([TAG_MANIFEST_EPOCH_FIELD, "app-tag"])).toEqual(["app-tag"]);
   });
 });
 
@@ -282,8 +291,8 @@ describe("evaluateEntry (three-state freshness)", () => {
     });
   });
 
-  it("stale past the revalidate window but within expire", () => {
-    expect(evaluateEntry(base, manifest({}), NOW + 120_000)).toEqual({ state: "stale" });
+  it("expires at the production revalidate boundary", () => {
+    expect(evaluateEntry(base, manifest({}), NOW + 120_000)).toEqual({ state: "expired" });
   });
 
   it("expired past the expire window", () => {

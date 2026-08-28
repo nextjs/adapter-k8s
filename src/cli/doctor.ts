@@ -102,12 +102,25 @@ async function checkDomainForHost(opts: {
   // Wildcard domains: skip the DNS A record check (can't resolve *.example.com)
   // but still check CNAME auth and cert status.
   const isWildcard = host.includes("*");
+  const normalizedHost = host.toLowerCase().replace(/\.$/, "");
+  // RFC 6761 reserves localhost and every name below it for loopback resolution. DNS's
+  // authoritative resolve4() path intentionally bypasses the operating-system resolver,
+  // so it reports ENOTFOUND for names such as lane1.localhost even while browsers, curl,
+  // and Node's lookup() correctly reach the local Gateway. Portable local clusters use
+  // those names to keep parallel Host-routed releases isolated; they do not need an A record.
+  const isLoopbackHost = normalizedHost === "localhost" || normalizedHost.endsWith(".localhost");
   const safeName = host.replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
 
   results.push({ name: `--- ${host}`, status: "pass", message: "---" });
 
   // A record (skip for wildcards — can't resolve *.example.com directly)
-  if (!isWildcard) {
+  if (isLoopbackHost) {
+    results.push({
+      name: `  A record`,
+      status: "pass",
+      message: `${host} is reserved for loopback`,
+    });
+  } else if (!isWildcard) {
     const resolvedIp = await resolve4(host)
       .then((ips) => ips[0] ?? null)
       .catch(() => null);
@@ -229,6 +242,14 @@ export async function runDoctor(options: {
   const results: CheckResult[] = [];
   let namespace = resolveK8sNamespace();
   const localComposition = loadProjectCompositionPlan(projectDir);
+  let compositionTargetFailed = false;
+  if (localComposition && localComposition.plan.metadata.releaseName !== releaseName) {
+    throw new Error(
+      `Composition-plan release mismatch: plan records ` +
+        `${JSON.stringify(localComposition.plan.metadata.releaseName)}, but doctor targets ` +
+        `${JSON.stringify(releaseName)}.`,
+    );
+  }
 
   // Ensure kubectl is pointing at the right cluster
   const infraPathForCtx = infrastructurePath(projectDir);
@@ -246,6 +267,7 @@ export async function runDoctor(options: {
         message: `${preflight.clusterIdentity}; Kubernetes ${preflight.serverVersion}`,
       });
     } catch (error) {
+      compositionTargetFailed = true;
       results.push({
         name: "Composition target",
         status: "fail",
@@ -292,6 +314,13 @@ export async function runDoctor(options: {
 
   console.log("\nRunning health checks...\n");
 
+  // Once target authentication fails, ambient kubectl data is untrusted. Stop before state or
+  // resource discovery so doctor cannot present another cluster's healthy objects as this release.
+  if (compositionTargetFailed) {
+    printCheckResults(results);
+    return;
+  }
+
   // --- Prerequisites ---
   if (!localComposition) results.push(await checkTool("gcloud", ["--version"]));
   results.push(await checkTool("kubectl", ["version", "--client", "-o", "yaml"]));
@@ -304,6 +333,13 @@ export async function runDoctor(options: {
   const infraPath = infrastructurePath(projectDir);
   if (existsSync(infraPath)) {
     results.push({ name: "infrastructure.json", status: "pass", message: infraPath });
+  } else if (localComposition) {
+    results.push({
+      name: "infrastructure.json",
+      status: "warn",
+      message: "Not found; using the verified composition plan",
+      fix: "Cloud-account and hostname checks are unavailable without the local infrastructure handoff",
+    });
   } else {
     results.push({
       name: "infrastructure.json",

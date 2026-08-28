@@ -28,8 +28,16 @@ function helmRender(template: string, values: Values = {}): string {
     return v[m[1] as "podCidrs" | "strict" | "nodeCidrs"];
   };
   const truthy = (x: string[] | boolean) => (Array.isArray(x) ? x.length > 0 : x === true);
-  const cond = (expr: string): boolean => {
+  const cond = (expr: string, current?: string): boolean => {
     let m: RegExpExecArray | null;
+    if (expr === 'contains ":" .') return current?.includes(":") === true;
+    if (expr === 'not (contains ":" .)') return current?.includes(":") !== true;
+    if (expr.startsWith('regexMatch "(^|,)[^,:]+/[0-9]+(,|$)"')) {
+      return v.podCidrs.some((cidr) => !cidr.includes(":"));
+    }
+    if (expr === 'contains ":" (join "," .Values.global.networkPolicy.podCidrs)') {
+      return v.podCidrs.some((cidr) => cidr.includes(":"));
+    }
     if ((m = /^or (\S+) (\S+)$/.exec(expr))) return truthy(lookup(m[1]!)) || truthy(lookup(m[2]!));
     if ((m = /^and (\S+) \(not (\S+)\)$/.exec(expr)))
       return truthy(lookup(m[1]!)) && !truthy(lookup(m[2]!));
@@ -38,7 +46,7 @@ function helmRender(template: string, values: Values = {}): string {
 
   const lines = template.split("\n");
   let i = 0;
-  const block = (emit: boolean): { out: string[]; term: "end" | "else" } => {
+  const block = (emit: boolean, current?: string): { out: string[]; term: "end" | "else" } => {
     const out: string[] = [];
     while (i < lines.length) {
       const line = lines[i]!;
@@ -58,10 +66,10 @@ function helmRender(template: string, values: Values = {}): string {
         continue;
       }
       if (kw === "if") {
-        const take = emit && cond(arg);
-        const first = block(take);
+        const take = emit && cond(arg, current);
+        const first = block(take, current);
         if (first.term === "else") {
-          const second = block(emit && !cond(arg));
+          const second = block(emit && !cond(arg, current), current);
           out.push(...(take ? first.out : second.out));
         } else {
           out.push(...first.out);
@@ -70,13 +78,13 @@ function helmRender(template: string, values: Values = {}): string {
       }
       // range
       const bodyStart = i;
-      block(false); // scan to the matching end
+      block(false, current); // scan to the matching end
       const endIdx = i;
       if (emit) {
         for (const item of lookup(arg) as string[]) {
           i = bodyStart;
           out.push(
-            ...block(true).out.map((l) => l.replace("{{ . | quote }}", JSON.stringify(item))),
+            ...block(true, item).out.map((l) => l.replace("{{ . | quote }}", JSON.stringify(item))),
           );
         }
       }
@@ -171,6 +179,8 @@ describe("renderNetworkPolicies — default (broad) posture", () => {
     expect(routingDoc).toContain("except:");
     expect(routingDoc).toContain('- "10.8.0.0/14"');
     expect(routingDoc).toContain('- "10.12.0.0/14"');
+    expect(routingDoc).toContain('cidr: "::/0"');
+    expect(routingDoc).not.toMatch(/cidr: "::\/0"\n\s+except:/);
     // Only the ports the routing service serves: gRPC 8443 + health 8081.
     expect(routingDoc).toContain("port: 8443");
     expect(routingDoc).toContain("port: 8081");
@@ -219,7 +229,36 @@ describe("renderNetworkPolicies — default (broad) posture", () => {
     const yaml = helmRender(template, { podCidrs: ["10.8.0.0/14"] });
     for (const cidr of STRICT_INGRESS_CIDRS) expect(yaml).not.toContain(cidr);
     // Exactly the pod CIDR subtraction, nothing else.
-    expect(cidrsOf(yaml)).toEqual(["0.0.0.0/0", "10.8.0.0/14", "0.0.0.0/0", "10.8.0.0/14"]);
+    expect(cidrsOf(yaml)).toEqual([
+      "0.0.0.0/0",
+      "10.8.0.0/14",
+      "::/0",
+      "0.0.0.0/0",
+      "10.8.0.0/14",
+      "::/0",
+    ]);
+  });
+
+  it("keeps IPv4 and IPv6 pod exclusions inside same-family broad blocks", () => {
+    const yaml = helmRender(renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr"] }), {
+      podCidrs: ["10.8.0.0/14", "fd00:10::/64"],
+    });
+    const routingDoc = yaml.slice(0, yaml.indexOf("---"));
+    expect(routingDoc).toMatch(/cidr: 0\.0\.0\.0\/0\n\s+except:\n\s+- "10\.8\.0\.0\/14"/);
+    expect(routingDoc).toMatch(/cidr: "::\/0"\n\s+except:\n\s+- "fd00:10::\/64"/);
+    expect(routingDoc).not.toMatch(
+      /cidr: 0\.0\.0\.0\/0[\s\S]*?- "fd00:10::\/64"[\s\S]*?cidr: "::\/0"/,
+    );
+  });
+
+  it("renders an IPv6-only broad policy without a null IPv4 exclusion", () => {
+    const yaml = helmRender(renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr"] }), {
+      podCidrs: ["fd00:10::/64"],
+    });
+    const routingDoc = yaml.slice(0, yaml.indexOf("---"));
+    expect(routingDoc).toMatch(/cidr: 0\.0\.0\.0\/0\n\s+- ipBlock:/);
+    expect(routingDoc).toMatch(/cidr: "::\/0"\n\s+except:\n\s+- "fd00:10::\/64"/);
+    expect(routingDoc).not.toContain("except: null");
   });
 
   it("renders nothing when only nodeCidrs is set (strict is what turns the allowlist on)", () => {
@@ -230,7 +269,11 @@ describe("renderNetworkPolicies — default (broad) posture", () => {
 
 describe("renderNetworkPolicies — strict (opt-in) posture", () => {
   const template = () =>
-    renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"] });
+    renderNetworkPolicies({
+      releaseName: "my-app",
+      poolNames: ["ssr", "api"],
+      ingressSources: { cidrs: [...STRICT_INGRESS_CIDRS], podSelectors: [] },
+    });
   const strict = (extra: Values = {}) =>
     helmRender(template(), { strict: true, nodeCidrs: ["10.128.0.0/20"], ...extra });
 
@@ -307,6 +350,22 @@ describe("renderNetworkPolicies — strict (opt-in) posture", () => {
     expect(yaml).toContain('cidr: "10.128.0.0/20"');
     expect(yaml).toContain('cidr: "10.129.0.0/20"');
   });
+
+  it("an empty source set renders no 8443 ingress rule", () => {
+    const rendered = helmRender(
+      renderNetworkPolicies({
+        releaseName: "my-app",
+        poolNames: ["ssr"],
+        ingressSources: { cidrs: [], podSelectors: [] },
+      }),
+      { strict: true, nodeCidrs: ["10.128.0.0/20"] },
+    );
+    const routing = rendered.slice(0, rendered.indexOf("---"));
+    expect(routing).not.toContain("port: 8443");
+    expect(routing).not.toContain("from: null");
+    expect(ingressRules(routing)).toHaveLength(1);
+    expect(ingressRules(routing)[0]).toContain("port: 8081");
+  });
 });
 
 describe("renderNetworkPolicies — input validation", () => {
@@ -356,7 +415,10 @@ function helmVersion(): string | null {
 }
 
 describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", () => {
-  function render(sets: string[]): { ok: boolean; out: string } {
+  function render(
+    sets: string[],
+    ingressSources = { cidrs: [...STRICT_INGRESS_CIDRS], podSelectors: [] },
+  ): { ok: boolean; out: string } {
     const dir = mkdtempSync(path.join(tmpdir(), "np-helm-"));
     try {
       mkdirSync(path.join(dir, "templates"));
@@ -364,7 +426,11 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
       writeFileSync(path.join(dir, "values.yaml"), "global:\n  networkPolicy:\n    podCidrs: []\n");
       writeFileSync(
         path.join(dir, "templates", "network-policy.yaml"),
-        renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"] }),
+        renderNetworkPolicies({
+          releaseName: "my-app",
+          poolNames: ["ssr", "api"],
+          ingressSources,
+        }),
       );
       const args = ["template", "np", dir];
       for (const s of sets) args.push("--set", s);
@@ -401,6 +467,26 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
     expect(docs).toBe(expected.trimEnd());
   });
 
+  it.each([
+    ["IPv4-only", ["10.17.0.0/17"]],
+    ["IPv6-only", ["fd00:10::/64"]],
+    ["dual-stack", ["10.17.0.0/17", "fd00:10::/64"]],
+  ] as const)("renders a family-correct %s broad policy with real helm", (_label, podCidrs) => {
+    const { ok, out } = render([`global.networkPolicy.podCidrs={${podCidrs.join(",")}}`]);
+    expect(ok).toBe(true);
+    expect(out).not.toContain("except: null");
+    const expected = helmRender(
+      renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"] }),
+      { podCidrs: [...podCidrs] },
+    );
+    const docs = out
+      .split(/^---\n# Source: [^\n]*\n/m)
+      .filter((doc) => doc.includes("kind: NetworkPolicy"))
+      .map((doc) => doc.trimEnd())
+      .join("\n---\n");
+    expect(docs).toBe(expected.trimEnd());
+  });
+
   it("strict posture matches the hand-rolled evaluator byte for byte", () => {
     const { ok, out } = render([
       "global.networkPolicy.strict=true",
@@ -408,7 +494,11 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
     ]);
     expect(ok).toBe(true);
     const expected = helmRender(
-      renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"] }),
+      renderNetworkPolicies({
+        releaseName: "my-app",
+        poolNames: ["ssr", "api"],
+        ingressSources: { cidrs: [...STRICT_INGRESS_CIDRS], podSelectors: [] },
+      }),
       { strict: true, nodeCidrs: ["10.128.0.0/20"] },
     );
     const docs = out
@@ -419,6 +509,21 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
     expect(docs).toBe(expected.trimEnd());
     expect(docs).toContain('cidr: "35.191.0.0/16"');
     expect(docs).not.toContain("0.0.0.0/0");
+  });
+
+  it("strict empty sources are valid YAML and deny routing data traffic", () => {
+    const { ok, out } = render(
+      ["global.networkPolicy.strict=true", "global.networkPolicy.nodeCidrs={10.128.0.0/20}"],
+      { cidrs: [], podSelectors: [] },
+    );
+    expect(ok).toBe(true);
+    const routingDoc = out
+      .split(/^---\n# Source: [^\n]*\n/m)
+      .find((doc) => doc.includes("name: my-app-routing-service"));
+    expect(routingDoc).toBeDefined();
+    expect(routingDoc).not.toContain("port: 8443");
+    expect(routingDoc).not.toContain("from: null");
+    expect(routingDoc).toContain("port: 8081");
   });
 
   it("helm itself refuses strict without nodeCidrs", () => {

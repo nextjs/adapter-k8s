@@ -21,7 +21,10 @@ Deployment targets are composed from independent cluster, exposure, and routing 
 
 Contributor guidance for a new controller or routing integration is in [CONTRIBUTING.md](./CONTRIBUTING.md) and [Writing a routing adapter](./docs/targets.md#writing-a-routing-adapter).
 
-With a shared cache configured, verified cache-component, PPR, and ISR paths share entries and propagate `revalidateTag` / `revalidatePath` across replicas. The upstream `partialFallback` contract and one PPR resume-data consistency case remain open; see [Distributed cache](./docs/configuration.md#distributed-cache-cache-components--ppr) and the exact [verification boundary](./docs/verification.md#known-coverage-gaps).
+With a shared cache configured, verified cache-component, PPR, ISR, and partial-fallback paths
+share entries and propagate `revalidateTag` / `revalidatePath` across replicas. The pinned
+two-replica verification includes the upstream 60-case prerender matrix, shell upgrades, resume
+data, and cached-navigation fallback params; see [Distributed cache](./docs/configuration.md#distributed-cache-cache-components--ppr) and the exact [verification boundary](./docs/verification.md#known-coverage-gaps).
 
 CDN and middleware behavior are coordinated so cached responses can never bypass middleware-protected routes—see [Architecture](#architecture) for how.
 
@@ -130,6 +133,7 @@ Then create `adapter.config.mjs`:
 import {
   createK8sAdapter,
   defineTarget,
+  envoyGatewayIngressSources,
   gatewayApiExposure,
   kubernetesCluster,
 } from "@next-community/adapter-k8s";
@@ -146,15 +150,21 @@ export default createK8sAdapter({
       access: { kind: "kubeconfig-context", context: "production" },
     }),
     exposure: gatewayApiExposure({
-      className: "example",
+      className: "eg",
       hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
       tlsSecretName: "app-tls",
+      ingressSources: envoyGatewayIngressSources({
+        // Namespace containing the Envoy proxy pods (the default EG deployment namespace).
+        namespace: "envoy-gateway-system",
+        // Must match <releaseName>-gateway and the release namespace.
+        gateways: [{ name: "my-app-gateway", namespace: "default" }],
+      }),
     }),
   }),
 });
 ```
 
-Use `ingressExposure({ className: "nginx", ... })` instead for an Ingress controller—Gateway API and Ingress are exposure choices, not providers. `deploy` asks you to confirm the target cluster (`--yes` in CI) unless both the kubeconfig context (`access`, pinned above) and the cluster identity (`identity`) are pinned—see [cluster access and identity](./docs/targets.md#portable-gateway-api-or-ingress).
+Use `ingressExposure({ className: "nginx", ... })` instead for an Ingress controller—Gateway API and Ingress are exposure choices, not providers. Every external exposure requires a non-empty `ingressSources` allowlist; for ingress-nginx, select its exact data-plane Helm instance label (for example `app.kubernetes.io/instance: external-ingress-nginx` in namespace `network`). `deploy` asks you to confirm the target cluster (`--yes` in CI) unless both the kubeconfig context (`access`, pinned above) and the cluster identity (`identity`) are pinned—see [cluster access and identity](./docs/targets.md#portable-gateway-api-or-ingress).
 
 **Already run a shared Gateway?** Most clusters terminate TLS, DNS, and tunnels once on a fleet-wide Gateway rather than per app. Use `httpRouteExposure` to attach to it instead of creating another one—the adapter then emits HTTPRoutes only, and TLS stays the Gateway owner's concern:
 
@@ -163,6 +173,10 @@ exposure: httpRouteExposure({
   className: "envoy",
   parentRefs: [{ name: "envoy-external", namespace: "network" }],
   hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+  ingressSources: envoyGatewayIngressSources({
+    namespace: "network",
+    gateways: [{ name: "envoy-external", namespace: "network" }],
+  }),
 }),
 ```
 
@@ -203,6 +217,10 @@ target: defineTarget({
     className: "eg",
     hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
     tlsSecretName: "app-tls",
+    ingressSources: envoyGatewayIngressSources({
+      namespace: "envoy-gateway-system",
+      gateways: [{ name: "my-app-gateway", namespace: "default" }],
+    }),
   }),
   routing: envoyNativeRouting(),
 }),

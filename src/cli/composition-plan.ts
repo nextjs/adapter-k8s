@@ -386,6 +386,15 @@ async function verifyClusterIdentity(
   }
 }
 
+/** Establish and verify the cluster named by an authenticated composition plan. */
+export async function establishCompositionPlanCluster(
+  plan: CompositionPlan,
+  explicitlyConfirmed = false,
+): Promise<string> {
+  await establishClusterAccess(plan);
+  return verifyClusterIdentity(plan, explicitlyConfirmed);
+}
+
 function implicitRequirements(plan: CompositionPlan): KubernetesApiRequirement[] {
   const readiness = compositionPlanReadiness(plan);
   return [

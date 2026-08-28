@@ -26,6 +26,8 @@ import {
   DISPATCH_PROOF_MAX_SKEW_MS,
   dispatchProofBodyMatches,
   dispatchProofInputsFromRequest,
+  encodeNodeOutgoingDispatchHeader,
+  encodeNodeOutgoingDispatchHeaders,
   INTERNAL_DISPATCH_HEADERS,
   matcherProofHeaderNames,
   NODE_SINGLETON_REQUEST_HEADERS,
@@ -184,6 +186,32 @@ describe("dispatch proof — canonicalization has no ambiguity", () => {
     );
     // …and the octets are still what is signed: a different value is still a different proof.
     expect(withCookie(Buffer.from([0xc3, 0xa8]))).not.toBe(withCookie(wire));
+  });
+
+  it("encodes a pool-authored dispatch value to the UTF-8 bytes Node must send", () => {
+    const semantic = "/🎉/日本語";
+    const nodeValue = encodeNodeOutgoingDispatchHeader(semantic);
+    expect(Buffer.from(nodeValue, "latin1")).toEqual(Buffer.from(semantic, "utf8"));
+  });
+
+  it("encodes the dispatch fields in an outgoing header record and leaves client fields alone", () => {
+    const headers: Record<string, string | string[] | undefined> = {
+      "x-output-id": "/🎉/日本語",
+      "x-route-matches": ["café", "日本語"],
+      cookie: "theme=日本語",
+    };
+
+    encodeNodeOutgoingDispatchHeaders(headers);
+
+    expect(Buffer.from(headers["x-output-id"] as string, "latin1").toString("utf8")).toBe(
+      "/🎉/日本語",
+    );
+    expect(
+      (headers["x-route-matches"] as string[]).map((value) =>
+        Buffer.from(value, "latin1").toString("utf8"),
+      ),
+    ).toEqual(["café", "日本語"]);
+    expect(headers.cookie).toBe("theme=日本語");
   });
 
   it("A0-DP-2: applies the same rule to the target and the authority", () => {

@@ -8,16 +8,20 @@ import type {
 } from "../composition-plan/types.js";
 import {
   assertSafeHostname,
+  assertSafeAnnotationName,
   assertSafeGcpResourceName,
+  assertSafeKubernetesObjectName,
   assertSafeNamespace,
   assertSafeProjectId,
   assertSafeRegion,
   assertSafeReleaseName,
+  assertSafeSecretName,
   sanitizeK8sName,
 } from "../emit/templates/utils.js";
 import type {
   ClusterBuildResult,
   ClusterComponent,
+  BackendHealthPolicy,
   DefineTargetOptions,
   ExposureBuildContext,
   ExposureBuildResult,
@@ -34,6 +38,7 @@ import type {
   RoutingComponent,
   TargetBuildContext,
 } from "./types.js";
+import { normalizeIngressSources } from "./ingress-sources.js";
 
 const DEFAULT_NETWORK = {
   podCidrs: { kind: "kubernetes-node-pod-cidrs" as const },
@@ -60,13 +65,43 @@ function copyHosts(hosts: readonly HostConfig[]): HostConfig[] {
 }
 
 function copyIngressSources(sources?: IngressSourceSet): IngressSourceSet {
-  return {
-    cidrs: [...(sources?.cidrs ?? [])],
-    podSelectors: (sources?.podSelectors ?? []).map((selector) => ({
-      ...(selector.namespace ? { namespace: selector.namespace } : {}),
-      labels: { ...selector.labels },
-    })),
-  };
+  return sources ? normalizeIngressSources(sources) : { cidrs: [], podSelectors: [] };
+}
+
+function requireExternalIngressSources(
+  exposureName: string,
+  sources: IngressSourceSet | undefined,
+): IngressSourceSet {
+  if (sources === undefined) {
+    throw new Error(
+      `${exposureName} requires explicit ingressSources so strict NetworkPolicy can admit ` +
+        `only the selected controller's data-plane traffic`,
+    );
+  }
+  const copied = normalizeIngressSources(sources);
+  if (copied.cidrs.length === 0 && copied.podSelectors.length === 0) {
+    throw new Error(`${exposureName} ingressSources must admit at least one CIDR or pod selector`);
+  }
+  return copied;
+}
+
+function copyAnnotations(
+  annotations: Record<string, string> | undefined,
+  field: string,
+): Record<string, string> | undefined {
+  if (annotations === undefined) return undefined;
+  if (!annotations || typeof annotations !== "object" || Array.isArray(annotations)) {
+    throw new Error(`${field} must be a string map`);
+  }
+  return Object.fromEntries(
+    Object.entries(annotations).map(([name, value]) => {
+      assertSafeAnnotationName(name);
+      if (typeof value !== "string") {
+        throw new Error(`${field}.${name} must be a string`);
+      }
+      return [name, value];
+    }),
+  );
 }
 
 function origin(context: TargetBuildContext): {
@@ -366,6 +401,11 @@ export function manualExposure(options: {
   });
 }
 
+/** Select GKE's HealthCheckPolicy for the stable origin Service. */
+export function gkeHealthCheckPolicy(): BackendHealthPolicy {
+  return { kind: "gke-health-check-policy" };
+}
+
 /**
  * cert-manager issuance for a dedicated exposure's in-namespace TLS Secret.
  *
@@ -385,13 +425,6 @@ export interface CertManagerTlsOptions {
   };
 }
 
-// cert-manager Issuer/ClusterIssuer names are DNS subdomains; asserted verbatim (NOT
-// sanitized) because the ref must match an existing issuer exactly — same contract as
-// httpRouteExposure's parentRef Gateway names.
-const ISSUER_NAME_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
-// Kubernetes API group: DNS subdomain (e.g. "cert-manager.io", "awspca.cert-manager.io").
-const API_GROUP_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
-
 function validateCertManagerOptions(
   certManager: CertManagerTlsOptions,
   exposureName: string,
@@ -407,7 +440,9 @@ function validateCertManagerOptions(
   if (!issuerRef || typeof issuerRef !== "object") {
     throw new Error(`${exposureName} certManager requires an issuerRef`);
   }
-  if (typeof issuerRef.name !== "string" || !ISSUER_NAME_RE.test(issuerRef.name)) {
+  try {
+    assertSafeKubernetesObjectName(issuerRef.name, "certManager issuerRef name");
+  } catch {
     throw new Error(`Invalid certManager issuerRef name ${JSON.stringify(issuerRef.name)}`);
   }
   if (issuerRef.kind !== "ClusterIssuer" && issuerRef.kind !== "Issuer") {
@@ -416,8 +451,12 @@ function validateCertManagerOptions(
         'expected "ClusterIssuer" or "Issuer"',
     );
   }
-  if (issuerRef.group !== undefined && !API_GROUP_RE.test(issuerRef.group)) {
-    throw new Error(`Invalid certManager issuerRef group ${JSON.stringify(issuerRef.group)}`);
+  if (issuerRef.group !== undefined) {
+    try {
+      assertSafeKubernetesObjectName(issuerRef.group, "certManager issuerRef group");
+    } catch {
+      throw new Error(`Invalid certManager issuerRef group ${JSON.stringify(issuerRef.group)}`);
+    }
   }
 }
 
@@ -494,13 +533,32 @@ export interface GatewayApiExposureOptions {
   annotations?: Record<string, string>;
   addresses?: Array<{ type: string; value: string }>;
   releaseAddresses?: Array<{ type: string; nameSuffix: string }>;
-  ingressSources?: IngressSourceSet;
+  ingressSources: IngressSourceSet;
+  backendHealth?: BackendHealthPolicy;
 }
 
 export function gatewayApiExposure(options: GatewayApiExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
-  if (!/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(options.className)) {
-    throw new Error(`Invalid GatewayClass name ${JSON.stringify(options.className)}`);
+  assertSafeKubernetesObjectName(options.className, "GatewayClass name");
+  const ingressSources = requireExternalIngressSources(
+    "gatewayApiExposure",
+    options.ingressSources,
+  );
+  const configuredAnnotations = copyAnnotations(
+    options.annotations,
+    "gatewayApiExposure.annotations",
+  );
+  if (options.tlsSecretName !== undefined) assertSafeSecretName(options.tlsSecretName);
+  if (options.controllerManagedCertificate) {
+    assertSafeAnnotationName(options.controllerManagedCertificate.annotation);
+  }
+  if (
+    options.backendHealth !== undefined &&
+    options.backendHealth.kind !== "gke-health-check-policy"
+  ) {
+    throw new Error(
+      `gatewayApiExposure received unsupported backendHealth ${JSON.stringify(options.backendHealth)}`,
+    );
   }
   const wantsTls = hosts.some((host) => host.tls.enabled);
   if (wantsTls && hosts.some((host) => !host.tls.enabled)) {
@@ -540,7 +598,7 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         : undefined;
       const routeName = sanitizeK8sName(`${context.releaseName}-routes`);
       const annotations = {
-        ...options.annotations,
+        ...configuredAnnotations,
         ...(wantsTls && options.controllerManagedCertificate
           ? {
               [options.controllerManagedCertificate.annotation]:
@@ -667,24 +725,27 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         },
         timeoutSeconds: 600,
       };
-      const routeReady: RoutingReadiness = {
-        kind: "kubernetes-condition",
-        object: {
-          apiVersion: "gateway.networking.k8s.io/v1",
-          resource: "httproutes",
-          name: routeName,
-          namespace: context.namespace,
-        },
-        conditionsAt: { kind: "parents" },
-        condition: {
-          type: "Accepted",
-          status: "True",
-          observedGeneration: "must-equal-metadata-generation",
-        },
-        timeoutSeconds: 600,
+      const routeRef = {
+        apiVersion: "gateway.networking.k8s.io/v1",
+        resource: "httproutes",
+        name: routeName,
+        namespace: context.namespace,
       };
-      const redirectReady: RoutingReadiness | undefined = redirectRoute
-        ? {
+      const routeReadiness: RoutingReadiness[] = (["Accepted", "ResolvedRefs"] as const).map(
+        (type) => ({
+          kind: "kubernetes-condition",
+          object: routeRef,
+          conditionsAt: { kind: "parents" },
+          condition: {
+            type,
+            status: "True",
+            observedGeneration: "must-equal-metadata-generation",
+          },
+          timeoutSeconds: 600,
+        }),
+      );
+      const redirectReadiness: RoutingReadiness[] = redirectRoute
+        ? (["Accepted", "ResolvedRefs"] as const).map((type) => ({
             kind: "kubernetes-condition",
             object: {
               apiVersion: "gateway.networking.k8s.io/v1",
@@ -694,13 +755,13 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
             },
             conditionsAt: { kind: "parents" },
             condition: {
-              type: "Accepted",
+              type,
               status: "True",
               observedGeneration: "must-equal-metadata-generation",
             },
             timeoutSeconds: 600,
-          }
-        : undefined;
+          }))
+        : [];
       return {
         objects: [
           gateway,
@@ -719,18 +780,27 @@ export function gatewayApiExposure(options: GatewayApiExposureOptions): Exposure
         ],
         readiness: [
           gatewayReady,
-          routeReady,
-          ...(redirectReady ? [redirectReady] : []),
+          ...routeReadiness,
+          ...redirectReadiness,
           ...(certManaged ? [certManaged.readiness] : []),
         ],
-        ingressSources: copyIngressSources(options.ingressSources),
+        ingressSources,
         capabilities: [
           {
             kind: "gateway-api",
             className: options.className,
             gateway: gatewayReady.object,
-            applicationRoutes: [routeReady.object],
+            applicationRoutes: [routeRef],
           },
+          ...(options.backendHealth
+            ? [
+                {
+                  kind: "backend-health" as const,
+                  policy: { ...options.backendHealth },
+                  service: { ...context.origin.service },
+                },
+              ]
+            : []),
         ],
       };
     },
@@ -770,15 +840,12 @@ export interface HttpRouteExposureOptions {
    * tight as the deployment allows: the routing tier authenticates no callers, so reachability to
    * its :8443 is what decides who can obtain a pool-trusted routing verdict.
    */
-  ingressSources?: IngressSourceSet;
+  ingressSources: IngressSourceSet;
+  backendHealth?: BackendHealthPolicy;
 }
 
 // Kubernetes sectionName is a Gateway API SectionName: DNS-label charset.
 const SECTION_NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
-// Gateway names are DNS subdomains; asserted verbatim (NOT sanitized) because the ref
-// must match an existing Gateway exactly.
-const PARENT_GATEWAY_NAME_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
-
 /**
  * Attach the app's HTTPRoute to EXISTING shared Gateway(s) via parentRefs — the common
  * fleet pattern (HTTPRoute -> shared envoy-internal/envoy-external in ns "network").
@@ -791,14 +858,27 @@ const PARENT_GATEWAY_NAME_RE = /^[a-z0-9](?:[-a-z0-9.]{0,251}[a-z0-9])?$/;
  */
 export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
-  if (!/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(options.className)) {
-    throw new Error(`Invalid GatewayClass name ${JSON.stringify(options.className)}`);
+  assertSafeKubernetesObjectName(options.className, "GatewayClass name");
+  const ingressSources = requireExternalIngressSources("httpRouteExposure", options.ingressSources);
+  const configuredAnnotations = copyAnnotations(
+    options.annotations,
+    "httpRouteExposure.annotations",
+  );
+  if (
+    options.backendHealth !== undefined &&
+    options.backendHealth.kind !== "gke-health-check-policy"
+  ) {
+    throw new Error(
+      `httpRouteExposure received unsupported backendHealth ${JSON.stringify(options.backendHealth)}`,
+    );
   }
   if (!Array.isArray(options.parentRefs) || options.parentRefs.length === 0) {
     throw new Error("httpRouteExposure requires at least one parentRef naming an existing Gateway");
   }
   const parentRefs = options.parentRefs.map((ref) => {
-    if (typeof ref.name !== "string" || !PARENT_GATEWAY_NAME_RE.test(ref.name)) {
+    try {
+      assertSafeKubernetesObjectName(ref.name, "parentRef Gateway name");
+    } catch {
       throw new Error(`Invalid parentRef Gateway name ${JSON.stringify(ref.name)}`);
     }
     if (ref.namespace !== undefined) assertSafeNamespace(ref.namespace);
@@ -845,8 +925,8 @@ export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureCo
         },
         {
           labels,
-          ...(options.annotations && Object.keys(options.annotations).length > 0
-            ? { annotations: options.annotations }
+          ...(configuredAnnotations && Object.keys(configuredAnnotations).length > 0
+            ? { annotations: configuredAnnotations }
             : {}),
         },
       );
@@ -894,7 +974,7 @@ export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureCo
           kind: "kubernetes-gateway-address" as const,
           gateway,
         })),
-        ingressSources: copyIngressSources(options.ingressSources),
+        ingressSources,
         capabilities: [
           {
             kind: "gateway-api",
@@ -902,6 +982,15 @@ export function httpRouteExposure(options: HttpRouteExposureOptions): ExposureCo
             gateway: parentGatewayRefs[0]!,
             applicationRoutes: [routeRef],
           },
+          ...(options.backendHealth
+            ? [
+                {
+                  kind: "backend-health" as const,
+                  policy: { ...options.backendHealth },
+                  service: { ...context.origin.service },
+                },
+              ]
+            : []),
         ],
       };
     },
@@ -930,11 +1019,15 @@ export interface IngressExposureOptions {
    */
   certManager?: CertManagerTlsOptions;
   annotations?: Record<string, string>;
-  ingressSources?: IngressSourceSet;
+  ingressSources: IngressSourceSet;
 }
 
 export function ingressExposure(options: IngressExposureOptions): ExposureComponent {
   const hosts = copyHosts(options.hosts);
+  assertSafeKubernetesObjectName(options.className, "IngressClass name");
+  const ingressSources = requireExternalIngressSources("ingressExposure", options.ingressSources);
+  const configuredAnnotations = copyAnnotations(options.annotations, "ingressExposure.annotations");
+  if (options.tlsSecretName !== undefined) assertSafeSecretName(options.tlsSecretName);
   const wantsTls = hosts.some((host) => host.tls.enabled);
   if (wantsTls && !options.tlsSecretName && !options.certManager) {
     throw new Error("ingressExposure requires tlsSecretName or certManager when TLS is enabled");
@@ -1001,7 +1094,7 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
             },
             {
               labels: { "app.kubernetes.io/name": context.releaseName },
-              ...(options.annotations ? { annotations: options.annotations } : {}),
+              ...(configuredAnnotations ? { annotations: configuredAnnotations } : {}),
             },
           ),
           ...(certManaged ? [certManaged.certificate] : []),
@@ -1011,7 +1104,7 @@ export function ingressExposure(options: IngressExposureOptions): ExposureCompon
           ...(certManaged ? [certManaged.requirement] : []),
         ],
         readiness: certManaged ? [certManaged.readiness] : [],
-        ingressSources: copyIngressSources(options.ingressSources),
+        ingressSources,
         capabilities: [{ kind: "ingress", className: options.className }],
       };
     },
@@ -1269,13 +1362,6 @@ export function gkeNativeRouting(
           dataplane: { kind: "external-ext-proc", transport: "tls", readiness },
         },
         readiness,
-        requirements: [
-          {
-            apiVersion: "networking.gke.io/v1",
-            resource: "healthcheckpolicies",
-            optional: false,
-          },
-        ],
         routingTier: {
           enabled: true,
           transport: "tls",

@@ -10,6 +10,9 @@ export {
   envoyNativeRouting,
   gatewayApiExposure,
   gkeCluster,
+  gkeHealthCheckPolicy,
+  gkeIngressSources,
+  envoyGatewayIngressSources,
   gkeNativeRouting,
   httpRouteExposure,
   ingressExposure,
@@ -55,6 +58,7 @@ export type {
 } from "./composition-plan/index.js";
 export type {
   CertManagerTlsOptions,
+  BackendHealthPolicy,
   ClusterBuildResult,
   ClusterComponent,
   DefineTargetOptions,
@@ -68,6 +72,7 @@ export type {
   HttpRouteExposureOptions,
   IngressExposureOptions,
   IngressSourceSet,
+  EnvoyGatewayIngressSourcesOptions,
   KubernetesClusterOptions,
   KubernetesContribution,
   KubernetesTargetDefinition,

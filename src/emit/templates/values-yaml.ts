@@ -78,10 +78,10 @@ export function renderValuesYaml({
       // load-balancer and health-check ranges plus the cluster's node range, rather than the
       // broad `0.0.0.0/0 except <pod CIDR>` denylist. The broad posture only ever isolated
       // in-cluster PODS: every VPC peer, VM and hostNetwork pod could still reach
-      // routing-service:8443, and that service answers an ordinary ext_proc call with the
-      // internal dispatch secret in its header mutation — so a VPC-reachable caller could
-      // read the secret and replay trusted dispatch headers straight to a pool, skipping
-      // middleware. Strict was not the default before only because `nodeCidrs` had to be
+      // routing-service:8443, and that service answers an ordinary ext_proc call with a
+      // valid dispatch proof for a request of the caller's choosing. The secret stays off
+      // the wire, but the reachable service is still a signing oracle for trusted routing
+      // verdicts. Strict was not the default before only because `nodeCidrs` had to be
       // supplied by hand (kubelet probes come from the node IP, and without that range
       // Calico leaves every pod unready); deploy now discovers it, so the secure posture
       // costs the operator nothing. `--allow-no-network-policy` remains the explicit opt-out.

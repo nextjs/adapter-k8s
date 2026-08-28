@@ -14,6 +14,7 @@ import { runTail } from "./tail.js";
 import { runEmulate } from "./emulate.js";
 import { runMigrate } from "./migrate.js";
 import { assertSafeReleaseName } from "../emit/templates/utils.js";
+import { loadProjectCompositionPlan } from "./composition-plan.js";
 
 // Boolean flags NEVER consume the following argument. The old parser let `--dry-run foo`
 // swallow `foo` as the flag's string value, and every consumer checks
@@ -138,6 +139,17 @@ export function parseArgs(argv: string[]): {
   return { command, flags };
 }
 
+export function resolveCliReleaseName(options: {
+  explicit?: string;
+  composition?: string;
+  infrastructure?: string;
+  directoryDefault: string;
+}): string {
+  return (
+    options.explicit ?? options.composition ?? options.infrastructure ?? options.directoryDefault
+  );
+}
+
 function printHelp(): void {
   console.log(`
 @next-community/adapter-k8s CLI
@@ -165,21 +177,20 @@ Options:
   --host <hostname>        Application hostname(s), comma-separated (e.g. app.example.com,api.example.com)
   --bucket <name>          GCS bucket name for static assets (init)
   --registry <url>         Container registry URL (init)
-  --release-name <name>    Helm release name (default: current directory name)
+  --release-name <name>    Helm release name (default: verified build/infra metadata, then directory)
   --namespace <name>       Kubernetes namespace (init; default: persisted value or default)
   --standard               Provision a GKE Standard cluster instead of Autopilot (init)
   --skip-build             Skip next build (deploy, emulate)
   --skip-push              Skip docker build + push (deploy)
   --port <port>            Listener port for the local Envoy proxy (emulate; default: 8080)
-  --yes, -y                Skip the confirmation prompt (destroy; deploy's and migrate's
-                              unpinned-context guards)
+  --yes, -y                Confirm an unpinned kubectl context (deploy, rollback, tail,
+                              migrate, destroy)
   --allow-unretained-manifest  Deploy even if the outgoing build's routing manifest cannot
                               be retained (rollback to it becomes image-only; recorded in
                               deploy state so doctor can report it)
   --allow-no-network-policy  Deploy even if the cluster pod CIDR can't be discovered
   --allow-mutable-tags     Deploy by image tag when no digest can be resolved
-                              (NetworkPolicies skipped — the routing service stays
-                              reachable from in-cluster pods; not recommended)
+                              (not recommended; immutable digests are safer)
   --previous-build <id>    The build the bundle's Service selectors stay pinned to (emit).
                               Default: the prior bundle's emit-metadata.json. With neither,
                               emit refuses — assert a genuine first deploy explicitly.
@@ -216,17 +227,22 @@ never take a value.
 
 async function main(): Promise<void> {
   const { command, flags } = parseArgs(process.argv);
+  if (command === "help" || command === "--help" || command === "-h") {
+    printHelp();
+    return;
+  }
   const projectDir = process.cwd();
 
   // Resolve the release name. Precedence:
   //   1. --release-name flag (explicit override)
-  //   2. releaseName persisted in .k8s-adapter/infrastructure.json (source of truth
+  //   2. the digest-verified local composition plan, when present
+  //   3. releaseName persisted in .k8s-adapter/infrastructure.json (source of truth
   //      written by `init`) — so read-only commands (doctor/describe/rollback/tail/
   //      destroy) target the ACTUAL deployed release without needing the flag. Without
   //      this, running from a directory whose name differs from the release (e.g. an
   //      `e2e/` dir that deployed release "test-app") derives the wrong cluster name
   //      (`e2e-cluster` vs `test-app-cluster`) and doctor fails to connect.
-  //   3. the sanitized directory name (default for a fresh, un-inited project)
+  //   4. the sanitized directory name (default for a fresh, un-inited project)
   // The directory-name default must degrade gracefully: truncate to the 40-char
   // release-name limit and strip trailing hyphens so a long directory name never
   // throws (only the explicit --release-name flag and the persisted
@@ -258,12 +274,22 @@ async function main(): Promise<void> {
       // target the wrong cluster.
       console.warn(
         `Warning: could not parse ${infraPath} (${(err as Error).message}) — ` +
-          `falling back to the directory-name release default.`,
+          `falling back to the verified composition plan or directory-name default.`,
       );
     }
   }
-  const releaseName =
-    (flags["release-name"] as string) ?? persistedReleaseName ?? defaultReleaseName;
+  const compositionReleaseName =
+    command === "init"
+      ? undefined
+      : loadProjectCompositionPlan(projectDir)?.plan.metadata.releaseName;
+  const releaseName = resolveCliReleaseName({
+    ...((flags["release-name"] as string | undefined)
+      ? { explicit: flags["release-name"] as string }
+      : {}),
+    ...(compositionReleaseName ? { composition: compositionReleaseName } : {}),
+    ...(persistedReleaseName ? { infrastructure: persistedReleaseName } : {}),
+    directoryDefault: defaultReleaseName,
+  });
   // M3: the release name is prefixed into GKE cluster names, K8s resources, IAM role
   // ids, and helm invocations — reject anything outside the safe charset at the CLI
   // boundary (main()'s catch prints the error and exits 1).
@@ -413,7 +439,11 @@ async function main(): Promise<void> {
 
     case "tail":
     case "logs": {
-      await runTail({ projectDir, releaseName });
+      await runTail({
+        projectDir,
+        releaseName,
+        yes: flags["yes"] === true || flags["y"] === true,
+      });
       break;
     }
 
@@ -436,12 +466,6 @@ async function main(): Promise<void> {
       });
       break;
     }
-
-    case "help":
-    case "--help":
-    case "-h":
-      printHelp();
-      break;
 
     default:
       console.error(`Unknown command: ${command}`);

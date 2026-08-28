@@ -82,6 +82,8 @@ function inputs(overrides: Partial<CutoverInputs> = {}): CutoverInputs {
     previousPools: ["ssr"],
     defaultPool: "ssr",
     hasPortableOrigin: false,
+    hasRoutingTier: true,
+    hasHealthCheckPolicy: true,
     previousReplicasByPool: new Map([["ssr", 2]]),
     state: { buildId: PREV, previousBuildId: "buildm0", generation: 4 },
     compositionSnapshot: null,
@@ -114,6 +116,8 @@ interface ClusterOverrides {
   routingReplicas?: number | null;
   /** D2 probe reports the routing Deployment as absent (the gate then skips entirely). */
   routingDeploymentMissing?: boolean;
+  /** D2 probe cannot read the routing Deployment. */
+  routingDeploymentReadFails?: boolean;
   newBuildHpa?: { min: number; max: number };
   /** EnvoyExtensionPolicy `-o json` body. */
   policy?: unknown;
@@ -127,6 +131,8 @@ interface ClusterOverrides {
   gcDeployments?: unknown[];
   /** Exact versioned companion objects keyed by `kind/name`; null means absent. */
   gcCompanions?: Record<string, unknown | null>;
+  /** Whether the GKE HealthCheckPolicy CRD exists. */
+  healthCheckPolicyCrd?: boolean;
 }
 
 /** A scripted cluster for one release serving `buildm`, with `buildn` landing. */
@@ -153,6 +159,13 @@ function cluster(overrides: ClusterOverrides = {}) {
       if (overrides.policyReadFails) return { exitCode: 1, stdout: "", stderr: "forbidden" };
       return ok(JSON.stringify(overrides.policy ?? ACCEPTED_CURRENT));
     }
+    if (args[0] === "get" && args[1] === "crd") {
+      return ok(
+        overrides.healthCheckPolicyCrd
+          ? "customresourcedefinition.apiextensions.k8s.io/healthcheckpolicies.networking.gke.io"
+          : "",
+      );
+    }
     // D1 listing: deployments by the EXACT version label.
     if (args[1] === "deployments" && j.includes("app.kubernetes.io/version=")) {
       events.push(`list-versioned:${args[args.indexOf("-l") + 1]}`);
@@ -175,6 +188,9 @@ function cluster(overrides: ClusterOverrides = {}) {
     // D2 routing-tier existence probe, which now also carries THIS tier's replica count
     // (checked before the D6 probe below — they share a jsonpath shape).
     if (args[0] === "get" && args[1] === "deployment" && args[2] === `${RELEASE}-routing-service`) {
+      if (overrides.routingDeploymentReadFails) {
+        return { exitCode: 1, stdout: "", stderr: "forbidden by RBAC" };
+      }
       if (overrides.routingDeploymentMissing) return ok("");
       const replicas = overrides.routingReplicas === undefined ? 2 : overrides.routingReplicas;
       return ok(`${RELEASE}-routing-service|${replicas === null ? "" : replicas}`);
@@ -631,6 +647,43 @@ describe("runCutover — A2: the two rollout gates budget the shapes they actual
     );
   });
 
+  it("fails when the build declares a routing tier but its Deployment is absent", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster({ routingDeploymentMissing: true }) as never);
+
+    await expect(runCutover(inputs({ hasRoutingTier: true }), deps)).rejects.toThrow(
+      /expected routing service.*is absent/i,
+    );
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+
+  it("fails when the expected routing Deployment cannot be read", async () => {
+    vi.mocked(execCapture).mockImplementation(
+      cluster({ routingDeploymentReadFails: true }) as never,
+    );
+
+    await expect(runCutover(inputs({ hasRoutingTier: true }), deps)).rejects.toThrow(
+      /could not read expected routing service[^]*forbidden by RBAC/i,
+    );
+    expect(events.some((event) => event.startsWith("patch:"))).toBe(false);
+    expect(deps.restoreEdgeToPreviousBuild).toHaveBeenCalled();
+  });
+
+  it("skips the routing Deployment probe when the build declares pool-local routing", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster({ routingDeploymentMissing: true }) as never);
+
+    await runCutover(inputs({ hasRoutingTier: false }), deps);
+
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(
+          ([, args]) =>
+            args[0] === "get" && args[1] === "deployment" && args[2] === "rel-routing-service",
+        ),
+    ).toBe(false);
+  });
+
   it("quotes the budget it actually used when the ROUTING rollout fails", async () => {
     // The abort message quoted a stale "120s" for two revisions; A2 then made it quote the
     // POOL gate's number on a routing failure. It must quote the wait this gate performed.
@@ -897,6 +950,7 @@ describe("runCutover — E6: superseded deployment ownership", () => {
     const foreignName = `${RELEASE}-foreign-buildl`;
     vi.mocked(execCapture).mockImplementation(
       cluster({
+        healthCheckPolicyCrd: true,
         gcDeployments: [
           poolDeployment(oldAdapterName, "ssr", "buildl"),
           poolDeployment(foreignName, "foreign", "buildl", false),
@@ -918,6 +972,9 @@ describe("runCutover — E6: superseded deployment ownership", () => {
     expect(events).toContain(`delete:deployment:${oldAdapterName}`);
     expect(events).toContain(`delete:service:${oldAdapterName}`);
     expect(events).toContain(`delete:healthcheckpolicy:${oldAdapterName}-hcp`);
+    expect(
+      vi.mocked(execCapture).mock.calls.some(([, args]) => args[0] === "get" && args[1] === "crd"),
+    ).toBe(false);
     expect(events.some((event) => event.includes(foreignName))).toBe(false);
     expect(
       vi
@@ -925,6 +982,25 @@ describe("runCutover — E6: superseded deployment ownership", () => {
         .mock.calls.map((call) => String(call[0]))
         .join("\n"),
     ).toContain(`keeping ambiguous Deployment "${foreignName}"`);
+  });
+
+  it("does not probe a GKE companion when the bundle declares no HealthCheckPolicy", async () => {
+    const oldAdapterName = `${RELEASE}-ssr-buildl`;
+    vi.mocked(execCapture).mockImplementation(
+      cluster({
+        gcDeployments: [poolDeployment(oldAdapterName, "ssr", "buildl")],
+        gcCompanions: {
+          [`service/${oldAdapterName}`]: poolService(oldAdapterName, "ssr", "buildl"),
+        },
+      }) as never,
+    );
+
+    await runCutover(inputs({ hasHealthCheckPolicy: false }), deps);
+
+    expect(events).toContain(`delete:service:${oldAdapterName}`);
+    expect(
+      vi.mocked(execCapture).mock.calls.some(([, args]) => args[1] === "healthcheckpolicy"),
+    ).toBe(false);
   });
 
   it("independently retains a foreign same-named Service beside an owned old Deployment", async () => {
@@ -1048,6 +1124,8 @@ describe("jobMain — the poison pill", () => {
         targetPlatforms: { [BUILD]: "linux/amd64" },
         secretsMode: "external",
         cutover: "job",
+        hasRoutingTier: true,
+        hasHealthCheckPolicy: true,
         ...extra,
       }),
     );

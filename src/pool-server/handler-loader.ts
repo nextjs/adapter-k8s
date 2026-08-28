@@ -8,6 +8,27 @@ export type ArtifactRouteHandler = (...args: unknown[]) => unknown;
 type LoadedModule = Record<string, unknown>;
 type LoadModuleFn = (entrypointPath: string) => Promise<LoadedModule>;
 
+type IncrementalCacheWriter = {
+  requestHeaders?: Record<string, string | string[] | undefined>;
+  set?: (key: string, value: unknown, ctx: Record<string, unknown>) => Promise<void>;
+};
+type IncrementalResponseEntry = {
+  cacheControl?: unknown;
+  isStale?: boolean | -1;
+  value?: { kind?: string };
+} | null;
+type ResponseGeneratorContext = Record<string, unknown> & { forceStaticRender?: boolean };
+type ResponseGenerator = (context: ResponseGeneratorContext) => unknown;
+type HandleRevalidate = (
+  key: string,
+  incrementalCache: IncrementalCacheWriter,
+  isRoutePPREnabled: boolean,
+  isFallback: boolean,
+  responseGenerator: ResponseGenerator,
+  previousIncrementalCacheEntry: IncrementalResponseEntry,
+  hasResolved: boolean,
+) => Promise<IncrementalResponseEntry>;
+
 // Normalize a Turbopack _ENTRIES key (`middleware_app/api/edge/route`,
 // `middleware_pages/api/foo`, `middleware_app/(group)/dashboard/page`) to the public
 // route pathname it serves, so a route can select ITS OWN entry from the
@@ -51,8 +72,12 @@ export function resolveRouteHandlerExport(
   // App Router route modules compiled by Turbopack may export routeModule with a handle method
   if (module.routeModule && typeof module.routeModule === "object") {
     const rm = module.routeModule as Record<string, unknown>;
-    if (typeof rm.handle === "function") return rm.handle as ArtifactRouteHandler;
-    if (typeof rm.render === "function") return rm.render as ArtifactRouteHandler;
+    if (typeof rm.handle === "function") {
+      return (rm.handle as ArtifactRouteHandler).bind(module.routeModule);
+    }
+    if (typeof rm.render === "function") {
+      return (rm.render as ArtifactRouteHandler).bind(module.routeModule);
+    }
   }
 
   // Edge runtime modules compiled by Turbopack register in globalThis._ENTRIES.
@@ -151,72 +176,20 @@ export function resolveUpgradeHandlerExport(
  */
 function unlatchResponseCache(
   module: LoadedModule,
-  ResponseCacheCtor: new (minimalMode: boolean) => unknown,
+  responseCacheCtor: () => new (minimalMode: boolean) => unknown,
+  rscHeader: string,
 ): void {
   type RouteModuleish = {
     getResponseCache?: (req: unknown) => unknown;
-    handleResponse?: (arg: Record<string, unknown>) => unknown;
   };
   const candidates = module as {
     routeModule?: RouteModuleish;
     default?: { routeModule?: RouteModuleish };
   };
   // The template exports `routeModule` at top level; some bundlings put the real exports
-  // on `default`. Attachment MUST be loud under the trace env: a silent no-op here
-  // disables the entire un-latch (and every wrapper below), which reads as "the
-  // revalidation never runs" from the outside — that ambiguity cost a diagnosis round.
+  // on `default`. Older artifacts without this route-module contract have nothing to un-latch.
   const rm = candidates.routeModule ?? candidates.default?.routeModule;
-  if (!rm || typeof rm.getResponseCache !== "function") {
-    if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
-      console.log(
-        `[cache-trace] ${JSON.stringify({
-          op: "unlatch-skipped",
-          hasRouteModule: !!rm,
-          keys: Object.keys(module as object).slice(0, 12),
-        })}`,
-      );
-    }
-    return;
-  }
-  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
-    console.log(`[cache-trace] {"op":"unlatch-attached"}`);
-  }
-  // Trace-channel visibility into the response pipeline (ADAPTER_K8S_CACHE_TRACE): whether
-  // handleResponse runs, whether it actually invokes the response GENERATOR (the code that
-  // hosts the entrypoint's RDC branch and its stale-revalidation scheduling), and what the
-  // generator returns. Thirteen stale-signalled reads with zero revalidate() calls
-  // (rdc, 2026-08-04) could not be localized without seeing this boundary.
-  if (process.env.ADAPTER_K8S_CACHE_TRACE === "1" && typeof rm.handleResponse === "function") {
-    const origHandle = rm.handleResponse.bind(rm);
-    rm.handleResponse = (arg: Record<string, unknown>) => {
-      const cacheKey = arg?.cacheKey;
-      console.log(`[cache-trace] ${JSON.stringify({ op: "rm-handleResponse", cacheKey })}`);
-      const gen = arg?.responseGenerator;
-      if (typeof gen === "function") {
-        arg = {
-          ...arg,
-          responseGenerator: async (...genArgs: unknown[]) => {
-            console.log(`[cache-trace] ${JSON.stringify({ op: "rm-generator", cacheKey })}`);
-            const out = (await (gen as (...a: unknown[]) => Promise<unknown>)(...genArgs)) as {
-              cacheControl?: unknown;
-              value?: { kind?: string; postponed?: unknown };
-            } | null;
-            console.log(
-              `[cache-trace] ${JSON.stringify({
-                op: "rm-generator-done",
-                cacheKey,
-                nullEntry: out === null,
-                hasCacheControl: !!out?.cacheControl,
-                hasPostponed: !!out?.value?.postponed,
-              })}`,
-            );
-            return out;
-          },
-        };
-      }
-      return origHandle(arg);
-    };
-  }
+  if (!rm || typeof rm.getResponseCache !== "function") return;
   const META = Symbol.for("NextInternalRequestMeta");
   const perMode = new Map<boolean, unknown>();
   rm.getResponseCache = (req: unknown): unknown => {
@@ -225,78 +198,113 @@ function unlatchResponseCache(
     )?.[META]?.minimalMode;
     let rc = perMode.get(minimal);
     if (!rc) {
+      const ResponseCacheCtor = responseCacheCtor();
       rc = new ResponseCacheCtor(minimal);
-      // Trace-channel visibility into Next's revalidation writes (ADAPTER_K8S_CACHE_TRACE):
-      // ResponseCache.handleRevalidate has two SILENT no-write paths — a null generator
-      // result and a missing cacheControl — and telling "the revalidation never ran" from
-      // "it ran and silently declined to persist" cost a full diagnosis round (rdc,
-      // 2026-08-04). Wrap revalidate() at the same seam that un-latches the mode.
-      if (process.env.ADAPTER_K8S_CACHE_TRACE === "1") {
-        const inst = rc as { revalidate?: (...args: unknown[]) => Promise<unknown> };
-        const orig = inst.revalidate?.bind(inst);
-        if (orig) {
-          inst.revalidate = async (...args: unknown[]) => {
-            const key = args[0];
-            console.log(`[cache-trace] ${JSON.stringify({ op: "rc-revalidate", key, minimal })}`);
-            try {
-              const out = (await orig(...args)) as {
-                cacheControl?: unknown;
-                value?: { kind?: string };
-              } | null;
-              console.log(
-                `[cache-trace] ${JSON.stringify({
-                  op: "rc-revalidate-done",
-                  key,
-                  nullEntry: out === null,
-                  hasCacheControl: !!out?.cacheControl,
-                  kind: out?.value?.kind,
-                })}`,
-              );
-              return out;
-            } catch (error) {
-              console.log(
-                `[cache-trace] ${JSON.stringify({
-                  op: "rc-revalidate-error",
-                  key,
-                  message: (error as Error)?.message?.slice(0, 200),
-                })}`,
-              );
-              throw error;
-            }
-          };
-        }
+      const inst = rc as { handleRevalidate?: HandleRevalidate };
+      // Next 16.3's public get() normally reaches revalidate(), but a PPR prefetch miss calls
+      // handleRevalidate() directly. Wrap the common conversion seam so both paths persist the
+      // platform-owned minimal-mode entry. This private positional signature is verified against
+      // the supported Next runtime when a route first requests its cache; it is not public API.
+      const orig = inst.handleRevalidate?.bind(inst);
+      if (!orig) {
+        throw new Error(
+          "Unsupported Next.js ResponseCache contract: handleRevalidate is unavailable; " +
+            "refusing to run because PPR cache persistence would be incorrect",
+        );
       }
+      inst.handleRevalidate = async (
+        key,
+        incrementalCache,
+        isRoutePPREnabled,
+        isFallback,
+        responseGenerator,
+        previousIncrementalCacheEntry,
+        hasResolved,
+      ) => {
+        // A dynamic RSC request first starts a normal background revalidation, then discovers
+        // the stale APP_PAGE/RDC and schedules the required force-static regeneration. Both use
+        // Next's pathname-only revalidate batcher, so the second generator joins the first and
+        // never runs. Force the FIRST generator static at this exact seam: it cannot resume from
+        // the stale page's embedded fetch/use-cache RDC, and its nested stale reads refresh
+        // synchronously before the new APP_PAGE is persisted.
+        const requestRsc = incrementalCache.requestHeaders?.[rscHeader.toLowerCase()];
+        const staleDynamicRscAppPage =
+          !minimal &&
+          requestRsc === "1" &&
+          isRoutePPREnabled &&
+          (previousIncrementalCacheEntry?.isStale === true ||
+            previousIncrementalCacheEntry?.isStale === -1) &&
+          previousIncrementalCacheEntry.value?.kind === "APP_PAGE";
+        const effectiveGenerator: ResponseGenerator = staleDynamicRscAppPage
+          ? (context) => responseGenerator({ ...context, forceStaticRender: true })
+          : responseGenerator;
+        const out = await orig(
+          key,
+          incrementalCache,
+          isRoutePPREnabled,
+          isFallback,
+          effectiveGenerator,
+          previousIncrementalCacheEntry,
+          hasResolved,
+        );
+
+        // Next deliberately skips incrementalCache.set under minimal mode because the
+        // deployment platform owns persistence. The pool is that platform: for a PPR
+        // APP_PAGE, persist the already-converted incremental value through the registered
+        // handler. Keep every other minimal response uncached.
+        if (minimal && isRoutePPREnabled && out?.cacheControl && out.value?.kind === "APP_PAGE") {
+          if (typeof incrementalCache?.set === "function") {
+            try {
+              await incrementalCache.set(key, out.value, {
+                cacheControl: out.cacheControl,
+                isFallback,
+                isRoutePPREnabled: true,
+              });
+            } catch (error) {
+              // Cache failure must not fail the request. The registered handler logs its own
+              // storage errors; this also covers a foreign/older handler throwing at the seam.
+              console.error("[pool-server] minimal PPR cache write failed:", error);
+            }
+          }
+        }
+
+        return out;
+      };
       perMode.set(minimal, rc);
     }
     return rc;
   };
 }
 
-/** Resolve Next's ResponseCache class through the APP's own next (the module graph the
- * entrypoints run in). Lazy and fail-open: an unresolvable class leaves the upstream
- * latch behavior untouched rather than breaking handler loading. */
-function defaultResponseCacheCtor(): (new (minimalMode: boolean) => unknown) | undefined {
+/** Resolve Next's ResponseCache class through the app's own Next.js module graph. */
+function defaultResponseCacheCtor(): new (minimalMode: boolean) => unknown {
   try {
     const req = createRequire(path.resolve(process.cwd(), "package.json"));
     const mod = req("next/dist/server/response-cache") as {
       default?: new (minimalMode: boolean) => unknown;
     };
-    return typeof mod.default === "function" ? mod.default : undefined;
-  } catch {
-    return undefined;
+    if (typeof mod.default === "function") return mod.default;
+    throw new Error("default export is not a constructor");
+  } catch (error) {
+    throw new Error(
+      "Unsupported Next.js ResponseCache contract: unable to load next/dist/server/response-cache",
+      { cause: error },
+    );
   }
 }
 
 export function createHandlerLoader(
   manifest: PoolManifest,
   loadModule: LoadModuleFn = (p) => import(pathToFileURL(path.resolve(process.cwd(), p)).href),
-  options?: { responseCacheCtor?: new (minimalMode: boolean) => unknown },
+  options?: {
+    responseCacheCtor?: new (minimalMode: boolean) => unknown;
+    rscHeader?: string;
+  },
 ) {
-  let resolvedCtor: (new (minimalMode: boolean) => unknown) | undefined | null = null;
-  const responseCacheCtor = (): (new (minimalMode: boolean) => unknown) | undefined => {
+  let resolvedCtor: (new (minimalMode: boolean) => unknown) | undefined;
+  const responseCacheCtor = (): new (minimalMode: boolean) => unknown => {
     if (options?.responseCacheCtor) return options.responseCacheCtor;
-    if (resolvedCtor === null) resolvedCtor = defaultResponseCacheCtor();
-    return resolvedCtor;
+    return (resolvedCtor ??= defaultResponseCacheCtor());
   };
   // Cache the imported module rather than only its HTTP handler. HTTP and WebSocket dispatch are
   // two entrypoints on the SAME generated route module and must share initialization, module state,
@@ -305,15 +313,15 @@ export function createHandlerLoader(
   const handlerCache = new Map<string, Promise<ArtifactRouteHandler>>();
 
   function loadModuleForOutput(outputId: string): Promise<LoadedModule> {
-    const cached = moduleCache.get(outputId);
-    if (cached) return cached;
-
     const output = manifest.outputs[outputId];
     if (!output) {
       return Promise.reject(
         new Error(`Unknown output ID: ${outputId} for pool ${manifest.poolName}`),
       );
     }
+    const moduleKey = output.filePath;
+    const cached = moduleCache.get(moduleKey);
+    if (cached) return cached;
 
     const promise = loadModule(output.filePath).then(async (module): Promise<LoadedModule> => {
       // Turbopack modules with top-level await (e.g., Genkit, heavy async deps) may export a
@@ -329,15 +337,21 @@ export function createHandlerLoader(
       ) {
         resolved = await (defaultExport as Promise<LoadedModule>);
       }
-      const ctor = responseCacheCtor();
-      if (ctor) unlatchResponseCache(resolved, ctor);
+      // Only generated route modules expose getResponseCache. Keep the private Next.js import
+      // behind that shape check so middleware, edge, and plain route-handler modules can load
+      // without depending on an implementation detail they never use.
+      unlatchResponseCache(
+        resolved,
+        responseCacheCtor,
+        (options?.rscHeader ?? "rsc").toLowerCase(),
+      );
       return resolved;
     });
     // A transient import failure must not poison either transport for the life of the pod.
     promise.catch(() => {
-      if (moduleCache.get(outputId) === promise) moduleCache.delete(outputId);
+      if (moduleCache.get(moduleKey) === promise) moduleCache.delete(moduleKey);
     });
-    moduleCache.set(outputId, promise);
+    moduleCache.set(moduleKey, promise);
     return promise;
   }
 

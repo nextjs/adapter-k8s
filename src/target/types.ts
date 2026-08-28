@@ -64,6 +64,9 @@ export interface IngressSourceSet {
   podSelectors: Array<{ namespace?: string; labels: Record<string, string> }>;
 }
 
+/** Backend health policy selected by an exposure, independent of its routing adapter. */
+export type BackendHealthPolicy = { kind: "gke-health-check-policy" };
+
 export type ExposureCapability =
   | { kind: "manual" }
   | {
@@ -72,7 +75,12 @@ export type ExposureCapability =
       gateway: KubernetesObjectRef;
       applicationRoutes: KubernetesObjectRef[];
     }
-  | { kind: "ingress"; className: string };
+  | { kind: "ingress"; className: string }
+  | {
+      kind: "backend-health";
+      policy: BackendHealthPolicy;
+      service: KubernetesServiceRef;
+    };
 
 export type ExposureRequirement = Extract<ExposureCapability, { kind: "gateway-api" }>;
 
@@ -199,6 +207,8 @@ export interface CompiledKubernetesTarget {
   defaultPool: string;
   hosts: HostConfig[];
   ingressSources: IngressSourceSet;
+  /** Exposure-selected policy for the stable origin Service, if any. */
+  backendHealth: BackendHealthPolicy | null;
   routingTier: RoutingTier;
   /** Validated routing component name stamped onto adapter-owned runtime telemetry. */
   routingProviderName: string;

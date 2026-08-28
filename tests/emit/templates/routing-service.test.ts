@@ -19,8 +19,21 @@ describe("renderRoutingServiceDeployment", () => {
     expect(yaml).toContain("path: /healthz");
     expect(yaml).not.toContain("tcpSocket");
     expect(yaml).toContain("ROUTING_REQUEST_TIMEOUT_MS");
+    expect(yaml).toMatch(/- name: TLS_CERT_FILE\n\s+value: \/tmp\/tls\/tls-cert\.pem/);
+    expect(yaml).toMatch(/- name: TLS_KEY_FILE\n\s+value: \/tmp\/tls\/tls-key\.pem/);
     // Fail-open defaults true when not specified.
     expect(yaml).toMatch(/ROUTING_FAIL_OPEN[\s\S]*?value: "true"/);
+  });
+
+  it("does not configure TLS identity paths for h2c", () => {
+    const yaml = renderRoutingServiceDeployment({
+      releaseName: "my-app",
+      buildId: "abc123",
+      imageRegistry: "reg",
+      transport: "h2c",
+    });
+    expect(yaml).not.toContain("TLS_CERT_FILE");
+    expect(yaml).not.toContain("TLS_KEY_FILE");
   });
 
   it("honors resource overrides and fail-closed policy", () => {
@@ -205,6 +218,9 @@ describe("renderRoutingServiceDeployment — review findings", () => {
   it("N71: explicit probe timings on both probes (no inherited 1s timeout)", () => {
     const yaml = renderRoutingServiceDeployment(base);
     expect(yamlOnly(yaml)).not.toMatch(/timeoutSeconds: 1$/m);
+    expect(yaml).toMatch(
+      /startupProbe:\n\s+httpGet:\n\s+path: \/healthz\n\s+port: 8081\n\s+periodSeconds: 5\n\s+timeoutSeconds: 3\n\s+failureThreshold: 30/,
+    );
     expect(yaml).toMatch(/readinessProbe:[\s\S]*?timeoutSeconds: 3/);
     expect(yaml).toMatch(/livenessProbe:[\s\S]*?timeoutSeconds: 5/);
   });
