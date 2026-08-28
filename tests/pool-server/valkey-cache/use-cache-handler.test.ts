@@ -872,11 +872,21 @@ describe("N84: `revalidate <= 0` is storable (only a non-finite/`expire<=0` entr
     expect(client.multiExpireArgs).toEqual([360]);
   });
 
-  it("stores a cacheLife({ revalidate: 0 }) entry", async () => {
+  it("stores a cacheLife({ revalidate: 0 }) entry but treats it as immediately due", async () => {
     const client = new FakeValkeyClient();
-    const h = new ValkeyCacheHandler({ client, buildId: "n84b", now: () => 1000 });
-    await h.set("k", Promise.resolve(makeEntry("v", { revalidate: 0, expire: 300 })));
-    expect(await h.get("k", [])).toBeDefined();
+    const clock = { t: 1000 };
+    client.serverNowFn = () => clock.t;
+    const h = new ValkeyCacheHandler({ client, buildId: "n84b", now: () => clock.t });
+    await h.set(
+      "k",
+      Promise.resolve(makeEntry("v", { timestamp: clock.t, revalidate: 0, expire: 300 })),
+    );
+    expect(client.hashes.has("k8s:n84b:entry:k")).toBe(true);
+    // Next's production handler stores zero-revalidate entries so their lifetime can propagate
+    // into an enclosing cache. Its strict `now > timestamp` comparison permits the exact write
+    // instant; one clock tick later the direct read is due and must regenerate.
+    clock.t++;
+    expect(await h.get("k", [])).toBeUndefined();
   });
 
   it("still skips `expire <= 0` (Next's dynamic / eviction-sentinel entries), silently", async () => {
