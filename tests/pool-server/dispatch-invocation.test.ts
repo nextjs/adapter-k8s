@@ -110,7 +110,7 @@ afterEach(() => {
 });
 
 describe("local handler loopback reuse", () => {
-  it("reuses one process-level listener across sequential invocations", async () => {
+  it("reuses one process-level listener and connection for bodyless reads", async () => {
     const listenerPorts: number[] = [];
     const peerPorts: number[] = [];
     const handler: NodeHandler = (req, res) => {
@@ -133,9 +133,53 @@ describe("local handler loopback reuse", () => {
 
     expect(listenerPorts).toHaveLength(3);
     expect(new Set(listenerPorts)).toHaveLength(1);
-    // Generated entrypoints can attach socket-scoped state. Keep the expensive listener but
-    // retire the cheap client connection at the invocation boundary, matching the old topology.
+    expect(new Set(peerPorts)).toHaveLength(1);
+  });
+
+  it("keeps mutation connections invocation-scoped", async () => {
+    const peerPorts: number[] = [];
+    const handler: NodeHandler = (req, res) => {
+      peerPorts.push(req.socket.remotePort!);
+      res.end("ok");
+    };
+
+    for (let invocation = 0; invocation < 3; invocation++) {
+      await invokeLocalHandlerOverHttp({
+        handler: handler as never,
+        req: mockReq(`/mutation-${invocation}`, {}, "POST"),
+        res: mockRes(),
+        matchedPathname: "/mutation",
+        routeMatches: null,
+        bufferedBody: Buffer.alloc(0),
+      });
+    }
+
+    // Generated action entrypoints attach request-body state to their socket. Never let a later
+    // mutation inherit it; this is the boundary the app-action-size-limit fixture regressed.
     expect(new Set(peerPorts)).toHaveLength(3);
+  });
+
+  it("does not let a mutation poison the reusable read connection", async () => {
+    const peerPorts: number[] = [];
+    const invoke = (method: "GET" | "POST") =>
+      invokeLocalHandlerOverHttp({
+        handler: ((req: IncomingMessage, innerRes: ServerResponse) => {
+          peerPorts.push(req.socket.remotePort!);
+          innerRes.end("ok");
+        }) as never,
+        req: mockReq(`/${method.toLowerCase()}`, {}, method),
+        res: mockRes(),
+        matchedPathname: "/boundary",
+        routeMatches: null,
+        bufferedBody: method === "POST" ? Buffer.from("action") : undefined,
+      });
+
+    await invoke("GET");
+    await invoke("POST");
+    await invoke("GET");
+
+    expect(peerPorts[0]).toBe(peerPorts[2]);
+    expect(peerPorts[1]).not.toBe(peerPorts[0]);
   });
 
   it("keeps concurrent invocation closures isolated and hides its selector header", async () => {

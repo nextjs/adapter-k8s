@@ -59,13 +59,19 @@ interface LocalHandlerLoopback {
 }
 
 let localHandlerLoopbackPromise: Promise<LocalHandlerLoopback> | undefined;
+// Bodyless reads cannot leave a partially-consumed request parser behind. Reuse their connection
+// to remove the remaining TCP handshake from ordinary page/RSC traffic, while mutation and PPR
+// resume invocations keep a private agent below. Bound idle sockets so burst concurrency cannot
+// turn into a permanent per-process fd floor.
+const localReadLoopbackAgent = new Agent({ keepAlive: true, maxFreeSockets: 64 });
 
 /**
  * One loopback listener per pool process. Generated Next entrypoints require real Node
  * IncomingMessage/ServerResponse objects, but allocating and closing a TCP listener for every
  * render adds measurable fixed latency. An opaque header selects the per-invocation closure; the
- * listener removes it before user code runs. Connections remain invocation-scoped: generated
- * entrypoints may attach socket state, and sharing one socket across renders broke Server Actions.
+ * listener removes it before user code runs. Connections carrying a body remain invocation-scoped:
+ * generated action entrypoints may attach parser state, and sharing one of those sockets across
+ * renders broke Server Actions. Proven-bodyless GET/HEAD requests may use the bounded read agent.
  */
 function localHandlerLoopback(): Promise<LocalHandlerLoopback> {
   localHandlerLoopbackPromise ??= new Promise<LocalHandlerLoopback>((resolve, reject) => {
@@ -1317,15 +1323,25 @@ export async function invokeLocalHandlerOverHttp({
     };
     const invocationId = randomUUID();
     const invocationAsyncResource = new AsyncResource("adapter-k8s:local-handler");
-    // Match the old per-listener lifecycle: keep-alive is useful for a PPR shell + resume inside
-    // one logical invocation, but the agent is destroyed before another request can inherit the
-    // generated entrypoint's socket-scoped state.
-    const invocationAgent = new Agent({ keepAlive: true });
+    const method = req.method?.toUpperCase() ?? "GET";
+    const bodylessRead =
+      (method === "GET" || method === "HEAD") &&
+      bufferedBody === undefined &&
+      req.headers["content-length"] === undefined &&
+      req.headers["transfer-encoding"] === undefined &&
+      req.headers["next-action"] === undefined &&
+      !captureActive;
+    // Generated action entrypoints can attach request-body state to a socket. A global agent here
+    // caused a successful multipart action to poison the following render and hang until timeout.
+    // Reuse is therefore limited to provably bodyless reads. PPR capture also stays private so its
+    // shell and POST resume share one connection without exposing that connection to another
+    // logical invocation.
+    const invocationAgent = bodylessRead ? localReadLoopbackAgent : new Agent({ keepAlive: true });
     const innerResponseClosures = new Set<Promise<void>>();
     let finished = false;
     const unregister = (): void => {
       if (loopback.handlers.delete(invocationId)) invocationAsyncResource.emitDestroy();
-      invocationAgent.destroy();
+      if (!bodylessRead) invocationAgent.destroy();
     };
     const finishResolve = (): void => {
       if (finished) return;
