@@ -111,6 +111,9 @@ const EMPTY_MANIFEST: TagManifest = new Map();
 
 interface PreparedInvocation {
   epoch: string | undefined;
+  /** Implicit tags Next supplied while reading a key in this invocation. A successful matching
+   * set can then safely write through to the local front instead of forcing another render. */
+  softTagsByCacheKey: Map<string, string[]>;
 }
 
 /** Closure returned by preflight and used to scope only the matching Next invocation. */
@@ -352,7 +355,10 @@ export class ValkeyCacheHandler implements CacheHandler {
         error,
       );
     }
-    const invocation: PreparedInvocation = { epoch: preparedEpoch };
+    const invocation: PreparedInvocation = {
+      epoch: preparedEpoch,
+      softTagsByCacheKey: new Map(),
+    };
     return <T>(callback: () => T): T => this.preparedInvocations.run(invocation, callback);
   }
 
@@ -400,6 +406,8 @@ export class ValkeyCacheHandler implements CacheHandler {
     const invocation = this.preparedInvocations.getStore();
     if (invocation) {
       if (invocation.epoch !== this.manifestEpoch) return undefined;
+      const previousSoftTags = invocation.softTagsByCacheKey.get(cacheKey) ?? [];
+      invocation.softTagsByCacheKey.set(cacheKey, capTags([...previousSoftTags, ...softTags]));
       const local = this.readLocalEntry(cacheKey, softTags);
       if (local) return local;
       // Do not await the backing store here. Cache Components observes that I/O boundary and
@@ -509,6 +517,22 @@ export class ValkeyCacheHandler implements CacheHandler {
         String(clientNow),
       );
       warnOnClockSkewClamp(clamped);
+      const invocation = this.preparedInvocations.getStore();
+      if (invocation && invocation.epoch === this.manifestEpoch && this.backingAvailable) {
+        // `get` already checked this invocation's manifest epoch outside Next's staged render
+        // and recorded the exact implicit tags. The write is now durable, so retaining the same
+        // bytes locally is equivalent to a backing warm without the extra request/recompute
+        // cycle. A peer tag update bumps the epoch and clears this entry at the next preflight.
+        this.putLocalEntry(cacheKey, {
+          tags: meta.tags,
+          verifiedSoftTags: invocation.softTagsByCacheKey.get(cacheKey) ?? [],
+          stale: entry.stale,
+          timestamp: entry.timestamp,
+          expire: entry.expire,
+          revalidate: entry.revalidate,
+          value: buf,
+        });
+      }
     } catch (error) {
       // The store script is atomic. A transport failure can be ambiguous after commit, so never
       // issue a cleanup DEL that could race a later writer and remove its successful value.

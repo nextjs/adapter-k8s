@@ -13,6 +13,10 @@ import {
   SUPPORTED_NEXT_RELEASE_LINE,
 } from "../next-runtime/version.js";
 import {
+  ensureNextNodeEnvironment,
+  registerInstrumentationHook,
+} from "../next-runtime/instrumentation.js";
+import {
   getRscConfig,
   INTERNAL_EXECUTION_DEADLINE_HEADER,
   manifestNextConfig,
@@ -106,140 +110,6 @@ import {
 } from "./cache-policy.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
-
-// Initialize Next.js Node runtime shims (AsyncLocalStorage, hooks, crypto polyfills).
-// This MUST run before any Next.js handler modules are imported.
-// Follows the AWS adapter's ensureNextNodeEnvironment pattern.
-async function ensureNextNodeEnvironment(): Promise<void> {
-  const req = createRequire(path.join(process.cwd(), "package.json"));
-  const candidates = [
-    "next/setup-node-env",
-    "next/dist/build/adapter/setup-node-env.external",
-    "next/dist/server/node-environment",
-  ];
-
-  for (const candidate of candidates) {
-    try {
-      req(candidate);
-      return;
-    } catch {
-      // Try the next candidate.
-    }
-  }
-
-  console.warn(
-    "[pool-server] Could not load Next.js node environment shims from app dependencies — AsyncLocalStorage may not work",
-  );
-}
-
-// Run the app's `instrumentation.js` `register()` hook before the pool serves anything,
-// which is what `next start` does — and the ordering, not just the fact of registration,
-// is the point: an app that sets up a tracer provider, monkey-patches `node:http`, or
-// installs an error reporter in `register()` expects that to have happened before the
-// first request is handled.
-//
-// What `next start` actually does (Next 16.2, verified in source and on a live server):
-//   • `NextNodeServer.prepareImpl()` → `runInstrumentationHookIfAvailable()` →
-//     `ensureInstrumentationRegistered(dir, distDir)`
-//     (server/lib/router-utils/instrumentation-globals.external.ts), which requires
-//     `<distDir>/server/instrumentation.js` and awaits its `register()`.
-//   • Ordering: `startServer` binds the port immediately but QUEUES every request behind
-//     `handlersPromise`, which resolves only after `render-server`'s `initializeImpl`
-//     awaits `server.prepare()`. Measured with a `register()` that sleeps 1500 ms: port
-//     accepting at +98 ms, register start +124 ms, register DONE +1626 ms, and the first
-//     response only at +1674 ms — with the hook's completion flag already set. So
-//     `register()` is awaited to completion before the first request is served.
-//   • Exactly once per process: the promise is memoized in a module-level
-//     `registerInstrumentationPromise` (`calls=1` on the probe, same pid as the request
-//     handler). There is no per-worker duplication in `next start`.
-//   • Missing file: `getInstrumentationModule` swallows ENOENT / MODULE_NOT_FOUND /
-//     ERR_MODULE_NOT_FOUND, so an app without instrumentation is a silent no-op.
-//   • A THROWING `register()`: the process does NOT exit. `next start` logs
-//     "Failed to prepare server" plus an unhandledRejection and stays up — but the
-//     rejected promise is memoized, so every subsequent request 500s forever (measured:
-//     3/3 `/api/*` and `/` → 500 "Internal Server Error", process alive after 6 s).
-//
-// The adapter goes through upstream's own `ensureInstrumentationRegistered` rather than
-// requiring `.next/server/instrumentation.js` itself, for one decisive reason: Next ALSO
-// calls it lazily from `RouteModule.prepare()` on the entrypoint path the pool dispatches
-// into. Both call sites resolve to the same file
-// (`<app>/node_modules/next/dist/server/lib/router-utils/instrumentation-globals.external.js`
-// — verified identical, and `require()` here shares the CJS cache entry with
-// route-module's `await import()`), so they share the memoized promise: registering here
-// guarantees exactly-once and cannot double-register, whereas a hand-rolled loader would
-// run `register()` a second time (an OTEL SDK started twice is a real failure).
-// Reusing it also keeps `afterRegistration()` — the cache-components tracer patch that
-// runs immediately after `register()` upstream.
-//
-// Failure policy: log loudly, do NOT block startup. The pod keeps answering `/healthz`,
-// static assets and `/_next/image`, while Next's own per-request
-// `ensureInstrumentationRegistered` re-awaits the same rejected promise and 500s the
-// routes it owns — i.e. `next start`'s observable behavior on the app's own routes,
-// without an instrumentation bug turning into a CrashLoopBackOff.
-//
-// N32: the outcome is REPORTED, not merely logged, so `/readyz` can answer 503 for it — "keeps
-// answering /healthz while every app route 500s" is precisely the state the blue/green gate used
-// to read as a healthy build. "absent" (no hook) and "registrar-missing" (this Next version moved
-// the registrar; Next's own lazy per-request path still runs the hook, once) are both serving
-// states; only "failed" is not.
-type InstrumentationStatus = "ok" | "absent" | "registrar-missing" | "failed";
-
-async function registerInstrumentationHook(
-  cwd: string,
-  distDir: string,
-): Promise<InstrumentationStatus> {
-  // `ensureInstrumentationRegistered` already tolerates a missing hook, but checking first
-  // keeps the "no instrumentation" case from depending on error-code sniffing at all.
-  if (!existsSync(path.join(cwd, distDir, "server", "instrumentation.js"))) return "absent";
-
-  // Resolving the registrar and RUNNING it fail for different reasons and must not share a
-  // diagnostic: "the app's hook threw" and "this Next version moved the registrar" call for
-  // different fixes. If the registrar can't be found, do NOT fall back to requiring the hook
-  // directly — that would break the shared memo with RouteModule.prepare and run register()
-  // a second time. Next's lazy path still runs it on the first request: late, but once.
-  const MODULE_ID = "next/dist/server/lib/router-utils/instrumentation-globals.external";
-  let ensureInstrumentationRegistered:
-    | ((projectDir: string, distDir: string) => Promise<void>)
-    | undefined;
-  try {
-    const appRequire = createRequire(path.join(cwd, "package.json"));
-    ({ ensureInstrumentationRegistered } = appRequire(MODULE_ID) as {
-      ensureInstrumentationRegistered?: (projectDir: string, distDir: string) => Promise<void>;
-    });
-  } catch (err) {
-    console.error(
-      `[pool-server] could not load ${MODULE_ID} from the app — instrumentation register() ` +
-        `will run lazily on the first request instead of at startup:`,
-      err,
-    );
-    return "registrar-missing";
-  }
-  if (typeof ensureInstrumentationRegistered !== "function") {
-    console.error(
-      `[pool-server] ${MODULE_ID} does not export ensureInstrumentationRegistered — ` +
-        `instrumentation register() will run lazily on the first request instead of at startup`,
-    );
-    return "registrar-missing";
-  }
-
-  try {
-    // Awaited: a hook that never settles holds the pod out of readiness, which fails the
-    // blue/green gate rather than cutting traffic to a half-initialized build. `next start`
-    // is equivalent — its requests queue behind the same unresolved promise.
-    await ensureInstrumentationRegistered(cwd, distDir);
-    console.log("[pool-server] instrumentation register() completed");
-    return "ok";
-  } catch (err) {
-    console.error(
-      "[pool-server] instrumentation register() FAILED — the pool will keep serving " +
-        "/healthz and static assets, but Next re-awaits this same rejected registration " +
-        "per request, so app routes will 500 (this is what next start does too). N32: /readyz " +
-        "now reports 503 for this state so the blue/green gate cannot promote this build:",
-      err,
-    );
-    return "failed";
-  }
-}
 
 /**
  * Default post-SIGTERM application drain budget (see the shutdown handler at the end of
