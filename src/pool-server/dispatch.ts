@@ -1,5 +1,6 @@
 // src/pool-server/dispatch.ts
-import { createServer, request as httpRequest } from "node:http";
+import { Agent, createServer, request as httpRequest } from "node:http";
+import { AsyncResource } from "node:async_hooks";
 import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
 import { pipeline } from "node:stream";
 import { randomUUID } from "node:crypto";
@@ -43,6 +44,69 @@ import { decodeNextPathname } from "../next-runtime/pathname.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 const PRERENDER_DEPLOY_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+const LOCAL_INVOCATION_HEADER = "x-adapter-k8s-local-invocation";
+
+type LocalLoopbackHandler = (req: IncomingMessage, res: ServerResponse) => void;
+
+interface LocalLoopbackInvocation {
+  asyncResource: AsyncResource;
+  handler: LocalLoopbackHandler;
+}
+
+interface LocalHandlerLoopback {
+  handlers: Map<string, LocalLoopbackInvocation>;
+  port: number;
+}
+
+let localHandlerLoopbackPromise: Promise<LocalHandlerLoopback> | undefined;
+
+/**
+ * One loopback listener per pool process. Generated Next entrypoints require real Node
+ * IncomingMessage/ServerResponse objects, but allocating and closing a TCP listener for every
+ * render adds measurable fixed latency. An opaque header selects the per-invocation closure; the
+ * listener removes it before user code runs. Connections remain invocation-scoped: generated
+ * entrypoints may attach socket state, and sharing one socket across renders broke Server Actions.
+ */
+function localHandlerLoopback(): Promise<LocalHandlerLoopback> {
+  localHandlerLoopbackPromise ??= new Promise<LocalHandlerLoopback>((resolve, reject) => {
+    const handlers = new Map<string, LocalLoopbackInvocation>();
+    const server = createServer((req, res) => {
+      const rawInvocationId = req.headers[LOCAL_INVOCATION_HEADER];
+      delete req.headers[LOCAL_INVOCATION_HEADER];
+      const invocationId = Array.isArray(rawInvocationId) ? rawInvocationId[0] : rawInvocationId;
+      const invocation = invocationId ? handlers.get(invocationId) : undefined;
+      if (!invocation) {
+        res.writeHead(404, { connection: "close", "content-type": "text/plain; charset=utf-8" });
+        res.end("Unknown local invocation");
+        return;
+      }
+      // A persistent server's async resources outlive the request that created the listener.
+      // Re-enter the invocation's captured context so Next/Otel/AsyncLocalStorage state cannot
+      // become pinned to that first request and leak into every later render in this process.
+      invocation.asyncResource.runInAsyncScope(invocation.handler, undefined, req, res);
+    });
+    const startupError = (error: Error): void => {
+      localHandlerLoopbackPromise = undefined;
+      reject(error);
+    };
+    server.once("error", startupError);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        startupError(new Error("Failed to allocate shared loopback port"));
+        return;
+      }
+      server.off("error", startupError);
+      server.on("error", (error) => {
+        console.error("[pool-server] shared loopback listener failed:", error);
+      });
+      server.unref();
+      resolve({ handlers, port: address.port });
+    });
+  });
+  return localHandlerLoopbackPromise;
+}
 
 export type PreparedUseCacheRunner = <T>(callback: () => T) => T;
 export type PrepareUseCache = () => Promise<void | PreparedUseCacheRunner>;
@@ -1223,6 +1287,7 @@ export async function invokeLocalHandlerOverHttp({
   // Option D applies only to MINIMAL invocations: a non-minimal render is resumed inline by
   // Next itself (app-page.ts:2038), so capturing there would only risk a duplicate resume.
   const captureActive = capturePostponedState && minimalMode;
+  const loopback = await localHandlerLoopback();
   await new Promise<void>((resolve, reject) => {
     // Option D: the postponed state of a live minimal-mode render, observed (never consumed)
     // through the documented onCacheEntryV2 callback. Written at most once per invocation.
@@ -1250,398 +1315,430 @@ export async function invokeLocalHandlerOverHttp({
         await Promise.all([...pendingWaitUntil]);
       }
     };
-    const server = createServer((innerReq, innerRes) => {
-      void (async () => {
-        try {
-          // BaseServer sets the render response status before entering an error page. App Router
-          // entrypoints read res.statusCode when deciding whether to emit default noindex metadata;
-          // requestMeta.invokeStatus alone is not consumed by that direct-entrypoint path.
-          if (invokeStatus !== undefined) innerRes.statusCode = invokeStatus;
-          // The PPR resume token is set on the OUTER req's meta symbol by the caller
-          // (see the pprRoutes branch below). The loopback createServer only carries req/res
-          // streaming — `ctx` here is a direct JS argument, so we thread `postponed` through it
-          // rather than relying on the symbol surviving the hop (it does not). The generated
-          // app-page handler calls setRequestMeta(req, ctx.requestMeta) then reads
-          // getRequestMeta(req, 'postponed') and resumes the dynamic holes onto the prebuilt
-          // shell, streamed. Spike-proven: injecting just `postponed` streams a correct resume
-          // (no minimal mode / resolvedPathname needed). See the PPR/cache-components design doc.
-          const outerMeta =
-            ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
-              NEXT_REQUEST_META
-            ] as { postponed?: string } | undefined) ?? {};
-          // The scheme must come from the validated x-forwarded-proto witness: TLS terminates
-          // at the load balancer, so hardcoding `http://` here made every absolute redirect a
-          // generated App Route entry derives from request.url/nextUrl (initURL below) escape
-          // to `http://` on an https deployment (live 307 form-redirect regression).
-          const publicRequestUrl = new URL(
-            req.url ?? "/",
-            `${requestProtocol(req)}://${req.headers.host ?? "localhost"}`,
-          );
-          const publicRequestPathname = publicRequestUrl.pathname;
-          const concreteInvocationPath = manifestPathname(
-            invocationPath
-              ? new URL(invocationPath, "http://localhost").pathname
-              : (pagesDataRequestPathnameToPagePath(publicRequestPathname, i18nLocales) ??
-                  publicRequestPathname),
-          );
-          const params = extractRouteParams(
-            matchedPathname,
-            routeMatches,
-            routeParamPathname ?? concreteInvocationPath,
-          );
-          let invocationMeta: Record<string, unknown> = {
-            // Always provide the concrete decoded/interpolated target. Direct dynamic requests do
-            // not have an `invocationPath`, but the entrypoint still needs this to match the right
-            // prerender/fallback record rather than treating the route template as the request.
-            resolvedPathname: concreteInvocationPath,
-            // Generated App Route handlers use initURL to construct request.nextUrl. Preserve the
-            // public host and port for ordinary requests; falling back to bare http://localhost
-            // makes an absolute 307/308 form redirect escape to port 80. Server Actions are
-            // intentionally excluded: their generated entrypoint owns a separate worker-forwarding
-            // URL protocol, and injecting initURL there turns single-pass action redirects into an
-            // extra network request (and breaks cross-worker action forwarding).
-            ...(req.headers["next-action"] === undefined
-              ? { initURL: publicRequestUrl.toString() }
-              : {}),
-            ...(invocationQuery ? { query: invocationQuery } : {}),
-            ...(invokeStatus !== undefined ? { invokeStatus } : {}),
-          };
-          if (params) invocationMeta.params = params;
-          if (new URL(req.url ?? "/", "http://localhost").pathname.includes("/_next/data/")) {
-            invocationMeta.isNextDataReq = true;
-          }
-          if (invocationPath) {
-            const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
-            const targetPathname = manifestPathname(target.pathname);
-            // Shared with both resolvers (routing-common.ts) — this was a byte-identical
-            // third copy of the repeated-key accumulation, the same duplication class that
-            // let Phase 2's output resolution drift from Phase 1's.
-            const query = queryFromUrl(target);
-            invocationMeta = {
-              ...invocationMeta,
-              query: invocationQuery ?? query,
-              // `matchedPathname`/`outputId` carry the executable route template. The documented
-              // request-meta contract instead defines `resolvedPathname` as decoded and with
-              // dynamic params interpolated, so it must carry the concrete invocation target.
-              resolvedPathname: targetPathname,
-              rewrittenPathname: targetPathname,
-            };
-          }
-          const maybeResult = await (handler as any)(innerReq, innerRes, {
-            waitUntil(waitable: Promise<unknown>) {
-              trackWaitUntil(waitable);
-            },
-            requestMeta: {
-              relativeProjectDir: ".",
-              hostname: req.headers.host?.split(":")[0] ?? "127.0.0.1",
-              minimalMode,
-              outputId: matchedPathname,
+    const invocationId = randomUUID();
+    const invocationAsyncResource = new AsyncResource("adapter-k8s:local-handler");
+    // Match the old per-listener lifecycle: keep-alive is useful for a PPR shell + resume inside
+    // one logical invocation, but the agent is destroyed before another request can inherit the
+    // generated entrypoint's socket-scoped state.
+    const invocationAgent = new Agent({ keepAlive: true });
+    const innerResponseClosures = new Set<Promise<void>>();
+    let finished = false;
+    const unregister = (): void => {
+      if (loopback.handlers.delete(invocationId)) invocationAsyncResource.emitDestroy();
+      invocationAgent.destroy();
+    };
+    const finishResolve = (): void => {
+      if (finished) return;
+      finished = true;
+      unregister();
+      resolve();
+    };
+    const finishReject = (error: unknown): void => {
+      if (finished) return;
+      finished = true;
+      unregister();
+      reject(error);
+    };
+    const waitForInnerResponses = async (): Promise<void> => {
+      if (innerResponseClosures.size > 0) {
+        await Promise.all(innerResponseClosures);
+      }
+    };
+    loopback.handlers.set(invocationId, {
+      asyncResource: invocationAsyncResource,
+      handler: (innerReq, innerRes) => {
+        let markClosed!: () => void;
+        const closed = new Promise<void>((resolveClosed) => {
+          markClosed = resolveClosed;
+        });
+        innerResponseClosures.add(closed);
+        innerRes.once("close", () => {
+          innerResponseClosures.delete(closed);
+          markClosed();
+        });
+        void (async () => {
+          try {
+            // BaseServer sets the render response status before entering an error page. App Router
+            // entrypoints read res.statusCode when deciding whether to emit default noindex metadata;
+            // requestMeta.invokeStatus alone is not consumed by that direct-entrypoint path.
+            if (invokeStatus !== undefined) innerRes.statusCode = invokeStatus;
+            // The PPR resume token is set on the OUTER req's meta symbol by the caller
+            // (see the pprRoutes branch below). The loopback createServer only carries req/res
+            // streaming — `ctx` here is a direct JS argument, so we thread `postponed` through it
+            // rather than relying on the symbol surviving the hop (it does not). The generated
+            // app-page handler calls setRequestMeta(req, ctx.requestMeta) then reads
+            // getRequestMeta(req, 'postponed') and resumes the dynamic holes onto the prebuilt
+            // shell, streamed. Spike-proven: injecting just `postponed` streams a correct resume
+            // (no minimal mode / resolvedPathname needed). See the PPR/cache-components design doc.
+            const outerMeta =
+              ((req as IncomingMessage & { [NEXT_REQUEST_META]?: { postponed?: string } })[
+                NEXT_REQUEST_META
+              ] as { postponed?: string } | undefined) ?? {};
+            // The scheme must come from the validated x-forwarded-proto witness: TLS terminates
+            // at the load balancer, so hardcoding `http://` here made every absolute redirect a
+            // generated App Route entry derives from request.url/nextUrl (initURL below) escape
+            // to `http://` on an https deployment (live 307 form-redirect regression).
+            const publicRequestUrl = new URL(
+              req.url ?? "/",
+              `${requestProtocol(req)}://${req.headers.host ?? "localhost"}`,
+            );
+            const publicRequestPathname = publicRequestUrl.pathname;
+            const concreteInvocationPath = manifestPathname(
+              invocationPath
+                ? new URL(invocationPath, "http://localhost").pathname
+                : (pagesDataRequestPathnameToPagePath(publicRequestPathname, i18nLocales) ??
+                    publicRequestPathname),
+            );
+            const params = extractRouteParams(
               matchedPathname,
               routeMatches,
-              ...invocationMeta,
-              ...(outerMeta.postponed ? { postponed: outerMeta.postponed } : {}),
-              // Cache Components entrypoints use the presence of the documented V2 callback to
-              // select adapter/minimal-mode cache semantics (including RDC generation). Returning
-              // false means the adapter observed the entry but did not write the HTTP response.
-              // Option D: for eligible shell-less PPR routes the same callback also OBSERVES the
-              // entry's postponed state (capture only — still returns false, and the callback is
-              // present either way so Next's presence-keyed branches cannot vary by eligibility).
-              onCacheEntryV2: captureActive
-                ? async (entry: unknown) => {
-                    const postponed = (entry as { value?: { postponed?: unknown } } | undefined)
-                      ?.value?.postponed;
-                    if (typeof postponed === "string" && postponed.length > 0) {
-                      capturedPostponed = postponed;
+              routeParamPathname ?? concreteInvocationPath,
+            );
+            let invocationMeta: Record<string, unknown> = {
+              // Always provide the concrete decoded/interpolated target. Direct dynamic requests do
+              // not have an `invocationPath`, but the entrypoint still needs this to match the right
+              // prerender/fallback record rather than treating the route template as the request.
+              resolvedPathname: concreteInvocationPath,
+              // Generated App Route handlers use initURL to construct request.nextUrl. Preserve the
+              // public host and port for ordinary requests; falling back to bare http://localhost
+              // makes an absolute 307/308 form redirect escape to port 80. Server Actions are
+              // intentionally excluded: their generated entrypoint owns a separate worker-forwarding
+              // URL protocol, and injecting initURL there turns single-pass action redirects into an
+              // extra network request (and breaks cross-worker action forwarding).
+              ...(req.headers["next-action"] === undefined
+                ? { initURL: publicRequestUrl.toString() }
+                : {}),
+              ...(invocationQuery ? { query: invocationQuery } : {}),
+              ...(invokeStatus !== undefined ? { invokeStatus } : {}),
+            };
+            if (params) invocationMeta.params = params;
+            if (new URL(req.url ?? "/", "http://localhost").pathname.includes("/_next/data/")) {
+              invocationMeta.isNextDataReq = true;
+            }
+            if (invocationPath) {
+              const target = new URL(invocationPath, `http://${req.headers.host ?? "localhost"}`);
+              const targetPathname = manifestPathname(target.pathname);
+              // Shared with both resolvers (routing-common.ts) — this was a byte-identical
+              // third copy of the repeated-key accumulation, the same duplication class that
+              // let Phase 2's output resolution drift from Phase 1's.
+              const query = queryFromUrl(target);
+              invocationMeta = {
+                ...invocationMeta,
+                query: invocationQuery ?? query,
+                // `matchedPathname`/`outputId` carry the executable route template. The documented
+                // request-meta contract instead defines `resolvedPathname` as decoded and with
+                // dynamic params interpolated, so it must carry the concrete invocation target.
+                resolvedPathname: targetPathname,
+                rewrittenPathname: targetPathname,
+              };
+            }
+            const maybeResult = await (handler as any)(innerReq, innerRes, {
+              waitUntil(waitable: Promise<unknown>) {
+                trackWaitUntil(waitable);
+              },
+              requestMeta: {
+                relativeProjectDir: ".",
+                hostname: req.headers.host?.split(":")[0] ?? "127.0.0.1",
+                minimalMode,
+                outputId: matchedPathname,
+                matchedPathname,
+                routeMatches,
+                ...invocationMeta,
+                ...(outerMeta.postponed ? { postponed: outerMeta.postponed } : {}),
+                // Cache Components entrypoints use the presence of the documented V2 callback to
+                // select adapter/minimal-mode cache semantics (including RDC generation). Returning
+                // false means the adapter observed the entry but did not write the HTTP response.
+                // Option D: for eligible shell-less PPR routes the same callback also OBSERVES the
+                // entry's postponed state (capture only — still returns false, and the callback is
+                // present either way so Next's presence-keyed branches cannot vary by eligibility).
+                onCacheEntryV2: captureActive
+                  ? async (entry: unknown) => {
+                      const postponed = (entry as { value?: { postponed?: unknown } } | undefined)
+                        ?.value?.postponed;
+                      if (typeof postponed === "string" && postponed.length > 0) {
+                        capturedPostponed = postponed;
+                      }
+                      return false;
                     }
-                    return false;
-                  }
-                : async () => false,
-              ...(render404 ? { render404 } : {}),
-              ...(revalidate ? { revalidate } : {}),
-            },
-          });
+                  : async () => false,
+                ...(render404 ? { render404 } : {}),
+                ...(revalidate ? { revalidate } : {}),
+              },
+            });
 
-          if (maybeResult instanceof Response) {
-            await writeWebResponseToNode(innerRes, maybeResult);
-            return;
-          }
-          // Node entrypoints own the response lifecycle. A Pages API handler may return while
-          // an outbound stream is still piping into `res`; ending here truncates that body to
-          // empty. The loopback client naturally completes when the entrypoint finishes `res`.
-        } catch (error) {
-          console.error(`[pool-server] handler error for ${matchedPathname}:`, error);
-          if (!innerRes.headersSent) {
-            if (renderError) {
-              await renderError(
-                innerReq,
-                innerRes,
-                error instanceof Error ? error : new Error(String(error)),
-              );
+            if (maybeResult instanceof Response) {
+              await writeWebResponseToNode(innerRes, maybeResult);
               return;
             }
-            innerRes.statusCode = 500;
-            innerRes.end("Internal Server Error");
-          } else if (!innerRes.writableEnded) {
-            innerRes.end();
+            // Node entrypoints own the response lifecycle. A Pages API handler may return while
+            // an outbound stream is still piping into `res`; ending here truncates that body to
+            // empty. The loopback client naturally completes when the entrypoint finishes `res`.
+          } catch (error) {
+            console.error(`[pool-server] handler error for ${matchedPathname}:`, error);
+            if (!innerRes.headersSent) {
+              if (renderError) {
+                await renderError(
+                  innerReq,
+                  innerRes,
+                  error instanceof Error ? error : new Error(String(error)),
+                );
+                return;
+              }
+              innerRes.statusCode = 500;
+              innerRes.end("Internal Server Error");
+            } else if (!innerRes.writableEnded) {
+              innerRes.end();
+            }
+            finishReject(error instanceof Error ? error : new Error(String(error)));
           }
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      })();
+        })();
+      },
     });
 
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("Failed to allocate loopback port")));
-        return;
-      }
+    const reqHeaders = toNodeHeaders(req);
+    // Dispatch headers are consumed by the pool and must never enter the generated app handler.
+    // Besides preserving the trust boundary, this keeps decoded Unicode control values away
+    // from Node's latin1-only loopback HTTP client.
+    for (const header of INTERNAL_DISPATCH_HEADERS) delete reqHeaders[header];
+    Object.assign(reqHeaders, invocationHeaders);
+    reqHeaders[LOCAL_INVOCATION_HEADER] = invocationId;
+    // Matrix B-cluster: canary's ResponseCache grew a minimal-mode LRU keyed
+    // (pathname + invocationID) — the platform stamps a unique `x-invocation-id` per
+    // invocation (route-module.ts:1153) so reuse is scoped to ONE request; without it the
+    // cache falls back to TTL mode and replays minimal renders byte-identically across
+    // requests (measured: the empty-shell "frozen badge" bake). Always overwrite: the id
+    // is a cache-scoping key, so a client-supplied value must never survive. The Option-D
+    // resume invocation clones these headers and deliberately SHARES the id — the resume
+    // is the same logical invocation.
+    if (minimalMode) {
+      reqHeaders["x-invocation-id"] = randomUUID();
+    }
+    // We forward a fixed-length buffered body (or none), so restate the framing:
+    // Node's HTTP parser rejects a request carrying BOTH transfer-encoding and
+    // content-length (spurious 400 before the handler runs), and a forged
+    // content-length with no body (e.g. `Content-Length: 100` on a GET) makes the
+    // loopback server await bytes that never arrive — hanging the invocation until
+    // the 300s requestTimeout, an unauthenticated resource pin.
+    restateFramingHeaders(reqHeaders, bufferedBody, req.method, true);
 
-      const reqHeaders = toNodeHeaders(req);
-      // Dispatch headers are consumed by the pool and must never enter the generated app handler.
-      // Besides preserving the trust boundary, this keeps decoded Unicode control values away
-      // from Node's latin1-only loopback HTTP client.
-      for (const header of INTERNAL_DISPATCH_HEADERS) delete reqHeaders[header];
-      Object.assign(reqHeaders, invocationHeaders);
-      // Matrix B-cluster: canary's ResponseCache grew a minimal-mode LRU keyed
-      // (pathname + invocationID) — the platform stamps a unique `x-invocation-id` per
-      // invocation (route-module.ts:1153) so reuse is scoped to ONE request; without it the
-      // cache falls back to TTL mode and replays minimal renders byte-identically across
-      // requests (measured: the empty-shell "frozen badge" bake). Always overwrite: the id
-      // is a cache-scoping key, so a client-supplied value must never survive. The Option-D
-      // resume invocation clones these headers and deliberately SHARES the id — the resume
-      // is the same logical invocation.
-      if (minimalMode) {
-        reqHeaders["x-invocation-id"] = randomUUID();
-      }
-      // We forward a fixed-length buffered body (or none), so restate the framing:
-      // Node's HTTP parser rejects a request carrying BOTH transfer-encoding and
-      // content-length (spurious 400 before the handler runs), and a forged
-      // content-length with no body (e.g. `Content-Length: 100` on a GET) makes the
-      // loopback server await bytes that never arrive — hanging the invocation until
-      // the 300s requestTimeout, an unauthenticated resource pin.
-      restateFramingHeaders(reqHeaders, bufferedBody, req.method, true);
-
-      // The loopback request URL is the PUBLIC request URL, verbatim. This mirrors Next's own
-      // boundary into a generated entrypoint: `BaseServer.renderToResponseWithComponentsImpl`
-      // sets `request.url = initURL.pathname + initURL.search` — the URL the CLIENT asked for,
-      // reconstructed from requestMeta.initURL — immediately before calling the entry, and
-      // carries the rewrite target only through requestMeta (`query`, `params`, and the
-      // `resolvedPathname`/`rewrittenPathname` the entry recomputes). Passing the rewrite
-      // DESTINATION here instead leaked it into everything user code sees, because generated
-      // entries derive `req.url`/`request.nextUrl`/`resolvedAsPath` from
-      // `new URL(innerReq.url, initURL)`: `/blog-post-2` (rewritten to
-      // `/blog/post-2?hello=world`) rendered `req.url` and `router.asPath` as
-      // `/blog/post-2?hello=world`, `/rewrite-source/foo` as `/rewrite-target?path=foo`, and
-      // `usePathname()` on a rewritten App page returned the destination. Empirically pinned
-      // against `next start` (Next 16.2.10, upstream getserversideprops/getinitialprops/
-      // app-dir-hooks fixtures): the public URL is `req.url`/`asPath`/`usePathname`, while the
-      // destination surfaces only as `resolvedUrl` and as merged `query`/`params`.
-      let loopbackPath = req.url ?? "/";
-      if (mergeInvocationQueryIntoUrl && invocationPath && invocationQuery) {
-        // App ROUTE (route.ts) entries are the single exception: their request has no
-        // requestMeta channel for search params (NextRequestAdapter reads the URL only), so a
-        // rewrite-added query has nowhere else to travel. Fold it onto the PUBLIC pathname —
-        // the identical treatment the edge App Route path in this file already applies. This is
-        // a deliberate, bounded divergence from `next start` (which drops these params); route
-        // handlers expose no asPath/usePathname/resolvedUrl, so nothing observable regresses.
-        const queryStart = loopbackPath.indexOf("?");
-        const rawPath = queryStart === -1 ? loopbackPath : loopbackPath.slice(0, queryStart);
-        const params = new URLSearchParams(
-          queryStart === -1 ? "" : loopbackPath.slice(queryStart + 1),
-        );
-        for (const [key, value] of Object.entries(invocationQuery)) {
-          params.delete(key);
-          for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
-        }
-        const search = params.toString();
-        loopbackPath = search ? `${rawPath}?${search}` : rawPath;
-      }
-
-      // N37: arm the invocation deadline. It covers everything up to the entrypoint's response
-      // HEAD — including the loopback dial — and is disarmed the moment those headers arrive, so
-      // a legitimately long stream is untouched. On expiry the loopback request is destroyed
-      // (which closes the ephemeral server and releases the port through the error path below)
-      // and the client gets a 504 if nothing has been written yet.
-      let invocationTimedOut = false;
-      let executionTimedOut = false;
-      let activeClientRes: IncomingMessage | undefined;
-      const invocationDeadline = setTimeout(() => {
-        invocationTimedOut = true;
-        console.error(
-          `[pool-server] handler for ${matchedPathname} did not respond within ` +
-            `${handlerTimeoutMs}ms — aborting the invocation`,
-        );
-        clientReq.destroy(new Error(`handler invocation timed out after ${handlerTimeoutMs}ms`));
-      }, handlerTimeoutMs);
-      invocationDeadline.unref?.();
-
-      const clientReq = httpRequest(
-        {
-          hostname: "127.0.0.1",
-          port: address.port,
-          method: req.method,
-          path: loopbackPath,
-          headers: reqHeaders,
-        },
-        (clientRes) => {
-          activeClientRes = clientRes;
-          clearTimeout(invocationDeadline);
-          const closeThenSettle = (onError: (error: unknown) => void): void => {
-            // App Router wires after() through res.on("close"). Close the loopback response first
-            // so that callback can register its waitUntil promise, then drain the complete batch.
-            // Draining before server.close races the close callback and silently loses after().
-            server.close(() => {
-              void settleWaitUntil()
-                .then(resolve)
-                .catch(onError)
-                .finally(() => {
-                  if (executionDeadline) clearTimeout(executionDeadline);
-                });
-            });
-          };
-          if (discardResponse) {
-            void (async () => {
-              for await (const _chunk of clientRes) {
-                // Drain the response so the loopback connection can close cleanly.
-              }
-            })()
-              .then(() => closeThenSettle(reject))
-              .catch((error) => server.close(() => reject(error)));
-            return;
-          }
-          // Option D: the render postponed and the state was captured — start the canonical
-          // resume NOW, in parallel with streaming the shell (the App Hosting model). POST,
-          // same loopback URL, `next-resume: 1`, raw state as the body (app-page.ts:384-406).
-          // Failure resolves null: the client gets the shell alone, never an error tail.
-          let resumeSuffix: Promise<IncomingMessage | null> | undefined;
-          if (
-            captureActive &&
-            clientRes.headers["x-nextjs-postponed"] === "1" &&
-            capturedPostponed
-          ) {
-            const stateBody = Buffer.from(capturedPostponed, "utf8");
-            const resumeHeaders = { ...reqHeaders, "next-resume": "1" };
-            restateFramingHeaders(resumeHeaders, stateBody, "POST", true);
-            resumeSuffix = new Promise<IncomingMessage | null>((resolveResume) => {
-              const resumeDeadline = setTimeout(() => {
-                console.error(
-                  `[pool-server] PPR resume for ${matchedPathname} did not respond within ` +
-                    `${handlerTimeoutMs}ms — serving the shell alone`,
-                );
-                resumeReq.destroy();
-                resolveResume(null);
-              }, handlerTimeoutMs);
-              resumeDeadline.unref?.();
-              const resumeReq = httpRequest(
-                {
-                  hostname: "127.0.0.1",
-                  port: address.port,
-                  method: "POST",
-                  path: loopbackPath,
-                  headers: resumeHeaders,
-                },
-                (resumeRes) => {
-                  clearTimeout(resumeDeadline);
-                  resolveResume(resumeRes);
-                },
-              );
-              resumeReq.once("error", () => {
-                clearTimeout(resumeDeadline);
-                resolveResume(null);
-              });
-              resumeReq.end(stateBody);
-            });
-          }
-          void writeInnerResponse(
-            res,
-            clientRes,
-            forceStatus,
-            responsePrefix
-              ? {
-                  body: responsePrefix.content ?? readFileSync(responsePrefix.filePath!),
-                  ...(responsePrefix.headers ? { headers: responsePrefix.headers } : {}),
-                  ...(responsePrefix.status ? { status: responsePrefix.status } : {}),
-                }
-              : undefined,
-            normalizePrerenderCacheControl,
-            resumeSuffix,
-            buildFallbackBacked,
-            platformCacheSeen,
-          )
-            .then(() => closeThenSettle(reject))
-            .catch((error) => {
-              server.close(() => (executionTimedOut ? resolve() : reject(error)));
-            });
-        },
+    // The loopback request URL is the PUBLIC request URL, verbatim. This mirrors Next's own
+    // boundary into a generated entrypoint: `BaseServer.renderToResponseWithComponentsImpl`
+    // sets `request.url = initURL.pathname + initURL.search` — the URL the CLIENT asked for,
+    // reconstructed from requestMeta.initURL — immediately before calling the entry, and
+    // carries the rewrite target only through requestMeta (`query`, `params`, and the
+    // `resolvedPathname`/`rewrittenPathname` the entry recomputes). Passing the rewrite
+    // DESTINATION here instead leaked it into everything user code sees, because generated
+    // entries derive `req.url`/`request.nextUrl`/`resolvedAsPath` from
+    // `new URL(innerReq.url, initURL)`: `/blog-post-2` (rewritten to
+    // `/blog/post-2?hello=world`) rendered `req.url` and `router.asPath` as
+    // `/blog/post-2?hello=world`, `/rewrite-source/foo` as `/rewrite-target?path=foo`, and
+    // `usePathname()` on a rewritten App page returned the destination. Empirically pinned
+    // against `next start` (Next 16.2.10, upstream getserversideprops/getinitialprops/
+    // app-dir-hooks fixtures): the public URL is `req.url`/`asPath`/`usePathname`, while the
+    // destination surfaces only as `resolvedUrl` and as merged `query`/`params`.
+    let loopbackPath = req.url ?? "/";
+    if (mergeInvocationQueryIntoUrl && invocationPath && invocationQuery) {
+      // App ROUTE (route.ts) entries are the single exception: their request has no
+      // requestMeta channel for search params (NextRequestAdapter reads the URL only), so a
+      // rewrite-added query has nowhere else to travel. Fold it onto the PUBLIC pathname —
+      // the identical treatment the edge App Route path in this file already applies. This is
+      // a deliberate, bounded divergence from `next start` (which drops these params); route
+      // handlers expose no asPath/usePathname/resolvedUrl, so nothing observable regresses.
+      const queryStart = loopbackPath.indexOf("?");
+      const rawPath = queryStart === -1 ? loopbackPath : loopbackPath.slice(0, queryStart);
+      const params = new URLSearchParams(
+        queryStart === -1 ? "" : loopbackPath.slice(queryStart + 1),
       );
+      for (const [key, value] of Object.entries(invocationQuery)) {
+        params.delete(key);
+        for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
+      }
+      const search = params.toString();
+      loopbackPath = search ? `${rawPath}?${search}` : rawPath;
+    }
 
-      const executionDeadline =
-        executionTimeoutMs !== undefined
-          ? setTimeout(() => {
-              executionTimedOut = true;
-              console.error(
-                `[pool-server] handler for ${matchedPathname} exceeded maxDuration after ` +
-                  `${executionTimeoutMs}ms — aborting the invocation`,
-              );
-              const error = new DeadlineExceededError(
-                `handler execution timed out after ${executionTimeoutMs}ms`,
-              );
-              activeClientRes?.destroy(error);
-              clientReq.destroy(error);
-              if (!discardResponse && !res.headersSent) {
-                res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
-                res.end("Gateway Timeout");
-              } else if (!discardResponse && !res.writableEnded) {
-                res.destroy(error);
-              }
-              server.close(() => resolve());
-            }, executionTimeoutMs)
-          : undefined;
-      executionDeadline?.unref?.();
+    // N37: arm the invocation deadline. It covers everything up to the entrypoint's response
+    // HEAD — including the loopback dial — and is disarmed the moment those headers arrive, so
+    // a legitimately long stream is untouched. On expiry the loopback request is destroyed
+    // (which releases this invocation's slot in the shared listener through the error path
+    // below) and the client gets a 504 if nothing has been written yet.
+    let invocationTimedOut = false;
+    let executionTimedOut = false;
+    let activeClientRes: IncomingMessage | undefined;
+    const invocationDeadline = setTimeout(() => {
+      invocationTimedOut = true;
+      console.error(
+        `[pool-server] handler for ${matchedPathname} did not respond within ` +
+          `${handlerTimeoutMs}ms — aborting the invocation`,
+      );
+      clientReq.destroy(new Error(`handler invocation timed out after ${handlerTimeoutMs}ms`));
+    }, handlerTimeoutMs);
+    invocationDeadline.unref?.();
 
-      clientReq.once("error", (error) => {
+    const clientReq = httpRequest(
+      {
+        hostname: "127.0.0.1",
+        port: loopback.port,
+        method: req.method,
+        path: loopbackPath,
+        headers: reqHeaders,
+        agent: invocationAgent,
+      },
+      (clientRes) => {
+        activeClientRes = clientRes;
         clearTimeout(invocationDeadline);
-        // Cleared on EVERY exit from this handler, including the timed-out branch below: a
-        // head-timeout abort used to leave the (unref'd) execution timer armed, and when it
-        // fired minutes later it logged a bogus "exceeded maxDuration" for a request that
-        // had already 504'd and re-destroyed the settled invocation. Clearing a timer that
-        // already fired (executionTimedOut) is a no-op.
-        if (executionDeadline) clearTimeout(executionDeadline);
-        // N37: a deadline abort is the adapter's own teardown, not an entrypoint crash — answer
-        // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
-        // invocations share the outer `res` with a response already sent to the client, so they
-        // must never write; they just release the socket and the port.
-        if (invocationTimedOut || executionTimedOut) {
-          if (!discardResponse && !res.headersSent) {
-            res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
-            res.end("Gateway Timeout");
-          } else if (!discardResponse && !res.writableEnded) {
-            res.end();
-          }
-          server.close(() => resolve());
+        const closeThenSettle = (onError: (error: unknown) => void): void => {
+          // App Router wires after() through res.on("close"). Wait for each loopback response
+          // to close so that callback can register its waitUntil promise, then drain the
+          // complete batch. Draining before the close event races the callback and silently
+          // loses after(). The process-level listener itself deliberately remains open.
+          void waitForInnerResponses()
+            .then(settleWaitUntil)
+            .then(finishResolve)
+            .catch(onError)
+            .finally(() => {
+              if (executionDeadline) clearTimeout(executionDeadline);
+            });
+        };
+        if (discardResponse) {
+          void (async () => {
+            for await (const _chunk of clientRes) {
+              // Drain the response so the loopback connection can close cleanly.
+            }
+          })()
+            .then(() => closeThenSettle(finishReject))
+            .catch(finishReject);
           return;
         }
-        server.close(() => reject(error));
-      });
+        // Option D: the render postponed and the state was captured — start the canonical
+        // resume NOW, in parallel with streaming the shell (the App Hosting model). POST,
+        // same loopback URL, `next-resume: 1`, raw state as the body (app-page.ts:384-406).
+        // Failure resolves null: the client gets the shell alone, never an error tail.
+        let resumeSuffix: Promise<IncomingMessage | null> | undefined;
+        if (captureActive && clientRes.headers["x-nextjs-postponed"] === "1" && capturedPostponed) {
+          const stateBody = Buffer.from(capturedPostponed, "utf8");
+          const resumeHeaders = { ...reqHeaders, "next-resume": "1" };
+          restateFramingHeaders(resumeHeaders, stateBody, "POST", true);
+          resumeSuffix = new Promise<IncomingMessage | null>((resolveResume) => {
+            const resumeDeadline = setTimeout(() => {
+              console.error(
+                `[pool-server] PPR resume for ${matchedPathname} did not respond within ` +
+                  `${handlerTimeoutMs}ms — serving the shell alone`,
+              );
+              resumeReq.destroy();
+              resolveResume(null);
+            }, handlerTimeoutMs);
+            resumeDeadline.unref?.();
+            const resumeReq = httpRequest(
+              {
+                hostname: "127.0.0.1",
+                port: loopback.port,
+                method: "POST",
+                path: loopbackPath,
+                headers: resumeHeaders,
+                agent: invocationAgent,
+              },
+              (resumeRes) => {
+                clearTimeout(resumeDeadline);
+                resolveResume(resumeRes);
+              },
+            );
+            resumeReq.once("error", () => {
+              clearTimeout(resumeDeadline);
+              resolveResume(null);
+            });
+            resumeReq.end(stateBody);
+          });
+        }
+        void writeInnerResponse(
+          res,
+          clientRes,
+          forceStatus,
+          responsePrefix
+            ? {
+                body: responsePrefix.content ?? readFileSync(responsePrefix.filePath!),
+                ...(responsePrefix.headers ? { headers: responsePrefix.headers } : {}),
+                ...(responsePrefix.status ? { status: responsePrefix.status } : {}),
+              }
+            : undefined,
+          normalizePrerenderCacheControl,
+          resumeSuffix,
+          buildFallbackBacked,
+          platformCacheSeen,
+        )
+          .then(() => closeThenSettle(finishReject))
+          .catch((error) => {
+            if (executionTimedOut) finishResolve();
+            else finishReject(error);
+          });
+      },
+    );
 
-      // If the outer client goes away while the handler is still computing, cancel the
-      // loopback request instead of letting the invocation run to completion into a
-      // dead socket. Skipped for discardResponse: that invocation is deliberately
-      // detached background work (E2E PPR shell fill) that shares the outer res
-      // object and must outlive the client response.
-      if (!discardResponse) {
-        abortOnClientClose(res, () =>
-          clientReq.destroy(new Error("client disconnected during handler invocation")),
-        );
-      }
+    const executionDeadline =
+      executionTimeoutMs !== undefined
+        ? setTimeout(() => {
+            executionTimedOut = true;
+            console.error(
+              `[pool-server] handler for ${matchedPathname} exceeded maxDuration after ` +
+                `${executionTimeoutMs}ms — aborting the invocation`,
+            );
+            const error = new DeadlineExceededError(
+              `handler execution timed out after ${executionTimeoutMs}ms`,
+            );
+            activeClientRes?.destroy(error);
+            clientReq.destroy(error);
+            if (!discardResponse && !res.headersSent) {
+              res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+              res.end("Gateway Timeout");
+            } else if (!discardResponse && !res.writableEnded) {
+              res.destroy(error);
+            }
+            finishResolve();
+          }, executionTimeoutMs)
+        : undefined;
+    executionDeadline?.unref?.();
 
-      if (bufferedBody && bufferedBody.length > 0) {
-        clientReq.end(bufferedBody);
-      } else {
-        clientReq.end();
+    clientReq.once("error", (error) => {
+      clearTimeout(invocationDeadline);
+      // Cleared on EVERY exit from this handler, including the timed-out branch below: a
+      // head-timeout abort used to leave the (unref'd) execution timer armed, and when it
+      // fired minutes later it logged a bogus "exceeded maxDuration" for a request that
+      // had already 504'd and re-destroyed the settled invocation. Clearing a timer that
+      // already fired (executionTimedOut) is a no-op.
+      if (executionDeadline) clearTimeout(executionDeadline);
+      // N37: a deadline abort is the adapter's own teardown, not an entrypoint crash — answer
+      // 504 and settle, rather than rejecting into the generic 500 path. `discardResponse`
+      // invocations share the outer `res` with a response already sent to the client, so they
+      // must never write; they just release the socket and the port.
+      if (invocationTimedOut || executionTimedOut) {
+        if (!discardResponse && !res.headersSent) {
+          res.writeHead(504, { "content-type": "text/plain; charset=utf-8" });
+          res.end("Gateway Timeout");
+        } else if (!discardResponse && !res.writableEnded) {
+          res.end();
+        }
+        finishResolve();
+        return;
       }
+      finishReject(error);
     });
+
+    // If the outer client goes away while the handler is still computing, cancel the
+    // loopback request instead of letting the invocation run to completion into a
+    // dead socket. Skipped for discardResponse: that invocation is deliberately
+    // detached background work (E2E PPR shell fill) that shares the outer res
+    // object and must outlive the client response.
+    if (!discardResponse) {
+      abortOnClientClose(res, () =>
+        clientReq.destroy(new Error("client disconnected during handler invocation")),
+      );
+    }
+
+    if (bufferedBody && bufferedBody.length > 0) {
+      clientReq.end(bufferedBody);
+    } else {
+      clientReq.end();
+    }
   });
 }
 
