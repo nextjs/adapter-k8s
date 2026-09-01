@@ -9,6 +9,11 @@ import {
   assertSupportedNextVersion,
   SUPPORTED_NEXT_RELEASE_LINE,
 } from "../next-runtime/version.js";
+import {
+  ensureNextNodeEnvironment,
+  registerInstrumentationHook,
+} from "../next-runtime/instrumentation.js";
+import { resolveNextDistDir } from "../next-runtime/dist-dir.js";
 import { createRequestHandler } from "./handler.js";
 import { createRoutingServer, startHealthServer } from "./server.js";
 
@@ -258,6 +263,17 @@ async function main() {
     );
   }
 
+  // The routing tier executes application middleware and owns adapter OTel spans/metrics. Run
+  // the same Next registrar as a pool before importing middleware; otherwise the app's provider
+  // is never installed here and every routing-service telemetry instrument is silently no-op.
+  await ensureNextNodeEnvironment(process.cwd(), "routing-service");
+  const runtimeDistDir = resolveNextDistDir(process.cwd(), manifest.distDir);
+  const instrumentationStatus = await registerInstrumentationHook(
+    process.cwd(),
+    runtimeDistDir.relative,
+    "routing-service",
+  );
+
   // Load middleware module (if present). This MUST mirror the pool's top-level-await
   // unwrap (pool-server resolveMiddlewareModule): Next compiles TLA middleware as
   // module.exports = Promise<realExports>, so a plain import() surfaces that Promise as
@@ -305,7 +321,7 @@ async function main() {
 
   // Real health endpoint (httpGet probe) — evicts a wedged/broken pod that a TCP
   // probe would leave in the NEG. Ready only once the ext_proc server is listening.
-  let ready = true;
+  let ready = instrumentationStatus !== "failed";
   const healthPort = parseInt(process.env.HEALTH_PORT ?? "8081", 10);
   const health = startHealthServer(healthPort, () => ready, listenHost);
 

@@ -141,7 +141,7 @@ Applies when the target hosts a routing tier (`envoyNativeRouting`, `gkeNativeRo
 ```js
 routingService: {
   scaling: { min: 2, max: 10, targetCPU: 70 },
-  resources: { cpu: '250m', memory: '256Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
+  resources: { cpu: '500m', memory: '512Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
   requestTimeoutMs: 4000,
   failureMode: 'auto',   // fails closed when the app has middleware (never bypass auth),
                          // fails open otherwise; 'open'/'closed' force it
