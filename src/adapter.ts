@@ -45,6 +45,7 @@ import {
   SHARED_POOL_IMAGE_LAYOUT,
   type PoolImageLayout,
 } from "./pool-image-layout.js";
+import { pruneNextRuntimePackage, pruneRuntimeSourceMaps } from "./runtime-image-prune.js";
 
 // Get current directory in a way that works in ESM and CJS bundle
 const _dirname =
@@ -1774,6 +1775,11 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       let poolImageLayout: PoolImageLayout | undefined;
       let prunedSharpPackages = 0;
       let prunedSharpBytes = 0;
+      let prunedNextFiles = 0;
+      let prunedNextBytes = 0;
+      let prunedServerSourceMapFiles = 0;
+      let prunedServerSourceMapBytes = 0;
+      const keepRuntimeSourceMaps = process.env.ADAPTER_K8S_KEEP_RUNTIME_SOURCE_MAPS === "1";
       const pruneSharpContext = async (context: string): Promise<void> => {
         const pruned = await pruneForeignSharpPackages(context, imageTargetPlatform);
         prunedSharpPackages += pruned.packages;
@@ -2234,6 +2240,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             );
           }
           await stageFile(projectDir, nextPkgDir, "node_modules/next", poolName);
+          const prunedNext = await pruneNextRuntimePackage(
+            path.join(projectDir, poolStageDir, "node_modules", "next"),
+            { keepSourceMaps: keepRuntimeSourceMaps },
+          );
+          prunedNextFiles += prunedNext.files;
+          prunedNextBytes += prunedNext.bytes;
 
           const sharpStaging = await stageCommonRuntimeFiles(poolName, false);
           poolSharpStaging.push(sharpStaging);
@@ -2362,6 +2374,12 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
         console.log(
           `[adapter-k8s] Removed ${prunedSharpPackages} target-incompatible Sharp package(s) ` +
             `(${(prunedSharpBytes / 1024 / 1024).toFixed(1)} MiB) from Linux image contexts.`,
+        );
+      }
+      if (prunedNextFiles > 0) {
+        console.log(
+          `[adapter-k8s] Removed ${prunedNextFiles.toLocaleString()} build-only Next.js file(s) ` +
+            `(${(prunedNextBytes / 1024 / 1024).toFixed(1)} MiB) from runtime image contexts.`,
         );
       }
 
@@ -2584,6 +2602,29 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               ];
         const routingContext = path.join(projectDir, OUTPUT_DIR(), "routing-service", "context");
         if (existsSync(routingContext)) runtimeContexts.push(routingContext);
+        if (!keepRuntimeSourceMaps) {
+          for (const context of runtimeContexts) {
+            // pool-base is a layered Docker context whose content/ directory is copied to /app;
+            // the other layouts stage the runtime tree directly at their context root.
+            const serverDirectories = [
+              path.join(context, distDirRel, "server"),
+              path.join(context, "content", distDirRel, "server"),
+            ];
+            for (const serverDirectory of serverDirectories) {
+              if (!existsSync(serverDirectory)) continue;
+              const pruned = await pruneRuntimeSourceMaps(serverDirectory);
+              prunedServerSourceMapFiles += pruned.files;
+              prunedServerSourceMapBytes += pruned.bytes;
+            }
+          }
+        }
+        if (prunedServerSourceMapFiles > 0) {
+          console.log(
+            `[adapter-k8s] Removed ${prunedServerSourceMapFiles.toLocaleString()} server source ` +
+              `map file(s) (${(prunedServerSourceMapBytes / 1024 / 1024).toFixed(1)} MiB) from ` +
+              `runtime image contexts. Set ADAPTER_K8S_KEEP_RUNTIME_SOURCE_MAPS=1 to retain them.`,
+          );
+        }
         // next build traces bytes produced for the BUILD host. Docker's --platform flag does
         // not rewrite a Prisma engine or arbitrary .node addon already copied into the context,
         // so reject detectable foreign binaries before an image can reach the cluster.
