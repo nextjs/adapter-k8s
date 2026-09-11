@@ -109,8 +109,8 @@ try {
     path.join(consumerDir, "package.json"),
     JSON.stringify({ name: "adapter-k8s-package-surface-consumer", private: true, type: "module" }),
   );
-  const supportedNext = sourceManifest.dependencies["@next/routing"];
-  assert.match(supportedNext, /^\d+\.\d+\.\d+/, "@next/routing must pin a concrete Next line");
+  const supportedNext = /^>=(\d+\.\d+\.\d+) </.exec(sourceManifest.peerDependencies.next)?.[1];
+  assert.ok(supportedNext, "Next peer range must declare the supported minimum version");
   run(
     "npm",
     [
