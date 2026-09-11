@@ -389,14 +389,16 @@ describe("image optimizer — S32 admission and single-flight", () => {
     expect(imageOptimizerAdmissionStats().inflightKeys).toBe(0);
   });
 
-  it("shares an error outcome with every waiter and leaves no map entry (failing encode)", async () => {
-    // HTML bytes under a .png name: nothing sniffs, sharp cannot decode them, and the no-sniff
-    // branch refuses to echo the guess back — 502 for all six waiters off one encode attempt.
-    // (An encode failure is deliberately NOT a rejection: where the type WAS byte-sniffed,
-    // `next start` parity makes it a 200 serving the source bytes.)
-    const before = imageOptimizerAdmissionStats();
+  it("shares a rejected image with every waiter and leaves no map entry", async () => {
+    // Fill admission first: Next rejects these bytes before Sharp, so the encode latch
+    // alone cannot keep the invalid request open long enough for other callers to join.
     sharpCalls = 0;
     holdEncodes();
+    const blockers = [32, 96, 128].map((width) =>
+      get(port, `/_next/image?url=/tiny.png&w=${width}&q=75`, { accept: "image/webp" }),
+    );
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 3, "admission to fill");
+    const before = imageOptimizerAdmissionStats();
     const inflight = Array.from({ length: 6 }, () =>
       get(port, "/_next/image?url=/html-as.png&w=64&q=75", { accept: "image/webp" }),
     );
@@ -405,19 +407,18 @@ describe("image optimizer — S32 admission and single-flight", () => {
       "five requests to join the failing key",
     );
     releaseEncodes();
+    await Promise.all(blockers);
     for (const res of await Promise.all(inflight)) {
-      expect(res.status).toBe(502);
-      expect(res.body.toString()).toBe("Failed to process image");
+      expect(res.status).toBe(400);
+      expect(res.body.toString()).toBe("The requested resource isn't a valid image.");
     }
-    expect(sharpCalls).toBe(1);
+    expect(sharpCalls).toBe(3);
     expect(imageOptimizerAdmissionStats().inflightKeys).toBe(0);
-    // The key is not poisoned: a later request runs the work again rather than joining a
-    // settled promise.
     const retry = await get(port, "/_next/image?url=/html-as.png&w=64&q=75", {
       accept: "image/webp",
     });
-    expect(retry.status).toBe(502);
-    expect(sharpCalls).toBe(2);
+    expect(retry.status).toBe(400);
+    expect(sharpCalls).toBe(3);
   });
 
   it("rejects every waiter when the shared work THROWS, and leaves no map entry", async () => {
