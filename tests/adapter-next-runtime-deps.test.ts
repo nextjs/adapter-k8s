@@ -46,7 +46,7 @@ function seedApp(
 ) {
   writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ name: "app" }));
   const nm = path.join(projectDir, "node_modules");
-  writePkg(path.join(nm, "next"), { name: "next", version: "16.3.0", dependencies: nextDeps });
+  writePkg(path.join(nm, "next"), { name: "next", version: "16.3.3", dependencies: nextDeps });
   writePkg(
     path.join(nm, "@swc", "helpers"),
     { name: "@swc/helpers", version: "0.5.15" },

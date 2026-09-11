@@ -61,7 +61,7 @@ ordinary process redundancy, not the same cache, routing, and release protocol.
 ## Requirements
 
 - Node.js >= 20.16.0 on Node 20, or >= 22.3.0 on Node 22 and newer
-- Next.js >= 16.3.0 and < 16.4.0. Each Next.js release line is reviewed before this bound widens;
+- Next.js >= 16.3.3 and < 16.4.0. Each Next.js release line is reviewed before this bound widens;
   the runtime rejects artifacts built outside it. The pinned 16.3 canary used by upstream
   conformance is an explicitly experimental verification lane, not part of the stable promise.
 - Kubernetes >= 1.33 with the APIs required by the selected target components. This is the

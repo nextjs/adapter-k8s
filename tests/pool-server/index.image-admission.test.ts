@@ -204,7 +204,7 @@ export async function proxy(request) {
       },
       poolAssignments: {},
       pprRoutes: {},
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
     }),
   );
   writeFileSync(path.join(configDir, "static-assets.json"), JSON.stringify([]));
@@ -481,7 +481,10 @@ describe("image optimizer — S32 admission and single-flight", () => {
     const inflight = [32, 48, 64, 96].map((w) =>
       get(port, `/_next/image?url=/tiny.png&w=${w}&q=75`, { accept: "image/webp" }),
     );
-    await waitUntil(() => imageOptimizerAdmissionStats().queued === 1, "one request to queue");
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().queued === 1 && sharpCalls === 3,
+      "three encodes with one request queued",
+    );
     const stats = imageOptimizerAdmissionStats();
     expect(stats.active).toBe(3);
     expect(stats.admitted - before.admitted).toBe(3);
@@ -504,7 +507,10 @@ describe("image optimizer — S32 admission and single-flight", () => {
     const inflight = [32, 48, 64].map((w) =>
       get(port, `/_next/image?url=/big.png&w=${w}&q=75`, { accept: "image/webp" }),
     );
-    await waitUntil(() => imageOptimizerAdmissionStats().queued === 1, "one request to queue");
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().queued === 1 && sharpCalls === 2,
+      "two encodes with one request queued on the byte budget",
+    );
     const stats = imageOptimizerAdmissionStats();
     expect(stats.active).toBe(2);
     expect(stats.admitted - before.admitted).toBe(2);

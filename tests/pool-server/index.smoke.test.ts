@@ -47,7 +47,7 @@ interface StagedDir {
 function writeStagedDir(
   withMiddleware: boolean,
   middlewareRuntime: "nodejs" | "edge" = "nodejs",
-  nextVersion = "16.3.0",
+  nextVersion = "16.3.3",
 ): StagedDir {
   const dir = mkdtempSync(path.join(REPO_ROOT, ".smoke-stage-"));
   const configDir = path.join(dir, "config");
@@ -435,7 +435,7 @@ describe("pool-server startup smoke test", () => {
     const previousConfigDir = process.env.CONFIG_DIR;
     process.env.CONFIG_DIR = stagedB.configDir;
     try {
-      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.0 <16\.4\.0/);
+      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.3 <16\.4\.0/);
     } finally {
       process.env.CONFIG_DIR = previousConfigDir;
       rmSync(stagedB.dir, { recursive: true, force: true });

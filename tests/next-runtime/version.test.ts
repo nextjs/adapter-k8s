@@ -9,7 +9,7 @@ import {
 } from "../../src/next-runtime/version.js";
 
 describe("supported Next.js runtime release line", () => {
-  it.each(["16.3.0", "16.3.7"])("accepts %s", (version) => {
+  it.each(["16.3.3", "16.3.4", "16.3.7"])("accepts %s", (version) => {
     expect(checkSupportedNextVersion(version)).toEqual({ supported: true, prerelease: false });
     expect(() => assertSupportedNextVersion(version, "test manifest")).not.toThrow();
   });
@@ -23,6 +23,9 @@ describe("supported Next.js runtime release line", () => {
 
   it.each<unknown>([
     "16.2.10",
+    "16.3.0",
+    "16.3.1",
+    "16.3.2",
     "16.4.0",
     "17.0.0",
     "canary",
@@ -50,7 +53,7 @@ describe("supported Next.js runtime release line", () => {
 
     expect(pkg.peerDependencies.next).toBe(SUPPORTED_NEXT_RELEASE_LINE);
     expect(pkg.engines.node).toBe(">=20.16.0 <21 || >=22.3.0");
-    expect(readme).toContain("Next.js >= 16.3.0 and < 16.4.0");
+    expect(readme).toContain("Next.js >= 16.3.3 and < 16.4.0");
     expect(readme).toContain("Node.js >= 20.16.0 on Node 20, or >= 22.3.0");
   });
 });

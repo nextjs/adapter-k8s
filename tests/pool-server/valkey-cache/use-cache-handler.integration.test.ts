@@ -175,7 +175,8 @@ describe.skipIf(!dockerAvailable)("ValkeyCacheHandler (integration)", () => {
     ] as const) {
       await h.set(
         key,
-        Promise.resolve(makeEntry(`v-${key}`, { timestamp: t0, revalidate, expire: 300 })),
+        // Keep this entry past the boundary despite local/server clock sampling jitter.
+        Promise.resolve(makeEntry(`v-${key}`, { timestamp: t0 - 1000, revalidate, expire: 300 })),
       );
       expect(await client.exists(`k8s:n84-int:entry:${key}`)).toBe(1);
       // A non-positive revalidate is already due and therefore reads as a production miss. The
