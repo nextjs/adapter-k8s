@@ -55,15 +55,14 @@ export async function createImageCache({
   if (config.images.customCacheHandler && config.cacheHandler) {
     try {
       const handlerUrl = formatDynamicImportPath(distDir, config.cacheHandler);
-      const adapterHandlerWithoutValkey =
-        !process.env.VALKEY_URL &&
+      const isAdapterHandler =
         fileURLToPath(handlerUrl) === path.resolve(projectDir, ".k8s-adapter", "cache-handler.cjs");
       // The adapter's no-Valkey delegate is Next's ordinary FileSystemCache, which
       // cannot store IMAGE entries. Use the dedicated image disk cache in that case.
-      if (!adapterHandlerWithoutValkey) {
+      if (!isAdapterHandler || process.env.VALKEY_URL) {
         const imported = await import(handlerUrl);
         const Handler = imported.default?.default ?? imported.default ?? imported;
-        cacheHandler = new Handler({
+        const handler: CacheHandler & { supportsImageCache?: boolean } = new Handler({
           dev: false,
           flushToDisk: config.experimental.isrFlushToDisk,
           serverDistDir: path.join(distDir, "server"),
@@ -71,6 +70,11 @@ export async function createImageCache({
           revalidatedTags: [],
           _requestHeaders: {},
         });
+        // N82 can also decline Valkey with its URL configured. Check the selected
+        // delegate rather than assuming that configuration made it image-capable.
+        if (!isAdapterHandler || handler.supportsImageCache !== false) {
+          cacheHandler = handler;
+        }
       }
     } catch {
       // An app handler failure must not interrupt image serving or silently move

@@ -395,6 +395,7 @@ describe("image optimizer — S32 admission and single-flight", () => {
     expect(imageOptimizerAdmissionStats().admitted - before.admitted).toBe(2);
     releaseEncodes();
     for (const res of await Promise.all(inflight)) expect(res.status).toBe(200);
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 0, "cache writes to drain");
     expect(sharpCalls).toBe(2);
   });
 
@@ -569,6 +570,7 @@ describe("image optimizer — S32 admission and single-flight", () => {
     expect(sharpCalls).toBe(3);
     releaseEncodes();
     for (const res of await Promise.all(inflight)) expect(res.status).toBe(200);
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 0, "cache writes to drain");
     expect(imageOptimizerAdmissionStats().active).toBe(0);
     expect(imageOptimizerAdmissionStats().reservedBytes).toBe(0);
   });
@@ -596,6 +598,7 @@ describe("image optimizer — S32 admission and single-flight", () => {
     expect(sharpCalls).toBe(2);
     releaseEncodes();
     for (const res of await Promise.all(inflight)) expect(res.status).toBe(200);
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 0, "cache writes to drain");
     expect(imageOptimizerAdmissionStats().reservedBytes).toBe(0);
   });
 

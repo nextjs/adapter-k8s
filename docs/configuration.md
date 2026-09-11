@@ -214,6 +214,7 @@ Optimized images are cached per pod in `<distDir>/cache/images`. The default pay
 is 256 MiB; set `images.maximumDiskCacheSize` to change it, or `0` to disable disk caching.
 Eviction is asynchronous, and filesystem overhead is additional. The generated chart's 1 GiB
 cache volume also holds other Next caches, so leave room for those when raising the budget.
+Exceeding the volume limit can cause Kubernetes to evict the pod.
 Entries are scoped to the build ID. Responses report `MISS`, `HIT`, or `STALE` in
 `x-nextjs-cache`; stale entries refresh in the background under the same admission limits.
 Source paths covered by middleware bypass persistent image caching and return `Cache-Control: no-store`.
@@ -233,7 +234,10 @@ that runtime connection, the adapter uses its image disk cache. An application-p
 buffers and revalidation metadata. This is the extension point for an object-store backend;
 the adapter does not currently ship an S3 image handler. Custom-handler failures degrade to
 cache misses. The disk budget does not limit a shared store; size Valkey and its eviction
-policy for the combined image and application cache workload.
+policy for the combined image and application cache workload. The adapter also caps each
+serialized Valkey entry at 16 MiB by default (`ADAPTER_K8S_MAX_CACHE_ENTRY_BYTES`). Image buffers
+are base64-encoded in that entry, so the stored size exceeds the image byte count. Oversized
+entries are served without caching.
 
 For an external image optimization service, use Next's `images.loader: "custom"` and
 `images.loaderFile` to generate that service's URLs.

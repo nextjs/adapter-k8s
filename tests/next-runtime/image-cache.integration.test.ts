@@ -117,7 +117,7 @@ describe.skipIf(!dockerAvailable)("image caching through the packaged Valkey han
     if (temporaryRoot) rmSync(temporaryRoot, { recursive: true, force: true });
   });
 
-  async function replica(buildId: string, minimumCacheTTL = 0) {
+  async function replica(buildId: string, minimumCacheTTL = 0, maximumDiskCacheSize = 0) {
     const projectDir = path.join(temporaryRoot, `replica-${replicaIndex++}`);
     const distDir = path.join(projectDir, ".next");
     mkdirSync(distDir, { recursive: true });
@@ -139,7 +139,7 @@ describe.skipIf(!dockerAvailable)("image caching through the packaged Valkey han
         images: {
           ...defaultConfig.images,
           customCacheHandler: true,
-          maximumDiskCacheSize: 0,
+          maximumDiskCacheSize,
           minimumCacheTTL,
         },
       },
@@ -172,6 +172,32 @@ describe.skipIf(!dockerAvailable)("image caching through the packaged Valkey han
     );
     for (const instance of [first, second, replacement]) {
       expect(existsSync(path.join(instance.distDir, "cache", "images"))).toBe(false);
+    }
+  });
+
+  it("uses the image disk cache when the packaged handler rejects the build ID", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { cache, distDir } = await replica("unsafe:build", 0, 1024);
+      const original = image("from-disk");
+      const generate = vi.fn(async () => original);
+      expect(await cache.get(params, generate, waitUntil)).toEqual({
+        image: original,
+        status: "MISS",
+      });
+      await Promise.allSettled(background);
+      expect(await cache.get(params, generate, waitUntil)).toEqual({
+        image: original,
+        status: "HIT",
+      });
+      expect(generate).toHaveBeenCalledOnce();
+      expect(existsSync(path.join(distDir, "cache", "images"))).toBe(true);
+      expect(log).toHaveBeenCalledWith(
+        expect.stringContaining("NEXT_BUILD_ID is unsafe"),
+        expect.any(String),
+      );
+    } finally {
+      log.mockRestore();
     }
   });
 
