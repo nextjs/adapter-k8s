@@ -210,6 +210,34 @@ or `images.domains` at every redirect. Private addresses are denied unless
 adapter's `ADAPTER_K8S_MAX_IMAGE_BYTES` remains an upper bound even if the application asks
 for a larger response. Concurrency, memory admission, and fetch deadlines still apply.
 
+Optimized images are cached per pod in `<distDir>/cache/images`. The default payload budget
+is 256 MiB; set `images.maximumDiskCacheSize` to change it, or `0` to disable disk caching.
+Eviction is asynchronous, and filesystem overhead is additional. The generated chart's 1 GiB
+cache volume also holds other Next caches, so leave room for those when raising the budget.
+Entries are scoped to the build ID. Responses report `MISS`, `HIT`, or `STALE` in
+`x-nextjs-cache`; stale entries refresh in the background under the same admission limits.
+Source paths covered by middleware bypass persistent image caching and return `Cache-Control: no-store`.
+
+To share images across replicas, enable the adapter's Valkey cache in `adapter.config` and
+opt images into the application's cache handler in `next.config`:
+
+```ts
+export default {
+  images: { customCacheHandler: true },
+};
+```
+
+With the adapter's handler and `VALKEY_URL` configured, optimized images use Valkey. Without
+that runtime connection, the adapter uses its image disk cache. An application-provided
+`cacheHandler` is also supported and must implement Next's `IMAGE` entries, including binary
+buffers and revalidation metadata. This is the extension point for an object-store backend;
+the adapter does not currently ship an S3 image handler. Custom-handler failures degrade to
+cache misses. The disk budget does not limit a shared store; size Valkey and its eviction
+policy for the combined image and application cache workload.
+
+For an external image optimization service, use Next's `images.loader: "custom"` and
+`images.loaderFile` to generate that service's URLs.
+
 ## Not yet implemented
 
 The old `imageOptimizer`, `skewProtection`, and top-level `routeExtension` keys were placeholders. They never changed emitted workloads and are no longer part of `K8sAdapterConfig`. Validation rejects them with a removal message instead of silently ignoring stale configuration. The implemented GKE routing timeout remains at `provider.gke.serviceExtensions.routeExtension.timeout` during the legacy migration window.

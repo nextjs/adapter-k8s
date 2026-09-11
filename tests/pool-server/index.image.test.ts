@@ -1640,3 +1640,54 @@ export function proxy(request) {
     expect(res.headers.get("content-type") ?? "").toContain("image/");
   });
 });
+
+describe("image optimizer cache at the HTTP boundary", () => {
+  const booter = makeBooter();
+  afterEach(async () => booter.cleanup());
+
+  it("reuses a disk entry and preserves conditional responses without rereading the source", async () => {
+    const { port } = await booter.boot(null, { publicFiles: ["cache.png"] });
+    const endpoint = "/_next/image?url=/cache.png&w=640&q=75";
+    const first = await rawGet(port, endpoint, {});
+    expect(first.status).toBe(200);
+    expect(first.headers["x-nextjs-cache"]).toBe("MISS");
+    writeFileSync(path.join(process.cwd(), "public", "cache.png"), HTML_BODY);
+    // Next resolves the response before the asynchronous cache write completes.
+    const deadline = Date.now() + 2000;
+    let hit = await rawGet(port, endpoint, {});
+    while (hit.headers["x-nextjs-cache"] !== "HIT" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      hit = await rawGet(port, endpoint, {});
+    }
+    expect(hit.headers["x-nextjs-cache"]).toBe("HIT");
+    expect(hit.body).toEqual(first.body);
+    expect(hit.headers.etag).toBe(first.headers.etag);
+    const conditional = await rawGet(port, endpoint, { "if-none-match": first.headers.etag! });
+    expect(conditional.status).toBe(304);
+    expect(conditional.body.length).toBe(0);
+  });
+
+  it("runs source middleware again after a successful image response", async () => {
+    const { port } = await booter.boot(null, {
+      middlewareMatcher: "^\\/covered\\.png$",
+      middlewareSource: `let allowed = true;
+export function proxy() {
+  if (allowed) {
+    allowed = false;
+    return new Response(Buffer.from("${ONE_PIXEL_PNG.toString("base64")}", "base64"), { headers: { "content-type": "image/png" } });
+  }
+  return new Response("denied", { status: 403 });
+}`,
+      publicFiles: ["covered.png"],
+    });
+    const endpoint = "/_next/image?url=/covered.png&w=640&q=75";
+    const first = await rawGet(port, endpoint, {});
+    expect(first.status).toBe(200);
+    expect(first.headers["x-nextjs-cache"]).toBe("MISS");
+    expect(first.headers["cache-control"]).toBe("no-store");
+    expect(first.headers["cache-tag"]).toBeUndefined();
+    const denied = await rawGet(port, endpoint, {});
+    expect(denied.status).toBe(400);
+    expect(denied.headers["content-type"] ?? "").not.toContain("image/");
+  });
+});

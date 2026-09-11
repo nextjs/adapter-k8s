@@ -16,7 +16,15 @@
 // releases it, which is what makes "N requests are in flight at once" a deterministic state
 // rather than a race against the encoder.
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+  readdirSync,
+  renameSync,
+} from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { createServer, request as httpRequest } from "node:http";
@@ -87,8 +95,7 @@ const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 );
-// HTML bytes under a .png name: nothing sniffs, so sharp is handed a source it cannot decode
-// and the no-sniff branch refuses to serve the guess — the optimizer's "failing encode".
+// HTML bytes under a .png name: Next rejects these bytes before encoding.
 const HTML_AS_PNG = "<html><body>not an image</body></html>";
 
 // --- admission knobs -------------------------------------------------------------
@@ -283,8 +290,11 @@ describe("image optimizer — S32 admission and single-flight", () => {
 
   // A test that fails mid-flight must not leave a request parked on the latch: it would hold an
   // admission slot, so every later test would shed, and server.close() would never finish.
-  afterEach(() => {
+  afterEach(async () => {
     releaseEncodes();
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 0, "image work to finish");
+    rmSync(path.join(staged.dir, ".next", "cache", "images"), { recursive: true, force: true });
+    writeFileSync(path.join(staged.dir, "public", "tiny.png"), TINY_PNG);
   });
 
   afterAll(async () => {
@@ -304,6 +314,34 @@ describe("image optimizer — S32 admission and single-flight", () => {
         }
       }
     }
+  });
+
+  it("holds admission after a stale response until its background encode finishes", async () => {
+    const url = "/_next/image?url=/tiny.png&w=640&q=75";
+    expect((await get(port, url)).headers["x-nextjs-cache"]).toBe("MISS");
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 0, "cache write to finish");
+    const imageRoot = path.join(staged.dir, ".next", "cache", "images");
+    const keyDir = path.join(imageRoot, readdirSync(imageRoot)[0]!);
+    const filename = readdirSync(keyDir)[0]!;
+    const parts = filename.split(".");
+    parts[1] = String(Date.now() - 1000);
+    renameSync(path.join(keyDir, filename), path.join(keyDir, parts.join(".")));
+    writeFileSync(path.join(staged.dir, "public", "tiny.png"), BIG_PNG);
+    sharpCalls = 0;
+    holdEncodes();
+    const stale = await get(port, url);
+    expect(stale.status).toBe(200);
+    expect(stale.headers["x-nextjs-cache"]).toBe("STALE");
+    await waitUntil(() => sharpCalls === 1, "background refresh to reach the encoder");
+    expect(imageOptimizerAdmissionStats().active).toBe(1);
+    releaseEncodes();
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().active === 0,
+      "background refresh to drain",
+    );
+    const fresh = await get(port, url);
+    expect(fresh.headers["x-nextjs-cache"]).toBe("HIT");
+    expect(fresh.body.equals(stale.body)).toBe(false);
   });
 
   // --- (b) single-flight ---------------------------------------------------------
