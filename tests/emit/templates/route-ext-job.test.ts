@@ -450,14 +450,14 @@ describe("N73: route-ext Job verifies the mounted route-extension.yaml", () => {
     }
     expect(yaml).toContain("Refusing to import");
     // …and the extension NAME must be this release's too.
-    expect(yaml).toContain(`grep -q '^name: "my-app-traffic-ext"$' /tmp/ext.yaml`);
+    expect(yaml).toContain(`grep -q '^name: "my-app-traffic-ext"$' "$WORK_DIR/ext.yaml"`);
   });
 
   it("extracts the mounted values with a well-formed sed expression", () => {
     // The rendered script must contain single-backslash BRE groups (a double backslash here
     // would make sed match a literal backslash and the comparison would always fail-closed).
-    expect(job()).toContain(`sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml`);
-    expect(job()).toContain(`sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml`);
+    expect(job()).toContain(`sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml"`);
+    expect(job()).toContain(`sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml"`);
   });
 });
 
@@ -484,14 +484,14 @@ describe("S9: whole-document verification", () => {
     expect(digest).toMatch(/^[a-f0-9]{64}$/);
     const job = renderRouteExtUpdateJob({ ...args, documentDigest: digest });
     expect(job).toContain(`EXPECT_DIGEST="${digest}"`);
-    expect(job).toContain("sha256sum /config/route-extension.yaml");
+    expect(job).toContain('sha256sum "$WORK_DIR/route-extension.yaml"');
     expect(job).toContain("the mounted ConfigMap was modified after render");
   });
 
   it("requires the forwarding-rule placeholder, so rules can only come from discovery", () => {
     // The specific attack: a document with a victim's rules hardcoded and no placeholder.
     const job = renderRouteExtUpdateJob({ ...args, documentDigest: "a".repeat(64) });
-    expect(job).toContain("grep -q 'FORWARDING_RULE_PLACEHOLDER' /config/route-extension.yaml");
+    expect(job).toContain(`grep -q 'FORWARDING_RULE_PLACEHOLDER' "$WORK_DIR/route-extension.yaml"`);
     expect(job).toContain("forwarding rules must come from this Job's own");
   });
 

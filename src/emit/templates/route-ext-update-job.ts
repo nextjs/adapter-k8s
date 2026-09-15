@@ -184,10 +184,12 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               #    (route extensions are unsupported on the global external ALB; traffic
               #    extensions run post-cache on origin traffic). Expand the placeholder line
               #    into one entry per forwarding rule.
-              echo "$FRS" | sed 's/^/  - "/; s/$/"/' > /tmp/fr_list.yaml
-              awk '/FORWARDING_RULE_PLACEHOLDER/{while((getline l < "/tmp/fr_list.yaml")>0) print l; next} {print}' \
-                /config/route-extension.yaml > /tmp/ext.yaml
-              cat /tmp/ext.yaml
+              # A projected ConfigMap can change between reads. Verify one private snapshot,
+              # then expand and import only those bytes, never reopen the mutable mount.
+              umask 077
+              WORK_DIR=$(mktemp -d /tmp/route-ext.XXXXXX)
+              trap 'rm -rf "$WORK_DIR"' EXIT
+              cp /config/route-extension.yaml "$WORK_DIR/route-extension.yaml"
               # N73 (SECURITY). /config is an operator-mutable ConfigMap, and this Job
               # imports whatever it finds there under a Workload Identity holding
               # networkservices.lbTrafficExtensions.* + compute.backendServices.update.
@@ -215,13 +217,13 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               # true while the placeholder is the sole source of them, so require it.
               EXPECT_DIGEST="${documentDigest ?? ""}"
               if [ -n "$EXPECT_DIGEST" ]; then
-                if ! grep -q 'FORWARDING_RULE_PLACEHOLDER' /config/route-extension.yaml; then
+                if ! grep -q 'FORWARDING_RULE_PLACEHOLDER' "$WORK_DIR/route-extension.yaml"; then
                   echo "ERROR: route-extension.yaml carries no FORWARDING_RULE_PLACEHOLDER."
                   echo "Refusing to import: forwarding rules must come from this Job's own"
                   echo "discovery, never from the mounted ConfigMap."
                   exit 1
                 fi
-                GOT_DIGEST=$(sha256sum /config/route-extension.yaml | cut -d" " -f1)
+                GOT_DIGEST=$(sha256sum "$WORK_DIR/route-extension.yaml" | cut -d" " -f1)
                 if [ "$GOT_DIGEST" != "$EXPECT_DIGEST" ]; then
                   echo "ERROR: route-extension.yaml does not match the rendered chart."
                   echo "  expected sha256: $EXPECT_DIGEST"
@@ -231,10 +233,14 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
                 fi
                 echo "route-extension.yaml matches the rendered chart (sha256) ✓"
               fi
+              echo "$FRS" | sed 's/^/  - "/; s/$/"/' > "$WORK_DIR/fr_list.yaml"
+              awk -v forwarding_rules="$WORK_DIR/fr_list.yaml" \
+                '/FORWARDING_RULE_PLACEHOLDER/{while((getline l < forwarding_rules)>0) print l; next} {print}' \
+                "$WORK_DIR/route-extension.yaml" > "$WORK_DIR/ext.yaml"
               EXPECT_SERVICE="projects/${projectId}/global/backendServices/${releaseName}-routing-service"
               EXPECT_AUTHORITY="${releaseName}-routing-service.{{ .Release.Namespace }}.svc.cluster.local"
-              GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
-              GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
+              GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml")
+              GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml")
               if [ "$GOT_SERVICE" != "$EXPECT_SERVICE" ]; then
                 echo "ERROR: route-extension.yaml service mismatch."
                 echo "  expected: $EXPECT_SERVICE"
@@ -251,7 +257,7 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               fi
               # The extension name is authenticated by the composition operation; a mismatch
               # means the mount was replaced wholesale.
-              if ! grep -q '^name: "${extensionName}"$' /tmp/ext.yaml; then
+              if ! grep -q '^name: "${extensionName}"$' "$WORK_DIR/ext.yaml"; then
                 echo "ERROR: route-extension.yaml is not for ${extensionName}."
                 exit 1
               fi
@@ -260,7 +266,7 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
                 ${extensionName} \
                 --project=${projectId} \
                 --location=global \
-                --source=/tmp/ext.yaml \
+                --source="$WORK_DIR/ext.yaml" \
                 --quiet
           env:
             - name: CLOUDSDK_CORE_PROJECT
