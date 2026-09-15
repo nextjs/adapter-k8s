@@ -48,6 +48,15 @@ export default createK8sAdapter({
       className: "nginx",
       hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
       tlsSecretName: "app-tls",
+      ingressSources: {
+        cidrs: [],
+        podSelectors: [
+          {
+            namespace: "network",
+            labels: { "app.kubernetes.io/instance": "external-ingress-nginx" },
+          },
+        ],
+      },
     }),
   }),
 });
@@ -81,6 +90,10 @@ A dedicated Gateway or Ingress terminates TLS from a Secret **in the app's names
 exposure: gatewayApiExposure({          // or ingressExposure({ className: "nginx", ...
   className: "eg",
   hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+  ingressSources: envoyGatewayIngressSources({
+    namespace: "envoy-gateway-system",
+    gateways: [{ name: "my-app-gateway", namespace: "apps" }],
+  }),
   certManager: {
     issuerRef: { name: "letsencrypt-production", kind: "ClusterIssuer" }, // or kind: "Issuer" (+ optional group)
   },
@@ -102,6 +115,7 @@ Most fleets already run shared Gateways — a home-ops cluster typically has `en
 import {
   createK8sAdapter,
   defineTarget,
+  envoyGatewayIngressSources,
   httpRouteExposure,
   kubernetesCluster,
 } from "@next-community/adapter-k8s";
@@ -123,6 +137,10 @@ export default createK8sAdapter({
       className: "envoy", // the shared GatewayClass
       parentRefs: [{ name: "envoy-external", namespace: "network", sectionName: "https" }],
       hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+      ingressSources: envoyGatewayIngressSources({
+        namespace: "network",
+        gateways: [{ name: "envoy-external", namespace: "network" }],
+      }),
     }),
   }),
 });
@@ -139,43 +157,26 @@ Notes on this journey:
 
 ### NetworkPolicy under `strict` with a shared gateway
 
-The shared gateway's proxy pods live in the **parent's** namespace, not the app's. Under `networkPolicy.strict`, `ingressSources` is the allowlist admitting traffic to the pools (`:3000`) and the routing tier (`:8443`) — and because the routing tier authenticates no callers, reachability to `:8443` is what decides who can obtain a pool-trusted routing verdict. Omitting `ingressSources` with strict NetworkPolicy means an **empty allowlist**: the shared gateway's proxies are blocked and every request fails closed.
+The shared gateway's proxy pods live in the **parent's** namespace, not the app's. `ingressSources` is the strict allowlist admitting traffic to the pools (`:3000`) and the routing tier (`:8443`) — and because the routing tier authenticates no callers, reachability to `:8443` is what decides who can obtain a pool-trusted routing verdict. External exposure constructors reject an omitted or empty source set; `manualExposure` is the only built-in that may deliberately leave it empty.
 
-Both selector values are static strings (the parent's namespace is known at config time):
+The selector values are static strings (the parent's namespace is known at config time):
 
 ```js
 exposure: httpRouteExposure({
   className: "envoy",
   parentRefs: [{ name: "envoy-external", namespace: "network", sectionName: "https" }],
   hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
-  ingressSources: {
-    cidrs: [],
-    podSelectors: [
-      {
-        // The proxy namespace — where the Envoy data-plane pods run
-        // (e.g. "envoy-gateway-system", or "network" if proxies deploy beside the Gateway).
-        namespace: "network",
-        labels: {
-          "app.kubernetes.io/name": "envoy",
-          "gateway.envoyproxy.io/owning-gateway-name": "envoy-external",
-          "gateway.envoyproxy.io/owning-gateway-namespace": "network",
-        },
-      },
-      {
-        // Merged/class-owned proxies (EnvoyProxy mergeGateways) carry ONLY the class label,
-        // never the per-gateway pair above.
-        namespace: "network",
-        labels: {
-          "app.kubernetes.io/name": "envoy",
-          "gateway.envoyproxy.io/owning-gatewayclass": "envoy",
-        },
-      },
-    ],
-  },
+  ingressSources: envoyGatewayIngressSources({
+    // The data-plane proxy namespace, not the controller namespace unless they coincide.
+    namespace: "network",
+    gateways: [{ name: "envoy-external", namespace: "network" }],
+  }),
 }),
 ```
 
-The proxy-pod labels are verified against a live Envoy Gateway v1.5.4 data plane — the data-plane pods carry `app.kubernetes.io/name: envoy` plus the `owning-gateway-{name,namespace}` (or, merged, `owning-gatewayclass`) labels; the controller deployment does not serve traffic.
+The helper emits the proxy labels Envoy Gateway owns: `app.kubernetes.io/name: envoy` plus the `owning-gateway-{name,namespace}` pair. For an `EnvoyProxy` with `mergeGateways: true`, pass `gatewayClasses: ["envoy"]` instead; merged proxies carry `owning-gatewayclass`, not the per-Gateway pair. The controller Deployment does not serve application traffic and must not be selected.
+
+ingress-nginx has no universal preset because operators choose its Helm release name. Use the exact data-plane instance selector. In the referenced home-cluster manifests both controllers run in `network`: `app.kubernetes.io/instance: external-ingress-nginx` and `app.kubernetes.io/instance: internal-ingress-nginx`. Choose the one named by the IngressClass; do not admit both by habit.
 
 Notes on this journey:
 
@@ -196,6 +197,10 @@ target: defineTarget({
     className: "eg",
     hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
     tlsSecretName: "app-tls",
+    ingressSources: envoyGatewayIngressSources({
+      namespace: "envoy-gateway-system",
+      gateways: [{ name: "my-app-gateway", namespace: "apps" }],
+    }),
   }),
   routing: envoyNativeRouting(),
 }),
@@ -233,7 +238,7 @@ target: defineTarget({
 
   `doctor` reports the ListenerSet CRD's presence as an informational line when the controller is ≥ 1.8.
 
-- **An explicit `ingressSources` override replaces the strict default entirely** — including the two proxy-pod selector sets the adapter emits by default (the per-gateway `owning-gateway-{name,namespace}` pair AND the merged-mode `owning-gatewayclass` label). Non-merged proxy pods carry only the per-gateway pair, never the class label (verified in Envoy Gateway source at v1.5.5 and v1.8.3: the class label is applied only under `mergeGateways`). An override listing only the class label therefore blocks Envoy→ext_proc under `networkPolicy.strict`, and because the routing tier fails closed when the app has middleware, the symptom is total: every request returns 500 (`ext_proc_error_gRPC_error_14`) and pool traffic 503s. If you override `ingressSources`, include the per-gateway labels (`gateway.envoyproxy.io/owning-gateway-name: <release>-gateway`, `gateway.envoyproxy.io/owning-gateway-namespace: <ns>`) unless the EnvoyProxy resource sets `mergeGateways: true`.
+- **`ingressSources` has no implicit controller guess.** Use `envoyGatewayIngressSources` with exact `gateways` for ordinary proxy Deployments, or `gatewayClasses` only when the EnvoyProxy sets `mergeGateways: true`. Non-merged proxy pods carry the per-Gateway labels, never the class label. Choosing the wrong mode blocks Envoy→ext_proc under strict NetworkPolicy; with middleware the result is fail-closed (`ext_proc_error_gRPC_error_14`).
 - **NetworkPolicy** is what isolates the routing tier in-cluster, so your CNI must enforce it (verified on Cilium). The in-cluster callout is plain h2c and the routing service authenticates no callers, so reachability to it is enough to have a crafted request resolved and signed — the dispatch credential is no longer readable off the wire, but the policy is still a required boundary rather than defense-in-depth. See [SECURITY.md](../SECURITY.md#generic-clusters-envoy-gateway).
 - **Node CIDRs.** Left unconfigured, `deploy` discovers the node addresses and allows exactly those—correct, but a snapshot: a node added afterwards can't probe the pods it hosts, so they never become ready. On any cluster that autoscales or replaces nodes, pin the node subnet with a static CIDR source on the cluster component (or `nodeCidrs` in the legacy `provider.generic` block).
 - **Failure mode** follows the routing-service policy: fail-closed when the app has middleware, fail-open otherwise. See [routing service tuning](./configuration.md#routing-service-tuning).
@@ -246,7 +251,7 @@ The GKE journey provisions its own infrastructure. `init` idempotently creates t
 npx adapter-k8s init --project-id my-project --host app.example.com
 ```
 
-The GKE target composes `gkeCluster()` + `gatewayApiExposure` (controller-managed TLS via Certificate Manager) + `gkeNativeRouting()`, which hosts the ext_proc callout on the Google load balancer as a traffic extension:
+The GKE target composes `gkeCluster()` + `gatewayApiExposure` (controller-managed TLS via Certificate Manager, `gkeIngressSources()`, and `gkeHealthCheckPolicy()`) + `gkeNativeRouting()`, which hosts the ext_proc callout on the Google load balancer as a traffic extension. Backend health is an exposure capability, not a routing side effect: it emits one HealthCheckPolicy for the stable origin Service and none for per-pool Services.
 
 When composing this target by hand, give `gatewayApiExposure` exactly one
 `{ type: "NamedAddress", value: addressName }` entry matching `gkeNativeRouting({ addressName })`.
@@ -409,7 +414,7 @@ Record the controller name, controller version, Kubernetes version, CRD versions
 
 ### `provider.generic`
 
-Any conformant cluster: k3s, kind, on-prem, or a managed cluster whose cloud integrations you'd rather not adopt. Translates to `kubernetesCluster` + `gatewayApiExposure` + `envoyNativeRouting`.
+Any conformant cluster: k3s, kind, on-prem, or a managed cluster whose cloud integrations you'd rather not adopt. Translates to `kubernetesCluster` + `gatewayApiExposure` + `envoyNativeRouting`. The compatibility translator builds the same exact Envoy proxy selectors as `envoyGatewayIngressSources`; new target configurations must declare them explicitly.
 
 ```js
 provider: {
@@ -425,11 +430,11 @@ provider: {
 },
 ```
 
-`gatewayNamespace` is the namespace where the Gateway controller runs its proxy pods—the source the emitted NetworkPolicy admits to the routing tier's ext_proc port. It defaults to Envoy Gateway's `envoy-gateway-system`. Note this is the proxies' namespace, not the app's.
+`gatewayNamespace` is the namespace containing the Envoy data-plane proxy pods—the source the emitted NetworkPolicy admits to the routing tier's ext_proc port. The translator admits both the exact `<release>-gateway` owner labels used by ordinary proxies and the GatewayClass label used by `mergeGateways`. It defaults to `envoy-gateway-system`; this is the proxies' namespace, not necessarily the controller's or the app's.
 
 ### `provider.gke`
 
-Translates to `gkeCluster` + `gatewayApiExposure` (controller-managed certificates, named address) + `gkeNativeRouting`. `provider.gke.gateway.type: "ingress"` is rejected—the GKE traffic extension requires Gateway API.
+Translates to `gkeCluster` + `gatewayApiExposure` (controller-managed certificates, named address, `gkeIngressSources()`, `gkeHealthCheckPolicy()`) + `gkeNativeRouting`. `provider.gke.gateway.type: "ingress"` is rejected—the GKE traffic extension requires Gateway API.
 
 ## See also
 

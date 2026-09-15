@@ -22,6 +22,7 @@ import type { CacheEntry } from "../../../src/pool-server/valkey-cache/types.js"
 import { ValkeyCacheHandler } from "../../../src/pool-server/valkey-cache/use-cache-handler.js";
 
 const SERVER_CLOCK_TOLERANCE_MS = 100;
+const HANDLER_CLOCK_TOLERANCE_MS = 1000;
 
 // The `rediss://` (TLS) variant of the plaintext integration suites: the SAME paths those cover —
 // RESP round-trips, the tag-manifest `updateTags` EVAL, cross-replica revalidation through both
@@ -563,8 +564,8 @@ describe.skipIf(!dockerAvailable || !opensslAvailable)(
       clock.t = t0 + 1000;
       await a.updateTags(["tls-tag"], { expire: 300 });
       const expiration = await b.getExpiration(["tls-tag"]);
-      expect(expiration).toBeGreaterThanOrEqual(t0 + 300_000 - 50);
-      expect(expiration).toBeLessThanOrEqual(Date.now() + 300_000 + 50);
+      expect(expiration).toBeGreaterThanOrEqual(clock.t + 300_000 - HANDLER_CLOCK_TOLERANCE_MS);
+      expect(expiration).toBeLessThanOrEqual(clock.t + 300_000 + HANDLER_CLOCK_TOLERANCE_MS);
       expect((await b.get("page", []))?.revalidate).toBe(-1); // stale, still served
 
       // Hard revalidation on A is visible LIVE on B (no refreshTags) — the whole point of the

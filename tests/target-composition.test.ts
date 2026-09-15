@@ -6,12 +6,15 @@ import {
   defineResourceComponent,
   defineRoutingComponent,
   defineTarget,
+  envoyGatewayIngressSources,
   envoyNativeRouting,
-  gatewayApiExposure,
+  gatewayApiExposure as buildGatewayApiExposure,
   gkeCluster,
+  gkeHealthCheckPolicy,
+  gkeIngressSources,
   gkeNativeRouting,
-  httpRouteExposure,
-  ingressExposure,
+  httpRouteExposure as buildHttpRouteExposure,
+  ingressExposure as buildIngressExposure,
   kubernetesCluster,
   manualExposure,
   portableRouting,
@@ -22,6 +25,40 @@ import type { TargetBuildContext } from "../src/target/types.js";
 import type { TelemetrySource } from "../src/composition-plan/index.js";
 
 const hosts = [{ hostname: "app.example.com", tls: { enabled: false } }];
+const envoySources = envoyGatewayIngressSources({
+  namespace: "envoy-gateway-system",
+  gatewayClasses: ["eg"],
+});
+const nginxSources = {
+  cidrs: [],
+  podSelectors: [
+    {
+      namespace: "network",
+      labels: { "app.kubernetes.io/instance": "external-ingress-nginx" },
+    },
+  ],
+};
+
+function gatewayApiExposure(
+  options: Omit<Parameters<typeof buildGatewayApiExposure>[0], "ingressSources"> &
+    Partial<Pick<Parameters<typeof buildGatewayApiExposure>[0], "ingressSources">>,
+) {
+  return buildGatewayApiExposure({ ingressSources: gkeIngressSources(), ...options });
+}
+
+function httpRouteExposure(
+  options: Omit<Parameters<typeof buildHttpRouteExposure>[0], "ingressSources"> &
+    Partial<Pick<Parameters<typeof buildHttpRouteExposure>[0], "ingressSources">>,
+) {
+  return buildHttpRouteExposure({ ingressSources: envoySources, ...options });
+}
+
+function ingressExposure(
+  options: Omit<Parameters<typeof buildIngressExposure>[0], "ingressSources"> &
+    Partial<Pick<Parameters<typeof buildIngressExposure>[0], "ingressSources">>,
+) {
+  return buildIngressExposure({ ingressSources: nginxSources, ...options });
+}
 
 function context(overrides: Partial<TargetBuildContext> = {}): TargetBuildContext {
   return {
@@ -240,6 +277,27 @@ describe("Kubernetes target composition", () => {
       resource: "gateways",
       optional: false,
     });
+    const routeConditions = compiled.plan.operations.resources.readiness.filter(
+      (entry) => entry.kind === "kubernetes-condition" && entry.object.resource === "httproutes",
+    );
+    expect(routeConditions).toEqual(
+      (["Accepted", "ResolvedRefs"] as const).map((type) => ({
+        kind: "kubernetes-condition",
+        object: {
+          apiVersion: "gateway.networking.k8s.io/v1",
+          resource: "httproutes",
+          name: "test-app-routes",
+          namespace: "apps",
+        },
+        conditionsAt: { kind: "parents" },
+        condition: {
+          type,
+          status: "True",
+          observedGeneration: "must-equal-metadata-generation",
+        },
+        timeoutSeconds: 600,
+      })),
+    );
   });
 
   it("emits a networking.k8s.io/v1 Ingress targeting the origin Service", () => {
@@ -523,7 +581,7 @@ describe("Kubernetes target composition", () => {
       hosts,
       build(ctx) {
         return {
-          ingressSources: { cidrs: [], podSelectors: [] },
+          ingressSources: envoySources,
           capabilities: [
             {
               kind: "gateway-api",
@@ -574,7 +632,7 @@ describe("Kubernetes target composition", () => {
       hosts,
       build() {
         return {
-          ingressSources: { cidrs: [], podSelectors: [] },
+          ingressSources: envoySources,
           capabilities: [
             {
               kind: "gateway-api",
@@ -638,7 +696,7 @@ describe("Kubernetes target composition", () => {
       hosts,
       build() {
         return {
-          ingressSources: { cidrs: [], podSelectors: [] },
+          ingressSources: envoySources,
           capabilities: [
             {
               kind: "gateway-api",
@@ -912,6 +970,179 @@ describe("Kubernetes target composition", () => {
     );
   });
 
+  it("requires every external exposure to declare a non-empty source allowlist", () => {
+    expect(() => buildGatewayApiExposure({ className: "eg", hosts } as never)).toThrow(
+      /requires explicit ingressSources/i,
+    );
+    expect(() =>
+      buildHttpRouteExposure({
+        className: "eg",
+        parentRefs: [{ name: "envoy-external", namespace: "network" }],
+        hosts,
+      } as never),
+    ).toThrow(/requires explicit ingressSources/i);
+    expect(() => buildIngressExposure({ className: "nginx", hosts } as never)).toThrow(
+      /requires explicit ingressSources/i,
+    );
+    expect(() =>
+      buildIngressExposure({
+        className: "nginx",
+        hosts,
+        ingressSources: { cidrs: [], podSelectors: [] },
+      }),
+    ).toThrow(/must admit at least one/i);
+
+    expect(
+      compileTarget(
+        defineTarget({ cluster: kubernetesCluster(), exposure: manualExposure({ hosts }) }),
+        context(),
+      ).ingressSources,
+    ).toEqual({ cidrs: [], podSelectors: [] });
+  });
+
+  it("provides explicit GKE and Envoy Gateway source presets", () => {
+    expect(gkeIngressSources()).toEqual({
+      cidrs: ["35.191.0.0/16", "130.211.0.0/22", "2600:2d00:1:1::/64", "2600:2d00:1:b029::/64"],
+      podSelectors: [],
+    });
+    expect(
+      envoyGatewayIngressSources({
+        namespace: "network",
+        gateways: [{ name: "envoy-external", namespace: "network" }],
+        gatewayClasses: ["envoy"],
+      }),
+    ).toEqual({
+      cidrs: [],
+      podSelectors: [
+        {
+          namespace: "network",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gateway-name": "envoy-external",
+            "gateway.envoyproxy.io/owning-gateway-namespace": "network",
+          },
+        },
+        {
+          namespace: "network",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gatewayclass": "envoy",
+          },
+        },
+      ],
+    });
+  });
+
+  it("validates class names, TLS Secrets, annotations, and source selectors eagerly", () => {
+    expect(() =>
+      buildIngressExposure({ className: "Bad_Class", hosts, ingressSources: nginxSources }),
+    ).toThrow(/IngressClass name/i);
+    expect(() =>
+      buildGatewayApiExposure({ className: "eg..broken", hosts, ingressSources: envoySources }),
+    ).toThrow(/GatewayClass name/i);
+    expect(() =>
+      buildGatewayApiExposure({
+        className: `${"a".repeat(64)}.example`,
+        hosts,
+        ingressSources: envoySources,
+      }),
+    ).toThrow(/GatewayClass name/i);
+    expect(() =>
+      buildIngressExposure({
+        className: "nginx",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+        tlsSecretName: "Bad Secret",
+        ingressSources: nginxSources,
+      }),
+    ).toThrow(/Secret name/i);
+    expect(() =>
+      buildIngressExposure({
+        className: "nginx",
+        hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
+        tlsSecretName: "wildcard.example.com",
+        ingressSources: nginxSources,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      buildGatewayApiExposure({
+        className: "eg",
+        hosts,
+        ingressSources: envoySources,
+        annotations: { "bad key": "value" },
+      }),
+    ).toThrow(/annotation name/i);
+    expect(() =>
+      buildIngressExposure({
+        className: "nginx",
+        hosts,
+        ingressSources: {
+          cidrs: [],
+          podSelectors: [{ namespace: "network", labels: { "bad key": "value" } }],
+        },
+      }),
+    ).toThrow(/annotation name/i);
+  });
+
+  it("validates metadata contributed by custom components at the composition boundary", () => {
+    const resource = defineResourceComponent({
+      name: "unsafe-metadata",
+      build() {
+        return {
+          objects: [
+            {
+              apiVersion: "v1",
+              kind: "ConfigMap",
+              resource: "configmaps",
+              metadata: { name: "Bad_Name", namespace: "apps" },
+              body: { data: {} },
+            },
+          ],
+          requirements: [],
+          readiness: [],
+        };
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          resources: [resource],
+        }),
+        context(),
+      ),
+    ).toThrow(/Kubernetes object name/i);
+
+    const unsafeService = defineResourceComponent({
+      name: "unsafe-service-name",
+      build() {
+        return {
+          objects: [
+            {
+              apiVersion: "v1",
+              kind: "Service",
+              resource: "services",
+              metadata: { name: "1service", namespace: "apps" },
+              body: { spec: { ports: [{ port: 80 }] } },
+            },
+          ],
+          requirements: [],
+          readiness: [],
+        };
+      },
+    });
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+          resources: [unsafeService],
+        }),
+        context(),
+      ),
+    ).toThrow(/Service name/i);
+  });
+
   it("passes httpRouteExposure ingressSources through to the compiled target", () => {
     const compiled = compileTarget(
       defineTarget({
@@ -966,12 +1197,19 @@ describe("Kubernetes target composition", () => {
             nameSuffix: "-certmap",
           },
           releaseAddresses: [{ type: "NamedAddress", nameSuffix: "-ip" }],
+          backendHealth: gkeHealthCheckPolicy(),
         }),
         routing: gkeNativeRouting(),
       }),
       context({ infrastructure: { projectId: "sample-project", region: "us-central1" } }),
     );
     expect(compiled.routingTier).not.toHaveProperty("registration");
+    expect(compiled.backendHealth).toEqual({ kind: "gke-health-check-policy" });
+    expect(compiled.plan.requirements.kubernetes.resources).toContainEqual({
+      apiVersion: "networking.gke.io/v1",
+      resource: "healthcheckpolicies",
+      optional: false,
+    });
     expect(compiled.plan.operations.routing.registration).toEqual({
       kind: "gcp-traffic-extension-v1",
       projectId: "sample-project",
@@ -1041,6 +1279,42 @@ describe("Kubernetes target composition", () => {
         expectedType: "TCP",
       },
     ]);
+  });
+
+  it("selects GKE backend health from exposure independently of routing", () => {
+    const gkeContext = context({
+      infrastructure: { projectId: "sample-project", region: "us-central1" },
+    });
+    const withPortableRouting = compileTarget(
+      defineTarget({
+        cluster: gkeCluster(),
+        exposure: gatewayApiExposure({
+          className: "gke-l7-global-external-managed",
+          hosts,
+          backendHealth: gkeHealthCheckPolicy(),
+        }),
+      }),
+      gkeContext,
+    );
+    expect(withPortableRouting.plan.operations.routing.protocol).toBe("pool-local-v1");
+    expect(withPortableRouting.backendHealth).toEqual({ kind: "gke-health-check-policy" });
+
+    const nativeRoutingWithoutBackendHealth = compileTarget(
+      defineTarget({
+        cluster: gkeCluster(),
+        exposure: gatewayApiExposure({
+          className: "gke-l7-global-external-managed",
+          hosts,
+          releaseAddresses: [{ type: "NamedAddress", nameSuffix: "-ip" }],
+        }),
+        routing: gkeNativeRouting(),
+      }),
+      gkeContext,
+    );
+    expect(nativeRoutingWithoutBackendHealth.backendHealth).toBeNull();
+    expect(
+      nativeRoutingWithoutBackendHealth.plan.requirements.kubernetes.resources,
+    ).not.toContainEqual(expect.objectContaining({ resource: "healthcheckpolicies" }));
   });
 
   it("compiles an enabled cache without a URL into managed Memorystore on gkeCluster", () => {
@@ -1757,6 +2031,27 @@ describe("legacy provider translation", () => {
       source: "legacy-provider",
       providerName: "generic",
       definition: { routing: { name: "envoy-native" } },
+    });
+    if (generic.source !== "legacy-provider") throw new Error("expected legacy target");
+    expect(compileTarget(generic.definition, context()).ingressSources).toEqual({
+      cidrs: [],
+      podSelectors: [
+        {
+          namespace: "envoy-gateway-system",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gateway-name": "test-app-gateway",
+            "gateway.envoyproxy.io/owning-gateway-namespace": "apps",
+          },
+        },
+        {
+          namespace: "envoy-gateway-system",
+          labels: {
+            "app.kubernetes.io/name": "envoy",
+            "gateway.envoyproxy.io/owning-gatewayclass": "eg",
+          },
+        },
+      ],
     });
 
     const gke = resolveConfiguredTarget({

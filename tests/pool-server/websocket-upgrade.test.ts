@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { Duplex, PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { handleWebSocketUpgrade } from "../../src/pool-server/websocket-upgrade.js";
+import { applyIncomingRequestTrustBoundary } from "../../src/pool-server/server.js";
 import { INTERNAL_DISPATCH_PROOF_HEADER, verifyDispatchProof } from "../../src/routing-common.js";
 
 function captureSocket() {
@@ -57,6 +58,7 @@ function dependencies(
     upgradeHandler?: ((...args: any[]) => unknown) | undefined;
     runtime?: "nodejs" | "edge";
     handshakeTimeoutMs?: number;
+    prepareUseCache?: (() => Promise<void | (<T>(callback: () => T) => T)>) | undefined;
   } = {},
 ) {
   const resolution = {
@@ -85,6 +87,7 @@ function dependencies(
         if (value === "permessage-deflate; =") throw new SyntaxError("invalid extension");
         return {};
       },
+      prepareUseCache: options.prepareUseCache,
       handshakeTimeoutMs: options.handshakeTimeoutMs,
     } as any,
     resolve,
@@ -113,6 +116,53 @@ describe("handleWebSocketUpgrade", () => {
       initURL: "https://example.com/rooms/alpha?existing=1",
       params: { room: "alpha" },
     });
+    socket.destroy();
+  });
+
+  it("awaits use-cache preparation before loading and invoking a local generated handler", async () => {
+    const order: string[] = [];
+    let scopeDepth = 0;
+    let finishPreparation: ((run: <T>(callback: () => T) => T) => void) | undefined;
+    const prepareUseCache = vi.fn(
+      () =>
+        new Promise<<T>(callback: () => T) => T>((resolve) => {
+          order.push("prepare");
+          finishPreparation = resolve;
+        }),
+    );
+    const upgradeHandler = vi.fn(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      order.push("invoke");
+      return { upgraded: true, statusCode: 101 };
+    });
+    const { deps, handlerLoader } = dependencies({ upgradeHandler, prepareUseCache });
+    handlerLoader.loadUpgrade.mockImplementation(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      order.push("load");
+      return upgradeHandler;
+    });
+    const { socket } = captureSocket();
+
+    const upgrade = handleWebSocketUpgrade(deps, request(), socket, Buffer.alloc(0));
+    await vi.waitFor(() => expect(prepareUseCache).toHaveBeenCalledOnce());
+    expect(handlerLoader.loadUpgrade).not.toHaveBeenCalled();
+    finishPreparation?.(<T>(callback: () => T): T => {
+      order.push("scope-enter");
+      scopeDepth++;
+      const result = callback();
+      if (result instanceof Promise) {
+        return result.finally(() => {
+          scopeDepth--;
+          order.push("scope-exit");
+        }) as T;
+      }
+      scopeDepth--;
+      order.push("scope-exit");
+      return result;
+    });
+
+    await expect(upgrade).resolves.toBe("accepted-local");
+    expect(order).toEqual(["prepare", "scope-enter", "load", "invoke", "scope-exit"]);
     socket.destroy();
   });
 
@@ -607,11 +657,17 @@ describe("handleWebSocketUpgrade", () => {
 
   it("tunnels a wrong-pool handshake with asserted headers, repeated cookies, and early data", async () => {
     let siblingSocket: Duplex | undefined;
+    let siblingWireHeaders: Record<string, string | string[] | undefined> | undefined;
     let siblingHeaders: Record<string, string | string[] | undefined> | undefined;
+    let siblingTrusted = false;
     const fromClient: Buffer[] = [];
     const sibling = createServer();
     sibling.on("upgrade", (req, socket) => {
       siblingSocket = socket;
+      siblingWireHeaders = { ...req.headers };
+      siblingTrusted = applyIncomingRequestTrustBoundary(req, {
+        internalSecret: "internal-secret",
+      });
       siblingHeaders = { ...req.headers };
       socket.on("data", (chunk) => fromClient.push(Buffer.from(chunk)));
       socket.write(
@@ -641,8 +697,9 @@ describe("handleWebSocketUpgrade", () => {
         pool: "chat",
         middlewareRequestHeaders: middlewareHeaders,
         resolvedHeaders,
-        invokePath: "/rooms/alpha?joined=1",
-        invocationQuery: { joined: "1" },
+        routeMatches: { room: "café" },
+        invokePath: "/rooms/café?joined=%E2%9C%93",
+        invocationQuery: { joined: "日本語" },
       },
     });
     deps.internalSecret = "internal-secret";
@@ -665,7 +722,11 @@ describe("handleWebSocketUpgrade", () => {
       expect(siblingHeaders?.["x-output-id"]).toBe("/rooms/[room]");
       expect(siblingHeaders?.["x-mw-evaluated"]).toBe("ran");
       expect(siblingHeaders?.["x-internal-secret"]).toBeUndefined();
-      const proof = siblingHeaders?.[INTERNAL_DISPATCH_PROOF_HEADER];
+      expect(siblingTrusted).toBe(true);
+      expect(siblingHeaders?.["x-route-matches"]).toBe(JSON.stringify({ room: "café" }));
+      expect(siblingHeaders?.["x-invoke-path"]).toBe("/rooms/café?joined=%E2%9C%93");
+      expect(siblingHeaders?.["x-invoke-query"]).toBe(JSON.stringify({ joined: "日本語" }));
+      const proof = siblingWireHeaders?.[INTERNAL_DISPATCH_PROOF_HEADER];
       expect(typeof proof).toBe("string");
       expect(
         verifyDispatchProof(
@@ -673,7 +734,7 @@ describe("handleWebSocketUpgrade", () => {
           {
             method: clientRequest.method,
             target: clientRequest.url,
-            headers: siblingHeaders ?? {},
+            headers: siblingWireHeaders ?? {},
           },
           proof as string,
         ).trusted,
@@ -682,7 +743,6 @@ describe("handleWebSocketUpgrade", () => {
       expect(siblingHeaders?.["x-mw-request-headers"]).toBe(
         JSON.stringify(Object.fromEntries(middlewareHeaders.entries())),
       );
-      expect(siblingHeaders?.["x-invoke-query"]).toBe(JSON.stringify({ joined: "1" }));
       expect(siblingHeaders?.["x-resolved-headers"]).toBe(
         JSON.stringify({ "x-route-header": "present", "set-cookie": ["route=1; Path=/"] }),
       );

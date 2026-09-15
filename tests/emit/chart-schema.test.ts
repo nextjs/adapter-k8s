@@ -57,6 +57,7 @@ function renderAndValidate(
   name: string,
   files: Record<string, string>,
   skippedCrdKinds: readonly string[],
+  networkPolicy: { strict?: boolean; podCidrs?: string[] } = {},
 ): string {
   const root = mkdtempSync(path.join(tmpdir(), `adapter-k8s-schema-${name}-`));
   tempDirs.push(root);
@@ -71,8 +72,9 @@ function renderAndValidate(
     [
       "global:",
       "  networkPolicy:",
-      '    podCidrs: ["10.244.0.0/16"]',
+      `    podCidrs: ${JSON.stringify(networkPolicy.podCidrs ?? ["10.244.0.0/16"])}`,
       '    nodeCidrs: ["10.0.0.0/16"]',
+      `    strict: ${networkPolicy.strict ?? true}`,
       "",
     ].join("\n"),
   );
@@ -113,6 +115,15 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
         className: "nginx",
         hosts: [{ hostname: "app.example.com", tls: { enabled: true } }],
         tlsSecretName: "app-tls",
+        ingressSources: {
+          cidrs: [],
+          podSelectors: [
+            {
+              namespace: "network",
+              labels: { "app.kubernetes.io/instance": "external-ingress-nginx" },
+            },
+          ],
+        },
       }),
     });
     const config = {
@@ -128,24 +139,33 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
       defaultPool: "default",
       failurePolicy: "closed",
     });
-    const output = renderAndValidate(
-      "schema-portable",
-      generateHelmChart({
-        pools,
-        buildId: "schema-build",
-        nextVersion: "16.3.0",
-        config,
-        imageRegistry: "registry.example.com/schema",
-        routingManifest,
-        releaseName: "schema-portable",
-        internalSecret: "a".repeat(64),
-        compiledTarget,
-      }),
-      [],
-    );
+    const files = generateHelmChart({
+      pools,
+      buildId: "schema-build",
+      nextVersion: "16.3.0",
+      config,
+      imageRegistry: "registry.example.com/schema",
+      routingManifest,
+      releaseName: "schema-portable",
+      internalSecret: "a".repeat(64),
+      compiledTarget,
+    });
+    const output = renderAndValidate("schema-portable", files, []);
     expect(output).toContain("Invalid: 0");
     expect(output).toContain("Errors: 0");
     expect(output).toContain("Skipped: 0");
+    for (const [suffix, podCidrs] of [
+      ["ipv4", ["10.244.0.0/16"]],
+      ["ipv6", ["fd00:10::/64"]],
+      ["dual", ["10.244.0.0/16", "fd00:10::/64"]],
+    ] as const) {
+      const broadOutput = renderAndValidate(`schema-portable-broad-${suffix}`, files, [], {
+        strict: false,
+        podCidrs: [...podCidrs],
+      });
+      expect(broadOutput).toContain("Invalid: 0");
+      expect(broadOutput).toContain("Errors: 0");
+    }
   });
 
   it("strict-validates native resources in the Envoy profile and names each skipped CRD", () => {

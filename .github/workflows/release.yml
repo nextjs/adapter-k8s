@@ -26,6 +26,19 @@ jobs:
           persist-credentials: false
           ref: ${{ github.event.release.tag_name }}
 
+      - name: Verify minimum Node host
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "20.16.0"
+          package-manager-cache: false
+
+      - name: Build and load CLI on minimum Node host
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+          node dist/cli.cjs --help
+
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "24"

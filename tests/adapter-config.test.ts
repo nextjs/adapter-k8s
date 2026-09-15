@@ -9,6 +9,7 @@ import {
   defineTarget,
   gatewayApiExposure,
   gkeCluster,
+  gkeIngressSources,
   gkeNativeRouting,
   manualExposure,
 } from "../src/target/index.js";
@@ -156,6 +157,35 @@ describe("Turbopack production filesystem cache", () => {
   });
 });
 
+describe("immutable asset adapter capability", () => {
+  afterEach(() => {
+    delete process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS;
+  });
+
+  it("returns the stable top-level Next adapter field", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    const modified = (await adapter.modifyConfig!({ experimental: {} } as any, {} as any)) as {
+      supportsImmutableAssets?: boolean;
+      experimental?: Record<string, unknown>;
+    };
+    expect(modified.supportsImmutableAssets).toBe(true);
+    expect(modified.experimental).not.toHaveProperty("supportsImmutableAssets");
+  });
+
+  it("preserves an app opt-out and the operator kill switch", async () => {
+    const appOptOut = createK8sAdapter(validConfig);
+    await expect(
+      appOptOut.modifyConfig!({ supportsImmutableAssets: false } as any, {} as any),
+    ).resolves.toMatchObject({ supportsImmutableAssets: false });
+
+    process.env.ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS = "1";
+    const forcedOff = createK8sAdapter(validConfig);
+    await expect(
+      forcedOff.modifyConfig!({ supportsImmutableAssets: true } as any, {} as any),
+    ).resolves.toMatchObject({ supportsImmutableAssets: false });
+  });
+});
+
 describe("Next output mode", () => {
   it("removes redundant standalone output before Next finalizes the adapter build", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -246,6 +276,31 @@ describe("cache handler bundle is required when cache.enabled (N50)", () => {
       if (saved === undefined) delete process.env.ADAPTER_K8S_BUNDLE_DIR;
       else process.env.ADAPTER_K8S_BUNDLE_DIR = saved;
       rmSync(emptyDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses modifyConfig projectDir when the build is launched from another directory", async () => {
+    const callerDir = mkdtempSync(path.join(os.tmpdir(), "adapter-caller-"));
+    const projectDir = mkdtempSync(path.join(os.tmpdir(), "adapter-project-"));
+    const bundleDir = mkdtempSync(path.join(os.tmpdir(), "adapter-bundles-"));
+    writeFileSync(path.join(bundleDir, "cache-handler.cjs"), "module.exports = class {};");
+    const saved = process.env.ADAPTER_K8S_BUNDLE_DIR;
+    process.env.ADAPTER_K8S_BUNDLE_DIR = bundleDir;
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(callerDir);
+    try {
+      const adapter = createK8sAdapter({ ...validConfig, cache: { enabled: true } });
+      const modified = await adapter.modifyConfig!({} as any, { projectDir } as any);
+      expect((modified as { turbopack?: { root?: string } }).turbopack?.root).toBe(projectDir);
+      expect((modified as { cacheHandler?: string }).cacheHandler).toBe(
+        path.join(projectDir, ".k8s-adapter/cache-handler.cjs"),
+      );
+    } finally {
+      cwd.mockRestore();
+      if (saved === undefined) delete process.env.ADAPTER_K8S_BUNDLE_DIR;
+      else process.env.ADAPTER_K8S_BUNDLE_DIR = saved;
+      rmSync(callerDir, { recursive: true, force: true });
+      rmSync(projectDir, { recursive: true, force: true });
+      rmSync(bundleDir, { recursive: true, force: true });
     }
   });
 });
@@ -377,6 +432,17 @@ describe("onBuildComplete build-time guards", () => {
       JSON.stringify(infra),
     );
   };
+
+  it("rejects a distDir equal to the project root before recursive staging", async () => {
+    const adapter = createK8sAdapter(validConfig);
+    await adapter.modifyConfig!({} as any, {} as any);
+    const build = ctx("b12345");
+    build.distDir = projectDir;
+
+    await expect(adapter.onBuildComplete!(build)).rejects.toThrow(
+      /project-root distDir would recursively copy the project/,
+    );
+  });
 
   it("completes a minimal build (skip-staging) and emits a valid CEL for a basePath app", async () => {
     const adapter = createK8sAdapter(validConfig);
@@ -603,6 +669,7 @@ describe("onBuildComplete build-time guards", () => {
           className: "gke-l7-global-external-managed",
           hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
           addresses: [{ type: "NamedAddress", value: "custom-frontend-ip" }],
+          ingressSources: gkeIngressSources(),
         }),
         routing: gkeNativeRouting({
           projectId: "cluster-project",

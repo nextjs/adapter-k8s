@@ -46,7 +46,9 @@ npx adapter-k8s deploy            # add --yes in CI to skip the unpinned-context
 # 4) Verify
 npx adapter-k8s doctor            # exits 1 on any FAIL
 npx adapter-k8s describe          # live architecture diagram, pod counts, revision tags
-npx adapter-k8s tail              # color-coded logs from all workloads
+npx adapter-k8s tail              # color-coded logs from all workloads; for an unpinned
+                                  # portable target, check `kubectl config current-context`
+                                  # first, then add --yes
 ```
 
 ## Reading Deploy Output
@@ -80,7 +82,8 @@ npx adapter-k8s doctor      # prerequisites, local config, deploy state (current
                             # previous build), cloud resources, K8s resources,
                             # composition-plan readiness, ext_proc wiring, DNS + TLS
 npx adapter-k8s describe    # confirm the serving build id and per-pool pod counts
-npx adapter-k8s tail        # watch for runtime errors under first traffic
+npx adapter-k8s tail        # watch for runtime errors; on an unpinned portable target, check
+                            # `kubectl config current-context` first, then add --yes
 ```
 
 Confirm each checkpoint: doctor shows 0 failures; `describe` shows the new build id serving; `tail` shows no crash loops. If verification fails, stop and report the exact failing check plus its printed `Fix:` line.

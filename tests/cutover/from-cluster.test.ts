@@ -49,6 +49,8 @@ function metadataFixture(overrides: Record<string, unknown> = {}): Record<string
     hasEnvoyExtensionPolicy: true,
     cdnEnabled: true,
     hasPortableOrigin: true,
+    hasRoutingTier: true,
+    hasHealthCheckPolicy: true,
     projectId: "my-project",
   };
   return { ...meta, ...overrides };
@@ -92,6 +94,8 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
       hasEnvoyExtensionPolicy: true,
       cdnEnabled: true,
       hasPortableOrigin: true,
+      hasRoutingTier: true,
+      hasHealthCheckPolicy: true,
       projectId: "my-project",
     });
   });
@@ -116,12 +120,23 @@ describe("readJobEmitMetadata — the mounted emit-metadata ConfigMap", () => {
     expect(meta.hasEnvoyExtensionPolicy).toBe(false);
     expect(meta.cdnEnabled).toBe(false);
     expect(meta.hasPortableOrigin).toBe(false);
+    expect(meta.hasRoutingTier).toBe(true);
     expect(meta.projectId).toBeUndefined();
     expect(meta.digests).toEqual({});
     expect(meta.previousBuildId).toBeNull();
     // "true"-ish strings are not true: the ConfigMap is operator-mutable.
     expect(readJobEmitMetadata(mount(metadataFixture({ cdnEnabled: "true" }))).cdnEnabled).toBe(
       false,
+    );
+  });
+
+  it("requires an explicit routing-tier declaration", () => {
+    expect(readWithout("hasRoutingTier")).toThrow(/no explicit hasRoutingTier declaration/i);
+  });
+
+  it("requires an explicit HealthCheckPolicy capability declaration", () => {
+    expect(readWithout("hasHealthCheckPolicy")).toThrow(
+      /no explicit hasHealthCheckPolicy declaration/i,
     );
   });
 
@@ -365,6 +380,7 @@ describe("buildCutoverInputsFromCluster — assembling CutoverInputs from the th
     expect(inputs.hasRouteExtJob).toBe(true);
     expect(inputs.hasEnvoyExtensionPolicy).toBe(true);
     expect(inputs.cdnEnabled).toBe(true);
+    expect(inputs.hasRoutingTier).toBe(true);
   });
 
   it("passes a loaded composition snapshot through (the Job must not drop target readiness)", () => {

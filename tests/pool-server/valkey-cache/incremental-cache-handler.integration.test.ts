@@ -148,6 +148,46 @@ describe.skipIf(!dockerAvailable)("ValkeyIncrementalCacheHandler (integration)",
     expect(await b.get("/page", {})).toBeNull();
   });
 
+  it("orders a regenerated write after the hard invalidation on the Valkey clock", async () => {
+    const client = newClient();
+    const writer = new ValkeyIncrementalCacheHandler({
+      client,
+      buildId: "server-order",
+      // Reproduce a pod whose wall clock trails Valkey. Before the write was server-stamped, the
+      // regenerated value inherited this old timestamp and its first read deleted it again.
+      now: () => Date.now() - 5 * 60_000,
+    });
+    await writer.revalidateTag("_N_T_/page");
+    await writer.set("/page", appPageEntry("fresh", "_N_T_/page"), {});
+
+    const reader = new ValkeyIncrementalCacheHandler({
+      client: newClient(),
+      buildId: "server-order",
+      now: () => Date.now(),
+    });
+    expect(await reader.get("/page", {})).not.toBeNull();
+  });
+
+  it("stamps only the top-level timestamp when application data contains the private marker", async () => {
+    const client = newClient();
+    const h = new ValkeyIncrementalCacheHandler({ client, buildId: "marker-collision" });
+    const marker = "__adapter_k8s_valkey_time__";
+    await h.set(
+      "/page",
+      { kind: "PAGES", html: "page", pageData: { lastModified: marker } },
+      { revalidate: 60 },
+    );
+
+    const raw = await client.get("k8s:marker-collision:inc:/page");
+    expect(raw).not.toBeNull();
+    const stored = JSON.parse(raw!) as {
+      lastModified: number;
+      value: { pageData: { lastModified: string } };
+    };
+    expect(stored.lastModified).toEqual(expect.any(Number));
+    expect(stored.value.pageData.lastModified).toBe(marker);
+  });
+
   it("N79: a 300-char IMPLICIT path tag is stored AND can still invalidate the entry", async () => {
     // The end-to-end consequence of the old flat 256-char cap, against real Valkey: the entry was
     // stored with `tags: []` (measured), so `revalidatePath`/`revalidateTag` could never reach it
@@ -229,10 +269,10 @@ describe.skipIf(!dockerAvailable)("ValkeyIncrementalCacheHandler (integration)",
     // N80: for a route WITH a numeric revalidate window the signal is a real `lastModified` shifted
     // just past that window (→ `isStale = true`, serve stale + revalidate behind the request), not
     // `-1` (→ `isStale = -1`, which response-cache implements as "block on a fresh render").
-    // The clock is `Date.now() + offset` so it always agrees with the SERVER clock the manifest is
-    // stamped from (N78) regardless of how long the surrounding suite takes.
+    // Entry writes and manifest updates use the same server clock. Keep them in distinct
+    // milliseconds because Next's predicate is deliberately `staleAt > entryTimestamp`.
     const client = newClient();
-    const offset = { ms: -5000 }; // the entry is written 5s "ago" (see the CROSS-REPLICA note)
+    const offset = { ms: 0 };
     const h = new ValkeyIncrementalCacheHandler({
       client,
       buildId: "swr",
@@ -241,7 +281,7 @@ describe.skipIf(!dockerAvailable)("ValkeyIncrementalCacheHandler (integration)",
     await h.set("/isr", appPageEntry("isr", "news"), {
       cacheControl: { revalidate: 60, expire: 300 },
     });
-    offset.ms = 0;
+    await sleep(5);
     await h.revalidateTag("news", { expire: 300 }); // stale=now, expired=now+300s (future)
     // The manifest write is best-effort by design; assert it landed so a swallowed failure can't
     // masquerade as "the entry wasn't stale".
@@ -259,14 +299,14 @@ describe.skipIf(!dockerAvailable)("ValkeyIncrementalCacheHandler (integration)",
     // `calculateRevalidate` returns `false` there, so `revalidateAfter` is `false` and nothing but
     // -1 can force a revalidation — blocking is the only expressible answer (N80).
     const client = newClient();
-    const offset = { ms: -5000 };
+    const offset = { ms: 0 };
     const h = new ValkeyIncrementalCacheHandler({
       client,
       buildId: "swr-static",
       now: () => Date.now() + offset.ms,
     });
     await h.set("/shell", appPageEntry("shell", "news"), { cacheControl: { revalidate: false } });
-    offset.ms = 0;
+    await sleep(5);
     await h.revalidateTag("news", { expire: 300 });
     expect((await client.hmget("k8s:swr-static:tags", "news"))[0]).toMatch(/"stale":/);
     offset.ms = 2000;

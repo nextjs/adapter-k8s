@@ -194,7 +194,7 @@ describe.skipIf(!dockerAvailable)("RespClient (integration)", () => {
         /* already gone */
       }
     }
-  }, 30_000);
+  }, 60_000);
 
   it("rejects (does not hang) when the endpoint is unreachable, within connectTimeoutMs", async () => {
     // 192.0.2.1 is TEST-NET-1 (RFC 5737) — reserved and unrouteable, so the connect blackholes.

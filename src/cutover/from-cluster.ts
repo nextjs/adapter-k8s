@@ -48,6 +48,8 @@ export interface JobEmitMetadata {
   hasEnvoyExtensionPolicy: boolean;
   cdnEnabled: boolean;
   hasPortableOrigin: boolean;
+  hasRoutingTier: boolean;
+  hasHealthCheckPolicy: boolean;
   projectId: string | undefined;
 }
 
@@ -93,11 +95,9 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
   if (typeof meta.registry !== "string" || !meta.registry) {
     throw new Error(`emit-metadata.json has no registry — the edge revert could not run.`);
   }
-  // The registry joins a digest below to form the routing image a `kubectl patch` puts on
-  // the routing Deployment — an unvalidated value is an arbitrary-image injection into the
-  // pod that holds the release's dispatch secret. Same for every other value that lands in
-  // a kubectl/gcloud argv or a label selector: the battery runs HERE, on the
-  // operator-mutable ConfigMap read, even though emit validated at write time.
+  // Validate operator-mutable ConfigMap metadata at consumption, even though emit
+  // validated it at write time. Recovery authorizes executable images separately
+  // against workload history; a syntactically valid registry is not that authority.
   assertSafeImageRegistry(meta.registry);
   const digests = meta.digests ?? {};
   for (const [key, digest] of Object.entries(digests)) {
@@ -130,6 +130,18 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
         `a failed rollout could not restore the edge's architecture selector.`,
     );
   }
+  if (typeof meta.hasRoutingTier !== "boolean") {
+    throw new Error(
+      `emit-metadata.json has no explicit hasRoutingTier declaration. The cutover Job cannot ` +
+        `distinguish an intentional pool-local target from a missing ext_proc Deployment.`,
+    );
+  }
+  if (typeof meta.hasHealthCheckPolicy !== "boolean") {
+    throw new Error(
+      `emit-metadata.json has no explicit hasHealthCheckPolicy declaration. The cutover Job ` +
+        `cannot choose its namespaced cleanup permissions from a cluster-wide CRD probe.`,
+    );
+  }
   return {
     buildId: meta.buildId,
     previousBuildId: meta.previousBuildId ?? null,
@@ -144,6 +156,8 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
     hasEnvoyExtensionPolicy: meta.hasEnvoyExtensionPolicy === true,
     cdnEnabled: meta.cdnEnabled === true,
     hasPortableOrigin: meta.hasPortableOrigin === true,
+    hasRoutingTier: meta.hasRoutingTier,
+    hasHealthCheckPolicy: meta.hasHealthCheckPolicy,
     projectId: typeof meta.projectId === "string" && meta.projectId ? meta.projectId : undefined,
   };
 }
@@ -284,6 +298,8 @@ export function buildCutoverInputsFromCluster(opts: {
     previousPools,
     defaultPool: metadata.defaultPool,
     hasPortableOrigin: metadata.hasPortableOrigin,
+    hasRoutingTier: metadata.hasRoutingTier,
+    hasHealthCheckPolicy: metadata.hasHealthCheckPolicy,
     previousReplicasByPool,
     state,
     compositionSnapshot,

@@ -1,5 +1,5 @@
 // src/cli/state.ts
-import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { stateFileName } from "./infrastructure-validation.js";
 import { execCapture, execCaptureStdin } from "./exec.js";
@@ -75,12 +75,9 @@ export interface AdapterState {
    * Per-build immutable routing-service image digest (`<buildId>` -> `sha256:…`), recorded at
    * the deploy that pushed it.
    *
-   * Rollback reconstructs the routing image reference from the target build id, which can only
-   * produce a TAG — so a rolled-back edge was one step less immutable than a freshly deployed
-   * one, exactly the mutable-tag exposure digest pinning exists to close (the deploy identity
-   * can retag, and these pods hold the internal dispatch secret). With the digest recorded here
-   * the revert can pin properly. Absent for builds deployed before this existed, and for those
-   * the tag remains the only option. Pruned to the two builds still in play, like `cdnTags`.
+   * Retained as deployment metadata and pruned to the two builds still in play, like cdnTags.
+   * This ConfigMap is mutable, so recovery authenticates the executable image against live
+   * Deployment/ReplicaSet history instead of treating a recorded digest as authorization.
    */
   routingImageDigests?: Record<string, string>;
   /**
@@ -176,17 +173,21 @@ function stateFilePath(projectDir: string): string {
   return path.join(projectDir, STATE_DIR, STATE_FILE());
 }
 
+/** Remove only this target variant's local deploy-state record and interrupted-write temp file. */
+export function removeLocalState(projectDir: string): void {
+  const target = stateFilePath(projectDir);
+  rmSync(target, { force: true });
+  rmSync(`${target}.tmp`, { force: true });
+}
+
 function isAdapterState(value: unknown): value is AdapterState {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const v = value as Record<string, unknown>;
   if (typeof v.buildId !== "string" || v.buildId === "") return false;
   if (!(v.previousBuildId === null || typeof v.previousBuildId === "string")) return false;
-  // The state ConfigMap is operator-mutable (any namespace actor with configmaps/update can
-  // rewrite it), and routingImageDigests flows — via revertRoutingServiceToBuild — into the
-  // image reference of a `kubectl patch` on the routing Deployment. edge.ts validates at the
-  // consumption point; this is the belt-and-braces half: a state blob whose digests are not
-  // sha256:<64 hex> (or whose keys are not build ids) reads as "unknown", never as deployable
-  // truth (N20: unknown must fail closed, not read as a first deploy).
+  // The state ConfigMap is operator-mutable. Validate its digest/build-id schema here,
+  // independently of recovery's workload-history authorization. Malformed state remains
+  // unknown, never a first deploy (N20).
   if (v.routingImageDigests !== undefined) {
     if (typeof v.routingImageDigests !== "object" || v.routingImageDigests === null) return false;
     if (Array.isArray(v.routingImageDigests)) return false;

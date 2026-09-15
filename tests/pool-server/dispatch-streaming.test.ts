@@ -95,6 +95,35 @@ afterEach(async () => {
   openServers = [];
 });
 
+describe("handler request trust boundary", () => {
+  it("does not relay decoded dispatch headers into the loopback app request", async () => {
+    let seenOutputId: string | string[] | undefined;
+    const server = createServer((req, res) => {
+      // This is the semantic value produced after the authenticated ingress proof is verified.
+      req.headers["x-output-id"] = "/🎉";
+      void invokeLocalHandlerOverHttp({
+        handler: (innerReq, innerRes) => {
+          seenOutputId = innerReq.headers["x-output-id"];
+          innerRes.writeHead(200);
+          innerRes.end("ok");
+        },
+        req,
+        res,
+        matchedPathname: "/🎉",
+        routeMatches: null,
+        bufferedBody: undefined,
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    openServers.push(server);
+
+    const response = await timedGet((server.address() as AddressInfo).port, "/%F0%9F%8E%89");
+    expect(response.status).toBe(200);
+    expect(response.body).toBe("ok");
+    expect(seenOutputId).toBeUndefined();
+  });
+});
+
 // S41 (AVAILABILITY): manifest-backed assets bypassed the size-aware static serving path and
 // synchronously buffered the complete body before even checking If-None-Match.
 describe("manifest-backed static asset bounds", () => {

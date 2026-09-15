@@ -22,7 +22,8 @@ You are a diagnosis orchestrator for @next-community/adapter-k8s releases. Do no
 npx adapter-k8s doctor
 
 # 2) Live logs across all workloads (routing + pools)
-npx adapter-k8s tail
+npx adapter-k8s tail          # for unpinned portable access, check
+                              # `kubectl config current-context` first, then add --yes
 
 # 3) Architecture diagram with live cluster status
 npx adapter-k8s describe

@@ -7,6 +7,7 @@ export {
   envoyNativeRouting,
   gatewayApiExposure,
   gkeCluster,
+  gkeHealthCheckPolicy,
   gkeNativeRouting,
   httpRouteExposure,
   ingressExposure,
@@ -14,6 +15,13 @@ export {
   manualExposure,
   portableRouting,
 } from "./components.js";
+export {
+  envoyGatewayIngressSources,
+  gkeIngressSources,
+  GKE_GFE_PROXY_CIDRS,
+  GKE_HEALTH_CHECK_PROBE_CIDRS,
+} from "./ingress-sources.js";
+export type { EnvoyGatewayIngressSourcesOptions } from "./ingress-sources.js";
 export type {
   CertManagerTlsOptions,
   GatewayApiExposureOptions,
@@ -24,6 +32,7 @@ export { compileTarget } from "./compiler.js";
 export type {
   ClusterBuildResult,
   ClusterComponent,
+  BackendHealthPolicy,
   CompiledKubernetesTarget,
   DefineTargetOptions,
   ExposureBuildContext,

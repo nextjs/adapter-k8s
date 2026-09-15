@@ -12,7 +12,6 @@ import {
   assertSafeImageRegistry,
   resolveK8sNamespace,
 } from "../emit/templates/utils.js";
-import { DIGEST_RE } from "../pipeline/digests.js";
 import {
   ROUTING_MANIFEST_SNAPSHOT_COMPONENT,
   ROUTING_MANIFEST_VOLUME_NAME,
@@ -21,12 +20,9 @@ import {
 } from "../emit/templates/routing-manifest-configmap.js";
 // N87: internal dispatch secrets are per BUILD, so reverting the edge has to move its
 // secretKeyRef with the image (see revertRoutingServiceToBuild).
-import {
-  INTERNAL_SECRET_KEY,
-  internalSecretName,
-  legacyInternalSecretName,
-} from "../emit/templates/internal-secret.js";
-import { targetArchitecture, type TargetPlatform } from "../target-platform.js";
+import { INTERNAL_SECRET_KEY } from "../emit/templates/internal-secret.js";
+import type { TargetPlatform } from "../target-platform.js";
+import { readTrustedRoutingRevision } from "./routing-history.js";
 
 // Annotation stamping the FULL build id onto retained snapshot ConfigMaps. Snapshot
 // NAMES go through sanitizeK8sName (lowercase + 63-char truncation), so two different
@@ -73,7 +69,7 @@ interface RoutingServingConfig {
  */
 type RoutingServingRead =
   | { status: "absent" }
-  | { status: "read"; config: RoutingServingConfig }
+  | { status: "read"; config: RoutingServingConfig; deploymentUid: string | undefined }
   | { status: "failed"; reason: string };
 
 // Read what the routing tier is ACTUALLY serving (image tag + manifest source).
@@ -193,6 +189,7 @@ export async function readRoutingServingConfig(
   }
   return {
     status: "read",
+    deploymentUid: (parsed as { metadata?: { uid?: string } })?.metadata?.uid,
     config: {
       imageTag: tag,
       image: typeof image === "string" ? image : "",
@@ -418,24 +415,17 @@ export async function revertRoutingServiceToBuild(opts: {
    */
   retainCurrentManifest?: boolean;
   /**
-   * The target build's recorded routing-image digest (`AdapterState.routingImageDigests`), when
-   * one exists. Without it the reference can only be a TAG, which leaves a rolled-back edge one
-   * step less immutable than a freshly deployed one.
+   * Legacy caller metadata; never an authority for the recovery image. Workload history
+   * supplies the literal image reference, even when this ConfigMap-sourced value differs.
    */
   targetImageDigest?: string | undefined;
-  /** The target build's recorded platform. Unknown legacy builds leave the selector alone. */
+  /** Legacy caller metadata; recovery uses the architecture in trusted workload history. */
   targetPlatform?: TargetPlatform | undefined;
 }): Promise<void> {
-  const { releaseName, targetBuildId, registry, targetPlatform } = opts;
+  const { releaseName, targetBuildId, registry } = opts;
   const namespace = resolveK8sNamespace(opts.namespace);
-  // SECURITY: every input that forms the image reference below is ConfigMap-sourced on the
-  // GitOps path (the emit-metadata CM mounts `registry`; the state CM carries
-  // `routingImageDigests`) and is therefore mutable by any namespace actor with
-  // configmaps/update — the exact actor the S1/S9 digest-pin defenses exist against. An
-  // unvalidated registry/digest pair here is an arbitrary-image injection into the routing
-  // Deployment via `kubectl patch`, and the routing pod starts with the release's internal
-  // dispatch secret. Validate at the point of consumption (AGENTS.md), even though the
-  // writers validated at write time.
+  // State and emit-metadata ConfigMaps are mutable by actors who cannot deploy code.
+  // Syntax checks alone therefore cannot authorize the image that receives dispatch secrets.
   assertSafeBuildId(targetBuildId);
   const deployName = routingServiceDeploymentName(releaseName);
   // N68: same distinction as retention — a read failure here used to return silently, i.e.
@@ -453,36 +443,19 @@ export async function revertRoutingServiceToBuild(opts: {
   }
   if (exists.status === "absent") return; // no routing tier on this release
 
-  if (!registry) {
-    throw new Error(
-      `infrastructure.json is missing containerRegistry, so the routing service image ` +
-        `reference cannot be formed. Restore it (re-run \`npx adapter-k8s init\`) and ` +
-        `re-run the rollback. Traffic was NOT switched.`,
-    );
-  }
-  assertSafeImageRegistry(registry);
-
-  // Digest when the deploy that pushed this build recorded one; tag otherwise (a build from
-  // before digests were recorded, where the tag is all that identifies it). A recorded digest
-  // that is not sha256:<64 hex> came out of an operator-mutable ConfigMap and is NOT a
-  // digest — refuse to put it in an image reference and revert by tag instead, exactly like
-  // a pre-digest build (availability is preserved; the injection vector is not).
-  let targetImageDigest: string | undefined;
-  if (opts.targetImageDigest === undefined) {
+  if (registry !== undefined) assertSafeImageRegistry(registry);
+  const target = await readTrustedRoutingRevision({
+    deploymentName: deployName,
+    deploymentUid: exists.deploymentUid,
+    namespace,
+    targetBuildId,
+    live: exists.config,
+  });
+  if (!target.image.includes("@sha256:")) {
     console.warn(
-      `  ! No recorded routing-image digest for build ${targetBuildId} — reverting the edge by ` +
-        `TAG. A retag of that tag would change what the edge runs on its next restart; the ` +
-        `next deploy records a digest so a later rollback can pin it.`,
+      `  ! The retained workload revision for build ${targetBuildId} uses a mutable TAG. ` +
+        `Recovery preserves that recorded reference; verify the tag has not moved.`,
     );
-  } else if (!DIGEST_RE.test(opts.targetImageDigest)) {
-    console.warn(
-      `  ! Ignoring the recorded routing-image digest for build ${targetBuildId}: ` +
-        `${JSON.stringify(opts.targetImageDigest)} is not sha256:<64 hex>. Deploy state is ` +
-        `operator-mutable, so a malformed digest never reaches an image reference. ` +
-        `Reverting by TAG.`,
-    );
-  } else {
-    targetImageDigest = opts.targetImageDigest;
   }
 
   // Exactly what the edge is serving BEFORE this function changes anything, so a failed
@@ -518,69 +491,46 @@ export async function revertRoutingServiceToBuild(opts: {
     );
   }
 
-  const image = targetImageDigest
-    ? `${registry}/routing-service@${targetImageDigest}`
-    : `${registry}/routing-service:${targetBuildId}`;
-  if (!targetPlatform) {
-    console.warn(
-      `  ! No recorded target platform for build ${targetBuildId}. This build predates ` +
-        `platform-aware deploy state, so the routing Deployment's kubernetes.io/arch ` +
-        `selector will NOT be changed. Verify that the live selector can run this image; ` +
-        `new builds record platform provenance, but this legacy build ID remains unknown.`,
-    );
-  }
-  // N87: the internal dispatch secret is per BUILD, so the edge's secretKeyRef must move with
-  // the image for the same reason NEXT_BUILD_ID does — otherwise a reverted edge presents the
-  // rolled-away-from build's secret to the rolled-back pools, which reject it and re-resolve
-  // every request locally (fail-safe per invariant 1, but middleware then runs TWICE per
-  // request for as long as the rollback lasts — and a rollback is not the moment to double
-  // the middleware bill). Only patched when the target's Secret actually EXISTS: pointing a
-  // container at a missing Secret is CreateContainerConfigError, i.e. it would turn a
-  // degraded edge into a dead one. A build deployed before per-build names used the legacy
-  // stable name, which deploy preserves (`helm.sh/resource-policy: keep`), so try that too.
-  let targetSecretRef: string | null = null;
-  for (const candidate of [
-    internalSecretName(releaseName, targetBuildId),
-    legacyInternalSecretName(releaseName),
-  ]) {
-    const got = await execCapture(
+  // Restore the Secret bound to this exact workload revision, including legacy stable
+  // names. Guessing a Secret from mutable state would break the image/credential pairing.
+  if (target.internalSecretRef) {
+    const secret = await execCapture(
       "kubectl",
-      ["get", "secret", candidate, "-n", namespace, "--ignore-not-found", "-o", "name"],
+      [
+        "get",
+        "secret",
+        target.internalSecretRef,
+        "-n",
+        namespace,
+        "--ignore-not-found",
+        "-o",
+        "name",
+      ],
       { timeoutMs: EXEC_TIMEOUTS.kubectl },
     );
-    if (got.exitCode === 0 && got.stdout.trim()) {
-      targetSecretRef = candidate;
-      break;
+    if (secret.exitCode !== 0 || !secret.stdout.trim()) {
+      throw new Error(
+        `Cannot recover routing build ${targetBuildId}: its recorded dispatch Secret is unavailable. Traffic was NOT switched.`,
+      );
     }
   }
-  if (!targetSecretRef) {
-    console.warn(
-      `  ! No internal dispatch Secret found for build ${targetBuildId} ` +
-        `(${internalSecretName(releaseName, targetBuildId)}). The edge keeps its current ` +
-        `secret, so the rolled-back pools will reject its dispatch headers and re-resolve ` +
-        `every request locally — correct (invariant 1), but middleware runs twice per request ` +
-        `until the next deploy.`,
-    );
-  } else if (targetSecretRef === priorSpec.internalSecretRef) {
-    // Already pointing at the right Secret (e.g. a legacy release where both builds share
-    // the stable name) — leave the env alone rather than patching it to itself.
-    targetSecretRef = null;
-  }
+  const restoreNodeArchitecture = target.nodeArchitecture !== priorSpec.nodeArchitecture;
+  const changeSecret = target.internalSecretRef !== priorSpec.internalSecretRef;
   const patch = {
     spec: {
       template: {
         spec: {
-          ...(targetPlatform
+          ...(restoreNodeArchitecture
             ? {
                 nodeSelector: {
-                  "kubernetes.io/arch": targetArchitecture(targetPlatform),
+                  "kubernetes.io/arch": target.nodeArchitecture,
                 },
               }
             : {}),
           containers: [
             {
               name: "routing-service",
-              image,
+              image: target.image,
               // The pod's NEXT_BUILD_ID must move WITH the image. This patch used to change
               // only the image (and the volume), leaving the env at whatever the last
               // `helm upgrade` stamped — and readRoutingServingConfig reads that env to decide
@@ -596,13 +546,20 @@ export async function revertRoutingServiceToBuild(opts: {
                 { name: "NEXT_BUILD_ID", value: targetBuildId },
                 // N87: same merge-by-name semantics; the live entry carries only `valueFrom`,
                 // so this replaces the Secret it resolves from and nothing else.
-                ...(targetSecretRef
+                ...(changeSecret
                   ? [
                       {
                         name: "INTERNAL_HEADER_SECRET",
-                        valueFrom: {
-                          secretKeyRef: { name: targetSecretRef, key: INTERNAL_SECRET_KEY },
-                        },
+                        ...(target.internalSecretRef
+                          ? {
+                              valueFrom: {
+                                secretKeyRef: {
+                                  name: target.internalSecretRef,
+                                  key: INTERNAL_SECRET_KEY,
+                                },
+                              },
+                            }
+                          : { $patch: "delete" }),
                       },
                     ]
                   : []),
@@ -678,7 +635,7 @@ export async function revertRoutingServiceToBuild(opts: {
       deployName,
       priorSpec,
       namespace,
-      targetPlatform !== undefined,
+      restoreNodeArchitecture,
     );
     throw new Error(
       `The routing service did not roll out to build ${targetBuildId} within ` +
@@ -730,9 +687,8 @@ async function restoreRoutingSpec(
     spec: {
       template: {
         spec: {
-          // Restore only fields this invocation changed. A legacy target with unknown platform
-          // deliberately leaves the selector alone in the forward patch, so touching it here
-          // would break patch/restore symmetry and trust parser fidelity unnecessarily.
+          // Restore only fields this invocation changed; an unchanged selector needs no patch.
+          // A historical revision without this key removes it, and restoration puts it back.
           ...(restoreNodeArchitecture
             ? {
                 // Strategic merge treats null as deletion and preserves unrelated selectors.
@@ -752,19 +708,19 @@ async function restoreRoutingSpec(
                 ? {
                     env: [
                       ...(prior.buildId ? [{ name: "NEXT_BUILD_ID", value: prior.buildId }] : []),
-                      ...(prior.internalSecretRef
-                        ? [
-                            {
-                              name: "INTERNAL_HEADER_SECRET",
+                      {
+                        name: "INTERNAL_HEADER_SECRET",
+                        ...(prior.internalSecretRef
+                          ? {
                               valueFrom: {
                                 secretKeyRef: {
                                   name: prior.internalSecretRef,
                                   key: INTERNAL_SECRET_KEY,
                                 },
                               },
-                            },
-                          ]
-                        : []),
+                            }
+                          : { $patch: "delete" }),
+                      },
                     ],
                   }
                 : {}),
@@ -886,9 +842,9 @@ export function createEdgeRecovery(opts: {
       `  The edge (ext_proc) is running build ${buildId}'s middleware and routing manifest ` +
         `while the pools serve ${previousBuildId}. Mismatched routes fall back to pool-local ` +
         `re-resolution (invariant 1), but edge middleware is the NEW build's until repaired:`,
-      `    kubectl -n ${namespace} set image deployment/` +
-        `${routingServiceDeploymentName(releaseName)} routing-service=` +
-        `${registry}/routing-service:${previousBuildId}`,
+      `  Restore a verified chart or workload revision for this build, including its ` +
+        `image, dispatch Secret, architecture, and routing manifest. Do not reconstruct ` +
+        `an image reference from the state or emit-metadata ConfigMap.`,
     ];
   };
 

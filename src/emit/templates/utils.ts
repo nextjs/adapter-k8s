@@ -414,6 +414,24 @@ export function assertSafeServiceName(name: unknown): asserts name is string {
   }
 }
 
+/** Kubernetes metadata.name for resources that use the DNS-1123 subdomain rule. */
+export function assertSafeKubernetesObjectName(
+  name: unknown,
+  field = "Kubernetes object name",
+): asserts name is string {
+  if (
+    typeof name !== "string" ||
+    name.length > 253 ||
+    !name.split(".").every((label) => NAMESPACE_RE.test(label))
+  ) {
+    throw new Error(
+      `Invalid ${field} ${JSON.stringify(name)}: must be a DNS-1123 subdomain ` +
+        `(lowercase letters, digits, "-" or ".", max 253 chars, starting and ending ` +
+        `with a letter or digit).`,
+    );
+  }
+}
+
 /** Validate Kubernetes qualified names used as annotation keys. */
 export function assertSafeAnnotationName(name: unknown): asserts name is string {
   if (typeof name !== "string") {
@@ -687,19 +705,18 @@ export function assertSafeRegion(region: string): void {
 }
 
 /**
- * Kubernetes Secret NAME charset — DNS-1123 subdomain minus the dots (every name this
- * adapter emits goes through sanitizeK8sName, so a dot means the value did not come from
- * here). Used for the internal-dispatch secretKeyRef override (cluster-sourced) and for
+ * Kubernetes Secret NAME charset — the API's DNS-1123 subdomain rule, including dots.
+ * Used for the internal-dispatch secretKeyRef override (cluster-sourced) and for
  * `imagePullSecrets` names from `next.config` — both land in bare/quoted YAML scalars in
  * the rendered pod spec, so they are validated at the point of consumption (AGENTS.md).
  */
-const SECRET_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,251}[a-z0-9])?$/;
-
 export function assertSafeSecretName(name: string): void {
-  if (typeof name !== "string" || !SECRET_NAME_RE.test(name)) {
+  try {
+    assertSafeKubernetesObjectName(name, "Secret name");
+  } catch {
     throw new Error(
-      `Invalid Secret name ${JSON.stringify(name)}: must match ${SECRET_NAME_RE} ` +
-        `(lowercase alphanumerics and "-", starting and ending alphanumeric, max 253 chars). ` +
+      `Invalid Secret name ${JSON.stringify(name)}: must be a DNS-1123 subdomain ` +
+        `(lowercase alphanumerics, "-", and ".", with each label at most 63 characters). ` +
         `It is interpolated into the rendered pod spec as a YAML scalar.`,
     );
   }

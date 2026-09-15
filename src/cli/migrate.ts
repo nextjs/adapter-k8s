@@ -37,6 +37,12 @@ import { INTERNAL_SECRET_COMPONENT } from "../emit/templates/internal-secret.js"
 import { ROUTING_MANIFEST_SNAPSHOT_COMPONENT } from "../emit/templates/routing-manifest-configmap.js";
 import { COMPOSITION_PLAN_COMPONENT } from "../emit/templates/composition-plan-configmap.js";
 import { EXTERNAL_SECRET_COMPONENT } from "../emit/templates/external-secret.js";
+import {
+  compositionPlanNeedsExplicitConfirmation,
+  currentKubeContext,
+  establishCompositionPlanCluster,
+  loadProjectCompositionPlan,
+} from "./composition-plan.js";
 
 export interface MigrateOptions {
   projectDir: string;
@@ -79,6 +85,13 @@ async function annotateByLabel(opts: {
   failures: string[];
 }): Promise<string[]> {
   const { kind, labelSelector, namespace, dryRun, failures } = opts;
+  if (dryRun) {
+    console.log(
+      `  [dry-run] selector sweep: kubectl annotate ${kind} -n ${namespace} ` +
+        `-l ${JSON.stringify(labelSelector)} ${keepAtBirthAnnotationArgs().join(" ")} --overwrite`,
+    );
+    return [];
+  }
   const list = await execCapture(
     "kubectl",
     [
@@ -106,14 +119,6 @@ async function annotateByLabel(opts: {
   const names = list.stdout.trim().split("\n").filter(Boolean);
   const annotated: string[] = [];
   for (const name of names) {
-    if (dryRun) {
-      console.log(
-        `  [dry-run] kubectl annotate ${kind} ${name} -n ${namespace} ` +
-          `${keepAtBirthAnnotationArgs().join(" ")} --overwrite`,
-      );
-      annotated.push(`${kind}/${name}`);
-      continue;
-    }
     const res = await execCapture(
       "kubectl",
       ["annotate", kind, name, "-n", namespace, ...keepAtBirthAnnotationArgs(), "--overwrite"],
@@ -136,16 +141,25 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
   const dryRun = options.dryRun === true;
   assertSafeReleaseName(releaseName);
 
+  const composition = loadProjectCompositionPlan(projectDir);
+  if (composition && composition.plan.metadata.releaseName !== releaseName) {
+    throw new Error(
+      `Composition-plan release mismatch: plan records ` +
+        `${JSON.stringify(composition.plan.metadata.releaseName)}, but migrate targets ` +
+        `${JSON.stringify(releaseName)}.`,
+    );
+  }
   const infraPath = infrastructurePath(projectDir);
-  const infra: Record<string, string | undefined> = existsSync(infraPath)
-    ? JSON.parse(readFileSync(infraPath, "utf-8"))
-    : {};
-  // S13 (SECURITY): the same idiom destroy/describe/doctor/tail/rollback already apply —
-  // infrastructure.json is operator-mutable (a poisoned checkout can carry one), and
-  // projectId/region below reach a `gcloud` argv. Validate at the point of read, before
-  // any subprocess is built from it.
-  assertSafeInfrastructure(infra);
-  const namespace = resolveK8sNamespace(infra.namespace);
+  const infra: Record<string, string | undefined> =
+    !composition && existsSync(infraPath) ? JSON.parse(readFileSync(infraPath, "utf-8")) : {};
+  if (!composition) {
+    // Legacy artifacts have no authenticated target plan. Validate operator-mutable coordinates
+    // before they reach gcloud; new artifacts use the plan's exact access and namespace instead.
+    assertSafeInfrastructure(infra);
+  }
+  const namespace = composition
+    ? composition.plan.metadata.namespace
+    : resolveK8sNamespace(infra.namespace);
 
   // Invariant 6 / destroy's C1 guard, verbatim idiom: pin the kubectl context before any
   // cluster contact; when pinning is impossible (generic/composition targets have no GKE
@@ -153,8 +167,35 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
   // non-interactively. Migrate only ANNOTATES — but annotating the wrong cluster's
   // objects silently "passes" the documented prerequisite while leaving the real
   // cluster unprotected, which is worse than failing.
-  const canPinContext = Boolean(infra.projectId && infra.region);
-  if (!dryRun && canPinContext) {
+  const canPinLegacyContext = !composition && Boolean(infra.projectId && infra.region);
+  if (!dryRun && composition) {
+    let explicitlyConfirmed = yes === true;
+    if (compositionPlanNeedsExplicitConfirmation(composition.plan) && !explicitlyConfirmed) {
+      const context = await currentKubeContext();
+      console.warn(
+        `\n  !!! WARNING: the composition plan requires explicit confirmation of the current ` +
+          `kubectl context before migration:\n      ${context ?? "(no current context / kubectl unavailable)"}\n`,
+      );
+      if (!process.stdin.isTTY) {
+        throw new Error(
+          "Refusing to migrate against an explicitly unverified composition-plan target " +
+            "non-interactively. Re-run with --yes only after confirming the context above.",
+        );
+      }
+      const answer = await promptConfirmation(
+        `  Type "yes" to confirm this kubectl context is the intended cluster: `,
+      );
+      if (answer.trim() !== "yes") {
+        throw new Error(
+          "Migrate aborted: the current kubectl context was not confirmed as the intended " +
+            "cluster. Nothing was annotated.",
+        );
+      }
+      explicitlyConfirmed = true;
+      console.log("");
+    }
+    await establishCompositionPlanCluster(composition.plan, explicitlyConfirmed);
+  } else if (!dryRun && canPinLegacyContext) {
     const clusterName = `${releaseName}-cluster`;
     console.log(`\n  → Connecting to GKE cluster "${clusterName}"...`);
     await execOrThrow(
@@ -172,7 +213,7 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
       ],
       { timeoutMs: EXEC_TIMEOUTS.cloudOperation },
     );
-  } else if (!dryRun && !canPinContext) {
+  } else if (!dryRun && !composition && !canPinLegacyContext) {
     const ctx = await execCapture("kubectl", ["config", "current-context"], {
       timeoutMs: EXEC_TIMEOUTS.kubectl,
     }).catch(() => null);
@@ -294,7 +335,7 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
   );
 
   for (const name of annotated) console.log(`    ✓ ${name}`);
-  if (annotated.length === 0 && failures.length === 0) {
+  if (!dryRun && annotated.length === 0 && failures.length === 0) {
     console.log(
       `    (nothing found — no per-build objects for release "${releaseName}" in ` +
         `namespace "${namespace}". Has this release ever been deployed here?)`,
@@ -310,7 +351,8 @@ export async function runMigrate(options: MigrateOptions): Promise<void> {
   }
   console.log(
     dryRun
-      ? `\n[dry-run] ${annotated.length} object(s) would be annotated.`
+      ? `\n[dry-run] Planned 8 selector sweeps. Object counts were not read because dry-run ` +
+          `does not contact the cluster.`
       : `\n  ✓ Migration complete: ${annotated.length} object(s) carry the keep-at-birth ` +
           `annotations. The release is safe to manage with a GitOps reconciler ` +
           `(cutover.mode: job bundles annotate new builds at birth from here on).`,

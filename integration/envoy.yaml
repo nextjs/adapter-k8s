@@ -1,4 +1,4 @@
-## Envoy config for local integration testing (`adapter-k8s emulate`).
+## Envoy config fixture for `adapter-k8s emulate`.
 ##
 ## Client :8080 → Envoy → ext_proc (routing service, :8443, gRPC/h2c) → Pool Server (:3000)
 ##
@@ -7,11 +7,11 @@
 ## (failure_mode_allow: false — same posture as the emitted extension chain default),
 ## with routing-header mutations allowed so the service can stamp the internal
 ## dispatch vocabulary (x-output-id, x-invoke-path, …) and the shared secret that
-## makes the pool trust them (Phase 2). `emulate` generates that secret per run and
-## injects INTERNAL_HEADER_SECRET into both child processes.
+## makes the pool trust them. `emulate` generates that secret per run and injects
+## INTERNAL_HEADER_SECRET into both child processes.
 ##
 ## Wire-compatibility of the connectrpc/protobuf-es ext_proc server with a real
-## Envoy was validated end-to-end through THIS config (see the emulate smoke flow);
+## Envoy was validated end-to-end through this config (see the emulate smoke flow);
 ## the same stack serves the live GXLB callout in production.
 
 static_resources:

@@ -5,7 +5,6 @@
 import { execCapture, EXEC_TIMEOUTS } from "../cli/exec.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
-import { routingServiceDeploymentName } from "../emit/templates/routing-manifest-configmap.js";
 import { revertRoutingServiceToBuild } from "./edge.js";
 import { assertSafeBuildId } from "../emit/templates/utils.js";
 import type { AdapterState } from "../cli/state.js";
@@ -245,8 +244,6 @@ export async function snapshotRevertSelectors(opts: {
   const { releaseName, namespace, poolNames, currentPoolNames, previousBuildId, state } = opts;
   const targetPoolSet = new Set(poolNames);
   const currentOnlyPools = currentPoolNames.filter((pool) => !targetPoolSet.has(pool));
-  const topologyChanged =
-    currentOnlyPools.length > 0 || poolNames.some((pool) => !currentPoolNames.includes(pool));
   const fallbackTargetPool = poolNames[0]!;
   let hasPortableOrigin = Boolean(state.defaultPools);
   const originLookup = await execCapture(
@@ -285,10 +282,6 @@ export async function snapshotRevertSelectors(opts: {
   ];
   const originalSelectors = new Map<string, Record<string, string>>();
   for (const { servicePool } of serviceDestinations) {
-    // Same-topology pool Services can be reconstructed from their own pool suffix and the
-    // current build. The origin cannot: its component is whichever pool that build declared
-    // as default, so it always needs an exact snapshot.
-    if (!topologyChanged && servicePool !== "origin") continue;
     const serviceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
     if (originalSelectors.has(serviceName)) continue;
     const read = await execCapture(
@@ -347,10 +340,16 @@ export async function flipSelectorsToPreviousBuild(opts: {
     opts;
   const { serviceDestinations, originalSelectors } = opts.plan;
   const patchFailures: { service: string; stderr: string }[] = [];
-  const patchedServices: { service: string; pool: string }[] = [];
+  const patchedServices: { service: string; selector: Record<string, string> }[] = [];
   console.log(`  → Switching traffic to previous build...`);
   for (const { servicePool, targetPool } of serviceDestinations) {
     const svcName = sanitizeK8sName(`${releaseName}-${servicePool}`);
+    const originalSelector = originalSelectors.get(svcName)!;
+    const nextSelector = {
+      ...originalSelector,
+      "app.kubernetes.io/component": targetPool,
+      "app.kubernetes.io/version": safePreviousBuild,
+    };
     const patchResult = await execCapture(
       "kubectl",
       [
@@ -366,14 +365,14 @@ export async function flipSelectorsToPreviousBuild(opts: {
         "-p",
         JSON.stringify([
           {
-            op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1component",
-            value: targetPool,
+            op: "test",
+            path: "/spec/selector",
+            value: originalSelector,
           },
           {
             op: "replace",
-            path: "/spec/selector/app.kubernetes.io~1version",
-            value: safePreviousBuild,
+            path: "/spec/selector",
+            value: nextSelector,
           },
         ]),
       ],
@@ -385,7 +384,7 @@ export async function flipSelectorsToPreviousBuild(opts: {
         stderr: sanitizeForTerminal(patchResult.stderr.trim()),
       });
     } else {
-      patchedServices.push({ service: svcName, pool: servicePool });
+      patchedServices.push({ service: svcName, selector: nextSelector });
     }
   }
 
@@ -393,10 +392,9 @@ export async function flipSelectorsToPreviousBuild(opts: {
   // Scaling the current deployment to 0 now would strand the still-current Services
   // with zero endpoints. Abort before scale-down, leaving the current build serving.
   if (patchFailures.length > 0) {
-    const safeCurrentBuild = sanitizeK8sName(currentBuildId);
     const revertFailures: string[] = [];
-    for (const { service: serviceName, pool } of patchedServices) {
-      const original = originalSelectors.get(serviceName);
+    for (const { service: serviceName, selector: patchedSelector } of patchedServices) {
+      const original = originalSelectors.get(serviceName)!;
       const revertResult = await execCapture(
         "kubectl",
         [
@@ -408,22 +406,10 @@ export async function flipSelectorsToPreviousBuild(opts: {
           "--type=json",
           "--field-manager=helm",
           "-p",
-          JSON.stringify(
-            original
-              ? [{ op: "replace", path: "/spec/selector", value: original }]
-              : [
-                  {
-                    op: "replace",
-                    path: "/spec/selector/app.kubernetes.io~1component",
-                    value: pool,
-                  },
-                  {
-                    op: "replace",
-                    path: "/spec/selector/app.kubernetes.io~1version",
-                    value: safeCurrentBuild,
-                  },
-                ],
-          ),
+          JSON.stringify([
+            { op: "test", path: "/spec/selector", value: patchedSelector },
+            { op: "replace", path: "/spec/selector", value: original },
+          ]),
         ],
         { timeoutMs: EXEC_TIMEOUTS.kubectl },
       );
@@ -477,11 +463,12 @@ export async function flipSelectorsToPreviousBuild(opts: {
           `back to pool-local re-resolution (invariant 1), but edge middleware is the ` +
           `PREVIOUS build's until repaired.`,
       );
-      console.error(`  Recover by re-running the rollback, or restore the edge manually:`);
       console.error(
-        `    kubectl -n ${namespace} set image deployment/` +
-          `${routingServiceDeploymentName(releaseName)} routing-service=` +
-          `${opts.registry ?? "<registry>"}/routing-service:${currentBuildId}`,
+        `  Recover by re-running the rollback after restoring trusted workload history.`,
+      );
+      console.error(
+        `  Restore a verified chart or workload revision, including its image, dispatch Secret, ` +
+          `architecture, and routing manifest. Do not reconstruct an image from deploy state.`,
       );
     }
     console.error(`  Both builds were left scaled up.`);

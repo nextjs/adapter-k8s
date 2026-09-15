@@ -69,7 +69,7 @@ failures recoverable.
 
 ## Rollback
 
-`npx adapter-k8s rollback` returns to the previous build: pools scale back up, the routing tier reverts to that build's image and manifest snapshot, and the Service selectors patch back. It is symmetric—running it again rolls forward. Current deploy state records the routing image digest and rollback prefers that immutable reference. State created before digest recording has no value to recover, so rollback falls back to the build tag and prints a warning.
+`npx adapter-k8s rollback` returns to the previous build: pools scale back up, the routing tier reverts to that build's image and manifest snapshot, and the Service selectors patch back. It is symmetric—running it again rolls forward. Recovery takes the routing image, dispatch Secret reference, and architecture from the live routing Deployment or its retained ReplicaSets, verifying controller ownership by Deployment UID. ConfigMap state cannot authorize a replacement image. Missing or conflicting workload history stops recovery before the routing Deployment changes. Keep the Deployment’s revision history (Kubernetes defaults to 10 retained revisions); deleting or recreating the Deployment also removes that rollback evidence. A legacy tag is usable only when workload history records it, with a warning that the tag may have moved.
 
 The routing pod refuses to start on a manifest that does not match its own image, so a mismatched image/manifest pair fails loudly rather than serving another build's route classification.
 

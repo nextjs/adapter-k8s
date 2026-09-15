@@ -67,6 +67,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     previousPools,
     defaultPool,
     hasPortableOrigin,
+    hasHealthCheckPolicy,
     previousReplicasByPool,
     state,
     compositionSnapshot,
@@ -102,7 +103,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
   await waitPoolRollouts(ctx);
 
   // D2. Verify the routing service (ext_proc edge) actually rolls out (7a-bis).
-  await waitRoutingRollout(ctx);
+  if (inputs.hasRoutingTier) await waitRoutingRollout(ctx);
 
   // D3. The traffic extension is part of the middleware security boundary. Reconcile and
   // verify it while the active Services still select the previous build; never cut traffic
@@ -373,6 +374,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     pools,
     previousPools,
     hasPortableOrigin,
+    hasHealthCheckPolicy,
   });
 }
 
@@ -540,6 +542,26 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
     previousBuildId,
     state,
   });
+
+  // Scaling and readiness can take minutes. A deploy or another rollback may commit while this
+  // target is warming, so re-read at the final read-only point before changing the routing edge.
+  // The later writeState generation check is too late: by then both edge and Service selectors
+  // have already moved.
+  const latestState = await readState(projectDir, releaseName, { namespace });
+  if (
+    !latestState ||
+    latestState.buildId !== currentBuildId ||
+    latestState.previousBuildId !== previousBuildId ||
+    (latestState.generation ?? 0) !== (state.generation ?? 0)
+  ) {
+    throw new Error(
+      `Committed deploy state changed while rollback target ${previousBuildId} was becoming ready ` +
+        `(expected ${currentBuildId} → ${previousBuildId} generation ${state.generation ?? 0}, ` +
+        `found ${latestState?.buildId ?? "no committed build"} → ` +
+        `${latestState?.previousBuildId ?? "no rollback target"} generation ` +
+        `${latestState?.generation ?? 0}). Refusing to mutate the routing edge or Service selectors.`,
+    );
+  }
 
   // 3b. Revert the routing tier (image + manifest) to the previous build BEFORE flipping
   // pool traffic — the same order deploy applies (edge first, selectors second), so the
