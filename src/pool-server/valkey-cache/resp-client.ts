@@ -619,8 +619,9 @@ class RespClient implements ValkeyClient {
     ).process?.getBuiltinModule;
     if (!getBuiltin) {
       throw new Error(
-        "[valkey-cache] process.getBuiltinModule is unavailable — Node >= 20.16 is required " +
-          "to open a Valkey connection (edge runtimes never connect; this code is inert there).",
+        "[valkey-cache] process.getBuiltinModule is unavailable — use Node 20 >=20.16 or " +
+          "Node >=22.3 to open a Valkey connection (edge runtimes never connect; this code " +
+          "is inert there).",
       );
     }
     const net = getBuiltin("node:net") as typeof import("node:net");

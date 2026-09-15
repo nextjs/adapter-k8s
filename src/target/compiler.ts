@@ -6,7 +6,12 @@ import type {
 } from "../composition-plan/types.js";
 import { parseCompositionPlan } from "../composition-plan/parse.js";
 import { MINIMUM_KUBERNETES_VERSION } from "../composition-plan/types.js";
-import { ADAPTER_RELEASE_LABEL } from "../emit/templates/utils.js";
+import {
+  ADAPTER_RELEASE_LABEL,
+  assertSafeAnnotationName,
+  assertSafeNamespace,
+  assertSafeServiceName,
+} from "../emit/templates/utils.js";
 import type {
   CompiledKubernetesTarget,
   KubernetesContribution,
@@ -14,6 +19,185 @@ import type {
   TargetBuildContext,
 } from "./types.js";
 import { targetFingerprint, validateTargetContext } from "./components.js";
+
+function validateRoutingOrigin(
+  componentName: string,
+  origin: import("./types.js").RoutingOrigin,
+  releaseNamespace: string,
+): void {
+  const backend = origin?.kind === "kubernetes-service" ? origin.service : undefined;
+  if (
+    !backend ||
+    typeof backend !== "object" ||
+    !Number.isInteger(backend.port) ||
+    backend.port < 1 ||
+    backend.port > 65_535
+  ) {
+    throw new Error(
+      `Routing component "${componentName}" returned an invalid origin Service reference`,
+    );
+  }
+  try {
+    // Namespace validation belongs at this consumption point. Exposure components embed the
+    // reference into Kubernetes objects before the composition-plan parser sees it.
+    assertSafeNamespace(backend.namespace);
+    assertSafeServiceName(backend.name);
+  } catch {
+    throw new Error(
+      `Routing component "${componentName}" returned an invalid origin Service reference`,
+    );
+  }
+  if (backend.namespace !== releaseNamespace) {
+    throw new Error(
+      `Routing component "${componentName}" returned an invalid origin Service reference: ` +
+        `current exposure components require namespace ${JSON.stringify(releaseNamespace)}`,
+    );
+  }
+}
+
+function validateRoutingContract(
+  componentName: string,
+  context: TargetBuildContext,
+  routing: import("./types.js").RoutingBuildResult,
+  originService: import("../composition-plan/types.js").KubernetesServiceRef,
+): void {
+  const tier = routing.routingTier;
+  if (!tier || typeof tier !== "object" || !routing.plan || typeof routing.plan !== "object") {
+    throw new Error(`Routing component "${componentName}" must return plan and routingTier`);
+  }
+  const tierUnknown = Object.keys(tier).filter(
+    (key) =>
+      ![
+        "enabled",
+        "transport",
+        "callerAuthentication",
+        "serviceAnnotations",
+        "registration",
+      ].includes(key),
+  );
+  if (tierUnknown.length > 0) {
+    throw new Error(
+      `Routing component "${componentName}" returned unknown routingTier field${tierUnknown.length === 1 ? "" : "s"}: ${tierUnknown.join(", ")}`,
+    );
+  }
+  if (
+    !tier.serviceAnnotations ||
+    typeof tier.serviceAnnotations !== "object" ||
+    Array.isArray(tier.serviceAnnotations)
+  ) {
+    throw new Error(
+      `Routing component "${componentName}" must return routingTier.serviceAnnotations`,
+    );
+  }
+  if (typeof tier.enabled !== "boolean") {
+    throw new Error(
+      `Routing component "${componentName}" returned invalid routingTier.enabled; expected a boolean`,
+    );
+  }
+  if (tier.registration !== "none" && tier.registration !== "gke-traffic-extension") {
+    throw new Error(
+      `Routing component "${componentName}" returned invalid routingTier.registration`,
+    );
+  }
+  for (const [name, value] of Object.entries(tier.serviceAnnotations)) {
+    try {
+      assertSafeAnnotationName(name);
+    } catch {
+      throw new Error(
+        `Routing component "${componentName}" returned an invalid routingTier annotation name`,
+      );
+    }
+    if (typeof value !== "string") {
+      throw new Error(
+        `Routing component "${componentName}" returned an invalid routingTier annotation value`,
+      );
+    }
+  }
+
+  if (routing.plan.protocol === "pool-local-v1") {
+    if (
+      tier.enabled !== false ||
+      tier.registration !== "none" ||
+      tier.transport !== undefined ||
+      tier.callerAuthentication !== undefined
+    ) {
+      throw new Error(
+        `Routing component "${componentName}" returned a pool-local plan with an enabled routing tier`,
+      );
+    }
+    if (routing.plan.dataplane.targetPool !== context.defaultPool) {
+      throw new Error(
+        `Routing component "${componentName}" targets pool ` +
+          `${JSON.stringify(routing.plan.dataplane.targetPool)} instead of defaultPool ` +
+          JSON.stringify(context.defaultPool),
+      );
+    }
+    const service = routing.plan.dataplane.service;
+    if (
+      service.name !== originService.name ||
+      service.namespace !== originService.namespace ||
+      service.port !== originService.port
+    ) {
+      throw new Error(
+        `Routing component "${componentName}" must use the same origin Service in its ` +
+          `pool-local plan and exposure`,
+      );
+    }
+    return;
+  }
+
+  if (tier.enabled !== true || (tier.transport !== "tls" && tier.transport !== "h2c")) {
+    throw new Error(
+      `Routing component "${componentName}" returned an ext_proc plan without an enabled routing tier`,
+    );
+  }
+  const callerAuthentication = tier.callerAuthentication;
+  if (!callerAuthentication || typeof callerAuthentication !== "object") {
+    throw new Error(
+      `Routing component "${componentName}" must declare caller authentication for its routing tier`,
+    );
+  }
+  const callerUnknown = Object.keys(callerAuthentication).filter(
+    (key) => !["kind", "networkPolicy", "transportSecurity"].includes(key),
+  );
+  if (callerUnknown.length > 0) {
+    throw new Error(
+      `Routing component "${componentName}" returned unknown caller authentication field${callerUnknown.length === 1 ? "" : "s"}: ${callerUnknown.join(", ")}`,
+    );
+  }
+  if (
+    callerAuthentication.kind !== "none" ||
+    callerAuthentication.networkPolicy !== "required" ||
+    (tier.transport === "tls"
+      ? callerAuthentication.transportSecurity !== "server-tls"
+      : callerAuthentication.transportSecurity !== "none")
+  ) {
+    throw new Error(
+      `Routing component "${componentName}" returned an invalid caller authentication posture`,
+    );
+  }
+  if (routing.plan.failurePolicy !== context.failurePolicy) {
+    throw new Error(
+      `Routing component "${componentName}" uses failure policy ` +
+        `${JSON.stringify(routing.plan.failurePolicy)}, but the build requires ` +
+        JSON.stringify(context.failurePolicy),
+    );
+  }
+  if (
+    routing.plan.dataplane.kind === "external-ext-proc" &&
+    routing.plan.dataplane.transport !== tier.transport
+  ) {
+    throw new Error(
+      `Routing component "${componentName}" enables ${tier.transport} transport, but its ` +
+        `ext_proc plan declares ${routing.plan.dataplane.transport}`,
+    );
+  }
+  if (tier.registration === "gke-traffic-extension" && tier.transport !== "tls") {
+    throw new Error(
+      `Routing component "${componentName}" must use tls transport for gke-traffic-extension registration`,
+    );
+  }
+}
 
 function contributionOf(
   contribution: KubernetesContribution,
@@ -159,8 +343,9 @@ export function compileTarget(
   if (!cluster || typeof cluster !== "object" || Array.isArray(cluster)) {
     throw new Error(`Target component "${target.cluster.name}" returned a non-object result`);
   }
-  const routingBackend = target.routing.backend(context);
-  const exposure = target.exposure.build({ ...context, backend: routingBackend });
+  const routingOrigin = target.routing.origin(context);
+  validateRoutingOrigin(target.routing.name, routingOrigin, context.namespace);
+  const exposure = target.exposure.build({ ...context, origin: routingOrigin });
   if (!exposure || typeof exposure !== "object" || Array.isArray(exposure)) {
     throw new Error(`Target component "${target.exposure.name}" returned a non-object result`);
   }
@@ -171,7 +356,6 @@ export function compileTarget(
         "access",
         "registry",
         "network",
-        "managedCache",
         "externalCleanup",
         "retained",
         "diagnostics",
@@ -231,6 +415,7 @@ export function compileTarget(
       `Target component "${target.routing.name}" returned unknown field${unknownRoutingFields.length === 1 ? "" : "s"}: ${unknownRoutingFields.join(", ")}`,
     );
   }
+  validateRoutingContract(target.routing.name, context, routing, routingOrigin.service);
 
   const contributions = [
     contributionOf(

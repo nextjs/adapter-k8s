@@ -242,6 +242,22 @@ describe("composition plan schema", () => {
       /dataplane\.service\.namespace.*namespace test-app/i,
     );
   });
+
+  it.each(["service.name", "1service"])("rejects invalid Service name %s", (name) => {
+    const plan = basePlan();
+    const resources = (plan.operations as Record<string, unknown>).resources as Record<
+      string,
+      unknown
+    >;
+    resources.readiness = [
+      {
+        kind: "kubernetes-service-endpoints",
+        service: { name, namespace: "test-app", port: 3000 },
+        minimumReady: 1,
+      },
+    ];
+    expect(() => parseCompositionPlan(plan)).toThrow(/invalid Service name/i);
+  });
 });
 
 describe("composition plan fingerprints", () => {

@@ -2,7 +2,7 @@
 
 ## What this is
 
-`@next-community/adapter-k8s` — a Next.js adapter (Next 16.3+ `adapterPath` API) that deploys
+`@next-community/adapter-k8s` — a Next.js adapter (Next >=16.3.0 <16.4.0 `adapterPath` API) that deploys
 Next.js apps to Kubernetes (GKE preset plus portable/generic targets). At build time it analyzes
 the route structure and generates pool servers, an ext_proc routing service, a Helm chart, and
 Dockerfiles. A CLI (`adapter-k8s`) provisions GCP infrastructure where the target calls for it
@@ -55,7 +55,9 @@ Run `npm test` and `npx tsc --noEmit` before considering any change done.
   `npm run build:protos`, never hand-edit.
 - `src/pool-server/valkey-cache/` — deliberately zero-dep RESP2 client + `use cache` handler +
   incremental cache handler + shared tag manifest (cross-replica `revalidateTag`).
-- `fixtures/` — Next.js test apps (main, pages, edge, i18n-rewrite, interception, ws-canary).
+- `fixtures/` — Next.js test apps (main, pages, edge, i18n-rewrite, interception). Experimental
+  WebSocket route-handler support is unit/transport tested; stable Next.js does not generate its
+  unpublished `upgradeHandler` contract, so there is no framework fixture yet.
 - `tests/` — vitest suites. **`test/` (singular) is different**: deploy-test manifests for the
   e2e shell scripts.
 - `plans/adapter-gke-design-doc.md` — the design doc. `plans/` is tracked.

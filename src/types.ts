@@ -154,9 +154,6 @@ export interface K8sAdapterConfig {
    * the Kubernetes pod-spec field verbatim so the rendered YAML is greppable from config.
    */
   imagePullSecrets?: string[];
-  imageOptimizer?: { enabled: boolean; mode: "sidecar" };
-  skewProtection?: { enabled: boolean; duration: string };
-  routeExtension?: { mode: "auto" | "wasm" | "extproc" };
   /** ext_proc routing service (the middleware tier) tuning. */
   routingService?: {
     resources?: { cpu?: string; memory?: string; cpuLimit?: string; memoryLimit?: string };
@@ -191,7 +188,11 @@ export interface K8sAdapterConfig {
   };
   /** Build-time Kubernetes composition. Legacy `provider` blocks are translated into this. */
   target?: KubernetesTargetDefinition;
-  /** @deprecated Use `target: defineTarget(...)`. */
+  /**
+   * @deprecated Use `target: defineTarget(...)`. Legacy provider blocks remain readable
+   * through the 0.x release line and will be removed in 1.0. New adapters must use target
+   * components instead of extending this union.
+   */
   provider?: { gke: GKEProviderConfig } | { generic: GenericProviderConfig };
 }
 

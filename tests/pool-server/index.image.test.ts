@@ -205,7 +205,7 @@ function writeStagedDir(
         : null,
       poolAssignments: options.poolAssignments ?? {},
       pprRoutes: {},
-      nextVersion: "16.2.10",
+      nextVersion: "16.3.0",
     }),
   );
   // Middleware module: never invoked by these tests, but its COVERAGE is what installs

@@ -315,6 +315,32 @@ describe("renderNetworkPolicies — input validation", () => {
       renderNetworkPolicies({ releaseName: 'foo";rm -rf /;"', poolNames: ["ssr"] }),
     ).toThrow(/Invalid releaseName/);
   });
+
+  it.each([
+    "999.1.1.1/24",
+    "10.0.0.0/33",
+    "2001:db8::/129",
+    "fe80::1%eth0/64",
+    "10.0.0.0/24\n- {}",
+  ])("rejects malformed ingress CIDR %s", (cidr) => {
+    expect(() =>
+      renderNetworkPolicies({
+        releaseName: "my-app",
+        poolNames: ["ssr"],
+        ingressSources: { cidrs: [cidr], podSelectors: [] },
+      }),
+    ).toThrow(/CIDR/i);
+  });
+
+  it("quotes validated IPv4 and IPv6 ingress CIDRs", () => {
+    const yaml = renderNetworkPolicies({
+      releaseName: "my-app",
+      poolNames: ["ssr"],
+      ingressSources: { cidrs: ["10.0.0.0/24", "2001:db8::/64"], podSelectors: [] },
+    });
+    expect(yaml).toContain('cidr: "10.0.0.0/24"');
+    expect(yaml).toContain('cidr: "2001:db8::/64"');
+  });
 });
 
 // Renders the template with REAL helm when the binary is present (offline; `helm
@@ -330,7 +356,10 @@ function helmVersion(): string | null {
 }
 
 describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", () => {
-  function render(sets: string[]): { ok: boolean; out: string } {
+  function render(
+    sets: string[],
+    ingressSources?: Parameters<typeof renderNetworkPolicies>[0]["ingressSources"],
+  ): { ok: boolean; out: string } {
     const dir = mkdtempSync(path.join(tmpdir(), "np-helm-"));
     try {
       mkdirSync(path.join(dir, "templates"));
@@ -338,7 +367,7 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
       writeFileSync(path.join(dir, "values.yaml"), "global:\n  networkPolicy:\n    podCidrs: []\n");
       writeFileSync(
         path.join(dir, "templates", "network-policy.yaml"),
-        renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"] }),
+        renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"], ingressSources }),
       );
       const args = ["template", "np", dir];
       for (const s of sets) args.push("--set", s);
@@ -357,6 +386,43 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
     const { ok, out } = render([]);
     expect(ok).toBe(true);
     expect(out).not.toContain("kind: NetworkPolicy");
+  });
+
+  it("denies the unauthenticated routing port when ingress sources are empty", () => {
+    const { ok, out } = render(
+      ["global.networkPolicy.strict=true", "global.networkPolicy.nodeCidrs={10.128.0.0/20}"],
+      { cidrs: [], podSelectors: [] },
+    );
+    expect(ok).toBe(true);
+    const routingPolicy = out
+      .split(/^---$/m)
+      .find((document) => document.includes("name: my-app-routing-service\n"));
+    expect(routingPolicy).toBeDefined();
+    expect(routingPolicy).not.toContain("port: 8443");
+    expect(routingPolicy).toContain("port: 8081");
+    expect(routingPolicy).toContain('cidr: "10.128.0.0/20"');
+  });
+
+  it("admits only the selected proxy pods to the native routing port", () => {
+    const { ok, out } = render(
+      ["global.networkPolicy.strict=true", "global.networkPolicy.nodeCidrs={10.128.0.0/20}"],
+      {
+        cidrs: [],
+        podSelectors: [
+          {
+            namespace: "envoy-gateway-system",
+            labels: { "gateway.envoyproxy.io/owning-gateway-name": "my-app-gateway" },
+          },
+        ],
+      },
+    );
+    expect(ok).toBe(true);
+    const routingPolicy = out
+      .split(/^---$/m)
+      .find((document) => document.includes("name: my-app-routing-service\n"));
+    expect(routingPolicy).toMatch(
+      /- from:\n\s+- podSelector:\n\s+matchLabels:\n\s+gateway\.envoyproxy\.io\/owning-gateway-name: "my-app-gateway"\n\s+namespaceSelector:\n\s+matchLabels:\n\s+kubernetes\.io\/metadata.name: "envoy-gateway-system"\n\s+ports:\n\s+- protocol: TCP\n\s+port: 8443/,
+    );
   });
 
   it("broad posture matches the hand-rolled evaluator byte for byte", () => {
@@ -391,7 +457,7 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
       .map((d) => d.trimEnd())
       .join("\n---\n");
     expect(docs).toBe(expected.trimEnd());
-    expect(docs).toContain("cidr: 35.191.0.0/16");
+    expect(docs).toContain('cidr: "35.191.0.0/16"');
     expect(docs).not.toContain("0.0.0.0/0");
   });
 

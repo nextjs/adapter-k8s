@@ -21,7 +21,6 @@ export type {
   IngressExposureOptions,
 } from "./components.js";
 export { compileTarget } from "./compiler.js";
-export { targetForConfig, targetHosts } from "./legacy.js";
 export type {
   ClusterBuildResult,
   ClusterComponent,
@@ -40,6 +39,9 @@ export type {
   ResourceComponent,
   RoutingBuildResult,
   RoutingBuildContext,
+  RoutingCallerAuthentication,
   RoutingComponent,
+  RoutingOrigin,
+  RoutingTier,
   TargetBuildContext,
 } from "./types.js";
