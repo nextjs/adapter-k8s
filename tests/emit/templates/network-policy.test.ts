@@ -356,7 +356,10 @@ function helmVersion(): string | null {
 }
 
 describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", () => {
-  function render(sets: string[]): { ok: boolean; out: string } {
+  function render(
+    sets: string[],
+    ingressSources?: Parameters<typeof renderNetworkPolicies>[0]["ingressSources"],
+  ): { ok: boolean; out: string } {
     const dir = mkdtempSync(path.join(tmpdir(), "np-helm-"));
     try {
       mkdirSync(path.join(dir, "templates"));
@@ -364,7 +367,7 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
       writeFileSync(path.join(dir, "values.yaml"), "global:\n  networkPolicy:\n    podCidrs: []\n");
       writeFileSync(
         path.join(dir, "templates", "network-policy.yaml"),
-        renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"] }),
+        renderNetworkPolicies({ releaseName: "my-app", poolNames: ["ssr", "api"], ingressSources }),
       );
       const args = ["template", "np", dir];
       for (const s of sets) args.push("--set", s);
@@ -383,6 +386,43 @@ describe.skipIf(!helmVersion())("renderNetworkPolicies — real helm render", ()
     const { ok, out } = render([]);
     expect(ok).toBe(true);
     expect(out).not.toContain("kind: NetworkPolicy");
+  });
+
+  it("denies the unauthenticated routing port when ingress sources are empty", () => {
+    const { ok, out } = render(
+      ["global.networkPolicy.strict=true", "global.networkPolicy.nodeCidrs={10.128.0.0/20}"],
+      { cidrs: [], podSelectors: [] },
+    );
+    expect(ok).toBe(true);
+    const routingPolicy = out
+      .split(/^---$/m)
+      .find((document) => document.includes("name: my-app-routing-service\n"));
+    expect(routingPolicy).toBeDefined();
+    expect(routingPolicy).not.toContain("port: 8443");
+    expect(routingPolicy).toContain("port: 8081");
+    expect(routingPolicy).toContain('cidr: "10.128.0.0/20"');
+  });
+
+  it("admits only the selected proxy pods to the native routing port", () => {
+    const { ok, out } = render(
+      ["global.networkPolicy.strict=true", "global.networkPolicy.nodeCidrs={10.128.0.0/20}"],
+      {
+        cidrs: [],
+        podSelectors: [
+          {
+            namespace: "envoy-gateway-system",
+            labels: { "gateway.envoyproxy.io/owning-gateway-name": "my-app-gateway" },
+          },
+        ],
+      },
+    );
+    expect(ok).toBe(true);
+    const routingPolicy = out
+      .split(/^---$/m)
+      .find((document) => document.includes("name: my-app-routing-service\n"));
+    expect(routingPolicy).toMatch(
+      /- from:\n\s+- podSelector:\n\s+matchLabels:\n\s+gateway\.envoyproxy\.io\/owning-gateway-name: "my-app-gateway"\n\s+namespaceSelector:\n\s+matchLabels:\n\s+kubernetes\.io\/metadata.name: "envoy-gateway-system"\n\s+ports:\n\s+- protocol: TCP\n\s+port: 8443/,
+    );
   });
 
   it("broad posture matches the hand-rolled evaluator byte for byte", () => {

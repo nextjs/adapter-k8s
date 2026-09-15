@@ -273,7 +273,16 @@ ${labels}${ns}`;
     })
     .join("\n");
   // Both lists render; an empty one contributes nothing.
-  const googleLbFrom = [cidrFrom, podSelectorFrom].filter(Boolean).join("\n");
+  const strictIngressFrom = [cidrFrom, podSelectorFrom].filter(Boolean).join("\n");
+  // An empty NetworkPolicy `from` allows every source. Omit the unauthenticated
+  // routing-port rule entirely until the exposure supplies an explicit allowlist.
+  const routingDataIngress = strictIngressFrom
+    ? `    - from:
+${strictIngressFrom}
+      ports:
+        - protocol: TCP
+          port: 8443`
+    : "";
 
   // Operator-supplied node/subnet range(s): kubelet probe traffic (N19). Required
   // whenever strict is on — the guard below refuses to render without it.
@@ -298,11 +307,7 @@ spec:
     - Ingress
   ingress:
 {{- if .Values.global.networkPolicy.strict }}
-    - from:
-${googleLbFrom}
-      ports:
-        - protocol: TCP
-          port: 8443
+${routingDataIngress}
     - from:
 ${nodeFrom}
       ports:
@@ -354,7 +359,7 @@ spec:
   ingress:
     - from:
 {{- if .Values.global.networkPolicy.strict }}
-${googleLbFrom}
+${strictIngressFrom}
 ${nodeFrom}
 {{- else }}
 ${broadFrom}
