@@ -69,7 +69,7 @@ failures recoverable.
 
 ## Rollback
 
-`npx adapter-k8s rollback` returns to the previous build: pools scale back up, the routing tier reverts to that build's image and manifest snapshot, and the Service selectors patch back. It is symmetric—running it again rolls forward. Deploys resolve images by digest; the routing tier's rollback path currently reconstructs its image reference from the build tag (digest-pinned rollback is on the [roadmap](../README.md#roadmap)).
+`npx adapter-k8s rollback` returns to the previous build: pools scale back up, the routing tier reverts to that build's image and manifest snapshot, and the Service selectors patch back. It is symmetric—running it again rolls forward. Current deploy state records the routing image digest and rollback prefers that immutable reference. State created before digest recording has no value to recover, so rollback falls back to the build tag and prints a warning.
 
 The routing pod refuses to start on a manifest that does not match its own image, so a mismatched image/manifest pair fails loudly rather than serving another build's route classification.
 
@@ -93,7 +93,7 @@ Kubernetes cleanup is exact: every object recorded in the composition plan is in
 
 ## Doctor
 
-`npx adapter-k8s doctor` health-checks the whole stack: prerequisites (`kubectl`, `helm`, a container runtime, `gcloud` where the target needs it), cloud resources, Kubernetes state, load-balancer backend health, and per-host DNS + TLS. Checks come from the composition plan's diagnostics, so a portable target is not probed for GCP resources. Failures print a concrete fix command where one exists.
+`npx adapter-k8s doctor` health-checks the whole stack: prerequisites (`kubectl`, `helm`, a container runtime, `gcloud` where the target needs it), cloud resources, Kubernetes state, load-balancer backend health, and per-host DNS + TLS. If the release has HPAs, it also warns when `metrics.k8s.io/v1beta1` is unavailable; fixed-replica releases do not require that API. Checks come from the composition plan's diagnostics, so a portable target is not probed for GCP resources. Failures print a concrete fix command where one exists.
 
 ## Deploy state
 

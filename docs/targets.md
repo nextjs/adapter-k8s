@@ -18,7 +18,7 @@ Routing defaults to `portableRouting()` when omitted.
 
 ## Portable Gateway API or Ingress
 
-Gateway API and Ingress are exposure choices, not providers. With the default portable routing, Next.js routing executes in the application origin and no Envoy CRD is emitted—any conformant cluster and any conformant controller works:
+Gateway API and Ingress are exposure choices, not providers. With the default portable routing, Next.js routing executes in the application origin and no Envoy CRD is emitted. The generated objects use the selected standard API; controller-specific TLS, streaming, and policy behavior still belongs to the operator's verification matrix:
 
 ```js
 import {
@@ -53,7 +53,7 @@ export default createK8sAdapter({
 });
 ```
 
-Use `gatewayApiExposure` instead for any conformant GatewayClass.
+Use `gatewayApiExposure` instead for a GatewayClass whose controller behavior you have verified.
 
 **One requirement on whatever terminates TLS.** The pool's own socket is always plaintext, so
 `x-forwarded-proto` is its only witness of the client-facing scheme: it decides middleware's
@@ -272,7 +272,7 @@ The GKE target composes `gkeCluster()` + `gatewayApiExposure` (controller-manage
                           +--------------+
 ```
 
-The callout arrives from Google's frontend over TLS—a stronger trust story than the in-cluster h2c path. GKE-specific features on this journey:
+The callout arrives over server-authenticated TLS from Google's frontend, unlike the in-cluster h2c path. This protects transport to the expected server but does not authenticate the caller to the routing service; NetworkPolicy remains required. GKE-specific features on this journey:
 
 - **Cloud CDN** with a Next.js-aware cache key and per-build cache-tag purge on cutover—see [configuration](./configuration.md#cloud-cdn-gke).
 - **Managed Memorystore-for-Valkey** provisioning for the distributed cache, created with AUTH + TLS by default—see [configuration](./configuration.md#distributed-cache-cache-components--ppr) and [SECURITY.md](../SECURITY.md#cache-security). Both the legacy GKE preset and an explicit target using `gkeCluster()` compile an enabled cache without `cache.url` into the same verified `gcp-memorystore` operation and deployment path.
@@ -331,13 +331,37 @@ The routing component interface has two methods:
 - `origin(context)` returns the destination that an exposure should reference. The only supported kind today is `{ kind: "kubernetes-service", service }`. The explicit kind leaves room for a future proxy origin without pretending it already works. It must return the same result for the same context.
 - `build(context)` returns the routing plan, routing-tier settings, Kubernetes objects, API requirements, readiness checks, diagnostics, cleanup operations, and telemetry. An enabled tier must state its caller-authentication posture. Both current native tiers declare no caller authentication and require enforced NetworkPolicy. Envoy uses cleartext h2c. GKE adds server-authenticated TLS, which does not authenticate the caller.
 
-`compileTarget` enforces the contract before it emits YAML. It rejects invalid Service references, pool-local plans that enable a routing tier, ext_proc plans that omit one, transport disagreements, failure-policy disagreements, unknown fields, duplicate objects, unsafe ownership labels, and invalid composition-plan values. The TypeScript types reject the same plan and tier mismatches during development.
+### Deferred proxy origins and BYOC migration
+
+The `RoutingOrigin` discriminant intentionally leaves room for an external proxy origin, including
+an incremental migration between a customer's Kubernetes deployment and Vercel or another control
+plane. Version 0.1 supports only `{ kind: "kubernetes-service", service }`; there is no proxy mode
+or Vercel integration to enable.
+
+A future origin kind must define, and test, at least this contract before it can ship:
+
+1. Stable external-origin identity, certificate validation, and TLS policy.
+2. Explicit path ownership and fallback behavior when only part of an application has migrated.
+3. Authentication plus stripping of internal dispatch and forwarding headers at both trust
+   boundaries.
+4. Request/response streaming, cancellation, body limits, and WebSocket upgrade semantics.
+5. Health and readiness signals that can block cutover rather than silently falling back.
+6. Cache ownership and middleware ordering that cannot turn an external cache hit or proxy failure
+   into a middleware bypass.
+
+That contract can later support a Vercel control plane or BYOC product without teaching the pool
+runtime about a specific vendor. The discriminant is preparation for that work, not an implemented
+proxy.
+
+The adapter's internal `compileTarget` enforces the contract before it emits YAML. It rejects invalid Service references, pool-local plans that enable a routing tier, ext_proc plans that omit one, transport disagreements, failure-policy disagreements, unknown fields, duplicate objects, unsafe ownership labels, and invalid composition-plan values. The TypeScript types reject the same plan and tier mismatches during development. Contributor tests may import it from `@next-community/adapter-k8s/internal`; that subpath deliberately has no compatibility guarantee.
 
 `registration: "gke-traffic-extension"` is the one remaining provider-specific field in this interface. Treat it as a built-in bridge, not an extension point. The chart has exactly one matching executor and it runs the GKE registration job. Before another external control plane is added, replace this field with a versioned apply operation and an executor selected by operation kind. Generalizing the string today would create an interface with one adapter and would let a custom target invoke the wrong cloud tool.
 
 Start a routing adapter test at the public interface:
 
 ```ts
+import { compileTarget } from "@next-community/adapter-k8s/internal";
+
 const compiled = compileTarget(
   defineTarget({
     cluster: kubernetesCluster(),
