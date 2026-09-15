@@ -100,21 +100,26 @@ describe("extractRouteParams sentinel filtering (the Phase-2 compensation)", () 
     expect(extractRouteParams("/about", { nxtPid: "$nxtPid", anything: "x" })).toBeUndefined();
   });
 
-  it("KNOWN GAP: a non-string value is not shape-checked and throws for a catch-all", () => {
+  it("drops non-string values instead of coercing or throwing", () => {
     // index.ts JSON.parses `x-route-matches` without validating the shape, so a buggy (or
     // compromised) routing extension holding the internal secret can deliver an array value.
-    // A single dynamic param survives it as type confusion; a catch-all reaches
-    // `value.split("/")` and throws, which surfaces as a 500. Not client-reachable — the
-    // header is stripped from any request that fails the internal-secret compare — and pinned
-    // here so the fix (a shape guard at the JSON.parse in index.ts, or in the shared
-    // sanitizer) has something to flip.
+    // A single dynamic param used to survive as type confusion, while a catch-all reached
+    // `value.split("/")` and threw. The header is stripped from requests that fail the
+    // internal-secret comparison, but a malformed trusted routing verdict must still be a
+    // bounded missing param rather than an application-visible value or a 500.
     const arrayValue = { nxtPid: ["a", "b"] } as unknown as Record<string, string>;
-    expect(extractRouteParams("/posts/[id]", arrayValue)).toEqual({ id: "a,b" });
-    expect(() =>
+    expect(extractRouteParams("/posts/[id]", arrayValue)).toBeUndefined();
+    expect(
       extractRouteParams("/[...rest]", { nxtPrest: ["a", "b"] } as unknown as Record<
         string,
         string
       >),
-    ).toThrow(TypeError);
+    ).toBeUndefined();
+    expect(
+      extractRouteParams("/[id]/[...rest]", {
+        nxtPid: "7",
+        nxtPrest: { hostile: true },
+      } as unknown as Record<string, string>),
+    ).toEqual({ id: "7" });
   });
 });

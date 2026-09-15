@@ -1528,10 +1528,11 @@ export function extractRouteParams(
     const name = match[1] ?? match[2];
     if (!name) continue;
     const value = routeMatches?.[name] ?? routeMatches?.[`nxtP${name}`];
-    // RegExp.test intentionally preserves the legacy coercion behaviour for a malformed
-    // secret-gated route-matches value; startsWith would throw before the existing shape path.
-    // oxlint-disable-next-line unicorn/prefer-string-starts-ends-with
-    if (value === undefined || /^\$nxtP/.test(value)) continue;
+    // `x-route-matches` is JSON from the trusted routing tier, not a runtime-enforced TypeScript
+    // value. A buggy or skewed tier can therefore send an array/object here. Never coerce it
+    // into a handler param, and never let a catch-all call `.split()` on it: an invalid routing
+    // hint is a bounded missing param, not a reason for the pool to answer 500.
+    if (typeof value !== "string" || value.startsWith("$nxtP")) continue;
     if (match[1]) {
       const segments = value.split("/");
       // With `trailingSlash: true`, @next/routing can preserve the terminal slash in a

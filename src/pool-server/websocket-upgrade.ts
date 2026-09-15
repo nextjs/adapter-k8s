@@ -29,6 +29,12 @@ import {
   extractRouteParams,
   validatedForwardedProtocol,
 } from "./dispatch.js";
+import {
+  parseDispatchDeadline,
+  parseDispatchHeaderMap,
+  parseDispatchInvocationQuery,
+  parseDispatchRouteMatches,
+} from "./dispatch-metadata.js";
 import type { HandlerLoader } from "./handler-loader.js";
 import type { ResolveResult } from "./resolve.js";
 import { trackTunnelFraming } from "./websocket-frame-cursor.js";
@@ -359,65 +365,6 @@ function removePrivateRawRequestHeaders(req: IncomingMessage): void {
   }
 }
 
-function parseHeaderMap(raw: string | undefined): Headers | undefined {
-  if (!raw) return undefined;
-  try {
-    const value = JSON.parse(raw) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-    const headers = new Headers();
-    for (const [name, item] of Object.entries(value as Record<string, unknown>)) {
-      if (Array.isArray(item) && item.every((entry) => typeof entry === "string")) {
-        item.forEach((entry) => headers.append(name, entry));
-      } else if (typeof item === "string") {
-        headers.set(name, item);
-      } else {
-        return undefined;
-      }
-    }
-    return headers;
-  } catch {
-    return undefined;
-  }
-}
-
-function parseJsonRecord(raw: string | undefined): Record<string, string> | null {
-  if (!raw) return null;
-  try {
-    const value = JSON.parse(raw) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    const record: Record<string, string> = {};
-    for (const [key, item] of Object.entries(value)) {
-      if (typeof item !== "string") return null;
-      record[key] = item;
-    }
-    return record;
-  } catch {
-    return null;
-  }
-}
-
-function parseInvocationQuery(
-  raw: string | undefined,
-): Record<string, string | string[]> | undefined {
-  if (!raw) return undefined;
-  try {
-    const value = JSON.parse(raw) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-    const query: Record<string, string | string[]> = {};
-    for (const [key, item] of Object.entries(value)) {
-      if (typeof item === "string") query[key] = item;
-      else if (Array.isArray(item) && item.every((entry) => typeof entry === "string")) {
-        query[key] = item as string[];
-      } else {
-        return undefined;
-      }
-    }
-    return query;
-  } catch {
-    return undefined;
-  }
-}
-
 function responseHeadersRecord(
   headers: Headers | undefined,
 ): Record<string, string | string[]> | undefined {
@@ -479,27 +426,13 @@ function trustedResolutionFromHeaders(req: IncomingMessage): ResolveResult | und
     return undefined;
   }
 
-  const routeMatchesRaw =
-    typeof req.headers["x-route-matches"] === "string" ? req.headers["x-route-matches"] : undefined;
-  const resolvedHeadersRaw =
-    typeof req.headers["x-resolved-headers"] === "string"
-      ? req.headers["x-resolved-headers"]
-      : undefined;
-  const middlewareRequestHeadersRaw =
-    typeof req.headers["x-mw-request-headers"] === "string"
-      ? req.headers["x-mw-request-headers"]
-      : undefined;
-  const invocationQueryRaw =
-    typeof req.headers["x-invoke-query"] === "string" ? req.headers["x-invoke-query"] : undefined;
-  const routeMatches = parseJsonRecord(routeMatchesRaw);
-  const resolvedHeaders = parseHeaderMap(resolvedHeadersRaw);
-  const middlewareRequestHeaders = parseHeaderMap(middlewareRequestHeadersRaw);
+  const routeMatches = parseDispatchRouteMatches(req.headers["x-route-matches"]);
+  const resolvedHeaders = parseDispatchHeaderMap(req.headers["x-resolved-headers"]);
+  const middlewareRequestHeaders = parseDispatchHeaderMap(req.headers["x-mw-request-headers"]);
+  const invocationQuery = parseDispatchInvocationQuery(req.headers["x-invoke-query"]);
+  const executionDeadline = parseDispatchDeadline(req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER]);
   const invokePath =
     typeof req.headers["x-invoke-path"] === "string" ? req.headers["x-invoke-path"] : undefined;
-  const invocationQuery = parseInvocationQuery(invocationQueryRaw);
-  const deadlineRaw = req.headers[INTERNAL_EXECUTION_DEADLINE_HEADER];
-  const deadline = typeof deadlineRaw === "string" ? Number(deadlineRaw) : Number.NaN;
-  const executionDeadlineAt = Number.isSafeInteger(deadline) && deadline > 0 ? deadline : undefined;
   const pool =
     typeof req.headers["x-upstream-pool"] === "string" ? req.headers["x-upstream-pool"] : undefined;
 
@@ -507,11 +440,11 @@ function trustedResolutionFromHeaders(req: IncomingMessage): ResolveResult | und
   // middleware while silently discarding its authoritative request-header replacement, rewrite
   // query, route params, response headers, or inherited deadline. Re-resolve the whole request.
   if (
-    (routeMatchesRaw !== undefined && routeMatches === null) ||
-    (resolvedHeadersRaw !== undefined && resolvedHeaders === undefined) ||
-    (middlewareRequestHeadersRaw !== undefined && middlewareRequestHeaders === undefined) ||
-    (invocationQueryRaw !== undefined && invocationQuery === undefined) ||
-    (deadlineRaw !== undefined && executionDeadlineAt === undefined)
+    !routeMatches.ok ||
+    !resolvedHeaders.ok ||
+    !middlewareRequestHeaders.ok ||
+    !invocationQuery.ok ||
+    !executionDeadline.ok
   ) {
     discardDispatch();
     return undefined;
@@ -522,12 +455,14 @@ function trustedResolutionFromHeaders(req: IncomingMessage): ResolveResult | und
     kind: "route",
     pool: pool ?? "",
     matchedPathname: outputId,
-    routeMatches,
-    resolvedHeaders,
-    ...(middlewareRequestHeaders ? { middlewareRequestHeaders } : {}),
+    routeMatches: routeMatches.value ?? null,
+    resolvedHeaders: resolvedHeaders.value,
+    ...(middlewareRequestHeaders.value
+      ? { middlewareRequestHeaders: middlewareRequestHeaders.value }
+      : {}),
     ...(invokePath ? { invokePath } : {}),
-    ...(invocationQuery ? { invocationQuery } : {}),
-    ...(executionDeadlineAt ? { executionDeadlineAt } : {}),
+    ...(invocationQuery.value ? { invocationQuery: invocationQuery.value } : {}),
+    ...(executionDeadline.value ? { executionDeadlineAt: executionDeadline.value } : {}),
   };
 }
 
