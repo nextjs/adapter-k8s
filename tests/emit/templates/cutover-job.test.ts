@@ -293,6 +293,7 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
       services: ["get", "list", "patch", "delete"],
       // D1/D2 rollout waits (get/list/watch), N64 live replica read, edge revert patch,
       // E6 deletes.
+      "apps/replicasets": ["list"],
       "apps/deployments": ["get", "list", "watch", "patch", "delete"],
       // kubectl scale (D6 capacity match, E5 park-at-zero) hits the scale subresource.
       "apps/deployments/scale": ["patch", "update"],
@@ -327,6 +328,7 @@ describe("renderCutoverRbac — namespace-scoped, verb-minimal", () => {
 
   it("never grants WRITE on the objects the Job only reads", () => {
     const rules = roleRules(out);
+    expect(rules.get("apps/replicasets")).toEqual(["list"]);
     // The policy gate is a poll, never a repair.
     expect(rules.get("gateway.envoyproxy.io/envoyextensionpolicies")).toEqual(["get"]);
     expect(rules.get("gateway.networking.k8s.io/httproutes")).toEqual(["get"]);

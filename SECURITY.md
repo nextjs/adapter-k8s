@@ -92,10 +92,12 @@ What the proof does **not** do is authenticate callers to the routing service. `
 
 The **base** image is tracked by tag (`node:24-slim`) so upstream security patches keep flowing. For reproducible builds, pin it with `ADAPTER_K8S_NODE_BASE_DIGEST=sha256:…`—which you then own updating.
 
-Current deploy state records the routing image digest, and rollback uses that immutable reference.
-Deploy state written before digest recording cannot recover a digest retroactively; rollback falls
-back to the build tag for those legacy targets and prints a warning. Treat that fallback like
-`--allow-mutable-tags`: verify the tag has not moved before using it.
+Rollback and cutover recovery take the literal image, dispatch Secret reference, and architecture
+from the live routing Deployment or retained ReplicaSets owned by that Deployment’s controller UID.
+ConfigMap registry, digest, and platform values cannot authorize an image. Missing or conflicting
+workload history makes recovery fail closed. Keep the routing Deployment’s revision history.
+A legacy workload revision may record a mutable tag; recovery preserves it with a warning. Treat
+that like `--allow-mutable-tags`: verify the tag has not moved before using it.
 
 ## Cache security
 
@@ -114,14 +116,14 @@ Two rules regardless of provider:
 
 ## Cloud IAM: two identities, split by pod-assumability
 
-- **`<release>-deploy`**—assumable by anyone who can create a Pod in the namespace, because the extension registration Job runs as it. It holds a release-scoped custom IAM role for traffic-extension registration and nothing else: no project-wide LB admin, no project-wide `compute.viewer`.
+- **`<release>-deploy`**—assumable by anyone who can create a Pod in the namespace, because the extension registration Job runs as it. It holds a custom IAM role named per release, limited to traffic-extension registration operations: no LB admin or `compute.viewer` role. Its IAM binding is project-wide, so the permitted operations are not isolated to that release’s resources.
 - **`<release>-cli`**—bucket `objectAdmin` and repository-scoped Artifact Registry **writer**, with **no Workload Identity binding**, so no pod can assume it. Pushing images is a CLI operation; the in-cluster Job never pushes. It is deliberately not `repoAdmin`: retag rights on an already-deployed repository would turn pod-creation into dispatch-secret theft on the next restart.
 
 `init` is idempotent and grants the CLI identity before revoking the deploy identity, so a failed run can never leave the release with neither identity holding a permission.
 
 **If your CI impersonates a service account, point it at `<release>-cli`.** A pipeline authenticated as `<release>-deploy` loses push permissions the next time `init` runs.
 
-**Residual risk:** releases deploy into the shared `default` namespace, so pod-creation there means assuming the deploy identity and reading the namespace's Secrets. The identity split shrinks what that is worth; it does not close it.
+**Residual risk:** the namespace is configurable and defaults to `default`. Without admission restrictions, an actor who can create Pods in the registration Job’s namespace can select its Kubernetes service account and mount that namespace’s Secrets. The deploy identity’s permitted traffic-extension operations apply project-wide, including other releases’ resources. Separate namespaces alone do not narrow that IAM binding.
 
 ## Other defaults
 
@@ -133,7 +135,7 @@ Two rules regardless of provider:
 ## Known limits and planned work
 
 - **No caller authentication on the ext_proc callout.** The per-request dispatch proof removed the replayable, wire-readable credential, but the routing service will still resolve and sign a request for any caller that reaches it. mTLS on the callout (via `BackendAuthenticationConfig` on GKE) would remove the dependency on network controls entirely and is the strongest planned fix. Until then, network reachability is the boundary.
-- **Legacy rollback state can be tag-pinned.** Modern state records and reuses the routing digest. A state entry that predates that field falls back to its build tag with a warning; verify the tag before rollback because the routing tier holds the dispatch secret.
+- **Legacy workload history can be tag-pinned.** Recovery preserves the image recorded in an authorized workload revision. A retained legacy tag is used with a warning; verify it before rollback because the routing tier holds the dispatch secret. Missing workload history cannot be replaced with ConfigMap image metadata.
 - **`hostNetwork` pods bypass NetworkPolicy** in both postures and on every CNI.
 - **Escape hatches disable guarantees.** `--allow-no-network-policy` and `--allow-mutable-tags` exist for constrained environments and turn off the controls described above; they are opt-in and loud.
 - **Namespace isolation.** Moving the registration Job's work into the CLI—removing the in-cluster identity altogether—is the preferred fix for the shared-namespace residual, ahead of per-release namespaces plus an admission policy.

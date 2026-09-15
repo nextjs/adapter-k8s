@@ -43,6 +43,7 @@ export interface CutoverRbacOptions {
 const BASE_RBAC_KEYS = new Set([
   "/services",
   "apps/deployments",
+  "apps/replicasets",
   "apps/deployments/scale",
   "autoscaling/horizontalpodautoscalers",
   "/pods",
@@ -335,6 +336,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "patch", "delete"]
+  # Recovery authenticates image/Secret pairs against Deployment-owned revision history.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
   # kubectl scale (D6 pre-cutover capacity match, E5 park-at-zero) hits the scale
   # subresource.
   - apiGroups: ["apps"]

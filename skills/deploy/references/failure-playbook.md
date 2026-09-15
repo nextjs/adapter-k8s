@@ -37,9 +37,9 @@ npx adapter-k8s rollback        # scales the previous build up, reverts the rout
 
 - It is symmetric: running it again rolls forward. The CLI prints `✓ Rollback complete. Now serving build: <id>`.
 - Do NOT rollback after a failed deploy — nothing was cut over; the previous build is already serving.
-- Rollback prefers the immutable routing image digest recorded for that build. State written by
-  older adapter versions has no digest, so rollback falls back to the build tag and prints a
-  warning.
+- Recovery takes the image from the live routing Deployment or its retained ReplicaSet history.
+  ConfigMap state cannot authorize a replacement image. Missing or conflicting history
+  stops recovery; a tag actually recorded in workload history is preserved with a warning.
 - If deploy warned `--allow-unretained-manifest` was used, rollback to that build is image-only (its routing manifest snapshot was not retained).
 
 ## Why Never `helm rollback`

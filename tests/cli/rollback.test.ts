@@ -3,6 +3,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import path from "node:path";
 
 vi.mock("../../src/cli/exec.js");
+// The provenance reader has real Kubernetes-object coverage in recovery-provenance.test.ts.
+// These orchestration tests supply authorized workload revisions at that boundary.
+vi.mock("../../src/cutover/routing-history.js");
+import { readTrustedRoutingRevision } from "../../src/cutover/routing-history.js";
+beforeEach(() => {
+  vi.mocked(readTrustedRoutingRevision).mockImplementation(async ({ targetBuildId, live }) => ({
+    image: `${live.image.split("/routing-service")[0]}/routing-service:${targetBuildId}`,
+    internalSecretRef: null,
+    nodeArchitecture: targetBuildId.includes("legacy")
+      ? live.nodeArchitecture
+      : targetBuildId === "buildn"
+        ? "arm64"
+        : "amd64",
+  }));
+});
 // Only the two state FUNCTIONS are mocked (same shape as deploy-orchestration.test.ts), so
 // the N69 suite below can swap the REAL writeState back in and exercise its generation
 // arithmetic through rollback's actual call site.
@@ -346,6 +361,11 @@ describe("runRollback — state and CDN invalidation", () => {
     const digestM = `sha256:${"b".repeat(64)}`;
     const cdnTags = { buildn: `build-${"ef".repeat(32)}`, buildm: `build-${"0a".repeat(32)}` };
     const routingImageDigests = { buildn: digestN, buildm: digestM };
+    vi.mocked(readTrustedRoutingRevision).mockImplementation(async ({ targetBuildId }) => ({
+      image: `gcr.io/p/routing-service@${targetBuildId === "buildm" ? digestM : digestN}`,
+      internalSecretRef: null,
+      nodeArchitecture: null,
+    }));
     const unretainedManifestBuilds = ["buildm"];
     let state = {
       buildId: "buildn",
@@ -1125,6 +1145,11 @@ describe("runRollback — routing service revert", () => {
   });
 
   it("moves an amd64 routing edge to arm64 and preserves both platform records", async () => {
+    vi.mocked(readTrustedRoutingRevision).mockResolvedValue({
+      image: `${REGISTRY}/routing-service:buildm`,
+      internalSecretRef: null,
+      nodeArchitecture: "arm64",
+    });
     vi.mocked(readState).mockResolvedValue({
       buildId: "buildn",
       previousBuildId: "buildm",
@@ -1377,7 +1402,8 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
       .filter(([, a]) => a.includes("patch") && a.includes("deployment"))
       .map(([, a]) => a.at(-1)!);
     expect(edgePatches[0]).toContain('"kubernetes.io/arch":"amd64"');
-    expect(edgePatches.at(-1)).toContain('"kubernetes.io/arch":"arm64"');
+    // The mocked live edge already carries arm64 on the second read.
+    expect(edgePatches.at(-1)).not.toContain("nodeSelector");
 
     const out = errorOutput();
     expect(out).toContain("ROLLBACK FAILED");
@@ -2363,40 +2389,6 @@ describe("revertRoutingServiceToBuild — ConfigMap-sourced image coordinates ar
     ).rejects.toThrow(/Invalid image registry/);
     expect(patchBodies()).toHaveLength(0);
   });
-
-  it("IGNORES a malformed recorded digest — the edge reverts by TAG, not by injection", async () => {
-    mockServingCluster();
-    const warnings: string[] = [];
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation((...a: unknown[]) => {
-      warnings.push(a.map(String).join(" "));
-    });
-    try {
-      await revertRoutingServiceToBuild({
-        releaseName: "rel",
-        targetBuildId: "target-build",
-        registry: "gcr.io/p",
-        targetImageDigest: "attacker.io/pwn@latest",
-      });
-    } finally {
-      warnSpy.mockRestore();
-    }
-    const body = patchBodies().join("\n");
-    expect(body).toContain("routing-service:target-build");
-    expect(body).not.toContain("attacker.io/pwn");
-    expect(warnings.join("\n")).toMatch(/not sha256:<64 hex>/);
-  });
-
-  it("pins a WELL-FORMED recorded digest exactly as before", async () => {
-    mockServingCluster();
-    const digest = `sha256:${"c".repeat(64)}`;
-    await revertRoutingServiceToBuild({
-      releaseName: "rel",
-      targetBuildId: "target-build",
-      registry: "gcr.io/p",
-      targetImageDigest: digest,
-    });
-    expect(patchBodies().join("\n")).toContain(`routing-service@${digest}`);
-  });
 });
 
 // N87 (SECURITY). The internal dispatch secret is per BUILD, so the edge's secretKeyRef has to
@@ -2412,6 +2404,13 @@ describe("revertRoutingServiceToBuild — the dispatch secret moves with the ima
   /** `existingSecrets` = the Secret names `kubectl get secret --ignore-not-found` finds. */
   function mockCluster(opts: { existingSecrets: string[]; liveSecretRef?: string | null }) {
     const patches: string[] = [];
+    vi.mocked(readTrustedRoutingRevision).mockResolvedValue({
+      image: "gcr.io/p/routing-service:target-build",
+      internalSecretRef: opts.existingSecrets.includes(TARGET_SECRET)
+        ? TARGET_SECRET
+        : LEGACY_SECRET,
+      nodeArchitecture: null,
+    });
     vi.mocked(execCapture).mockImplementation((async (_cmd: string, args: string[]) => {
       if (args[0] === "get" && args[1] === "secret") {
         const name = args[2]!;
@@ -2477,7 +2476,7 @@ describe("revertRoutingServiceToBuild — the dispatch secret moves with the ima
     expect(body).toContain(TARGET_SECRET);
   });
 
-  it("falls back to the LEGACY stable name for a build deployed before per-build names", async () => {
+  it("restores the recorded LEGACY stable name for a build deployed before per-build names", async () => {
     // deploy preserves that Secret (`helm.sh/resource-policy: keep`), and it is the one a
     // pre-N87 target build's pods actually hold.
     const patches = mockCluster({
@@ -2494,20 +2493,16 @@ describe("revertRoutingServiceToBuild — the dispatch secret moves with the ima
     expect(patches.join("\n")).toContain(LEGACY_SECRET);
   });
 
-  it("leaves the env alone (with a warning) when the target has no Secret at all", async () => {
-    // Pointing a container at a missing Secret is CreateContainerConfigError — that would turn
-    // a degraded edge into a dead one.
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("refuses an unavailable recorded Secret before changing the routing Deployment", async () => {
     const patches = mockCluster({ existingSecrets: [] });
-
-    await revertRoutingServiceToBuild({
-      releaseName: "rel",
-      targetBuildId: TARGET,
-      registry: "gcr.io/p",
-    });
-
-    expect(patches.join("\n")).not.toContain("INTERNAL_HEADER_SECRET");
-    expect(warn.mock.calls.flat().join(" ")).toMatch(/No internal dispatch Secret found for build/);
+    await expect(
+      revertRoutingServiceToBuild({
+        releaseName: "rel",
+        targetBuildId: TARGET,
+        registry: "gcr.io/p",
+      }),
+    ).rejects.toThrow(/recorded dispatch Secret is unavailable/);
+    expect(patches).toEqual([]);
   });
 
   it("restores the PRIOR secretKeyRef when the reverted rollout fails", async () => {
@@ -2791,8 +2786,13 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
       .map((c) => c[1][c[1].length - 1]!)
       .join("\n");
 
-  it("pins by digest when the deploy recorded one", async () => {
+  it("preserves the digest recorded in workload history", async () => {
     mockCluster();
+    vi.mocked(readTrustedRoutingRevision).mockResolvedValue({
+      image: `gcr.io/p/routing-service@${DIGEST}`,
+      internalSecretRef: null,
+      nodeArchitecture: "arm64",
+    });
     await revertRoutingServiceToBuild({
       releaseName: "rel",
       targetBuildId: "target",
@@ -2805,7 +2805,7 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
     expect(patchBody()).toContain('"kubernetes.io/arch":"arm64"');
   });
 
-  it("falls back to the tag for a build with no recorded digest, and warns", async () => {
+  it("preserves an authorized legacy workload tag and warns", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     mockCluster();
     await revertRoutingServiceToBuild({
@@ -2815,8 +2815,9 @@ describe("revertRoutingServiceToBuild — digest pinning", () => {
     });
     expect(patchBody()).toContain("routing-service:legacy");
     expect(patchBody()).not.toContain("nodeSelector");
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/reverting the edge by\s+TAG/i));
-    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/No recorded target platform/i));
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/retained workload revision.*mutable TAG/i),
+    );
     warn.mockRestore();
   });
 });
