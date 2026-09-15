@@ -7,7 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NextConfigRuntime } from "next/dist/server/config-shared.js";
 import type { IncrementalResponseCacheEntry } from "next/dist/server/response-cache/index.js";
 import { createImageCache } from "../../src/next-runtime/image-cache.js";
-import type { ImageParams, OptimizedImage } from "../../src/next-runtime/image-optimizer.js";
+import {
+  imageVariantKey,
+  type ImageParams,
+  type OptimizedImage,
+} from "../../src/next-runtime/image-optimizer.js";
 
 const require = createRequire(import.meta.url);
 const { defaultConfig } = require("next/dist/server/config-shared");
@@ -91,6 +95,22 @@ describe("Next image response cache integration", () => {
     expect(await store.get(params, generate, waitUntil)).toEqual({ image: image(), status: "HIT" });
     expect(generate).toHaveBeenCalledOnce();
     expect(generate).toHaveBeenCalledWith(null);
+  });
+
+  it("separates URL/width variants that collide in Next's cache key", async () => {
+    const first = { ...params, href: "/logo.png20", width: 48 };
+    const second = { ...params, href: "/logo.png", width: 2048 };
+    expect(ImageOptimizerCache.getCacheKey(first)).toBe(ImageOptimizerCache.getCacheKey(second));
+    const store = await cache();
+    await store.get(first, async () => image("first"), waitUntil);
+    expect(await store.get(second, async () => image("second"), waitUntil)).toEqual({
+      image: image("second"),
+      status: "MISS",
+    });
+    expect(await store.get(first, async () => image("unexpected"), waitUntil)).toEqual({
+      image: image("first"),
+      status: "HIT",
+    });
   });
 
   it.each(["image/svg+xml", "image/gif", "image/jp2", "image/tiff"])(
@@ -190,7 +210,13 @@ describe("Next image response cache integration", () => {
     await store.get(params, async () => image("123456"), waitUntil);
     const nextParams = { ...params, href: "/second.png" };
     await store.get(nextParams, async () => image("abcdef"), waitUntil);
-    const nextKey = getHash(["build1", ImageOptimizerCache.getCacheKey(nextParams)]);
+    const nextKey = getHash([
+      JSON.stringify([
+        "build1",
+        ImageOptimizerCache.getCacheKey(nextParams),
+        imageVariantKey(nextParams),
+      ]),
+    ]);
     await vi.waitFor(async () => {
       expect(await readdir(path.join(distDir, "cache", "images"))).toEqual([nextKey]);
     });

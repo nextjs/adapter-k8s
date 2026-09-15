@@ -5,7 +5,11 @@ import path from "node:path";
 import { build } from "esbuild";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { createImageCache } from "../../src/next-runtime/image-cache.js";
-import type { ImageParams, OptimizedImage } from "../../src/next-runtime/image-optimizer.js";
+import {
+  imageVariantKey,
+  type ImageParams,
+  type OptimizedImage,
+} from "../../src/next-runtime/image-optimizer.js";
 import {
   createValkeyClient,
   type ValkeyClient,
@@ -207,7 +211,7 @@ describe.skipIf(!dockerAvailable)("image caching through the packaged Valkey han
     const second = await replica(buildId, 1);
     const original = image("before-expiry", 0);
     await first.cache.get(params, async () => original, waitUntil);
-    const key = `k8s:${buildId}:inc:${getHash([buildId, ImageOptimizerCache.getCacheKey(params)])}`;
+    const key = `k8s:${buildId}:inc:${getHash([JSON.stringify([buildId, ImageOptimizerCache.getCacheKey(params), imageVariantKey(params)])])}`;
     const stored = JSON.parse((await client.get(key))!);
     expect(stored.value.kind).toBe("IMAGE");
     expect(stored.value.revalidate).toBe(1);

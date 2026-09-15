@@ -8,7 +8,7 @@ import type {
   IncrementalResponseCacheEntry,
 } from "next/dist/server/response-cache/index.js";
 import type { RouteKind } from "next/dist/server/route-kind.js";
-import type { ImageParams, OptimizedImage } from "./image-optimizer.js";
+import { imageVariantKey, type ImageParams, type OptimizedImage } from "./image-optimizer.js";
 
 const DEFAULT_DISK_CACHE_BYTES = 256 * 1024 * 1024;
 
@@ -98,7 +98,11 @@ export async function createImageCache({
     ): Promise<{ image: OptimizedImage; status: "MISS" | "HIT" | "STALE" }> {
       // Image URLs such as /logo.png can change at cutover. Scope every store,
       // including application-provided handlers, to the build that produced it.
-      const key = getHash([buildId, ImageOptimizerCache.getCacheKey(params)]);
+      // Keep Next's cache version, but also bind the unambiguous variant: its
+      // upstream key alone can collide across distinct URL/width combinations.
+      const key = getHash([
+        JSON.stringify([buildId, ImageOptimizerCache.getCacheKey(params), imageVariantKey(params)]),
+      ]);
       const entry = await responseCache.get(
         key,
         async ({ previousCacheEntry, hasResolved }) => {
