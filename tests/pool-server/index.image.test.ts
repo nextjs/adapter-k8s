@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { request as httpRequest } from "node:http";
@@ -356,12 +356,26 @@ describe("image optimizer disabled by Next configuration", () => {
 describe("image optimizer source fetch configuration", () => {
   const booter = makeBooter();
   const sourceRequests: string[] = [];
+  const streamingResponses = new Set<ServerResponse>();
   let source: ReturnType<typeof createServer>;
   let sourcePort: number;
 
   beforeAll(async () => {
     source = createServer((req, res) => {
       sourceRequests.push(req.url!);
+      if (req.url!.startsWith("/streaming-redirect/")) {
+        const kind = req.url!.slice("/streaming-redirect/".length);
+        const location = kind === "invalid" ? "http://[" : "/image.png";
+        res.writeHead(302, kind === "missing" ? {} : { location });
+        res.write("discarded redirect body");
+        streamingResponses.add(res);
+        const timer = setInterval(() => res.write("still streaming"), 10);
+        res.once("close", () => {
+          clearInterval(timer);
+          streamingResponses.delete(res);
+        });
+        return;
+      }
       const redirects = /^\/redirect\/(\d+)$/.exec(req.url!);
       if (redirects && Number(redirects[1]) > 0) {
         res.writeHead(302, { location: `/redirect/${Number(redirects[1]) - 1}` });
@@ -382,6 +396,7 @@ describe("image optimizer source fetch configuration", () => {
   });
 
   afterEach(async () => {
+    for (const response of streamingResponses) response.destroy();
     await booter.cleanup();
     sourceRequests.length = 0;
   });
@@ -448,6 +463,24 @@ describe("image optimizer source fetch configuration", () => {
     );
     expect(response.status).toBe(testCase.status);
     expect(sourceRequests).toEqual(testCase.requests);
+  });
+
+  it.each([
+    { kind: "follow", limit: 1, status: 200 },
+    { kind: "missing", limit: 1, status: 500 },
+    { kind: "invalid", limit: 1, status: 500 },
+    { kind: "limit", limit: 0, status: 508 },
+  ])("closes a streaming redirect body on $kind", async ({ kind, limit, status }) => {
+    const { port } = await booter.boot(
+      remoteConfig({ dangerouslyAllowLocalIP: true, maximumRedirects: limit }),
+    );
+    const response = await rawGet(
+      port,
+      optimizerUrl(`http://127.0.0.1:${sourcePort}/streaming-redirect/${kind}`),
+      {},
+    );
+    expect(response.status).toBe(status);
+    await expect.poll(() => streamingResponses.size, { timeout: 500 }).toBe(0);
   });
 
   it.each([

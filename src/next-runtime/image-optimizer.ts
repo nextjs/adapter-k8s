@@ -11,6 +11,12 @@ type ImageLocalPattern = NonNullable<ImageConfig["localPatterns"]>[number];
 export type ImageParams = ImageOptimizer.ImageParamsResult;
 export type OptimizedImage = Awaited<ReturnType<typeof ImageOptimizer.imageOptimizer>>;
 
+export function imageVariantKey(params: ImageParams): string {
+  // Next's hash concatenates URL and width without separators: /image20 at 48
+  // collides with /image at 2048. Preserve tuple boundaries before sharing work.
+  return JSON.stringify([params.href, params.width, params.quality, params.mimeType]);
+}
+
 function toAllowedSizes(values: unknown[]): number[] {
   return values.filter(
     (value): value is number =>

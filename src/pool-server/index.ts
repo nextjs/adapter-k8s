@@ -69,6 +69,7 @@ import {
 import { decodePublicPathname } from "./public-files.js";
 import {
   createImageOptimizer,
+  imageVariantKey,
   type ImageConfig,
   type OptimizedImage,
 } from "../next-runtime/image-optimizer.js";
@@ -1092,8 +1093,10 @@ async function fetchExternalImageSafely(
         (imgRes) => {
           const status = imgRes.statusCode ?? 502;
           if (status >= 300 && status < 400) {
-            imgRes.resume(); // drain
             const location = imgRes.headers.location;
+            // Discarded bodies must close before this hop releases its deadline.
+            // Draining would let a streaming redirect outlive image admission.
+            imgRes.destroy();
             if (!location) return settle({ error: "redirect-without-location" });
             return settle({ redirect: location });
           }
@@ -2874,7 +2877,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         }
       };
 
-      const optimizeKey = `${distDir}|${imageRuntime.upstream.ImageOptimizerCache.getCacheKey(params)}`;
+      const optimizeKey = JSON.stringify([distDir, imageVariantKey(params)]);
 
       let outcome: ImageOptimizationOutcome;
       try {

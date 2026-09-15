@@ -389,6 +389,44 @@ describe("image optimizer — S32 admission and single-flight", () => {
     expect(imageOptimizerAdmissionStats().inflightKeys).toBe(0);
   });
 
+  it("keeps colliding upstream URL/width keys from sharing an error", async () => {
+    const { ImageOptimizerCache } = nodeRequire("next/dist/server/image-optimizer");
+    const variant = { quality: 75, mimeType: "image/webp" };
+    expect(ImageOptimizerCache.getCacheKey({ ...variant, href: "/tiny.png20", width: 48 })).toBe(
+      ImageOptimizerCache.getCacheKey({ ...variant, href: "/tiny.png", width: 2048 }),
+    );
+
+    holdEncodes();
+    const blockers = [32, 96, 128].map((width) =>
+      get(port, `/_next/image?url=/tiny.png&w=${width}&q=75`, { accept: "image/webp" }),
+    );
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 3, "admission to fill");
+    const before = imageOptimizerAdmissionStats();
+    const attacker = get(port, "/_next/image?url=/tiny.png20&w=48&q=75", {
+      accept: "image/webp",
+    });
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().queued === 1,
+      "the missing source to queue",
+    );
+    const victim = get(port, "/_next/image?url=/tiny.png&w=2048&q=75", {
+      accept: "image/webp",
+    });
+    await waitUntil(
+      () =>
+        imageOptimizerAdmissionStats().queued === 2 ||
+        imageOptimizerAdmissionStats().joined > before.joined,
+      "both colliding requests to reach admission or single-flight",
+    );
+    releaseEncodes();
+    await Promise.all(blockers);
+    expect((await attacker).status).toBe(400);
+    const response = await victim;
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe("image/webp");
+    expect(imageOptimizerAdmissionStats().joined).toBe(before.joined);
+  });
+
   it("shares a rejected image with every waiter and leaves no map entry", async () => {
     // Fill admission first: Next rejects these bytes before Sharp, so the encode latch
     // alone cannot keep the invalid request open long enough for other callers to join.
