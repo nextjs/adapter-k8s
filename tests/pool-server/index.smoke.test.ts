@@ -47,7 +47,7 @@ interface StagedDir {
 function writeStagedDir(
   withMiddleware: boolean,
   middlewareRuntime: "nodejs" | "edge" = "nodejs",
-  nextVersion = "16.3.0",
+  nextVersion = "16.3.3",
 ): StagedDir {
   const dir = mkdtempSync(path.join(REPO_ROOT, ".smoke-stage-"));
   const configDir = path.join(dir, "config");
@@ -337,7 +337,7 @@ describe("pool-server startup smoke test", () => {
     expect(raw).not.toContain("500");
   });
 
-  it("502s (never passthrough) when sharp fails on bytes whose type is only a GUESS", async () => {
+  it("rejects invalid image bytes without serving them", async () => {
     // `corrupt.png` is the text "this is not actually a png": NO magic signature matches,
     // so the only candidate content type is the `.png` extension — a guess. Upstream 400s
     // this case before sharp runs (its `upstreamType` is always byte-derived, and a source
@@ -345,7 +345,7 @@ describe("pool-server startup smoke test", () => {
     // fallback-to-source path added for jp2 must NOT extend here: serving unvalidated bytes
     // under a guessed image type is exactly the XSS channel that fallback was removed for.
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/corrupt.png&w=640&q=75`);
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(400);
     // The raw bytes must NOT be served back under a guessed content-type.
     expect(res.headers.get("content-type")).not.toBe("image/png");
     expect(await res.text()).not.toContain("this is not actually a png");
@@ -435,7 +435,7 @@ describe("pool-server startup smoke test", () => {
     const previousConfigDir = process.env.CONFIG_DIR;
     process.env.CONFIG_DIR = stagedB.configDir;
     try {
-      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.0 <16\.4\.0/);
+      await expect(startPoolServer()).rejects.toThrow(/supports >=16\.3\.3 <16\.4\.0/);
     } finally {
       process.env.CONFIG_DIR = previousConfigDir;
       rmSync(stagedB.dir, { recursive: true, force: true });

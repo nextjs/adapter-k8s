@@ -1,4 +1,4 @@
-export const SUPPORTED_NEXT_RELEASE_LINE = ">=16.3.0 <16.4.0";
+export const SUPPORTED_NEXT_RELEASE_LINE = ">=16.3.3 <16.4.0";
 export const PINNED_NEXT_CANARY = "16.3.0-canary.97";
 
 export type NextVersionSupport =
@@ -38,6 +38,10 @@ export function checkSupportedNextVersion(version: unknown): NextVersionSupport 
     return { supported: true, prerelease: true };
   }
 
+  // 16.3.3 includes the image-optimizer AVIF security mitigation (GHSA-2xp9-vwfh-vxw4).
+  if (Number(match[3]) < 3) {
+    return { supported: false, reason: "predates the required Next.js 16.3.3 security fixes" };
+  }
   return { supported: true, prerelease: false };
 }
 

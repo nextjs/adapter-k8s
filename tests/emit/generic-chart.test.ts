@@ -27,7 +27,7 @@ const routingManifest = {
   middleware: { filePath: "middleware.js" },
   poolAssignments: { "/": "default" },
   pprRoutes: {},
-  nextVersion: "16.3.0",
+  nextVersion: "16.3.3",
 } as unknown as RoutingManifest;
 
 const pools = new Map<string, PoolDefinition>([
@@ -51,7 +51,7 @@ function genericChart(
   return generateHelmChart({
     pools,
     buildId: "b1",
-    nextVersion: "16.3.0",
+    nextVersion: "16.3.3",
     targetPlatform,
     config,
     imageRegistry: "registry.example.com/ns",
@@ -249,7 +249,7 @@ describe("generic provider — callout policy matches the server's", () => {
     const files = generateHelmChart({
       pools,
       buildId: "b1",
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
       config: {
         pools: {},
         routingService: { requestTimeoutMs: 2500 },

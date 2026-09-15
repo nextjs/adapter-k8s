@@ -204,7 +204,7 @@ export async function proxy(request) {
       },
       poolAssignments: {},
       pprRoutes: {},
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
     }),
   );
   writeFileSync(path.join(configDir, "static-assets.json"), JSON.stringify([]));
@@ -389,14 +389,54 @@ describe("image optimizer — S32 admission and single-flight", () => {
     expect(imageOptimizerAdmissionStats().inflightKeys).toBe(0);
   });
 
-  it("shares an error outcome with every waiter and leaves no map entry (failing encode)", async () => {
-    // HTML bytes under a .png name: nothing sniffs, sharp cannot decode them, and the no-sniff
-    // branch refuses to echo the guess back — 502 for all six waiters off one encode attempt.
-    // (An encode failure is deliberately NOT a rejection: where the type WAS byte-sniffed,
-    // `next start` parity makes it a 200 serving the source bytes.)
+  it("keeps colliding upstream URL/width keys from sharing an error", async () => {
+    const { ImageOptimizerCache } = nodeRequire("next/dist/server/image-optimizer");
+    const variant = { quality: 75, mimeType: "image/webp" };
+    expect(ImageOptimizerCache.getCacheKey({ ...variant, href: "/tiny.png20", width: 48 })).toBe(
+      ImageOptimizerCache.getCacheKey({ ...variant, href: "/tiny.png", width: 2048 }),
+    );
+
+    holdEncodes();
+    const blockers = [32, 96, 128].map((width) =>
+      get(port, `/_next/image?url=/tiny.png&w=${width}&q=75`, { accept: "image/webp" }),
+    );
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 3, "admission to fill");
     const before = imageOptimizerAdmissionStats();
+    const attacker = get(port, "/_next/image?url=/tiny.png20&w=48&q=75", {
+      accept: "image/webp",
+    });
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().queued === 1,
+      "the missing source to queue",
+    );
+    const victim = get(port, "/_next/image?url=/tiny.png&w=2048&q=75", {
+      accept: "image/webp",
+    });
+    await waitUntil(
+      () =>
+        imageOptimizerAdmissionStats().queued === 2 ||
+        imageOptimizerAdmissionStats().joined > before.joined,
+      "both colliding requests to reach admission or single-flight",
+    );
+    releaseEncodes();
+    await Promise.all(blockers);
+    expect((await attacker).status).toBe(400);
+    const response = await victim;
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe("image/webp");
+    expect(imageOptimizerAdmissionStats().joined).toBe(before.joined);
+  });
+
+  it("shares a rejected image with every waiter and leaves no map entry", async () => {
+    // Fill admission first: Next rejects these bytes before Sharp, so the encode latch
+    // alone cannot keep the invalid request open long enough for other callers to join.
     sharpCalls = 0;
     holdEncodes();
+    const blockers = [32, 96, 128].map((width) =>
+      get(port, `/_next/image?url=/tiny.png&w=${width}&q=75`, { accept: "image/webp" }),
+    );
+    await waitUntil(() => imageOptimizerAdmissionStats().active === 3, "admission to fill");
+    const before = imageOptimizerAdmissionStats();
     const inflight = Array.from({ length: 6 }, () =>
       get(port, "/_next/image?url=/html-as.png&w=64&q=75", { accept: "image/webp" }),
     );
@@ -405,19 +445,18 @@ describe("image optimizer — S32 admission and single-flight", () => {
       "five requests to join the failing key",
     );
     releaseEncodes();
+    await Promise.all(blockers);
     for (const res of await Promise.all(inflight)) {
-      expect(res.status).toBe(502);
-      expect(res.body.toString()).toBe("Failed to process image");
+      expect(res.status).toBe(400);
+      expect(res.body.toString()).toBe("The requested resource isn't a valid image.");
     }
-    expect(sharpCalls).toBe(1);
+    expect(sharpCalls).toBe(3);
     expect(imageOptimizerAdmissionStats().inflightKeys).toBe(0);
-    // The key is not poisoned: a later request runs the work again rather than joining a
-    // settled promise.
     const retry = await get(port, "/_next/image?url=/html-as.png&w=64&q=75", {
       accept: "image/webp",
     });
-    expect(retry.status).toBe(502);
-    expect(sharpCalls).toBe(2);
+    expect(retry.status).toBe(400);
+    expect(sharpCalls).toBe(3);
   });
 
   it("rejects every waiter when the shared work THROWS, and leaves no map entry", async () => {
@@ -480,7 +519,10 @@ describe("image optimizer — S32 admission and single-flight", () => {
     const inflight = [32, 48, 64, 96].map((w) =>
       get(port, `/_next/image?url=/tiny.png&w=${w}&q=75`, { accept: "image/webp" }),
     );
-    await waitUntil(() => imageOptimizerAdmissionStats().queued === 1, "one request to queue");
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().queued === 1 && sharpCalls === 3,
+      "three encodes with one request queued",
+    );
     const stats = imageOptimizerAdmissionStats();
     expect(stats.active).toBe(3);
     expect(stats.admitted - before.admitted).toBe(3);
@@ -503,7 +545,10 @@ describe("image optimizer — S32 admission and single-flight", () => {
     const inflight = [32, 48, 64].map((w) =>
       get(port, `/_next/image?url=/big.png&w=${w}&q=75`, { accept: "image/webp" }),
     );
-    await waitUntil(() => imageOptimizerAdmissionStats().queued === 1, "one request to queue");
+    await waitUntil(
+      () => imageOptimizerAdmissionStats().queued === 1 && sharpCalls === 2,
+      "two encodes with one request queued on the byte budget",
+    );
     const stats = imageOptimizerAdmissionStats();
     expect(stats.active).toBe(2);
     expect(stats.admitted - before.admitted).toBe(2);

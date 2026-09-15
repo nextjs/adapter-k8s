@@ -40,7 +40,7 @@ function makeManifest(overrides: Partial<RoutingManifest> = {}): RoutingManifest
     middleware: null,
     poolAssignments: { "/": "ssr", "/about": "ssr", "/api/hello": "api" },
     pprRoutes: {},
-    nextVersion: "16.3.0",
+    nextVersion: "16.3.3",
     ...overrides,
   };
 }

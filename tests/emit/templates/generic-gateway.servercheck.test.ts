@@ -61,7 +61,7 @@ describe.skipIf(!ctx)("generic templates validate against a real API server", ()
       middleware: null,
       poolAssignments: { "/": "default" },
       pprRoutes: {},
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
     };
     const out = apply(
       renderHTTPRoute({

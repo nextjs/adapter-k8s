@@ -153,7 +153,7 @@ function writeStagedDir(): { dir: string; configDir: string } {
         "/echo-target": "main",
       },
       pprRoutes: {},
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
     }),
   );
   writeFileSync(path.join(dir, "mw.mjs"), "export function proxy(request) {}\n");

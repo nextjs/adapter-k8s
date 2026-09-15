@@ -195,6 +195,21 @@ Static ranges do not follow node autoscale: give the enclosing subnet range, not
 
 A requested variant must provide its own `infrastructure.<variant>.json`—there is deliberately no fallback to the default infrastructure file. Falling back would build one cluster's config against another's registry, which is silent until pods try to pull images they have no credentials for. Note the config file does fall back: when `adapter.config.<variant>.mjs` is absent, the default `adapter.config.mjs` is loaded, so provide the variant config file too if the targets differ.
 
+## Image optimization
+
+Each pool serves `/_next/image` using the application's installed Next.js optimizer. Configure
+images through `next.config`, including allowed sources, sizes, qualities, formats, loaders,
+and `unoptimized`. A custom loader or `unoptimized: true` disables this endpoint.
+
+Middleware and rewrites run before image handling. Local source requests also pass through
+middleware when it covers the source path. Remote sources must match `images.remotePatterns`
+or `images.domains` at every redirect. Private addresses are denied unless
+`images.dangerouslyAllowLocalIP` is explicitly enabled.
+
+`images.maximumRedirects` and `images.maximumResponseBody` apply to source fetching. The
+adapter's `ADAPTER_K8S_MAX_IMAGE_BYTES` remains an upper bound even if the application asks
+for a larger response. Concurrency, memory admission, and fetch deadlines still apply.
+
 ## Not yet implemented
 
 The old `imageOptimizer`, `skewProtection`, and top-level `routeExtension` keys were placeholders. They never changed emitted workloads and are no longer part of `K8sAdapterConfig`. Validation rejects them with a removal message instead of silently ignoring stale configuration. The implemented GKE routing timeout remains at `provider.gke.serviceExtensions.routeExtension.timeout` during the legacy migration window.
