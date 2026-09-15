@@ -980,6 +980,112 @@ describe("Kubernetes target composition", () => {
       },
     ]);
   });
+
+  it("compiles an enabled cache without a URL into managed Memorystore on gkeCluster", () => {
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: gkeCluster(),
+        exposure: manualExposure({ hosts }),
+      }),
+      context({
+        infrastructure: { projectId: "sample-project", region: "us-central1" },
+        cache: {
+          kind: "managed",
+          region: "europe-west1",
+          sizeGb: 5,
+          tier: "STANDARD_HA",
+          auth: false,
+        },
+      }),
+    );
+
+    expect(compiled.plan.operations.cache).toEqual({
+      kind: "gcp-memorystore",
+      projectId: "sample-project",
+      region: "europe-west1",
+      name: "test-app-cache",
+      network: "default",
+      sizeGb: 5,
+      tier: "STANDARD_HA",
+      security: { kind: "legacy-plaintext-explicit-opt-out" },
+    });
+    expect(compiled.plan.operations.cleanup.external).toContainEqual({
+      kind: "gcp-memorystore",
+      projectId: "sample-project",
+      region: "europe-west1",
+      name: "test-app-cache",
+    });
+  });
+
+  it("rejects managed-cache intent when no target component declares provisioning", () => {
+    expect(() =>
+      compileTarget(
+        defineTarget({
+          cluster: kubernetesCluster(),
+          exposure: manualExposure({ hosts }),
+        }),
+        context({
+          cache: {
+            kind: "managed",
+            sizeGb: 1,
+            tier: "BASIC",
+            auth: true,
+          },
+        }),
+      ),
+    ).toThrow(/does not provide managed cache provisioning.*cache\.url/i);
+  });
+
+  it("preserves disabled and BYO cache operations on gkeCluster", () => {
+    const target = defineTarget({
+      cluster: gkeCluster(),
+      exposure: manualExposure({ hosts }),
+    });
+    const infrastructure = { projectId: "sample-project", region: "us-central1" };
+
+    expect(
+      compileTarget(target, context({ infrastructure, cache: "none" })).plan.operations.cache,
+    ).toEqual({ kind: "none" });
+    expect(
+      compileTarget(target, context({ infrastructure, cache: "external" })).plan.operations.cache,
+    ).toEqual({ kind: "external", lifecycle: "operator-managed" });
+  });
+
+  it("accepts managed cache provisioning from a resource contribution", () => {
+    const cache = defineResourceComponent({
+      name: "managed-cache",
+      build: (ctx) => ({
+        cache: {
+          kind: "gcp-memorystore",
+          projectId: "sample-project",
+          region: "us-central1",
+          name: `${ctx.releaseName}-cache`,
+          network: "default",
+          sizeGb: 2,
+          tier: "BASIC",
+          security: { kind: "auth-tls-required" },
+        },
+      }),
+    });
+    const compiled = compileTarget(
+      defineTarget({
+        cluster: kubernetesCluster(),
+        exposure: manualExposure({ hosts }),
+        resources: [cache],
+      }),
+      context({
+        cache: { kind: "managed", sizeGb: 2, tier: "BASIC", auth: true },
+      }),
+    );
+
+    expect(compiled.plan.operations.cache.kind).toBe("gcp-memorystore");
+    expect(compiled.plan.operations.cleanup.external).toContainEqual({
+      kind: "gcp-memorystore",
+      projectId: "sample-project",
+      region: "us-central1",
+      name: "test-app-cache",
+    });
+  });
 });
 
 describe("open build-time hooks", () => {

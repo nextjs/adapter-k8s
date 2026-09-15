@@ -31,6 +31,7 @@ export type {
   PoolManifest,
 } from "./types.js";
 export type {
+  CacheProvisioning,
   ClusterAccess,
   ClusterIdentity,
   CompositionPlan,
@@ -78,6 +79,8 @@ export type {
   KubernetesClusterOptions,
   KubernetesContribution,
   KubernetesTargetDefinition,
+  ManagedCacheRequest,
+  ResourceBuildResult,
   ResourceComponent,
   RoutingBuildResult,
   RoutingBuildContext,

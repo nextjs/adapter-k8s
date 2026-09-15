@@ -33,13 +33,19 @@ import { runDomainChecks } from "../../src/cli/doctor.js";
 import { provisionMemorystore } from "../../src/cli/provision-cache.js";
 import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { routingManifestSnapshotName } from "../../src/emit/templates/routing-manifest-configmap.js";
-import { poolResourceNames } from "../../src/emit/templates/utils.js";
+import { compositionPlanConfigMapName } from "../../src/emit/templates/composition-plan-configmap.js";
+import { poolResourceNames, sanitizeK8sName } from "../../src/emit/templates/utils.js";
 import { renderHPA } from "../../src/emit/templates/hpa.js";
 import { cdnTagForBuildId } from "../../src/cdn-tags.js";
 import {
   internalSecretName,
   legacyInternalSecretName,
 } from "../../src/emit/templates/internal-secret.js";
+import {
+  fingerprintCompositionPlan,
+  type CompositionPlan,
+} from "../../src/composition-plan/index.js";
+import { compileTarget, defineTarget, gkeCluster, manualExposure } from "../../src/target/index.js";
 
 const PROJECT = "/proj";
 const RELEASE = "rel";
@@ -136,6 +142,8 @@ interface InfraFixture {
   region?: string;
   containerRegistry?: string;
   cacheRegion?: string;
+  cacheProjectId?: string;
+  cacheProvisioningPending?: string;
   namespace?: string;
 }
 
@@ -153,20 +161,34 @@ let fixturePools: string[] = ["ssr"];
 function setupFs({
   infra = BASE_INFRA,
   metadata = { buildId: "buildn", pools: ["ssr"], cacheEnabled: false },
+  compositionPlan,
   cdn = true,
   outputName = "output",
   infrastructureName = "infrastructure.json",
 }: {
   infra?: InfraFixture;
   metadata?: Record<string, unknown>;
+  compositionPlan?: CompositionPlan;
   cdn?: boolean;
   outputName?: string;
   infrastructureName?: string;
 } = {}) {
-  fixturePools = Array.isArray(metadata.pools) ? (metadata.pools as string[]) : ["ssr"];
+  const effectiveMetadata = compositionPlan
+    ? {
+        ...metadata,
+        compositionPlan: {
+          digest: fingerprintCompositionPlan(compositionPlan),
+          targetFingerprint: compositionPlan.target.fingerprint,
+        },
+      }
+    : metadata;
+  fixturePools = Array.isArray(effectiveMetadata.pools)
+    ? (effectiveMetadata.pools as string[])
+    : ["ssr"];
   const fixtureInfraPath = path.join(PROJECT, ".k8s-adapter", infrastructureName);
   const fixtureOutput = path.join(PROJECT, ".k8s-adapter", outputName);
   const fixtureMetaPath = path.join(fixtureOutput, "build-metadata.json");
+  const fixturePlanPath = path.join(fixtureOutput, "composition-plan.json");
   const fixtureCdnFilter = path.join(fixtureOutput, "chart", "templates", "cdn-http-filter.yaml");
   const fixtureRouteExtJobYaml = path.join(
     fixtureOutput,
@@ -178,14 +200,49 @@ function setupFs({
     (p) =>
       p === fixtureInfraPath ||
       p === fixtureMetaPath ||
+      (compositionPlan !== undefined && p === fixturePlanPath) ||
       (cdn && p === fixtureCdnFilter) ||
       p === fixtureRouteExtJobYaml,
   );
   vi.mocked(readFileSync).mockImplementation((p) => {
     if (p === fixtureInfraPath) return JSON.stringify(infra);
-    if (p === fixtureMetaPath) return JSON.stringify(metadata);
+    if (p === fixtureMetaPath) return JSON.stringify(effectiveMetadata);
+    if (p === fixturePlanPath && compositionPlan) return JSON.stringify(compositionPlan);
     return "";
   });
+}
+
+function gkeCompositionPlan(options: {
+  buildId?: string;
+  cache:
+    | "none"
+    | "external"
+    | {
+        kind: "managed";
+        region?: string;
+        sizeGb: number;
+        tier: "BASIC" | "STANDARD_HA";
+        auth: boolean;
+      };
+}): CompositionPlan {
+  return compileTarget(
+    defineTarget({
+      cluster: gkeCluster({ projectId: "my-project", region: "us-central1" }),
+      exposure: manualExposure({
+        hosts: [{ hostname: "app.example.com", tls: { enabled: false } }],
+      }),
+    }),
+    {
+      releaseName: RELEASE,
+      namespace: "default",
+      buildId: options.buildId ?? "buildn",
+      imageRegistry: REGISTRY,
+      pools: ["ssr"],
+      defaultPool: "ssr",
+      failurePolicy: "closed",
+      cache: options.cache,
+    },
+  ).plan;
 }
 
 /** What the previous build's LIVE Deployment reports to the capacity gate. */
@@ -633,6 +690,73 @@ function happyCluster(
   });
 }
 
+function happyCompositionCluster(
+  events: string[],
+  deployedPlans: Record<string, CompositionPlan> = {},
+) {
+  const cluster = happyCluster(events);
+  return vi.fn(async (cmd: string, args: string[]) => {
+    const raw = args.at(-1);
+    if (cmd === "kubectl" && args.includes("--raw") && raw === "/version") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ gitVersion: "v1.35.2-gke.10" }),
+        stderr: "",
+      };
+    }
+    if (
+      cmd === "kubectl" &&
+      args.includes("--raw") &&
+      raw?.startsWith("/apis/discovery.k8s.io/v1/namespaces/")
+    ) {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ items: [{ endpoints: [{ conditions: { ready: true } }] }] }),
+        stderr: "",
+      };
+    }
+    if (cmd === "kubectl" && args.includes("--raw")) {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          resources: [
+            { name: "services", kind: "Service" },
+            { name: "deployments", kind: "Deployment" },
+            { name: "horizontalpodautoscalers", kind: "HorizontalPodAutoscaler" },
+            { name: "poddisruptionbudgets", kind: "PodDisruptionBudget" },
+            { name: "networkpolicies", kind: "NetworkPolicy" },
+            { name: "endpointslices", kind: "EndpointSlice" },
+          ],
+        }),
+        stderr: "",
+      };
+    }
+    if (cmd === "kubectl" && args[0] === "get" && args[1] === "configmap") {
+      const plan = Object.values(deployedPlans).find(
+        (entry) => compositionPlanConfigMapName(RELEASE, entry.metadata.buildId) === args[2],
+      );
+      if (plan) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            metadata: {
+              annotations: {
+                "adapter-k8s.dev/composition-digest": fingerprintCompositionPlan(plan),
+              },
+            },
+            data: { "plan.json": JSON.stringify(plan) },
+          }),
+          stderr: "",
+        };
+      }
+    }
+    if (cmd === "gcloud" && args.includes("delete") && args.includes("rel-cache")) {
+      events.push("cache-delete");
+    }
+    return cluster(cmd, args);
+  });
+}
+
 describe("runDeploy — orchestration", () => {
   let events: string[];
 
@@ -1044,13 +1168,13 @@ describe("runDeploy — orchestration", () => {
         ([, a]) => a.includes("patch") && a.includes("service") && a.includes("rel-ssr"),
       );
     expect(patchCalls).toHaveLength(2);
-    const forward = JSON.parse(patchCalls[0]![1].at(-1)!)[0].value;
+    const forward = JSON.parse(patchCalls[0]![1].at(-1)!)[1].value;
     expect(forward).toMatchObject({
       "app.kubernetes.io/component": "ssr",
       "app.kubernetes.io/version": "buildn",
       "example.com/custom": "kept",
     });
-    const restored = JSON.parse(patchCalls[1]![1].at(-1)!)[0].value;
+    const restored = JSON.parse(patchCalls[1]![1].at(-1)!)[1].value;
     expect(restored).toEqual({
       "app.kubernetes.io/name": "rel",
       "app.kubernetes.io/component": "legacy-fallback",
@@ -1092,7 +1216,7 @@ describe("runDeploy — orchestration", () => {
       .mock.calls.find(
         ([, args]) => args[0] === "patch" && args[1] === "service" && args[2] === "rel-api",
       );
-    const selector = JSON.parse(apiPatch![1].at(-1)!)[0].value;
+    const selector = JSON.parse(apiPatch![1].at(-1)!)[1].value;
     expect(selector).toEqual({
       "app.kubernetes.io/name": "rel",
       "app.kubernetes.io/component": "api",
@@ -1251,7 +1375,11 @@ describe("runDeploy — guards and teardown", () => {
     // Regression: metadata from an older adapter version carries cacheEnabled but no
     // cacheManaged flag; the teardown branch then deleted a LIVE managed Memorystore.
     setupFs({
-      infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
@@ -1482,7 +1610,17 @@ describe("runDeploy — guards and teardown", () => {
       previousBuildId: null,
       poolTopologies: { [prevBuild]: ["ssr"] },
     } as never);
-    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCluster(events, {
+        activeSelectorByPool: {
+          [`${longRelease}-ssr`.slice(`${RELEASE}-`.length)]: {
+            "app.kubernetes.io/name": longRelease,
+            "app.kubernetes.io/component": "ssr",
+            "app.kubernetes.io/version": sanitizeK8sName(prevBuild),
+          },
+        },
+      }) as never,
+    );
 
     await runDeploy({ projectDir: PROJECT, releaseName: longRelease, skipBuild: true });
 
@@ -1529,27 +1667,481 @@ describe("runDeploy — guards and teardown", () => {
     ).rejects.toThrow(new RegExp(`Failed to parse ${infraPath.replace(/[/.]/g, "\\$&")}`));
   });
 
-  it("managed→BYO: tears down the previously provisioned Memorystore and clears cacheRegion", async () => {
+  it("refuses a legacy managed→BYO transition before Kubernetes or GCP changes", async () => {
     setupFs({
-      infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
+      metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
+    });
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (cmd === "gcloud" && args.includes("delete") && args.includes("rel-cache")) {
+        events.push("cache-delete");
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing legacy build.*bring-your-own.*composition plan/s);
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
+    expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(calls.some((a) => a.includes("delete secret"))).toBe(false);
+    expect(events).not.toContain("helm");
+    expect(vi.mocked(writeState)).not.toHaveBeenCalled();
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unauthenticated legacy cache transition before Helm can fail", async () => {
+    setupFs({
+      infra: { ...BASE_INFRA, cacheRegion: "us-central1", cacheProjectId: "my-project" },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: true, cacheManaged: false },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+    vi.mocked(execOrThrow).mockImplementation((async (cmd: string) => {
+      if (cmd === "helm") throw new Error("helm failed");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing legacy build/);
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(events).not.toContain("helm");
+  });
+
+  it("refuses a composed transition when the outgoing managed build has no plan anchor", async () => {
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing legacy build buildm.*bring-your-own/s);
+
+    expect(events).not.toContain("helm");
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(([, args]) => args.includes("delete") && args.includes("rel-cache")),
+    ).toBe(false);
+  });
+
+  it("provisions the authenticated composition plan's managed Memorystore operation", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: {
+        kind: "managed",
+        region: "europe-west1",
+        sizeGb: 5,
+        tier: "STANDARD_HA",
+        auth: false,
+      },
+    });
+    setupFs({
+      compositionPlan,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+        cacheMemorystore: {
+          region: "europe-west1",
+          sizeGb: 5,
+          tier: "STANDARD_HA",
+          auth: false,
+        },
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
 
     await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
 
-    const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
-    expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(true);
-    // The BYO Secret is helm-owned — the imperative secret delete must NOT run.
-    expect(calls.some((a) => a.includes("delete secret"))).toBe(false);
-    // cacheRegion was cleared from infrastructure.json.
+    expect(vi.mocked(provisionMemorystore)).toHaveBeenCalledWith({
+      projectId: "my-project",
+      region: "europe-west1",
+      releaseName: RELEASE,
+      network: "default",
+      sizeGb: 5,
+      tier: "STANDARD_HA",
+      auth: false,
+      log: expect.any(Function),
+    });
     const infraWrites = vi
       .mocked(writeFileSync)
       .mock.calls.filter(([p]) => p === infraPath)
       .map(([, content]) => String(content));
-    expect(infraWrites.length).toBeGreaterThan(0);
-    expect(infraWrites[infraWrites.length - 1]).not.toContain("cacheRegion");
+    expect(infraWrites.some((content) => content.includes('"cacheRegion": "europe-west1"'))).toBe(
+      true,
+    );
+    expect(infraWrites.some((content) => content.includes('"cacheProjectId": "my-project"'))).toBe(
+      true,
+    );
+    expect(
+      infraWrites.some((content) => content.includes('"cacheProvisioningPending": "true"')),
+    ).toBe(true);
+    expect(infraWrites.at(-1)).not.toContain("cacheProvisioningPending");
+  });
+
+  it("records pending cache coordinates before provisioning can fail", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    setupFs({
+      compositionPlan,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+    vi.mocked(provisionMemorystore).mockRejectedValueOnce(new Error("AUTH string unavailable"));
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/AUTH string unavailable/);
+
+    const infraWrites = vi
+      .mocked(writeFileSync)
+      .mock.calls.filter(([p]) => p === infraPath)
+      .map(([, content]) => String(content));
+    expect(infraWrites.at(-1)).toContain('"cacheRegion": "us-central1"');
+    expect(infraWrites.at(-1)).toContain('"cacheProjectId": "my-project"');
+    expect(infraWrites.at(-1)).toContain('"cacheProvisioningPending": "true"');
+    expect(events).not.toContain("helm");
+  });
+
+  it("requires a managed retry while a paid cache operation is pending", async () => {
+    const compositionPlan = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+        cacheProvisioningPending: "true",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/managed-cache provision is pending.*Retry the same managed-cache plan/s);
+
     expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
+  });
+
+  it("refuses to infer a legacy cache project from mutable cluster coordinates", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    setupFs({
+      compositionPlan,
+      infra: { ...BASE_INFRA, cacheRegion: "us-central1" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/incomplete managed-cache identity.*cacheProjectId=undefined/s);
+
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
+  });
+
+  it("re-reads deploy state before Helm after paid-resource preparation", async () => {
+    setupFs();
+    vi.mocked(readState)
+      .mockResolvedValueOnce({
+        buildId: "buildm",
+        previousBuildId: null,
+        poolTopologies: { buildm: ["ssr"] },
+      } as never)
+      .mockResolvedValueOnce({
+        buildId: "buildn",
+        previousBuildId: "buildm",
+        poolTopologies: { buildn: ["ssr"], buildm: ["ssr"] },
+      } as never);
+    vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/state changed during release preparation.*stale state/s);
+
+    expect(vi.mocked(readState)).toHaveBeenCalledTimes(2);
+    expect(events).not.toContain("helm");
+  });
+
+  it("refuses to orphan a managed cache when its project or region changes", async () => {
+    const compositionPlan = gkeCompositionPlan({
+      cache: {
+        kind: "managed",
+        region: "europe-west1",
+        sizeGb: 5,
+        tier: "STANDARD_HA",
+        auth: true,
+      },
+    });
+    setupFs({
+      compositionPlan,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+        cacheMemorystore: {
+          region: "europe-west1",
+          sizeGb: 5,
+          tier: "STANDARD_HA",
+          auth: true,
+        },
+      },
+    });
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/Cannot replace the managed cache.*us-central1.*europe-west1/s);
+
+    expect(vi.mocked(provisionMemorystore)).not.toHaveBeenCalled();
+    expect(events).not.toContain("helm");
+  });
+
+  it("cleans a composed managed cache only after cutover using the outgoing plan's state anchor", async () => {
+    const outgoing = gkeCompositionPlan({
+      buildId: "buildm",
+      cache: {
+        kind: "managed",
+        region: "europe-west1",
+        sizeGb: 3,
+        tier: "BASIC",
+        auth: true,
+      },
+    });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "europe-west1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCompositionCluster(events, { buildm: outgoing }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const deleteCall = vi
+      .mocked(execCapture)
+      .mock.calls.find(
+        ([cmd, args]) => cmd === "gcloud" && args.includes("delete") && args.includes("rel-cache"),
+      );
+    expect(deleteCall?.[1]).toContain("europe-west1");
+    expect(deleteCall?.[1]).toContain("my-project");
+    expect(events.indexOf("cache-delete")).toBeGreaterThan(events.indexOf("writeState"));
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(
+          ([cmd, args]) =>
+            cmd === "kubectl" &&
+            args[1] === "configmap" &&
+            args[2] === compositionPlanConfigMapName(RELEASE, "buildm"),
+        ),
+    ).toBe(true);
+  });
+
+  it("defers composed cache cleanup when the outgoing plan cannot be authenticated", async () => {
+    const outgoing = gkeCompositionPlan({
+      buildId: "buildm",
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(happyCompositionCluster(events) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toMatch(
+      /could not authenticate.*NOT deleted.*outgoing build artifact.*adapter-k8s destroy/s,
+    );
+  });
+
+  it("does not treat the cluster cache claim as cloud-deletion authority", async () => {
+    const outgoing = gkeCompositionPlan({
+      buildId: "buildm",
+      cache: { kind: "managed", sizeGb: 1, tier: "BASIC", auth: true },
+    });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    const cluster = happyCompositionCluster(events, { buildm: outgoing });
+    vi.mocked(execCapture).mockImplementation((async (cmd: string, args: string[]) => {
+      if (
+        cmd === "kubectl" &&
+        args[0] === "get" &&
+        args[1] === "configmap" &&
+        args[2] === "rel-cache-identity"
+      ) {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            metadata: {
+              labels: {
+                "app.kubernetes.io/name": RELEASE,
+                "app.kubernetes.io/component": "managed-cache-identity",
+                "adapter-k8s.dev/release": RELEASE,
+              },
+            },
+            data: { projectId: "my-project", region: "us-central1" },
+          }),
+          stderr: "",
+        };
+      }
+      return cluster(cmd, args);
+    }) as never);
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(vi.mocked(console.warn).mock.calls.flat().join("\n")).toMatch(
+      /authenticated plan names my-project\/us-central1.*durable provisioning state records undefined\/undefined/s,
+    );
+  });
+
+  it("ignores stale local cache markers when neither composed plan owns a managed cache", async () => {
+    const outgoing = gkeCompositionPlan({ buildId: "buildm", cache: "external" });
+    const incoming = gkeCompositionPlan({ cache: "external" });
+    setupFs({
+      compositionPlan: incoming,
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-central1",
+        cacheProjectId: "my-project",
+      },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: false,
+      },
+    });
+    vi.mocked(readState).mockResolvedValue({
+      buildId: "buildm",
+      previousBuildId: "buildm0",
+      poolTopologies: { buildm: ["ssr"], buildm0: ["ssr"] },
+      compositionPlans: {
+        buildm: {
+          digest: fingerprintCompositionPlan(outgoing),
+          targetFingerprint: outgoing.target.fingerprint,
+        },
+      },
+    } as never);
+    vi.mocked(execCapture).mockImplementation(
+      happyCompositionCluster(events, { buildm: outgoing }) as never,
+    );
+
+    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
+    expect(calls.some((args) => args.includes("redis instances delete rel-cache"))).toBe(false);
   });
 
   it("aborts before Helm rather than adopting a foreign-owned non-cache Secret", async () => {
@@ -1586,20 +2178,25 @@ describe("runDeploy — guards and teardown", () => {
     expect(valkeyPatches).toHaveLength(0);
   });
 
-  it("cache disabled: removes the Secret AND the managed instance (regression)", async () => {
+  it("refuses to disable a legacy managed cache before deleting its Secret or instance", async () => {
     setupFs({
-      infra: { ...BASE_INFRA, cacheRegion: "us-east1" },
+      infra: {
+        ...BASE_INFRA,
+        cacheRegion: "us-east1",
+        cacheProjectId: "my-project",
+      },
       metadata: { buildId: "buildn", pools: ["ssr"], cacheEnabled: false, cacheManaged: false },
     });
     vi.mocked(execCapture).mockImplementation(happyCluster(events) as never);
 
-    await runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).rejects.toThrow(/outgoing legacy build.*disabled caching/s);
 
     const calls = vi.mocked(execCapture).mock.calls.map(([, a]) => a.join(" "));
-    expect(calls.some((a) => a.includes("delete secret rel-valkey"))).toBe(true);
-    expect(
-      calls.some((a) => a.includes("redis instances delete rel-cache") && a.includes("us-east1")),
-    ).toBe(true);
+    expect(calls.some((a) => a.includes("delete secret rel-valkey"))).toBe(false);
+    expect(calls.some((a) => a.includes("redis instances delete rel-cache"))).toBe(false);
+    expect(events).not.toContain("helm");
   });
 
   it("BYO from the start (no cacheRegion): no teardown of anything", async () => {
