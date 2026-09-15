@@ -3841,6 +3841,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     port,
     host: process.env.ADAPTER_K8S_LISTEN_HOST,
     poolName,
+    requestLogging: routingManifest.requestLogging !== false,
     trustInternalHeaders,
     internalSecret,
     proofHeaderNames,

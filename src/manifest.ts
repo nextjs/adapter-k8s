@@ -167,6 +167,7 @@ export function buildRoutingManifest({
   i18n,
   trailingSlash,
   caseSensitive = false,
+  requestLogging,
   nextVersion,
   projectDir,
   distDir,
@@ -179,6 +180,7 @@ export function buildRoutingManifest({
   i18n: BuildCompleteContext["config"]["i18n"] | null;
   trailingSlash: boolean;
   caseSensitive?: boolean;
+  requestLogging?: boolean;
   nextVersion: string;
   projectDir: string;
   /**
@@ -361,6 +363,10 @@ export function buildRoutingManifest({
     builtAt: stableBuiltAt(resolvedDistDir),
     basePath,
     trailingSlash,
+    // Omit the default so retained manifests from older builds remain byte-compatible and
+    // continue to log. Next's object-form controls apply to its development logger; this
+    // production access-log opt-out deliberately follows only the top-level false contract.
+    ...(requestLogging === false ? { requestLogging: false as const } : {}),
     middleware: outputs.middleware
       ? {
           filePath: path.relative(projectDir, outputs.middleware.filePath),

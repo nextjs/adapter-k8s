@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import {
+  assertSafeGcpResourceName,
   assertSafeReleaseName,
   assertSafeProjectId,
-  assertSafeRegion,
   assertSafeBuildId,
   renderImagePullSecrets,
 } from "./utils.js";
@@ -20,15 +20,17 @@ export function routeExtJobName(releaseName: string, buildId: string): string {
 export function renderRouteExtUpdateJob({
   releaseName,
   projectId,
-  region,
   buildId,
+  extensionName = `${releaseName}-traffic-ext`,
+  addressName = `${releaseName}-ip`,
   documentDigest,
   pullSecrets,
 }: {
   releaseName: string;
   projectId: string;
-  region: string;
   buildId: string;
+  extensionName?: string;
+  addressName?: string;
   /**
    * S9. SHA-256 of the route-extension.yaml body this chart rendered
    * (routeExtDocumentDigest()). The Job refuses to import a mounted document that does not
@@ -50,8 +52,9 @@ export function renderRouteExtUpdateJob({
   // before interpolation so shell metacharacters can't break out of the script.
   assertSafeReleaseName(releaseName);
   assertSafeProjectId(projectId);
-  assertSafeRegion(region);
   assertSafeBuildId(buildId);
+  assertSafeGcpResourceName(extensionName, "traffic extension name");
+  assertSafeGcpResourceName(addressName, "global address name");
   // Registry pull auth — "" when unconfigured, keeping existing charts byte-identical.
   const pullSecretsBlock = renderImagePullSecrets(pullSecrets, "      ");
   // Include buildId in the Job name so each deploy creates a fresh Job
@@ -112,13 +115,13 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               # Discover forwarding rules by the gateway's OWN frontend IP, never by a
               # name~releaseName substring: a short or shared release name (e.g. "app") would
               # regex-match another application's forwarding rules and attach this middleware
-              # to their load balancer. The reserved static IP "${releaseName}-ip" is this
+              # to their load balancer. The reserved static IP "${addressName}" is this
               # gateway's frontend, so filtering on IPAddress selects exactly this LB's rules.
-              echo "Resolving gateway frontend IP (${releaseName}-ip)..."
-              GWIP=$(gcloud compute addresses describe ${releaseName}-ip --global \
+              echo "Resolving gateway frontend IP (${addressName})..."
+              GWIP=$(gcloud compute addresses describe ${addressName} --global \
                 --project=${projectId} --format="value(address)" 2>/dev/null)
               if [ -z "$GWIP" ]; then
-                echo "ERROR: could not resolve gateway IP '${releaseName}-ip'. Refusing to fall"
+                echo "ERROR: could not resolve gateway IP '${addressName}'. Refusing to fall"
                 echo "back to name matching (could attach middleware to another app's LB)."
                 exit 1
               fi
@@ -181,10 +184,12 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               #    (route extensions are unsupported on the global external ALB; traffic
               #    extensions run post-cache on origin traffic). Expand the placeholder line
               #    into one entry per forwarding rule.
-              echo "$FRS" | sed 's/^/  - "/; s/$/"/' > /tmp/fr_list.yaml
-              awk '/FORWARDING_RULE_PLACEHOLDER/{while((getline l < "/tmp/fr_list.yaml")>0) print l; next} {print}' \
-                /config/route-extension.yaml > /tmp/ext.yaml
-              cat /tmp/ext.yaml
+              # A projected ConfigMap can change between reads. Verify one private snapshot,
+              # then expand and import only those bytes, never reopen the mutable mount.
+              umask 077
+              WORK_DIR=$(mktemp -d /tmp/route-ext.XXXXXX)
+              trap 'rm -rf "$WORK_DIR"' EXIT
+              cp /config/route-extension.yaml "$WORK_DIR/route-extension.yaml"
               # N73 (SECURITY). /config is an operator-mutable ConfigMap, and this Job
               # imports whatever it finds there under a Workload Identity holding
               # networkservices.lbTrafficExtensions.* + compute.backendServices.update.
@@ -212,13 +217,13 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
               # true while the placeholder is the sole source of them, so require it.
               EXPECT_DIGEST="${documentDigest ?? ""}"
               if [ -n "$EXPECT_DIGEST" ]; then
-                if ! grep -q 'FORWARDING_RULE_PLACEHOLDER' /config/route-extension.yaml; then
+                if ! grep -q 'FORWARDING_RULE_PLACEHOLDER' "$WORK_DIR/route-extension.yaml"; then
                   echo "ERROR: route-extension.yaml carries no FORWARDING_RULE_PLACEHOLDER."
                   echo "Refusing to import: forwarding rules must come from this Job's own"
                   echo "discovery, never from the mounted ConfigMap."
                   exit 1
                 fi
-                GOT_DIGEST=$(sha256sum /config/route-extension.yaml | cut -d" " -f1)
+                GOT_DIGEST=$(sha256sum "$WORK_DIR/route-extension.yaml" | cut -d" " -f1)
                 if [ "$GOT_DIGEST" != "$EXPECT_DIGEST" ]; then
                   echo "ERROR: route-extension.yaml does not match the rendered chart."
                   echo "  expected sha256: $EXPECT_DIGEST"
@@ -228,10 +233,14 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
                 fi
                 echo "route-extension.yaml matches the rendered chart (sha256) ✓"
               fi
+              echo "$FRS" | sed 's/^/  - "/; s/$/"/' > "$WORK_DIR/fr_list.yaml"
+              awk -v forwarding_rules="$WORK_DIR/fr_list.yaml" \
+                '/FORWARDING_RULE_PLACEHOLDER/{while((getline l < forwarding_rules)>0) print l; next} {print}' \
+                "$WORK_DIR/route-extension.yaml" > "$WORK_DIR/ext.yaml"
               EXPECT_SERVICE="projects/${projectId}/global/backendServices/${releaseName}-routing-service"
               EXPECT_AUTHORITY="${releaseName}-routing-service.{{ .Release.Namespace }}.svc.cluster.local"
-              GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
-              GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml)
+              GOT_SERVICE=$(sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml")
+              GOT_AUTHORITY=$(sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml")
               if [ "$GOT_SERVICE" != "$EXPECT_SERVICE" ]; then
                 echo "ERROR: route-extension.yaml service mismatch."
                 echo "  expected: $EXPECT_SERVICE"
@@ -246,18 +255,18 @@ ${pullSecretsBlock}      # This Job uses the same immutable multi-platform image
                 echo "  found:    $GOT_AUTHORITY"
                 exit 1
               fi
-              # The extension name is this release's by construction; a mismatch means the
-              # mount was replaced wholesale.
-              if ! grep -q '^name: "${releaseName}-traffic-ext"$' /tmp/ext.yaml; then
-                echo "ERROR: route-extension.yaml is not for ${releaseName}-traffic-ext."
+              # The extension name is authenticated by the composition operation; a mismatch
+              # means the mount was replaced wholesale.
+              if ! grep -q '^name: "${extensionName}"$' "$WORK_DIR/ext.yaml"; then
+                echo "ERROR: route-extension.yaml is not for ${extensionName}."
                 exit 1
               fi
               echo "route-extension.yaml verified against rendered service/authority ✓"
               gcloud service-extensions lb-traffic-extensions import \
-                ${releaseName}-traffic-ext \
+                ${extensionName} \
                 --project=${projectId} \
                 --location=global \
-                --source=/tmp/ext.yaml \
+                --source="$WORK_DIR/ext.yaml" \
                 --quiet
           env:
             - name: CLOUDSDK_CORE_PROJECT

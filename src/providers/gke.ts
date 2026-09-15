@@ -69,42 +69,50 @@ export const gkeProvider: ProviderAdapter = {
     releaseName,
     buildId,
     infrastructure,
+    executorProjectId,
+    registration,
     extensionChainJson,
     routeExtDocumentDigest,
     config,
   }: ProviderExtProcContext) {
     if (!extensionChainJson) return {};
-    // N50: without projectId/region the chain JSON renders
+    // N50: without a resource project the chain JSON renders
     // `projects//global/backendServices/...` and nothing can register it — the chart would
     // install the routing service while the edge silently kept the previous build's chain (or
     // bypassed the middleware tier) and the deploy reported success. Refuse instead.
+    const projectId = registration?.projectId ?? infrastructure?.projectId;
+    const identityProjectId = executorProjectId ?? infrastructure?.projectId ?? projectId;
+    const extensionName = registration?.extensionName ?? `${releaseName}-traffic-ext`;
+    const addressName = registration?.addressName ?? `${releaseName}-ip`;
     const missing = [
-      infrastructure?.projectId ? null : "projectId",
-      infrastructure?.region ? null : "region",
-    ].filter((m): m is string => m !== null);
+      projectId ? null : "routing projectId",
+      identityProjectId ? null : "executor projectId",
+    ].filter((entry): entry is string => entry !== null);
     if (missing.length > 0) {
       throw new Error(
-        `[adapter-k8s] Cannot render the GXLB traffic extension: .k8s-adapter/` +
-          `infrastructure.json is missing ${missing.join(" and ")}. Without ${missing.join(" and ")} ` +
+        `[adapter-k8s] Cannot render the GXLB traffic extension: the authenticated target is ` +
+          `missing ${missing.join(" and ")}. Without ${missing.join(" and ")} ` +
           `the chart would install the ext_proc routing service but never register the route ` +
           `extension — the edge would keep the previous build's chain (or bypass the middleware ` +
           `tier entirely) while the deploy reported success. Run \`npx adapter-k8s init\` to ` +
-          `regenerate infrastructure.json.`,
+          `regenerate the composition plan.`,
       );
     }
 
     const files: Record<string, string> = {};
     files["templates/route-ext-config.yaml"] = renderRouteExtConfigMap({
       releaseName,
+      extensionName,
       // Guaranteed non-empty by generateHelmChart's `if (extensionChainJson)` guard.
       extensionChainJson: extensionChainJson!,
     });
     // Guaranteed present by generateHelmChart's guard.
     files["templates/route-ext-update-job.yaml"] = renderRouteExtUpdateJob({
       releaseName,
-      projectId: infrastructure!.projectId!,
-      region: infrastructure!.region!,
+      projectId: projectId!,
       buildId,
+      extensionName,
+      addressName,
       // S9: pin the Job to the exact document the ConfigMap above rendered.
       documentDigest: routeExtDocumentDigest(),
       // Same imagePullSecrets as every other pod the chart creates.
@@ -114,7 +122,7 @@ export const gkeProvider: ProviderAdapter = {
     });
     files["templates/deploy-service-account.yaml"] = renderDeployServiceAccount({
       releaseName,
-      projectId: infrastructure!.projectId!,
+      projectId: identityProjectId!,
     });
     return files;
   },

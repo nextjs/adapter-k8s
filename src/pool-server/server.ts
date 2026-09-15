@@ -397,6 +397,8 @@ export interface PoolServerOptions {
   appOwnsProbePath?: (pathname: string) => boolean;
   /** Validated build-time pool name, used only as a bounded telemetry attribute. */
   poolName?: string;
+  /** Whether to emit one completion log per request. Mirrors Next's top-level `logging: false`. */
+  requestLogging?: boolean;
 }
 
 interface ActiveResponseState {
@@ -485,6 +487,7 @@ export function createPoolServer(options: PoolServerOptions) {
     readiness,
     appOwnsProbePath,
     poolName,
+    requestLogging = true,
   } = options;
 
   // /readyz detail goes to the pod LOG, not the wire: the probe interception runs before any
@@ -665,10 +668,12 @@ export function createPoolServer(options: PoolServerOptions) {
           setSpanHttpStatus(span, res.statusCode);
           recordPoolRequest(ms, metricAttributes);
 
-          // Log the pathname only — the raw query string routinely carries tokens and
-          // signed parameters (pre-signed URLs, session hints) that must not land in logs.
-          const logPath = req.url?.split("?", 1)[0] ?? "";
-          console.log(`${req.method} ${logPath} → ${res.statusCode} (${Math.round(ms)}ms)`);
+          if (requestLogging) {
+            // Log the pathname only — the raw query string routinely carries tokens and
+            // signed parameters (pre-signed URLs, session hints) that must not land in logs.
+            const logPath = req.url?.split("?", 1)[0] ?? "";
+            console.log(`${req.method} ${logPath} → ${res.statusCode} (${Math.round(ms)}ms)`);
+          }
         }
       },
     );

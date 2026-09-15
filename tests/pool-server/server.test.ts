@@ -146,6 +146,36 @@ describe("createPoolServer", () => {
       logSpy.mockRestore();
     }
   });
+
+  it("suppresses request logs when Next logging is disabled", async () => {
+    const onRequest = vi.fn((req: IncomingMessage, res: ServerResponse) => {
+      if (req.url === "/boom") throw new Error("visible in the pod log");
+      res.writeHead(200);
+      res.end("ok");
+    });
+    server = createPoolServer({ onRequest, port: 0, requestLogging: false });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const { port } = await server.start();
+      const res = await fetch(`http://127.0.0.1:${port}/quiet`);
+      expect(res.status).toBe(200);
+      const failed = await fetch(`http://127.0.0.1:${port}/boom`);
+      expect(failed.status).toBe(500);
+
+      const logs = logSpy.mock.calls.map((call) => String(call[0]));
+      expect(logs).toContainEqual(expect.stringContaining("Pool server listening on port"));
+      expect(logs).not.toContainEqual(expect.stringContaining("GET /quiet"));
+      expect(logs).not.toContainEqual(expect.stringContaining("GET /boom"));
+      expect(errorSpy).toHaveBeenCalledWith(
+        "Unhandled request error:",
+        expect.objectContaining({ message: "visible in the pod log" }),
+      );
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 describe("internal header security", () => {

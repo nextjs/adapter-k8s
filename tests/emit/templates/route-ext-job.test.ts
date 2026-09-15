@@ -31,11 +31,26 @@ const MINIMAL_CHAIN_JSON = JSON.stringify(
 );
 
 describe("renderRouteExtUpdateJob", () => {
+  it("renders plan-selected extension and frontend address names", () => {
+    const yaml = renderRouteExtUpdateJob({
+      releaseName: "my-app",
+      projectId: "routing-project",
+      buildId: "abc123",
+      extensionName: "custom-traffic-ext",
+      addressName: "custom-frontend-ip",
+    });
+
+    expect(yaml).toContain("gcloud compute addresses describe custom-frontend-ip");
+    expect(yaml).toMatch(/lb-traffic-extensions import\s+custom-traffic-ext/);
+    expect(yaml).toContain("--project=routing-project");
+    expect(yaml).not.toContain("my-app-traffic-ext");
+    expect(yaml).not.toContain("my-app-ip");
+  });
+
   it("renders a Helm hook Job using import command", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     });
     expect(yaml).toContain("kind: Job");
@@ -57,7 +72,6 @@ describe("renderRouteExtUpdateJob", () => {
     const args = {
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     };
     const yaml = renderRouteExtUpdateJob({ ...args, pullSecrets: ["docker-regcred"] });
@@ -76,7 +90,6 @@ describe("renderRouteExtUpdateJob", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId,
     });
     // The rendered Job name MUST equal routeExtJobName's output — deploy.ts skips the
@@ -110,7 +123,6 @@ describe("renderRouteExtUpdateJob", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     });
     expect(yaml).toMatch(/google-cloud-cli@sha256:[0-9a-f]{64}/);
@@ -120,7 +132,6 @@ describe("renderRouteExtUpdateJob", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     });
     // Finished Jobs are swept after an hour.
@@ -145,7 +156,6 @@ describe("renderRouteExtUpdateJob", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     });
     // The Job needs its SA token to call gcloud via Workload Identity — unlike the app
@@ -158,7 +168,6 @@ describe("renderRouteExtUpdateJob", () => {
     const yaml = renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     });
     // P1: must NOT select a single/HTTPS-only forwarding rule — that leaves http:// traffic
@@ -178,7 +187,6 @@ describe("renderRouteExtUpdateJob", () => {
       renderRouteExtUpdateJob({
         releaseName: 'foo";rm -rf /;"',
         projectId: "my-project",
-        region: "us-central1",
         buildId: "abc123",
       }),
     ).toThrow(/Invalid releaseName/);
@@ -190,7 +198,6 @@ describe("renderRouteExtUpdateJob", () => {
         renderRouteExtUpdateJob({
           releaseName,
           projectId: "my-project",
-          region: "us-central1",
           buildId: "abc123",
         }),
       ).toThrow(/Invalid releaseName/);
@@ -202,7 +209,6 @@ describe("renderRouteExtUpdateJob", () => {
       renderRouteExtUpdateJob({
         releaseName: "my-app",
         projectId: "my-project",
-        region: "us-central1",
         buildId: 'abc"123',
       }),
     ).toThrow(/Invalid buildId/);
@@ -213,21 +219,9 @@ describe("renderRouteExtUpdateJob", () => {
       renderRouteExtUpdateJob({
         releaseName: "my-app",
         projectId: 'p";curl evil"',
-        region: "us-central1",
         buildId: "abc123",
       }),
     ).toThrow(/Invalid projectId/);
-  });
-
-  it("rejects a region containing shell metacharacters", () => {
-    expect(() =>
-      renderRouteExtUpdateJob({
-        releaseName: "my-app",
-        projectId: "my-project",
-        region: "us-central1;reboot",
-        buildId: "abc123",
-      }),
-    ).toThrow(/Invalid region/);
   });
 });
 
@@ -427,7 +421,6 @@ describe("N73: route-ext Job verifies the mounted route-extension.yaml", () => {
     renderRouteExtUpdateJob({
       releaseName: "my-app",
       projectId: "my-project",
-      region: "us-central1",
       buildId: "abc123",
     });
 
@@ -457,14 +450,14 @@ describe("N73: route-ext Job verifies the mounted route-extension.yaml", () => {
     }
     expect(yaml).toContain("Refusing to import");
     // …and the extension NAME must be this release's too.
-    expect(yaml).toContain(`grep -q '^name: "my-app-traffic-ext"$' /tmp/ext.yaml`);
+    expect(yaml).toContain(`grep -q '^name: "my-app-traffic-ext"$' "$WORK_DIR/ext.yaml"`);
   });
 
   it("extracts the mounted values with a well-formed sed expression", () => {
     // The rendered script must contain single-backslash BRE groups (a double backslash here
     // would make sed match a literal backslash and the comparison would always fail-closed).
-    expect(job()).toContain(`sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml`);
-    expect(job()).toContain(`sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' /tmp/ext.yaml`);
+    expect(job()).toContain(`sed -n 's/^ *service: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml"`);
+    expect(job()).toContain(`sed -n 's/^ *authority: *"\\(.*\\)" *$/\\1/p' "$WORK_DIR/ext.yaml"`);
   });
 });
 
@@ -482,7 +475,6 @@ describe("S9: whole-document verification", () => {
   const args = {
     releaseName: "my-app",
     projectId: "p-123456",
-    region: "us-central1",
     buildId: "b1",
   };
 
@@ -492,14 +484,14 @@ describe("S9: whole-document verification", () => {
     expect(digest).toMatch(/^[a-f0-9]{64}$/);
     const job = renderRouteExtUpdateJob({ ...args, documentDigest: digest });
     expect(job).toContain(`EXPECT_DIGEST="${digest}"`);
-    expect(job).toContain("sha256sum /config/route-extension.yaml");
+    expect(job).toContain('sha256sum "$WORK_DIR/route-extension.yaml"');
     expect(job).toContain("the mounted ConfigMap was modified after render");
   });
 
   it("requires the forwarding-rule placeholder, so rules can only come from discovery", () => {
     // The specific attack: a document with a victim's rules hardcoded and no placeholder.
     const job = renderRouteExtUpdateJob({ ...args, documentDigest: "a".repeat(64) });
-    expect(job).toContain("grep -q 'FORWARDING_RULE_PLACEHOLDER' /config/route-extension.yaml");
+    expect(job).toContain(`grep -q 'FORWARDING_RULE_PLACEHOLDER' "$WORK_DIR/route-extension.yaml"`);
     expect(job).toContain("forwarding rules must come from this Job's own");
   });
 
