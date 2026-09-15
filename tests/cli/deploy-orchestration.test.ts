@@ -2534,7 +2534,7 @@ describe("runDeploy — N25: every post-helm abort puts the ext_proc edge back",
     expect(writeState).not.toHaveBeenCalled();
   });
 
-  it("names the edge's ACTUAL state (and the recovery command) when the revert also fails", async () => {
+  it("names the edge's actual state and trusted recovery requirements when the revert also fails", async () => {
     vi.mocked(revertRoutingServiceToBuild).mockRejectedValue(new Error("field manager conflict"));
     vi.mocked(execCapture).mockImplementation(
       happyCluster(events, { podsNeverReady: true }) as never,
@@ -2549,7 +2549,8 @@ describe("runDeploy — N25: every post-helm abort puts the ext_proc edge back",
     const out = printedErrors();
     expect(out).toContain("could not revert the routing edge to build buildm");
     expect(out).toContain("is running build buildn's middleware");
-    expect(out).toContain("kubectl -n default set image deployment/rel-routing-service");
+    expect(out).toContain("Restore a verified chart or workload revision");
+    expect(out).not.toContain("set image");
     expect(out).not.toContain("reverted to build buildm, so edge and pools are consistent");
   });
 

@@ -95,11 +95,9 @@ export function readJobEmitMetadata(metadataPath: string): JobEmitMetadata {
   if (typeof meta.registry !== "string" || !meta.registry) {
     throw new Error(`emit-metadata.json has no registry — the edge revert could not run.`);
   }
-  // The registry joins a digest below to form the routing image a `kubectl patch` puts on
-  // the routing Deployment — an unvalidated value is an arbitrary-image injection into the
-  // pod that holds the release's dispatch secret. Same for every other value that lands in
-  // a kubectl/gcloud argv or a label selector: the battery runs HERE, on the
-  // operator-mutable ConfigMap read, even though emit validated at write time.
+  // Validate operator-mutable ConfigMap metadata at consumption, even though emit
+  // validated it at write time. Recovery authorizes executable images separately
+  // against workload history; a syntactically valid registry is not that authority.
   assertSafeImageRegistry(meta.registry);
   const digests = meta.digests ?? {};
   for (const [key, digest] of Object.entries(digests)) {

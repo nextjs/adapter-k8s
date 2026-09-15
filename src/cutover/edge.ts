@@ -842,9 +842,9 @@ export function createEdgeRecovery(opts: {
       `  The edge (ext_proc) is running build ${buildId}'s middleware and routing manifest ` +
         `while the pools serve ${previousBuildId}. Mismatched routes fall back to pool-local ` +
         `re-resolution (invariant 1), but edge middleware is the NEW build's until repaired:`,
-      `    kubectl -n ${namespace} set image deployment/` +
-        `${routingServiceDeploymentName(releaseName)} routing-service=` +
-        `${registry}/routing-service:${previousBuildId}`,
+      `  Restore a verified chart or workload revision for this build, including its ` +
+        `image, dispatch Secret, architecture, and routing manifest. Do not reconstruct ` +
+        `an image reference from the state or emit-metadata ConfigMap.`,
     ];
   };
 

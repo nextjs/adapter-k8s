@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../src/cli/exec.js");
 import { execCapture, execCaptureStdin } from "../../src/cli/exec.js";
-import { revertRoutingServiceToBuild } from "../../src/cutover/edge.js";
+import { createEdgeRecovery, revertRoutingServiceToBuild } from "../../src/cutover/edge.js";
 
 const TRUSTED_IMAGE = `trusted.example/project/routing-service@sha256:${"b".repeat(64)}`;
 const ATTACKER_IMAGE = `registry.example/attacker/routing-service@sha256:${"a".repeat(64)}`;
@@ -84,6 +84,24 @@ beforeEach(() => {
   vi.mocked(execCaptureStdin).mockResolvedValue(ok());
 });
 describe("routing recovery workload provenance", () => {
+  it("does not suggest an attacker image as a manual repair when history is missing", async () => {
+    cluster([]);
+    const recovery = createEdgeRecovery({
+      releaseName: "sample",
+      buildId: "new-build",
+      previousBuildId: "old-build",
+      registry: "registry.example/attacker",
+      revertRoutingService: revertRoutingServiceToBuild,
+    });
+    recovery.markHelmMutationAttempted();
+    const result = await recovery.restoreEdgeToPreviousBuild();
+    expect(result.restored).toBe(false);
+    const guidance = recovery.edgeStatusLines(result).join("\n");
+    expect(guidance).not.toContain("registry.example/attacker");
+    expect(guidance).not.toContain("set image");
+    expect(guidance).toContain("Restore a verified chart or workload revision");
+  });
+
   it("ignores well-formed attacker ConfigMap coordinates and restores the authorized image, Secret, and architecture together", async () => {
     const live = workload("new-build");
     live.spec.template.spec.nodeSelector["kubernetes.io/arch"] = "amd64";

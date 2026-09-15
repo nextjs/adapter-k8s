@@ -5,7 +5,6 @@
 import { execCapture, EXEC_TIMEOUTS } from "../cli/exec.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
-import { routingServiceDeploymentName } from "../emit/templates/routing-manifest-configmap.js";
 import { revertRoutingServiceToBuild } from "./edge.js";
 import { assertSafeBuildId } from "../emit/templates/utils.js";
 import type { AdapterState } from "../cli/state.js";
@@ -464,11 +463,12 @@ export async function flipSelectorsToPreviousBuild(opts: {
           `back to pool-local re-resolution (invariant 1), but edge middleware is the ` +
           `PREVIOUS build's until repaired.`,
       );
-      console.error(`  Recover by re-running the rollback, or restore the edge manually:`);
       console.error(
-        `    kubectl -n ${namespace} set image deployment/` +
-          `${routingServiceDeploymentName(releaseName)} routing-service=` +
-          `${opts.registry ?? "<registry>"}/routing-service:${currentBuildId}`,
+        `  Recover by re-running the rollback after restoring trusted workload history.`,
+      );
+      console.error(
+        `  Restore a verified chart or workload revision, including its image, dispatch Secret, ` +
+          `architecture, and routing manifest. Do not reconstruct an image from deploy state.`,
       );
     }
     console.error(`  Both builds were left scaled up.`);

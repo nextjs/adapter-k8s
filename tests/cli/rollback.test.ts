@@ -1430,7 +1430,7 @@ describe("runRollback — partial selector-patch failure rolls the edge forward"
     expect(out).toContain("pools serving buildn");
     // ...and how to recover.
     expect(out).toContain("re-running the rollback");
-    expect(out).toContain("kubectl -n default set image deployment/rel-routing-service");
+    expect(out).toContain("Restore a verified chart or workload revision");
     expect(out).not.toContain(
       "The routing edge (image + manifest) was restored to the current build.",
     );
