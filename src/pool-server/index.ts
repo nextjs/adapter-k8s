@@ -72,7 +72,9 @@ import {
   imageVariantKey,
   type ImageConfig,
   type OptimizedImage,
+  type PreviousImageCacheEntry,
 } from "../next-runtime/image-optimizer.js";
+import { createImageCache } from "../next-runtime/image-cache.js";
 import {
   applyRequestTrustBoundary,
   createPoolServer,
@@ -607,7 +609,12 @@ async function acquireImageAdmission(): Promise<ImageAdmission | null> {
  * (If-None-Match → 304, HEAD, and the error body) is applied by each caller afterwards.
  */
 type ImageOptimizationOutcome =
-  | { kind: "image"; image: OptimizedImage; isStatic: boolean }
+  | {
+      kind: "image";
+      image: OptimizedImage;
+      isStatic: boolean;
+      cacheStatus?: "MISS" | "HIT" | "STALE";
+    }
   | { kind: "error"; status: number; body: string };
 
 /**
@@ -981,6 +988,7 @@ type FetchedImage = {
   // The upstream's own Cache-Control. Next raises the optimizer response's max-age to the
   // upstream's when it is longer than images.minimumCacheTTL, so it has to travel back.
   cacheControl: string | null;
+  etag: string | null;
   body: Buffer;
 };
 
@@ -1117,6 +1125,7 @@ async function fetchExternalImageSafely(
               status,
               contentType: imgRes.headers["content-type"] ?? "image/jpeg",
               cacheControl: imgRes.headers["cache-control"] ?? null,
+              etag: imgRes.headers.etag ?? null,
               body: Buffer.concat(chunks),
             }),
           );
@@ -1365,8 +1374,11 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     );
 
   // Allowlist for external /_next/image sources (SSRF guard).
-  const imageRuntime = createImageOptimizer(process.cwd(), distDir);
+  const imageProjectDir = process.cwd();
+  const imageRuntime = createImageOptimizer(imageProjectDir, distDir);
   const imageConfig = imageRuntime.config.images;
+  let imageCache: ReturnType<typeof createImageCache> | undefined;
+  const imageCacheWork = new Set<Promise<unknown>>();
 
   // A path-based assetPrefix (e.g. "/assets") prefixes `_next/static` URLs; strip it so those
   // requests are served/404'd like un-prefixed ones. (URL assetPrefixes point at a separate host,
@@ -2186,7 +2198,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       req.headers["x-nextjs-ppr"] === "1" ||
       (typeof extPprOutputId === "string" && isLocallyKnownPprRoute(extPprOutputId)) ||
       (!servedAsPlainAsset && isLocallyKnownPprRoute(url.pathname));
-    const forcedCacheControl = forcedCdnCacheControl({
+    let forcedCacheControl = forcedCdnCacheControl({
       isPprRoute,
       // S2: path-only. A conditionally-covered route must be treated as covered here —
       // the cache entry this decides is shared across requests whose has/missing verdicts
@@ -2195,7 +2207,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       emulateNextServer,
       rscHeadersUnvalidated,
     });
-    if (forcedCacheControl) {
+    if (forcedCacheControl || middlewareModule || edgeMiddlewareRunner) {
       const originalWriteHead = res.writeHead.bind(res);
       // Cache-control values seen BEFORE a later wrapper rewrote the headers argument.
       // dispatch's resolved-header merge stacks OVER this wrapper and MUTATES the
@@ -2206,6 +2218,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // first; the never-weaken-`no-store` rule depends on this record.
       const preMergeCacheControls: string[] = [];
       const forceWriteHead = function forceCacheControl(...args: unknown[]) {
+        if (!forcedCacheControl) {
+          return originalWriteHead(...(args as Parameters<typeof originalWriteHead>));
+        }
         // An EXPLICIT app-owned cache-control (next.config headers() / middleware response
         // headers, carried by the resolved routing verdict) overrides the middleware-matched
         // `no-cache` default — the app took ownership of the cache decision, matching
@@ -2617,6 +2632,26 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             url: params.href,
           };
       const imageByteLimit = Math.min(MAX_IMAGE_BYTES, imageConfig.maximumResponseBody);
+      const sourcePath = urlParam.isAbsolute ? null : urlParam.pathname;
+      const publicSourcePath =
+        sourcePath === null
+          ? null
+          : basePath && sourcePath !== basePath && !sourcePath.startsWith(`${basePath}/`)
+            ? `${basePath}${sourcePath}`
+            : sourcePath;
+      // Cache hits must not skip source middleware. Coverage is intentionally path-only,
+      // including conditional matchers whose headers differ between requests (S3).
+      const sourceCoveredByMiddleware =
+        publicSourcePath !== null &&
+        !!(middlewareModule || edgeMiddlewareRunner) &&
+        middlewareMayCoverPath(middlewareMatchers, new URL(`${url.origin}${publicSourcePath}`));
+      // A CDN hit must not skip source middleware either. This verdict is applied
+      // by the inner writeHead wrapper, after routing headers have been merged.
+      if (sourceCoveredByMiddleware) forcedCacheControl = "no-store";
+      const filesystemSourcePath = sourcePath === null ? "" : stripBasePath(sourcePath, basePath);
+      const isStaticSource =
+        filesystemSourcePath.startsWith("/_next/static/media/") ||
+        filesystemSourcePath.startsWith("/_next/static/immutable/media/");
 
       // The optimizer pipeline as ONE unit of work: acquire the source, sniff it, negotiate the
       // output format, encode. It takes its admission (S32) as an argument because the source
@@ -2629,6 +2664,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
       // negotiates the same output.
       const optimizeImage = async (
         admission: ImageAdmission,
+        previousCacheEntry?: PreviousImageCacheEntry,
       ): Promise<ImageOptimizationOutcome> => {
         // Resolve the image: internal (relative) or external (absolute URL)
         let imageBuffer: Buffer;
@@ -2638,9 +2674,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         // external image). Next raises the response's max-age to it when it asks for
         // longer than images.minimumCacheTTL.
         let upstreamCacheControl: string | null = null;
-        // Next's `isStatic`: a build-emitted, content-addressed source under
-        // /_next/static/**/media is immutable, so the optimized derivative is too.
-        let isStaticSource = false;
+        let upstreamEtag: string | null = null;
 
         // Upstream's own `isAbsolute`, decided once by ImageOptimizerCache.validateParams, rather than a
         // second `startsWith("/")` test that could drift from the one that validated it.
@@ -2683,13 +2717,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             return { kind: "error", status: 400, body: '"url" parameter is not allowed' };
           }
 
-          // Matches Next's `isStatic` check (`${basePath}/_next/static/media` and the
-          // `immutable/media` variant), evaluated on the DECODED path so an encoded
-          // prefix can't claim immutability for a public/ file.
-          isStaticSource =
-            filesystemImagePath.startsWith("/_next/static/media/") ||
-            filesystemImagePath.startsWith("/_next/static/immutable/media/");
-
           // S3 (SECURITY + PARITY). Does middleware cover the SOURCE pathname? If so the disk
           // read below would serve bytes middleware was supposed to gate: the sibling fast
           // paths (`/_next/static/`, `/_next/data/`) both refuse to short-circuit a covered
@@ -2706,9 +2733,6 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           // Path-only coverage (middlewareMayCoverPath) is deliberate: the optimizer's own
           // response is cacheable, so a conditionally-covered source must take the re-entry
           // for every request, not just the ones whose has/missing match (see S2).
-          const sourceCoveredByMiddleware =
-            !!(middlewareModule || edgeMiddlewareRunner) &&
-            middlewareMayCoverPath(middlewareMatchers, new URL(`${url.origin}${publicImagePath}`));
 
           let localImageFile: string | null = null;
           let localImageSize = 0;
@@ -2818,6 +2842,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // the response's own Content-Type is the fallback, not an extension guess.
             selfFetchContentType = imgRes.headers.get("content-type");
             upstreamCacheControl = imgRes.headers.get("cache-control");
+            upstreamEtag = imgRes.headers.get("etag");
           }
           contentType = selfFetchContentType ?? getContentType(filesystemImagePath);
         } else {
@@ -2853,6 +2878,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
           imageBuffer = fetched.body;
           contentType = fetched.contentType;
           upstreamCacheControl = fetched.cacheControl;
+          upstreamEtag = fetched.etag;
         }
 
         // S32: the source is resident from here on, so replace the worst-case reservation with
@@ -2865,8 +2891,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             imageBuffer,
             contentType,
             upstreamCacheControl,
-            null,
+            upstreamEtag,
             params,
+            previousCacheEntry,
           );
           return { kind: "image", image, isStatic: isStaticSource };
         } catch (error) {
@@ -2891,10 +2918,49 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
             // answered before a single byte of source has been read.
             return { kind: "error", status: 503, body: "Image optimization unavailable" };
           }
+          let backgroundWork: Promise<unknown> | undefined;
           try {
-            return await optimizeImage(admission);
+            if (sourceCoveredByMiddleware) return await optimizeImage(admission);
+            imageCache ??= createImageCache({
+              projectDir: imageProjectDir,
+              distDir,
+              buildId,
+              config: imageRuntime.config,
+            });
+            const cache = await imageCache;
+            const cached = await cache.get(
+              params,
+              async (previous) => {
+                const generated = await optimizeImage(admission, previous);
+                if (generated.kind === "error") {
+                  throw new imageRuntime.upstream.ImageError(generated.status, generated.body);
+                }
+                return generated.image;
+              },
+              (work) => {
+                // ResponseCache resolves STALE before refresh and writes complete. Hold
+                // admission through that lifetime so background encodes cannot bypass S32.
+                backgroundWork = work.then(
+                  () => admission.release(),
+                  () => admission.release(),
+                );
+                imageCacheWork.add(backgroundWork);
+                void backgroundWork.then(() => imageCacheWork.delete(backgroundWork!));
+              },
+            );
+            return {
+              kind: "image",
+              image: cached.image,
+              isStatic: isStaticSource,
+              cacheStatus: cached.status,
+            };
+          } catch (error) {
+            if (error instanceof imageRuntime.upstream.ImageError) {
+              return { kind: "error", status: error.statusCode, body: error.message };
+            }
+            throw error;
           } finally {
-            admission.release();
+            if (!backgroundWork) admission.release();
           }
         });
       } catch {
@@ -2916,7 +2982,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
         : `public, max-age=${outcome.image.maxAge}, must-revalidate`;
       for (const [key, value] of Object.entries(cdnCacheTag(policy, buildId)))
         res.setHeader(key, value);
-      imageRuntime.send(req, res, imageUrl, outcome.image, outcome.isStatic);
+      imageRuntime.send(req, res, imageUrl, outcome.image, outcome.isStatic, outcome.cacheStatus);
       return;
     }
 
@@ -3227,6 +3293,9 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     // Drops idle keep-alive sockets at once, lets finite responses use the whole budget, then
     // closes SSE/WebSockets protocol-appropriately and always settles — see server.stop().
     await server.stop({ graceMs: SHUTDOWN_GRACE_MS });
+    // A stale image response may have finished before its refresh. The hard exit above
+    // bounds this drain by the same application shutdown budget.
+    await Promise.allSettled(imageCacheWork);
     clearTimeout(hardExit);
     process.exit(0);
   };

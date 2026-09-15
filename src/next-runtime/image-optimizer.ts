@@ -9,6 +9,9 @@ import type * as ImageOptimizer from "next/dist/server/image-optimizer.js";
 export type ImageConfig = ImageConfigComplete;
 type ImageLocalPattern = NonNullable<ImageConfig["localPatterns"]>[number];
 export type ImageParams = ImageOptimizer.ImageParamsResult;
+export type PreviousImageCacheEntry =
+  | import("next/dist/server/response-cache/index.js").IncrementalResponseCacheEntry
+  | null;
 export type OptimizedImage = Awaited<ReturnType<typeof ImageOptimizer.imageOptimizer>>;
 
 export function imageVariantKey(params: ImageParams): string {
@@ -159,6 +162,7 @@ export function createImageOptimizer(projectDir: string, distDir: string) {
       cacheControl: string | null,
       etag: string | null,
       params: ImageParams,
+      previousCacheEntry?: PreviousImageCacheEntry,
     ) {
       // Missing native code is a broken deployment, not an optimization failure that
       // should silently serve originals. Memoize failures too (canary.97 incident).
@@ -179,7 +183,7 @@ export function createImageOptimizer(projectDir: string, distDir: string) {
         { buffer, contentType, cacheControl, etag: upstream.extractEtag(etag, buffer) },
         params,
         config,
-        { isDev: false, silent: true },
+        { isDev: false, silent: true, ...(previousCacheEntry ? { previousCacheEntry } : {}) },
       );
     },
     send(

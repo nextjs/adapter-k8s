@@ -73,6 +73,7 @@ interface Delegate {
 }
 
 export default class CacheHandler {
+  readonly supportsImageCache: boolean = false;
   private readonly impl: Delegate;
 
   constructor(ctx: unknown) {
@@ -93,6 +94,7 @@ export default class CacheHandler {
     const valkey = getValkeyHandler();
     if (valkey) {
       this.impl = valkey as unknown as Delegate;
+      this.supportsImageCache = true;
     } else {
       // Fall back to Next's file-system cache (build time / local / cache disabled). Lazy-required
       // so this module never pulls node internals at eval (edge).
