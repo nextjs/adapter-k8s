@@ -20,10 +20,13 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e-setup-common.sh"
 
 # --- 5. Start pool server ---
-PORT=$(node -e "const s=require('net').createServer();s.listen(0,()=>{console.log(s.address().port);s.close()})")
+# Asking the pool itself to bind port zero leaves allocation and ownership in one atomic kernel
+# operation. Reserving a port in a probe process first still left a close-to-listen window where an
+# unrelated Next.js test process could claim it, even when adapter deploy lanes serialized.
+PORT=0
 export PORT POOL_NAME=default NEXT_BUILD_ID="${BUILD_ID}" CONFIG_DIR="$(pwd)/config" NODE_ENV=production
 
-echo "[adapter-k8s] Starting on :${PORT}..." >&2
+echo "[adapter-k8s] Starting on an ephemeral loopback port..." >&2
 echo "[adapter-k8s] Pool server CJS at: ${POOL_SERVER_CJS_LOCAL}" >&2
 echo "[adapter-k8s] CONFIG_DIR=${CONFIG_DIR}" >&2
 ls config/ >&2
@@ -31,14 +34,14 @@ node "${POOL_SERVER_CJS_LOCAL}" > .adapter-server.log 2>&1 &
 SERVER_PID=$!
 echo $SERVER_PID > .adapter-server.pid
 echo "[adapter-k8s] Server PID: ${SERVER_PID}" >&2
-sleep 2
-echo "[adapter-k8s] Server still running: $(kill -0 $SERVER_PID 2>/dev/null && echo yes || echo no)" >&2
-echo "[adapter-k8s] Server log so far:" >&2
-cat .adapter-server.log >&2
 
 # --- 6. Wait for ready ---
+BOUND_PORT=""
 for i in $(seq 1 60); do
-  if node -e "const socket=require('net').createConnection(${PORT},'127.0.0.1');socket.on('connect',()=>{socket.destroy();process.exit(0)});socket.on('error',()=>process.exit(1));setTimeout(()=>{socket.destroy();process.exit(1)},400)" 2>/dev/null; then
+  BOUND_PORT="$(sed -n 's/^Pool server listening on port \([0-9][0-9]*\)$/\1/p' .adapter-server.log | tail -n 1)"
+  if [ -n "$BOUND_PORT" ] && node -e "const socket=require('net').createConnection(Number(process.argv[1]),'127.0.0.1');socket.on('connect',()=>{socket.destroy();process.exit(0)});socket.on('error',()=>process.exit(1));setTimeout(()=>{socket.destroy();process.exit(1)},400)" "$BOUND_PORT" 2>/dev/null; then
+    PORT="$BOUND_PORT"
+    export PORT
     echo "[adapter-k8s] Ready on :${PORT}" >&2
     break
   fi

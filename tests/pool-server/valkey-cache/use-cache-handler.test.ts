@@ -339,6 +339,35 @@ describe("set/get round-trip (fake client)", () => {
 });
 
 describe("staged-render safe reads", () => {
+  it("writes a generated entry through to the prepared local front", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    const hgetall = vi.spyOn(client, "hgetallBuffer");
+    const h = new ValkeyCacheHandler({ client, buildId: "stage-write-through", now: () => 1000 });
+    const run = await h.prepareForInvocation();
+
+    await run(async () => {
+      expect(await h.get("k", ["_N_T_/cache"])).toBeUndefined();
+      await h.set(
+        "k",
+        Promise.resolve(
+          makeEntry("generated", {
+            tags: ["explicit"],
+            timestamp: 1000,
+            revalidate: 60,
+            expire: 300,
+          }),
+        ),
+      );
+    });
+    hgetall.mockClear();
+
+    const nextRequest = await preparedGet(h, "k", ["_N_T_/cache"]);
+    expect(nextRequest).toBeDefined();
+    expect(await readStream(nextRequest!.value)).toBe("generated");
+    expect(hgetall).not.toHaveBeenCalled();
+  });
+
   it("turns a cold Valkey hit into an immediate miss, then warms the local front", async () => {
     const client = new FakeValkeyClient();
     client.serverNow = 1000;

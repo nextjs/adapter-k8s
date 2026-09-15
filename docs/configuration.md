@@ -116,10 +116,11 @@ Runtime-specific requirements (nerdctl's buildkit socket, podman's digest rewrit
 
 Two Next features the adapter turns on by default are still experimental upstream. Both have an environment escape so an app can A/B them, or turn one off during an incident, without a `next.config` edit and a review cycle. Set them in the environment that runs `next build` (or `adapter-k8s deploy`), and read them as "off for this build only" — the next build without the variable is back on the default.
 
-| Variable                                    | Effect when set to `1`                                                                                                                                                                               |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS`      | Forces `supportsImmutableAssets: false` — asset URLs stay off `/_next/static/immutable/`. For checking whether the immutable-asset split regressed client bootstrap.                                 |
-| `ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE` | Forces `experimental.turbopackFileSystemCacheForBuild: false` — a fully cold compile, ignoring `<distDir>/cache`. For a suspected upstream cache-invalidation bug (see [docs/ci-cd.md](./ci-cd.md)). |
+| Variable                                    | Effect when set to `1`                                                                                                                                                                                                                                                  |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ADAPTER_K8S_DISABLE_IMMUTABLE_ASSETS`      | Forces `supportsImmutableAssets: false` — asset URLs stay off `/_next/static/immutable/`. For checking whether the immutable-asset split regressed client bootstrap.                                                                                                    |
+| `ADAPTER_K8S_DISABLE_TURBOPACK_BUILD_CACHE` | Forces `experimental.turbopackFileSystemCacheForBuild: false` — a fully cold compile, ignoring `<distDir>/cache`. For a suspected upstream cache-invalidation bug (see [docs/ci-cd.md](./ci-cd.md)).                                                                    |
+| `ADAPTER_K8S_KEEP_RUNTIME_SOURCE_MAPS`      | Keeps generated server and Next runtime `.map` files in image contexts. By default they are omitted because emitted containers do not enable Node source maps. Set to `1` together with source-map-aware diagnostics when stack traces must resolve through those maps. |
 
 Each one wins over an explicit `true` in `next.config`, not just over the adapter's default: an app that has pinned the flag on is exactly the app that could not otherwise disable it without changing code.
 
@@ -140,7 +141,7 @@ Applies when the target hosts a routing tier (`envoyNativeRouting`, `gkeNativeRo
 ```js
 routingService: {
   scaling: { min: 2, max: 10, targetCPU: 70 },
-  resources: { cpu: '250m', memory: '256Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
+  resources: { cpu: '500m', memory: '512Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
   requestTimeoutMs: 4000,
   failureMode: 'auto',   // fails closed when the app has middleware (never bypass auth),
                          // fails open otherwise; 'open'/'closed' force it
