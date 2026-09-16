@@ -1,6 +1,6 @@
 # Kubernetes targets
 
-`defineTarget` composes four independent layers into a single deployment target. Each layer is a component with a typed `build()` hook; the compiler turns the composition into one versioned plan that every lifecycle command consumes—deploy, rollback, doctor, describe, and destroy all read the same plan, including cluster identity, API requirements, readiness, diagnostics, and exact cleanup ownership.
+`defineTarget` composes four independent layers into a single deployment target. Each layer is a component with a typed `build()` hook. The compiler turns the composition into one versioned plan that every lifecycle command consumes. Deploy, rollback, doctor, describe, and destroy read the same cluster identity, API requirements, readiness checks, diagnostics, and cleanup ownership.
 
 | Layer     | Built-ins                                                                      | Extension hook            |
 | --------- | ------------------------------------------------------------------------------ | ------------------------- |
@@ -183,7 +183,7 @@ Notes on this journey:
 - **Registry.** The CLI reads `containerRegistry` from `.k8s-adapter/infrastructure.json`—create it by hand for an existing cluster (see the README quick start). Digest lookup uses the OCI distribution API by default; authentication uses your ambient credentials.
 - **TLS** terminates from a Kubernetes Secret; `tls.enabled` without a TLS source (`tlsSecretName` or [`certManager`](#tls-for-dedicated-exposures-cert-manager)) is a config error.
 - **CDN**: put any CDN in front of the exposure. The routing tier always runs post-cache (see the architecture note in the README).
-- **Cache**: bring your own Valkey/Redis via `cache.url`. Disabling the cache makes ISR/PPR revalidation per-replica. Set `managedCache: "none"` for custom clusters—managed cache provisioning is currently supplied only by the GKE preset. See [configuration](./configuration.md#distributed-cache-cache-components--ppr).
+- **Cache**: bring your own Valkey/Redis via `cache.url`. Disabling the cache makes ISR/PPR revalidation per-replica. Cache provisioning does not belong to a cluster component. See [configuration](./configuration.md#distributed-cache-cache-components--ppr).
 
 ## Envoy Gateway native routing
 
@@ -309,7 +309,6 @@ const cluster = defineClusterComponent({
         },
         missingSourcePolicy: "fail",
       },
-      managedCache: "none",
     };
   },
 });
@@ -317,13 +316,64 @@ const cluster = defineClusterComponent({
 
 Custom exposure and resource components emit typed Kubernetes objects. They must declare their API requirements and readiness conditions; the adapter checks them before mutation and records their exact object identities for rollback and cleanup. Raw YAML and inferred cloud names are deliberately outside this boundary.
 
-Any cluster, exposure, routing, or resource component can also return `telemetry: TelemetrySource[]`. A source declaratively identifies its producer and owner, activation mechanism, protocols and propagation, structured signal names, affected workloads, and bounded static attributes. The compiler validates and merges the sources, rejects duplicate IDs and the adapter-reserved `adapter.*` prefix, includes them in the target fingerprint, and stores them in the composition plan consumed by `describe` and `doctor`. This is how a project-owned NGINX ingress component can declare Prometheus/OTLP signals or OpenTelemetry Operator activation without adding an `if nginx` branch to the compiler. The contribution is inventory—not an executable callback, exporter selection, or permission to mutate a shared controller.
+Any cluster, exposure, routing, or resource component can also return `telemetry: TelemetrySource[]`. A source identifies its producer and owner, activation mechanism, protocols, propagation, signal names, workloads, and static attributes. The compiler merges the sources, rejects duplicate IDs and the adapter-reserved `adapter.*` prefix, includes them in the target fingerprint, and stores them for `describe` and `doctor`. A project-owned NGINX ingress component can declare Prometheus or OTLP signals without adding an `if nginx` branch to the compiler. This is inventory. It cannot run callbacks, choose exporters, or mutate a shared controller.
 
-Set `managedCache: "none"` for custom clusters and configure an operator-managed Valkey/Redis endpoint through `cache.url`. Managed cache provisioning is currently supplied only by the GKE preset.
+Configure an operator-managed Valkey or Redis endpoint through `cache.url`. Cache provisioning is not part of the cluster component interface. The existing managed Memorystore workflow belongs to the legacy GKE preset until it becomes an independent resource component.
+
+## Writing a routing adapter
+
+A routing adapter is a routing component created with `defineRoutingComponent`. Keep exposure and routing separate. `ingressExposure({ className: "nginx" })` already supports ingress-nginx with portable routing. ingress-nginx does not have an ext_proc integration, so it is not a native routing adapter. A controller-specific native adapter only makes sense when that controller can run `@next/routing` before the origin and pass the resulting dispatch decision to the selected pool.
+
+The routing component interface has two methods:
+
+- `origin(context)` returns the destination that an exposure should reference. The only supported kind today is `{ kind: "kubernetes-service", service }`. The explicit kind leaves room for a future proxy origin without pretending it already works. It must return the same result for the same context.
+- `build(context)` returns the routing plan, routing-tier settings, Kubernetes objects, API requirements, readiness checks, diagnostics, cleanup operations, and telemetry. An enabled tier must state its caller-authentication posture. Both current native tiers declare no caller authentication and require enforced NetworkPolicy. Envoy uses cleartext h2c. GKE adds server-authenticated TLS, which does not authenticate the caller.
+
+`compileTarget` enforces the contract before it emits YAML. It rejects invalid Service references, pool-local plans that enable a routing tier, ext_proc plans that omit one, transport disagreements, failure-policy disagreements, unknown fields, duplicate objects, unsafe ownership labels, and invalid composition-plan values. The TypeScript types reject the same plan and tier mismatches during development.
+
+`registration: "gke-traffic-extension"` is the one remaining provider-specific field in this interface. Treat it as a built-in bridge, not an extension point. The chart has exactly one matching executor and it runs the GKE registration job. Before another external control plane is added, replace this field with a versioned apply operation and an executor selected by operation kind. Generalizing the string today would create an interface with one adapter and would let a custom target invoke the wrong cloud tool.
+
+Start a routing adapter test at the public interface:
+
+```ts
+const compiled = compileTarget(
+  defineTarget({
+    cluster: kubernetesCluster(),
+    exposure: myCompatibleExposure,
+    routing: myRoutingAdapter(),
+  }),
+  {
+    releaseName: "conformance",
+    namespace: "apps",
+    buildId: "build-123",
+    imageRegistry: "registry.example.com/team/app",
+    pools: ["default", "api"],
+    defaultPool: "default",
+    failurePolicy: "closed",
+  },
+);
+
+expect(compiled.plan.operations.routing.failurePolicy).toBe("closed");
+expect(compiled.plan.operations.resources.objects).toContainEqual(
+  expect.objectContaining({ kind: "YourRoutingPolicy" }),
+);
+```
+
+Compilation is the first conformance level, not the last. A native routing adapter also needs controller-backed tests for all of these behaviors:
+
+1. Middleware, redirects, rewrites, and headers match `next start`.
+2. A client cannot smuggle trusted dispatch headers to a pool.
+3. The declared failure policy matches controller behavior when the routing service is unavailable. Middleware-covered routes must fail closed.
+4. Request bodies arrive byte-for-byte, response streaming starts before completion, and WebSocket upgrades work when the controller claims support.
+5. Every emitted object reports the readiness condition the adapter declared. A missing controller or rejected attachment must block cutover with a useful reason.
+6. Cleanup removes adapter-owned objects and leaves shared Gateways, certificates, controllers, and namespaces alone.
+7. NetworkPolicy enforcement is verified on the tested CNI. API discovery alone does not prove enforcement, and the h2c routing service does not authenticate callers itself.
+
+Record the controller name, controller version, Kubernetes version, CRD versions, CNI, transport, and tested failure mode in [verification](./verification.md). Do not add a provider enum or a branch in the target compiler. New cluster and registry support belongs in cluster components, ingress choices belong in exposure components, native request dispatch belongs here, and managed dependencies belong in resource components. This keeps a future EKS or other cluster adapter independent from its registry and ingress choices without implementing those adapters today.
 
 ## Legacy provider configuration
 
-`provider.gke` and `provider.generic` remain accepted for compatibility and are translated into built-in target components. New integrations should use `target: defineTarget(...)`; adding another provider enum is not required. Configuring both `target` and `provider` is an error—the two definitions can select different clusters and routing paths.
+`provider.gke` and `provider.generic` remain accepted through the 0.x release line and are planned for removal in 1.0. One internal translator maps them to built-in target definitions. The old chart emitter remains isolated for the GKE CDN and managed-cache behavior that composition does not represent yet. New integrations must use `target: defineTarget(...)`. Do not extend the provider union. Configuring both `target` and `provider` is an error because they can select different clusters and routing paths.
 
 ### `provider.generic`
 

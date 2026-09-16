@@ -1,8 +1,9 @@
 // src/config.ts
 import type { K8sAdapterConfig, PoolConfig } from "./types.js";
 import { DEFAULT_CDN_CACHE_KEY_HEADERS } from "./emit/templates/gcp-http-filter.js";
-import { targetForConfig } from "./target/legacy.js";
+import { resolveConfiguredTarget } from "./target/legacy.js";
 import {
+  assertSafeCidr,
   assertSafeHostname,
   assertSafePoolName,
   assertSafeQuantity,
@@ -157,31 +158,37 @@ function validateEnvFrom(envFrom: unknown, where: string): void {
   }
 }
 
-/**
- * One IPv4 or IPv6 CIDR. Deliberately the same charset shape deploy.ts accepts for
- * `provider.generic.nodeCidrs` (`/^[0-9a-fA-F:.]+\/\d{1,3}$/`) — these values reach a helm
- * `--set` brace list on the deploy path and a JSON values array on the emit path, so the
- * charset is what keeps one list entry from splitting into several. Exported for the emit
- * verb, which consumes `networkPolicy.podCidrs`/`nodeCidrs` at values-write time
- * (sanitize-at-consumption, AGENTS.md).
- */
-export const CIDR_RE = /^[0-9a-fA-F:.]+\/\d{1,3}$/;
-
 export function assertSafeCidrList(cidrs: unknown, where: string): asserts cidrs is string[] {
   if (!Array.isArray(cidrs)) {
     throw new Error(`${where} must be an array of CIDR strings (e.g. ["10.0.0.0/16"])`);
   }
-  const bad = cidrs.filter((c) => typeof c !== "string" || !CIDR_RE.test(c));
+  const bad = cidrs.filter((cidr) => {
+    try {
+      assertSafeCidr(cidr, where);
+      return false;
+    } catch {
+      return true;
+    }
+  });
   if (bad.length > 0) {
     throw new Error(
       `${where} contains invalid CIDR(s): ${bad.map((c) => JSON.stringify(c)).join(", ")}. ` +
-        `Expected entries like "10.0.0.0/16" (matching ${CIDR_RE}).`,
+        `Expected valid entries like "10.0.0.0/16".`,
     );
   }
 }
 
 export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
+  const inputRecord = input as Record<string, unknown>;
+  for (const removed of ["imageOptimizer", "skewProtection", "routeExtension"] as const) {
+    if (Object.hasOwn(inputRecord, removed) && inputRecord[removed] !== undefined) {
+      throw new Error(
+        `${removed} is not a supported adapter config option. It was a placeholder and never ` +
+          `changed emitted workloads. Remove it from adapter.config.mjs.`,
+      );
+    }
+  }
   validateEnvMap(config.env, "adapter config");
   validateEnvFrom(config.envFrom, "adapter config");
   // Registry pull auth for private registries. Each name lands in `imagePullSecrets` on
@@ -326,7 +333,7 @@ export function validateConfig(input: unknown, releaseName?: string): void {
   validateResources(config.routingService?.resources, "routingService");
   validateScaling(config.routingService?.scaling, "routingService");
 
-  const target = targetForConfig(config);
+  const target = resolveConfiguredTarget(config).definition;
   const gatewayHosts = [...target.exposure.hosts];
   if (gatewayHosts.length === 0) {
     throw new Error("target exposure must contain at least one host");
@@ -393,15 +400,6 @@ export function validateConfig(input: unknown, releaseName?: string): void {
     // `process.env.VALKEY_AUTH` are both plain strings here. Do not claim to know which source
     // the operator used. The scaffold documents the environment-variable form instead.
   }
-  if (config.imageOptimizer?.enabled) {
-    throw new Error("imageOptimizer.enabled is not implemented yet");
-  }
-  if (config.skewProtection?.enabled) {
-    throw new Error("skewProtection.enabled is not implemented yet");
-  }
-  if (config.routeExtension?.mode === "wasm") {
-    throw new Error('routeExtension.mode "wasm" is not implemented; use "auto" or "extproc"');
-  }
 }
 
 export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
@@ -411,15 +409,6 @@ export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
       enabled: false,
       provider: "valkey",
       ...config.cache,
-    },
-    skewProtection: {
-      enabled: false,
-      duration: "1m",
-      ...config.skewProtection,
-    },
-    routeExtension: {
-      mode: "auto",
-      ...config.routeExtension,
     },
     containerStrategy: config.containerStrategy ?? "traced-assets",
     // CDN defaults are a GKE concept (Cloud CDN via GCPHTTPFilter). A target composition or

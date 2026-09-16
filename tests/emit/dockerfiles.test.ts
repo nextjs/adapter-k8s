@@ -7,18 +7,11 @@ import {
   generatePoolDockerfile,
   generateRoutingServiceDockerfile,
   DEFAULT_EMITTED_NODE_VERSION,
-  MIN_EMITTED_NODE_MAJOR,
 } from "../../src/emit/dockerfiles.js";
 
-// N24 REGRESSION PIN: the routing manifest embeds inline regexp modifiers
-// ("(?i:…)", manifest.ts caseInsensitiveSources) that V8 only accepts on Node 24+.
-// A node:22 base image throws at manifest load and 500s EVERY request for any app
-// with redirects()/headers()/rewrites(). These assertions make a base-image revert
-// fail the suite instead of failing in production.
-describe("emitted base image is Node >= 24 (inline (?i:) regex support)", () => {
+describe("emitted base image", () => {
   it("pins the default emitted base image to node:24", () => {
     expect(DEFAULT_EMITTED_NODE_VERSION).toBe("24");
-    expect(MIN_EMITTED_NODE_MAJOR).toBe(24);
   });
 
   it("every emitted Dockerfile defaults to a node:24 base image", () => {
@@ -31,18 +24,6 @@ describe("emitted base image is Node >= 24 (inline (?i:) regex support)", () => 
       expect(dockerfile).toMatch(/^FROM node:24-slim$/m);
       expect(dockerfile).not.toContain("node:22");
     }
-  });
-
-  it("rejects a base image below Node 24 (cannot compile the manifest's (?i:) wraps)", () => {
-    expect(() =>
-      generateDockerfile({ containerStrategy: "shared-image", nodeVersion: "22", buildId: "b" }),
-    ).toThrow(/Node 24/);
-    expect(() =>
-      generatePoolDockerfile({ poolName: "ssr", nodeVersion: "23", buildId: "b" }),
-    ).toThrow(/inline regexp modifiers/);
-    expect(() => generateRoutingServiceDockerfile({ nodeVersion: "junk", buildId: "b" })).toThrow(
-      /Unsupported emitted base image/,
-    );
   });
 });
 

@@ -74,7 +74,7 @@ function writeStagedDir(instrumentation: string | null): { dir: string; configDi
       middleware: null,
       poolAssignments: {},
       pprRoutes: {},
-      nextVersion: "16.2.10",
+      nextVersion: "16.3.0",
     }),
   );
   return { dir, configDir };

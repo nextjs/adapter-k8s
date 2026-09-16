@@ -9,6 +9,10 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { PoolManifest, RoutingManifest, StaticAssetEntry } from "../types.js";
 import {
+  assertSupportedNextVersion,
+  SUPPORTED_NEXT_RELEASE_LINE,
+} from "../next-runtime/version.js";
+import {
   getRscConfig,
   INTERNAL_EXECUTION_DEADLINE_HEADER,
   manifestNextConfig,
@@ -1873,6 +1877,16 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     throw new Error(`Routing manifest not found: ${routingManifestPath}`);
   }
   const routingManifest: RoutingManifest = JSON.parse(readFileSync(routingManifestPath, "utf-8"));
+  const nextSupport = assertSupportedNextVersion(
+    routingManifest.nextVersion,
+    `Routing manifest at ${routingManifestPath}`,
+  );
+  if (nextSupport.prerelease) {
+    console.warn(
+      `[pool-server] Next.js ${routingManifest.nextVersion} is accepted for the pinned ` +
+        `upstream conformance lane; stable releases support ${SUPPORTED_NEXT_RELEASE_LINE}.`,
+    );
+  }
 
   // Load static assets manifest
   const staticAssetsPath = path.join(configDir, "static-assets.json");

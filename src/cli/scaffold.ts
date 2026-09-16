@@ -32,9 +32,6 @@ export default createK8sAdapter({
   // is meant to be committed. Use an env indirection instead:
   //   cache: { enabled: true, provider: 'valkey', url: 'rediss://my-valkey.internal:6379',
   //            password: process.env.VALKEY_AUTH },
-  // Not yet implemented (validates but throws at build time):
-  //   skewProtection: { enabled: true, duration: '5m' },
-
   provider: {
     gke: {
       cdn: {

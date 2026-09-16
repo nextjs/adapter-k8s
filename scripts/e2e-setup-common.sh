@@ -354,5 +354,4 @@ if [ -d ".k8s-adapter/output" ]; then
   find .k8s-adapter/output -name "pool-manifest-*.json" -exec cp {} config/ \; 2>/dev/null || true
 fi
 [ -f config/pool-manifest-default.json ] || echo '{"buildId":"'"${BUILD_ID}"'","poolName":"default","outputs":{}}' > config/pool-manifest-default.json
-[ -f config/routing-manifest.json ] || echo '{"routeGraph":{"beforeMiddleware":[],"beforeFiles":[],"afterFiles":[],"dynamicRoutes":[],"onMatch":[],"fallback":[],"shouldNormalizeNextData":false,"rsc":{}},"pathnames":[],"i18n":null,"buildId":"'"${BUILD_ID}"'","basePath":"","middleware":null,"poolAssignments":{},"pprRoutes":{},"nextVersion":"16.2.0"}' > config/routing-manifest.json
-
+[ -f config/routing-manifest.json ] || echo '{"routeGraph":{"beforeMiddleware":[],"beforeFiles":[],"afterFiles":[],"dynamicRoutes":[],"onMatch":[],"fallback":[],"shouldNormalizeNextData":false,"rsc":{}},"pathnames":[],"i18n":null,"buildId":"'"${BUILD_ID}"'","basePath":"","middleware":null,"poolAssignments":{},"pprRoutes":{},"nextVersion":"16.3.0"}' > config/routing-manifest.json
