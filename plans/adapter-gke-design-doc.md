@@ -1,9 +1,14 @@
 # `@next-community/adapter-k8s` — Design Document
 
-**Status:** Draft
+**Status:** Historical draft — not the release contract
 **Authors:** James Daniels
 **Last Updated:** 2026-03-24
-**Next.js Version Target:** 16.2.0+ (stable `adapterPath`)
+
+> This document records the starting GKE design and contains superseded assumptions, including
+> pre-CDN routing, image sidecars, and provider enums. The current contracts and verified claims
+> live in [targets](../docs/targets.md), [verification](../docs/verification.md), and
+> [SECURITY.md](../SECURITY.md). AWS components are intentionally deferred; the provider-neutral
+> component seams are preparation, not an EKS support promise.
 
 ---
 
@@ -2895,8 +2900,10 @@ The key principle: **the architecture doesn't change.** All optimizations replac
 
 ## 21. Future Work
 
-- **EKS provider** — implement `provider: { eks: { ... } }` with CloudFront CDN, ALB Ingress, S3 static assets, and Lambda@Edge or CloudFront Functions for pre-CDN middleware
-- **Generic provider** — implement `provider: { generic: { ... } }` with in-cluster Envoy ext_proc for clusters without cloud-specific load balancer extensions
+- **AWS/EKS components are deferred** — preserve the provider-neutral cluster, registry, exposure,
+  routing, and resource seams without selecting AWS services before the first release
+- **Generic Kubernetes targets** — implemented through component composition; expand the recorded
+  controller/CNI verification matrix rather than adding another provider enum
 - **Cloud CDN Image Optimization** — switch from Sharp sidecar to native Cloud primitives if/when available (GKE provider)
 - **Multi-cluster / Multi-region** — generate Helm charts for multi-cluster GKE with MCS (Multi Cluster Services)
 - **Cloud Run hybrid** — deploy edge-runtime routes or low-traffic pools to Cloud Run for scale-to-zero (GKE provider)

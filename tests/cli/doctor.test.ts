@@ -31,6 +31,8 @@ interface ClusterData {
   bsList?: string;
   health?: string;
   dnsAuth?: string;
+  hpas?: string;
+  metricsApi?: { exitCode: number; stdout?: string; stderr?: string };
 }
 
 /** Router-style execCapture stub: per-resource responses with sane passing defaults. */
@@ -42,6 +44,13 @@ function stubCluster(data: ClusterData): void {
     if (args.includes("get-credentials")) return ok();
     if (args.includes("print-access-token")) return ok("token");
     if (args.includes("cluster-info")) return ok();
+    if (args.includes("--raw=/apis/metrics.k8s.io/v1beta1"))
+      return {
+        exitCode: data.metricsApi?.exitCode ?? 0,
+        stdout: data.metricsApi?.stdout ?? '{"kind":"APIResourceList"}',
+        stderr: data.metricsApi?.stderr ?? "",
+      };
+    if (args.includes("hpa")) return ok(data.hpas ?? "");
     if (args.includes("get-health")) return ok(data.health ?? "[]");
     if (args.includes("deployments")) return ok(data.deployments ?? "");
     if (args.includes("endpointslice")) return ok(data.endpoints ?? "");
@@ -234,6 +243,40 @@ describe("runDoctor", () => {
       /process\.exit:1/,
     );
     expect(printed()).toContain("0 ready endpoints — selector matches no ready pods");
+  });
+
+  it("warns when release HPAs exist but metrics.k8s.io is unavailable", async () => {
+    stubCluster({
+      hpas: "horizontalpodautoscaler.autoscaling/rel-ssr",
+      metricsApi: { exitCode: 1, stderr: "the server could not find the requested resource" },
+    });
+
+    await runDoctor({ projectDir: tmpDir, releaseName: RELEASE });
+
+    const out = printed();
+    expect(out).toContain("Autoscaling metrics: Release HPAs exist");
+    expect(out).toContain("metrics.k8s.io/v1beta1 is unavailable");
+    expect(out).toContain("Install Metrics Server or another metrics.k8s.io");
+  });
+
+  it("passes the autoscaling check when release HPAs can reach metrics.k8s.io", async () => {
+    stubCluster({ hpas: "horizontalpodautoscaler.autoscaling/rel-ssr" });
+
+    await runDoctor({ projectDir: tmpDir, releaseName: RELEASE });
+
+    expect(printed()).toContain(
+      "Autoscaling metrics: metrics.k8s.io/v1beta1 is available for the release's HPAs",
+    );
+  });
+
+  it("does not require metrics.k8s.io when the release has no HPAs", async () => {
+    stubCluster({ hpas: "" });
+
+    await runDoctor({ projectDir: tmpDir, releaseName: RELEASE });
+
+    const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args);
+    expect(calls.some((args) => args.includes("--raw=/apis/metrics.k8s.io/v1beta1"))).toBe(false);
+    expect(printed()).not.toContain("Autoscaling metrics");
   });
 
   it("NEG check finds the Initialized condition BY TYPE (not conditions[0])", async () => {
