@@ -136,7 +136,7 @@ function ctxFor({
     repoRoot: projectDir,
     distDir,
     config,
-    nextVersion: "16.2.0",
+    nextVersion: "16.3.0",
   } as never;
 }
 
