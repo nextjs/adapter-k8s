@@ -147,7 +147,7 @@ async function describeInstanceConfiguration(
           ? Number(parsed.memorySizeGb)
           : Number.NaN;
     if (
-      typeof parsed.authEnabled !== "boolean" ||
+      (parsed.authEnabled !== undefined && typeof parsed.authEnabled !== "boolean") ||
       typeof parsed.transitEncryptionMode !== "string" ||
       !Number.isInteger(memorySizeGb) ||
       typeof parsed.tier !== "string" ||
@@ -157,7 +157,10 @@ async function describeInstanceConfiguration(
       return null;
     }
     return {
-      authEnabled: parsed.authEnabled,
+      // GCP omits this optional boolean when AUTH is disabled (observed on the live fixture).
+      // The Instance API defines the missing value as false. A secure plan still rejects it;
+      // only an explicit plaintext plan may reuse it, and malformed present values fail above.
+      authEnabled: parsed.authEnabled ?? false,
       transitEncryptionMode: parsed.transitEncryptionMode,
       memorySizeGb,
       tier: parsed.tier,
