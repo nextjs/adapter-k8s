@@ -36,6 +36,8 @@ export type {
   KubernetesClusterOptions,
   KubernetesContribution,
   KubernetesTargetDefinition,
+  ManagedCacheRequest,
+  ResourceBuildResult,
   ResourceComponent,
   RoutingBuildResult,
   RoutingBuildContext,

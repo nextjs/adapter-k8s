@@ -20,6 +20,7 @@ describe("assertSafeInfrastructure", () => {
         containerRegistry: "us-central1-docker.pkg.dev/my-project-123/nextjs",
         gcsBucket: "my-project-123-assets",
         cacheRegion: "us-central1",
+        cacheProjectId: "my-project-123",
         clusterName: "my-app-cluster",
       }),
     ).not.toThrow();
@@ -38,6 +39,7 @@ describe("assertSafeInfrastructure", () => {
       ["containerRegistry", 'gcr.io/p"&calc'],
       ["gcsBucket", "bucket&calc"],
       ["cacheRegion", "us&calc"],
+      ["cacheProjectId", "x&calc"],
       ["clusterName", "cluster&calc"],
     ] as const;
     for (const [field, value] of bad) {
