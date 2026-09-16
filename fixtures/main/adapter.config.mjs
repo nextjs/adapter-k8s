@@ -14,7 +14,9 @@ export default createK8sAdapter({
   cache: {
     enabled: true,
     provider: "valkey",
-    memorystore: { region: "us-central1", sizeGb: 1 },
+    // This fixture reuses a legacy plaintext instance. Declare its existing posture explicitly;
+    // the default AUTH/TLS plan must reject it rather than silently accepting weaker settings.
+    memorystore: { region: "us-central1", sizeGb: 1, auth: false },
   },
   containerStrategy: "traced-assets",
 
