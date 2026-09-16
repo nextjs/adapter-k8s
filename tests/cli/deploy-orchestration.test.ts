@@ -1471,6 +1471,59 @@ describe("runDeploy — guards and teardown", () => {
     expect(events).not.toContain("helm");
   });
 
+  it("bootstraps a fresh namespace before claiming and provisioning managed cache", async () => {
+    vi.mocked(execOrThrow).mockImplementation(async (cmd, args) => {
+      if (cmd === "helm") events.push("helm");
+      if (args.includes("get-credentials")) events.push("get-credentials");
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+    vi.mocked(provisionMemorystore).mockImplementation(async () => {
+      events.push("provision-cache");
+      return { host: "10.0.0.1", port: 6379 };
+    });
+    setupFs({
+      infra: { ...BASE_INFRA, namespace: "prod" },
+      metadata: {
+        buildId: "buildn",
+        pools: ["ssr"],
+        cacheEnabled: true,
+        cacheManaged: true,
+        namespace: "prod",
+      },
+    });
+    vi.mocked(readState).mockResolvedValue(null);
+    const cluster = happyCluster(events);
+    vi.mocked(execCapture).mockImplementation(async (cmd, args) => {
+      if (cmd === "kubectl" && args[0] === "create" && args[1] === "namespace") {
+        expect(args[2]).toBe("prod");
+        events.push("create-namespace");
+        return { exitCode: 0, stdout: "namespace/prod created", stderr: "" };
+      }
+      return cluster(cmd, args);
+    });
+    vi.mocked(execCaptureStdin).mockImplementation(async (_cmd, _args, input) => {
+      const object = JSON.parse(input);
+      if (object.kind === "ConfigMap" && object.metadata.namespace === "prod") {
+        if (!events.includes("create-namespace")) {
+          return {
+            exitCode: 1,
+            stdout: "",
+            stderr: 'Error from server (NotFound): namespaces "prod" not found',
+          };
+        }
+        events.push("claim-cache");
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+    await expect(
+      runDeploy({ projectDir: PROJECT, releaseName: RELEASE, skipBuild: true }),
+    ).resolves.toBeUndefined();
+    expect(events.indexOf("get-credentials")).toBeLessThan(events.indexOf("create-namespace"));
+    expect(events.indexOf("create-namespace")).toBeLessThan(events.indexOf("claim-cache"));
+    expect(events.indexOf("claim-cache")).toBeLessThan(events.indexOf("provision-cache"));
+    expect(events.indexOf("provision-cache")).toBeLessThan(events.indexOf("helm"));
+  });
+
   it("uses a custom namespace for Helm, cluster state, and routing retention", async () => {
     setupFs({
       infra: { ...BASE_INFRA, namespace: "prod" },

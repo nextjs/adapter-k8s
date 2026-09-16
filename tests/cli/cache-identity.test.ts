@@ -26,7 +26,7 @@ function identity(projectId = "project-one", region = "us-central1") {
 
 describe("managed cache identity coordination", () => {
   beforeEach(() => {
-    vi.mocked(exec.execCapture).mockReset();
+    vi.mocked(exec.execCapture).mockReset().mockResolvedValue(ok());
     vi.mocked(exec.execCaptureStdin).mockReset();
   });
 
@@ -60,6 +60,39 @@ describe("managed cache identity coordination", () => {
     });
   });
 
+  it.each(["AlreadyExists", "already exists"])(
+    "continues when the namespace %s",
+    async (stderr) => {
+      vi.mocked(exec.execCapture)
+        .mockResolvedValueOnce(ok())
+        .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr });
+      vi.mocked(exec.execCaptureStdin).mockResolvedValueOnce(ok());
+      await claimManagedCacheIdentity("my-app", "apps", {
+        projectId: "project-one",
+        region: "us-central1",
+      });
+      expect(exec.execCapture).toHaveBeenCalledWith(
+        "kubectl",
+        ["create", "namespace", "apps"],
+        expect.any(Object),
+      );
+      expect(exec.execCaptureStdin).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("stops before claiming infrastructure when namespace creation is forbidden", async () => {
+    vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(ok())
+      .mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "namespaces is forbidden" });
+    await expect(
+      claimManagedCacheIdentity("my-app", "apps", {
+        projectId: "project-one",
+        region: "us-central1",
+      }),
+    ).rejects.toThrow("Could not create managed-cache namespace apps: namespaces is forbidden");
+    expect(exec.execCaptureStdin).not.toHaveBeenCalled();
+  });
+
   it("accepts an existing identity only when coordinates and ownership match", async () => {
     vi.mocked(exec.execCapture).mockResolvedValueOnce(ok(identity()));
 
@@ -73,6 +106,7 @@ describe("managed cache identity coordination", () => {
 
   it("rejects a concurrent claim for different paid coordinates", async () => {
     vi.mocked(exec.execCapture)
+      .mockResolvedValueOnce(ok())
       .mockResolvedValueOnce(ok())
       .mockResolvedValueOnce(ok(identity("project-two", "europe-west1")));
     vi.mocked(exec.execCaptureStdin).mockResolvedValueOnce({
