@@ -40,11 +40,14 @@ interface StoredMeta {
 interface StoredRead {
   meta: StoredMeta;
   localTimestamp: number;
+  tagExpiresAt: number;
   value: Buffer;
   freshness: Freshness;
 }
 
 interface LocalEntry {
+  /** Earliest applicable tag expiry, translated to this replica's clock. */
+  tagExpiresAt: number;
   tags: string[];
   /** Implicit tags whose shared manifest state was checked before this backing entry was warmed. */
   verifiedSoftTags: string[];
@@ -108,6 +111,18 @@ const LOCAL_ENTRY_OVERHEAD_BYTES = 256;
 const PENDING_SET_WAIT_MS = 5_000;
 
 const EMPTY_MANIFEST: TagManifest = new Map();
+
+/** Future tag expiry does not change the manifest epoch when its deadline arrives. Retain the
+ * earliest watermark newer than this entry; older watermarks cannot invalidate a later render. */
+function nextTagExpiration(timestamp: number, manifest: TagManifest): number {
+  let deadline = Number.POSITIVE_INFINITY;
+  for (const state of manifest.values()) {
+    if (state.expired !== undefined && state.expired > timestamp) {
+      deadline = Math.min(deadline, state.expired);
+    }
+  }
+  return deadline;
+}
 
 interface PreparedInvocation {
   epoch: string | undefined;
@@ -247,11 +262,11 @@ export class ValkeyCacheHandler implements CacheHandler {
     // A cache key can be reused with different implicit path tags. Never transfer one backing
     // read's tag verdict to another set: the new combination takes one safe miss and warms itself.
     if (softTags.some((tag) => !entry.verifiedSoftTags.includes(tag))) return undefined;
-    // Tag freshness was checked when the entry was produced/warmed, and any later tag update
-    // changes the global epoch and clears the whole front before this callback runs. Only the
-    // entry's time lifetime remains to evaluate here.
-    const freshness = evaluateEntry({ ...entry, tags: [] }, EMPTY_MANIFEST, this.now());
-    if (freshness.state === "expired") {
+    // New tag updates clear the front via the epoch. A previously scheduled expiry must also
+    // be checked locally: time passing does not produce another tag update or epoch change.
+    const now = this.now();
+    const freshness = evaluateEntry({ ...entry, tags: [] }, EMPTY_MANIFEST, now);
+    if (now >= entry.tagExpiresAt || freshness.state === "expired") {
       this.removeLocalEntry(cacheKey);
       return undefined;
     }
@@ -301,6 +316,7 @@ export class ValkeyCacheHandler implements CacheHandler {
           verifiedSoftTags: capTags(softTags),
           stale: read.meta.stale,
           timestamp: read.localTimestamp,
+          tagExpiresAt: read.tagExpiresAt,
           expire: read.meta.expire,
           revalidate: read.freshness.revalidate,
           value: read.value,
@@ -386,6 +402,7 @@ export class ValkeyCacheHandler implements CacheHandler {
     return {
       meta,
       localTimestamp: clock.toLocal(meta.timestamp),
+      tagExpiresAt: clock.toLocal(nextTagExpiration(meta.timestamp, manifest)),
       value,
       freshness,
     };
@@ -454,7 +471,7 @@ export class ValkeyCacheHandler implements CacheHandler {
   async set(cacheKey: string, pendingEntry: Promise<CacheEntry>): Promise<void> {
     // A writer supersedes any local value and every in-flight backing warm. One coarse generation
     // keeps that race bounded without retaining a per-key version map for attacker-chosen keys.
-    this.writeGeneration++;
+    const writeGeneration = ++this.writeGeneration;
     this.removeLocalEntry(cacheKey);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -462,6 +479,7 @@ export class ValkeyCacheHandler implements CacheHandler {
     });
     this.pendingSets.set(cacheKey, gate);
     const key = this.entryKey(cacheKey);
+    let stored = false;
     try {
       const entry = await pendingEntry;
       // H4: a NON-FINITE lifetime would produce a NaN/Infinity EXPIRE argument, which Valkey
@@ -516,22 +534,40 @@ export class ValkeyCacheHandler implements CacheHandler {
         String(entry.timestamp),
         String(clientNow),
       );
+      stored = true;
       warnOnClockSkewClamp(clamped);
       const invocation = this.preparedInvocations.getStore();
       if (invocation && invocation.epoch === this.manifestEpoch && this.backingAvailable) {
-        // `get` already checked this invocation's manifest epoch outside Next's staged render
-        // and recorded the exact implicit tags. The write is now durable, so retaining the same
-        // bytes locally is equivalent to a backing warm without the extra request/recompute
-        // cycle. A peer tag update bumps the epoch and clears this entry at the next preflight.
-        this.putLocalEntry(cacheKey, {
-          tags: meta.tags,
-          verifiedSoftTags: invocation.softTagsByCacheKey.get(cacheKey) ?? [],
-          stale: entry.stale,
-          timestamp: entry.timestamp,
-          expire: entry.expire,
-          revalidate: entry.revalidate,
-          value: buf,
-        });
+        // Preflight records only the epoch, not individual tag watermarks. Check explicit and
+        // implicit tags before admitting a write, just as a backing warm does. This I/O belongs
+        // to set(), never the staged get() callback, and does not download the stored body again.
+        const softTags = invocation.softTagsByCacheKey.get(cacheKey) ?? [];
+        const tags = [...meta.tags, ...softTags];
+        const manifest = await this.tagStates(tags);
+        const clock = await sampleValkeyClock(this.client, this.now);
+        const serverTimestamp = entry.timestamp + clock.serverNow - clock.localNow;
+        const freshness = evaluateEntry(
+          { ...entry, timestamp: serverTimestamp, tags },
+          manifest,
+          clock.serverNow,
+        );
+        if (
+          freshness.state === "fresh" &&
+          invocation.epoch === this.manifestEpoch &&
+          this.backingAvailable &&
+          this.writeGeneration === writeGeneration
+        ) {
+          this.putLocalEntry(cacheKey, {
+            tags: meta.tags,
+            verifiedSoftTags: softTags,
+            stale: entry.stale,
+            timestamp: entry.timestamp,
+            tagExpiresAt: clock.toLocal(nextTagExpiration(serverTimestamp, manifest)),
+            expire: entry.expire,
+            revalidate: entry.revalidate,
+            value: buf,
+          });
+        }
       }
     } catch (error) {
       // The store script is atomic. A transport failure can be ambiguous after commit, so never
@@ -540,8 +576,10 @@ export class ValkeyCacheHandler implements CacheHandler {
       // promise (a failed render) lands here too, which is why this is rate-limited rather than
       // per-occurrence.
       logErrorRateLimited(
-        "use-cache-set",
-        "[valkey-cache] `use cache` write failed; the entry was not cached (the pool will recompute it)",
+        stored ? "use-cache-admit" : "use-cache-set",
+        stored
+          ? "[valkey-cache] local `use cache` admission failed; the entry remains stored in Valkey"
+          : "[valkey-cache] `use cache` write failed; the entry was not cached (the pool will recompute it)",
         error,
       );
     } finally {
