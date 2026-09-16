@@ -912,6 +912,11 @@ export function installResolvedResponseHeaders(
   const originalWriteHead = res.writeHead.bind(res);
   res.writeHead = ((status: number, ...args: unknown[]) => {
     const headersIndex = typeof args[0] === "string" ? 1 : 0;
+    // Next's image helper uses setHeader/end, which commits an implicit writeHead.
+    // Apply the routing verdict there too, including middleware cookies and CSP.
+    if (args[headersIndex] === undefined || args[headersIndex] === null) {
+      args[headersIndex] = res.getHeaders();
+    }
     if (args[headersIndex] !== undefined && args[headersIndex] !== null) {
       args[headersIndex] = isGeneratedWebSocketFallback(status, args[headersIndex])
         ? mergeResolvedHeadersIntoWebSocketFallback(resolvedHeaders, args[headersIndex])

@@ -7,10 +7,10 @@
 // images config, one with dangerouslyAllowSVG enabled). The staged dirs live UNDER
 // THE REPO ROOT so createRequire(<staged>/package.json) can resolve the repo's
 // `next` (pool-server requires several next/dist modules at boot).
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import path from "node:path";
-import { createServer } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { request as httpRequest } from "node:http";
@@ -205,7 +205,7 @@ function writeStagedDir(
         : null,
       poolAssignments: options.poolAssignments ?? {},
       pprRoutes: {},
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
     }),
   );
   // Middleware module: never invoked by these tests, but its COVERAGE is what installs
@@ -319,6 +319,198 @@ function makeBooter() {
     },
   };
 }
+
+describe("image optimizer disabled by Next configuration", () => {
+  const booter = makeBooter();
+  afterEach(async () => booter.cleanup());
+
+  it.each([{ unoptimized: true }, { loader: "custom", loaderFile: "./loader.js" }])(
+    "returns 404 when images is %j",
+    async (images) => {
+      const { port } = await booter.boot(images);
+      const response = await rawGet(port, "/_next/image?url=/mislabeled.jpg&w=384&q=75", {});
+      expect(response.status).toBe(404);
+    },
+  );
+
+  it.each([{ unoptimized: true }, { loader: "custom", loaderFile: "./loader.js" }])(
+    "runs image-route middleware before rejecting disabled images %j",
+    async (images) => {
+      const { port } = await booter.boot(images, {
+        middlewareMatcher: "^\\/_next\\/image$",
+        middlewareSource: `export function proxy() {
+  return new Response("image access denied", {
+    status: 401,
+    headers: { "x-image-middleware": "ran" },
+  });
+}\n`,
+      });
+      const response = await rawGet(port, "/_next/image?url=/mislabeled.jpg&w=384&q=75", {});
+      expect(response.status).toBe(401);
+      expect(response.headers["x-image-middleware"]).toBe("ran");
+      expect(response.body.toString()).toBe("image access denied");
+    },
+  );
+});
+
+describe("image optimizer source fetch configuration", () => {
+  const booter = makeBooter();
+  const sourceRequests: string[] = [];
+  const streamingResponses = new Set<ServerResponse>();
+  let source: ReturnType<typeof createServer>;
+  let sourcePort: number;
+
+  beforeAll(async () => {
+    source = createServer((req, res) => {
+      sourceRequests.push(req.url!);
+      if (req.url!.startsWith("/streaming-redirect/")) {
+        const kind = req.url!.slice("/streaming-redirect/".length);
+        const location = kind === "invalid" ? "http://[" : "/image.png";
+        res.writeHead(302, kind === "missing" ? {} : { location });
+        res.write("discarded redirect body");
+        streamingResponses.add(res);
+        const timer = setInterval(() => res.write("still streaming"), 10);
+        res.once("close", () => {
+          clearInterval(timer);
+          streamingResponses.delete(res);
+        });
+        return;
+      }
+      const redirects = /^\/redirect\/(\d+)$/.exec(req.url!);
+      if (redirects && Number(redirects[1]) > 0) {
+        res.writeHead(302, { location: `/redirect/${Number(redirects[1]) - 1}` });
+        res.end();
+        return;
+      }
+      res.setHeader("content-type", "image/png");
+      if (req.url === "/streamed.png") {
+        res.write(ONE_PIXEL_PNG.subarray(0, 16));
+        res.end(ONE_PIXEL_PNG.subarray(16));
+      } else {
+        res.setHeader("content-length", ONE_PIXEL_PNG.length);
+        res.end(ONE_PIXEL_PNG);
+      }
+    });
+    await new Promise<void>((resolve) => source.listen(0, "127.0.0.1", resolve));
+    sourcePort = (source.address() as AddressInfo).port;
+  });
+
+  afterEach(async () => {
+    for (const response of streamingResponses) response.destroy();
+    await booter.cleanup();
+    sourceRequests.length = 0;
+  });
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) =>
+      source.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  function remoteConfig(overrides: Record<string, unknown> = {}) {
+    return {
+      remotePatterns: [
+        { protocol: "http", hostname: "127.0.0.1", port: String(sourcePort), pathname: "/**" },
+      ],
+      ...overrides,
+    };
+  }
+
+  function optimizerUrl(sourcePath: string) {
+    return `/_next/image?url=${encodeURIComponent(sourcePath)}&w=384&q=75`;
+  }
+
+  it("rejects an allowlisted loopback source unless local IP access is enabled", async () => {
+    const { port } = await booter.boot(remoteConfig());
+    const response = await rawGet(
+      port,
+      optimizerUrl(`http://127.0.0.1:${sourcePort}/image.png`),
+      {},
+    );
+    expect(response.status).toBe(400);
+    expect(response.body.toString()).toBe('"url" parameter is not allowed');
+    expect(sourceRequests).toEqual([]);
+  });
+
+  it("fetches an allowlisted loopback source when local IP access is enabled", async () => {
+    const { port } = await booter.boot(remoteConfig({ dangerouslyAllowLocalIP: true }));
+    const response = await rawGet(port, optimizerUrl(`http://127.0.0.1:${sourcePort}/image.png`), {
+      accept: "image/png",
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers["content-type"]).toBe("image/png");
+    expect(response.body.subarray(0, 8)).toEqual(ONE_PIXEL_PNG.subarray(0, 8));
+    expect(sourceRequests).toEqual(["/image.png"]);
+  });
+
+  it.each([
+    { limit: 0, redirects: 1, status: 508, requests: ["/redirect/1"] },
+    { limit: 1, redirects: 1, status: 200, requests: ["/redirect/1", "/redirect/0"] },
+    { limit: 1, redirects: 2, status: 508, requests: ["/redirect/2", "/redirect/1"] },
+    {
+      limit: 2,
+      redirects: 2,
+      status: 200,
+      requests: ["/redirect/2", "/redirect/1", "/redirect/0"],
+    },
+  ])("allows at most $limit redirects for a $redirects-hop source", async (testCase) => {
+    const { port } = await booter.boot(
+      remoteConfig({ dangerouslyAllowLocalIP: true, maximumRedirects: testCase.limit }),
+    );
+    const response = await rawGet(
+      port,
+      optimizerUrl(`http://127.0.0.1:${sourcePort}/redirect/${testCase.redirects}`),
+      {},
+    );
+    expect(response.status).toBe(testCase.status);
+    expect(sourceRequests).toEqual(testCase.requests);
+  });
+
+  it.each([
+    { kind: "follow", limit: 1, status: 200 },
+    { kind: "missing", limit: 1, status: 500 },
+    { kind: "invalid", limit: 1, status: 500 },
+    { kind: "limit", limit: 0, status: 508 },
+  ])("closes a streaming redirect body on $kind", async ({ kind, limit, status }) => {
+    const { port } = await booter.boot(
+      remoteConfig({ dangerouslyAllowLocalIP: true, maximumRedirects: limit }),
+    );
+    const response = await rawGet(
+      port,
+      optimizerUrl(`http://127.0.0.1:${sourcePort}/streaming-redirect/${kind}`),
+      {},
+    );
+    expect(response.status).toBe(status);
+    await expect.poll(() => streamingResponses.size, { timeout: 500 }).toBe(0);
+  });
+
+  it.each([
+    { sourcePath: "/mislabeled.jpg", remote: false },
+    { sourcePath: "/generated-image", remote: false },
+    { sourcePath: "/image.png", remote: true },
+    { sourcePath: "/streamed.png", remote: true },
+  ])("enforces maximumResponseBody for $sourcePath", async ({ sourcePath, remote }) => {
+    const { port } = await booter.boot(
+      remoteConfig({
+        dangerouslyAllowLocalIP: true,
+        maximumResponseBody: ONE_PIXEL_PNG.length - 1,
+      }),
+      {
+        middlewareMatcher: "^\\/generated-image$",
+        middlewareSource: `const PNG = Buffer.from("${ONE_PIXEL_PNG.toString("base64")}", "base64");
+export function proxy() {
+  return new Response(PNG, { headers: { "content-type": "image/png" } });
+}\n`,
+      },
+    );
+    const sourceUrl = remote ? `http://127.0.0.1:${sourcePort}${sourcePath}` : sourcePath;
+    const response = await rawGet(port, optimizerUrl(sourceUrl), {});
+    expect(response.status).toBe(413);
+    expect(response.body.toString()).toBe(
+      `"url" parameter is valid but ${remote ? "upstream" : "internal"} response is invalid`,
+    );
+    expect(sourceRequests).toEqual(remote ? [sourcePath] : []);
+  });
+});
 
 describe("image optimizer parity — default config", () => {
   const booter = makeBooter();
@@ -721,19 +913,19 @@ describe("image optimizer parity — default config", () => {
     }
   });
 
-  it("still 502s undecodable bytes whose type is only a GUESS (never echoes them back)", async () => {
+  it("rejects unrecognized image bytes with Next’s 400 response", async () => {
     // The XSS vector the fallback was originally removed for: HTML under an image name.
     // Nothing sniffs, so the type would come from the extension/upstream header — upstream
     // 400s this case outright, and the adapter must not serve the bytes under a guess.
     const res = await fetch(`http://127.0.0.1:${port}/_next/image?url=/html-as.png&w=384&q=75`);
-    expect(res.status).toBe(502);
+    expect(res.status).toBe(400);
     expect(res.headers.get("content-type")).toBeNull();
     expect(await res.text()).not.toContain("alert(1)");
   });
 
   // --- `url` rejection at the server boundary (validateParams, the `url` half) ------
   //
-  // The unit-level table lives in image-utils.test.ts; these pin the wiring: the gate runs
+  // These HTTP cases pin Next’s validation at the adapter boundary: the gate runs
   // BEFORE w/q, the 400 carries no Content-Type, and the branches that used to fall through
   // to the loopback self-fetch now stop here. Bodies measured against `next start` on a
   // scratch copy of Next's test/e2e/image-optimizer fixture, 2026-07-25.

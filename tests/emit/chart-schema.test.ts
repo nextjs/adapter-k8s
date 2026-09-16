@@ -29,7 +29,7 @@ const routingManifest = {
   middleware: { filePath: "middleware.js" },
   poolAssignments: { "/": "default" },
   pprRoutes: {},
-  nextVersion: "16.3.0",
+  nextVersion: "16.3.3",
 } as unknown as RoutingManifest;
 
 const extensionChainJson = JSON.stringify([
@@ -142,7 +142,7 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
     const files = generateHelmChart({
       pools,
       buildId: "schema-build",
-      nextVersion: "16.3.0",
+      nextVersion: "16.3.3",
       config,
       imageRegistry: "registry.example.com/schema",
       routingManifest,
@@ -186,7 +186,7 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
       generateHelmChart({
         pools,
         buildId: "schema-build",
-        nextVersion: "16.3.0",
+        nextVersion: "16.3.3",
         config,
         imageRegistry: "registry.example.com/schema",
         routingManifest,
@@ -220,7 +220,7 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
       generateHelmChart({
         pools,
         buildId: "schema-build",
-        nextVersion: "16.3.0",
+        nextVersion: "16.3.3",
         config,
         imageRegistry: "us-central1-docker.pkg.dev/schema-project/apps",
         routingManifest,
