@@ -21,6 +21,7 @@
 //  5. PPR ownership must distinguish injected shells, runtime capture, unresolved root
 //     params, and requests that cannot be resumed at the adapter boundary.
 import { describe, it, expect, vi, afterEach } from "vitest";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createDispatcher, invokeLocalHandlerOverHttp } from "../../src/pool-server/dispatch.js";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ResolveResult } from "../../src/pool-server/resolve.js";
@@ -106,6 +107,163 @@ function makeDispatcher(handler: NodeHandler, options: Record<string, unknown> =
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe("local handler loopback reuse", () => {
+  it("reuses one process-level listener and connection for bodyless reads", async () => {
+    const listenerPorts: number[] = [];
+    const peerPorts: number[] = [];
+    const handler: NodeHandler = (req, res) => {
+      listenerPorts.push(req.socket.localPort!);
+      peerPorts.push(req.socket.remotePort!);
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+    };
+
+    for (let invocation = 0; invocation < 3; invocation++) {
+      await invokeLocalHandlerOverHttp({
+        handler: handler as never,
+        req: mockReq(`/reuse-${invocation}`),
+        res: mockRes(),
+        matchedPathname: "/[slug]",
+        routeMatches: { slug: `reuse-${invocation}` },
+        bufferedBody: undefined,
+      });
+    }
+
+    expect(listenerPorts).toHaveLength(3);
+    expect(new Set(listenerPorts)).toHaveLength(1);
+    expect(new Set(peerPorts)).toHaveLength(1);
+  });
+
+  it("keeps mutation connections invocation-scoped", async () => {
+    const peerPorts: number[] = [];
+    const handler: NodeHandler = (req, res) => {
+      peerPorts.push(req.socket.remotePort!);
+      res.end("ok");
+    };
+
+    for (let invocation = 0; invocation < 3; invocation++) {
+      await invokeLocalHandlerOverHttp({
+        handler: handler as never,
+        req: mockReq(`/mutation-${invocation}`, {}, "POST"),
+        res: mockRes(),
+        matchedPathname: "/mutation",
+        routeMatches: null,
+        bufferedBody: Buffer.alloc(0),
+      });
+    }
+
+    // Generated action entrypoints attach request-body state to their socket. Never let a later
+    // mutation inherit it; this is the boundary the app-action-size-limit fixture regressed.
+    expect(new Set(peerPorts)).toHaveLength(3);
+  });
+
+  it("does not let a mutation poison the reusable read connection", async () => {
+    const peerPorts: number[] = [];
+    const invoke = (method: "GET" | "POST") =>
+      invokeLocalHandlerOverHttp({
+        handler: ((req: IncomingMessage, innerRes: ServerResponse) => {
+          peerPorts.push(req.socket.remotePort!);
+          innerRes.end("ok");
+        }) as never,
+        req: mockReq(`/${method.toLowerCase()}`, {}, method),
+        res: mockRes(),
+        matchedPathname: "/boundary",
+        routeMatches: null,
+        bufferedBody: method === "POST" ? Buffer.from("action") : undefined,
+      });
+
+    await invoke("GET");
+    await invoke("POST");
+    await invoke("GET");
+
+    expect(peerPorts[0]).toBe(peerPorts[2]);
+    expect(peerPorts[1]).not.toBe(peerPorts[0]);
+  });
+
+  it("keeps concurrent invocation closures isolated and hides its selector header", async () => {
+    const responseA = mockRes();
+    const responseB = mockRes();
+    const invoke = (name: string, delay: number, res: ServerResponse) =>
+      invokeLocalHandlerOverHttp({
+        handler: (async (req: IncomingMessage, innerRes: ServerResponse) => {
+          expect(req.headers["x-adapter-k8s-local-invocation"]).toBeUndefined();
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          innerRes.end(name);
+        }) as never,
+        req: mockReq(`/${name}`),
+        res,
+        matchedPathname: "/[slug]",
+        routeMatches: { slug: name },
+        bufferedBody: undefined,
+      });
+
+    await Promise.all([invoke("alpha", 20, responseA), invoke("beta", 0, responseB)]);
+
+    expect(responseA._body).toBe("alpha");
+    expect(responseB._body).toBe("beta");
+  });
+
+  it("restores each invocation's async context on the shared listener", async () => {
+    const storage = new AsyncLocalStorage<string>();
+    const seen: string[] = [];
+
+    const invoke = (context: string) =>
+      storage.run(context, () =>
+        invokeLocalHandlerOverHttp({
+          handler: ((_req: IncomingMessage, innerRes: ServerResponse) => {
+            seen.push(storage.getStore() ?? "missing");
+            innerRes.end("ok");
+          }) as never,
+          req: mockReq(`/${context}`),
+          res: mockRes(),
+          matchedPathname: "/[slug]",
+          routeMatches: { slug: context },
+          bufferedBody: undefined,
+        }),
+      );
+
+    await invoke("first");
+    await invoke("second");
+
+    expect(seen).toEqual(["first", "second"]);
+  });
+
+  it("does not reuse a connection whose handler answered before consuming the request body", async () => {
+    const peerPorts: number[] = [];
+    const earlyResponse = invokeLocalHandlerOverHttp({
+      handler: ((req: IncomingMessage, innerRes: ServerResponse) => {
+        peerPorts.push(req.socket.remotePort!);
+        innerRes.writeHead(413);
+        innerRes.end("too large");
+      }) as never,
+      req: mockReq("/too-large", { "content-type": "application/octet-stream" }, "POST"),
+      res: mockRes(),
+      matchedPathname: "/too-large",
+      routeMatches: null,
+      bufferedBody: Buffer.alloc(3 * 1024 * 1024),
+      handlerTimeoutMs: 1_000,
+    });
+    await earlyResponse;
+
+    const nextResponse = mockRes();
+    await invokeLocalHandlerOverHttp({
+      handler: ((req: IncomingMessage, innerRes: ServerResponse) => {
+        peerPorts.push(req.socket.remotePort!);
+        innerRes.end("healthy");
+      }) as never,
+      req: mockReq("/healthy"),
+      res: nextResponse,
+      matchedPathname: "/healthy",
+      routeMatches: null,
+      bufferedBody: undefined,
+      handlerTimeoutMs: 1_000,
+    });
+
+    expect(nextResponse._body).toBe("healthy");
+    expect(new Set(peerPorts)).toHaveLength(2);
+  });
 });
 
 describe("RSC cache-busting query param (_rsc)", () => {

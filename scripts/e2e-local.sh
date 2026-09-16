@@ -24,6 +24,17 @@ NEXTJS_DIR="${NEXTJS_DIR:-${WORKSPACE}/next.js}"
 TEST_PATTERN="${1:-}"
 NEXTJS_REF="${2:-v16.3.0-canary.97}"
 TEST_GROUP="${3:-1/1}"
+
+# The build/CLI surface supports Node 20, but this harness boots the emitted pool runtime. That
+# runtime deliberately targets Node 24 (`process.getBuiltinModule` and Node-24 regex syntax are
+# both used by the pinned Next release). Failing once here is much cheaper and clearer than
+# building every fixture and reporting a wall of identical runtime parse failures.
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+if [ "$NODE_MAJOR" -lt 24 ]; then
+  echo "ERROR: the adapter e2e serving runtime requires Node >=24 (found $(node --version))." >&2
+  echo "Run this suite under Node 24; Node 20 remains covered by the build/CLI compatibility lane." >&2
+  exit 1
+fi
 # Match upstream CI (.github/workflows/integration_tests_reusable.yml `num_retries: 2`) so
 # our pass/fail numbers are comparable to Next's own. This was 0 while the adapter still had
 # ~1000 failures — retrying a wall of real failures only burned wall-clock. Now that the
