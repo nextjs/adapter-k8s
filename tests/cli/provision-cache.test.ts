@@ -204,6 +204,43 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     );
   });
 
+  it("reuses explicitly plaintext cache when GCP omits the default false authEnabled field", async () => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      [
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(
+          JSON.stringify(
+            existingConfig({ authEnabled: undefined, transitEncryptionMode: "DISABLED" }),
+          ),
+        ),
+      ],
+    ]);
+    expect(await provisionMemorystore({ ...OPTS, auth: false })).toEqual({
+      host: "10.0.0.1",
+      port: 6379,
+    });
+    expect(vi.mocked(exec.execCapture).mock.calls.some(([, args]) => args.includes("create"))).toBe(
+      false,
+    );
+    await expect(provisionMemorystore(OPTS)).rejects.toThrow(/incompatible.*AUTH/i);
+  });
+
+  it.each([null, "false", 0])("rejects an invalid authEnabled value %j", async (authEnabled) => {
+    mockGcloud([
+      ["services enable", ok()],
+      ["--format=value(state,host,port)", ok("READY 10.0.0.1 6379")],
+      [
+        "--format=json(authEnabled,transitEncryptionMode",
+        ok(JSON.stringify(existingConfig({ authEnabled, transitEncryptionMode: "DISABLED" }))),
+      ],
+    ]);
+    await expect(provisionMemorystore({ ...OPTS, auth: false })).rejects.toThrow(
+      /Could not verify the full configuration/,
+    );
+  });
+
   it("reuses an existing AUTH-enabled instance and returns its credentials", async () => {
     mockGcloud([
       ["services enable", ok()],
