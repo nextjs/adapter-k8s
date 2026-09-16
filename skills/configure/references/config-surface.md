@@ -150,7 +150,7 @@ Merged-gateway caveat (EnvoyProxy `mergeGateways: true`): Envoy Gateway rejects 
 
 ### `gkeNativeRouting(options?)`
 
-`{ projectId?, addressName?, extensionName?, gatewayClassName? /* default 'gke-l7-global-external-managed' */ }` — GCP traffic-extension ext_proc over TLS. Requires matching Gateway API exposure and a projectId.
+`{ projectId?, addressName?, extensionName?, gatewayClassName? /* default 'gke-l7-global-external-managed' */ }` — GCP traffic-extension ext_proc over TLS. Requires a matching Gateway API exposure and project. The project must equal the `gkeCluster` project, and the exposure must declare exactly one `{ type: "NamedAddress", value: addressName }`; cross-project registration is not supported.
 
 ## Complete non-GKE example (Envoy Gateway)
 

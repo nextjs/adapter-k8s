@@ -125,7 +125,6 @@ export interface ResourceBuildResult extends KubernetesContribution {
 export type DisabledRoutingTier = {
   enabled: false;
   serviceAnnotations: Record<string, string>;
-  registration: "none";
   transport?: never;
   callerAuthentication?: never;
 };
@@ -136,26 +135,12 @@ export type RoutingCallerAuthentication = {
   transportSecurity: "none" | "server-tls";
 };
 
-export type EnabledRoutingTier =
-  | {
-      enabled: true;
-      transport: "tls" | "h2c";
-      callerAuthentication: RoutingCallerAuthentication;
-      serviceAnnotations: Record<string, string>;
-      registration: "none";
-    }
-  | {
-      enabled: true;
-      transport: "tls";
-      callerAuthentication: RoutingCallerAuthentication & { transportSecurity: "server-tls" };
-      serviceAnnotations: Record<string, string>;
-      /**
-       * Built-in GKE bridge. This is not an extension hook because Helm has one matching
-       * executor. Move registration into a versioned apply operation before adding another
-       * external control plane.
-       */
-      registration: "gke-traffic-extension";
-    };
+export type EnabledRoutingTier = {
+  enabled: true;
+  transport: "tls" | "h2c";
+  callerAuthentication: RoutingCallerAuthentication;
+  serviceAnnotations: Record<string, string>;
+};
 
 export type RoutingTier = DisabledRoutingTier | EnabledRoutingTier;
 

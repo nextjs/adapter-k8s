@@ -4,6 +4,7 @@
 // adapters belong under src/target. This module remains only so provider.gke and provider.generic
 // keep their existing chart output through the documented 0.x migration window.
 import type { K8sAdapterConfig, PoolDefinition, RoutingManifest } from "../types.js";
+import type { RoutingRegistration } from "../composition-plan/types.js";
 
 /**
  * How the ext_proc callout gets registered with the data plane.
@@ -30,8 +31,11 @@ export interface ProviderChartContext {
 /** Context for the ext_proc wiring, which needs the pool set and the routing tier's name. */
 export interface ProviderExtProcContext extends ProviderChartContext {
   buildId: string;
-  /** GKE only: the traffic-extension registration Job needs project/region to call gcloud. */
+  /** Legacy GKE only: project information loaded from infrastructure.json. */
   infrastructure?: { projectId?: string; region?: string } | undefined;
+  /** GKE project that owns the deploy GSA bound to the chart's Kubernetes ServiceAccount. */
+  executorProjectId?: string | undefined;
+  registration?: Extract<RoutingRegistration, { kind: "gcp-traffic-extension-v1" }> | undefined;
   extensionChainJson?: string | undefined;
   routeExtDocumentDigest: () => string;
   /**
