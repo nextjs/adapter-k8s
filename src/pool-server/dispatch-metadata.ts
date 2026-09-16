@@ -83,3 +83,22 @@ export function parseDispatchDeadline(raw: unknown): ParsedDispatchField<number>
   const value = Number(raw);
   return Number.isSafeInteger(value) && value > 0 ? { ok: true, value } : invalid();
 }
+
+export function parseDispatchExternalRewrite(raw: unknown): ParsedDispatchField<URL> {
+  if (raw === undefined) return absent();
+  if (typeof raw !== "string") return invalid();
+  try {
+    const url = new URL(raw);
+    if (
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.username !== "" ||
+      url.password !== ""
+    ) {
+      return invalid();
+    }
+    url.hash = "";
+    return { ok: true, value: url };
+  } catch {
+    return invalid();
+  }
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cleanup for the PHASE 3 (real cluster) topology.
+# Cleanup for the Kubernetes topology.
 #
 # Deliberately does NOT tear the release down. Every suite deploys to the same release,
 # and the next one's blue/green cutover replaces this build — destroying it here would
@@ -22,7 +22,18 @@ fi
 
 if [ -n "$RELEASE" ] && command -v kubectl >/dev/null 2>&1; then
   echo "=== Pool pod tail (release ${RELEASE}) ==="
-  kubectl logs -l "app.kubernetes.io/instance=${RELEASE}" \
+  # Pin logs to the build selected by the active pool Service. A release-wide selector also
+  # includes the outgoing build and routing service; whichever pod kubectl returned last used to
+  # hide the failing fixture's evidence behind logs from the previous suite.
+  ACTIVE_VERSION="$(
+    kubectl get service "${RELEASE}-default" \
+      -o 'jsonpath={.spec.selector.app\.kubernetes\.io/version}' 2>/dev/null || true
+  )"
+  POD_SELECTOR="app.kubernetes.io/name=${RELEASE},app.kubernetes.io/component!=routing-service"
+  if [ -n "$ACTIVE_VERSION" ]; then
+    POD_SELECTOR="${POD_SELECTOR},app.kubernetes.io/version=${ACTIVE_VERSION}"
+  fi
+  kubectl logs -l "$POD_SELECTOR" \
     --all-containers --tail=40 --since=15m 2>&1 | tail -80 || true
 fi
 

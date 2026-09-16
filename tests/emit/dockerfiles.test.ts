@@ -204,9 +204,10 @@ describe("generateRoutingServiceDockerfile", () => {
     expect(result).not.toContain("tls-cert.pem -out");
     // openssl stays installed for the runtime generation.
     expect(result).toContain("apt-get install -y --no-install-recommends openssl");
-    // Cert paths point at the pod's /tmp emptyDir (root FS is read-only).
-    expect(result).toContain("TLS_CERT_FILE=/tmp/tls/tls-cert.pem");
-    expect(result).toContain("TLS_KEY_FILE=/tmp/tls/tls-key.pem");
+    // Cert paths are runtime Deployment configuration, not image metadata. Keeping the
+    // private-key path out of ENV also avoids BuildKit's secret-in-ENV warning.
+    expect(result).not.toContain("TLS_CERT_FILE");
+    expect(result).not.toContain("TLS_KEY_FILE");
   });
 });
 

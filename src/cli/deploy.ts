@@ -23,7 +23,7 @@ import { retainRemovedPoolResources } from "./stable-pool-resources.js";
 import { runCutover } from "../cutover/run.js";
 import { createEdgeRecovery } from "../cutover/edge.js";
 import { CutoverExitError } from "../cutover/inputs.js";
-import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "./rollback.js";
+import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "../cutover/edge.js";
 
 /**
  * The liveness path, used ONLY as the one-cycle fallback for the stable HealthCheckPolicy when
@@ -38,11 +38,10 @@ import {
   buildDeleteMemorystoreCommand,
   cacheInstanceName,
 } from "./provision-cache.js";
-import { isAlreadyGoneError } from "./destroy.js";
+import { cleanupManagedCache } from "./managed-cache-cleanup.js";
 import { MIN_GKE_VERSION_FOR_CDN } from "./gke-version.js";
 import {
   claimManagedCacheIdentity,
-  deleteManagedCacheIdentityArgs,
   readManagedCacheIdentity,
   type ManagedCacheIdentity,
 } from "./cache-identity.js";
@@ -87,20 +86,6 @@ import {
   resolveBuiltTargetPlatform,
 } from "../pipeline/fingerprints.js";
 
-// Moved to src/pipeline/ (GitOps PR1); re-exported here so the import surface of the CLI
-// module is unchanged for existing consumers and tests-through-runDeploy.
-export {
-  assertSafePoolName,
-  buildDockerCommands,
-  refreshFetchCacheStaging,
-  type DockerCommandOptions,
-} from "../pipeline/images.js";
-export {
-  resolveDeployImageDigests,
-  resolveImageDigest,
-  resolveRegistryDigest,
-  resolveRegistryDigestAny,
-} from "../pipeline/digests.js";
 import {
   assertCompositionPlanInvocation,
   compositionPlanNeedsExplicitConfirmation,
@@ -647,7 +632,7 @@ export function buildHelmUpgradeArgs(options: {
  * Discover the cluster's pod CIDR for the chart-rendered NetworkPolicies. FAIL-CLOSED:
  * the helm `podCidrs` guard renders NO policy when the value is absent, so a failed or
  * malformed lookup throws (the NetworkPolicies are what close in-cluster access to the
- * routing service's dispatch secret, H1) — unless the operator explicitly opts out with
+ * routing service's unauthenticated dispatch-proof endpoint, H1) — unless the operator opts out with
  * `--allow-no-network-policy`, in which case this warns loudly and returns null.
  */
 export async function discoverClusterPodCidr({
@@ -704,13 +689,14 @@ const CIDR_LIST_RE = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}(,(\d{1,3}\.){3}\d{1,3}\/\d
  * `discoverClusterNodeCidrs` below asks gcloud for the cluster's subnetwork, which a K3s,
  * kind or on-prem cluster does not have — so the strict NetworkPolicy posture was simply
  * unavailable there and the dataplane stayed on the broad `0.0.0.0/0 except pods` denylist.
- * That matters because the routing tier's ext_proc reply carries the internal dispatch secret.
+ * That matters because any caller reaching the routing tier can obtain a request-bound dispatch
+ * proof for a request it composed, even though the underlying secret never crosses the wire.
  *
  * Node addresses are exact (`/32`) rather than a subnet: the API reports the addresses the
  * kubelets actually have, which is tighter than the enclosing range and needs no cloud
  * metadata. The trade is that adding a node requires a redeploy to admit it — acceptable, and
  * failing CLOSED (a new node's probes are denied until then) is the right direction for a
- * control whose job is to bound who can reach the dispatch secret.
+ * control whose job is to bound who can ask the routing service for a trusted verdict.
  *
  * Returns null on any failure so the caller owns the fail-closed decision.
  */
@@ -1042,6 +1028,13 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // Which provider this build targets. Older metadata predates the field; default to gke,
   // which is what every build before this change was.
   const buildProvider: string = typeof metadata.provider === "string" ? metadata.provider : "gke";
+  const hasHealthCheckPolicy = compositionSnapshot
+    ? compositionSnapshot.plan.requirements.kubernetes.resources.some(
+        (requirement) =>
+          requirement.apiVersion === "networking.gke.io/v1" &&
+          requirement.resource === "healthcheckpolicies",
+      )
+    : buildProvider === "gke";
   // A2 (pipeline/fingerprints.ts): artifact platform, target fingerprint (registry +
   // namespace), and pool-topology validation — identical in emit and deploy by construction.
   const builtTargetPlatform = resolveBuiltTargetPlatform(metadata);
@@ -1359,8 +1352,8 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       `Cannot determine the NetworkPolicy source ranges: .k8s-adapter/infrastructure.json is ` +
         `missing ${missing.join(" and ")}. Without ${missing.join(" and ")} neither the pod CIDR ` +
         `nor the node range can be discovered, and the chart would render NO NetworkPolicies — ` +
-        `leaving the routing tier's ext_proc port reachable, which is what makes the internal ` +
-        `dispatch secret obtainable. Run \`npx adapter-k8s init\` to regenerate ` +
+        `leaving the routing tier's ext_proc port reachable as a signing oracle for pool-trusted ` +
+        `dispatch verdicts. Run \`npx adapter-k8s init\` to regenerate ` +
         `infrastructure.json, or pass --allow-no-network-policy to deploy without isolation ` +
         `deliberately.`,
     );
@@ -2373,6 +2366,10 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           previousPools,
           defaultPool,
           hasPortableOrigin,
+          hasRoutingTier: existsSync(
+            path.join(outputDir, "chart", "templates", "routing-service-deployment.yaml"),
+          ),
+          hasHealthCheckPolicy,
           previousReplicasByPool,
           state,
           compositionSnapshot,
@@ -2471,32 +2468,27 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
           `${metadata.cacheEnabled ? "switched to bring-your-own cache" : "cache is disabled"}...`,
       );
       const del = buildDeleteMemorystoreCommand(releaseName, cleanup.region, cleanup.projectId);
-      const res = await execCapture(del.command, del.args, {
-        timeoutMs: EXEC_TIMEOUTS.cloudOperation,
+      const result = await cleanupManagedCache({
+        releaseName,
+        namespace,
+        deletion: del,
+        infrastructure: infra,
+        infrastructurePath: infraPath,
       });
-      if (res.exitCode === 0 || isAlreadyGoneError(res.stderr)) {
-        const identityDelete = await execCapture(
-          "kubectl",
-          deleteManagedCacheIdentityArgs(releaseName, namespace),
-          { timeoutMs: EXEC_TIMEOUTS.kubectl },
-        );
-        if (identityDelete.exitCode !== 0 && !isAlreadyGoneError(identityDelete.stderr)) {
-          console.warn(
-            `    Warning: the cache was deleted, but its coordination ConfigMap could not be ` +
-              `removed. Delete ${releaseName}-cache-identity before choosing a new cache ` +
-              `project or region.\n    ${sanitizeForTerminal(identityDelete.stderr.trim())}`,
-          );
-        }
-        delete infra.cacheRegion;
-        delete infra.cacheProjectId;
-        delete infra.cacheProvisioningPending;
-        writeFileSync(infraPath, JSON.stringify(infra, null, 2));
+      if (result.status === "cleared") {
         console.log(`    ${del.desc} deleted`);
-      } else {
+      } else if (result.status === "cloud-delete-failed") {
         console.warn(
           `    Warning: could not delete ${del.desc} in ${cleanup.region} — it may still be ` +
             `billed. Delete it manually or run \`adapter-k8s destroy\`.\n    ` +
-            `${sanitizeForTerminal(res.stderr.trim())}`,
+            result.detail,
+        );
+      } else {
+        console.warn(
+          `    Warning: the cache was deleted, but its coordination ConfigMap could not be ` +
+            `removed. Local cache coordinates were preserved for retry. Delete ` +
+            `${releaseName}-cache-identity before choosing a new cache project or region.\n    ` +
+            result.detail,
         );
       }
     }

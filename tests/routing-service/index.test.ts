@@ -14,9 +14,9 @@ describe("ensureTlsIdentity — ROUTING_TRANSPORT (S26)", () => {
     process.env = { ...saved };
   });
 
-  it("serves h2c when the transport is explicitly h2c, even with TLS paths baked in", () => {
-    // The emitted image bakes TLS_CERT_FILE/TLS_KEY_FILE, and the plaintext opt-in only
-    // applied when BOTH were unset — so on an in-cluster gateway the service self-signed and
+  it("serves h2c when the transport is explicitly h2c, even with TLS paths present", () => {
+    // The old image-level TLS defaults meant the plaintext opt-in only applied when BOTH paths
+    // were unset — so on an in-cluster gateway the service self-signed and
     // served h2 TLS while Envoy dialled h2c. MEASURED: every callout 500s while :8081 health
     // stays green, so the deployment looks fine and no request is ever routed.
     const dir = mkdtempSync(path.join(os.tmpdir(), "h2c-"));

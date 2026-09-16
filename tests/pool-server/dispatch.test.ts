@@ -429,12 +429,14 @@ describe("createDispatcher", () => {
   });
 
   it("renders a Pages 404 through /_error with invokeStatus when no /404 output exists", async () => {
+    let statusDuringRender: number | undefined;
     const errorHandler = vi.fn(
       (
         _req: IncomingMessage,
         res: ServerResponse,
         ctx: { requestMeta: Record<string, unknown> },
       ) => {
+        statusDuringRender = res.statusCode;
         expect(ctx.requestMeta.outputId).toBe("/_error");
         expect(ctx.requestMeta.invokeStatus).toBe(404);
         res.writeHead(200, { "content-type": "text/html" });
@@ -456,6 +458,7 @@ describe("createDispatcher", () => {
     await dispatcher.dispatch(mockReq("/missing"), res, { kind: "not-found" });
 
     expect(errorHandler).toHaveBeenCalledOnce();
+    expect(statusDuringRender).toBe(404);
     expect(res._status).toBe(404);
     expect(res._body).toContain("pages error entrypoint");
   });
@@ -661,14 +664,29 @@ describe("createDispatcher", () => {
 
   it("merges dynamic params into the request URL for edge Pages outputs", async () => {
     let backgroundComplete = false;
-    const edgeRouteRunner = vi.fn().mockResolvedValue({
-      response: new Response("ok"),
-      waitUntil: new Promise<void>((resolve) => {
-        setTimeout(() => {
-          backgroundComplete = true;
-          resolve();
-        }, 5);
-      }),
+    let scopeDepth = 0;
+    const prepareUseCache = vi.fn(async () => <T>(callback: () => T): T => {
+      scopeDepth++;
+      const result = callback();
+      if (result instanceof Promise) {
+        return result.finally(() => {
+          scopeDepth--;
+        }) as T;
+      }
+      scopeDepth--;
+      return result;
+    });
+    const edgeRouteRunner = vi.fn(async () => {
+      expect(scopeDepth).toBeGreaterThan(0);
+      return {
+        response: new Response("ok"),
+        waitUntil: new Promise<void>((resolve) => {
+          setTimeout(() => {
+            backgroundComplete = true;
+            resolve();
+          }, 5);
+        }),
+      };
     });
     const dispatcher = createDispatcher({
       handlerLoader: {
@@ -683,6 +701,7 @@ describe("createDispatcher", () => {
       poolName: "ssr",
       buildId: "test123",
       staticAssets: [],
+      prepareUseCache,
       edgeRouteRunner,
     });
 
@@ -708,6 +727,51 @@ describe("createDispatcher", () => {
     expect(res._status).toBe(200);
     expect(res._body).toBe("ok");
     expect(backgroundComplete).toBe(true);
+  });
+
+  it("preserves the public Host for Edge Server Action forwarding", async () => {
+    const edgeRouteRunner = vi.fn().mockResolvedValue({
+      response: new Response("ok"),
+      waitUntil: Promise.resolve(),
+    });
+    const dispatcher = createDispatcher({
+      handlerLoader: {
+        load: vi.fn(),
+        has: vi.fn().mockReturnValue(true),
+        get: vi.fn().mockReturnValue({
+          runtime: "edge",
+          type: "APP_PAGE",
+          filePath: "/app/.next/server/edge/page.js",
+        }),
+      } as any,
+      poolName: "ssr",
+      buildId: "test123",
+      staticAssets: [],
+      edgeRouteRunner,
+    });
+    const req = mockReq("/edge-action", {
+      host: "public.example:8443",
+      "next-action": "action-id",
+    });
+    req.method = "POST";
+
+    await dispatcher.dispatch(req, mockRes(), {
+      kind: "route",
+      pool: "ssr",
+      matchedPathname: "/edge-action",
+      routeMatches: null,
+      resolvedHeaders: undefined,
+    });
+
+    expect(edgeRouteRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        request: expect.objectContaining({
+          headers: expect.objectContaining({
+            "x-forwarded-host": "public.example:8443",
+          }),
+        }),
+      }),
+    );
   });
 
   it("recovers Edge App catch-all params from the concrete pathname", async () => {
@@ -1581,10 +1645,27 @@ describe("createDispatcher", () => {
         path.join(tmpDir, "index.segments", "__PAGE__.segment.rsc"),
         "seeded-segment-rsc",
       );
-      const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+      let scopeDepth = 0;
+      const prepareUseCache = vi.fn(async () => <T>(callback: () => T): T => {
+        scopeDepth++;
+        const result = callback();
+        if (result instanceof Promise) {
+          return result.finally(() => {
+            scopeDepth--;
+          }) as T;
+        }
+        scopeDepth--;
+        return result;
+      });
+      const localHandlerInvoker = vi.fn(async () => {
+        expect(scopeDepth).toBeGreaterThan(0);
+      });
       const dispatcher = createDispatcher({
         handlerLoader: {
-          load: vi.fn().mockResolvedValue(vi.fn()),
+          load: vi.fn(async () => {
+            expect(scopeDepth).toBeGreaterThan(0);
+            return vi.fn();
+          }),
           has: vi.fn((pathname: string) => pathname === "/"),
           get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
         } as any,
@@ -1599,6 +1680,7 @@ describe("createDispatcher", () => {
             prerender: true,
           },
         ],
+        prepareUseCache,
         localHandlerInvoker,
         entrypointOwnsPprShell: true,
         rscConfig: {
@@ -1627,6 +1709,7 @@ describe("createDispatcher", () => {
       );
 
       await vi.waitFor(() => expect(localHandlerInvoker).toHaveBeenCalledOnce());
+      expect(prepareUseCache).toHaveBeenCalledTimes(1);
       expect(localHandlerInvoker).toHaveBeenCalledWith(
         expect.objectContaining({
           discardResponse: true,
@@ -1859,6 +1942,7 @@ describe("createDispatcher", () => {
 
       expect(res._status).toBe(200);
       expect(res._body).toBe("materialized-segment");
+      expect(res._headers["x-nextjs-postponed"]).toBe("2");
     });
 
     it("a STORED entry WITHOUT the requested segment falls back to the seeded file", async () => {
@@ -2017,6 +2101,39 @@ describe("createDispatcher", () => {
       expect(resEncoded._status).not.toBe(404);
       expect(localHandlerInvoker).toHaveBeenCalledTimes(2);
     });
+
+    it.each(["/blog/a%2Fb", "/_next/data/test123/blog/a%2Fb.json"])(
+      "404s a non-generated fallback:false path with an encoded slash (%s)",
+      async (url) => {
+        const localHandlerInvoker = vi.fn().mockResolvedValue(undefined);
+        const dispatcher = createDispatcher({
+          handlerLoader: {
+            load: vi.fn().mockResolvedValue(vi.fn()),
+            has: vi.fn((p: string) => p === "/blog/[slug]"),
+            get: vi.fn().mockReturnValue({ runtime: "nodejs" }),
+          } as any,
+          poolName: "ssr",
+          buildId: "test123",
+          staticAssets: [],
+          localHandlerInvoker,
+          strictDynamicRoutes: [{ pageRegex: /^\/blog\/([^/]+?)(?:\/)?$/ }],
+          prerenderedPaths: new Set(["/blog/first"]),
+          buildIdForData: "test123",
+        });
+        const res = mockRes();
+
+        await dispatcher.dispatch(mockReq(url), res, {
+          kind: "route",
+          pool: "ssr",
+          matchedPathname: "/blog/[slug]",
+          routeMatches: { slug: "a%2Fb" },
+          resolvedHeaders: undefined,
+        });
+
+        expect(res._status).toBe(404);
+        expect(localHandlerInvoker).not.toHaveBeenCalled();
+      },
+    );
 
     it("does NOT 404 a dynamic path that matches no strict route (fallback:blocking / dynamicParams:true)", async () => {
       // App has a fallback:false route (/blog/[slug]) but the request is for a

@@ -61,6 +61,7 @@ describe("runDescribe", () => {
       .mock.calls.find(([cmd, args]) => cmd === "kubectl" && args.includes("deployments"));
     expect(depCall).toBeDefined();
     expect(depCall![1].join(" ")).toContain("-n default");
+    expect(depCall![1].filter((arg) => arg.startsWith("jsonpath="))).toHaveLength(1);
   });
 
   it("uses the configured namespace for state and deployment reads", async () => {

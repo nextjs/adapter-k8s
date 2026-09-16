@@ -92,6 +92,7 @@ interface SeenInvocation {
   matchedPath: string | undefined;
   body: string;
   hadCaptureCallback: boolean;
+  minimalMode?: boolean;
 }
 
 /**
@@ -183,6 +184,7 @@ describe("shell-less PPR capable route: live postpone → canonical resume → a
         matchedPath: undefined,
         body: "",
         hadCaptureCallback: typeof ctx?.requestMeta?.onCacheEntryV2 === "function",
+        minimalMode: ctx?.requestMeta?.minimalMode,
       });
       res.writeHead(200, { "content-type": "text/html" });
       res.end("<complete-dynamic-document>");
@@ -223,17 +225,36 @@ describe("shell-less PPR capable route: live postpone → canonical resume → a
     expect(res._body).toBe("<shell>");
   });
 
-  it("resumes RSC requests too — a truncated Flight payload is the same bug (spec test plan #3)", async () => {
+  it("does not run the document POST-resume protocol for an RSC response", async () => {
     const seen: SeenInvocation[] = [];
-    const dispatcher = makeDispatcher(postponingHandler(seen), {
+    const rscHandler: NodeHandler = async (req, res, ctx) => {
+      seen.push({
+        method: req.method,
+        nextResume: req.headers["next-resume"] as string | undefined,
+        matchedPath: undefined,
+        body: "",
+        hadCaptureCallback: typeof ctx?.requestMeta?.onCacheEntryV2 === "function",
+        minimalMode: ctx?.requestMeta?.minimalMode,
+      });
+      // Real generated RSC entrypoints own their Flight response. Even if they report an APP_PAGE
+      // cache entry through the always-present callback, the adapter must not append an HTML-style
+      // POST resume tail to this transport.
+      await ctx?.requestMeta?.onCacheEntryV2?.({
+        value: { kind: "APP_PAGE", postponed: "RSC-STATE", html: "unused" },
+      });
+      res.writeHead(200, { "content-type": "text/x-component" });
+      res.end("<complete-flight>");
+    };
+    const dispatcher = makeDispatcher(rscHandler, {
       rscConfig: { header: "rsc", suffix: ".rsc" },
     });
     const res = mockRes();
     await dispatcher.dispatch(mockReq("/novel/early-span", { rsc: "1" }), res, routeResolution());
 
-    expect(seen).toHaveLength(2);
-    expect(seen[1]!.nextResume).toBe("1");
-    expect(res._body).toBe("<shell><resumed-tail>");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.nextResume).toBeUndefined();
+    expect(seen[0]!.minimalMode).toBe(false);
+    expect(res._body).toBe("<complete-flight>");
   });
 
   it("serves the shell alone when the resume invocation fails — never the error body", async () => {

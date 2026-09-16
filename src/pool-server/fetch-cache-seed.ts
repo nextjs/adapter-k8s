@@ -2,7 +2,7 @@
 //
 // The image ships the BUILD's fetch-cache under `.k8s-adapter/fetch-cache-seed` rather than
 // its runtime location (`<distDir>/cache/fetch-cache`) because the pod mounts a writable
-// emptyDir at `/app/.next/cache` (deployment.ts `next-cache`, required under
+// emptyDir at `/app/<distDir>/cache` (deployment.ts `next-cache`, required under
 // readOnlyRootFilesystem) — anything baked into the image at the mounted path is simply
 // INVISIBLE in the pod. Measured 2026-08-04: the image had the files, `kubectl exec` showed
 // an empty dir, and both consumers read the runtime location — Next's FileSystemCache
@@ -12,17 +12,18 @@
 // cache-components background revalidation dies under load (rdc stale-forever).
 //
 // The copy is per-file and never clobbers: a file already present in the emptyDir is a
-// RUNTIME write (fresher than the build's) and must win. `.next` is the same fixed distDir
-// assumption the seed readers make (fsMirrorSeed/fetchCacheSeed); for a custom-distDir app
-// the mount does not shadow the image (the chart mounts `/app/.next/cache` literally), so
-// the restore is a harmless no-op there.
+// RUNTIME write (fresher than the build's) and must win. The validated manifest distDir is
+// shared by the chart mount, this restore, and both seed readers.
 import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 
-export function restoreFetchCacheSeed(appRoot: string): void {
+export function restoreFetchCacheSeed(
+  appRoot: string,
+  distDir = path.join(appRoot, ".next"),
+): void {
   const src = path.join(appRoot, ".k8s-adapter", "fetch-cache-seed");
   if (!existsSync(src)) return;
-  const dest = path.join(appRoot, ".next", "cache", "fetch-cache");
+  const dest = path.join(distDir, "cache", "fetch-cache");
   try {
     mkdirSync(dest, { recursive: true });
     let restored = 0;

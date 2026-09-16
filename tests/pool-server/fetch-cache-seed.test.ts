@@ -41,6 +41,14 @@ describe("restoreFetchCacheSeed", () => {
     );
   });
 
+  it("restores into a custom distDir", () => {
+    write(".k8s-adapter/fetch-cache-seed/abc123", "entry-bytes");
+    restoreFetchCacheSeed(appRoot, path.join(appRoot, "build"));
+    expect(readFileSync(path.join(appRoot, "build/cache/fetch-cache/abc123"), "utf-8")).toBe(
+      "entry-bytes",
+    );
+  });
+
   it("no-ops without a staged seed", () => {
     restoreFetchCacheSeed(appRoot);
     expect(existsSync(path.join(appRoot, ".next/cache"))).toBe(false);

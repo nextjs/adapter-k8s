@@ -9,7 +9,7 @@
 //     path), so served immutable for a year.
 //
 // The `?dpl` skew-protection token on asset URLs is a separate concern handled by Next at build
-// time via `experimental.supportsImmutableAssets`; this only governs response headers on serve.
+// time via `supportsImmutableAssets`; this only governs response headers on serve.
 
 export interface StaticAssetHeaders {
   cacheControl: string;

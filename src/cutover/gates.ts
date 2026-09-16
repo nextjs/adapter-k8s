@@ -278,32 +278,50 @@ export async function waitRoutingRollout(ctx: GateContext): Promise<void> {
     { timeoutMs: EXEC_TIMEOUTS.kubectl },
   );
   const [foundName, replicasField] = rsExists.stdout.trim().split("|");
-  if (rsExists.exitCode === 0 && foundName) {
-    // An unreadable count degrades to the floor (deriveRolloutWaitBudget), never to zero: the
-    // rollout still has to be waited on, and a short wait is the dangerous direction.
-    const rolloutWait = deriveRolloutWaitBudget(parseInt(replicasField ?? "", 10));
-    console.log(`    Waiting for ${routingDeploy}...`);
-    const rsRollout = await execCapture(
-      "kubectl",
-      ["rollout", "status", `deployment/${routingDeploy}`, "-n", namespace, rolloutWait.arg],
-      { timeoutMs: rolloutWait.execTimeoutMs },
+  if (rsExists.exitCode !== 0) {
+    const edge = await deps.restoreEdgeToPreviousBuild();
+    throw new Error(
+      [
+        `Could not read expected routing service (${routingDeploy}); refusing traffic cutover.`,
+        sanitizeForTerminal(rsExists.stderr.trim()) || `kubectl exited ${rsExists.exitCode}`,
+        ...deps.edgeStatusLines(edge),
+      ].join("\n"),
     );
-    if (rsRollout.exitCode !== 0) {
-      // The new routing pods can't roll — but the OLD routing pods already picked up the
-      // new build's manifest from the (helm-overwritten) stable ConfigMap via kubelet
-      // volume sync, so the edge is on the new build regardless. Revert it (N25).
-      const edge = await deps.restoreEdgeToPreviousBuild();
-      throw new Error(
-        [
-          `Routing service (${routingDeploy}) did not become healthy within ` +
-            `${rolloutWait.seconds}s. Traffic was NOT switched — the previous build's pools ` +
-            `are still serving.`,
-          `${sanitizeForTerminal((rsRollout.stderr || rsRollout.stdout).trim())}`,
-          `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${namespace} --tail=40`,
-          ...deps.edgeStatusLines(edge),
-        ].join("\n"),
-      );
-    }
+  }
+  if (!foundName) {
+    const edge = await deps.restoreEdgeToPreviousBuild();
+    throw new Error(
+      [
+        `The build expected routing service (${routingDeploy}), but its Deployment is absent. ` +
+          `Refusing traffic cutover because middleware routing would silently fall back to pools.`,
+        ...deps.edgeStatusLines(edge),
+      ].join("\n"),
+    );
+  }
+  // An unreadable count degrades to the floor (deriveRolloutWaitBudget), never to zero: the
+  // rollout still has to be waited on, and a short wait is the dangerous direction.
+  const rolloutWait = deriveRolloutWaitBudget(parseInt(replicasField ?? "", 10));
+  console.log(`    Waiting for ${routingDeploy}...`);
+  const rsRollout = await execCapture(
+    "kubectl",
+    ["rollout", "status", `deployment/${routingDeploy}`, "-n", namespace, rolloutWait.arg],
+    { timeoutMs: rolloutWait.execTimeoutMs },
+  );
+  if (rsRollout.exitCode !== 0) {
+    // The new routing pods can't roll — but the OLD routing pods already picked up the
+    // new build's manifest from the (helm-overwritten) stable ConfigMap via kubelet
+    // volume sync, so the edge is on the new build regardless. Revert it (N25).
+    const edge = await deps.restoreEdgeToPreviousBuild();
+    throw new Error(
+      [
+        `Routing service (${routingDeploy}) did not become healthy within ` +
+          `${rolloutWait.seconds}s. Traffic was NOT switched — the previous build's pools ` +
+          `are still serving.`,
+        `${sanitizeForTerminal((rsRollout.stderr || rsRollout.stdout).trim())}`,
+        `Inspect: kubectl logs -l app.kubernetes.io/component=routing-service -n ${namespace} --tail=40`,
+        ...deps.edgeStatusLines(edge),
+      ].join("\n"),
+    );
   }
 }
 

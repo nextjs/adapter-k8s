@@ -1,10 +1,11 @@
 // src/cli/tail.ts
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { execCapture } from "./exec.js";
+import { EXEC_TIMEOUTS, execCapture } from "./exec.js";
 import { sanitizeForTerminal } from "./terminal.js";
 import { assertSafeInfrastructure, infrastructurePath } from "./infrastructure-validation.js";
 import { resolveK8sNamespace } from "../emit/templates/utils.js";
+import { establishCompositionPlanCluster, loadProjectCompositionPlan } from "./composition-plan.js";
 
 const COLORS = [
   "\x1b[36m", // cyan
@@ -22,13 +23,34 @@ const DIM = "\x1b[2m";
 const RESET = "\x1b[0m";
 const RED = "\x1b[31m";
 
-export async function runTail(options: { projectDir: string; releaseName: string }): Promise<void> {
+export async function runTail(options: {
+  projectDir: string;
+  releaseName: string;
+  yes?: boolean;
+}): Promise<void> {
   const { projectDir, releaseName } = options;
   let namespace = resolveK8sNamespace();
 
-  // Connect to the right cluster
-  const infraPath = infrastructurePath(projectDir);
-  if (existsSync(infraPath)) {
+  // A composition plan is the authenticated target contract. Legacy infrastructure coordinates
+  // are only a fallback for artifacts that predate it.
+  const composition = loadProjectCompositionPlan(projectDir);
+  if (composition) {
+    if (composition.plan.metadata.releaseName !== releaseName) {
+      throw new Error(
+        `Composition-plan release mismatch: plan records ` +
+          `${JSON.stringify(composition.plan.metadata.releaseName)}, but tail targets ` +
+          `${JSON.stringify(releaseName)}.`,
+      );
+    }
+    namespace = composition.plan.metadata.namespace;
+    await establishCompositionPlanCluster(composition.plan, options.yes === true);
+  } else {
+    const infraPath = infrastructurePath(projectDir);
+    if (!existsSync(infraPath)) {
+      throw new Error(
+        `Cannot determine the cluster for tail: no authenticated composition plan or ${infraPath}.`,
+      );
+    }
     let infra: { projectId?: string; region?: string; namespace?: string };
     try {
       infra = JSON.parse(readFileSync(infraPath, "utf-8"));
@@ -41,23 +63,44 @@ export async function runTail(options: { projectDir: string; releaseName: string
       throw new Error(`Invalid ${infraPath}: ${(err as Error).message}`);
     }
     if (infra.projectId && infra.region) {
-      const credResult = await execCapture("gcloud", [
-        "container",
-        "clusters",
-        "get-credentials",
-        `${releaseName}-cluster`,
-        "--region",
-        infra.region,
-        "--project",
-        infra.projectId,
-        "--quiet",
-      ]);
+      const credResult = await execCapture(
+        "gcloud",
+        [
+          "container",
+          "clusters",
+          "get-credentials",
+          `${releaseName}-cluster`,
+          "--region",
+          infra.region,
+          "--project",
+          infra.projectId,
+          "--quiet",
+        ],
+        { timeoutMs: EXEC_TIMEOUTS.cloudOperation },
+      );
       if (credResult.exitCode !== 0) {
         // L14: gcloud stderr is cluster-sourced — strip terminal control characters.
         console.error(
           `Failed to connect to cluster: ${sanitizeForTerminal(credResult.stderr.trim())}`,
         );
         process.exit(1);
+      }
+    } else {
+      const context = await execCapture("kubectl", ["config", "current-context"], {
+        timeoutMs: EXEC_TIMEOUTS.kubectl,
+      }).catch(() => null);
+      const currentContext =
+        context && context.exitCode === 0 ? sanitizeForTerminal(context.stdout.trim()) : "";
+      console.warn(
+        `\n  !!! WARNING: legacy infrastructure has no projectId/region, so tail cannot pin ` +
+          `kubectl to this release's cluster.\n      Current context: ` +
+          `${currentContext || "(no current context / kubectl unavailable)"}\n`,
+      );
+      if (options.yes !== true) {
+        throw new Error(
+          "Refusing to tail an unpinned kubectl context. Confirm the context above and re-run " +
+            "with --yes (or restore projectId/region in the infrastructure handoff).",
+        );
       }
     }
   }
@@ -125,16 +168,20 @@ export async function runTail(options: { projectDir: string; releaseName: string
   }
 
   async function refreshPods() {
-    const podsResult = await execCapture("kubectl", [
-      "get",
-      "pods",
-      "-n",
-      namespace,
-      "-l",
-      `app.kubernetes.io/name=${releaseName}`,
-      "-o",
-      'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}|{.status.phase}{"\\n"}{end}',
-    ]);
+    const podsResult = await execCapture(
+      "kubectl",
+      [
+        "get",
+        "pods",
+        "-n",
+        namespace,
+        "-l",
+        `app.kubernetes.io/name=${releaseName}`,
+        "-o",
+        'jsonpath={range .items[*]}{.metadata.name}|{.metadata.labels.app\\.kubernetes\\.io/component}|{.status.phase}{"\\n"}{end}',
+      ],
+      { timeoutMs: EXEC_TIMEOUTS.kubectl },
+    );
 
     if (podsResult.exitCode !== 0 || !podsResult.stdout.trim()) return;
 

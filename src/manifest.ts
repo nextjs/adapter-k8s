@@ -10,6 +10,7 @@ import type {
 import { unsafeConditionPattern, type RouteHasCondition } from "./routing-common.js";
 import { assertSafePathname } from "./emit/templates/utils.js";
 import { collectPublicPathnames } from "./pool-server/public-files.js";
+import { normalizeNextDistDir } from "./next-runtime/dist-dir.js";
 
 // Build-time middleware matcher shape (outputs.middleware.config.matchers).
 interface MiddlewareMatcherBuild {
@@ -190,6 +191,9 @@ export function buildRoutingManifest({
   distDir?: string;
 }): RoutingManifest {
   const resolvedDistDir = distDir ?? path.join(projectDir, ".next");
+  const distDirRelative = normalizeNextDistDir(
+    path.relative(projectDir, resolvedDistDir).split(path.sep).join(path.posix.sep) || ".",
+  );
   // Build pool assignments: pathname → pool name.
   // Also track output id → pool so prerenders can inherit their parent's pool.
   const poolAssignments: Record<string, string> = {};
@@ -362,6 +366,7 @@ export function buildRoutingManifest({
     buildId,
     builtAt: stableBuiltAt(resolvedDistDir),
     basePath,
+    distDir: distDirRelative,
     trailingSlash,
     // Omit the default so retained manifests from older builds remain byte-compatible and
     // continue to log. Next's object-form controls apply to its development logger; this

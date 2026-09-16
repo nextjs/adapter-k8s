@@ -1,4 +1,4 @@
-// Structural mirror of Next 16.2's `use cache` handler interface
+// Structural mirror of Next 16.3's `use cache` handler interface
 // (next/dist/server/lib/cache-handlers/types.d.ts). Defined locally so the adapter's
 // pool-server bundle doesn't take a compile-time dependency on Next internals.
 

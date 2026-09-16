@@ -237,6 +237,7 @@ describe("adapter-owned OpenTelemetry bindings", () => {
     const REASONS: Record<DispatchProofRejectionReason, true> = {
       malformed: true,
       mismatch: true,
+      "invalid-utf8": true,
       stale: true,
       premature: true,
       "body-unexpected": true,

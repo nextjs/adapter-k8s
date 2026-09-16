@@ -208,16 +208,20 @@ describe("createRequestHandler", () => {
     expect(setHeaders.find((h) => h.header.key === "Refresh")!.header.value).toBe("0;url=/login");
   });
 
-  it("hands an external rewrite to the pool instead of authoring a 502 (N40)", async () => {
+  it("hands an authenticated external-rewrite terminal to the pool instead of re-resolving", async () => {
     // N40. This tier used to answer 502 ("External rewrites are not supported in adapter-k8s
     // v1"). Phase 1 returns `external-rewrite` and pool-server/dispatch.ts PROXIES it —
     // measured against `next start`, which proxies too (a `/ext-rewrite` →
     // `https://example.com/probe` rewrite returned example.com's own page and
     // `server: cloudflare`). Because the CEL is `!(…)` whenever the app has middleware, the
     // 502 fired in production for a route that worked in the e2e harness. Never author a
-    // status the other tier doesn't: CONTINUE with the dispatch vocabulary cleared and NO
-    // secret, exactly like the body-request backstop, so the pool re-resolves and owns it.
+    // status the other tier doesn't. The pool owns the proxy hop, but must not re-run routing or
+    // middleware after this tier already produced the verdict.
+    const previousSecret = process.env.INTERNAL_HEADER_SECRET;
+    process.env.INTERNAL_HEADER_SECRET = "s3cr3t";
     const handler = createRequestHandler(makeManifest(), null);
+    if (previousSecret === undefined) delete process.env.INTERNAL_HEADER_SECRET;
+    else process.env.INTERNAL_HEADER_SECRET = previousSecret;
     vi.mocked(resolveRoutes).mockResolvedValue({
       externalRewrite: new URL("https://external.com/api"),
     } as any);
@@ -225,17 +229,17 @@ describe("createRequestHandler", () => {
     const response = await handler(makeHeaders("/proxy"));
     expect(response.immediateResponse).toBeUndefined();
     const mutation = response.requestHeaders!.response!.headerMutation!;
-    expect(mutation.setHeaders ?? []).toEqual([]);
-    // Every internal dispatch header AND the secret must be removed, or a client could
-    // smuggle a spoofed x-output-id past the extension on this path.
-    expect(new Set(mutation.removeHeaders)).toEqual(
-      new Set([
-        ...INTERNAL_DISPATCH_HEADERS,
-        ...UNTRUSTED_NEXT_REQUEST_HEADERS,
-        INTERNAL_SECRET_HEADER,
-        INTERNAL_DISPATCH_PROOF_HEADER,
-      ]),
+    const set = Object.fromEntries(
+      (mutation.setHeaders ?? []).map((entry) => [entry.header.key, entry.header.value]),
     );
+    expect(set["x-external-rewrite-url"]).toBe("https://external.com/api");
+    expect(set["x-mw-evaluated"]).toBe("none");
+    expect(set["x-upstream-pool"]).toBe("ssr");
+    expect(set["x-output-id"]).toBeUndefined();
+    expect(mutation.removeHeaders).not.toContain("x-external-rewrite-url");
+    const proof = set[INTERNAL_DISPATCH_PROOF_HEADER];
+    expect(proof).toBeDefined();
+    expect(verifyAsPool(proof!, { target: "/proxy", headers: poolViewOf(mutation) })).toBe(true);
   });
 
   it("sets x-nextjs-ppr header for PPR routes", async () => {
@@ -265,18 +269,36 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
     vi.clearAllMocks();
   });
 
+  it("delegates edge middleware to the pool without stamping a trusted skip", async () => {
+    const manifest = makeManifest({
+      middleware: { filePath: ".next/server/middleware.js", runtime: "edge", matchers: [] },
+    });
+    const response = await createRequestHandler(manifest, null)(makeHeaders("/about"));
+    const mutation = response.requestHeaders!.response!.headerMutation!;
+    expect(mutation.setHeaders ?? []).toEqual([]);
+    expect(new Set(mutation.removeHeaders)).toEqual(
+      new Set([
+        ...INTERNAL_DISPATCH_HEADERS,
+        ...UNTRUSTED_NEXT_REQUEST_HEADERS,
+        INTERNAL_SECRET_HEADER,
+        INTERNAL_DISPATCH_PROOF_HEADER,
+      ]),
+    );
+    expect(resolveRoutes).not.toHaveBeenCalled();
+  });
+
   it("invokes a web-adapter-shaped middleware with { handler, request, page } (not the wrong { request } shape)", async () => {
     // Web-adapter module: default is the adapter fn, `middleware` is the handler fn.
     let backgroundComplete = false;
+    let finishBackground!: () => void;
+    const background = new Promise<void>((resolve) => {
+      finishBackground = () => {
+        backgroundComplete = true;
+        resolve();
+      };
+    });
     const adapterFn = vi.fn(async ({ request }: any) => {
-      request.waitUntil(
-        new Promise<void>((resolve) => {
-          setTimeout(() => {
-            backgroundComplete = true;
-            resolve();
-          }, 5);
-        }),
-      );
+      request.waitUntil(background);
       return { response: new Response("ok") };
     });
     const handlerFn = vi.fn();
@@ -296,7 +318,16 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
     vi.mocked(responseToMiddlewareResult).mockReturnValue({} as any);
 
     const handler = createRequestHandler(makeManifest(), middlewareModule);
-    await handler(makeHeaders("/about"));
+    const handled = handler(makeHeaders("/about"));
+    const first = await Promise.race([
+      handled.then(() => "resolved" as const),
+      new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 25)),
+    ]);
+    expect(first).toBe("resolved");
+    expect(backgroundComplete).toBe(false);
+    finishBackground();
+    await background;
+    await handled;
 
     // Web-adapter path must be taken: adapter called with handler + page, not { request } only.
     expect(adapterFn).toHaveBeenCalledTimes(1);
@@ -323,7 +354,10 @@ describe("createRequestHandler middleware invocation (Fix A)", () => {
       } as any;
     });
 
-    const handler = createRequestHandler(makeManifest(), {});
+    const handler = createRequestHandler(
+      makeManifest({ middleware: { filePath: "middleware.js" } }),
+      {},
+    );
     const response = await handler(makeHeaders("/about"));
     const setHeaders = response.requestHeaders!.response!.headerMutation!.setHeaders!;
     const mw = setHeaders.find((h) => h.header.key === "x-mw-evaluated");

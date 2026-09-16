@@ -4,140 +4,39 @@ on:
   workflow_dispatch:
     inputs:
       nextjsRef:
-        description: "Next.js repo ref (branch/tag/SHA)"
-        default: "canary"
+        description: "Pinned Next.js tag or commit SHA"
+        required: true
+        default: "v16.3.0-canary.97"
         type: string
-  # Uncomment for nightly runs:
-  # schedule:
-  #   - cron: '0 2 * * *'
 
 permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build Next.js + adapter
+  e2e:
+    name: Canonical local deploy suite
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
+    env:
+      E2E_PLAYWRIGHT_WITH_DEPS: "1"
+      NEXT_TEST_CONCURRENCY: "4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          path: adapter
-          persist-credentials: false
-
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: vercel/next.js
-          ref: ${{ inputs.nextjsRef || 'canary' }}
-          path: nextjs
-          fetch-depth: 25
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with: { node-version: "24" }
-
-      - name: Setup pnpm
-        # corepack must be installed globally before any lockfile exists; version is pinned
-        run: npm i -g corepack@0.31 && corepack enable # zizmor: ignore[adhoc-packages]
-
-      - name: Install & build Next.js
-        working-directory: nextjs
-        run: pnpm install && pnpm build && pnpm install
-
-      - name: Install Playwright
-        working-directory: nextjs
-        run: pnpm playwright install --with-deps chromium
-
-      - name: Build adapter
-        working-directory: adapter
-        run: npm install && npm run build
-
-      - name: Validate adapter test assets
-        run: |
-          test -f adapter/test/deploy-tests-manifest.adapter-k8s.json
-          bash -n adapter/scripts/e2e-deploy.sh
-          bash -n adapter/scripts/e2e-cleanup.sh
-          bash -n adapter/scripts/e2e-logs.sh
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nextjs-adapter-build-${{ github.run_id }}
-          if-no-files-found: error
-          compression-level: 0
-          path: |
-            nextjs
-            adapter
-            ~/.cache/ms-playwright
+          node-version: "24"
+          cache: npm
 
-  test:
-    name: Tests (${{ matrix.group }})
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        group:
-          [
-            1/16,
-            2/16,
-            3/16,
-            4/16,
-            5/16,
-            6/16,
-            7/16,
-            8/16,
-            9/16,
-            10/16,
-            11/16,
-            12/16,
-            13/16,
-            14/16,
-            15/16,
-            16/16,
-          ]
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: nextjs-adapter-build-${{ github.run_id }}
-          path: .
+      - name: Install adapter dependencies
+        run: npm ci
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with: { node-version: "24" }
+      - name: Install pinned Corepack
+        run: npm install --global corepack@0.31.0 && corepack enable # zizmor: ignore[adhoc-packages]
 
-      - name: Setup pnpm
-        # corepack must be installed globally before any lockfile exists; version is pinned
-        run: npm i -g corepack@0.31 && corepack enable # zizmor: ignore[adhoc-packages]
-
-      - name: Ensure Playwright browser
-        working-directory: nextjs
-        run: pnpm playwright install chromium
-
-      - name: Validate adapter test assets
-        run: |
-          test -f adapter/test/deploy-tests-manifest.adapter-k8s.json
-          bash -n adapter/scripts/e2e-deploy.sh
-          bash -n adapter/scripts/e2e-cleanup.sh
-          bash -n adapter/scripts/e2e-logs.sh
-
-      - name: Make scripts executable
-        run: |
-          chmod +x adapter/scripts/e2e-deploy.sh
-          chmod +x adapter/scripts/e2e-logs.sh
-          chmod +x adapter/scripts/e2e-cleanup.sh
-
-      - name: Run deploy tests
-        working-directory: nextjs
+      - name: Run canonical deploy suite
         env:
-          NEXT_TEST_MODE: deploy
-          NEXT_E2E_TEST_TIMEOUT: 240000
-          NEXT_EXTERNAL_TESTS_FILTERS: ${{ github.workspace }}/adapter/test/deploy-tests-manifest.adapter-k8s.json
-          ADAPTER_DIR: ${{ github.workspace }}/adapter
-          IS_TURBOPACK_TEST: 1
-          NEXT_TEST_JOB: 1
-          NEXT_TELEMETRY_DISABLED: 1
-          NEXTJS_DIR: ${{ github.workspace }}/nextjs
-          NEXT_TEST_DEPLOY_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-deploy.sh
-          NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-logs.sh
-          NEXT_TEST_CLEANUP_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-cleanup.sh
-        run: node run-tests.js --timings -g ${{ matrix.group }} -c 2 --type e2e
+          NEXTJS_REF: ${{ inputs.nextjsRef }}
+        run: bash scripts/e2e-local.sh "" "$NEXTJS_REF"

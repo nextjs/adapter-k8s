@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Next.js Adapter E2E Deploy Script — PHASE 1 topology (pool server only).
+# Next.js Adapter E2E Deploy Script — local pool-server topology.
 #
 # The harness points the suite straight at the pool, so requests take the pool's own
-# local resolution path (middleware runs in-pool). The ext_proc edge is exercised by
-# scripts/e2e-integration-deploy.sh instead.
+# local resolution path (middleware runs in-pool). The local k3d harness exercises the
+# deployed Envoy Gateway, ext_proc routing service, pools, and cache topology.
 #
-# Shared setup (pack/install/build/config) lives in e2e-setup-common.sh so the two
-# topologies cannot drift apart — see the note there.
+# Shared setup (pack/install/build/config) lives in e2e-setup-common.sh so local and
+# Kubernetes deploys cannot drift apart — see the note there.
 #
 # Contract (from nextjs.org/docs/.../adapterPath#testing-adapters):
 # - cwd is set to the isolated test app by the harness
