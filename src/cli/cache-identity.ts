@@ -115,6 +115,22 @@ export async function claimManagedCacheIdentity(
     return;
   }
 
+  // The identity must precede paid provisioning, which precedes Helm's --create-namespace.
+  // Bootstrap it here without adopting or changing an existing namespace. Concurrent deploys
+  // may create it first; only AlreadyExists is safe to ignore.
+  const namespaceCreated = await execCapture("kubectl", ["create", "namespace", namespace], {
+    timeoutMs: EXEC_TIMEOUTS.kubectl,
+  });
+  if (
+    namespaceCreated.exitCode !== 0 &&
+    !/alreadyexists|already exists/i.test(namespaceCreated.stderr)
+  ) {
+    throw new Error(
+      `Could not create managed-cache namespace ${namespace}: ` +
+        `${sanitizeForTerminal(namespaceCreated.stderr.trim()) || `kubectl exited ${namespaceCreated.exitCode}`}`,
+    );
+  }
+
   const created = await execCaptureStdin(
     "kubectl",
     ["create", "-f", "-"],

@@ -1169,3 +1169,33 @@ describe("build-seed fallback: an empty Valkey behaves like next start's warm fi
     expect(await h.get("/blog/tim")).toBeNull();
   });
 });
+
+describe("dispatch cache keys", () => {
+  it.each([
+    ["/posts/%2541", "/posts/%41", "/posts/A"],
+    ["/posts/%2525", "/posts/%25", "/posts/%25"],
+    ["/posts/%25F0%259F%258E%2589", "/posts/%F0%9F%8E%89", "/posts/%F0%9F%8E%89"],
+  ])(
+    "preserves literal percent text for %s across stored and seed reads",
+    async (wireKey, manifestKey, otherWireKey) => {
+      const value = appPageEntry("literal percent text");
+      const seed = { lastModified: 500, tags: [], value };
+      const seedLookup = vi.fn(async (key: string) => (key === manifestKey ? seed : null));
+      const h = new ValkeyIncrementalCacheHandler({
+        client: new FakeValkeyClient(),
+        buildId: "percent-paths",
+        now: () => 1000,
+        seedLookup,
+      });
+      expect((await h.get(wireKey))?.value).toEqual(value);
+      expect((await h.getSeed(manifestKey))?.value).toEqual(value);
+      expect((await h.getPeek(manifestKey))?.value).toEqual(value);
+      await h.set(wireKey, value, {});
+      await h.set(otherWireKey, appPageEntry("other page"), {});
+      expect((await h.get(wireKey))?.value).toEqual(value);
+      expect((await h.getStored(manifestKey))?.value).toEqual(value);
+      expect((await h.getPeek(manifestKey))?.value).toEqual(value);
+      expect((await h.getSeed(manifestKey))?.value).toEqual(value);
+    },
+  );
+});

@@ -1149,3 +1149,116 @@ describe("N78: watermarks are rebased onto the Valkey server clock", () => {
     expect(await reader.getExpiration(["t"])).toBe(readerNow);
   });
 });
+
+describe("scheduled tag expiry in the local front", () => {
+  it("keeps a durable write but withholds the local entry when its tag check fails", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    const h = new ValkeyCacheHandler({ client, buildId: "admit-failure", now: () => 1000 });
+    const run = await h.prepareForInvocation();
+    const hmget = vi.spyOn(client, "hmget").mockRejectedValueOnce(new Error("tag read failed"));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await run(() =>
+        h.set("k", Promise.resolve(makeEntry("durable", { tags: ["t"], timestamp: 1000 }))),
+      );
+      expect(client.hashes.has("k8s:admit-failure:entry:k")).toBe(true);
+      expect(await preparedGet(h, "k", [])).toBeUndefined();
+      expect(await h.get("k", [])).toBeDefined();
+    } finally {
+      hmget.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it("does not admit a write whose tag check crosses a newer local write", async () => {
+    const client = new FakeValkeyClient();
+    client.serverNow = 1000;
+    const h = new ValkeyCacheHandler({ client, buildId: "admit-race", now: () => 1000 });
+    const run = await h.prepareForInvocation();
+    let releaseTags!: (tags: null[]) => void;
+    const blockedTags = new Promise<null[]>((resolve) => {
+      releaseTags = resolve;
+    });
+    const hmget = vi.spyOn(client, "hmget").mockImplementationOnce(() => blockedTags);
+    const first = run(() =>
+      h.set("k", Promise.resolve(makeEntry("old", { tags: ["t"], timestamp: 1000 }))),
+    );
+    await vi.waitFor(() => expect(hmget).toHaveBeenCalled());
+    // This unprepared write supersedes the first and deliberately does not fill the front.
+    await h.set("k", Promise.resolve(makeEntry("new", { tags: ["t"], timestamp: 1000 })));
+    releaseTags([null]);
+    await first;
+    expect(await preparedGet(h, "k", [])).toBeUndefined();
+    expect(await readStream((await h.get("k", []))!.value)).toBe("new");
+    hmget.mockRestore();
+  });
+
+  const cases = ["warm", "write"] as const;
+  describe.each(cases)("%s admission", (admission) => {
+    it.each([
+      ["explicit", 0],
+      ["implicit", 0],
+      ["explicit", 120_000],
+      ["implicit", 120_000],
+      ["explicit", -120_000],
+      ["implicit", -120_000],
+    ])("honors the earliest %s tag deadline with clock offset %i", async (kind, offset) => {
+      const client = new FakeValkeyClient();
+      let serverNow = 1000;
+      client.serverNowFn = () => serverNow;
+      const h = new ValkeyCacheHandler({
+        client,
+        buildId: "scheduled-tag",
+        now: () => serverNow + offset,
+      });
+      await h.updateTags(["later"], { expire: 20 });
+      await h.updateTags(["earlier"], { expire: 10 });
+      const tags = ["later", "earlier"];
+      const softTags = kind === "implicit" ? tags : [];
+      const store = () =>
+        h.set(
+          "k",
+          Promise.resolve(
+            makeEntry("regenerated", {
+              tags: kind === "explicit" ? tags : [],
+              timestamp: serverNow + offset,
+              revalidate: 3600,
+              expire: 7200,
+            }),
+          ),
+        );
+      const admit = async () => {
+        if (admission === "write") {
+          const run = await h.prepareForInvocation();
+          await run(async () => {
+            await h.get("k", softTags);
+            await store();
+          });
+        } else {
+          await store();
+          expect(await preparedGet(h, "k", softTags)).toBeUndefined();
+          await vi.waitFor(async () => expect(await preparedGet(h, "k", softTags)).toBeDefined());
+        }
+      };
+      serverNow = 2000;
+      await admit();
+      serverNow = 10_999;
+      // Hot reads still perform no Valkey I/O inside Next's staged render.
+      const run = await h.prepareForInvocation();
+      const hmget = vi.spyOn(client, "hmget");
+      const hgetall = vi.spyOn(client, "hgetallBuffer");
+      expect(await run(() => h.get("k", softTags))).toBeDefined();
+      expect(hmget).not.toHaveBeenCalled();
+      expect(hgetall).not.toHaveBeenCalled();
+      serverNow = 11_000;
+      expect(await h.get("k", softTags)).toBeUndefined();
+      expect(await preparedGet(h, "k", softTags)).toBeUndefined();
+      // An entry computed after both deadlines must not inherit those old expirations.
+      serverNow = 22_000;
+      await admit();
+      expect(await h.get("k", softTags)).toBeDefined();
+      expect(await preparedGet(h, "k", softTags)).toBeDefined();
+    });
+  });
+});
