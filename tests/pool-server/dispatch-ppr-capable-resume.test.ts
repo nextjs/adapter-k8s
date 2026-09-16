@@ -1,5 +1,4 @@
-// Shell-less PPR template resume — spec rev 4 "Option D"
-// (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md).
+// Shell-less PPR template resume, "Option D".
 //
 // The class: routes in `pprCapableRoutes` with `rootParams: []` run MINIMAL (correctly — the
 // fallback-shells `without-io` flavour must stay minimal), but when such a render POSTPONES,

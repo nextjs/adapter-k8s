@@ -12,6 +12,8 @@ E2E-FAILURE-RUNBOOK.md
 # Adapter build + deploy output (generated per build; machine-local state)
 .k8s-adapter/
 .playwright-mcp/
+# Local agent worktrees and session state are never package inputs.
+.claude/
 
 # Stray tsc declaration emit for tests/config (real declarations go to dist/ via build:types)
 tests/**/*.d.ts

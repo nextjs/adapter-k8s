@@ -436,9 +436,8 @@ describe("Cloud CDN", () => {
   // registry with NO byte replay in production (replay is emulatePlatformCache-only), so the
   // test passed while proving nothing; the deterministic body hid the re-renders. Real cached
   // plain-SSG evidence lives in tests/e2e/live/edge.test.ts (byte markers, fixtures/edge).
-  // The shell-less-template caching story is tracked by
-  // docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md; when that lands,
-  // replace this smoke check with a byte-marker cache assertion.
+  // The resolved-content contract has its own assertion below. This remains a smoke check until
+  // the fixture has a byte marker that can distinguish cache replay from a fresh render.
   it("serves a shell-less PPR-capable template instance (smoke, caching NOT asserted)", async () => {
     const slug = `live-probe-${Date.now().toString(36)}`;
     const first = await req(`/isr-template/${slug}`);

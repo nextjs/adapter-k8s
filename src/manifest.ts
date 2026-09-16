@@ -153,78 +153,6 @@ function readDynamicRouteFallbackRootParams(distDir: string): Map<string, string
   return byRoute;
 }
 
-// The fields of a PRERENDER output this module reads. Declared structurally because synthetic
-// build contexts (unit tests) supply only these, and because `groupId` is typed `number` upstream
-// while a mock may key groups by any stable value.
-interface PrerenderView {
-  pathname: string;
-  groupId?: string | number;
-  fallback?: { filePath?: string; postponedState?: string } | null;
-}
-
-interface PrerenderGroup {
-  /** ANY member of the group carries a postponed state, i.e. this route's build render postponed. */
-  postpones: boolean;
-  /**
-   * Pathnames of members carrying a `fallback` object with NO `filePath` — the exact shape
-   * upstream uses for the `.rsc` PRERENDER sibling of a PARTIALLY_STATIC route
-   * (`filePath: undefined` at build-complete.js:989). Used only by the build-time assertion.
-   */
-  fileless: string[];
-}
-
-// N16b. Upstream records the postponed state of a PARTIALLY_STATIC route TEMPLATE on a SIBLING
-// output, not always on the template's own output. `build-complete.js` pushes the template with
-// `fallback.postponedState: undefined` and then pushes a `${dynamicRoute}.rsc` PRERENDER carrying
-// `postponedState: meta.postponed` (next@16.2.10
-// node_modules/next/dist/build/adapter/build-complete.js:986-991). A template that HAS a
-// build-emitted shell also ends up with the state on its own output, because `handleAppMeta`
-// mutates `initialOutput.fallback.postponedState` in place first (build-complete.js:596) — but
-// that mutation is guarded on `initialOutput.fallback` existing, so a template whose shell was
-// suppressed (`fallback: null` in the prerender manifest) keeps `fallback: undefined` and ONLY the
-// sibling records that the build render postponed. Reading `fallback.postponedState` off the
-// template alone therefore cannot tell "never postpones" from "postpones, shell suppressed" — and
-// types.ts documents those two flavours as needing OPPOSITE handling.
-//
-// Measured against a probe app on next 16.2.10:
-//   - empty root shell (`hasEmptyStaticShell`, build/index.js:1825) demotes the route to
-//     BLOCKING_STATIC_RENDER → template `fallback: undefined`, sibling postponedState PRESENT.
-//     This is the `/novel/early-span` class that was served as a bare 1,358-byte closed Suspense
-//     boundary where `next start` returns 7,658 bytes of resolved content.
-//   - a dynamic-segment route whose page never postpones keeps its shell but has NO postponed
-//     state anywhere in its group (the app-dir/fallback-shells `without-io` class, which MUST
-//     stay minimal).
-//
-// The join is on `groupId` — the build's own "revalidated together" grouping — never on munging
-// `.rsc` on/off ids. `rscParentCandidates` in dispatch.ts exists because suffix arithmetic on
-// these ids is error-prone; `groupId` is exact, since `prerenderGroupId` increments once per
-// template and once per concrete generateStaticParams route (verified: template `/p/[slug]` and
-// `/p/[slug].rsc` share group 3 while its concrete `/p/one` is group 2, so a concrete param can
-// never leak its postponed state into the template's flag).
-//
-// Every non-`.rsc` group member hardcodes `postponedState: undefined` (segment prerenders at
-// build-complete.js:634, data routes at 860/1027), so "some member of this group carries a
-// postponed state" is equivalent to "this route's build render postponed" without having to
-// identify WHICH member carried it.
-function indexPrerenderGroups(outputs: AdapterOutputs): Map<string | number, PrerenderGroup> {
-  const groups = new Map<string | number, PrerenderGroup>();
-  for (const output of outputs.prerenders as unknown as PrerenderView[]) {
-    const groupId = output.groupId;
-    // A synthetic output with no groupId must not join every other group-less output: an
-    // `undefined` key would make one such entry's postponed state answer for all of them.
-    if (groupId === undefined) continue;
-    let group = groups.get(groupId);
-    if (!group) {
-      group = { postpones: false, fileless: [] };
-      groups.set(groupId, group);
-    }
-    const fb = output.fallback;
-    if (fb?.postponedState) group.postpones = true;
-    if (fb && !fb.filePath) group.fileless.push(output.pathname);
-  }
-  return groups;
-}
-
 export function buildRoutingManifest({
   routing,
   outputs,
@@ -311,21 +239,8 @@ export function buildRoutingManifest({
   // unresolved ROOT params that stopped it. See the types.ts doc comment — the pool needs both
   // the membership (a PPR route, so keep it out of the emulated-SSG flip) and the root-param
   // flavour (the only flavour that must run NON-minimal).
-  const pprCapableRoutes: Record<
-    string,
-    { rootParams: string[]; wouldPostpone: boolean; allowQuery?: string[] }
-  > = {};
-  // Survey Tier 2 #7 (plans/lessons-from-sibling-adapters.md): PARTIALLY_STATIC prerenders whose
-  // fallback carries a postponedState but NO filePath — the shell-less `.rsc` postponed-state
-  // siblings (build-complete.js:986-991, the dynamic-RSC prefetch responses for PPR routes).
-  // `pprRoutes` requires a shell and `pprCapableRoutes` only admits route templates, so these
-  // were dropped from the manifest entirely and the resume implementation could not see them.
-  // Gated on `allowQuery === []` per the reference adapter (adapter-vercel outputs.ts:652-673):
-  // with no route-param variance the state is shareable across requests; with params (or with
-  // variance unknown) it is not and the route must cold-render instead.
-  const pprStatePrerenders: RoutingManifest["pprStatePrerenders"] = {};
+  const pprCapableRoutes: Record<string, { rootParams: string[]; allowQuery?: string[] }> = {};
   const dynamicRouteRootParams = readDynamicRouteFallbackRootParams(resolvedDistDir);
-  const prerenderGroups = indexPrerenderGroups(outputs);
   for (const prerender of outputs.prerenders) {
     const config = prerender.config as Record<string, unknown>;
     const fb = (
@@ -346,32 +261,11 @@ export function buildRoutingManifest({
     // prerenders (`/without-io/foo`) and `/_global-error` and flipped them non-minimal.
     const rootParams = dynamicRouteRootParams.get(prerender.pathname);
     if (config.renderingMode === "PARTIALLY_STATIC" && rootParams !== undefined) {
-      // N16b: the `.rsc` PRERENDER sibling is how the build reports that a template's render
-      // postponed (see indexPrerenderGroups). Assert it exists for every PARTIALLY_STATIC
-      // template — both flavours, since either could lose it — so an upstream change that stops
-      // emitting it FAILS THE BUILD instead of silently reclassifying every shell-less PPR
-      // template back to "never postpones", which is exactly the truncation this bit fixes.
-      // Only app-router routes reach PARTIALLY_STATIC (build/index.js only sets it under
-      // `isAppPPREnabled` for app pages), so the Pages-Router i18n branch of build-complete.js —
-      // the one path that emits no `.rsc` sibling — cannot trip this.
-      const groupId = (prerender as unknown as PrerenderView).groupId;
-      const group = groupId === undefined ? undefined : prerenderGroups.get(groupId);
-      // N16c. No build-time assertion on the sibling's presence. An earlier revision threw
-      // here when a PARTIALLY_STATIC template had no same-groupId `.rsc` sibling, to protect the
-      // `wouldPostpone` signal below — but that signal turned out not to discriminate (see the
-      // N16c note at the minimalMode gate in pool-server/dispatch.ts), so nothing consumes it in
-      // a load-bearing way and a hard throw could only fail builds for no benefit.
-      // N16c. Computed and carried, but NOT used to decide minimal mode — measured on the e2e
-      // suite, it classifies fallback-shells' never-postponing routes the same as a template that
-      // genuinely postpones, so using it regressed fallback-shells 13→8 passing. Kept (with its
-      // tests) so the next attempt starts from the measurement rather than re-deriving it.
-      const wouldPostpone = group?.postpones ?? false;
       // Shell-BEARING templates are handled via pprRoutes/handlerPprInfo and are deliberately
       // DISJOINT from this map, so keep the existing `fallback: null` restriction.
       if (!(fb?.postponedState && fb.filePath)) {
         pprCapableRoutes[prerender.pathname] = {
           rootParams,
-          wouldPostpone,
           // Shell-less templates partition the platform cache key too
           // (the with-root same-entry cells prove sharing through the header alone).
           ...(Array.isArray(config.allowQuery)
@@ -381,15 +275,6 @@ export function buildRoutingManifest({
             : {}),
         };
       }
-    }
-    if (
-      config.renderingMode === "PARTIALLY_STATIC" &&
-      fb?.postponedState &&
-      !fb.filePath &&
-      Array.isArray(config.allowQuery) &&
-      config.allowQuery.length === 0
-    ) {
-      pprStatePrerenders[prerender.pathname] = { postponedState: fb.postponedState };
     }
     if (config.renderingMode === "PARTIALLY_STATIC" && fb?.postponedState && fb.filePath) {
       // Shell cache tags come from the build's initialHeaders (x-next-cache-tags = the
@@ -499,10 +384,6 @@ export function buildRoutingManifest({
     ...(Object.keys(routeExecutionTimeouts).length > 0 ? { routeExecutionTimeouts } : {}),
     ...(Object.keys(poolResponseHeadTimeouts).length > 0 ? { poolResponseHeadTimeouts } : {}),
     pprRoutes,
-    // Sorted for byte-identical chart regeneration, like pprCapableRoutes below.
-    pprStatePrerenders: Object.fromEntries(
-      Object.entries(pprStatePrerenders).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
-    ),
     // Sorted so two chart generations of the same build are byte-identical.
     pprCapableRoutes: Object.fromEntries(
       Object.entries(pprCapableRoutes).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),

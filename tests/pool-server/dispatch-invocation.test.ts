@@ -829,23 +829,18 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
       expect(calls[0].minimalMode).toBe(true);
     });
 
-    // N16c: `wouldPostpone` is recorded on `pprCapableRoutes` entries (manifest.ts
-    // indexPrerenderGroups reads the same-groupId `.rsc` sibling's `fallback.postponedState`) but
-    // it is DELIBERATELY NOT a rung of the minimalMode gate. It was added as one, to fix
-    // `/novel/early-span` (1,358 bytes ending in an empty closed `<!--$--><!--/$-->` boundary,
-    // where `next start` returns 7,658 bytes of resolved content) — and MEASURED against upstream:
+    // Manifests emitted during the N16b experiment carried an inert `wouldPostpone` property.
+    // Rolling upgrades may still load one. Keep proving that the old property cannot change the
+    // root-param gate: the build-time state did not discriminate the two runtime behaviors.
     //
     //   with the rung:    app-dir/fallback-shells  8 passed / 5 failed
     //   without the rung: app-dir/fallback-shells 13 passed / 0 failed
     //   (and cache-components-allow-otel-spans stayed 3/1 either way — the rung only traded
     //    `early-span` for `prerendering at runtime` in the same file.)
     //
-    // So the signal does not discriminate: fallback-shells' never-postponing routes carry sibling
-    // postponed state too, and flipping non-minimal on it re-breaks them exactly like the blunt
-    // `|| handlerPprCapable` fix that preceded it. The truth table below pins that the bit is
-    // INERT at the gate; the real fix has to implement the platform's half of the resume
-    // (docs/superpowers/specs/2026-07-26-ppr-resume-shell-less-templates.md, option B).
-    describe("wouldPostpone truth table (N16c: inert at the gate)", () => {
+    // The current manifest no longer emits the property. Option D uses the live render result
+    // instead, while this table pins compatibility with an outgoing build.
+    describe("legacy wouldPostpone entries are ignored", () => {
       // (has build shell, has root params, wouldPostpone) → expected minimalMode.
       // A build never emits shell-bearing AND pprCapableRoutes for the same template — manifest.ts
       // keeps the two maps disjoint and tests that — but the rows are included anyway to pin that
@@ -888,7 +883,7 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
               : {},
             pprCapableRoutes: {
               "/x/[id]": { rootParams: hasRootParams ? ["lang"] : [], wouldPostpone },
-            },
+            } as any,
             incrementalCacheShared: true,
             rscConfig,
             localHandlerInvoker: invoker as any,
@@ -915,7 +910,7 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
           buildId: "test123",
           staticAssets: [],
           pprRoutes: {},
-          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } },
+          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } } as any,
           entrypointOwnsPprShell: true,
           rscConfig,
           localHandlerInvoker: invoker as any,
@@ -939,7 +934,7 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
           buildId: "test123",
           staticAssets: [],
           pprRoutes: {},
-          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } },
+          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } } as any,
           incrementalCacheShared: false,
           entrypointOwnsPprShell: false,
           rscConfig,
@@ -988,7 +983,7 @@ describe("PPR minimal-mode gate with a registered classic cacheHandler", () => {
           buildId: "test123",
           staticAssets: [],
           pprRoutes: {},
-          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } },
+          pprCapableRoutes: { "/x/[id]": { rootParams: [], wouldPostpone: true } } as any,
           incrementalCacheShared: true,
           rscConfig,
           localHandlerInvoker: invoker as any,
