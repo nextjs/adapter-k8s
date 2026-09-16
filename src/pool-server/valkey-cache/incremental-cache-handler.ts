@@ -631,9 +631,11 @@ export class ValkeyIncrementalCacheHandler {
     }
   }
 
-  /** get() without the seed fallback: STORED entries only (a post-deploy write or null). */
+  /** Dispatch reads (getStored/getSeed/getPeek) accept already-decoded manifest pathnames.
+   * Only Next's get/set boundary decodes wire keys. Decoding here again would alias a literal
+   * percent sequence such as `/posts/%41` with `/posts/A` and replay another route's page.
+   * get() without the seed fallback: STORED entries only (a post-deploy write or null). */
   async getStored(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    cacheKey = canonicalPathCacheKey(cacheKey);
     return this.getImpl(cacheKey, ctx, { skipSeed: true, peek: true });
   }
 
@@ -642,13 +644,11 @@ export class ValkeyIncrementalCacheHandler {
    * a TEMPLATE key would share one sibling's materialized page across the whole route.
    * Serving-only like every dispatch read (see getPeek). */
   async getSeed(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    cacheKey = canonicalPathCacheKey(cacheKey);
     return this.seedFallback(cacheKey, ctx, true);
   }
 
   /** Dispatch serving read. Staleness is reported through `isStale` with the true timestamp. */
   async getPeek(cacheKey: string, ctx: GetCtx = {}): Promise<CacheHandlerValue | null> {
-    cacheKey = canonicalPathCacheKey(cacheKey);
     return this.getImpl(cacheKey, ctx, { skipSeed: false, peek: true });
   }
 

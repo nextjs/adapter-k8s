@@ -614,55 +614,66 @@ describe("PPR serve ladder reads the platform cache", () => {
     expect(res._body).toContain("build shell");
   });
 
-  it("serves the MATERIALIZED page over the Pages fallback skeleton once it exists", async () => {
-    // After the data fetch materializes the concrete entry, documents must serve it —
-    // otherwise the skeleton would be served forever.
-    const invoker = vi.fn();
-    const dispatcher = createDispatcher(
-      baseOptions({
-        pprRoutes: {},
-        staticAssets: [
-          {
-            pathname: "/[slug]",
-            filePath: shellFile,
-            prerender: true,
-            cacheControl: "public, max-age=0, must-revalidate",
+  it.each([
+    ["/first", "first"],
+    ["/%2541", "%41"],
+    ["/%F0%9F%8E%89", "🎉"],
+  ])(
+    "serves the MATERIALIZED page over the Pages fallback skeleton for %s",
+    async (wirePath, slug) => {
+      // After the data fetch materializes the concrete entry, documents must serve it —
+      // otherwise the skeleton would be served forever.
+      const invoker = vi.fn();
+      const dispatcher = createDispatcher(
+        baseOptions({
+          pprRoutes: {},
+          staticAssets: [
+            {
+              pathname: "/[slug]",
+              filePath: shellFile,
+              prerender: true,
+              cacheControl: "public, max-age=0, must-revalidate",
+            },
+          ],
+          handlerLoader: handlerLoaderFor("/[slug]"),
+          localHandlerInvoker: invoker as any,
+          platformCache: {
+            read: async () => null,
+            readStored: async (key: string) =>
+              key === `/${slug}`
+                ? {
+                    lastModified: Date.now(),
+                    value: {
+                      kind: "PAGES",
+                      html: "<html>materialized first</html>",
+                      pageData: {},
+                      headers: { "x-next-cache-tags": "strip-me" },
+                      status: 200,
+                    },
+                  }
+                : null,
           },
-        ],
-        handlerLoader: handlerLoaderFor("/[slug]"),
-        localHandlerInvoker: invoker as any,
-        platformCache: {
-          read: async () => null,
-          readStored: async (key: string) =>
-            key === "/first"
-              ? {
-                  lastModified: Date.now(),
-                  value: {
-                    kind: "PAGES",
-                    html: "<html>materialized first</html>",
-                    pageData: {},
-                    headers: { "x-next-cache-tags": "strip-me" },
-                    status: 200,
-                  },
-                }
-              : null,
-        },
-      }),
-    );
-    const res = mockRes();
-    await dispatcher.dispatch(mockReq("/first"), res, {
-      kind: "route",
-      pool: "ssr",
-      matchedPathname: "/[slug]",
-      routeMatches: { slug: "first" },
-    } as any);
-    expect(invoker).not.toHaveBeenCalled();
-    expect(res._body).toContain("materialized first");
-    expect(res._headers["x-next-cache-tags"]).toBeUndefined();
-    expect(res._headers["cache-control"]).toBe("public, max-age=0, must-revalidate");
-  });
+        }),
+      );
+      const res = mockRes();
+      await dispatcher.dispatch(mockReq(wirePath), res, {
+        kind: "route",
+        pool: "ssr",
+        matchedPathname: "/[slug]",
+        routeMatches: { slug },
+      } as any);
+      expect(invoker).not.toHaveBeenCalled();
+      expect(res._body).toContain("materialized first");
+      expect(res._headers["x-next-cache-tags"]).toBeUndefined();
+      expect(res._headers["cache-control"]).toBe("public, max-age=0, must-revalidate");
+    },
+  );
 
-  it("serves a STORED (revalidated) entry in preference to the build seed for a non-PPR prerender", async () => {
+  it.each([
+    ["/isr-page", "/isr-page"],
+    ["/%2541", "/%41"],
+    ["/%F0%9F%8E%89", "/🎉"],
+  ])("serves a STORED entry over the non-PPR build seed for %s", async (wirePath, manifestPath) => {
     // revalidate-reason: res.revalidate() renders with reason 'on-demand' and persists the
     // fresh entry through the registered handler — but the concrete-seed rung kept serving
     // the BUILD artifact (whose build render had no reason at all). A stored entry written
@@ -673,7 +684,7 @@ describe("PPR serve ladder reads the platform cache", () => {
         pprRoutes: {},
         staticAssets: [
           {
-            pathname: "/isr-page",
+            pathname: manifestPath,
             filePath: shellFile,
             prerender: true,
             cacheControl: "public, max-age=0, must-revalidate",
@@ -681,28 +692,31 @@ describe("PPR serve ladder reads the platform cache", () => {
           },
         ],
         localHandlerInvoker: invoker as any,
-        handlerLoader: handlerLoaderFor("/isr-page"),
+        handlerLoader: handlerLoaderFor(manifestPath),
         platformCache: {
           read: async () => null,
-          readStored: async () => ({
-            lastModified: Date.now(),
-            value: {
-              kind: "PAGES",
-              html: "<html>revalidated content</html>",
-              pageData: {},
-              headers: { "x-next-cache-tags": "_N_T_/isr-page" },
-              status: 200,
-            },
-          }),
+          readStored: async (key: string) =>
+            key === manifestPath
+              ? {
+                  lastModified: Date.now(),
+                  value: {
+                    kind: "PAGES",
+                    html: "<html>revalidated content</html>",
+                    pageData: {},
+                    headers: { "x-next-cache-tags": "_N_T_/isr-page" },
+                    status: 200,
+                  },
+                }
+              : null,
           write: async () => {},
         },
       }),
     );
     const res = mockRes();
-    await dispatcher.dispatch(mockReq("/isr-page"), res, {
+    await dispatcher.dispatch(mockReq(wirePath), res, {
       kind: "route",
       pool: "ssr",
-      matchedPathname: "/isr-page",
+      matchedPathname: manifestPath,
       routeMatches: null,
     } as any);
     expect(invoker).not.toHaveBeenCalled();
@@ -947,4 +961,53 @@ describe("PPR serve ladder reads the platform cache", () => {
       delete process.env.__NEXT_PREVIEW_MODE_ID;
     }
   });
+});
+
+it("PPR dispatch does not replay another percent-encoded path", async () => {
+  const { ValkeyIncrementalCacheHandler, STORE_INCREMENTAL_ENTRY_SCRIPT } =
+    await import("../../src/pool-server/valkey-cache/incremental-cache-handler.js");
+  const { READ_VALKEY_TIME_SCRIPT } =
+    await import("../../src/pool-server/valkey-cache/valkey-clock.js");
+  const strings = new Map<string, string>();
+  const client = {
+    get: async (key: string) => strings.get(key) ?? null,
+    hmget: async (_key: string, ...fields: string[]) => fields.map(() => null),
+    eval: async (script: string, _count: number, key: string, data: string) => {
+      if (script === READ_VALKEY_TIME_SCRIPT) return 1000;
+      if (script === STORE_INCREMENTAL_ENTRY_SCRIPT) {
+        const entry = JSON.parse(data);
+        entry.lastModified = 1000;
+        strings.set(key, JSON.stringify(entry));
+        return 0;
+      }
+      throw new Error("Unexpected script");
+    },
+  } as any;
+  const cache = new ValkeyIncrementalCacheHandler({ client, buildId: "b1", now: () => 1000 });
+  await cache.set(
+    "/posts/%2541",
+    { kind: "APP_PAGE", html: "literal percent 41", headers: {} },
+    {},
+  );
+  await cache.set("/posts/A", { kind: "APP_PAGE", html: "letter A", headers: {} }, {});
+  const dispatcher = createDispatcher(
+    baseOptions({
+      pprRoutes: { "/posts/[id]": { postponedState: "build-token", fallbackFilePath: shellFile } },
+      handlerLoader: handlerLoaderFor("/posts/[id]"),
+      localHandlerInvoker: vi.fn(),
+      platformCache: {
+        read: (key: string, ctx: any) => cache.getPeek(key, ctx),
+        readStored: (key: string, ctx: any) => cache.getStored(key, ctx),
+        readSeed: (key: string, ctx: any) => cache.getSeed(key, ctx),
+      },
+    }),
+  );
+  const res = mockRes();
+  await dispatcher.dispatch(mockReq("/posts/%2541"), res, {
+    kind: "route",
+    pool: "ssr",
+    matchedPathname: "/posts/[id]",
+    routeMatches: { id: "%41" },
+  } as any);
+  expect(res._body).toBe("literal percent 41");
 });

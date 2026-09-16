@@ -2159,6 +2159,7 @@ export interface DispatcherOptions {
    * The platform's own view of the shared incremental cache (Valkey classic handler): the
    * serve ladder reads materialized/seed entries through it (get() owns tag staleness).
    * Regeneration writes use Next's ResponseCache and registered handler.
+   * Cache keys are decoded manifest pathnames, including literal percent sequences.
    */
   platformCache?: {
     read: (
@@ -2950,10 +2951,9 @@ export function createDispatcher(options: DispatcherOptions) {
         ) {
           // Same key contract as the PPR ladder: Next writes under the resolved invocation
           // pathname (rewrite destination), so read under it too — never the public URL.
-          const storedConcrete = new URL(
-            resolution.invokePath ?? req.url ?? "/",
-            "http://localhost",
-          ).pathname;
+          const storedConcrete = manifestPathname(
+            new URL(resolution.invokePath ?? req.url ?? "/", "http://localhost").pathname,
+          );
           const storedKey = storedConcrete === "/" ? "/index" : storedConcrete;
           const stored = await platformCache
             .readStored(storedKey, { kind: "APP_PAGE" })
@@ -3051,10 +3051,9 @@ export function createDispatcher(options: DispatcherOptions) {
               // non-minimal data render (measured: `inc:/second` written by exactly that);
               // once it exists the STORED page supersedes the skeleton — without this rung
               // documents would serve the skeleton forever.
-              const fallbackConcrete = new URL(
-                resolution.invokePath ?? req.url ?? "/",
-                "http://localhost",
-              ).pathname;
+              const fallbackConcrete = manifestPathname(
+                new URL(resolution.invokePath ?? req.url ?? "/", "http://localhost").pathname,
+              );
               const fallbackKey = fallbackConcrete === "/" ? "/index" : fallbackConcrete;
               const stored = await platformCache!.readStored!(fallbackKey, {
                 kind: "PAGES",
