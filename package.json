@@ -79,7 +79,8 @@
     "lint:fix": "oxlint --fix",
     "typecheck": "tsc --noEmit",
     "build:middle-cache": "cp docker/middle-cache/main.go dist/middle-cache.go",
-    "test:middle-cache": "cd docker/middle-cache && go test -race ./..."
+    "test:middle-cache": "cd docker/middle-cache && go test -race ./...",
+    "test:e2e:continuity": "npm run build && E2E_CONTINUITY_BUILD=1 vitest run --config vitest.e2e-live.config.ts tests/e2e/live/continuity.test.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.12.1",
