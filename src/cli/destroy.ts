@@ -180,7 +180,11 @@ function parseOwnedHpaNames(stdout: string, deployments: PoolDeploymentIdentity[
   return [...names];
 }
 
-type StablePoolResourceKind = "service" | "poddisruptionbudget" | "healthcheckpolicy";
+type StablePoolResourceKind =
+  | "service"
+  | "poddisruptionbudget"
+  | "healthcheckpolicy"
+  | "gcpbackendpolicy";
 
 /** Validate topology-retained stable pool objects before deleting any exact name. */
 function parseStablePoolResourceNames(
@@ -225,7 +229,9 @@ function parseStablePoolResourceNames(
         ? resourceNames.service
         : kind === "poddisruptionbudget"
           ? resourceNames.pdb
-          : resourceNames.hcp;
+          : kind === "gcpbackendpolicy"
+            ? resourceNames.bcp
+            : resourceNames.hcp;
     if (name !== expected) {
       throw new Error(
         `Retained ${kind} "${name}" claims pool "${component}", but its adapter-derived ` +
@@ -252,7 +258,7 @@ function parseStablePoolResourceNames(
       }
     }
     if (
-      kind === "healthcheckpolicy" &&
+      (kind === "healthcheckpolicy" || kind === "gcpbackendpolicy") &&
       (item?.spec?.targetRef?.group !== "" ||
         item.spec.targetRef.kind !== "Service" ||
         item.spec.targetRef.name !== resourceNames.service)
@@ -267,7 +273,7 @@ function parseStablePoolResourceNames(
 }
 
 function isOptionalHealthCheckPolicyApiMissing(stderr: string): boolean {
-  const s = stderr.toLowerCase();
+  const s = stderr.toLowerCase().replaceAll("gcpbackendpolicy", "healthcheckpolicy");
   if (hasDeletionFailureMarker(s)) return false;
   return (
     s.includes('the server doesn\'t have a resource type "healthcheckpolicy"') ||
@@ -972,6 +978,11 @@ export async function runDestroy(options: DestroyOptions): Promise<void> {
     {
       kind: "healthcheckpolicy",
       description: "retained stable pool HealthCheckPolicies",
+      apiOptional: true,
+    },
+    {
+      kind: "gcpbackendpolicy",
+      description: "retained stable pool GCPBackendPolicies",
       apiOptional: true,
     },
   ] as const) {

@@ -323,7 +323,9 @@ split-selector state is what the cutover design exists to avoid.
 Keep the `HelmRelease` timeout above the emitted Job's SEQUENTIAL gate budget:
 `pools x 10m` (pool rollouts, awaited one at a time) `+ 30m` (the routing rollout, at its
 ceiling) `+ 10m` (the ext_proc registration Job, GKE only; allow 1m for the generic policy gate)
-`+ the composition-plan readiness budget` `+ 2m` (the readiness/capacity gate), then add at
+`+ the composition-plan readiness budget` `+ 2m` (the readiness/capacity gate)
+`+ GKE stable Services x 10m` (five minutes of backend warm-up per Service, plus another
+five minutes to warm its original endpoints if a later Service fails), then add at
 least 10m for the bounded kubectl reads and patches between waits. Do not omit the composition
 term: `waitForCompositionPlanReadiness` waits its distinct entries ONE AT A TIME, each with its
 own deadline. Read `.k8s-adapter/output/composition-plan.json` and sum the `timeoutSeconds` of
@@ -331,8 +333,10 @@ the distinct entries in `operations.resources.readiness` and
 `operations.routing.dataplane.readiness`; count `kubernetes-service-endpoints` as 120s and
 `gcp-traffic-extension` as 600s because those two kinds carry fixed runtime defaults instead.
 Identical entries present in both arrays are waited once. For example, three pools, GKE
-registration, four distinct 10-minute composition checks, and the 10-minute command cushion need
-at least `30 + 30 + 10 + 40 + 2 + 10 = 122m`, not 72m. Two of those numbers are worst cases rather
+registration, four distinct 10-minute composition checks, three GKE stable Services, and the
+10-minute command cushion need at least `30 + 30 + 10 + 40 + 2 + 30 + 10 = 152m`.
+Increase the example's HelmRelease and parent Kustomization timeouts for that topology.
+Two of those numbers are worst cases rather
 than typical ones: the routing gate derives its wait from that tier's live replica count (10
 minutes at the default HPA floor of 2, rising to the 30-minute ceiling around 6 replicas), and a
 pool rollout only spends its full budget if pods are slow to boot. Budget the ceiling anyway —

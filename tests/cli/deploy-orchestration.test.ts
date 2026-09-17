@@ -80,14 +80,20 @@ const routeExtJobYaml = path.join(
 );
 
 function stablePoolObject(
-  kind: "service" | "poddisruptionbudget" | "healthcheckpolicy",
+  kind: "service" | "poddisruptionbudget" | "healthcheckpolicy" | "gcpbackendpolicy",
   pool: string,
   retained = false,
   legacyHcpLabels = false,
 ) {
   const base = `${RELEASE}-${pool}`;
   const name =
-    kind === "service" ? base : kind === "poddisruptionbudget" ? `${base}-pdb` : `${base}-hcp`;
+    kind === "service"
+      ? base
+      : kind === "poddisruptionbudget"
+        ? `${base}-pdb`
+        : kind === "gcpbackendpolicy"
+          ? `${base}-bcp`
+          : `${base}-hcp`;
   return {
     metadata: {
       name,
@@ -3387,7 +3393,11 @@ describe("runDeploy — N70: build-scoped pool topology", () => {
         args.includes("-l") &&
         args.join(" ").includes("adapter-k8s.dev/release=")
       ) {
-        const kind = args[1] as "service" | "poddisruptionbudget" | "healthcheckpolicy";
+        const kind = args[1] as
+          | "service"
+          | "poddisruptionbudget"
+          | "healthcheckpolicy"
+          | "gcpbackendpolicy";
         return {
           exitCode: 0,
           stdout: JSON.stringify({
@@ -3398,7 +3408,9 @@ describe("runDeploy — N70: build-scoped pool topology", () => {
       }
       if (
         args[0] === "delete" &&
-        ["service", "poddisruptionbudget", "healthcheckpolicy"].includes(args[1]!)
+        ["service", "poddisruptionbudget", "healthcheckpolicy", "gcpbackendpolicy"].includes(
+          args[1]!,
+        )
       ) {
         events.push(`delete-stable:${args[1]}:${args[2]}`);
         return { exitCode: 0, stdout: "", stderr: "" };
@@ -3410,6 +3422,7 @@ describe("runDeploy — N70: build-scoped pool topology", () => {
 
     const deletions = [
       "delete-stable:healthcheckpolicy:rel-obsolete-hcp",
+      "delete-stable:gcpbackendpolicy:rel-obsolete-bcp",
       "delete-stable:poddisruptionbudget:rel-obsolete-pdb",
       "delete-stable:service:rel-obsolete",
     ];

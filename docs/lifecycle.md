@@ -18,6 +18,29 @@ What `deploy`, `rollback`, `destroy`, and `doctor` actually do, and where deploy
 
 Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target.
 
+For GKE Services backed by a network endpoint group, cutover first selects the ready
+outgoing and incoming pods together using temporary labels. This lets GKE register
+incoming endpoints while outgoing endpoints remain available. The adapter requires
+every incoming endpoint to be healthy in each attached backend for 30 consecutive
+seconds, and verifies that the backend's 60-second connection drain policy has applied,
+before selecting only the incoming build. Middleware can run on either verified build
+during this overlap. Deploy and rollback use the same sequence.
+
+Backend warm-up has a five-minute polling budget. Failed health checks, a changed
+incoming pod set, or a failed final selector update restore the original selector and
+leave the outgoing build running. If restoration cannot be confirmed, both builds and
+the temporary labels remain in place and the command fails. The
+`adapter-k8s.io/backend-warmup` Service annotation holds the exact original and target
+selectors for recovery if the CLI or Job is killed during overlap. Stop any active
+cutover before repairing an interrupted one; do not scale either build down while that
+annotation remains. Successful completion or confirmed restoration removes the annotation.
+
+The CLI's Google identity needs permission to list backend services and read their
+configuration and health. GKE cutover Jobs use the Google metadata token endpoint and
+need a Workload Identity principal with the same Compute read permissions. Tokens are
+used only in HTTPS authorization headers, never passed on command lines. Generic
+Kubernetes Services keep their existing selector switch and need no Google credentials.
+
 `/readyz` is the pod's own verdict: it answers 503 until instrumentation registration has succeeded and at least one route module has imported. The selector value comes from the same sanitizer that stamps the pod label—a mismatch would drain the Service to zero endpoints, which is why both sides derive from one function.
 
 ### Long-lived requests during cutover

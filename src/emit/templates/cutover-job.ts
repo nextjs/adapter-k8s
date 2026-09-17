@@ -132,6 +132,11 @@ function renderAdditionalRbacRules(options: CutoverRbacOptions): string {
   if (options.hasHealthCheckPolicy) {
     merge({
       apiGroup: "networking.gke.io",
+      resource: "gcpbackendpolicies",
+      verbs: new Set(["get", "list", "delete"]),
+    });
+    merge({
+      apiGroup: "networking.gke.io",
       resource: "healthcheckpolicies",
       verbs: new Set(["get", "list", "delete"]),
     });
@@ -354,7 +359,7 @@ rules:
   # diagnostics run the in-pod /readyz probe (pods/exec) and read pod logs.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list"]
+    verbs: ${JSON.stringify(options.hasHealthCheckPolicy ? ["get", "list", "patch"] : ["get", "list"])}
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
