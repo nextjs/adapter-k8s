@@ -168,6 +168,12 @@ spec:
   default:
     connectionDraining:
       drainingTimeoutSec: 60
+    # A GCPBackendPolicy without logging disables the Gateway's default access logs.
+    # Preserve the controller's default 100% sampling while adding connection draining.
+    # https://docs.cloud.google.com/kubernetes-engine/docs/how-to/configure-gateway-resources
+    logging:
+      enabled: true
+      sampleRate: 1000000
   targetRef:
     group: ""
     kind: Service

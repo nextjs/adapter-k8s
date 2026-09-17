@@ -180,6 +180,7 @@ describe("poolResourceNames (single source of truth for template-rendered names)
     expect(activePdbDoc).toContain("kind: PodDisruptionBudget");
     expect(activeBcpDoc).toContain("kind: GCPBackendPolicy");
     expect(activeBcpDoc).toContain("drainingTimeoutSec: 60");
+    expect(activeBcpDoc).toMatch(/logging:\s+enabled: true\s+sampleRate: 1000000/);
     expect(metadataName(activeBcpDoc!)).toBe(sanitizeK8sName(`${releaseName}-${poolName}`, "-bcp"));
     expect(names.hcp.length).toBeLessThanOrEqual(63);
 

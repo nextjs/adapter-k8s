@@ -25,6 +25,8 @@ every incoming endpoint to be healthy in each attached backend for 30 consecutiv
 seconds, and verifies that the backend's 60-second connection drain policy has applied,
 before selecting only the incoming build. Middleware can run on either verified build
 during this overlap. Deploy and rollback use the same sequence.
+The backend policy explicitly preserves GKE Gateway's default access logging at 100%
+sampling. Omitting logging from a `GCPBackendPolicy` would disable those logs.
 
 Backend warm-up has a five-minute polling budget. Failed health checks, a changed
 incoming pod set, or a failed final selector update restore the original selector and
