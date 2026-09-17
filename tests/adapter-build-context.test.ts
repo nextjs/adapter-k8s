@@ -152,6 +152,35 @@ async function build(overrides: Parameters<typeof ctxFor>[0] = {}, cfg = validCo
   await adapter.onBuildComplete!(ctxFor(overrides));
 }
 
+describe("middle cache image staging", () => {
+  it.each(["traced-assets", "shared-image"] as const)(
+    "stages the runtime and sidecar for %s",
+    async (containerStrategy) => {
+      seedProject();
+      writeFileSync(path.join(bundleDir, "middle-cache.go"), "package main\nfunc main() {}\n");
+      await build({}, { ...validConfig, containerStrategy, middleCache: { enabled: true } });
+      const context = containerStrategy === "shared-image" ? sharedContext : poolContext;
+      expect(readFileSync(context("config/middle-cache.go"), "utf8")).toContain("package main");
+      const dockerfile = outputFile(
+        containerStrategy === "shared-image" ? "shared-context/Dockerfile" : "pools/ssr/Dockerfile",
+      );
+      expect(dockerfile).toContain("AS middle-cache-build");
+      expect(dockerfile).toContain("/usr/local/bin/middle-cache");
+      const deployment = outputFile("chart/templates/ssr-deployment.yaml");
+      expect(deployment).toContain("name: middle-cache");
+      expect(deployment).toContain('value: "3001"');
+      expect(deployment).toContain('value: "127.0.0.1"');
+    },
+  );
+
+  it("refuses to ship an enabled cache without its runtime source", async () => {
+    seedProject();
+    await expect(build({}, { ...validConfig, middleCache: { enabled: true } })).rejects.toThrow(
+      "middle-cache.go",
+    );
+  });
+});
+
 // N40 (routing-tier handoff): Next never enumerates `public/` as an adapter output, so the
 // CEL's per-file exclusion loop had nothing to iterate — the emitted expression carried ZERO
 // per-file exclusions and the oversize warning's advice ("reduce the number of public files")

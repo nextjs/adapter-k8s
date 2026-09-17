@@ -108,7 +108,7 @@ function renderAndValidate(
 }
 
 describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () => {
-  it("strict-validates a portable ingress target without skipping native resources", () => {
+  it.each([false, true])("strict-validates portable ingress, middle cache=%s", (middleCache) => {
     const target = defineTarget({
       cluster: kubernetesCluster(),
       exposure: ingressExposure({
@@ -128,6 +128,7 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
     });
     const config = {
       pools: { default: { routes: ["appPages"] } },
+      middleCache: { enabled: middleCache },
       target,
     } as K8sAdapterConfig;
     const compiledTarget = compileTarget(target, {

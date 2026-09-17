@@ -44,6 +44,23 @@ function assertSafeSharpVersion(version: string): void {
   }
 }
 
+// Build inside the target image so local builds need no Go toolchain. The final binary
+// is static and shared by the Node container and its Go-only sidecar.
+function middleCacheBuild(source: string, enabled: boolean): string {
+  if (!enabled) return "";
+  return `FROM golang:1.26-bookworm AS middle-cache-build
+WORKDIR /build
+COPY ${source}/config/middle-cache.go ./main.go
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /middle-cache main.go
+`;
+}
+
+function middleCacheCopy(enabled: boolean): string {
+  return enabled
+    ? "COPY --from=middle-cache-build /middle-cache /usr/local/bin/middle-cache\n"
+    : "";
+}
+
 // The in-image sharp install, shared by both emitted app Dockerfiles.
 // Keep it outside /app: npm would otherwise prune traced packages that are deliberately
 // absent from the minimal staged package.json before the container ever starts.
@@ -65,6 +82,7 @@ export function generateDockerfile({
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
+  middleCache = false,
 }: {
   containerStrategy: "shared-image" | "traced-assets";
   targetPlatform?: TargetPlatform;
@@ -76,13 +94,14 @@ export function generateDockerfile({
    * so this strategy needs the same in-image install fallback.
    */
   installSharpVersion?: string;
+  middleCache?: boolean;
 }): string {
   // `=== undefined` (not falsy): an EMPTY version string must reach the validator, which
   // rejects it, rather than silently skipping the install step.
   const sharpInstall =
     installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
-  return `FROM ${baseImageRef()}
-WORKDIR /app
+  return `${middleCacheBuild(".", middleCache)}FROM ${baseImageRef()}
+${middleCacheCopy(middleCache)}WORKDIR /app
 COPY --chown=node:node . .
 ${sharpInstall}ENV NODE_ENV=production
 ENV NEXT_BUILD_ID=${buildId}
@@ -98,6 +117,7 @@ export function generatePoolDockerfile({
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
+  middleCache = false,
 }: {
   poolName: string;
   targetPlatform?: TargetPlatform;
@@ -110,14 +130,15 @@ export function generatePoolDockerfile({
    * staged sharp JS package.
    */
   installSharpVersion?: string;
+  middleCache?: boolean;
 }): string {
   // `=== undefined` (not falsy): an EMPTY version string must reach the validator, which
   // rejects it, rather than silently skipping the install step.
   const sharpInstall =
     installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
   // context/ is prepared by the adapter with exactly what's needed.
-  return `FROM ${baseImageRef()}
-WORKDIR /app
+  return `${middleCacheBuild("context", middleCache)}FROM ${baseImageRef()}
+${middleCacheCopy(middleCache)}WORKDIR /app
 COPY --chown=node:node context/ .
 ${sharpInstall}ENV NODE_ENV=production
 ENV POOL_NAME=${poolName}
@@ -134,15 +155,17 @@ export function generatePoolBaseDockerfile({
   targetPlatform = DEFAULT_TARGET_PLATFORM,
   buildId,
   installSharpVersion,
+  middleCache = false,
 }: {
   targetPlatform?: TargetPlatform;
   buildId: string;
   installSharpVersion?: string;
+  middleCache?: boolean;
 }): string {
   const sharpInstall =
     installSharpVersion === undefined ? "" : sharpInstallStep(installSharpVersion, targetPlatform);
-  return `FROM ${baseImageRef()}
-WORKDIR /app
+  return `${middleCacheBuild("content", middleCache)}FROM ${baseImageRef()}
+${middleCacheCopy(middleCache)}WORKDIR /app
 COPY --chown=node:node dependencies/ .
 ${sharpInstall}COPY --chown=node:node content/ .
 COPY --chown=node:node fetch-cache/ .

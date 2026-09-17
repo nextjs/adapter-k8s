@@ -34,6 +34,7 @@ export function generateBuildMetadata({
   hasMiddleware,
   failureModeAllow,
   cacheEnabled,
+  compressionEnabled,
   cacheManaged,
   incrementalCacheHandler,
   cacheMemorystore,
@@ -69,6 +70,7 @@ export function generateBuildMetadata({
   /** ext_proc callout failure policy. `false` = fail CLOSED (middleware is never bypassed). */
   failureModeAllow: boolean;
   cacheEnabled: boolean;
+  compressionEnabled?: boolean;
   /** cache enabled with no BYO url ⇒ the deploy step must provision managed Memorystore. */
   cacheManaged: boolean;
   /**
@@ -135,6 +137,7 @@ export function generateBuildMetadata({
       hasMiddleware,
       failureModeAllow,
       cacheEnabled,
+      ...(compressionEnabled !== undefined ? { compressionEnabled } : {}),
       cacheManaged,
       incrementalCacheHandler,
       ...(cacheMemorystore ? { cacheMemorystore } : {}),

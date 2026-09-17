@@ -13,6 +13,12 @@ import {
   type DispatchProofRejectionReason,
 } from "../routing-common.js";
 import { guardStreamErrors } from "./dispatch.js";
+import {
+  MIDDLE_CACHE_ASSET_HEADER,
+  MIDDLE_CACHE_REQUEST_HEADER,
+  middleCacheHandoff,
+  acceptMiddleCacheRequest,
+} from "./middle-cache.js";
 // A leaf: it knows about byte positions in a relayed frame stream and nothing about dispatch, so
 // importing it keeps the "no dependency on the dispatcher" property `onUpgrade` is spelled out for.
 import { injectTunnelCloseFrame } from "./websocket-frame-cursor.js";
@@ -275,6 +281,7 @@ export function applyRequestTrustBoundary(
   res: ServerResponse,
   options: RequestTrustOptions,
 ): void {
+  acceptMiddleCacheRequest(req);
   applyIncomingRequestTrustBoundary(req, options);
 
   // Wrap res.writeHead to strip internal headers from responses.
@@ -297,6 +304,19 @@ export function applyRequestTrustBoundary(
         args[headersArgIdx],
         isInternalResponseHeader,
       );
+    }
+    // Stamp after filtering every application-supplied header representation. Only the
+    // static-file branch can populate the WeakMap; middleware/proxy headers cannot.
+    const asset = middleCacheHandoff(res);
+    if (asset && statusCode === 200) {
+      res.setHeader(MIDDLE_CACHE_ASSET_HEADER, asset);
+      res.setHeader("content-length", "0");
+      if (args[headersArgIdx] !== undefined) {
+        args[headersArgIdx] = filterWriteHeadHeadersArg(
+          args[headersArgIdx],
+          (name) => name.toLowerCase() === "content-length",
+        );
+      }
     }
     return origWriteHead(statusCode, ...args);
   };
@@ -329,6 +349,8 @@ function isInternalResponseHeader(name: string): boolean {
   const lower = name.toLowerCase();
   if (PUBLIC_MIDDLEWARE_RESPONSE_HEADERS.has(lower)) return false;
   return (
+    lower === MIDDLE_CACHE_ASSET_HEADER ||
+    lower === MIDDLE_CACHE_REQUEST_HEADER ||
     INTERNAL_RESPONSE_HEADERS.includes(lower) ||
     lower.startsWith("x-middleware-request-") ||
     lower.startsWith("x-middleware-")

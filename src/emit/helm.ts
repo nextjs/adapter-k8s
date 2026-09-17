@@ -281,6 +281,8 @@ export function generateHelmChart({
     const mergedEnv = { ...config.env, ...poolConfig?.env };
     const mergedEnvFrom = [...(config.envFrom ?? []), ...(poolConfig?.envFrom ?? [])];
     files[`templates/${poolName}-deployment.yaml`] = renderDeployment({
+      middleCache: config.middleCache?.enabled === true,
+      compression: config.compression?.enabled !== false,
       poolName,
       buildId,
       releaseName,

@@ -34,6 +34,13 @@ minor.
 
 ## The layers
 
+The opt-in middle cache has separate Go transport tests. Run `npm run test:middle-cache`
+with Go 1.26 or newer to check authorization on warm-cache and conditional requests,
+per-request headers and cookies, bounded eviction, path containment, streaming and
+WebSocket forwarding under the race detector. CI runs this command's Go equivalent in
+the Go build image. Node tests cover the handoff trust boundary and image staging.
+These checks do not establish live-cluster behavior or performance for this option.
+
 ### 1. Unit and schema suites
 
 Covers the adapter, both runtime tiers (pool server and routing service), the CLI, and the emitted
@@ -204,6 +211,12 @@ The specific behaviors the architecture exists to get right, each confirmed agai
 - ext_proc path locally: `npx adapter-k8s emulate` in `fixtures/main`
 - Live suite: `E2E_BASE_URL=https://<host> npm run test:e2e:live` against a deployed release
 - Edge tier actually in use: add `E2E_ASSERT_EDGE_DISPATCH=1` to the live suite. It asserts the middleware that produced a response ran in the ext_proc tier — i.e. the pool VERIFIED the per-request dispatch proof rather than failing safe to local re-resolution, which is correct but silent and would otherwise leave the edge tier doing nothing but adding a hop. Requires a deployment built from the current `fixtures/main`
+
+Response compression has a real Envoy transport suite:
+`ADAPTER_K8S_CONTAINER_CLI=podman npx vitest run tests/emit/compression.integration.test.ts`.
+It defaults to Docker and skips when no runtime is available. The Linux-only suite uses
+loopback sockets and host networking, verifies codec negotiation and decoded payloads,
+streaming, range exclusions, response metadata and signed dispatch headers.
 
 ## See also
 

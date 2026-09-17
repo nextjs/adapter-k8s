@@ -4,6 +4,7 @@ import { createK8sAdapter } from "@next-community/adapter-k8s";
 // provisioned). CDN is enabled here to validate the GCPHTTPFilter path on real
 // infrastructure — the running rev-24 deployment predates that feature.
 export default createK8sAdapter({
+  middleCache: { enabled: true },
   pools: {
     default: {
       routes: ["appPages", "appRoutes", "pages", "pagesApi"],

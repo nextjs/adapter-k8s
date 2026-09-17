@@ -71,6 +71,7 @@ const RESERVED_ENV_NAMES = new Set([
   "RELEASE_NAME",
   "ADAPTER_K8S_PROVIDER_NAME",
   "ADAPTER_K8S_LISTEN_HOST",
+  "ADAPTER_K8S_MIDDLE_CACHE",
   "INTERNAL_HEADER_SECRET",
   "VALKEY_URL",
   "VALKEY_AUTH",
@@ -182,6 +183,24 @@ export function assertSafeCidrList(cidrs: unknown, where: string): asserts cidrs
 export function validateConfig(input: unknown, releaseName?: string): void {
   const config = input as K8sAdapterConfig;
   const inputRecord = input as Record<string, unknown>;
+  if (
+    config.compression !== undefined &&
+    (!config.compression ||
+      typeof config.compression !== "object" ||
+      Array.isArray(config.compression) ||
+      typeof config.compression.enabled !== "boolean")
+  ) {
+    throw new Error("compression must be an object with a boolean enabled field");
+  }
+  if (
+    config.middleCache !== undefined &&
+    (!config.middleCache ||
+      typeof config.middleCache !== "object" ||
+      Array.isArray(config.middleCache) ||
+      typeof config.middleCache.enabled !== "boolean")
+  ) {
+    throw new Error("middleCache must be an object with a boolean enabled field");
+  }
   for (const removed of ["imageOptimizer", "skewProtection", "routeExtension"] as const) {
     if (Object.hasOwn(inputRecord, removed) && inputRecord[removed] !== undefined) {
       throw new Error(
@@ -418,6 +437,7 @@ export function validateConfig(input: unknown, releaseName?: string): void {
 export function applyDefaults(config: K8sAdapterConfig): K8sAdapterConfig {
   return {
     ...config,
+    compression: { enabled: true, ...config.compression },
     cache: {
       enabled: false,
       provider: "valkey",

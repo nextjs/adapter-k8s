@@ -1073,6 +1073,8 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
       };
       const modified: MutableNextConfig = {
         ...nextConfig,
+        // Response compression belongs in the proxy, outside the Node runtime.
+        // Override the app's value through the deployment adapter hook too.
         compress: false,
         // Set turbopack root to the project directory to avoid workspace detection issues
         // when the adapter is loaded from outside the project tree (e.g., e2e tests)
@@ -2117,6 +2119,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           JSON.stringify(staticManifest, null, 2),
           absSharedStageDir,
         );
+        if (cfg.middleCache?.enabled) {
+          await writeOutputFile(
+            projectDir,
+            "config/middle-cache.go",
+            readAdapterBundle("middle-cache.go"),
+            absSharedStageDir,
+          );
+        }
 
         for (const [poolName, pool] of pools) {
           await writeOutputFile(
@@ -2133,6 +2143,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           // Base image version comes from DEFAULT_EMITTED_NODE_VERSION (dockerfiles.ts). Node 24
           // is required by the manifest's scoped regexp compatibility modifiers.
           generateDockerfile({
+            middleCache: cfg.middleCache?.enabled === true,
             containerStrategy: "shared-image",
             buildId,
             targetPlatform: imageTargetPlatform,
@@ -2288,11 +2299,20 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             JSON.stringify(staticManifest, null, 2),
             poolStageDir,
           );
+          if (cfg.middleCache?.enabled) {
+            await writeOutputFile(
+              projectDir,
+              "config/middle-cache.go",
+              readAdapterBundle("middle-cache.go"),
+              poolStageDir,
+            );
+          }
 
           await writeOutputFile(
             projectDir,
             `Dockerfile`,
             generatePoolDockerfile({
+              middleCache: cfg.middleCache?.enabled === true,
               poolName,
               buildId,
               targetPlatform: imageTargetPlatform,
@@ -2344,6 +2364,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
               projectDir,
               "Dockerfile",
               generatePoolBaseDockerfile({
+                middleCache: cfg.middleCache?.enabled === true,
                 buildId,
                 targetPlatform: imageTargetPlatform,
                 ...(installSharpVersion ? { installSharpVersion } : {}),
@@ -2686,6 +2707,7 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           hasMiddleware: !!outputs.middleware,
           failureModeAllow,
           cacheEnabled: cfg.cache?.enabled ?? false,
+          compressionEnabled: cfg.compression?.enabled !== false,
           cacheManaged: compiledTarget
             ? compiledTarget.plan.operations.cache.kind === "gcp-memorystore"
             : !!cfg.cache?.enabled && !cfg.cache.url,

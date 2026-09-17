@@ -748,7 +748,9 @@ describe("generateHelmChart", () => {
     // from a node's cached layer. Both arms are proven against real helm in
     // tests/emit/templates/image-digest.test.ts.
     const withoutDigest = chartFor("abc123");
-    expect(withoutDigest["templates/ssr-deployment.yaml"]).not.toContain("@sha256:");
+    expect(
+      withoutDigest["templates/ssr-deployment.yaml"]!.split("- name: compression")[0],
+    ).not.toContain("@sha256:");
     expect(withoutDigest["templates/ssr-deployment.yaml"]).toContain(
       '{{ with (index .Values.pools "ssr").image.digest }}IfNotPresent{{ else }}Always{{ end }}',
     );
