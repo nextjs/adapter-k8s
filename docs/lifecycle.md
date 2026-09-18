@@ -16,7 +16,7 @@ What `deploy`, `rollback`, `destroy`, and `doctor` actually do, and where deploy
 
 ## Blue/green semantics
 
-Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target by default. Opt-in [previous-build retention](./configuration.md#previous-build-retention) keeps one standby replica per pool and temporarily forwards old immutable assets and Server Actions to it.
+Each deploy creates a new versioned Deployment alongside the previous one. Traffic points at a stable active Service whose selector is patched only after every new pod passes readiness _and_ is verified serving via `/readyz` directly on the pod. The previous build is kept at zero replicas as a rollback target by default. Opt-in [previous-build retention](./configuration.md#previous-build-retention) keeps one standby replica per pool and temporarily forwards old immutable assets and Server Actions to it. A cluster cleanup job scales the standby to zero after expiry; rollback restores its capacity before cutover.
 
 For GKE Services backed by a network endpoint group, cutover first selects the ready
 outgoing and incoming pods together using temporary labels. This lets GKE register

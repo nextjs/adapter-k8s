@@ -1,4 +1,5 @@
 import { prepareRetention } from "./retention.js";
+import { protectRetentionBuild } from "./retention-expiry.js";
 // src/cutover/run.ts
 // GitOps PR2: the cutover/promotion orchestrators, extracted from src/cli/deploy.ts step 7
 // (runCutover) and src/cli/rollback.ts steps 1-5 (runRevert). No TTY, no readline, no
@@ -100,6 +101,13 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
     deps,
   };
 
+  // Fence any old expiry job before this build's readiness checks can pass.
+  try {
+    await protectRetentionBuild(releaseName, namespace, buildId, pools);
+  } catch (error) {
+    await deps.restoreEdgeToPreviousBuild();
+    throw error;
+  }
   // D1. Wait for the new build's pool Deployments to be ready (7a).
   await waitPoolRollouts(ctx);
 
@@ -421,6 +429,7 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
     registry,
   } = inputs;
 
+  await protectRetentionBuild(releaseName, namespace, previousBuildId, poolNames);
   // 1. Scale up every pool's previous deployment — to at least the capacity the CURRENT
   // build is running (N26), never the old hardcoded 2. Done BEFORE any selector flip so
   // the target is already at size when traffic arrives.

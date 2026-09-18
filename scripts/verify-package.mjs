@@ -66,6 +66,7 @@ try {
     "dist/cli.cjs",
     "dist/envoy.yaml",
     "dist/pool-server.cjs",
+    "dist/retention-cleanup.cjs",
     "dist/middle-cache.go",
     "dist/routing-service.cjs",
     "dist/cache-handler.cjs",

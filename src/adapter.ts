@@ -2147,6 +2147,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
           readAdapterBundle("pool-server.cjs"),
           absSharedStageDir,
         );
+        if (cfg.retention?.enabled) {
+          await writeOutputFile(
+            projectDir,
+            "retention-cleanup.cjs",
+            readAdapterBundle("retention-cleanup.cjs"),
+            absSharedStageDir,
+          );
+        }
 
         await writeOutputFile(
           projectDir,
@@ -2321,6 +2329,14 @@ export function createK8sAdapter(userConfig?: K8sAdapterConfig): NextAdapter {
             readAdapterBundle("pool-server.cjs"),
             poolStageDir,
           );
+          if (cfg.retention?.enabled) {
+            await writeOutputFile(
+              projectDir,
+              "retention-cleanup.cjs",
+              readAdapterBundle("retention-cleanup.cjs"),
+              poolStageDir,
+            );
+          }
 
           await writeOutputFile(
             projectDir,

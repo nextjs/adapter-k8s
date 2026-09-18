@@ -9,6 +9,7 @@ import {
 } from "../emit/templates/utils.js";
 import { internalSecretName, INTERNAL_SECRET_KEY } from "../emit/templates/internal-secret.js";
 import { retentionName } from "../emit/templates/retention.js";
+import { setRetentionExpiry } from "./retention-expiry.js";
 import {
   RETENTION_MAX_BYTES,
   signRetention,
@@ -206,6 +207,9 @@ export async function prepareRetention(
     await delay(300);
   }
   await waitForIndex(json);
+  // Arm before cutover: if the CLI dies after committing state, the cluster can
+  // retire the standby at the finite preparation deadline. Active builds are protected.
+  await setRetentionExpiry(releaseName, namespace, outgoing, builds[1]!.pools, expiresAt);
   console.log(
     `  → Previous build remains routable until ${new Date(expiresAt).toISOString()}; one standby replica per pool`,
   );
@@ -229,6 +233,13 @@ export async function prepareRetention(
         );
         if (updated.exitCode !== 0) throw new Error("Could not finalize retention deadline");
         await waitForIndex(current.data["index.json"]);
+        await setRetentionExpiry(
+          releaseName,
+          namespace,
+          outgoing,
+          builds[1]!.pools,
+          finalExpiresAt,
+        );
         console.log(
           `  → Retained build serving deadline: ${new Date(finalExpiresAt).toISOString()}`,
         );

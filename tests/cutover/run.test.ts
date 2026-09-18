@@ -1386,6 +1386,9 @@ describe("retained build promotion", () => {
         events.push("retention-probe");
         return { exitCode: 0, stdout: "", stderr: "" };
       }
+      if (args[0] === "patch" && args[1] === "deployment" && args[2] === `rel-ssr-${PREV}`) {
+        events.push("expiry-arm");
+      }
       return base(command, args);
     });
     return { publications, before };
@@ -1398,10 +1401,24 @@ describe("retained build promotion", () => {
     expect(publications[0][PREV]).toEqual(before[PREV]);
     expect(Object.keys(publications[0]).sort()).toEqual([BUILD, PREV].sort());
     expect(events.indexOf("retention-probe")).toBeLessThan(events.indexOf("patch:rel-ssr"));
+    expect(events.indexOf("expiry-arm")).toBeGreaterThan(events.indexOf("retention-probe"));
+    expect(events.indexOf("expiry-arm")).toBeLessThan(events.indexOf("patch:rel-ssr"));
     const calls = vi.mocked(execCapture).mock.calls.map(([, args]) => args.join(" "));
     expect(calls).toContain(`scale deployment/rel-ssr-${PREV} -n ${NS} --replicas=1`);
     expect(calls).not.toContain(`scale deployment/rel-ssr-${PREV} -n ${NS} --replicas=0`);
     const expiry = JSON.parse(publications[1][BUILD].payload)[0].expiresAt;
+    const expiryPatches = vi
+      .mocked(execCapture)
+      .mock.calls.filter(([, args]) => args[0] === "patch" && args[2] === `rel-ssr-${PREV}`)
+      .map(([, args]) =>
+        JSON.parse(
+          JSON.parse(args.at(-1)!).metadata.annotations["adapter-k8s.io/retention-expiry"],
+        ),
+      );
+    expect(expiryPatches.map((marker) => marker.expiresAt)).toEqual([
+      JSON.parse(publications[0][BUILD].payload)[0].expiresAt,
+      expiry,
+    ]);
     expect(expiry).toBeGreaterThan(Date.now() + 400_000);
     expect(expiry).toBeLessThanOrEqual(Date.now() + 420_000);
   });
