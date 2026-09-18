@@ -239,6 +239,40 @@ afterEach(() => {
 });
 
 describe("previous-build semantics (N20's new front door)", () => {
+  it.each(["none", "job"] as const)(
+    "%s clears inherited native direct routing for first deploy, unknown predecessor, and same-build re-emit",
+    async (cutover) => {
+      for (const firstDeploy of [true, false]) {
+        writeFixture({ nodeCidrs: ["10.0.0.0/16"], cutoverGate: true });
+        const chartValuesPath = path.join(
+          projectDir,
+          ".k8s-adapter",
+          "output",
+          "chart",
+          "values.yaml",
+        );
+        const { header, values } = parseChartValues(readFileSync(chartValuesPath, "utf8"));
+        writeFileSync(
+          chartValuesPath,
+          header + JSON.stringify({ ...values, nativePoolRouting: true }),
+        );
+        const bundleDir = path.join(projectDir, ".k8s-adapter", "gitops");
+        rmSync(bundleDir, { recursive: true, force: true });
+        const options = {
+          ...baseOptions(),
+          cutover,
+          cutoverImage: CUTOVER_IMAGE,
+          ...(firstDeploy ? { firstDeploy: true } : { previousBuild: PREV_BUILD }),
+        };
+        await runEmit(options);
+        expect(bundleValues().nativePoolRouting).toBe(false);
+        await runEmit({ ...baseOptions(), cutover, cutoverImage: CUTOVER_IMAGE });
+        expect(bundleValues().nativePoolRouting).toBe(false);
+        expect(bundleMetadata().previousBuildId).toBe(firstDeploy ? null : PREV_BUILD);
+      }
+    },
+  );
+
   it("REFUSES when there is no prior bundle and no explicit flag — never infers first deploy", async () => {
     writeFixture({ nodeCidrs: ["10.0.0.0/16"] });
     await expect(runEmit(baseOptions())).rejects.toThrow(/--first-deploy/);

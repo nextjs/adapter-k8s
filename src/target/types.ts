@@ -178,7 +178,14 @@ export interface RoutingBuildContext extends TargetBuildContext {
  * today. The discriminant leaves room for a future proxy origin without overloading a Service
  * reference or changing the exposure context shape.
  */
-export type RoutingOrigin = { kind: "kubernetes-service"; service: KubernetesServiceRef };
+export type RoutingOrigin = {
+  kind: "kubernetes-service";
+  service: KubernetesServiceRef;
+  /** The native routing tier sets x-upstream-pool before Gateway API backend selection.
+   * Built-in Gateway exposures can send that traffic straight to the owning pool. The
+   * origin Service remains the fallback when the tier defers to local resolution. */
+  poolHeaderRouting?: true;
+};
 
 export interface RoutingComponent {
   readonly componentType: "routing";

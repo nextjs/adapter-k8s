@@ -21,6 +21,7 @@ import { resolveProvider } from "../providers/index.js";
 import { gkeProvider } from "../providers/gke.js";
 import type { CompiledKubernetesTarget } from "../target/types.js";
 import { renderComposedResources } from "./templates/composed-resources.js";
+import { isNativePoolRoutingRoute } from "./native-pool-routing.js";
 import { renderCompositionPlanConfigMap } from "./templates/composition-plan-configmap.js";
 import {
   DEFAULT_TARGET_PLATFORM,
@@ -207,6 +208,8 @@ export function generateHelmChart({
     config,
     imageRegistry,
     defaultPool,
+    nativePoolRoutingSupported:
+      compiledTarget?.plan.operations.resources.objects.some(isNativePoolRoutingRoute) === true,
   });
 
   // Routing and Config

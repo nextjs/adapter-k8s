@@ -37,6 +37,7 @@ import { assertCompositionPlanInvocation, loadLocalCompositionPlan } from "./com
 import { cdnTagForBuildId } from "../cdn-tags.js";
 import { assertSafeCidrList } from "../config.js";
 import { SECRET_CHART_FILES } from "../emit/helm.js";
+import { isNativePoolRoutingRoute } from "../emit/native-pool-routing.js";
 import { renderExternalSecrets } from "../emit/templates/external-secret.js";
 import {
   assertSafeBuildId,
@@ -1066,6 +1067,16 @@ export async function runEmit(options: EmitOptions): Promise<void> {
   const { header, values } = parseChartValues(
     readFileSync(path.join(chartSrcDir, "values.yaml"), "utf-8"),
   );
+  // A previous bundle describes intent, not live Service availability. Re-emits and
+  // both GitOps cutover modes must not inherit an earlier CLI optimization choice.
+  if ("nativePoolRouting" in values) {
+    values.nativePoolRouting = false;
+    if (compositionSnapshot?.plan.operations.resources.objects.some(isNativePoolRoutingRoute)) {
+      console.log(
+        "  → Native owning-pool routing: origin fallback (offline bundle; no live endpoint verification)",
+      );
+    }
+  }
   const global = values.global as {
     image: Record<string, string>;
     networkPolicy: Record<string, unknown>;
