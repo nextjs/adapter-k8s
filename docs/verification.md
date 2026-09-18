@@ -206,6 +206,43 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   500s and nineteen 504s over 33 seconds coincided with the last old routing pod shutting
   down. Load-balancer logs identified ext_proc `UNAVAILABLE` and `DEADLINE_EXCEEDED`,
   before cleanup changed any replica counts. Zero-error deployment remains unproven.
+- **Routing readiness withdrawal on live GKE.** A follow-up on September 18, 2026
+  deployed two updated builds and rolled back under 51,126 normal requests and 9,426
+  middleware-denial requests. GKE reported the outgoing routing endpoints unhealthy
+  13–20 seconds after readiness
+  withdrawal; all four updated outgoing pods finished draining at 120 seconds without
+  forced teardown. The initial migration had no probe failures. The next deployment
+  produced four HTTP 504s, and rollback produced one, all confirmed as ext_proc
+  `DEADLINE_EXCEEDED`. All five occurred on the one-request-per-second keep-alive lane;
+  the faster request lanes and middleware-denial probes stayed clean. The rollback
+  timeout preceded routing readiness withdrawal, so pod shutdown alone does not explain
+  the remaining failures. Both updated builds and the restored build passed all 30 live
+  checks. Zero-error cutover is still unresolved.
+- **Callout timeout follow-up.** Request-ID tracing on the same fixture reproduced
+  two 504s in 11,548 requests without pod shutdown, including a fresh frontend
+  connection. Keeping a withdrawn pod alive produced one timeout in 15,250 requests;
+  that request reached a healthy pod after its public deadline, and Node wrote its
+  response about 2ms later. These failures are not explained by shutdown alone.
+  The default GKE callout deadline was also corrected from 4s to 5s around the existing
+  4000ms handler budget. A subsequent five-minute sample passed 10,669 requests, all
+  30 live tests, and 32 doctor checks. The cause of the delivery delay remains unresolved.
+- **Full cutover repeat with the five-second default.** Later on September 18, 2026,
+  two fresh deployments and rollback ran under 106,419 normal requests and 10,506
+  middleware-denial checks. Eight normal requests failed: three HTTP 500s with ext_proc
+  `UNAVAILABLE` and five HTTP 504s with `DEADLINE_EXCEEDED`. The first deployment had
+  four failures, the second one, and rollback three. All denial checks passed.
+  This run added fresh-connection probes to the earlier page, asset, and keep-alive
+  workload, so its failure rate is not a controlled before/after comparison.
+  All six outgoing routing pods became unhealthy in GCP within 11–19 seconds of
+  readiness withdrawal and completed their 120-second drain without forced teardown.
+  Each deployed or restored build passed all 30 live checks; final doctor passed 32/32.
+  Three correlated failures took 4.4–5.1 seconds to reach Node, which wrote responses
+  2–5ms later with no queued writes and available HTTP/2 flow-control capacity.
+  One used stream 1091 on an established session, so new connection setup alone
+  cannot explain the failures. The earliest 500 also preceded readiness withdrawal
+  and the traffic-extension update. The five-second default is verified through
+  deployment and rollback, but zero-error cutover remains unresolved. Temporary
+  diagnostic observers and inspector listeners were removed afterward.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,

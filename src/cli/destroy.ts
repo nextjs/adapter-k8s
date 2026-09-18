@@ -324,6 +324,18 @@ export function buildReleaseScopedGcpResources(
       ],
     },
     {
+      desc: `routing health check "${releaseName}-routing-ready-hc"`,
+      args: [
+        "compute",
+        "health-checks",
+        "delete",
+        `${releaseName}-routing-ready-hc`,
+        "--global",
+        `--project=${projectId}`,
+        "--quiet",
+      ],
+    },
+    {
       desc: `static IP "${releaseName}-ip"`,
       args: [
         "compute",

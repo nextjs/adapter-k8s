@@ -1401,8 +1401,8 @@ export async function runDoctor(options: {
         );
       }
 
-      // Routing health check must be TCP — a plaintext gRPC check passes against a TLS
-      // ext_proc server yet the callout still fails (the failure mode that hid for months).
+      // HTTP readiness becomes unhealthy while the TLS data listener still serves,
+      // giving the load balancer time to stop sending callouts before shutdown.
       const hcType = (
         await execCapture(
           "gcloud",
@@ -1410,7 +1410,7 @@ export async function runDoctor(options: {
             "compute",
             "health-checks",
             "describe",
-            `${releaseName}-routing-hc`,
+            `${releaseName}-routing-ready-hc`,
             "--global",
             "--project",
             projectId,
@@ -1421,15 +1421,15 @@ export async function runDoctor(options: {
       ).stdout
         .trim()
         .toUpperCase();
-      if (hcType && hcType !== "TCP") {
+      if (hcType && hcType !== "HTTP") {
         results.push({
           name: "routing health check",
           status: "warn",
-          message: `${hcType} (needs TCP; a gRPC check passes plaintext but the TLS callout fails)`,
-          fix: `gcloud compute health-checks delete ${releaseName}-routing-hc --global --project ${projectId} --quiet  # then re-run init`,
+          message: `${hcType} (needs HTTP readiness on port 8081)`,
+          fix: "Re-run adapter-k8s init to update deploy permissions, then deploy to reconcile routing readiness",
         });
-      } else if (hcType === "TCP") {
-        results.push({ name: "routing health check", status: "pass", message: "TCP" });
+      } else if (hcType === "HTTP") {
+        results.push({ name: "routing health check", status: "pass", message: "HTTP readiness" });
       }
     }
 

@@ -49,7 +49,7 @@ Test first: probe for an effect YOUR middleware produces (a header it sets, a re
 - `covers N/M forwarding rules`: `http://` requests on uncovered rules bypass middleware (auth/rewrites). Same fix — redeploy re-attaches every rule.
 - `routing backend scheme: FAIL — <scheme>`: the traffic extension requires `EXTERNAL_MANAGED`. Delete `<release>-routing-service` (backend service) and re-run init + deploy, per the printed fix.
 - `routing backend NEG: FAIL — no NEG attached`: the ext_proc callout has no backend; redeploy.
-- `routing health check: WARN — <type>`: must be TCP. A gRPC check passes plaintext against the TLS ext_proc server while the callout still fails — the failure mode that hid for months. Delete `<release>-routing-hc` and re-run init.
+- `routing health check: WARN — <type>`: `<release>-routing-ready-hc` must use HTTP on port 8081 at `/readyz`. Re-run `npx adapter-k8s init` with the original infrastructure options to update the deployment identity permissions, then rebuild and deploy. The registration Job attaches the readiness check and enables backend connection draining. Leave the legacy `<release>-routing-hc` in place until `destroy`; deleting an attached health check disrupts traffic. If the Job reports denied `compute.healthChecks` permissions, confirm init updated the deployment identity before retrying.
 
 **Generic provider (EnvoyExtensionPolicy).** Deploy itself gates the cutover: it polls the policy until `Accepted=True` for the current generation and aborts otherwise. If it reported `not Accepted`:
 

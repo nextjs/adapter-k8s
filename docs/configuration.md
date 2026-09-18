@@ -142,13 +142,20 @@ Applies when the target hosts a routing tier (`envoyNativeRouting`, `gkeNativeRo
 routingService: {
   scaling: { min: 2, max: 10, targetCPU: 70 },
   resources: { cpu: '500m', memory: '512Mi', cpuLimit: '1000m', memoryLimit: '512Mi' },
-  requestTimeoutMs: 4000,
+  // Omit requestTimeoutMs to use the default handler and callout budgets.
   failureMode: 'auto',   // fails closed when the app has middleware (never bypass auth),
                          // fails open otherwise; 'open'/'closed' force it
 },
 ```
 
-`requestTimeoutMs` is the per-request handler budget in milliseconds; it must stay under the 5s ext_proc deadline.
+`requestTimeoutMs` is the per-request handler budget in milliseconds. When it is omitted,
+GKE uses a 4000ms handler budget and a 5s callout deadline, leaving one second for transport.
+Explicit settings keep their existing behavior: a configured handler budget derives a GKE
+callout deadline rounded up to whole seconds, with a minimum of 1s;
+`provider.gke.serviceExtensions.routeExtension.timeout` overrides that deadline in seconds.
+If you configure either timeout, leave room for transport between the handler budget and
+the callout deadline. Native Envoy's callout deadline is controlled separately by
+`envoyNativeRouting({ messageTimeoutMs })`.
 
 ## Multiple hosts & wildcards
 

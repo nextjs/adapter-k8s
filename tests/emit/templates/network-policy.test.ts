@@ -294,7 +294,7 @@ describe("renderNetworkPolicies — strict (opt-in) posture", () => {
     expect(yaml).not.toContain("except:");
   });
 
-  it("routing tier: Google LB ranges reach 8443 only; the node range reaches 8081 only", () => {
+  it("routing tier: Google LB ranges reach callouts and readiness; nodes reach health only", () => {
     const yaml = strict();
     const routingDoc = yaml.slice(0, yaml.indexOf("---"));
     const rules = ingressRules(routingDoc);
@@ -303,7 +303,7 @@ describe("renderNetworkPolicies — strict (opt-in) posture", () => {
     const [lbRule, kubeletRule] = rules as [string, string];
     expect(ipBlocksOf(lbRule)).toEqual([...STRICT_INGRESS_CIDRS]);
     expect(lbRule).toContain("port: 8443");
-    expect(lbRule).not.toContain("port: 8081");
+    expect(lbRule).toContain("port: 8081");
     // The ext_proc callout is the only thing that may reach the gRPC port; the node
     // range must NOT be able to.
     expect(ipBlocksOf(lbRule)).not.toContain("10.128.0.0/20");

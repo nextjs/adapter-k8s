@@ -45,6 +45,26 @@ Kubernetes Services keep their existing selector switch and need no Google crede
 
 `/readyz` is the pod's own verdict: it answers 503 until instrumentation registration has succeeded and at least one route module has imported. The selector value comes from the same sanitizer that stamps the pod label—a mismatch would drain the Service to zero endpoints, which is why both sides derive from one function.
 
+### Routing-service drain
+
+The routing pod's `preStop` hook withdraws `/readyz` through a loopback-only
+`POST /drain`, then keeps serving middleware callouts for 120 seconds while endpoint
+removal propagates. `/healthz` stays live during this interval. SIGTERM then closes
+HTTP/2 sessions gracefully, allowing accepted callouts up to 30 seconds to finish.
+Incomplete handshakes and remaining connections are closed at that deadline.
+
+GKE checks HTTP readiness on port 8081 using `<release>-routing-ready-hc`; the
+routing backend has a 60-second connection drain timeout. The registration Job
+reconciles both settings and leaves an already-correct backend unchanged. The old
+`<release>-routing-hc` TCP check remains until `destroy` removes it.
+
+For an existing GKE installation, re-run `init` with the original infrastructure
+options before deploying this upgrade. This updates the deployment identity's
+custom role with `compute.healthChecks.get`, `create`, `update`, and `useReadOnly`
+permissions. Then rebuild and deploy to install the readiness probes, NetworkPolicy,
+and registration Job. A rollback to an older routing image retains its original
+sleep behavior; that image cannot withdraw readiness through `/drain`.
+
 ### Long-lived requests during cutover
 
 A cutover changes where **new** connections go; it cannot move a live TCP connection or an
