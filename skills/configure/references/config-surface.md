@@ -115,7 +115,7 @@ gatewayApiExposure({
 
 Cannot mix TLS and plaintext hosts. Emits Gateway + HTTPRoute (+ HTTP→HTTPS redirect when TLS) and waits for `Programmed`/`Accepted`.
 
-`requestTimeout` requires Gateway API request-timeout support. It applies to the application route, with either portable or native routing. Use `"0s"` for long streams through Envoy or a finite Gateway API duration such as `"30s"`. Idle limits and configured route `maxDuration` still apply. The redirect-only route is unchanged.
+`requestTimeout` requires Gateway API request-timeout support. It applies to the application route, with either portable or native routing. Use `"0s"` for long streams through Envoy or a finite Gateway API duration such as `"30s"`. Configured route `maxDuration` still applies. Set the controller's `streamIdleTimeout` separately if stalled streams must expire: Envoy Gateway 1.9.1 disables the default idle deadline too when request timeout is zero and no explicit idle policy exists. The redirect-only route is unchanged.
 
 Either dedicated exposure can issue its own certificate instead of referencing one: top-level `certManager: { issuerRef: { name, kind: 'ClusterIssuer' | 'Issuer', group? } }` emits a `cert-manager.io/v1 Certificate` (secretName = `tlsSecretName` or a derived `<release>-tls`), declares the CRD requirement, and gates readiness on its `Ready` condition. Mutually exclusive with `controllerManagedTls`.
 

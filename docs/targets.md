@@ -171,8 +171,13 @@ The option emits `spec.rules[].timeouts.request` on the application HTTPRoute on
 It requires a controller supporting Gateway API request timeouts, an extended feature
 in the standard API since v1.2. Check the controller's support before using it.
 Pool response-header deadlines and configured route `maxDuration` still apply.
-Gateway idle limits also remain in force; SSE applications should send periodic
-heartbeats within the operator's idle limit. This option does not configure nginx Ingress.
+Configure the controller's stream-idle timeout separately to close stalled streams.
+[Envoy Gateway 1.9.1 derives an idle timeout from the request timeout](https://github.com/envoyproxy/gateway/blob/v1.9.1/internal/xds/translator/route.go#L422)
+when neither a route `BackendTrafficPolicy` nor the gateway's `ClientTrafficPolicy`
+sets `timeout.http.streamIdleTimeout`. In that case, `requestTimeout: "0s"` disables
+both default deadlines. Set an explicit `streamIdleTimeout` in the appropriate
+operator-owned policy if idle streams must expire. SSE applications should send
+heartbeats within that limit. This option does not configure nginx Ingress.
 
 ### NetworkPolicy under `strict` with a shared gateway
 

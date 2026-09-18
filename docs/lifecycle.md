@@ -57,8 +57,9 @@ The terminal behavior is protocol-specific:
   signal that clients are ending on close code 1006.
 
 For long streams through Envoy, set `requestTimeout: "0s"` on `gatewayApiExposure` or
-`httpRouteExposure`. This disables Envoy's 15-second total route deadline; the gateway's
-stream-idle timeout still applies. Omitting the option leaves the controller's default.
+`httpRouteExposure`. This disables Envoy's 15-second total route deadline. Configure
+`streamIdleTimeout` separately if stalled streams must expire; Envoy Gateway can disable
+the default idle deadline too when the request timeout is zero. Omitting the option leaves the controller's default.
 See [streaming and request timeouts](./targets.md#streaming-and-request-timeouts).
 Other exposure layers supplied by an operator need equivalent streaming and WebSocket behavior.
 Provider-specific GKE backend draining/timeout policy is not changed by this portable contract.
