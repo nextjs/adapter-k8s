@@ -42,6 +42,7 @@ import {
 // failure. The emit version truncates first, then strips, so it can't regress that.
 import { sanitizeK8sName } from "../emit/templates/utils.js";
 import { decodeNextPathname } from "../next-runtime/pathname.js";
+import { createStaticAssetIndex, type StaticAssetIndex } from "./static-asset-index.js";
 
 const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
 const PRERENDER_DEPLOY_CACHE_CONTROL = "public, max-age=0, must-revalidate";
@@ -2115,6 +2116,7 @@ export interface DispatcherOptions {
   poolName: string;
   buildId: string;
   staticAssets: StaticAssetEntry[];
+  staticAssetIndex?: StaticAssetIndex;
   releaseName?: string;
   localHandlerInvoker?: LocalHandlerInvoker;
   /** Refresh shared `use cache` invalidation state before entering Next's staged render. Valkey
@@ -2289,6 +2291,7 @@ export function createDispatcher(options: DispatcherOptions) {
     routeExecutionTimeouts = {},
     poolResponseHeadTimeouts = {},
   } = options;
+  const staticAssetIndex = options.staticAssetIndex ?? createStaticAssetIndex(staticAssets);
 
   // Anchor the ISR seed-freshness window to BUILD time, not pod start: a pod
   // (re)started long after the build must not re-serve a stale seed as "fresh" for
@@ -2752,24 +2755,7 @@ export function createDispatcher(options: DispatcherOptions) {
         const mp = resolution.matchedPathname;
         routedPathnameCandidates = manifestPathnameCandidates(mp);
         const isRSC = req.headers[rscConfig?.header ?? "rsc"] === "1";
-        const staticAsset = staticAssets.find((a) =>
-          routedPathnameCandidates.some(
-            (candidate) =>
-              a.pathname === candidate ||
-              a.pathname === (candidate.endsWith("/") ? candidate.slice(0, -1) : candidate + "/") ||
-              // The Pages Router root prerender is keyed "/index"; a request
-              // resolved to "/" (now that "/" is a recognized page) must find it.
-              (candidate === "/" && a.pathname === "/index") ||
-              // Fully-static root outputs may remain keyed as `/` while public
-              // routing resolves the configured basePath root (for example `/docs`).
-              (basePath &&
-                candidate === basePath &&
-                (a.pathname === "/" || a.pathname === "/index")) ||
-              (basePath && candidate === basePath && a.pathname === `${basePath}/index`) ||
-              // RSC requests: serve the .rsc prerendered payload if available
-              (isRSC && a.pathname === candidate + ".rsc"),
-          ),
-        );
+        const staticAsset = staticAssetIndex.findRoute(routedPathnameCandidates, basePath, isRSC);
         dispatchStaticAsset = staticAsset;
         const isReadMethod = req.method === "GET" || req.method === "HEAD";
         // N38 (SECURITY): a VERIFIED credential, not a cookie-name substring. This gate used to be
@@ -3697,9 +3683,7 @@ export function createDispatcher(options: DispatcherOptions) {
           // shell (`/en/[slug]`). The handler is necessarily the generic template, but resuming
           // it with the generic postponed state for an `/en/*` request duplicates/misplaces the
           // root-param shell. Fall back to the handler key only when no specialized entry exists.
-          const matchedPrerender = staticAssets.find(
-            (asset) => asset.prerender && routedPathnameCandidates.includes(asset.pathname),
-          );
+          const matchedPrerender = staticAssetIndex.find(routedPathnameCandidates, "prerender");
           const handlerPprCandidates = [
             resolution.matchedPathname,
             handlerPathname,

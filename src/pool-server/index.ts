@@ -65,6 +65,7 @@ import {
   parseDispatchRouteMatches,
 } from "./dispatch-metadata.js";
 import { nextStaticAssetHeaders } from "../static-asset-headers.js";
+import { createStaticAssetIndex } from "./static-asset-index.js";
 import {
   ifNoneMatchMatches,
   STATIC_STREAM_THRESHOLD_BYTES,
@@ -1363,6 +1364,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   const staticAssets: StaticAssetEntry[] = existsSync(staticAssetsPath)
     ? JSON.parse(readFileSync(staticAssetsPath, "utf-8"))
     : [];
+  const staticAssetIndex = createStaticAssetIndex(staticAssets);
   const middleAssetsByPath = new Map(
     process.env.ADAPTER_K8S_MIDDLE_CACHE === "1"
       ? staticAssets
@@ -1377,12 +1379,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
   // through dispatcher.dispatch, which merges the resolved routing verdict; the disk
   // fallback (servePublicFileFromDisk) is reserved for pathnames this returns false for.
   const staticManifestCovers = (pathname: string): boolean =>
-    staticAssets.some(
-      (a) =>
-        a.pathname === pathname ||
-        a.pathname === (pathname.endsWith("/") ? pathname.slice(0, -1) : pathname + "/") ||
-        (pathname === "/" && a.pathname === "/index"),
-    );
+    staticAssetIndex.findRoute([pathname]) !== undefined;
 
   // Allowlist for external /_next/image sources (SSRF guard).
   const imageProjectDir = process.cwd();
@@ -1968,6 +1965,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     poolName,
     buildId,
     staticAssets,
+    staticAssetIndex,
     releaseName,
     edgeRouteRunner,
     pprRoutes: routingManifest.pprRoutes,
@@ -2129,13 +2127,7 @@ export async function startPoolServer(): Promise<ReturnType<typeof createPoolSer
     const servedAsPlainAsset =
       staticPathname.startsWith("/_next/") ||
       stripBasePath(url.pathname, basePath).startsWith("/_next/") ||
-      staticAssets.some(
-        (a) =>
-          !a.prerender &&
-          (a.pathname === url.pathname ||
-            a.pathname ===
-              (url.pathname.endsWith("/") ? url.pathname.slice(0, -1) : url.pathname + "/")),
-      );
+      staticAssetIndex.hasPlainPath(url.pathname);
 
     // next.config headers() + middleware response headers, serialized by the routing
     // extension (secret-gated: server.ts already stripped the header unless the request
