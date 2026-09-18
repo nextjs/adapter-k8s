@@ -230,7 +230,7 @@ describe.skipIf(!helm || !kubeconform)("generated chart Kubernetes schemas", () 
         extensionChainJson,
         infrastructure: { projectId: "schema-project", region: "us-central1" },
       }),
-      ["Gateway", "HTTPRoute", "HealthCheckPolicy", "GCPHTTPFilter"],
+      ["Gateway", "HTTPRoute", "HealthCheckPolicy", "GCPBackendPolicy", "GCPHTTPFilter"],
     );
     expect(output).toContain("Invalid: 0");
     expect(output).toContain("Errors: 0");

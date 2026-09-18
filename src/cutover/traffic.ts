@@ -2,6 +2,7 @@
 // GitOps PR2: Phase E1 — the selector cutover, moved verbatim from src/cli/deploy.ts step 7c
 // and src/cli/rollback.ts step 4 (snapshot-first, full-`/spec/selector` replace where a
 // snapshot exists, by-NAME addressing because Helm rewrites the `managed-by` label).
+import { replaceServiceSelector } from "./service-selector.js";
 import { execCapture, EXEC_TIMEOUTS } from "../cli/exec.js";
 import { sanitizeForTerminal } from "../cli/terminal.js";
 import { sanitizeK8sName } from "../emit/templates/utils.js";
@@ -22,6 +23,7 @@ export async function switchTrafficToNewBuild(opts: {
   releaseName: string;
   namespace: string;
   safeBuildId: string;
+  projectId?: string | undefined;
   expectedCurrentBuildId: string | null;
   pools: string[];
   hasPortableOrigin: boolean;
@@ -43,6 +45,7 @@ export async function switchTrafficToNewBuild(opts: {
   const patchFailures: { pool: string; service: string; stderr: string }[] = [];
   const patchedServices: string[] = [];
   const originalServiceSelectors = new Map<string, Record<string, string>>();
+  const serviceAnnotations = new Map<string, Record<string, string>>();
   const patchedServiceSelectors = new Map<string, Record<string, string>>();
 
   // A topology-changing rollback may have redirected a stable Service to a fallback pool.
@@ -62,7 +65,9 @@ export async function switchTrafficToNewBuild(opts: {
     let selector: unknown;
     if (read.exitCode === 0) {
       try {
-        selector = JSON.parse(read.stdout)?.spec?.selector;
+        const object = JSON.parse(read.stdout);
+        selector = object?.spec?.selector;
+        serviceAnnotations.set(activeServiceName, object?.metadata?.annotations ?? {});
       } catch {
         selector = undefined;
       }
@@ -108,38 +113,14 @@ export async function switchTrafficToNewBuild(opts: {
         "app.kubernetes.io/component": targetPool,
         "app.kubernetes.io/version": safeBuildId,
       };
-      const patchResult = await execCapture(
-        "kubectl",
-        [
-          "patch",
-          "service",
-          activeServiceName,
-          "-n",
-          namespace,
-          "--type=json",
-          // Keep this imperative cutover under helm's field manager. On Helm 4's server-side
-          // path that prevents the next upgrade conflicting on the selector we flip here;
-          // Helm 3's client-side merge does not enforce managed-field conflicts.
-          // NOTE: --force-conflicts is NOT a valid `kubectl patch` flag (it only exists on
-          // `kubectl apply --server-side`); a JSON patch is not server-side apply and needs
-          // no conflict override.
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify([
-            {
-              op: "test",
-              path: "/spec/selector",
-              value: originalSelector,
-            },
-            {
-              op: "replace",
-              path: "/spec/selector",
-              value: nextSelector,
-            },
-          ]),
-        ],
-        { timeoutMs: EXEC_TIMEOUTS.kubectl },
-      );
+      const patchResult = await replaceServiceSelector({
+        namespace,
+        service: activeServiceName,
+        original: originalSelector,
+        next: nextSelector,
+        annotations: serviceAnnotations.get(activeServiceName),
+        projectId: opts.projectId,
+      });
       if (patchResult.exitCode !== 0) {
         patchFailures.push({
           pool: servicePool,
@@ -162,32 +143,14 @@ export async function switchTrafficToNewBuild(opts: {
     for (const serviceName of patchedServices) {
       const originalSelector = originalServiceSelectors.get(serviceName)!;
       const patchedSelector = patchedServiceSelectors.get(serviceName)!;
-      const revertResult = await execCapture(
-        "kubectl",
-        [
-          "patch",
-          "service",
-          serviceName,
-          "-n",
-          namespace,
-          "--type=json",
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify([
-            {
-              op: "test",
-              path: "/spec/selector",
-              value: patchedSelector,
-            },
-            {
-              op: "replace",
-              path: "/spec/selector",
-              value: originalSelector,
-            },
-          ]),
-        ],
-        { timeoutMs: EXEC_TIMEOUTS.kubectl },
-      );
+      const revertResult = await replaceServiceSelector({
+        namespace,
+        service: serviceName,
+        original: patchedSelector,
+        next: originalSelector,
+        annotations: serviceAnnotations.get(serviceName),
+        projectId: opts.projectId,
+      });
       if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
     }
     // N25: the pools stay on the previous build, so the edge must too.
@@ -226,6 +189,7 @@ export async function switchTrafficToNewBuild(opts: {
 export interface RevertSelectorPlan {
   serviceDestinations: { servicePool: string; targetPool: string }[];
   originalSelectors: Map<string, Record<string, string>>;
+  annotations?: Map<string, Record<string, string>>;
 }
 
 // N70 (rollback step 3.5): Helm is not rolled back, so HTTPRoute still carries the
@@ -281,6 +245,7 @@ export async function snapshotRevertSelectors(opts: {
       : []),
   ];
   const originalSelectors = new Map<string, Record<string, string>>();
+  const annotations = new Map<string, Record<string, string>>();
   for (const { servicePool } of serviceDestinations) {
     const serviceName = sanitizeK8sName(`${releaseName}-${servicePool}`);
     if (originalSelectors.has(serviceName)) continue;
@@ -292,7 +257,9 @@ export async function snapshotRevertSelectors(opts: {
     let selector: unknown;
     if (read.exitCode === 0) {
       try {
-        selector = JSON.parse(read.stdout)?.spec?.selector;
+        const object = JSON.parse(read.stdout);
+        selector = object?.spec?.selector;
+        annotations.set(serviceName, object?.metadata?.annotations ?? {});
       } catch {
         selector = undefined;
       }
@@ -311,7 +278,7 @@ export async function snapshotRevertSelectors(opts: {
     }
     originalSelectors.set(serviceName, selector as Record<string, string>);
   }
-  return { serviceDestinations, originalSelectors };
+  return { serviceDestinations, originalSelectors, annotations };
 }
 
 // Rollback step 4 (E1's mirror). Switch traffic: patch active Service selectors to the
@@ -332,6 +299,7 @@ export async function flipSelectorsToPreviousBuild(opts: {
   currentBuildId: string;
   previousBuildId: string;
   safePreviousBuild: string;
+  projectId?: string | undefined;
   plan: RevertSelectorPlan;
   state: AdapterState;
   registry: string | undefined;
@@ -350,34 +318,14 @@ export async function flipSelectorsToPreviousBuild(opts: {
       "app.kubernetes.io/component": targetPool,
       "app.kubernetes.io/version": safePreviousBuild,
     };
-    const patchResult = await execCapture(
-      "kubectl",
-      [
-        "patch",
-        "service",
-        svcName,
-        "-n",
-        namespace,
-        "--type=json",
-        // --force-conflicts is NOT a valid `kubectl patch` flag (only `apply
-        // --server-side` accepts it); a JSON patch needs no conflict override.
-        "--field-manager=helm",
-        "-p",
-        JSON.stringify([
-          {
-            op: "test",
-            path: "/spec/selector",
-            value: originalSelector,
-          },
-          {
-            op: "replace",
-            path: "/spec/selector",
-            value: nextSelector,
-          },
-        ]),
-      ],
-      { timeoutMs: EXEC_TIMEOUTS.kubectl },
-    );
+    const patchResult = await replaceServiceSelector({
+      namespace,
+      service: svcName,
+      original: originalSelector,
+      next: nextSelector,
+      annotations: opts.plan.annotations?.get(svcName),
+      projectId: opts.projectId,
+    });
     if (patchResult.exitCode !== 0) {
       patchFailures.push({
         service: svcName,
@@ -395,24 +343,14 @@ export async function flipSelectorsToPreviousBuild(opts: {
     const revertFailures: string[] = [];
     for (const { service: serviceName, selector: patchedSelector } of patchedServices) {
       const original = originalSelectors.get(serviceName)!;
-      const revertResult = await execCapture(
-        "kubectl",
-        [
-          "patch",
-          "service",
-          serviceName,
-          "-n",
-          namespace,
-          "--type=json",
-          "--field-manager=helm",
-          "-p",
-          JSON.stringify([
-            { op: "test", path: "/spec/selector", value: patchedSelector },
-            { op: "replace", path: "/spec/selector", value: original },
-          ]),
-        ],
-        { timeoutMs: EXEC_TIMEOUTS.kubectl },
-      );
+      const revertResult = await replaceServiceSelector({
+        namespace,
+        service: serviceName,
+        original: patchedSelector,
+        next: original,
+        annotations: opts.plan.annotations?.get(serviceName),
+        projectId: opts.projectId,
+      });
       if (revertResult.exitCode !== 0) revertFailures.push(serviceName);
     }
 

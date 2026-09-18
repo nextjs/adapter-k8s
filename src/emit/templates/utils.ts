@@ -81,6 +81,7 @@ export interface StablePoolResourceNames {
   service: string;
   pdb: string;
   hcp: string;
+  bcp: string;
 }
 
 /** Stable per-pool objects emitted together by renderActiveService. */
@@ -94,6 +95,7 @@ export function stablePoolResourceNames(
   return {
     service: sanitizeK8sName(base),
     pdb: sanitizeK8sName(base, "-pdb"),
+    bcp: sanitizeK8sName(base, "-bcp"),
     hcp: sanitizeK8sName(base, "-hcp"),
   };
 }

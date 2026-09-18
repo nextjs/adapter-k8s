@@ -195,6 +195,7 @@ export async function runCutover(inputs: CutoverInputs, deps: CutoverDeps): Prom
 
   // E1 (7c). Cut traffic over: patch each active Service selector to the new build.
   await switchTrafficToNewBuild({
+    projectId: inputs.projectId,
     releaseName,
     namespace,
     safeBuildId,
@@ -579,6 +580,7 @@ export async function runRevert(inputs: RevertInputs): Promise<void> {
 
   // 4. Switch traffic: patch active Service selectors to the previous build (traffic.ts).
   await flipSelectorsToPreviousBuild({
+    projectId: inputs.projectId,
     releaseName,
     namespace,
     currentBuildId,

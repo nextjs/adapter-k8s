@@ -12,7 +12,7 @@ const KEEP_ANNOTATION = "helm.sh/resource-policy";
 const KEEP_VALUE = "keep";
 const GKE_HCP_CRD = "healthcheckpolicies.networking.gke.io";
 
-type StableKind = "service" | "poddisruptionbudget" | "healthcheckpolicy";
+type StableKind = "service" | "poddisruptionbudget" | "healthcheckpolicy" | "gcpbackendpolicy";
 
 interface StableResource {
   kind: StableKind;
@@ -26,13 +26,14 @@ const typeForKind: Record<StableKind, string> = {
   service: "service",
   poddisruptionbudget: "poddisruptionbudget",
   healthcheckpolicy: "healthcheckpolicy",
+  gcpbackendpolicy: "gcpbackendpolicy",
 };
 
 function expectedName(releaseName: string, pool: string, kind: StableKind): string {
   const names = stablePoolResourceNames(releaseName, pool);
   if (kind === "service") return names.service;
   if (kind === "poddisruptionbudget") return names.pdb;
-  return names.hcp;
+  return kind === "gcpbackendpolicy" ? names.bcp : names.hcp;
 }
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
@@ -188,7 +189,10 @@ export async function retainRemovedPoolResources(options: {
     { kind: "service", name: names.service, required: true },
     { kind: "poddisruptionbudget", name: names.pdb, required: false },
     ...(healthCheckPolicyCrd
-      ? [{ kind: "healthcheckpolicy" as const, name: names.hcp, required: false }]
+      ? [
+          { kind: "healthcheckpolicy" as const, name: names.hcp, required: false },
+          { kind: "gcpbackendpolicy" as const, name: names.bcp, required: false },
+        ]
       : []),
   ];
   const retained: StableKind[] = [];
@@ -270,7 +274,7 @@ export async function cleanupRetainedStablePoolResources(options: {
   const kinds: StableKind[] = [
     "service",
     "poddisruptionbudget",
-    ...(healthCheckPolicyCrd ? (["healthcheckpolicy"] as const) : []),
+    ...(healthCheckPolicyCrd ? (["healthcheckpolicy", "gcpbackendpolicy"] as const) : []),
   ];
   const resources: StableResource[] = [];
   const failures: string[] = [];
@@ -358,6 +362,7 @@ export async function cleanupRetainedStablePoolResources(options: {
   for (const [, poolResources] of byPool) {
     const ordered = [...poolResources].sort((a, b) => {
       const order: Record<StableKind, number> = {
+        gcpbackendpolicy: 0,
         healthcheckpolicy: 0,
         poddisruptionbudget: 1,
         service: 2,
