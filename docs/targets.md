@@ -214,6 +214,31 @@ Notes on this journey:
 
 Add `envoyNativeRouting()` only when the selected GatewayClass is managed by Envoy Gateway and ext_proc routing is desired: middleware, rewrites, and redirects then execute at the gateway, before a request reaches any pool.
 
+With `gatewayApiExposure` or `httpRouteExposure`, `deploy` can send resolved requests directly
+to the owning pool's active Service. It enables this only when the committed predecessor has
+the same pools and default pool, and every selected stable Service already has ready endpoints
+for its own predecessor pool. All generated rules share the same routing policy; the receiving
+pool still verifies the dispatch proof before trusting the decision.
+
+First installs, topology changes, missing or unverified endpoints, and offline `emit` bundles
+keep the origin route. GitOps uses this fallback in both `none` and `job` cutover modes, including
+same-build re-emits. A previous bundle is not proof that its Services are currently serving.
+Native middleware still runs at the gateway, but requests for another pool then pass through
+the origin's authenticated proxy. A later CLI deployment with verified unchanged topology can
+enable direct routing. This trades one forwarding hop for avoiding a new pool's empty
+previous-build Service during chart sync.
+
+`deploy` reports the choice and its reason. The live HTTPRoute annotation
+`adapter-k8s.dev/native-pool-routing` records `origin` or `owning`. The chart defaults to `origin`;
+do not manually enable its deployment optimization value or carry a CLI values override into
+GitOps. These checks prevent publishing the new-pool backend from an unverified topology. They
+do not make Gateway or EndpointSlice reconciliation instantaneous.
+
+The origin Service remains the fallback when the routing tier defers to local resolution,
+including body requests covered by middleware and requests whose dispatch metadata would exceed
+the header limit. Gateway API allows 16 rules per HTTPRoute, so the adapter adds direct rules for
+up to 15 non-default pools, sorted by name. Additional pools use the origin's cross-pool proxy.
+
 ```js
 target: defineTarget({
   cluster: kubernetesCluster(),

@@ -61,42 +61,65 @@ function closeServer(server: Server | undefined): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
-describe.skipIf(!dockerAvailable)("ext_proc route-cache clearing (real Envoy)", () => {
-  const containerName = `adapter-k8s-route-cache-${process.pid}`;
-  const previousTransport = process.env.ROUTING_TRANSPORT;
-  let red: Awaited<ReturnType<typeof listenBackend>> | undefined;
-  let blue: Awaited<ReturnType<typeof listenBackend>> | undefined;
-  let routingServer: ReturnType<typeof createRoutingServer> | undefined;
-  let envoyPort = 0;
+for (const policyScope of ["listener", "route"] as const) {
+  describe.skipIf(!dockerAvailable)(
+    `ext_proc route-cache clearing (${policyScope} policy, real Envoy)`,
+    () => {
+      const containerName = `adapter-k8s-route-cache-${policyScope}-${process.pid}`;
+      const previousTransport = process.env.ROUTING_TRANSPORT;
+      let red: Awaited<ReturnType<typeof listenBackend>> | undefined;
+      let blue: Awaited<ReturnType<typeof listenBackend>> | undefined;
+      let routingServer: ReturnType<typeof createRoutingServer> | undefined;
+      let envoyPort = 0;
 
-  beforeAll(async () => {
-    red = await listenBackend("red");
-    blue = await listenBackend("blue");
+      beforeAll(async () => {
+        red = await listenBackend("red");
+        blue = await listenBackend("blue");
 
-    process.env.ROUTING_TRANSPORT = "h2c";
-    routingServer = createRoutingServer({
-      port: 0,
-      failOpen: false,
-      timeoutMs: 1_000,
-      handler: async (headers) => {
-        const pathname = headerValue(headers, ":path") ?? "/";
-        const removesPool = pathname.startsWith("/remove/");
-        const response = removesPool
-          ? buildHeaderMutationResponse([], ["x-upstream-pool"])
-          : buildHeaderMutationResponse([{ key: "x-upstream-pool", value: "blue" }]);
+        process.env.ROUTING_TRANSPORT = "h2c";
+        routingServer = createRoutingServer({
+          port: 0,
+          failOpen: false,
+          timeoutMs: 1_000,
+          handler: async (headers) => {
+            const pathname = headerValue(headers, ":path") ?? "/";
+            const removesPool = pathname.startsWith("/remove/");
+            const response = removesPool
+              ? buildHeaderMutationResponse([], ["x-upstream-pool"])
+              : buildHeaderMutationResponse([{ key: "x-upstream-pool", value: "blue" }]);
 
-        // Differential control: same protobuf/header mutation, only the cache-clear bit differs.
-        // Without this request the test could pass merely because the mutation was accepted,
-        // without proving that the bit itself changed backend selection.
-        if (pathname.endsWith("/retain")) {
-          response.requestHeaders!.response!.clearRouteCache = false;
-        }
-        return response;
-      },
-    });
-    const { port: routingPort } = await routingServer.start();
+            // Differential control: same protobuf/header mutation, only the cache-clear bit differs.
+            // Without this request the test could pass merely because the mutation was accepted,
+            // without proving that the bit itself changed backend selection.
+            if (pathname.endsWith("/retain")) {
+              response.requestHeaders!.response!.clearRouteCache = false;
+            }
+            return response;
+          },
+        });
+        const { port: routingPort } = await routingServer.start();
 
-    const envoyConfig = `static_resources:
+        // Envoy Gateway attaches the policy to each HTTPRoute rule. Start with header processing
+        // disabled at the listener so the route-scoped case proves the overrides are applied.
+        const perRoute =
+          policyScope === "route"
+            ? `
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              overrides:
+                                grpc_service:
+                                  envoy_grpc: { cluster_name: routing-service }
+                                  timeout: 2s
+                                processing_mode:
+                                  request_header_mode: SEND
+                                  response_header_mode: SKIP
+                                  request_body_mode: NONE
+                                  response_body_mode: NONE
+                                  request_trailer_mode: SKIP
+                                  response_trailer_mode: SKIP`
+            : "";
+        const envoyConfig = `static_resources:
   listeners:
     - name: listener
       address:
@@ -118,9 +141,9 @@ describe.skipIf(!dockerAvailable)("ext_proc route-cache clearing (real Envoy)", 
                             headers:
                               - name: x-upstream-pool
                                 string_match: { exact: blue }
-                          route: { cluster: blue }
+                          route: { cluster: blue }${perRoute}
                         - match: { prefix: "/" }
-                          route: { cluster: red }
+                          route: { cluster: red }${perRoute}
                 http_filters:
                   - name: envoy.filters.http.ext_proc
                     typed_config:
@@ -131,7 +154,7 @@ describe.skipIf(!dockerAvailable)("ext_proc route-cache clearing (real Envoy)", 
                       failure_mode_allow: false
                       message_timeout: 2s
                       processing_mode:
-                        request_header_mode: SEND
+                        request_header_mode: ${policyScope === "route" ? "SKIP" : "SEND"}
                         response_header_mode: SKIP
                         request_body_mode: NONE
                         response_body_mode: NONE
@@ -178,81 +201,94 @@ describe.skipIf(!dockerAvailable)("ext_proc route-cache clearing (real Envoy)", 
                     socket_address: { address: host.docker.internal, port_value: ${blue.port} }
 `;
 
-    docker([
-      "run",
-      "-d",
-      "--rm",
-      "--name",
-      containerName,
-      "--add-host",
-      "host.docker.internal:host-gateway",
-      "-p",
-      "127.0.0.1::18080",
-      "envoyproxy/envoy:v1.32-latest",
-      "--config-yaml",
-      envoyConfig,
-      "--log-level",
-      "warning",
-    ]);
-    envoyPort = Number(docker(["port", containerName, "18080/tcp"]).split(":").pop());
+        docker([
+          "run",
+          "-d",
+          "--rm",
+          "--name",
+          containerName,
+          "--add-host",
+          "host.docker.internal:host-gateway",
+          "-p",
+          "127.0.0.1::18080",
+          "envoyproxy/envoy:v1.32-latest",
+          "--config-yaml",
+          envoyConfig,
+          "--log-level",
+          "warning",
+        ]);
+        envoyPort = Number(docker(["port", containerName, "18080/tcp"]).split(":").pop());
 
-    for (let attempt = 0; attempt < 100; attempt++) {
-      try {
-        const response = await fetch(`http://127.0.0.1:${envoyPort}/ready`, {
-          signal: AbortSignal.timeout(500),
+        for (let attempt = 0; attempt < 100; attempt++) {
+          try {
+            const response = await fetch(`http://127.0.0.1:${envoyPort}/ready`, {
+              signal: AbortSignal.timeout(500),
+            });
+            await response.arrayBuffer();
+            return;
+          } catch {
+            await sleep(100);
+          }
+        }
+        throw new Error(`Envoy did not become ready:\n${docker(["logs", containerName])}`);
+      }, 120_000);
+
+      afterAll(async () => {
+        try {
+          docker(["rm", "-f", containerName]);
+        } catch {
+          // The container may already have exited after a configuration failure.
+        }
+        await routingServer?.stop().catch(() => undefined);
+        await Promise.all([closeServer(red?.server), closeServer(blue?.server)]);
+        if (previousTransport === undefined) delete process.env.ROUTING_TRANSPORT;
+        else process.env.ROUTING_TRANSPORT = previousTransport;
+      });
+
+      async function request(pathname: string, poolHeader?: string) {
+        const response = await fetch(`http://127.0.0.1:${envoyPort}${pathname}`, {
+          headers: poolHeader ? { "x-upstream-pool": poolHeader } : undefined,
         });
-        await response.arrayBuffer();
-        return;
-      } catch {
-        await sleep(100);
+        expect(response.status).toBe(200);
+        return (await response.json()) as { backend: string; poolHeader: string | null };
       }
-    }
-    throw new Error(`Envoy did not become ready:\n${docker(["logs", containerName])}`);
-  }, 120_000);
 
-  afterAll(async () => {
-    try {
-      docker(["rm", "-f", containerName]);
-    } catch {
-      // The container may already have exited after a configuration failure.
-    }
-    await routingServer?.stop().catch(() => undefined);
-    await Promise.all([closeServer(red?.server), closeServer(blue?.server)]);
-    if (previousTransport === undefined) delete process.env.ROUTING_TRANSPORT;
-    else process.env.ROUTING_TRANSPORT = previousTransport;
-  });
+      it("reselects the backend after setting x-upstream-pool", async () => {
+        // Both requests reach the backend with the mutation. Only clearRouteCache changes which
+        // backend Envoy chooses, proving that merely serializing the header is insufficient.
+        await expect(request("/set/retain")).resolves.toEqual({
+          backend: "red",
+          poolHeader: "blue",
+        });
+        await expect(request("/set/clear")).resolves.toEqual({
+          backend: "blue",
+          poolHeader: "blue",
+        });
+      });
 
-  async function request(pathname: string, poolHeader?: string) {
-    const response = await fetch(`http://127.0.0.1:${envoyPort}${pathname}`, {
-      headers: poolHeader ? { "x-upstream-pool": poolHeader } : undefined,
-    });
-    expect(response.status).toBe(200);
-    return (await response.json()) as { backend: string; poolHeader: string | null };
-  }
-
-  it("reselects the backend after setting x-upstream-pool", async () => {
-    // Both requests reach the backend with the mutation. Only clearRouteCache changes which
-    // backend Envoy chooses, proving that merely serializing the header is insufficient.
-    await expect(request("/set/retain")).resolves.toEqual({
-      backend: "red",
-      poolHeader: "blue",
-    });
-    await expect(request("/set/clear")).resolves.toEqual({
-      backend: "blue",
-      poolHeader: "blue",
-    });
-  });
-
-  it("reselects safely after stripping a spoofed x-upstream-pool", async () => {
-    // The initial route is attacker-selected blue. Header removal reaches both backends, but
-    // only route-cache clearing returns selection to the clean catch-all red route.
-    await expect(request("/remove/retain", "blue")).resolves.toEqual({
-      backend: "blue",
-      poolHeader: null,
-    });
-    await expect(request("/remove/clear", "blue")).resolves.toEqual({
-      backend: "red",
-      poolHeader: null,
-    });
-  });
-});
+      it("reselects safely after stripping a spoofed x-upstream-pool", async () => {
+        // The initial route is attacker-selected blue. Header removal reaches both backends, but
+        // only route-cache clearing returns selection to the clean catch-all red route.
+        await expect(request("/remove/retain", "blue")).resolves.toEqual({
+          backend: "blue",
+          poolHeader: null,
+        });
+        await expect(request("/remove/clear", "blue")).resolves.toEqual({
+          backend: "red",
+          poolHeader: null,
+        });
+      });
+      it("fails closed when the processor is unavailable, including with a spoofed route", async () => {
+        await routingServer?.stop();
+        for (const poolHeader of [undefined, "blue"]) {
+          const response = await fetch(`http://127.0.0.1:${envoyPort}/unavailable`, {
+            headers: poolHeader ? { "x-upstream-pool": poolHeader } : undefined,
+            signal: AbortSignal.timeout(5_000),
+          });
+          await response.arrayBuffer();
+          expect(response.status).toBe(500);
+        }
+      });
+    },
+  );
+}

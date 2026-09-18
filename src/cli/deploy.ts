@@ -21,6 +21,8 @@ import { retainRemovedPoolResources } from "./stable-pool-resources.js";
 // The edge-recovery revert function is injected from ./rollback.js (below) so the module
 // boundary the orchestration tests mock stays authoritative for "revert the edge".
 import { runCutover } from "../cutover/run.js";
+import { inspectNativePoolRouting } from "./native-pool-routing.js";
+import { isNativePoolRoutingRoute } from "../emit/native-pool-routing.js";
 import { createEdgeRecovery } from "../cutover/edge.js";
 import { CutoverExitError } from "../cutover/inputs.js";
 import { retainLiveRoutingManifest, revertRoutingServiceToBuild } from "../cutover/edge.js";
@@ -524,6 +526,8 @@ export function buildHelmUpgradeArgs(options: {
   poolHealthCheckPath?: string;
   /** Determined from `helm upgrade --help`; defaults to the historical Helm 4 behavior. */
   helmUpgradeMode?: HelmUpgradeMode;
+  /** Explicit on every invocation so --reuse-values cannot retain an earlier enablement. */
+  nativePoolRouting?: boolean;
 }): string[] {
   const {
     releaseName,
@@ -569,6 +573,8 @@ export function buildHelmUpgradeArgs(options: {
     `build.id=${buildId}`,
     "--set",
     `activeBuildId=${sanitizeK8sName(previousBuildId ?? buildId)}`,
+    "--set",
+    `nativePoolRouting=${options.nativePoolRouting === true}`,
   ];
 
   if (defaultPool !== undefined) {
@@ -1882,13 +1888,6 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
       ? { poolHealthCheckPath: LIVENESS_PATH_FOR_MIGRATION }
       : {}),
   };
-  const helmArgs = buildHelmUpgradeArgs({
-    ...helmArgsBase,
-    // Dry-run's first printed form is the Helm 3 client-side command. The Helm 4 form is
-    // rendered separately at the execution site below.
-    helmUpgradeMode: helmUpgradeMode ?? "client-side",
-  });
-
   const chartTemplatesDir = path.join(outputDir, "chart", "templates");
 
   // N32: wipe any retained-manifest files from an EARLIER deploy before writing this
@@ -2288,6 +2287,43 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     revertRoutingService: revertRoutingServiceToBuild,
   });
   const { restoreEdgeToPreviousBuild, edgeStatusLines } = edgeRecovery;
+
+  const nativePoolRouting =
+    compositionSnapshot &&
+    compositionSnapshot.plan.operations.resources.objects.some(isNativePoolRoutingRoute)
+      ? await inspectNativePoolRouting({
+          plan: compositionSnapshot.plan,
+          state,
+          previousBuildId,
+          pools,
+          defaultPool,
+          dryRun: dryRun === true,
+        })
+      : undefined;
+  if (nativePoolRouting) {
+    console.log(
+      `  → Native owning-pool routing: ${nativePoolRouting.enabled ? "enabled" : "origin fallback"} (${nativePoolRouting.reason})`,
+    );
+  }
+  if (nativePoolRouting?.enabled) {
+    const serving = await readServingState();
+    if (
+      !serving.state ||
+      serving.state.buildId !== previousBuildId ||
+      serving.previousBuildId !== previousBuildId ||
+      (serving.state?.generation ?? 0) !== (state?.generation ?? 0)
+    ) {
+      throw new Error(
+        "Serving state changed while checking native pool endpoints; re-run deploy before publishing routing rules.",
+      );
+    }
+  }
+  const helmArgs = buildHelmUpgradeArgs({
+    ...helmArgsBase,
+    nativePoolRouting: nativePoolRouting?.enabled === true,
+    // Dry-run prints Helm 3 first and Helm 4 separately below.
+    helmUpgradeMode: helmUpgradeMode ?? "client-side",
+  });
 
   console.log("\n  → Running helm upgrade...");
   // From this point the edge MAY run the new build. Helm overwrites the stable routing-manifest

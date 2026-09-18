@@ -71,6 +71,9 @@ function validateRoutingOrigin(
         `current exposure components require namespace ${JSON.stringify(releaseNamespace)}`,
     );
   }
+  if (origin.poolHeaderRouting !== undefined && origin.poolHeaderRouting !== true) {
+    throw new Error(`Routing component "${componentName}" returned invalid poolHeaderRouting`);
+  }
 }
 
 function validateRoutingContract(
@@ -533,6 +536,11 @@ export function compileTarget(
     );
   }
   validateRoutingContract(target.routing.name, context, routing, routingOrigin.service);
+  if (routingOrigin.poolHeaderRouting && routing.plan.protocol !== "envoy-ext-proc-v3") {
+    throw new Error(
+      `Routing component "${target.routing.name}" requires ext_proc for poolHeaderRouting`,
+    );
+  }
   assertGcpTrafficExtensionTopology({
     identity: cluster.identity,
     routing: routing.plan,
