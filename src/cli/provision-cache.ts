@@ -381,7 +381,7 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
     return withAuth(await waitForReady(name, region, projectId, log), secured);
   }
 
-  const gcpTier = (tier ?? "").toUpperCase() === "STANDARD_HA" ? "standard_ha" : "basic";
+  const gcpTier = (tier ?? "").toUpperCase() === "STANDARD_HA" ? "standard" : "basic";
   log(
     `    Creating Memorystore ${name} (${sizeGb}GB, tier ${gcpTier}` +
       `${wantAuthOnCreate ? ", AUTH + in-transit encryption" : ""}) — this takes a few minutes…`,
@@ -404,7 +404,7 @@ export async function provisionMemorystore(opts: ProvisionCacheOptions): Promise
       "--connect-mode",
       "DIRECT_PEERING",
       ...(wantAuthOnCreate
-        ? ["--auth-enabled", "--transit-encryption-mode", "SERVER_AUTHENTICATION"]
+        ? ["--enable-auth", "--transit-encryption-mode", "SERVER_AUTHENTICATION"]
         : []),
       "--project",
       projectId,

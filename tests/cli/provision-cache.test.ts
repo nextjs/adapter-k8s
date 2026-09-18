@@ -82,7 +82,10 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     expect(exec.execCapture).not.toHaveBeenCalled();
   });
 
-  it("creates the instance with AUTH + SERVER_AUTHENTICATION and returns authString + CA", async () => {
+  it.each([
+    ["BASIC", "basic"],
+    ["STANDARD_HA", "standard"],
+  ] as const)("creates %s with gcloud's tier and AUTH flags", async (tier, gcloudTier) => {
     // describeInstance is called twice with the same args: not-found first (create
     // path), then READY (waitForReady). Track calls to sequence the two answers.
     let describes = 0;
@@ -102,7 +105,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
       }
       return ok();
     });
-    const endpoint = await provisionMemorystore({ ...OPTS, auth: true });
+    const endpoint = await provisionMemorystore({ ...OPTS, auth: true, tier });
     expect(endpoint).toEqual({
       host: "10.0.0.1",
       port: 6379,
@@ -112,7 +115,8 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     const createCall = vi
       .mocked(exec.execCapture)
       .mock.calls.find(([, args]) => args.includes("create"));
-    expect(createCall?.[1]).toContain("--auth-enabled");
+    expect(createCall?.[1][createCall[1].indexOf("--tier") + 1]).toBe(gcloudTier);
+    expect(createCall?.[1]).toContain("--enable-auth");
     expect(createCall?.[1]).toContain("--transit-encryption-mode");
     expect(createCall?.[1]).toContain("SERVER_AUTHENTICATION");
   });
@@ -144,7 +148,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     const createCall = vi
       .mocked(exec.execCapture)
       .mock.calls.find(([, args]) => args.includes("create"));
-    expect(createCall?.[1]).toContain("--auth-enabled");
+    expect(createCall?.[1]).toContain("--enable-auth");
     expect(createCall?.[1]).toContain("SERVER_AUTHENTICATION");
   });
 
@@ -170,7 +174,7 @@ describe("provisionMemorystore with AUTH + in-transit encryption", () => {
     const createCall = vi
       .mocked(exec.execCapture)
       .mock.calls.find(([, args]) => args.includes("create"));
-    expect(createCall?.[1]).not.toContain("--auth-enabled");
+    expect(createCall?.[1]).not.toContain("--enable-auth");
     expect(logs.join("\n")).toMatch(/UNAUTHENTICATED/);
   });
 
