@@ -1,4 +1,5 @@
 // src/pool-server/dispatch.ts
+import { handOffStaticAsset } from "./middle-cache.js";
 import { Agent, createServer, request as httpRequest } from "node:http";
 import { AsyncResource } from "node:async_hooks";
 import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
@@ -91,6 +92,13 @@ function localHandlerLoopback(): Promise<LocalHandlerLoopback> {
       // become pinned to that first request and leak into every later render in this process.
       invocation.asyncResource.runInAsyncScope(invocation.handler, undefined, req, res);
     });
+    // This listener and its clients live in the same process. Let the agents own idle
+    // connection lifetime: reads retain at most 64 free sockets; mutation/PPR agents are
+    // destroyed after their invocation. Node's default server idle timer raced reuse at
+    // six-second probe gaps during live cutovers, resetting requests before their handler
+    // ran (ECONNRESET -> 500). Removing that timer avoids the race without replaying handlers
+    // or imposing an inactivity timeout on legitimate response streams.
+    server.keepAliveTimeout = 0;
     const startupError = (error: Error): void => {
       localHandlerLoopbackPromise = undefined;
       reject(error);
@@ -3120,6 +3128,17 @@ export function createDispatcher(options: DispatcherOptions) {
               }
               if (varyKey && varyKey !== "vary") delete headers[varyKey];
               headers.vary = [...varyTokens].join(", ");
+            }
+            // Resolution and response-header wrappers are already installed. Hand off only
+            // immutable build-file bytes, before Node reads/hashes them. Prerenders keep
+            // their ISR/PPR invalidation path and never enter this cache.
+            if (serveStaticFile) {
+              deleteHeaderCaseInsensitive(headers, "x-next-cache-tags");
+              Object.assign(
+                headers,
+                cdnCacheTag(String(headers["cache-control"] ?? staticAsset.cacheControl), buildId),
+              );
+              if (handOffStaticAsset(req, res, staticAsset, headers)) return;
             }
             // Next's generated service-worker chunks are deliberately mutable and revalidated.
             // Static files bypass the Next server in this adapter, so the adapter must supply the

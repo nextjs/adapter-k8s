@@ -138,6 +138,10 @@ export interface K8sAdapterConfig {
       auth?: boolean;
     };
   };
+  /** Serve build assets through a Go sidecar after middleware. Its byte cache is per pod/build. */
+  middleCache?: { enabled: boolean };
+  /** Compress responses with Envoy outside Node. Enabled by default on every target. */
+  compression?: { enabled: boolean };
   containerStrategy?: "traced-assets" | "shared-image";
   /**
    * Names of `kubernetes.io/dockerconfigjson` Secrets (e.g. `docker-regcred`) in the app

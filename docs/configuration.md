@@ -242,6 +242,62 @@ entries are served without caching.
 For an external image optimization service, use Next's `images.loader: "custom"` and
 `images.loaderFile` to generate that service's URLs.
 
+## Middle cache for build assets
+
+Set `middleCache: { enabled: true }` in your adapter config to serve build assets through
+a Go sidecar. It works with every target and both container strategies. Middleware and
+proxy routing still run for every request, including cache hits, HEAD and conditional
+requests. The sidecar serves the resolved file and preserves the current request's
+response headers and cookies. Responses covered by middleware retain `Cache-Control:
+no-cache`, so an upstream CDN cannot skip middleware.
+
+The cache holds file bytes from `public/` and build-emitted static assets. It excludes
+prerenders, ISR/PPR, image optimization, dynamic responses and external proxy responses.
+Each pod caches at most 64 MiB and 4,096 files, with a 1 MiB limit per cached file. Larger
+files stream from disk. The sidecar admits at most 64 concurrent file responses and
+answers excess requests with an uncacheable 503. Cache entries belong to the pod's build;
+deploy and rollback switch the sidecar and app together through the existing Service.
+
+This option adds a Go process with a 128 MiB memory request and 256 MiB limit to each pool
+pod. It uses the same image as the pool, with a static Go binary compiled during the
+Docker build. The host does not need Go. Port 3000 remains the public pod port; the Node
+server listens on loopback port 3001. With compression enabled, Envoy owns port 3000
+and the middle cache listens on loopback port 3002. Readiness checks pass through both
+proxies to Node.
+Disable the option and rebuild to return to Node file serving. Local `emulate` continues
+to serve files through Node.
+
+## Response compression
+
+The deployment adapter overrides Next's `compress` setting to `false`, including when
+the app sets it to `true`. Generated pool pods run a separate Envoy process for response
+compression by default, on every target including GKE. Set `compression: { enabled: false }`
+in the adapter config to omit this proxy when your own ingress handles compression.
+Next compression remains disabled.
+
+Envoy negotiates Brotli, Zstandard and gzip from `Accept-Encoding`, honors client quality
+values, and prefers Brotli for ties. It compresses HTML, RSC, JSON, JavaScript, CSS, XML,
+SVG and WebAssembly. Responses with a known length below 1 KiB remain uncompressed.
+SSE, partial-range responses, already encoded bodies and responses with `Cache-Control:
+no-transform` pass through unchanged. Compression adds `Vary: Accept-Encoding`, preserves
+cookies and weak ETags, and removes strong ETags when transforming the body.
+
+Brotli and gzip flush incremental HTML/RSC chunks. Envoy 1.38.3's Zstandard compressor
+does not flush intermediate chunks, so the adapter skips Zstandard on responses without
+`Content-Length`. If negotiation selects Zstandard for such a response, Envoy sends it
+uncompressed. It never buffers a response to determine its length.
+
+The proxy preserves the request target, authority, forwarded headers and `Accept-Encoding`
+so middleware dispatch proofs remain valid. With the middle cache enabled, the response
+passes from Node through the asset cache and then through Envoy. The cache keeps original
+file bytes; compression does not cache response headers or skip middleware.
+
+Each pool pod gains a digest-pinned Envoy 1.38.3 container with two worker threads, a
+100m CPU and 64 MiB memory request, and limits of 1 CPU and 128 MiB. Port 3000 stays the
+public port and readiness checks traverse the proxy. Its shutdown hook waits for load
+balancer draining before draining active connections. Local `emulate` uses the same codecs
+in its existing front proxy.
+
 ## Not yet implemented
 
 The old `imageOptimizer`, `skewProtection`, and top-level `routeExtension` keys were placeholders. They never changed emitted workloads and are no longer part of `K8sAdapterConfig`. Validation rejects them with a removal message instead of silently ignoring stale configuration. The implemented GKE routing timeout remains at `provider.gke.serviceExtensions.routeExtension.timeout` during the legacy migration window.

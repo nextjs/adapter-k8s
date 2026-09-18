@@ -84,7 +84,7 @@ describe.skipIf(!helmAvailable())("real helm: image digest seam (S7)", () => {
     const out = render(pool(), []);
     expect(out).toContain('image: "gcr.io/proj/nextjs-app-ssr:b1"');
     expect(out).toContain("imagePullPolicy: Always");
-    expect(out).not.toContain("@sha256:");
+    expect(out.split("- name: compression")[0]).not.toContain("@sha256:");
   });
 
   it("pool: digest in values ⇒ immutable reference + IfNotPresent", () => {

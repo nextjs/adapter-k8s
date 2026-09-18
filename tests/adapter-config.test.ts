@@ -28,6 +28,15 @@ const validConfig: K8sAdapterConfig = {
 };
 
 describe("createK8sAdapter config normalization", () => {
+  it.each([undefined, true, false])(
+    "disables Next compression when configured as %s",
+    async (compress) => {
+      const adapter = createK8sAdapter(validConfig);
+      const modified = await adapter.modifyConfig!({ compress } as any, {} as any);
+      expect(modified).toMatchObject({ compress: false });
+    },
+  );
+
   it("rejects an unreviewed Next.js release before modifying the build config", async () => {
     const adapter = createK8sAdapter(validConfig);
 

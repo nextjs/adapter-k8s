@@ -68,7 +68,7 @@
     "build:routing-service": "esbuild ./src/routing-service/index.ts --bundle --format=cjs --platform=node --outfile=./dist/routing-service.cjs --external:@next/routing",
     "build:cli": "esbuild ./src/cli/index.ts --bundle --format=cjs --platform=node --outfile=./dist/cli.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cli.cjs && cp ./integration/envoy.yaml ./dist/envoy.yaml",
     "build:cutover-job": "esbuild ./src/cutover/job-main.ts --bundle --format=cjs --platform=node --outfile=./dist/cutover-job.cjs --banner:js='#!/usr/bin/env node' && chmod +x ./dist/cutover-job.cjs",
-    "build": "npm run build:clean && npm run build:types && npm run build:package && npm run build:pool-server && npm run build:cache-handler && npm run build:protos && npm run build:routing-service && npm run build:cli && npm run build:cutover-job",
+    "build": "npm run build:clean && npm run build:types && npm run build:package && npm run build:pool-server && npm run build:cache-handler && npm run build:protos && npm run build:routing-service && npm run build:cli && npm run build:cutover-job && npm run build:middle-cache",
     "prepack": "npm run build",
     "prepublishOnly": "npm run release:check",
     "release:check": "npm run fmt:check && npm run lint && npm run typecheck && npm run audit && npm test && npm run test:schema && npm run test:package",
@@ -77,7 +77,9 @@
     "fmt:check": "oxfmt --check",
     "lint": "oxlint --deny-warnings",
     "lint:fix": "oxlint --fix",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:middle-cache": "cp docker/middle-cache/main.go dist/middle-cache.go",
+    "test:middle-cache": "cd docker/middle-cache && go test -race ./..."
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.12.1",
