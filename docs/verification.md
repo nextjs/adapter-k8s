@@ -218,6 +218,15 @@ The specific behaviors the architecture exists to get right, each confirmed agai
   timeout preceded routing readiness withdrawal, so pod shutdown alone does not explain
   the remaining failures. Both updated builds and the restored build passed all 30 live
   checks. Zero-error cutover is still unresolved.
+- **Callout timeout follow-up.** Request-ID tracing on the same fixture reproduced
+  two 504s in 11,548 requests without pod shutdown, including a fresh frontend
+  connection. Keeping a withdrawn pod alive produced one timeout in 15,250 requests;
+  that request reached a healthy pod after its public deadline, and Node wrote its
+  response about 2ms later. These failures are not explained by shutdown alone.
+  The default GKE callout deadline was also corrected from 4s to 5s around the existing
+  4000ms handler budget. A subsequent five-minute sample passed 10,669 requests, all
+  30 live tests, and 32 doctor checks. The cause of the delivery delay remains unresolved,
+  and the full deploy/rollback sequence has not been repeated with the corrected budget.
 - **Full-topology runs are operator-initiated, not per-commit CI.** The cluster-topology
   suite (layer 2) covers the ext_proc path end to end, but it runs on a local k3d cluster
   when a maintainer launches it—hours, not minutes. Pull requests are gated by the unit,
