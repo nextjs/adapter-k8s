@@ -111,6 +111,8 @@ export interface DeployOptions {
   releaseName: string;
   skipBuild?: boolean;
   skipPush?: boolean;
+  /** Keep outgoing capacity, superseded builds and retired cache resources after cutover. */
+  skipCleanup?: boolean;
   dryRun?: boolean;
   /**
    * Explicit opt-out of the fail-closed NetworkPolicy posture: allow the deploy to
@@ -938,6 +940,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
     releaseName,
     skipBuild,
     skipPush,
+    skipCleanup,
     dryRun,
     allowNoNetworkPolicy,
     allowMutableTags,
@@ -2406,6 +2409,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
             path.join(outputDir, "chart", "templates", "routing-service-deployment.yaml"),
           ),
           hasHealthCheckPolicy,
+          skipCleanup: skipCleanup ?? false,
           previousReplicasByPool,
           state,
           compositionSnapshot,
@@ -2435,7 +2439,7 @@ export async function runDeploy(options: DeployOptions): Promise<void> {
   // build still serving 100% of traffic. Only its retained, state-authenticated composition
   // plan can authorize the cloud mutation, and it happens after runCutover commits the new build.
   // Legacy builds were rejected before Helm because their markers cannot prove ownership.
-  if (!dryRun && !cacheManaged) {
+  if (!dryRun && !cacheManaged && !skipCleanup) {
     if (!metadata.cacheEnabled) {
       const secretDelete = await execCapture(
         "kubectl",

@@ -256,6 +256,24 @@ describe("runRollback — state and CDN invalidation", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  it("can reverse traffic and state while retaining the rolled-away build capacity", async () => {
+    vi.mocked(execCapture).mockImplementation(capture(false) as never);
+    await runRollback({ projectDir: PROJECT, releaseName: RELEASE, skipCleanup: true });
+    expect(vi.mocked(writeState).mock.calls[0]?.[1]).toMatchObject({
+      buildId: "buildm",
+      previousBuildId: "buildn",
+    });
+    for (const calls of [vi.mocked(execCapture).mock.calls, vi.mocked(execOrThrow).mock.calls]) {
+      expect(calls.some(([cmd, args]) => cmd === "kubectl" && args[0] === "delete")).toBe(false);
+      expect(
+        calls.some(
+          ([cmd, args]) =>
+            cmd === "kubectl" && args[0] === "scale" && args.includes("--replicas=0"),
+        ),
+      ).toBe(false);
+    }
+  });
+
   it("invalidates the rolled-away-from build (currentBuildId) on a successful switch", async () => {
     vi.mocked(execCapture).mockImplementation(capture(false) as never);
 

@@ -397,6 +397,24 @@ function printedErrors(): string {
 }
 
 describe("runCutover — the happy path's ordering", () => {
+  it("can commit a gated cutover without parking or deleting any retained resources", async () => {
+    vi.mocked(execCapture).mockImplementation(cluster() as never);
+    await runCutover(inputs({ skipCleanup: true }), deps);
+    expect(events).toContain("patch:rel-ssr");
+    expect(vi.mocked(writeState).mock.calls[0]?.[1]).toMatchObject({
+      buildId: BUILD,
+      previousBuildId: PREV,
+    });
+    expect(
+      events.some((event) => event.startsWith("park:") || event.startsWith("delete-hpa:")),
+    ).toBe(false);
+    expect(
+      vi
+        .mocked(execCapture)
+        .mock.calls.some(([cmd, args]) => cmd === "kubectl" && args[0] === "delete"),
+    ).toBe(false);
+  });
+
   it("gates, then patches selectors, then commits state, then parks the previous build", async () => {
     vi.mocked(execCapture).mockImplementation(cluster() as never);
 
