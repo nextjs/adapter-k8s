@@ -311,11 +311,26 @@ does not configure one. Ordinary navigation still follows Next's recovery onto t
 current build.
 
 Only the immediately previous build is retained. Each of its pools keeps one replica,
-including its configured sidecars, with its HPA removed. **These standby replicas remain
-after the serving deadline**, ready for rollback, until the next deployment removes the
-superseded build. This bounds standby capacity to one previous build; it does not scale
-the standby to zero on a timer. Leave retention disabled to keep the usual zero-replica
-rollback target.
+including its configured sidecars, with its HPA removed. After the serving deadline,
+a cluster CronJob scales those pools to zero and preserves their rollback resources.
+It checks once per minute; scheduling delays and the normal pod termination grace period
+can extend the time until the pods disappear. Rollback restores capacity and verifies
+readiness before moving traffic. Leave retention disabled to park the rollback target
+at zero immediately after cutover.
+
+The cleanup job uses the deployed default-pool image and a separate service account.
+Its namespace Role can read the release's deploy state, list Deployments, Services, and
+HPAs, and patch Deployment scale subresources. It cannot read Secrets or edit pod
+templates. The worker checks the release, build, serving selectors, deadline, and HPA
+ownership. Each scale-down requires the Deployment's observed UID and resource version
+to still match. Promotion and rollback renew that build's expiry marker before readiness,
+so cleanup cannot act on an older observation after the build is prepared to serve.
+
+Expiry markers have a one-hour recovery deadline during preparation. If the CLI exits
+after committing traffic but before finalizing retention, the job can still retire the
+standby later. It leaves capacity untouched when state or selectors disagree, API reads
+fail, or an HPA still controls the target. Recover an interrupted cutover or remove the
+outgoing HPA through a successful deploy/rollback before expecting cleanup in those cases.
 
 `gracePeriodSeconds` accepts integers from 1 to 3600 and defaults to 300. After successful
 cutover, the CLI publishes a signed serving deadline with an additional 120-second
